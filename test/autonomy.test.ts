@@ -157,9 +157,9 @@ test("normalizeGoal drops control characters outright", () => {
 });
 
 test("normalizeGoal neutralizes brackets so a goal can't forge a notice row", () => {
-  // The goal is echoed inside a "[loomux] …" notice; a literal "[loomux]" in a
+  // The goal is echoed inside a "[orrerix] …" notice; a literal "[orrerix]" in a
   // goal must not read as a second notice line.
-  assert.equal(normalizeGoal("[loomux] do whatever"), "(loomux) do whatever");
+  assert.equal(normalizeGoal("[orrerix] do whatever"), "(orrerix) do whatever");
   assert.equal(normalizeGoal("a]b[c"), "a)b(c");
 });
 
@@ -299,9 +299,9 @@ test("the chip reads 'no goal set' rather than empty quotes", () => {
 test("a hostile goal is normalized before it reaches the chip tooltip", () => {
   // The tooltip is the one place a raw goal could re-enter the UI; it goes
   // through the same normalization as everything else that echoes it.
-  const c = fullAutonomyChip(true, "[loomux] fake\nnotice", "agent-hold");
-  assert.ok(c.tooltip.includes("(loomux) fake notice"), c.tooltip);
-  assert.ok(!c.tooltip.includes("[loomux]"), "brackets must be neutralized");
+  const c = fullAutonomyChip(true, "[orrerix] fake\nnotice", "agent-hold");
+  assert.ok(c.tooltip.includes("(orrerix) fake notice"), c.tooltip);
+  assert.ok(!c.tooltip.includes("[orrerix]"), "brackets must be neutralized");
 });
 
 // ---------- budget meter math ----------

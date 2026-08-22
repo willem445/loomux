@@ -197,6 +197,18 @@ pub fn resolve_repo_file(
 /// before comparing, so a capital letter here matches nothing — and fails
 /// *open*, with no compile error.
 ///
+/// **Unforgeable only in the delivery direction, and that asymmetry is the
+/// whole design constraint** (carried here from this const's previous home in
+/// `text`). Nothing an agent sends *through* this app can carry the marker:
+/// `notify::sanitize_gh_text` rewrites `[`→`(` in every untrusted field
+/// before it is formatted into a notice, and `intake`'s own test pins that a
+/// third-party issue title can never produce this string. But an agent's pane
+/// *output* is not sanitized at all, so an agent can print these bytes itself
+/// — echoing a notice back, quoting one in a summary, or induced to by a
+/// hostile prompt. A marker row is therefore evidence that *someone wrote a
+/// notice-shaped row*, never proof that this app wrote this one, and
+/// `mask_loomux_notices` is scoped to exactly what that weaker claim supports.
+///
 /// [`notify::sanitize_pane_text`]: crate::notify::sanitize_pane_text
 pub const NOTICE_MARKER: &str = "[orrerix]";
 
