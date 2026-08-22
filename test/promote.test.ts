@@ -24,6 +24,8 @@ const spawnRequest = (overrides: Partial<OrchSpawnRequest> = {}): OrchSpawnReque
   argv: ["claude", "--resume", "11111111-2222-3333-4444-555555555555", "--strict-mcp-config"],
   env: [
     ["PATH", "C:\\shim;C:\\Windows"],
+    ["ORRERIX_GROUP_DIR", "C:\\state\\loomux-1a2b"],
+    ["ORRERIX_AGENT_ID", "orch-4"],
     ["LOOMUX_GROUP_DIR", "C:\\state\\loomux-1a2b"],
     ["LOOMUX_AGENT_ID", "orch-4"],
   ],
@@ -32,13 +34,15 @@ const spawnRequest = (overrides: Partial<OrchSpawnRequest> = {}): OrchSpawnReque
 
 // ---------- the env/argv trap ----------
 
-test("a promoted pane is spawned WITH the request's env — the gh shim and LOOMUX_GROUP_DIR reach the pty", () => {
+test("a promoted pane is spawned WITH the request's env — the gh shim and BOTH group-dir spellings reach the pty", () => {
   // A normal launcher pane carries no env at all, so dropping this is invisible:
   // the pane looks right and simply has no merge gate. This is the assertion that
   // notices.
   const opts = promotePaneOptions(spawnRequest(), "11111111-2222-3333-4444-555555555555");
   assert.deepEqual(opts.env, [
     ["PATH", "C:\\shim;C:\\Windows"],
+    ["ORRERIX_GROUP_DIR", "C:\\state\\loomux-1a2b"],
+    ["ORRERIX_AGENT_ID", "orch-4"],
     ["LOOMUX_GROUP_DIR", "C:\\state\\loomux-1a2b"],
     ["LOOMUX_AGENT_ID", "orch-4"],
   ]);
