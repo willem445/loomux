@@ -167,6 +167,92 @@ address. With `debug = "line-tables-only"` now in place, the "drop the matching
 `loomux.pdb` beside the installed `loomux.exe`" workaround *does* symbolicate
 loomux frames (it would not have with the old `debug=false` PDB).
 
+### 1b. Allocation-failure reporting (#1219, after #1218 round 3)
+
+**The panic hook structurally cannot see the class that actually killed us.**
+#1218's round-3 unwind found all three production crashes to be the same thing,
+and it was not a panic: a `Vec<u8>` grow (64 MiB, then 128 MiB) refused on a
+machine pinned at its commit limit → `RawVec::handle_error` took the
+`AllocError` arm → `handle_alloc_error` → `abort()` → `__fastfail(7)` →
+`0xc0000409`. `handle_alloc_error` **never enters `std::panicking`**, so no
+panic hook of any shape runs. The write-first ordering above, on its own, would
+still have produced nothing for any of those three.
+
+`std::alloc::set_alloc_error_hook` is the matching seam and is **nightly-only**.
+The stable one is a `#[global_allocator]`:
+
+```rust
+// crates/loomux-engine/src/obs.rs
+unsafe impl GlobalAlloc for CrashReportingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if p.is_null() { on_alloc_failure(layout.size(), layout.align()); }
+        p            // unchanged — handle_alloc_error still aborts
+    }
+    // …alloc_zeroed and realloc the same; dealloc is a bare delegation
+}
+```
+
+It **adds a record; it does not change what the process does.** The null is
+returned unmodified, so `handle_alloc_error` aborts exactly as before.
+
+**Why it is declared in `src-tauri/src/lib.rs`.** A `#[global_allocator]` may be
+declared once per artifact, and which allocator a binary uses is the binary's
+decision — `loomux-server` links the same engine without inheriting this one.
+The engine owns the *type*; the host owns the *declaration*. Every
+`src-tauri/tests/*` binary links that lib, so the suite runs under it too. No
+new dependency: `System` is std (constraint 2 — nothing here reaches
+`getrandom`).
+
+**The discipline of the failure path.** It runs inside `GlobalAlloc::alloc`, on
+the return path of a request that has just failed, so it **may not allocate** —
+an allocation there re-enters the allocator in the one state where it cannot
+serve, and a large enough failure recurses. So:
+
+- the log is **opened once at startup** (`install_alloc_error_reporting`) and
+  the handle kept, because `File::open` allocates (on Windows, the UTF-16 path
+  conversion);
+- the record is composed into a **stack `FixedBuf<512>`** through the *same*
+  `Sink` composers the panic hook's first phase uses — `push_crash_head` /
+  `push_crash_tail` are shared verbatim, so a human opening the file reads one
+  format regardless of which death produced it;
+- `write_all` + `flush` on an already-open `fs::File` allocate nothing;
+- a **thread-local latch** (`ReentryGuard`, the same type the panic hook uses on
+  its own latch) makes a nested failure a no-op rather than a recursion. Unlike
+  the panic side, this one is load-bearing: nothing in std stops
+  `GlobalAlloc::alloc` being re-entered.
+
+**The thread name is deliberately not recorded.** `std::thread::current()`
+materialises the `Thread` for any thread std did not start, which allocates —
+on the one path that must not. The faulting thread is in the WER dump (#1218
+read `tokio-rt-worker` straight off both), and the refused `Layout` is the field
+that actually localises the site: 64 MiB/align 1 is what identified
+`usage.rs`'s transcript buffer.
+
+**Two costs, stated rather than buried.**
+
+1. `<logs>/crash-alloc.log` is a **fixed name, opened at every startup**, so an
+   empty one exists for the whole of a healthy run. The name has to be
+   derivable *before* the crash, which rules out a per-run timestamp derived at
+   failure time. Consequently `newest_crash_log_since` now ignores
+   **zero-length** files — otherwise every unclean exit would point the user at
+   that empty file and, worse, suppress the `crash-log-gap` breadcrumb below.
+   The empty file is deliberately **not** deleted on clean exit: a second
+   instance on the same data root would be holding it open, and removing it out
+   from under that instance trades a cosmetic problem for a real one.
+2. Allocation failures **before** the arm point are not recorded — there is no
+   derived path yet, and deriving one is exactly what the failure path may not
+   do. Arming sits after `init_data_root` (so the handle is on the settled root)
+   and after `check_and_arm` (so the empty file it creates cannot be mistaken
+   for the previous run's crash log). Startup allocations are small and precede
+   any of the large, unbounded ones this exists to catch.
+
+**What this does not do.** It records the death; it does not prevent it. The
+allocation that failed in #1218 was unbounded by design (`usage.rs` building a
+whole multi-MiB transcript in memory once a second per agent), and the fix for
+*that* is #1218's own, not this. Making the remaining small allocations fallible
+would be a far larger and far less valuable change.
+
 ### 2. Breadcrumb log
 
 `breadcrumb(event, detail)` appends one timestamped line to
@@ -224,11 +310,18 @@ crash.
 `unclean_prev=true` **with no crash log from that run** is a specific,
 diagnosable signature — it is the one #1218 produced — and until #1219 it was
 reported to the *user* as a toast and to nobody at all in the durable record.
-`check_and_arm` now writes one breadcrumb when it sees it:
+`check_and_arm` now writes one breadcrumb when it sees it, **naming the likely
+class**:
 
 ```
-<stamp> crash-log-gap unclean_prev=true crash_log=none the_previous_run_died_without_the_panic_hook_completing look=%LOCALAPPDATA%\CrashDumps and=EventViewer>WindowsLogs>Application(source:Application_Error)
+<stamp> crash-log-gap unclean_prev=true crash_log=none likely=heap_alloc_abort(handle_alloc_error->abort,0xc0000409_param7) or=stack_overflow|FFI_access_violation|external_kill look=%LOCALAPPDATA%\CrashDumps and=EventViewer>WindowsLogs>Application(source:Application_Error)
 ```
+
+The class is named because #1218 answered the question: all three of its
+production crashes were a refused heap allocation. §1b now records that class,
+so a gap on a build carrying this change means *neither* recorder finished —
+the alloc wrapper was not yet armed, or the death was one of the classes
+nothing in-process can catch.
 
 It goes in *before* this run's own `startup` breadcrumb, because it is a
 statement about the previous run. Both of its inputs come off the same
@@ -323,10 +416,15 @@ The panic hook only fires for **unwinding** panics. It will *not* capture:
   stderr — which is nowhere in a `windows_subsystem = "windows"` build — and
   aborts);
 - an FFI/`unsafe` access violation from the ConPTY / windows-sys layer;
-- an explicit `abort()` or an allocation failure;
+- an explicit `abort()`;
 - a **panic raised inside the hook itself** — std aborts before the hook is
   re-entered (see *The write is two-phase* above), which is why the ordering
   there matters more than any guard inside the hook body.
+
+A **refused allocation** used to be on that list and is the one item taken off
+it: `handle_alloc_error` still never runs the panic hook, but the
+`#[global_allocator]` wrapper in §1b records it first. That was not a
+theoretical gap — it was every crash #1218 examined.
 
 For these the crash log won't exist, but the **breadcrumb log survives** (it's
 flushed per line) and the **unclean-exit notice still fires** (the sentinel is

@@ -38,6 +38,11 @@
 //! violation, `abort()`) never runs the hook — see `doc/design/crash-observability.md`.
 
 use crate::brand;
+// `GlobalAlloc`/`Layout`/`System` are here for `CrashReportingAlloc` (#1219):
+// the crash-reporting `#[global_allocator]` wrapper. `System` is std's own
+// allocator — no new dependency, and nothing that could reach `getrandom`
+// (CLAUDE.md constraint 2).
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -478,9 +483,66 @@ fn civil_from_days(z: i64) -> (i64, u64, u64) {
 // formatting_machinery` scans between this marker and its END for the tokens
 // that would put `core::fmt` back on the path.
 
+/// Where the composers below put their bytes. Two implementations, and the
+/// difference between them is the entire reason this is a trait rather than a
+/// `Vec<u8>` parameter:
+///
+/// - the **panic** hook may allocate (a panic is not an out-of-memory, and a
+///   panic message or a source path has no useful upper bound), so it composes
+///   into a `Vec<u8>`;
+/// - the **allocation-failure** handler may not allocate *at all* — it runs
+///   inside `GlobalAlloc::alloc` on the return path of a request that just
+///   failed — so it composes into a [`FixedBuf`] on the stack.
+///
+/// One set of composers, one record format, two memory disciplines.
+trait Sink {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+impl Sink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// A stack-resident byte buffer that **truncates rather than growing**. The
+/// allocation-failure path's sink: `N` is chosen to hold the whole record it
+/// composes, and overflow is recorded rather than panicked on, because the one
+/// thing this path may never do is fail loudly.
+struct FixedBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+    overflow: bool,
+}
+
+impl<const N: usize> FixedBuf<N> {
+    const fn new() -> Self {
+        FixedBuf { buf: [0u8; N], len: 0, overflow: false }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> Sink for FixedBuf<N> {
+    fn put(&mut self, bytes: &[u8]) {
+        let take = bytes.len().min(N - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+        self.len += take;
+        if take < bytes.len() {
+            self.overflow = true;
+        }
+    }
+}
+
+/// Zero padding for [`push_dec`], as a slice rather than a push loop. Twenty
+/// is `u64::MAX`'s digit count, so no caller can ask for more.
+const ZEROS: &[u8; 20] = b"00000000000000000000";
+
 /// Append `n` as decimal ASCII, left-padded with `'0'` to at least `width`.
 /// `width` of 1 means "no padding" (the value's own digits).
-fn push_dec(out: &mut Vec<u8>, mut n: u64, width: usize) {
+fn push_dec<S: Sink>(out: &mut S, mut n: u64, width: usize) {
     let mut buf = [0u8; 20]; // u64::MAX is 20 digits
     let mut i = buf.len();
     loop {
@@ -491,10 +553,11 @@ fn push_dec(out: &mut Vec<u8>, mut n: u64, width: usize) {
             break;
         }
     }
-    for _ in (buf.len() - i)..width {
-        out.push(b'0');
+    let digits = buf.len() - i;
+    if digits < width {
+        out.put(&ZEROS[..(width - digits).min(ZEROS.len())]);
     }
-    out.extend_from_slice(&buf[i..]);
+    out.put(&buf[i..]);
 }
 
 /// Append `YYYYMMDD-HHMMSS` (UTC) for unix-millis `ms`. The single
@@ -503,7 +566,7 @@ fn push_dec(out: &mut Vec<u8>, mut n: u64, width: usize) {
 /// `ms` is unsigned, so the day count is never negative and the year is never
 /// before 1970 — the `max(0)` is a total-function guard, not a reachable case,
 /// and a year past 9999 simply widens the field rather than truncating it.
-fn push_stamp(out: &mut Vec<u8>, ms: u64) {
+fn push_stamp<S: Sink>(out: &mut S, ms: u64) {
     let secs = ms / 1000;
     let days = (secs / 86_400) as i64;
     let sod = secs % 86_400;
@@ -511,7 +574,7 @@ fn push_stamp(out: &mut Vec<u8>, ms: u64) {
     push_dec(out, y.max(0) as u64, 4);
     push_dec(out, m, 2);
     push_dec(out, d, 2);
-    out.push(b'-');
+    out.put(b"-");
     push_dec(out, sod / 3600, 2);
     push_dec(out, (sod % 3600) / 60, 2);
     push_dec(out, sod % 60, 2);
@@ -522,10 +585,35 @@ fn push_stamp(out: &mut Vec<u8>, ms: u64) {
 /// the thread name as well as the panic location: a `thread::Builder::name`
 /// carrying a space would otherwise split the detail field in two, and a
 /// payload with a newline in it would split the record into two lines.
-fn push_spaceless(out: &mut Vec<u8>, s: &str) {
+fn push_spaceless<S: Sink>(out: &mut S, s: &str) {
     for &b in s.as_bytes() {
-        out.push(if b == b' ' || b < 0x20 { b'_' } else { b });
+        out.put(&[if b == b' ' || b < 0x20 { b'_' } else { b }]);
     }
+}
+
+/// The crash record's head, up to and including the `panic:   ` label — shared
+/// verbatim by the panic hook's first phase and by the allocation-failure
+/// handler, so the file a human opens has one format regardless of which of the
+/// two ways this process died. The caller writes the message itself (the two
+/// have nothing in common there) and then calls [`push_crash_tail`].
+fn push_crash_head<S: Sink>(out: &mut S, app_version: &str, now: u64, thread: &str) {
+    out.put(b"loomux crash log\nversion: ");
+    out.put(app_version.as_bytes());
+    out.put(b"\ntime:    ");
+    push_stamp(out, now);
+    out.put(b" UTC (");
+    push_dec(out, now, 1);
+    out.put(b" ms since epoch)\nthread:  ");
+    out.put(thread.as_bytes());
+    out.put(b"\npanic:   ");
+}
+
+/// …and the tail from the location line on, closing the record with the blank
+/// line that separates it from an appended `backtrace:` section.
+fn push_crash_tail<S: Sink>(out: &mut S, loc: &str) {
+    out.put(b"\nat:      ");
+    out.put(loc.as_bytes());
+    out.put(b"\n\n");
 }
 
 // FMT-FREE REGION END (#1219)
@@ -575,11 +663,11 @@ fn breadcrumb_bytes_in(dir: &Path, event: &str, detail: &[u8]) {
     // short-write at these sizes — rather than by contract; see `append_audit`.)
     let mut line = Vec::with_capacity(24 + event.len() + detail.len());
     push_stamp(&mut line, now_ms());
-    line.push(b' ');
-    line.extend_from_slice(event.as_bytes());
-    line.push(b' ');
-    line.extend_from_slice(detail);
-    line.push(b'\n');
+    line.put(b" ");
+    line.put(event.as_bytes());
+    line.put(b" ");
+    line.put(detail);
+    line.put(b"\n");
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -622,8 +710,8 @@ pub fn install_panic_hook(app_version: &'static str) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Armed for the whole of this run, `default(info)` included, and
-        // disarmed by its own `Drop`. See `HookGuard`.
-        let guard = HookGuard::enter();
+        // disarmed by its own `Drop`. See `ReentryGuard`.
+        let guard = ReentryGuard::enter(&IN_HOOK);
         if guard.is_first() {
             // Never let the hook itself unwind and mask the real panic. On
             // today's std this is belt-and-braces rather than the load-bearing
@@ -633,6 +721,12 @@ pub fn install_panic_hook(app_version: &'static str) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 write_crash_log(app_version, info)
             }));
+            // Hygiene rather than correctness: `HOOK_TARGET` is only ever read
+            // from the re-entrant branch below, which only runs while a hook
+            // run is in progress, and phase one overwrites it every time. It
+            // is cleared here so a later reader cannot find a path from a run
+            // that has finished.
+            HOOK_TARGET.with(|c| *c.borrow_mut() = None);
         } else {
             // Re-entry: a second panic reached the hook while this thread's
             // first run was still in progress. Do the least possible — one
@@ -661,30 +755,35 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// RAII arm/disarm for the crash hook's thread-local re-entry latch (#1219).
-/// `enter()` always yields a guard; `is_first()` says whether this is the
-/// OUTERMOST run on this thread, i.e. whether the full two-phase write is safe
-/// to attempt or whether this is a panic-while-panicking that gets the
-/// single-line emergency path instead.
+/// RAII arm/disarm for a thread-local re-entry latch (#1219). `enter()` always
+/// yields a guard; `is_first()` says whether this is the OUTERMOST run on this
+/// thread — i.e. whether the full recorder is safe to attempt, or whether this
+/// is a death-while-recording that gets the minimal fallback instead.
 ///
-/// **What this can and cannot catch, stated plainly.** On today's std the
-/// common double-panic never reaches here at all: `panic_count::increase` sees
-/// its own `in_panic_hook` flag and returns `MustAbort::PanicInHook`, printing
-/// "thread panicked while processing panic" and aborting *before* the hook is
-/// called a second time. So the load-bearing defence against #1218's shape is
-/// the write-first ordering below, not this latch. The latch is the cheap
-/// complement: it covers a hook invoked outside that path (a chained hook that
-/// re-enters, a future std that lets a nested panic through) and it costs one
-/// thread-local read per panic. It is here because "do nothing on re-entry" is
-/// the behaviour that produced a zero-byte forensic record twice.
-struct HookGuard {
+/// One type, two latches (`IN_HOOK`, `IN_ALLOC_FAILURE`), because the policy —
+/// arm on entry, divert on re-entry, and let *only* the outermost run disarm —
+/// is the same in both places and must not acquire a second implementation
+/// that can drift from the first.
+///
+/// **What a latch here can and cannot catch, stated plainly.** For the panic
+/// hook, the common double panic never reaches it at all: `panic_count::
+/// increase` sees its own `in_panic_hook` flag, returns
+/// `MustAbort::PanicInHook`, prints "thread panicked while processing panic"
+/// and aborts *before* the hook is called a second time. So the load-bearing
+/// defence against #1218's panic-shape is the write-first ordering below, not
+/// this latch, and the latch covers a hook reached outside that path. On the
+/// **allocation** side it is stronger than that: nothing in std stops
+/// `GlobalAlloc::alloc` being re-entered, so this is what keeps a failure
+/// inside the reporter from recursing into an allocator that has just refused.
+struct ReentryGuard {
+    latch: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
     first: bool,
 }
 
-impl HookGuard {
-    fn enter() -> Self {
-        let already = IN_HOOK.with(|c| c.replace(true));
-        HookGuard { first: !already }
+impl ReentryGuard {
+    fn enter(latch: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> Self {
+        let already = latch.with(|c| c.replace(true));
+        ReentryGuard { latch, first: !already }
     }
 
     fn is_first(&self) -> bool {
@@ -692,14 +791,13 @@ impl HookGuard {
     }
 }
 
-impl Drop for HookGuard {
+impl Drop for ReentryGuard {
     fn drop(&mut self) {
         // Only the outermost run disarms. An inner guard clearing the latch
-        // would hand a *third* panic the full capture path again, which is the
-        // one thing this exists to stop.
+        // would hand a *third* death the full path again, which is the one
+        // thing this exists to stop.
         if self.first {
-            IN_HOOK.with(|c| c.set(false));
-            HOOK_TARGET.with(|c| *c.borrow_mut() = None);
+            self.latch.with(|c| c.set(false));
         }
     }
 }
@@ -795,19 +893,9 @@ fn record_crash_first_phase(
 
     let mut head =
         Vec::with_capacity(96 + app_version.len() + thread.len() + msg.len() + loc.len());
-    head.extend_from_slice(b"loomux crash log\nversion: ");
-    head.extend_from_slice(app_version.as_bytes());
-    head.extend_from_slice(b"\ntime:    ");
-    push_stamp(&mut head, now);
-    head.extend_from_slice(b" UTC (");
-    push_dec(&mut head, now, 1);
-    head.extend_from_slice(b" ms since epoch)\nthread:  ");
-    head.extend_from_slice(thread.as_bytes());
-    head.extend_from_slice(b"\npanic:   ");
-    head.extend_from_slice(msg.as_bytes());
-    head.extend_from_slice(b"\nat:      ");
-    head.extend_from_slice(loc.as_bytes());
-    head.extend_from_slice(b"\n\n");
+    push_crash_head(&mut head, app_version, now, thread);
+    head.put(msg.as_bytes());
+    push_crash_tail(&mut head, loc);
 
     // Append rather than truncate: two threads panicking into the same-second
     // filename both leave a record instead of one clobbering the other.
@@ -892,6 +980,195 @@ fn write_crash_log(app_version: &str, info: &std::panic::PanicHookInfo<'_>) {
     );
 }
 
+// ---------- allocation-failure reporting (#1219, after #1218 round 3) ----------
+//
+// The panic hook above cannot see this class at all, and that is not a bug in
+// it. When a global allocator returns null, `RawVec` calls
+// `handle_alloc_error`, which calls `abort()` — it never enters
+// `std::panicking`, so no hook of any kind runs. #1218's three production
+// crashes were all exactly this: a `Vec<u8>` grow of 64 MiB and then 128 MiB
+// refused on a machine pinned at its commit limit, `handle_alloc_error` →
+// `abort` → `__fastfail(7)` → `0xc0000409`. A write-first panic hook would
+// still have produced nothing for any of them.
+//
+// `std::alloc::set_alloc_error_hook` is the matching seam and is nightly-only.
+// The stable one is this: a `#[global_allocator]` that delegates every call to
+// `System` and, on a null return, writes the record BEFORE handing the null
+// back to `handle_alloc_error`. The host installs it — see
+// `src-tauri/src/lib.rs` — because a `#[global_allocator]` may be declared only
+// once per artifact and that is the artifact's decision, not the engine's.
+//
+// **The discipline this path is written under.** It runs inside
+// `GlobalAlloc::alloc`, on the return path of a request that has just failed,
+// so it may not allocate — an allocation here would re-enter the allocator in
+// the one state where it cannot serve, and a large enough failure would recurse.
+// Hence: the file is opened ONCE at startup and the handle kept
+// (`ALLOC_LOG`); the record is composed into a stack `FixedBuf` through the same
+// `Sink` composers the panic hook's first phase uses; and a thread-local latch
+// makes a nested failure a no-op rather than a recursion. `write_all` and
+// `flush` on an already-open `fs::File` allocate nothing.
+
+/// Size of the stack buffer the allocation-failure record is composed into.
+/// The record is bounded — a version string, two timestamps, two integers and
+/// fixed labels — so this is generous rather than tight, and [`FixedBuf`]
+/// truncates rather than growing if that estimate is ever wrong.
+const ALLOC_RECORD_CAP: usize = 512;
+
+/// The crash log the allocation-failure handler appends to, opened once at
+/// startup so the failure path never has to.
+///
+/// It is a **fixed name** (`crash-alloc.log`) rather than a per-run timestamped
+/// one because the name has to be derivable before the crash, and appending
+/// keeps every occurrence. It matches `crash-*.log`, so
+/// [`newest_crash_log_since`] names it in the next-launch toast — which is only
+/// correct because that function ignores zero-length files: this one exists,
+/// empty, for the whole of every healthy run.
+static ALLOC_LOG: std::sync::OnceLock<fs::File> = std::sync::OnceLock::new();
+
+/// The app version to stamp into that record, captured at install time.
+static ALLOC_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// Re-entry latch for the allocation-failure handler. Distinct from
+    /// `IN_HOOK`: a panic and an allocation failure are different deaths and a
+    /// process can, in principle, be in both.
+    static IN_ALLOC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm allocation-failure reporting: open `<logs>/crash-alloc.log` and remember
+/// the version to stamp. Call once at startup, **after** [`init_data_root`]
+/// (so the handle is on the settled root) and after [`check_and_arm`] (so the
+/// empty file this creates cannot be mistaken for the previous run's crash log
+/// — see the zero-length rule on [`newest_crash_log_since`]).
+///
+/// Allocation failures before this runs are not recorded: there is no derived
+/// path to write to, and deriving one is exactly what the failure path may not
+/// do. Startup allocations are small and precede any of the large, unbounded
+/// ones this exists to catch.
+pub fn install_alloc_error_reporting(app_version: &'static str) {
+    install_alloc_error_reporting_in(&logs_dir(), app_version);
+}
+
+fn install_alloc_error_reporting_in(dir: &Path, app_version: &'static str) -> bool {
+    let _ = fs::create_dir_all(dir);
+    let Ok(f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("crash-alloc.log"))
+    else {
+        return false;
+    };
+    let _ = ALLOC_VERSION.set(app_version);
+    ALLOC_LOG.set(f).is_ok()
+}
+
+// FMT-FREE REGION BEGIN (#1219) — the allocation-failure path. Everything here
+// runs inside `GlobalAlloc::alloc` after a failed request; see the section note
+// above for why it may not allocate.
+
+/// Compose the allocation-failure record. Shares `push_crash_head` /
+/// `push_crash_tail` with the panic hook's first phase, so the file reads the
+/// same either way, and differs only where the two deaths genuinely differ: the
+/// `panic:` line carries the refused `Layout` instead of a message.
+///
+/// The **thread name is deliberately not read.** `std::thread::current()`
+/// materialises the `Thread` for any thread std did not start, which allocates
+/// — on the one path that must not. The faulting thread is in the WER dump
+/// (#1218 read it straight off both), and the refused size is the field that
+/// actually localises the site.
+fn alloc_failure_record(app_version: &str, now: u64, size: usize, align: usize) -> FixedBuf<ALLOC_RECORD_CAP> {
+    let mut b = FixedBuf::<ALLOC_RECORD_CAP>::new();
+    push_crash_head(&mut b, app_version, now, "<not read: see alloc_failure_record>");
+    b.put(b"allocation of ");
+    push_dec(&mut b, size as u64, 1);
+    b.put(b" bytes (align ");
+    push_dec(&mut b, align as u64, 1);
+    b.put(b") was refused by the system allocator");
+    push_crash_tail(&mut b, "<global allocator> (handle_alloc_error aborts next)");
+    b
+}
+
+/// Write one allocation-failure record through an already-open handle. One
+/// `write_all` of one composed buffer, for the same `O_APPEND`-atomicity reason
+/// the breadcrumb writer gives.
+fn write_alloc_failure(f: &fs::File, app_version: &str, now: u64, size: usize, align: usize) {
+    let record = alloc_failure_record(app_version, now, size, align);
+    let mut w = f;
+    let _ = w.write_all(record.as_slice());
+    let _ = w.flush();
+}
+
+/// The handler proper: everything the `GlobalAlloc` impl does on a null return.
+/// Best-effort at every step, and a no-op when reporting was never armed or
+/// when this thread is already inside it.
+fn on_alloc_failure(size: usize, align: usize) {
+    let guard = ReentryGuard::enter(&IN_ALLOC_FAILURE);
+    if !guard.is_first() {
+        return; // already reporting on this thread — do not recurse
+    }
+    if let (Some(f), Some(v)) = (ALLOC_LOG.get(), ALLOC_VERSION.get()) {
+        write_alloc_failure(f, v, now_ms(), size, align);
+    }
+}
+
+/// A `#[global_allocator]` that delegates everything to [`System`] and reports
+/// the one thing `System` cannot tell anybody about: a refused request.
+///
+/// **Success path.** `alloc`/`alloc_zeroed`/`realloc` add one null test on a
+/// pointer already in a register and nothing else; `dealloc` is a bare
+/// delegation with no added instruction. Nothing is counted, logged or locked
+/// per allocation — this is not an allocation profiler and must never become
+/// one, because it sits under every `Vec` push in the process.
+///
+/// **Failure path.** [`on_alloc_failure`], which allocates nothing (section
+/// note above), and then the null is returned unchanged so `handle_alloc_error`
+/// aborts exactly as it would have. This adds a record; it does not change what
+/// the process does.
+///
+/// No new dependency: `System` is `std` (CLAUDE.md constraint 2 — nothing here
+/// can reach `getrandom`).
+pub struct CrashReportingAlloc;
+
+unsafe impl GlobalAlloc for CrashReportingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if p.is_null() {
+            on_alloc_failure(layout.size(), layout.align());
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc_zeroed(layout);
+        if p.is_null() {
+            on_alloc_failure(layout.size(), layout.align());
+        }
+        p
+    }
+
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if p.is_null() {
+            // The REQUESTED size, not the old one: `new_size` with the old
+            // alignment is the `Layout` `handle_alloc_error` is about to abort
+            // on, and #1218's whole diagnosis turned on reading that number.
+            on_alloc_failure(new_size, layout.align());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+}
+
+// FMT-FREE REGION END (#1219)
+
 // ---------- unclean-exit detection ----------
 
 /// Outcome of the startup check: whether the previous run ended uncleanly and
@@ -905,14 +1182,26 @@ pub struct StartupCheck {
 /// from it" contradiction (#1219).
 const CRASH_LOG_GAP_EVENT: &str = "crash-log-gap";
 
-/// …and its detail. One line, no free text, pointing at the two records that
-/// DO exist when ours does not. On Windows — the platform this app ships on —
-/// an abort that never unwinds is recorded by Windows Error Reporting, not by
-/// us: `%LOCALAPPDATA%\CrashDumps` holds the dump if local dump collection is
-/// enabled, and the Application event log holds the "Application Error" entry
-/// with the exception code either way. See `doc/design/crash-observability.md`.
+/// …and its detail. One line, no free text: the **named likely class** first,
+/// then the records that DO exist when ours does not.
+///
+/// The class is named because #1218 answered it. All three of its production
+/// crashes were a refused heap allocation — `handle_alloc_error` → `abort()` →
+/// `__fastfail(7)` → `0xc0000409` — which never enters `std::panicking`, so no
+/// panic hook of any shape would have written a thing. That is what
+/// `install_alloc_error_reporting` now covers, and a gap therefore means
+/// *neither* recorder finished: the alloc wrapper was not yet armed, or the
+/// death was one of the classes nothing in-process can catch (a stack overflow,
+/// an FFI access violation, an external kill).
+///
+/// On Windows — the platform this app ships on — such a death is recorded by
+/// Windows Error Reporting rather than by us: `%LOCALAPPDATA%\CrashDumps` holds
+/// a dump *if local dump collection has been enabled* (it is off by default),
+/// and the Application event log holds the "Application Error" entry with the
+/// exception code either way. See `doc/design/crash-observability.md`.
 const CRASH_LOG_GAP_DETAIL: &str = "unclean_prev=true crash_log=none \
-     the_previous_run_died_without_the_panic_hook_completing \
+     likely=heap_alloc_abort(handle_alloc_error->abort,0xc0000409_param7) \
+     or=stack_overflow|FFI_access_violation|external_kill \
      look=%LOCALAPPDATA%\\CrashDumps \
      and=EventViewer>WindowsLogs>Application(source:Application_Error)";
 
@@ -947,7 +1236,8 @@ impl StartupCheck {
                 p.display()
             ),
             None => "loomux exited unexpectedly last run — no crash log was written \
-                     (a hard abort, not an unwinding panic); see breadcrumbs.log"
+                     (a hard abort, not an unwinding panic); see breadcrumbs.log \
+                     and %LOCALAPPDATA%\\CrashDumps"
                 .to_string(),
         })
     }
@@ -1006,22 +1296,33 @@ fn is_crash_log(p: &Path) -> bool {
 }
 
 /// Newest `crash-*.log` in `dir` (by filename — stamps sort lexically) whose
-/// mtime is at or after `since`. The mtime gate is what keeps a hard abort (no
-/// crash log written) from mis-attributing an older log to this crash; pass
-/// `since = None` to disable it (best effort when the sentinel mtime is
-/// unreadable). `None` when nothing qualifies.
+/// mtime is at or after `since` **and which has something in it**. The mtime
+/// gate is what keeps a hard abort (no crash log written) from mis-attributing
+/// an older log to this crash; pass `since = None` to disable it (best effort
+/// when the sentinel mtime is unreadable). `None` when nothing qualifies.
+///
+/// **The zero-length rule (#1219).** An empty crash log is not a crash record,
+/// and naming one in the next-launch toast is a lie that also suppresses the
+/// `crash-log-gap` breadcrumb — the one thing that says a death went
+/// unrecorded. It became load-bearing rather than merely tidy when
+/// `install_alloc_error_reporting` started opening `crash-alloc.log` at every
+/// startup: that file exists, empty, for the whole of a healthy run, and
+/// without this filter every unclean exit would point the user at it.
 fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
     entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| is_crash_log(p))
-        .filter(|p| match since {
-            Some(t) => fs::metadata(p)
-                .and_then(|m| m.modified())
-                .map(|m| m >= t)
-                .unwrap_or(false),
-            None => true,
+        .filter(|p| {
+            let Ok(meta) = fs::metadata(p) else { return false };
+            if meta.len() == 0 {
+                return false;
+            }
+            match since {
+                Some(t) => meta.modified().map(|m| m >= t).unwrap_or(false),
+                None => true,
+            }
         })
         .max()
 }
@@ -1397,31 +1698,57 @@ mod tests {
     /// run, making it process-wide, and never clearing it.
     #[test]
     fn the_hook_reentry_latch_is_thread_local_and_only_the_outer_run_disarms_it() {
-        let outer = HookGuard::enter();
+        let outer = ReentryGuard::enter(&IN_HOOK);
         assert!(outer.is_first(), "the first hook run on a thread takes the full two-phase path");
         {
-            let nested = HookGuard::enter();
+            let nested = ReentryGuard::enter(&IN_HOOK);
             assert!(
                 !nested.is_first(),
                 "a panic reaching the hook while this thread is already in it must be \
                  diverted to the emergency path, never handed the backtrace path again"
             );
         }
-        let third = HookGuard::enter();
+        let third = ReentryGuard::enter(&IN_HOOK);
         assert!(
             !third.is_first(),
             "an inner guard's drop must not disarm the OUTER run — a third panic would \
              otherwise get the full capture path back"
         );
         drop(third);
-        let elsewhere = std::thread::spawn(|| HookGuard::enter().is_first()).join().unwrap();
+        let elsewhere =
+            std::thread::spawn(|| ReentryGuard::enter(&IN_HOOK).is_first()).join().unwrap();
         assert!(
             elsewhere,
             "the latch must be per-thread: a concurrent panic on another thread is not a \
              double panic and still deserves a full crash log"
         );
         drop(outer);
-        assert!(HookGuard::enter().is_first(), "the latch must clear when the outer run ends");
+        assert!(
+            ReentryGuard::enter(&IN_HOOK).is_first(),
+            "the latch must clear when the outer run ends"
+        );
+    }
+
+    /// The **same** guard on the allocation latch, because one implementation
+    /// serving two latches is only safe if both are exercised: a guard that
+    /// hard-coded `IN_HOOK` would pass the test above and leave the allocation
+    /// path with no latch at all.
+    #[test]
+    fn the_alloc_reentry_latch_is_the_same_guard_on_a_different_latch() {
+        let outer = ReentryGuard::enter(&IN_ALLOC_FAILURE);
+        assert!(outer.is_first());
+        assert!(
+            !ReentryGuard::enter(&IN_ALLOC_FAILURE).is_first(),
+            "a failure inside the reporter must not recurse into an allocator that just \
+             refused"
+        );
+        assert!(
+            ReentryGuard::enter(&IN_HOOK).is_first(),
+            "…and arming the allocation latch must not arm the PANIC latch — they are \
+             different deaths, and a process can be in both"
+        );
+        drop(outer);
+        assert!(ReentryGuard::enter(&IN_ALLOC_FAILURE).is_first(), "clears with the outer run");
     }
 
     /// The emergency write ADDS to whatever phase one managed to flush. If it
@@ -1510,6 +1837,122 @@ mod tests {
         );
     }
 
+    // ---------- #1219: the allocation-failure class (#1218 round 3) ----------
+
+    /// **The wrapper actually reports a refused allocation, and returns null.**
+    /// Not a simulation: it asks `System` — through the shipped `GlobalAlloc`
+    /// impl — for an allocation no machine can serve, and reads what landed on
+    /// disk. The panic hook cannot reach this class at all
+    /// (`handle_alloc_error` never enters `std::panicking`), so if this test is
+    /// wrong there is nothing else that would notice.
+    ///
+    /// This is the one test that arms the process-wide `ALLOC_LOG`/
+    /// `ALLOC_VERSION` cells, which are `OnceLock`s — no other test may arm
+    /// them, or one of the two would silently observe the other's directory.
+    #[test]
+    fn a_refused_allocation_writes_a_record_and_still_returns_null() {
+        let _serial = SERIAL.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            install_alloc_error_reporting_in(tmp.path(), "9.9.9-test"),
+            "arming must succeed on a writable dir"
+        );
+        let log = tmp.path().join("crash-alloc.log");
+        assert!(log.is_file(), "the handle is opened at ARM time, not at failure time");
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0, "…and nothing is written until it fails");
+
+        // The success path must stay silent — the negative control, without
+        // which "writes on every allocation" would pass everything below.
+        let small = Layout::from_size_align(64, 8).unwrap();
+        let ok = unsafe { CrashReportingAlloc.alloc(small) };
+        assert!(!ok.is_null(), "a 64-byte allocation must succeed");
+        unsafe { CrashReportingAlloc.dealloc(ok, small) };
+        assert_eq!(
+            fs::metadata(&log).unwrap().len(),
+            0,
+            "the success path must write NOTHING — this sits under every Vec push"
+        );
+
+        // …and now one no allocator on any machine can serve. 4 EiB exceeds
+        // the address space on every 64-bit target this ships to, so `System`
+        // returns null rather than over-committing.
+        let huge = Layout::from_size_align(1usize << 62, 1).unwrap();
+        let p = unsafe { CrashReportingAlloc.alloc(huge) };
+        assert!(
+            p.is_null(),
+            "the wrapper must hand the failure BACK unchanged — handle_alloc_error is \
+             what aborts, and it is not this code's job to change that"
+        );
+
+        let body = fs::read_to_string(&log).unwrap();
+        assert!(body.contains("loomux crash log"), "same record format as a panic: {body}");
+        assert!(body.contains("version: 9.9.9-test"), "carries the host's version: {body}");
+        assert!(
+            body.contains(&format!("allocation of {} bytes (align 1)", 1usize << 62)),
+            "the refused Layout is the field that localises the site — #1218 was \
+             diagnosed off exactly this number. Got: {body}"
+        );
+        assert!(body.contains("global allocator"), "…and says which recorder wrote it: {body}");
+
+        // It is a crash log by the same rules as any other, so the next launch
+        // names it instead of reporting a gap.
+        assert!(is_crash_log(&log), "must match the crash-*.log glob");
+        assert_eq!(
+            newest_crash_log_since(tmp.path(), None).as_deref(),
+            Some(log.as_path()),
+            "an alloc-abort record must be findable as THE crash log of that run"
+        );
+    }
+
+    /// The record composition, away from the live allocator: same head/tail as
+    /// a panic record, and it **truncates instead of growing** when the buffer
+    /// is too small — the one behaviour that keeps the failure path from
+    /// needing an allocation it cannot have.
+    #[test]
+    fn the_alloc_record_shares_the_panic_format_and_truncates_rather_than_growing() {
+        let rec = alloc_failure_record("9.9.9-test", 1_783_209_600_000, 67_108_864, 1);
+        let text = String::from_utf8(rec.as_slice().to_vec()).unwrap();
+        assert!(text.starts_with("loomux crash log\nversion: 9.9.9-test\ntime:    20260705-000000"));
+        assert!(text.contains("allocation of 67108864 bytes (align 1)"), "got:\n{text}");
+        assert!(text.ends_with("\n\n"), "the record must close like a panic record: {text:?}");
+        assert!(!rec.overflow, "{ALLOC_RECORD_CAP} bytes must hold the whole record");
+
+        // A sink far too small must lose bytes, not grow and not panic.
+        let mut tiny = FixedBuf::<8>::new();
+        tiny.put(b"0123456789");
+        assert_eq!(tiny.as_slice(), b"01234567", "truncates at the cap");
+        assert!(tiny.overflow, "and records that it did");
+        tiny.put(b"more");
+        assert_eq!(tiny.as_slice(), b"01234567", "a full buffer stays full rather than panicking");
+    }
+
+    /// **An empty crash log is not a crash record.** Load-bearing since
+    /// `crash-alloc.log` exists, empty, for the whole of every healthy run:
+    /// without this the next launch would name it and the `crash-log-gap`
+    /// breadcrumb — the only thing that says a death went unrecorded — would
+    /// never fire again.
+    #[test]
+    fn a_zero_length_crash_log_is_never_named_and_never_hides_the_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        check_and_arm_in(tmp.path()); // run 1 arms the sentinel
+        let empty = tmp.path().join("crash-alloc.log");
+        fs::write(&empty, "").unwrap();
+
+        assert!(is_crash_log(&empty), "it matches the glob — the filter is on CONTENT");
+        assert_eq!(
+            newest_crash_log_since(tmp.path(), None),
+            None,
+            "an empty crash log must not be named"
+        );
+        let gap = check_and_arm_in(tmp.path());
+        assert!(gap.crash_log_gap(), "…and must not suppress the gap breadcrumb");
+
+        // One byte in it and it becomes a real record again.
+        fs::write(&empty, "boom").unwrap();
+        assert_eq!(newest_crash_log_since(tmp.path(), None).as_deref(), Some(empty.as_path()));
+        assert!(!check_and_arm_in(tmp.path()).crash_log_gap());
+    }
+
     /// **The fmt-free property of the crash path, pinned by inspection.**
     ///
     /// Nothing behavioural can catch a `format!` creeping back into phase one:
@@ -1545,10 +1988,11 @@ mod tests {
         }
         assert_eq!(
             regions.len(),
-            3,
-            "expected three marked regions (the composition primitives, the breadcrumb \
-             line, and the crash hook's two phases) — a renamed or deleted marker must \
-             fail here rather than silently shrink what is scanned"
+            4,
+            "expected four marked regions (the composition primitives, the breadcrumb \
+             line, the crash hook's two phases, and the allocation-failure path) — a \
+             renamed or deleted marker must fail here rather than silently shrink what \
+             is scanned"
         );
         let scanned: usize = regions.iter().map(|r| r.len()).sum();
         assert!(

@@ -151,6 +151,10 @@ crash log. Forensics live under `<data dir>/loomux/logs/`:
   so a crash that dies collecting the backtrace still leaves a readable record
   with no `backtrace:` section. A `double-panic:` line at the end means a second
   crash hit while the first was being recorded.
+- `crash-alloc.log` — written when the process runs out of memory: a request the
+  system allocator refused, with the size and alignment it refused. This one is
+  **created empty at every launch** and stays empty unless that happens, so an
+  empty file is normal and means nothing went wrong.
 - `breadcrumbs.log` — a rotating record of lifecycle events (pane/PTY open/close,
   agent spawn/exit, delivery outcomes) with **no prompt content**.
 

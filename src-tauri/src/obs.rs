@@ -28,8 +28,8 @@
 //! compiles there. See that function's doc comment for the argument.
 
 pub use loomux_engine::obs::{
-    breadcrumb, check_and_arm, data_root, init_data_root, install_panic_hook, logs_dir,
-    mark_clean_exit, LockExt, StartupCheck,
+    breadcrumb, check_and_arm, data_root, init_data_root, install_alloc_error_reporting,
+    install_panic_hook, logs_dir, mark_clean_exit, CrashReportingAlloc, LockExt, StartupCheck,
 };
 
 use std::sync::Mutex;

@@ -28,6 +28,23 @@ pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-teste
 use std::sync::Arc;
 use tauri::Manager;
 
+/// Crash observability for the class the panic hook structurally cannot see
+/// (#1219, after #1218's round-3 diagnosis). A refused allocation goes
+/// `handle_alloc_error` → `abort()` and never enters `std::panicking`, so no
+/// panic hook runs — all three of #1218's production crashes were that, and all
+/// three left nothing. `std::alloc::set_alloc_error_hook` is the matching seam
+/// and is nightly-only; a `#[global_allocator]` wrapper that reports on a null
+/// return is the stable one.
+///
+/// It is declared **here**, not in `loomux-engine`, because a
+/// `#[global_allocator]` may be declared once per artifact: which allocator a
+/// binary uses is the binary's decision, and `loomux-server` links the same
+/// engine without inheriting this one. `obs::install_alloc_error_reporting`
+/// below arms it; until then the wrapper is a pure delegation to `System`.
+/// Every `src-tauri/tests/*` binary links this lib, so they run under it too.
+#[global_allocator]
+static ALLOC: loomux_engine::obs::CrashReportingAlloc = loomux_engine::obs::CrashReportingAlloc;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Crash observability (issue #53): install the panic hook before anything
@@ -48,6 +65,13 @@ pub fn run() {
     // move to the next launch. See `doc/design/rebrand-filesystem.md`.
     obs::init_data_root();
     let startup = obs::check_and_arm();
+    // Arm the allocation-failure recorder (#1219). Ordering is load-bearing in
+    // both directions: AFTER `init_data_root` so the handle is opened on the
+    // settled root, and AFTER `check_and_arm` because it creates an empty
+    // `crash-alloc.log` that the previous run's crash-log search must not see
+    // (that search ignores zero-length files, and this is the ordering that
+    // keeps it from having to).
+    obs::install_alloc_error_reporting(env!("CARGO_PKG_VERSION"));
     obs::breadcrumb(
         "startup",
         &format!(
