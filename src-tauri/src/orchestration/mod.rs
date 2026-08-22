@@ -1700,7 +1700,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   # a `*` could reach a filename. (loomux never writes one — sanitize_id /
   # sanitize_condition reject glob characters — so this is belt, not braces.)
   set -f
-  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""; g_maxdiff=0
+  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""; g_maxdiff=0; g_rpaths=""; g_rrevs=""
   # `|| [ -n "$g_k" ]` is load-bearing: POSIX `read` returns non-zero at EOF, so a
   # final line with NO trailing newline would otherwise be silently DROPPED — and a
   # dropped `reviewer`/`also` line makes the gate WEAKER, which is the one direction
@@ -1715,6 +1715,14 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
       # #1174's small-batch clause. A structured key, not an `also:` token,
       # because it carries a NUMBER — see `Gate::max_diff_lines`.
       max-diff-lines) g_maxdiff="$g_v" ;;
+      # #1176's path routing. Each rule arrives as two kinds of line, stitched
+      # back together by the 1-based index in $g_v — three fixed fields, because
+      # this loop has three variables and no arrays to unpack a packed line into.
+      # Collected as `<index>:<value>` tokens; VALIDATED below, where a half with
+      # no partner becomes a malformed gate rather than a rule that quietly
+      # requires nobody.
+      route-path)     g_rpaths="$g_rpaths $g_v:$g_w" ;;
+      route-reviewer) g_rrevs="$g_rrevs $g_v:$g_w" ;;
       # An unrecognized key is NOT skipped. loomux writes an `unrepresentable` line
       # when it cannot safely serialize a token (rather than dropping the clause),
       # and a hand edit or a truncation lands here too. Skipping any of them would
@@ -1759,6 +1767,118 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
     esac
     [ "$d_lines" -le "$g_maxdiff" ] || loomux_block_wf "diff-too-large" "this PR changes $d_lines lines and this repo's merge gate declares max_diff_lines: $g_maxdiff. Split it into PRs that each land under the limit — a review nobody can hold in their head is the failure this gate exists to prevent"
   fi
+  # ── PATH-BASED REVIEWER ROUTING (#1176) ──────────────────────────────────────
+  # Runs BEFORE the verdict counting below because it decides what that counting
+  # counts: `$g_revs` is the static list until here, and the routed lanes are
+  # appended to it. Everything downstream — the pass/stale/outstanding split, the
+  # `body-unchanged` loop — then treats a routed reviewer exactly like a declared
+  # one, which is the whole design: routing resolves to a reviewer list and gets
+  # out of the way, so there is one gate decision and not two.
+  #
+  # It can only ever ADD. There is no spelling here that removes a reviewer the
+  # gate already named, which is what makes "declaring a routing rule cannot make
+  # this gate easier to satisfy" a property of the code rather than a promise.
+  g_routed=""; g_rfired=""; g_rnote=""
+  if [ -n "$g_rpaths$g_rrevs" ]; then
+    # `threshold` + routing is refused at parse and unrepresentable in the gate
+    # file. Reaching here means a hand edit or a regressed writer, so: malformed,
+    # never "read it as a threshold gate and hope" — that reading is the laxer one.
+    [ "$g_req" = "all-pass" ] || loomux_block_wf "malformed-gate" "the merge gate declares path routing together with require: '$g_req'. Routing makes the required reviewer set depend on the diff and a threshold counts votes over a fixed list; loomux will not guess which of the two this gate meant"
+    # Shape first: every token must be <positive index>:<non-empty value>. A
+    # token this cannot read is a rule half, and a dropped rule half is a
+    # required reviewer that silently stops being required.
+    g_rmax=0
+    for g_t in $g_rpaths $g_rrevs; do
+      case "$g_t" in *:*) : ;; *) loomux_block_wf "malformed-gate" "the merge gate carries a routing line loomux cannot read ('$g_t')" ;; esac
+      g_i=${g_t%%:*}
+      case "$g_i" in ''|*[!0-9]*) loomux_block_wf "malformed-gate" "the merge gate carries a routing line whose rule number is not a number ('$g_t')" ;; esac
+      [ "$g_i" -ge 1 ] || loomux_block_wf "malformed-gate" "the merge gate carries a routing line numbered 0 — routing rules are numbered from 1"
+      [ -n "${g_t#*:}" ] || loomux_block_wf "malformed-gate" "the merge gate carries an empty routing value for rule $g_i"
+      [ "$g_i" -le "$g_rmax" ] || g_rmax="$g_i"
+    done
+    # …then completeness: rules are numbered 1..N and each needs BOTH halves. A
+    # rule with paths and no reviewers requires nobody; one with reviewers and no
+    # paths can never fire. Both are the same laxening in different clothes.
+    g_i=1
+    while [ "$g_i" -le "$g_rmax" ]; do
+      g_hasp=0; g_hasr=0
+      for g_t in $g_rpaths; do case "$g_t" in "$g_i":*) g_hasp=1 ;; esac; done
+      for g_t in $g_rrevs;  do case "$g_t" in "$g_i":*) g_hasr=1 ;; esac; done
+      { [ "$g_hasp" = "1" ] && [ "$g_hasr" = "1" ]; } || loomux_block_wf "malformed-gate" "the merge gate declares routing rule $g_i with only half of it — a rule needs at least one path and at least one reviewer"
+      g_i=$((g_i+1))
+    done
+    # THE CHANGED-FILE LIST. `__ROUTING_FILES_JQ__` is interpolated from
+    # `workflow.rs` (ROUTING_FILES_JQ) so this and the merge queue ask GitHub the
+    # SAME question — including the truncation clause, without which a PR of more
+    # than 100 files reports a short list and a rule whose only matching file is
+    # on page two never fires. Unlike the size gate, that failure is invisible:
+    # the gate goes green one lane short and nothing anywhere says so.
+    #
+    # Piped, never a heredoc and never an unquoted expansion of gh's output: the
+    # paths in it are chosen by whoever opened the PR, and an unquoted heredoc
+    # body performs command substitution on its content. `printf`/pipe is the
+    # only shape where a filename cannot become a command.
+    #
+    # The loop runs in a subshell (POSIX pipes do), so its answer LEAVES as
+    # stdout: `hit<indices>` when the list was complete, `bad` otherwise. A
+    # subshell that set a variable would set it in the subshell.
+    g_hit=$("$REAL_GH" pr view $rf "$num" --json files,changedFiles --jq '__ROUTING_FILES_JQ__' 2>/dev/null | {
+      r_ok=0; r_hit=" "
+      while IFS= read -r r_line; do
+        if [ "$r_ok" = "0" ]; then
+          # The header, and the only word that means "every changed file is below".
+          [ "$r_line" = "ok" ] || { r_ok=2; break; }
+          r_ok=1; continue
+        fi
+        [ -n "$r_line" ] || continue
+        # A line without the prefix is a protocol this build does not speak.
+        case "$r_line" in "p "?*) : ;; *) r_ok=2; break ;; esac
+        r_f=${r_line#p }
+        for r_t in $g_rpaths; do
+          r_i=${r_t%%:*}; r_g=${r_t#*:}
+          # This rule already fired; nothing another file could say changes it.
+          case "$r_hit" in *" $r_i "*) continue ;; esac
+          # THE GLOB. `$r_g` is unquoted in pattern position, which is what makes
+          # `*` a wildcard — and `sanitize_glob` is what makes that safe: the
+          # alphabet it permits contains no `[`, `\`, `?`, brace or space, so `*`
+          # is the ONLY metacharacter that can reach here. `*` crosses `/` in a
+          # shell pattern, and `glob_match` in workflow.rs says the same, on
+          # purpose: over-matching requires an extra lane, under-matching skips
+          # one, and only one of those is survivable.
+          case "$r_f" in $r_g) r_hit="$r_hit$r_i "; continue ;; esac
+          # A leading `**/` is optional, so `**/Cargo.toml` covers the one at the
+          # repo root too — the mirror of `glob_match`'s rule 3.
+          case "$r_g" in '**/'*) r_g2=${r_g#'**/'}; case "$r_f" in $r_g2) r_hit="$r_hit$r_i " ;; esac ;; esac
+        done
+      done
+      if [ "$r_ok" = "1" ]; then printf 'hit%s\n' "$r_hit"; else printf 'bad\n'; fi
+    })
+    case "$g_hit" in
+      hit*) g_hit=" ${g_hit#hit} " ;;
+      *) loomux_block_wf "routing-unaccountable" "this repo's merge gate routes reviewers by path, and loomux could not account for every file this PR changed — either gh would not report them, or it reported fewer files than the PR says it has (its file list pages at 100). It therefore cannot tell which routing rules apply, and an unknown reviewer requirement is refused rather than assumed empty. Re-run the merge; if this PR permanently changes more than 100 files, split it — path routing cannot be enforced for it" ;;
+    esac
+    # The union, in declaration order: the static list, then each fired rule.
+    # `workflow::route_reviewers` appends in exactly this order, so the two
+    # produce the same LIST and not merely the same set.
+    for g_t in $g_rrevs; do
+      g_i=${g_t%%:*}; g_r=${g_t#*:}
+      case "$g_hit" in *" $g_i "*) : ;; *) continue ;; esac
+      case " $g_revs " in *" $g_r "*) continue ;; esac
+      g_revs="$g_revs $g_r"; g_routed="$g_routed $g_r"
+    done
+    # …and which rules fired, so a refusal says WHY a lane it names is required.
+    g_i=1
+    while [ "$g_i" -le "$g_rmax" ]; do
+      case "$g_hit" in
+        *" $g_i "*)
+          g_gl=""
+          for g_t in $g_rpaths; do case "$g_t" in "$g_i":*) g_gl="$g_gl ${g_t#*:}" ;; esac; done
+          g_rfired="$g_rfired rule $g_i (paths:$g_gl);" ;;
+      esac
+      g_i=$((g_i+1))
+    done
+    [ -z "$g_routed" ] || g_rnote=" This PR's changed files matched path routing$g_rfired so reviewer(s)$g_routed are required on top of the gate's own list."
+  fi
   g_pass=0; g_out=""; g_bad=""; g_stale=""
   for g_r in $g_revs; do
     g_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$g_r"
@@ -1800,7 +1920,10 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
       # all-pass — THE #151 CASE: a reviewer that has not recorded anything (or whose
       # pass predates the code that would merge) keeps the gate shut, however loudly
       # the others approved.
-      [ -z "$g_why" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — $g_why" ;;
+      # `$g_rnote` (#1176) names the routing rules that fired and the lanes they
+      # added, so a refusal naming a reviewer the gate's own `reviewers:` never
+      # mentions is not a mystery to whoever reads it.
+      [ -z "$g_why" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — $g_why.$g_rnote" ;;
   esac
   # `also:` conditions. ci-green is checked against the real gh; anything this build
   # does not know how to check FAILS CLOSED — a clause loomux silently ignored would
@@ -1947,8 +2070,12 @@ loomux_block "gate-closed" "$default" "$num"
     // in the template above and neither contains a `'`, which is what makes a
     // plain substitution safe; the test below asserts that, so a future edit that
     // introduces one is red rather than a broken shim.
+    // #1176 rides the same arrangement: `ROUTING_FILES_JQ` is the ONE definition
+    // of "which files did this PR change, and can we account for all of them",
+    // read here by the shim and by `mqdriver::pr_files_argv` in the queue.
     TPL.replace("__BASE_CHECK_RUNS_JQ__", workflow::BASE_CHECK_RUNS_JQ)
         .replace("__BASE_STATUS_JQ__", workflow::BASE_STATUS_JQ)
+        .replace("__ROUTING_FILES_JQ__", workflow::ROUTING_FILES_JQ)
         .replace("__REAL_GH__", real_gh)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
         .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
@@ -11962,6 +12089,12 @@ pub struct OrchRegistry {
     /// integration tests record a verdict against a known body and then edit it —
     /// the race #565 is about — without a live GitHub PR. `None` in the app.
     pr_body_override: Mutex<Option<String>>,
+    /// Test seam (#1176), the changed-files half of `pr_head_override`: when set,
+    /// `pr_changed_files` returns this list instead of shelling out. Lets the
+    /// integration tests drive path-based reviewer routing against a known diff
+    /// without a live GitHub PR. `None` in the app — and `Some(vec![])` is a real
+    /// answer (a PR that changed nothing), which is why this is not `Vec<String>`.
+    pr_files_override: Mutex<Option<Vec<String>>>,
     /// Test seam (#791): when set, `gh_capture` runs THIS program on THIS
     /// deadline instead of the resolved `gh` on `GH_CAPTURE_TIMEOUT`.
     ///
@@ -24390,6 +24523,7 @@ impl OrchRegistry {
             group_file_io: Mutex::new(()),
             pr_head_override: Mutex::new(None),
             pr_body_override: Mutex::new(None),
+            pr_files_override: Mutex::new(None),
             gh_exec_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
@@ -38466,6 +38600,52 @@ impl OrchRegistry {
             .map_err(Self::gh_failure_text)
     }
 
+    /// The PR's changed paths (#1176), for path-based reviewer routing — through
+    /// `workflow::ROUTING_FILES_JQ`, the same reduction the `gh` shim and the
+    /// merge queue read, so all three ask GitHub one question and get one answer.
+    ///
+    /// `Err` covers every way the answer can be incomplete rather than merely
+    /// absent: gh unavailable, the PR gone, **and a file list gh could not show
+    /// to be whole** (its `files` connection pages at 100 while `changedFiles`
+    /// counts them all). Callers hand that to `route_reviewers` as `None`, which
+    /// refuses — an unknown reviewer requirement is never an empty one.
+    ///
+    /// Called ONLY when the gate actually declares routing: a repo that never
+    /// wrote the key must not pay a live `gh` call for a feature it does not use.
+    fn pr_changed_files(&self, repo: &str, pr: u64) -> Result<Vec<String>, String> {
+        if let Some(files) = self.pr_files_override.lock_safe().clone() {
+            return Ok(files);
+        }
+        let out = self
+            .gh_capture(
+                repo,
+                &[
+                    "pr",
+                    "view",
+                    &pr.to_string(),
+                    "--json",
+                    "files,changedFiles",
+                    "--jq",
+                    workflow::ROUTING_FILES_JQ,
+                ],
+            )
+            .map_err(Self::gh_failure_text)?;
+        workflow::parse_routed_files(&out).ok_or_else(|| {
+            format!(
+                "gh pr view #{pr}: loomux could not account for every file this PR changed \
+                 (its file list pages at 100), so it cannot say which routing rules apply"
+            )
+        })
+    }
+
+    /// Test seam: pretend `gh pr view --json files,changedFiles` reports these
+    /// paths for every PR. Lets the integration tests drive #1176's routing
+    /// without a live GitHub repo.
+    #[doc(hidden)]
+    pub fn set_pr_files_override(&self, files: Option<Vec<String>>) {
+        *self.pr_files_override.lock_safe() = files;
+    }
+
     /// A failed `gh` read's message, made safe to quote back to an agent
     /// (rev-lead finding 1 on #791).
     ///
@@ -38771,6 +38951,57 @@ impl OrchRegistry {
         };
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
         let head = self.pr_head(&repo, pr);
+        // #1176. Resolve path routing FIRST: it decides who the required
+        // reviewers are, and everything below counts verdicts from that list.
+        // The live `gh` read happens only for a gate that declares routing —
+        // `route_reviewers` never looks at the list otherwise, so a repo which
+        // never wrote the key pays nothing for a feature it does not use.
+        let changed = if gate.routing.is_empty() {
+            Err(String::new())
+        } else {
+            self.pr_changed_files(&repo, pr)
+        };
+        let Some(routed) =
+            workflow::route_reviewers(&gate, changed.as_ref().ok().map(|v| v.as_slice()))
+        else {
+            // Says what the shim's `routing-unaccountable` refusal says, because
+            // it IS that refusal: an unknown reviewer requirement is refused,
+            // never assumed empty.
+            return Some(format!(
+                "merge gate for PR #{pr}: this repo's gate routes reviewers by path, and loomux                  could not account for every file this PR changed, so it cannot say which lanes                  are required. The merge is refused until it can.{} {GATE_REFUSAL_EXITS}",
+                changed
+                    .as_ref()
+                    .err()
+                    .filter(|e| !e.is_empty())
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            ));
+        };
+        // The routed lanes, named with the rules that pulled them in — AC1's
+        // "which rules fired and why", on the SATISFACTION side (the shim owns
+        // the refusal side, where it is the only thing that can speak).
+        let routing_note = if routed.fired.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Path routing required {} on top of the gate's own list: {}.",
+                routed.required[gate.reviewers.len()..].join(", "),
+                routed
+                    .fired
+                    .iter()
+                    .map(|f| format!(
+                        "rule {} (paths: {}) matched, requiring {}",
+                        f.index,
+                        f.paths.join(", "),
+                        f.reviewers.join(", ")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        // Routing spent: from here down this is an ordinary gate whose reviewer
+        // list happens to have been derived. One gate decision, not two.
+        let gate = routed.gate(&gate);
         let outcome =
             workflow::evaluate_merge_gate(&gate, &self.verdict_map(group, pr), head.as_ref().ok().map(|s| s.as_str()));
         let also = if gate.also.is_empty() {
@@ -38851,7 +39082,7 @@ impl OrchRegistry {
                 head.as_ref().err().map(|e| format!(" (gh pr view #{pr}: {e})")).unwrap_or_default()
             ),
         };
-        Some(format!("{line}{body_note}"))
+        Some(format!("{line}{routing_note}{body_note}"))
     }
 
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {
