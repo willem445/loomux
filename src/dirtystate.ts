@@ -263,7 +263,7 @@ export function keepOpenOnExit(state: {
 export function exitDiagnosticLine(receivedOutput: boolean): string | null {
   if (receivedOutput) return null;
   return (
-    "[loomux] produced no output before exiting — it likely died before printing " +
+    "[orrerix] produced no output before exiting — it likely died before printing " +
     "anything at all (a missing/corrupt session, a rejected resume flag, or a gone " +
     "working directory are the usual causes)"
   );

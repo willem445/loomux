@@ -882,7 +882,7 @@ Distinct from the 🔔 desktop-notification toggle above — that raises a toast
 notice goes to the *agent*, typed into its own pane. Agents don't sit watching a PR's CI:
 the orchestrator, workers, and reviewers can register a background watch — a PR's checks, or
 a specific GitHub Actions run — and go do other work; orrerix polls in the background (every
-30s) and types a `[loomux] PR #241 checks: SUCCESS — … (watch n-3)`-style notice into the
+30s) and types an `[orrerix] PR #241 checks: SUCCESS — … (watch n-3)`-style notice into the
 registering agent's own pane the moment it resolves, expires, or fails repeatedly. A watch is
 capped (4 per agent / 12 per group) and time-bounded (5–240 min, default 60). Pausing a group
 freezes a watch entirely (no polling, firing, or expiry) until you resume it.
@@ -913,11 +913,11 @@ and time-bounded" above), never open-ended: a genuinely hung agent holding a wat
 silent-but-unreported for at most that TTL plus one more stall window before the orchestrator
 gets a notice, and `watchdog-suppressed` audit lines mark the wait the whole time.
 
-**When a notice can't get in.** A `[loomux]` notice is typed into the agent's pane, and a pane
+**When a notice can't get in.** An `[orrerix]` notice is typed into the agent's pane, and a pane
 that is mid-turn can't take one — so if an agent blocks its own turn waiting on the very thing
 the notice would tell it about, the notice sits in that pane's queue and nothing clears. Orrerix
 watches for exactly that shape: a pane that has accepted nothing for ten minutes while holding
-one of orrerix's own notices gets a `[loomux] notice undeliverable 10 min: … — pane mid-turn …`
+one of orrerix's own notices gets an `[orrerix] notice undeliverable 10 min: … — pane mid-turn …`
 sent to the group's orchestrator (and to the audit viewer as `notice-undeliverable`), alongside
 the ⏸ held chip and the needs-attention badge you'd see anyway. The message says which of the
 three it looked like — a pane mid-turn, a human's own line in the box, or a dialog waiting for an
@@ -1014,7 +1014,7 @@ that work is done.
 
 **Nothing blocks.** `acquire_lock` answers immediately — either the lock is yours, or you are
 queued at a stated position. A queued agent ends its turn and gets a
-`[loomux] lock 'build' is yours` notice typed into its pane when its turn comes, exactly like
+`[orrerix] lock 'build' is yours` notice typed into its pane when its turn comes, exactly like
 a CI watch resolving. That is not a convenience: a notice is *typed into a pane*, and a pane
 that sat blocking on its own lock could never receive the one telling it to proceed.
 
@@ -1090,7 +1090,7 @@ never invisible.
 
 **Sender and receiver.** A channel is directional: one member is the **sender**, everyone
 else is a **receiver**. The sender's `channel_send(text)` broadcasts to every receiver, any
-time — it lands as a typed `[loomux] channel chan-N - <name> (<role>, <repo>): <text>`
+time — it lands as a typed `[orrerix] channel chan-N - <name> (<role>, <repo>): <text>`
 message in each peer's own pane, the same visible-prompt delivery every other agent-to-pane
 message already uses. A receiver's `channel_send` is **reply-only**: it works once the
 sender has messaged that receiver (one reply per message, to the sender only — never to
@@ -1197,7 +1197,7 @@ From the lifecycle panel you can:
   names reviewers the current roster can't spawn, the row warns loudly instead.
 - **Advanced-orchestrator toggle** — flip a repo's custom workflow on or off
   live, no relaunch: the merge gate and the roster for future spawns update
-  immediately, and the orchestrator's pane gets a `[loomux] workflow mode
+  immediately, and the orchestrator's pane gets an `[orrerix] workflow mode
   changed: …` notice so it can adjust its spawn/review strategy mid-session.
   Agents already running keep the role they were spawned under; only new
   spawns pick up the swapped roster.
@@ -1307,7 +1307,7 @@ none of it: it cannot report, read the task board, or be steered, and from
 inside its own pane it looks like orrerix is broken. Add the server to the list:
 
 ```yaml
-tools: ["read", "edit", "execute", "loomux/*"]
+tools: ["read", "edit", "execute", "orrerix/*"]
 ```
 
 orrerix repairs this for you where it safely can — it launches such a block from
@@ -1648,7 +1648,7 @@ pastes `/compact` the moment the pane actually goes idle, not immediately (a mid
 would land as a queued message). Before calling it, the persona is expected to offload
 durable state (task board, `set_state`, relevant GitHub issues/PRs) — the tool warns, but
 never blocks, if that looks skipped. If a group sets a context-usage threshold (percent of
-the model's context window), crossing it delivers a `[loomux] context at NN% …` notice; if
+the model's context window), crossing it delivers an `[orrerix] context at NN% …` notice; if
 the agent still hasn't asked by the next check, orrerix requests one on its behalf rather than
 letting the CLI hit its own emergency auto-compact with no offload.
 

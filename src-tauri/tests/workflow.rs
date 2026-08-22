@@ -22,7 +22,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, CLI_CAPS, EFFORT_LEVELS,
+    block_contract_text, cli_caps, command_line_length_guard, copilot_tools_gap_warning, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, ToolsGapAction, CLI_CAPS, EFFORT_LEVELS,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -2063,7 +2063,7 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
         let expected = format!(
             "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
              --model {model} --permission-mode {perm} --add-dir \"C:/data/group\" \
-             --allowedTools mcp__loomux{extra} --agent {handle}"
+             --allowedTools mcp__orrerix{extra} --agent {handle}"
         );
         assert_eq!(cmd, &expected, "{block_id}'s command line changed in an unexpected way");
         assert_eq!(handle, &format!("loomux-{}-{block_id}", g.id), "handle naming convention");
@@ -2874,7 +2874,7 @@ fn copilot_persona_tools_list_without_loomux_is_repaired_by_a_generated_copy() {
         .map(|t| t.as_str().unwrap().to_string())
         .collect();
     assert!(
-        tools.contains(&"loomux/*".to_string()),
+        tools.contains(&"orrerix/*".to_string()),
         "the documented server-wildcard grant must be present: {tools:?}"
     );
     // The user's own scoping intent survives verbatim — loomux widens by exactly
@@ -2918,7 +2918,7 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
         (cmd, line)
     };
 
-    // An OMISSION — nobody writes this meaning "and loomux must not work".
+    // An OMISSION — nobody writes this meaning "and the MCP server must not work".
     // Repaired: `--agent` moves off the user's own handle.
     let (cmd, line) = case("[\"read\", \"edit\"]");
     assert!(!cmd.contains("--agent p "), "an omission is repaired: {cmd}");
@@ -2928,26 +2928,138 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
     let (cmd, line) = case("[]");
     assert!(
         cmd.contains("--agent p"),
-        "an explicit empty list is left exactly as written — loomux does not overrule \"no tools\" \
-         into \"none except loomux\": {cmd}"
+        "an explicit empty list is left exactly as written — this app does not overrule \"no tools\" \
+         into \"none except its own\": {cmd}"
     );
     assert!(line.contains("deliberate no-tools decision"), "and says why: {line}");
 
     // A DECISION: the server is scoped per-tool on purpose.
-    let (cmd, line) = case("[\"read\", \"loomux/report\"]");
+    let (cmd, line) = case("[\"read\", \"orrerix/report\"]");
     assert!(
         cmd.contains("--agent p"),
-        "a per-tool scope is left as written — widening it to loomux/* would be loomux granting \
+        "a per-tool scope is left as written — widening it to orrerix/* would be this app granting \
          itself more than it was given: {cmd}"
     );
     assert!(line.contains("per-tool"), "and says why: {line}");
+
+    // THE SAME DECISION, WRITTEN BEFORE THE FLAG DAY (rev-967 B1). This is the
+    // row that is red without `scopes_mcp_server_per_tool`'s legacy arm, and it
+    // is the whole reason that arm exists.
+    //
+    // #1153 phase 3 renamed the MCP server, and a persona file in somebody's
+    // repo still says `loomux/report`. The author's decision did not change
+    // when our server's name did: they asked for exactly one tool. Reading the
+    // stale spelling as "never mentions the server" made this an OMISSION, and
+    // the repair path then appended the full-server grant — this app widening a
+    // narrowing nobody widened, which is what #222's capability closure forbids
+    // and what `tools_gap_refusal`'s own doc promises never happens.
+    //
+    // Pinned NEXT TO the current-spelling case rather than replacing it. An
+    // earlier revision of this PR moved this test's specimen to
+    // `orrerix/report`, which left CI green across a live behaviour change
+    // because the only witness had stopped being a member of the class at risk.
+    let (cmd, line) = case("[\"read\", \"loomux/report\"]");
+    assert!(
+        cmd.contains("--agent p"),
+        "a per-tool scope written before the rename is still a DECISION — repairing it would \
+         hand the delegate every tool on the server where its author named one: {cmd}"
+    );
+    assert!(line.contains("per-tool"), "and it is reported as one: {line}");
+    assert!(
+        !line.contains("re-pointed"),
+        "the repair path must not have run at all — running it IS the widening: {line}"
+    );
+    assert!(
+        line.contains("\"names_server_as\":\"loomux\""),
+        "and the record says which spelling the file used, so a human can act on it: {line}"
+    );
+
+    // The NEGATIVE CONTROL for that arm, and the asymmetry it protects. A stale
+    // WHOLE-server grant is deliberately NOT a per-tool scope: `loomux/*` asks
+    // for the whole server, so the repair gives exactly that under the name the
+    // server actually has. Keeping it native instead would hand the delegate a
+    // filter matching nothing — no orchestration tools at all — which is the
+    // regression a well-meaning "accept both spellings everywhere" produces.
+    // Argued in `grants_loomux_tools`'s doc; asserted here so the argument
+    // cannot be undone by someone tidying the two predicates into one.
+    for whole_server in ["[\"read\", \"loomux/*\"]", "[\"read\", \"loomux\"]"] {
+        let (cmd, line) = case(whole_server);
+        assert!(
+            !cmd.contains("--agent p "),
+            "{whole_server}: a stale whole-server grant is a GAP on purpose — the repair spells \
+             the author's own intent the way the server is spelled now: {cmd}"
+        );
+        assert!(line.contains("re-pointed"), "{whole_server}: {line}");
+    }
+}
+
+/// rev-967 B1, the human-facing half: a persona whose scope stopped matching
+/// because the SERVER was renamed must be told that, in those words.
+///
+/// From inside the file nothing looks wrong — the `tools:` line is right there,
+/// naming a server, scoping it to a tool. The only thing that changed is a name
+/// the author never chose and cannot see from their own repo, so a warning that
+/// merely says "does not grant the MCP server" sends them looking for a typo
+/// they did not make.
+#[test]
+fn a_persona_scoping_the_pre_rename_server_is_told_the_name_is_what_went_stale() {
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(&copilot_profile_workflow("w", "p.md")).agent_file(
+        "p.md",
+        "---\nname: p\ndescription: A worker.\ntools: [\"read\", \"loomux/report\"]\n---\nDo the work.",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let b = g.guardrails.block("w").unwrap();
+    let persona = reg.resolve_persona(&g, b).unwrap_or(None).expect("the persona resolves");
+
+    assert!(
+        persona.scopes_mcp_server_per_tool(),
+        "the pre-rename spelling must read as a per-tool scope, or the repair path widens it"
+    );
+    assert_eq!(
+        persona.mcp_server_named_in_tools(),
+        Some("loomux"),
+        "and the file's own spelling is what gets reported back"
+    );
+
+    let warning = copilot_tools_gap_warning("w", &persona, ToolsGapAction::KeptNativeForPerToolScope);
+    assert!(
+        warning.contains("PRE-RENAME server `loomux`"),
+        "the warning must name the stale spelling: {warning}"
+    );
+    assert!(
+        warning.contains("orrerix"),
+        "…and the current one, or the reader still cannot act on it: {warning}"
+    );
+
+    // The negative control: a persona scoping the CURRENT server per-tool is a
+    // plain partial grant and must NOT be told its name went stale.
+    let (reg2, _d2) = test_registry();
+    let repo2 = Repo::new().workflow(&copilot_profile_workflow("w", "p.md")).agent_file(
+        "p.md",
+        "---\nname: p\ndescription: A worker.\ntools: [\"read\", \"orrerix/report\"]\n---\nDo the work.",
+    );
+    let g2 = reg2.create_group(&repo2.path(), rails()).unwrap();
+    let b2 = g2.guardrails.block("w").unwrap();
+    let current = reg2.resolve_persona(&g2, b2).unwrap_or(None).expect("the persona resolves");
+    let warning2 =
+        copilot_tools_gap_warning("w", &current, ToolsGapAction::KeptNativeForPerToolScope);
+    assert!(
+        !warning2.contains("PRE-RENAME"),
+        "a current-spelling scope is not a stale name, and saying so would send a human editing \
+         a file that is already right: {warning2}"
+    );
+    assert!(
+        warning2.contains("grants some orrerix tools but not all"),
+        "it gets the partial-grant wording instead: {warning2}"
+    );
 }
 
 #[test]
 fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path() {
     // The repair must not over-trigger: an unfiltered persona (the common case,
     // and every file in this repo's own `.github/agents/`) is untouched, and so
-    // is one that already grants the server — by `*`, by `loomux/*`, or by the
+    // is one that already grants the server — by `*`, by `orrerix/*`, or by the
     // bare argv spelling the CLI's own `--allow-tool` uses.
     //
     // rev-lead N3: this was a guard that had never been observed red, i.e. a
@@ -2957,7 +3069,7 @@ fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path
     // "always repair" fails these; and a `grants_mcp_server` stuck at either
     // constant fails one side or the other. No mutation run needed, and the
     // coverage lives in CI forever rather than in a cited log line.
-    for tools_line in ["", "tools: [\"*\"]\n", "tools: [\"read\", \"loomux/*\"]\n", "tools: [\"read\", \"loomux\"]\n"] {
+    for tools_line in ["", "tools: [\"*\"]\n", "tools: [\"read\", \"orrerix/*\"]\n", "tools: [\"read\", \"orrerix\"]\n"] {
         let (reg, d) = test_registry();
         let repo = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
             "open.md",
@@ -2987,7 +3099,7 @@ fn copilot_persona_that_grants_loomux_or_declares_no_tools_keeps_the_native_path
         // out must come out the OTHER way. Without this, every assertion above
         // would still pass if the repair had been disabled outright, and the
         // test would be certifying nothing.
-        let stripped = tools_line.replace("\"loomux/*\"", "\"search\"").replace("\"loomux\"", "\"search\"");
+        let stripped = tools_line.replace("\"orrerix/*\"", "\"search\"").replace("\"orrerix\"", "\"search\"");
         let stripped = if tools_line.is_empty() { "tools: [\"read\"]\n".to_string() } else { stripped.replace("[\"*\"]", "[\"read\"]") };
         let (reg2, d2) = test_registry();
         let repo2 = Repo::new().workflow(&copilot_profile_workflow("w", "open.md")).agent_file(
@@ -3108,7 +3220,7 @@ fn a_repaired_stand_in_carries_every_other_frontmatter_key_verbatim() {
     // NOT survive alongside it (two files claiming one handle is the ambiguity
     // `handle_resolves_to` refuses elsewhere).
     assert_eq!(front["name"].as_str(), Some(handle.as_str()), "{generated}");
-    assert!(front["description"].as_str().unwrap().contains("loomux"), "{generated}");
+    assert!(front["description"].as_str().unwrap().contains("orrerix"), "{generated}");
 }
 
 #[test]
@@ -3167,7 +3279,7 @@ fn mcp_spawn_reply_says_when_a_persona_tools_list_stripped_the_loomux_server() {
     assert_eq!(out["isError"], json!(false), "{:?}", out["content"][0]["text"]);
     let text = out["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("loomux/*"),
+        text.contains("orrerix/*"),
         "the reply must carry the exact line to add to the persona file: {text}"
     );
     assert!(text.contains("scoped"), "...and name the persona to add it to: {text}");
@@ -3191,8 +3303,8 @@ fn a_tools_frontmatter_is_read_in_every_yaml_shape_a_real_agent_file_uses() {
             Some(["read".to_string(), "edit".to_string()].as_slice()),
             "{label} shape must read as the same two tools"
         );
-        assert!(!p.grants_mcp_server("loomux"), "{label}: neither entry grants loomux");
-        assert!(!p.mentions_mcp_server("loomux"), "{label}: nor mentions it");
+        assert!(!p.grants_mcp_server("orrerix"), "{label}: neither entry grants the server");
+        assert!(!p.mentions_mcp_server("orrerix"), "{label}: nor mentions it");
     }
 
     // Absent vs. empty are DIFFERENT, and the difference is a capability:
@@ -3201,16 +3313,16 @@ fn a_tools_frontmatter_is_read_in_every_yaml_shape_a_real_agent_file_uses() {
     // empty list read as "grants everything" and hide the worst case of all.
     let absent = profiles::parse_profile("a", "---\nname: a\ndescription: d\n---\nbody").unwrap();
     assert_eq!(absent.tools, None);
-    assert!(absent.grants_mcp_server("loomux"), "no filter means every tool, loomux's included");
+    assert!(absent.grants_mcp_server("orrerix"), "no filter means every tool, the server's included");
     let empty = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: []\n---\nbody").unwrap();
     assert_eq!(empty.tools.as_deref(), Some::<&[String]>(&[]));
-    assert!(!empty.grants_mcp_server("loomux"), "an explicit empty list disables everything");
+    assert!(!empty.grants_mcp_server("orrerix"), "an explicit empty list disables everything");
 
     // A per-tool grant is *mentioned* but not a full grant — the warning says
     // something different in that case, and it has to be able to tell.
-    let partial = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"loomux/report\"]\n---\nbody").unwrap();
-    assert!(!partial.grants_mcp_server("loomux"));
-    assert!(partial.mentions_mcp_server("loomux"));
+    let partial = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"orrerix/report\"]\n---\nbody").unwrap();
+    assert!(!partial.grants_mcp_server("orrerix"));
+    assert!(partial.mentions_mcp_server("orrerix"));
 
     // `mcp-servers:` presence is what blocks the rewrite; a file without it must
     // never be mistaken for one that has it.
@@ -3637,7 +3749,7 @@ fn a_kickoff_persona_is_framed_as_an_addendum_not_a_replacement() {
     let generated = fs::read_to_string(&generated_path).expect("generated wrapper must exist");
     assert!(generated.contains("You are terse."), "the persona is delivered");
     assert!(
-        generated.contains("does not override the loomux mechanics"),
+        generated.contains("does not override the orrerix mechanics"),
         "the persona must be framed as an addendum: {generated}"
     );
 
@@ -3649,7 +3761,7 @@ fn a_kickoff_persona_is_framed_as_an_addendum_not_a_replacement() {
     assert!(k.contains("You are terse."), "the persona is delivered");
     assert!(k.contains("worker.md"), "the loomux contract is still pointed at");
     assert!(
-        k.contains("does not override the loomux mechanics"),
+        k.contains("does not override the orrerix mechanics"),
         "the persona must be framed as an addendum: {k}"
     );
 }
@@ -4847,11 +4959,11 @@ fn a_copilot_blocks_allow_patterns_ride_the_one_allow_tool_value() {
         "a block's own patterns must not add a second occurrence: {cmd}"
     );
     assert!(
-        cmd.contains("--allow-tool \"loomux,shell(git:*),shell(gh:*),shell(make:*)\""),
+        cmd.contains("--allow-tool \"orrerix,shell(git:*),shell(gh:*),shell(make:*)\""),
         "the MCP grant leads the one value and the block's pattern extends it: {cmd}"
     );
     assert!(
-        argv.iter().any(|a| a == "loomux,shell(git:*),shell(gh:*),shell(make:*)"),
+        argv.iter().any(|a| a == "orrerix,shell(git:*),shell(gh:*),shell(make:*)"),
         "and it is one literal argv token: {argv:?}"
     );
 }
@@ -4877,7 +4989,7 @@ fn a_copilot_allow_pattern_containing_a_comma_is_refused_and_audited() {
         "neither the pattern nor either fragment of it may reach the CLI: {cmd}"
     );
     assert!(
-        cmd.contains("--allow-tool \"loomux,shell(git:*),shell(gh:*),shell(make:*)\""),
+        cmd.contains("--allow-tool \"orrerix,shell(git:*),shell(gh:*),shell(make:*)\""),
         "the block's other pattern is unaffected — one bad pattern is not a lost block: {cmd}"
     );
 
@@ -5401,7 +5513,7 @@ const LIVE: [(&str, &str, &[&str]); 5] = [
 /// So the golden carries the literal `{{HOLD_LABEL}}` and this renders it, which
 /// keeps the pin biting on the prose AROUND it.
 fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) -> String {
-    let vars: [(&str, String); 7] = [
+    let vars: [(&str, String); 8] = [
         ("REPO", g.repo.clone()),
         ("GROUP_ID", g.id.to_string()),
         ("MAX_AGENTS", g.guardrails.max_agents.to_string()),
@@ -5409,6 +5521,11 @@ fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) 
         ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer).to_string()),
         ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner).to_string()),
         ("HOLD_LABEL", g.guardrails.intake.hold.clone()),
+        // #1153 phase 3. Like HOLD_LABEL and NOT like `LIVE`'s keys: it
+        // resolves to a real path for every group, so the golden carries the
+        // literal `{{LESSONS_PATH}}` and this renders it — which keeps the
+        // pin biting on the prose around it.
+        ("LESSONS_PATH", loomux_lib::orchestration::lessons::lessons_path(&g.repo).to_string()),
     ];
     let mut out = tpl.to_string();
     for (k, v) in vars {

@@ -885,7 +885,7 @@ test("agentFreshCommand: copilot argv form also stays space form / two elements 
 test("stripSoloMcpFlags removes claude's solo MCP flags and reports the CLI", () => {
   assert.deepEqual(
     stripSoloMcpFlags(
-      'claude --model opus --mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__loomux --resume abc',
+      'claude --model opus --mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__orrerix --resume abc',
       null
     ),
     { cli: "claude", command: "claude --model opus --resume abc" }
@@ -895,7 +895,7 @@ test("stripSoloMcpFlags removes claude's solo MCP flags and reports the CLI", ()
 test("stripSoloMcpFlags removes copilot's solo MCP flags and reports the CLI", () => {
   assert.deepEqual(
     stripSoloMcpFlags(
-      'copilot --additional-mcp-config "@C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-11.json" --allow-tool loomux',
+      'copilot --additional-mcp-config "@C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-11.json" --allow-tool orrerix',
       null
     ),
     { cli: "copilot", command: "copilot" }
@@ -911,7 +911,7 @@ test("stripSoloMcpFlags removes copilot's solo MCP flags and reports the CLI", (
 test("stripSoloMcpFlags removes claude's solo MCP flags when the config path contains a space", () => {
   assert.deepEqual(
     stripSoloMcpFlags(
-      'claude --model opus --mcp-config "C:/Users/Will H/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__loomux --resume abc',
+      'claude --model opus --mcp-config "C:/Users/Will H/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__orrerix --resume abc',
       null
     ),
     { cli: "claude", command: "claude --model opus --resume abc" }
@@ -921,7 +921,7 @@ test("stripSoloMcpFlags removes claude's solo MCP flags when the config path con
 test("stripSoloMcpFlags removes copilot's solo MCP flags when the config path contains a space", () => {
   assert.deepEqual(
     stripSoloMcpFlags(
-      'copilot --additional-mcp-config "@C:/Users/Will H/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-11.json" --allow-tool loomux',
+      'copilot --additional-mcp-config "@C:/Users/Will H/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-11.json" --allow-tool orrerix',
       null
     ),
     { cli: "copilot", command: "copilot" }
@@ -958,7 +958,7 @@ test("stripSoloMcpFlags handles the argv form the same way", () => {
       "C:/configs/solo-6.json",
       "--strict-mcp-config",
       "--allowedTools",
-      "mcp__loomux",
+      "mcp__orrerix",
       "--resume",
       "abc",
     ]),
@@ -970,6 +970,62 @@ test("stripSoloMcpFlags handles the argv form the same way", () => {
   });
 });
 
+// #1153 phase 3. A tab saved before the rename records the OLD MCP identity,
+// and the config path it names is just as dead as a new one's. If these flags
+// are not recognised, the excision silently does nothing and the pane is
+// relaunched pointing at a file agent exit deleted — the exact failure the
+// whole function exists to prevent, reintroduced for every pane a user had
+// open across the upgrade. Both forms are covered because the string branch
+// and the argv branch are separate code paths reading the same two arrays.
+test("stripSoloMcpFlags still recognises a solo command recorded before the rename", () => {
+  assert.deepEqual(
+    stripSoloMcpFlags(
+      'claude --model opus --mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__loomux --resume abc',
+      null
+    ),
+    { cli: "claude", command: "claude --model opus --resume abc" },
+    "a pre-rename claude command must still be stripped, or its dead config path is replayed"
+  );
+  assert.deepEqual(
+    stripSoloMcpFlags(
+      'copilot --additional-mcp-config "@C:/configs/solo-11.json" --allow-tool loomux',
+      null
+    ),
+    { cli: "copilot", command: "copilot" }
+  );
+  assert.deepEqual(
+    stripSoloMcpFlags(null, [
+      "claude",
+      "--mcp-config",
+      "C:/configs/solo-6.json",
+      "--strict-mcp-config",
+      "--allowedTools",
+      "mcp__loomux",
+      "--resume",
+      "abc",
+    ]),
+    { cli: "claude", argv: ["claude", "--resume", "abc"] },
+    "…and so must the argv form, which is a separate scan"
+  );
+  assert.deepEqual(
+    stripSoloMcpFlags(null, ["copilot", "--additional-mcp-config", "@/c/solo-1.json", "--allow-tool", "loomux"]),
+    { cli: "copilot", argv: ["copilot"] }
+  );
+});
+
+// The negative control for the test above: dual-accept must widen the accepted
+// SET, not the accepted SHAPE. A server name that is neither spelling is not a
+// solo identity, and treating it as one would strip flags this app never
+// minted out of a user's own command line.
+test("stripSoloMcpFlags does not strip a third party's MCP flags", () => {
+  const cmd = 'claude --mcp-config "C:/x.json" --strict-mcp-config --allowedTools mcp__someoneelse --resume abc';
+  assert.deepEqual(stripSoloMcpFlags(cmd, null), { cli: null, command: cmd });
+  assert.deepEqual(
+    stripSoloMcpFlags(null, ["copilot", "--additional-mcp-config", "@/c/x.json", "--allow-tool", "someoneelse"]),
+    { cli: null, argv: ["copilot", "--additional-mcp-config", "@/c/x.json", "--allow-tool", "someoneelse"] }
+  );
+});
+
 test("stripSoloMcpFlags on neither command nor argv reports no CLI and nothing to append to", () => {
   assert.deepEqual(stripSoloMcpFlags(null, null), { cli: null });
   assert.deepEqual(stripSoloMcpFlags("", []), { cli: null });
@@ -977,8 +1033,8 @@ test("stripSoloMcpFlags on neither command nor argv reports no CLI and nothing t
 
 test("appendSoloMcpArgs appends a freshly-minted identity's flags to a cleaned command", () => {
   assert.deepEqual(
-    appendSoloMcpArgs("claude --model opus --resume abc", undefined, '--mcp-config "C:/new/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux'),
-    { command: 'claude --model opus --resume abc --mcp-config "C:/new/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux' }
+    appendSoloMcpArgs("claude --model opus --resume abc", undefined, '--mcp-config "C:/new/solo-9.json" --strict-mcp-config --allowedTools mcp__orrerix'),
+    { command: 'claude --model opus --resume abc --mcp-config "C:/new/solo-9.json" --strict-mcp-config --allowedTools mcp__orrerix' }
   );
 });
 
@@ -987,15 +1043,15 @@ test("appendSoloMcpArgs appends a freshly-minted SPACED path just as well — it
     appendSoloMcpArgs(
       "claude --model opus --resume abc",
       undefined,
-      '--mcp-config "C:/Users/Will H/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux'
+      '--mcp-config "C:/Users/Will H/solo-9.json" --strict-mcp-config --allowedTools mcp__orrerix'
     ),
-    { command: 'claude --model opus --resume abc --mcp-config "C:/Users/Will H/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux' }
+    { command: 'claude --model opus --resume abc --mcp-config "C:/Users/Will H/solo-9.json" --strict-mcp-config --allowedTools mcp__orrerix' }
   );
 });
 
 test("appendSoloMcpArgs works on the argv form, tokenizing mcpArgs", () => {
-  assert.deepEqual(appendSoloMcpArgs(undefined, ["claude", "--resume", "abc"], "--additional-mcp-config @/new/solo-9.json --allow-tool loomux"), {
-    argv: ["claude", "--resume", "abc", "--additional-mcp-config", "@/new/solo-9.json", "--allow-tool", "loomux"],
+  assert.deepEqual(appendSoloMcpArgs(undefined, ["claude", "--resume", "abc"], "--additional-mcp-config @/new/solo-9.json --allow-tool orrerix"), {
+    argv: ["claude", "--resume", "abc", "--additional-mcp-config", "@/new/solo-9.json", "--allow-tool", "orrerix"],
   });
 });
 
@@ -1008,7 +1064,7 @@ test("appendSoloMcpArgs on the argv form strips quotes and keeps a SPACED path a
     appendSoloMcpArgs(
       undefined,
       ["claude", "--resume", "abc"],
-      '--mcp-config "C:/Users/Will H/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux'
+      '--mcp-config "C:/Users/Will H/solo-9.json" --strict-mcp-config --allowedTools mcp__orrerix'
     ),
     {
       argv: [
@@ -1019,7 +1075,7 @@ test("appendSoloMcpArgs on the argv form strips quotes and keeps a SPACED path a
         "C:/Users/Will H/solo-9.json",
         "--strict-mcp-config",
         "--allowedTools",
-        "mcp__loomux",
+        "mcp__orrerix",
       ],
     }
   );
@@ -1031,7 +1087,7 @@ test("strip + append round-trips: a resumed claude command replaces the dead SPA
   // Both the dead and the fresh path carry a space (the real shape of a
   // Windows profile path), pinning B1's fix end to end, not just in isolation.
   const recorded =
-    'claude --mcp-config "C:/Users/Old User/dead/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__loomux --session-id old';
+    'claude --mcp-config "C:/Users/Old User/dead/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__orrerix --session-id old';
   const resumed = agentResumeCommand(recorded, null, "new-session");
   assert.match(resumed.command!, /Old User\/dead\/configs\/solo-6\.json/, "sanity: the dead path is still there pre-strip");
   // The fix: strip the dead flags, then append a freshly-minted config's flags.
@@ -1040,7 +1096,7 @@ test("strip + append round-trips: a resumed claude command replaces the dead SPA
   const final = appendSoloMcpArgs(
     stripped.command,
     stripped.argv,
-    '--mcp-config "C:/Users/New User/fresh/configs/solo-42.json" --strict-mcp-config --allowedTools mcp__loomux'
+    '--mcp-config "C:/Users/New User/fresh/configs/solo-42.json" --strict-mcp-config --allowedTools mcp__orrerix'
   );
   assert.doesNotMatch(final.command!, /Old User\/dead\/configs\/solo-6\.json/, "the dead path must never survive restore");
   assert.match(final.command!, /New User\/fresh\/configs\/solo-42\.json/, "a freshly-minted path replaces it");

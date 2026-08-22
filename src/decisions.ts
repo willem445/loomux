@@ -345,7 +345,7 @@ export function feedbackRoute(status: string): FeedbackRoute {
  *  1. **A second press while the first write is outstanding.** Hitting
  *     Ctrl+Enter twice is an ordinary habit when a dialog does not visibly
  *     respond. On a merge-gate row that used to issue two `orch_request_changes`
- *     calls — two `Requested changes: …` notes on one task and two `[loomux]`
+ *     calls — two `Requested changes: …` notes on one task and two `[orrerix]`
  *     deliveries for one decision. `inFlight` makes the second press a no-op.
  *  2. **A retry after a PARTIAL failure.** The merge-gate route is a two-call
  *     chain. If `orch_request_changes` lands and the status flip then fails, the

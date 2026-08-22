@@ -354,7 +354,7 @@ sent a round of investigation the wrong way:
   default. The built-in roster on the same machine was fine, which read as "the
   workflow spawn path is broken" when the truth was "the file it points at is
   narrower".
-- **No permission grant can undo it.** `--allow-tool loomux` and
+- **No permission grant can undo it.** `--allow-tool orrerix` and
   `permissions-config.json`'s `{"kind":"mcp","serverName":"loomux","toolName":
   null}` (see the orchestration note's *two permission surfaces*) both grant
   permission over what is *available*; `tools:` decides what is available at all.
@@ -390,7 +390,7 @@ choice rather than an oversight:
 |---|---|
 | its own `mcp-servers:` | the stand-in models loomux's server and nothing else, so substituting would silently delete servers the user declared |
 | `tools: []` | documented as *"disables all tools"* — a deliberate "nothing", not to be overruled into "nothing except loomux" |
-| `tools: ["loomux/report"]` | the server is scoped per-tool on purpose; widening it to `loomux/*` would be loomux granting itself more than it was given |
+| `tools: ["loomux/report"]` | the server is scoped per-tool on purpose; widening it to `orrerix/*` would be loomux granting itself more than it was given |
 
 A list that simply never mentions loomux is the omission — nobody writes
 `tools: [read, edit]` *meaning* "and loomux must not work" — and that is the only
@@ -591,7 +591,7 @@ launcher preview does, without needing to tear the group down first.
 The live setter is not a new mechanism — it is modeled on the two setters that
 already do exactly this shape: `set_max_agents` (validate → persist-first via
 an in-place `group.json` patch → update the in-memory guardrail → audit →
-deliver a `[loomux] …` notice) and `set_autonomous` (same shape, also
+deliver an `[orrerix] …` notice) and `set_autonomous` (same shape, also
 notice-delivering). Turning the toggle **on** re-runs the identical
 `load_workflow` → `sync_merge_gate` → `Guardrails::clamped()` sequence a fresh
 launch already runs — not a second loader — and swaps `guardrails.blocks` for
@@ -613,15 +613,15 @@ is deliberately out of scope here.
 
 **The notice.** Both directions call the existing `deliver_to_orchestrator`
 path — the same one `set_max_agents`/`set_autonomous` already use, not a new
-delivery mechanism — with a `[loomux] workflow mode changed: …` line naming
+delivery mechanism — with an `[orrerix] workflow mode changed: …` line naming
 the new state (workflow name and the armed gate, or "built-in roster, no merge
 gate") so the orchestrator can revise its spawn/review strategy mid-session
 instead of discovering the change on a bounced merge.
 
 The notice is `workflow_mode_notice`'s literal text
-(`src-tauri/src/orchestration/mod.rs`): off reads `"[loomux] workflow mode
+(`src-tauri/src/orchestration/mod.rs`): off reads `"[orrerix] workflow mode
 changed: built-in roster, no merge gate — re-plan your spawn/review
-strategy."`; on reads `"[loomux] workflow mode changed: '<name>' active,
+strategy."`; on reads `"[orrerix] workflow mode changed: '<name>' active,
 <gate clause> — re-plan your spawn/review strategy."`, where `<gate clause>`
 is `merge gate requires all of|N of [<reviewers>]` plus a ` · `-joined
 `also:` list when the gate declares one, or `no merge gate declared` when it
@@ -1254,7 +1254,7 @@ by itself, and nothing opens *it* but the verdicts:
 
     gh pr merge
       │
-      ├─ no LOOMUX_GROUP_DIR ── a merge loomux cannot gate ───────────── REFUSE
+      ├─ no ORRERIX_GROUP_DIR ── a merge loomux cannot gate ───────────── REFUSE
       │
       ├─ workflow merge gate  ── declared in .loomux/workflow.yml ────── REFUSE unless satisfied
       │                          (verdicts for the CURRENT head,
@@ -1404,12 +1404,12 @@ and lists calling the real `gh` by absolute path, a shell alias, or **forging a
 grant file** as the shapes it does not close. **Everything there applies to this
 gate too**, and the verdict store adds its own shapes. An agent with a shell can:
 
-- **Forge a verdict.** `printf 'pass\n<head-sha>\n' > $LOOMUX_GROUP_DIR/verdicts/pr-7/rev-tests`
+- **Forge a verdict.** `printf 'pass\n<head-sha>\n' > $ORRERIX_GROUP_DIR/verdicts/pr-7/rev-tests`
   satisfies the gate. The verdict dir is on disk under the agent's own uid, exactly
   like `merge_grants/`. What loomux guarantees is that no *MCP surface* lets a
   non-reviewer record one (enforced twice — dispatch and registry), not that the
   filesystem forbids it.
-- **Delete the gate.** `rm $LOOMUX_GROUP_DIR/merge_gate` removes it for that
+- **Delete the gate.** `rm $ORRERIX_GROUP_DIR/merge_gate` removes it for that
   group — **but only for up to `WORKFLOW_GATE_POLL_INTERVAL` (30s), not until
   the next launch, as of #385.** If `.loomux/workflow.yml` still declares
   `gates.merge` (the common case — the file itself wasn't touched, just the
@@ -1422,7 +1422,7 @@ gate too**, and the verdict store adds its own shapes. An agent with a shell can
   deliberately) or disabling/killing the background reload thread, which is
   a much bigger compromise than deleting one file — **or pausing the group,
   the next bullet.**
-- **Pause the group.** `touch $LOOMUX_GROUP_DIR/paused` has no LIVE effect —
+- **Pause the group.** `touch $ORRERIX_GROUP_DIR/paused` has no LIVE effect —
   `run_workflow_gate_reload` (and every other background pass) checks the
   in-memory `paused` set, not this file, and `pause_group`/`resume_group`
   aren't reachable from any MCP surface an agent can call, only a human's
@@ -1436,10 +1436,10 @@ gate too**, and the verdict store adds its own shapes. An agent with a shell can
   agent left it there) or the human notices the group reads paused and looks
   closer. Same class as the other two bullets: a filesystem write under the
   group dir an agent's own shell can already make, not a new API surface.
-- **Unset the group dir.** `env -u LOOMUX_GROUP_DIR gh pr merge 7` used to skip the
+- **Unset the group dir.** `env -u ORRERIX_GROUP_DIR gh pr merge 7` used to skip the
   workflow gate entirely — with nothing in the audit, since there is no audit log
   without a group dir. **That one is now closed**: the shim refuses *any* merge with
-  no `LOOMUX_GROUP_DIR`, matching what the human gate already did on the default
+  no `ORRERIX_GROUP_DIR`, matching what the human gate already did on the default
   branch. Every agent pane gets the variable and the shimmed PATH together, and a
   human's own shell has neither, so an unset variable at the shim is evasion rather
   than a supported flow. The remaining shapes above are the same class as

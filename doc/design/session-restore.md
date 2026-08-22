@@ -273,9 +273,12 @@ session ones — which is exactly right for `--model`, `--permission-mode`, etc.
 but wrong for one flag group: a standalone (launcher-spawned) claude/copilot
 pane with channel tools on gets a solo channel identity at launch
 (`soloPrepare`/#271 W3 addendum), and its command line carries that identity's
-MCP flags (`--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
-for claude, `--additional-mcp-config "@<path>" --allow-tool loomux` for
-copilot). That config file — and the identity's token — are deleted the moment
+MCP flags (`--mcp-config <path> --strict-mcp-config --allowedTools mcp__orrerix`
+for claude, `--additional-mcp-config "@<path>" --allow-tool orrerix` for
+copilot) — **or, on a tab recorded before #1153 phase 3, the same flags naming
+the old MCP identity, which `stripSoloMcpFlags` still recognises for exactly the
+reason the rest of this paragraph gives.** That config file — and the identity's
+token — are deleted the moment
 the pane's agent process exits (same lifecycle as an orchestration member).
 Replaying the recorded flags on restore therefore points at a file that is
 **guaranteed gone**: claude hard-errors (`MCP config file not found`) and
@@ -1533,5 +1536,5 @@ mode neuters both flags while leaving `--autopilot` (not a permissive option)
 working — a posture indistinguishable from this bug from the outside, which is
 why the flag path was worth clearing before concluding it was innocent. loomux
 cannot flag its way past a policy; the targeted grants it already emits
-(`--allow-tool loomux`, `--add-dir`) are not permissive options and are what
+(`--allow-tool orrerix`, `--add-dir`) are not permissive options and are what
 keeps such a pane usable at all.

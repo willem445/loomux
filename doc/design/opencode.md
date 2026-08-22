@@ -95,7 +95,7 @@ deliveries, so the two cannot disagree.
 ```jsonc
 {
   "mcp": { "loomux": { "type": "remote", "url": "http://127.0.0.1:<port>/mcp",
-                       "enabled": true, "headers": { "X-Loomux-Agent": "<token>" },
+                       "enabled": true, "headers": { "X-Orrerix-Agent": "<token>" },
                        "oauth": false, "timeout": 30000 } },
   "share": "disabled",
   "permission": { /* the global posture — see below */ },

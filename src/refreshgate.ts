@@ -104,7 +104,7 @@ export class CoalescingRefresh {
       // either way, and swallowing here (loudly) keeps `request()`'s void
       // contract from producing an unhandled rejection. Views already toast
       // their own failures; this is the backstop, not the reporting path.
-      console.error("[loomux] coalesced refresh failed", err);
+      console.error("[orrerix] coalesced refresh failed", err);
     } finally {
       if (this.gate.end()) this.request();
     }

@@ -204,14 +204,14 @@ const GOAL_CONTROL = /\p{Cc}/u;
  *  two reasons that are both about honesty: the goal the panel shows (and puts in
  *  the chip tooltip) must be the goal that is actually in force, and committing an
  *  edit that normalizes to the value already stored must be recognizable as a
- *  no-op — every enable delivers a `[loomux] …` notice into the orchestrator's
+ *  no-op — every enable delivers an `[orrerix] …` notice into the orchestrator's
  *  pane, so a blur that changed nothing must not fire one.
  *
  *  Same three rules, same order as the backend: whitespace runs (checked FIRST,
  *  so `\n`/`\t` become a space rather than being dropped as control characters)
  *  collapse to one space and the leading one is dropped; other control characters
  *  are dropped outright; `[`/`]` become `(`/`)` so a goal echoed inside a
- *  `[loomux] …` notice can never forge a second notice row. The cap counts CODE
+ *  `[orrerix] …` notice can never forge a second notice row. The cap counts CODE
  *  POINTS (`for…of` iterates them, like Rust's `chars()`) so a multibyte goal
  *  never truncates mid-character, and the result never ends on the space the cap
  *  happened to land on. Idempotent — the marker is a file a human can edit, so it

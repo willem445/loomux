@@ -532,7 +532,7 @@ pub fn batch_pr_title(batch_id: &str, prs: &[u64]) -> String {
 /// itself writes.
 pub fn batch_pr_body(batch_id: &str, target: &str, scratch_sha: &str, prs: &[u64]) -> String {
     let mut s = String::new();
-    s.push_str("Speculative merge-queue batch opened by loomux. **Do not merge by hand.**\n\n");
+    s.push_str("Speculative merge-queue batch opened by orrerix. **Do not merge by hand.**\n\n");
     s.push_str(&format!("- batch: `{batch_id}`\n"));
     s.push_str(&format!("- target: `{target}`\n"));
     s.push_str(&format!("- tested object: `{scratch_sha}`\n\n"));
@@ -581,7 +581,7 @@ pub fn culprit_comment(
     siblings: &[u64],
 ) -> String {
     let mut s = String::new();
-    s.push_str("**loomux merge queue: this PR was isolated as the batch's culprit.**\n\n");
+    s.push_str("**orrerix merge queue: this PR was isolated as the batch's culprit.**\n\n");
     s.push_str(&format!("- batch: `{}`\n", quote(batch_id)));
     if failing.is_empty() {
         s.push_str("- failing checks: none reported by name\n");
@@ -1115,7 +1115,7 @@ pub fn reconcile_batch(
         None => {
             report.resumed = true;
             report.notices.push(format!(
-                "[loomux] merge queue: resumed batch {} after a restart - scratch ref and draft PR #{} both still present.",
+                "[orrerix] merge queue: resumed batch {} after a restart - scratch ref and draft PR #{} both still present.",
                 quote(&batch.id),
                 batch.draft_pr.unwrap_or(0)
             ));
@@ -1131,7 +1131,7 @@ pub fn reconcile_batch(
             // through recovery instead of through a cancel.
             finish_batch(state);
             report.notices.push(format!(
-                "[loomux] merge queue: batch {} could NOT be resumed after a restart ({}). {} entr{} kicked back; nothing landed.",
+                "[orrerix] merge queue: batch {} could NOT be resumed after a restart ({}). {} entr{} kicked back; nothing landed.",
                 quote(&batch.id),
                 quote(&why),
                 batch.prs.len(),
@@ -1181,7 +1181,7 @@ pub fn culprit_notice(culprit: u64, batch_id: &str, failing: &[String], survivor
     let more =
         if failing.len() > 1 { format!(" +{} more failing", failing.len() - 1) } else { String::new() };
     format!(
-        "[loomux] merge queue: #{culprit} isolated as batch {}'s culprit{check}{more}. \
+        "[orrerix] merge queue: #{culprit} isolated as batch {}'s culprit{check}{more}. \
          {survivors} sibling{} requeued; details on #{culprit}.",
         quote(batch_id),
         if survivors == 1 { "" } else { "s" }
@@ -1197,7 +1197,7 @@ pub fn culprit_notice(culprit: u64, batch_id: &str, failing: &[String], survivor
 pub fn unverifiable_notice(batch_id: &str, draft_pr: Option<u64>, why: &str) -> String {
     let where_ = draft_pr.map(|p| format!(" (batch PR #{p})")).unwrap_or_default();
     format!(
-        "[loomux] merge queue: batch {}{where_} is UNVERIFIABLE - {}. Nothing landed; \
+        "[orrerix] merge queue: batch {}{where_} is UNVERIFIABLE - {}. Nothing landed; \
          entries requeued. This is not a red batch and no PR is implicated.",
         quote(batch_id),
         quote(why)
@@ -1788,7 +1788,7 @@ fn advance_in_flight(
                     "transitions": moves_json(&moves) }),
         );
         rep.notices.push(format!(
-            "[loomux] merge queue: batch {} has no draft PR on record and cannot be observed. \
+            "[orrerix] merge queue: batch {} has no draft PR on record and cannot be observed. \
              {} entr{} kicked back; nothing landed.",
             quote(&batch.id),
             batch.prs.len(),
@@ -1990,7 +1990,7 @@ fn narrow_search(
                         "transitions": moves_json(&moves) }),
             );
             rep.notices.push(format!(
-                "[loomux] merge queue: batch {}'s search ended with nothing to attribute. \
+                "[orrerix] merge queue: batch {}'s search ended with nothing to attribute. \
                  Entries requeued; no PR is implicated.",
                 quote(&batch.id)
             ));
@@ -2141,7 +2141,7 @@ fn build_probe(
                         "red": red, "transitions": moves_json(&moves) }),
             );
             rep.notices.push(format!(
-                "[loomux] merge queue: batch {}'s search was abandoned - the next probe could \
+                "[orrerix] merge queue: batch {}'s search was abandoned - the next probe could \
                  not be built. {} entr{} requeued; nothing attributed.",
                 quote(&prev.id),
                 red.len(),
@@ -2605,7 +2605,7 @@ fn kick_back_one(
                 "transitions": moves_json(&moves) }),
     );
     rep.notices.push(format!(
-        "[loomux] merge queue: #{pr} was kicked back before any CI was spent - {}. \
+        "[orrerix] merge queue: #{pr} was kicked back before any CI was spent - {}. \
          The batch rebuilds without it.",
         quote(why)
     ));
@@ -2810,7 +2810,7 @@ pub fn landed_notice(batch_id: &str, target: &str, prs: &[u64]) -> String {
         String::new()
     };
     format!(
-        "[loomux] merge queue: batch {} landed on {} - {}{}. The tested object is the target head.",
+        "[orrerix] merge queue: batch {} landed on {} - {}{}. The tested object is the target head.",
         quote(batch_id),
         quote(target),
         named.join(", "),
@@ -2827,7 +2827,7 @@ pub fn land_refused_notice(
 ) -> String {
     match culprit {
         Some(pr) => format!(
-            "[loomux] merge queue: batch {} was REFUSED at landing on #{pr} ({}). \
+            "[orrerix] merge queue: batch {} was REFUSED at landing on #{pr} ({}). \
              #{pr} kicked back; {} sibling{} requeued; nothing landed.",
             quote(batch_id),
             quote(why),
@@ -2835,7 +2835,7 @@ pub fn land_refused_notice(
             if batch_size == 2 { "" } else { "s" }
         ),
         None => format!(
-            "[loomux] merge queue: batch {} could NOT land ({}). All {batch_size} entries \
+            "[orrerix] merge queue: batch {} could NOT land ({}). All {batch_size} entries \
              requeued; nothing landed and no PR is implicated.",
             quote(batch_id),
             quote(why)
@@ -2846,7 +2846,7 @@ pub fn land_refused_notice(
 /// A batch that could not be constructed at all (§10's abort rows).
 pub fn batch_aborted_notice(prs: &[u64], why: &str) -> String {
     format!(
-        "[loomux] merge queue: a batch of {} entr{} was ABORTED before CI - {}. \
+        "[orrerix] merge queue: a batch of {} entr{} was ABORTED before CI - {}. \
          Entries requeued; nothing landed.",
         prs.len(),
         if prs.len() == 1 { "y" } else { "ies" },
@@ -2866,7 +2866,7 @@ pub fn batch_aborted_notice(prs: &[u64], why: &str) -> String {
 pub fn flake_notice(culprit: u64, batch_id: &str, failing: &[String], survivors: usize) -> String {
     let check = failing.first().map(|f| format!(" ({})", quote(f))).unwrap_or_default();
     format!(
-        "[loomux] merge queue: batch {} is still red at k=1 on #{culprit}{check}, but #{culprit}'s \
+        "[orrerix] merge queue: batch {} is still red at k=1 on #{culprit}{check}, but #{culprit}'s \
          OWN checks are green - treat this as infrastructure/flake, not a bad diff. \
          #{culprit} kicked back; {survivors} sibling{} requeued.",
         quote(batch_id),
