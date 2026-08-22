@@ -591,6 +591,20 @@ fn push_spaceless<S: Sink>(out: &mut S, s: &str) {
     }
 }
 
+/// Append `s` with **control bytes only** turned into `'_'`, so it cannot break
+/// out of the line it is on.
+///
+/// The weaker sibling of [`push_spaceless`], and the two are separate because
+/// their contracts are: a *breadcrumb* is three space-separated fields, so a
+/// space inside one of them is a format break; a *crash log* line has no such
+/// contract, and mangling a panic message's spaces there loses fidelity for
+/// nothing. Use this wherever the only requirement is "stay on one line".
+fn push_oneline<S: Sink>(out: &mut S, s: &str) {
+    for &b in s.as_bytes() {
+        out.put(&[if b < 0x20 { b'_' } else { b }]);
+    }
+}
+
 /// The crash record's head, up to and including the `panic:   ` label — shared
 /// verbatim by the panic hook's first phase and by the allocation-failure
 /// handler, so the file a human opens has one format regardless of which of the
@@ -838,12 +852,16 @@ fn panic_location(info: &std::panic::PanicHookInfo<'_>) -> String {
 /// The single line a re-entrant hook run appends: short enough to be one
 /// `write`, and composed from byte slices so nothing on this path can panic a
 /// third time.
+///
+/// `push_oneline`, not `push_spaceless` — this lands in a crash log, where the
+/// panic message's own spaces are content, not a field separator. Only bytes
+/// that would end the line early are replaced.
 fn emergency_line(msg: &str, loc: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(32 + msg.len() + loc.len());
     v.extend_from_slice(b"\ndouble-panic: ");
-    push_spaceless(&mut v, msg);
+    push_oneline(&mut v, msg);
     v.extend_from_slice(b" at ");
-    push_spaceless(&mut v, loc);
+    push_oneline(&mut v, loc);
     v.push(b'\n');
     v
 }
@@ -1774,6 +1792,20 @@ mod tests {
         );
         assert_eq!(body.matches("double-panic").count(), 1, "exactly one line, not a loop");
         assert!(body.ends_with('\n'), "and it must terminate its own line");
+
+        // The message's own spaces are CONTENT here, not a field separator —
+        // this lands in a crash log, not in a breadcrumb. But a payload
+        // carrying a newline must still not break the record into two lines.
+        write_emergency(&p, "line one\nline two", "src/y.rs:2:2\r");
+        let body = fs::read_to_string(&p).unwrap();
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("double-panic: line one"))
+            .expect("the message must survive with its spaces intact");
+        assert_eq!(
+            line, "double-panic: line one_line two at src/y.rs:2:2_",
+            "only the bytes that would end the line early may be replaced"
+        );
     }
 
     /// Exactly one of the four crossings is a gap. The set assertion is what
