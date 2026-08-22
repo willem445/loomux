@@ -8547,3 +8547,454 @@ fn the_board_block_can_never_widen_anything() {
     assert!(parse_board("board:\n  wip:\n    review: soon\n").is_err());
     assert!(parse_board("board:\n  enforce: 3\n").is_err());
 }
+
+// ───────── path-based reviewer routing: the pure contract (#1176) ─────────
+//
+// Everything here is pure, so it pins the semantics in microseconds and gives
+// the `gh` shim's POSIX mirror something to agree with. The shell itself is
+// EXECUTED end-to-end in tests/orchestration.rs — a shim/mirror agreement
+// asserted only against source text is not an agreement, it is a comment.
+
+/// A workflow declaring one worker, three reviewers and a merge gate whose
+/// `gates.merge` body is `gate_body`.
+fn routed_workflow(gate_body: &str) -> String {
+    format!(
+        "version: 1\nblocks:\n\
+         \x20 - id: w\n    kind: worker\n\
+         \x20 - id: rev-lead\n    kind: reviewer\n\
+         \x20 - id: rev-ui\n    kind: reviewer\n\
+         \x20 - id: rev-deps\n    kind: reviewer\n\
+         gates:\n  merge:\n{gate_body}"
+    )
+}
+
+/// The gate out of a workflow that must parse.
+fn routed_gate(gate_body: &str) -> workflow::Gate {
+    workflow::parse_workflow(&routed_workflow(gate_body))
+        .unwrap_or_else(|e| panic!("must parse: {e:?}"))
+        .gates
+        .get("merge")
+        .expect("a merge gate")
+        .clone()
+}
+
+fn routed_errs(gate_body: &str) -> Vec<String> {
+    workflow::parse_workflow(&routed_workflow(gate_body)).unwrap_err()
+}
+
+fn paths(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn the_glob_contract_is_star_only_star_crosses_slash_and_a_leading_doublestar_is_optional() {
+    use workflow::glob_match as m;
+    // Rule 1: `*` is any run of characters, INCLUDING `/`. Deliberately coarser
+    // than gitignore — over-matching requires an extra lane, under-matching
+    // skips one, and only one of those is survivable.
+    assert!(m("src/**", "src/app.ts"));
+    assert!(m("src/**", "src/deep/nested/app.ts"), "`*` crosses `/`: that IS the contract");
+    assert!(m("src/*", "src/deep/nested/app.ts"), "one star and two are the same set");
+    assert!(!m("src/**", "srcfoo"), "the `/` after src is a literal and must be there");
+    assert!(!m("src/**", "docs/src/app.ts"), "anchored at the START");
+    assert!(!m("src/**", "src"), "`src/**` needs something under src/");
+
+    // Rule 3: a LEADING `**/` is optional — the one place `**` means more than
+    // `*`. Without it `**/Cargo.toml` silently misses the root one, which is a
+    // SKIPPED reviewer.
+    assert!(m("**/Cargo.toml", "Cargo.toml"), "the leading `**/` is optional");
+    assert!(m("**/Cargo.toml", "crates/loomux-engine/Cargo.toml"));
+    assert!(!m("**/Cargo.toml", "Cargo.lock"));
+    assert!(!m("**/Cargo.toml", "crates/Cargo.toml.bak"), "anchored at the END");
+
+    // Rule 4, both ends, and the exact-literal case.
+    assert!(m("package-lock.json", "package-lock.json"));
+    assert!(!m("package-lock.json", "web/package-lock.json"), "no implicit `**/` — it is written");
+    assert!(!m("package-lock.json", "package-lock.json.bak"));
+
+    // `*` may match nothing at all.
+    assert!(m("docs/*.md", "docs/.md"));
+    assert!(m("*", ""));
+    assert!(m("*.rs", "a.rs"));
+    assert!(m("a*b*c", "abc"));
+    assert!(m("a*b*c", "axxbyyc"));
+    assert!(!m("a*b*c", "axxbyy"));
+
+    // `?` is NOT a metacharacter — `sanitize_glob` refuses it, and if one ever
+    // reached here it must be a literal rather than the one construct whose
+    // meaning a shell `case` and a Rust matcher could not be shown to share.
+    assert!(m("a?c", "a?c"));
+    assert!(!m("a?c", "abc"));
+}
+
+#[test]
+fn sanitize_glob_refuses_every_glob_that_could_never_fire_or_could_reach_the_shell() {
+    use workflow::sanitize_glob as s;
+    // The alphabet, unchanged by the filter — which is what `parse_workflow`
+    // compares against, so "unchanged" is the whole acceptance test.
+    for ok in ["src/**", "**/Cargo.toml", "package-lock.json", "a_b-c.d/*", "*"] {
+        assert_eq!(s(ok).as_deref(), Some(ok), "{ok} is inside the alphabet");
+    }
+    // Outside the alphabet: the filter CHANGES them, which `parse_workflow`
+    // reads as a refusal (reject, never rewrite — the #225 contract).
+    for bad in ["src/[ab]*", "src/a\\*b", "a?c", "src/{a,b}", "src/a b", "a$b", "a;b"] {
+        assert_ne!(s(bad).as_deref(), Some(bad), "{bad} must not survive unchanged");
+    }
+    // Shapes refused outright: each is a rule that could NEVER fire, and a rule
+    // that never fires silently drops a reviewer the repo asked for.
+    assert_eq!(s(""), None);
+    assert_eq!(s("   "), None);
+    assert_eq!(s("/src/**"), None, "GitHub reports changed paths repo-relative");
+    assert_eq!(s("src/"), None, "every changed path names a file, never a directory");
+    assert_eq!(s("../etc/**"), None);
+    assert_eq!(s("a/../b"), None);
+    // …but `..` INSIDE a segment is an ordinary filename.
+    assert_eq!(s("a..b.txt").as_deref(), Some("a..b.txt"));
+}
+
+#[test]
+fn route_reviewers_is_the_union_and_an_unaccountable_file_list_refuses() {
+    let g = routed_gate(
+        "    reviewers: [rev-lead]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [rev-ui]\n\
+         \x20     - paths: [\"**/Cargo.toml\", package-lock.json]\n\
+         \x20       reviewers: [rev-deps]\n",
+    );
+    assert_eq!(g.routing.len(), 2);
+    assert_eq!(g.routing[0].paths, paths(&["src/**"]));
+    assert_eq!(g.routing[1].reviewers, paths(&["rev-deps"]));
+
+    let decide = |files: &[&str]| {
+        workflow::route_reviewers(&g, Some(&paths(files))).expect("a resolvable list")
+    };
+
+    // Nothing matched: the static list, untouched. Routing is ADDITIVE.
+    let d = decide(&["docs/orchestration.md"]);
+    assert_eq!(d.required, paths(&["rev-lead"]));
+    assert!(d.fired.is_empty());
+
+    // One rule matched → its lane is appended AFTER the static list, and the
+    // ORDER is part of the contract because the shim appends in the same one.
+    let d = decide(&["src/app.ts"]);
+    assert_eq!(d.required, paths(&["rev-lead", "rev-ui"]));
+    assert_eq!(d.fired.len(), 1);
+    assert_eq!(d.fired[0].index, 1, "1-based, matching the position in the file");
+    assert_eq!(
+        d.fired[0].paths,
+        paths(&["src/**"]),
+        "the rule's OWN globs, not the one that happened to match"
+    );
+
+    // Both, in declaration order.
+    let d = decide(&["Cargo.toml", "src/app.ts"]);
+    assert_eq!(d.required, paths(&["rev-lead", "rev-ui", "rev-deps"]));
+    assert_eq!(d.fired.iter().map(|f| f.index).collect::<Vec<_>>(), vec![1, 2]);
+
+    // A rule matches on its SECOND glob just as well as its first.
+    assert_eq!(decide(&["package-lock.json"]).required, paths(&["rev-lead", "rev-deps"]));
+
+    // A complete answer that is empty is not the same as no answer.
+    assert_eq!(decide(&[]).required, paths(&["rev-lead"]));
+
+    // THE FAIL-CLOSED CASE. The unknown here is *which reviewers are required*,
+    // so "no rule fired" would be a guess in favour of merging.
+    assert!(workflow::route_reviewers(&g, None).is_none());
+
+    // A gate with NO routing never looks at the list at all — the absent-config
+    // no-op, which is what keeps a repo that never wrote the key on exactly the
+    // path it was on before #1176.
+    let plain = routed_gate("    reviewers: [rev-lead]\n");
+    assert!(plain.routing.is_empty());
+    assert_eq!(
+        workflow::route_reviewers(&plain, None)
+            .expect("no routing declared, so nothing to resolve")
+            .required,
+        paths(&["rev-lead"])
+    );
+}
+
+#[test]
+fn a_routed_reviewer_already_on_the_static_list_is_required_once_not_twice() {
+    // A duplicate in `required` would let one PASS count twice under a
+    // threshold and would inflate `gate_need` — the same integrity gap a
+    // duplicate in `reviewers:` is refused for.
+    let g = routed_gate(
+        "    reviewers: [rev-lead, rev-ui]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [rev-ui, rev-deps]\n",
+    );
+    let d = workflow::route_reviewers(&g, Some(&paths(&["src/a.ts"]))).unwrap();
+    assert_eq!(d.required, paths(&["rev-lead", "rev-ui", "rev-deps"]));
+    assert_eq!(workflow::gate_need(&d.gate(&g)), 3);
+}
+
+#[test]
+fn the_effective_gate_carries_every_other_clause_forward_and_then_spends_routing() {
+    // Routing resolves to a reviewer list and gets out of the way, so
+    // `evaluate_merge_gate`/`gate_need`/the body-digest loop stay ONE
+    // implementation each. An effective gate that still carried rules would be
+    // an invitation to resolve them a second time, differently.
+    let g = routed_gate(
+        "    also: [ci-green]\n    max_diff_lines: 800\n    reviewers: [rev-lead]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [rev-ui]\n",
+    );
+    let eff = workflow::route_reviewers(&g, Some(&paths(&["src/a.ts"]))).unwrap().gate(&g);
+    assert_eq!(eff.reviewers, paths(&["rev-lead", "rev-ui"]));
+    assert!(eff.routing.is_empty(), "spent");
+    assert_eq!(eff.also, g.also, "every other clause is carried through untouched");
+    assert_eq!(eff.require, g.require);
+    assert_eq!(eff.max_diff_lines, g.max_diff_lines);
+}
+
+#[test]
+fn routing_rules_are_validated_at_parse_and_every_refusal_is_loud() {
+    let has = |errs: &[String], needle: &str| {
+        assert!(errs.iter().any(|e| e.contains(needle)), "expected {needle:?} in {errs:?}");
+    };
+
+    // THE ONE THAT IS NOT OBVIOUS: routing + threshold. A threshold counts
+    // passes over a fixed list; routing makes the list depend on the diff. Read
+    // together, an added lane could SUPPLY one of the N passes instead of adding
+    // one — so declaring a routing rule would make the gate EASIER to satisfy.
+    let errs = routed_errs(
+        "    require: threshold\n    threshold: 1\n    reviewers: [rev-lead, rev-ui]\n\
+         \x20   routing:\n      - paths: [src/**]\n        reviewers: [rev-deps]\n",
+    );
+    has(&errs, "cannot both be declared");
+    has(&errs, "all-pass");
+
+    // A rule with no paths can never fire; one with no reviewers requires
+    // nobody. Both are the same laxening wearing different clothes.
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: []\n        reviewers: [rev-ui]\n",
+        ),
+        "declares no paths",
+    );
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [src/**]\n        reviewers: []\n",
+        ),
+        "names no reviewers",
+    );
+
+    // The reviewer checks are the STATIC list's checks, from one definition —
+    // so a routing rule cannot quietly accept what `reviewers:` refuses.
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [src/**]\n        reviewers: [ghost]\n",
+        ),
+        "names no block",
+    );
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [src/**]\n        reviewers: [w]\n",
+        ),
+        "is a worker block, not a reviewer",
+    );
+    // …and the message points at the RULE, not merely at "a reviewer".
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [a/**]\n        reviewers: [rev-ui]\n      - paths: [b/**]\n        reviewers: [ghost]\n",
+        ),
+        "routing rule 2 reviewer",
+    );
+
+    // Duplicates, both halves.
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [src/**, src/**]\n        reviewers: [rev-ui]\n",
+        ),
+        "more than once",
+    );
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [src/**]\n        reviewers: [rev-ui, rev-ui]\n",
+        ),
+        "more than once",
+    );
+
+    // A glob outside the alphabet, and two that could never fire.
+    for bad_glob in ["src/[ab]*", "/src/**", "src/"] {
+        has(
+            &routed_errs(&format!(
+                "    reviewers: [rev-lead]\n    routing:\n      - paths: [\"{bad_glob}\"]\n        reviewers: [rev-ui]\n"
+            )),
+            "not a usable path glob",
+        );
+    }
+
+    // A misspelled key is a refusal, not a rule that silently routes nothing —
+    // `deny_unknown_fields`, the same closed vocabulary every other section has.
+    has(
+        &routed_errs(
+            "    reviewers: [rev-lead]\n    routing:\n      - path: [src/**]\n        reviewers: [rev-ui]\n",
+        ),
+        "unknown field",
+    );
+
+    // The caps are bounds on work the SHIM does on the merge path.
+    let many: String = (0..workflow::ROUTING_RULES_MAX + 1)
+        .map(|i| format!("      - paths: [d{i}/**]\n        reviewers: [rev-ui]\n"))
+        .collect();
+    has(
+        &routed_errs(&format!("    reviewers: [rev-lead]\n    routing:\n{many}")),
+        "routing rules — at most",
+    );
+    let wide: Vec<String> =
+        (0..workflow::ROUTING_PATHS_MAX + 1).map(|i| format!("d{i}/**")).collect();
+    has(
+        &routed_errs(&format!(
+            "    reviewers: [rev-lead]\n    routing:\n      - paths: [{}]\n        reviewers: [rev-ui]\n",
+            wide.join(", ")
+        )),
+        "paths — at most",
+    );
+}
+
+#[test]
+fn the_gate_file_round_trips_routing_and_refuses_every_file_it_cannot_stitch() {
+    let g = routed_gate(
+        "    also: [ci-green]\n    reviewers: [rev-lead]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**, index.html]\n\
+         \x20       reviewers: [rev-ui]\n\
+         \x20     - paths: [\"**/Cargo.toml\"]\n\
+         \x20       reviewers: [rev-deps]\n",
+    );
+    let text = workflow::gate_file_text(&g);
+    // Line-oriented `key value value`, because the reader is a POSIX
+    // `while read -r k v w` with no arrays.
+    assert!(text.contains("route-path 1 src/**\n"), "{text}");
+    assert!(text.contains("route-path 1 index.html\n"), "{text}");
+    assert!(text.contains("route-reviewer 1 rev-ui\n"), "{text}");
+    assert!(text.contains("route-path 2 **/Cargo.toml\n"), "{text}");
+    assert!(text.contains("route-reviewer 2 rev-deps\n"), "{text}");
+    assert_eq!(workflow::parse_gate_file(&text).as_ref(), Some(&g), "round trip");
+
+    // A gate with no routing writes no routing lines — the absent-config no-op
+    // is visible in the file, not merely in the behaviour.
+    let plain = routed_gate("    reviewers: [rev-lead]\n");
+    assert!(!workflow::gate_file_text(&plain).contains("route-"));
+
+    // Every unreadable file refuses OUTRIGHT. `parse_gate_file` returning None
+    // is reported by both callers as "malformed — every merge refused", which is
+    // the only safe reading: a routing line that is dropped is a required
+    // reviewer that silently stops being required.
+    let base = "require all-pass\nreviewer rev-lead\n";
+    for bad in [
+        "route-path 1 src/**\n",                            // paths, no reviewer
+        "route-reviewer 1 rev-ui\n",                        // reviewer, no paths
+        "route-path 1 src/**\nroute-reviewer 2 rev-ui\n",   // halves of different rules
+        "route-path 2 src/**\nroute-reviewer 2 rev-ui\n",   // a gap: no rule 1
+        "route-path 0 src/**\nroute-reviewer 0 rev-ui\n",   // rules are numbered from 1
+        "route-path x src/**\nroute-reviewer x rev-ui\n",   // not a number
+        "route-path 1 src/[ab]\nroute-reviewer 1 rev-ui\n", // outside the glob alphabet
+        "route-path 1 /src/**\nroute-reviewer 1 rev-ui\n",  // could never fire
+        "route-path 1\nroute-reviewer 1 rev-ui\n",          // truncated line
+        "route-path 1 src/**\nroute-reviewer 1\n",          // truncated line
+    ] {
+        assert!(
+            workflow::parse_gate_file(&format!("{base}{bad}")).is_none(),
+            "a gate file loomux cannot stitch must refuse every merge, not become a laxer gate: {bad:?}"
+        );
+    }
+    // The pair `parse_workflow` refuses is refused HERE too, rather than
+    // trusted to be impossible: this reader's job is to be the half that does
+    // not assume the other half held.
+    assert!(workflow::parse_gate_file(
+        "require threshold 1\nreviewer rev-lead\nroute-path 1 src/**\nroute-reviewer 1 rev-ui\n"
+    )
+    .is_none());
+}
+
+#[test]
+fn an_unrepresentable_routing_rule_poisons_the_gate_file_rather_than_vanishing_from_it() {
+    // The #222 contract, extended to routing: a token that cannot be serialized
+    // safely writes a line the shim cannot parse — which refuses every merge —
+    // instead of disappearing and leaving a gate one requirement short.
+    let with = |routing: Vec<workflow::RoutingRule>| workflow::Gate {
+        require: GateRequire::AllPass,
+        reviewers: vec!["rev-lead".into()],
+        also: vec![],
+        max_diff_lines: None,
+        routing,
+    };
+    for bad in [
+        workflow::RoutingRule { paths: paths(&["src/[ab]"]), reviewers: paths(&["rev-ui"]) },
+        workflow::RoutingRule { paths: paths(&["src/**"]), reviewers: paths(&["rev ui"]) },
+        workflow::RoutingRule { paths: vec![], reviewers: paths(&["rev-ui"]) },
+        workflow::RoutingRule { paths: paths(&["src/**"]), reviewers: vec![] },
+    ] {
+        let g = with(vec![bad.clone()]);
+        let text = workflow::gate_file_text(&g);
+        assert!(text.contains(workflow::POISON_KEY), "must poison, not drop: {bad:?} -> {text}");
+        assert!(workflow::parse_gate_file(&text).is_none(), "and the poison must refuse: {text}");
+    }
+    // …including the pair that has no honest reading.
+    let g = workflow::Gate {
+        require: GateRequire::Threshold(1),
+        reviewers: vec!["rev-lead".into()],
+        also: vec![],
+        max_diff_lines: None,
+        routing: vec![workflow::RoutingRule {
+            paths: paths(&["src/**"]),
+            reviewers: paths(&["rev-ui"]),
+        }],
+    };
+    assert!(workflow::gate_file_text(&g).contains(workflow::POISON_KEY));
+}
+
+#[test]
+fn the_changed_file_protocol_answers_completely_or_not_at_all() {
+    use workflow::parse_routed_files as p;
+    assert_eq!(p("ok\np src/a.ts\np Cargo.toml\n"), Some(paths(&["src/a.ts", "Cargo.toml"])));
+    // A COMPLETE answer that happens to be empty — a PR that changed nothing —
+    // is not the same statement as "loomux cannot say", and the difference is
+    // the whole point of the `Option`.
+    assert_eq!(p("ok\n"), Some(Vec::new()));
+    // Paths with spaces survive: the prefix is the delimiter, not whitespace.
+    assert_eq!(p("ok\np docs/a b.md\n"), Some(paths(&["docs/a b.md"])));
+
+    // Everything else refuses. `unaccountable` is the reduction's own word for
+    // a payload that cannot support the question — including the truncated file
+    // list, which is the one that would otherwise fail OPEN.
+    for bad in [
+        "",
+        "unaccountable",
+        "unaccountable\n",
+        "null\n",
+        "ok\nsrc/a.ts\n",
+        "ok\np \n",
+        "ok\nq src/a.ts\n",
+        "src/a.ts\n",
+    ] {
+        assert_eq!(p(bad), None, "{bad:?} is not a complete answer");
+    }
+}
+
+#[test]
+fn the_changed_file_reduction_is_one_definition_the_shim_can_carry() {
+    let jq = workflow::ROUTING_FILES_JQ;
+    // Interpolated into a SINGLE-QUOTED POSIX string in the `gh` shim, which is
+    // what makes a plain substitution safe — the same property #1181 pinned for
+    // the base-green reductions, and for the same reason: a future edit that
+    // introduces a quote must be red here rather than a broken shim.
+    assert!(!jq.contains('\''), "no single quote may appear in the reduction");
+    assert!(!jq.contains('\n'), "and it must stay one line");
+    // The truncation clause is the whole reason this is a reduction and not a
+    // plain `.files[].path`: `gh pr view --json files` pages at 100 while
+    // `changedFiles` counts them all, and for ROUTING a short list fails OPEN.
+    assert!(jq.contains("changedFiles"), "{jq}");
+    assert!(jq.contains("!="), "the count is compared for equality, not for `<`: {jq}");
+    assert!(jq.contains("has(\"changedFiles\")"), "the shape is checked, not assumed: {jq}");
+    assert!(jq.contains("has(\"files\")"), "{jq}");
+    // …and the words it may answer in are the ones both readers know.
+    assert!(jq.contains(&format!("\"{}\"", workflow::ROUTED_FILES_OK)), "{jq}");
+    assert!(jq.contains(&format!("\"{}\"", workflow::ROUTED_FILES_PREFIX)), "{jq}");
+}

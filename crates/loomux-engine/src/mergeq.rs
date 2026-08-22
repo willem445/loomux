@@ -1316,6 +1316,11 @@ mod tests {
             // the gate at all.
             base_green: None,
             changed_lines: None,
+            // #1176, on the same footing and for the same reason: no gate in
+            // this suite declares `routing:`, so the list must be inert here —
+            // and `None` is the value that would REFUSE if one ever did, rather
+            // than a plausible one that would hide a routing check gone missing.
+            changed_files: None,
         }
     }
 
@@ -1446,6 +1451,7 @@ mod tests {
             ci_green: Some(true),
             base_green: Some(true),
             changed_lines: Some(1),
+            changed_files: Some(Vec::new()),
         };
         for c in crate::workflow::KNOWN_CONDITIONS {
             let g = GateSpec::Declared(gate(&["rev-a"], &[c]));
