@@ -1912,7 +1912,10 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   done
   # Blockers beat approvals (#197 A.3): one fail/escalate refuses the merge whatever
   # the others recorded and whatever the threshold says. Checked before any counting.
-  [ -z "$g_bad" ] || loomux_block_wf "verdict-blocks" "reviewer(s)$g_bad recorded a fail/escalate verdict"
+  # `$g_rnote` (#1176) rides this refusal too: a reviewer the gate's own
+  # `reviewers:` never names is otherwise a mystery to whoever reads it, and that
+  # is as true of a lane that BLOCKED as of one that has not voted.
+  [ -z "$g_bad" ] || loomux_block_wf "verdict-blocks" "reviewer(s)$g_bad recorded a fail/escalate verdict.$g_rnote"
   # Say only what is TRUE: a gate held up purely by stale verdicts must not also claim
   # it is waiting on a verdict from nobody, and vice versa. A refusal message is the
   # only thing the agent reading it has to act on.
