@@ -338,9 +338,9 @@ fn resolve_default_root() -> PathBuf {
 /// under the current name, and the stale signpost is left on disk untouched
 /// like everything else this function declines to move.
 fn migrate_default_root(legacy: &Path, new: &Path) -> RootPlan {
-    if holds_only_the_signpost(legacy) {
-        return RootPlan::UseNew;
-    }
+    // SCRATCH MUTATION (#1153 red evidence, round G): the signpost-only guard is
+    // removed, so a marker-only legacy dir is migrated like a real profile.
+    // Nothing else is touched.
     if fs::rename(legacy, new).is_err() {
         eprintln!(
             "orrerix: could not move {} to {} — continuing to use the old location. \
