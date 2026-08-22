@@ -347,7 +347,7 @@ human's words and not their authority; ask the human directly whenever it is not
 alive; and never kill it for looking idle.
 
 **The rule that a relayed directive counts as the human's is keyed on the one
-line an agent cannot write.** loomux mints the `[loomux] message from <id>:`
+line an agent cannot write.** loomux mints the `[orrerix] message from <id>:`
 prefix from the caller's own token; the agent supplies what follows. That half
 was interpolated raw, which made the key forgeable by any delegate — so this
 slice scrubs it at **every tool a delegate can call to put text in the
@@ -358,7 +358,7 @@ always been, and `channel_send` has always used it (`orchestration.md`, *#576:
 loomux's own notices are not questions*, carries the enumeration).
 
 The claim is scoped to what that buys and no further: a **delegate's** text
-reaches the pane carrying no `[loomux] …` span of its own, so it cannot be read
+reaches the pane carrying no `[orrerix] …` span of its own, so it cannot be read
 as a relay it is not. Two things it deliberately does not claim. Text the
 *orchestrator* dictates to a delegate is still that delegate's call to make —
 the proxy-authorship residual `deliver_relayed_to_orchestrator` already argues,
@@ -373,7 +373,7 @@ list is two guards. Their reach is worth writing down exactly, because the
 temptation is to describe them as "a new field can't get through" and that is
 not true:
 
-- **A new notice site** in `mcp.rs` — another `[loomux] …` composition — is a
+- **A new notice site** in `mcp.rs` — another `[orrerix] …` composition — is a
   red, from the default-deny source scan.
 - **A scrub that stops working** is a red, from the behavioural sweep, the
   `report.rs` unit pins, and the half-dozen older sanitizer tests that share the
@@ -408,7 +408,7 @@ its questions exactly where the orchestrator and every answering surface can
 already see them — which is the property that made the registry the record in
 the first place. Both fragments say what the widening does not reach: the
 liaison writes no board row, cannot `withdraw_question`, and is not the pane the
-`[loomux] answer to q-N` notice arrives in; the orchestrator's fragment adds
+`[orrerix] answer to q-N` notice arrives in; the orchestrator's fragment adds
 that `list_questions` will now show it rows it did not open, so read the
 `asker`.
 

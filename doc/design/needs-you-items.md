@@ -321,12 +321,12 @@ always were.
 
 ### The resolve notice
 
-`[loomux] the human resolved needs-you item n-N (t-M): <note>`, delivered through
+`[orrerix] the human resolved needs-you item n-N (t-M): <note>`, delivered through
 the ordinary `deliver_to_orchestrator` path — **only when the resolve carried a
 note**. A note-less resolve is the human tidying their own queue, and a pane
 delivery per tidy is noise the orchestrator pays for on every turn.
 
-Both the note and the task ref are untrusted text entering a `[loomux]` line. The
+Both the note and the task ref are untrusted text entering an `[orrerix]` line. The
 human is trusted; the pane still cannot tell one line from another, so an
 embedded newline would forge a second line reading as its own legitimate notice.
 The task ref is worse — nothing validates the string an ask attached to its item,
