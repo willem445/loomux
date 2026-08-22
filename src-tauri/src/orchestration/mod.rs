@@ -1882,7 +1882,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
       g_i=${g_t%%:*}; g_r=${g_t#*:}
       case "$g_hit" in *" $g_i "*) : ;; *) continue ;; esac
       case " $g_revs " in *" $g_r "*) continue ;; esac
-      g_revs="$g_revs $g_r"; g_routed="$g_routed $g_r"
+      : # RED EVIDENCE (#1176 scratch A): the shim adds no routed lane
     done
     # …and which rules fired, so a refusal says WHY a lane it names is required.
     g_i=1
