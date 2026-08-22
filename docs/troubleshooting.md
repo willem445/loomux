@@ -86,16 +86,20 @@ terminal and run `claude --version` / `copilot --version` / `opencode
 An agent pane that dies with an error **stays open** so you can read what
 happened — it isn't closed out from under you.
 
-## A Copilot agent can't use its loomux tools
+## A Copilot agent can't use its orrerix tools
 
-If a Copilot pane lists the `loomux` MCP server but the agent says it has no
+If a Copilot pane lists the `orrerix` MCP server but the agent says it has no
 permission to use its tools, check `~/.copilot/permissions-config.json` (or
 `%USERPROFILE%\.copilot\permissions-config.json`). orrerix records two grants
 there when it spawns a Copilot pane, keyed by the repository's git root:
 
 - your agent's workspace under `allowed_directories`, and
-- `{ "kind": "mcp", "serverName": "loomux", "toolName": null }` under
-  `tool_approvals`, which approves every loomux tool for that repository.
+- `{ "kind": "mcp", "serverName": "orrerix", "toolName": null }` under
+  `tool_approvals`, which approves every orrerix tool for that repository.
+
+A group created before the rename has `loomux` in its own generated config and
+its grant recorded under that name. Both keep working — the server accepts
+either identity — so there is nothing to edit by hand.
 
 If the file is missing or the entry isn't there, orrerix couldn't write it —
 usually because `~/.copilot` isn't writable, or because `COPILOT_HOME` points
@@ -105,6 +109,20 @@ instead, which an unattended agent has no one to answer.
 Note that a Copilot Business or Enterprise administrator can block
 allow-all-permissions options outright; orrerix can't override that policy, and
 the targeted grants above are what keep such a pane usable at all.
+
+## A group that was running when I updated behaves oddly
+
+Agents are briefed once, at spawn, with the vocabulary of the version that
+spawned them. The rename in v1.2 changed strings agents are told to recognise —
+most visibly the `[orrerix]` prefix on notices orrerix types into a pane, which
+those agents were told to look for as `[loomux]`.
+
+Nothing is lost and nothing needs repairing: recorded sessions, saved tabs,
+audit logs and queued deliveries are all still read under either name. But an
+agent that was already running may not react to a notice it does not recognise.
+**Finish (or end) a running group before updating**, and spawn its replacements
+afterwards — a freshly spawned agent gets the current vocabulary even inside an
+older group.
 
 ## macOS: "app is damaged and can't be opened"
 

@@ -764,7 +764,7 @@ directly-reachable port has no authentication at all, only the appearance of it.
 
 Today the separation is transport-shaped: the webview reaches `#[tauri::command]`s
 in-process, agents reach `mcp::serve()`'s `127.0.0.1:0` listener and are
-identified by an `X-Loomux-Agent` token that `resolve_token` maps to
+identified by an `X-Orrerix-Agent` token that `resolve_token` maps to
 `Caller { agent_id, group: GroupId, role, … }`.
 
 That shape survives verbatim, and the reasons are worth stating because "one API
@@ -772,7 +772,7 @@ for every caller" is the tempting simplification:
 
 - **Two listeners, two credential namespaces.** The display WebSocket and the MCP
   server stay separate: a display credential can never authenticate an MCP call,
-  and an `X-Loomux-Agent` token can never authenticate a display connection.
+  and an `X-Orrerix-Agent` token can never authenticate a display connection.
 - **The MCP tool roster carries no grant-writing tool** — task approval, merge
   and release grants, dangerous mode and autonomy raises are all webview-side
   command writes. That invariant is load-bearing for constraints 7 and 9, and it

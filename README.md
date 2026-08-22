@@ -230,6 +230,13 @@ Backend checks (what CI gates on) run from the repo root: `cargo check --locked
 - A repo's committed config lives in `.orrerix/` (`workflow.yml`, `lessons.md`,
   `workflow.layout.json`). A repo still using `.loomux/` is read exactly as before
   and is **never** renamed for you; `.orrerix/` wins if both are present.
+- The strings agents match on — the `[orrerix]` notice marker, the MCP server and
+  its token header, the audit actor, the `ORRERIX_GROUP_DIR`/`ORRERIX_AGENT_ID`
+  exports — moved with the same rule and one extra clause: **one spelling is
+  emitted, every spelling is accepted.** A session recorded, a group created or a
+  tab saved before the rename still resolves. Let a running agent group finish
+  before upgrading, though: its agents were briefed with the old vocabulary. See
+  [`doc/design/rebrand-protocol.md`](doc/design/rebrand-protocol.md).
 
 The Windows installer ships one prebuilt, MIT-licensed runtime — a modern ConPTY
 host (`conpty.dll` + `OpenConsole.exe`, committed in

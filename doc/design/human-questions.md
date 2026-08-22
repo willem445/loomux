@@ -257,11 +257,11 @@ same one an id that never existed gets.
 
 ### The answer notice
 
-`[loomux] answer to q-N (via <source>): <answer>`, delivered through the ordinary
-`deliver_to_orchestrator` path — the same queue every other `[loomux]` notice
+`[orrerix] answer to q-N (via <source>): <answer>`, delivered through the ordinary
+`deliver_to_orchestrator` path — the same queue every other `[orrerix]` notice
 uses, so the human sees it in the pane verbatim.
 
-The answer is untrusted text entering a `[loomux]` line. The human is trusted;
+The answer is untrusted text entering an `[orrerix]` line. The human is trusted;
 the pane still cannot tell one line from another, so an embedded newline would
 forge a second line that reads as its own legitimate notice. It goes through
 `sanitize_gh_text` like every other notice field, and the id and source tag —
@@ -310,7 +310,7 @@ What is **not** here is the human's half:
   CLI deny tier, which is what makes the original incident impossible rather
   than merely discouraged.
 
-The answer *delivery* is wired here: `answer_question` sends the `[loomux]`
+The answer *delivery* is wired here: `answer_question` sends the `[orrerix]`
 notice through `deliver_to_orchestrator`, so an answer that is somehow entered
 does reach the pane. The gap is upstream of that — with no inbox, there is in
 practice **no human-answer path** for a question asked between this merge and

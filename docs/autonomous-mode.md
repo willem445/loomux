@@ -82,7 +82,7 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
 
 - **The idle tick.** A background timer watches each orchestrator pane. When it
   has been output-quiet — *and* free of your typing — for the idle-tick window, it
-  gets exactly **one** `[loomux] idle tick` notice telling it to run its cadence
+  gets exactly **one** `[orrerix] idle tick` notice telling it to run its cadence
   and **start** labeled work. An orchestrator that's actually working (a real burst
   of output) resets the clock, so a busy group never gets nagged.
 - **Labeled work only** *(policy, not enforced).* The idle-tick notice tells the
