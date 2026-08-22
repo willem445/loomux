@@ -268,6 +268,23 @@ pub const MCP_SERVER: &str = NAME;
 /// notably tab restore, which parses a launch command captured months ago.
 pub const LEGACY_MCP_SERVER: &str = LEGACY_NAME;
 
+/// The tool-name prefix an agent CLI builds out of [`MCP_SERVER`] — what
+/// claude's `--allowedTools` takes on argv, and what an agent actually types.
+///
+/// Spelled as a literal because it has to be: `concat!` takes literals, not
+/// consts, so `"mcp__" + MCP_SERVER` cannot be written as a `const`. What
+/// makes it a DERIVATION rather than a second driftable spelling is
+/// `the_tool_prefixes_are_derived_from_the_server_names`, which computes it
+/// and compares — and it matters here more than the usual amount, because a
+/// prefix that disagrees with the server map is not a wrong string, it is an
+/// allowlist that denies every tool call the agent makes.
+pub const MCP_TOOL_PREFIX: &str = "mcp__orrerix";
+
+/// The pre-#1153 tool prefix. Read, never written: it is what an
+/// already-recorded launch command line says, and tab restore has to
+/// recognise its own past output.
+pub const LEGACY_MCP_TOOL_PREFIX: &str = "mcp__loomux";
+
 /// The token header each agent CLI's generated MCP config presents to the
 /// orchestration server, and the one this server issues going forward.
 pub const AGENT_TOKEN_HEADER: &str = "X-Orrerix-Agent";
@@ -460,6 +477,16 @@ mod tests {
         assert_eq!(AGENT_TOKEN_HEADER, "X-Orrerix-Agent");
         assert_eq!(MCP_SERVER, "orrerix");
         assert_eq!(AUDIT_ACTOR, "orrerix");
+    }
+
+    /// The two tool prefixes are DERIVED, and this is the derivation — the
+    /// literals above cannot be written any other way, so this is the only
+    /// thing standing between them and a silent disagreement with the server
+    /// map that would deny every tool call an agent makes.
+    #[test]
+    fn the_tool_prefixes_are_derived_from_the_server_names() {
+        assert_eq!(MCP_TOOL_PREFIX, format!("mcp__{MCP_SERVER}"));
+        assert_eq!(LEGACY_MCP_TOOL_PREFIX, format!("mcp__{LEGACY_MCP_SERVER}"));
     }
 
     /// The marker is compared against a lowercased row, so an upper-case
