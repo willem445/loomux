@@ -654,6 +654,10 @@ fn tool_defs(
                     "urgency": { "type": "string", "enum": ["normal", "high"], "description": "How loudly this should reach the human. Default \"normal\"; the panel pins `high` above the rest. An unrecognized value is rejected, never treated as normal." },
                 }),
                 &["kind", "text"]),
+            tool("resolve_needs_you",
+                "SCRATCH ONLY: mark an item as looked-at.",
+                json!({ "id": { "type": "string" }, "note": { "type": "string" } }),
+                &["id"]),
             tool("withdraw_attention",
                 "Take back a needs-you item the human no longer needs to look at — the demo was scrapped, the feedback arrived another way, the ask was overtaken by events. The item is settled as `withdrawn:<your agent id>` rather than deleted, so a human part-way through looking can still see what became of it, and so it is never mistaken for their own acknowledgement. Refuses an item that is already resolved (you are told which), and refuses an id this group does not have. Withdraw generously: a stale row in the human's queue costs their attention and teaches them the queue is noise. This is NOT resolving — nothing on this surface can do that. Withdrawing takes back YOUR OWN group's ask; resolving is the human saying they looked.",
                 json!({
@@ -1258,6 +1262,17 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         // Withdrawing is NOT that fourth tool: it settles a row as
         // `withdrawn:<agent>`, which is visibly not an acknowledgement — the
         // same distinction `withdraw_question` draws, pinned the same way.
+        "resolve_needs_you" => {
+            require_orchestrator(caller)?;
+            let id = arg_str(args, "id").ok_or("id required")?;
+            let item = reg.resolve_needs_you(
+                &caller.group,
+                id,
+                arg_str(args, "note"),
+                super::needsyou::ResolveSource::Webview,
+            )?;
+            Ok(format!("{} resolved", item.id))
+        }
         "list_needs_you" => {
             let (rows, omitted_resolved) = reg.needs_you_list(&caller.group)?;
             Ok(json!({ "items": rows, "omitted_resolved": omitted_resolved }).to_string())
