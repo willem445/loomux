@@ -4430,14 +4430,14 @@ button.wf-finding:hover { background: var(--surface-2); }
  * document order. True but fragile, so it stays written down: a `.sidedock` z-index raise
  * must raise `.git-menu` with it.
  *
- * THE RENDERED WIDTH BOUND IS HERE (#1097 rev-767 B2), and it is not the only bound — The reserve used to be applied
- * only while dragging, so a width persisted on a wide monitor came back whole on a narrow
- * one and covered every pane — and the same held after any window resize. `max-width`
- * holds at boot, on restore, and on every resize, with no listener to forget. `max()` keeps
- * the documented narrow-window degradation: below the reserve the minimum wins, exactly as
- * `clampDockWidth` already decided. PINNED: both numbers mirror DOCK_MIN_W and
- * DOCK_TERM_RESERVE_PX in src/sidedockmodel.ts, and test/sidedockmodel.test.ts reads this
- * rule off disk and fails if they drift.
+ * THE RENDERED WIDTH BOUND IS HERE (#1097 rev-767 B2), and it is not the only one. The
+ * reserve used to be applied only while dragging, so a width persisted on a wide monitor
+ * came back whole on a narrow one and covered every pane — and the same held after any
+ * window resize. `max-width` holds at boot, on restore, and on every resize, with no
+ * listener to forget. `max()` keeps the documented narrow-window degradation: below the
+ * reserve the minimum wins, exactly as `clampDockWidth` already decided. PINNED: both
+ * numbers mirror DOCK_MIN_W and DOCK_TERM_RESERVE_PX in src/sidedockmodel.ts, and
+ * test/sidedockmodel.test.ts reads this rule off disk and fails if they drift.
  *
  * It bounds what the dock ASKS FOR, against the whole workspace, and that is no longer the
  * whole guarantee: it cannot see #sessions, which takes 344px of the same row. The floor
