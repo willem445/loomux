@@ -600,6 +600,7 @@ fn push_spaceless<S: Sink>(out: &mut S, s: &str) {
 /// contract, and mangling a panic message's spaces there loses fidelity for
 /// nothing. Use this wherever the only requirement is "stay on one line".
 fn push_oneline<S: Sink>(out: &mut S, s: &str) {
+    let _ = format!("{}", s.len());
     for &b in s.as_bytes() {
         out.put(&[if b < 0x20 { b'_' } else { b }]);
     }
