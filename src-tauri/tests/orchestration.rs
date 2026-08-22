@@ -53863,6 +53863,42 @@ fn gh_shim_harness_executes_path_routing_and_refuses_a_diff_it_cannot_account_fo
     recorded(&reg, &ui, "7", "pass", "frontend reviewed");
     assert!(merge_files(&fake_files(&["src/app.ts"])).0, "the routed lane passed, so the gate opens");
 
+    // …and a re-push re-stales that pass exactly as it would a declared one
+    // (#1176 AC4). Executed here rather than reasoned about: routing resolves
+    // into the reviewer list BEFORE the verdict counting, so this is the same
+    // code path #197 already closed — which is a claim, until the shell runs it.
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let (ok, err) = merge_env(
+        &shim,
+        &group_dir,
+        "main",
+        NEW_HEAD,
+        "0",
+        &[("FAKE_FILES", fake_files(&["src/app.ts"]).as_str())],
+    );
+    assert!(!ok, "a routed lane's pass must not survive a re-push either");
+    assert!(
+        err.contains("rev-ui") && err.contains("EARLIER revision"),
+        "the refusal must name the routed lane and say its pass is stale: {err}"
+    );
+    // Both lanes re-review the new head, and it clears — the routed one is not
+    // a special case on the way back in either.
+    reg.set_pr_head_override(Some(NEW_HEAD.into()));
+    recorded(&reg, &lead, "7", "pass", "re-reviewed the new head");
+    recorded(&reg, &ui, "7", "pass", "re-reviewed the new head");
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+    assert!(
+        merge_env(&shim, &group_dir, "main", NEW_HEAD, "0",
+                  &[("FAKE_FILES", fake_files(&["src/app.ts"]).as_str())]).0,
+        "re-reviewing clears it, the same way it does for a declared reviewer"
+    );
+    // Put the fixture back on the original head for the rest of this test, both
+    // verdicts with it — otherwise every assertion below would be measuring
+    // staleness rather than the routing it is about.
+    reg.set_pr_head_override(Some(HEAD.into()));
+    recorded(&reg, &lead, "7", "pass", "reviewed");
+    recorded(&reg, &ui, "7", "pass", "frontend reviewed");
+
     // A blocking verdict from a ROUTED lane refuses, the same way a declared
     // one's does — blockers beat approvals whoever recorded them.
     let deps = reviewer_caller(&reg, &gid, "rev-deps");
