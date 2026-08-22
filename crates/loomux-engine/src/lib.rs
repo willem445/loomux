@@ -252,7 +252,9 @@
 //! Its finding is a kind of edge the previous six batches never met, because
 //! grep cannot see it. Every batch so far enumerated a module's outbound edges
 //! by searching for `super::`/`crate::`; `obs.rs` has none — and it still had
-//! one, in `record_crash`'s `env!("CARGO_PKG_VERSION")`. **`env!` is an edge to
+//! one, in the crash writer's `env!("CARGO_PKG_VERSION")` (then `record_crash`;
+//! split into `record_crash_first_phase`/`append_backtrace` by #1219).
+//! **`env!` is an edge to
 //! the crate a file is compiled in**, and moving the file silently re-points it:
 //! this crate's version is deliberately `0.0.0` (see the manifest), so a
 //! verbatim move would have made every crash log read `version: 0.0.0` while

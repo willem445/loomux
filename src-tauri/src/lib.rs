@@ -28,6 +28,13 @@ pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-teste
 use std::sync::Arc;
 use tauri::Manager;
 
+// The crash-reporting `#[global_allocator]` (#1219) is declared in `main.rs`,
+// NOT here. A global allocator is inherited by everything that links the crate
+// declaring it, and `tests/usage_memory.rs` declares a counting one of its own
+// (#1218) — two in one artifact is a hard compile error. See `main.rs` for the
+// full argument; `obs::install_alloc_error_reporting` in `run()` below arms it
+// wherever it is declared.
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Crash observability (issue #53): install the panic hook before anything
@@ -48,6 +55,13 @@ pub fn run() {
     // move to the next launch. See `doc/design/rebrand-filesystem.md`.
     obs::init_data_root();
     let startup = obs::check_and_arm();
+    // Arm the allocation-failure recorder (#1219). Ordering is load-bearing in
+    // both directions: AFTER `init_data_root` so the handle is opened on the
+    // settled root, and AFTER `check_and_arm` because it creates an empty
+    // `crash-alloc.log` that the previous run's crash-log search must not see
+    // (that search ignores zero-length files, and this is the ordering that
+    // keeps it from having to).
+    obs::install_alloc_error_reporting(env!("CARGO_PKG_VERSION"));
     obs::breadcrumb(
         "startup",
         &format!(

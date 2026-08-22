@@ -1,6 +1,7 @@
 # Design: crash observability
 
-Status: implemented (issue #53).
+Status: implemented (issue #53); fail-log robustness hardening in #1219, after
+#1218 showed the hook losing exactly the crashes it exists to record.
 
 ## Problem
 
@@ -54,6 +55,63 @@ the PTY reader/waiter threads, the MCP request threads, the delivery threads,
 and the watchers — not just the main thread. The hook body is wrapped in
 `catch_unwind` and every I/O step is best-effort, so the hook can never panic
 and mask the original crash.
+
+#### The write is two-phase (#1219)
+
+`catch_unwind` is not the protection it reads as, and that matters for the
+order the hook does things in. A panic raised *inside* the hook is a
+panic-while-panicking: std's `panic_count::increase` sees its own
+`in_panic_hook` flag, returns `MustAbort::PanicInHook`, prints "thread panicked
+while processing panic" and **aborts on the spot**. No unwind starts, so
+`catch_unwind` never gets control, and the hook is never called a second time.
+Everything the hook had not yet written is lost.
+
+That is exactly what #1218 was: the hook captured and symbolicated a backtrace
+*first* and wrote the file *afterwards*, so a death inside the capture — dbghelp
+plus rustc-demangle plus unbounded allocation, the most fragile code in the
+process at the worst possible moment — produced **zero bytes on disk** twice in
+two days, on a build whose whole purpose was to leave a record.
+
+So the write is split:
+
+1. **Phase one — the record that has to survive.** Open `crash-<ts>.log`, write
+   and flush version / time / thread / panic message / location, and write the
+   `panic` breadcrumb. Then, and only then, is anything fragile attempted.
+2. **Phase two — everything that can die trying.** `Backtrace::force_capture()`,
+   `to_string()`, and a second `write_all` appending `backtrace:` through the
+   same handle.
+
+The file is opened `create(true).append(true)` in phase one and phase two writes
+through that handle, so the two-phase split changes the *order*, not the format:
+the phases concatenate to the same bytes the single write produced, and a crash
+log with no `backtrace:` section is a complete record of a crash that died
+collecting one.
+
+**Phase one composes without `core::fmt`.** `format!`/`write!` is a deep generic
+call tree that runs arbitrary `Display` impls and does its own capacity
+arithmetic — `capacity overflow` frames were live at abort time in #1218 — and a
+panic down there is the abort above. So the filename, the record and the
+breadcrumb line are built out of byte slices and a hand-rolled integer formatter
+(`push_dec`, `push_stamp`, `push_spaceless`). The distinction is narrow on
+purpose: allocation is fine (an allocation failure aborts however you spell it);
+it is the *formatting machinery* that is kept off the path. Nothing behavioural
+can catch a `format!` creeping back — it would pass every test and show itself
+only as another empty crash log on a user's machine — so
+`the_first_phase_composes_without_the_formatting_machinery` scans the marked
+source regions for the tokens instead, and states its own blind spot (it cannot
+follow a call out of a region; the callees are listed and checked by hand).
+
+**Double-panic fallback.** A thread-local latch (`HookGuard`) is armed for the
+whole of a hook run. A re-entrant run does the least possible: one appended
+`double-panic: <msg> at <loc>` line to the path phase one already derived — no
+backtrace, no directory work, no formatting — and then chains to the default
+hook, so the process dies exactly the way std would have made it die. On today's
+std that latch is belt-and-braces rather than the load-bearing guard: the common
+double panic aborts before the hook is re-entered at all (above). The
+load-bearing defence is the write-first ordering; the latch covers a hook
+reached outside that path and costs one thread-local read per panic. It is there
+because "do nothing on re-entry" is the behaviour that produced a zero-byte
+forensic record twice.
 
 **Backtrace symbol quality.** Two profile settings interact, and the one that
 actually matters for naming loomux's own frames is **`debug`, not `strip`**:
@@ -129,6 +187,163 @@ exactly and to bracket each frame to a function's start address. #1218 was
 root-caused that way before its PDB existed. It gives addresses, not names —
 which is why shipping the PDB is worth the two steps above.
 
+### 1b. Allocation-failure reporting (#1219, after #1218 round 3)
+
+**The panic hook structurally cannot see the class that actually killed us.**
+#1218's round-3 unwind found all three production crashes to be the same thing,
+and it was not a panic: a `Vec<u8>` grow (64 MiB, then 128 MiB) refused on a
+machine pinned at its commit limit → `RawVec::handle_error` took the
+`AllocError` arm → `handle_alloc_error` → `abort()` → `__fastfail(7)` →
+`0xc0000409`. `handle_alloc_error` **never enters `std::panicking`**, so no
+panic hook of any shape runs. The write-first ordering above, on its own, would
+still have produced nothing for any of those three.
+
+`std::alloc::set_alloc_error_hook` is the matching seam and is **nightly-only**.
+The stable one is a `#[global_allocator]`:
+
+```rust
+// crates/loomux-engine/src/obs.rs
+unsafe impl GlobalAlloc for CrashReportingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if p.is_null() { on_alloc_failure(layout.size(), layout.align()); }
+        p            // unchanged — handle_alloc_error still aborts
+    }
+    // …alloc_zeroed and realloc the same; dealloc is a bare delegation
+}
+```
+
+It **adds a record; it does not change what the process does.** The null is
+returned unmodified, so `handle_alloc_error` aborts exactly as before.
+
+**Where our record lands in the sequence, and what std was already saying.**
+#1218's round-4 symbolication named the whole abort path, and it is longer than
+"abort" suggests:
+
+```
+CrashReportingAlloc::alloc  →  System.alloc returns null
+    → on_alloc_failure          ← OUR RECORD IS WRITTEN AND FLUSHED HERE
+  ← null returned unchanged
+alloc::raw_vec::handle_error (AllocError arm)
+  → alloc::alloc::handle_alloc_error
+    → std::alloc::_::__rust_alloc_error_handler
+      → std::alloc::rust_oom
+        → std::alloc::default_alloc_error_hook   ← prints to stderr
+        → __fastfail(7)                          ← 0xc0000409
+```
+
+So the abort is **print-then-die, not silent**: std's default hook writes
+`memory allocation of N bytes failed` to **stderr** before the fast-fail. In a
+`windows_subsystem = "windows"` build there is no console attached, so that
+message goes nowhere anyone can read — which is why nothing was ever observed,
+even though something was always being said.
+
+Two things follow. First, our record is written **strictly earlier** in this
+sequence than std's message, so the two do not race and ours is not a
+duplicate: it carries the alignment, the timestamp and the app version as well
+as the size, in a file that survives the process. Second, capturing stderr
+would be a genuinely useful *complement* rather than a substitute — see the
+follow-up below.
+
+**Follow-up — #1219 does not do this; #1255 tracks it: redirect stderr to a
+file at startup.** The value is not the allocation message, which we now record
+better; it is the other things std prints on paths where **no** in-process
+recorder of ours can run:
+
+- `thread panicked while processing panic. aborting.` — the double-panic abort
+  in §1's write-first argument, which by construction never reaches our hook;
+- `panic in a function that cannot unwind`;
+- the guard-page message for a **stack overflow**, which is otherwise the
+  largest remaining hole in *Limitation: abort-level failures* below.
+
+It is out of scope here because it is not the same kind of change: it needs
+`SetStdHandle(STD_ERROR_HANDLE, …)` — Windows FFI, in a crate that is
+deliberately `std`-plus-`dirs` — and it rewires process-wide stdio at startup,
+which is exactly the sort of change that has to be validated on a real windowed
+build rather than reasoned about. Sizing it honestly is the first task, not an
+afterthought.
+
+**Why it is declared in `src-tauri/src/main.rs`.** A `#[global_allocator]` may
+be declared once per linked artifact, and it is **inherited by everything that
+links the crate declaring it**. The engine owns the *type*; the artifact owns
+the *declaration*, so `loomux-server` links the same engine without inheriting
+this one.
+
+The binary, specifically, and not `lib.rs`: an integration test that needs a
+different allocator has to be able to say so, and `tests/usage_memory.rs` is
+exactly that — its method for proving the streaming parse bounds peak memory
+(#1218) is to declare a **counting** `#[global_allocator]` and assert a
+high-water mark. Declared in the lib, this one is inherited by every
+`src-tauri/tests/*` binary and that test stops compiling outright:
+
+```
+error: the `#[global_allocator]` in this crate conflicts with global allocator in: loomux_lib
+```
+
+In `main.rs` it covers exactly what it should — the shipped `loomux.exe` and
+the E2E build made from the same entry point — and nothing at runtime is lost,
+because the choice is made at link time for the whole process: allocations made
+by code inside `loomux_lib`, which is all of them, go through the wrapper just
+the same. The corollary is that `cargo test` runs under the system allocator, so
+the suite exercises `CrashReportingAlloc` by **calling it directly**
+(`a_refused_allocation_writes_a_record_and_still_returns_null`) rather than by
+being linked against it.
+
+No new dependency: `System` is std (constraint 2 — nothing here reaches
+`getrandom`).
+
+**The discipline of the failure path.** It runs inside `GlobalAlloc::alloc`, on
+the return path of a request that has just failed, so it **may not allocate** —
+an allocation there re-enters the allocator in the one state where it cannot
+serve, and a large enough failure recurses. So:
+
+- the log is **opened once at startup** (`install_alloc_error_reporting`) and
+  the handle kept, because `File::open` allocates (on Windows, the UTF-16 path
+  conversion);
+- the record is composed into a **stack `FixedBuf<512>`** through the *same*
+  `Sink` composers the panic hook's first phase uses — `push_crash_head` /
+  `push_crash_tail` are shared verbatim, so a human opening the file reads one
+  format regardless of which death produced it;
+- `write_all` + `flush` on an already-open `fs::File` allocate nothing;
+- a **thread-local latch** (`ReentryGuard`, the same type the panic hook uses on
+  its own latch) makes a nested failure a no-op rather than a recursion. Unlike
+  the panic side, this one is load-bearing: nothing in std stops
+  `GlobalAlloc::alloc` being re-entered.
+
+**The thread name is deliberately not recorded.** `std::thread::current()`
+materialises the `Thread` for any thread std did not start, which allocates —
+on the one path that must not. The faulting thread is in the WER dump (#1218
+read `tokio-rt-worker` straight off both), and the refused `Layout` is the field
+that actually localises the site: 64 MiB/align 1 is what identified
+`usage.rs`'s transcript buffer.
+
+**Two costs, stated rather than buried.**
+
+1. `<logs>/crash-alloc.log` is a **fixed name, opened at every startup**, so an
+   empty one exists for the whole of a healthy run. The name has to be
+   derivable *before* the crash, which rules out a per-run timestamp derived at
+   failure time. Consequently `newest_crash_log_since` now ignores
+   **zero-length** files — otherwise every unclean exit would point the user at
+   that empty file and, worse, suppress the `crash-log-gap` breadcrumb below.
+   The empty file is deliberately **not** deleted on clean exit: a second
+   instance on the same data root would be holding it open, and removing it out
+   from under that instance trades a cosmetic problem for a real one.
+2. Allocation failures **before** the arm point are not recorded — there is no
+   derived path yet, and deriving one is exactly what the failure path may not
+   do. Arming sits after `init_data_root` (so the handle is on the settled root)
+   and after `check_and_arm` (so the empty file it creates cannot be mistaken
+   for the previous run's crash log). Startup allocations are small and precede
+   any of the large, unbounded ones this exists to catch.
+
+**What this does not do.** It records the death; it does not prevent it. The
+allocation that failed in #1218 was unbounded by design — `usage.rs` building a
+whole multi-MiB transcript in memory once a second per agent — and the fix for
+*that* is #1218's own, landed separately (`f7962fb5`, which streams the parse).
+The two are complementary and neither subsumes the other: streaming removed the
+one allocation we know about, and this records the next one we do not. Making
+the remaining small allocations fallible would be a far larger and far less
+valuable change than either.
+
 ### 2. Breadcrumb log
 
 `breadcrumb(event, detail)` appends one timestamped line to
@@ -181,6 +396,80 @@ handler (including some abrupt-but-benign terminations) is reported as unclean.
 A false "exited unexpectedly" toast is a cheap price for never missing a real
 crash.
 
+#### Naming the gap (#1219)
+
+`unclean_prev=true` **with no crash log from that run** is a specific,
+diagnosable signature — it is the one #1218 produced — and until #1219 it was
+reported to the *user* as a toast and to nobody at all in the durable record.
+`check_and_arm` now writes one breadcrumb when it sees it, **naming the likely
+class**:
+
+```
+<stamp> crash-log-gap unclean_prev=true crash_log=none likely=heap_alloc_abort(handle_alloc_error->abort,0xc0000409_param7) or=stack_overflow|FFI_access_violation|external_kill look=%LOCALAPPDATA%\CrashDumps and=EventViewer>WindowsLogs>Application(source:Application_Error)
+```
+
+The class is named because #1218 answered the question: all three of its
+production crashes were a refused heap allocation. §1b now records that class,
+so a gap on a build carrying this change means *neither* recorder finished —
+the alloc wrapper was not yet armed, or the death was one of the classes
+nothing in-process can catch.
+
+It goes in *before* this run's own `startup` breadcrumb, because it is a
+statement about the previous run. Both of its inputs come off the same
+`StartupCheck` — `unclean`, and the crash log `newest_crash_log_since` found
+under that same sentinel mtime — so the detector cannot disagree with itself in
+the window it exists to name. `is_crash_log_gap` is the whole predicate, and
+`only_an_unclean_start_with_no_crash_log_is_a_gap` pins all four crossings, so
+neither "always" nor "never" can pass.
+
+### Windows Error Reporting is the fallback record
+
+When our own hook writes nothing, something else did. On the shipped platform:
+
+- **Event Viewer → Windows Logs → Application**, source `Application Error`, is
+  written for a faulting process with no configuration at all, and it carries
+  the **exception code** and the faulting module. It is the record to look for
+  first, because it always exists.
+- `%LOCALAPPDATA%\CrashDumps` holds a user-mode dump, but **only if local dump
+  collection has been enabled** — Microsoft's *Collecting user-mode dumps* says
+  of it, verbatim: *"This feature is not enabled by default. Enabling the
+  feature requires administrator privileges."* The settings live under
+  `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Windows Error
+  Reporting\LocalDumps`, whose `DumpFolder` **defaults** to
+  `%LOCALAPPDATA%\CrashDumps`. So an empty (or absent) directory is evidence of
+  nothing — check the key before concluding anything from it.
+
+**What `0xc0000409` means for a Rust binary.** The code's symbolic name is
+`STATUS_STACK_BUFFER_OVERRUN`, and on a Rust binary the name is almost always a
+red herring. It is the code a **fast-fail** request surfaces as. Microsoft's
+`__fastfail` reference, verbatim: *"User-mode fast fail requests appear as a
+second chance non-continuable exception with exception code 0xC0000409, and
+with at least one exception parameter. The first exception parameter is the
+`code` value."* That first parameter is the `FAST_FAIL_*` constant from
+`winnt.h` saying *why*, and `FAST_FAIL_FATAL_APP_EXIT` is **7** — the generic
+"this process asked to die".
+
+Rust's `std` aborts through exactly that path (inline asm issuing the
+`__fastfail` request; rust-lang/rust#73215 tracks the same for
+`panic_abort`). So `0xc0000409` with first parameter `7` is what **every**
+Rust-side abort looks like from outside the process: a panic-while-panicking,
+an allocation failure, or an explicit `abort()` — indistinguishable from one
+another at the OS level, which is the whole reason the in-process record has to
+survive.
+
+Reading it in practice: the exception parameters are in the dump or the WER
+report's `P` fields, not in the plain "Application Error" line, so treat the
+`0xc0000409` code plus **the absence of a `crash-*.log` of ours** as the pair of
+facts that says *"the panic hook did not finish"* — not as evidence of memory
+corruption. Codes to distinguish it from: `0xc0000005` (`ACCESS_VIOLATION`) is a
+real fault, typically the ConPTY/windows-sys FFI layer, and `0xc00000fd`
+(`STACK_OVERFLOW`) is the guard page — both of which the hook genuinely cannot
+catch (see *Limitation: abort-level failures* below).
+
+Sources: [`__fastfail`](https://learn.microsoft.com/en-us/cpp/intrinsics/fastfail?view=msvc-170),
+[Collecting user-mode dumps](https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps),
+[rust-lang/rust#73215](https://github.com/rust-lang/rust/issues/73215).
+
 ## Hot-path hardening (mutex-poison cascade)
 
 The crash review's leading hypothesis: a single PTY/registry operation panics
@@ -218,12 +507,29 @@ The panic hook only fires for **unwinding** panics. It will *not* capture:
   stderr — which is nowhere in a `windows_subsystem = "windows"` build — and
   aborts);
 - an FFI/`unsafe` access violation from the ConPTY / windows-sys layer;
-- an explicit `abort()` or an allocation failure.
+- an explicit `abort()`;
+- a **panic raised inside the hook itself** — std aborts before the hook is
+  re-entered (see *The write is two-phase* above), which is why the ordering
+  there matters more than any guard inside the hook body.
+
+For each of these std **does print a message to stderr** first — the guard-page
+notice, `thread panicked while processing panic. aborting.`,
+`panic in a function that cannot unwind` — and a windowed build discards all of
+it. That is the case for the stderr-capture follow-up sketched in §1b and
+tracked as **#1255** (open, not implemented), and it is the honest answer to
+"why can't the hook catch a stack overflow": it cannot, but something else
+already knows and we are throwing it away.
+
+A **refused allocation** used to be on that list and is the one item taken off
+it: `handle_alloc_error` still never runs the panic hook, but the
+`#[global_allocator]` wrapper in §1b records it first. That was not a
+theoretical gap — it was every crash #1218 examined.
 
 For these the crash log won't exist, but the **breadcrumb log survives** (it's
 flushed per line) and the **unclean-exit notice still fires** (the sentinel is
 still present), so there's always *something* to read — the breadcrumb tail
-shows what was in flight.
+shows what was in flight, and the next launch's `crash-log-gap` breadcrumb names
+the contradiction and points at WER (both above).
 
 Capturing aborts properly needs an OS-level handler. The honest options, none
 implemented here to respect the "no heavyweight crates / nothing pulling
@@ -248,7 +554,28 @@ need global state serialize on a test mutex and restore the panic hook):
 - **forced panic in a named background thread writes a crash log** capturing the
   thread name and message (the issue's acceptance criterion), plus a `panic`
   breadcrumb;
-- `record_crash` writes the expected fields;
+- `records_crash_file_with_context` writes the expected fields, driven through
+  the two shipped phases (`record_crash_first_phase` + `append_backtrace`)
+  rather than a test-only one-shot wrapper, and pins that they **join** into
+  the historical bytes;
+- **the write-first ordering** (`the_minimal_record_and_the_breadcrumb_land_
+  before_the_backtrace_runs`): the backtrace source is injected, so the test
+  reads the log directory from *inside* the capture — the instant #1218's
+  process died at — and asserts the record and the `panic` breadcrumb are
+  already on disk and carry no `backtrace:` section;
+- **the double-panic latch** (`the_hook_reentry_latch_is_thread_local_and_only_
+  the_outer_run_disarms_it`): one assertion each for never arming it, disarming
+  it from an inner run, making it process-wide, and never clearing it — plus
+  `the_emergency_write_appends_one_line_and_never_truncates`, since a fallback
+  that clobbered phase one would destroy the record it exists to protect;
+- **the startup gap**: `only_an_unclean_start_with_no_crash_log_is_a_gap` pins
+  all four crossings of the predicate, and
+  `an_unclean_start_with_no_crash_log_names_the_gap_in_a_breadcrumb` pins that
+  the startup path writes it exactly once, with the WER pointers;
+- **the fmt-free property**, by source scan
+  (`the_first_phase_composes_without_the_formatting_machinery`) — nothing
+  behavioural can catch a `format!` creeping back into phase one, and the scan
+  states its own blind spot;
 - **unclean-exit detection**: first launch clean + arms sentinel; a launch with
   a leftover sentinel reports unclean and yields the notice; a clean exit clears
   it;
