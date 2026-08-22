@@ -317,6 +317,19 @@ pub struct Gate {
     /// closed** in the shim rather than silently passing — see
     /// [`KNOWN_CONDITIONS`].
     pub also: Vec<String>,
+    /// The small-batch clause (#1174): the largest PR, in changed lines
+    /// (additions + deletions), this gate will let through. `None` — the key
+    /// absent — is the whole feature off, byte-for-byte the pre-#1174 flow.
+    ///
+    /// **A structured key rather than an `also:` token, deliberately.** `also:`
+    /// is a closed vocabulary of *parameterless* conditions; a threshold is a
+    /// number, and stuffing it into a token (`max-diff-800`) would put a
+    /// parameter into a namespace whose whole safety property is that every
+    /// entry either matches a known name or fails closed.
+    ///
+    /// Pure repo config (CLAUDE.md constraint 8): loomux never learns what 800
+    /// means for this repo, only that this repo said 800.
+    pub max_diff_lines: Option<u32>,
 }
 
 // ── resources: named lock resources (#858) ─────────────────────────────────
@@ -992,6 +1005,8 @@ struct RawGate {
     reviewers: Vec<String>,
     #[serde(default)]
     also: Vec<String>,
+    #[serde(default)]
+    max_diff_lines: Option<u32>,
 }
 
 /// `to: worker` and `to: [rev-a, rev-b]` are both legal — a fan-out reads
@@ -1069,6 +1084,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         threshold: Some(1),
         reviewers: vec!["rev".into()],
         also: vec!["ci-green".into()],
+        max_diff_lines: Some(800),
     };
     let labels = RawIntakeLabels {
         ready: "agent-ready".into(),
@@ -1219,6 +1235,11 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     // above; the refuse-vs-clamp half is pinned behaviorally by the test, because
     // it is a fact about what `parse_workflow` DOES, not one this file can assert.
     fact("gate.threshold", "min", json!(1));
+    // #1174. A floor, no ceiling: "how big is too big" is this repo's call and
+    // loomux has no business inventing an upper bound for it. `0` is refused
+    // rather than read as "unlimited" — a gate clause that gates nothing is a
+    // typo, and the way to mean "no limit" is to omit the key.
+    fact("gate.max_diff_lines", "min", json!(1));
     fact("merge_queue.max_batch", "min", json!(1));
     fact("merge_queue.checks_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("merge_queue.checks_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
@@ -1943,6 +1964,16 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 }
             }
         }
+        // #1174's small-batch clause. `0` is a parse error, not "unlimited":
+        // the same rule `threshold` follows, and for the same reason — a bound
+        // a repo wrote down must never be read as the absence of one. A
+        // negative or fractional value never reaches here at all; serde refuses
+        // the whole file at `Option<u32>`, which is exactly what `threshold: -1`
+        // already does.
+        if rg.max_diff_lines == Some(0) {
+            errs.push(format!("gates.{name}: max_diff_lines must be a positive number — omit the key to declare no limit"));
+            bad = true;
+        }
         if bad {
             continue;
         }
@@ -1952,6 +1983,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 require,
                 reviewers: rg.reviewers.iter().map(|r| r.trim().to_string()).collect(),
                 also,
+                max_diff_lines: rg.max_diff_lines,
             },
         );
     }
@@ -2538,12 +2570,91 @@ pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerd
 /// and the check would be noise. Baking it in either way would be baking one
 /// repo's merge habit into a generic tool (CLAUDE.md constraint 8), so it is a
 /// clause a repo writes down.
-pub const KNOWN_CONDITIONS: [&str; 2] = ["ci-green", "body-unchanged"];
+/// `base-green` (#1174) is the stop-the-line clause: it refuses a merge while
+/// the **base ref's HEAD** is red or its checks cannot be resolved, so a fleet
+/// cannot pile work onto a branch that is already broken. Opt-in for the same
+/// reason `body-unchanged` is: a repo with no CI would otherwise be refused
+/// every merge forever by a clause it never asked for.
+pub const KNOWN_CONDITIONS: [&str; 3] = ["ci-green", "body-unchanged", "base-green"];
 
 /// Whether the shim can evaluate this `also:` condition. See [`KNOWN_CONDITIONS`].
 pub fn condition_supported(c: &str) -> bool {
     KNOWN_CONDITIONS.contains(&c.trim())
 }
+
+/// The `base-green` reductions (#1174) — **one definition, two consumers**: the
+/// `gh` shim interpolates these constants into its POSIX body, and
+/// `mqdriver::base_check_runs_argv`/`base_status_argv` pass them to `gh --jq`.
+///
+/// They live here, with the rest of the gate contract, precisely because the
+/// first cut had a *copy* in each place. The two were byte-identical, which
+/// looked like the two-implementations-one-contract property holding — and it
+/// was, but what the contract SAID was wrong in both, and nothing could have
+/// told them apart from two copies that had drifted. A shared constant makes
+/// "the shim and the queue ask GitHub the same question" a fact about the
+/// program rather than a claim in a PR body.
+///
+/// Each reduces a JSON payload to ONE word from a closed vocabulary —
+/// `red` | `truncated` | `pending` | `none` | `green` — because the shim has no
+/// JSON parser and must decide a merge from a shell `case`.
+///
+/// **The clause order is the contract, and each step earns its place:**
+///
+/// 1. **`red` first, and only for COMPLETED runs.** A visible failure is the
+///    most actionable answer, so it outranks everything below — but a run still
+///    in progress carries `conclusion: null`, which the conclusion allow-list
+///    would otherwise call red. Reporting "the base is RED" about a base that
+///    is merely still building would be a false sentence in a refusal, so
+///    `.status == "completed"` guards it.
+/// 2. **`truncated` next — the #1181 review's blocking finding.**
+///    `/commits/{ref}/check-runs` is **paginated**: `check_runs` is capped at
+///    `per_page` while `total_count` counts them all. `any(.check_runs[]; …)`
+///    therefore asks "is anything on THIS PAGE red", and before this clause a
+///    base with more runs than one page — an ordinary OS x version matrix,
+///    exactly the repo that adopts a stop-the-line gate — reported **green**
+///    with its failures sitting on page 2. Reproduced against this repo's own
+///    API: a commit with 3 `failure` runs answered `red` at full page size and
+///    `green` at `?per_page=3`. A page that does not carry every run says
+///    nothing about the runs it omits, so it is not an answer.
+/// 3. `pending`, then `none`, then `green` — the residue, unchanged.
+///
+/// **The shape the payload is ASSUMED to have is checked, not assumed (#1181
+/// rev-lead NB5).** `total_count` is documented as always present, and the
+/// truncation clause above rests entirely on it — but jq sorts `null` below
+/// every number, so an absent key makes `.total_count > (.check_runs|length)`
+/// evaluate `null > N`, which is **false**, and the expression falls straight
+/// through to `green`. That is round one's defect wearing a different hat: an
+/// unstated assumption about the payload, failing open, in the one clause whose
+/// whole premise is that unknown is never green. `has("total_count")` answers
+/// `truncated` instead, so a payload that cannot support the question refuses
+/// rather than passing.
+///
+/// **[`BASE_STATUS_JQ`] carries the same guard over ITS inputs**, which the
+/// review did not ask for and this repo's own rule requires: a guard reads every
+/// one of its inputs by one rule, and taking one signal from a checked shape and
+/// the next from an unchecked one is a bypass exactly the width of that
+/// asymmetry. `null | length` is `0` in jq rather than an error, so an absent
+/// `statuses` would read as the *definite* claim "this commit has no legacy
+/// statuses"; an absent `state` would fall to the `else` and report `red`,
+/// which refuses but says something false about the base while doing it.
+///
+/// **Only the check-runs half needs the truncation clause**, and the asymmetry
+/// is worth stating rather than leaving to be re-derived: the combined-status
+/// endpoint carries a top-level `.state` that is GitHub's own rollup across
+/// *all* statuses, so [`BASE_STATUS_JQ`] is pagination-proof by construction.
+/// `check-runs` has no rollup field — only `total_count` — which is why one
+/// half was safe and the other was not.
+///
+/// Green is an ALLOW-list of conclusions (`success`, `neutral`, `skipped`), so
+/// a conclusion GitHub adds tomorrow reads as red rather than as green.
+pub const BASE_CHECK_RUNS_JQ: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (has(\"total_count\")|not) then \"truncated\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
+
+/// The combined-status reduction — see [`BASE_CHECK_RUNS_JQ`] for the shared
+/// contract and for why this one needs no truncation clause.
+///
+/// `.state` is `pending` both when a context is pending and when there are no
+/// statuses at all, so the count is read first and answers `none`.
+pub const BASE_STATUS_JQ: &str = "if (has(\"statuses\")|not) or (has(\"state\")|not) then \"truncated\" elif (.statuses|length) == 0 then \"none\" elif .state == \"success\" then \"green\" elif .state == \"pending\" then \"pending\" else \"red\" end";
 
 /// Why a merge gate is (not) satisfied — the pure spec the shim's shell mirrors,
 /// and what the `review_verdict` tool reports back to the reviewer that just voted.
@@ -2859,8 +2970,22 @@ pub fn gate_file_text(gate: &Gate) -> String {
             _ => out.push_str(&format!("{POISON_KEY} unusable-condition\n")),
         }
     }
+    // #1174. A `0` here would be a clause that gates nothing, and `parse_workflow`
+    // has already refused it — so if one ever reaches this far the file is
+    // poisoned rather than written with a limit the shim would ignore.
+    match gate.max_diff_lines {
+        None => {}
+        Some(0) => out.push_str(&format!("{POISON_KEY} unusable-max-diff-lines\n")),
+        Some(n) => out.push_str(&format!("{MAX_DIFF_LINES_KEY} {n}\n")),
+    }
     out
 }
+
+/// The [`MERGE_GATE_FILE`] key carrying [`Gate::max_diff_lines`]. Hyphenated to
+/// match `all-pass`/`ci-green` — the file's own spelling convention, which is
+/// not the YAML key's (`max_diff_lines`), because the two have different
+/// readers and the shim's is a `case` over word-split tokens.
+pub const MAX_DIFF_LINES_KEY: &str = "max-diff-lines";
 
 /// The key [`gate_file_text`] writes when a token cannot be represented safely.
 /// Nothing parses it — by design: the shim refuses any gate-file line whose key it
@@ -2885,6 +3010,7 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
     let mut require = GateRequire::AllPass;
     let mut reviewers: Vec<BlockId> = Vec::new();
     let mut also: Vec<String> = Vec::new();
+    let mut max_diff_lines: Option<u32> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2909,12 +3035,61 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
                 Some(c) => also.push(c),
                 None => return None,
             },
+            // #1174. Unlike `require threshold`, an unusable number here has no
+            // stricter fallback to land on — "no limit" is the LAXER reading, so
+            // the whole file is unusable instead, which the callers report as
+            // "malformed — every merge refused". Same direction as the
+            // `reviewer`/`also` arms above.
+            (Some(MAX_DIFF_LINES_KEY), Some(n), _) => {
+                match n.parse::<u32>().ok().filter(|n| *n > 0) {
+                    Some(n) => max_diff_lines = Some(n),
+                    None => return None,
+                }
+            }
             // Anything else — a poison line, a truncated key, a hand edit — makes
             // the whole file unusable. Skipping it would drop a requirement.
             _ => return None,
         }
     }
-    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also })
+    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also, max_diff_lines })
+}
+
+/// What the small-batch clause (#1174) says about one PR — the pure decision
+/// the shim's shell mirrors and the merge queue re-runs, so there is exactly
+/// one definition of "too big" in this codebase and two readers of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffSizeVerdict {
+    /// No `max_diff_lines` declared, or the PR is within it.
+    Ok,
+    /// The PR's changed-line count exceeds the declared limit.
+    TooLarge { lines: u64, limit: u32 },
+    /// The limit is declared and the PR's size could not be read at all.
+    /// **Refuses** — the same posture `ci-green` takes on unreadable checks and
+    /// the queue takes on an unverifiable base: unknown is never "fine".
+    Unknown { limit: u32 },
+}
+
+impl DiffSizeVerdict {
+    pub fn ok(&self) -> bool {
+        matches!(self, DiffSizeVerdict::Ok)
+    }
+}
+
+/// Apply [`Gate::max_diff_lines`] to a PR whose changed-line count is `lines`
+/// (additions + deletions), or `None` when that could not be resolved.
+///
+/// A gate that declares no limit answers [`DiffSizeVerdict::Ok`] **without
+/// looking at `lines`** — the absent-config no-op that keeps every repo which
+/// never declared the key on exactly the path it was on before #1174.
+pub fn check_diff_size(gate: &Gate, lines: Option<u64>) -> DiffSizeVerdict {
+    let Some(limit) = gate.max_diff_lines else {
+        return DiffSizeVerdict::Ok;
+    };
+    match lines {
+        None => DiffSizeVerdict::Unknown { limit },
+        Some(lines) if lines > u64::from(limit) => DiffSizeVerdict::TooLarge { lines, limit },
+        Some(_) => DiffSizeVerdict::Ok,
+    }
 }
 
 // ── schema field-inventory pin (#382 P1 rev-26 NB1) ─────────────────────────

@@ -1494,6 +1494,7 @@ fn workflow_mode_notice_reads_naturally() {
         require: workflow::GateRequire::AllPass,
         reviewers: vec!["rev-orch".into(), "rev-ui".into(), "rev-tests".into()],
         also: vec!["ci-green".into()],
+        max_diff_lines: None,
     };
     assert_eq!(
         workflow_mode_notice(true, "loomux", Some(&all_pass_gate)),
@@ -1504,6 +1505,7 @@ fn workflow_mode_notice_reads_naturally() {
         require: workflow::GateRequire::Threshold(2),
         reviewers: vec!["a".into(), "b".into(), "c".into()],
         also: vec![],
+        max_diff_lines: None,
     };
     assert_eq!(
         workflow_mode_notice(true, "focused-review", Some(&threshold_gate)),
@@ -8451,6 +8453,11 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
     // refuse: the file does not load at all.
     for (what, text) in [
         ("gate.threshold", format!("version: 1\n{block}gates:\n  merge:\n    require: threshold\n    threshold: 0\n    reviewers: [w]\n")),
+        // #1174. Declared over a REVIEWER block, so the refusal is attributable to the
+        // bound: `gate.threshold` above names a worker as its reviewer, which the parser
+        // also refuses, and a row that would fail for two reasons pins neither. The
+        // `err.contains` below is the other half of making it attributable.
+        ("gate.max_diff_lines", "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    max_diff_lines: 0\n".to_string()),
         ("merge_queue.max_batch", format!("version: 1\n{block}merge_queue:\n  max_batch: 0\n")),
         ("resource.slots", format!("version: 1\n{block}resources:\n  build:\n    slots: 0\n")),
         ("resource.slots-above-max", format!("version: 1\n{block}resources:\n  build:\n    slots: 65\n")),
@@ -8463,6 +8470,15 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
         assert!(
             !err.is_empty(),
             "{what}: a refusal must say something — a generated control quotes this back to the human"
+        );
+        // …and it must say which FIELD, or the human is told their file is bad and
+        // left to find out where. (`what` carries a `-above-max` suffix on the rows
+        // that drive the ceiling rather than the floor; the field name is the part
+        // before it, and before the section prefix.)
+        let field = what.split('.').nth(1).unwrap().split('-').next().unwrap();
+        assert!(
+            err.iter().any(|e| e.contains(field)),
+            "{what}: the refusal must name the field it is about, and {err:?} does not mention {field:?}"
         );
     }
 
@@ -37979,10 +37995,22 @@ fn shim_with_fake_gh(bin: &Path) -> PathBuf {
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
          \x20 case \"$*\" in *headRefOid*) printf '%s\\n' \"$FAKE_HEAD\"; exit 0 ;; esac\n\
          \x20 case \"$*\" in *\"--json body\"*) printf '%s\\n' \"$FAKE_BODY\"; exit 0 ;; esac\n\
+         \x20 case \"$*\" in *additions*) printf '%s\\n' \"${FAKE_DIFF_LINES-10}\"; exit 0 ;; esac\n\
          \x20 printf '%s\\n' \"${FAKE_BASE:-main} 7\"; exit 0\n\
          fi\n\
-         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf 'main\\n'; exit 0; fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then\n\
+         \x20 case \"$*\" in *nameWithOwner*) printf '%s\\n' \"${FAKE_NWO-o/r}\"; exit 0 ;; esac\n\
+         \x20 printf 'main\\n'; exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"api\" ]; then\n\
+         \x20 case \"$*\" in *check-runs*) printf '%s\\n' \"${FAKE_BASE_RUNS-green}\"; exit 0 ;; esac\n\
+         \x20 case \"$*\" in *\"/status\"*) printf '%s\\n' \"${FAKE_BASE_STATUS-green}\"; exit 0 ;; esac\n\
+         \x20 exit 0\n\
+         fi\n\
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then exit \"${FAKE_CHECKS:-0}\"; fi\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then\n\
+         \x20 printf 'https://example.invalid/pr/7\\n'; exit \"${FAKE_CREATE_RC:-0}\"\n\
+         fi\n\
          printf 'MERGED\\n'; exit 0\n").unwrap();
     let shim = bin.join("gh");
     fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
@@ -37994,13 +38022,31 @@ fn shim_with_fake_gh(bin: &Path) -> PathBuf {
 /// Run the real shim: `gh pr merge 7`, with the PR based on `base`, its head at
 /// `head`, and CI exiting `checks` (0 = all green). Returns (allowed, stderr).
 fn merge_with(shim: &Path, group_dir: &Path, base: &str, head: &str, checks: &str) -> (bool, String) {
-    let out = std::process::Command::new("sh")
-        .arg(shim).args(["pr", "merge", "7"])
+    merge_env(shim, group_dir, base, head, checks, &[])
+}
+
+/// [`merge_with`] plus the #1174 knobs the fake `gh` reads — the PR's size
+/// (`FAKE_DIFF_LINES`) and the base HEAD's two check surfaces
+/// (`FAKE_BASE_RUNS`/`FAKE_BASE_STATUS`). An entry set to `""` makes the fake
+/// print an EMPTY answer, which is how "loomux could not read it" is expressed.
+fn merge_env(
+    shim: &Path,
+    group_dir: &Path,
+    base: &str,
+    head: &str,
+    checks: &str,
+    extra: &[(&str, &str)],
+) -> (bool, String) {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg(shim).args(["pr", "merge", "7"])
         .env("LOOMUX_GROUP_DIR", group_dir)
         .env("FAKE_BASE", base)
         .env("FAKE_HEAD", head)
-        .env("FAKE_CHECKS", checks)
-        .output().expect("run shim");
+        .env("FAKE_CHECKS", checks);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run shim");
     (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
@@ -39250,6 +39296,47 @@ fn gh_shim_script_enforces_the_workflow_merge_gate() {
     assert!(sh.contains("ci-green") && sh.contains("pr checks"), "ci-green is checked with the real gh");
     assert!(sh.contains("body-unchanged") && sh.contains("--json body"),
         "and the opt-in body-unchanged condition re-reads the PR body with the real gh (#565)");
+    // #1174. Both behavioural claims are EXECUTED in the two harness tests below;
+    // these pin the shape, like every other line in this test.
+    assert!(sh.contains("max-diff-lines") && sh.contains("--json additions,deletions"),
+        "the small-batch clause reads the PR's size from gh's own JSON, never from `pr diff --stat`'s prose");
+    assert!(sh.contains("diff-too-large") && sh.contains("diff-size-unknown"),
+        "…and an oversized PR and an unmeasurable one are distinct, audited refusals");
+    assert!(sh.contains("base-green") && sh.contains("/check-runs") && sh.contains("/status"),
+        "base-green reads BOTH check surfaces — either alone is blind to half of GitHub");
+    // ONE definition, two consumers (#1181 rev-lead). The shim interpolates the
+    // same constants the merge queue passes to `gh --jq`, so the two cannot ask
+    // GitHub different questions — the first cut kept a copy here, the copies were
+    // byte-identical, and both were wrong in the same way, which is exactly what a
+    // copy cannot surface.
+    assert!(sh.contains(workflow::BASE_CHECK_RUNS_JQ),
+        "the shim must carry the SHARED check-runs reduction, not a copy of it");
+    assert!(sh.contains(workflow::BASE_STATUS_JQ),
+        "…and the shared status reduction");
+    // Both are interpolated into single-quoted shell words, so a `'` in either
+    // would end the quote and hand the rest of the reduction to the shell as code.
+    // Neither has one today; this is what makes that a fact rather than luck.
+    for jq in [workflow::BASE_CHECK_RUNS_JQ, workflow::BASE_STATUS_JQ] {
+        assert!(!jq.contains('\''),
+            "a single quote in a reduction would break out of the shim's quoting: {jq}");
+    }
+    assert!(sh.contains("per_page=100"),
+        "the page-size mitigation rides along with the truncation guard");
+    assert!(sh.contains("nameWithOwner"),
+        "…and resolves the repo explicitly, because `gh api`'s {{owner}}/{{repo}} placeholders would ignore a -R");
+    // EVERY condition this build claims to know must have an arm in the shell. The
+    // failure this closes is silent and one-directional: a token added to
+    // KNOWN_CONDITIONS with no arm here falls through to `unknown-condition` and
+    // refuses every merge for the repos that adopted it, while `condition_supported`
+    // goes on answering yes. (Textual, and it says so: this sees a `case` arm, not
+    // whether the arm CHECKS anything — that is what the executed harness tests are
+    // for, one per condition.)
+    for c in workflow::KNOWN_CONDITIONS {
+        assert!(
+            sh.contains(&format!("{c})")),
+            "the shim has no `case` arm for the condition {c:?}, which this build reports as supported — it would refuse every merge that declares it"
+        );
+    }
     assert!(sh.contains("malformed-gate"), "a truncated/hand-edited gate file refuses, not passes");
     assert!(sh.contains("fail|escalate"), "a blocking verdict is refused");
     assert!(sh.contains("merge-gate-workflow-blocked") && sh.contains("merge-gate-workflow-ok"),
@@ -39362,6 +39449,229 @@ fn gh_shim_harness_refuses_the_merge_until_every_named_reviewer_has_passed() {
     assert!(audit.contains("merge-gate-workflow-ok"), "and so is a satisfied gate");
     assert!(audit.contains("\"reason\":\"verdict-outstanding\"") && audit.contains("\"reason\":\"verdict-blocks\""),
         "with the reason, so a human can reconstruct the run: {audit}");
+}
+
+/// #1174 A1, executed: the small-batch clause through the REAL shim.
+#[test]
+fn gh_shim_harness_refuses_a_merge_over_max_diff_lines() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_a_merge_over_max_diff_lines: no POSIX sh");
+        return;
+    }
+    let (reg, d, _repo, gid) = gated_group("    max_diff_lines: 50\n");
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    // The declared limit reaches the file the shim reads — a clause that never got
+    // written out would make every assertion below pass for the wrong reason.
+    let spec = fs::read_to_string(group_dir.join("merge_gate")).unwrap();
+    assert!(spec.contains("max-diff-lines 50"), "{spec}");
+
+    // The reviewer half is satisfied throughout and the human gate held open, so
+    // everything refused below is refused by the SIZE clause and nothing else.
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &gid, block);
+        recorded(&reg, &c, "7", "pass", "reviewed");
+    }
+    let regrant = || reg.grant_merge(&gid, "7", None, "human").unwrap();
+
+    // Within the limit — and exactly AT it, which `max` means is allowed.
+    regrant();
+    let (ok, err) = merge_env(&shim, &group_dir, "main", HEAD, "0", &[("FAKE_DIFF_LINES", "50")]);
+    assert!(ok, "a PR exactly at the limit is within it: {err}");
+
+    // One line over is over, and the refusal carries BOTH numbers — an agent told
+    // only "too big" does not know how much has to come out.
+    regrant();
+    let (ok, err) = merge_env(&shim, &group_dir, "main", HEAD, "0", &[("FAKE_DIFF_LINES", "51")]);
+    assert!(!ok, "51 changed lines must not merge under max_diff_lines: 50");
+    assert!(err.contains("51") && err.contains("50"), "the refusal must name the size and the limit: {err}");
+    assert!(err.contains("Split it"), "…and what to do about it: {err}");
+
+    // A size loomux could not read REFUSES. This is the fail-closed half, and it is
+    // the one that quietly inverts if anyone ever treats an empty answer as 0.
+    regrant();
+    let (ok, err) = merge_env(&shim, &group_dir, "main", HEAD, "0", &[("FAKE_DIFF_LINES", "")]);
+    assert!(!ok, "an unmeasurable PR must not merge");
+    assert!(err.contains("could not read this PR's size"), "{err}");
+
+    // …and the refusal did not BURN the human's grant, like every other
+    // workflow-gate refusal (the gate exits before the grant is read).
+    assert!(group_dir.join("merge_grants").join("pr-7").is_file());
+
+    // THE NEGATIVE CONTROL. The same enormous PR, on a gate that declares no
+    // limit: without this, everything above would pass just as well against a
+    // shim that refused every merge.
+    let (reg2, d2, _r2, gid2) = gated_group("");
+    let gd2 = d2.path().join(gid2.as_str());
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg2, &gid2, block);
+        recorded(&reg2, &c, "7", "pass", "reviewed");
+    }
+    reg2.grant_merge(&gid2, "7", None, "human").unwrap();
+    let (ok, err) = merge_env(&shim, &gd2, "main", HEAD, "0", &[("FAKE_DIFF_LINES", "999999")]);
+    assert!(ok, "a repo that declared no limit must be on exactly its old path: {err}");
+    // Including when the size is UNREADABLE — the absent-config no-op has to hold
+    // for the failure case too, or declaring nothing would still cost a refusal.
+    reg2.grant_merge(&gid2, "7", None, "human").unwrap();
+    let (ok, err) = merge_env(&shim, &gd2, "main", HEAD, "0", &[("FAKE_DIFF_LINES", "")]);
+    assert!(ok, "no declared limit means the size is never even asked about: {err}");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("\"reason\":\"diff-too-large\"") && audit.contains("\"reason\":\"diff-size-unknown\""),
+        "both refusals are audited distinctly: {audit}");
+}
+
+/// #1174, executed: the PR-open advisory — the one thing in this shim that
+/// FAILS OPEN, because it decides nothing.
+#[test]
+fn gh_shim_harness_warns_at_pr_create_without_ever_blocking_it() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_warns_at_pr_create_without_ever_blocking_it: no POSIX sh");
+        return;
+    }
+    let (_reg, d, _repo, gid) = gated_group("    max_diff_lines: 50\n");
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    let create = |gd: &Path, env: &[(&str, &str)]| -> (bool, String) {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(&shim).args(["pr", "create", "--title", "t", "--body", "b"])
+            .env("LOOMUX_GROUP_DIR", gd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // Over the limit: the PR is STILL CREATED, and the author is told now — when
+    // the split is cheap — rather than after a review has been spent on it.
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "500")]);
+    assert!(ok, "the advisory must never fail the create: {err}");
+    assert!(err.contains("500") && err.contains("50"), "it names the size and the limit: {err}");
+    assert!(err.contains("advisory only"), "…and says it did not block anything: {err}");
+
+    // Under the limit: silence. An advisory that fired on every PR would be
+    // ignored by the third one.
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "10")]);
+    assert!(ok && !err.contains("heads up"), "a PR within the limit is not warned about: {err}");
+
+    // FAIL-OPEN, and this is the half that distinguishes it from every other
+    // check in this shim: a size gh would not report REFUSES at merge time and
+    // says NOTHING here. Same for the real gh failing — the exit status is
+    // passed through and no advisory is invented about a PR that was not created.
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "")]);
+    assert!(ok && !err.contains("heads up"), "an unreadable size is silent here, not fatal: {err}");
+    let (ok, err) = create(&group_dir, &[("FAKE_DIFF_LINES", "500"), ("FAKE_CREATE_RC", "1")]);
+    assert!(!ok, "a failed create must still fail");
+    assert!(!err.contains("heads up"), "…and must not be advised about: {err}");
+
+    // No group dir at all — a merge would be REFUSED for this (it is evasion of a
+    // gate); a create is not gated at all, so it simply proceeds unadvised.
+    let nowhere = tempfile::tempdir().unwrap();
+    assert!(create(nowhere.path(), &[("FAKE_DIFF_LINES", "500")]).0);
+
+    // The negative control: no declared limit, nothing said, whatever the size.
+    let (_r2, d2, _rp2, gid2) = gated_group("");
+    let (ok, err) = create(&d2.path().join(gid2.as_str()), &[("FAKE_DIFF_LINES", "999999")]);
+    assert!(ok && !err.contains("heads up"), "a repo with no declared limit hears nothing: {err}");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("pr-size-advisory"),
+        "the advisory is in the audit log — which is how the orchestrator sees it: {audit}");
+}
+
+/// #1174 A3, executed: the stop-the-line clause through the REAL shim.
+#[test]
+fn gh_shim_harness_refuses_a_merge_onto_a_base_that_is_not_green() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_a_merge_onto_a_base_that_is_not_green: no POSIX sh");
+        return;
+    }
+    let (reg, d, _repo, gid) = gated_group("    also: [base-green]\n");
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &gid, block);
+        recorded(&reg, &c, "7", "pass", "reviewed");
+    }
+    let regrant = || reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let try_merge = |runs: &str, status: &str| {
+        regrant();
+        merge_env(&shim, &group_dir, "main", HEAD, "0",
+                  &[("FAKE_BASE_RUNS", runs), ("FAKE_BASE_STATUS", status)])
+    };
+
+    // A green base merges. (Either surface may be silent — a repo on Actions alone
+    // reports nothing from the legacy status API, and vice versa.)
+    assert!(try_merge("green", "green").0, "a green base merges");
+    assert!(try_merge("green", "none").0, "a repo with no legacy statuses is not thereby unknown");
+    assert!(try_merge("none", "green").0, "…nor is one with no check runs");
+
+    // A red base stops the line — whichever surface reports it.
+    for (runs, status) in [("red", "green"), ("green", "red"), ("red", "none")] {
+        let (ok, err) = try_merge(runs, status);
+        assert!(!ok, "a red base ({runs}/{status}) must not be merged onto");
+        assert!(err.contains("is RED") && err.contains("main"), "the refusal names the branch: {err}");
+    }
+
+    // Still running is NOT green: a base whose result is not in yet is not a base
+    // known to be healthy.
+    let (ok, err) = try_merge("pending", "green");
+    assert!(!ok, "an unfinished base is not a green base");
+    assert!(err.contains("have not finished"), "{err}");
+
+    // Nothing reported at all, from either surface → UNKNOWN → refused. This is the
+    // #1174 AC3 posture (unknown is never safe) and its cost is stated in the text.
+    let (ok, err) = try_merge("none", "none");
+    assert!(!ok, "a base nobody can call healthy is not a base to merge onto");
+    assert!(err.contains("no checks or statuses at all"), "{err}");
+
+    // #1181 rev-lead, BLOCKING: the check-runs endpoint is PAGINATED, and a page
+    // that does not carry every run says nothing about the ones it omits. Before
+    // the fix this reduced to `green` and the merge onto a red base was ALLOWED —
+    // the fail-open inversion of this clause's entire premise.
+    let (ok, err) = try_merge("truncated", "green");
+    assert!(!ok, "a base whose check runs loomux cannot see in full must not be merged onto");
+    assert!(err.contains("cannot account for all of the checks"), "{err}");
+    // …from either surface, and it outranks a merely-pending sibling.
+    assert!(!try_merge("green", "truncated").0);
+    assert!(!try_merge("truncated", "pending").0);
+    // A visible failure still outranks truncation: `red` is the more actionable
+    // answer, and the reduction puts it first for that reason.
+    let (ok, err) = try_merge("red", "truncated");
+    assert!(!ok);
+    assert!(err.contains("is RED"), "a visible failure is reported as red, not as unreadable: {err}");
+
+    // An answer loomux could not read at all is the same refusal class, and the
+    // repo itself failing to resolve is too — both are `base-unverifiable`.
+    let (ok, err) = try_merge("wat", "green");
+    assert!(!ok, "an unreadable answer is not a green one");
+    assert!(err.contains("could not read the check runs"), "{err}");
+    regrant();
+    let (ok, err) = merge_env(&shim, &group_dir, "main", HEAD, "0", &[("FAKE_NWO", "")]);
+    assert!(!ok, "a repo loomux cannot name is a base it cannot check");
+    assert!(err.contains("could not resolve which repository"), "{err}");
+
+    // THE NEGATIVE CONTROL: a gate that never declared base-green never asks. A red
+    // base is inert for it, which is what makes this clause opt-in rather than a new
+    // rule every repo silently acquired.
+    let (reg2, d2, _r2, gid2) = gated_group("");
+    let gd2 = d2.path().join(gid2.as_str());
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg2, &gid2, block);
+        recorded(&reg2, &c, "7", "pass", "reviewed");
+    }
+    reg2.grant_merge(&gid2, "7", None, "human").unwrap();
+    let (ok, err) = merge_env(&shim, &gd2, "main", HEAD, "0",
+                              &[("FAKE_BASE_RUNS", "red"), ("FAKE_BASE_STATUS", "red")]);
+    assert!(ok, "a repo that never declared base-green must be on exactly its old path: {err}");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("\"reason\":\"base-not-green\"") && audit.contains("\"reason\":\"base-unverifiable\""),
+        "both refusal classes are audited distinctly: {audit}");
 }
 
 #[test]

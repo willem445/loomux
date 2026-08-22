@@ -1564,6 +1564,65 @@ elif [ "$cmd" = "api" ]; then
   case "$all" in *pulls*) case "$all" in *"/merge"*) is_merge=1 ;; esac ;; esac
 fi
 
+# ── THE PR-OPEN SIZE ADVISORY (#1174) — BEST-EFFORT, AND IT FAILS *OPEN* ──────
+# The only thing in this shim that does. It decides NOTHING: `gh pr create` runs
+# first, its exit status is passed through untouched, and every step below is
+# skipped on any doubt — no gate file, an unreadable limit, a size gh would not
+# tell us. A courtesy notice that could break or delay opening a PR would be a
+# far worse trade than one that occasionally does not appear.
+#
+# It goes to the pane of the agent that OPENED the PR — which is the actor that
+# can split it, at the moment the split is cheapest. It is deliberately not sent
+# to the orchestrator: the shim's only channel into loomux is audit.jsonl, and
+# building a durable agent-writable file whose text lands in the orchestrator's
+# tool results would be a prompt-injection channel into the trust root. See
+# doc/design/workflows.md → "The PR-open advisory, and which way each half fails".
+#
+# The REFUSAL is the enforced half and lives in the merge gate below, where
+# "unknown is never safe" applies in full.
+if [ "$cmd" = "pr" ] && [ "$sub" = "create" ]; then
+  "$REAL_GH" "$@"
+  a_rc=$?
+  if [ "$a_rc" -eq 0 ] && [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
+    a_max=0
+    # Builtins only — no sed/awk — and the same trailing-newline-safe read as the
+    # gate parser. An unrecognized key is simply not this one; unlike the gate
+    # parser, an unreadable file here means "say nothing", never "refuse".
+    while read -r a_k a_v || [ -n "$a_k" ]; do
+      [ "$a_k" = "max-diff-lines" ] && a_max="$a_v"
+    done < "$LOOMUX_GROUP_DIR/merge_gate"
+    case "$a_max" in ''|*[!0-9]*) a_max=0 ;; esac
+    # `--head` names a branch OTHER than the checked-out one, and the lookup below
+    # has no PR number to use — it resolves the CURRENT branch's PR, which would
+    # then be a confident size for the wrong PR (#1181 rev-lead NB3). Every other
+    # doubt on this path goes silent; this one would print misinformation, so it
+    # is the one shape that is skipped outright rather than measured. (The
+    # neighbouring case — a branch that already has an open PR — closes itself:
+    # `gh pr create` fails there, and a non-zero rc already skips all of this.)
+    a_head=0
+    for a_tok in "$@"; do
+      case "$a_tok" in --head|--head=*|-H|-H?*) a_head=1 ;; esac
+    done
+    if [ "$a_max" -gt 0 ] && [ "$a_head" = "0" ]; then
+      # Fully quoted, in both branches — no unquoted expansion, so there is no
+      # globbing question to answer here at all (#1181 rev-lead NB2). The merge
+      # path below word-splits its own `-R` under `set -f`; this path runs BEFORE
+      # `set -f` is reached, so it must not rely on it.
+      if [ -n "$repo" ]; then
+        a_lines=$("$REAL_GH" pr view -R "$repo" --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+      else
+        a_lines=$("$REAL_GH" pr view --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+      fi
+      case "$a_lines" in ''|*[!0-9]*) a_lines="" ;; esac
+      if [ -n "$a_lines" ] && [ "$a_lines" -gt "$a_max" ]; then
+        printf '%s\n' "loomux: heads up — this PR changes $a_lines lines and this repo's merge gate declares max_diff_lines: $a_max, so the merge WILL be refused as it stands. Split it now, before anyone reviews it: a split after review means the review is spent twice. (This notice is advisory only — the PR was created.)" >&2
+        loomux_audit "pr-size-advisory" "{\"lines\":$a_lines,\"limit\":$a_max}"
+      fi
+    fi
+  fi
+  exit "$a_rc"
+fi
+
 if [ "$is_merge" = "0" ]; then
   exec "$REAL_GH" "$@"
 fi
@@ -1641,7 +1700,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   # a `*` could reach a filename. (loomux never writes one — sanitize_id /
   # sanitize_condition reject glob characters — so this is belt, not braces.)
   set -f
-  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""
+  g_req="all-pass"; g_thr=0; g_revs=""; g_also=""; g_maxdiff=0
   # `|| [ -n "$g_k" ]` is load-bearing: POSIX `read` returns non-zero at EOF, so a
   # final line with NO trailing newline would otherwise be silently DROPPED — and a
   # dropped `reviewer`/`also` line makes the gate WEAKER, which is the one direction
@@ -1653,6 +1712,9 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
       require)  g_req="$g_v"; [ -n "$g_w" ] && g_thr="$g_w" ;;
       reviewer) [ -n "$g_v" ] && g_revs="$g_revs $g_v" ;;
       also)     [ -n "$g_v" ] && g_also="$g_also $g_v" ;;
+      # #1174's small-batch clause. A structured key, not an `also:` token,
+      # because it carries a NUMBER — see `Gate::max_diff_lines`.
+      max-diff-lines) g_maxdiff="$g_v" ;;
       # An unrecognized key is NOT skipped. loomux writes an `unrepresentable` line
       # when it cannot safely serialize a token (rather than dropping the clause),
       # and a hand edit or a truncation lands here too. Skipping any of them would
@@ -1675,6 +1737,28 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
                [ "$g_thr" -ge 1 ] || loomux_block_wf "malformed-gate" "the declared merge gate says require: threshold but carries no usable threshold number" ;;
     *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — loomux understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
   esac
+  # THE SMALL-BATCH CLAUSE (#1174), checked BEFORE the verdict counting below —
+  # deliberately. Its remedy ("split this PR") does not depend on any verdict, and
+  # the whole point of a size gate is that the split happens before review effort
+  # is spent; telling an agent to wait for reviewers on a PR it is going to have to
+  # split anyway is the wrong first sentence. An unusable number is a MALFORMED
+  # gate, never "no limit": the lax reading of a bound the repo wrote down is the
+  # one direction this design never takes. (loomux only writes well-formed values —
+  # `parse_workflow` refuses 0 and serde refuses a negative — so this is the
+  # hand-edited/truncated case, the same one the `require` arm above covers.)
+  case "$g_maxdiff" in ''|*[!0-9]*) loomux_block_wf "malformed-gate" "the merge gate declares a max-diff-lines value loomux cannot read as a number ('$g_maxdiff')" ;; esac
+  if [ "$g_maxdiff" -gt 0 ]; then
+    # additions+deletions over the whole PR, from gh's own JSON — NOT parsed out of
+    # `gh pr diff --stat`'s English summary line, whose wording ("1 file changed, 2
+    # insertions(+)") is prose gh may reword and which drops the word entirely for a
+    # zero count. A shim that has to word-split a sentence to decide a merge is a
+    # shim that fails in a new way every time that sentence changes.
+    d_lines=$("$REAL_GH" pr view $rf "$num" --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
+    case "$d_lines" in
+      ''|*[!0-9]*) loomux_block_wf "diff-size-unknown" "the gate declares max_diff_lines: $g_maxdiff and loomux could not read this PR's size, so it cannot tell whether it is within the limit — an unmeasurable PR is refused, not waved through" ;;
+    esac
+    [ "$d_lines" -le "$g_maxdiff" ] || loomux_block_wf "diff-too-large" "this PR changes $d_lines lines and this repo's merge gate declares max_diff_lines: $g_maxdiff. Split it into PRs that each land under the limit — a review nobody can hold in their head is the failure this gate exists to prevent"
+  fi
   g_pass=0; g_out=""; g_bad=""; g_stale=""
   for g_r in $g_revs; do
     g_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$g_r"
@@ -1766,6 +1850,53 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
           [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now" ] || b_bad="$b_bad $b_r"
         done
         [ -z "$b_bad" ] || loomux_block_wf "body-changed" "the PR body is not the one reviewer(s)$b_bad passed — and this repo squash-merges, so that body becomes the permanent commit message. Whoever edited it, the fix is the same: those reviewers re-read the body as it stands and re-record" ;;
+      # #1174 STOP THE LINE. `ci-green` asks about THIS PR; `base-green` asks about
+      # the branch it would land on. Merging onto a base whose HEAD is already red
+      # compounds failures and hands the merge queue's bisect a culprit set it cannot
+      # untangle — so the fleet stops until the base is fixed, which is the whole of
+      # trunk-based "fix the build first".
+      #
+      # TWO endpoints, because ONE would be a lie on half of GitHub: the combined
+      # status API sees only the legacy Status API, and the check-runs API sees only
+      # check runs (GitHub Actions). A repo using either alone reports "none" from
+      # the other, so "green" means neither said anything bad AND at least one of them
+      # said something at all. Zero signal from BOTH is UNKNOWN, and unknown refuses —
+      # the same call `ci-green` makes on a PR with no checks reported, and the same
+      # posture the merge queue's `base-unverifiable` takes.
+      base-green)
+        # `gh api` has no -R: its {owner}/{repo} placeholders resolve from the CWD's
+        # remote, which is the WRONG repo whenever the merge was invoked with -R. So
+        # the repo is resolved explicitly, through the one flag `gh repo view` accepts
+        # (a positional, per #294), and an unresolvable one refuses.
+        bg_nwo=$("$REAL_GH" repo view $repo --json nameWithOwner --jq .nameWithOwner 2>/dev/null)
+        case "$bg_nwo" in
+          ''|*[!A-Za-z0-9._/-]*) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not resolve which repository this PR belongs to, so it cannot read the base branch's checks" ;;
+        esac
+        # ONE definition of each reduction, interpolated from `workflow.rs` — see
+        # BASE_CHECK_RUNS_JQ. The first cut kept a COPY here; the two were
+        # byte-identical, and both were wrong in the same way (#1181 rev-lead),
+        # which is precisely the failure a copy cannot surface.
+        #
+        # `per_page=100` is the API maximum and only a MITIGATION: the reduction's
+        # own total_count clause is what stops a truncated page reading green.
+        bg_runs=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/check-runs?per_page=100" --jq '__BASE_CHECK_RUNS_JQ__' 2>/dev/null)
+        bg_stat=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/status" --jq '__BASE_STATUS_JQ__' 2>/dev/null)
+        case "$bg_runs" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        case "$bg_stat" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        # Compared word by word, never as a concatenation (#1181 rev-lead NB4). The
+        # concatenated form happened to be right for every pair in today's
+        # vocabulary, but it was right by an argument nobody had written down and
+        # one new word away from being wrong — and this round added a word.
+        # Ordered worst-answer-first, mirroring `base_ci_green` arm for arm.
+        if [ "$bg_runs" = "red" ] || [ "$bg_stat" = "red" ]; then
+          loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop"
+        elif [ "$bg_runs" = "truncated" ] || [ "$bg_stat" = "truncated" ]; then
+          loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux cannot account for all of the checks on the HEAD of '$base' — either it reports more check runs than one API page carries, or a payload arrived without the field that says how many there are. Either way loomux will not guess about the checks it cannot see. Re-run the merge once the run count settles; if this base permanently carries more than 100 checks, base-green cannot be enforced for it and should not be declared"
+        elif [ "$bg_runs" = "pending" ] || [ "$bg_stat" = "pending" ]; then
+          loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green"
+        elif [ "$bg_runs" = "none" ] && [ "$bg_stat" = "none" ]; then
+          loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so loomux cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green"
+        fi ;;
       *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
     esac
   done
@@ -1810,7 +1941,15 @@ loomux_block "gate-closed" "$default" "$num"
     // endings, which git may check out as CRLF on Windows — but a CRLF `#!/bin/sh`
     // script is broken under POSIX sh. The `.cmd` wrapper (which needs CRLF) is
     // built separately with explicit `\r\n`.
-    TPL.replace("__REAL_GH__", real_gh)
+    // #1174/#1181: the `base-green` reductions are ONE definition (workflow.rs),
+    // interpolated here and passed to `gh --jq` by the merge queue — so the shim
+    // and the queue cannot ask GitHub different questions. Both are single-quoted
+    // in the template above and neither contains a `'`, which is what makes a
+    // plain substitution safe; the test below asserts that, so a future edit that
+    // introduces one is red rather than a broken shim.
+    TPL.replace("__BASE_CHECK_RUNS_JQ__", workflow::BASE_CHECK_RUNS_JQ)
+        .replace("__BASE_STATUS_JQ__", workflow::BASE_STATUS_JQ)
+        .replace("__REAL_GH__", real_gh)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
         .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
         .replace("__GIT_PLUMBING__\n", &gh_shim_git_plumbing(paths.git_dir.as_deref()))
@@ -34810,6 +34949,10 @@ impl OrchRegistry {
                 },
                 "reviewers": g.reviewers,
                 "also": g.also,
+                // #1174. `null` when undeclared — the pane keeps "no limit"
+                // apart from any number, so the chip never announces a clause
+                // this repo did not write.
+                "max_diff_lines": g.max_diff_lines,
                 "satisfiable": missing.is_empty(),
                 "missing_blocks": missing,
             })

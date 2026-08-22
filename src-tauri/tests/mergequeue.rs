@@ -45,14 +45,16 @@ use loomux_lib::orchestration::mqloop::{
     StateError, MAX_TERMINAL_RETAINED,
 };
 use loomux_lib::orchestration::mqdriver::{
-    classify_checks, cleanup_scratch, close_draft_argv, default_branch_argv, delete_scratch_argv,
+    base_check_runs_argv, base_ci_green, base_status_argv, classify_checks, cleanup_scratch,
+    close_draft_argv, default_branch_argv, delete_scratch_argv,
     land_batch, land_push_argv, ls_remote_argv, mint_scratch, pr_checks_argv, pr_ci_green,
     pr_facts_argv, push_scratch, resolve_and_validate_target, resolve_default_branch, resolve_pr,
     scratch_exists, scratch_push_argv, validate_target, BatchVerification, CmdOut, LandRefusal,
     MintError, MqRunner, TargetRefusal, MINT_ATTEMPTS, REMOTE,
 };
 use loomux_lib::orchestration::workflow::{
-    body_digest, parse_gate_file, BlockId, ReviewVerdict, Verdict,
+    body_digest, parse_gate_file, BlockId, ReviewVerdict, Verdict, BASE_CHECK_RUNS_JQ,
+    BASE_STATUS_JQ,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -1132,11 +1134,51 @@ fn the_lookup_argvs_are_the_shims_own_two_lookups() {
     );
     assert_eq!(
         pr_facts_argv(612),
-        vec!["pr", "view", "612", "--json", "baseRefName,headRefOid,body"]
+        vec!["pr", "view", "612", "--json", "baseRefName,headRefOid,body,additions,deletions"]
     );
-    // One round trip for base + head + body: a second call would be a second
-    // moment, and §6's whole point is that the gate is re-verified at ONE.
+    // One round trip for base + head + body + SIZE (#1174): a second call would
+    // be a second moment, and §6's whole point is that the gate is re-verified
+    // at ONE. The size rides here rather than behind a `declares_…` branch
+    // precisely because it costs nothing extra in a call already being made.
     assert_eq!(pr_facts_argv(612).len(), 5);
+    // #1174's base-green lookups. TWO endpoints, and the pin says why: the
+    // combined-status API sees only legacy statuses and the check-runs API only
+    // check runs, so a repo using either alone reports nothing from the other.
+    assert_eq!(
+        base_check_runs_argv("integration/x")[..2],
+        [
+            "api".to_string(),
+            "repos/{owner}/{repo}/commits/integration/x/check-runs?per_page=100".to_string()
+        ],
+        "the API maximum page size — a MITIGATION for pagination, never the guard (#1181)"
+    );
+    assert_eq!(
+        base_status_argv("integration/x")[..2],
+        ["api".to_string(), "repos/{owner}/{repo}/commits/integration/x/status".to_string()]
+    );
+    // `--jq` reduces each to ONE word in gh, not in Rust — the shim has to do
+    // exactly this in shell with no JSON parser, and the two halves of the
+    // contract are easiest to keep identical when they are the same expression.
+    for argv in [base_check_runs_argv("m"), base_status_argv("m")] {
+        assert_eq!(argv[2], "--jq", "{argv:?}");
+        assert!(argv[3].contains("\"green\"") && argv[3].contains("\"none\""), "{argv:?}");
+    }
+    // Green is an ALLOW-list of conclusions, so a conclusion GitHub adds
+    // tomorrow reads as red rather than as green.
+    let runs_jq = base_check_runs_argv("m").remove(3);
+    for good in ["success", "neutral", "skipped"] {
+        assert!(runs_jq.contains(good), "{runs_jq}");
+    }
+    assert!(!runs_jq.contains("failure"), "an allow-list must not be spelled as a deny-list: {runs_jq}");
+    // The argv carries the SHARED constant, not a copy that matches today.
+    assert_eq!(runs_jq, BASE_CHECK_RUNS_JQ);
+    assert_eq!(base_status_argv("m").remove(3), BASE_STATUS_JQ);
+    // #1181: the paginated endpoint's guard is a comparison against total_count,
+    // and it is what a per_page bump can never replace.
+    assert!(
+        runs_jq.contains("total_count") && runs_jq.contains("truncated"),
+        "a page that does not carry every run must not be able to answer green: {runs_jq}"
+    );
     assert_eq!(ls_remote_argv("loomux/mq/g1-mq-1"), vec![
         "ls-remote",
         "--exit-code",
@@ -1146,6 +1188,179 @@ fn the_lookup_argvs_are_the_shims_own_two_lookups() {
     // Slice C's schema constant is what D1 builds against — a mismatch here
     // would mean the two slices disagree about the file they share.
     assert_eq!(MERGE_QUEUE_VERSION, 1);
+}
+
+/// Is a real `jq` available to EXECUTE the reductions? (Preinstalled on all
+/// three GitHub-hosted runner images; frequently absent on a dev box.) Skipped
+/// rather than failed when missing — the `have_sh()` precedent.
+fn have_jq() -> bool {
+    std::process::Command::new("jq")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// **The reductions, EXECUTED** (#1181 rev-lead NB1 — and the blocking finding).
+///
+/// `BASE_CHECK_RUNS_JQ`/`BASE_STATUS_JQ` *are* the `base-green` decision, and
+/// until this test nothing ran them: the queue's `Fake` and the shim harness's
+/// fake `gh` both return the already-reduced word, and the only other pins were
+/// string containment. So every test agreed about a string none of them had
+/// evaluated — which is how a suite green on three platforms coexisted with a
+/// truncated page reducing to `green` and a red base merging.
+///
+/// **Limit, stated rather than implied:** the shipped consumer is `gh`'s built-in
+/// **gojq**, and this runs the same expression under **jq**. The constructs used
+/// (`any/2`, `length`, `>`, string equality, `if`/`elif`) are ones the two
+/// implement identically; nothing here proves gojq parity in general, and a
+/// reduction that reached for a jq-only builtin would need a different harness.
+#[test]
+fn the_base_green_reductions_reduce_real_payloads_to_the_right_word() {
+    if !have_jq() {
+        eprintln!("SKIP the_base_green_reductions_reduce_real_payloads_to_the_right_word: no jq");
+        return;
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/basegreen");
+    let reduce = |jq: &str, fixture: &str| -> String {
+        let json = std::fs::read_to_string(dir.join(fixture))
+            .unwrap_or_else(|e| panic!("{fixture}: {e}"));
+        let mut c = std::process::Command::new("jq")
+            .args(["-r", jq])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn jq");
+        use std::io::Write;
+        c.stdin.as_mut().unwrap().write_all(json.as_bytes()).unwrap();
+        let out = c.wait_with_output().expect("run jq");
+        assert!(
+            out.status.success(),
+            "{fixture}: jq refused the expression: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    for (fixture, want) in [
+        ("checkruns-green.json", "green"),
+        // Every green-ish conclusion in the allow-list, and nothing else.
+        ("checkruns-red-at-tail.json", "red"),
+        // THE REGRESSION. Same six runs, page cut before the three failures:
+        // `any(.check_runs[]; …)` can only see page 1, so before #1181 this
+        // reduced to `green` and the merge onto a red base was allowed.
+        ("checkruns-truncated.json", "truncated"),
+        // A run still in progress is PENDING, never red — `conclusion: null`
+        // would satisfy the conclusion allow-list's negation, so the red clause
+        // is guarded on `.status == "completed"`. A refusal that called a
+        // still-building base "RED" would be a false sentence.
+        ("checkruns-pending.json", "pending"),
+        ("checkruns-none.json", "none"),
+        // #1181 rev-lead NB5: the truncation clause rests on `total_count`, and
+        // jq sorts `null` BELOW every number — so an absent key makes `null > N`
+        // false, skips that clause and falls through to `green`. Round one's
+        // defect in different clothing, which is why the shape is checked and
+        // not assumed.
+        ("checkruns-no-total-count.json", "truncated"),
+        // …and the negative control: a payload can be shape-broken AND carry a
+        // visible failure, and `red` still wins — a failure we can actually see
+        // is the more actionable answer.
+        ("checkruns-no-total-count-with-failure.json", "red"),
+    ] {
+        assert_eq!(reduce(BASE_CHECK_RUNS_JQ, fixture), want, "check-runs: {fixture}");
+    }
+    for (fixture, want) in [
+        ("status-green.json", "green"),
+        ("status-red.json", "red"),
+        // `.state` is `pending` both for a pending context and for NO statuses,
+        // so the count is read first — otherwise a repo with no legacy statuses
+        // would hold every merge forever.
+        ("status-none.json", "none"),
+        ("status-pending.json", "pending"),
+        // The same guard over THIS reduction's inputs — not asked for by the
+        // review, required by the repo's own rule that a guard reads every one of
+        // its inputs by one rule. `null | length` is 0 rather than an error, so an
+        // absent `statuses` would read as the definite claim "no legacy statuses
+        // exist"; an absent `state` would fall to the `else` and report `red`,
+        // refusing while saying something false about the base.
+        ("status-no-statuses.json", "truncated"),
+        ("status-no-state.json", "truncated"),
+    ] {
+        assert_eq!(reduce(BASE_STATUS_JQ, fixture), want, "status: {fixture}");
+    }
+
+    // ── the two defects, EXECUTED rather than described ────────────────────
+    //
+    // Both review rounds found this expression failing OPEN on an assumption it
+    // never checked, and a green suite saw neither. So the superseded
+    // expressions are kept as literals and run against the same fixtures: the
+    // reds that justify the guards are part of the suite permanently, instead
+    // of living on a scratch branch someone has to go and find.
+    //
+    // These strings are HISTORY, deliberately NOT derived from the live
+    // constants — that is the whole point. Editing the constants must not
+    // touch them.
+    const BEFORE_ROUND_1: &str = "if (.check_runs|length) == 0 then \"none\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif any(.check_runs[]; .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" else \"green\" end";
+    assert_eq!(
+        reduce(BEFORE_ROUND_1, "checkruns-truncated.json"),
+        "green",
+        "the pre-round-1 reduction called a TRUNCATED page green: six runs, three failing, page cut before them — the merge onto a red base this clause exists to stop"
+    );
+    const BEFORE_ROUND_2: &str = "if any(.check_runs[]; .status == \"completed\" and .conclusion != \"success\" and .conclusion != \"neutral\" and .conclusion != \"skipped\") then \"red\" elif (.total_count > (.check_runs|length)) then \"truncated\" elif any(.check_runs[]; .status != \"completed\") then \"pending\" elif (.check_runs|length) == 0 then \"none\" else \"green\" end";
+    assert_eq!(
+        reduce(BEFORE_ROUND_2, "checkruns-no-total-count.json"),
+        "green",
+        "round 1 guarded with a field it never checked for: jq sorts null below every number, so `null > N` is false and an absent total_count fell through to green — the same fail-open one clause further in"
+    );
+    // …and both fixtures answer `truncated` under the SHIPPED reduction, in the
+    // table above. Old expression green, new expression refuses: the before and
+    // after, executed on every run.
+}
+
+/// #1174: how the two base-check answers COMBINE. Driven through the real
+/// runner seam, because the combination is the part a reader gets wrong.
+#[test]
+fn base_ci_green_combines_two_surfaces_and_treats_silence_as_unknown() {
+    let ask = |runs: &str, status: &str| {
+        let f = Fake::new()
+            .gh("check-runs", 0, runs, "")
+            .gh("/status", 0, status, "");
+        base_ci_green(&f, "integration/x")
+    };
+    // Green needs BOTH surfaces quiet-or-green AND at least one of them to have
+    // said something. A repo on Actions alone reports nothing from the legacy
+    // status API, and a repo on statuses alone reports no check runs — neither
+    // is thereby unknown.
+    assert_eq!(ask("green", "green"), Some(true));
+    assert_eq!(ask("green", "none"), Some(true));
+    assert_eq!(ask("none", "green"), Some(true));
+    // Red from either surface is red.
+    assert_eq!(ask("red", "green"), Some(false));
+    assert_eq!(ask("green", "red"), Some(false));
+    assert_eq!(ask("red", "none"), Some(false));
+    // Red OUTRANKS pending: the worse answer wins, so a base that is both
+    // broken and still building is reported broken.
+    assert_eq!(ask("red", "pending"), Some(false));
+    // #1181: a truncated page is UNKNOWN, from either surface, and it outranks
+    // pending/none the way the shim's chain does. The queue lands ONTO this
+    // branch, so "we could not see all of its checks" is never "it is fine".
+    assert_eq!(ask("truncated", "green"), None);
+    assert_eq!(ask("green", "truncated"), None);
+    assert_eq!(ask("truncated", "none"), None);
+    // …but a run we CAN see failing still reports red, which is the more
+    // actionable answer and the reason the reduction tests red first.
+    assert_eq!(ask("red", "truncated"), Some(false));
+
+    // Unknown — `None`, which the gate refuses on. Still running, silent on
+    // both surfaces, or an answer this build cannot read at all.
+    assert_eq!(ask("pending", "green"), None);
+    assert_eq!(ask("green", "pending"), None);
+    assert_eq!(ask("none", "none"), None, "nothing said this commit is healthy");
+    assert_eq!(ask("wat", "green"), None, "an unreadable answer is not a green one");
+    // A non-zero exit from gh is unknown too, never green.
+    let failing = Fake::new().gh("check-runs", 1, "", "boom").gh("/status", 0, "green", "");
+    assert_eq!(base_ci_green(&failing, "integration/x"), None);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

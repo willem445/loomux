@@ -32,7 +32,8 @@
 //!    decision is a defect, not an optimization.
 
 use crate::workflow::{
-    condition_supported, evaluate_merge_gate, parse_gate_file, BlockId, Gate, GateOutcome, ReviewVerdict,
+    check_diff_size, condition_supported, evaluate_merge_gate, parse_gate_file, BlockId,
+    DiffSizeVerdict, Gate, GateOutcome, ReviewVerdict,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -717,6 +718,15 @@ pub struct PrObservation {
     /// determined — again a refusal, mirroring the shim's `ci-not-green` arm,
     /// which treats failing, still-running and no-checks-reported alike.
     pub ci_green: Option<bool>,
+    /// Whether the HEAD of the branch this PR would land on is all-green
+    /// (#1174's `base-green`). Same `None`-refuses discipline as `ci_green`,
+    /// and the same reason: the queue lands ONTO that branch, so a base nobody
+    /// can say is healthy is a base the queue must not push to.
+    pub base_green: Option<bool>,
+    /// The PR's size in changed lines (additions + deletions) for #1174's
+    /// `max_diff_lines`. `None` when it could not be read, which
+    /// [`workflow::check_diff_size`] turns into a refusal.
+    pub changed_lines: Option<u64>,
 }
 
 /// Why an `also:` clause refuses.
@@ -733,6 +743,12 @@ pub enum ConditionRefusal {
     /// — the shim's `unresolved-body`/`no-sha256` arms. Unknown is never
     /// "unbound, therefore fine".
     BodyUnknown,
+    /// `base-green` is declared and the HEAD of the branch this PR would land
+    /// on is not all-green (#1174).
+    BaseNotGreen,
+    /// `base-green` is declared and the base's checks could not be read — or
+    /// have not finished. Refuses: the queue's own `base-unverifiable` posture.
+    BaseUnknown,
     /// A clause this build cannot check. **Fails closed**: a condition loomux
     /// silently ignored would make a stricter-looking workflow file a weaker
     /// one, the worst failure a gate can have.
@@ -752,6 +768,10 @@ pub enum GateRecheck {
     Reviewers(GateOutcome),
     /// An `also:` clause refuses, naming the clause.
     Condition { condition: String, refusal: ConditionRefusal },
+    /// The small-batch clause refuses (#1174) — the PR is over
+    /// `max_diff_lines`, or its size could not be read at all. Never
+    /// [`DiffSizeVerdict::Ok`], which is not a refusal.
+    DiffSize(DiffSizeVerdict),
 }
 
 impl GateRecheck {
@@ -836,6 +856,16 @@ pub fn recheck_gate(
             }
         } else if c.as_str() == "body-unchanged" {
             body_unchanged(gate, verdicts, head, observed.body_digest.as_deref())
+        } else if c.as_str() == "base-green" {
+            // #1174. `ci-green` above asks about this PR; this asks about the
+            // branch the queue would PUSH to. Landing onto a red base is what
+            // makes the bisect's culprit set unattributable — the failure the
+            // queue exists to attribute.
+            match observed.base_green {
+                Some(true) => None,
+                Some(false) => Some(ConditionRefusal::BaseNotGreen),
+                None => Some(ConditionRefusal::BaseUnknown),
+            }
         } else {
             // `condition_supported` said yes and no arm handled it: a condition
             // was added to KNOWN_CONDITIONS without teaching the queue to check
@@ -845,6 +875,15 @@ pub fn recheck_gate(
         if let Some(refusal) = refusal {
             return GateRecheck::Condition { condition: c.clone(), refusal };
         }
+    }
+    // #1174's small-batch clause — a structured key, so it is checked here
+    // rather than in the `also:` loop above. Same definition of "too big" as the
+    // shim enforces, from the one function both sides read: a gate the SHIM
+    // would refuse must never be a gate the QUEUE lands, or the queue becomes
+    // the way around the size limit.
+    match check_diff_size(gate, observed.changed_lines) {
+        DiffSizeVerdict::Ok => {}
+        refusal => return GateRecheck::DiffSize(refusal),
     }
     GateRecheck::Ok
 }
@@ -1212,6 +1251,7 @@ mod tests {
             require: GateRequire::AllPass,
             reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
             also: also.iter().map(|c| c.to_string()).collect(),
+            max_diff_lines: None,
         }
     }
 
@@ -1232,7 +1272,23 @@ mod tests {
     }
 
     fn observed(ci: Option<bool>, body: Option<&str>) -> PrObservation {
-        PrObservation { body_digest: body.map(|b| b.to_string()), ci_green: ci }
+        PrObservation {
+            body_digest: body.map(|b| b.to_string()),
+            ci_green: ci,
+            // The #1174 defaults are the ones the clauses are OFF for: no gate
+            // in this suite declares `base-green` or `max_diff_lines`, so both
+            // must be inert here. `changed_lines: None` is deliberately the
+            // *unreadable* value — a helper that handed every test a plausible
+            // size would hide a `check_diff_size` that had stopped consulting
+            // the gate at all.
+            base_green: None,
+            changed_lines: None,
+        }
+    }
+
+    /// [`observed`] plus the #1174 facts, for the tests that exercise them.
+    fn observed_1174(base_green: Option<bool>, changed_lines: Option<u64>) -> PrObservation {
+        PrObservation { base_green, changed_lines, ..observed(Some(true), None) }
     }
 
     #[test]
@@ -1291,6 +1347,7 @@ mod tests {
             require: GateRequire::Threshold(2),
             reviewers: vec!["rev-a".into(), "rev-b".into(), "rev-c".into()],
             also: vec![],
+            max_diff_lines: None,
         });
         let v: BTreeMap<_, _> = [
             verdict("rev-a", Verdict::Pass, "NEW", ""),
@@ -1336,6 +1393,104 @@ mod tests {
         assert_eq!(
             GateSpec::read(Some("require all-pass\nreviewer rev-a\nalso ci-green\n")),
             GateSpec::Declared(gate(&["rev-a"], &["ci-green"]))
+        );
+    }
+
+    #[test]
+    fn every_condition_this_build_claims_to_know_is_one_the_queue_can_actually_check() {
+        // The trap this closes, which is silent in the direction that hurts: adding a
+        // token to `KNOWN_CONDITIONS` teaches the SHIM's `case` and leaves this
+        // function's `else` chain behind, so `condition_supported` answers yes while
+        // the queue refuses every landing with `Unsupported`. Fail-closed, and still
+        // a build in which a declared clause makes the merge queue unusable.
+        //
+        // Driven over the constant itself, so a fourth condition is red here rather
+        // than discovered by the first repo that declares it.
+        let v: BTreeMap<_, _> = [verdict("rev-a", Verdict::Pass, "NEW", "d")].into();
+        let all_satisfied = PrObservation {
+            body_digest: Some("d".into()),
+            ci_green: Some(true),
+            base_green: Some(true),
+            changed_lines: Some(1),
+        };
+        for c in crate::workflow::KNOWN_CONDITIONS {
+            let g = GateSpec::Declared(gate(&["rev-a"], &[c]));
+            assert_eq!(
+                recheck_gate(&g, &v, Some("NEW"), &all_satisfied),
+                GateRecheck::Ok,
+                "the queue has no arm for {c:?}, which this build reports as supported"
+            );
+        }
+    }
+
+    #[test]
+    fn base_green_refuses_a_landing_onto_a_base_the_queue_cannot_call_healthy() {
+        // #1174. The queue PUSHES to the base, so this clause is about the ref
+        // it is about to write, not about the PR — which is why the queue has to
+        // check it at all rather than leaving it to the shim (the queue never
+        // calls `gh pr merge`, so the shim's arm never runs for a landing).
+        let v: BTreeMap<_, _> = [verdict("rev-a", Verdict::Pass, "NEW", "")].into();
+        let g = GateSpec::Declared(gate(&["rev-a"], &["base-green"]));
+        assert!(recheck_gate(&g, &v, Some("NEW"), &observed_1174(Some(true), None)).passed());
+        assert_eq!(
+            recheck_gate(&g, &v, Some("NEW"), &observed_1174(Some(false), None)),
+            GateRecheck::Condition {
+                condition: "base-green".into(),
+                refusal: ConditionRefusal::BaseNotGreen
+            },
+            "a red base stops the line"
+        );
+        assert_eq!(
+            recheck_gate(&g, &v, Some("NEW"), &observed_1174(None, None)),
+            GateRecheck::Condition {
+                condition: "base-green".into(),
+                refusal: ConditionRefusal::BaseUnknown
+            },
+            "and a base nobody can call healthy is not a base to land on — unknown is never green"
+        );
+        // The negative control: the same unreadable base is INERT for a gate
+        // that never declared the clause. Without this the two assertions above
+        // would pass just as well against a queue that refused everything.
+        let off = GateSpec::Declared(gate(&["rev-a"], &[]));
+        assert!(recheck_gate(&off, &v, Some("NEW"), &observed_1174(None, None)).passed());
+    }
+
+    #[test]
+    fn max_diff_lines_refuses_an_oversized_pr_and_an_unmeasurable_one() {
+        // #1174. The structured half of the small-batch gate, re-enforced here
+        // for the reason §6 exists at all: the queue must never land what the
+        // shim would refuse, or it becomes the way around the limit.
+        let v: BTreeMap<_, _> = [verdict("rev-a", Verdict::Pass, "NEW", "")].into();
+        let sized = |limit: Option<u32>| {
+            GateSpec::Declared(Gate { max_diff_lines: limit, ..gate(&["rev-a"], &[]) })
+        };
+        assert!(recheck_gate(&sized(Some(800)), &v, Some("NEW"), &observed_1174(None, Some(800)))
+            .passed(), "exactly at the limit is within it");
+        assert_eq!(
+            recheck_gate(&sized(Some(800)), &v, Some("NEW"), &observed_1174(None, Some(801))),
+            GateRecheck::DiffSize(DiffSizeVerdict::TooLarge { lines: 801, limit: 800 }),
+            "one line over is over — and the refusal carries both numbers, so the agent reading it \
+             knows how much has to come out"
+        );
+        assert_eq!(
+            recheck_gate(&sized(Some(800)), &v, Some("NEW"), &observed_1174(None, None)),
+            GateRecheck::DiffSize(DiffSizeVerdict::Unknown { limit: 800 }),
+            "a PR whose size could not be read is refused, not waved through"
+        );
+        // ABSENT CONFIG IS A NO-OP, and it is the no-op that matters most: every
+        // repo that never declared the key must be on exactly the path it was on
+        // before #1174, including when the size is unreadable.
+        assert!(recheck_gate(&sized(None), &v, Some("NEW"), &observed_1174(None, None)).passed());
+        assert!(
+            recheck_gate(&sized(None), &v, Some("NEW"), &observed_1174(None, Some(9_999_999)))
+                .passed(),
+            "no declared limit means no limit — not a built-in one"
+        );
+        // Inside §11.1's closed vocabulary, like every other gate refusal.
+        assert_eq!(
+            recheck_gate(&sized(Some(1)), &v, Some("NEW"), &observed_1174(None, Some(2)))
+                .refusal_code(),
+            Some("gate-not-met")
         );
     }
 

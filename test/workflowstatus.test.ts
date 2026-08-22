@@ -58,6 +58,23 @@ test("gateSummaryLine: reviewers + all-pass + also-conditions, in the demo's own
   );
 });
 
+test("gateSummaryLine: a declared size limit is one of the clauses (#1174)", () => {
+  // A clause the gate ENFORCES and the summary omits makes the summary a weaker
+  // statement than the gate — the same defect as a silently-ignored `also:` token,
+  // one surface out. The wording is the human one ("at most N changed lines"), not
+  // the wire key.
+  assert.equal(
+    gateSummaryLine(status({ gate: gate({ max_diff_lines: 800 }) })),
+    "merges to the default branch require: rev-orch + rev-ui + rev-tests · all-pass · ci-green · at most 800 changed lines"
+  );
+  // Undeclared says NOTHING — not "at most null", and not a default this pane made
+  // up. Both spellings of undeclared, since the backend sends `null` and an older
+  // one sends no key at all.
+  const noLimit = "merges to the default branch require: rev-orch + rev-ui + rev-tests · all-pass · ci-green";
+  assert.equal(gateSummaryLine(status()), noLimit);
+  assert.equal(gateSummaryLine(status({ gate: gate({ max_diff_lines: null }) })), noLimit);
+});
+
 test("gateSummaryLine: a threshold requirement reads as a pass count, not the raw wire string", () => {
   const line = gateSummaryLine(status({ gate: gate({ require: "threshold 2", also: [] }) }));
   assert.equal(

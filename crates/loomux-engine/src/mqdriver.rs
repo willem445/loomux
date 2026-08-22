@@ -281,20 +281,122 @@ pub fn default_branch_argv() -> Vec<String> {
     ]
 }
 
-/// The argv for the per-PR lookup: the base branch, the live head, and the body
-/// (the last two feed the gate re-check, §6).
+/// The argv for the per-PR lookup: the base branch, the live head, the body,
+/// and the PR's size (all but the first feed the gate re-check, §6).
 ///
-/// One call for three facts, like the shim's `pr view --json baseRefName,number`
+/// One call for every fact, like the shim's `pr view --json baseRefName,number`
 /// — a second round-trip would be a second moment, and §6's whole point is that
-/// the gate is re-verified at **one** moment.
+/// the gate is re-verified at **one** moment. `additions`/`deletions` (#1174)
+/// ride along here rather than behind a `declares_…` branch for exactly that
+/// reason: they cost nothing extra in this call and buying them separately
+/// would buy them at a different instant.
 pub fn pr_facts_argv(pr: u64) -> Vec<String> {
     vec![
         "pr".into(),
         "view".into(),
         pr.to_string(),
         "--json".into(),
-        "baseRefName,headRefOid,body".into(),
+        "baseRefName,headRefOid,body,additions,deletions".into(),
     ]
+}
+
+/// The argv for the check RUNS on one ref's HEAD (#1174's `base-green`), and
+/// [`base_status_argv`] for the legacy commit statuses on the same commit.
+///
+/// **Two endpoints, because one would be a lie on half of GitHub**: the combined
+/// status API sees only the legacy Status API and the check-runs API sees only
+/// check runs (GitHub Actions), so a repo using either alone reports "nothing"
+/// from the other. Both `--jq` down to a single word here rather than in Rust:
+/// the shim has to do exactly this in shell with no JSON parser, and the two
+/// halves of the contract are easiest to keep identical when they are the same
+/// expression.
+///
+/// `{owner}/{repo}` is gh's own placeholder, resolved from the repository the
+/// runner is invoked in. The shim cannot use it (its merge may carry `-R`, which
+/// `gh api` has no equivalent of, so it resolves `nameWithOwner` explicitly);
+/// the queue never has one — it only ever operates on its own group's repo.
+/// `?per_page=100` is the API maximum, and it is the *mitigation*, never the
+/// guard: it makes truncation rare, and [`BASE_CHECK_RUNS_JQ`]'s `total_count`
+/// clause is what keeps a truncated page from reading green. A page size is a
+/// number GitHub is free to cap differently; the count comparison is not.
+pub fn base_check_runs_argv(base: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        format!("repos/{{owner}}/{{repo}}/commits/{base}/check-runs?per_page=100"),
+        "--jq".into(),
+        crate::workflow::BASE_CHECK_RUNS_JQ.into(),
+    ]
+}
+
+/// See [`base_check_runs_argv`].
+pub fn base_status_argv(base: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        format!("repos/{{owner}}/{{repo}}/commits/{base}/status"),
+        "--jq".into(),
+        crate::workflow::BASE_STATUS_JQ.into(),
+    ]
+}
+
+/// Whether the HEAD of `base` is all-green (#1174's `base-green` clause).
+///
+/// `Some(true)` green, `Some(false)` **red**, `None` **not known** — which
+/// includes "still running" and "nothing reported at all", exactly as
+/// [`pr_ci_green`] lumps them, and both refuse at the gate. Unknown is never
+/// treated as green: the queue pushes ONTO this branch.
+pub fn base_ci_green(r: &dyn MqRunner, base: &str) -> Option<bool> {
+    let word = |argv: Vec<String>| -> Option<String> {
+        let out = r.gh(&as_args(&argv)).ok()?;
+        if !out.ok() {
+            return None;
+        }
+        // The closed vocabulary the two reductions may answer in. Anything else
+        // — including a future word one of them learns and this list does not —
+        // is `None`, which refuses.
+        match out.line().trim() {
+            w @ ("none" | "pending" | "red" | "green" | "truncated") => Some(w.to_string()),
+            _ => None,
+        }
+    };
+    let runs = word(base_check_runs_argv(base))?;
+    let status = word(base_status_argv(base))?;
+    if runs == "red" || status == "red" {
+        return Some(false);
+    }
+    // #1181 rev-lead: the check-runs endpoint is PAGINATED, so a page that does
+    // not carry every run tells us nothing about the runs it left out. Reported
+    // as its own word rather than folded into `pending`, because the two need
+    // different sentences from the shim — and refused either way.
+    if runs == "truncated" || status == "truncated" {
+        return None;
+    }
+    if runs == "pending" || status == "pending" {
+        return None;
+    }
+    // Both silent: nothing said this commit is healthy, so nothing here will.
+    if runs == "none" && status == "none" {
+        return None;
+    }
+    Some(true)
+}
+
+/// Whether this gate names `base-green`, and therefore whether the base's checks
+/// have to be read at all.
+///
+/// **Answers `false` for `Absent`/`Malformed`, where [`declares_ci_green`]
+/// answers `true`** — a deliberate divergence, not an oversight. Both of those
+/// refuse the landing *before any observation is read*
+/// ([`crate::mergeq::recheck_gate`] returns `NotConfigured`/`Malformed` on its
+/// first two lines), so a fetch there buys nothing and costs a round trip.
+/// And the fail direction is still the safe one: an un-fetched value is `None`,
+/// which this clause reads as `BaseUnknown` and **refuses**. `declares_ci_green`
+/// fails toward fetching to avoid a *spurious refusal*, which is not a risk for
+/// a value nothing consults.
+pub(crate) fn declares_base_green(spec: &GateSpec) -> bool {
+    match spec {
+        GateSpec::Declared(g) => g.also.iter().any(|c| c == "base-green"),
+        GateSpec::Absent | GateSpec::Malformed => false,
+    }
 }
 
 /// The argv for one PR's **own** checks (§6: `also: [ci-green]` means the
@@ -316,6 +418,11 @@ pub struct PrFacts {
     pub base: String,
     pub head: String,
     pub body: String,
+    /// additions + deletions (#1174). `None` when gh did not report both — a
+    /// size loomux could not read, which [`crate::workflow::check_diff_size`]
+    /// refuses on rather than reading as zero. **Not defaulted to 0**: zero is
+    /// under every limit, so the tolerant default would be the fail-OPEN one.
+    pub changed_lines: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -326,6 +433,10 @@ struct RawPrFacts {
     head_ref_oid: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    additions: Option<u64>,
+    #[serde(default)]
+    deletions: Option<u64>,
 }
 
 pub(crate) fn as_args(v: &[String]) -> Vec<&str> {
@@ -433,6 +544,10 @@ pub fn resolve_pr_detailed(r: &dyn MqRunner, pr: u64) -> Result<PrFacts, Resolve
         base: raw.base_ref_name.trim().to_string(),
         head: raw.head_ref_oid.trim().to_string(),
         body: raw.body,
+        changed_lines: match (raw.additions, raw.deletions) {
+            (Some(a), Some(d)) => Some(a.saturating_add(d)),
+            _ => None,
+        },
     })
 }
 
@@ -1123,6 +1238,8 @@ pub fn land_batch(
     })?;
 
     let mut target: Option<String> = None;
+    // Memoized across the batch — see the `base_green` comment below.
+    let mut base_green: Option<Option<bool>> = None;
     for &pr in prs {
         let facts = resolve_pr(r, pr).map_err(|refusal| LandRefusal::Target { pr, refusal })?;
         // Layer 3. Every sub-PR's live base must be the recorded target, so a
@@ -1144,6 +1261,16 @@ pub fn land_batch(
         let observed = PrObservation {
             body_digest: Some(body_digest(&facts.body)),
             ci_green: if declares_ci_green(gate) { pr_ci_green(r, pr) } else { None },
+            // #1174. Read once per LAND call, not once per sub-PR: every entry
+            // in a batch has been validated to share this base (the layer-3
+            // check above), so the second read would be the same question asked
+            // again — and D2's bisect walks this path repeatedly.
+            base_green: if declares_base_green(gate) {
+                *base_green.get_or_insert_with(|| base_ci_green(r, &validated))
+            } else {
+                None
+            },
+            changed_lines: facts.changed_lines,
         };
         let recheck = crate::mergeq::recheck_gate(
             gate,

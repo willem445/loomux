@@ -34,6 +34,12 @@ export function gateSummaryLine(status: WorkflowStatus): string | null {
   const gate = status.gate;
   if (!gate) return null;
   const clauses = [gate.reviewers.join(" + "), requireLabel(gate.require), ...gate.also];
+  // #1174. A clause the gate enforces and this line did not mention would make the
+  // summary a weaker statement than the gate — the same failure an ignored `also:`
+  // token would be, one surface out.
+  if (typeof gate.max_diff_lines === "number") {
+    clauses.push(`at most ${gate.max_diff_lines} changed lines`);
+  }
   return `merges to the default branch require: ${clauses.join(" · ")}`;
 }
 

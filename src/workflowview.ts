@@ -2139,7 +2139,28 @@ export class WorkflowView {
             }, false),
           "ci-green"
         ),
-        "Comma-separated extra conditions, enforced by the backend (#197)."
+        "Comma-separated extra conditions, enforced by the backend (#197). Known: ci-green, body-unchanged, base-green — one this build cannot check refuses the merge rather than being ignored."
+      )
+    );
+
+    // #1174's small-batch clause. Declared-only, like `threshold` above: empty means
+    // UNDECLARED (no limit), never `0` — which the engine refuses outright, so a form
+    // that wrote one would produce a file that will not load.
+    box.append(
+      this.field(
+        "Max diff lines",
+        this.boundedNumber(
+          gate.max_diff_lines,
+          POLICY_BOUNDS["gate.max_diff_lines"]!,
+          (v) =>
+            this.mutate((next) => {
+              const g = next.gates.merge!;
+              if (v === undefined) delete g.max_diff_lines;
+              else g.max_diff_lines = v;
+            }, false),
+          "no limit"
+        ),
+        "Refuse a merge whose PR changes more than this many lines (additions + deletions). Leave empty for no limit."
       )
     );
     return box;

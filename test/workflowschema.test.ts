@@ -324,6 +324,7 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "gate.threshold",
   "gate.reviewers",
   "gate.also",
+  "gate.max_diff_lines",
   "intake.source",
   "intake.labels.ready",
   "intake.labels.investigate",
