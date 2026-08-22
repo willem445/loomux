@@ -117,6 +117,12 @@ pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
 // there is no host in it — see that batch's block below. `mqdriver` crossed in
 // batch 12a and `mqloop` in 12b, so both import `crate::workflow::…` now and
 // neither reaches this line any more.)
+// The manager mailbox (#1161 M2) — born in the engine rather than moved into
+// it, so it appears in no extraction batch; see `loomux_engine`'s own module doc
+// for why. Re-exported flat, like `humanq` is reachable as `humanq::`, so the
+// registry methods below and the integration suite spell it the same way.
+pub use loomux_engine::mailbox;
+
 pub use loomux_engine::{locks, profiles, workflow};
 
 // Batch 5's one revision to a batch-4 decision, and the reason it is here
@@ -12020,6 +12026,29 @@ pub struct OrchRegistry {
     /// The resolve path's success audit and its pane DELIVERY both happen after
     /// the guard is dropped: an audit write is cheap, a delivery enqueues.
     needs_you_lock: Mutex<()>,
+    /// Serializes every read-modify-write of a group's `mailbox.json` (#1161 M2).
+    ///
+    /// **A leaf of its own, like `questions_lock` and `needs_you_lock`.** The
+    /// mailbox shares no invariant with the board or the question registry: a
+    /// `kind: question` row is a POKE that names a `q-N`, and the question
+    /// itself is the record — nothing reads one row of each as a unit, so a
+    /// shared lock would be serializing two files that never move together.
+    ///
+    /// **Lock order: nothing. It is taken alone**, and no registry lock is held
+    /// across it. `post_to_manager` resolves the manager block through
+    /// `self.group(..)` BEFORE taking this guard, deliberately — the groups
+    /// mutex would otherwise be taken under it and the leaf claim would be
+    /// false.
+    ///
+    /// Also taken under this guard, both leaves and both the same two the
+    /// siblings above name: `AUDIT_LOCK` on the refusal paths (what was turned
+    /// away must be recorded before returning), and the app-handle mutex on a
+    /// successful write (`write_mailbox` emits `orch-mailbox-changed`, exactly
+    /// as `write_questions` emits under `questions_lock`).
+    ///
+    /// There is no delivery on any path here. That is the point of the feature:
+    /// a mailbox write is what happens INSTEAD of typing into the pane.
+    mailbox_lock: Mutex<()>,
     /// Serializes every read-modify-write of a group's `usage.json` (#743 S4b).
     ///
     /// **A leaf of its own, split out of `tasks_lock`.** The usage store used to
@@ -14225,6 +14254,17 @@ pub enum RefusalReason {
     /// be spawned. Pre-#633 this wrote the `no-app-handle` reason too — one
     /// line claiming a cause that was not the one that fired.
     RegistryNotShared,
+    /// `deliver_prompt_as` (#1161 M2): the target was this group's MANAGER and
+    /// the delivery was not one of the two the no-injection guarantee permits.
+    /// Refused BEFORE admission, like the two above, so no id was minted and no
+    /// queue was touched.
+    ///
+    /// **Unlike every other reason here, this one is a POLICY refusal rather
+    /// than a resource one**, and the difference matters to whoever reads the
+    /// row: the other five say loomux could not deliver, this one says it will
+    /// not. Nothing about the pane changes that — resuming it, freeing its
+    /// queue and binding it a terminal all leave the answer the same.
+    ManagerPane,
 }
 
 impl RefusalReason {
@@ -14235,6 +14275,7 @@ impl RefusalReason {
             RefusalReason::NoTerminal => "no-terminal-at-call",
             RefusalReason::NoAppHandle => "no-app-handle",
             RefusalReason::RegistryNotShared => "registry-not-shared",
+            RefusalReason::ManagerPane => "manager-pane",
         }
     }
 
@@ -14248,6 +14289,7 @@ impl RefusalReason {
             "no-terminal-at-call" => Some(RefusalReason::NoTerminal),
             "no-app-handle" => Some(RefusalReason::NoAppHandle),
             "registry-not-shared" => Some(RefusalReason::RegistryNotShared),
+            "manager-pane" => Some(RefusalReason::ManagerPane),
             _ => None,
         }
     }
@@ -14283,6 +14325,11 @@ impl RefusalReason {
             RefusalReason::RegistryNotShared => {
                 "the registry was not shared, so no drainer could be started — the admission \
                  was withdrawn rather than left to strand; nothing is queued"
+            }
+            RefusalReason::ManagerPane => {
+                "the target is the group's manager — the human's own pane, which loomux \
+                 never types into; nothing was queued and nothing will be. Post status to \
+                 message_manager, or put a decision to the human with ask_human"
             }
         })
     }
@@ -24677,6 +24724,7 @@ impl OrchRegistry {
             tasks_lock: Mutex::new(()),
             questions_lock: Mutex::new(()),
             needs_you_lock: Mutex::new(()),
+            mailbox_lock: Mutex::new(()),
             usage_lock: Mutex::new(()),
             usage_memo: Mutex::new(HashMap::new()),
             default_branch_memo: Mutex::new(HashMap::new()),
@@ -26041,6 +26089,205 @@ impl OrchRegistry {
                 "task": item.task, "raiser": item.raiser,
             }));
         }
+    }
+
+    // ---------- the manager mailbox (#1161 M2) ----------
+
+    fn mailbox_path(&self, group: &GroupId) -> PathBuf {
+        self.group_dir(group).join(mailbox::MAILBOX_FILE)
+    }
+
+    /// The group's declared manager block, if it has one.
+    ///
+    /// Read off the group's own resolved roster rather than by re-parsing
+    /// `workflow.yml` (`lock_resources`' shape) because blocks, unlike declared
+    /// resources, ARE on the group — `resolve_blocks` has already run, and a
+    /// second read of the file could disagree with the roster the group is
+    /// actually running.
+    ///
+    /// A default group can never answer `Some` here: `Role::Manager` is
+    /// workflow-only and `builtin_roster` has no manager block (#1169).
+    pub fn manager_block(&self, group: &GroupId) -> Option<workflow::Block> {
+        self.group(group)?.blocks.into_iter().find(|b| b.kind == Role::Manager)
+    }
+
+    /// Read a group's mailbox file.
+    ///
+    /// **Absent is empty; malformed or unreadable is LOUD** — `questions`'
+    /// posture, for its reason applied to this file: every mutation below is a
+    /// read-modify-write of the whole file, so a read that answered "no mail"
+    /// for a file it merely failed to parse would let the very next
+    /// `message_manager` overwrite it, silently destroying status the human has
+    /// not read. That is the one loss this registry exists to prevent, so it is
+    /// the one failure mode that must never be quiet.
+    ///
+    /// Deliberately unlike [`tasks`](Self::tasks), which collapses every failure
+    /// to an empty board because a board is re-derivable and a human is looking
+    /// at it.
+    pub fn mailbox(&self, group: &GroupId) -> Result<Vec<mailbox::Message>, String> {
+        let text = match fs::read_to_string(self.mailbox_path(group)) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {e}", mailbox::MAILBOX_FILE)),
+        };
+        serde_json::from_str(&text)
+            .map_err(|e| format!("{} is malformed: {e}", mailbox::MAILBOX_FILE))
+    }
+
+    /// How many messages the manager has not read — what the pane's unread chip
+    /// shows and what `orch_mailbox_status` returns.
+    ///
+    /// A read that fails answers 0 rather than erroring: this is chrome, and a
+    /// momentarily unreadable file should not make a badge into a dialog. Every
+    /// path that MUTATES the file goes through [`mailbox`](Self::mailbox)
+    /// directly and keeps its loud posture.
+    pub fn mailbox_unread(&self, group: &GroupId) -> usize {
+        self.mailbox(group).map(|m| mailbox::unread_count(&m)).unwrap_or(0)
+    }
+
+    fn write_mailbox(&self, group: &GroupId, messages: &[mailbox::Message]) -> Result<(), String> {
+        let dir = self.group_dir(group);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let body = serde_json::to_string_pretty(messages).map_err(|e| e.to_string())?;
+        // Atomic replace (#133), for `write_questions`' reason: a torn
+        // mailbox.json is the human's status stream gone.
+        atomic_write(&dir.join(mailbox::MAILBOX_FILE), body.as_bytes())
+            .map_err(|e| e.to_string())?;
+        // The single mutation point, so the single notification point — the
+        // `emit_tasks_changed` / `orch-questions-changed` shape. M5's unread
+        // chip is the listener; until then the event is inert, which is cheaper
+        // than a second visit to this function later.
+        if let Some(app) = self.app.lock_safe().clone() {
+            let _ = app.emit(
+                "orch-mailbox-changed",
+                json!({ "group_id": group, "unread": mailbox::unread_count(messages) }),
+            );
+        }
+        Ok(())
+    }
+
+    /// Post a message into the manager's mailbox (#1161 M2).
+    ///
+    /// Nothing here delivers anything: this is a file write and an audit line.
+    /// **That is the feature, not a limitation** — a manager pane takes no
+    /// mid-session delivery at all (`deliver_prompt` refuses it), so a mailbox
+    /// row is read when the manager next takes a turn, which is when its human
+    /// next speaks to it.
+    ///
+    /// `from` and `kind` are supplied by the caller's own resolved identity and
+    /// a closed-set parse; only `text` is authored, and it is sanitized and
+    /// bounded by `mailbox::validate_post` before it is stored.
+    pub fn post_to_manager(
+        &self,
+        group: &GroupId,
+        from: &str,
+        text: &str,
+        kind: mailbox::Kind,
+    ) -> Result<mailbox::Message, String> {
+        // Refused BEFORE the file is touched: a mailbox in a group with no
+        // manager is a write nobody will ever read, and absorbing it silently
+        // is how an orchestrator ends up believing it briefed a human who does
+        // not exist. `mcp.rs` also omits the tool from the listing for such a
+        // group — this is the dispatch half of that double gate (#243).
+        if self.manager_block(group).is_none() {
+            self.audit(group, from, "mail-reject", json!({ "reason": "no-manager-block" }));
+            return Err(
+                "this group declares no manager block, so there is no mailbox to post to — a \
+                 manager is declared in the repo's workflow.yml (kind: manager). Put it to the \
+                 human with ask_human or request_attention instead."
+                    .into(),
+            );
+        }
+        let text = mailbox::validate_post(text)?;
+        let message = {
+            let _guard = self.mailbox_lock.lock_safe();
+            let mut messages = self.mailbox(group)?;
+            let unread = mailbox::unread_count(&messages);
+            if unread >= mailbox::UNREAD_MAX {
+                // Refuse the WRITER; never evict an unread row to make room.
+                // See `mailbox::UNREAD_MAX` for why that asymmetry is the whole
+                // point of the cap.
+                self.audit(group, from, "mail-reject", json!({
+                    "reason": "unread-cap", "unread": unread,
+                }));
+                return Err(format!(
+                    "{unread} messages are already unread in this group's mailbox (max {}) — the \
+                     manager has not taken a turn since they were posted, which means its human \
+                     has been away. Nothing is dropped to make room: say it in your own pane, or \
+                     raise it where the human will see it away from the keyboard (ask_human, \
+                     request_attention)",
+                    mailbox::UNREAD_MAX
+                ));
+            }
+            let message = mailbox::Message {
+                id: mailbox::next_id(&messages),
+                from: from.to_string(),
+                kind,
+                text,
+                created_ms: now_ms(),
+                read_ms: None,
+            };
+            messages.push(message.clone());
+            mailbox::prune(&mut messages, mailbox::READ_RETAINED);
+            self.write_mailbox(group, &messages)?;
+            message
+        };
+        self.audit(
+            group,
+            from,
+            "mail-post",
+            serde_json::to_value(&message).unwrap_or(Value::Null),
+        );
+        Ok(message)
+    }
+
+    /// The manager's consuming read: return what is waiting and stamp it read.
+    ///
+    /// `include_read` returns the retained read rows too and stamps nothing —
+    /// see `mailbox::project_check` for why that escape hatch exists (a session
+    /// that dies between the stamp and the sentence has marked the human's
+    /// status read without the human having seen it) and why it deliberately
+    /// cannot un-stamp anything.
+    ///
+    /// The projection is taken from the SAME vector the stamp is applied to,
+    /// under one guard, so what is returned is exactly what was marked read.
+    /// Reading and stamping through two separate calls would let a post landing
+    /// between them be stamped read without ever being returned — a message
+    /// silently consumed by nobody, which is the failure this whole registry is
+    /// built to make impossible.
+    pub fn check_mail(
+        &self,
+        group: &GroupId,
+        actor: &str,
+        include_read: bool,
+    ) -> Result<(Vec<mailbox::Message>, usize), String> {
+        let (out, omitted, stamped) = {
+            let _guard = self.mailbox_lock.lock_safe();
+            let mut messages = self.mailbox(group)?;
+            let (out, omitted) = mailbox::project_check(&messages, include_read);
+            let stamped = if include_read {
+                // A re-read is a re-read: it consumes nothing, so it writes
+                // nothing. Skipping the write also keeps a manager that is
+                // re-reading after a compact from churning the file (and the
+                // chip event) for no state change.
+                0
+            } else {
+                let stamped = mailbox::mark_all_read(&mut messages, now_ms());
+                if stamped > 0 {
+                    mailbox::prune(&mut messages, mailbox::READ_RETAINED);
+                    self.write_mailbox(group, &messages)?;
+                }
+                stamped
+            };
+            (out, omitted, stamped)
+        };
+        if stamped > 0 {
+            self.audit(group, actor, "mail-read", json!({
+                "read": stamped,
+                "ids": out.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            }));
+        }
+        Ok((out, omitted))
     }
 
     // ---------- task board ----------
@@ -30939,6 +31186,23 @@ impl OrchRegistry {
                          planners can never join a channel"
                 .into());
         }
+        // #1161 M2: a manager can never join a channel either, and for a
+        // different reason worth stating rather than folding into the arm
+        // above. A planner is excluded because its pane will not be there;
+        // a manager's pane will be there and is exactly the problem —
+        // `channel_send` DELIVERS, and delivery into the human's own
+        // conversation is the one thing this feature forbids.
+        //
+        // `deliver_prompt` would refuse the send anyway, so this is not what
+        // makes the guarantee hold. It is what makes the refusal legible: a
+        // human connecting two panes learns now, at the gesture, instead of
+        // watching every later message vanish into an audit line.
+        if a.role == Role::Manager || b.role == Role::Manager {
+            return Err("a manager's pane is the human's own conversation, and loomux never \
+                         types into it (#1161) — a manager can never join a channel. The \
+                         orchestrator reaches it with message_manager instead."
+                .into());
+        }
 
         let mut channels = self.channels.lock_safe();
         let mut agent_channel = self.agent_channel.lock_safe();
@@ -33485,7 +33749,14 @@ impl OrchRegistry {
                         "shape": shape_label }));
             let instructions_path_str = instructions_path.display().to_string();
             let notice = compact_reinjection_notice(&shape, &instructions_path_str, &ledger_path_str, ledger_embed.as_deref());
-            let _ = self.deliver_prompt(&id, &notice, brand::AUDIT_ACTOR, Delivery::MidSession);
+            // `Delivery::Regrounding`, not `MidSession` (#1161 M2). This is the
+            // ONE mid-session text orrerix may type into a `Role::Manager` pane
+            // (decision D2), and it is spelled as its own delivery kind so that
+            // carve-out is a property of the enum rather than a bypass at this
+            // call site. It behaves identically to `MidSession` in every other
+            // respect, which its own test pins — nothing about how a compacted
+            // pane is re-grounded changes for any other class.
+            let _ = self.deliver_prompt(&id, &notice, brand::AUDIT_ACTOR, Delivery::Regrounding);
         }
         // rev-42 delta (round 2): terminal-state audits for the confirmed-
         // delivery gate — visibility for both outcomes the fix contract
@@ -42359,6 +42630,45 @@ impl OrchRegistry {
         // re-target to — only a caller that named an id that never existed,
         // and that caller is told synchronously.
         let a = self.agent(agent_id).ok_or("unknown agent")?;
+        // THE NO-INJECTION GUARANTEE (#1161 M2, requirement 4). A manager pane
+        // is the human's own conversation, and loomux never types into it.
+        //
+        // It is enforced HERE, at the one door every producer already funnels
+        // through, rather than at each of them: `channel_send`, `send_prompt`,
+        // the watchdog and stall notices, `[loomux] answer to q-N`, the lock
+        // and watch notices, the compact nudge and every other `[loomux]` line
+        // all reach a pane by calling this function. One refusal covers them
+        // all, including the ones a future slice writes without knowing this
+        // rule exists — which is what a structural guarantee means and what N
+        // conventions at N call sites would not give.
+        //
+        // Several of those producers are ALSO unreachable for a manager by
+        // their own gates (it cannot join a channel, register a watch or take
+        // a lock, and `send_prompt` names it with a better error). That is
+        // belt-and-braces on purpose, and this is the braces: those gates are
+        // convenience and DX, this one is the guarantee. If one of them is
+        // ever relaxed, the property still holds.
+        //
+        // It is refused BEFORE the dead/no-terminal checks and before any
+        // admission, so a manager-targeted payload never enters a queue at
+        // all — which is what keeps `flush_paused_queues` (which replays
+        // persisted entries WITHOUT passing back through this function) from
+        // being a second, unguarded door.
+        //
+        // The permitted set is a property of `Delivery`, not a list here:
+        // `permitted_into_manager_pane` is the whole of it, and it is pinned
+        // as a set so a fourth carve-out cannot be added quietly. See
+        // `doc/design/manager.md`.
+        if a.role == Role::Manager && !delivery.permitted_into_manager_pane() {
+            self.audit_delivery_refused(
+                &a.group, agent_id, from, text, RefusalReason::ManagerPane,
+            );
+            return Err(format!(
+                "{agent_id} is this group's manager — the human's own pane, which loomux never \
+                 types into. Nothing was delivered. Put status in its mailbox with \
+                 message_manager, or put a decision to the human with ask_human."
+            ));
+        }
         // The two PRE-admission refusals (#633). Both wrote nothing before —
         // #615 turned the second from a silent `Ok` into a silent `Err`, which
         // is a better contract for the sender and no record at all for anyone
