@@ -1259,7 +1259,8 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         // `withdrawn:<agent>`, which is visibly not an acknowledgement — the
         // same distinction `withdraw_question` draws, pinned the same way.
         "list_needs_you" => {
-            let (rows, omitted_resolved) = reg.needs_you_list(&caller.group)?;
+            let rows = reg.needs_you(&caller.group)?;
+            let omitted_resolved = 0;
             Ok(json!({ "items": rows, "omitted_resolved": omitted_resolved }).to_string())
         }
         "request_attention" => {
