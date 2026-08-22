@@ -36,6 +36,14 @@ opinions — see the `ci-validate` skill.)
   and not shared between worktrees, so a freshly-cut one has none. A
   missing-package error is *you never installed*, never a red suite — the
   `ci-validate` skill has the trap in full.
+- **Every text file is CRLF on disk and LF in the blob** — `core.autocrlf=true`
+  is this project's Windows baseline (see `.gitattributes`, which overrides it
+  for exactly the files a build rewrites). So a `node -e` anchor built from an
+  LF string, or from `git show <ref>:<file>`, never matches the worktree copy,
+  and writing one back with bare LF silently flips that region's endings.
+  Read the file's own EOL and rewrite your anchor to match; run a byte-identity
+  or prefix proof blob-vs-blob (`git show` both sides), never blob-vs-worktree.
+  Signature: `anchor not found` on a string you can see in the file (#1196).
 - **Anchor every `cd` at an absolute path.** The Bash tool's cwd persists
   between calls, so a second relative `cd src-tauri/src/...` resolves against
   the previous `cd` and fails with `No such file or directory`.
@@ -337,6 +345,15 @@ narrow their ask back down to the original ticket on your own judgment.
   (`.claude/`, `.github/`, `.loomux/`) as mismatched, and an error string
   compared as a blob reads as a real difference. Prefix `MSYS_NO_PATHCONV=1`
   on any `git`/`gh` invocation whose argument carries a ref-colon-path (#841).
+- **An end-of-file append conflicts on its shared trailing tokens, not on its
+  content.** Test blocks in `src-tauri/tests/orchestration.rs` all end `);` + `}`,
+  so two branches appending there get that tail matched as common context and
+  each side arrives ending mid-assertion; concatenating splices one block into
+  the middle of the other's final `assert!`. Prove the resolution rather than
+  parse-checking it: the base blob must be a verbatim **prefix** of the resolved
+  one (`startsWith` over `git show <ref>:<file>` for both), with a single append
+  hunk in `git diff -U0`. Signature: a conflict whose two sides are each
+  syntactically incomplete (#1196).
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,

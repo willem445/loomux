@@ -293,6 +293,15 @@ evidence a worker cites for "the suite passes" in a PR description or a `done`
 report, and a run id carried over from before a rebase is evidence about a
 commit that is no longer there (step 6).
 
+A run id also goes stale on a **rerun** — same id, same `headSha`, new verdict —
+which the `headSha` check structurally cannot catch, because nothing about the
+commit changed. Re-read `run_attempt` and `conclusion` (`gh api
+repos/<owner>/<repo>/actions/runs/<id>`) at the body gate, and never write a
+present-tense claim about state *outside* your diff — "`main` is red", "merges
+are frozen" — into a body a squash turns into the permanent commit message: past
+tense with the attempt named, or drop it. Signature: a body citing a failure a
+rerun has since cleared (#1196).
+
 ## Red-before-green evidence goes through CI too
 
 Every PR owes its new tests seen *failing* without the change. With local
@@ -304,13 +313,28 @@ own draft PR**, and CI's log is the failure line you quote.
 1. **Commit your real work first** (#493) — the scratch edits are destructive
    and a `git checkout --` to undo them takes everything uncommitted in the
    file with it.
-2. Cut `scratch/<issue>-red` from your branch head, set **one** behaviour
-   aside — leave everything else wired — and push.
+2. Cut `scratch/<issue>-red-<n>` from your branch head, set **one** behaviour
+   aside — leave everything else wired — and push. One branch per behaviour,
+   numbered, so a wave can go out together (see below).
 3. Open it as a draft titled `[scratch] … — do not merge`, body saying which
    single behaviour is neutered and that every failure line will be quoted in
    the real PR.
 4. Quote the run link and the failure lines in the real PR body; **close the
    scratch PR and delete its branch** once cited.
+
+**Prefer one branch per round, pushed as a wave.** Reusing one scratch branch
+(below) still works — it just serialises rounds that are independent, at a full
+CI cycle each: #1196 cut five branches instead, queued within 14 s of each other
+and all conclusive 14 min later, against ~64 min of serialised run time. A branch
+per round also keeps each red citable at its own SHA, so when the two rules below
+retire one round's evidence — a watched red is dated to the commit it was watched
+on, and transfers only if you SHOW it does — only that round is re-cut, and the
+others stay citable where they are. Bound it by the job list, not by a
+remembered product: `ci.yml` today runs **four** jobs per run — `build` on
+`ubuntu-22.04`, `windows-latest` and `macos-latest`, plus `e2e-windows` — so a
+five-round wave is **twenty** concurrent jobs. Re-read that list rather than
+this sentence if `ci.yml` gains or loses a job, and don't launch a wave against
+the green run you are waiting on (#1196).
 
 **One behaviour per round.** Two at once, or a neuter that stops it compiling,
 and the failures stop being attributable to the behaviour they evidence — a
