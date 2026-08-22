@@ -84,7 +84,7 @@ rather than "seen only here."**
 - **FAILURE SIGNATURE** — `recurrence: 0` with `corroborated_by: []` on a wall
   generic enough to state in one clause (a shell-quoting death, a missing install),
   and a sibling session in the same train whose digest you have not read.
-- **POINTER** — #1189's process review (where the byte-identical key
+- **POINTER** — #1215, the #1189 process review (where the byte-identical key
   `tool_error:Bash:cat:exit code # <path> -c: line` read `0`/`[]` from one session
   and `1` naming that very session from another, minutes apart).
 
