@@ -38050,6 +38050,7 @@ fn shim_with_fake_gh(bin: &Path) -> PathBuf {
          \x20 case \"$*\" in *headRefOid*) printf '%s\\n' \"$FAKE_HEAD\"; exit 0 ;; esac\n\
          \x20 case \"$*\" in *\"--json body\"*) printf '%s\\n' \"$FAKE_BODY\"; exit 0 ;; esac\n\
          \x20 case \"$*\" in *additions*) printf '%s\\n' \"${FAKE_DIFF_LINES-10}\"; exit 0 ;; esac\n\
+         \x20 case \"$*\" in *changedFiles*) printf '%s\\n' \"${FAKE_FILES-ok}\"; exit 0 ;; esac\n\
          \x20 printf '%s\\n' \"${FAKE_BASE:-main} 7\"; exit 0\n\
          fi\n\
          if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then\n\
@@ -53743,4 +53744,192 @@ fn the_mcp_surface_has_no_path_to_the_item_resolve_entry_point() {
          the one thing `resolved_by` exists to keep unambiguous. The board's auto-resolve and an \
          agent's withdraw write their own tags for exactly this reason."
     );
+}
+
+/// A repo whose gate names ONE static reviewer and routes two more by path
+/// (#1176). Separate from [`gated_repo`] rather than parameterized onto it: the
+/// roster differs, and the capacity assertions elsewhere in this file are pinned
+/// to that one's.
+fn routed_repo() -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join(".loomux");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("workflow.yml"),
+        "version: 1\nname: path-routed\n\
+         blocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-lead\n    kind: reviewer\n    prompt: Everything.\n\
+         \x20 - id: rev-ui\n    kind: reviewer\n    prompt: Frontend only.\n\
+         \x20 - id: rev-deps\n    kind: reviewer\n    prompt: Dependency manifests only.\n\
+         gates:\n  merge:\n    reviewers: [rev-lead]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [rev-ui]\n\
+         \x20     - paths: [\"**/Cargo.toml\", package-lock.json]\n\
+         \x20       reviewers: [rev-deps]\n",
+    )
+    .unwrap();
+    td
+}
+
+/// [`gated_group`] for [`routed_repo`].
+fn routed_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupId) {
+    let (reg, d) = test_registry();
+    reg.set_pr_head_override(Some(HEAD.into()));
+    let repo = routed_repo();
+    let g = reg
+        .create_group(
+            &repo.path().to_string_lossy(),
+            Guardrails { advanced_orchestrator: true, ..rails() },
+        )
+        .unwrap();
+    let id = g.id.clone();
+    (reg, d, repo, id)
+}
+
+/// The `ok`-protocol answer the fake `gh` gives for a PR touching `files`.
+fn fake_files(files: &[&str]) -> String {
+    let mut out = String::from("ok\n");
+    for f in files {
+        out.push_str(&format!("p {f}\n"));
+    }
+    out
+}
+
+#[test]
+fn gh_shim_harness_executes_path_routing_and_refuses_a_diff_it_cannot_account_for() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_executes_path_routing_and_refuses_a_diff_it_cannot_account_for: no POSIX sh");
+        return;
+    }
+    // #1176. The pure decision is pinned in tests/workflow.rs; this runs the
+    // SHELL, because a shim/mirror agreement asserted against source text is not
+    // an agreement. Every claim below is the real generated shim, executed.
+    let (reg, d, _repo, gid) = routed_group();
+    let group_dir = d.path().join(gid.as_str());
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+
+    // The declared rules reach the spec file the shim reads, keyed by rule.
+    let spec = fs::read_to_string(group_dir.join("merge_gate")).unwrap();
+    assert!(spec.contains("route-path 1 src/**"), "{spec}");
+    assert!(spec.contains("route-reviewer 1 rev-ui"), "{spec}");
+    assert!(spec.contains("route-path 2 **/Cargo.toml"), "{spec}");
+    assert!(spec.contains("route-path 2 package-lock.json"), "{spec}");
+    assert!(spec.contains("route-reviewer 2 rev-deps"), "{spec}");
+
+    let lead = reviewer_caller(&reg, &gid, "rev-lead");
+    recorded(&reg, &lead, "7", "pass", "reviewed");
+    let merge_files = |files: &str| {
+        reg.grant_merge(&gid, "7", None, "human").unwrap();
+        merge_env(&shim, &group_dir, "main", HEAD, "0", &[("FAKE_FILES", files)])
+    };
+
+    // A diff no rule matches: the static list is the whole gate, and one pass
+    // opens it. Routing is ADDITIVE — it never subtracts, and it never fires on
+    // a PR that did not touch its paths.
+    assert!(
+        merge_files(&fake_files(&["docs/orchestration.md", "README.md"])).0,
+        "no rule matched, so the gate is exactly the one the repo declared"
+    );
+
+    // The same PR, one file different: rule 1 fires and rev-ui is now required,
+    // even though the gate's own `reviewers:` never names it.
+    let (ok, err) = merge_files(&fake_files(&["docs/x.md", "src/app.ts"]));
+    assert!(!ok, "a routed lane keeps the gate shut exactly as a declared one does");
+    assert!(err.contains("rev-ui"), "the refusal must name the lane it is waiting on: {err}");
+    assert!(
+        err.contains("rule 1") && err.contains("src/**"),
+        "…and WHY it is required — the rule that fired, and its paths: {err}"
+    );
+    assert!(!err.contains("rev-deps"), "rule 2 did not match, so its lane is not required: {err}");
+
+    // Both rules, on one PR.
+    let (ok, err) = merge_files(&fake_files(&["src/app.ts", "crates/x/Cargo.toml"]));
+    assert!(!ok);
+    assert!(err.contains("rev-ui") && err.contains("rev-deps"), "{err}");
+    assert!(err.contains("rule 2"), "{err}");
+
+    // The routed lanes record, and the gate opens. Nothing about them is
+    // special once routing has resolved: they are counted, staled and blocked on
+    // by the same code that handles a declared reviewer.
+    let ui = reviewer_caller(&reg, &gid, "rev-ui");
+    recorded(&reg, &ui, "7", "pass", "frontend reviewed");
+    assert!(merge_files(&fake_files(&["src/app.ts"])).0, "the routed lane passed, so the gate opens");
+
+    // A blocking verdict from a ROUTED lane refuses, the same way a declared
+    // one's does — blockers beat approvals whoever recorded them.
+    let deps = reviewer_caller(&reg, &gid, "rev-deps");
+    recorded(&reg, &deps, "7", "fail", "an unreviewed dependency was added");
+    let (ok, err) = merge_files(&fake_files(&["package-lock.json"]));
+    assert!(!ok, "a routed lane's fail refuses the merge");
+    assert!(err.contains("rev-deps"), "{err}");
+    // …and that same fail is INERT on a PR whose paths its rule does not match,
+    // because the rule never fires and the lane is never required.
+    assert!(
+        merge_files(&fake_files(&["src/app.ts"])).0,
+        "rule 2 did not match, so rev-deps is not part of this PR's gate at all"
+    );
+
+    // THE FAIL-CLOSED CASE, and the one that matters most: the reduction could
+    // not account for every changed file — a truncated page, a shape it could
+    // not read, gh failing. Every required verdict on the PR is a live PASS and
+    // it is STILL refused, because what is unknown here is *which lanes are
+    // required*, and guessing "none" is guessing in favour of merging.
+    // (An EMPTY capture is the same refusal and is pinned on `parse_routed_files`
+    // instead: `Command::env(k, "")` is not portably distinguishable from an
+    // unset variable, so driving it through this fake would be testing Windows'
+    // environment-block semantics rather than the shim's.)
+    for unaccountable in ["unaccountable", "null", "ok\nsrc/app.ts", "ok\nq src/app.ts"] {
+        let (ok, err) = merge_files(unaccountable);
+        assert!(!ok, "an unaccountable changed-file list must refuse: {unaccountable:?}");
+        assert!(
+            err.contains("account for every file"),
+            "and say so, rather than reporting a missing verdict: {err}"
+        );
+    }
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("routing-unaccountable"), "audited: {audit}");
+}
+
+
+#[test]
+fn the_rust_gate_status_names_the_routing_rules_that_fired_and_refuses_what_the_shim_refuses() {
+    // The SATISFACTION side of #1176 — the shim owns the refusal side (above),
+    // being the only half that can speak at merge time; this is what the
+    // reviewer that just recorded a verdict, and the task board, read.
+    let (reg, _d, _repo, gid) = routed_group();
+    let lead = reviewer_caller(&reg, &gid, "rev-lead");
+    recorded(&reg, &lead, "7", "pass", "reviewed");
+
+    // A diff matching rule 1: the routed lane is required, so the gate is NOT
+    // satisfied by the declared reviewer's pass alone — and the line says which
+    // rule pulled that lane in.
+    reg.set_pr_files_override(Some(vec!["src/app.ts".into()]));
+    let s = reg.gate_status_line(&gid, 7).expect("a declared gate");
+    assert!(!s.contains("SATISFIED") || s.contains("NOT YET SATISFIED"), "{s}");
+    assert!(s.contains("rev-ui"), "the routed lane is named: {s}");
+    assert!(s.contains("rule 1") && s.contains("src/**"), "…with the rule and its paths: {s}");
+    assert!(!s.contains("rev-deps"), "rule 2 did not match: {s}");
+
+    // A diff matching nothing: the gate is exactly the declared one, and the
+    // line says nothing about routing — a note about rules that did NOT fire
+    // would be noise on every PR in the repo.
+    reg.set_pr_files_override(Some(vec!["docs/x.md".into()]));
+    let s = reg.gate_status_line(&gid, 7).expect("a declared gate");
+    assert!(s.contains("SATISFIED"), "{s}");
+    assert!(!s.contains("rev-ui") && !s.contains("Path routing"), "{s}");
+
+    // And a list loomux cannot account for refuses HERE too — never SATISFIED,
+    // which is the one thing the two halves must never disagree about.
+    reg.set_pr_files_override(None);
+    reg.set_gh_exec_override(Some((
+        _repo.path().join("no-such-gh-binary"),
+        Duration::from_secs(2),
+    )));
+    let s = reg.gate_status_line(&gid, 7).expect("a declared gate");
+    assert!(s.contains("account for every file"), "{s}");
+    assert!(!s.contains("SATISFIED"), "a status line may never claim what the shim would refuse: {s}");
+    reg.set_gh_exec_override(None);
 }
