@@ -1175,11 +1175,7 @@ pub struct CrashReportingAlloc;
 
 unsafe impl GlobalAlloc for CrashReportingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if p.is_null() {
-            on_alloc_failure(layout.size(), layout.align());
-        }
-        p
+        System.alloc(layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
