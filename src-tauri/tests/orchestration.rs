@@ -1495,6 +1495,7 @@ fn workflow_mode_notice_reads_naturally() {
         reviewers: vec!["rev-orch".into(), "rev-ui".into(), "rev-tests".into()],
         also: vec!["ci-green".into()],
         max_diff_lines: None,
+        routing: Vec::new(),
     };
     assert_eq!(
         workflow_mode_notice(true, "loomux", Some(&all_pass_gate)),
@@ -1506,6 +1507,7 @@ fn workflow_mode_notice_reads_naturally() {
         reviewers: vec!["a".into(), "b".into(), "c".into()],
         also: vec![],
         max_diff_lines: None,
+        routing: Vec::new(),
     };
     assert_eq!(
         workflow_mode_notice(true, "focused-review", Some(&threshold_gate)),
