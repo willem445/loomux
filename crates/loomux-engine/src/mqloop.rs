@@ -532,7 +532,7 @@ pub fn batch_pr_title(batch_id: &str, prs: &[u64]) -> String {
 /// itself writes.
 pub fn batch_pr_body(batch_id: &str, target: &str, scratch_sha: &str, prs: &[u64]) -> String {
     let mut s = String::new();
-    s.push_str("Speculative merge-queue batch opened by loomux. **Do not merge by hand.**\n\n");
+    s.push_str("Speculative merge-queue batch opened by orrerix. **Do not merge by hand.**\n\n");
     s.push_str(&format!("- batch: `{batch_id}`\n"));
     s.push_str(&format!("- target: `{target}`\n"));
     s.push_str(&format!("- tested object: `{scratch_sha}`\n\n"));
@@ -581,7 +581,7 @@ pub fn culprit_comment(
     siblings: &[u64],
 ) -> String {
     let mut s = String::new();
-    s.push_str("**loomux merge queue: this PR was isolated as the batch's culprit.**\n\n");
+    s.push_str("**orrerix merge queue: this PR was isolated as the batch's culprit.**\n\n");
     s.push_str(&format!("- batch: `{}`\n", quote(batch_id)));
     if failing.is_empty() {
         s.push_str("- failing checks: none reported by name\n");
