@@ -26128,24 +26128,6 @@ impl OrchRegistry {
 
         let guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
-        // ---- WIP limits (#1175): the counts on the board this write STARTED
-        // from — taken here, above the `idx` resolution, because that is where a
-        // NEW row is pushed, and a row this write is adding is not part of the
-        // board it started from (rev-2 B4).
-        //
-        // Tallied below the push, `before` and `after` both counted the new row
-        // in its born status, so they agreed and `wip_breaches` skipped the
-        // status: a `queued:` cap could never fire on task creation, silently,
-        // in either posture. It is the same class as the B1 defect it came in
-        // with — one input from the pre-write board, another from a board
-        // already half-mutated — and the insertion IS part of the write.
-        //
-        // Nothing here needs `idx` or `this_id`, so the hoist keeps one rule
-        // rather than subtracting the new row back out in the caller's head,
-        // which is the shape `wip_occupants` dropped its `skip` parameter to
-        // avoid. The judgement itself still happens after the apply, against
-        // the post-write board — see `wip_breaches`.
-        let before_wip = wip_counts(&board, &tasks);
         let idx = match id {
             Some(id) => tasks
                 .iter()
@@ -26380,6 +26362,24 @@ impl OrchRegistry {
                 }
             }
         }
+        // ---- WIP limits (#1175): the counts on the board this write STARTED
+        // from — taken here, above the `idx` resolution, because that is where a
+        // NEW row is pushed, and a row this write is adding is not part of the
+        // board it started from (rev-2 B4).
+        //
+        // Tallied below the push, `before` and `after` both counted the new row
+        // in its born status, so they agreed and `wip_breaches` skipped the
+        // status: a `queued:` cap could never fire on task creation, silently,
+        // in either posture. It is the same class as the B1 defect it came in
+        // with — one input from the pre-write board, another from a board
+        // already half-mutated — and the insertion IS part of the write.
+        //
+        // Nothing here needs `idx` or `this_id`, so the hoist keeps one rule
+        // rather than subtracting the new row back out in the caller's head,
+        // which is the shape `wip_occupants` dropped its `skip` parameter to
+        // avoid. The judgement itself still happens after the apply, against
+        // the post-write board — see `wip_breaches`.
+        let before_wip = wip_counts(&board, &tasks);
         let claim = patch.claim;
         let task = &mut tasks[idx];
         if let Some(t) = patch.title {
