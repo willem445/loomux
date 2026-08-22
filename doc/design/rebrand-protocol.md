@@ -37,6 +37,15 @@ hole. `NOTICE_MARKERS` and `AGENT_TOKEN_HEADERS` are arrays both sides iterate, 
 `brand::tests::every_accepted_marker_is_also_neutralized` asserts the two halves against
 the array itself rather than against a list retyped in a test.
 
+**The clause holds within a language, and there is exactly one place it cannot.** Tab
+restore parses a recorded launch command in TypeScript, across a process boundary no
+Rust constant reaches, so `panerestore.ts` carries its own copy of the accepted MCP
+identities. That duplication is asserted rather than argued away
+(`the_frontend_accepts_every_mcp_identity_the_backend_still_mints`), and the asymmetry is
+worth knowing: Rust dropping a spelling the frontend still strips is harmless, while the
+frontend dropping one Rust still mints leaves a dead `--mcp-config` path in a replayed
+command.
+
 ## The readers, and what dropping each one would actually cost
 
 Not one of these is a courtesy to a user with a stale config. Each is a live defect if it

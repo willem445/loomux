@@ -263,9 +263,17 @@ pub fn leading_notice_marker(text: &str) -> Option<&'static str> {
 /// its own argument — not a typo this file quietly absorbed.
 pub const MCP_SERVER: &str = NAME;
 
-/// The pre-#1153 server name. Read where a *generated* config or an
-/// *already-recorded* command line has to be understood after the rename —
-/// notably tab restore, which parses a launch command captured months ago.
+/// The pre-#1153 server name, kept so the deprecation has a name in Rust and
+/// so the emit-side scan can ban what the app still accepts.
+///
+/// The reader that actually needs it is **not** in this language: tab restore
+/// parses a launch command captured months ago, in `src/panerestore.ts`, which
+/// carries its own copy of the accepted set because no Rust constant crosses
+/// that boundary. `rebrand.rs`'s
+/// `the_frontend_accepts_every_mcp_identity_the_backend_still_mints` is what
+/// keeps the two from diverging — stated here rather than left as an
+/// implication, because a doc claiming a coupling that does not exist is how
+/// the next reader deletes one side believing the other follows.
 pub const LEGACY_MCP_SERVER: &str = LEGACY_NAME;
 
 /// The tool-name prefix an agent CLI builds out of [`MCP_SERVER`] — what

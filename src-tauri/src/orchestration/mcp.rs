@@ -144,7 +144,7 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
     let token = req
         .headers()
         .iter()
-        .find(|h| brand::AGENT_TOKEN_HEADERS.iter().any(|n| h.field.equiv(n)))
+        .find(|h| is_agent_token_header(&h.field.to_string()))
         .map(|h| h.value.as_str().to_string());
 
     let mut body = String::new();
@@ -196,6 +196,22 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
 }
 
 /// Protocol dispatch, separated from HTTP so tests can drive it directly.
+/// Is `name` one of the agent-token header spellings this server accepts?
+///
+/// Case-insensitive because HTTP field names are, and because the `equiv` this
+/// replaced was — a caller's CLI writes the header from a generated config and
+/// nothing guarantees its casing round-trips through every proxy in between.
+///
+/// **Every accepted spelling, and that is not a convenience.** An agent's MCP
+/// config is written once, at group create, and lives in that group's dir. A
+/// group created before #1153 phase 3 presents the pre-rename header on every
+/// call it will ever make, so a server reading only the current name would
+/// fail every tool call in every live group the moment the app updated
+/// underneath it — silently, as an auth failure rather than an upgrade error.
+pub fn is_agent_token_header(name: &str) -> bool {
+    brand::AGENT_TOKEN_HEADERS.iter().any(|n| name.eq_ignore_ascii_case(n))
+}
+
 pub fn dispatch(
     reg: &OrchRegistry,
     caller: &Caller,
