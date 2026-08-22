@@ -840,13 +840,21 @@ export class GroupView {
     const repo = this.getRepo?.() ?? null;
     if (!repo) {
       return (
-        "Switches future spawns to this repo's declared workflow (.loomux/workflow.yml) and " +
+        "Switches future spawns to this repo's declared workflow file and " +
         "arms any merge gate it declares. Agents already running keep their current block."
       );
     }
     const preview = await workflowPreview(repo, getDefaultAgent().id).catch(() => null);
-    if (!preview || !preview.present) {
-      return `No .loomux/workflow.yml found at ${repo} — turning workflow mode on will be refused.`;
+    if (!preview) {
+      return `Couldn't read the workflow file at ${repo} — turning workflow mode on may be refused.`;
+    }
+    if (!preview.present) {
+      // `preview.path` is the backend's RESOLVED spelling (#1153 phase 4): the path
+      // this repo would use, so a repo with neither config dir is pointed at
+      // `.orrerix/workflow.yml` and one still on `.loomux/` is pointed at its own.
+      // The `!preview.valid` branch below already used it; this one hard-coded the
+      // deprecated name while the resolved value sat in the same object.
+      return `No ${preview.path} found at ${repo} — turning workflow mode on will be refused.`;
     }
     if (!preview.valid) {
       return (
@@ -1348,7 +1356,7 @@ export class GroupView {
     if (gateLine) bits.push(gateLine);
     this.workflowLineEl.textContent = bits.join(" · ");
     this.workflowLineEl.title = w.advanced
-      ? "This group is running a repo-declared custom workflow (.loomux/workflow.yml)."
+      ? "This group is running a repo-declared custom workflow file."
       : "This group is running the built-in roster (orchestrator/worker/reviewer/planner).";
 
     const warn = gateSatisfiabilityWarning(w);

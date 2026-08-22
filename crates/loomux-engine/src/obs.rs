@@ -150,11 +150,19 @@ fn platform_data_dir() -> PathBuf {
 /// pre-#1153 `<data>/loomux`.
 ///
 /// **This enum is the migration policy, and it is deliberately the whole of
-/// it.** See `doc/design/rebrand-filesystem.md`: the shipped policy is
-/// move-on-first-launch, and reverting to read-the-old-one-forever is one
-/// `match` arm below (`Migrate` → `UseLegacy`) plus a doc edit — not a
-/// re-architecture. It is stated as a pure decision precisely so that
-/// ratifying, amending or reverting it never requires reading the fs code.
+/// it.** See `doc/design/rebrand-filesystem.md`. The shipped policy is
+/// move-on-first-launch; reverting to read-the-old-one-forever is **one arm of
+/// [`plan_default_root`]** — `(false, true) => RootPlan::UseLegacy` instead of
+/// `Migrate` — plus a doc edit, not a re-architecture.
+///
+/// That revert works only because [`root_action`] gives `UseLegacy` its **own**
+/// dispatch arm. It did not, in this PR's first cut: `UseLegacy` was folded in
+/// with `Migrate` on the argument that `plan_default_root` "cannot return it",
+/// which made the documented revert **inert** — the edited arm still reached
+/// `migrate_default_root` and still renamed the user's data. A comment whose
+/// premise the documented next edit voids is not a guard, so the premise is
+/// gone and every variant is dispatched on its own (rev-lead round 1, B1).
+/// `the_documented_revert_really_stops_the_migration` is the pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootPlan {
     /// `<data>/orrerix` already exists. Use it, and never touch `<data>/loomux`
@@ -175,11 +183,39 @@ pub enum RootPlan {
 
 /// The migration decision, pure: the fs probes are the caller's, so every arm
 /// is reachable in a test without a disk.
+///
+/// **This is the function a policy revert edits** — see [`RootPlan`].
 pub fn plan_default_root(new_exists: bool, legacy_exists: bool) -> RootPlan {
     match (new_exists, legacy_exists) {
         (true, _) => RootPlan::UseNew,
         (false, true) => RootPlan::Migrate,
         (false, false) => RootPlan::Fresh,
+    }
+}
+
+/// What a plan tells the caller to actually *do* — the dispatch, lifted out of
+/// the filesystem code so all four variants are decided in one pure place and
+/// pinned without a disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAction {
+    /// Use `<data>/orrerix` as it stands.
+    UseNew,
+    /// Use `<data>/loomux` as it stands. **No move, no rename** — this is both
+    /// the refused-move fallback and, after a policy revert, the steady state.
+    UseLegacy,
+    /// Move `<data>/loomux` to `<data>/orrerix`, then use the new one. A refused
+    /// move degrades to `UseLegacy` — see [`migrate_default_root`].
+    MoveThenUseNew,
+}
+
+/// The dispatch. **Exactly one variant may move anything**, and that fact is
+/// what makes the documented revert real: flipping `plan_default_root`'s
+/// `(false, true)` arm to `UseLegacy` lands here on an arm that renames nothing.
+pub fn root_action(plan: RootPlan) -> RootAction {
+    match plan {
+        RootPlan::UseNew | RootPlan::Fresh => RootAction::UseNew,
+        RootPlan::UseLegacy => RootAction::UseLegacy,
+        RootPlan::Migrate => RootAction::MoveThenUseNew,
     }
 }
 
@@ -233,16 +269,13 @@ fn init_data_root_from(env_override: Option<std::ffi::OsString>) -> bool {
     }
     let _ = DEFAULT_ROOT.get_or_init(|| {
         let (new, legacy) = default_root_pair();
-        match plan_default_root(new.is_dir(), legacy.is_dir()) {
-            RootPlan::UseNew | RootPlan::Fresh => new,
-            // `UseLegacy` is unreachable from `plan_default_root`; it is what a
-            // refused move reports back, and it lands in the same arm.
-            RootPlan::Migrate | RootPlan::UseLegacy => {
-                match migrate_default_root(&legacy, &new) {
-                    RootPlan::UseNew => new,
-                    _ => legacy,
-                }
-            }
+        match root_action(plan_default_root(new.is_dir(), legacy.is_dir())) {
+            RootAction::UseNew => new,
+            RootAction::UseLegacy => legacy,
+            RootAction::MoveThenUseNew => match migrate_default_root(&legacy, &new) {
+                RootPlan::UseNew => new,
+                _ => legacy,
+            },
         }
     });
     true
@@ -261,9 +294,11 @@ fn resolve_default_root() -> PathBuf {
     DEFAULT_ROOT
         .get_or_init(|| {
             let (new, legacy) = default_root_pair();
-            match plan_default_root(new.is_dir(), legacy.is_dir()) {
-                RootPlan::UseNew | RootPlan::Fresh => new,
-                RootPlan::Migrate | RootPlan::UseLegacy => legacy,
+            match root_action(plan_default_root(new.is_dir(), legacy.is_dir())) {
+                RootAction::UseNew => new,
+                // No move has happened, so the data is still under the old name
+                // — for a pending `MoveThenUseNew` exactly as for `UseLegacy`.
+                RootAction::UseLegacy | RootAction::MoveThenUseNew => legacy,
             }
         })
         .clone()
@@ -288,7 +323,24 @@ fn resolve_default_root() -> PathBuf {
 /// where their data used to be — finds an explanation instead of an absence.
 /// Its failure is ignored: a signpost we could not write is a worse experience,
 /// not a failed migration.
+///
+/// **A signpost-only directory is not a profile, and is never re-migrated**
+/// (rev-lead round 1). The signpost recreates `<data>/loomux`, so a user who
+/// later deletes `<data>/orrerix` — a reset, a partial uninstall — leaves the
+/// marker directory as the only one standing. Without this check the next
+/// launch would read that as "an unmigrated install", rename the marker into
+/// place, and write a *fresh* signpost, so `<data>/orrerix/MOVED-TO-ORRERIX.txt`
+/// would tell the user their data had moved to the directory it was sitting in.
+/// Harmless, but confusing at exactly the moment someone already is.
+///
+/// The answer there is `UseNew` and **not** `UseLegacy`: there is no profile to
+/// fall back to — the marker directory holds no state — so the run starts clean
+/// under the current name, and the stale signpost is left on disk untouched
+/// like everything else this function declines to move.
 fn migrate_default_root(legacy: &Path, new: &Path) -> RootPlan {
+    if holds_only_the_signpost(legacy) {
+        return RootPlan::UseNew;
+    }
     if fs::rename(legacy, new).is_err() {
         eprintln!(
             "orrerix: could not move {} to {} — continuing to use the old location. \
@@ -318,6 +370,28 @@ fn migrate_default_root(legacy: &Path, new: &Path) -> RootPlan {
 /// Name of the signpost file left in the old data root after a move. A `.txt`
 /// so that double-clicking it on Windows opens something readable.
 pub const MOVED_MARKER: &str = "MOVED-TO-ORRERIX.txt";
+
+/// True when `dir` exists and contains nothing but [`MOVED_MARKER`] — i.e. it is
+/// a signpost we left behind, not a profile.
+///
+/// Fails **closed toward migrating**: an unreadable directory answers `false`,
+/// so an unexpected permission error degrades to the normal move attempt (which
+/// then fails safely on its own) rather than silently declining to migrate a
+/// real profile.
+fn holds_only_the_signpost(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut saw_marker = false;
+    for entry in entries.flatten() {
+        if entry.file_name() == MOVED_MARKER {
+            saw_marker = true;
+        } else {
+            return false; // anything else at all means there is state here
+        }
+    }
+    saw_marker
+}
 
 /// `<user data dir>/orrerix` (or `$ORRERIX_DATA_DIR` / `$LOOMUX_DATA_DIR` if
 /// set) — the root every persisted-state singleton (`orchestration/`, `logs/`,
@@ -689,6 +763,43 @@ mod tests {
         assert_eq!(override_root(None), None);
     }
 
+    /// **The escape hatch, pinned.** The PR shipping this policy without the
+    /// human's ratification rests on "reverting is one arm of
+    /// `plan_default_root`". That claim is only true if the dispatch below it
+    /// honours `UseLegacy` — and in the first cut it did not: `UseLegacy` was
+    /// folded in with `Migrate`, so the documented edit still renamed the
+    /// user's data (rev-lead round 1, B1).
+    ///
+    /// This simulates the revert at its own seam: the edited arm's return
+    /// value, fed to the real dispatch. If it ever reads `MoveThenUseNew`
+    /// again, the policy has become one nobody can undo by the documented
+    /// procedure.
+    #[test]
+    fn the_documented_revert_really_stops_the_migration() {
+        let what_the_reverted_arm_returns = RootPlan::UseLegacy;
+        assert_eq!(
+            root_action(what_the_reverted_arm_returns),
+            RootAction::UseLegacy,
+            "the one-arm revert must stop the move — if this is MoveThenUseNew the \
+             documented escape hatch is inert and the shipped policy cannot be undone"
+        );
+    }
+
+    /// Every variant dispatched on its own, and **exactly one of them moves**.
+    /// The count is the assertion: it is what stops a future arm from being
+    /// quietly folded into the migrating branch again.
+    #[test]
+    fn exactly_one_plan_variant_moves_anything() {
+        use RootPlan::*;
+        let all = [UseNew, Migrate, UseLegacy, Fresh];
+        let movers: Vec<RootPlan> =
+            all.iter().copied().filter(|p| root_action(*p) == RootAction::MoveThenUseNew).collect();
+        assert_eq!(movers, vec![Migrate], "only Migrate may move; got {movers:?}");
+        assert_eq!(root_action(UseNew), RootAction::UseNew);
+        assert_eq!(root_action(Fresh), RootAction::UseNew, "a first-ever launch has nothing to move");
+        assert_eq!(root_action(UseLegacy), RootAction::UseLegacy);
+    }
+
     #[test]
     fn the_new_root_existing_means_the_old_one_is_never_touched() {
         // Both present is the state a *reverted* build, or an old instance that
@@ -733,6 +844,31 @@ mod tests {
             marker.contains("ORRERIX_DATA_DIR"),
             "signpost must name the escape hatch, got: {marker}"
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A signpost-only legacy dir is our own leftover, not a profile, so it is
+    /// never migrated — and the run starts clean under the CURRENT name rather
+    /// than adopting the marker directory. Without this, deleting
+    /// `<data>/orrerix` (a reset, a partial uninstall) would move the stale
+    /// marker into place and write a fresh signpost pointing at the directory
+    /// it now sits in (rev-lead round 1, non-blocking).
+    #[test]
+    fn a_signpost_only_legacy_dir_is_never_re_migrated() {
+        let tmp = std::env::temp_dir().join(format!("orrerix-signpost-{}", now_ms()));
+        let legacy = tmp.join(brand::LEGACY_NAME);
+        let new = tmp.join(brand::NAME);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(MOVED_MARKER), "moved").unwrap();
+
+        assert_eq!(migrate_default_root(&legacy, &new), RootPlan::UseNew);
+        assert!(legacy.join(MOVED_MARKER).is_file(), "the stale signpost is left alone");
+        assert!(!new.exists(), "and nothing was moved into the new name");
+
+        // …but one real file beside it makes it a profile again, and it moves.
+        fs::write(legacy.join("tabs.json"), "{}").unwrap();
+        assert_eq!(migrate_default_root(&legacy, &new), RootPlan::UseNew);
+        assert!(new.join("tabs.json").is_file(), "a dir with real state must still migrate");
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -10,7 +10,11 @@
 //!    its hazard and its escape hatch are argued in
 //!    `doc/design/rebrand-filesystem.md`; the decision itself is
 //!    [`obs::plan_default_root`](crate::obs::plan_default_root), deliberately a
-//!    pure function so the policy is one `match` arm to change.
+//!    pure function so the policy is one `match` arm to change — its
+//!    `(false, true)` arm, `Migrate` → `UseLegacy`, and nothing else. That the
+//!    edit really works is pinned by
+//!    `obs::tests::the_documented_revert_really_stops_the_migration`, because
+//!    the first cut of it did not (see [`obs::RootPlan`](crate::obs::RootPlan)).
 //! 2. **A repo's committed config dir** (`.loomux/`) — *the user's*, in *their*
 //!    git history, on *their* branches. Never moved, never renamed, not once:
 //!    the preferred name is read first and the legacy name is read when the

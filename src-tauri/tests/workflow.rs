@@ -6944,7 +6944,7 @@ fn gate_missing_blocks_is_empty_against_the_roster_that_actually_declares_them()
     let repo = repo_root();
     let wf = match workflow::load_workflow(&repo) {
         Ok(Some(wf)) => wf,
-        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::WORKFLOW_PATH),
+        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
     };
     let gate = wf.gates.get("merge").unwrap();
     assert_eq!(
@@ -6992,7 +6992,7 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
     let repo = repo_root();
     let wf = match workflow::load_workflow(&repo) {
         Ok(Some(wf)) => wf,
-        Ok(None) => panic!("the repo must ship its own {}", workflow::WORKFLOW_PATH),
+        Ok(None) => panic!("the repo must ship its own {}", workflow::workflow_path(&repo)),
         Err(errors) => panic!("loomux's own workflow file does not validate: {errors:#?}"),
     };
 

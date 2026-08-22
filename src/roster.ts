@@ -23,6 +23,7 @@
 // a second parser is a second set of answers, and the only answer that matters is
 // the engine's.
 
+import { WORKFLOW_FILE } from "./workflowmodel.ts";
 import type { OrchRole } from "./orchbadge";
 
 export type { OrchRole };
@@ -261,7 +262,7 @@ export function resolveRoster(
       status: "none",
       blocks: builtin,
       errors: [],
-      summary: `No ${preview?.path ?? ".loomux/workflow.yml"} in this repo — the standard roster will run. Create one to declare your own blocks.`,
+      summary: `No ${preview?.path ?? WORKFLOW_FILE} in this repo — the standard roster will run. Create one to declare your own blocks.`,
       capacity: null,
     };
   }

@@ -14,6 +14,7 @@ import type { OrchSpawnRequest } from "./orchestration";
 import type { PaneOptions } from "./pane";
 // Explicit `.ts` (as sessionroute.ts does) — a VALUE import in a module that
 // `node --test` loads directly has to resolve without a bundler.
+import { WORKFLOW_FILE } from "./workflowmodel.ts";
 import { badgeFor } from "./orchbadge.ts";
 
 /** Strip the machine-readable `promote-<tag>:` prefix off a backend refusal,
@@ -78,7 +79,7 @@ export function promoteConfirmLines(repo: string, workflow: PromoteWorkflow | nu
       "group beside a live one. orrerix tells you which once it resolves.",
   ];
   if (workflow === null) return lines;
-  const named = workflow.name || ".loomux/workflow.yml";
+  const named = workflow.name || WORKFLOW_FILE;
   // The reattach clause is on BOTH arms, and that is not symmetry for its own
   // sake: which roster a promote ends up running turns on the group case as much
   // as on this file, and that stays true when the file is broken — a dormant

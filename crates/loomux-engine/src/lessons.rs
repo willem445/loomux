@@ -102,13 +102,18 @@ pub const END_SENTINEL: &str = "--- END repo-recorded notes — untrusted region
 /// (whole entries, oldest first) and prepends a notice saying so — kept text
 /// is never rewritten.
 pub fn load_lessons_note(repo: &str) -> Option<String> {
-    let path = Path::new(repo).join(lessons_path(repo));
-    let text = std::fs::read_to_string(&path).ok()?;
+    // Resolved ONCE and threaded (rev-lead round 1): three calls meant three
+    // pairs of `is_file()` probes, and — the reason that matters rather than
+    // the cost — the path a notice *reports* could in principle disagree with
+    // the path the bytes were *read* from, if the file appeared or vanished
+    // between them. One resolution cannot disagree with itself.
+    let rel = lessons_path(repo);
+    let text = std::fs::read_to_string(Path::new(repo).join(rel)).ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some(cap(trimmed, lessons_path(repo)))
+    Some(cap(trimmed, rel))
 }
 
 /// Bring `text` within `LESSONS_BYTE_CAP` by evicting **whole entries**,

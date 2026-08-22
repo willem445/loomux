@@ -792,14 +792,14 @@ export class WelcomeForm {
     const advancedLabel = document.createElement("label");
     advancedLabel.className = "dlg-toggle";
     const advancedText = document.createElement("span");
-    advancedText.textContent = "Advanced orchestrator — run this repo's .loomux/workflow.yml";
+    advancedText.textContent = "Advanced orchestrator — run this repo's workflow file";
     advancedLabel.append(this.advancedInput, advancedText);
     this.editWorkflowBtn = document.createElement("button");
     this.editWorkflowBtn.className = "dlg-btn";
     this.editWorkflowBtn.type = "button";
     this.editWorkflowBtn.textContent = "Edit workflow…";
     this.editWorkflowBtn.title =
-      "Open .loomux/workflow.yml in a workflow pane. This setup pane BECOMES that " +
+      "Open this repo's workflow file in a workflow pane. This setup pane BECOMES that " +
       "editor, so the launcher settings here are not kept — open a new pane to launch " +
       "once the file is right.";
     this.editWorkflowBtn.addEventListener("click", () => void this.openWorkflowPane());

@@ -1008,7 +1008,7 @@ async function confirmPromote(repo: string, workflow: PromoteWorkflow | null): P
       : {
           label: "Run this repo's workflow roster (advanced)",
           checked: advanced,
-          title: "Load .loomux/workflow.yml and run the blocks it declares, instead of the built-in four roles.",
+          title: "Load this repo's workflow file and run the blocks it declares, instead of the built-in four roles.",
           onChange: (v) => {
             advanced = v;
           },

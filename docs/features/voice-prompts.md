@@ -64,6 +64,16 @@ auto-detects (`%LOCALAPPDATA%\orrerix\whisper`):
 powershell -ExecutionPolicy Bypass -File scripts\stage-whisper.ps1
 ```
 
+> **Already staged under the old name?** Orrerix still finds
+> `%LOCALAPPDATA%\loomux\whisper` and reads it exactly as before — nothing is moved,
+> because what is in there is a runtime and a model *you* downloaded. But the script's
+> default destination is now `%LOCALAPPDATA%\orrerix\whisper`, so re-running it
+> downloads a **second** copy (several hundred MB) rather than updating the one you
+> have. To keep using your existing directory, either pass it explicitly
+> (`-Dest "$env:LOCALAPPDATA\loomux\whisper"`) or just don't re-run the script — your
+> current install keeps working. To move at your own pace, rename the directory by
+> hand once nothing is using it.
+
 Restart orrerix and press `Alt+S`.
 
 ### By hand
