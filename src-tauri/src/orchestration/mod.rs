@@ -1807,6 +1807,15 @@ if [ -f "$ORX_GD/merge_gate" ]; then
       [ -n "${g_t#*:}" ] || loomux_block_wf "malformed-gate" "the merge gate carries an empty routing value for rule $g_i"
       [ "$g_i" -le "$g_rmax" ] || g_rmax="$g_i"
     done
+    # The rule cap, from the SAME constant `parse_workflow` and `parse_gate_file`
+    # refuse above (`ROUTING_RULES_MAX`, interpolated). Without it the two halves
+    # disagree: a hand-edited file with more rules than the cap is unreadable to
+    # Rust — which reports "malformed, every merge refused" — and perfectly
+    # readable to this loop. That divergence happens to fall on the STRICT side
+    # (more rules is more required reviewers), which is exactly why it would
+    # never have been noticed; "the two halves agree, and both fail closed" is
+    # the property, not "the disagreement is harmless this time".
+    [ "$g_rmax" -le __ROUTING_RULES_MAX__ ] || loomux_block_wf "malformed-gate" "the merge gate declares routing rule $g_rmax, past the __ROUTING_RULES_MAX__-rule limit loomux will load — so this file is one loomux cannot read back, and an unreadable gate refuses every merge"
     # …then completeness: rules are numbered 1..N and each needs BOTH halves. A
     # rule with paths and no reviewers requires nobody; one with reviewers and no
     # paths can never fire. Both are the same laxening in different clothes.
@@ -2099,6 +2108,7 @@ loomux_block "gate-closed" "$default" "$num"
     TPL.replace("__BASE_CHECK_RUNS_JQ__", workflow::BASE_CHECK_RUNS_JQ)
         .replace("__BASE_STATUS_JQ__", workflow::BASE_STATUS_JQ)
         .replace("__ROUTING_FILES_JQ__", workflow::ROUTING_FILES_JQ)
+        .replace("__ROUTING_RULES_MAX__", &workflow::ROUTING_RULES_MAX.to_string())
         .replace("__REAL_GH__", real_gh)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
         .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
