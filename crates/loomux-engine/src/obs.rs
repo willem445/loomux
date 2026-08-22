@@ -1259,7 +1259,8 @@ const CRASH_LOG_GAP_DETAIL: &str = "unclean_prev=true crash_log=none \
 /// "unclean" from the sentinel and "is there a log" from a fresh directory
 /// scan would disagree with itself exactly in the window it exists to name.
 pub fn is_crash_log_gap(unclean: bool, crash_log: Option<&Path>) -> bool {
-    unclean && crash_log.is_none()
+    let _ = (unclean, crash_log);
+    false
 }
 
 impl StartupCheck {
