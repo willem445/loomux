@@ -7088,7 +7088,7 @@ fn build_agent_command_full_line_snapshots() {
         cmd("copilot", "auto", false, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
-         --allow-tool \"loomux,shell(git:*),shell(gh:*)\""
+         --allow-tool \"orrerix,shell(git:*),shell(gh:*)\""
     );
 
     // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
@@ -7146,7 +7146,7 @@ fn build_agent_command_full_line_snapshots() {
         cmd("copilot", "auto", false, Containment::NoEdits),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --no-auto-update \
-         --allow-tool \"loomux,shell(git:*),shell(gh:*)\" --deny-tool \"write\""
+         --allow-tool \"orrerix,shell(git:*),shell(gh:*)\" --deny-tool \"write\""
     );
 
     // Unknown CLI falls back to the claude adapter byte-for-byte (never a
