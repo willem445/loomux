@@ -390,8 +390,9 @@ a restart — are on the **[Project tabs](features/project-tabs.html)** feature 
 orrerix has no settings/preferences window yet — the handful of durable app
 settings that exist live in a hand-editable `settings.json` next to `tabs.json`
 in the app's data directory (Windows:
-`%APPDATA%\loomux\settings.json`). It's seeded with the defaults on first run,
-so the file is there to find. Edit it and relaunch orrerix to pick up a change
+`%APPDATA%\orrerix\settings.json`, or `%APPDATA%\loomux\settings.json` on an
+install that predates the rename and has not been moved yet). It's seeded with
+the defaults on first run, so the file is there to find. Edit it and relaunch orrerix to pick up a change
 — there's no live reload.
 
 | Key | Default | What changing it does |

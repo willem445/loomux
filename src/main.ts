@@ -2047,7 +2047,7 @@ function closeOrKeep(ws: Workspace, pane: Pane, exit: PtyExit, keep: KeepOpenRea
       hasUnsavedWork: pane.hasUnsavedWork(),
     })
   ) {
-    // The auto-close skips notifyExited, so the in-pane [loomux] diagnostic
+    // The auto-close skips notifyExited, so the in-pane [orrerix] diagnostic
     // (#281) never gets written here — the toast is the only pointer the
     // human gets, so it has to say WHERE the actual evidence lives (the
     // orchestrator's own pane got the same exit notice; the audit log is

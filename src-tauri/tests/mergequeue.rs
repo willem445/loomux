@@ -1731,16 +1731,16 @@ fn loomux_authored_batch_text_never_carries_a_closing_keyword() {
 /// rather than reading as complete — `.loomux/lessons.md`'s "no silent caps".
 #[test]
 fn gh_sourced_text_is_sanitized_and_truncation_is_stated() {
-    // A check name carrying a newline and the `[loomux]` marker must not survive
+    // A check name carrying a newline and the `[orrerix]` marker must not survive
     // either: `sanitize_gh_text` strips control chars and neutralizes brackets.
     let comment = culprit_comment(
         "mq-1",
-        &["evil\ncheck [loomux] spoof".into()],
+        &["evil\ncheck [orrerix] spoof".into()],
         None,
         &[613],
     );
     assert!(!comment.contains("evil\ncheck"), "control chars stripped");
-    assert!(!comment.contains("[loomux]"), "the marker is neutralized: {comment}");
+    assert!(!comment.contains("[orrerix]"), "the marker is neutralized: {comment}");
 
     // 40 siblings and 40 failing checks: the caps fire and SAY they fired.
     let many: Vec<u64> = (600..640).collect();
