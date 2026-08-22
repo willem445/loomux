@@ -1030,10 +1030,8 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     // ONLY place `**` means more than `*` is this one, and a rule the shim can
     // state in a two-line `case` is a rule the two implementations can be shown
     // to share.
-    match pattern.strip_prefix("**/") {
-        Some(rest) => star_match(rest.as_bytes(), path.as_bytes()),
-        None => false,
-    }
+    // RED EVIDENCE (#1176 scratch C2): a leading `**/` is no longer optional.
+    false
 }
 
 /// Anchored `*`-only wildcard match, iterative with one backtrack point — the
@@ -2365,118 +2363,15 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             errs.push(format!("gates.{name}: max_diff_lines must be a positive number — omit the key to declare no limit"));
             bad = true;
         }
-        // #1176's path-based routing. Every refusal below is LOUD — a rule
-        // loomux could not read is never a rule it quietly drops, because the
-        // whole point of a routing rule is to ADD a required reviewer, and the
-        // failure mode of silently dropping one is a merge that skipped a lane
-        // the repo asked for.
+        // RED EVIDENCE (#1176 scratch C1): a routing rule is accepted whatever
+        // it says — no threshold-pair check, no empty-list check, no reviewer
+        // check, no glob check, no caps.
         let mut routing: Vec<RoutingRule> = Vec::new();
-        if !rg.routing.is_empty() {
-            // `threshold: N` counts votes over a FIXED list; routing makes the
-            // list a function of the diff. Together they have no honest meaning:
-            // adding a lane would also add a candidate that could supply one of
-            // the N passes, so declaring a routing rule could make the gate
-            // EASIER to satisfy — the one direction a gate must never move. The
-            // refusal says what to do instead (#782) rather than picking a
-            // reading and hoping the author meant it.
-            if matches!(require, GateRequire::Threshold(_)) {
-                errs.push(format!(
-                    "gates.{name}: routing: and require: threshold cannot both be declared — a \
-                     threshold counts passes over a fixed reviewer list, and a routing rule makes \
-                     that list depend on the diff, so together they would let an extra lane SUPPLY \
-                     one of the required passes instead of adding one. Use require: all-pass with \
-                     routing:, and let each rule name the lane its paths need."
-                ));
-                bad = true;
-            }
-            if rg.routing.len() > ROUTING_RULES_MAX {
-                errs.push(format!(
-                    "gates.{name}: {} routing rules — at most {ROUTING_RULES_MAX}. The shim \
-                     evaluates every rule against every changed file on every merge; past this \
-                     many lanes the block has stopped routing and started listing.",
-                    rg.routing.len()
-                ));
-                bad = true;
-            }
-        }
-        for (i, rr) in rg.routing.iter().enumerate() {
-            // 1-based, matching the position an author counts to in their own
-            // file — and the number every refusal downstream cites.
-            let idx = i + 1;
-            let ctx = format!("routing rule {idx} reviewer");
-            if rr.paths.is_empty() {
-                errs.push(format!(
-                    "gates.{name}: routing rule {idx} declares no paths — a rule that matches \
-                     nothing can never require anybody. Omit the rule, or give it a path glob."
-                ));
-                bad = true;
-            }
-            if rr.paths.len() > ROUTING_PATHS_MAX {
-                errs.push(format!(
-                    "gates.{name}: routing rule {idx} declares {} paths — at most {ROUTING_PATHS_MAX}.",
-                    rr.paths.len()
-                ));
-                bad = true;
-            }
-            if rr.reviewers.is_empty() {
-                errs.push(format!(
-                    "gates.{name}: routing rule {idx} names no reviewers — a rule that requires \
-                     nobody is not a rule."
-                ));
-                bad = true;
-            }
-            let mut paths: Vec<String> = Vec::new();
-            let mut seen_paths: BTreeSet<String> = BTreeSet::new();
-            for p in &rr.paths {
-                // Rejected, never rewritten — the #225 contract. An author must
-                // be able to reference the glob they actually wrote, and a glob
-                // loomux silently narrowed is a lane loomux silently dropped.
-                match sanitize_glob(p) {
-                    Some(clean) if clean == p.trim() => {
-                        if !seen_paths.insert(clean.clone()) {
-                            errs.push(format!(
-                                "gates.{name}: routing rule {idx} lists the path {p:?} more than \
-                                 once — name each glob once."
-                            ));
-                            bad = true;
-                            continue;
-                        }
-                        paths.push(clean);
-                    }
-                    _ => {
-                        errs.push(format!(
-                            "gates.{name}: routing rule {idx}: {p:?} is not a usable path glob. \
-                             Use letters, digits, '.', '_', '-', '/' and '*' — and write a file \
-                             glob, not a directory: 'src/**', never 'src/', '/src/**' or a '..' \
-                             segment (GitHub reports changed paths repo-relative, so those match \
-                             nothing at all)."
-                        ));
-                        bad = true;
-                    }
-                }
-            }
-            let mut reviewers: Vec<BlockId> = Vec::new();
-            let mut seen_routed: BTreeSet<String> = BTreeSet::new();
-            for r in &rr.reviewers {
-                let rname = r.trim();
-                // Same set-not-sequence rule the static list follows, and for a
-                // milder version of the same reason: a name written twice in one
-                // rule is a typo for a second lane, not an emphasis.
-                if !seen_routed.insert(rname.to_string()) {
-                    errs.push(format!(
-                        "gates.{name}: routing rule {idx} names reviewer {rname:?} more than once"
-                    ));
-                    bad = true;
-                    continue;
-                }
-                if let Some(e) = gate_reviewer_error(&name, &ctx, rname, &blocks) {
-                    errs.push(e);
-                    bad = true;
-                    continue;
-                }
-                reviewers.push(rname.to_string());
-            }
-            routing.push(RoutingRule { paths, reviewers });
+        for rr in &rg.routing {
+            routing.push(RoutingRule {
+                paths: rr.paths.iter().filter_map(|p| sanitize_glob(p)).collect(),
+                reviewers: rr.reviewers.iter().map(|r| r.trim().to_string()).collect(),
+            });
         }
         if bad {
             continue;
