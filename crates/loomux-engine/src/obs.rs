@@ -228,9 +228,10 @@ fn init_data_root_from(env_override: Option<std::ffi::OsString>) -> bool {
     // open, which is precisely the state #394's override exists to avoid
     // touching. The rule is read through `override_root`, the same function
     // `data_root_from` decides with, so "which root is in force" has one answer.
-    if override_root(env_override).is_some() {
-        return false;
-    }
+    // SCRATCH MUTATION (#1153 red evidence, round E): the explicit-root guard is
+    // removed — the override is still read (and still rejected when bad), but it
+    // no longer stops the platform default from being settled and migrated.
+    let _ = override_root(env_override);
     let _ = DEFAULT_ROOT.get_or_init(|| {
         let (new, legacy) = default_root_pair();
         match plan_default_root(new.is_dir(), legacy.is_dir()) {
