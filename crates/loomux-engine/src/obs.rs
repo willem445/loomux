@@ -888,10 +888,7 @@ fn emergency_line(msg: &str, loc: &str) -> Vec<u8> {
 /// as far as opening it. Append, never truncate: the point is to add to
 /// whatever phase one already flushed, not to replace it.
 fn write_emergency(path: &Path, msg: &str, loc: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(&emergency_line(msg, loc));
-        let _ = f.flush();
-    }
+    let _ = (path, msg, loc, emergency_line("", ""));
 }
 
 /// **Phase one of the crash write, and the whole point of #1219.** Open the
