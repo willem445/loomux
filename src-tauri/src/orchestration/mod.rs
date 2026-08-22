@@ -1811,9 +1811,15 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
     g_i=1
     while [ "$g_i" -le "$g_rmax" ]; do
       g_hasp=0; g_hasr=0
-      for g_t in $g_rpaths; do case "$g_t" in "$g_i":*) g_hasp=1 ;; esac; done
+      for g_t in $g_rpaths; do case "$g_t" in "$g_i":*) g_hasp=$((g_hasp+1)) ;; esac; done
       for g_t in $g_rrevs;  do case "$g_t" in "$g_i":*) g_hasr=1 ;; esac; done
-      { [ "$g_hasp" = "1" ] && [ "$g_hasr" = "1" ]; } || loomux_block_wf "malformed-gate" "the merge gate declares routing rule $g_i with only half of it — a rule needs at least one path and at least one reviewer"
+      { [ "$g_hasp" -ge 1 ] && [ "$g_hasr" = "1" ]; } || loomux_block_wf "malformed-gate" "the merge gate declares routing rule $g_i with only half of it — a rule needs at least one path and at least one reviewer"
+      # The PER-RULE path cap, the other half of the bound the Rust readers
+      # enforce (#1176 rev-972 N1). Left open, a 33-path rule was unreadable to
+      # `parse_gate_file` — malformed, every merge refused — and perfectly
+      # readable here: the same two-halves divergence the rule cap above closed,
+      # one bound over, and no more harmless for falling on the strict side.
+      [ "$g_hasp" -le __ROUTING_PATHS_MAX__ ] || loomux_block_wf "malformed-gate" "the merge gate declares $g_hasp paths on routing rule $g_i, past the __ROUTING_PATHS_MAX__-path limit loomux will load — so this file is one loomux cannot read back, and an unreadable gate refuses every merge"
       g_i=$((g_i+1))
     done
     # THE CHANGED-FILE LIST. `__ROUTING_FILES_JQ__` is interpolated from
@@ -2098,6 +2104,7 @@ loomux_block "gate-closed" "$default" "$num"
         .replace("__BASE_STATUS_JQ__", workflow::BASE_STATUS_JQ)
         .replace("__ROUTING_FILES_JQ__", workflow::ROUTING_FILES_JQ)
         .replace("__ROUTING_RULES_MAX__", &workflow::ROUTING_RULES_MAX.to_string())
+        .replace("__ROUTING_PATHS_MAX__", &workflow::ROUTING_PATHS_MAX.to_string())
         .replace("__REAL_GH__", real_gh)
         .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
         .replace("__RELEASE_GRANT_VALID__\n", RELEASE_GRANT_VALID_SH)
@@ -38998,7 +39005,7 @@ impl OrchRegistry {
             // it IS that refusal: an unknown reviewer requirement is refused,
             // never assumed empty.
             return Some(format!(
-                "merge gate for PR #{pr}: this repo's gate routes reviewers by path, and loomux                  could not account for every file this PR changed, so it cannot say which lanes                  are required. The merge is refused until it can.{} {GATE_REFUSAL_EXITS}",
+                "merge gate for PR #{pr}: this repo's gate routes reviewers by path, and loomux could not account for every file this PR changed, so it cannot say which lanes are required. The merge is refused until it can.{} {GATE_REFUSAL_EXITS}",
                 changed
                     .as_ref()
                     .err()
@@ -39010,12 +39017,20 @@ impl OrchRegistry {
         // The routed lanes, named with the rules that pulled them in — AC1's
         // "which rules fired and why", on the SATISFACTION side (the shim owns
         // the refusal side, where it is the only thing that can speak).
-        let routing_note = if routed.fired.is_empty() {
+        // Gated on what routing ADDED, not on whether a rule fired (rev-972 N2).
+        // A rule whose reviewers are all already on the static list is legal and
+        // supported — `a_routed_reviewer_already_on_the_static_list_is_required_once_not_twice`
+        // pins exactly that — and it fires with an EMPTY added-set, which rendered
+        // as "Path routing required  on top of…". The shim guards the same way
+        // (`[ -z "$g_routed" ] || g_rnote=…`) and says nothing; this now matches it,
+        // which is the point: the two halves describe one gate.
+        let added = &routed.required[gate.reviewers.len()..];
+        let routing_note = if added.is_empty() {
             String::new()
         } else {
             format!(
                 " Path routing required {} on top of the gate's own list: {}.",
-                routed.required[gate.reviewers.len()..].join(", "),
+                added.join(", "),
                 routed
                     .fired
                     .iter()

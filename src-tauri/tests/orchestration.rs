@@ -53687,43 +53687,53 @@ fn the_mcp_surface_has_no_path_to_the_item_resolve_entry_point() {
     );
 }
 
-/// A repo whose gate names ONE static reviewer and routes two more by path
-/// (#1176). Separate from [`gated_repo`] rather than parameterized onto it: the
-/// roster differs, and the capacity assertions elsewhere in this file are pinned
-/// to that one's.
-fn routed_repo() -> tempfile::TempDir {
+/// The `gates.merge` body [`routed_repo`] writes unless a test wants another:
+/// one static reviewer, and two more routed by path.
+const ROUTED_GATE: &str = "    reviewers: [rev-lead]\n\
+     \x20   routing:\n\
+     \x20     - paths: [src/**]\n\
+     \x20       reviewers: [rev-ui]\n\
+     \x20     - paths: [\"**/Cargo.toml\", package-lock.json]\n\
+     \x20       reviewers: [rev-deps]\n";
+
+/// A repo with three reviewer lanes and `gate_body` as its `gates.merge` (#1176).
+/// Separate from [`gated_repo`] rather than parameterized onto it: the roster
+/// differs, and the capacity assertions elsewhere in this file are pinned to
+/// that one's.
+fn routed_repo_with(gate_body: &str) -> tempfile::TempDir {
     let td = tempfile::tempdir().unwrap();
     let dir = td.path().join(".loomux");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("workflow.yml"),
-        "version: 1\nname: path-routed\n\
-         blocks:\n\
-         \x20 - id: worker\n    kind: worker\n\
-         \x20 - id: rev-lead\n    kind: reviewer\n    prompt: Everything.\n\
-         \x20 - id: rev-ui\n    kind: reviewer\n    prompt: Frontend only.\n\
-         \x20 - id: rev-deps\n    kind: reviewer\n    prompt: Dependency manifests only.\n\
-         gates:\n  merge:\n    reviewers: [rev-lead]\n\
-         \x20   routing:\n\
-         \x20     - paths: [src/**]\n\
-         \x20       reviewers: [rev-ui]\n\
-         \x20     - paths: [\"**/Cargo.toml\", package-lock.json]\n\
-         \x20       reviewers: [rev-deps]\n",
+        format!(
+            "version: 1\nname: path-routed\n\
+             blocks:\n\
+             \x20 - id: worker\n    kind: worker\n\
+             \x20 - id: rev-lead\n    kind: reviewer\n    prompt: Everything.\n\
+             \x20 - id: rev-ui\n    kind: reviewer\n    prompt: Frontend only.\n\
+             \x20 - id: rev-deps\n    kind: reviewer\n    prompt: Dependency manifests only.\n\
+             gates:\n  merge:\n{gate_body}"
+        ),
     )
     .unwrap();
     td
 }
 
-/// [`gated_group`] for [`routed_repo`].
+/// [`routed_repo_with`] carrying the ordinary two-rule gate.
+fn routed_repo() -> tempfile::TempDir {
+    routed_repo_with(ROUTED_GATE)
+}
+
+/// A group on `repo`, with the advanced orchestrator on.
 ///
 /// `max_agents` is raised above [`rails`]'s 2: this roster has three reviewer
 /// lanes and the point of routing is that a PR can require more than one of
-/// them, so a cap that stopped the third from spawning would make the test
-/// unable to reach the state it exists to check.
-fn routed_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupId) {
+/// them, so a cap that stopped the third from spawning would make a test unable
+/// to reach the state it exists to check.
+fn group_for(repo: &tempfile::TempDir) -> (OrchRegistry, tempfile::TempDir, GroupId) {
     let (reg, d) = test_registry();
     reg.set_pr_head_override(Some(HEAD.into()));
-    let repo = routed_repo();
     let g = reg
         .create_group(
             &repo.path().to_string_lossy(),
@@ -53731,6 +53741,13 @@ fn routed_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupI
         )
         .unwrap();
     let id = g.id.clone();
+    (reg, d, id)
+}
+
+/// [`gated_group`] for [`routed_repo`].
+fn routed_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupId) {
+    let repo = routed_repo();
+    let (reg, d, id) = group_for(&repo);
     (reg, d, repo, id)
 }
 
@@ -53903,6 +53920,30 @@ fn the_rust_gate_status_names_the_routing_rules_that_fired_and_refuses_what_the_
     assert!(s.contains("SATISFIED"), "{s}");
     assert!(!s.contains("rev-ui") && !s.contains("Path routing"), "{s}");
 
+    // A rule that fires but adds NOBODY NEW says nothing at all (rev-972 N2).
+    // A rule whose reviewers are already on the static list is legal — see
+    // `a_routed_reviewer_already_on_the_static_list_is_required_once_not_twice` —
+    // and it fires with an empty added-set, which used to render as
+    // "Path routing required  on top of…" with a hole where the names go. The
+    // shim is silent in this case; the two halves describe one gate, so this is
+    // too. Asserted on the ADDED-set being empty, not on the rule not firing:
+    // the rule does fire, and that is the whole point of the case.
+    let selfrouted = routed_repo_with(
+        "    reviewers: [rev-lead]
+             routing:
+               - paths: [src/**]
+                 reviewers: [rev-lead]
+",
+    );
+    let (reg2, _d2, gid2) = group_for(&selfrouted);
+    reg2.set_pr_files_override(Some(vec!["src/app.ts".into()]));
+    let lead2 = reviewer_caller(&reg2, &gid2, "rev-lead");
+    recorded(&reg2, &lead2, "7", "pass", "reviewed");
+    let s = reg2.gate_status_line(&gid2, 7).expect("a declared gate");
+    assert!(s.contains("SATISFIED"), "{s}");
+    assert!(!s.contains("Path routing"), "a rule that added nobody says nothing: {s}");
+    assert!(!s.contains("  "), "and leaves no hole where the names would go: {s}");
+
     // And a list loomux cannot account for refuses HERE too — never SATISFIED,
     // which is the one thing the two halves must never disagree about.
     reg.set_pr_files_override(None);
@@ -54030,6 +54071,36 @@ fn gh_shim_harness_refuses_a_routing_gate_file_rust_could_not_read_back() {
         "the cap itself must be readable — otherwise the case below proves nothing"
     );
     assert!(merge_now(&fake_files(&["docs/x.md"])).0, "a gate AT the cap still merges");
+
+    // The PER-RULE PATH cap is the same bound one level down (rev-972 N1), and
+    // was the half left open when the rule cap was closed. Same two assertions:
+    // Rust's answer first, then the shim's, so neither is taken on trust.
+    let paths = |n: usize| {
+        let mut s = String::from("require all-pass
+reviewer rev-lead
+");
+        for i in 1..=n {
+            s.push_str(&format!("route-path 1 d{i}/**
+"));
+        }
+        s.push_str("route-reviewer 1 rev-lead
+");
+        s
+    };
+    fs::write(&gate_file, paths(workflow::ROUTING_PATHS_MAX)).unwrap();
+    assert!(
+        workflow::parse_gate_file(&fs::read_to_string(&gate_file).unwrap()).is_some(),
+        "the path cap itself must be readable — otherwise the case below proves nothing"
+    );
+    assert!(merge_now(&fake_files(&["docs/x.md"])).0, "a rule AT the path cap still merges");
+    fs::write(&gate_file, paths(workflow::ROUTING_PATHS_MAX + 1)).unwrap();
+    assert!(
+        workflow::parse_gate_file(&fs::read_to_string(&gate_file).unwrap()).is_none(),
+        "Rust's half refuses past the path cap — that is the fact the shim has to match"
+    );
+    let (ok, err) = merge_now(&fake_files(&["docs/x.md"]));
+    assert!(!ok, "and so must the shim's half");
+    assert!(err.contains("merge gate"), "{err}");
 
     // One past it: Rust cannot read it back, so the shim must refuse rather than
     // enforce a file loomux itself calls malformed.
