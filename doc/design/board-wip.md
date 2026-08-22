@@ -2,7 +2,8 @@
 
 Status: implemented (PR #1182). Config in `loomux-engine::workflow` (`BoardPolicy`,
 `RawBoard`/`RawWip`), accounting and enforcement in `orchestration::mod`
-(`wip_occupants`, `wip_entry_breach`, `OrchRegistry::upsert_task_from`), agent surface in
+(`wip_occupants`, `wip_counts`, `wip_breaches`, `wip_may_change`,
+`OrchRegistry::upsert_task_from`), agent surface in
 `orchestration::mcp` (`list_tasks`, `upsert_task`), chrome in `src/wipchips.ts` +
 `src/tasksview.ts`.
 
@@ -120,6 +121,19 @@ landing — an edit to a row already sitting in one, and every move out of one. 
 board (a cap lowered under live work, a human edit, warn mode doing its job) stays workable
 rather than frozen, and it stays so for a reason that is now a property of the comparison
 rather than a special case in the code.
+
+**"Before" means before the whole write, insertion included.** The tally is taken above the
+row-insertion that a create performs, not below it — and the first cut of this redesign got
+that wrong (rev-2 B4). Tallied below, a newly created row was counted on *both* sides in the
+status it is born into (`queued`), so the two agreed and the comparison skipped that status:
+a `queued:` cap could never fire on task creation, in either posture, silently. It is the
+same class as the defect the redesign itself fixed — one input from the pre-write board,
+another from a board already half-mutated — and it is worth naming as such, because the
+lesson is that "the board this write started from" has to be taken before the *first* thing
+the write does, not merely before the field application. The alternative (subtract the new
+row back out of the `before` tally when the write is a create) was rejected for the reason
+`wip_occupants` has no `skip` parameter: it is the same subtract-a-row-in-your-head shape
+that produced both bugs.
 
 A `claim` needs no special handling either: it sets `in-progress` on the row like any other
 write, and the post-write board says so. That it is the motivating case — an orchestrator
