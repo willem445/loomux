@@ -520,6 +520,36 @@ mod orch_signature_tests {
     #[test]
     fn kickoffs_yield_role_and_group() {
         let (role, gid) = detect_orch_signature(
+            "You are the orchestrator of orrerix agent group sempkg-74fe4043 for the repository C:\\x.",
+        )
+        .unwrap();
+        assert_eq!(role, "orchestrator");
+        assert_eq!(gid.as_deref(), Some("sempkg-74fe4043"));
+
+        let (role, gid) = detect_orch_signature(
+            "You are \"worker 1\" (w-2), a worker agent in orrerix group sempkg-74fe4043 for repository X.",
+        )
+        .unwrap();
+        assert_eq!(role, "worker");
+        assert_eq!(gid.as_deref(), Some("sempkg-74fe4043"));
+
+        let (role, _) = detect_orch_signature(
+            "You are \"reviewer 1\" (rev-3), a reviewer agent in orrerix group g-1 for repository X.",
+        )
+        .unwrap();
+        assert_eq!(role, "reviewer");
+    }
+
+    /// #1153 phase 3, and the one dual-accept in this rename that can never
+    /// be retired. A transcript is written ONCE by the agent CLI and read for
+    /// as long as the user keeps the session; nothing rewrites the sessions a
+    /// user already has. Drop either spelling and every pre-rename session
+    /// silently loses its role and its group — no error, no red, just a group
+    /// that stops offering to resume. All three role shapes are covered
+    /// because they are three separate entries in the phrase table.
+    #[test]
+    fn a_transcript_recorded_before_the_rename_still_names_its_role_and_group() {
+        let (role, gid) = detect_orch_signature(
             "You are the orchestrator of loomux agent group sempkg-74fe4043 for the repository C:\\x.",
         )
         .unwrap();
@@ -538,6 +568,10 @@ mod orch_signature_tests {
         )
         .unwrap();
         assert_eq!(role, "reviewer");
+
+        let (role, gid) = detect_orch_signature("[loomux] w-2 reports progress: ready").unwrap();
+        assert_eq!(role, "orchestrator", "a pre-rename notice row still marks an orchestrator pane");
+        assert!(gid.is_none());
     }
 
     #[test]
@@ -549,9 +583,15 @@ mod orch_signature_tests {
         assert_eq!(role, "orchestrator");
         assert!(gid.is_none());
         assert!(detect_orch_signature("please fix the login bug").is_none());
+        for name in [crate::brand::NAME, crate::brand::LEGACY_NAME] {
+            assert!(
+                detect_orch_signature(&format!("the word {name} alone should not match")).is_none(),
+                "prose mentioning {name} must not mark a session"
+            );
+        }
         assert!(
-            detect_orch_signature("the word loomux alone should not match").is_none(),
-            "prose mentioning loomux must not mark a session"
+            detect_orch_signature("[orrerix]no space after the marker").is_none(),
+            "the marker arm requires a following space, and dual-accept must not have widened that"
         );
     }
 }
