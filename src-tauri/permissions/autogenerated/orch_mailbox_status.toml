@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-mailbox-status"
+description = "Enables the orch_mailbox_status command without any pre-configured scope."
+commands.allow = ["orch_mailbox_status"]
+
+[[permission]]
+identifier = "deny-orch-mailbox-status"
+description = "Denies the orch_mailbox_status command without any pre-configured scope."
+commands.deny = ["orch_mailbox_status"]
