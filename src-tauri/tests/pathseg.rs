@@ -465,12 +465,22 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
             "a.id is a minted roster id, never caller-supplied",
             "let agent_id = format!(\"{}-{seq}\", block.prefix());",
         ),
-        // Not an identifier at all — a formatted timestamp.
-        (
-            "let path = dir.join(format!(\"crash-{}.log\", stamp(now)));",
-            "crash-log name is a timestamp, not an id",
-            "format!(\"{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}\")",
-        ),
+        // The crash-log name used to be a row here ("not an identifier at all —
+        // a formatted timestamp"). #1219 removed the site rather than the
+        // property: the panic hook's first phase may not touch `core::fmt` (a
+        // panic down there aborts the process before anything is written), so
+        // `crash-<stamp>.log` is now composed byte-wise by `push_stamp` in
+        // `crates/loomux-engine/src/obs.rs`. There is no `format!` template
+        // left for this scan's trigger to match.
+        //
+        // **Residual blind spot, recorded here because the row's absence is
+        // otherwise indistinguishable from the row never having been needed:**
+        // a value interpolated into a file name by `extend_from_slice` instead
+        // of `format!` is invisible to this scan by construction. Today the
+        // crash name's only input is a `u64` from `now_ms()` — no identifier
+        // reaches it — and the same is true of the allocation-failure log,
+        // whose name is a fixed literal. A future caller threading a name into
+        // either would need a different guard, not a row here.
         // **The known non-member of this family, and the reason it is listed
         // rather than fixed here.** A workflow block id becomes `<id>.md` in the
         // group dir, and it is validated by `workflow::sanitize_id` — a FIFTH
