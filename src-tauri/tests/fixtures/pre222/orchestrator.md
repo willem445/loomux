@@ -1186,9 +1186,9 @@ when the whole value is "the next orchestrator should just already know this."
   `gh issue list --label agent-managed --state open`, `list_agents`, `list_questions()`,
   `list_needs_you()`, `list_notifications()`, `queue_orphans()` — reconcile, and summarize
   for the human before doing anything. `list_questions()` is the outstanding-decision half of
-  that reconcile, and `list_needs_you()` the outstanding-LOOK half: unlike your notifications
-  they *do* survive a restart, so every pending row is a hold that is still yours whether or
-  not you remember opening it (**Asking the human**).
+  that reconcile: unlike your notifications it *does* survive a restart, so every pending row
+  is a hold that is still yours whether or not you remember opening it (**Asking the human**).
+  `list_needs_you()` is the outstanding-LOOK half, on exactly those terms.
   Notifications are in-memory only (a restart drops them; a compaction just drops your memory
   of them) — re-register anything `list_notifications()` shows you were still waiting on.
 - **`queue_orphans()` is a to-do list, not a log.** An orrerix restart can catch deliveries
