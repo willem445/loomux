@@ -62,7 +62,7 @@ for (const action of ["watch-fired", "watch-expired", "watch-failed"]) {
           id: "n-3",
           kind: "pr_checks",
           agent: "w-1",
-          text: "[loomux] PR #241 checks: SUCCESS — all 6 checks passed (watch n-3)",
+          text: "[orrerix] PR #241 checks: SUCCESS — all 6 checks passed (watch n-3)",
         },
         "loomux"
       )

@@ -328,7 +328,7 @@
 //!
 //! It is the largest module to cross so far and the cheapest to argue, which is
 //! the point worth recording: `queue`'s whole outbound set is `GroupId`,
-//! [`model::Delivery`] and [`text::LOOMUX_NOTICE_MARKER`], and `queuestate`'s is
+//! [`model::Delivery`] and [`brand::NOTICE_MARKER`], and `queuestate`'s is
 //! `GroupId`, `Delivery`, `queue` itself and [`obs::LockExt`] — every one of
 //! them landed here in batches 2, 7 and 8, so nothing had to be lifted ahead of
 //! them. The
