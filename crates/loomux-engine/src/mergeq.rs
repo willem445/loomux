@@ -32,8 +32,8 @@
 //!    decision is a defect, not an optimization.
 
 use crate::workflow::{
-    check_diff_size, condition_supported, evaluate_merge_gate, parse_gate_file, BlockId,
-    DiffSizeVerdict, Gate, GateOutcome, ReviewVerdict,
+    check_diff_size, condition_supported, evaluate_merge_gate, parse_gate_file, route_reviewers,
+    BlockId, DiffSizeVerdict, Gate, GateOutcome, ReviewVerdict,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -727,6 +727,20 @@ pub struct PrObservation {
     /// `max_diff_lines`. `None` when it could not be read, which
     /// [`workflow::check_diff_size`] turns into a refusal.
     pub changed_lines: Option<u64>,
+    /// The PR's changed paths for #1176's path-based reviewer routing.
+    ///
+    /// `None` is the same refusal every other field here takes on `None` —
+    /// with one extra reason to be strict about it. The driver fills this from
+    /// `workflow::ROUTING_FILES_JQ`, which answers `None` not only when gh
+    /// failed but when the file list it got back **could not be shown to be
+    /// complete** (that list pages at 100). A short list would fail OPEN and
+    /// invisibly: a rule whose only matching file sits on page two never fires,
+    /// and the queue lands a PR one required lane short with nothing anywhere
+    /// saying so.
+    ///
+    /// The driver leaves it `None` when the gate declares no routing, and
+    /// [`route_reviewers`] never looks at it in that case.
+    pub changed_files: Option<Vec<String>>,
 }
 
 /// Why an `also:` clause refuses.
@@ -755,6 +769,7 @@ pub enum ConditionRefusal {
     Unsupported(String),
 }
 
+
 /// The outcome of re-checking the merge gate for one sub-PR (§6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateRecheck {
@@ -772,6 +787,11 @@ pub enum GateRecheck {
     /// `max_diff_lines`, or its size could not be read at all. Never
     /// [`DiffSizeVerdict::Ok`], which is not a refusal.
     DiffSize(DiffSizeVerdict),
+    /// The gate routes reviewers by path (#1176) and the PR's changed-file list
+    /// could not be resolved, or could not be shown to be complete. **Refuses**:
+    /// the unknown here is *which reviewers are required*, so treating it as
+    /// "no rule fired" would be guessing in favour of landing.
+    RoutingUnaccountable,
 }
 
 impl GateRecheck {
@@ -827,6 +847,18 @@ pub fn recheck_gate(
         GateSpec::Malformed => return GateRecheck::Malformed,
         GateSpec::Declared(g) => g,
     };
+    // #1176's path routing, resolved BEFORE anything counts verdicts — it is
+    // what decides whose verdicts are counted. From here down `gate` is the
+    // EFFECTIVE gate: the same one, with routing already resolved into its
+    // reviewer list, so `evaluate_merge_gate`, `gate_need` and the
+    // `body-unchanged` loop below all read one list and there is still exactly
+    // one gate decision in this codebase. A queue that skipped a routed lane the
+    // shim requires would BE the way around path routing.
+    let Some(routed) = route_reviewers(gate, observed.changed_files.as_deref()) else {
+        return GateRecheck::RoutingUnaccountable;
+    };
+    let effective = routed.gate(gate);
+    let gate = &effective;
     // An empty head is NO head (rev-157). `evaluate_merge_gate` would refuse an
     // empty string anyway — but only incidentally, because no stored head
     // equals `""` so every verdict reads *stale*, which is arithmetic about
