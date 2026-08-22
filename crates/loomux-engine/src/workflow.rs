@@ -139,13 +139,22 @@ pub const LEGACY_WORKFLOW_PATH: &str = ".loomux/workflow.yml";
 /// Which of the two spellings a given repo actually uses — the string every
 /// message, audit line and preview must name, so that "this repo declares a
 /// workflow (`…`)" points at the file that was really read.
-pub fn workflow_path(repo: &str) -> &'static str {
-    crate::brand::resolve_repo_file(repo, WORKFLOW_PATH, LEGACY_WORKFLOW_PATH)
+pub fn workflow_path(_repo: &str) -> &'static str {
+    // SCRATCH MUTATION (#1153 red evidence, round A2): the REPORTED path stops
+    // following the file that was read. Discovery below is untouched — it
+    // resolves directly — so `load_workflow` still opens the right file, the
+    // `src-tauri` lib suite stays green, and the integration binaries are
+    // reached.
+    WORKFLOW_PATH
 }
 
 /// The absolute workflow file for `repo`, resolved through [`workflow_path`].
 pub fn workflow_file(repo: &str) -> std::path::PathBuf {
-    Path::new(repo).join(workflow_path(repo))
+    Path::new(repo).join(crate::brand::resolve_repo_file(
+        repo,
+        WORKFLOW_PATH,
+        LEGACY_WORKFLOW_PATH,
+    ))
 }
 
 /// Schema version this build understands. Recorded in the file so a future
