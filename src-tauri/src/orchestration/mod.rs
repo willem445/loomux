@@ -35956,7 +35956,7 @@ impl OrchRegistry {
                     self.audit(&g, brand::AUDIT_ACTOR, "attention-toast",
                         json!({ "agent": i.agent_id, "reason": i.reason }));
                 }
-                notify_desktop(&format!("loomux · {}", i.name), &i.detail);
+                notify_desktop(&format!("orrerix · {}", i.name), &i.detail);
             }
         }
         if let Some(app) = self.app.lock_safe().clone() {
@@ -39806,7 +39806,7 @@ impl OrchRegistry {
         // The frontmatter split in `profiles::parse_profile` only ever
         // looks at the FIRST `\n---` after the opening one, so a `---`
         // line anywhere inside `body_text` itself is inert.
-        let description = format!("loomux {} agent for group {group}", block.id);
+        let description = format!("orrerix {} agent for group {group}", block.id);
         // #802, and ONLY on the repair path (see `repair`'s doc). Two things
         // happen here, and they are one idea: this file is standing in for a
         // file the user wrote, so it must not quietly become a different
