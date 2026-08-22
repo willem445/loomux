@@ -614,16 +614,29 @@ export type SoloCli = "claude" | "copilot";
 // flags at all) comes back byte-identical, and the surviving remainder of a
 // matched command keeps whatever whitespace it already had (#439 review B1 +
 // N1).
+/** Every MCP identity a RECORDED launch command can carry (#1153 phase 3).
+ *  The backend mints exactly one -- today's -- but this module reads command
+ *  lines saved by a PAST session, so a tab recorded before the flag day still
+ *  names the old server. Failing to recognise it would leave the dead
+ *  `--mcp-config` path in the replayed command: the pane then boots against a
+ *  file agent exit already deleted, which is exactly what this excision
+ *  exists to prevent. Two spellings, listed once and read by BOTH forms --
+ *  the string regexes below alternate over these arrays and the argv scan
+ *  membership-tests the same ones -- so a third spelling cannot reach one
+ *  form and miss the other. */
+const MCP_TOOL_PREFIXES = ["mcp__orrerix", "mcp__loomux"] as const;
+const MCP_SERVERS = ["orrerix", "loomux"] as const;
+
 const CLAUDE_SOLO_MCP_RE = new RegExp(
-  `(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--strict-mcp-config\\s+--allowedTools\\s+mcp__loomux(?=\\s|$)`
+  `(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--strict-mcp-config\\s+--allowedTools\\s+(?:${MCP_TOOL_PREFIXES.join("|")})(?=\\s|$)`
 );
 const COPILOT_SOLO_MCP_RE = new RegExp(
-  `(^|\\s)--additional-mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--allow-tool\\s+loomux(?=\\s|$)`
+  `(^|\\s)--additional-mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--allow-tool\\s+(?:${MCP_SERVERS.join("|")})(?=\\s|$)`
 );
 
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
- *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
- *  (claude) or `--additional-mcp-config @<path> --allow-tool loomux`
+ *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__<server>`
+ *  (claude) or `--additional-mcp-config @<path> --allow-tool <server>`
  *  (copilot) — the exact, contiguous flag group `launcher.ts:1343` appends via
  *  `soloPrepare`'s `mcp_args`. That path is guaranteed gone by the time ANY
  *  restore replays it: agent exit deletes the config file and clears the
@@ -676,11 +689,11 @@ export function stripSoloMcpFlags(
         argv[i] === "--mcp-config" &&
         argv[i + 2] === "--strict-mcp-config" &&
         argv[i + 3] === "--allowedTools" &&
-        argv[i + 4] === "mcp__loomux"
+        (MCP_TOOL_PREFIXES as readonly string[]).includes(argv[i + 4])
       ) {
         return { cli: "claude", argv: [...argv.slice(0, i), ...argv.slice(i + 5)] };
       }
-      if (argv[i] === "--additional-mcp-config" && argv[i + 2] === "--allow-tool" && argv[i + 3] === "loomux") {
+      if (argv[i] === "--additional-mcp-config" && argv[i + 2] === "--allow-tool" && (MCP_SERVERS as readonly string[]).includes(argv[i + 3])) {
         return { cli: "copilot", argv: [...argv.slice(0, i), ...argv.slice(i + 4)] };
       }
     }

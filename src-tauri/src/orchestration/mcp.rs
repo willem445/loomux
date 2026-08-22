@@ -4,11 +4,13 @@
 //! Hand-rolled JSON-RPC-over-POST instead of an SDK: every tool here is a
 //! quick request/response (no server→client streaming), so the whole
 //! protocol surface is `initialize`, `ping`, `tools/list`, and `tools/call`.
-//! Identity comes from the `X-Loomux-Agent` token header written into each
+//! Identity comes from the agent token header (`brand::AGENT_TOKEN_HEADER`,
+//! and every legacy spelling beside it) written into each
 //! agent's `--mcp-config` file; the token maps to (group, agent, role) and
 //! every tool is scoped to the caller's group — panes without a token can't
 //! reach this server's state at all, and group A can never see group B.
 
+use super::brand;
 use super::report;
 use super::workflow;
 use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
@@ -142,7 +144,7 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
     let token = req
         .headers()
         .iter()
-        .find(|h| h.field.equiv("X-Loomux-Agent"))
+        .find(|h| brand::AGENT_TOKEN_HEADERS.iter().any(|n| h.field.equiv(n)))
         .map(|h| h.value.as_str().to_string());
 
     let mut body = String::new();
@@ -179,7 +181,8 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
                 &format!("method={method} token_present={}", token.is_some()),
             );
             respond(req, 200, rpc_error(&id, -32000,
-                "unknown or missing X-Loomux-Agent token — this MCP server only serves loomux-managed agents"));
+                &format!("unknown or missing {} token — this MCP server only serves agents it manages",
+                    brand::AGENT_TOKEN_HEADER)));
             return;
         }
     };
@@ -208,7 +211,10 @@ pub fn dispatch(
             Ok(json!({
                 "protocolVersion": requested,
                 "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "loomux-orchestration", "version": env!("CARGO_PKG_VERSION") },
+                "serverInfo": {
+                    "name": format!("{}-orchestration", brand::MCP_SERVER),
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
             }))
         }
         "ping" => Ok(json!({})),
