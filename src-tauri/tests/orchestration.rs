@@ -36939,6 +36939,50 @@ fn a_promoted_pane_resumes_its_own_session_and_gets_orchestrator_wiring() {
     assert_eq!(spawn.detail["resume"], json!(true));
 }
 
+/// #1153 phase 3. The kickoff and the transcript scraper are one contract with
+/// no compiler between them: `kickoff_body` WRITES a phrase, and
+/// `detect_orch_signature` READS it back out of the CLI's own transcript months
+/// later to say what role a pane held and which group it belonged to. Nothing
+/// couples the two — they are a `format!` in one crate and a phrase table in
+/// another — so a rename on either side is silently one-way, and the symptom is
+/// not an error: it is a session that simply stops offering to resume.
+///
+/// This is the only test that puts a REAL kickoff through the real scraper.
+/// The unit tests beside `detect_orch_signature` pin its phrase table against
+/// strings typed into that file, which is exactly the coupling this one exists
+/// to not rely on.
+#[test]
+fn every_kickoff_this_app_writes_is_one_session_restore_can_read_back() {
+    use loomux_lib::sessions::detect_orch_signature;
+
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+
+    for (role, expect) in [
+        (Role::Orchestrator, "orchestrator"),
+        (Role::Worker, "worker"),
+        (Role::Reviewer, "reviewer"),
+    ] {
+        let a = reg.spawn_agent(&g.id, role, "n", "t", false, None).unwrap();
+        let agent = reg.agent(&a.id).unwrap();
+        let group = reg.group(&g.id).unwrap();
+        let kickoff = reg.kickoff_prompt_ex(&agent, &group, "", None, KickoffOrigin::Normal);
+
+        let (found_role, found_gid) = detect_orch_signature(&kickoff).unwrap_or_else(|| {
+            panic!(
+                "session restore cannot recognise the kickoff this app just wrote for a \
+                 {expect}. The two spell the same phrase and nothing makes them agree:\n{kickoff}"
+            )
+        });
+        assert_eq!(found_role, expect, "…and it must read back as the role it was written for");
+        assert_eq!(
+            found_gid.as_deref(),
+            Some(g.id.as_str()),
+            "…carrying the group it names, which is what a resume joins on"
+        );
+    }
+}
+
 #[test]
 fn a_promoted_orchestrator_is_typed_the_full_contract_with_a_preamble() {
     use std::sync::Arc;
