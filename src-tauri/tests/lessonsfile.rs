@@ -746,13 +746,24 @@ fn a_repo_still_on_the_legacy_config_dir_has_its_lessons_read_and_named() {
     let repo = Repo::at("legacy-dir", LEGACY_LESSONS_PATH);
     repo.write_lessons_at(LEGACY_LESSONS_PATH, "## Old home\nStill injected.\n");
     let kickoff = orchestrator_kickoff(&repo);
+    // Two independent properties, each asserted on the RAW kickoff first. That
+    // ordering is deliberate: `injected_region` panics from inside a helper when
+    // no untrusted block exists at all, which would swallow both claims into one
+    // unattributable "sentinel missing" — and the second would never be reached.
+    // Substring checks move on their own, so a red names which property broke.
     assert!(
-        injected_region(&kickoff).contains("Still injected."),
-        "a legacy-dir lessons file must still be injected, got: {kickoff}"
+        kickoff.contains("Still injected."),
+        "a legacy-dir lessons file must still be READ, got: {kickoff}"
     );
     assert!(
         kickoff.contains(LEGACY_LESSONS_PATH),
-        "the kickoff must name the file it actually read, got: {kickoff}"
+        "the kickoff must NAME the file it actually read, got: {kickoff}"
+    );
+    // Only now the stronger claim: it is inside the untrusted region, not merely
+    // somewhere in the kickoff.
+    assert!(
+        injected_region(&kickoff).contains("Still injected."),
+        "…and it must sit inside the provenance-framed region, got: {kickoff}"
     );
 }
 
