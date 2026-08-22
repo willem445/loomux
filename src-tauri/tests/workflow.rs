@@ -6292,6 +6292,7 @@ fn gate(require: GateRequire, reviewers: &[&str], also: &[&str]) -> workflow::Ga
         reviewers: reviewers.iter().map(|s| s.to_string()).collect(),
         also: also.iter().map(|s| s.to_string()).collect(),
         max_diff_lines: None,
+        routing: Vec::new(),
     }
 }
 
@@ -6865,6 +6866,7 @@ fn check_diff_size_is_the_one_definition_of_too_big() {
         reviewers: vec!["r".into()],
         also: vec![],
         max_diff_lines: limit,
+        routing: Vec::new(),
     };
     use workflow::DiffSizeVerdict as V;
     assert_eq!(workflow::check_diff_size(&with(Some(800)), Some(799)), V::Ok);
