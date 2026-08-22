@@ -1722,6 +1722,36 @@ mod tests {
         // no-op, which is what keeps every pre-#1176 repo on its old path.
         let plain = GateSpec::Declared(gate(&["rev-a"], &[]));
         assert_eq!(recheck_gate(&plain, &only_a, Some("NEW"), &with(None)), GateRecheck::Ok);
+
+        // RE-STALING APPLIES PER REQUIRED REVIEWER, routed or declared (#1176
+        // AC4). It is not a separate mechanism and must not become one: a routed
+        // lane is in the effective gate's reviewer list by the time
+        // `evaluate_merge_gate` runs, so "a pass only counts for the revision it
+        // reviewed" covers it for free. This pins that the free thing is real.
+        let stale_ui: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", ""),
+            verdict("rev-ui", Verdict::Pass, "OLD", ""),
+        ]
+        .into();
+        match recheck_gate(&spec, &stale_ui, Some("NEW"), &with(files(&["src/app.ts"]))) {
+            GateRecheck::Reviewers(GateOutcome::Short { stale, outstanding, .. }) => {
+                assert_eq!(stale, vec!["rev-ui".to_string()], "the routed lane's pass went stale");
+                assert!(outstanding.is_empty(), "it HAS voted — just not on this revision");
+            }
+            other => panic!("a routed lane's stale pass must not open the gate: {other:?}"),
+        }
+        // …and a routed lane's BLOCKING verdict beats the declared lane's pass,
+        // whatever revision it was recorded against — blockers are
+        // revision-independent for a routed reviewer too.
+        let blocked: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", ""),
+            verdict("rev-ui", Verdict::Fail, "OLD", ""),
+        ]
+        .into();
+        assert_eq!(
+            recheck_gate(&spec, &blocked, Some("NEW"), &with(files(&["src/app.ts"]))),
+            GateRecheck::Reviewers(GateOutcome::Blocked { blocking: vec!["rev-ui".into()] })
+        );
     }
 
     #[test]
