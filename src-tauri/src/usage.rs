@@ -450,9 +450,12 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
     // so peak live bytes are one line rather than the whole file. What still
     // scales with the session is the parser's message-id dedupe set, which is
     // ids only — kilobytes where this was tens of megabytes.
-    Some(parse_claude_transcript_lines(
-        BufReader::new(file).lines().map_while(Result::ok),
-    ))
+    let mut text = String::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    Some(parse_claude_transcript(&text))
 }
 
 // ---------------------------------------------------------------------------
