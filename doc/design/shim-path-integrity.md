@@ -164,7 +164,7 @@ No batch quoting fixes this. Measured against that exact argument:
 
 | delegator form | result |
 | --- | --- |
-| `"%LOOMUX_SH%" "%~dp0git" %*` (shipped) | `'merge)$' is not recognized` |
+| `"%ORRERIX_SH%" "%~dp0git" %*` (shipped) | `'merge)$' is not recognized` |
 | `set "ARGS=%*"` + `setlocal EnableDelayedExpansion` + `!ARGS!` | `'merge)$' is not recognized` |
 | per-argument `%~1` re-quoting loop | `'merge)$' is not recognized` |
 | native `git.exe`, same argument | `arg3=[^branch\.(remote\|merge)$]` — intact |
