@@ -214,7 +214,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $name = "loomux-$($env:TAG -replace '^v', '')-x64.pdb.zip"
-          Compress-Archive -Path target/release/loomux.pdb -DestinationPath $name -CompressionLevel Optimal
+          Compress-Archive -Path target/release/loomux.pdb -DestinationPath $name -CompressionLevel Optimal -Force
           "name=$name" >> $env:GITHUB_OUTPUT
 
       # Uploaded BY RELEASE ID, never by a tag lookup — the draft this run
@@ -222,6 +222,10 @@ jobs:
       # other release-touching step here (a tag lookup cannot even see a
       # draft reliably, and picking the wrong draft is precisely the
       # incident). tauri-action attaches its bundles to this same id.
+      #
+      # #282 has a second half, and it is in the script below: the write has
+      # to survive a RE-RUN against an already-populated draft. Addressing by
+      # id without that only gets you to the right release to fail against.
       - name: Attach the debug symbols to the release
         if: matrix.platform == 'windows-latest'
         uses: actions/github-script@v7
@@ -232,10 +236,50 @@ jobs:
           script: |
             const fs = require("fs")
             const name = process.env.ASSET
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const release_id = Number(process.env.RELEASE_ID)
+
+            // DELETE FIRST — do not simplify this away.
+            //
+            // POST /releases/{id}/assets returns 422 `already_exists` when
+            // the release already carries an asset of this name; it never
+            // overwrites. Without the delete, ANY re-run of this leg against
+            // a release that already got the zip throws here, fails `build`,
+            // skips `promote`, and strands the release in draft until a human
+            // removes the asset by hand.
+            //
+            // That is the documented recovery path, not an edge case:
+            // `create-release` above contemplates "Re-run all jobs" against an
+            // existing release id, the `concurrency` note contemplates a manual
+            // re-trigger, and the release SKILL.md says to re-run a failed
+            // matrix leg. This step is the LAST one in the leg, so by the time
+            // anything else fails the upload has usually already happened.
+            //
+            // tauri-action deletes before uploading for exactly this reason, so
+            // every BUNDLE already survives a re-run. This makes the symbols
+            // survive one too, instead of being the single asset that wedges
+            // the release. (per_page 100 covers a release that holds ~10.)
+            const { data: assets } = await github.rest.repos.listReleaseAssets({
+              owner,
+              repo,
+              release_id,
+              per_page: 100,
+            })
+            const existing = assets.find((a) => a.name === name)
+            if (existing) {
+              core.info(`Replacing existing ${name} (asset ${existing.id})`)
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: existing.id,
+              })
+            }
+
             await github.rest.repos.uploadReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: Number(process.env.RELEASE_ID),
+              owner,
+              repo,
+              release_id,
               name,
               headers: {
                 "content-type": "application/zip",
