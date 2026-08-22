@@ -145,6 +145,24 @@ fn u64_field(usage: &Value, key: &str) -> u64 {
 ///   switched models is priced correctly; if no message used a priced model,
 ///   `cost_usd` is `None`.
 pub fn parse_claude_transcript(text: &str) -> SessionUsage {
+    parse_claude_transcript_lines(text.lines())
+}
+
+/// [`parse_claude_transcript`] over a LINE ITERATOR instead of one `&str`.
+///
+/// Same rules, same result — the `&str` form is literally this function fed
+/// `text.lines()`, so the two cannot drift. It exists because the caller that
+/// reads a transcript off disk must never hold the whole file: see
+/// [`claude_session_usage_in`] and #1218.
+///
+/// The fold was ALREADY per-line; nothing but the source of the lines
+/// changed. Memory is bounded by the longest single line plus the dedupe set
+/// of message ids — not by the file.
+pub fn parse_claude_transcript_lines<I, S>(lines: I) -> SessionUsage
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut totals = TokenUsage::default();
     let mut cost = 0.0f64;
     let mut any_priced = false;
@@ -152,8 +170,8 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
     // Track the priced model with the most output tokens, for display.
     let mut best_model: Option<(String, u64)> = None;
 
-    for line in text.lines() {
-        let line = line.trim();
+    for line in lines {
+        let line = line.as_ref().trim();
         if line.is_empty() {
             continue;
         }
@@ -410,14 +428,31 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
     let session = PathSegment::parse(session_id).ok()?;
     let path = claude_transcript_path(root, &session)?;
     let file = fs::File::open(&path).ok()?;
-    // Read the whole file line by line rather than into one big string: these
-    // transcripts can be large, and we only keep running totals.
-    let mut text = String::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        text.push_str(&line);
-        text.push('\n');
-    }
-    Some(parse_claude_transcript(&text))
+    // STREAM it — never materialize the transcript (#1218).
+    //
+    // This used to build one `String` holding the whole file, under a comment
+    // claiming it did the opposite of what it did. That was `read_to_string`
+    // with extra steps, and it is what killed the app three times: a
+    // multi-day agent transcript passes 32 MiB, `String`'s backing `Vec<u8>`
+    // grows by DOUBLING, and an infallible `Vec` grow whose allocation fails
+    // calls `handle_alloc_error`, which aborts the process immediately. That
+    // abort never enters `std::panicking`, so the panic hook does not run and
+    // NOTHING is written — no crash log, no breadcrumb. Both 1.2.0-beta1
+    // dumps are that exact abort, one asking for 64 MiB and one for 128 MiB,
+    // on a machine whose commit charge was pinned at its limit.
+    //
+    // It is on the app's hottest poll: `compute_group_usage` runs this for
+    // every live agent, at most once per `USAGE_POLL_MAX_AGE` (1 s). So the
+    // old code allocated, filled and freed every agent's entire transcript
+    // about once a second.
+    //
+    // `lines()` yields one `String` at a time and drops it before the next,
+    // so peak live bytes are one line rather than the whole file. What still
+    // scales with the session is the parser's message-id dedupe set, which is
+    // ids only — kilobytes where this was tens of megabytes.
+    Some(parse_claude_transcript_lines(
+        BufReader::new(file).lines().map_while(Result::ok),
+    ))
 }
 
 // ---------------------------------------------------------------------------
