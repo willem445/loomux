@@ -52319,3 +52319,635 @@ fn a_long_task_title_shortens_into_the_auto_raised_text_rather_than_losing_the_i
         "Short one — parked in human-testing for your look"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Board WIP limits (#1175 / #1170 A2)
+//
+// Appended as one block rather than folded in beside the other board tests:
+// #1156 is in flight on this same file, and a contiguous tail is the shape that
+// rebases cleanly. The fixtures below deliberately do NOT reuse `board_with`,
+// which creates its group on a fake repo with plain `rails()` — no
+// `advanced_orchestrator`, no workflow file — so every cap would read as "the
+// repo declares nothing" and every assertion here would pass against a feature
+// that had never run. That is the trap `repo_with_resources` documents for the
+// lock suite, and it is the same one here.
+// ---------------------------------------------------------------------------
+
+/// A repo whose `.loomux/workflow.yml` declares `body` (a `board:` block).
+fn repo_with_board(tag: &str, body: &str) -> std::path::PathBuf {
+    let repo = scratch_dir(tag);
+    fs::create_dir_all(repo.join(".loomux")).unwrap();
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        format!(
+            "version: {}\n\
+             blocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\n\
+             {body}",
+            workflow::SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+    // The fixture asserts its own validity: a file that never parsed would
+    // otherwise fail the caller's assertion as "the limits did nothing".
+    let loaded = workflow::load_workflow(repo.to_str().unwrap());
+    assert!(
+        matches!(&loaded, Ok(Some(wf)) if !wf.board.wip.is_empty()),
+        "fixture must parse with a non-empty board.wip block, got {loaded:?}"
+    );
+    repo
+}
+
+/// A group on a repo declaring `body`, with `titles` already on its board.
+/// Every row is created by an AGENT write, which is what a real board is.
+fn wip_board(tag: &str, body: &str, titles: &[&str]) -> (OrchRegistry, tempfile::TempDir, GroupId) {
+    let (reg, dir) = test_registry();
+    let repo = repo_with_board(tag, body);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    for title in titles {
+        reg.upsert_task(&g.id, "orch", None, patch(Some(title), None, None)).unwrap();
+    }
+    (reg, dir, g.id)
+}
+
+/// `review: 2`, warn posture (no `enforce:` key at all — the default).
+const REVIEW_TWO_WARN: &str = "board:\n  wip:\n    review: 2\n";
+/// The same cap, refusing agent writes.
+const REVIEW_TWO_ENFORCED: &str = "board:\n  wip:\n    review: 2\n  enforce: true\n";
+
+fn status_patch(status: &str) -> TaskPatch {
+    TaskPatch { status: Some(status.into()), ..Default::default() }
+}
+
+fn wip_audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
+    reg.audit_log(group).into_iter().map(|e| e.action).collect()
+}
+
+fn wip_statuses(reg: &OrchRegistry, group: &GroupId) -> Vec<(String, String)> {
+    reg.tasks(group).into_iter().map(|t| (t.id, t.status)).collect()
+}
+
+/// The absent-block guarantee (acceptance criterion 1): a repo that declares no
+/// `board:` block behaves exactly as it did before this feature existed.
+///
+/// Asserted on the two things that could betray it — a refusal, and an audit
+/// row — rather than on "it did not crash": the failure mode of an opt-in
+/// feature is that it is quietly always-on, and both of those are how that
+/// would show.
+#[test]
+fn a_board_with_no_wip_block_never_refuses_and_never_audits_a_crossing() {
+    let (reg, _d) = test_registry();
+    let g = board_with(&reg, &["a", "b", "c", "d", "e"]);
+    for t in ["t-1", "t-2", "t-3", "t-4", "t-5"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review"))
+            .unwrap_or_else(|e| panic!("{t} into review must land with no caps declared: {e}"));
+    }
+    assert_eq!(
+        reg.tasks(&g).iter().filter(|t| t.status == "review").count(),
+        5,
+        "five rows in review, because nothing capped it"
+    );
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "a group with no caps must not audit a crossing — there is no cap to cross"
+    );
+    assert!(
+        reg.wip_status_for_agents(&g).is_empty(),
+        "…and list_tasks reports no caps, rather than inventing defaults"
+    );
+}
+
+/// Warn is the DEFAULT posture (acceptance criterion 2): the write lands, and
+/// the crossing is both audited and delivered to the orchestrator's pane.
+///
+/// The notice matters more than it looks: under `enforce: false` it is the
+/// ONLY effect the feature has, so a warn mode that audits but never tells
+/// anyone is a feature that does nothing at all.
+#[test]
+fn a_warn_mode_crossing_lands_and_is_both_audited_and_announced() {
+    let (reg, _d, g) = wip_board("wip-warn", REVIEW_TWO_WARN, &["a", "b", "c"]);
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "run", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 71);
+
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "filling a cap to its limit is not crossing it — 2 of 2 is what the repo asked for"
+    );
+
+    let third = reg.upsert_task(&g, "orch", Some("t-3"), status_patch("review"));
+    assert!(third.is_ok(), "warn mode LANDS the write: {third:?}");
+    assert_eq!(
+        reg.get_task(&g, "t-3").unwrap().status,
+        "review",
+        "…and the row really is in review, not silently left behind"
+    );
+    let crossing = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "task-wip-crossed")
+        .expect("a landed crossing is audited, or the durable record cannot show the board went over");
+    assert_eq!(crossing.detail["status"], "review");
+    assert_eq!(crossing.detail["limit"], 2);
+    assert_eq!(crossing.detail["count"], 3);
+    assert_eq!(crossing.detail["enforce"], false);
+    assert_eq!(crossing.detail["origin"], "agent");
+
+    let notices = delivered_texts(&reg, &g);
+    assert!(
+        notices.iter().any(|t| t.contains("WIP limit crossed") && t.contains("review")),
+        "the orchestrator must be TOLD — under enforce:false the notice is the whole feature: {notices:?}"
+    );
+}
+
+/// `enforce: true` (acceptance criterion 3): an agent entry past the cap is
+/// refused, the refusal names what a reader needs to act on, and — the part
+/// that is easy to get wrong — the board is left exactly as it was.
+#[test]
+fn an_enforced_cap_refuses_an_agent_entry_and_writes_nothing() {
+    let (reg, _d, g) = wip_board("wip-enforce", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    let before = wip_statuses(&reg, &g);
+
+    let err = reg
+        .upsert_task(&g, "orch", Some("t-3"), status_patch("review"))
+        .expect_err("the third entry into a cap of 2 must be refused");
+    // Actionable, not merely correct: the cap, the count, and WHICH rows are in
+    // the way, so "finish one of these" needs no second call to act on.
+    assert!(err.contains("review"), "the refusal names the status: {err}");
+    assert!(err.contains("capped at 2"), "…the cap: {err}");
+    assert!(err.contains("t-1") && err.contains("t-2"), "…and the rows already there: {err}");
+    assert!(err.contains("t-3"), "…and the row it refused: {err}");
+    assert!(
+        err.contains("board.wip.review"),
+        "…and where the cap is declared, so it can be changed rather than fought: {err}"
+    );
+
+    assert_eq!(wip_statuses(&reg, &g), before, "a refused write leaves the board byte-for-byte");
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "a refusal is not a crossing: auditing one would be the log claiming a write that never happened"
+    );
+}
+
+/// The design call the issue asked to be argued, pinned as behaviour: under the
+/// SAME `enforce: true` config that refuses the agent above, the human's own
+/// board edit lands.
+///
+/// Pinned as a PAIR against the agent refusal, in one test, on one config: the
+/// property is a difference between two origins, and two tests on two fixtures
+/// could both pass while the difference itself was gone.
+#[test]
+fn an_enforced_cap_never_refuses_the_human_even_where_it_refuses_the_agent() {
+    let (reg, _d, g) = wip_board("wip-human", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "run", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 72);
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    assert!(
+        reg.upsert_task(&g, "orch", Some("t-3"), status_patch("review")).is_err(),
+        "control: the agent IS refused on this config, or the human case below proves nothing"
+    );
+
+    let human = reg.upsert_task_by_human(&g, "human", Some("t-3"), status_patch("review"));
+    assert!(human.is_ok(), "the human's own board edit is never bounced by a cap: {human:?}");
+    assert_eq!(reg.get_task(&g, "t-3").unwrap().status, "review");
+
+    // Warned, though — never silently exempt. The orchestrator has to learn the
+    // board moved past a cap whoever moved it.
+    let crossing = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "task-wip-crossed")
+        .expect("the human's crossing is audited like anyone's");
+    assert_eq!(crossing.detail["origin"], "human");
+    assert_eq!(crossing.detail["enforce"], true, "…on a config that DOES enforce, for agents");
+
+    // …and the NOTICE says whose edit it was, which is the half that changes
+    // what the orchestrator does about it: its own crossing is its to unwind,
+    // the human's is a board to re-read rather than argue with (rev-1 N5).
+    let notices = delivered_texts(&reg, &g);
+    assert!(
+        notices
+            .iter()
+            .any(|t| t.contains("WIP limit crossed") && t.contains("the human's board edit to t-3")),
+        "the crossing notice must name the human as its author: {notices:?}"
+    );
+}
+
+/// **A cap is a door, not a fence** — the half of `wip_breaches`' test that says
+/// a write is judged only when it RAISES a status's count. That is what keeps a
+/// status already over its limit workable rather than frozen: an edit to a row
+/// sitting in one, a re-assertion of the status it already has, and every move
+/// OUT all leave the count where it is or lower, so none of them is refused.
+///
+/// Three cases in one test because they are one property, and each alone is a
+/// rule a reader would reasonably doubt. (The docstring here used to state the
+/// superseded "only an ENTRY is judged" rule — an entry is still the common
+/// case, which is why the name keeps the word, but it is no longer what the
+/// guard decides on: rev-1 B1 replaced it with the before/after comparison.)
+#[test]
+fn an_over_limit_status_still_takes_edits_and_always_lets_work_out() {
+    let (reg, _d, g) = wip_board("wip-entry", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+
+    // (a) A write to a row ALREADY in the full status. It adds nothing to the
+    // count, so refusing it would freeze every note and PR ref on the work the
+    // cap is asking to be finished — the exact opposite of the point.
+    let note = reg.upsert_task(
+        &g,
+        "orch",
+        Some("t-1"),
+        TaskPatch { note: Some("reviewer engaged".into()), ..Default::default() },
+    );
+    assert!(note.is_ok(), "an edit to a row already in a full status must land: {note:?}");
+
+    // (b) Re-asserting the same status is not an entry either.
+    assert!(
+        reg.upsert_task(&g, "orch", Some("t-1"), status_patch("review")).is_ok(),
+        "re-writing the status a row already has moves nothing"
+    );
+
+    // (c) The way OUT is never blocked — including when the board is already
+    // over the cap, which is how a lowered cap or a human edit unwinds.
+    reg.upsert_task_by_human(&g, "human", Some("t-3"), status_patch("review")).unwrap();
+    assert_eq!(reg.tasks(&g).iter().filter(|t| t.status == "review").count(), 3, "over the cap");
+    assert!(
+        reg.upsert_task(&g, "orch", Some("t-2"), status_patch("pr")).is_ok(),
+        "moving work OUT of an over-limit status must always land, or the board deadlocks"
+    );
+}
+
+/// A `claim` is an entry into `in-progress`, and it is the entry the whole
+/// feature is about: an orchestrator that keeps starting new tasks while review
+/// debt piles up is exactly a sequence of claims.
+///
+/// The claim path reaches the status by its own route (it does not set
+/// `patch.status`), so a check that only read `patch.status` would pass every
+/// other test in this file and leave the motivating case unguarded.
+#[test]
+fn a_claim_is_an_entry_into_in_progress_and_an_enforced_cap_refuses_it() {
+    let (reg, _d, g) =
+        wip_board("wip-claim", "board:\n  wip:\n    in-progress: 1\n  enforce: true\n", &["a", "b"]);
+    reg.upsert_task(
+        &g,
+        "orch",
+        Some("t-1"),
+        TaskPatch { assignee: Some("w-1".into()), claim: true, ..Default::default() },
+    )
+    .expect("the first claim fills the cap");
+
+    let err = reg
+        .upsert_task(
+            &g,
+            "orch",
+            Some("t-2"),
+            TaskPatch { assignee: Some("w-2".into()), claim: true, ..Default::default() },
+        )
+        .expect_err("a second claim past in-progress: 1 must be refused");
+    assert!(err.contains("in-progress"), "the refusal names the status a claim enters: {err}");
+    let t2 = reg.get_task(&g, "t-2").unwrap();
+    assert_eq!(t2.status, "queued", "the refused claim left the row queued");
+    assert_eq!(t2.assignee, None, "…and unassigned — a refused claim assigns nobody");
+}
+
+/// A cap counts LEAF rows. Two halves, both load-bearing: a container sitting
+/// in the capped status does not consume a slot, and moving a container into a
+/// full status is not refused.
+///
+/// Without this, `in-progress: 4` means four items on a flat board and fewer on
+/// a nested one — and #1156 is making nesting the normal shape.
+#[test]
+fn a_wip_cap_counts_leaf_rows_so_a_container_never_consumes_a_slot() {
+    let (reg, _d, g) =
+        wip_board("wip-leaf", REVIEW_TWO_ENFORCED, &["epic", "slice one", "slice two"]);
+    // t-2 and t-3 sit inside t-1, which makes t-1 a container.
+    for t in ["t-2", "t-3"] {
+        reg.upsert_task(
+            &g,
+            "orch",
+            Some(t),
+            TaskPatch { parent: Some("t-1".into()), ..Default::default() },
+        )
+        .unwrap();
+    }
+    // The container goes to review first. If containers counted, it would eat
+    // one of the two slots and the second slice below would be refused.
+    reg.upsert_task(&g, "orch", Some("t-1"), status_patch("review")).unwrap();
+    for t in ["t-2", "t-3"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review"))
+            .unwrap_or_else(|e| panic!("{t} is the 1st/2nd LEAF in review and must land: {e}"));
+    }
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "two leaves under a cap of 2 is not a crossing, whatever their container is doing"
+    );
+
+    // The other half: a container's own move is exempt from the check, so a
+    // full status never traps the rollup row above the work in it.
+    reg.upsert_task(&g, "orch", Some("t-1"), status_patch("queued")).unwrap();
+    assert!(
+        reg.upsert_task(&g, "orch", Some("t-1"), status_patch("review")).is_ok(),
+        "a container may enter a full status: what it carries is counted where the work is"
+    );
+}
+
+/// Acceptance criterion 4 — the counts the board renders, and the same rows the
+/// orchestrator reads back from `list_tasks`. One source, asserted through both
+/// surfaces, because a chip that disagreed with the refusal would be worse than
+/// no chip.
+#[test]
+fn the_caps_and_their_live_counts_reach_both_the_board_and_the_agent() {
+    let (reg, _d, g) = wip_board("wip-counts", REVIEW_TWO_WARN, &["a", "b", "c"]);
+    reg.upsert_task(&g, "orch", Some("t-1"), status_patch("review")).unwrap();
+    // A container in review, to pin that the DISPLAYED count uses the same
+    // leaf-only rule the refusal does rather than a second tally.
+    reg.upsert_task(
+        &g,
+        "orch",
+        Some("t-3"),
+        TaskPatch { parent: Some("t-2".into()), ..Default::default() },
+    )
+    .unwrap();
+    reg.upsert_task(&g, "orch", Some("t-2"), status_patch("review")).unwrap();
+
+    let rows = reg.wip_status_for_agents(&g);
+    assert_eq!(rows.len(), 1, "one declared cap, one row: {rows:?}");
+    assert_eq!(rows[0]["status"], "review");
+    assert_eq!(rows[0]["limit"], 2);
+    assert_eq!(
+        rows[0]["count"], 1,
+        "t-1 is the only LEAF in review — t-2 is a container, and counting it would make the \
+         chip say 2/2 on a board the seam would still let another row into"
+    );
+    assert_eq!(rows[0]["enforce"], false);
+
+    let status = reg.workflow_status(&g);
+    assert_eq!(status["wip"], serde_json::Value::Array(rows), "the board reads the same rows");
+}
+
+/// A refusal names up to `WIP_NAMED_OCCUPANTS` rows, and **says so when there
+/// are more**. A truncated list that did not admit it reads as the whole set —
+/// "finish one of these four" on a status holding six — which is a refusal that
+/// misdescribes the board it is refusing on.
+#[test]
+fn a_refusal_that_cannot_name_every_occupant_says_how_many_it_left_out() {
+    let (reg, _d, g) = wip_board(
+        "wip-trunc",
+        "board:\n  wip:\n    review: 6\n  enforce: true\n",
+        &["a", "b", "c", "d", "e", "f", "g"],
+    );
+    for t in ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    let err = reg
+        .upsert_task(&g, "orch", Some("t-7"), status_patch("review"))
+        .expect_err("the seventh entry into a cap of 6 must be refused");
+    assert!(
+        err.contains("holding 7"),
+        "the count is the REAL post-write one, not the named subset: {err}"
+    );
+    assert!(err.contains("t-1") && err.contains("t-4"), "the first four are named: {err}");
+    assert!(
+        err.contains("and 2 more"),
+        "…and the two it could not name are admitted rather than dropped: {err}"
+    );
+}
+
+/// **rev-1 B1: the guard reads the whole post-write board, by one rule.**
+///
+/// The first cut derived the target status from the patch and the container
+/// topology from the un-mutated board, which is CLAUDE.md's "a guard reads every
+/// one of its inputs by one rule" violated exactly — and it failed in BOTH
+/// directions.
+///
+/// The four crossings of {this row reparented in / out} × {the target status
+/// full / not} are **four separate tests**, deliberately, and not four cases in
+/// one: a red evidences only the assertion it reached and moved, and the first
+/// cut of this WAS one test — whose panic on case (a) meant the round evidenced
+/// nothing at all about (b) or (c). Split, each face reddens on its own
+/// mutation and the negative control is visibly untouched.
+///
+/// (a) The false REFUSAL. `review: 2` full with two leaves; the write nests the
+/// new row under one of them, which turns that row into a container and frees
+/// the slot in the same write. The old guard counted the pre-write leaves and
+/// refused, naming as an occupant the very row it was about to stop counting —
+/// and `upsert_task`'s own tool description recommends exactly this call shape.
+#[test]
+fn nesting_a_row_as_you_move_it_frees_the_slot_its_new_container_held() {
+    let (reg, _d, g) = wip_board("wip-b1-in", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    let landed = reg.upsert_task(
+        &g,
+        "orch",
+        Some("t-3"),
+        TaskPatch {
+            parent: Some("t-2".into()),
+            status: Some("review".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        landed.is_ok(),
+        "t-2 becomes a container in this very write, so review holds two LEAVES afterwards \
+         (t-1, t-3) and the write is within the cap: {landed:?}"
+    );
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "…and it is not a crossing either — warn mode must not announce one"
+    );
+}
+
+/// (b) The false PERMIT, and the worst of the four: clearing a `parent` while
+/// entering a status adds TWO leaves in one write — the row arriving, and the
+/// ex-container it leaves behind becoming countable. The old guard counted one
+/// and let it through with no refusal, no audit and **no notice**, which under
+/// the default warn posture is the feature failing at the only thing it does.
+#[test]
+fn clearing_a_parent_while_entering_a_status_counts_the_container_left_behind() {
+    let (reg, _d, g) = wip_board("wip-b1-out", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
+    reg.upsert_task(&g, "orch", Some("t-4"), parent_patch("t-2")).unwrap();
+    for t in ["t-1", "t-2"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    assert_eq!(
+        reg.wip_status_for_agents(&g)[0]["count"],
+        1,
+        "control: t-2 is a container, so review holds one leaf and there is room"
+    );
+    let err = reg
+        .upsert_task(
+            &g,
+            "orch",
+            Some("t-4"),
+            TaskPatch {
+                parent: Some(String::new()), // the clear
+                status: Some("review".into()),
+                ..Default::default()
+            },
+        )
+        .expect_err("clearing the parent AND entering review adds two leaves to a cap of 2");
+    assert!(err.contains("holding 3"), "the refusal counts the post-write board: {err}");
+    let t4 = reg.get_task(&g, "t-4").unwrap();
+    assert_eq!(t4.status, "queued", "and the refused write left the row alone");
+    assert_eq!(t4.parent.as_deref(), Some("t-2"), "…parent included");
+}
+
+/// (c) A parent-ONLY write can push a status over with no status in the patch at
+/// all: promoting a container's last child to TOP LEVEL turns that container
+/// into countable work, and nothing stops being counted in its place. (Moving it
+/// under another row in the same status would NOT bite — that is case (a).) The
+/// old `may_enter` predicate never even read the policy for this shape.
+#[test]
+fn a_parent_only_write_that_frees_a_container_into_a_full_status_is_refused() {
+    let (reg, _d, g) = wip_board("wip-b1-parent-only", REVIEW_TWO_ENFORCED, &["a", "b", "c", "d"]);
+    reg.upsert_task(&g, "orch", Some("t-3"), parent_patch("t-2")).unwrap();
+    for t in ["t-1", "t-2", "t-4"] {
+        reg.upsert_task(&g, "orch", Some(t), status_patch("review")).unwrap();
+    }
+    assert_eq!(
+        reg.wip_status_for_agents(&g)[0]["count"],
+        2,
+        "control: t-1 and t-4 are the leaves in review; t-2 is a container"
+    );
+    let err = reg
+        .upsert_task(
+            &g,
+            "orch",
+            Some("t-3"),
+            TaskPatch { parent: Some(String::new()), ..Default::default() },
+        )
+        .expect_err("promoting t-2's only child makes t-2 a third leaf in a review capped at 2");
+    assert!(err.contains("review"), "the refusal names the status that went over: {err}");
+    assert!(
+        err.contains("holding 3"),
+        "…and counts the board this write produces, not the one it started from: {err}"
+    );
+}
+
+/// (d) The negative control the three above need: a reparent that moves nothing
+/// into a capped status is not refused, so none of this is a guard that simply
+/// says no to `parent`.
+#[test]
+fn a_reparent_that_touches_no_capped_status_is_never_refused() {
+    let (reg, _d, g) = wip_board("wip-b1-control", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
+    reg.upsert_task(&g, "orch", Some("t-1"), status_patch("review")).unwrap();
+    assert!(
+        reg.upsert_task(&g, "orch", Some("t-3"), parent_patch("t-2")).is_ok(),
+        "a reparent among queued rows touches no cap and must land"
+    );
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "…and announces nothing"
+    );
+}
+
+/// rev-1 N3: the cost claim the PR makes out loud — a write that cannot move a
+/// count does not read the workflow file — pinned on the predicate that decides
+/// it, since the read itself has no observable effect to assert on.
+#[test]
+fn the_wip_guard_reads_the_policy_only_for_a_write_that_could_move_a_count() {
+    let note = TaskPatch { note: Some("just a note".into()), ..Default::default() };
+    assert!(
+        !loomux_lib::orchestration::wip_may_change(false, &note),
+        "a note on an existing row cannot change any count, so it must not pay a YAML parse"
+    );
+    let title = TaskPatch { title: Some("renamed".into()), ..Default::default() };
+    assert!(!loomux_lib::orchestration::wip_may_change(false, &title));
+    let pr = TaskPatch { pr: Some("#9".into()), ..Default::default() };
+    assert!(!loomux_lib::orchestration::wip_may_change(false, &pr));
+
+    // …and every shape that CAN move one does read it. `parent` is the one the
+    // first cut missed (rev-1 B1): it moves no row's status and changes the
+    // counts anyway, by changing which rows are leaves.
+    assert!(loomux_lib::orchestration::wip_may_change(true, &note), "a new row enters a status");
+    assert!(loomux_lib::orchestration::wip_may_change(false, &status_patch("review")));
+    assert!(loomux_lib::orchestration::wip_may_change(false, &parent_patch("t-1")));
+    assert!(loomux_lib::orchestration::wip_may_change(
+        false,
+        &TaskPatch { claim: true, ..Default::default() }
+    ));
+}
+
+
+/// **rev-2 B4: a row this write is ADDING is not part of the board it started
+/// from.**
+///
+/// The pre-write tally used to be taken below the `idx` resolution, which is
+/// where a new row is pushed — so on a create, `before` and `after` both counted
+/// the new row in its born status, agreed, and `wip_breaches` skipped the status
+/// entirely. A `queued:` cap could therefore never fire on task creation: no
+/// refusal under `enforce`, and — worse, because it is the default — no notice
+/// and no audit under warn.
+///
+/// It is exactly `queued` and exactly on creation, because a row born `queued`
+/// and left there is the only shape where the born status and the final status
+/// are the same. That is precisely why no existing fixture caught it: every
+/// other test here caps `review` or `in-progress`, which a new row only ever
+/// reaches by moving off its born status.
+#[test]
+fn creating_a_row_into_a_full_born_status_is_refused() {
+    let (reg, _d, g) =
+        wip_board("wip-b4-create", "board:\n  wip:\n    queued: 2\n  enforce: true\n", &["a", "b"]);
+    assert_eq!(reg.tasks(&g).len(), 2, "the fixture filled the cap exactly, and was allowed to");
+
+    let err = reg
+        .upsert_task(&g, "orch", None, patch(Some("third"), None, None))
+        .expect_err("a third row born into a queued capped at 2 must be refused");
+    assert!(err.contains("queued"), "the refusal names the born status: {err}");
+    assert!(err.contains("holding 3"), "…and counts the board this write would produce: {err}");
+    assert_eq!(
+        reg.tasks(&g).len(),
+        2,
+        "and the refused create wrote nothing — no half-added row survives the refusal"
+    );
+}
+
+/// The negative control B4's pin needs: creating into a capped status with room
+/// still lands. Without it the test above passes on a guard that refuses every
+/// create, which would be a far worse bug than the one it is pinning.
+#[test]
+fn creating_a_row_into_a_born_status_with_room_still_lands() {
+    let (reg, _d, g) =
+        wip_board("wip-b4-room", "board:\n  wip:\n    queued: 3\n  enforce: true\n", &["a", "b"]);
+    let third = reg.upsert_task(&g, "orch", None, patch(Some("third"), None, None));
+    assert!(third.is_ok(), "the third row fits a queued capped at 3: {third:?}");
+    assert_eq!(reg.tasks(&g).len(), 3);
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "…and filling a cap to its limit is not a crossing"
+    );
+}
+
+/// The same off-by-one under the DEFAULT posture, where the loss is quieter and
+/// therefore worse: warn mode's whole effect is the notice and the audit row, so
+/// a create that skipped the comparison lost the only thing the feature does.
+#[test]
+fn a_create_that_crosses_a_cap_is_announced_in_warn_mode() {
+    let (reg, _d, g) = wip_board("wip-b4-warn", "board:\n  wip:\n    queued: 2\n", &["a", "b"]);
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "run", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 73);
+
+    let third = reg.upsert_task(&g, "orch", None, patch(Some("third"), None, None));
+    assert!(third.is_ok(), "warn mode lands the write: {third:?}");
+    let crossing = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "task-wip-crossed")
+        .expect("a create that puts queued over its cap is audited like any other crossing");
+    assert_eq!(crossing.detail["status"], "queued");
+    assert_eq!(crossing.detail["count"], 3);
+    let notices = delivered_texts(&reg, &g);
+    assert!(
+        notices.iter().any(|t| t.contains("WIP limit crossed") && t.contains("queued")),
+        "…and announced, which under enforce:false is the entire feature: {notices:?}"
+    );
+}

@@ -2373,6 +2373,31 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: 1; min-width: 0; color: var(--ink-dim); font-size: 10.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* Board WIP chips (#1175) — `review 3/3` on the board header, one per cap the
+   repo declares. Three fills, because "full" is the state the practice is
+   about (start nothing new) and "over" additionally means the board is
+   somewhere a cap says it should not be. Under the cap is deliberately quiet:
+   a limit nobody is near should not draw the eye every time the board
+   repaints. */
+.tasks-wip { display: flex; align-items: center; gap: 4px; flex: none; }
+.wip-chip {
+  flex: none; font-size: 9.5px; border-radius: 4px; padding: 1px 6px;
+  background: var(--surface-2); color: var(--ink-dim);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.wip-chip.wip-full {
+  background: color-mix(in srgb, var(--state-attention) 14%, transparent);
+  color: var(--state-attention); font-weight: 600;
+}
+.wip-chip.wip-over {
+  background: color-mix(in srgb, var(--state-danger) 14%, transparent);
+  color: var(--state-danger); font-weight: 600;
+}
+/* An enforced cap refuses an agent's write rather than warning about it, so a
+   full one is a wall and not a nudge. The outline says which it is without
+   spending a second colour channel on it. */
+.wip-chip.wip-enforced.wip-full,
+.wip-chip.wip-enforced.wip-over { outline: 1px solid currentColor; outline-offset: -1px; }
 .tasks-list { flex: 1; overflow-y: auto; padding: 4px 6px 8px; }
 .tasks-list::-webkit-scrollbar { width: 9px; }
 .tasks-list::-webkit-scrollbar-thumb {

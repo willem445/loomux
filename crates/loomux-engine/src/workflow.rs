@@ -105,6 +105,13 @@
 //!   enabled: true          # feature is off and behavior is byte-for-byte
 //!   max_batch: 3           # unchanged. See [`MergeQueuePolicy`].
 //!   checks_timeout_minutes: 60
+//!
+//! board:                   # OPT-IN, default off (#1175). Absent block = no
+//!   wip:                   # limits at all. See [`BoardPolicy`].
+//!     in-progress: 4       # per-status caps on how much work may sit there
+//!     review: 3
+//!   enforce: false         # false (the default) = warn + notify; true =
+//!                          # AGENT writes crossing a cap are refused
 //! ```
 //!
 //! `id` is immutable and human-meaningful and `name` is display-only on
@@ -457,6 +464,69 @@ impl Default for MergeQueuePolicy {
     }
 }
 
+// ── board: per-status WIP limits (#1175 / #1170 A2) ────────────────────────
+
+/// The smallest cap that means anything. `0` would say "nothing may ever enter
+/// this status", which is a *stop*, not a work-in-progress limit — and under
+/// `enforce` it would wedge the board rather than pace it. Refused at parse
+/// time, the posture `merge_queue.max_batch` and `resources.slots` take.
+pub const WIP_LIMIT_MIN: u32 = 1;
+
+/// The one status a cap may **not** name, and the reason it may not.
+///
+/// `done` is terminal and it is the *relief valve*: every other cap is
+/// relieved by work reaching it. A limit there would refuse the very
+/// transition that unblocks the board — the exact inversion of what a WIP
+/// limit is for — so the wire struct simply has no field for it and
+/// `deny_unknown_fields` refuses `done:` with an error naming the statuses
+/// that ARE cappable. Stated as a constant so the docs, the error path and
+/// the test that pins the field set all read the same name.
+pub const WIP_UNCAPPABLE_STATUS: &str = "done";
+
+/// The `board:` block — what a repo declares about how much work may sit in
+/// each board status at once (#1175; the practice is kanban's WIP limit, and
+/// the loomux-specific motivation is in `doc/design/board-wip.md`).
+///
+/// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a
+/// toolchain, a branch, a repo path or an agent: the whole schema is a handful
+/// of integers and one bool, keyed by loomux's own board statuses.
+///
+/// **Restrict-only, like `resources:` before it.** A `board:` block can make a
+/// write wait or warn; it can never grant a capability, and it cannot reach
+/// the capability-closure spine (`blocks:`/`edges:`/`gates:`). The worst a
+/// hostile `.loomux/workflow.yml` can do with it is declare `in-progress: 1`
+/// and slow a group down — and even that only bounces *agent* writes, never
+/// the human's own board edits (see [`BoardPolicy::enforce`]).
+///
+/// **An absent block means the feature is off**: no `board:` at all leaves
+/// [`BoardPolicy::wip`] empty, no write is ever counted, and behavior is
+/// byte-for-byte what it was. Same posture — and the same
+/// `deny_unknown_fields` consequence for older builds — as `merge_queue:`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BoardPolicy {
+    /// Per-status caps, keyed by the board status exactly as it is spelled on
+    /// the wire (`in-progress`, `human-testing`, …). A status **absent from
+    /// this map has no cap** — this is not a map with defaults, it is the set
+    /// of limits the repo actually declared. Empty = the feature is off.
+    ///
+    /// Kept as a map rather than as the wire struct so every consumer
+    /// (accounting, the refusal text, the board's own chips) stays
+    /// status-generic: the closed struct exists to *validate* the names, not
+    /// to be the shape the rest of loomux reasons about.
+    pub wip: BTreeMap<String, u32>,
+    /// **Default false**, which is warn-and-notify. `true` makes an
+    /// **agent-origin** write that would cross a cap a hard refusal.
+    ///
+    /// It never applies to the human's own board edits, under either setting.
+    /// The board's authority is the human's, not a queue discipline — the same
+    /// reason `claim` is deliberately not exposed on the human's board command
+    /// — and a limit a human set for their agents must not bounce the human
+    /// who set it. Their crossing still warns and still audits, so the
+    /// orchestrator learns the board moved; it is only ever the *refusal* that
+    /// is agent-only.
+    pub enforce: bool,
+}
+
 // ── intake: source + label vocabulary (#382 P1) ────────────────────────────
 //
 // Where autonomous work comes from and what its label vocabulary is called —
@@ -649,6 +719,10 @@ pub struct Workflow {
     /// **Empty** when the file declares no `resources:` block — which is what
     /// turns the lock tools off for the group entirely.
     pub resources: BTreeMap<String, ResourcePolicy>,
+    /// Board policy — per-status WIP limits (#1175). Always resolved; the
+    /// default carries **no limits at all**, which is what an absent `board:`
+    /// block means.
+    pub board: BoardPolicy,
 }
 
 impl Workflow {
@@ -909,6 +983,66 @@ struct RawWorkflow {
     /// an ignored line.
     #[serde(default)]
     resources: BTreeMap<String, RawResource>,
+    /// Board policy — per-status WIP limits (#1175). `None` when the file
+    /// declares no `board:` block, which resolves to [`BoardPolicy::default`],
+    /// i.e. **no limits**, and behavior is byte-for-byte unchanged.
+    ///
+    /// Like `intake:`, `merge_queue:` and `resources:`, this block can never
+    /// grant a capability: every field is a bool or a number, there is no
+    /// spelling that names a program, a path, an agent or a branch, and
+    /// `deny_unknown_fields` on [`RawBoard`]/[`RawWip`] makes an attempt at
+    /// one a hard parse error rather than an ignored line.
+    #[serde(default)]
+    board: Option<RawBoard>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawBoard {
+    #[serde(default)]
+    wip: Option<RawWip>,
+    #[serde(default)]
+    enforce: bool,
+}
+
+/// The wire shape of `board.wip` — **one optional field per cappable board
+/// status**, deliberately closed rather than a `BTreeMap<String, u32>`.
+///
+/// A map would accept `in-porgress: 4` and declare a limit on nothing, in
+/// silence, for the lifetime of the file: an open key namespace cannot tell a
+/// typo from a status a newer loomux might have. The closed struct hands that
+/// check to `deny_unknown_fields`, whose error already names every field it
+/// *would* have accepted — so the repo that misspells a status is told which
+/// spellings exist, at parse time, without this module writing the check.
+///
+/// The price is that the field list is a second copy of `TASK_STATUSES` (which
+/// lives in `src-tauri`, on the other side of an arrow this crate may not
+/// point back along). It is pinned, not trusted:
+/// `src-tauri/tests/workflow.rs` asserts this struct's serde field names
+/// are exactly `TASK_STATUSES` minus [`WIP_UNCAPPABLE_STATUS`], so a ninth
+/// status reddens rather than quietly arriving uncappable.
+///
+/// `Option<u32>` rather than a defaulted number so "omitted" and "written as
+/// 1" stay distinguishable: the parse refuses a zero, and refusing one the
+/// author never wrote would be an error about nothing (the reasoning
+/// [`RawResource::slots`] states).
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawWip {
+    #[serde(default)]
+    queued: Option<u32>,
+    #[serde(default, rename = "in-progress")]
+    in_progress: Option<u32>,
+    #[serde(default)]
+    review: Option<u32>,
+    #[serde(default)]
+    pr: Option<u32>,
+    #[serde(default)]
+    prototype: Option<u32>,
+    #[serde(default, rename = "human-testing")]
+    human_testing: Option<u32>,
+    #[serde(default)]
+    blocked: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1097,7 +1231,20 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
     let merge_queue =
         RawMergeQueue { enabled: true, max_batch: Some(3), checks_timeout_minutes: Some(60) };
     let resource = RawResource { slots: Some(1), max_hold_minutes: Some(30) };
+    // Every field populated, per this function's docblock: a `None` here would
+    // drop the key from the serialization and shrink the manifest silently.
+    let wip = RawWip {
+        queued: Some(8),
+        in_progress: Some(4),
+        review: Some(3),
+        pr: Some(3),
+        prototype: Some(2),
+        human_testing: Some(2),
+        blocked: Some(4),
+    };
     let mut out = BTreeMap::new();
+    out.insert("board.wip".to_string(), keys_of("board.wip", &wip));
+    let board = RawBoard { wip: Some(wip), enforce: true };
     // Read before `workflow` takes ownership of its own copies below — the point
     // of populating them there is that no field of the top-level type is left at
     // a zero value.
@@ -1108,6 +1255,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
     out.insert("intake.labels".to_string(), keys_of("intake.labels", &labels));
     out.insert("merge_queue".to_string(), keys_of("merge_queue", &merge_queue));
     out.insert("resource".to_string(), keys_of("resource", &resource));
+    out.insert("board".to_string(), keys_of("board", &board));
     let workflow = RawWorkflow {
         version: SCHEMA_VERSION,
         name: "w".into(),
@@ -1118,6 +1266,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         intake: Some(intake),
         merge_queue: Some(merge_queue),
         resources: BTreeMap::from([("build".to_string(), resource)]),
+        board: Some(board),
     };
     out.insert("workflow".to_string(), keys_of("workflow", &workflow));
     out
@@ -1184,6 +1333,13 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
         ("intake.labels", wire_defaults::<RawIntakeLabels>("{}", &[])),
         ("merge_queue", wire_defaults::<RawMergeQueue>("{}", &[])),
         ("resource", wire_defaults::<RawResource>("{}", &[])),
+        ("board", wire_defaults::<RawBoard>("{}", &[])),
+        // Deliberately contributes nothing: every field of `RawWip` is an
+        // `Option` with no wire default, because an omitted status is the
+        // ABSENCE of a cap and not a cap with a default value. Listed anyway
+        // so a field that ever does gain one is picked up here rather than
+        // needing this loop remembered.
+        ("board.wip", wire_defaults::<RawWip>("{}", &[])),
     ] {
         for (field, value) in defaults {
             // A nested section's own default is the section, not a value a form
@@ -1249,6 +1405,17 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("resource.max_hold_minutes", "max", json!(RESOURCE_MAX_HOLD_MINUTES_MAX));
     // Cardinality: the only section with a cap on how many entries it may hold.
     fact("workflow.resources", "max_entries", json!(RESOURCES_MAX));
+    // Every WIP cap has the same floor and deliberately no ceiling: a limit
+    // above the board's own size degenerates to "no limit", which is what the
+    // author asked for, so there is nothing for loomux to refuse (the posture
+    // `merge_queue.max_batch` takes, and the opposite of `resources.slots`,
+    // where the ceiling is a legibility claim about serialization). Derived
+    // from the wire struct's own field list rather than re-typed here — the
+    // eighth status must not arrive bound-less because this loop was written
+    // out by hand.
+    for status in workflow_schema_keys().get("board.wip").into_iter().flatten() {
+        fact(&format!("board.wip.{status}"), "min", json!(WIP_LIMIT_MIN));
+    }
 
     out
 }
@@ -2146,6 +2313,49 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         resources.insert(name, ResourcePolicy { slots, max_hold_minutes });
     }
 
+    // Board policy — per-status WIP limits (#1175). `None` (no `board:` block
+    // at all) resolves to the default, which declares no limits: the feature
+    // is off and behavior is byte-for-byte unchanged.
+    //
+    // A bad value is a hard ERROR, never a silent substitution — the posture
+    // `merge_queue.max_batch` and `resources.slots` take, for the reason §11.2
+    // gives: a repo that wrote `review: 0` believes something about how its
+    // board paces, and quietly handing it "no limit" would leave that belief
+    // in place while the behaviour went the other way.
+    //
+    // The declared caps are read back out THROUGH serde rather than by
+    // matching on `RawWip`'s seven fields here. Hand-listing them a second
+    // time is how the eighth status would arrive parsed-but-unenforced: the
+    // struct is the one place the field set is written down, and this loop
+    // reads whatever that struct accepted.
+    let board = match &raw.board {
+        None => BoardPolicy::default(),
+        Some(rb) => {
+            let mut wip: BTreeMap<String, u32> = BTreeMap::new();
+            if let Some(rw) = &rb.wip {
+                let declared = match serde_json::to_value(rw) {
+                    Ok(serde_json::Value::Object(map)) => map,
+                    other => panic!("board.wip: expected a mapping, got {other:?}"),
+                };
+                for (status, value) in declared {
+                    // `null` is the field the document simply never wrote —
+                    // "no cap on this status", which is not a value to check.
+                    let Some(n) = value.as_u64() else { continue };
+                    if n < WIP_LIMIT_MIN as u64 {
+                        errs.push(format!(
+                            "board.wip.{status}: must be at least {WIP_LIMIT_MIN} — a cap of 0 is a \
+                             stop, not a work-in-progress limit, and under `enforce` it would wedge \
+                             the board rather than pace it"
+                        ));
+                        continue;
+                    }
+                    wip.insert(status, n as u32);
+                }
+            }
+            BoardPolicy { wip, enforce: rb.enforce }
+        }
+    };
+
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -2159,6 +2369,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         intake,
         merge_queue,
         resources,
+        board,
     })
 }
 
@@ -3145,6 +3356,33 @@ mod tests {
                 // weaken the human gate. What it CAN do is make an agent wait,
                 // which is the whole of its restrict-only contract.
                 resources: _,
+                // #1175. Confirmed against the rule above before being named
+                // here: `board:` is per-status WIP limits — a handful of
+                // integers keyed by loomux's own board statuses, plus one
+                // bool (`RawBoard`/`RawWip`, both `deny_unknown_fields`). It
+                // names no branch, no reviewer, no program and no agent, and
+                // nothing in the merge/release path reads it. What it CAN do
+                // is make a board write warn, or refuse an AGENT's write —
+                // never a human's, and never a merge.
+                board: _,
+            } = v;
+        }
+        // #1175: the same inventory rule one level down. A field added to
+        // `RawBoard` is a new board policy, and a field added to `RawWip` is a
+        // new cappable status — both are changes a reader of this file must
+        // see, not ones that pass every existing test.
+        fn raw_board_fields(v: RawBoard) {
+            let RawBoard { wip: _, enforce: _ } = v;
+        }
+        fn raw_wip_fields(v: RawWip) {
+            let RawWip {
+                queued: _,
+                in_progress: _,
+                review: _,
+                pr: _,
+                prototype: _,
+                human_testing: _,
+                blocked: _,
             } = v;
         }
         fn raw_intake_fields(v: RawIntake) {
@@ -3171,6 +3409,8 @@ mod tests {
             raw_intake_fields as fn(RawIntake),
             raw_intake_labels_fields as fn(RawIntakeLabels),
             raw_merge_queue_fields as fn(RawMergeQueue),
+            raw_board_fields as fn(RawBoard),
+            raw_wip_fields as fn(RawWip),
         );
     }
 }
