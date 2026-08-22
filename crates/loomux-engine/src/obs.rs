@@ -1334,9 +1334,6 @@ fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathB
         .filter(|p| is_crash_log(p))
         .filter(|p| {
             let Ok(meta) = fs::metadata(p) else { return false };
-            if meta.len() == 0 {
-                return false;
-            }
             match since {
                 Some(t) => meta.modified().map(|m| m >= t).unwrap_or(false),
                 None => true,
