@@ -53774,6 +53774,11 @@ fn routed_repo() -> tempfile::TempDir {
 }
 
 /// [`gated_group`] for [`routed_repo`].
+///
+/// `max_agents` is raised above [`rails`]'s 2: this roster has three reviewer
+/// lanes and the point of routing is that a PR can require more than one of
+/// them, so a cap that stopped the third from spawning would make the test
+/// unable to reach the state it exists to check.
 fn routed_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupId) {
     let (reg, d) = test_registry();
     reg.set_pr_head_override(Some(HEAD.into()));
@@ -53781,7 +53786,7 @@ fn routed_group() -> (OrchRegistry, tempfile::TempDir, tempfile::TempDir, GroupI
     let g = reg
         .create_group(
             &repo.path().to_string_lossy(),
-            Guardrails { advanced_orchestrator: true, ..rails() },
+            Guardrails { advanced_orchestrator: true, max_agents: 4, ..rails() },
         )
         .unwrap();
     let id = g.id.clone();
@@ -53932,4 +53937,73 @@ fn the_rust_gate_status_names_the_routing_rules_that_fired_and_refuses_what_the_
     assert!(s.contains("account for every file"), "{s}");
     assert!(!s.contains("SATISFIED"), "a status line may never claim what the shim would refuse: {s}");
     reg.set_gh_exec_override(None);
+}
+
+/// **No `case` inside a `$( … )` in the generated `gh` shim** (#1176).
+///
+/// Not style, and not something `sh -n` on a developer machine will ever tell
+/// you: a `case` pattern's `)` is unbalanced, and a shell that locates the end
+/// of a command substitution by COUNTING parens rather than parsing recursively
+/// stops at that `)`, mis-reads everything after it, and reports a syntax error
+/// at the first `;;`. bash 3.2 is such a shell, and bash 3.2 is `/bin/sh` on
+/// macOS — so the shim parses cleanly under bash 5 and dash, and is a broken
+/// script on one third of this repo's own CI matrix. #1176's first cut did
+/// exactly that (38 failures, macOS only, every shim test at once); the fix is
+/// to put the `case` in a shell FUNCTION, whose body is parsed where it is
+/// defined rather than inside the substitution.
+///
+/// **The scan models the failing parser, not a correct one.** It counts from a
+/// `$(` the way bash 3.2 does, so what it flags is what bash 3.2 would mis-read.
+/// Its stated limits: it is textual, and it does not track quoting — a literal
+/// `(`/`)` inside a string shifts its count, which is also true of the shell it
+/// models, so the two are wrong in the same direction. It does not need to be a
+/// parser to be a floor.
+#[test]
+fn the_gh_shim_never_puts_a_case_inside_a_command_substitution() {
+    let sh = gh_shim_sh("/usr/bin/gh", &shim_paths());
+    let b = sh.as_bytes();
+    let mut i = 0usize;
+    let mut findings: Vec<String> = Vec::new();
+    while i + 1 < b.len() {
+        if !(b[i] == b'$' && b[i + 1] == b'(') {
+            i += 1;
+            continue;
+        }
+        // Walk to the paren this substitution CLOSES ON under a counting scanner.
+        let start = i;
+        let mut depth = 0i32;
+        let mut j = i + 1;
+        let mut saw_case = false;
+        while j < b.len() {
+            match b[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            // Bytes, not `sh[j..]`: the shim carries non-ASCII (em dashes), so a
+            // string slice at an arbitrary index is a panic waiting for the
+            // first comment that moves.
+            if b[j..].starts_with(b"case ") {
+                saw_case = true;
+            }
+            j += 1;
+        }
+        if saw_case {
+            let end = (start + 160).min(b.len());
+            findings.push(String::from_utf8_lossy(&b[start..end]).replace('\n', " / "));
+        }
+        i = start + 2;
+    }
+    assert!(
+        findings.is_empty(),
+        "a `case` inside `$( … )` is a shim that parses on this machine and is a SYNTAX ERROR \
+         under macOS's /bin/sh (bash 3.2). Move the `case` into a shell function and call it \
+         from the substitution:\n{}",
+        findings.join("\n---\n")
+    );
 }
