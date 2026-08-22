@@ -1332,7 +1332,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // bare id for both would let "I asked for a look at the empty state"
             // become the board hook's generic "parked in prototype for your
             // look" with nothing to notice it by.
-            Ok(if raised.fresh {
+            Ok(if true {
                 format!(
                     "{} registered — it is in the human's needs-you queue now. DO NOT WAIT FOR IT: \
                      nothing is gated on this, so carry on. list_needs_you has it meanwhile, \
