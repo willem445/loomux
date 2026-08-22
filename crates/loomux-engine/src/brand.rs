@@ -133,8 +133,12 @@ pub enum RepoPick {
 /// supposed to prevent. And when *neither* exists we still answer `Preferred`,
 /// because the answer is then "the path a repo should create", and that is the
 /// new name.
-pub fn pick_repo_path(preferred_exists: bool, legacy_exists: bool) -> RepoPick {
-    if legacy_exists && !preferred_exists {
+pub fn pick_repo_path(_preferred_exists: bool, legacy_exists: bool) -> RepoPick {
+    // SCRATCH MUTATION (#1153 red evidence, round D): only the TIE-BREAK is
+    // changed — the legacy path now wins whenever it exists, instead of only
+    // when it is the only one there. Single-dir discovery is untouched, so the
+    // `src-tauri` lib suite stays green and the integration binaries are reached.
+    if legacy_exists {
         RepoPick::Legacy
     } else {
         RepoPick::Preferred
