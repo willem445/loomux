@@ -662,7 +662,8 @@ from a unit test of product code, agents are banned from running cargo locally
     This is the batch's real finding and it generalises past `obs`. Every batch
     so far enumerated a module's outbound edges by searching for
     `super::`/`crate::`. `obs.rs` has none — and it still had one:
-    `record_crash` builds the crash log's `version:` line from
+    `record_crash` (split into `record_crash_first_phase`/`append_backtrace` by
+    #1219) builds the crash log's `version:` line from
     `env!("CARGO_PKG_VERSION")`. That macro names *the crate the file is
     compiled in*, so the move re-points it, and this crate's version is
     deliberately `0.0.0` (a placeholder, not the release number — see its

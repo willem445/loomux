@@ -6,6 +6,13 @@
 //! 1. A **panic hook** that appends a crash log (message + location + thread +
 //!    backtrace) to `<data>/orrerix/logs/crash-<ts>.log`. It wraps — and still
 //!    chains to — the default hook, and is written to never panic itself.
+//!    It writes in **two phases** (#1219): the minimal record and the `panic`
+//!    breadcrumb are composed without `core::fmt` and flushed *before* any
+//!    backtrace work, so a death during symbolication — which aborts the
+//!    process outright, with no unwind and no second hook call — still leaves
+//!    the record it exists to leave. A thread-local latch diverts a re-entrant
+//!    run to a single emergency line. See `write_crash_log_in`, `HookGuard`,
+//!    and `doc/design/crash-observability.md`.
 //! 2. A **breadcrumb log** (`breadcrumbs.log`, rotated once at ~2 MB) of
 //!    timestamped one-liners for lifecycle events — pane/PTY open/close/resize,
 //!    agent spawn/death, MCP request failures, delivery outcomes. It must never
@@ -423,13 +430,18 @@ pub fn logs_dir() -> PathBuf {
 /// sortable, so "newest crash log" is a plain string max. Pure — computed via
 /// Howard Hinnant's days-from-civil algorithm so no date crate is pulled in
 /// (and nothing that would drag in getrandom; see Cargo.toml).
+///
+/// A thin wrapper over [`push_stamp`], which is the one implementation of the
+/// format: the crash path needs the same stamp without `core::fmt` (#1219),
+/// and two implementations of a filename format is two chances to drift.
 fn stamp(ms: u64) -> String {
-    let secs = ms / 1000;
-    let days = (secs / 86_400) as i64;
-    let sod = secs % 86_400;
-    let (y, m, d) = civil_from_days(days);
-    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
-    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
+    let mut v = Vec::with_capacity(16);
+    push_stamp(&mut v, ms);
+    // Unreachable by construction — `push_stamp` emits ASCII digits and one
+    // `'-'`. Written as a fallback rather than an `unwrap` because callers
+    // include a panic hook, where a second panic is the exact failure mode
+    // this change exists to prevent.
+    String::from_utf8(v).unwrap_or_default()
 }
 
 /// Civil (year, month, day) from a count of days since the Unix epoch.
@@ -445,6 +457,78 @@ fn civil_from_days(z: i64) -> (i64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
+
+// ---------- allocation-light, `core::fmt`-free composition (#1219) ----------
+//
+// Everything the panic hook's FIRST phase emits — the crash filename, the
+// minimal crash record, and the `panic` breadcrumb — is composed with these
+// rather than with `format!`/`write!`. The distinction is narrow and
+// deliberate: a `Vec` growth is a `malloc`, and an allocation failure aborts
+// the process however you spell it, whereas `core::fmt` is a deep generic
+// call tree that runs arbitrary `Display` impls and does its own capacity
+// arithmetic. A panic raised down there, while a panic is already in flight,
+// is a panic-while-panicking: std's `panic_count` returns `MustAbort::
+// PanicInHook` and aborts on the spot, so the hook is never re-entered, no
+// unwind starts, and `catch_unwind` never gets control. #1218 is that shape
+// twice in two days — a `capacity overflow` under backtrace demangling, and
+// zero bytes on disk. So the record that has to survive is built out of byte
+// slices and hand-rolled integers.
+//
+// FMT-FREE REGION BEGIN (#1219) — `the_first_phase_composes_without_the_
+// formatting_machinery` scans between this marker and its END for the tokens
+// that would put `core::fmt` back on the path.
+
+/// Append `n` as decimal ASCII, left-padded with `'0'` to at least `width`.
+/// `width` of 1 means "no padding" (the value's own digits).
+fn push_dec(out: &mut Vec<u8>, mut n: u64, width: usize) {
+    let mut buf = [0u8; 20]; // u64::MAX is 20 digits
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for _ in (buf.len() - i)..width {
+        out.push(b'0');
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// Append `YYYYMMDD-HHMMSS` (UTC) for unix-millis `ms`. The single
+/// implementation of the stamp format; [`stamp`] is its `String` wrapper.
+///
+/// `ms` is unsigned, so the day count is never negative and the year is never
+/// before 1970 — the `max(0)` is a total-function guard, not a reachable case,
+/// and a year past 9999 simply widens the field rather than truncating it.
+fn push_stamp(out: &mut Vec<u8>, ms: u64) {
+    let secs = ms / 1000;
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    push_dec(out, y.max(0) as u64, 4);
+    push_dec(out, m, 2);
+    push_dec(out, d, 2);
+    out.push(b'-');
+    push_dec(out, sod / 3600, 2);
+    push_dec(out, (sod % 3600) / 60, 2);
+    push_dec(out, sod % 60, 2);
+}
+
+/// Append `s` with spaces and control bytes turned into `'_'`, so a breadcrumb
+/// stays the single `stamp event detail` line its readers split on. Applied to
+/// the thread name as well as the panic location: a `thread::Builder::name`
+/// carrying a space would otherwise split the detail field in two, and a
+/// payload with a newline in it would split the record into two lines.
+fn push_spaceless(out: &mut Vec<u8>, s: &str) {
+    for &b in s.as_bytes() {
+        out.push(if b == b' ' || b < 0x20 { b'_' } else { b });
+    }
+}
+
+// FMT-FREE REGION END (#1219)
 
 // ---------- breadcrumbs ----------
 
@@ -466,6 +550,16 @@ pub fn breadcrumb(event: &str, detail: &str) {
 }
 
 fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
+    breadcrumb_bytes_in(dir, event, detail.as_bytes())
+}
+
+// FMT-FREE REGION BEGIN (#1219) — the panic breadcrumb is written from inside
+// the crash hook's first phase, so its line composition is under the same
+// no-`core::fmt` rule as the crash record; see the region note above.
+
+/// The breadcrumb write proper. Takes the detail as bytes so the crash path
+/// can hand it a buffer it composed itself without a `String` round trip.
+fn breadcrumb_bytes_in(dir: &Path, event: &str, detail: &[u8]) {
     let _ = fs::create_dir_all(dir);
     rotate_if_needed(
         &dir.join("breadcrumbs.log"),
@@ -479,15 +573,29 @@ fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
     // pane thread, so the same race lives here. (`write_all` loops on a short
     // write, so this is one syscall *in practice* — regular files don't
     // short-write at these sizes — rather than by contract; see `append_audit`.)
-    let line = format!("{} {} {}\n", stamp(now_ms()), event, detail);
+    let mut line = Vec::with_capacity(24 + event.len() + detail.len());
+    push_stamp(&mut line, now_ms());
+    line.push(b' ');
+    line.extend_from_slice(event.as_bytes());
+    line.push(b' ');
+    line.extend_from_slice(detail);
+    line.push(b'\n');
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("breadcrumbs.log"))
     {
-        let _ = f.write_all(line.as_bytes());
+        let _ = f.write_all(&line);
+        // A no-op today — `fs::File` is unbuffered, so the `write_all` above
+        // already *is* the syscall. It is spelled out because the crash path
+        // now depends on the last pre-death breadcrumb being durable (#1219):
+        // wrapping this handle in a `BufWriter` later would otherwise silently
+        // move the `panic` line into a buffer that dies with the process.
+        let _ = f.flush();
     }
 }
+
+// FMT-FREE REGION END (#1219)
 
 // ---------- panic hook ----------
 
@@ -500,8 +608,8 @@ fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
 /// through the process-wide hook, not just the main thread.
 ///
 /// `app_version` is the version stamped into every crash log, and it is a
-/// PARAMETER rather than an `env!("CARGO_PKG_VERSION")` down in `record_crash`
-/// because of where this code now lives (#888 slice A3 batch 7). That macro
+/// PARAMETER rather than an `env!("CARGO_PKG_VERSION")` down in the crash
+/// writer because of where this code now lives (#888 slice A3 batch 7). That macro
 /// names the crate a file is *compiled in*, so once `obs` moved into the engine
 /// it would have resolved to this crate's permanent `0.0.0` placeholder — see
 /// the manifest — and every crash log would have quietly stopped naming the
@@ -513,69 +621,275 @@ fn breadcrumb_in(dir: &Path, event: &str, detail: &str) {
 pub fn install_panic_hook(app_version: &'static str) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Never let the hook itself unwind and mask the real panic.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            write_crash_log(app_version, info)
-        }));
+        // Armed for the whole of this run, `default(info)` included, and
+        // disarmed by its own `Drop`. See `HookGuard`.
+        let guard = HookGuard::enter();
+        if guard.is_first() {
+            // Never let the hook itself unwind and mask the real panic. On
+            // today's std this is belt-and-braces rather than the load-bearing
+            // guard it reads as — a panic in here aborts before any unwind
+            // begins (see the fmt-free region note) — but it costs nothing and
+            // it is what keeps the hook honest if that ever changes.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_crash_log(app_version, info)
+            }));
+        } else {
+            // Re-entry: a second panic reached the hook while this thread's
+            // first run was still in progress. Do the least possible — one
+            // short append to the path phase one already derived, no
+            // backtrace, no directory work, no formatting — and then chain, so
+            // the process dies exactly the way std would have made it die.
+            let loc = panic_location(info);
+            HOOK_TARGET.with(|c| {
+                if let Some(p) = c.borrow().as_deref() {
+                    write_emergency(p, panic_message(info), &loc);
+                }
+            });
+        }
         default(info);
     }));
 }
 
-fn write_crash_log(app_version: &str, info: &std::panic::PanicHookInfo<'_>) {
-    let thread = std::thread::current();
-    let tname = thread.name().unwrap_or("<unnamed>").to_string();
-    let payload = info.payload();
-    let msg = payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_string());
-    let loc = info
-        .location()
-        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-        .unwrap_or_else(|| "<unknown location>".to_string());
-    // force_capture ignores RUST_BACKTRACE, so a crash log always carries a
-    // backtrace. Frame *symbols* depend on the release profile keeping a
-    // symbol table (see the design note); the addresses are always useful.
-    let bt = std::backtrace::Backtrace::force_capture().to_string();
-    record_crash(&logs_dir(), app_version, &tname, &msg, &loc, &bt);
-    breadcrumb(
-        "panic",
-        &format!("thread={tname} at {}", loc.replace(' ', "_")),
-    );
+thread_local! {
+    /// Armed for the whole of this thread's crash-hook run (#1219).
+    static IN_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The crash-log path phase one derived, so a re-entrant run has an
+    /// **already-derivable** target for its one emergency line: re-deriving it
+    /// would mean `logs_dir()` — an env read, the data-root `OnceLock`, and a
+    /// `PathBuf` join — in a process that has now panicked twice.
+    static HOOK_TARGET: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Write one crash log. Split from `write_crash_log` so the file format is
-/// testable without a live `PanicHookInfo` (which can't be constructed) — and,
-/// since the version arrives as an argument, so the `version:` line is testable
-/// too rather than being whatever crate the test happens to compile in.
-fn record_crash(
+/// RAII arm/disarm for the crash hook's thread-local re-entry latch (#1219).
+/// `enter()` always yields a guard; `is_first()` says whether this is the
+/// OUTERMOST run on this thread, i.e. whether the full two-phase write is safe
+/// to attempt or whether this is a panic-while-panicking that gets the
+/// single-line emergency path instead.
+///
+/// **What this can and cannot catch, stated plainly.** On today's std the
+/// common double-panic never reaches here at all: `panic_count::increase` sees
+/// its own `in_panic_hook` flag and returns `MustAbort::PanicInHook`, printing
+/// "thread panicked while processing panic" and aborting *before* the hook is
+/// called a second time. So the load-bearing defence against #1218's shape is
+/// the write-first ordering below, not this latch. The latch is the cheap
+/// complement: it covers a hook invoked outside that path (a chained hook that
+/// re-enters, a future std that lets a nested panic through) and it costs one
+/// thread-local read per panic. It is here because "do nothing on re-entry" is
+/// the behaviour that produced a zero-byte forensic record twice.
+struct HookGuard {
+    first: bool,
+}
+
+impl HookGuard {
+    fn enter() -> Self {
+        let already = IN_HOOK.with(|c| c.replace(true));
+        HookGuard { first: !already }
+    }
+
+    fn is_first(&self) -> bool {
+        self.first
+    }
+}
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        // Only the outermost run disarms. An inner guard clearing the latch
+        // would hand a *third* panic the full capture path again, which is the
+        // one thing this exists to stop.
+        if self.first {
+            IN_HOOK.with(|c| c.set(false));
+            HOOK_TARGET.with(|c| *c.borrow_mut() = None);
+        }
+    }
+}
+
+// FMT-FREE REGION BEGIN (#1219) — the crash hook's first phase and its
+// double-panic fallback; see the region note above `push_dec`.
+
+/// The panic payload as a borrowed `&str` — no allocation, no `Display`
+/// dispatch, covering the two payload types `panic!` produces.
+fn panic_message<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
+    let payload = info.payload();
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+        .unwrap_or("<non-string panic payload>")
+}
+
+/// `file:line:col` for the panic site, composed byte-wise.
+fn panic_location(info: &std::panic::PanicHookInfo<'_>) -> String {
+    match info.location() {
+        Some(l) => {
+            let mut v = Vec::with_capacity(l.file().len() + 16);
+            v.extend_from_slice(l.file().as_bytes());
+            v.push(b':');
+            push_dec(&mut v, l.line() as u64, 1);
+            v.push(b':');
+            push_dec(&mut v, l.column() as u64, 1);
+            // ASCII plus a `&str`'s own bytes — the fallback is unreachable,
+            // and is a fallback rather than an `unwrap` for the reason given
+            // on `stamp`.
+            String::from_utf8(v).unwrap_or_default()
+        }
+        None => String::from("<unknown location>"),
+    }
+}
+
+/// The single line a re-entrant hook run appends: short enough to be one
+/// `write`, and composed from byte slices so nothing on this path can panic a
+/// third time.
+fn emergency_line(msg: &str, loc: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + msg.len() + loc.len());
+    v.extend_from_slice(b"\ndouble-panic: ");
+    push_spaceless(&mut v, msg);
+    v.extend_from_slice(b" at ");
+    push_spaceless(&mut v, loc);
+    v.push(b'\n');
+    v
+}
+
+/// Append one emergency line to `path`, creating it if the outer run never got
+/// as far as opening it. Append, never truncate: the point is to add to
+/// whatever phase one already flushed, not to replace it.
+fn write_emergency(path: &Path, msg: &str, loc: &str) {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(&emergency_line(msg, loc));
+        let _ = f.flush();
+    }
+}
+
+/// **Phase one of the crash write, and the whole point of #1219.** Open the
+/// crash log and flush the minimal record — version, time, thread, panic
+/// message, location — BEFORE anything fragile runs, and hand the open handle
+/// back so phase two can append through it.
+///
+/// The previous version captured and symbolicated a backtrace *first* and
+/// wrote afterwards, so a panic during that capture left nothing at all on
+/// disk: at panic-count 2 std aborts immediately, with no unwind for the
+/// hook's `catch_unwind` to catch and no second hook call. #1218 is that
+/// happening twice in two days — demangle frames live at abort time, zero
+/// bytes written.
+///
+/// `None` means the file could not be opened or the header could not be
+/// written; the caller then skips phase two rather than writing a backtrace
+/// with no record above it.
+fn record_crash_first_phase(
     dir: &Path,
     app_version: &str,
     thread: &str,
     msg: &str,
     loc: &str,
-    backtrace: &str,
-) {
+) -> Option<fs::File> {
     let _ = fs::create_dir_all(dir);
     let now = now_ms();
-    let path = dir.join(format!("crash-{}.log", stamp(now)));
-    let body = format!(
-        "loomux crash log\n\
-         version: {ver}\n\
-         time:    {ts} UTC ({now} ms since epoch)\n\
-         thread:  {thread}\n\
-         panic:   {msg}\n\
-         at:      {loc}\n\n\
-         backtrace:\n{backtrace}\n",
-        ver = app_version,
-        ts = stamp(now),
-    );
+    let mut name = Vec::with_capacity(32);
+    name.extend_from_slice(b"crash-");
+    push_stamp(&mut name, now);
+    name.extend_from_slice(b".log");
+    let path = dir.join(String::from_utf8(name).unwrap_or_default());
+    // Remember the target BEFORE opening, so a re-entrant run has somewhere to
+    // put its one line even when the open itself is what died.
+    HOOK_TARGET.with(|c| *c.borrow_mut() = Some(path.clone()));
+
+    let mut head =
+        Vec::with_capacity(96 + app_version.len() + thread.len() + msg.len() + loc.len());
+    head.extend_from_slice(b"loomux crash log\nversion: ");
+    head.extend_from_slice(app_version.as_bytes());
+    head.extend_from_slice(b"\ntime:    ");
+    push_stamp(&mut head, now);
+    head.extend_from_slice(b" UTC (");
+    push_dec(&mut head, now, 1);
+    head.extend_from_slice(b" ms since epoch)\nthread:  ");
+    head.extend_from_slice(thread.as_bytes());
+    head.extend_from_slice(b"\npanic:   ");
+    head.extend_from_slice(msg.as_bytes());
+    head.extend_from_slice(b"\nat:      ");
+    head.extend_from_slice(loc.as_bytes());
+    head.extend_from_slice(b"\n\n");
+
     // Append rather than truncate: two threads panicking into the same-second
     // filename both leave a record instead of one clobbering the other.
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(body.as_bytes());
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    f.write_all(&head).ok()?;
+    // Durable before phase two starts. `fs::File` is unbuffered, so the
+    // `write_all` already is the syscall; the call is spelled out so the "phase
+    // one is on disk" contract cannot be quietly broken by a `BufWriter` later.
+    let _ = f.flush();
+    Some(f)
+}
+
+/// Phase two: append the backtrace through the handle phase one opened. A
+/// separate `write_all` on purpose — if this never runs because the process
+/// died taking the backtrace, the file still holds a complete, readable
+/// record instead of nothing.
+fn append_backtrace(f: &mut fs::File, backtrace: &str) {
+    let mut tail = Vec::with_capacity(16 + backtrace.len());
+    tail.extend_from_slice(b"backtrace:\n");
+    tail.extend_from_slice(backtrace.as_bytes());
+    tail.push(b'\n');
+    let _ = f.write_all(&tail);
+    let _ = f.flush();
+}
+
+/// The two-phase crash write. `logs_dir()` and the backtrace source are
+/// injected so the ORDER is testable: the capture closure runs only once the
+/// minimal record and the `panic` breadcrumb are on disk, and a test can
+/// assert exactly that by reading the log directory from inside it.
+fn write_crash_log_in(
+    dir: &Path,
+    app_version: &str,
+    thread: &str,
+    msg: &str,
+    loc: &str,
+    capture_backtrace: impl FnOnce() -> String,
+) {
+    // ---- phase one: the record that has to survive ----
+    let opened = record_crash_first_phase(dir, app_version, thread, msg, loc);
+    // The `panic` breadcrumb belongs in this phase too (#1219). It used to be
+    // written *after* the backtrace, so every crash that died capturing one
+    // lost the breadcrumb along with the crash log — and the breadcrumb tail is
+    // what the design note promises still survives an abort.
+    let mut detail = Vec::with_capacity(16 + thread.len() + loc.len());
+    detail.extend_from_slice(b"thread=");
+    push_spaceless(&mut detail, thread);
+    detail.extend_from_slice(b" at ");
+    push_spaceless(&mut detail, loc);
+    breadcrumb_bytes_in(dir, "panic", &detail);
+
+    // ---- phase two: everything that can die trying ----
+    let bt = capture_backtrace();
+    if let Some(mut f) = opened {
+        append_backtrace(&mut f, &bt);
     }
+}
+
+// FMT-FREE REGION END (#1219)
+
+fn write_crash_log(app_version: &str, info: &std::panic::PanicHookInfo<'_>) {
+    let thread = std::thread::current();
+    let tname = thread.name().unwrap_or("<unnamed>");
+    let loc = panic_location(info);
+    write_crash_log_in(
+        &logs_dir(),
+        app_version,
+        tname,
+        panic_message(info),
+        &loc,
+        // force_capture ignores RUST_BACKTRACE, so a crash log always carries a
+        // backtrace when the process survives long enough to take one. Frame
+        // *symbols* depend on the release profile keeping a symbol table (see
+        // the design note); the addresses are always useful. This is PHASE TWO
+        // for a reason: symbolication runs dbghelp and rustc-demangle and
+        // allocates without bound, and a panic in there kills the process on
+        // the spot (#1218).
+        || std::backtrace::Backtrace::force_capture().to_string(),
+    );
 }
 
 // ---------- unclean-exit detection ----------
@@ -587,7 +901,41 @@ pub struct StartupCheck {
     pub crash_log: Option<PathBuf>,
 }
 
+/// Breadcrumb event naming the "unclean previous exit, and yet no crash log
+/// from it" contradiction (#1219).
+const CRASH_LOG_GAP_EVENT: &str = "crash-log-gap";
+
+/// …and its detail. One line, no free text, pointing at the two records that
+/// DO exist when ours does not. On Windows — the platform this app ships on —
+/// an abort that never unwinds is recorded by Windows Error Reporting, not by
+/// us: `%LOCALAPPDATA%\CrashDumps` holds the dump if local dump collection is
+/// enabled, and the Application event log holds the "Application Error" entry
+/// with the exception code either way. See `doc/design/crash-observability.md`.
+const CRASH_LOG_GAP_DETAIL: &str = "unclean_prev=true crash_log=none \
+     the_previous_run_died_without_the_panic_hook_completing \
+     look=%LOCALAPPDATA%\\CrashDumps \
+     and=EventViewer>WindowsLogs>Application(source:Application_Error)";
+
+/// Is this startup the #1218 signature — the sentinel says the previous run did
+/// not exit cleanly, and yet no `crash-*.log` newer than that run's start
+/// exists to say why?
+///
+/// Both inputs are read off the SAME [`StartupCheck`]: `unclean` and the crash
+/// log `newest_crash_log_since` found under that same sentinel's mtime. There
+/// is deliberately no second source for either — a gap detector that took
+/// "unclean" from the sentinel and "is there a log" from a fresh directory
+/// scan would disagree with itself exactly in the window it exists to name.
+pub fn is_crash_log_gap(unclean: bool, crash_log: Option<&Path>) -> bool {
+    unclean && crash_log.is_none()
+}
+
 impl StartupCheck {
+    /// True when this startup has a contradiction to name: see
+    /// [`is_crash_log_gap`].
+    pub fn crash_log_gap(&self) -> bool {
+        is_crash_log_gap(self.unclean, self.crash_log.as_deref())
+    }
+
     /// The next-launch toast text, or `None` when the previous exit was clean.
     pub fn notice(&self) -> Option<String> {
         if !self.unclean {
@@ -631,7 +979,17 @@ fn check_and_arm_in(dir: &Path) -> StartupCheck {
     };
     let crash_log = if unclean { newest_crash_log_since(dir, since) } else { None };
     let _ = fs::write(&lock, stamp(now_ms()));
-    StartupCheck { unclean, crash_log }
+    let check = StartupCheck { unclean, crash_log };
+    // Name the gap in the breadcrumb log (#1219). A hard abort, a nounwind/FFI
+    // fault, or a death inside the hook itself all present identically at the
+    // next launch — leftover sentinel, nothing to read — and until now that
+    // combination was reported to the *user* as a toast and to nobody at all in
+    // the durable record. It goes in before this run's own `startup`
+    // breadcrumb because it is a statement about the PREVIOUS run.
+    if check.crash_log_gap() {
+        breadcrumb_in(dir, CRASH_LOG_GAP_EVENT, CRASH_LOG_GAP_DETAIL);
+    }
+    check
 }
 
 /// Remove the sentinel to record a clean shutdown. Called from the window
@@ -907,17 +1265,36 @@ mod tests {
         assert!(stamp(2_000_000_000_000) > stamp(1_751_673_600_000));
     }
 
+    /// The one `crash-*.log` in `dir`, or `None` when none exists yet. Used to
+    /// read the file *mid-write* as well as after, so it must not assume one
+    /// is there.
+    fn only_crash_log(dir: &Path) -> Option<String> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_crash_log(p))
+            .collect();
+        assert!(found.len() <= 1, "expected at most one crash log, got {found:?}");
+        fs::read_to_string(found.pop()?).ok()
+    }
+
+    /// The crash-log FORMAT, driven through the two shipped phases rather than
+    /// through a test-only one-shot wrapper — `record_crash` was exactly such a
+    /// wrapper and #1219 removed it, because a format pinned on a path the app
+    /// does not take is a format free to drift.
     #[test]
     fn records_crash_file_with_context() {
         let tmp = tempfile::tempdir().unwrap();
-        record_crash(
+        let mut f = record_crash_first_phase(
             tmp.path(),
             "9.9.9-test",
             "worker-3",
             "boom",
             "src/pty.rs:42:9",
-            "0: frame\n1: frame",
-        );
+        )
+        .expect("phase one must open and write the record");
+        append_backtrace(&mut f, "0: frame\n1: frame");
         let files: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
@@ -943,6 +1320,271 @@ mod tests {
         assert!(body.contains("panic:   boom"));
         assert!(body.contains("src/pty.rs:42:9"));
         assert!(body.contains("0: frame"));
+        // The two phases must JOIN into the one format a human reads — the
+        // split is an ordering change, not a format change, and the only place
+        // that is observable is the seam between them.
+        assert!(
+            body.starts_with("loomux crash log\nversion: 9.9.9-test\ntime:    "),
+            "phase one owns the head, unchanged — got:\n{body}"
+        );
+        assert!(
+            body.ends_with(
+                "\nthread:  worker-3\npanic:   boom\nat:      src/pty.rs:42:9\n\n\
+                 backtrace:\n0: frame\n1: frame\n"
+            ),
+            "the seam between the phases must leave the historical bytes — got:\n{body}"
+        );
+    }
+
+    // ---------- #1219: write-first, double-panic, startup gap ----------
+
+    /// **The write-first ordering, pinned at its own seam.** The backtrace
+    /// source is injected, so this reads the log directory from INSIDE the
+    /// capture — the exact instant the old code spent in dbghelp
+    /// symbolication and rustc-demangle, and the instant #1218's process died
+    /// at. Whatever is on disk here is what such a death leaves behind.
+    #[test]
+    fn the_minimal_record_and_the_breadcrumb_land_before_the_backtrace_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at_capture: std::cell::RefCell<Option<(String, String)>> =
+            std::cell::RefCell::new(None);
+        write_crash_log_in(
+            tmp.path(),
+            "9.9.9-test",
+            "worker-3",
+            "boom",
+            "src/pty.rs:42:9",
+            || {
+                *at_capture.borrow_mut() = Some((
+                    only_crash_log(tmp.path()).unwrap_or_default(),
+                    fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap_or_default(),
+                ));
+                "0: frame\n1: frame".to_string()
+            },
+        );
+        let (log, crumbs) = at_capture
+            .borrow()
+            .clone()
+            .expect("the injected backtrace capture must actually have been called");
+
+        assert!(log.contains("version: 9.9.9-test"), "no record on disk at capture time:\n{log}");
+        assert!(log.contains("thread:  worker-3"), "…and it must name the thread:\n{log}");
+        assert!(log.contains("panic:   boom"), "…and the message:\n{log}");
+        assert!(log.contains("at:      src/pty.rs:42:9"), "…and the location:\n{log}");
+        assert!(
+            log.ends_with('\n'),
+            "phase one must leave a COMPLETE record, not a truncated line:\n{log}"
+        );
+        assert!(
+            !log.contains("backtrace"),
+            "phase one must not have waited on the backtrace — it is the step that kills \
+             the process:\n{log}"
+        );
+        assert!(
+            crumbs.contains("panic thread=worker-3 at src/pty.rs:42:9"),
+            "the panic breadcrumb must land in the FIRST flush, not after the capture — \
+             got {crumbs:?}"
+        );
+
+        // …and phase two still appends, so the finished file is the one format.
+        let full = only_crash_log(tmp.path()).expect("a crash log must exist");
+        assert!(full.starts_with(&log), "phase two must APPEND, never rewrite phase one");
+        assert!(full.ends_with("backtrace:\n0: frame\n1: frame\n"), "got:\n{full}");
+    }
+
+    /// **The double-panic latch.** Four distinct ways to get this wrong, each
+    /// with its own assertion: never arming it, disarming it from an inner
+    /// run, making it process-wide, and never clearing it.
+    #[test]
+    fn the_hook_reentry_latch_is_thread_local_and_only_the_outer_run_disarms_it() {
+        let outer = HookGuard::enter();
+        assert!(outer.is_first(), "the first hook run on a thread takes the full two-phase path");
+        {
+            let nested = HookGuard::enter();
+            assert!(
+                !nested.is_first(),
+                "a panic reaching the hook while this thread is already in it must be \
+                 diverted to the emergency path, never handed the backtrace path again"
+            );
+        }
+        let third = HookGuard::enter();
+        assert!(
+            !third.is_first(),
+            "an inner guard's drop must not disarm the OUTER run — a third panic would \
+             otherwise get the full capture path back"
+        );
+        drop(third);
+        let elsewhere = std::thread::spawn(|| HookGuard::enter().is_first()).join().unwrap();
+        assert!(
+            elsewhere,
+            "the latch must be per-thread: a concurrent panic on another thread is not a \
+             double panic and still deserves a full crash log"
+        );
+        drop(outer);
+        assert!(HookGuard::enter().is_first(), "the latch must clear when the outer run ends");
+    }
+
+    /// The emergency write ADDS to whatever phase one managed to flush. If it
+    /// truncated, a double panic would destroy the very record the write-first
+    /// ordering exists to bank.
+    #[test]
+    fn the_emergency_write_appends_one_line_and_never_truncates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("crash-19700101-000000.log");
+        let banked = "loomux crash log\nversion: 9.9.9-test\npanic:   first\n";
+        fs::write(&p, banked).unwrap();
+
+        write_emergency(&p, "second boom", "src/x.rs:1:1");
+
+        let body = fs::read_to_string(&p).unwrap();
+        assert!(
+            body.starts_with(banked),
+            "phase one's record must survive a double panic byte for byte — got:\n{body}"
+        );
+        assert!(
+            body.contains("double-panic: second boom at src/x.rs:1:1"),
+            "the emergency line must name the second panic — got:\n{body}"
+        );
+        assert_eq!(body.matches("double-panic").count(), 1, "exactly one line, not a loop");
+        assert!(body.ends_with('\n'), "and it must terminate its own line");
+    }
+
+    /// Exactly one of the four crossings is a gap. The set assertion is what
+    /// stops "always true" (every clean start shouting) and "always false"
+    /// (the silent abort that started all this) from both passing.
+    #[test]
+    fn only_an_unclean_start_with_no_crash_log_is_a_gap() {
+        let some = Path::new("crash-20260705-120000.log");
+        assert!(is_crash_log_gap(true, None), "#1218's signature: died, and said nothing");
+        assert!(!is_crash_log_gap(true, Some(some)), "an unclean exit that explained itself");
+        assert!(!is_crash_log_gap(false, None), "a clean exit has no contradiction to name");
+        assert!(!is_crash_log_gap(false, Some(some)), "…nor one that left an older log around");
+    }
+
+    /// …and the startup path actually writes it, once, with the pointers a
+    /// human needs when our own record is the one that is missing.
+    #[test]
+    fn an_unclean_start_with_no_crash_log_names_the_gap_in_a_breadcrumb() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Run 1: nothing known yet, and nothing to say.
+        let first = check_and_arm_in(tmp.path());
+        assert!(!first.crash_log_gap());
+        assert!(
+            !tmp.path().join("breadcrumbs.log").exists(),
+            "a first, clean start must not manufacture a gap"
+        );
+
+        // Run 2: the sentinel survived and no crash log from run 1 exists.
+        let gap = check_and_arm_in(tmp.path());
+        assert!(gap.unclean && gap.crash_log.is_none(), "the state under test");
+        assert!(gap.crash_log_gap());
+        let crumbs = fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap();
+        assert_eq!(crumbs.lines().count(), 1, "exactly one line names the gap: {crumbs:?}");
+        assert!(crumbs.contains(" crash-log-gap "), "got {crumbs:?}");
+        assert!(crumbs.contains("unclean_prev=true crash_log=none"), "got {crumbs:?}");
+        assert!(
+            crumbs.contains(r"%LOCALAPPDATA%\CrashDumps"),
+            "must point at WER's dump directory — the record that DOES exist: {crumbs:?}"
+        );
+        assert!(
+            crumbs.contains("Application_Error"),
+            "…and at the Application event log entry: {crumbs:?}"
+        );
+
+        // Run 3: an unclean exit that DID leave a crash log is not a gap. The
+        // contradiction is the trigger, not the unclean exit.
+        let start3 = fs::metadata(running_lock(tmp.path())).unwrap().modified().unwrap();
+        let fresh = tmp.path().join("crash-20260705-120000.log");
+        fs::write(&fresh, "boom").unwrap();
+        set_mtime(&fresh, start3 + Duration::from_secs(5));
+
+        let explained = check_and_arm_in(tmp.path());
+        assert!(explained.unclean && explained.crash_log.is_some(), "the state under test");
+        assert!(!explained.crash_log_gap());
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap().lines().count(),
+            1,
+            "no second gap line when the crash explained itself"
+        );
+    }
+
+    /// **The fmt-free property of the crash path, pinned by inspection.**
+    ///
+    /// Nothing behavioural can catch a `format!` creeping back into phase one:
+    /// it would pass every test above and only show itself as a zero-byte
+    /// crash log on a user's machine, which is precisely the failure #1219
+    /// exists to end. So this is a source scan, and it is written the way this
+    /// repo's other scans are: it decides on a **shape** (a macro token inside
+    /// a marked region), never on a binding's name, and it default-denies.
+    ///
+    /// **Blind spot, stated rather than hidden:** a textual scan cannot follow
+    /// a call out of the region. The functions the regions call are checked by
+    /// hand and are exactly these — `now_ms`, `civil_from_days`,
+    /// `rotate_if_needed`, `fs::*`, `Path::join`, `String::from_utf8` — none of
+    /// which reaches `core::fmt`. Adding a call to anything else from inside a
+    /// region means re-checking that list by hand; the scan will not do it for
+    /// you.
+    #[test]
+    fn the_first_phase_composes_without_the_formatting_machinery() {
+        // Built with `concat!` so this source file does not itself contain the
+        // marker as a contiguous string: a scan that could match its OWN test
+        // body would go green with the real markers deleted.
+        let begin = concat!("FMT-FREE", " REGION BEGIN");
+        let end = concat!("FMT-FREE", " REGION END");
+        let src = include_str!("obs.rs");
+
+        let mut regions: Vec<&str> = Vec::new();
+        let mut rest = src;
+        while let Some(b) = rest.find(begin) {
+            let after = &rest[b + begin.len()..];
+            let e = after.find(end).expect("every region opener needs its closer");
+            regions.push(&after[..e]);
+            rest = &after[e..];
+        }
+        assert_eq!(
+            regions.len(),
+            3,
+            "expected three marked regions (the composition primitives, the breadcrumb \
+             line, and the crash hook's two phases) — a renamed or deleted marker must \
+             fail here rather than silently shrink what is scanned"
+        );
+        let scanned: usize = regions.iter().map(|r| r.len()).sum();
+        assert!(
+            scanned > 3000,
+            "the marked regions collapsed to {scanned} bytes — the markers are no longer \
+             around the code they were written for"
+        );
+
+        // Scan the CODE, not the prose: these regions carry comments that name
+        // the very macros they exist to keep out, and a scan that reddened on
+        // an explanation would teach the next author to delete the
+        // explanation. Line comments only — no region contains a `//` inside a
+        // string literal, and a block comment would have to be added to break
+        // this, which is itself worth failing on.
+        let code: Vec<String> = regions
+            .iter()
+            .map(|r| {
+                r.lines()
+                    .map(|l| l.split("//").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+
+        // Default-deny: every route back into `core::fmt`, plus the two
+        // shapes that panic outright.
+        for banned in ["format!", "write!", "writeln!", "format_args!", ".unwrap()", ".expect("] {
+            for (i, region) in code.iter().enumerate() {
+                assert!(
+                    !region.contains(banned),
+                    "marked region {i} contains `{banned}` — the crash hook's first phase \
+                     must compose from byte slices and must not panic; see the region note \
+                     above `push_dec`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -975,7 +1617,8 @@ mod tests {
             assert!(body.contains("synthetic background crash"), "captures the message");
             // The version the host handed `install_panic_hook` survives the
             // whole path — closure capture, `catch_unwind`, `write_crash_log`,
-            // `record_crash` — and lands in the file. `records_crash_file_with
+            // `write_crash_log_in`, `record_crash_first_phase` — and lands in
+            // the file. `records_crash_file_with
             // _context` pins the format; this pins that the hook is what
             // carries the value there.
             assert!(body.contains("version: 9.9.9-test"), "carries the host's app version");

@@ -1,6 +1,7 @@
 # Design: crash observability
 
-Status: implemented (issue #53).
+Status: implemented (issue #53); fail-log robustness hardening in #1219, after
+#1218 showed the hook losing exactly the crashes it exists to record.
 
 ## Problem
 
@@ -54,6 +55,63 @@ the PTY reader/waiter threads, the MCP request threads, the delivery threads,
 and the watchers — not just the main thread. The hook body is wrapped in
 `catch_unwind` and every I/O step is best-effort, so the hook can never panic
 and mask the original crash.
+
+#### The write is two-phase (#1219)
+
+`catch_unwind` is not the protection it reads as, and that matters for the
+order the hook does things in. A panic raised *inside* the hook is a
+panic-while-panicking: std's `panic_count::increase` sees its own
+`in_panic_hook` flag, returns `MustAbort::PanicInHook`, prints "thread panicked
+while processing panic" and **aborts on the spot**. No unwind starts, so
+`catch_unwind` never gets control, and the hook is never called a second time.
+Everything the hook had not yet written is lost.
+
+That is exactly what #1218 was: the hook captured and symbolicated a backtrace
+*first* and wrote the file *afterwards*, so a death inside the capture — dbghelp
+plus rustc-demangle plus unbounded allocation, the most fragile code in the
+process at the worst possible moment — produced **zero bytes on disk** twice in
+two days, on a build whose whole purpose was to leave a record.
+
+So the write is split:
+
+1. **Phase one — the record that has to survive.** Open `crash-<ts>.log`, write
+   and flush version / time / thread / panic message / location, and write the
+   `panic` breadcrumb. Then, and only then, is anything fragile attempted.
+2. **Phase two — everything that can die trying.** `Backtrace::force_capture()`,
+   `to_string()`, and a second `write_all` appending `backtrace:` through the
+   same handle.
+
+The file is opened `create(true).append(true)` in phase one and phase two writes
+through that handle, so the two-phase split changes the *order*, not the format:
+the phases concatenate to the same bytes the single write produced, and a crash
+log with no `backtrace:` section is a complete record of a crash that died
+collecting one.
+
+**Phase one composes without `core::fmt`.** `format!`/`write!` is a deep generic
+call tree that runs arbitrary `Display` impls and does its own capacity
+arithmetic — `capacity overflow` frames were live at abort time in #1218 — and a
+panic down there is the abort above. So the filename, the record and the
+breadcrumb line are built out of byte slices and a hand-rolled integer formatter
+(`push_dec`, `push_stamp`, `push_spaceless`). The distinction is narrow on
+purpose: allocation is fine (an allocation failure aborts however you spell it);
+it is the *formatting machinery* that is kept off the path. Nothing behavioural
+can catch a `format!` creeping back — it would pass every test and show itself
+only as another empty crash log on a user's machine — so
+`the_first_phase_composes_without_the_formatting_machinery` scans the marked
+source regions for the tokens instead, and states its own blind spot (it cannot
+follow a call out of a region; the callees are listed and checked by hand).
+
+**Double-panic fallback.** A thread-local latch (`HookGuard`) is armed for the
+whole of a hook run. A re-entrant run does the least possible: one appended
+`double-panic: <msg> at <loc>` line to the path phase one already derived — no
+backtrace, no directory work, no formatting — and then chains to the default
+hook, so the process dies exactly the way std would have made it die. On today's
+std that latch is belt-and-braces rather than the load-bearing guard: the common
+double panic aborts before the hook is re-entered at all (above). The
+load-bearing defence is the write-first ordering; the latch covers a hook
+reached outside that path and costs one thread-local read per panic. It is there
+because "do nothing on re-entry" is the behaviour that produced a zero-byte
+forensic record twice.
 
 **Backtrace symbol quality.** Two profile settings interact, and the one that
 actually matters for naming loomux's own frames is **`debug`, not `strip`**:
@@ -161,6 +219,73 @@ handler (including some abrupt-but-benign terminations) is reported as unclean.
 A false "exited unexpectedly" toast is a cheap price for never missing a real
 crash.
 
+#### Naming the gap (#1219)
+
+`unclean_prev=true` **with no crash log from that run** is a specific,
+diagnosable signature — it is the one #1218 produced — and until #1219 it was
+reported to the *user* as a toast and to nobody at all in the durable record.
+`check_and_arm` now writes one breadcrumb when it sees it:
+
+```
+<stamp> crash-log-gap unclean_prev=true crash_log=none the_previous_run_died_without_the_panic_hook_completing look=%LOCALAPPDATA%\CrashDumps and=EventViewer>WindowsLogs>Application(source:Application_Error)
+```
+
+It goes in *before* this run's own `startup` breadcrumb, because it is a
+statement about the previous run. Both of its inputs come off the same
+`StartupCheck` — `unclean`, and the crash log `newest_crash_log_since` found
+under that same sentinel mtime — so the detector cannot disagree with itself in
+the window it exists to name. `is_crash_log_gap` is the whole predicate, and
+`only_an_unclean_start_with_no_crash_log_is_a_gap` pins all four crossings, so
+neither "always" nor "never" can pass.
+
+### Windows Error Reporting is the fallback record
+
+When our own hook writes nothing, something else did. On the shipped platform:
+
+- **Event Viewer → Windows Logs → Application**, source `Application Error`, is
+  written for a faulting process with no configuration at all, and it carries
+  the **exception code** and the faulting module. It is the record to look for
+  first, because it always exists.
+- `%LOCALAPPDATA%\CrashDumps` holds a user-mode dump, but **only if local dump
+  collection has been enabled** — Microsoft's *Collecting user-mode dumps* says
+  of it, verbatim: *"This feature is not enabled by default. Enabling the
+  feature requires administrator privileges."* The settings live under
+  `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Windows Error
+  Reporting\LocalDumps`, whose `DumpFolder` **defaults** to
+  `%LOCALAPPDATA%\CrashDumps`. So an empty (or absent) directory is evidence of
+  nothing — check the key before concluding anything from it.
+
+**What `0xc0000409` means for a Rust binary.** The code's symbolic name is
+`STATUS_STACK_BUFFER_OVERRUN`, and on a Rust binary the name is almost always a
+red herring. It is the code a **fast-fail** request surfaces as. Microsoft's
+`__fastfail` reference, verbatim: *"User-mode fast fail requests appear as a
+second chance non-continuable exception with exception code 0xC0000409, and
+with at least one exception parameter. The first exception parameter is the
+`code` value."* That first parameter is the `FAST_FAIL_*` constant from
+`winnt.h` saying *why*, and `FAST_FAIL_FATAL_APP_EXIT` is **7** — the generic
+"this process asked to die".
+
+Rust's `std` aborts through exactly that path (inline asm issuing the
+`__fastfail` request; rust-lang/rust#73215 tracks the same for
+`panic_abort`). So `0xc0000409` with first parameter `7` is what **every**
+Rust-side abort looks like from outside the process: a panic-while-panicking,
+an allocation failure, or an explicit `abort()` — indistinguishable from one
+another at the OS level, which is the whole reason the in-process record has to
+survive.
+
+Reading it in practice: the exception parameters are in the dump or the WER
+report's `P` fields, not in the plain "Application Error" line, so treat the
+`0xc0000409` code plus **the absence of a `crash-*.log` of ours** as the pair of
+facts that says *"the panic hook did not finish"* — not as evidence of memory
+corruption. Codes to distinguish it from: `0xc0000005` (`ACCESS_VIOLATION`) is a
+real fault, typically the ConPTY/windows-sys FFI layer, and `0xc00000fd`
+(`STACK_OVERFLOW`) is the guard page — both of which the hook genuinely cannot
+catch (see *Limitation: abort-level failures* below).
+
+Sources: [`__fastfail`](https://learn.microsoft.com/en-us/cpp/intrinsics/fastfail?view=msvc-170),
+[Collecting user-mode dumps](https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps),
+[rust-lang/rust#73215](https://github.com/rust-lang/rust/issues/73215).
+
 ## Hot-path hardening (mutex-poison cascade)
 
 The crash review's leading hypothesis: a single PTY/registry operation panics
@@ -198,12 +323,16 @@ The panic hook only fires for **unwinding** panics. It will *not* capture:
   stderr — which is nowhere in a `windows_subsystem = "windows"` build — and
   aborts);
 - an FFI/`unsafe` access violation from the ConPTY / windows-sys layer;
-- an explicit `abort()` or an allocation failure.
+- an explicit `abort()` or an allocation failure;
+- a **panic raised inside the hook itself** — std aborts before the hook is
+  re-entered (see *The write is two-phase* above), which is why the ordering
+  there matters more than any guard inside the hook body.
 
 For these the crash log won't exist, but the **breadcrumb log survives** (it's
 flushed per line) and the **unclean-exit notice still fires** (the sentinel is
 still present), so there's always *something* to read — the breadcrumb tail
-shows what was in flight.
+shows what was in flight, and the next launch's `crash-log-gap` breadcrumb names
+the contradiction and points at WER (both above).
 
 Capturing aborts properly needs an OS-level handler. The honest options, none
 implemented here to respect the "no heavyweight crates / nothing pulling
@@ -228,7 +357,28 @@ need global state serialize on a test mutex and restore the panic hook):
 - **forced panic in a named background thread writes a crash log** capturing the
   thread name and message (the issue's acceptance criterion), plus a `panic`
   breadcrumb;
-- `record_crash` writes the expected fields;
+- `records_crash_file_with_context` writes the expected fields, driven through
+  the two shipped phases (`record_crash_first_phase` + `append_backtrace`)
+  rather than a test-only one-shot wrapper, and pins that they **join** into
+  the historical bytes;
+- **the write-first ordering** (`the_minimal_record_and_the_breadcrumb_land_
+  before_the_backtrace_runs`): the backtrace source is injected, so the test
+  reads the log directory from *inside* the capture — the instant #1218's
+  process died at — and asserts the record and the `panic` breadcrumb are
+  already on disk and carry no `backtrace:` section;
+- **the double-panic latch** (`the_hook_reentry_latch_is_thread_local_and_only_
+  the_outer_run_disarms_it`): one assertion each for never arming it, disarming
+  it from an inner run, making it process-wide, and never clearing it — plus
+  `the_emergency_write_appends_one_line_and_never_truncates`, since a fallback
+  that clobbered phase one would destroy the record it exists to protect;
+- **the startup gap**: `only_an_unclean_start_with_no_crash_log_is_a_gap` pins
+  all four crossings of the predicate, and
+  `an_unclean_start_with_no_crash_log_names_the_gap_in_a_breadcrumb` pins that
+  the startup path writes it exactly once, with the WER pointers;
+- **the fmt-free property**, by source scan
+  (`the_first_phase_composes_without_the_formatting_machinery`) — nothing
+  behavioural can catch a `format!` creeping back into phase one, and the scan
+  states its own blind spot;
 - **unclean-exit detection**: first launch clean + arms sentinel; a launch with
   a leftover sentinel reports unclean and yields the notice; a clean exit clears
   it;
