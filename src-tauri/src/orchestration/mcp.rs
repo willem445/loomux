@@ -1306,15 +1306,6 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // would then read `tasks.json` from inside the items lock, which is
             // the nesting `needs_you_lock`'s doc rules out in the other
             // direction.
-            if let Some(t) = task {
-                if !reg.tasks(&caller.group).iter().any(|row| row.id == t) {
-                    return Err(format!(
-                        "unknown task: {t} — an item must name a live row on this board, or \
-                         nothing can ever auto-resolve it and it sits in the human's queue until \
-                         someone clears it by hand. Check list_tasks."
-                    ));
-                }
-            }
             let raised = reg.raise_needs_you(
                 &caller.group,
                 &caller.agent_id,
