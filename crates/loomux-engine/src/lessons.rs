@@ -35,8 +35,10 @@ pub const LEGACY_LESSONS_PATH: &str = ".loomux/lessons.md";
 /// Which of the two spellings a given repo actually uses — the path a kickoff
 /// must name, so an orchestrator told "the full file is at X" is told where
 /// the bytes it just read really came from.
-pub fn lessons_path(repo: &str) -> &'static str {
-    crate::brand::resolve_repo_file(repo, LESSONS_PATH, LEGACY_LESSONS_PATH)
+pub fn lessons_path(_repo: &str) -> &'static str {
+    // SCRATCH MUTATION (#1153 red evidence, round B): the lessons reader stops
+    // consulting the repo. `pick_repo_path` and the workflow side are untouched.
+    LESSONS_PATH
 }
 
 /// Hard ceiling on the **lesson content read from the file** — roughly 1,000
