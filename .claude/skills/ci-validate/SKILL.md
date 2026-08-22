@@ -325,8 +325,10 @@ own draft PR**, and CI's log is the failure line you quote.
 (below) still works — it just serialises rounds that are independent, at a full
 CI cycle each: #1196 cut five branches instead, queued within 14 s of each other
 and all conclusive 14 min later, against ~64 min of serialised run time. A branch
-per round also keeps each red citable at its own SHA, so a later fix that
-rewrites one round's mutation target re-cuts only that round. Bound it — a round
+per round also keeps each red citable at its own SHA, so when the two rules below
+retire one round's evidence — a watched red is dated to the commit it was watched
+on, and transfers only if you SHOW it does — only that round is re-cut, and the
+others stay citable where they are. Bound it — a round
 is three platforms, so a five-round wave is fifteen concurrent jobs; don't launch
 one against the green run you are waiting on (#1196).
 
