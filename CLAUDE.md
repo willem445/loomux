@@ -343,10 +343,10 @@ narrow their ask back down to the original ticket on your own judgment.
   too — the squash aggregates it and it cannot be edited in place, so flag it
   in the body for whoever squashes (#909). Run the sweep whenever YOU narrow a
   guarantee, not only when a review names a false claim: a mid-branch fix
-  falsifies your own earlier prose with nothing pointing at it, and a
-  reviewer's list of sites is a sample, not the set (#1189 — 6 named, 11 found,
-  and the site the reviewer called the worst was a module header this PR's own
-  later commit had falsified).
+  falsifies your own earlier prose and nothing MECHANICAL points at it — no
+  number to re-derive, no test to redden — and a reviewer's list of sites is a
+  sample, not the set (#1189: a module header falsified by that PR's own later
+  commit, and 6 sites named against 11 found; #1215).
 - **A doc naming a file or test that hasn't landed must say so in its tense
   and name the slice** — `` `tests/perf_dispatch.rs` *will* enforce … (#743
   S2/S3) `` — or the pointer waits for that slice. Present tense beside a
