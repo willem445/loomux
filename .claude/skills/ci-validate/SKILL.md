@@ -329,12 +329,30 @@ and all conclusive 14 min later, against ~64 min of serialised run time. A branc
 per round also keeps each red citable at its own SHA, so when the two rules below
 retire one round's evidence — a watched red is dated to the commit it was watched
 on, and transfers only if you SHOW it does — only that round is re-cut, and the
-others stay citable where they are. Bound it by the job list, not by a
-remembered product: `ci.yml` today runs **four** jobs per run — `build` on
-`ubuntu-22.04`, `windows-latest` and `macos-latest`, plus `e2e-windows` — so a
+others stay citable where they are. That holds only while nothing the survivors
+*reach* has moved either: once a review fix lands mid-wave, re-cut the wave
+rather than defend the survivors ("that criterion does not close", below).
+Bound the wave by the job list, not by a remembered product: `ci.yml` today
+runs **four** jobs per run — `build` on `ubuntu-22.04`, `windows-latest` and
+`macos-latest`, plus `e2e-windows` — so a
 five-round wave is **twenty** concurrent jobs. Re-read that list rather than
 this sentence if `ci.yml` gains or loses a job, and don't launch a wave against
 the green run you are waiting on (#1196).
+
+**Bank the base green at the wave's own SHA — and re-derive `origin/main`
+immediately before you push.** "A red only counts against a banked green" (below)
+is a citation rule for one round; for a wave it is a *launch precondition*,
+because whatever breaks the tree breaks every round identically and a compile
+error evidences nothing. **Your green is dated to the `main` it merged against,
+not only to your SHA**: `ci.yml` runs on `push` for `main` alone, so every
+scratch round is proved on `refs/pull/N/merge` — your head merged with `main`'s
+tip *at run-creation time* — while the `headSha` it reports is your branch head
+by itself. A sibling that merged in between is in every round's tree and in none
+of your evidence, and neither side is broken on its own. Re-run the green on the
+merge if `main` moved. Signature: a whole wave returns failing on one message and
+none of them is an assertion (#1236 — seven rounds dead on a
+`#[global_allocator]` collision present in neither the wave base nor `main`, only
+in the merge of the two, from a sibling that landed four minutes earlier).
 
 **One behaviour per round.** Two at once, or a neuter that stops it compiling,
 and the failures stop being attributable to the behaviour they evidence — a
@@ -368,7 +386,9 @@ That is the commoner half of the paragraph above: rebases land mid-review here, 
 the head a PR merges from is rarely the one a scratch round was cut on, and a
 mutated site that is still there reads as still-valid without being it. What
 carries the red is byte-identity of the regions the round mutated and of the tests
-it reddened, at both commits. `git range-diff <old-base>..<old-head>
+it reddened, at both commits — **necessary, and not sufficient**: read "that
+criterion does not close" below before you bank it.
+`git range-diff <old-base>..<old-head>
 <new-base>..<new-head>` marking every prior commit `=` is the shortcut for a pure
 rebase — but only once `git merge-base --is-ancestor <old-base> <new-base>` has
 exited 0. All-`=` says the patches match, never that the bases are related: two
@@ -376,12 +396,35 @@ merely-diverged bases report a clean all-`=` too (measured), and then the tree
 around your mutation is not the tree you measured on. Name the commit each round
 descends from, never "the current head" (#1182 — rounds F/G/H, four rebases).
 
+**That criterion does not close — and the cheap fix is to stop needing it.**
+Byte-identity covers the region you mutated and the test that reddened; it never
+looks at what that test *calls*. A transitive callee rewritten after the
+measurement — a review fix two frames down — retires the red exactly as silently,
+and again nothing goes red to say so. Extending the check to "identity plus a
+judgement call about the callees" only banks more hand-verified inertness claims,
+which is the shape this loop keeps catching stale. A wave is ONE CI cycle
+whatever its width, so re-cut every carried round from the head and delete the
+transfer argument instead — the head need not move for that, only the body.
+Signature: a round's mutated site is byte-identical at both commits and a
+function it calls is not (#1236 — three of eight rounds reached
+`record_crash_first_phase` / `newest_crash_log_since`, both rewritten by that
+PR's own review fixes).
+
 **A red only counts against a banked green.** Keep the unmutated tree's passing
 run for the same tests: a test that has never passed reddens for its own bug,
 not for your mutation, and the red then evidences nothing about the property.
 And a mutation that **hangs** the suite is a timeout, not a red — the job dies
 without naming an assertion, so there is no failure line to quote. Race a
 watchdog inside the test so the failure arrives as an assertion instead (#744).
+
+**Reconcile every round's test count against the banked green's.** Read passed +
+failed off the round's own log and check the total matches the green run's total
+for that binary. A row that does not reconcile means its red is not attributable
+to the behaviour the round was cut for **until you can say why** — a mutation
+with side effects, a flake, a test added or removed between the two runs, or the
+fail-fast truncation that stops a red run reaching later binaries. The extra reds
+are the ones you would otherwise quote. Signature: a round reddens three tests
+where one was expected (#1236 — eight rounds, each reconciling to 376).
 
 ### The frontend half runs its base red locally — build the isolated tree right
 

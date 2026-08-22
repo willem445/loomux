@@ -314,6 +314,14 @@ compiles.
   written row back out in your head, and when a review names one asymmetry
   re-derive EVERY input — the redesign is where the next one lands. Signature:
   the fix for a one-rule finding ships a second of the same class (#1182).
+- **A `Mutex` that serialises tests is locked with `lock_safe`, never
+  `.lock().unwrap()`.** One failing test panics under the guard and poisons it,
+  so every later test on that lock dies of `PoisonError` — one genuine failure
+  reported as N, and a mutation round's reds stop being attributable to the
+  behaviour they were cut for. Restore any global the harness overrode from a
+  `Drop` guard, for the same reason. Signature: extra tests reddening with
+  `Result::unwrap() on an Err value: PoisonError` beside the one you
+  expected (`SERIAL` in `crates/loomux-engine/src/obs.rs`, #1236).
 
 ## Refinements & scope increases from the user
 
