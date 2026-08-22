@@ -103,20 +103,40 @@ static WARNED_BAD_DATA_DIR: std::sync::Once = std::sync::Once::new();
 /// stay isolated. The `loomux`→`orrerix` rename applies only to the *platform
 /// default* below, via [`resolve_default_root`].
 fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
-    if let Some(dir) = &env_override {
-        let path = PathBuf::from(dir);
-        if !dir.is_empty() && path.is_absolute() {
-            return path;
-        }
-        WARNED_BAD_DATA_DIR.call_once(|| {
-            eprintln!(
-                "orrerix: {}={dir:?} is empty or not an absolute path — ignoring it \
-                 and using the platform data dir instead",
-                brand::env_names("DATA_DIR"),
-            );
-        });
+    match override_root(env_override) {
+        Some(path) => path,
+        None => resolve_default_root(),
     }
-    resolve_default_root()
+}
+
+/// The **one** definition of "this run is using an explicitly-named root", and
+/// the one place a bad override is rejected and reported.
+///
+/// Extracted because two guards depend on the same answer and must never
+/// disagree about it: `data_root_from` decides which root to *use*, and
+/// `init_data_root` decides whether to *migrate* — and a migration guard that
+/// read the variable by its own slightly different rule would be a bypass
+/// exactly the width of the difference. `None` means "no usable override; the
+/// platform default applies", for both callers alike.
+///
+/// Rejecting rather than warning-and-using is the pre-existing #394 behaviour:
+/// every consumer treats persistence as best-effort, so an empty or relative
+/// value would not error — it would silently redirect orchestration state, logs
+/// and tabs into the process's current working directory (often a git repo).
+fn override_root(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = env_override?;
+    let path = PathBuf::from(&dir);
+    if !dir.is_empty() && path.is_absolute() {
+        return Some(path);
+    }
+    WARNED_BAD_DATA_DIR.call_once(|| {
+        eprintln!(
+            "orrerix: {}={dir:?} is empty or not an absolute path — ignoring it \
+             and using the platform data dir instead",
+            brand::env_names("DATA_DIR"),
+        );
+    });
+    None
 }
 
 /// The platform data dir itself — the parent both the current and the legacy
@@ -193,6 +213,24 @@ static DEFAULT_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 /// which is the same safe state as a refused rename, and it retries next
 /// launch.
 pub fn init_data_root() {
+    init_data_root_from(brand::env_os("DATA_DIR").value);
+}
+
+/// [`init_data_root`] with the environment reading as a parameter. Returns
+/// whether it settled (and possibly migrated) the **platform default** — false
+/// means an explicit root is in force and this call did nothing at all, which
+/// is the branch a test can assert without a disk.
+fn init_data_root_from(env_override: Option<std::ffi::OsString>) -> bool {
+    // An explicitly-named root is used exactly as given: no rename, no
+    // migration, no probing of a sibling. Without this guard, a run pointed at
+    // an isolated profile — an E2E run, a second dev instance — would still
+    // rename the user's REAL `<data>/loomux` out from under the app they have
+    // open, which is precisely the state #394's override exists to avoid
+    // touching. The rule is read through `override_root`, the same function
+    // `data_root_from` decides with, so "which root is in force" has one answer.
+    if override_root(env_override).is_some() {
+        return false;
+    }
     let _ = DEFAULT_ROOT.get_or_init(|| {
         let (new, legacy) = default_root_pair();
         match plan_default_root(new.is_dir(), legacy.is_dir()) {
@@ -207,6 +245,7 @@ pub fn init_data_root() {
             }
         }
     });
+    true
 }
 
 /// The two platform-default roots, current and legacy, derived from one
@@ -620,6 +659,35 @@ mod tests {
     }
 
     // ---------- the loomux -> orrerix data-root migration (#1153 phase 4) ----------
+
+    /// The migration must never fire for a run pointed at an explicit root.
+    /// Without this guard an E2E run — or any second dev instance on an
+    /// isolated profile — would rename the user's REAL `<data>/loomux` out from
+    /// under the app they have open, which is the one directory #394's override
+    /// exists to keep its hands off.
+    #[test]
+    fn an_explicit_root_is_never_migrated() {
+        let explicit = std::env::temp_dir().join("orrerix-explicit-root");
+        assert!(
+            !init_data_root_from(Some(explicit.into_os_string())),
+            "an absolute override must make init a no-op — it must not settle, \
+             let alone migrate, the platform default"
+        );
+    }
+
+    /// …and the two guards agree on WHICH values count as explicit. A value
+    /// `data_root_from` rejects must not be one `init_data_root` treats as "an
+    /// operator named a root", or the difference between the two rules is a
+    /// silent window in which the platform default is used but never migrated.
+    #[test]
+    fn a_rejected_override_is_not_treated_as_an_explicit_root() {
+        for bad in ["", r"relative\path"] {
+            assert_eq!(override_root(Some(std::ffi::OsString::from(bad))), None, "{bad:?}");
+        }
+        let good = std::env::temp_dir().join("orrerix-explicit-root");
+        assert_eq!(override_root(Some(good.clone().into_os_string())), Some(good));
+        assert_eq!(override_root(None), None);
+    }
 
     #[test]
     fn the_new_root_existing_means_the_old_one_is_never_touched() {
