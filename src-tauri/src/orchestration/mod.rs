@@ -9484,8 +9484,8 @@ impl WipBreach {
         };
         format!(
             "board.wip: {} is capped at {} and this write leaves it holding {}{held} — finish one \
-             or move it out of {} before writing {this_id}. The cap is `board.wip.{}` in \
-             .loomux/workflow.yml.",
+             or move it out of {} before writing {this_id}. The cap is `board.wip.{}` in this \
+             repo's workflow file.",
             self.status, self.limit, self.count, self.status, self.status,
         )
     }

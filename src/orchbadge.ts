@@ -9,7 +9,7 @@ import type { PaneBadge } from "./pane";
 import { IDENTITY } from "./theme.ts";
 
 /** A capability class, as the backend's `Role` serializes it. `manager` (#1161)
- *  is declarable only in a repo's the workflow file — it is never part of
+ *  is declarable only in a repo's workflow file — it is never part of
  *  the built-in roster, so widening this union deliberately does NOT widen
  *  `ORCH_ROLES` (roster.ts), which is the launcher's per-role form AND the
  *  built-in roster itself. */

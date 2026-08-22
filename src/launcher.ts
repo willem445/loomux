@@ -16,7 +16,7 @@
 //   Git          — a PTY-less pane hosting the git view over a repo (#217): graph,
 //                  status, diffs, staging, #208 worktree switching. The Alt+G
 //                  overlay, as a pane.
-//   Workflow     — a PTY-less pane over the repo's the workflow file (#222): the
+//   Workflow     — a PTY-less pane over the repo's workflow file (#222): the
 //                  agent blocks a run may use, the advisory path between them, and the
 //                  enforced merge gate. Rooted at the repo; the file need not exist yet.
 //
@@ -167,7 +167,7 @@ export type WelcomeResult =
   /** A git pane (#217): `root` is a directory this form has already confirmed is
    *  inside a git work tree (`gitRepoRoot`), so the pane can't open on a non-repo. */
   | { kind: "git"; name: string; root: string }
-  /** A workflow pane (#222): `root` is the repo whose the workflow file the pane
+  /** A workflow pane (#222): `root` is the repo whose workflow file the pane
    *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
    *  a repo without one is the normal starting point, and the pane offers to create it. */
   | { kind: "workflow"; name: string; root: string }
@@ -366,7 +366,7 @@ export class WelcomeForm {
    *  (`rolePicks`, submit) that must decide what a control's value MEANS without
    *  awaiting anything. Absent = not known, which `knobState` disables. */
   private knownKnobs = new Map<string, CliKnobs | null>();
-  // Advanced orchestrator (#222): run the repo's the workflow file instead
+  // Advanced orchestrator (#222): run the repo's workflow file instead
   // of the four fixed roles. OFF by default — a workflow file arrives with a
   // `git clone`, so it takes effect only when the human opts in, having been
   // shown (in `rosterEl`) the blocks and repo-authored personas they'd be

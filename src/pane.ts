@@ -324,8 +324,8 @@ export interface ContentPaneOptions {
    *  editor on its tree with nothing selected.
    *
    *  WORKFLOW kind (#222): which workflow file to edit, root-relative. Defaults to
-   *  the workflow file when absent — the welcome flow's case — and is set when the
-   *  browser opens a *different* YAML as a workflow. */
+   *  the repo's own workflow path when absent — the welcome flow's case — and is set
+   *  when the browser opens a *different* YAML as a workflow. */
   file?: string;
   /** Open without stealing keyboard focus (same contract as PaneOptions). */
   background?: boolean;
@@ -1993,8 +1993,8 @@ export class Pane implements VoiceTargetPane {
 
     if (opts.kind === "workflow") {
       // The workflow file rides in `file`, exactly as the editor's open file does, so the
-      // capture/restore path needed no new field (tabstore.ts). Absent = the default
-      // the workflow file, which is what the welcome form creates.
+      // capture/restore path needed no new field (tabstore.ts). Absent = the repo's
+      // default workflow path, which is what the welcome form creates.
       this.workflowPaneView = new WorkflowView({
         getRoot: () => this.contentRoot,
         getFile: () => this.contentFile ?? WORKFLOW_FILE,

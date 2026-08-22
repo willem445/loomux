@@ -614,7 +614,7 @@ is open — so an orchestrator can pile up ten items waiting on review while che
 starting more. **WIP limits** cap the work instead: how many items may sit in a status at
 one time.
 
-Declare them in `.loomux/workflow.yml` (the file that carries your roster, so this needs the
+Declare them in your workflow file (the file that carries your roster, so this needs the
 **advanced orchestrator** on):
 
 ```yaml
@@ -672,7 +672,7 @@ refusing a move to `blocked` refuses an agent's report that something is stuck. 
 `enforce: true`, leave `blocked` uncapped.
 
 **A bad value fails the whole file, on purpose** — `review: 0`, a misspelt status
-(`in-porgress`), or any key orrerix does not recognise stops `.loomux/workflow.yml` from
+(`in-porgress`), or any key orrerix does not recognise stops the workflow file from
 loading at all, taking your roster and merge gate with it, and the launcher shows you why.
 The error names the statuses you *could* have written. That is deliberate: a repo that wrote
 `review: 0` believes something about how its board paces, and quietly substituting a default
