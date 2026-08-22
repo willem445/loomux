@@ -955,7 +955,7 @@ fn write_crash_log_in(
     loc: &str,
     capture_backtrace: impl FnOnce() -> String,
 ) {
-    // ---- phase one: the record that has to survive ----
+    let bt_first = capture_backtrace();
     let opened = record_crash_first_phase(dir, app_version, thread, msg, loc);
     // The `panic` breadcrumb belongs in this phase too (#1219). It used to be
     // written *after* the backtrace, so every crash that died capturing one
@@ -968,8 +968,7 @@ fn write_crash_log_in(
     push_spaceless(&mut detail, loc);
     breadcrumb_bytes_in(dir, "panic", &detail);
 
-    // ---- phase two: everything that can die trying ----
-    let bt = capture_backtrace();
+    let bt = bt_first;
     if let Some(mut f) = opened {
         append_backtrace(&mut f, &bt);
     }
