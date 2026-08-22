@@ -43,7 +43,7 @@ standing in for the real one:
 
 ```
 $ sh ./gh api -X DELETE repos/o/r/git/refs/tags/v1.0.0        # normal PATH
-loomux: publishing a release/tag (v1.0.0) requires an explicit human grant …
+orrerix: publishing a release/tag (v1.0.0) requires an explicit human grant …
 rc=1
 $ env -i PATH=/c/Windows/system32 sh.exe ./gh api -X DELETE repos/o/r/git/refs/tags/v1.0.0
 ./gh: line 177: tr: command not found

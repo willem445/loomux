@@ -4627,7 +4627,11 @@ fn a_refused_stranded_marker_reports_the_pane_state_it_left_behind() {
     assert_eq!(r.items[0].text, None, "there are no bytes to re-send, and never were");
     assert_eq!(r.items[0].bytes, None);
     assert_eq!(r.items[0].enqueue_reason, None, "a marker is not admitted under an EnqueueReason");
-    assert_eq!(r.items[0].from, "loomux", "the marker push is loomux's own act");
+    // Deliberately the PRE-RENAME sender (#1153 phase 3): this row is read back
+    // out of a record written before the flag day, and `is_host_actor` accepting
+    // it is the compatibility claim. The current spelling is covered by every
+    // other host-send specimen in this file.
+    assert_eq!(r.items[0].from, "loomux", "the marker push is this app's own act");
     assert_eq!(
         r.items[0].consequence.as_deref(),
         Some("text is pasted in the pane with nothing queued to submit it"),
@@ -12046,7 +12050,7 @@ fn path_keys_follow_the_hosts_own_path_semantics() {
     } else {
         ("/home/u/demo", "/home/u/demo-worktrees/w-1")
     };
-    let written = copilot_permissions_grant("", loc, wt, "loomux").unwrap();
+    let written = copilot_permissions_grant("", loc, wt, "orrerix").unwrap();
     let v: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert!(
         !v["locations"][loc].is_null(),
@@ -12093,7 +12097,7 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     const REPO: &str = r"C:\Projects\demo";
     const WORKTREE: &str = r"C:\Projects\demo-worktrees\fix-1";
 
-    let fresh = copilot_permissions_grant("", REPO, WORKTREE, "loomux").unwrap();
+    let fresh = copilot_permissions_grant("", REPO, WORKTREE, "orrerix").unwrap();
     let v: serde_json::Value = serde_json::from_str(&fresh).unwrap();
     let entry = &v["locations"][REPO];
     assert_eq!(
@@ -12103,7 +12107,7 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     );
     assert_eq!(
         entry["tool_approvals"],
-        json!([{ "kind": "mcp", "serverName": "loomux", "toolName": null }]),
+        json!([{ "kind": "mcp", "serverName": "orrerix", "toolName": null }]),
         "toolName: null is the documented 'every tool on the server' approval: {fresh}"
     );
 
@@ -12111,14 +12115,14 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     // long-lived group) can't grow this file without bound the way the
     // `trustedFolders` list once did.
     assert!(
-        copilot_permissions_grant(&fresh, REPO, WORKTREE, "loomux").is_none(),
+        copilot_permissions_grant(&fresh, REPO, WORKTREE, "orrerix").is_none(),
         "an already-granted location must produce no write at all"
     );
 
     // A SECOND worktree under the same repo joins the existing location rather
     // than creating a new one — that is the point of keying by git root.
     let second =
-        copilot_permissions_grant(&fresh, REPO, r"C:\Projects\demo-worktrees\fix-2", "loomux")
+        copilot_permissions_grant(&fresh, REPO, r"C:\Projects\demo-worktrees\fix-2", "orrerix")
             .expect("a new workspace is a real change");
     let v: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(v["locations"].as_object().unwrap().len(), 1, "one repo, one location key: {second}");
@@ -12138,7 +12142,7 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
         }
     }))
     .unwrap();
-    let merged = copilot_permissions_grant(&existing, REPO, WORKTREE, "loomux").unwrap();
+    let merged = copilot_permissions_grant(&existing, REPO, WORKTREE, "orrerix").unwrap();
     let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
     assert_eq!(v["locations"][r"C:\Other\repo"]["tool_approvals"], json!([{ "kind": "write" }]));
     let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
@@ -12162,7 +12166,7 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     let seeded =
         serde_json::to_string_pretty(&json!({ "locations": serde_json::Value::Object(locs) }))
             .unwrap();
-    let variant = copilot_permissions_grant(&seeded, REPO, WORKTREE, "loomux").unwrap();
+    let variant = copilot_permissions_grant(&seeded, REPO, WORKTREE, "orrerix").unwrap();
     let v: serde_json::Value = serde_json::from_str(&variant).unwrap();
     assert_eq!(
         v["locations"].as_object().unwrap().len(),
@@ -12177,11 +12181,11 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     // tool ungranted, which is #802's symptom with extra steps.
     let narrow = serde_json::to_string_pretty(&json!({
         "locations": { r"C:\Projects\demo": { "tool_approvals": [
-            { "kind": "mcp", "serverName": "loomux", "toolName": "report" }
+            { "kind": "mcp", "serverName": "orrerix", "toolName": "report" }
         ] } }
     }))
     .unwrap();
-    let widened = copilot_permissions_grant(&narrow, REPO, WORKTREE, "loomux")
+    let widened = copilot_permissions_grant(&narrow, REPO, WORKTREE, "orrerix")
         .expect("a per-tool approval does not satisfy the server-wide grant");
     let v: serde_json::Value = serde_json::from_str(&widened).unwrap();
     let approvals = v["locations"][REPO]["tool_approvals"].as_array().unwrap();
@@ -12189,7 +12193,7 @@ fn copilot_permissions_grant_writes_the_documented_shape() {
     assert!(approvals.iter().any(|a| a["toolName"].is_null()), "{widened}");
 
     // Corrupt file: never clobbered, same policy as `add_trusted_folder`.
-    assert!(copilot_permissions_grant("{ not json", REPO, WORKTREE, "loomux").is_none());
+    assert!(copilot_permissions_grant("{ not json", REPO, WORKTREE, "orrerix").is_none());
 }
 
 #[test]
@@ -12211,7 +12215,7 @@ fn pre_trust_writes_both_permission_surfaces_and_keys_the_grant_by_repo() {
     let entry = &v["locations"][r"C:\Projects\demo"];
     assert!(!entry.is_null(), "the grant must be keyed by the repo's git root: {perms}");
     assert_eq!(entry["allowed_directories"], json!([r"C:\Projects\demo-worktrees\w-1"]));
-    assert_eq!(entry["tool_approvals"][0]["serverName"], "loomux");
+    assert_eq!(entry["tool_approvals"][0]["serverName"], "orrerix");
     assert!(entry["tool_approvals"][0]["toolName"].is_null());
 
     // The legacy surface is still written — the docs' silence about
@@ -17276,9 +17280,12 @@ fn compact_rails(minutes: u32, roles: &[&str]) -> Guardrails {
 /// CONFIRMED delivery to `agent_id` at `submit_sent_ms` — what a real
 /// `deliver_prompt` background thread would eventually record, supplied
 /// directly since unit tests have no live pty/app handle to exercise it for
-/// real (see `DeliveryConfirmation`'s doc). `from: "loomux"` — every
-/// existing caller uses this to simulate loomux's OWN reinjection delivery
-/// confirming, never a human/other-agent message.
+/// real (see `DeliveryConfirmation`'s doc). `from` is the PRE-RENAME host
+/// sender on purpose (#1153 phase 3): every existing caller uses this to
+/// simulate this app's OWN reinjection delivery confirming, never a
+/// human/other-agent message, and a confirmation restored from a record
+/// written before the flag day is exactly what `brand::is_host_actor` has to
+/// keep recognising for the inference-arm cooldown to hold across an upgrade.
 fn confirmed_delivery(agent_id: &str, submit_sent_ms: u64) -> HashMap<String, DeliveryConfirmation> {
     [(agent_id.to_string(), DeliveryConfirmation { submit_sent_ms, confirmed: true, from: "loomux".to_string() })]
         .into_iter()
@@ -20630,10 +20637,11 @@ fn compact_nudge_tick_never_reads_its_own_compact_paste_echo_as_a_manually_typed
     // genuine, already-resolved compaction can still be sitting in the
     // bounded tail when the human later types something completely
     // UNRELATED (satisfying manual detection's recency-of-ANY-keystroke
-    // gate) — misreading loomux's own stale echo as a freshly human-typed
-    // `/compact`. The provenance fix: a CONFIRMED delivery `from ==
-    // "loomux"` extends the inference-arm cooldown, independent of and in
-    // addition to the post-resolve cooldown above.
+    // gate) — misreading this app's own stale echo as a freshly human-typed
+    // `/compact`. The provenance fix: a CONFIRMED delivery whose `from` is
+    // this app's own (either spelling, `brand::is_host_actor`) extends the
+    // inference-arm cooldown, independent of and in addition to the
+    // post-resolve cooldown above.
     let (reg, _d, gid, oid) = compact_nudge_setup(5); // heuristic on — the loomux-initiated arm
     let empty = HashMap::new();
     // Loomux's own fire, busy-then-quiet resolve — a genuine, real compaction.

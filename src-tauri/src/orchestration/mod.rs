@@ -1010,7 +1010,7 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
          # itself be defeated by the very PATH problem it is testing for.\n\
          for _dep in tr head tail date cat rm mv; do\n\
          \x20 command -v \"$_dep\" >/dev/null 2>&1 && continue\n\
-         \x20 printf '%s\\n' \"loomux: the merge/release gate shim cannot find the POSIX tool '$_dep' on PATH, so it cannot normalize the values it gates on. Refusing this command outright rather than running it through a gate that would silently skip those checks (#509). This means loomux could not locate Git for Windows' coreutils (usr/bin) when it wrote the shim: repair or reinstall Git for Windows, then open a new pane.\" >&2\n\
+         \x20 printf '%s\\n' \"orrerix: the merge/release gate shim cannot find the POSIX tool '$_dep' on PATH, so it cannot normalize the values it gates on. Refusing this command outright rather than running it through a gate that would silently skip those checks (#509). This means orrerix could not locate Git for Windows' coreutils (usr/bin) when it wrote the shim: repair or reinstall Git for Windows, then open a new pane.\" >&2\n\
          \x20 loomux_audit \"gate-degraded-missing-dep\" \"{{\\\"dep\\\":\\\"$_dep\\\"}}\"\n\
          \x20 exit 1\n\
          done\n\
@@ -1026,7 +1026,7 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
          # $1=raw input $2=normalized output $3=field name for the audit\n\
          loomux_norm_guard() {{\n\
          \x20 [ -n \"$1\" ] && [ -z \"$2\" ] || return 0\n\
-         \x20 printf '%s\\n' \"loomux: the merge/release gate could not normalize $3 — the POSIX tool that folds its case resolved but produced nothing, so every gate pattern below would match against an empty string and let this command through. Refusing it instead (#509). Check that Git for Windows' coreutils are intact.\" >&2\n\
+         \x20 printf '%s\\n' \"orrerix: the merge/release gate could not normalize $3 — the POSIX tool that folds its case resolved but produced nothing, so every gate pattern below would match against an empty string and let this command through. Refusing it instead (#509). Check that Git for Windows' coreutils are intact.\" >&2\n\
          \x20 loomux_audit \"gate-degraded-normalize-failed\" \"{{\\\"field\\\":\\\"$3\\\"}}\"\n\
          \x20 exit 1\n\
          }}\n"
@@ -1121,7 +1121,7 @@ loomux_block() { # $1=reason $2=base $3=pr
 # a human grant, autonomous auto-merge and supervised dangerous mode all sit BELOW
 # it and none of them can open it. $1=reason (audit) $2=human-readable detail.
 loomux_block_wf() { # $1=reason $2=detail
-  printf '%s\n' "loomux: this repo's workflow.yml declares a merge gate on PR #$num and it is NOT satisfied — $2. The merge is refused. Reviewers record their outcome with the review_verdict MCP tool (pass | fail | escalate); a fail/escalate from ANY named reviewer refuses the merge whatever the others said. Wait for the reviews, or take it to the human — do NOT work around this. Three ways forward: (1) get the named reviewer(s) to run and record a verdict, (2) have the human turn workflow mode off for this session (clears the gate), or (3) merge this PR from the GitHub UI, which is not gated." >&2
+  printf '%s\n' "orrerix: this repo's workflow.yml declares a merge gate on PR #$num and it is NOT satisfied — $2. The merge is refused. Reviewers record their outcome with the review_verdict MCP tool (pass | fail | escalate); a fail/escalate from ANY named reviewer refuses the merge whatever the others said. Wait for the reviews, or take it to the human — do NOT work around this. Three ways forward: (1) get the named reviewer(s) to run and record a verdict, (2) have the human turn workflow mode off for this session (clears the gate), or (3) merge this PR from the GitHub UI, which is not gated." >&2
   loomux_audit "merge-gate-workflow-blocked" "{\"reason\":\"$1\",\"pr\":\"$num\"}"
   exit 1
 }
@@ -1129,14 +1129,14 @@ loomux_block_release() { # $1=tag $2=action $3=conflicting caller-supplied tag (
   if [ -n "$3" ]; then
     # rev B1: the URL names one release and the body names a different tag. Never
     # matched against a grant — a grant authorizes ONE tag and this call names two.
-    printf '%s\n' "loomux: refusing this release call — the release it addresses is tagged '$1', but the call's own tag_name/ref field says '$3'. loomux takes an id-addressed release's identity from the id in the URL, never from a tag field the caller supplied, so this cannot be matched to a grant: a grant authorizes one tag and this names two. If you meant to edit the '$1' release, drop the tag_name/ref field. If you meant to RETAG it to '$3', that publishes a tag nobody has authorized — ask the human to grant '$3' first; do NOT publish." >&2
+    printf '%s\n' "orrerix: refusing this release call — the release it addresses is tagged '$1', but the call's own tag_name/ref field says '$3'. orrerix takes an id-addressed release's identity from the id in the URL, never from a tag field the caller supplied, so this cannot be matched to a grant: a grant authorizes one tag and this names two. If you meant to edit the '$1' release, drop the tag_name/ref field. If you meant to RETAG it to '$3', that publishes a tag nobody has authorized — ask the human to grant '$3' first; do NOT publish." >&2
   elif [ -n "$1" ]; then
-    printf '%s\n' "loomux: publishing a release/tag ($1) requires an explicit human grant — releases publish to the world (GitHub release + npm), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT publish." >&2
+    printf '%s\n' "orrerix: publishing a release/tag ($1) requires an explicit human grant — releases publish to the world (GitHub release + npm), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT publish." >&2
   else
     # #437: the pre-fix message rendered this case as "release/tag ()" — the empty
     # parens being the only clue that the shim had found no tag to key a grant on,
     # which is a different problem needing a different action from the agent.
-    printf '%s\n' "loomux: this call publishes a release but names no tag loomux could resolve, so it cannot be matched against a release grant — and a grant authorizes ONE tag, never 'whichever release this turns out to be'. Refusing it rather than guessing. If you addressed a release by numeric id, check that id exists and that gh can read it (loomux resolves id → tag with one read-only lookup); otherwise address the release by its tag. Then ask the human to grant THAT release; do NOT publish." >&2
+    printf '%s\n' "orrerix: this call publishes a release but names no tag orrerix could resolve, so it cannot be matched against a release grant — and a grant authorizes ONE tag, never 'whichever release this turns out to be'. Refusing it rather than guessing. If you addressed a release by numeric id, check that id exists and that gh can read it (orrerix resolves id → tag with one read-only lookup); otherwise address the release by its tag. Then ask the human to grant THAT release; do NOT publish." >&2
   fi
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
@@ -1624,7 +1624,7 @@ if [ "$cmd" = "pr" ] && [ "$sub" = "create" ]; then
       fi
       case "$a_lines" in ''|*[!0-9]*) a_lines="" ;; esac
       if [ -n "$a_lines" ] && [ "$a_lines" -gt "$a_max" ]; then
-        printf '%s\n' "loomux: heads up — this PR changes $a_lines lines and this repo's merge gate declares max_diff_lines: $a_max, so the merge WILL be refused as it stands. Split it now, before anyone reviews it: a split after review means the review is spent twice. (This notice is advisory only — the PR was created.)" >&2
+        printf '%s\n' "orrerix: heads up — this PR changes $a_lines lines and this repo's merge gate declares max_diff_lines: $a_max, so the merge WILL be refused as it stands. Split it now, before anyone reviews it: a split after review means the review is spent twice. (This notice is advisory only — the PR was created.)" >&2
         loomux_audit "pr-size-advisory" "{\"lines\":$a_lines,\"limit\":$a_max}"
       fi
     fi
@@ -2205,7 +2205,7 @@ fi
 for a in "$@"; do
   case "$a" in
     --tags|--follow-tags|--mirror)
-      printf '%s\n' "loomux: a bulk tag push ($a) is not allowed — push the specific approved tag and have the human grant that release." >&2
+      printf '%s\n' "orrerix: a bulk tag push ($a) is not allowed — push the specific approved tag and have the human grant that release." >&2
       loomux_audit "release-gate-blocked" "{\"tag\":\"(bulk)\",\"action\":\"push $a\"}"
       exit 1 ;;
   esac
