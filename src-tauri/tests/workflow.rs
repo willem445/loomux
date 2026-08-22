@@ -3191,8 +3191,8 @@ fn a_tools_frontmatter_is_read_in_every_yaml_shape_a_real_agent_file_uses() {
             Some(["read".to_string(), "edit".to_string()].as_slice()),
             "{label} shape must read as the same two tools"
         );
-        assert!(!p.grants_mcp_server("loomux"), "{label}: neither entry grants loomux");
-        assert!(!p.mentions_mcp_server("loomux"), "{label}: nor mentions it");
+        assert!(!p.grants_mcp_server("orrerix"), "{label}: neither entry grants the server");
+        assert!(!p.mentions_mcp_server("orrerix"), "{label}: nor mentions it");
     }
 
     // Absent vs. empty are DIFFERENT, and the difference is a capability:
@@ -3201,16 +3201,16 @@ fn a_tools_frontmatter_is_read_in_every_yaml_shape_a_real_agent_file_uses() {
     // empty list read as "grants everything" and hide the worst case of all.
     let absent = profiles::parse_profile("a", "---\nname: a\ndescription: d\n---\nbody").unwrap();
     assert_eq!(absent.tools, None);
-    assert!(absent.grants_mcp_server("loomux"), "no filter means every tool, loomux's included");
+    assert!(absent.grants_mcp_server("orrerix"), "no filter means every tool, the server's included");
     let empty = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: []\n---\nbody").unwrap();
     assert_eq!(empty.tools.as_deref(), Some::<&[String]>(&[]));
-    assert!(!empty.grants_mcp_server("loomux"), "an explicit empty list disables everything");
+    assert!(!empty.grants_mcp_server("orrerix"), "an explicit empty list disables everything");
 
     // A per-tool grant is *mentioned* but not a full grant — the warning says
     // something different in that case, and it has to be able to tell.
     let partial = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"orrerix/report\"]\n---\nbody").unwrap();
-    assert!(!partial.grants_mcp_server("loomux"));
-    assert!(partial.mentions_mcp_server("loomux"));
+    assert!(!partial.grants_mcp_server("orrerix"));
+    assert!(partial.mentions_mcp_server("orrerix"));
 
     // `mcp-servers:` presence is what blocks the rewrite; a file without it must
     // never be mistaken for one that has it.
