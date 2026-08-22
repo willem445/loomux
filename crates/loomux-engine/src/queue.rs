@@ -1830,7 +1830,7 @@ pub fn rebinds_to(entry: &QueuedDelivery, agent_is_orchestrator: bool, agent_ses
 pub fn recovered_notice(agent_id: &str, count: usize, oldest_minutes: u64) -> String {
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     format!(
-        "[orrerix] {n} to {agent_id} queued before a loomux restart {oldest_minutes} min ago have been \
+        "[orrerix] {n} to {agent_id} queued before an orrerix restart {oldest_minutes} min ago have been \
          re-queued in their original order and are delivering now — judge staleness before acting on them"
     )
 }
@@ -1843,7 +1843,7 @@ pub fn recovered_notice(agent_id: &str, count: usize, oldest_minutes: u64) -> St
 pub fn orphaned_notice(count: usize) -> String {
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     format!(
-        "[orrerix] {n} queued before the last loomux restart could not be re-bound to a live pane — \
+        "[orrerix] {n} queued before the last orrerix restart could not be re-bound to a live pane — \
          call queue_orphans() to read them (payloads intact) and re-send what still applies"
     )
 }
@@ -1855,7 +1855,7 @@ pub fn orphaned_notice(count: usize) -> String {
 pub fn stranded_lost_notice(count: usize) -> String {
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     format!(
-        "[orrerix] {n} had already been typed into a pane and was waiting only for Enter when loomux \
+        "[orrerix] {n} had already been typed into a pane and was waiting only for Enter when orrerix \
          restarted — that pane is gone, so the text is NOT recoverable; check the `prompt` audit lines \
          for what it was and re-send if it still applies"
     )

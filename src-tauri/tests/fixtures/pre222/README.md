@@ -741,6 +741,33 @@ version of the test built its expected value out of the live template, so both s
 moved together and unconditional prose added to a template sailed through the very
 pin advertised to stop it (rev-11 F1).
 
+- **#1153 phase 3, the protocol strings** — all four files, plus `manager.md`
+  unchanged. The notice marker every template teaches an agent to recognise is
+  now `[orrerix]`; the merge-gate refusal an orchestrator is told to expect,
+  the audit `from` it is told to look for, and the restart notice it is told to
+  tell apart from two similar ones all moved with the code strings that emit
+  them, in the same commit — a template quoting a string the code never says is
+  the defect #1191 avoided by deliberately NOT renaming that last one while the
+  code still said `loomux`.
+
+  **The half that is a behaviour fix, not a rename**: the lessons file is now
+  `{{LESSONS_PATH}}`, a per-group VALUE variable (like `{{HOLD_LABEL}}`, so it
+  stays literal here and `render_with_legacy_vars` renders it), resolved by
+  `lessons::lessons_path(repo)`. Phase 4 made repo config resolve per file —
+  `.orrerix/` preferred, `.loomux/` read when it is the only one there — and
+  left these four templates hard-coding the legacy spelling because a re-bless
+  wants its own round. In a repo that has moved, the old text sent a reader to
+  a file that repo does not have; at `orchestrator.md`'s learning loop it sent
+  a **writer** there, and that one is silently ignored rather than merely
+  wrong, because `lessons_path` prefers `.orrerix/lessons.md` and never reads
+  the entry again.
+
+  Two `loomux` spellings survive in `orchestrator.md` on purpose: the
+  `loomux-worktrees` path example (a convention derived from the REPO's name,
+  not the product's) and the `agent-managed` label description, which mirrors
+  `gh.rs`'s label table verbatim and would orphan every existing label if only
+  one side moved.
+
 ## If this test fails
 
 It is telling you that **the text every agent in every default group reads has

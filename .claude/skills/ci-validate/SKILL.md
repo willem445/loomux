@@ -243,7 +243,7 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    notify_when(kind: "pr_checks", pr: <pr>)
    ```
    …then **end your turn.** orrerix polls on your behalf and types a
-   `[loomux] …` notice into your pane when the checks resolve.
+   `[orrerix] …` notice into your pane when the checks resolve.
 
    Waiting for that result in the same turn is a **deadlock**, not merely
    slow: the notice is delivered by typing into the pane, and a pane that is
