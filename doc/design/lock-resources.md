@@ -85,11 +85,11 @@ description, because an agent that cannot see what exists guesses (`cargo`, `bui
 ## The load-bearing decision: acquire never blocks
 
 `acquire_lock` returns immediately — granted, or queued with a position — and a grant that
-arrives later is **typed into the caller's pane** as a `[loomux]` notice, exactly like a
+arrives later is **typed into the caller's pane** as an `[orrerix]` notice, exactly like a
 `notify_when` watch resolving.
 
 The alternative (block the MCP call until the lock is free) is a deadlock by construction, and
-loomux has already paid for that lesson once. A `[loomux]` notice is delivered by *writing into
+loomux has already paid for that lesson once. An `[orrerix]` notice is delivered by *writing into
 a pane*, and a pane that is mid-call cannot take a delivery — so an agent blocked waiting for
 its lock would be blocking the delivery of the message telling it the lock is ready. That is
 #590's shape reached by a new route, and it would be worse than #590 because nothing external
@@ -193,7 +193,7 @@ once at the boundary fixes the audit log and `list_locks` in the same stroke.
 
 The **resource name** is a separate question and is handled by the parser: `sanitize_id`'s
 letters/digits/`-`/`_` alphabet, reject-not-rewrite. That matters more than it looks, because the
-name *is* interpolated into the `[loomux]` notices typed into panes — the alphabet is what stops a
+name *is* interpolated into the `[orrerix]` notices typed into panes — the alphabet is what stops a
 repo-authored name from forging a prompt there. The `note` never reaches a pane-typed notice at
 all.
 

@@ -2193,7 +2193,7 @@ test("sanitizeAllowPattern mirrors the engine's alphabet, both ways (#1020)", ()
     sanitizeAllowPattern("Bash(gh pr view --json title,body)"),
     "Bash(gh pr view --json title,body)"
   );
-  assert.equal(sanitizeAllowPattern("mcp__loomux/report:*"), "mcp__loomux/report:*");
+  assert.equal(sanitizeAllowPattern("mcp__orrerix/report:*"), "mcp__orrerix/report:*");
   // Filtered — every one of these reaches the CLI's flag as something else.
   assert.equal(sanitizeAllowPattern('Bash(echo "$X" | tee f)'), "Bash(echo X  tee f)");
   assert.equal(sanitizeAllowPattern("  Bash(ls)  "), "Bash(ls)");

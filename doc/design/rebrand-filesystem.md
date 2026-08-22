@@ -283,11 +283,14 @@ the current name first.
 
 ## What this phase deliberately does not touch
 
-Phase 3 owns the protocol identities — the `(loomux)` notice marker, the MCP server
-name and `X-Loomux-Agent` header, the audit sender, the shim labels, and the
-agent-visible `LOOMUX_GROUP_DIR` / `LOOMUX_AGENT_ID` exports. They must flip
-together, per group, on a flag day; nothing here anticipates that. Phase 5 owns the
-published identities (`productName`, the bundle identifier, the npm package, the
+Phase 3 owns the protocol identities — the notice marker (`[loomux]`, not
+`(loomux)`: the parenthesised form is what the anti-forgery sanitizer PRODUCES,
+and the phase-0 plan's spelling of it was wrong), the MCP server name and token
+header, the audit actor, the shim internals, and the agent-visible group-dir /
+agent-id exports. Nothing here anticipated that; it has since landed — see
+[`rebrand-protocol.md`](rebrand-protocol.md), which states the rule this phase's
+dual-discovery could not use: emit one spelling, accept every spelling. Phase 5
+owns the published identities (`productName`, the bundle identifier, the npm package, the
 GitHub repo), which are human-performed.
 
 `brand.rs` is meant to shrink and eventually die. Every `LEGACY_` constant in it is
