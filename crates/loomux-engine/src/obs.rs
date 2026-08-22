@@ -432,9 +432,14 @@ pub fn logs_dir() -> PathBuf {
 // ---------- timestamps ----------
 
 /// Format unix-millis as `YYYYMMDD-HHMMSS` (UTC): filename-safe and lexically
-/// sortable, so "newest crash log" is a plain string max. Pure — computed via
-/// Howard Hinnant's days-from-civil algorithm so no date crate is pulled in
-/// (and nothing that would drag in getrandom; see Cargo.toml).
+/// sortable, so a directory listing reads in chronological order. Pure —
+/// computed via Howard Hinnant's days-from-civil algorithm so no date crate is
+/// pulled in (and nothing that would drag in getrandom; see Cargo.toml).
+///
+/// That sortability is a **convenience for whoever opens the folder**, and is
+/// no longer what picks the newest crash log: `newest_crash_log_since` orders
+/// on mtime, because `crash-alloc.log` joined that set in #1219 and its name is
+/// not a stamp. See that function.
 ///
 /// A thin wrapper over [`push_stamp`], which is the one implementation of the
 /// format: the crash path needs the same stamp without `core::fmt` (#1219),
@@ -740,7 +745,7 @@ pub fn install_panic_hook(app_version: &'static str) {
             // run is in progress, and phase one overwrites it every time. It
             // is cleared here so a later reader cannot find a path from a run
             // that has finished.
-            HOOK_TARGET.with(|c| *c.borrow_mut() = None);
+            let _ = HOOK_TARGET.try_with(|c| *c.borrow_mut() = None);
         } else {
             // Re-entry: a second panic reached the hook while this thread's
             // first run was still in progress. Do the least possible — one
@@ -748,7 +753,7 @@ pub fn install_panic_hook(app_version: &'static str) {
             // backtrace, no directory work, no formatting — and then chain, so
             // the process dies exactly the way std would have made it die.
             let loc = panic_location(info);
-            HOOK_TARGET.with(|c| {
+            let _ = HOOK_TARGET.try_with(|c| {
                 if let Some(p) = c.borrow().as_deref() {
                     write_emergency(p, panic_message(info), &loc);
                 }
@@ -765,6 +770,19 @@ thread_local! {
     /// **already-derivable** target for its one emergency line: re-deriving it
     /// would mean `logs_dir()` — an env read, the data-root `OnceLock`, and a
     /// `PathBuf` join — in a process that has now panicked twice.
+    ///
+    /// **Read through `try_with`, never `with`** (review N2). Unlike the two
+    /// latches above — `Cell<bool>`, `const`-initialised, no destructor, so
+    /// their `with` is infallible — this holds a `PathBuf` and therefore
+    /// registers a TLS destructor, and `LocalKey::with` *panics* once that
+    /// value has been destroyed ("cannot access a Thread Local Storage value
+    /// during or after destruction"). A `Drop` impl that panics during thread
+    /// teardown would reach the hook after this thread's TLS is gone; phase
+    /// one's write to this cell sits **above** its `OpenOptions::open`, so a
+    /// panic there is a panic-while-panicking abort with zero bytes written —
+    /// exactly the failure the two-phase ordering exists to end, reachable
+    /// inside the fix itself. `try_with`'s `Err` arm gets the same answer every
+    /// other step on this path gets: do less, keep going.
     static HOOK_TARGET: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -907,7 +925,7 @@ fn record_crash_first_phase(
     let path = dir.join(String::from_utf8(name).unwrap_or_default());
     // Remember the target BEFORE opening, so a re-entrant run has somewhere to
     // put its one line even when the open itself is what died.
-    HOOK_TARGET.with(|c| *c.borrow_mut() = Some(path.clone()));
+    let _ = HOOK_TARGET.try_with(|c| *c.borrow_mut() = Some(path.clone()));
 
     let mut head =
         Vec::with_capacity(96 + app_version.len() + thread.len() + msg.len() + loc.len());
@@ -1321,11 +1339,28 @@ fn is_crash_log(p: &Path) -> bool {
         .is_some_and(|n| n.starts_with("crash-") && n.ends_with(".log"))
 }
 
-/// Newest `crash-*.log` in `dir` (by filename — stamps sort lexically) whose
-/// mtime is at or after `since` **and which has something in it**. The mtime
-/// gate is what keeps a hard abort (no crash log written) from mis-attributing
-/// an older log to this crash; pass `since = None` to disable it (best effort
-/// when the sentinel mtime is unreadable). `None` when nothing qualifies.
+/// Newest `crash-*.log` in `dir` **by mtime**, restricted to those at or after
+/// `since` and with something in them. The `since` gate is what keeps a hard
+/// abort (no crash log written) from mis-attributing an older log to this
+/// crash; pass `since = None` to disable it (best effort when the sentinel
+/// mtime is unreadable). `None` when nothing qualifies.
+///
+/// **Selection is by mtime, not by filename, and that changed in #1219.** It
+/// used to be a plain `max()` over paths, justified by crash-log names being
+/// timestamps that sort lexically — true while every member of the set was
+/// `crash-<stamp>.log`. `crash-alloc.log` is not: it compares `'a'` (0x61)
+/// against a digit (`'2'` = 0x32) at byte 6, so a lexical max ranks it above
+/// **every** timestamped crash log that will ever exist. It would have won on
+/// the letter `a`, not on recency.
+///
+/// That is reachable rather than theoretical: a refused allocation does not
+/// always abort — a `try_reserve`-style caller takes the null and carries on,
+/// after `on_alloc_failure` has already appended a record — so a process can
+/// hold a non-empty `crash-alloc.log` and then die of an ordinary panic. The
+/// next launch would then name the allocation record and hide the panic log
+/// **that has the backtrace in it**. Ordering on mtime costs nothing here: the
+/// filter already reads `metadata` for the length and the `since` gate.
+/// Filename breaks a tie, so the choice stays deterministic.
 ///
 /// **The zero-length rule (#1219).** An empty crash log is not a crash record,
 /// and naming one in the next-launch toast is a lie that also suppresses the
@@ -1340,17 +1375,25 @@ fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathB
         .flatten()
         .map(|e| e.path())
         .filter(|p| is_crash_log(p))
-        .filter(|p| {
-            let Ok(meta) = fs::metadata(p) else { return false };
+        .filter_map(|p| {
+            let meta = fs::metadata(&p).ok()?;
             if meta.len() == 0 {
-                return false;
+                return None;
             }
-            match since {
-                Some(t) => meta.modified().map(|m| m >= t).unwrap_or(false),
-                None => true,
+            let mtime = meta.modified().ok();
+            if let Some(t) = since {
+                // Unreadable mtime cannot clear the gate — same conservative
+                // answer the filename-ordered version gave.
+                if mtime.map(|m| m < t).unwrap_or(true) {
+                    return None;
+                }
             }
+            // …but with no gate to clear it is still a candidate, ranked last
+            // rather than dropped.
+            Some((mtime.unwrap_or(UNIX_EPOCH), p))
         })
         .max()
+        .map(|(_, p)| p)
 }
 
 // The next-launch notice's *Tauri surface* — `StartupNotice` and the
@@ -1608,7 +1651,9 @@ mod tests {
         assert_eq!(stamp(1_783_209_600_000 + 86_400_000 + 3_723_000), "20260706-010203");
         // Epoch.
         assert_eq!(stamp(0), "19700101-000000");
-        // Newer stamp must sort after older lexically (drives newest_crash_log).
+        // Newer stamp must sort after older lexically. This orders a directory
+        // listing for a human; it does NOT drive `newest_crash_log_since`, which
+        // orders on mtime since `crash-alloc.log` joined the set (#1219, N1).
         assert!(stamp(2_000_000_000_000) > stamp(1_751_673_600_000));
     }
 
@@ -2013,6 +2058,54 @@ mod tests {
         assert!(!check_and_arm_in(tmp.path()).crash_log_gap());
     }
 
+    /// **The newest crash log is the newest one, not the alphabetically last**
+    /// (review N1). `crash-alloc.log` compares `'a'` against a digit at byte 6,
+    /// so under the old lexical `max()` it outranked every `crash-<stamp>.log`
+    /// that will ever exist — winning on the letter `a` rather than on recency.
+    ///
+    /// The scenario is reachable because a refused allocation does not always
+    /// abort: a `try_reserve`-style caller takes the null and carries on, after
+    /// `on_alloc_failure` has appended a record. The process can then die of an
+    /// ordinary panic, and the next launch must name the panic log — the one
+    /// with the backtrace in it — not the older allocation record.
+    #[test]
+    fn the_newest_crash_log_is_chosen_by_mtime_not_by_filename() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_783_209_600);
+
+        // The allocation record: written FIRST, and alphabetically last.
+        let alloc = tmp.path().join("crash-alloc.log");
+        fs::write(&alloc, "allocation of 67108864 bytes (align 1) was refused").unwrap();
+        set_mtime(&alloc, base);
+
+        // The panic that actually killed the process, five minutes later.
+        let panic_log = tmp.path().join("crash-20260705-000500.log");
+        fs::write(&panic_log, "panic:   boom\nbacktrace:\n0: frame").unwrap();
+        set_mtime(&panic_log, base + Duration::from_secs(300));
+
+        assert!(
+            alloc.file_name() > panic_log.file_name(),
+            "guard on the premise: if these ever stop being mis-ordered by name, \
+             this test is no longer witnessing anything"
+        );
+        assert_eq!(
+            newest_crash_log_since(tmp.path(), None).as_deref(),
+            Some(panic_log.as_path()),
+            "the later file must win — a lexical max would name crash-alloc.log \
+             and hide the log carrying the backtrace"
+        );
+
+        // …and the ordering is a real comparison, not a preference for the
+        // timestamped name: make the allocation record the later one and it wins.
+        set_mtime(&alloc, base + Duration::from_secs(600));
+        assert_eq!(
+            newest_crash_log_since(tmp.path(), None).as_deref(),
+            Some(alloc.as_path()),
+            "when the allocation record IS the newest, it is the right answer"
+        );
+    }
+
     /// **The fmt-free property of the crash path, pinned by inspection.**
     ///
     /// Nothing behavioural can catch a `format!` creeping back into phase one:
@@ -2077,9 +2170,32 @@ mod tests {
             })
             .collect();
 
-        // Default-deny: every route back into `core::fmt`, plus the two
-        // shapes that panic outright.
-        for banned in ["format!", "write!", "writeln!", "format_args!", ".unwrap()", ".expect("] {
+        // Default-deny. Two groups, and the list is meant to be exhaustive for
+        // each rather than illustrative (review N3):
+        //
+        //   - routes into `core::fmt`. `.to_string()` is here because it is
+        //     `Display::to_string`, which goes straight through the formatting
+        //     machinery — and because it is by a distance the most idiomatic
+        //     way this property gets broken (`l.file().to_string()`,
+        //     `p.display().to_string()`, `e.to_string()`);
+        //   - shapes that panic. The `assert*`/`unreachable!`/`todo!` family
+        //     panics AND formats, so it fails both halves at once.
+        for banned in [
+            "format!",
+            "write!",
+            "writeln!",
+            "format_args!",
+            ".to_string()",
+            ".unwrap()",
+            ".expect(",
+            "panic!",
+            "assert!",
+            "assert_eq!",
+            "assert_ne!",
+            "unreachable!",
+            "todo!",
+            "unimplemented!",
+        ] {
             for (i, region) in code.iter().enumerate() {
                 assert!(
                     !region.contains(banned),
