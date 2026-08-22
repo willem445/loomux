@@ -38051,7 +38051,16 @@ impl OrchRegistry {
         // participate in the return below: whether an agent pane gets a PATH at all
         // stays a gh/git question, and a machine with neither has no shim dir on PATH
         // for this to live on anyway.
-        self.write_refusal_shim(&dir, brand::AUDIT_ACTOR, loomux_shim_sh(), loomux_shim_cmd());
+        // NOT the audit actor, and not renameable with the rest of #1153
+        // phase 3: this argument is the FILE NAME the refusal shim is written
+        // under, so it must be the name of the launcher an agent could
+        // actually type. The launcher is still `loomux` (phase 5 owns the npm
+        // package and the installed exe), and a shim written as `orrerix`
+        // blocks nothing while leaving `loomux` runnable — #815's guard
+        // defeated, silently. `tests/pathseg.rs` pins this call site verbatim
+        // as the proof that `program` is a literal here; a bulk sweep took it
+        // once and that guard is what caught it.
+        self.write_refusal_shim(&dir, "loomux", loomux_shim_sh(), loomux_shim_cmd());
         (gh || git).then_some(dir)
     }
 
