@@ -267,6 +267,33 @@
           "min": 1,
           "on_out_of_range": "refuse",
           "help": "The largest PR, in changed lines (additions + deletions), this gate will let through. Omit the key for no limit — 0 is refused, because a bound that bounds nothing is a typo. A PR whose size cannot be read is refused too."
+        },
+        {
+          "name": "routing",
+          "type": "section-list",
+          "section": "gate.routing",
+          "default": [],
+          "max_entries": 32,
+          "help": "Path-based reviewer routing: rules that ADD required reviewers when the PR's changed files match one of their globs. The required set is `reviewers` plus every rule that matched, so a rule can only ever make this gate stricter. Absent = no routing, and no changed-file lookup at all. Cannot be combined with `require: threshold` — a threshold counts votes over a fixed list, and routing makes the list depend on the diff."
+        }
+      ]
+    },
+    "gate.routing": {
+      "title": "Routing rule",
+      "help": "One path-routing rule: if this PR changed any file matching `paths`, these reviewers are required too. Globs use `*` only — any run of characters, INCLUDING `/` — a leading `**/` is optional, and the match is anchored at both ends. Deliberately coarse: over-matching asks for one more review, under-matching skips one the repo asked for, and only one of those is survivable. A PR whose changed-file list loomux cannot account for refuses the merge rather than being read as \"no rule matched\".",
+      "fields": [
+        {
+          "name": "paths",
+          "type": "string-list",
+          "default": [],
+          "max_entries": 32,
+          "help": "Path globs, matched against the PR's changed files. Letters, digits, '.', '_', '-', '/' and '*'. Write file globs, not directories: `src/**`, never `src/`, `/src/**` or a `..` segment — those match nothing at all, so they are refused rather than silently never firing."
+        },
+        {
+          "name": "reviewers",
+          "type": "block-ref-list",
+          "default": [],
+          "help": "Reviewer blocks required when any path matches. Validated exactly as the gate's own `reviewers:` are — the block must exist and be `kind: reviewer` — because a rule naming anything else could never be satisfied."
         }
       ]
     },

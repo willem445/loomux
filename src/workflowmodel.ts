@@ -329,6 +329,32 @@ export const GATE_THRESHOLD_MIN = 1;
  *  engine. `0` is refused rather than read as "unlimited": the way to mean no limit is
  *  to omit the key, and a bound that bounds nothing is a typo (#1174). */
 export const GATE_MAX_DIFF_LINES_MIN = 1;
+/** #1176's caps — `fact("gate.routing", "max_entries", …)` and
+ *  `fact("gate.routing.paths", "max_entries", …)` on the engine. Bounds on work the
+ *  `gh` shim does on the merge path (every rule against every changed file), not on
+ *  what this form can render. */
+export const GATE_ROUTING_RULES_MAX = 32;
+export const GATE_ROUTING_PATHS_MAX = 32;
+/** Longest path glob the engine accepts (`MAX_GLOB_CHARS`) — past it `sanitize_glob`
+ *  truncates, which the parse reads as a glob it had to change, which is a refusal. */
+export const ROUTING_GLOB_MAX_CHARS = 200;
+
+/** Is this a path glob the engine would accept — `sanitize_glob`, mirrored.
+ *
+ *  The alphabet is what a POSIX `case` pattern can carry with `*` as its ONLY
+ *  metacharacter: no `[`, `\\`, `?`, brace, quote or space. The three refused shapes
+ *  are the ones that could never fire against a repo-relative changed path, and a
+ *  rule that never fires silently drops a reviewer the repo asked for. */
+export function isRoutingGlob(p: string): boolean {
+  return (
+    p.length > 0 &&
+    p.length <= ROUTING_GLOB_MAX_CHARS &&
+    /^[A-Za-z0-9._\-/*]+$/.test(p) &&
+    !p.startsWith("/") &&
+    !p.endsWith("/") &&
+    !p.split("/").includes("..")
+  );
+}
 /** `checks_timeout_minutes` is the one policy number the engine CLAMPS rather than
  *  refuses (`clamp_expires_minutes`), so a value outside this range is a warning here,
  *  not an error: the file loads, it just doesn't do what it says. */
@@ -490,6 +516,20 @@ export interface MergeGate {
    *  through. Absent = no limit, and absent is kept apart from any number here — a
    *  `0` this pane invented would be a file the engine refuses. */
   max_diff_lines?: number;
+  /** Path-based reviewer routing (#1176). Absent (or empty) = no routing.
+   *
+   *  Read and emitted here even though this pane offers no editor for it yet, and
+   *  that is the whole point: `MergeGate` has no unknown-key bag, so a key this
+   *  model did not carry would be a rule the next form edit silently DELETED — and
+   *  the thing deleted would be a required reviewer. */
+  routing?: RoutingRule[];
+}
+
+/** One `gates.merge.routing[]` rule: if the PR changed a file matching any of
+ *  `paths`, `reviewers` are required on top of the gate's own list. */
+export interface RoutingRule {
+  paths: string[];
+  reviewers: string[];
 }
 
 export interface WorkflowGates {
@@ -617,6 +657,7 @@ export type FindingCode =
   | "gate-not-a-reviewer"
   | "gate-bad-threshold"
   | "gate-bad-max-diff-lines"
+  | "gate-bad-routing"
   | "isolated-block"
   | "unreachable-block"
   | "no-entry-block"
@@ -1355,6 +1396,18 @@ function emitGatesLines(w: Workflow, order: Map<string, number>): string[] {
     out.push(`    reviewers: [${sortByBlocks(gate.reviewers, order).map(emitScalar).join(", ")}]`);
     if (gate.also.length) out.push(`    also: [${gate.also.map(emitScalar).join(", ")}]`);
     if (gate.max_diff_lines !== undefined) out.push(`    max_diff_lines: ${gate.max_diff_lines}`);
+    // #1176. A block sequence of mappings — the one place this emitter writes
+    // one. `emitScalar` already quotes a value starting with `*`, which every
+    // `**/…` glob does and which YAML would otherwise read as an ALIAS.
+    if (gate.routing?.length) {
+      out.push("    routing:");
+      for (const rule of gate.routing) {
+        out.push(`      - paths: [${rule.paths.map(emitScalar).join(", ")}]`);
+        out.push(
+          `        reviewers: [${sortByBlocks(rule.reviewers, order).map(emitScalar).join(", ")}]`
+        );
+      }
+    }
   }
   out.push(...extraLines(w.gates.extra, "  "));
   return out;
@@ -2411,6 +2464,41 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
       message: `gates.merge.max_diff_lines must be a number (found "${String(r.max_diff_lines)}").`,
     });
   }
+  // #1176. Same rule as `max_diff_lines` above and for a sharper version of the
+  // same reason: what a dropped key costs here is a REQUIRED REVIEWER. So a
+  // routing block this reader cannot make sense of is a finding plus an
+  // entry kept as-far-as-it-was-read, never a silent omission.
+  if (Array.isArray(r.routing)) {
+    const rules: RoutingRule[] = [];
+    r.routing.forEach((raw, i) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        findings.push({
+          severity: "error",
+          code: "gate-bad-routing",
+          message: `gates.merge.routing[${i}] must be a { paths: […], reviewers: […] } mapping.`,
+        });
+        return;
+      }
+      const rr = raw as Record<string, YamlValue>;
+      for (const key of Object.keys(rr)) {
+        if (key !== "paths" && key !== "reviewers") {
+          findings.push({
+            severity: "error",
+            code: "gate-bad-routing",
+            message: `gates.merge.routing[${i}]: unknown key "${key}" — a routing rule takes paths: and reviewers: only. The engine refuses the whole file over one, so this pane will not bless it.`,
+          });
+        }
+      }
+      rules.push({ paths: list(rr.paths ?? []), reviewers: list(rr.reviewers ?? []) });
+    });
+    if (rules.length) gate.routing = rules;
+  } else if (r.routing !== undefined) {
+    findings.push({
+      severity: "error",
+      code: "gate-bad-routing",
+      message: `gates.merge.routing must be a list of rules (found "${String(r.routing)}").`,
+    });
+  }
   return gate;
 }
 
@@ -2636,45 +2724,119 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         message: "The merge gate names no reviewers — a gate with nothing to wait for gates nothing.",
       });
     }
-    for (const id of gate.reviewers) {
+    // ONE definition for both reviewer lists — the gate's own and every routing
+    // rule's (#1176). They ask the same question ("could a verdict for this id
+    // ever be recorded?"), and answering it twice is how the static list ends up
+    // refusing a manager while a routing rule quietly accepts one. `subject`
+    // names which list, so the finding points at the line to fix; the backend's
+    // `gate_reviewer_error` is the same function on the other side.
+    const reviewerFinding = (subject: string, id: string): Finding | null => {
       const b = byId.get(id);
       if (!b) {
-        findings.push({
+        return {
           severity: "error",
           code: "gate-unknown-reviewer",
-          message: `The merge gate requires a verdict from "${id}", but no block has that id — the gate could never open.`,
-        });
-      } else if (b.kind === "manager") {
+          message: `${subject} requires a verdict from "${id}", but no block has that id — the gate could never open.`,
+        };
+      }
+      if (b.kind === "manager") {
         // Reached before the generic kind arm below, which would otherwise
         // describe this as a type error ("that block's kind is manager").
         // An author who named the manager on a gate meant "the human signs
         // off", which is real and which this gate cannot express — so say
         // that. Mirrors the backend's own arm in `parse_workflow` (#1161).
-        findings.push({
+        return {
           severity: "error",
           code: "gate-not-a-reviewer",
-          message: `The merge gate names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate orrerix already applies on top of it.`,
+          message: `${subject} names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate orrerix already applies on top of it.`,
           blockId: id,
-        });
-      } else if (b.kind !== "reviewer") {
-        findings.push({
+        };
+      }
+      if (b.kind !== "reviewer") {
+        return {
           severity: "error",
           code: "gate-not-a-reviewer",
-          message: `The merge gate names "${id}" as a reviewer, but that block's kind is "${b.kind || "(none)"}" — only a reviewer records a verdict.`,
+          message: `${subject} names "${id}" as a reviewer, but that block's kind is "${b.kind || "(none)"}" — only a reviewer records a verdict.`,
           blockId: id,
-        });
-      } else if (b.role_hint?.trim().toLowerCase() === "liaison") {
+        };
+      }
+      if (b.role_hint?.trim().toLowerCase() === "liaison") {
         // Reviewer-KIND, but a liaison never records a verdict (#891) — so a
         // gate naming one waits on something no code path can produce. Same
         // unsatisfiable-gate finding as the arm above, one kind further in;
         // mirrors the backend's own refusal in `parse_workflow`.
-        findings.push({
+        return {
           severity: "error",
           code: "gate-not-a-reviewer",
-          message: `The merge gate names "${id}" as a reviewer, but that block is a liaison — it presents the human's questions and never records a verdict, so the gate could never open.`,
+          message: `${subject} names "${id}" as a reviewer, but that block is a liaison — it presents the human's questions and never records a verdict, so the gate could never open.`,
           blockId: id,
+        };
+      }
+      return null;
+    };
+    for (const id of gate.reviewers) {
+      const f = reviewerFinding("The merge gate", id);
+      if (f) findings.push(f);
+    }
+    // #1176's routing rules. Every refusal below is one the ENGINE refuses the
+    // whole file over, so a pane that stayed quiet would be blessing a workflow
+    // that will not load — and what it would have blessed is a gate that
+    // silently stopped requiring a lane.
+    (gate.routing ?? []).forEach((rule, i) => {
+      const subject = `Routing rule ${i + 1}`;
+      if (!rule.paths.length) {
+        findings.push({
+          severity: "error",
+          code: "gate-bad-routing",
+          message: `${subject} declares no paths — a rule that matches nothing can never require anybody.`,
         });
       }
+      if (!rule.reviewers.length) {
+        findings.push({
+          severity: "error",
+          code: "gate-bad-routing",
+          message: `${subject} names no reviewers — a rule that requires nobody is not a rule.`,
+        });
+      }
+      if (rule.paths.length > GATE_ROUTING_PATHS_MAX) {
+        findings.push({
+          severity: "error",
+          code: "gate-bad-routing",
+          message: `${subject} declares ${rule.paths.length} paths — at most ${GATE_ROUTING_PATHS_MAX}.`,
+        });
+      }
+      for (const p of rule.paths) {
+        if (!isRoutingGlob(p)) {
+          findings.push({
+            severity: "error",
+            code: "gate-bad-routing",
+            message: `${subject}: "${p}" is not a usable path glob. Use letters, digits, '.', '_', '-', '/' and '*' — and write a file glob, not a directory: "src/**", never "src/", "/src/**" or a ".." segment, which match nothing at all.`,
+          });
+        }
+      }
+      for (const id of rule.reviewers) {
+        const f = reviewerFinding(subject, id);
+        if (f) findings.push(f);
+      }
+    });
+    if ((gate.routing?.length ?? 0) > GATE_ROUTING_RULES_MAX) {
+      findings.push({
+        severity: "error",
+        code: "gate-bad-routing",
+        message: `The merge gate declares ${gate.routing!.length} routing rules — at most ${GATE_ROUTING_RULES_MAX}.`,
+      });
+    }
+    // The pair with no honest reading: a threshold counts passes over a FIXED
+    // list, routing makes the list depend on the diff, so together an extra lane
+    // could SUPPLY one of the N passes instead of adding one — the gate would get
+    // easier to satisfy the more rules you wrote. The engine refuses the file.
+    if (gate.routing?.length && gate.require === "threshold") {
+      findings.push({
+        severity: "error",
+        code: "gate-bad-routing",
+        message:
+          "routing: and require: threshold cannot both be declared — a threshold counts passes over a fixed reviewer list, and a routing rule makes that list depend on the diff. Use require: all-pass with routing:.",
+      });
     }
     // #1174. UNCONDITIONAL — unlike `threshold`, which is only meaningful under
     // `require: threshold` and so is only checked there. This clause has no mode to
