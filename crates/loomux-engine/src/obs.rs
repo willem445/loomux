@@ -212,10 +212,13 @@ pub enum RootAction {
 /// what makes the documented revert real: flipping `plan_default_root`'s
 /// `(false, true)` arm to `UseLegacy` lands here on an arm that renames nothing.
 pub fn root_action(plan: RootPlan) -> RootAction {
+    // SCRATCH MUTATION (#1153 red evidence, round F): `UseLegacy` folded back in
+    // with `Migrate` — exactly the shape review found, in which the documented
+    // one-arm revert is inert because the edited arm still reaches
+    // `migrate_default_root`. Nothing else is touched.
     match plan {
         RootPlan::UseNew | RootPlan::Fresh => RootAction::UseNew,
-        RootPlan::UseLegacy => RootAction::UseLegacy,
-        RootPlan::Migrate => RootAction::MoveThenUseNew,
+        RootPlan::UseLegacy | RootPlan::Migrate => RootAction::MoveThenUseNew,
     }
 }
 
