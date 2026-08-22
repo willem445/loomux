@@ -264,3 +264,90 @@ fn the_self_launch_shim_is_named_after_a_command_the_launcher_installs() {
          and nothing else in this repo would notice."
     );
 }
+
+/// The token-header axis, which had **no witness at all** before this test.
+///
+/// Every fixture in the tree carried the current spelling: the config writers
+/// emit it, and the suite reaches `resolve_token` directly rather than through
+/// the HTTP layer where the header is actually read. So the guarantee that a
+/// pre-rename group keeps authenticating rested on a line nothing exercised —
+/// a value every fixture happens to share, on the axis the rename made
+/// load-bearing.
+///
+/// It is the most consequential dual-accept in #1153 phase 3. An agent's MCP
+/// config is written once, at group create, and lives in that group's dir; a
+/// group created before the flag day presents the old header on every call it
+/// will ever make. A server reading only the current name fails **every tool
+/// call in every live group** the moment the app updates underneath it, and it
+/// fails as an auth error, which reads like a bad token rather than an upgrade.
+#[test]
+fn the_server_takes_a_token_under_either_header_spelling_and_nothing_else() {
+    use loomux_lib::orchestration::mcp::is_agent_token_header;
+
+    assert!(is_agent_token_header("X-Orrerix-Agent"), "the spelling every config written from now on carries");
+    assert!(is_agent_token_header("X-Loomux-Agent"), "…and the one every live pre-rename group still presents");
+
+    // Case-insensitive on both, because HTTP field names are and nothing
+    // guarantees a proxy preserves the casing a generated config wrote.
+    assert!(is_agent_token_header("x-orrerix-agent"));
+    assert!(is_agent_token_header("X-LOOMUX-AGENT"));
+
+    // The negative control, without which "accept everything" would pass every
+    // assertion above: dual-accept widens the accepted SET, never the shape.
+    for other in [
+        "X-Orrerix",
+        "X-Orrerix-Agent-Token",
+        "Authorization",
+        "X-Someone-Else-Agent",
+        "",
+    ] {
+        assert!(!is_agent_token_header(other), "{other:?} is not an agent token header");
+    }
+}
+
+/// The accepted MCP identities are written down **twice**, and this is the only
+/// thing that keeps the two copies honest.
+///
+/// `brand` says "write the accepted set down exactly once", and within one
+/// language it does. But tab restore reads a recorded command line in
+/// TypeScript, across a process boundary no Rust constant reaches, so
+/// `panerestore.ts` carries its own `MCP_TOOL_PREFIXES` / `MCP_SERVERS`. That
+/// is a real duplication, not a tidy one — so it is asserted rather than
+/// asserted-away: whatever Rust accepts, the frontend must accept too.
+///
+/// The failure this prevents is asymmetric and quiet. Rust dropping a spelling
+/// the frontend still strips is harmless; the frontend dropping one Rust still
+/// mints leaves a dead `--mcp-config` path in a replayed command, and the pane
+/// boots against a file agent exit already deleted.
+///
+/// Textual, with the limits that implies: it reads the array literals, so a
+/// spelling assembled at runtime or moved to another module would read as
+/// absent. Neither happens today, and the assertion names the file so a move
+/// fails loudly here rather than silently in a user's restored tab.
+#[test]
+fn the_frontend_accepts_every_mcp_identity_the_backend_still_mints() {
+    use loomux_lib::orchestration::brand;
+
+    let ts = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../src/panerestore.ts"
+    ))
+    .expect("src/panerestore.ts — if this moved, re-point the test; the coupling did not go away");
+
+    for (array, spellings) in [
+        ("MCP_TOOL_PREFIXES", [brand::MCP_TOOL_PREFIX, brand::LEGACY_MCP_TOOL_PREFIX]),
+        ("MCP_SERVERS", [brand::MCP_SERVER, brand::LEGACY_MCP_SERVER]),
+    ] {
+        let line = ts
+            .lines()
+            .find(|l| l.contains(&format!("const {array} =")))
+            .unwrap_or_else(|| panic!("`{array}` is gone from panerestore.ts — tab restore's accepted set has moved somewhere this test cannot see"));
+        for spelling in spellings {
+            assert!(
+                line.contains(&format!("\"{spelling}\"")),
+                "the backend still accepts `{spelling}` but `{array}` does not list it: {line}\n\
+                 A tab recorded under that identity would keep its dead --mcp-config path on restore."
+            );
+        }
+    }
+}
