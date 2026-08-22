@@ -40,7 +40,14 @@ opinions — see the `ci-validate` skill.)
   between calls, so a second relative `cd src-tauri/src/...` resolves against
   the previous `cd` and fails with `No such file or directory`.
 - **There is no `python3`** — the `WindowsApps` alias stub exits 126
-  (`Permission denied`). Use `node -e` for ad-hoc scripting.
+  (`Permission denied`). Use `node -e` for ad-hoc scripting. A scratch script
+  **must be `.cjs`**: `package.json` sets `"type": "module"`, so a `.js` file
+  anywhere in the tree is ESM and `require` is a `ReferenceError: require is
+  not defined in ES module scope` — not a broken script (#1181).
+- **A multi-line shell script is a file, not a `-c` argument.** Inline Bash dies
+  on Git Bash quoting (`unexpected EOF while looking for matching '`, reported
+  far from the real line). Write it under `./.scratch/` and run the file; pipe
+  prose to `gh` with `--body-file -` (#1181).
 
 ### Agent workers: NO local Rust builds — CI is the only build/test path
 

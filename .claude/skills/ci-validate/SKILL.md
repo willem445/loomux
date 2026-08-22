@@ -114,6 +114,37 @@ what `>/dev/null` is for). So:
 - Never commit a reformatting, and never "fix" a `Diff in …` line.
 - Match the surrounding style.
 
+### rustfmt parses the *Rust* — not the shell or jq inside it
+
+`gh_shim_sh` (`src-tauri/src/orchestration/mod.rs`) holds ~850 lines of POSIX
+sh in a `const TPL: &str = r#"…"#`, and `workflow.rs`'s `BASE_*_JQ` consts hold
+jq programs the shim interpolates. To rustfmt those are one string literal: it
+reports nothing, and **no local check parses them at all**. A dropped `;;` or an
+unbalanced quote therefore reaches CI intact, where it does not fail as one
+test — the script stops parsing and every shim test dies at once, so a mutation
+round taken on that push is unattributable and has to be discarded (#1181).
+
+Extract the literal and run the parser the language has, before pushing:
+
+```sh
+node .scratch/xtpl.cjs src-tauri/src/orchestration/mod.rs 'const TPL: &str = r#"' \
+  > .scratch/gh-shim.sh && sh -n .scratch/gh-shim.sh
+```
+
+(`.cjs`, not `.js` — `package.json` is `"type": "module"`. The extractor is four
+lines: read the file, slice between the `r#"` after the marker and the next
+`"#`.) The `__PLACEHOLDER__` tokens are ordinary words and parse fine, so the
+un-substituted template is checkable as-is. `sh -n` is a parse, not a run —
+nothing in the script executes. Verified both directions: the extracted shim
+passes `sh -n`, and a `case` arm with its `;;` removed fails it with a
+`syntax error near unexpected token` naming that line.
+
+**The jq consts have no local check** — there is no `jq` on this machine, and
+gh's is `gojq`, reachable only through a network call. Their parser of record is
+the CI fixture test (`the_base_green_reductions_reduce_real_payloads_to_the_right_word`),
+which pipes committed payloads through real `jq` on all three platforms. Add a
+fixture there rather than reasoning about what a reduction returns.
+
 ### Why this is permitted under the ban
 
 **rustfmt is a parser, not a build.** It doesn't invoke cargo, doesn't invoke
@@ -265,6 +296,29 @@ own draft PR**, and CI's log is the failure line you quote.
 and the failures stop being attributable to the behaviour they evidence — a
 compile error proves nothing. Several rounds on one scratch branch is normal.
 
+**Your mutation must not leave the token a source-shape pin greps for.** Several
+guards here assert on the *text* of a generated artifact (`sh.contains("diff-too-large")`,
+the scans in `tests/groupid.rs` / `tests/pathseg.rs` / `tests/perf_dispatch.rs`).
+Comment the behaviour out and name it in the comment — `// removed the
+diff-too-large refusal` — and the token is still in the file, so the pin stays
+**green while the behaviour is gone** and you bank a coverage claim nothing
+evidenced. Delete the lines, or comment them with wording that contains none of
+the strings the pins match, and re-run the identical mutation if you got a green
+you did not expect. Signature: a mutation reddens the behavioural test and its
+source-shape sibling stays green (#1181).
+
+**A watched red is dated to the commit it was watched on.** The mutation table
+in a PR body is a set of hand-derived claims, and a later review round that
+rewrites the mutated lines retires the red measured on them as silently as a
+rebase does — the test name still exists, so nothing goes red to tell you. On
+each round, re-check every earlier row against the shipped tree and mark the ones
+whose site no longer exists as **superseded** rather than restating them. Better,
+stop the table needing that: promote the superseded expression into a permanent
+in-suite witness — a literal copy of the *old* reduction, deliberately not
+derived from the live constant, asserted against a committed fixture (`BEFORE_ROUND_1`
+in `src-tauri/tests/mergequeue.rs`). The red then lives in the suite instead of on
+a deleted scratch branch (#1181).
+
 **A red only counts against a banked green.** Keep the unmutated tree's passing
 run for the same tests: a test that has never passed reddens for its own bug,
 not for your mutation, and the red then evidences nothing about the property.
@@ -302,6 +356,12 @@ to evidence produces no output, and the round is wasted. Split by target:
   **wiring** instead — the call site, or the gate's consumption of the value —
   and leave the lib function intact, so the lib suite stays green and the
   integration binary is actually reached.
+
+The same stop-at-first-failure also bounds a round that **did** hit its target:
+if the property is pinned in two binaries, the later one never ran, so it is
+covered by inspection, not by a watched red — say which half moved rather than
+claiming both (#1181; the repo rule it instantiates is CLAUDE.md's "a red
+evidences only the assertion it REACHED and MOVED").
 
 Precedent: #869 (scratch PRs #870, #872).
 

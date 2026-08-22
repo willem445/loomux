@@ -63,8 +63,3 @@ A `[loomux]` notice arrives by typing into a pane, and a mid-turn pane can't tak
 delivery — waiting on CI queues the answer behind the turn (#590). Register the watch,
 END the turn, act on the notice. Same for any pane-delivered answer: reading once is
 fine, waiting is the defect.
-
-## A multi-line shell script is a file, not a `-c` argument
-
-Inline Bash dies on Git Bash quoting (`unexpected EOF ... matching '`, reported far off).
-Write it to `./.scratch/` and run the file; pipe prose via `--body-file -`.
