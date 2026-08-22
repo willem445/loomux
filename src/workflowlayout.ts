@@ -299,7 +299,7 @@ export function layoutEquals(a: WorkflowLayout, b: WorkflowLayout): boolean {
 
 // ---------- the layout file ----------
 
-/** Read `.loomux/workflow.layout.json`. NEVER throws and never reports: a layout we can't
+/** Read the `workflow.layout.json` beside the workflow. NEVER throws and never reports: a layout we can't
  *  read is a layout we compute instead, and the workflow still opens. That asymmetry with the
  *  workflow file is the point — a corrupt `workflow.yml` is a problem the human must see and
  *  fix, while a corrupt `workflow.layout.json` is a picture we can simply redraw. Nothing in

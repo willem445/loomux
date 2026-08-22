@@ -1,4 +1,4 @@
-// Pure model for `.loomux/workflow.yml` — the user-defined agent workflow (#222).
+// Pure model for the repo's `workflow.yml` — the user-defined agent workflow (#222).
 // DOM-free and I/O-free: parse, validate, derive the graph, serialize. The pane
 // (workflowview.ts) is a VIEW over this; the FILE is the source of truth (the
 // Kestra pattern — a form edit rewrites the YAML, it does not become a second,
@@ -13,7 +13,7 @@
 //     touches nothing else.
 //  2. No coordinates, ever. Dify/ComfyUI/Langflow all embed x/y in the semantic file,
 //     so nudging a node churns the logic diff. Layout (if the view ever draws any) goes
-//     in `.loomux/workflow.layout.json`; this file is the workflow.
+//     in the `workflow.layout.json` beside it; this file is the workflow.
 //  3. Validate BEFORE a run, not during one. Flowise, Langflow and Dify discover a
 //     dangling reference at runtime; Dify will happily *publish* a workflow whose node
 //     isn't installed. `validateWorkflow` is the whole pre-run pass, and it is pure
@@ -3286,7 +3286,7 @@ gates:
 export const AUTHORED_WITH_KEY = "authored_with";
 
 /** The workflow loomux runs today, as a file: plan → work → review, with the reviewer's
- *  verdict gating the merge. The starting point a repo with no `.loomux/workflow.yml`
+ *  verdict gating the merge. The starting point a repo with no workflow file
  *  opens on, so the pane's empty state is a working example rather than a blank page.
  *
  *  `authoredWith` is the loomux version doing the creating; omit it and the key is simply

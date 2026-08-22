@@ -983,7 +983,7 @@ async function openActionPane(
       // two clicks, and the rest of the layout restores around it (#214, #217, #222).
       //
       // The WORKFLOW pane probes the same way (is the root a readable directory?) and
-      // deliberately does NOT probe the workflow FILE: a repo whose `.loomux/workflow.yml`
+      // deliberately does NOT probe the workflow FILE: a repo whose the workflow file
       // has been deleted is not a broken pane, it is a pane with nothing in it yet — and
       // it opens on the empty state that offers to create one.
       const kind =
@@ -1019,7 +1019,7 @@ async function openActionPane(
           // The editor reopens the file it was showing (a path — never a buffer; see
           // panerestore). A file deleted since just fails to open with a toast, in a
           // pane that is otherwise back exactly as it was. The workflow pane's file rides
-          // the same field, and an ABSENT one means the default `.loomux/workflow.yml`.
+          // the same field, and an ABSENT one means the default the workflow file.
           file: a.type === "open-files" ? undefined : a.file ?? undefined,
           background: true,
         },
@@ -1833,7 +1833,7 @@ async function handleWelcomeSubmit(
     // PTY, nothing to reap. The root was confirmed for real by the form before it fired
     // this: a readable directory for files/editor/workflow, a git work tree for git. The
     // workflow pane takes no `file` here — the welcome flow means the repo's default
-    // `.loomux/workflow.yml`.
+    // the workflow file.
     pane.startContent({ kind: result.kind, name: result.name, root: result.root });
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.

@@ -16,7 +16,7 @@
 //   Git          — a PTY-less pane hosting the git view over a repo (#217): graph,
 //                  status, diffs, staging, #208 worktree switching. The Alt+G
 //                  overlay, as a pane.
-//   Workflow     — a PTY-less pane over the repo's `.loomux/workflow.yml` (#222): the
+//   Workflow     — a PTY-less pane over the repo's the workflow file (#222): the
 //                  agent blocks a run may use, the advisory path between them, and the
 //                  enforced merge gate. Rooted at the repo; the file need not exist yet.
 //
@@ -167,7 +167,7 @@ export type WelcomeResult =
   /** A git pane (#217): `root` is a directory this form has already confirmed is
    *  inside a git work tree (`gitRepoRoot`), so the pane can't open on a non-repo. */
   | { kind: "git"; name: string; root: string }
-  /** A workflow pane (#222): `root` is the repo whose `.loomux/workflow.yml` the pane
+  /** A workflow pane (#222): `root` is the repo whose the workflow file the pane
    *  edits — a confirmed directory, like files/editor. The workflow FILE is not probed:
    *  a repo without one is the normal starting point, and the pane offers to create it. */
   | { kind: "workflow"; name: string; root: string }
@@ -366,7 +366,7 @@ export class WelcomeForm {
    *  (`rolePicks`, submit) that must decide what a control's value MEANS without
    *  awaiting anything. Absent = not known, which `knobState` disables. */
   private knownKnobs = new Map<string, CliKnobs | null>();
-  // Advanced orchestrator (#222): run the repo's `.loomux/workflow.yml` instead
+  // Advanced orchestrator (#222): run the repo's the workflow file instead
   // of the four fixed roles. OFF by default — a workflow file arrives with a
   // `git clone`, so it takes effect only when the human opts in, having been
   // shown (in `rosterEl`) the blocks and repo-authored personas they'd be
@@ -1416,7 +1416,7 @@ export class WelcomeForm {
   }
 
   /** Turn this setup pane into a workflow pane over the repo (#223), so the human
-   *  can fix or write `.loomux/workflow.yml` before launching. One-shot, like every
+   *  can fix or write the workflow file before launching. One-shot, like every
    *  other kind this form can become — the launcher settings are not carried over,
    *  which the button's tooltip says. */
   private async openWorkflowPane(): Promise<void> {
@@ -1880,7 +1880,7 @@ export class WelcomeForm {
       // tree with no explanation — so probe first and bounce the user back to the
       // field with an inline error, exactly like a missing CLI (#214).
       //
-      // The workflow pane (#222) probes the same way and no further: `.loomux/workflow.yml`
+      // The workflow pane (#222) probes the same way and no further: the workflow file
       // NOT existing is the normal way to start (the pane offers to create it), so probing
       // for the file would turn "you don't have a workflow yet" into "this pane refuses to
       // open" — which is the one thing a config editor must never do.
@@ -1995,7 +1995,7 @@ export class WelcomeForm {
           watchdogStallMinutes: intVal(this.watchdogInput, 10),
           maxSpawnsPerHour: intVal(this.spawnRateInput, 0),
           autonomyBudgetTokens: Math.max(0, intVal(this.autonomyBudgetInput, 0)),
-          // #222. Off = the backend never opens `.loomux/workflow.yml`. A broken
+          // #222. Off = the backend never opens the workflow file. A broken
           // file is deliberately NOT a submit blocker: the backend audits it and
           // falls back to the standard roster, so refusing the launch here would
           // invent a failure mode the engine doesn't have. The roster box has

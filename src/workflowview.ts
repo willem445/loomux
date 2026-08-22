@@ -1,4 +1,4 @@
-// The WORKFLOW pane (#222, restructured by #880): `.loomux/workflow.yml`, made configurable.
+// The WORKFLOW pane (#222, restructured by #880): the repo's workflow file, made configurable.
 //
 // ONE buffer, and the buffer is the FILE (the Kestra pattern — an inspector edit rewrites the
 // YAML under the hood; the YAML is never a stale export of some hidden canvas state). What
@@ -147,7 +147,7 @@ import { IDENTITY, SEMANTIC } from "./theme.ts";
 export interface WorkflowHost {
   /** The repo/folder the workflow file lives under (the pane's root). */
   getRoot(): string | null;
-  /** Root-relative path of the workflow file. Defaults to `.loomux/workflow.yml`. */
+  /** Root-relative path of the workflow file. Defaults to `.orrerix/workflow.yml`, falling back to `.loomux/workflow.yml` when only that exists. */
   getFile?(): string;
   /** Never called in embedded mode — the pane's own ✕ closes it (and asks first). */
   onClose(): void;
@@ -189,7 +189,7 @@ export class WorkflowView {
    *  from "there isn't one" — see the error surface. Null when the file loaded (or is simply
    *  absent, which is not an error). */
   private loadError: string | null = null;
-  /** Node positions (`.loomux/workflow.layout.json`). NOT part of the workflow: a drag changes
+  /** Node positions (`workflow.layout.json`, beside the workflow file). NOT part of the workflow: a drag changes
    *  this and nothing else, and it is never serialized into the semantic file (§4). */
   private layout: WorkflowLayout = emptyLayout();
   /** The layout as last written, so a drag that ends where it began writes nothing. */
@@ -231,7 +231,7 @@ export class WorkflowView {
    *  `render()` rather than fixed at construction: the button because being pressable is a
    *  DECISION (`createAllowed`) and not a side-effect of being on screen, and the labels because
    *  this pane opens on any `.yml` the file browser hands it (#217's `file`), so a pane rooted on
-   *  `ci/flow.yml` that says `.loomux/workflow.yml` is telling the human about a file they are
+   *  `ci/flow.yml` that says the default workflow path is telling the human about a file they are
    *  not looking at — which, on the error surface, means naming the wrong file as unreadable. */
   private starterBtn: HTMLButtonElement;
   private startPathEl: HTMLElement;
@@ -827,11 +827,11 @@ export class WorkflowView {
     return fresh.hash;
   }
 
-  /** Make sure `.loomux/` exists before writing into it.
+  /** Make sure the workflow file's directory exists before writing into it.
    *
    *  THE OTHER HALF OF v2 BUG 1, and it made the pane's headline feature a lie: `ft_write_file`
    *  writes atomically (temp file + rename) and does NOT create parent directories, so in a
-   *  repo with no `.loomux/` — i.e. EVERY repo that has never had a workflow, which is exactly
+   *  repo with no config dir — i.e. EVERY repo that has never had a workflow, which is exactly
    *  the repo the "create a workflow" button exists for — the write failed with a raw io error
    *  ("The system cannot find the path specified"). The button appeared to work, the toast
    *  said "Save failed", and reopening the pane showed the empty state again, because nothing

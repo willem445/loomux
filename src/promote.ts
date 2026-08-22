@@ -37,7 +37,7 @@ export function promoteFailureText(message: string): string {
   return m ? text.slice(m[0].length) : text;
 }
 
-/** The repo's `.loomux/workflow.yml` as the confirm needs it: `null` when there
+/** The repo's workflow file as the confirm needs it: `null` when there
  *  is no file at all, otherwise its `name` (`""` for a nameless one) and whether
  *  it actually validated.
  *

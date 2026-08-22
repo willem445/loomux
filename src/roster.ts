@@ -89,11 +89,11 @@ export interface RosterBlock {
   role_hint?: string | null;
 }
 
-/** The backend's read of `<repo>/.loomux/workflow.yml` (`orch_workflow_preview`).
+/** The backend's read of the repo's workflow file (`orch_workflow_preview`).
  *  Never an error: a repo with no file, and a repo with a broken one, are both
  *  things the launcher has to be able to describe. */
 export interface WorkflowPreview {
-  /** `.loomux/workflow.yml` — from the backend, so the two can't drift. */
+  /** The resolved workflow path — from the backend, so the two can't drift. */
   path: string;
   /** Whether the repo has the file at all. */
   present: boolean;

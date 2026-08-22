@@ -288,7 +288,7 @@ export function savePlan(state: { exists: boolean; savedHash: string }): SavePla
  *  left is the explicit **Format** action: a human asking, in one step, to rewrite the whole
  *  file into canonical form — fixed key order, no comments, whatever was there before. For a
  *  file loomux itself wrote that costs nothing. For a file a HUMAN wrote, the comments are
- *  frequently the most valuable lines in it: this repo's own `.loomux/workflow.yml` is 126
+ *  frequently the most valuable lines in it: this repo's own workflow file is 126
  *  lines of which 60 are comments explaining the roster and the `.github/agents/` convention —
  *  and Format would silently take all 60 without this.
  *

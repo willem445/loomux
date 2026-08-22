@@ -26,7 +26,7 @@
 // "a path was given" rule lives here.
 
 // #222 adds a FOURTH content kind: `workflow` — the pane that makes
-// `.loomux/workflow.yml` (the user-defined agent workflow: blocks, edges, gates)
+// the workflow file (the user-defined agent workflow: blocks, edges, gates)
 // configurable. Its one input is the REPO the workflow file lives in, so it validates
 // exactly like its three siblings: the path is mandatory here, and whether it is a
 // readable directory is I/O the form probes.
@@ -165,7 +165,7 @@ export interface GitPlan {
   root: string;
   name: string;
 }
-/** A WORKFLOW pane (#222): `.loomux/workflow.yml` — the repo's agent workflow (blocks,
+/** A WORKFLOW pane (#222): the workflow file — the repo's agent workflow (blocks,
  *  advisory edges, enforced gates) — as an editable surface. `root` is the repo the file
  *  lives in; the pane derives the path from it, so the kind still takes exactly ONE input
  *  like its three siblings. A repo with no workflow file yet is not an error: the pane
