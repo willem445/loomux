@@ -9031,7 +9031,15 @@ fn the_gate_file_round_trips_routing_and_refuses_every_file_it_cannot_stitch() {
         "route-path 2 src/**\nroute-reviewer 2 rev-ui\n",   // a gap: no rule 1
         "route-path 0 src/**\nroute-reviewer 0 rev-ui\n",   // rules are numbered from 1
         "route-path x src/**\nroute-reviewer x rev-ui\n",   // not a number
+        // THE REWRITE CLASS, and the one that is not obvious: `sanitize_glob`
+        // and `sanitize_id` FILTER rather than refuse, so reading them without
+        // comparing turns `src/[ab]` into `src/ab` and `rev@ui` into `revui` —
+        // not a refusal, a DIFFERENT RULE silently substituted for the one the
+        // file carries. Both halves are present in each line below, so what
+        // these pin is the rewrite and not a missing partner.
         "route-path 1 src/[ab]\nroute-reviewer 1 rev-ui\n", // outside the glob alphabet
+        "route-path 1 src/a b\nroute-reviewer 1 rev-ui\n",  // a glob the writer could not have written
+        "route-path 1 src/**\nroute-reviewer 1 rev@ui\n",   // outside the id alphabet
         "route-path 1 /src/**\nroute-reviewer 1 rev-ui\n",  // could never fire
         "route-path 1\nroute-reviewer 1 rev-ui\n",          // truncated line
         "route-path 1 src/**\nroute-reviewer 1\n",          // truncated line

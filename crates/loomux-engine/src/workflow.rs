@@ -3691,11 +3691,34 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
             // would have added is a REQUIRED reviewer. A dropped one is a merge
             // that skipped a lane, which is precisely the laxening this reader
             // refuses to perform.
+            // **Rejected, never rewritten** — and the comparison is what makes
+            // that true. `sanitize_glob`/`sanitize_id` FILTER: `src/[ab]` comes
+            // back as `src/ab`, which is not a refusal, it is a DIFFERENT RULE
+            // silently substituted for the one the file carries. `gate_file_text`
+            // poisons rather than writes such a token, so anything reaching here
+            // is a hand edit or a corruption — exactly the case this reader must
+            // refuse rather than quietly reinterpret.
+            //
+            // A **fourth token** is refused for the same reason: neither
+            // alphabet contains whitespace, so a line that has any has already
+            // been truncated by the word split — `route-path 1 src/a b` reads as
+            // the narrower glob `src/a`, which is clean and wrong. Exactly three
+            // fields, or the file is not a gate.
             (Some(ROUTE_PATH_KEY), Some(i), Some(g)) => {
-                rule_paths.entry(routing_index(i)?).or_default().push(sanitize_glob(g)?);
+                let idx = routing_index(i)?;
+                let clean = sanitize_glob(g)?;
+                if clean != g || f.next().is_some() {
+                    return None;
+                }
+                rule_paths.entry(idx).or_default().push(clean);
             }
             (Some(ROUTE_REVIEWER_KEY), Some(i), Some(r)) => {
-                rule_reviewers.entry(routing_index(i)?).or_default().push(sanitize_id(r)?);
+                let idx = routing_index(i)?;
+                let clean = sanitize_id(r)?;
+                if clean != r || f.next().is_some() {
+                    return None;
+                }
+                rule_reviewers.entry(idx).or_default().push(clean);
             }
             // Anything else — a poison line, a truncated key, a hand edit — makes
             // the whole file unusable. Skipping it would drop a requirement.
