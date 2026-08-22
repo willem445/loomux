@@ -53984,3 +53984,61 @@ fn the_gh_shim_never_puts_a_case_inside_a_command_substitution() {
         findings.join("\n---\n")
     );
 }
+
+#[test]
+fn gh_shim_harness_refuses_a_routing_gate_file_rust_could_not_read_back() {
+    if !have_sh() {
+        eprintln!("SKIP gh_shim_harness_refuses_a_routing_gate_file_rust_could_not_read_back: no POSIX sh");
+        return;
+    }
+    // THE TWO HALVES MUST AGREE, and this is the shape where they nearly did not
+    // (#1176 self-review). Rust refuses a gate file carrying more routing rules
+    // than `ROUTING_RULES_MAX` — `parse_gate_file` answers `None`, which both
+    // callers report as "malformed, every merge refused". The shim's loop had no
+    // such cap, so the same file was unreadable to one half and perfectly
+    // readable to the other.
+    //
+    // The divergence fell on the STRICT side (more rules is more required
+    // reviewers), which is exactly why it would never have been noticed. The
+    // property is "the two halves agree, and both fail closed" — not "the
+    // disagreement is harmless this time".
+    let (reg, d, _repo, gid) = routed_group();
+    let group_dir = d.path().join(gid.as_str());
+    let gate_file = group_dir.join("merge_gate");
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    let lead = reviewer_caller(&reg, &gid, "rev-lead");
+    recorded(&reg, &lead, "7", "pass", "reviewed");
+
+    let rules = |n: usize| {
+        let mut s = String::from("require all-pass\nreviewer rev-lead\n");
+        for i in 1..=n {
+            s.push_str(&format!("route-path {i} d{i}/**\nroute-reviewer {i} rev-lead\n"));
+        }
+        s
+    };
+    let merge_now = |files: &str| {
+        reg.grant_merge(&gid, "7", None, "human").unwrap();
+        merge_env(&shim, &group_dir, "main", HEAD, "0", &[("FAKE_FILES", files)])
+    };
+
+    // AT the cap: Rust reads it, so the shim must too — otherwise this test
+    // would pass against a shim that simply refused everything.
+    fs::write(&gate_file, rules(workflow::ROUTING_RULES_MAX)).unwrap();
+    assert!(
+        workflow::parse_gate_file(&fs::read_to_string(&gate_file).unwrap()).is_some(),
+        "the cap itself must be readable — otherwise the case below proves nothing"
+    );
+    assert!(merge_now(&fake_files(&["docs/x.md"])).0, "a gate AT the cap still merges");
+
+    // One past it: Rust cannot read it back, so the shim must refuse rather than
+    // enforce a file loomux itself calls malformed.
+    fs::write(&gate_file, rules(workflow::ROUTING_RULES_MAX + 1)).unwrap();
+    assert!(
+        workflow::parse_gate_file(&fs::read_to_string(&gate_file).unwrap()).is_none(),
+        "Rust's half refuses past the cap — that is the fact the shim has to match"
+    );
+    let (ok, err) = merge_now(&fake_files(&["docs/x.md"]));
+    assert!(!ok, "and so must the shim's half");
+    assert!(err.contains("merge gate"), "{err}");
+}
