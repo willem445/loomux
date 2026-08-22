@@ -112,7 +112,7 @@ is dropped). A **max-duration guard** (`MAX_RECORDING_SECS`, 5 min) caps growth
 and appends a "recording capped" note to the transcript rather than growing
 memory without bound.
 
-**Diagnostics:** `LOOMUX_VOICE_KEEP_WAV=1` preserves the scratch WAV and logs its
+**Diagnostics:** `ORRERIX_VOICE_KEEP_WAV=1` preserves the scratch WAV and logs its
 path, duration, and RMS level (via the pure `rms` / `duration_secs` helpers) — a
 near-zero RMS on a long capture is the fingerprint of a silent/starved capture.
 This is the tool that was missing while first chasing the bug.
@@ -126,7 +126,7 @@ RMS is sane).
 
 git.rs-style `Command` with `CREATE_NO_WINDOW`; args assembled by
 `build_whisper_args` (`-nt -l en -t <threads>`, plus optional `--prompt` and the
-`LOOMUX_WHISPER_ARGS` passthrough — see *Invocation tuning* below). stdout is
+`ORRERIX_WHISPER_ARGS` passthrough — see *Invocation tuning* below). stdout is
 parsed into one prompt line (timestamps and `[BLANK_AUDIO]`-style markers
 stripped).
 
@@ -169,11 +169,18 @@ independently, each in this priority:
    (+ its DLLs) and `<resource dir>/whisper/models/ggml-base.en.bin`. Nothing
    ships there today (voice is opt-in); the probe is kept so a future decision
    to bundle needs zero backend changes.
-2. **Env overrides** — `LOOMUX_WHISPER_CLI` / `LOOMUX_WHISPER_MODEL` (power users
+2. **Env overrides** — `ORRERIX_WHISPER_CLI` / `ORRERIX_WHISPER_MODEL` (power users
    / a custom whisper build or model).
-3. **`%LOCALAPPDATA%\loomux\whisper\`** — `whisper-cli.exe` (or legacy `main.exe`)
+3. **`%LOCALAPPDATA%\orrerix\whisper\`** — `whisper-cli.exe` (or legacy `main.exe`)
    and `models\` (prefers `ggml-base.en.bin`, then `ggml-tiny.en.bin`, then the
    first `*.bin`).
+
+Both the `ORRERIX_*` variables and that directory carry their pre-#1153 spellings
+as fallbacks: every variable falls back to `LOOMUX_*`, and `%LOCALAPPDATA%\loomux\
+whisper\` is still discovered when the current directory is absent. The whisper
+directory is **discovered, never moved** — unlike the app's own data root, its
+contents are a build and a model the user downloaded and wrote scripts around. See
+doc/design/rebrand-filesystem.md.
 
 Every failure names all three locations so the message is actionable.
 
@@ -190,15 +197,15 @@ The whisper argument vector is assembled by the pure, unit-tested
   inference is memory-bandwidth-bound, so throughput flattens past ~8 threads,
   and using all logical cores (SMT) on a busy desktop contends with the
   OS/webview for little gain.
-- **`LOOMUX_WHISPER_ARGS`** — a raw passthrough (whitespace-split, no shell) for
+- **`ORRERIX_WHISPER_ARGS`** — a raw passthrough (whitespace-split, no shell) for
   power users. It is appended **last**; whisper.cpp's parser takes the *last*
   occurrence of a scalar flag, so a user's `-t 12`/`-fa`/`-bs 5` overrides
   loomux's defaults. No shell is involved — tokens go straight to `Command::arg`.
 - **Vocabulary → `--prompt`.** An optional
-  `%LOCALAPPDATA%\loomux\whisper\vocab.txt` (one term/phrase per line, `#`
+  `%LOCALAPPDATA%\orrerix\whisper\vocab.txt` (one term/phrase per line, `#`
   comments) is assembled by the pure `build_prompt_arg` into a compact
   `Terms: a, b, c.` biasing sentence and passed as whisper's initial `--prompt`.
-  Precedence: `LOOMUX_WHISPER_PROMPT` env (verbatim) **replaces** the file; empty
+  Precedence: `ORRERIX_WHISPER_PROMPT` env (verbatim) **replaces** the file; empty
   or missing → **no `--prompt` at all**.
   - *Token budget is approximated.* whisper's initial-prompt cap is ~224 tokens
     (`n_text_ctx/2`); we have no tokenizer, so `build_prompt_arg` truncates on

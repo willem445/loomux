@@ -1,4 +1,5 @@
-//! Roles as data: the **block model** and `<repo>/.loomux/workflow.yml` (#222).
+//! Roles as data: the **block model** and `<repo>/.orrerix/workflow.yml` (#222;
+//! the legacy `.loomux/` spelling is still discovered — see [`workflow_path`]).
 //!
 //! Until now an agent's identity *was* its [`Role`] — a closed 4-variant enum
 //! that simultaneously decided the persona, the template, the model, the CLI
@@ -110,7 +111,7 @@
 //! `id` is immutable and human-meaningful and `name` is display-only on
 //! purpose: n8n keys its graph by *display name*, so renaming a node silently
 //! breaks every reference to it. Layout/coordinates live in a separate
-//! `.loomux/workflow.layout.json` (the GUI pane's file, sub-PR 2) so a canvas
+//! `workflow.layout.json` beside it (the GUI pane's file, sub-PR 2) so a canvas
 //! nudge never churns the semantic diff.
 
 use crate::model::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
@@ -127,7 +128,25 @@ pub type BlockId = String;
 /// Where in the repo a workflow lives. Committed and shareable: a repo's
 /// workflow is a property of the *project*, not of one developer's machine
 /// (the #51 requirement).
-pub const WORKFLOW_PATH: &str = ".loomux/workflow.yml";
+pub const WORKFLOW_PATH: &str = ".orrerix/workflow.yml";
+
+/// The pre-#1153 spelling, still discovered when `.orrerix/workflow.yml` is
+/// absent — permanently, and never renamed on the repo's behalf: it is a
+/// tracked file in somebody's git history. See [`crate::brand`] for the rule
+/// and `doc/design/rebrand-filesystem.md` for the argument.
+pub const LEGACY_WORKFLOW_PATH: &str = ".loomux/workflow.yml";
+
+/// Which of the two spellings a given repo actually uses — the string every
+/// message, audit line and preview must name, so that "this repo declares a
+/// workflow (`…`)" points at the file that was really read.
+pub fn workflow_path(repo: &str) -> &'static str {
+    crate::brand::resolve_repo_file(repo, WORKFLOW_PATH, LEGACY_WORKFLOW_PATH)
+}
+
+/// The absolute workflow file for `repo`, resolved through [`workflow_path`].
+pub fn workflow_file(repo: &str) -> std::path::PathBuf {
+    Path::new(repo).join(workflow_path(repo))
+}
 
 /// Schema version this build understands. Recorded in the file so a future
 /// breaking change can be detected rather than mis-parsed.
@@ -2169,7 +2188,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
 /// off, #222), and the launcher's preview distinguishes "this repo has no
 /// workflow" from "it has one and it is broken".
 pub fn workflow_file_exists(repo: &str) -> bool {
-    Path::new(repo).join(WORKFLOW_PATH).is_file()
+    workflow_file(repo).is_file()
 }
 
 /// Whether a block may carry a persona at all.
@@ -2219,7 +2238,7 @@ pub fn roster_is_custom(blocks: &[Block]) -> bool {
     blocks.iter().any(|b| !b.is_builtin() || b.has_persona() || b.kind == Role::Manager)
 }
 
-/// Read + validate `<repo>/.loomux/workflow.yml`.
+/// Read + validate the repo's workflow file ([`workflow_path`]).
 ///
 /// - `Ok(None)` — no file (the common case): the caller synthesizes
 ///   [`default_roster`] and behaves exactly like pre-#222 loomux.
@@ -2227,7 +2246,7 @@ pub fn roster_is_custom(blocks: &[Block]) -> bool {
 ///   skips it**, falling back to the default roster. A workflow file must never
 ///   be able to block a spawn.
 pub fn load_workflow(repo: &str) -> Result<Option<Workflow>, Vec<String>> {
-    let path = Path::new(repo).join(WORKFLOW_PATH);
+    let path = workflow_file(repo);
     if !path.is_file() {
         return Ok(None);
     }
@@ -2952,7 +2971,13 @@ pub const MERGE_GATE_FILE: &str = "merge_gate";
 /// cannot parse, and an unparseable line refuses every merge until a human looks.
 pub fn gate_file_text(gate: &Gate) -> String {
     let mut out = String::from(
-        "# loomux merge gate — generated from .loomux/workflow.yml (#222). Do not edit.\n",
+        // The source file is named GENERICALLY (#1153 phase 4): a repo may
+        // declare its workflow at `.orrerix/workflow.yml` or the legacy
+        // `.loomux/workflow.yml`, this function has no repo to resolve which,
+        // and a header naming the wrong one would send a human editing a file
+        // that isn't there. The `loomux` brand word in the first phrase is
+        // protocol text and flips with #1153 phase 3, not here.
+        "# loomux merge gate — generated from this repo's workflow file (#222). Do not edit.\n",
     );
     match gate.require {
         GateRequire::AllPass => out.push_str("require all-pass\n"),

@@ -1,11 +1,12 @@
-//! `.loomux/lessons.md` (#268): durable per-repo lessons injected into the
+//! `.orrerix/lessons.md` (#268): durable per-repo lessons injected into the
 //! orchestrator's kickoff. Lives as an integration test (not inline
 //! `#[cfg(test)]`) per repo constraint #4 — a unit-test binary linking the
 //! full lib misses the comctl32-v6 manifest `build.rs` only embeds for
 //! integration-test targets.
 
 use loomux_lib::orchestration::lessons::{
-    BEGIN_SENTINEL, END_SENTINEL, LESSONS_BYTE_CAP, LESSONS_PATH, NOTICE_BYTE_CAP, PIN_MARKER,
+    BEGIN_SENTINEL, END_SENTINEL, LEGACY_LESSONS_PATH, LESSONS_BYTE_CAP, LESSONS_PATH,
+    NOTICE_BYTE_CAP, PIN_MARKER,
 };
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{Guardrails, OrchRegistry, Role};
@@ -16,16 +17,27 @@ struct Repo(std::path::PathBuf);
 
 impl Repo {
     fn new(tag: &str) -> Self {
+        Self::at(tag, LESSONS_PATH)
+    }
+    /// A repo whose lessons file lives at `rel` — the config dir is derived
+    /// from that path rather than hard-coded, so `.orrerix/` and the legacy
+    /// `.loomux/` (#1153 phase 4) are set up by the same helper.
+    fn at(tag: &str, rel: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("lessons-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".loomux")).unwrap();
+        std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
         Repo(dir)
     }
     fn root(&self) -> String {
         self.0.to_string_lossy().to_string()
     }
     fn write_lessons(&self, content: &str) {
-        std::fs::write(self.0.join(LESSONS_PATH), content).unwrap();
+        self.write_lessons_at(LESSONS_PATH, content);
+    }
+    fn write_lessons_at(&self, rel: &str, content: &str) {
+        let path = self.0.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
     }
 }
 
@@ -147,7 +159,7 @@ fn block(name: &str, bytes: usize, pinned: bool) -> String {
 
 #[test]
 fn absent_lessons_file_is_a_no_op() {
-    // No `.loomux/lessons.md` at all — the common case, and the one that must
+    // No lessons file at all — the common case, and the one that must
     // read exactly as it did before this feature existed.
     let repo = Repo::new("absent");
     let kickoff = orchestrator_kickoff(&repo);
@@ -720,4 +732,42 @@ fn scope_is_orchestrator_only_worker_kickoff_never_carries_it() {
         !kickoff.contains("recorded lessons") && !kickoff.contains("some durable fact"),
         "a worker's kickoff must not carry code-injected lessons content, got: {kickoff}"
     );
+}
+
+// ---------- `.orrerix/` preferred, `.loomux/` still read (#1153 phase 4) ----------
+
+#[test]
+fn a_repo_still_on_the_legacy_config_dir_has_its_lessons_read_and_named() {
+    // The deprecation contract, and the case that must never regress: a repo
+    // whose `.loomux/lessons.md` is committed on somebody's main branch keeps
+    // working with no action from them. The kickoff must also NAME that file —
+    // an orchestrator told "the full file is at `.orrerix/lessons.md`" would be
+    // sent to a path its repo does not have.
+    let repo = Repo::at("legacy-dir", LEGACY_LESSONS_PATH);
+    repo.write_lessons_at(LEGACY_LESSONS_PATH, "## Old home\nStill injected.\n");
+    let kickoff = orchestrator_kickoff(&repo);
+    assert!(
+        injected_region(&kickoff).contains("Still injected."),
+        "a legacy-dir lessons file must still be injected, got: {kickoff}"
+    );
+    assert!(
+        kickoff.contains(LEGACY_LESSONS_PATH),
+        "the kickoff must name the file it actually read, got: {kickoff}"
+    );
+}
+
+#[test]
+fn with_both_config_dirs_the_preferred_lessons_file_is_the_one_read() {
+    // A repo mid-migration has both. `.orrerix/` wins — otherwise adding the
+    // new file would have no effect until the author also deleted the old one,
+    // which is exactly the "why is my edit ignored" trap a fallback exists to
+    // prevent.
+    let repo = Repo::at("both-dirs", LESSONS_PATH);
+    repo.write_lessons_at(LEGACY_LESSONS_PATH, "## Stale\nOLD-CONTENT-MARKER\n");
+    repo.write_lessons_at(LESSONS_PATH, "## Current\nNEW-CONTENT-MARKER\n");
+    let kickoff = orchestrator_kickoff(&repo);
+    let region = injected_region(&kickoff);
+    assert!(region.contains("NEW-CONTENT-MARKER"), "the preferred file must win, got: {region}");
+    assert!(!region.contains("OLD-CONTENT-MARKER"), "the legacy file must not be read too");
+    assert!(kickoff.contains(LESSONS_PATH), "and the kickoff must name the preferred path");
 }

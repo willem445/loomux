@@ -334,7 +334,7 @@ the cargo ban covers — agents validate E2E through the CI job only.
 - The exe under test must always be the `tauri.e2e.conf.json`-identifier
   build (`npx tauri build --debug --no-bundle --config
   src-tauri/tauri.e2e.conf.json`) launched through `e2e/fixtures.ts`'s
-  `LOOMUX_DATA_DIR` + isolated-profile handling. Never point `LOOMUX_E2E_EXE`
+  `ORRERIX_DATA_DIR` + isolated-profile handling. Never point `LOOMUX_E2E_EXE`
   at an installed build or skip the identifier override — that's the fix for
   #394's shared-WebView2-process hazard, and skipping it locally reintroduces
   exactly the collision-with-a-running-instance risk it exists to prevent.

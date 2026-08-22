@@ -49,7 +49,7 @@ interface QueueDepthItem {
  *  The backend keys this event by pty id and nothing in the DOM exposes one, so
  *  rather than add a test-only hook to product code the spec addresses a small
  *  RANGE and lets the panes on screen match whichever ids they were given. The
- *  ids are minted by a per-process counter against the isolated `LOOMUX_DATA_DIR`
+ *  ids are minted by a per-process counter against the isolated `ORRERIX_DATA_DIR`
  *  this harness creates, so a handful of panes cannot get out of this range;
  *  ids nobody holds are simply unused by the handler, which looks panes up by
  *  their own pty. */
