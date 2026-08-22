@@ -1327,7 +1327,7 @@ Two things to know before you adopt it:
   `max_diff_lines` above probably wanted anyway).
 
 The workflow pane shows your rules and preserves them across edits, but does not
-offer a control for adding one yet — edit `.loomux/workflow.yml` directly.
+offer a control for adding one yet — edit `.orrerix/workflow.yml` directly.
 
 **Verdict notices are short on purpose.** Recording a verdict also types a
 courtesy notice into the orchestrator's pane, so it learns the review landed
