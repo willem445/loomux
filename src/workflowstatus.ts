@@ -40,6 +40,13 @@ export function gateSummaryLine(status: WorkflowStatus): string | null {
   if (typeof gate.max_diff_lines === "number") {
     clauses.push(`at most ${gate.max_diff_lines} changed lines`);
   }
+  // #1176, same rule. Named as a COUNT and not spelled out: which lanes a rule
+  // actually adds depends on the PR, and a summary line with no PR in front of it
+  // that promised specific reviewers would be saying more than it knows.
+  const rules = gate.routing?.length ?? 0;
+  if (rules) {
+    clauses.push(`+ reviewers routed by path (${rules} rule${rules === 1 ? "" : "s"})`);
+  }
   return `merges to the default branch require: ${clauses.join(" · ")}`;
 }
 

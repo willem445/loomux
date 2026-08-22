@@ -1053,13 +1053,21 @@ hex characters, refuses *this condition* and says so.
         reviewers: [rev-security, rev-tests]
         also: [ci-green, body-unchanged, base-green]
         max_diff_lines: 800      # optional; omit for no limit
+        routing:                 # optional; omit for no path routing
+          - paths: ["src/**"]
+            reviewers: [rev-ui]
 
 `all-pass` (the default when `require:` is omitted) needs every named reviewer to
 have recorded a `pass` — so **a reviewer that has recorded nothing keeps the gate
 shut**, which is literally the #151 bug. `threshold: N` needs N passes and does
 *not* wait for the reviewers it doesn't need: an author who writes `threshold: 2`
 over three reviewers has said in the file that two are enough. They still cannot
-merge over a `fail`.
+merge over a `fail`. **`threshold:` and `routing:` cannot both be declared** —
+see the routing section below for why the pair has no honest reading.
+
+`routing:` (#1176, below) makes the required set a function of the diff: the
+static list plus every rule whose `paths:` matched the PR's changed files.
+Additive only.
 
 `also:` names extra conditions. **`ci-green`** is checked in the shim with
 `gh pr checks` (which exits non-zero when a check is failing, still running, or
@@ -1208,6 +1216,213 @@ was invoked as `gh pr merge -R other/repo`. The shim therefore resolves
 `nameWithOwner` explicitly (through `gh repo view`'s positional repo argument,
 per #294) and refuses if it cannot. The merge queue keeps the placeholders: it
 only ever operates on its own group's repo, and never has an `-R` to honour.
+
+### Path-based reviewer routing: `routing:` (#1176)
+
+    gates:
+      merge:
+        require: all-pass
+        reviewers: [rev-lead]
+        routing:
+          - paths: ["src/**"]
+            reviewers: [rev-ui]
+          - paths: ["**/Cargo.toml", "package-lock.json"]
+            reviewers: [rev-deps]
+
+A gate's `reviewers:` list is static, so a multi-lane workflow has two options
+and both are bad: require every lane on every PR (three panes per PR, two of
+which abstain "outside my lane") or leave the routing to orchestrator prose,
+which is not a mechanism. `routing:` makes the required set a **function of the
+diff** — the practice is code-owner review routing (GitHub CODEOWNERS, Gerrit
+OWNERS). The dependency-manifest lane, which this repo's own constraint 2 makes
+review-worthy, falls out as one rule.
+
+**Required set = `reviewers:` ∪ every rule that matched.** Additive, in that
+order, each id once. There is no spelling here that *removes* a reviewer the
+gate already named, which is what makes "declaring a routing rule cannot make
+this gate easier to satisfy" a property of the code rather than a promise in a
+doc. Once resolved, routing is **spent**: `route_reviewers` returns an effective
+gate whose `reviewers:` is the union and whose `routing:` is empty, and
+everything downstream — `evaluate_merge_gate`, `gate_need`, the `body-unchanged`
+loop — reads that one list. A routed lane is counted, staled, blocked-on and
+digest-checked by exactly the code that handles a declared one, because it *is*
+a declared one by the time that code runs. One gate decision, not two.
+
+**Not the repo's `CODEOWNERS`.** That file names GitHub users and teams; a gate
+names workflow blocks. The mapping between them would be repo config either way,
+so it is written where the gate is.
+
+#### The glob contract, and why it is coarser than gitignore
+
+One metacharacter, `*`, and four rules:
+
+1. `*` matches any run of characters, **including `/`**.
+2. Every other character matches itself.
+3. A **leading** `**/` is optional: `**/Cargo.toml` matches `Cargo.toml` as well
+   as `crates/a/Cargo.toml`.
+4. The match is anchored at both ends — the pattern describes the whole path.
+
+Rule 1 is deliberately coarser than gitignore's, and the argument is the
+**direction of the error**. Routing decides which reviewers are *required*:
+over-matching adds a lane (one review nobody needed), under-matching skips one
+(a merge the repo said needed that lane). Only one of those is survivable, so the
+semantics err toward matching. Coarse also buys the thing this feature actually
+has to pay for — `*`-crossing-`/` is exactly what a POSIX `case` does for free,
+so the shim and `workflow::glob_match` are the *same* matcher rather than two
+hand-written ones that agree today. Rule 3 exists because `**/X` is the natural
+spelling of "every X" and rules 1–2 alone would silently miss the one at the repo
+root: a skipped reviewer, the unsurvivable direction. `**` anywhere else is `*`
+repeated, which matches the same set.
+
+**`?` is excluded, and it is the interesting omission.** It would be trivial to
+allow, and it is the one character whose meaning the two implementations could
+not be made to *provably* share: shell `case` matches one character in the
+shell's locale (one byte in the C locale `sh` usually runs under), while a Rust
+mirror matches either a byte or a `char`, and the two answers differ on the first
+non-ASCII path anybody commits. With `*` as the only metacharacter, "any run of
+characters" and "any run of bytes" are the same set, and shim/mirror agreement is
+a property of the alphabet rather than a claim in a PR body. Nobody routing
+reviewers by area needs a single-character wildcard.
+
+The alphabet is therefore `A-Za-z0-9._-/` plus `*`, and it is what a `case`
+pattern can carry safely: no `[`, `\`, `{`, `}`, quote or space, so `*` is the
+only thing the shell can read as anything but a literal. Three further shapes are
+refused outright — a **leading `/`**, a **trailing `/`**, and a **`..` segment** —
+all for one reason: GitHub reports changed paths repo-relative and every one of
+them names a file, so each of those rules could never fire, and a rule that never
+fires silently drops a reviewer the repo asked for. That is the same
+unsatisfiable-gate refusal a gate naming a worker already gets. (`src/` is the
+common one; the refusal says to write `src/**`.)
+
+#### `routing:` and `require: threshold` cannot both be declared
+
+A threshold counts passes over a **fixed** list; routing makes the list depend on
+the diff. Read together, an added lane would also be a new *candidate* able to
+supply one of the N passes — so declaring a routing rule could make the gate
+**easier** to satisfy, which is the one direction a gate must never move. Rather
+than invent a reading (routed lanes are always all-pass? the threshold scales?)
+and hope the author meant it, the pair is a parse error naming the alternative:
+`require: all-pass` with `routing:`. Under `all-pass` — the default, and what
+this repo runs — there was never an ambiguity to resolve. `parse_gate_file`
+refuses the pair too, rather than trusting `parse_workflow` to have held: that
+reader's whole job is to be the half that does not assume the other half did.
+
+#### The changed-file list, and the truncation clause that is the whole point
+
+`gh pr view --json files,changedFiles`, reduced by `workflow::ROUTING_FILES_JQ`
+to a line protocol — the word `ok`, then one `p <path>` line per file — which the
+shim reads with a `while read` loop and the queue reads with
+`workflow::parse_routed_files`. One definition, two consumers, the arrangement
+`BASE_CHECK_RUNS_JQ` established in #1181 for exactly this reason: two
+byte-identical copies of a reduction look like agreement right up until what the
+contract *says* is wrong in both.
+
+**`gh pr view --json files` fetches ONE page.** The GraphQL `files` connection is
+capped at 100 while `changedFiles` counts them all — verified live against this
+repo: PR #1181 answers `{changed: 32, listed: 32}`, PR #1018 answers
+`{changed: 135, listed: 100}`. For a *size* gate that omission would be visible.
+For routing it fails **open, and invisibly**: the one file that would have matched
+a rule sits on page two, no rule fires, and the lane the repo asked for is quietly
+not required — the gate goes green one requirement short and nothing anywhere says
+so. That is #1181's pagination finding wearing routing's hat, so it gets the same
+answer. The reduction compares `(.files|length) != .changedFiles` — `!=`, not `<`,
+because a count that disagrees in *either* direction means the payload is not the
+shape the question rests on — and checks `has("files")`/`has("changedFiles")`
+first, since `null` sorts below every number in jq and an absent key would make the
+comparison read false and fall straight through to the answer that merges. It also
+refuses a path carrying a newline or carriage return: that cannot be expressed in a
+one-path-per-line protocol at all, so a reader would see two files where the repo
+has one — and this reader is a merge gate being fed a path whoever opened the PR
+chose.
+
+**Unaccountable refuses.** There is deliberately no partial answer: "some of the
+files this PR changed" cannot answer "did it touch `src/**`". The unknown here is
+sharper than the usual one — what is unknown is *which reviewers are required* —
+so reading it as "no rule fired" would be guessing in favour of merging. A
+complete answer that happens to be **empty** (a PR that changed nothing) is a
+different statement and is honoured as one: nothing fires, and the declared gate
+stands.
+
+The shim reads that list through a **pipe**, never a heredoc and never an
+unquoted expansion. An unquoted heredoc body performs command substitution on its
+content, and the content here is filenames chosen by whoever opened the PR;
+`printf`/pipe is the only shape in which a filename cannot become a command. The
+loop therefore runs in a subshell and returns its answer on **stdout** (`hit
+<indices>` or `bad`) rather than by setting a variable a subshell could not
+export.
+
+**Absent is off.** A gate with no `routing:` never resolves a changed-file list at
+all — no `gh` call, no jq, no refusal path — so every repo that has not adopted
+this is byte-for-byte on its pre-#1176 path. The same shape `max_diff_lines`
+takes.
+
+#### Where it is enforced, and what each surface says
+
+Three enforcement points, one decision:
+
+- the **`gh` shim**, which refuses `gh pr merge` and names the rules that fired
+  (`routing-unaccountable` when it cannot see the diff);
+- the **merge queue**, which never calls `gh pr merge` at all — it fast-forwards
+  a scratch ref — so a clause the shim alone enforced would leave the queue as
+  the way around routing (`GateRecheck::RoutingUnaccountable`);
+- `gate_status_line`, the **satisfaction** side: the line a reviewer reads after
+  recording a verdict names the routed lanes and the rule that pulled each in.
+  It says nothing at all when no rule fired, because a note about rules that
+  did *not* fire would be noise on every PR in the repo.
+
+`gate_missing_blocks` counts routed reviewers too (#316's satisfiability
+guarantee): a rule naming a block the live roster cannot spawn makes the gate
+unsatisfiable for the subset of PRs whose paths match it, which is the same
+failure arriving quietly. `recommend_capacity` counts them the same way, on the
+worst case — a PR that touches every rule's paths — because under-advising a
+capacity floor is how #255 happens.
+
+#### The gate file
+
+Two line kinds per rule, each carrying the rule's 1-based index:
+
+    route-path 1 src/**
+    route-reviewer 1 rev-ui
+    route-path 2 **/Cargo.toml
+    route-path 2 package-lock.json
+    route-reviewer 2 rev-deps
+
+The reader is a POSIX `while read -r k v w` with no arrays, so a rule packed onto
+one line would have to be re-split inside the shell, and every spelling of that
+(an `IFS` swap, a `set --`) either clobbers the shim's own positional parameters
+or introduces a second delimiter the glob alphabet would then have to avoid.
+Three fixed fields fit the loop that is already there; the index stitches the
+halves back together, and **anything that does not stitch makes the file
+unusable** — a gap, an index with only one half, a number that is not a number.
+Unusable is reported by both readers as "malformed — every merge refused", which
+is the only safe reading of a file whose dropped line would have been a required
+reviewer. A token that cannot be serialized safely writes the `unrepresentable`
+poison line rather than vanishing, exactly as a reviewer id or an `also:`
+condition does.
+
+**`ROUTING_RULES_MAX` is enforced in all three readers, and the third one was
+nearly missed.** `parse_workflow` refuses a workflow past the cap and
+`parse_gate_file` refuses a gate *file* past it — so a file with more rules than
+loomux will load is one loomux reports as malformed, and a malformed gate refuses
+every merge. The shim's loop originally had no cap, which made the same file
+unreadable to one half of the gate and perfectly readable to the other. That
+divergence fell on the **strict** side (more rules is more required reviewers),
+which is exactly why it survived review of the code that introduced it: nothing
+went wrong, so nothing looked wrong. The property is *the two halves agree, and
+both fail closed* — not *this particular disagreement is harmless*. The shim now
+carries the cap as the interpolated constant, never a number re-typed in shell,
+and the test drives the real shim at the cap and one past it so it cannot pass
+against a shim that simply refuses both.
+
+#### What this does not do
+
+Rules are evaluated independently and every match is additive; there is no
+first-match-wins, no negation, and no "these paths need *no* review". Those are
+CODEOWNERS features whose value here is unclear and whose failure mode is the one
+this design refuses everywhere else — a spelling that makes a gate weaker. The
+workflow pane reads, emits and validates `routing:` (without which a rule would be
+a line the next form edit silently deleted) and shows the rules read-only; an
+editor for them is not built yet.
 
 ### The PR-open advisory, and which way each half fails (#1174)
 
