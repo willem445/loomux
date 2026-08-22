@@ -1252,6 +1252,7 @@ mod tests {
             reviewers: reviewers.iter().map(|r| r.to_string()).collect(),
             also: also.iter().map(|c| c.to_string()).collect(),
             max_diff_lines: None,
+            routing: Vec::new(),
         }
     }
 
@@ -1348,6 +1349,7 @@ mod tests {
             reviewers: vec!["rev-a".into(), "rev-b".into(), "rev-c".into()],
             also: vec![],
             max_diff_lines: None,
+            routing: Vec::new(),
         });
         let v: BTreeMap<_, _> = [
             verdict("rev-a", Verdict::Pass, "NEW", ""),
