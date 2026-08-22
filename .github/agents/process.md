@@ -73,6 +73,21 @@ that two healthy sessions corroborate each other into `recurrence >= 1`.
   resolved to a deliberate red or a pending check); exit codes in
   `.claude/skills/ci-validate/SKILL.md`.
 
+**A capped scan also makes the count ASYMMETRIC, so a `0` is scan-window-relative
+rather than "seen only here."**
+
+- **RULE** — while `corroboration_capped` is `true`, re-run `session_digest` on the
+  sibling sessions of the same PR train (your PR's reviewer, the worker beside it)
+  and compare `key` strings verbatim before writing a `recurrence: 0` window off as
+  a one-off; the scan reads only the most recent `sessions_scanned` others, so an
+  older session can see a newer one that the newer one cannot see back.
+- **FAILURE SIGNATURE** — `recurrence: 0` with `corroborated_by: []` on a wall
+  generic enough to state in one clause (a shell-quoting death, a missing install),
+  and a sibling session in the same train whose digest you have not read.
+- **POINTER** — #1189's process review (where the byte-identical key
+  `tool_error:Bash:cat:exit code # <path> -c: line` read `0`/`[]` from one session
+  and `1` naming that very session from another, minutes apart).
+
 The one thing `recurrence` cannot see is a wall the group only ever hit ONCE but
 that is certain to recur — a documented invariant somebody violated, a constraint in
 `CLAUDE.md` that a worker missed. Proposing that on a `recurrence: 0` window is

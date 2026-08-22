@@ -301,6 +301,25 @@ Every PR owes its new tests seen *failing* without the change. With local
 #299) — so the red half is produced on a **throwaway scratch branch with its
 own draft PR**, and CI's log is the failure line you quote.
 
+### The frontend half runs its base red locally — build the isolated tree right
+
+That paragraph is the Rust path. Node commands are not banned, so a frontend PR
+produces its own red locally — but checking out the base is not the way: a new
+`src/*.ts` module does not exist there, so every test in the file dies on a
+module-load error, which masks the behaviour instead of evidencing it. Build an
+isolated tree from the BASE's `src/` and copy in **only** the new module, so the
+imports resolve and everything the assertions are *about* is still the base's.
+
+**Then check what those tests read off disk.** Guards here are source-scanning by
+convention (CLAUDE.md), so `test/*.test.ts` files `readFileSync` other `src/`
+files as text — a file missing from the isolated tree reddens the tests that read
+it with `ENOENT`, and that red is a harness artefact, not evidence. Quoting one is
+the easiest mistake in this flow. Measured on #1189's tree: the complete isolated
+tree gives `tests 16 / pass 14 / fail 2`; the same tree with `src/pane.ts` removed
+gives `fail 3`, the extra being `pane.ts arms its fit timer from this policy`
+(`test/resizeburst.test.ts:482`). Read every failure's *reason*, and re-run after
+copying in whatever failed on `ENOENT` (#1189).
+
 1. **Commit your real work first** (#493) — the scratch edits are destructive
    and a `git checkout --` to undo them takes everything uncommitted in the
    file with it.
