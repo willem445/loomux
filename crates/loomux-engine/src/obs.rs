@@ -814,8 +814,8 @@ struct ReentryGuard {
 
 impl ReentryGuard {
     fn enter(latch: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> Self {
-        let already = latch.with(|c| c.replace(true));
-        ReentryGuard { latch, first: !already }
+        latch.with(|c| c.replace(true));
+        ReentryGuard { latch, first: true }
     }
 
     fn is_first(&self) -> bool {
