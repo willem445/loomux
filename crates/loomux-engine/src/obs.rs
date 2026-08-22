@@ -1390,7 +1390,8 @@ fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathB
             }
             // …but with no gate to clear it is still a candidate, ranked last
             // rather than dropped.
-            Some((mtime.unwrap_or(UNIX_EPOCH), p))
+            let _ = mtime;
+            Some((UNIX_EPOCH, p))
         })
         .max()
         .map(|(_, p)| p)
