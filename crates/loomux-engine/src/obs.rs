@@ -1377,9 +1377,6 @@ fn newest_crash_log_since(dir: &Path, since: Option<SystemTime>) -> Option<PathB
         .filter(|p| is_crash_log(p))
         .filter_map(|p| {
             let meta = fs::metadata(&p).ok()?;
-            if meta.len() == 0 {
-                return None;
-            }
             let mtime = meta.modified().ok();
             if let Some(t) = since {
                 // Unreadable mtime cannot clear the gate — same conservative
