@@ -100,10 +100,18 @@ function widthTransitionMs(selector: string): number {
  *  `#sessions` on the left, and `.sidedock` on the right since #1150 moved it
  *  from an overlay into the row (doc/design/side-dock.md).
  *
- *  LIMIT, stated rather than left to be discovered: this list is written down,
- *  so a THIRD in-flow panel added to `#workspace` is not detected here. Nothing
- *  in a stylesheet says which rules are flex siblings of the grid; the two that
- *  are, are named. */
+ *  TWO LIMITS, stated rather than left to be discovered.
+ *
+ *  This list is written down, so a THIRD in-flow panel added to `#workspace` is
+ *  not detected here. Nothing in a stylesheet says which rules are flex siblings
+ *  of the grid; the two that are, are named.
+ *
+ *  And each panel's transition is checked against the ceiling ON ITS OWN, so a
+ *  COMPOSITE burst is invisible here: one panel's slide changing the room, and
+ *  the other's width being re-targeted on top of it, can run past the ceiling
+ *  while both durations pass this check individually. That is #1203 — read the
+ *  assertion below as "no panel animates too long by itself", never as "no burst
+ *  can outlast the ceiling". */
 const LAYOUT_PANELS = ["#sessions", ".sidedock"] as const;
 
 const SESSIONS_TRANSITION_MS = widthTransitionMs("#sessions");

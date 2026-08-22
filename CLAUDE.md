@@ -76,7 +76,10 @@ compiles.
    permissible is not that they are old or asked-for: it is that each width
    change is a DISCRETE human click whose purpose is to change how much room
    the terminals get, and that `src/resizeburst.ts` collapses the whole
-   animated burst into one fit per pane at the settled geometry. A PASSIVE or
+   animated burst into one fit per pane at the settled geometry. One known
+   exception is open and watched rather than claimed away: the dock also
+   re-widths itself when the room around it changes, so one panel's slide can
+   chain onto the other's ease and outrun that coalescer (#1203). A PASSIVE or
    continuous trigger (a focus change, a follow, a timer, an attention flip)
    may still never reach a PTY resize — the side dock's own pane-following
    costs zero, and that is the line, not the panel count. Adding a third

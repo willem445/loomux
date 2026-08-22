@@ -4402,21 +4402,26 @@ button.wf-finding:hover { background: var(--surface-2); }
  *     per toggle, ~90 with six panes open). src/resizeburst.ts moved the coalescing into
  *     the fit debounce itself, so a whole animated burst collapses into ONE fit per pane at
  *     the settled geometry. The dock inherits that by being in the flex row at all: no
- *     bracketing, no second coalescer, no code on the resize path. That inheritance is what
- *     `test/resizeburst.test.ts` pins — the transition below must stay inside
- *     FIT_MAX_WAIT_MS minus one FIT_WINDOW_MS, or a ceiling fit would land mid-slide and
- *     put a ConPTY resize at an intermediate geometry.
+ *     bracketing and no second coalescer. `test/resizeburst.test.ts` pins one half of it —
+ *     the transition below must stay inside FIT_MAX_WAIT_MS minus one FIT_WINDOW_MS, or a
+ *     ceiling fit would land mid-slide and put a ConPTY resize at an intermediate geometry.
+ *     It checks each panel's transition IN ISOLATION, so it cannot see a composite burst:
+ *     one panel's slide changing the room, and this one's ease re-targeting on top of it.
+ *     That case is open as #1203 (doc/design/side-dock.md) — do not read this pin as
+ *     covering it.
  *   - So the residual cost is honest and small: one resize per pane per toggle, plus the
  *     per-frame LAYOUT work of the animation (which is why the panel's contents are pulled
- *     out of that animation — see .sidedock-inner). What the old overlay bought — zero —
- *     is given up in exchange for the panes staying fully visible, which is what was asked
- *     for.
+ *     out of the TOGGLE's animation — see .sidedock-inner; a ROOM change re-lays them out
+ *     instead, #1203). What the old overlay bought — zero — is given up in exchange for
+ *     the panes staying fully visible, which is what was asked for.
  *
- * THE CONTENTS DO NOT ANIMATE, only the column does. `.sidedock-inner` is absolutely
- * positioned at a FIXED width (set in JS beside the column's own width, from `dockBoxes`)
- * and the column clips it. Without that, every frame of the 240 ms slide would re-lay-out
- * a git graph or a file tree at an intermediate width — the transition would be cheap for
- * the terminals and expensive for the panel. Same device, same reason, as `.sessions-inner`.
+ * THE CONTENTS DO NOT ANIMATE ON A TOGGLE, only the column does. `.sidedock-inner` is
+ * absolutely positioned at a FIXED width (set in JS beside the column's own width, from
+ * `dockBoxes`) and the column clips it. Without that, every frame of the 240 ms slide would
+ * re-lay-out a git graph or a file tree at an intermediate width — the transition would be
+ * cheap for the terminals and expensive for the panel. Same device, same reason, as
+ * `.sessions-inner`. The width is fixed PER TOGGLE, not absolutely: it follows the room, so
+ * a room that moves over time does re-lay the contents out (#1203, side-dock.md).
  *
  * NO SHADOW, deliberately. `--shadow-float` is a 40px soft shadow, and its penumbra would
  * fall on a live WebGL terminal canvas — the documented way to make this app slow
@@ -4473,10 +4478,13 @@ button.wf-finding:hover { background: var(--surface-2); }
    `content-visibility` half of `.resizing` is further down, with the lists it hides.) */
 .sidedock.resizing { transition: none; }
 
-/* The panel's contents, lifted out of the column's animation: a fixed width, so a slide
-   clips them instead of re-laying them out 15 times. JS sets this width from the same
+/* The panel's contents, lifted out of the column's TOGGLE animation: a fixed width, so a
+   slide clips them instead of re-laying them out 15 times. JS sets this width from the same
    `dockBoxes` call that sets the column's, so the two cannot disagree. Anchored RIGHT, so
-   the collapse wipes from the grid side — the mirror of `.sessions-inner`. */
+   the collapse wipes from the grid side — the mirror of `.sessions-inner`.
+   The width follows the ROOM, though, which is what stops a squeezed column cropping the
+   panel — so a room that moves over time puts these contents back into an animation
+   (#1203, doc/design/side-dock.md). */
 .sidedock-inner {
   position: absolute; top: 0; right: 0; bottom: 0;
   display: flex; flex-direction: column; min-width: 0;

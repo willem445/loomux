@@ -551,7 +551,9 @@ for the gesture shape it was built for.
 The distinction from the toggle is the point, and `test/resizeburst.test.ts`
 measures both. A **transition** has no end to hook but it *settles*, so
 `resizeburst.ts`'s window resolves it: one fit per pane, at the settled size, no
-bracketing required. A **drag** never settles for as long as the human holds the
+bracketing required — for one transition. Chain a second onto its tail (the room
+moving under the dock while `#sessions` slides) and the composite burst can
+outlast the ceiling instead, which is #1203 above. A **drag** never settles for as long as the human holds the
 mouse, so the coalescer correctly falls back to its ceiling and fits every
 `FIT_MAX_WAIT_MS` (400 ms) — deliberately, because a terminal frozen at its
 pre-drag size for the whole gesture is the failure that ceiling exists to

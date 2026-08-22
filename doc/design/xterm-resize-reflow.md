@@ -214,7 +214,13 @@ Being in the debounce is the point. A bracket covers the gestures somebody
 remembered to bracket; this covers every consumer of the path -- the
 transition, equalize, autosize, a native split, the window's own resize, and
 the side-dock autosize (#1150), which was written afterwards and inherited it
-without adding a line to the resize path.
+for its own toggle without adding a line to the resize path. Not for every
+gesture it has: the dock also re-widths itself when the ROOM around it changes,
+and a room that is itself animating re-targets the dock's 240 ms ease, so the
+composite burst can outlast the ceiling -- one panel's transition driving
+another's. That case is open as #1203, and the isolation this section's pin
+assumes (each panel's transition checked against the ceiling on its own) is
+exactly what makes it invisible to `test/resizeburst.test.ts`.
 
 ### Where it schedules MORE, and why that is the trade
 

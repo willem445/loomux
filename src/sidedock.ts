@@ -15,12 +15,21 @@
 // to cost one xterm reflow plus one `ResizePseudoConsole` per pane PER FRAME of
 // its transition. #1149 moved the coalescing into the fit debounce itself
 // (resizeburst.ts), so a whole animated burst collapses into ONE fit per pane at
-// the settled geometry. This module inherits that by doing nothing at all: the
-// panes' own `ResizeObserver`s see the flex row change and the shared policy
-// decides the rest. There is no coalescer here, no bracketing of the toggle, and
-// no code on the resize path — which is exactly the property to preserve, since
-// anything added here would be a second mechanism covering one gesture instead
-// of the one mechanism covering every consumer.
+// the settled geometry. On the TOGGLE this module inherits that by doing nothing
+// at all: the panes' own `ResizeObserver`s see the flex row change and the
+// shared policy decides the rest. There is no coalescer here and no bracketing
+// of the toggle, and anything added would be a second mechanism covering one
+// gesture instead of the one mechanism covering every consumer.
+//
+// "Nothing on the resize path" is NOT true of this module as a whole, and the
+// boundary is worth knowing before editing it. `roomObs` (see `onRoomChanged`)
+// writes the column's width whenever the ROOM changes, which is what keeps a
+// squeezed dock narrow instead of cropped — and a room that is itself animating
+// (a `#sessions` slide) therefore re-targets this panel's own 240 ms ease, so
+// the composite burst can outlast the coalescer's 400 ms ceiling and take one
+// mid-slide fit per pane. Open as #1203, argued in doc/design/side-dock.md,
+// deferred rather than fixed blind: the chain is a browser behaviour nothing in
+// this repo's test rig can execute.
 //
 // The one gesture that IS bracketed is the grip drag, and it is bracketed with
 // the mechanism that already exists for divider drags (`beginResizeHold` /
