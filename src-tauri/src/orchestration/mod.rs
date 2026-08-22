@@ -25803,16 +25803,20 @@ impl OrchRegistry {
 
     /// The group's declared manager block, if it has one.
     ///
-    /// Read off the group's own resolved roster rather than by re-parsing
-    /// `workflow.yml` (`lock_resources`' shape) because blocks, unlike declared
-    /// resources, ARE on the group — `resolve_blocks` has already run, and a
-    /// second read of the file could disagree with the roster the group is
-    /// actually running.
+    /// Read off the group's own resolved roster (`Guardrails::block_for`)
+    /// rather than by re-parsing `workflow.yml` — `lock_resources`' shape is
+    /// right for declared RESOURCES, which live only in the file, and wrong for
+    /// blocks, which the group already carries resolved. A second read of the
+    /// file could disagree with the roster the group is actually running.
+    ///
+    /// `block_for` answers "the first block of that kind", which for a manager
+    /// is "the only one": `workflow::MANAGER_MAX` is 1 and a second is a parse
+    /// error (#1169).
     ///
     /// A default group can never answer `Some` here: `Role::Manager` is
     /// workflow-only and `builtin_roster` has no manager block (#1169).
     pub fn manager_block(&self, group: &GroupId) -> Option<workflow::Block> {
-        self.group(group)?.blocks.into_iter().find(|b| b.kind == Role::Manager)
+        self.group(group)?.guardrails.block_for(Role::Manager).cloned()
     }
 
     /// Read a group's mailbox file.
@@ -50329,6 +50333,30 @@ fn open_external_url(url: &str) -> Result<(), String> {
 /// shows nothing rather than throwing, exactly as `orch_tasks` does for an
 /// unparseable board. Nothing WRITES through this path, so the loud read that
 /// protects the file is untouched.
+/// How many mailbox messages this group's manager has not read (#1161 M2) —
+/// what the pane's unread chip renders (M5).
+///
+/// `0` for every group that declares no manager, which is nearly all of them:
+/// no manager means no mailbox file, and an absent file reads as empty.
+///
+/// **A read failure reads as 0**, on `orch_questions_list`'s reasoning applied
+/// to chrome: this command has no error channel and its caller renders a badge,
+/// so an unreadable file hides the chip rather than throwing. The registry's
+/// own loud read (`mailbox`) is untouched, and every path that WRITES the file
+/// still goes through it — see `OrchRegistry::mailbox_unread`.
+///
+/// Off-thread (#743 S4c), like every other fs-touching command. Read-only and
+/// takes no lock: writers replace `mailbox.json` through `atomic_write`, so a
+/// concurrent reader sees the whole old file or the whole new one.
+#[tauri::command]
+pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
+    let reg = reg_of(&app);
+    // #904: no error channel, so an unvalidated id yields the same 0 a group
+    // with no mail does. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return 0 };
+    run_blocking(move || reg.mailbox_unread(&group_id)).await
+}
+
 #[tauri::command]
 pub async fn orch_questions_list(app: AppHandle, group_id: String) -> Vec<humanq::Question> {
     let reg = reg_of(&app);

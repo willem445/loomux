@@ -236,6 +236,7 @@ pub fn run() {
             orchestration::orch_workflow_status,
             orchestration::orch_group_watches,
             orchestration::orch_lock_state,
+            orchestration::orch_mailbox_status,
             orchestration::orch_questions_list,
             orchestration::orch_question_answer,
             orchestration::orch_needs_you_list,
