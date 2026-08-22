@@ -135,10 +135,17 @@ somebody else's filename does not.**
   package and the installed executable are still called that — phase 5 — and a refusal
   naming a command the user does not have would be useless. Only that shim's tool-surface
   sentence moved.
-- **The `agent-managed` label description** (`"Managed by a loomux orchestrator"`). Brand
-  prose on a GitHub label, matched by *name* and never by description; flipping it would
-  leave every existing label describing itself differently from every new one, for no
-  reader benefit. A prose-sweep item.
+- **Both `agent-*` label descriptions** (`gh.rs`'s table: *"Managed by a loomux
+  orchestrator"*, *"Groomed and ready for a loomux agent to build"*). Brand prose on a
+  GitHub label, matched by *name* and never by description; flipping them would leave
+  every existing label describing itself differently from every new one, for no reader
+  benefit. A prose-sweep item.
+- **The merge queue's git ref namespace** — `refs/remotes/loomux-mq/*` and the
+  `loomux-mq-<batch>` branch name (`mqloop.rs`). Refs written into the user's own `.git`,
+  with fetch and prune semantics attached; renaming them orphans every ref a live queue
+  is holding. Phase 4's class of problem — an identity on somebody's disk — and it wants
+  the same kind of argument, not a sweep. (The PR *prose* the queue posts to GitHub did
+  move: nothing matches it, and every human and agent who opens the PR reads it.)
 - **The `<repo>-worktrees/` convention.** Derived from the repository's name, not the
   product's.
 - **Rust and TypeScript identifiers** — `mask_loomux_notices`, `is_loomux_notice`, the
@@ -147,9 +154,16 @@ somebody else's filename does not.**
   this diff unreviewable for no agent-visible gain.
 - **`localStorage` keys** (`loomux.defaultAgent`, …) and the workflow file's
   `authored_with:` stamp. Persisted user state — phase 4's class.
-- **Brand prose in Rust doc and code comments.** Roughly a thousand mentions across
-  `src-tauri`, none of them read by an agent. Phase 0 called for a lazy rename of
+- **Brand prose in Rust doc and code comments** — roughly a thousand mentions across
+  `src-tauri`, none of it reaching an agent. Phase 0 called for a lazy rename of
   narrative surfaces, and a sweep here would bury the protocol diff.
+
+  The line is *reaches an agent*, not *is in Rust*: `mcp.rs` is agent-facing end to end
+  — its module doc and every tool `description:` is text a delegate reads — so its 42
+  mentions moved with the identities. The audit-actor rename had made one of them
+  actively wrong: `queue_orphans` told an orchestrator to look for a `from` value this
+  app no longer stamps. Same test for the generated Copilot agent file's
+  `description:`, the merge-queue PR body, and the shim refusals.
 
 ## Where the vocabulary lives
 

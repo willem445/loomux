@@ -23994,7 +23994,7 @@ pub fn undeliverable_notice(
     cause: UndeliverableCause,
 ) -> String {
     let subject = if notices == 1 {
-        format!("1 of {depth} deliveries queued for {agent_id} is loomux's own notice")
+        format!("1 of {depth} deliveries queued for {agent_id} is this app's own notice")
     } else {
         format!("{notices} of {depth} deliveries queued for {agent_id} are loomux's own notices")
     };
