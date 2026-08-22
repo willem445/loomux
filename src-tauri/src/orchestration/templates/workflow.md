@@ -31,7 +31,7 @@ the gate names has recorded a `pass` with `review_verdict(...)` (a `threshold: N
 of them). A `fail` or `escalate` from **any** named reviewer refuses the merge whatever the
 others recorded — first-to-approve never wins. Read the state with **`list_verdicts(pr)`**: it
 is what the interceptor reads, and it tells you whether a merge is possible before you attempt
-one. A reviewer's `[loomux] … recorded verdict …` message in your pane is a courtesy copy —
+one. A reviewer's `[orrerix] … recorded verdict …` message in your pane is a courtesy copy —
 and a deliberately **capped** one, carrying the head of the summary plus a pointer rather
 than the whole thing, because your pane's text is context you re-pay for on every later
 turn; `list_verdicts` is the truth, and where the rest of a truncated summary is.

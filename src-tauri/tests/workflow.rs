@@ -5401,7 +5401,7 @@ const LIVE: [(&str, &str, &[&str]); 5] = [
 /// So the golden carries the literal `{{HOLD_LABEL}}` and this renders it, which
 /// keeps the pin biting on the prose AROUND it.
 fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) -> String {
-    let vars: [(&str, String); 7] = [
+    let vars: [(&str, String); 8] = [
         ("REPO", g.repo.clone()),
         ("GROUP_ID", g.id.to_string()),
         ("MAX_AGENTS", g.guardrails.max_agents.to_string()),
@@ -5409,6 +5409,11 @@ fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) 
         ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer).to_string()),
         ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner).to_string()),
         ("HOLD_LABEL", g.guardrails.intake.hold.clone()),
+        // #1153 phase 3. Like HOLD_LABEL and NOT like `LIVE`'s keys: it
+        // resolves to a real path for every group, so the golden carries the
+        // literal `{{LESSONS_PATH}}` and this renders it — which keeps the
+        // pin biting on the prose around it.
+        ("LESSONS_PATH", loomux_lib::orchestration::lessons::lessons_path(&g.repo).to_string()),
     ];
     let mut out = tpl.to_string();
     for (k, v) in vars {

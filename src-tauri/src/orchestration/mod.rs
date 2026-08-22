@@ -37624,6 +37624,16 @@ impl OrchRegistry {
             // conditionally injected: it is a per-group VALUE, not
             // workflow-conditional prose, and it renders for every group.
             ("HOLD_LABEL", g.guardrails.intake.hold.as_str()),
+            // #1153 phase 3, and the PRIORITY half of it: the four role
+            // templates name the repo's lessons file, and orchestrator.md's
+            // learning loop tells its reader to WRITE one. A hard-coded
+            // `.loomux/lessons.md` is wrong in a repo that has moved to
+            // `.orrerix/` — and wrong in the one way phase 4's per-file
+            // resolution cannot forgive, because `lessons_path` prefers the
+            // new spelling: an entry committed to the old path is never read
+            // again. Threaded as a per-group VALUE, like HOLD_LABEL, because
+            // it resolves to a real path for every group.
+            ("LESSONS_PATH", lessons::lessons_path(&g.repo)),
             ("WORKFLOW", workflow_section.as_str()),
             ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
             ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
@@ -41284,6 +41294,11 @@ impl OrchRegistry {
             // every spawn, so a var missing from this list would leave a live
             // `{{HOLD_LABEL}}` in the file the agent actually reads.
             ("HOLD_LABEL", group.guardrails.intake.hold.as_str()),
+            // Same value and same reason as the group-render list above: a
+            // block re-renders its instruction file on every spawn, so a var
+            // missing here would leave a live `{{LESSONS_PATH}}` in the file
+            // the agent actually reads.
+            ("LESSONS_PATH", lessons::lessons_path(&group.repo)),
         ];
         // Audited, not swallowed: the kickoff below hands the agent this file's
         // path as "read your role instructions", so a failed write means an agent
