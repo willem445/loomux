@@ -2318,6 +2318,14 @@ fn refresh_and_select(
                     ci_green,
                     base_green,
                     changed_lines: facts.changed_lines,
+                    // #1176. Per sub-PR — the base is one question for the whole
+                    // pass, but "which files did THIS PR change" is a different
+                    // question for every entry in it.
+                    changed_files: if crate::mqdriver::declares_routing(gate) {
+                        crate::mqdriver::pr_changed_files(r, *pr)
+                    } else {
+                        None
+                    },
                 };
                 let recheck =
                     recheck_gate(gate, &verdicts(*pr), Some(facts.head.as_str()), &observed);

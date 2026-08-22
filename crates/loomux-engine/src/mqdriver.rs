@@ -1079,6 +1079,62 @@ pub fn classify_checks(raw: Result<&str, &str>) -> BatchVerification {
     }
 }
 
+/// The argv for one PR's changed-file list (#1176's path routing).
+///
+/// Through `workflow::ROUTING_FILES_JQ` — **one definition, two consumers**,
+/// the arrangement [`base_check_runs_argv`] established: the `gh` shim
+/// interpolates that same constant into its POSIX body, so the queue and the
+/// shim cannot ask GitHub different questions about which files a PR changed.
+/// The reduction carries the truncation guard (`gh pr view --json files` pages
+/// at 100 while `changedFiles` counts them all); see it for why a short list is
+/// the fail-OPEN direction here and not merely a smaller answer.
+///
+/// A **separate call** from [`pr_facts_argv`], unlike `additions`/`deletions`,
+/// and for the reason that one gives for riding along: those cost nothing extra
+/// in a call already being made, while this one needs its own `--jq` and is
+/// bought only by a gate that declares routing.
+pub fn pr_files_argv(pr: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        pr.to_string(),
+        "--json".into(),
+        "files,changedFiles".into(),
+        "--jq".into(),
+        crate::workflow::ROUTING_FILES_JQ.into(),
+    ]
+}
+
+/// Read one PR's changed paths through the seam (#1176).
+///
+/// `None` for every incomplete answer — the seam failed, gh failed, or the file
+/// list could not be shown to be whole — which `recheck_gate` turns into
+/// [`crate::mergeq::GateRecheck::RoutingUnaccountable`]. There is deliberately
+/// no partial answer: "some of the files this PR changed" cannot answer "did it
+/// touch `src/**`".
+pub fn pr_changed_files(r: &dyn MqRunner, pr: u64) -> Option<Vec<String>> {
+    let out = r.gh(&as_args(&pr_files_argv(pr))).ok()?;
+    if !out.ok() {
+        return None;
+    }
+    crate::workflow::parse_routed_files(&out.stdout)
+}
+
+/// Whether this gate routes reviewers by path (#1176) — the `declares_…` branch
+/// that decides whether [`pr_changed_files`] is worth a round-trip.
+///
+/// Mirrors [`declares_ci_green`] arm for arm, including the belt on a gate this
+/// build cannot read: an unreadable gate file must never be the reason a lookup
+/// was skipped. (It changes no outcome — `recheck_gate` refuses a malformed or
+/// absent gate before routing is consulted — which is exactly why the two
+/// helpers can afford to be one rule rather than two.)
+pub(crate) fn declares_routing(spec: &GateSpec) -> bool {
+    match spec {
+        GateSpec::Declared(g) => !g.routing.is_empty(),
+        GateSpec::Absent | GateSpec::Malformed => true,
+    }
+}
+
 /// Read one PR's **own** checks through the seam and classify them (§6:
 /// `also: [ci-green]` is about the sub-PR, never the batch).
 ///
@@ -1271,6 +1327,10 @@ pub fn land_batch(
                 None
             },
             changed_lines: facts.changed_lines,
+            // #1176. Per sub-PR, unlike `base_green` above: the base is one
+            // question for the whole batch, but "which files did THIS PR
+            // change" is a different question for every entry in it.
+            changed_files: if declares_routing(gate) { pr_changed_files(r, pr) } else { None },
         };
         let recheck = crate::mergeq::recheck_gate(
             gate,
