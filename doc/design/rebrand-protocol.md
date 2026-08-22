@@ -140,12 +140,16 @@ somebody else's filename does not.**
   GitHub label, matched by *name* and never by description; flipping them would leave
   every existing label describing itself differently from every new one, for no reader
   benefit. A prose-sweep item.
-- **The merge queue's git ref namespace** — `refs/remotes/loomux-mq/*` and the
-  `loomux-mq-<batch>` branch name (`mqloop.rs`). Refs written into the user's own `.git`,
-  with fetch and prune semantics attached; renaming them orphans every ref a live queue
-  is holding. Phase 4's class of problem — an identity on somebody's disk — and it wants
-  the same kind of argument, not a sweep. (The PR *prose* the queue posts to GitHub did
-  move: nothing matches it, and every human and agent who opens the PR reads it.)
+- **Both of the merge queue's git namespaces.** `refs/remotes/loomux-mq/*` and the
+  `loomux-mq-<batch>` remote name (`mqloop.rs`) on the fetch side; `loomux/mq/<group>-<id>`
+  (`mergeq.rs`) for the scratch branch pushed to the user's remote, which `mqdriver`
+  guards by exact prefix so the queue can only ever force-push and delete inside it.
+  Refs in somebody else's repository, with fetch, prune, lease and delete semantics
+  attached: renaming either orphans every ref a live queue is holding, and renaming the
+  second without its prefix check is a queue that cannot clean up after itself. Phase 4's
+  class of problem — an identity on somebody's disk — and it wants the same kind of
+  argument, not a sweep. (The PR *prose* the queue posts to GitHub did move: nothing
+  matches it, and every human and agent who opens the PR reads it.)
 - **The `<repo>-worktrees/` convention.** Derived from the repository's name, not the
   product's.
 - **Rust and TypeScript identifiers** — `mask_loomux_notices`, `is_loomux_notice`, the
