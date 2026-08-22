@@ -52539,9 +52539,17 @@ fn an_enforced_cap_never_refuses_the_human_even_where_it_refuses_the_agent() {
     );
 }
 
-/// Only an ENTRY is judged. Three cases in one test because they are one
-/// property — the cap is a door, not a fence — and each alone is a rule a
-/// reader would reasonably doubt.
+/// **A cap is a door, not a fence** — the half of `wip_breaches`' test that says
+/// a write is judged only when it RAISES a status's count. That is what keeps a
+/// status already over its limit workable rather than frozen: an edit to a row
+/// sitting in one, a re-assertion of the status it already has, and every move
+/// OUT all leave the count where it is or lower, so none of them is refused.
+///
+/// Three cases in one test because they are one property, and each alone is a
+/// rule a reader would reasonably doubt. (The docstring here used to state the
+/// superseded "only an ENTRY is judged" rule — an entry is still the common
+/// case, which is why the name keeps the word, but it is no longer what the
+/// guard decides on: rev-1 B1 replaced it with the before/after comparison.)
 #[test]
 fn an_over_limit_status_still_takes_edits_and_always_lets_work_out() {
     let (reg, _d, g) = wip_board("wip-entry", REVIEW_TWO_ENFORCED, &["a", "b", "c"]);
@@ -52867,4 +52875,79 @@ fn the_wip_guard_reads_the_policy_only_for_a_write_that_could_move_a_count() {
         false,
         &TaskPatch { claim: true, ..Default::default() }
     ));
+}
+
+
+/// **rev-2 B4: a row this write is ADDING is not part of the board it started
+/// from.**
+///
+/// The pre-write tally used to be taken below the `idx` resolution, which is
+/// where a new row is pushed — so on a create, `before` and `after` both counted
+/// the new row in its born status, agreed, and `wip_breaches` skipped the status
+/// entirely. A `queued:` cap could therefore never fire on task creation: no
+/// refusal under `enforce`, and — worse, because it is the default — no notice
+/// and no audit under warn.
+///
+/// It is exactly `queued` and exactly on creation, because a row born `queued`
+/// and left there is the only shape where the born status and the final status
+/// are the same. That is precisely why no existing fixture caught it: every
+/// other test here caps `review` or `in-progress`, which a new row only ever
+/// reaches by moving off its born status.
+#[test]
+fn creating_a_row_into_a_full_born_status_is_refused() {
+    let (reg, _d, g) =
+        wip_board("wip-b4-create", "board:\n  wip:\n    queued: 2\n  enforce: true\n", &["a", "b"]);
+    assert_eq!(reg.tasks(&g).len(), 2, "the fixture filled the cap exactly, and was allowed to");
+
+    let err = reg
+        .upsert_task(&g, "orch", None, patch(Some("third"), None, None))
+        .expect_err("a third row born into a queued capped at 2 must be refused");
+    assert!(err.contains("queued"), "the refusal names the born status: {err}");
+    assert!(err.contains("holding 3"), "…and counts the board this write would produce: {err}");
+    assert_eq!(
+        reg.tasks(&g).len(),
+        2,
+        "and the refused create wrote nothing — no half-added row survives the refusal"
+    );
+}
+
+/// The negative control B4's pin needs: creating into a capped status with room
+/// still lands. Without it the test above passes on a guard that refuses every
+/// create, which would be a far worse bug than the one it is pinning.
+#[test]
+fn creating_a_row_into_a_born_status_with_room_still_lands() {
+    let (reg, _d, g) =
+        wip_board("wip-b4-room", "board:\n  wip:\n    queued: 3\n  enforce: true\n", &["a", "b"]);
+    let third = reg.upsert_task(&g, "orch", None, patch(Some("third"), None, None));
+    assert!(third.is_ok(), "the third row fits a queued capped at 3: {third:?}");
+    assert_eq!(reg.tasks(&g).len(), 3);
+    assert!(
+        !wip_audit_actions(&reg, &g).contains(&"task-wip-crossed".to_string()),
+        "…and filling a cap to its limit is not a crossing"
+    );
+}
+
+/// The same off-by-one under the DEFAULT posture, where the loss is quieter and
+/// therefore worse: warn mode's whole effect is the notice and the audit row, so
+/// a create that skipped the comparison lost the only thing the feature does.
+#[test]
+fn a_create_that_crosses_a_cap_is_announced_in_warn_mode() {
+    let (reg, _d, g) = wip_board("wip-b4-warn", "board:\n  wip:\n    queued: 2\n", &["a", "b"]);
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "run", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 73);
+
+    let third = reg.upsert_task(&g, "orch", None, patch(Some("third"), None, None));
+    assert!(third.is_ok(), "warn mode lands the write: {third:?}");
+    let crossing = reg
+        .audit_log(&g)
+        .into_iter()
+        .find(|e| e.action == "task-wip-crossed")
+        .expect("a create that puts queued over its cap is audited like any other crossing");
+    assert_eq!(crossing.detail["status"], "queued");
+    assert_eq!(crossing.detail["count"], 3);
+    let notices = delivered_texts(&reg, &g);
+    assert!(
+        notices.iter().any(|t| t.contains("WIP limit crossed") && t.contains("queued")),
+        "…and announced, which under enforce:false is the entire feature: {notices:?}"
+    );
 }
