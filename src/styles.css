@@ -292,11 +292,35 @@ html, body {
   background: var(--surface-2);
 }
 .bar-btn:active { transform: translateY(0.5px); }
+/* A top-bar control that cannot help right now has to LOOK like it (#1150). The
+   side dock disables its own toggle when the row has no room to seat it, and a
+   disabled button that still lit up on hover and depressed on click would be
+   the same "did that do anything?" confusion the floor exists to remove — the
+   dock would be honest and the button would not. `title` carries the reason and
+   both ways out; this carries the fact. Every state is restated rather than
+   left to specificity, because `:hover` and `:active` both still match a
+   disabled button. */
+.bar-btn:disabled,
+.bar-btn:disabled:hover {
+  color: var(--ink-faint); border-color: var(--line);
+  background: var(--surface-1); cursor: default;
+}
+.bar-btn:disabled:active { transform: none; }
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
-/* The tab bar, then a stack of per-tab workspaces, fill the grid area. */
-#grid-area { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* The tab bar, then a stack of per-tab workspaces, fill the grid area.
+   THE MIN-WIDTH IS THE TERMINAL'S RESERVE (#1150), not a layout nicety. Two
+   panels now displace this row — #sessions on the left and .sidedock on the
+   right — and `.sidedock`'s own `max-width: calc(100% - 240px)` bounds only
+   what the DOCK asks for, against the whole workspace, in ignorance of the
+   session browser. With both open on a 640px window the two columns want
+   764px, and a `min-width: 0` grid would hand over every pixel and render
+   nothing. The floor belongs on the thing being protected: the grid keeps
+   240px whatever asks for room, and the dock — the only shrinkable item in the
+   row — yields instead. MIRRORS DOCK_TERM_RESERVE_PX (src/sidedockmodel.ts);
+   test/sidedockmodel.test.ts reads this number off disk and fails on drift. */
+#grid-area { flex: 1; min-width: 240px; display: flex; flex-direction: column; }
 /* The workspace stack holds one .workspace per tab; only the active one is
    shown (the rest are display:none — zero-width panes, no PTY resize, #63). */
 #workspace-stack { flex: 1; min-width: 0; min-height: 0; display: flex; }
@@ -4361,68 +4385,118 @@ button.wf-finding:hover { background: var(--surface-2); }
 .wf-inline-findings .wf-error { color: var(--state-danger); }
 .wf-inline-findings .wf-warning { color: var(--state-attention); }
 
-/* ======================== the right-side dock (#1020 item 6, #934) ==========================
+/* ================ the right-side dock (#1020 item 6, #934; autosize #1150) ==================
  *
- * An OVERLAY over the right edge of #workspace — never a flex sibling. This is the whole
- * structural point, and it is worth stating next to the rules that implement it:
+ * A FLEX SIBLING of #grid-area, the mirror of #sessions on the other edge. Opening it
+ * shrinks the grid and the open panes autosize to share the row; closing it gives the
+ * column back. That is a reversal — the dock shipped as an `position: absolute` overlay
+ * that occluded panes precisely so it could never resize one — and it is a deliberate,
+ * human-directed reversal (#1150, beta1 feedback: "autosize the OPEN panes the way the
+ * Sessions UI does"). doc/design/side-dock.md carries the argument; the short form:
  *
- *   - #workspace gains `position: relative` and NOTHING else. That makes it the containing
- *     block for the panel below; it moves no flex item by a pixel, because a bare
- *     `position: relative` with `z-index: auto` changes only what an absolutely-positioned
- *     descendant resolves against.
- *   - `.sidedock` is `position: absolute`, so it is OUT OF FLOW and therefore not a flex
- *     item of #workspace at all. It cannot squeeze #grid-area, no pane's ResizeObserver
- *     fires, no applyFit() runs, and no ConPTY is resized — CLAUDE.md constraint 1 held by
- *     construction rather than by care. Contrast #sessions, an in-flow flex item that
- *     ANIMATES its width, so the whole transition is a layout pass per frame and every
- *     terminal in the grid is refitted and its ConPTY resized — once per pane per toggle
- *     since #1149 coalesced the fit burst (src/resizeburst.ts), where it used to be once
- *     per pane PER FRAME. One is the floor for a panel that displaces; zero is what being
- *     out of flow costs (doc/design/ui-redesign.md §X10 names it as the mistake not to
- *     repeat).
- *   - The cost, stated rather than hidden: the dock OCCLUDES panes instead of displacing
- *     them. That is the trade the no-resize rule buys, and it is why the dock defaults
- *     closed, toggles in one click, and reserves a strip of grid it may never cover
- *     (DOCK_TERM_RESERVE_PX, sidedockmodel.ts).
+ *   - CLAUDE.md constraint 1 is about RATIONING ConPTY resizes, not about forbidding
+ *     panels. #sessions has always been the sanctioned in-flow panel; the dock is now the
+ *     second, and both pay the same, bounded price.
+ *   - What made the price bounded is #1149. A displacing panel used to cost one xterm
+ *     reflow + one ResizePseudoConsole per pane PER FRAME of its transition (~15 per pane
+ *     per toggle, ~90 with six panes open). src/resizeburst.ts moved the coalescing into
+ *     the fit debounce itself, so a whole animated burst collapses into ONE fit per pane at
+ *     the settled geometry. The dock inherits that by being in the flex row at all: no
+ *     bracketing and no second coalescer. `test/resizeburst.test.ts` pins one half of it —
+ *     the transition below must stay inside FIT_MAX_WAIT_MS minus one FIT_WINDOW_MS, or a
+ *     ceiling fit would land mid-slide and put a ConPTY resize at an intermediate geometry.
+ *     It checks each panel's transition IN ISOLATION, so it cannot see a composite burst:
+ *     one panel's slide changing the room, and this one's ease re-targeting on top of it.
+ *     That case is open as #1203 (doc/design/side-dock.md) — do not read this pin as
+ *     covering it.
+ *   - So the residual cost is honest and small: one resize per pane per toggle, plus the
+ *     per-frame LAYOUT work of the animation (which is why the panel's contents are pulled
+ *     out of the TOGGLE's animation — see .sidedock-inner; a ROOM change re-lays them out
+ *     instead, #1203). What the old overlay bought — zero — is given up in exchange for
+ *     the panes staying fully visible, which is what was asked for.
+ *
+ * THE CONTENTS DO NOT ANIMATE ON A TOGGLE, only the column does. `.sidedock-inner` is
+ * absolutely positioned at a FIXED width (set in JS beside the column's own width, from
+ * `dockBoxes`) and the column clips it. Without that, every frame of the 240 ms slide would
+ * re-lay-out a git graph or a file tree at an intermediate width — the transition would be
+ * cheap for the terminals and expensive for the panel. Same device, same reason, as
+ * `.sessions-inner`. The width is fixed PER TOGGLE, not absolutely: it follows the room, so
+ * a room that moves over time does re-lay the contents out (#1203, side-dock.md).
  *
  * NO SHADOW, deliberately. `--shadow-float` is a 40px soft shadow, and its penumbra would
  * fall on a live WebGL terminal canvas — the documented way to make this app slow
  * (doc/design/performance.md), and what maintainability rule 5 refuses. The dock separates
  * the way principle 1 says surfaces should: elevation plus a hairline.
  *
- * z-index 40 sits above a maximized pane (30) so the dock stays reachable, and below the
- * pane drag layer (60/61), the tab menu (90), the shared context menu (200), toasts (100)
- * and modals (1000). ONE surface ties with it rather than sitting above: `.git-menu` is
- * also 40 — the menu the dock's own Git tab opens — and it paints above only because
- * `showMenu` appends it to `document.body`, i.e. after `#app` in document order. That is
- * true but fragile, so it is written down rather than left to be rediscovered: a future
- * `.sidedock` z-index raise must raise `.git-menu` with it.
+ * z-index 40 no longer separates the dock from anything in the grid — an in-flow panel
+ * does not overlap the panes it sits beside — and it is kept anyway so the panel stays in
+ * the same documented band as the menus its own views open: `.git-menu` is also 40, and it
+ * paints above only because `showMenu` appends it to `document.body`, i.e. after `#app` in
+ * document order. True but fragile, so it stays written down: a `.sidedock` z-index raise
+ * must raise `.git-menu` with it.
  *
- * THE WIDTH BOUND IS HERE, NOT IN JS, and that is the point (#1097 rev-767 B2). The
+ * THE RENDERED WIDTH BOUND IS HERE (#1097 rev-767 B2), and it is not the only one. The
  * reserve used to be applied only while dragging, so a width persisted on a wide monitor
  * came back whole on a narrow one and covered every pane — and the same held after any
  * window resize. `max-width` holds at boot, on restore, and on every resize, with no
- * listener to forget and nothing that could reach a PTY. `max()` keeps the documented
- * narrow-window degradation: below the reserve the minimum wins, exactly as
- * `clampDockWidth` already decided. PINNED: both numbers mirror DOCK_MIN_W and
- * DOCK_TERM_RESERVE_PX in src/sidedockmodel.ts, and test/sidedockmodel.test.ts reads this
- * rule off disk and fails if they drift. */
-#workspace { position: relative; }
-
+ * listener to forget. `max()` keeps the documented narrow-window degradation: below the
+ * reserve the minimum wins, exactly as `clampDockWidth` already decided. PINNED: both
+ * numbers mirror DOCK_MIN_W and DOCK_TERM_RESERVE_PX in src/sidedockmodel.ts, and
+ * test/sidedockmodel.test.ts reads this rule off disk and fails if they drift.
+ *
+ * It bounds what the dock ASKS FOR, against the whole workspace, and that is no longer the
+ * whole guarantee: it cannot see #sessions, which takes 344px of the same row. The floor
+ * that actually protects the terminal lives on #grid-area's `min-width` (above), and
+ * `flex: 0 1 auto` here is its other half — the dock is the row's only shrinkable item, so
+ * a squeezed row costs the dock its width rather than costing the grid its existence.
+ *
+ * THE THIRD BOUND IS IN JS, and saying "the bound is in CSS" was only ever true of the
+ * RENDERED width. `sidedockmodel.ts`'s `dockBoxes` bounds two things a stylesheet cannot:
+ * the width that gets PERSISTED (against the room the dock and grid share, not the
+ * workspace — #1189 review finding 2), and the width the fixed panel INSIDE the column is
+ * laid out at. The second is why a squeezed dock is narrow rather than cropped, and why
+ * below the room a readable dock needs (`DOCK_MIN_W` + the reserve) it takes no column at
+ * all instead of showing a sliver of a panel built for a width it does not have. */
 .sidedock {
-  position: absolute; top: 0; right: 0; bottom: 0;
+  position: relative;
+  flex: 0 1 auto;
   z-index: 40;
   max-width: max(280px, calc(100% - 240px));
-  display: flex; flex-direction: column; min-width: 0;
+  min-width: 0; overflow: hidden;
   background: var(--surface-1);
   border-left: var(--line-w) solid var(--line-strong);
+  transition: width 0.24s var(--ease);
+}
+/* Closed is a ZERO-WIDTH COLUMN, never `display: none`: the panes reclaim the space by
+   watching it animate away, and `display: none` has no transition to watch. The width
+   itself is inline (it is the human's dragged preference — `dockBoxes`); this rule carries
+   only the border, which would otherwise leave a 1px line down the grid's right edge. */
+.sidedock.collapsed { border-left-width: 0; }
+/* On the grip drag the width follows the mouse, so the toggle's ease has to go: it would
+   both trail the pointer and keep the geometry moving after the human stopped, which the
+   fit coalescer would then resolve at a width the drag had already left. (The heavy-list
+   `content-visibility` half of `.resizing` is further down, with the lists it hides.) */
+.sidedock.resizing { transition: none; }
+
+/* The panel's contents, lifted out of the column's TOGGLE animation: a fixed width, so a
+   slide clips them instead of re-laying them out 15 times. JS sets this width from the same
+   `dockBoxes` call that sets the column's, so the two cannot disagree. Anchored RIGHT, so
+   the collapse wipes from the grid side — the mirror of `.sessions-inner`.
+   The width follows the ROOM, though, which is what stops a squeezed column cropping the
+   panel — so a room that moves over time puts these contents back into an animation
+   (#1203, doc/design/side-dock.md). */
+.sidedock-inner {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  display: flex; flex-direction: column; min-width: 0;
 }
 
-/* The resize grip. Widening the dock costs nothing but the dock's own box — there is no
-   terminal on the other side of this drag, which is exactly what makes an overlay's
-   divider cheap where an embed slot's is not. */
+/* The resize grip — now a real divider, with terminals on the other side of it. The drag
+   is bracketed with the panes' own beginResizeHold/endResizeHold (#432), the same as a
+   grid divider's: a gesture with a start and an end is exactly the shape a bracket fits,
+   and it collapses a whole drag's worth of ConPTY resizes into one at release.
+   Inside the box, not straddling the border, because the column clips its overflow. */
 .sidedock-grip {
-  position: absolute; top: 0; left: calc(-1 * var(--space-1)); bottom: 0;
+  position: absolute; top: 0; left: 0; bottom: 0;
   width: var(--space-3);
   cursor: ew-resize; z-index: 1;
 }

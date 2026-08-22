@@ -104,7 +104,12 @@ export const FIT_WINDOW_MS = 60;
  *  the app (`#sessions`, 240 ms) plus one window — a ceiling that fired
  *  mid-transition would put a fit, and therefore a ConPTY resize, at an
  *  intermediate geometry, which is precisely the repaint this module exists to
- *  remove. And it must be low enough that a continuous gesture with no settled
+ *  remove. "The longest transition" is per-panel, and since #1150 that is not
+ *  quite the same as the longest BURST: `.sidedock` re-widths itself when the
+ *  room around it changes, so a `#sessions` slide can re-target the dock's own
+ *  240 ms ease and the two chain past this ceiling (#1203 — deferred, and
+ *  neither this constant nor `test/resizeburst.test.ts` covers that case).
+ *  And it must be low enough that a continuous gesture with no settled
  *  geometry (dragging the window's edge) still reflows often enough to look
  *  alive — ~2.5 times a second here, whatever the display does.
  *

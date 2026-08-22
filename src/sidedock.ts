@@ -3,20 +3,37 @@
 // pane is currently active. The pure decisions are in sidedockmodel.ts; the
 // argument for the whole shape is doc/design/side-dock.md.
 //
-// THE ONE STRUCTURAL RULE. This panel is `position: absolute` inside
-// `#workspace` — an OVERLAY, never a flex sibling. `#sessions` is the
-// counter-example the redesign brief names explicitly (ui-redesign.md §X10): it
-// is an in-flow flex item that animates its width, so opening it walks the grid
-// through a whole animation's worth of intermediate widths — a layout pass per
-// frame, and a terminal reflow plus a ConPTY resize on every pane. #1149
-// coalesced the second half of that to ONE per pane per toggle (resizeburst.ts),
-// which is a cost reduced, not a cost removed: the number a displacing panel can
-// reach is one, and the number an overlay pays is zero. An out-of-flow child of a flex
-// container is not a flex item, so nothing here can move `#grid-area` by a
-// pixel; no pane's `ResizeObserver` fires, no `applyFit()` runs, and no ConPTY
-// is resized — by construction, not by care. The dock therefore OCCLUDES panes
-// rather than displacing them, which is the honest trade and the reason it
-// defaults closed and toggles in one click.
+// THE ONE STRUCTURAL RULE, and #1150 reversed it. This panel is a FLEX SIBLING
+// of `#grid-area` — the mirror of `#sessions` on the other edge — so opening it
+// shrinks the grid and the open panes autosize to share the row. It shipped as
+// the opposite: `position: absolute`, out of flow, occluding panes precisely so
+// that nothing here could ever move a terminal. The human asked for the
+// Sessions behaviour instead (#1150, beta1 feedback), and doc/design/side-dock.md
+// carries the argument for why that is affordable now and was not before.
+//
+// The short form, because it is the thing to keep true: a displacing panel used
+// to cost one xterm reflow plus one `ResizePseudoConsole` per pane PER FRAME of
+// its transition. #1149 moved the coalescing into the fit debounce itself
+// (resizeburst.ts), so a whole animated burst collapses into ONE fit per pane at
+// the settled geometry. On the TOGGLE this module inherits that by doing nothing
+// at all: the panes' own `ResizeObserver`s see the flex row change and the
+// shared policy decides the rest. There is no coalescer here and no bracketing
+// of the toggle, and anything added would be a second mechanism covering one
+// gesture instead of the one mechanism covering every consumer.
+//
+// "Nothing on the resize path" is NOT true of this module as a whole, and the
+// boundary is worth knowing before editing it. `roomObs` (see `onRoomChanged`)
+// writes the column's width whenever the ROOM changes, which is what keeps a
+// squeezed dock narrow instead of cropped — and a room that is itself animating
+// (a `#sessions` slide) therefore re-targets this panel's own 240 ms ease, so
+// the composite burst can outlast the coalescer's 400 ms ceiling and take one
+// mid-slide fit per pane. Open as #1203, argued in doc/design/side-dock.md,
+// deferred rather than fixed blind: the chain is a browser behaviour nothing in
+// this repo's test rig can execute.
+//
+// The one gesture that IS bracketed is the grip drag, and it is bracketed with
+// the mechanism that already exists for divider drags (`beginResizeHold` /
+// `endResizeHold`, #432) rather than a new one — see `beginResize`.
 //
 // WHY IT OWNS ITS OWN VIEW INSTANCES. `Pane` already builds a `GitView` and a
 // `FileEditView` per pane, for its Alt+G / Alt+F overlays and its #361 embed
@@ -40,8 +57,10 @@ import {
   decideFollow,
   decideViewSync,
   decodeDockPrefs,
+  dockBoxes,
   encodeDockPrefs,
   normalizeDockRoot,
+  type DockBoxes,
   type DockPrefs,
   type DockTab,
 } from "./sidedockmodel";
@@ -55,6 +74,12 @@ import {
  *  300ms) sit in the same range. */
 const FOLLOW_DEBOUNCE_MS = 250;
 
+/** What the toggle says when the row cannot seat a readable dock (#1150, review
+ *  finding 3). It names both ways out, because "no room" on its own reads as a
+ *  failure rather than as a thing the human can do something about. */
+const NO_ROOM_REASON =
+  "Side dock — not enough room at this window size. Close the session browser, or widen the window.";
+
 /** What the dock needs from the app: the active pane's cwd, pulled on demand.
  *
  *  Pulled, never pushed — the same closure shape (`getCwd: () => this.cwdRaw`)
@@ -64,6 +89,33 @@ export interface SideDockHost {
   /** The active tab's active pane's working directory, or null when it has
    *  none (an SSH pane, whose OSC 7 names a remote path; a welcome pane). */
   activeCwd(): string | null;
+
+  /**
+   * Begin coalescing every visible pane's PTY resize for the duration of a
+   * gesture, and return the release.
+   *
+   * Only the grip drag uses this, and only since #1150 made the grip a real
+   * divider with terminals on the other side of it. A drag has a start and an
+   * end, which is the shape `Pane.beginResizeHold` was built for (#432): xterm
+   * keeps re-fitting so the terminal looks right throughout, and the
+   * `ResizePseudoConsole` call is withheld until release, collapsing a whole
+   * drag into one. The open/close toggle deliberately does NOT use it — a CSS
+   * transition has no end to hook, and `resizeburst.ts` already coalesces it
+   * without being told.
+   *
+   * The dock cannot reach panes itself (it is app-level chrome, and which panes
+   * exist is the active tab's business), so the host supplies this.
+   */
+  holdPaneResizes(): () => void;
+
+  /**
+   * Report whether the dock can be shown at all in the room the row currently
+   * has, so the top-bar toggle can say so instead of appearing dead.
+   *
+   * Called only when the verdict changes. `reason` is null when it is
+   * available; when it is not, it is the sentence to put on the control.
+   */
+  setToggleAvailability(available: boolean, reason: string | null): void;
 }
 
 /** One hosted view, plus the root it was constructed at. */
@@ -88,9 +140,14 @@ const TAB_LABEL: Record<DockTab, string> = { git: "Git", files: "Files", editor:
 const TAB_ICON = { git: "git-graph", files: "folder-open", editor: "file-pen" } as const;
 
 export class SideDock {
-  /** The overlay panel itself, appended to `#workspace`. */
+  /** The dock's own column in `#workspace`'s flex row. */
   readonly el: HTMLElement;
 
+  /** The panel inside that column, at a fixed width the column clips (#1150).
+   *  Everything except the grip lives in here: the grip has to stay on the
+   *  column's live left edge, which the panel's edge stops being the moment the
+   *  column is narrower than the panel. */
+  private readonly innerEl: HTMLElement;
   private readonly bodyEl: HTMLElement;
   private readonly rootChipEl: HTMLElement;
   private readonly holdEl: HTMLElement;
@@ -103,8 +160,31 @@ export class SideDock {
   private readonly views = new Map<DockTab, Hosted>();
   private followTimer: number | undefined;
 
+  /** The width the dock and the grid share, cached so no per-frame path has to
+   *  measure. Infinite until the first measurement — an unmeasured room must
+   *  never read as a small one (`dockBoxes`). */
+  private room = Number.POSITIVE_INFINITY;
+  /** The last geometry actually written, so a room change that moves nothing
+   *  writes nothing. */
+  private applied: DockBoxes | null = null;
+  /** Is the row too small to seat a readable dock? Mirrors `applied.starved`. */
+  private starved = false;
+  /** Fires on any change to the room — a window resize, or #sessions opening. */
+  private readonly roomObs: ResizeObserver;
+
+  /** Is the dock actually on screen? Open is the human's intent; this is the
+   *  intent AND the room to honour it, and it is what every "no work while it is
+   *  not showing" guard keys off — a starved dock builds no views for the same
+   *  reason a closed one does not. */
+  private get shown(): boolean {
+    return this.prefs.open && !this.starved;
+  }
+
   constructor(
     private readonly workspaceEl: HTMLElement,
+    /** `#grid-area` — the sibling the dock shares the row with. Held to measure
+     *  that shared room, which is the bound on every width here. */
+    private readonly gridEl: HTMLElement,
     private readonly host: SideDockHost
   ) {
     this.prefs = loadPrefs();
@@ -112,8 +192,9 @@ export class SideDock {
     this.el = document.createElement("aside");
     this.el.className = "sidedock";
     this.el.setAttribute("aria-label", "Side dock");
-    this.el.hidden = !this.prefs.open;
-    this.el.style.width = `${this.prefs.width}px`;
+
+    this.innerEl = document.createElement("div");
+    this.innerEl.className = "sidedock-inner";
 
     const grip = document.createElement("div");
     grip.className = "sidedock-grip";
@@ -153,8 +234,19 @@ export class SideDock {
     this.bodyEl = document.createElement("div");
     this.bodyEl.className = "sidedock-body";
 
-    this.el.append(grip, head, this.rootChipEl, this.holdEl, this.bodyEl);
+    this.innerEl.append(head, this.rootChipEl, this.holdEl, this.bodyEl);
+    this.el.append(grip, this.innerEl);
+    // LAST in the row, after #grid-area — the dock is the right-hand column and
+    // the flex order is the visual one.
     this.workspaceEl.appendChild(this.el);
+    // Measure BEFORE the first apply, so a dock restored open into a window too
+    // small for it is never painted as a sliver on the way to being hidden.
+    this.measureRoom();
+    // Before the first paint, so a dock restored open is simply open and a dock
+    // restored closed never animates itself shut in front of the human.
+    this.applyOpenState();
+    this.roomObs = new ResizeObserver(() => this.onRoomChanged());
+    this.roomObs.observe(this.gridEl);
 
     this.syncTabButtons();
     // Boot with whatever pane is active. A dock restored CLOSED returns from
@@ -177,7 +269,7 @@ export class SideDock {
       return;
     }
     this.prefs.open = true;
-    this.el.hidden = false;
+    this.applyOpenState();
     savePrefs(this.prefs);
     // `open` is set FIRST, because every follow path is guarded on it: this is
     // the call that pulls the live cwd for the first time and adopts it. Reading
@@ -190,7 +282,7 @@ export class SideDock {
   close(): void {
     if (!this.prefs.open) return;
     this.prefs.open = false;
-    this.el.hidden = true;
+    this.applyOpenState();
     savePrefs(this.prefs);
     // Nothing is disposed. Closing is hiding: it must not destroy the editor's
     // buffer, and it should not throw away a git view's loaded log either. The
@@ -211,10 +303,11 @@ export class SideDock {
    */
   followActivePane(immediate = false): void {
     this.clearFollowTimer();
-    // A closed dock does nothing at all — it does not even arm a timer, and it
-    // records no pending root. `show()` pulls the live cwd, which is a better
-    // answer than replaying one captured while the dock was hidden.
-    if (!this.prefs.open) return;
+    // A dock that is not showing does nothing at all — it does not even arm a
+    // timer, and it records no pending root. `show()` pulls the live cwd, which
+    // is a better answer than replaying one captured while it was hidden, and
+    // the same holds for a starved dock coming back into a room that fits.
+    if (!this.shown) return;
     if (immediate) {
       this.applyFollow();
       return;
@@ -248,6 +341,7 @@ export class SideDock {
   }
 
   dispose(): void {
+    this.roomObs.disconnect();
     this.clearFollowTimer();
     for (const hosted of this.views.values()) hosted.dispose();
     this.views.clear();
@@ -274,7 +368,7 @@ export class SideDock {
   private applyFollow(): void {
     this.followTimer = undefined;
     const action = decideFollow({
-      open: this.prefs.open,
+      open: this.shown,
       dockRoot: this.dockRoot,
       paneCwd: this.host.activeCwd(),
     });
@@ -303,7 +397,7 @@ export class SideDock {
    * refresh affordances, which is the right shape for a destructive reload.
    */
   private refreshActiveView(): void {
-    if (!this.prefs.open) return;
+    if (!this.shown) return;
     this.views.get(this.prefs.tab)?.refresh?.();
   }
 
@@ -335,7 +429,7 @@ export class SideDock {
    * a previously-held editor gets to re-ask whether it is clean now.
    */
   private syncActiveView(): void {
-    if (!this.prefs.open) return;
+    if (!this.shown) return;
     const tab = this.prefs.tab;
     const hosted = this.views.get(tab);
     const action = decideViewSync({
@@ -495,12 +589,27 @@ export class SideDock {
     const startX = e.clientX;
     const startW = this.el.offsetWidth;
     this.el.classList.add("resizing");
+    // The grip is a DIVIDER now (#1150): the grid is on the other side of it, so
+    // every mousemove re-fits every pane. Bracketed exactly the way grid.ts
+    // brackets its split divider — xterm keeps fitting so the terminals track
+    // the drag, and the ConPTY resize is withheld until release. Without it a
+    // drag costs one ResizePseudoConsole per pane per FIT_MAX_WAIT_MS (the
+    // coalescer's ceiling, which is what a gesture with no settled geometry
+    // resolves to) for as long as the human holds the mouse.
+    //
+    // The release is captured ONCE here rather than re-derived in `onEnd`, so
+    // begin/end stay balanced 1:1 per pane even if the pane set changes
+    // mid-drag — the same reason grid.ts captures its pane list up front.
+    const release = this.host.holdPaneResizes();
     startDragSession({
       // Dragging LEFT widens: the dock is pinned to the right edge.
       onMove: (ev) =>
-        this.applyWidth(clampDockWidth(startW + (startX - ev.clientX), this.workspaceEl.clientWidth)),
+        this.applyWidth(clampDockWidth(startW + (startX - ev.clientX), this.room)),
+      // Fires on mouseup OR on a drag that ends without one (window blur,
+      // Escape) — `startDragSession`'s whole job — so the hold cannot strand.
       onEnd: () => {
         this.el.classList.remove("resizing");
+        release();
         // Persist on release only, never per mousemove — the same discipline
         // every other divider in this codebase already keeps.
         savePrefs(this.prefs);
@@ -510,7 +619,116 @@ export class SideDock {
 
   private applyWidth(px: number): void {
     this.prefs.width = px;
-    this.el.style.width = `${px}px`;
+    this.applyBoxes();
+  }
+
+  /**
+   * The width the dock and the terminal grid SHARE — the quantity every clamp
+   * here is against, and never the workspace's own width.
+   *
+   * `#sessions` is a `flex: none` sibling of both, so it takes its 344px off the
+   * top and the two of them divide what is left. That sum does not move as the
+   * divider between them moves, which is what makes it safe to measure once and
+   * hold for the length of a drag, and what stops writing the dock's own width
+   * from feeding back into the measurement (see `onRoomChanged`).
+   *
+   * Measured with `offsetWidth` on both, so a border counts as the room it
+   * occupies.
+   */
+  private measureRoom(): void {
+    this.room = this.gridEl.offsetWidth + this.el.offsetWidth;
+  }
+
+  /**
+   * Push the dock's two widths into the DOM: the column's, and the width of the
+   * panel the column clips.
+   *
+   * ONE place, and both from ONE `dockBoxes` call, because the column and its
+   * contents have to agree about what "the dock's width" is.
+   *
+   * Two style writes and nothing else, because the drag calls this on every
+   * mousemove: the open/closed half below is the part that must not be on a
+   * per-frame path. It reads the CACHED room rather than measuring, so a drag
+   * costs no layout reads at all.
+   */
+  private applyBoxes(): DockBoxes {
+    const boxes = dockBoxes(this.prefs.open, this.prefs.width, this.room);
+    this.applied = boxes;
+    this.starved = boxes.starved;
+    this.el.style.width = `${boxes.columnPx}px`;
+    this.innerEl.style.width = `${boxes.contentPx}px`;
+    return boxes;
+  }
+
+  /**
+   * Everything that changes when the dock opens, closes, or crosses the starve
+   * threshold — the widths above, the collapse class, the accessibility half,
+   * and the toggle button's availability. Deliberately NOT on the drag path or
+   * on every room measurement: re-writing `aria-hidden` sixty times a second
+   * during a resize is churn on the two gestures this change already made more
+   * expensive.
+   *
+   * **A hidden dock is `inert`, not `hidden`.** It used to be `el.hidden`, which
+   * is `display: none` — nothing to tab into, nothing for a screen reader. A
+   * zero-width column with `overflow: hidden` is only VISUALLY empty: without
+   * this, the dock's buttons and its editor's buffer would still be in the tab
+   * order and still be announced, which is a regression the human would hit long
+   * before they worked out why. Applied immediately rather than on
+   * `transitionend`: a panel on its way out should stop taking input at the
+   * moment it is dismissed, and nothing has to be scheduled or cleaned up.
+   *
+   * The three states collapse to one question — is there a column? — so a dock
+   * the human opened into a room too small for it is inert for the same reason
+   * and by the same code as one they closed.
+   */
+  private applyOpenState(): void {
+    this.applyShownState(this.applyBoxes());
+  }
+
+  /** The open/closed half, for geometry that has already been written. Split
+   *  out so `onRoomChanged` can write the widths on every delivery and this
+   *  only when the answer to "is there a column?" actually changed — and so the
+   *  whole class derives its geometry from ONE `dockBoxes` call. */
+  private applyShownState(boxes: DockBoxes): void {
+    const showing = boxes.columnPx > 0;
+    this.el.classList.toggle("collapsed", !showing);
+    this.el.inert = !showing;
+    this.el.setAttribute("aria-hidden", String(!showing));
+    // A toggle that silently does nothing is the other way to look broken, so
+    // the button says why instead of pretending it can help.
+    this.host.setToggleAvailability(!boxes.starved, boxes.starved ? NO_ROOM_REASON : null);
+  }
+
+  /**
+   * The room changed — the window was resized, or `#sessions` was toggled.
+   *
+   * Two reasons this exists rather than leaving the layout to CSS. The panel
+   * inside the column is laid out at a FIXED width, so it cannot adapt to a
+   * column the flex row squeezed; only this can re-lay it out. And the starve
+   * verdict is a threshold, so nothing in CSS can express it.
+   *
+   * **It cannot oscillate**, which is the hazard with any observer that writes
+   * geometry: the measured room is `grid + dock`, which is invariant to how wide
+   * this makes the dock, so a write here produces at most one more delivery that
+   * measures the same room, computes the same boxes, and returns without
+   * writing.
+   *
+   * The open/closed half runs only when the starve verdict actually flips, so a
+   * window drag that never crosses the threshold costs two style writes per
+   * frame at most — and nothing at all once the widths stop moving.
+   */
+  private onRoomChanged(): void {
+    const before = this.applied;
+    this.measureRoom();
+    const boxes = this.applyBoxes();
+    if (before !== null && before.starved === boxes.starved) return;
+    this.applyShownState(boxes);
+    // Crossing back into a room that fits is the same work `show()` does: while
+    // starved the dock builds nothing, so it has a root and views to catch up on.
+    if (this.shown) {
+      this.followActivePane(true);
+      this.syncActiveView();
+    }
   }
 }
 
