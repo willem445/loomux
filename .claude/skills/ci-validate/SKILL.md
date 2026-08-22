@@ -339,6 +339,19 @@ derived from the live constant, asserted against a committed fixture (`BEFORE_RO
 in `src-tauri/tests/mergequeue.rs`). The red then lives in the suite instead of on
 a deleted scratch branch (#1181).
 
+**And where the site still EXISTS, the red transfers only if you SHOW it does.**
+That is the commoner half of the paragraph above: rebases land mid-review here, so
+the head a PR merges from is rarely the one a scratch round was cut on, and a
+mutated site that is still there reads as still-valid without being it. What
+carries the red is byte-identity of the regions the round mutated and of the tests
+it reddened, at both commits. `git range-diff <old-base>..<old-head>
+<new-base>..<new-head>` marking every prior commit `=` is the shortcut for a pure
+rebase — but only once `git merge-base --is-ancestor <old-base> <new-base>` has
+exited 0. All-`=` says the patches match, never that the bases are related: two
+merely-diverged bases report a clean all-`=` too (measured), and then the tree
+around your mutation is not the tree you measured on. Name the commit each round
+descends from, never "the current head" (#1182 — rounds F/G/H, four rebases).
+
 **A red only counts against a banked green.** Keep the unmutated tree's passing
 run for the same tests: a test that has never passed reddens for its own bug,
 not for your mutation, and the red then evidences nothing about the property.
