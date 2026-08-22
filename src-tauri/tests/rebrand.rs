@@ -29,11 +29,18 @@
 //! - **A literal split across a concatenation** (`"[loo" "mux]"`) or built at
 //!   runtime (`format!("[{}]", legacy)`) is invisible here. Neither appears
 //!   today; the point of saying so is that this scan is a net, not a proof.
-//! - **Only Rust source and the role templates are scanned.** The frontend
-//!   legitimately holds both spellings (`panerestore.ts`'s accepted arrays are
-//!   the feature, not a leak), and the test suites hold pre-rename specimens
-//!   on purpose; allow-listing all of those would leave the scan enforcing
-//!   nothing worth the file it lives in.
+//! - **Only Rust source and the role templates are scanned**, and within them
+//!   only the SHIPPED part. The frontend legitimately holds both spellings
+//!   (`panerestore.ts`'s accepted arrays are the feature, not a leak), and
+//!   every test suite holds pre-rename specimens on purpose — including the
+//!   `#[cfg(test)]` modules that live INSIDE a scanned file, which is why
+//!   scanning stops at the first one. Allow-listing all of those instead
+//!   would leave the scan enforcing nothing worth the file it lives in.
+//! - **Scanning stops at the first `#[cfg(test)]` line and does not resume.**
+//!   True for this repo, where the convention is one trailing test module per
+//!   file, and stated because it is a real limit rather than a proof: a file
+//!   that put production code AFTER a test module would go unscanned from
+//!   that point. Nothing does today.
 
 use std::path::{Path, PathBuf};
 
@@ -97,6 +104,16 @@ fn is_comment(line: &str, is_rust: bool) -> bool {
     is_rust && line.trim_start().starts_with("//")
 }
 
+/// Where a Rust file stops being shipped code. See the blind-spot note above:
+/// a unit test's pre-rename specimen is a specimen, not an emitter, and this
+/// scan is about what the app WRITES.
+fn shipped_len(text: &str, is_rust: bool) -> usize {
+    if !is_rust {
+        return text.lines().count();
+    }
+    text.lines().position(|l| l.trim_start().starts_with("#[cfg(test)]")).unwrap_or(usize::MAX)
+}
+
 #[test]
 fn no_shipped_code_line_writes_a_pre_rename_protocol_literal() {
     let mut files = Vec::new();
@@ -118,7 +135,11 @@ fn no_shipped_code_line_writes_a_pre_rename_protocol_literal() {
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let allow_idx = ALLOWED.iter().position(|(f, _)| *f == name);
 
+        let shipped = shipped_len(&text, is_rust);
         for (n, line) in text.lines().enumerate() {
+            if n >= shipped {
+                break;
+            }
             if is_comment(line, is_rust) {
                 continue;
             }
