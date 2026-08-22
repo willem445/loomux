@@ -1,0 +1,110 @@
+# Manual-only: rebuild a shipped release's binary WITH its PDB, so a minidump
+# from that build can be symbolicated.
+#
+# Why this exists at all: the release profile sets `strip = "debuginfo"` and
+# the release workflow ships only the installer, so no PDB survives a release
+# build (#1218). A crash dump from an installed build therefore resolves to
+# `loomux.exe+0x<rva>` and nothing else. This job checks out the ORIGINAL tag,
+# rebuilds it on the same runner image the release used, and uploads
+# `loomux.pdb` alongside `loomux.exe` so the two can be compared byte-for-byte
+# against the installed binary before any symbol is trusted.
+#
+# A rebuild is NOT the same binary. The PDB's GUID will differ, and any drift
+# in the toolchain, the runner image or the dependency graph moves code around
+# under `lto = true, codegen-units = 1`, where a single changed function
+# reshuffles the whole `.text` layout. That is why `toolchain` is an input and
+# why `rustc -vV` is reported before anything is built: the caller is expected
+# to match the original build's rustc commit hash (readable out of the shipped
+# exe — release binaries embed `/rustc/<commit>/library/...` panic-location
+# paths) and then to VALIDATE layout equivalence at the fault offset. Treat an
+# unvalidated symbol from this job as a guess.
+#
+# workflow_dispatch ONLY, deliberately: this is a heavy release-profile build
+# (LTO, one codegen unit) that produces nothing the project ships, and it is
+# useful only when a human is holding a dump. It must never run on push or PR.
+name: Symbolicate (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build — the tag/sha of the build the dump came from"
+        required: true
+        default: "v1.2.0-beta1"
+      toolchain:
+        description: "Rust toolchain (stable, or a pinned version like 1.89.0) — match the original build's rustc"
+        required: true
+        default: "stable"
+      probe_only:
+        description: "Report rustc -vV and stop, without building (cheap toolchain-matching probe)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-with-pdb:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.toolchain }}
+
+      # Before the build, not after: a probe run exists to answer "which
+      # toolchain has commit hash X?" in two minutes instead of an hour.
+      - name: Report toolchain identity
+        shell: bash
+        run: |
+          rustc -vV | tee rustc-version.txt
+          {
+            echo '### Toolchain'
+            echo '```'
+            cat rustc-version.txt
+            echo '```'
+            echo "ref: ${{ inputs.ref }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install frontend dependencies
+        if: ${{ !inputs.probe_only }}
+        run: npm ci
+
+      # `tauri build` runs this as its beforeBuildCommand, and tauri's codegen
+      # embeds `../dist` into the binary — so the release build had it and a
+      # layout-comparable rebuild needs it too.
+      - name: Build frontend
+        if: ${{ !inputs.probe_only }}
+        run: npm run build
+
+      # `--locked` so the rebuild resolves the exact dependency versions the
+      # tag's Cargo.lock pinned; anything else changes the linked graph and
+      # with it the code layout.
+      - name: Build loomux (release profile, with PDB)
+        if: ${{ !inputs.probe_only }}
+        run: cargo build --release --locked -p loomux
+
+      - name: Report build outputs
+        if: ${{ !inputs.probe_only }}
+        shell: bash
+        run: ls -l target/release/loomux.exe target/release/loomux.pdb
+
+      - name: Upload symbols
+        if: ${{ !inputs.probe_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: loomux-symbols-${{ inputs.ref }}
+          path: |
+            target/release/loomux.exe
+            target/release/loomux.pdb
+            rustc-version.txt
+          retention-days: 14
+          if-no-files-found: error
