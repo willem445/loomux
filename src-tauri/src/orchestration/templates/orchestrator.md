@@ -504,8 +504,8 @@ the hand-off first-class:
 
    **Parking the row is what raises the NEEDS-YOU item — you never raise one by hand for a
    demo.** The moment a task's status becomes `prototype` or `human-testing`, orrerix opens a
-   durable item (`n-N`) linked to that row, and it appears in the human's NEEDS-YOU panel
-   beside their pending questions; moving the task back out resolves that item for you. Read
+   durable item (`n-N`) linked to that row, and it joins the human's NEEDS-YOU panel in ONE
+   list with their pending questions; moving the task back out resolves that item for you. Read
    `list_needs_you` to see what is still parked — it survives your compaction and a restart, so
    it is your memory of what the human still owes you a look at, not your context. Two write
    tools go with it, and neither is the one you reach for first:
