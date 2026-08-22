@@ -3257,12 +3257,20 @@ pub fn gate_need(gate: &Gate) -> u32 {
 /// the built-in four, so `spawn_agent(block: "rev-orch")` failed with "unknown
 /// block" and the gate could never be satisfied from inside that session). Pure,
 /// so both the arm-time refusal and a live status read share one rule.
+/// **Routed reviewers count too** (#1176). A rule naming a block this roster
+/// cannot spawn makes the gate unsatisfiable for every PR whose paths match it —
+/// which is the same #316 failure the static list is checked for, arriving on a
+/// subset of PRs instead of all of them. Reported here rather than left to be
+/// discovered as "the merge gate stopped opening on frontend PRs only".
 pub fn gate_missing_blocks(gate: &Gate, blocks: &[Block]) -> Vec<BlockId> {
-    gate.reviewers
-        .iter()
-        .filter(|id| !blocks.iter().any(|b| &b.id == *id && b.kind == Role::Reviewer))
-        .cloned()
-        .collect()
+    let mut out: Vec<BlockId> = Vec::new();
+    let named = gate.reviewers.iter().chain(gate.routing.iter().flat_map(|r| r.reviewers.iter()));
+    for id in named {
+        if !blocks.iter().any(|b| &b.id == id && b.kind == Role::Reviewer) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
 }
 
 /// The agent-capacity a declared workflow structurally needs (#255) — derived
@@ -3342,7 +3350,21 @@ pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityReco
     // that under-advises is wrong TODAY; it is not a head start on M3's work.
     let has_manager = blocks.iter().any(|b| b.kind == Role::Manager);
 
-    let reviewers_needed = gate.map_or(reviewers, gate_need);
+    // #1176. A gate that routes by path needs, in the WORST case, its declared
+    // list plus every lane any rule can add — a PR that touches all of them. The
+    // worst case is the one a capacity floor has to be built on: under-advising
+    // here is how #255 happens, an orchestrator discovering two hours in that it
+    // must kill a live agent to complete one review round. Deduped against the
+    // declared list, and against itself, so a lane two rules both name counts once.
+    let reviewers_needed = gate.map_or(reviewers, |g| {
+        let mut extra: Vec<&BlockId> = Vec::new();
+        for id in g.routing.iter().flat_map(|r| r.reviewers.iter()) {
+            if !g.reviewers.contains(id) && !extra.contains(&id) {
+                extra.push(id);
+            }
+        }
+        gate_need(g) + extra.len() as u32
+    });
     let worker_slot = u32::from(workers > 0);
     CapacityRecommendation {
         // `minimum` is deliberately untouched: it is what ONE REVIEW ROUND

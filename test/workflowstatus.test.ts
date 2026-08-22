@@ -252,3 +252,33 @@ test("approveWillMerge: a recorded base cannot un-gate a task with no PR, or a g
     { ok: true }
   );
 });
+
+test("gateSummaryLine: path routing is named as a rule count, not as reviewers (#1176)", () => {
+  // Same rule as the size clause above: a clause the gate ENFORCES and this line
+  // omits makes the summary a weaker statement than the gate. But it is named as a
+  // COUNT, deliberately — which lanes a rule adds depends on the PR, and a line with
+  // no PR in front of it that promised specific reviewers would say more than it knows.
+  assert.equal(
+    gateSummaryLine(
+      status({ gate: gate({ routing: [{ paths: ["src/**"], reviewers: ["rev-ui"] }] }) })
+    ),
+    "merges to the default branch require: rev-orch + rev-ui + rev-tests · all-pass · ci-green · + reviewers routed by path (1 rule)"
+  );
+  assert.equal(
+    gateSummaryLine(
+      status({
+        gate: gate({
+          routing: [
+            { paths: ["src/**"], reviewers: ["rev-ui"] },
+            { paths: ["**/Cargo.toml"], reviewers: ["rev-deps"] },
+          ],
+        }),
+      })
+    ),
+    "merges to the default branch require: rev-orch + rev-ui + rev-tests · all-pass · ci-green · + reviewers routed by path (2 rules)"
+  );
+  // Undeclared says NOTHING — both spellings, since an older backend sends no key.
+  const none = "merges to the default branch require: rev-orch + rev-ui + rev-tests · all-pass · ci-green";
+  assert.equal(gateSummaryLine(status()), none);
+  assert.equal(gateSummaryLine(status({ gate: gate({ routing: [] }) })), none);
+});
