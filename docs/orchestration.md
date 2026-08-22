@@ -745,9 +745,19 @@ These deserve their own detail — see:
 
     The panel is the only place a question gets **answered**, and the only
     place an item gets **resolved** — no agent can do either, by any path.
-    Withdrawing stays the separate, agent-side path it always was:
-    `withdraw_question` settles an overtaken question too, just as
-    *withdrawn* rather than answered.
+    Withdrawing stays the separate, agent-side path it always was, and there
+    is now one of those for each tier: `withdraw_question` settles an
+    overtaken question, `withdraw_attention` an overtaken item, each of them
+    visibly *withdrawn* rather than answered or seen.
+
+    **The orchestrator's own side of the item tier is three tools.**
+    `request_attention` raises one, `withdraw_attention` takes one back, and
+    `list_needs_you` is how a pane re-reads what it has left with you after a
+    compaction or a restart — which is why a demo you parked days ago is still
+    accounted for by an orchestrator that has long since forgotten the
+    conversation. Parking a task already raises its demo item, so a
+    well-behaved orchestrator reaches for `request_attention` mainly to ask
+    for **feedback**, the one kind nothing on the board raises for it.
   - **orrerix's protocol is that no agent asks you through a blocking
     dialog.** The orchestrator's role instructions — and a liaison pane's,
     where the group's workflow declares one — call for filing every question

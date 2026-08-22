@@ -52951,3 +52951,735 @@ fn a_create_that_crosses_a_cap_is_announced_in_warn_mode() {
         "…and announced, which under enforce:false is the entire feature: {notices:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The needs-you MCP surface (#1151 slice B)
+//
+// Slice A built the record; these are the three tools an agent reaches it
+// through, and the one it does not. The property tested hardest is the same
+// one the question registry's sweep pins for answering: **every agent may
+// raise, no agent may ever resolve** — because resolving is the human saying
+// they have looked, and an agent that could say it for them would be
+// certifying a look that never happened.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A group with an orchestrator and a worker, MCP callers for both, and one
+/// board row that is **not** demo-gated.
+///
+/// The status matters: `in-progress` keeps slice A's lifecycle hook out of
+/// these tests entirely, so every item that exists in one is an item a TOOL
+/// asked for. A `prototype` row here would auto-raise a demo item on setup and
+/// quietly supply half of what several of these tests are asserting.
+fn setup_needs_you_mcp() -> (OrchRegistry, tempfile::TempDir, GroupId, Caller, Caller, String, String)
+{
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let cw = reg.resolve_token(&worker.token).unwrap();
+    let t = reg
+        .upsert_task(&g.id, &orch.id, None, patch(Some("A live row"), Some("in-progress"), None))
+        .unwrap();
+    (reg, dir, g.id, co, cw, orch.id, t.id)
+}
+
+#[test]
+fn request_attention_registers_an_item_and_answers_the_caller_immediately() {
+    let (reg, _d, g, co, _cw, orch_id, task) = setup_needs_you_mcp();
+
+    let out = q_call(&reg, &co, "request_attention", json!({
+        "kind": "feedback",
+        "text": "  Does the empty state read as broken or as calm?  ",
+        "task": task.as_str(),
+        "urgency": "high",
+    }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+
+    // The reply leads with the id (it is what a board note cites) and then says
+    // the one thing that decides what this agent does next.
+    let text = q_text(&out);
+    assert!(text.starts_with("n-1 registered"), "reply must lead with the id: {text}");
+    assert!(text.contains("DO NOT WAIT"), "the reply must say not to block: {text}");
+    assert!(
+        text.contains("cannot resolve it"),
+        "…and must say the one thing this tool does NOT buy: {text}"
+    );
+
+    let items = reg.needs_you(&g).expect("needs-you.json readable");
+    assert_eq!(items.len(), 1);
+    let i = &items[0];
+    assert_eq!(i.id, "n-1");
+    assert_eq!(i.kind, needsyou::Kind::Feedback);
+    assert_eq!(i.raiser, orch_id, "the raiser is recorded, not inferred");
+    assert_eq!(i.text, "Does the empty state read as broken or as calm?", "text is trimmed");
+    assert_eq!(i.task.as_deref(), Some(task.as_str()));
+    assert_eq!(i.urgency, needsyou::Urgency::High);
+    assert_eq!(i.status, needsyou::Status::Open);
+    assert!(i.created_ms > 0, "an item is stamped when it is raised");
+    assert!(i.resolved_ms.is_none() && i.resolved_by.is_none() && i.resolution.is_none());
+
+    let log = reg.audit_log(&g);
+    let opened = audit_of(&log, "needs-you-open");
+    assert_eq!(opened.len(), 1, "the raise is audited");
+    assert_eq!(opened[0].detail["id"], "n-1");
+    assert_eq!(opened[0].actor, orch_id);
+}
+
+/// **A deduped raise must say that the caller's words were thrown away.**
+///
+/// Parking a board row already raises its demo item (slice A's hook), and
+/// `needsyou::admit` deliberately returns the EXISTING row for a second demo
+/// raise on the same task rather than a duplicate. That is right for the queue
+/// and invisible in a bare id: the row that comes back carries the *board's*
+/// generic wording, and the ask the orchestrator actually wrote is gone. So the
+/// reply branches on `Raised::fresh`, which is the only reason that bit is
+/// returned at all.
+#[test]
+fn raising_a_demo_for_an_already_parked_task_returns_the_existing_item_and_says_so() {
+    let (reg, _d, g, co, _cw, orch_id, task) = setup_needs_you_mcp();
+    // Park it — the hook raises the demo item, with the board's own wording.
+    reg.upsert_task(&g, &orch_id, Some(&task), patch(None, Some("prototype"), None)).unwrap();
+    let before = reg.needs_you(&g).unwrap();
+    assert_eq!(before.len(), 1, "parking raised exactly one item: {before:?}");
+    assert_eq!(before[0].kind, needsyou::Kind::Demo);
+    let board_text = before[0].text.clone();
+
+    let out = q_call(&reg, &co, "request_attention", json!({
+        "kind": "demo",
+        "text": "specifically: does the empty state read as broken?",
+        "task": task.as_str(),
+    }));
+    assert_eq!(out["isError"], false, "a deduped raise is not an error: {}", q_text(&out));
+    let text = q_text(&out);
+    assert!(text.starts_with("n-1 was ALREADY OPEN"), "the reply names the existing row: {text}");
+    assert!(text.contains(&task), "…and the task it is about: {text}");
+    assert!(
+        text.contains("NOT recorded"),
+        "the caller must be TOLD its text was dropped, not left to infer it: {text}"
+    );
+    assert!(
+        text.contains("feedback"),
+        "…and pointed at the tool that would have carried the ask: {text}"
+    );
+
+    // One row, still the board's wording, and no second audit line: a dedupe is
+    // not a second open.
+    let after = reg.needs_you(&g).unwrap();
+    assert_eq!(after.len(), 1, "no duplicate row: {after:?}");
+    assert_eq!(after[0].text, board_text, "the EXISTING text stands");
+    assert_eq!(
+        audit_of(&reg.audit_log(&g), "needs-you-open").len(),
+        1,
+        "the dedupe is not audited as a second raise"
+    );
+}
+
+/// **The write tools refuse a delegate at the DISPATCH gate**, and the read
+/// tool is deliberately not.
+///
+/// The role-filtered listing is cosmetic — a tool omitted from a listing is
+/// still callable by name — so what matters is that a worker's *call* is
+/// refused. `list_needs_you` is shared on purpose, and for one reason more than
+/// `list_questions` has: the human's panel unions the two registries, so a
+/// delegate able to read only half of what is waiting on the human would be
+/// reasoning about a queue the human does not see.
+#[test]
+fn the_needs_you_write_tools_refuse_a_delegate_and_the_dispatch_check_is_the_gate() {
+    let (reg, _d, g, co, cw, _orch, task) = setup_needs_you_mcp();
+    q_call(&reg, &co, "request_attention", json!({ "kind": "feedback", "text": "A or B?" }));
+
+    for (name, args) in [
+        ("request_attention", json!({ "kind": "feedback", "text": "a worker's ask", "task": task.as_str() })),
+        ("withdraw_attention", json!({ "id": "n-1" })),
+    ] {
+        let denied = q_call(&reg, &cw, name, args);
+        assert_eq!(denied["isError"], true, "{name} must refuse a worker at dispatch");
+        assert!(
+            q_text(&denied).contains("orchestrator-only"),
+            "{name}'s refusal must say why: {}",
+            q_text(&denied)
+        );
+    }
+    // The refused calls changed nothing: no second item, and n-1 is intact.
+    let items = reg.needs_you(&g).unwrap();
+    assert_eq!(items.len(), 1, "a refused raise must not register an item");
+    assert_eq!(items[0].status, needsyou::Status::Open, "a refused withdraw must not settle one");
+
+    // The read tool IS shared.
+    let listed = q_call(&reg, &cw, "list_needs_you", json!({}));
+    assert_eq!(listed["isError"], false, "list_needs_you is the shared read tier");
+    let body: Value = serde_json::from_str(&q_text(&listed)).unwrap();
+    assert_eq!(body["items"][0]["id"], "n-1");
+    assert_eq!(body["omitted_resolved"], 0);
+
+    // …and the cosmetic half: the orchestrator sees all three, a worker sees
+    // only the read.
+    let orch_names = tool_names(&reg, &co);
+    let worker_names = tool_names(&reg, &cw);
+    for name in ["request_attention", "withdraw_attention"] {
+        assert!(orch_names.contains(&name.to_string()), "orchestrator must SEE {name}");
+        assert!(!worker_names.contains(&name.to_string()), "a worker must not be offered {name}");
+    }
+    for names in [&orch_names, &worker_names] {
+        assert!(names.contains(&"list_needs_you".to_string()), "both roles read items");
+    }
+}
+
+/// **The liaison poses questions and does NOT raise items — and that asymmetry
+/// is the decision this slice made, so it is pinned rather than left to prose.**
+///
+/// `#1151`'s plan specified `require_orchestrator_or_liaison` for
+/// `request_attention`, by analogy with `ask_human`. `doc/design/liaison.md`
+/// states a trip-wire against exactly that: the liaison's two widenings hang off
+/// the root "a liaison faces the human", and *"a THIRD tool on the second root
+/// is the trigger, and the next one that is a write is the trigger regardless of
+/// count … the answer then is the fifth kind, deliberately, not a longer
+/// table."* Raising an item fires both clauses at once, and the fifth kind now
+/// exists (`Role::Manager`, #1161), citing this trip-wire as its reason. So the
+/// human-facing pane's raise belongs to the manager's own enumerated surface,
+/// and this test is what makes widening it later a deliberate act rather than a
+/// one-word slip.
+///
+/// Pinned in three directions, because a refusal pinned on its own is
+/// indistinguishable from a tool nobody can call:
+///
+/// 1. The liaison CAN still `ask_human` — the shipped widening is untouched, so
+///    "the liaison was refused" is a fact about THIS tool, not about the block.
+/// 2. It cannot `request_attention` or `withdraw_attention`, at the gate and in
+///    the listing.
+/// 3. The orchestrator of the SAME group can — so the refusal is a gate, not a
+///    broken tool.
+#[test]
+fn a_liaison_may_pose_a_question_but_may_not_raise_a_needs_you_item() {
+    let (reg, _d, _repo, gid) = liaison_group();
+    let liaison = reviewer_caller(&reg, &gid, "human");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    // 1 — THE CONTROL FOR THE BLOCK. The question widening still holds.
+    let posed = q_call(&reg, &liaison, "ask_human", json!({ "text": "Ship it, or hold?" }));
+    assert_eq!(posed["isError"], false, "the liaison's shipped widening is untouched: {posed:?}");
+    assert!(q_text(&posed).starts_with("q-1 registered"), "{}", q_text(&posed));
+
+    // 2 — and neither item write is widened alongside it.
+    for (name, args) in [
+        ("request_attention", json!({ "kind": "feedback", "text": "does this feel right?" })),
+        ("withdraw_attention", json!({ "id": "n-1" })),
+    ] {
+        let denied = q_call(&reg, &liaison, name, args);
+        assert_eq!(denied["isError"], true, "{name} must refuse the liaison at the gate");
+        assert!(
+            q_text(&denied).contains("orchestrator-only"),
+            "{name}'s refusal must say why: {}",
+            q_text(&denied)
+        );
+        let names = listed_tools(&reg, &liaison);
+        assert!(
+            !names.contains(&name.to_string()),
+            "…and the listing must agree with the gate on {name}: {names:?}"
+        );
+    }
+    // The read half is NOT withheld — this narrows the write tier only.
+    assert!(
+        listed_tools(&reg, &liaison).contains(&"list_needs_you".to_string()),
+        "the liaison still READS what is waiting on the human"
+    );
+
+    // 3 — POSITIVE CONTROL. Same group, same registry: the orchestrator can
+    // raise. Without this, every assertion above would also hold in a build
+    // where `request_attention` was broken for everybody.
+    let raised = q_call(&reg, &co, "request_attention", json!({
+        "kind": "feedback", "text": "the orchestrator's own ask",
+    }));
+    assert_eq!(raised["isError"], false, "the tool must work for its own tier: {raised:?}");
+    assert!(q_text(&raised).starts_with("n-1 registered"), "{}", q_text(&raised));
+    let items = reg.needs_you(&gid).unwrap();
+    assert_eq!(items.len(), 1, "exactly the orchestrator's row exists: {items:?}");
+    assert_eq!(items[0].raiser, co.agent_id, "…and it is attributed to it");
+}
+
+/// **`request_attention` refuses a `task` that is not on the board, and that
+/// check lives here rather than in the registry.**
+///
+/// `needsyou::validate_raise` is pure and board-blind, and says in its own doc
+/// that the existence check belongs at this entry point: for the board hook the
+/// check would have nothing to catch, and for an agent it catches an id that
+/// leaves the human a card joined to nothing — and, for a `demo`, an item the
+/// board can never settle, since the auto-resolve filters `is_open_demo_for` and
+/// so fires only for a demo item and only on a real row's transition. A
+/// `feedback` item is never auto-resolved whatever its task, which is why the
+/// check is justified by the LINK rather than by the settle alone.
+#[test]
+fn request_attention_refuses_a_phantom_task_a_bad_kind_and_a_demo_with_no_row() {
+    let (reg, _d, g, co, _cw, _orch, task) = setup_needs_you_mcp();
+
+    let phantom = q_call(&reg, &co, "request_attention", json!({
+        "kind": "demo", "text": "go look", "task": "t-999",
+    }));
+    assert_eq!(phantom["isError"], true, "a task that is not on the board is refused");
+    assert!(
+        q_text(&phantom).contains("t-999"),
+        "…BY NAME, so a caller that mistyped can see which string was wrong: {}",
+        q_text(&phantom)
+    );
+
+    // A demo with nothing linked — `validate_raise`'s own refusal, reached
+    // through the tool so the arm is shown to pass it through rather than
+    // silently defaulting a task in.
+    let unlinked =
+        q_call(&reg, &co, "request_attention", json!({ "kind": "demo", "text": "go look" }));
+    assert_eq!(unlinked["isError"], true, "a demo item needs a task");
+    assert!(q_text(&unlinked).contains("demo item needs a task"), "{}", q_text(&unlinked));
+
+    // An unrecognized kind is an ERROR, never a defaulted one: a caller that
+    // wrote "demos" meant a demo, and filing it as feedback silently changes
+    // what the human is being asked to do.
+    let bad = q_call(&reg, &co, "request_attention", json!({ "kind": "demos", "text": "x" }));
+    assert_eq!(bad["isError"], true, "an unknown kind is refused, not defaulted");
+    assert!(q_text(&bad).contains("unknown kind"), "{}", q_text(&bad));
+    let bad_urgency = q_call(&reg, &co, "request_attention", json!({
+        "kind": "feedback", "text": "x", "urgency": "urgent",
+    }));
+    assert_eq!(bad_urgency["isError"], true, "…and so is an unknown urgency");
+
+    // NOTHING was registered by any of the four.
+    assert!(reg.needs_you(&g).unwrap().is_empty(), "a refused raise writes no row");
+
+    // POSITIVE CONTROL: the same call with the real row succeeds, so the four
+    // refusals above are about their inputs and not about the tool being dead.
+    let ok = q_call(&reg, &co, "request_attention", json!({
+        "kind": "demo", "text": "go look", "task": task.as_str(),
+    }));
+    assert_eq!(ok["isError"], false, "{}", q_text(&ok));
+    assert_eq!(reg.needs_you(&g).unwrap().len(), 1);
+}
+
+/// Withdrawal is a settle, never a delete, and it is visibly not the human's
+/// acknowledgement — driven through the tool, since slice A pinned the registry
+/// method and this is the arm that reaches it.
+#[test]
+fn withdraw_attention_settles_the_row_and_never_passes_for_a_human_look() {
+    let (reg, _d, g, co, _cw, orch_id, _task) = setup_needs_you_mcp();
+    q_call(&reg, &co, "request_attention", json!({
+        "kind": "feedback", "text": "overtaken by events",
+    }));
+
+    let out = q_call(&reg, &co, "withdraw_attention", json!({ "id": "n-1" }));
+    assert_eq!(out["isError"], false, "{}", q_text(&out));
+    assert!(q_text(&out).starts_with("n-1 withdrawn"), "{}", q_text(&out));
+    assert!(
+        q_text(&out).contains("never mistaken"),
+        "the reply must say what a withdrawal is NOT: {}",
+        q_text(&out)
+    );
+
+    let items = reg.needs_you(&g).unwrap();
+    assert_eq!(items.len(), 1, "a withdrawal keeps the row");
+    assert_eq!(items[0].status, needsyou::Status::Resolved);
+    let expected_tag = format!("withdrawn:{orch_id}");
+    assert_eq!(
+        items[0].resolved_by.as_deref(),
+        Some(expected_tag.as_str()),
+        "a withdrawal names who took it back and is never spelled `webview`"
+    );
+    assert!(items[0].resolution.is_none(), "and puts no words in the human's mouth");
+
+    // Neither an already-settled row nor an id this group does not have.
+    for (id, why) in [("n-1", "already resolved"), ("n-99", "unknown needs-you item")] {
+        let denied = q_call(&reg, &co, "withdraw_attention", json!({ "id": id }));
+        assert_eq!(denied["isError"], true, "{id} must be refused");
+        assert!(q_text(&denied).contains(why), "{id}: {}", q_text(&denied));
+    }
+}
+
+/// **The agent-facing list is a projection, and the human's close-out note is
+/// not in it.**
+///
+/// `needsyou::AgentItem` withholds `resolution` deliberately: the note is
+/// delivered, sanitized, into the ORCHESTRATOR's own pane, which is the surface
+/// it was written for — but this read is SHARED with every delegate, and a note
+/// the human typed to their orchestrator is not thereby addressed to the whole
+/// fleet. `had_resolution` carries the one bit an agent needs, so it can ask
+/// rather than invent. This is the assertion that notices the day someone
+/// swaps the projection for the stored struct.
+#[test]
+fn list_needs_you_shows_the_projection_and_never_the_humans_close_out_note() {
+    let (reg, _d, g, co, cw, _orch, task) = setup_needs_you_mcp();
+    q_call(&reg, &co, "request_attention", json!({
+        "kind": "demo", "text": "go run it", "task": task.as_str(),
+    }));
+    q_call(&reg, &co, "request_attention", json!({ "kind": "feedback", "text": "still open" }));
+    const SECRET: &str = "I looked and the spacing is wrong on the third row";
+    reg.resolve_needs_you(&g, "n-1", Some(SECRET), needsyou::ResolveSource::Webview).unwrap();
+
+    // Both roles read the same projection.
+    for (caller, who) in [(&co, "the orchestrator"), (&cw, "a worker")] {
+        let body: Value =
+            serde_json::from_str(&q_text(&q_call(&reg, caller, "list_needs_you", json!({}))))
+                .unwrap();
+        let raw = body.to_string();
+        assert!(!raw.contains(SECRET), "{who} was shown the human's note verbatim: {raw}");
+        assert!(!raw.contains("\"resolution\""), "{who} was shown the note's key: {raw}");
+
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "open rows first, then the resolved tail: {items:?}");
+        // Open first, in raise order — the panel does the sorting, not this.
+        assert_eq!(items[0]["id"], "n-2", "the open row leads: {items:?}");
+        assert_eq!(items[0]["status"], "open");
+        assert_eq!(items[0]["had_resolution"], false);
+        assert_eq!(items[1]["id"], "n-1");
+        assert_eq!(items[1]["status"], "resolved");
+        assert_eq!(items[1]["kind"], "demo");
+        assert_eq!(items[1]["task"], task);
+        // The ONE bit an agent gets about the note: that there is one.
+        assert_eq!(items[1]["had_resolution"], true, "{items:?}");
+        // …and `resolved_by`, which is the field that distinguishes "the human
+        // looked" from "the board moved on" from "I took it back myself".
+        assert_eq!(items[1]["resolved_by"], "webview", "{items:?}");
+        assert_eq!(body["omitted_resolved"], 0, "nothing was left off, and it says so");
+    }
+
+    // POSITIVE CONTROL for the withholding: the note really IS on the stored
+    // row. Without this, "the agent could not see it" would also pass in a build
+    // where the note was never written at all.
+    assert_eq!(
+        reg.needs_you(&g).unwrap().iter().find(|i| i.id == "n-1").unwrap().resolution.as_deref(),
+        Some(SECRET),
+        "the note must exist where the projection is refusing to show it"
+    );
+}
+
+/// Membership is enforced by WHICH FILE was read, not by comparing a field:
+/// each group's items live in its own group dir, so another group's id is
+/// simply absent — the same refusal an id that never existed gets, leaking
+/// nothing about the other group.
+#[test]
+fn a_needs_you_item_is_scoped_to_the_group_that_raised_it() {
+    let (reg, _d, g_a, co_a, _cw, _orch, _task) = setup_needs_you_mcp();
+    let g_b = reg.create_group("C:/tmp/other-repo", rails()).unwrap();
+    let orch_b = reg.spawn_agent(&g_b.id, Role::Orchestrator, "orch-b", "", false, None).unwrap();
+    let co_b = reg.resolve_token(&orch_b.token).unwrap();
+
+    q_call(&reg, &co_a, "request_attention", json!({ "kind": "feedback", "text": "group A's ask" }));
+
+    // Group B cannot see it…
+    let listed: Value =
+        serde_json::from_str(&q_text(&q_call(&reg, &co_b, "list_needs_you", json!({})))).unwrap();
+    assert_eq!(listed["items"].as_array().unwrap().len(), 0, "{listed}");
+    // …cannot withdraw it…
+    let denied = q_call(&reg, &co_b, "withdraw_attention", json!({ "id": "n-1" }));
+    assert_eq!(denied["isError"], true);
+    assert!(
+        q_text(&denied).contains("unknown needs-you item"),
+        "the refusal must leak nothing about the other group: {}",
+        q_text(&denied)
+    );
+    // …and cannot resolve it through its own group dir either.
+    let err = reg
+        .resolve_needs_you(&g_b.id, "n-1", None, needsyou::ResolveSource::Webview)
+        .expect_err("another group's item is not resolvable here");
+    assert!(err.contains("unknown needs-you item"), "{err}");
+
+    // Group A's row is untouched, and B's raise of its OWN item mints `n-1`
+    // in B's file — proof the two registries are separate files rather than
+    // one keyed store.
+    assert_eq!(reg.needs_you(&g_a).unwrap()[0].status, needsyou::Status::Open);
+    q_call(&reg, &co_b, "request_attention", json!({ "kind": "feedback", "text": "B's own ask" }));
+    let b_items = reg.needs_you(&g_b.id).unwrap();
+    assert_eq!(b_items.len(), 1, "{b_items:?}");
+    assert_eq!(b_items[0].id, "n-1", "ids are minted per group, not globally");
+    assert_eq!(reg.needs_you(&g_a).unwrap().len(), 1, "…and A still has exactly its own");
+}
+
+/// **THE structural assertion of this slice: no agent token can RESOLVE.**
+///
+/// Resolving an item is the human saying they have looked at the thing. An
+/// agent able to produce that would be certifying a look that never happened,
+/// and the panel would be theatre. So this drives the entire MCP tool surface —
+/// every tool BOTH roles are offered, with a resolve-shaped argument bag — plus
+/// every name a future slice might plausibly give a resolve tool, and asserts
+/// that after every one of them the item still carries no human acknowledgement.
+///
+/// **The forbidden act is precisely a `webview` settle**, the same way the
+/// question sweep's is precisely `Answered`. A tool that settles a row as
+/// `withdrawn:<agent>` is fine — an orchestrator taking back its own ask is not
+/// the same power as deciding the human has looked — and those two assertions
+/// are what pin the difference.
+#[test]
+fn no_agent_token_can_resolve_a_needs_you_item_through_the_mcp_surface() {
+    let (reg, _d, g, co, cw, _orch, _task) = setup_needs_you_mcp();
+
+    // Excluded from the sweep because each shells out to `gh` or waits on a
+    // pane bind — driving them here would make this a network test, not because
+    // any of them is trusted. They are covered instead by
+    // `the_mcp_surface_has_no_path_to_the_item_resolve_entry_point`, which reads
+    // the source of every arm including these. Asserted to be a SUBSET of what
+    // is actually listed, so a renamed tool cannot silently drop out of the
+    // sweep by matching nothing.
+    const SHELLS_OUT: [&str; 6] = [
+        "spawn_agent",
+        "list_verdicts",
+        "queue_merge",
+        "merge_queue_status",
+        "cancel_queued_merge",
+        "session_digest",
+    ];
+
+    let mut names = tool_names(&reg, &co);
+    names.extend(tool_names(&reg, &cw));
+    for skipped in SHELLS_OUT {
+        if skipped == "session_digest" {
+            continue; // process-hinted blocks only; not listed for these two
+        }
+        assert!(names.contains(&skipped.to_string()), "{skipped} is no longer a listed tool — \
+            update SHELLS_OUT so the sweep keeps covering the surface it claims to");
+    }
+    names.retain(|n| !SHELLS_OUT.contains(&n.as_str()));
+    // Names a future slice might plausibly reach for. None of these exists, and
+    // this is the assertion that notices the day one does.
+    names.extend(
+        [
+            "resolve_needs_you",
+            "resolve_attention",
+            "needs_you_resolve",
+            "orch_needs_you_resolve",
+            "acknowledge_attention",
+            "clear_needs_you",
+            "mark_seen",
+        ]
+        .map(str::to_string),
+    );
+
+    // EVERY swept tool gets its own FRESH OPEN item, and this is load-bearing
+    // rather than tidiness — the question sweep learned it the hard way.
+    // `withdraw_attention` is in the sweep and legitimately settles a row, so a
+    // single shared item would be settled early and every later tool would be
+    // aimed at a row that `resolve_needs_you` refuses on its own account. The
+    // headline assertion could then no longer observe the thing it exists to
+    // catch.
+    //
+    // Raised through the REGISTRY rather than through `request_attention`, and
+    // that differs from the question sweep deliberately: `request_attention` is
+    // itself one of the swept tools, so raising through it would leave the
+    // sweep's own rows lying about, and "the item I am watching" would stop
+    // being unambiguous. Housekeeping that cannot be mistaken for a call under
+    // test is worth more here than symmetry with the older sweep.
+    //
+    // `feedback`, with no task: an item linked to a board row could be settled
+    // by the LIFECYCLE HOOK if a swept tool moved that row, and `board:<status>`
+    // is a legitimate settle. Keeping the watched row unlinked means the only
+    // thing that can touch it is the tool under test.
+    let raise_fresh = |label: &str| -> String {
+        reg.raise_needs_you(&g, "sweep", feedback_req(&format!("open for {label}")))
+            .expect("the sweep needs a fresh item")
+            .item
+            .id
+    };
+
+    for (caller, who) in [(&co, "the orchestrator"), (&cw, "a worker")] {
+        for name in &names {
+            let id = raise_fresh(name);
+            // One bag carrying every argument name any of these tools takes, so
+            // each call gets as far into its own handler as it possibly can.
+            // `kind` is `feedback` rather than a `notify_when` kind on purpose:
+            // the tool this sweep is about is the item surface, and a bag that
+            // made `request_attention` fail at argument parsing would drive it
+            // less deeply than every other tool here.
+            let payload = json!({
+                "id": id, "item": id, "note": "the human looked", "resolution": "looks good",
+                "text": "looks good", "source": "webview", "resolved_by": "webview",
+                "status": "resolved", "kind": "feedback", "state": "{}", "title": "t", "name": "n",
+            });
+            // The call may legitimately succeed, fail, or be unknown — none of
+            // that is what is under test. What is under test is the state
+            // afterwards.
+            let _ = dispatch(
+                &reg,
+                caller,
+                "tools/call",
+                &json!({ "name": name, "arguments": payload }),
+            );
+            let items = reg.needs_you(&g).expect("needs-you.json readable");
+            let i = items.iter().find(|i| i.id == id).expect("the item still exists");
+            assert_ne!(
+                i.resolved_by.as_deref(),
+                Some("webview"),
+                "{who} settled {id} as the HUMAN by calling {name:?} — no agent may ever resolve"
+            );
+            assert!(
+                i.resolution.is_none(),
+                "{who} put a close-out note on {id} by calling {name:?}: {:?}",
+                i.resolution
+            );
+            // …and the one settle an agent legitimately HAS is still visibly a
+            // withdrawal, which is what makes the two assertions above a
+            // distinction rather than a blanket ban.
+            if i.status.is_resolved() {
+                assert!(
+                    i.resolved_by.as_deref().is_some_and(|b| b.starts_with("withdrawn:")),
+                    "{who} settled {id} via {name:?} as {:?} — the only settle an agent may \
+                     perform is a withdrawal",
+                    i.resolved_by
+                );
+            }
+            // Clear the slot for the next tool. Through the registry, never a
+            // tool call, so the sweep's own housekeeping can never be mistaken
+            // for one of the calls under test. Already-settled is fine.
+            let _ = reg.withdraw_needs_you(&g, "sweep", &id);
+        }
+    }
+
+    // And the plausible names really are unknown, rather than existing and
+    // merely refusing — the difference between a gate and a missing feature.
+    // Against an OPEN item, so "unknown tool" is the only reason left for the
+    // call to fail: aimed at a settled one, a real resolve tool would refuse for
+    // its own reasons and read as absent when it is merely blocked.
+    //
+    // Both roles, not just the orchestrator: "this name does not exist" is a
+    // claim about the whole surface, and a tool listed for nobody is still
+    // callable by anybody.
+    for name in ["resolve_needs_you", "orch_needs_you_resolve", "acknowledge_attention"] {
+        for (caller, who) in [(&co, "the orchestrator"), (&cw, "a worker")] {
+            let id = raise_fresh(name);
+            let out = dispatch(
+                &reg,
+                caller,
+                "tools/call",
+                &json!({ "name": name, "arguments": { "id": id, "note": "seen" } }),
+            )
+            .unwrap();
+            assert_eq!(out["isError"], true, "{who} got a non-error from {name}");
+            assert!(
+                q_text(&out).contains("unknown tool"),
+                "{name} must not exist at all on the MCP surface, for {who}: {}",
+                q_text(&out)
+            );
+            let _ = reg.withdraw_needs_you(&g, "sweep", &id);
+        }
+    }
+
+    // ---- POSITIVE CONTROL: what de-shadows every assertion above ----
+    //
+    // A sweep that finds no resolve proves the boundary held ONLY IF the check
+    // could have seen one. Every assertion above is satisfied trivially when a
+    // tool simply does not exist — dispatch returns "unknown tool", nothing
+    // happens, the item is untouched — which is indistinguishable from a tool
+    // that exists and was properly refused. Left there, this test would keep
+    // passing even if `resolved_by` stopped being written at all, or if
+    // `needs_you()` started returning stale rows: it would be asserting against
+    // a mechanism that can no longer report the thing it is watching for.
+    //
+    // So drive the ONE path that is allowed to resolve, and confirm the very
+    // same observation fires. Green above now means "nothing resolved it", not
+    // "nothing could have been observed".
+    let id = raise_fresh("positive control");
+    reg.resolve_needs_you(&g, &id, Some("the human looked"), needsyou::ResolveSource::Webview)
+        .expect("the trusted webview path must be able to resolve");
+    let items = reg.needs_you(&g).unwrap();
+    let i = items.iter().find(|i| i.id == id).expect("the control item exists");
+    assert_eq!(
+        i.resolved_by.as_deref(),
+        Some("webview"),
+        "the trusted path could not resolve {id} — so the sweep above proves nothing: its \
+         assertions would pass whether or not an agent had resolved"
+    );
+    assert_eq!(
+        i.resolution.as_deref(),
+        Some("the human looked"),
+        "the note must land where the sweep above looks for it"
+    );
+}
+
+/// The source half of the same guarantee: `mcp.rs` — the whole of what an agent
+/// can reach — contains no call to the resolve entry point and never names the
+/// source type. A behavioural sweep can only drive tools that exist today; this
+/// is what a slice adding one tomorrow trips over.
+#[test]
+fn the_mcp_surface_has_no_path_to_the_item_resolve_entry_point() {
+    let mcp = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/mcp.rs"))
+        .expect("read mcp.rs");
+    assert!(
+        !mcp.contains("resolve_needs_you"),
+        "mcp.rs names resolve_needs_you — the MCP surface is agent-reachable, so a resolve tool \
+         there would let an agent certify that the HUMAN had looked at something (#1151). \
+         Resolves enter only through trusted surfaces; add a ResolveSource variant and its own \
+         entry point. (Prose does not get an exemption: see the note on the needs-you arms.)"
+    );
+    assert!(
+        !mcp.contains("ResolveSource"),
+        "mcp.rs names ResolveSource — see above; the agent-reachable surface must not be able to \
+         construct a resolve provenance."
+    );
+
+    // Nothing else in the backend may become a resolving surface without this
+    // test noticing: the type is defined in `needsyou.rs` and used in `mod.rs`
+    // (the trusted `orch_needs_you_resolve` command), and nowhere else.
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect_rs(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")), &mut files);
+    assert!(files.len() > 10, "the source scan found almost nothing — did the tree move?");
+    let mut mentions: Vec<String> = files
+        .iter()
+        .filter(|p| fs::read_to_string(p).is_ok_and(|s| s.contains("ResolveSource")))
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
+    mentions.sort();
+    assert_eq!(
+        mentions,
+        vec!["mod.rs".to_string(), "needsyou.rs".to_string()],
+        "ResolveSource escaped its two homes (needsyou.rs defines it; mod.rs's \
+         orch_needs_you_resolve supplies it). A new file naming it is a new resolving surface — \
+         which may one day be right, but is never accidental: read needsyou.rs's resolve-boundary \
+         section, then update this list deliberately."
+    );
+
+    // ---- The closed SET of resolve sources ----
+    //
+    // The two assertions above pin WHERE the type may be named. Neither pins
+    // WHAT it can spell, and that is the boundary's actual load-bearing claim:
+    // there is no variant for an agent, and adding one would defeat the feature
+    // rather than extend it. Without this, `ResolveSource::Agent` could be added
+    // inside `needsyou.rs` — a legitimate home — and every check above would stay
+    // green while the trust boundary quietly acquired an agent-shaped source.
+    //
+    // Read off the declaration rather than matched in Rust on purpose: an
+    // exhaustive `match` would fail to COMPILE on a new variant, and a compile
+    // error is the one failure that tells a reader nothing about behaviour. This
+    // fails with a sentence instead.
+    let src =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/needsyou.rs"))
+            .expect("read needsyou.rs");
+    let decl = src
+        .split_once("pub enum ResolveSource {")
+        .expect("ResolveSource's declaration moved — find it before weakening this test")
+        .1
+        .split_once('}')
+        .expect("unterminated enum body")
+        .0;
+    let variants: Vec<&str> = decl
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+        .map(|l| l.trim_end_matches(','))
+        .collect();
+    assert_eq!(
+        variants,
+        vec!["Webview"],
+        "ResolveSource gained a variant. Every one of them is an entry point loomux itself \
+         controls, and there is deliberately no agent-shaped one — a `board` or `agent` variant \
+         would make a weaker settle indistinguishable from the human's acknowledgement, which is \
+         the one thing `resolved_by` exists to keep unambiguous. The board's auto-resolve and an \
+         agent's withdraw write their own tags for exactly this reason."
+    );
+}

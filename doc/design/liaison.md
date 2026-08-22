@@ -254,6 +254,7 @@ a liaison is, and cannot add to it.
 | `liaison` | `reviewer` | **narrows**: `review_verdict` withheld from this hint | shipped |
 | `liaison` | `reviewer` | **widens**: `group_usage`, otherwise orchestrator-only | shipped |
 | `liaison` | `reviewer` | **widens**: `ask_human` — the pose only; `withdraw_question` stays orchestrator-only | shipped |
+| `liaison` | `reviewer` | **no widening**: `request_attention` / `withdraw_attention` stay orchestrator-only — the trip-wire below fired instead | shipped |
 
 **Capability is not the only thing a hint can key on, so the enumeration owes a
 second table.** These rules change no tool surface at all — the liaison's tokens
@@ -303,6 +304,25 @@ second root is the trigger**, and the next one that is a *write* is the trigger
 regardless of count — because two writes granted to a pane whose whole doctrine
 is "holds no orchestration authority" is a class asking to exist, and the answer
 then is the fifth kind, deliberately, not a longer table.
+
+**The trip-wire has now fired, and the answer was the one it named** (#1151 slice B).
+`request_attention` — the tool that puts a demo or a feedback ask into the human's
+NEEDS-YOU queue — arrived as a candidate for the same widening `ask_human` got, and the
+plan that specified it (#1151, plan-861) said `require_orchestrator_or_liaison` by
+analogy. It hits BOTH clauses above at once: it would be the third tool on the second
+root, and it would be that root's second write.
+
+It was **not** widened. The gate is `require_orchestrator`, and the human-facing pane's
+raise belongs to `Role::Manager` (#1161), whose own definition cites this trip-wire as
+the reason the fifth kind exists at all — so the manager's enumerated tool surface, not
+a fourth row on the table above, is where that grant goes. Two things make this cheap
+rather than austere: widening later is one word at one call site, while narrowing a
+shipped grant is a contract break; and the liaison loses nothing it had, since a raise
+it cannot make is one it tells the orchestrator about through `message_orchestrator`,
+exactly as it does for `withdraw_question` today.
+
+So the rule this section states is now also a rule this section has been measured
+against once, which is the only way to tell a trip-wire from a sentence.
 
 ## The prose
 

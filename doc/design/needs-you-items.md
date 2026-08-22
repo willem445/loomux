@@ -1,9 +1,9 @@
 # Needs-you items — the thing waiting on the human, as a record
 
-*#1151. This note covers slice A: the item entity, the per-group registry, the
+*#1151. This note covers slice A — the item entity, the per-group registry, the
 board lifecycle mapping, the clear-completed watermark, and the trusted Tauri
-commands. The MCP raise surface (slice B) and the panel rework (slice C) extend
-this note as they land. It is the companion to
+commands — and slice B, the MCP surface an agent reaches them through. It also covers
+slice C's panel, which reads both registries into one list. It is the companion to
 [human-questions.md](human-questions.md), which owns the other half of the same
 panel.*
 
@@ -35,8 +35,8 @@ is available — is **joined live from `tasks.json` at render**.
 
 That split is the whole design. Snapshotting a task's fields onto an item would
 create a second record about board state that starts drifting the moment the
-board moves, which is exactly the shape slice C's projection was written to
-avoid. The item owns the *ask*; the task keeps owning the *facts*.
+board moves, which is exactly the shape the old DEMOS projection (#1091 slice C,
+which #1151 slice C replaced) already had. The item owns the *ask*; the task keeps owning the *facts*.
 
 ```
 needs-you.json   ── item n-3 ──link──▶  tasks.json ── t-12
@@ -175,6 +175,69 @@ the rest of this feature refuses.
 defined as "cannot write a file". The upgrade migration used to run here; see
 [the migration](#the-one-shot-migration) for why that was wrong twice over.
 
+### MCP tools
+
+Three, and the count is the point: `request_attention` raises, `withdraw_attention`
+takes back, `list_needs_you` reads. There is no fourth, because the fourth would be
+resolve — see [The resolve boundary](#the-resolve-boundary).
+
+| tool | tier | notes |
+| --- | --- | --- |
+| `list_needs_you()` | every role | `{ items, omitted_resolved }`, `AgentItem` rows |
+| `request_attention(kind, text, task?, urgency?)` | orchestrator | returns `n-N`; deduped `demo` returns the existing id |
+| `withdraw_attention(id)` | orchestrator | settles `withdrawn:<agent>` |
+
+**The read is shared and the writes are not**, which is `list_questions`' split and
+one argument more. The panel unions the two registries, so an agent that could read
+only half of what is waiting on the human would be reasoning about a queue the human
+does not see; and a delegate reading that a demo it is about to ask for is already
+parked is the opposite of a leak.
+
+**Both writes are orchestrator-only, and this is a deliberate departure from the
+plan** (#1151, plan-861), which specified `require_orchestrator_or_liaison` for the
+raise by analogy with `ask_human`. [liaison.md](liaison.md) states a trip-wire on the
+`liaison` hint: the two widenings it has (`group_usage`, `ask_human`) hang off the
+root *"a liaison faces the human"*, and *"a THIRD tool on the second root is the
+trigger, and the next one that is a write is the trigger regardless of count … the
+answer then is the fifth kind, deliberately, not a longer table."* Raising an item is
+both clauses at once — third tool, second write — and the fifth kind now exists:
+`Role::Manager` (#1161), whose own definition cites this trip-wire as its reason.
+
+So the human-facing pane's raise belongs to the manager's enumerated tool surface
+(#1161 M2/M4), not to a third row on the liaison's table. The asymmetry is also the
+cheap direction: widening this later is one word at one call site, while narrowing a
+shipped grant is a contract break. liaison.md carries the same decision in its own
+enumeration, so neither note can drift into claiming the widening happened.
+
+**`request_attention` checks that `task` names a live board row, and that check lives
+at the tool rather than in the registry.** `validate_raise` is pure and deliberately
+board-blind: for the hook and the migration the check would have nothing to catch
+(both supply the id of a row they have just read), and for an agent it catches a
+dangling link.
+
+**What a phantom id actually costs, and it is not the same for the two kinds.**
+Both lose the LINK: the panel joins the task live to show what to look at, so the
+human gets a card pointing at nothing. A `demo` loses more — it also loses any way
+to settle on its own, because the auto-resolve filters `is_open_demo_for` and so
+fires only for a demo item and only on a real row's transition. A `feedback` item
+is **never** auto-resolved, however real its task; it ends when the human resolves
+it or the raiser withdraws it. So the check is justified by the link for both
+kinds, and additionally by the settle for `demo` — an earlier draft of this
+paragraph gave only the settle reason, which implied a feedback item with a good
+task would eventually clear itself. Pushing the check down into `raise_needs_you` would
+mean reading `tasks.json` from inside the items lock, the nesting `needs_you_lock`
+rules out in the other direction; so the tool reads the board first, then raises.
+
+**The raise reply says which of the two things happened.** A deduped raise keeps the
+existing row's text and discards the new ask's, and that is invisible in a bare id —
+so the arm branches on `Raised::fresh` and, on a dedupe, says the words were not
+stored and points at `kind: "feedback"` for an ask that is genuinely something else.
+
+**What the tools do NOT get.** No `resolve`, at any tier. No `clear` — the watermark
+is a fact about the human's view, and an agent hiding rows from the human's own panel
+is the inverse of this feature. No `task` back-reference write: an item links a task,
+never the other way round.
+
 ### What an agent reads
 
 **Never a stored `Item`.** `project_list` — the projection behind slice B's
@@ -215,7 +278,7 @@ and still leak.
 
 Emitted from `write_needs_you`, the single mutation point — so, the single
 notification point, the `orch-tasks-changed` / `orch-questions-changed` shape. The
-panel is the listener (slice C).
+panel is the listener (`decisionsview.ts`, #1151 slice C).
 
 ### Audit actions
 
@@ -232,7 +295,7 @@ An item is settled three ways, and they are deliberately not one operation:
 | how | `resolved_by` | who can do it |
 | --- | --- | --- |
 | the human acknowledges | `webview` | the trusted Tauri command only |
-| the raiser takes it back | `withdrawn:<agent>` | the raiser, through MCP (slice B) |
+| the raiser takes it back | `withdrawn:<agent>` | the orchestrator, through `withdraw_attention` |
 | the board moves on | `board:<new-status>` | the lifecycle hook |
 
 **There is no MCP resolve, and `ResolveSource` is a closed enum supplied by the
@@ -317,7 +380,8 @@ never deduped: two agents can legitimately want an opinion on one row.
 `admit` returns a `Raised { item, fresh }` rather than a bare item. For the hook
 that bit is uninteresting; for a caller with an author to answer it is the
 difference between "registered" and "there was already one of these, and your
-words were not stored". Slice B's `request_attention` must say which.
+words were not stored". `request_attention` reads that bit and branches its reply
+on it, which is the whole reason it is returned.
 
 **Both halves are best-effort against the board.** The board write has already
 landed and cannot be unwound, so a raise refused by the cap, or an items file
@@ -430,23 +494,22 @@ delivery enqueues.
 4. **New task statuses for attention.** The exact model being rejected: it makes
    the ask a property of the work item again, which is where this started.
 
-## What slice A does and does not reach
+## What this note's slices do and do not reach
 
 **Reaches:** the entity, the registry and its caps, the lifecycle hook and
 one-shot migration, the watermark, the three Tauri commands and their ACL grants, the
-audit actions, the event.
+audit actions, the event — and (slice B) the three MCP tools an agent reaches the
+registry through.
+
+**The panel is slice C (#1188), and it has landed** — `decisionsview.ts` listens
+for `orch-needs-you-changed` and renders one unified list over both registries,
+and the old DEMOS projection is gone. So the three surfaces this note describes
+are all live, and a reader should treat the whole note as shipped behaviour
+rather than as a design still arriving in pieces.
 
 **Does not reach, and is not silently missing:**
 
-- **The MCP surface** (`request_attention`, `withdraw_attention`,
-  `list_needs_you`) — slice B. Until it lands, `raise_needs_you` and
-  `withdraw_needs_you` have exactly one caller each: the board hook, and nothing.
-  The registry methods exist and are tested; no agent can reach them yet.
-- **The panel** — slice C. `orch-needs-you-changed` has no listener until then,
-  which is cheaper than a second visit to the write path later. The DEMOS tier
-  keeps rendering its projection in the meantime, so nothing regresses: the items
-  accumulate correctly behind it and the panel starts reading them when C lands.
 - **The sort** (#1151 decision D1, urgency-pinned then newest-first) is the
   panel's, not this projection's. `project_list` returns open rows in raise order
   and a newest-first resolved tail; sorting here would put a second, weaker
-  ordering in the way of the union sort C has to do anyway.
+  ordering in the way of the union sort the panel does anyway.
