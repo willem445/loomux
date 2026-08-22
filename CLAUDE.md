@@ -351,17 +351,15 @@ narrow their ask back down to the original ticket on your own judgment.
   to the total you are claiming (#859, #862, #889, #907, #914, #921).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
-  and work merged meanwhile authors fresh instances of the very string you removed —
-  a live defect that did not exist when you looked, not a stale measurement. A pure
-  rebase is no defence and cannot be: an all-`=` `git range-diff` (`ci-validate`'s
-  recipe) says your patches replayed unchanged, never that the base they replayed onto
-  is clean of what you swept — #1205's was `=` on every commit with five fresh
-  instances sitting in the new base. So re-run the entity grep after every rebase and
-  before the final green, across EVERY root (`crates/`, `src-tauri/`, `src/`, `docs/`,
-  `test/`, `e2e/`); a re-grep scoped to the directory you last edited is the miss, and
-  `git log -S` names the commit that authored each survivor. Signature: review names N
-  stale sites and the whole-tree grep finds N+1 (#1205 round 2; #1191, where the
-  rebase brought a fourth twin in with `main`).
+  and work merged meanwhile authors fresh instances of the string you removed — a live
+  defect, not a stale measurement. An all-`=` `git range-diff` (`ci-validate`'s recipe)
+  does not cover it and cannot: it says your patches replayed unchanged, never that the
+  base they replayed onto is clean of what you swept. So re-grep the entity across EVERY
+  root (`crates/`, `src-tauri/`, `src/`, `docs/`, `test/`, `e2e/`) after each rebase and
+  before the final green — scoping it to the directory you last edited is the miss —
+  and `git log -S` names the commit that authored each survivor. Signature: review names
+  N stale sites and the whole-tree grep finds N+1 (#1205, whose range-diff was `=` on
+  every commit with five fresh instances sitting in the new base; #1191).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
