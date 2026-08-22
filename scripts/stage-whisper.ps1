@@ -12,13 +12,13 @@
       <Dest>/*.dll               (whisper, ggml, ggml-base, ggml-cpu-*)
       <Dest>/models/ggml-base.en.bin
 
-  -Dest defaults to %LOCALAPPDATA%\loomux\whisper — the power-user path in
-  loomux's resolution order (bundled resources -> LOOMUX_WHISPER_* env vars ->
+  -Dest defaults to %LOCALAPPDATA%\orrerix\whisper — the power-user path in
+  loomux's resolution order (bundled resources -> ORRERIX_WHISPER_* env vars ->
   %LOCALAPPDATA%). After running, restart loomux and press Alt+S.
 
   If you install elsewhere, point loomux at it with the env overrides:
-      setx LOOMUX_WHISPER_CLI   "<Dest>\whisper-cli.exe"
-      setx LOOMUX_WHISPER_MODEL "<Dest>\models\ggml-base.en.bin"
+      setx ORRERIX_WHISPER_CLI   "<Dest>\whisper-cli.exe"
+      setx ORRERIX_WHISPER_MODEL "<Dest>\models\ggml-base.en.bin"
 
   Re-running is cheap: artifacts already present and matching their sha256 are
   not re-downloaded.
@@ -27,7 +27,7 @@
   Install directory. Defaults to loomux's %LOCALAPPDATA% whisper dir.
 #>
 param(
-    [string]$Dest = (Join-Path $env:LOCALAPPDATA 'loomux\whisper')
+    [string]$Dest = (Join-Path $env:LOCALAPPDATA 'orrerix\whisper')
 )
 $ErrorActionPreference = 'Stop'
 

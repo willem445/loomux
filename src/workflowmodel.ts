@@ -228,8 +228,32 @@ export function isReviewingBlock(b: { kind?: string; role_hint?: string }): bool
 /** The schema version this build reads and writes. */
 export const WORKFLOW_VERSION = 1;
 
+/** The repo's committed orrerix config dir, relative to the repo root. */
+export const CONFIG_DIR = ".orrerix";
+
+/** The pre-#1153 spelling of {@link CONFIG_DIR}, still read when `.orrerix/` is absent.
+ *  NEVER renamed on the user's behalf — it is a tracked directory in their repository.
+ *  See `doc/design/rebrand-filesystem.md`. */
+export const LEGACY_CONFIG_DIR = ".loomux";
+
 /** Where the workflow lives, relative to the repo root. */
-export const WORKFLOW_FILE = ".loomux/workflow.yml";
+export const WORKFLOW_FILE = `${CONFIG_DIR}/workflow.yml`;
+
+/** The legacy location, tried when {@link WORKFLOW_FILE} is not there. */
+export const LEGACY_WORKFLOW_FILE = `${LEGACY_CONFIG_DIR}/workflow.yml`;
+
+/** After reading `tried` came back NOT-FOUND, the next path worth trying — or null when
+ *  there is nothing left to try.
+ *
+ *  Deliberately narrow: only the DEFAULT workflow path falls back. A pane opened on an
+ *  explicit file (the editor's `getFile`, a restored tab) is showing the file it was asked
+ *  to show, and silently opening a different one because that one is missing would be the
+ *  pane lying about what it has open. And the fallback happens exactly once — `tried` is
+ *  the legacy path on the second call, which returns null — so a repo with neither file
+ *  lands on the "no workflow yet" empty state after two reads, not a loop. */
+export function legacyFallbackFor(tried: string): string | null {
+  return tried === WORKFLOW_FILE ? LEGACY_WORKFLOW_FILE : null;
+}
 
 /** What a `merge` gate can require of its reviewers. `all-pass` = every named reviewer
  *  recorded PASS; `threshold` = at least N of them did. These are the CANONICAL

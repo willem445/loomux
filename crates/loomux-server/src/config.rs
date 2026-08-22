@@ -253,6 +253,15 @@ impl ServerConfig {
     /// belongs to whoever first writes under it, and a config check that
     /// created directories as a side effect would be a surprising thing for
     /// `--check-config` to do.
+    ///
+    /// That is also why the daemon does **not** call `obs::init_data_root()`
+    /// here (#1153 phase 4): the `loomux`→`orrerix` move is a real filesystem
+    /// rename, and `--check-config` is the one invocation that must be free of
+    /// side effects. The default falls back to whichever root already exists,
+    /// so a daemon on a pre-rename machine still finds its state. When this
+    /// crate grows an actual serve loop, `init_data_root()` belongs at the top
+    /// of it, next to where the desktop app calls it — see
+    /// `doc/design/rebrand-filesystem.md`.
     pub fn state_root(&self) -> PathBuf {
         match &self.state_root {
             Some(root) => root.clone(),

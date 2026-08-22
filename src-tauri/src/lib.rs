@@ -39,6 +39,14 @@ pub fn run() {
     // crate it is written in. Here it names the release, which is what a crash
     // log has to say.
     obs::install_panic_hook(env!("CARGO_PKG_VERSION"));
+    // #1153 phase 4: settle WHICH data root this run uses before anything reads
+    // one, moving a pre-rename `<data>/loomux` profile to `<data>/orrerix` if
+    // this is the first launch that finds only the old name. It has to precede
+    // `check_and_arm` (which writes `running.lock` into the root) and the
+    // breadcrumb below (which writes into `<root>/logs`) — either of those
+    // going first would pin the old root for the whole process and defer the
+    // move to the next launch. See `doc/design/rebrand-filesystem.md`.
+    obs::init_data_root();
     let startup = obs::check_and_arm();
     obs::breadcrumb(
         "startup",
