@@ -1830,10 +1830,18 @@ if [ -f "$ORX_GD/merge_gate" ]; then
     # body performs command substitution on its content. `printf`/pipe is the
     # only shape where a filename cannot become a command.
     #
-    # The loop runs in a subshell (POSIX pipes do), so its answer LEAVES as
+    # The scan is a FUNCTION, called from the command substitution rather than
+    # written inside it. That is not style: a `case` pattern's `)` is unbalanced,
+    # and a shell that finds the end of `$( … )` by COUNTING parens rather than
+    # parsing recursively — bash 3.2, which is `/bin/sh` on macOS — mis-locates
+    # the closing paren and reports a syntax error at the first `;;`. A function
+    # body is parsed where it is DEFINED, out here, so the substitution below
+    # contains no `case` at all.
+    #
+    # It runs in a subshell either way (POSIX pipes do), so its answer LEAVES as
     # stdout: `hit<indices>` when the list was complete, `bad` otherwise. A
     # subshell that set a variable would set it in the subshell.
-    g_hit=$("$REAL_GH" pr view $rf "$num" --json files,changedFiles --jq '__ROUTING_FILES_JQ__' 2>/dev/null | {
+    loomux_route_scan() {
       r_ok=0; r_hit=" "
       while IFS= read -r r_line; do
         if [ "$r_ok" = "0" ]; then
@@ -1863,7 +1871,8 @@ if [ -f "$ORX_GD/merge_gate" ]; then
         done
       done
       if [ "$r_ok" = "1" ]; then printf 'hit%s\n' "$r_hit"; else printf 'bad\n'; fi
-    })
+    }
+    g_hit=$("$REAL_GH" pr view $rf "$num" --json files,changedFiles --jq '__ROUTING_FILES_JQ__' 2>/dev/null | loomux_route_scan)
     case "$g_hit" in
       hit*) g_hit=" ${g_hit#hit} " ;;
       *) loomux_block_wf "routing-unaccountable" "this repo's merge gate routes reviewers by path, and loomux could not account for every file this PR changed — either gh would not report them, or it reported fewer files than the PR says it has (its file list pages at 100). It therefore cannot tell which routing rules apply, and an unknown reviewer requirement is refused rather than assumed empty. Re-run the merge; if this PR permanently changes more than 100 files, split it — path routing cannot be enforced for it" ;;
