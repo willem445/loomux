@@ -146,9 +146,27 @@ free. Details in
 If orrerix exits uncleanly, the next launch surfaces a toast naming the newest
 crash log. Forensics live under `<data dir>/loomux/logs/`:
 
-- `crash-<timestamp>.log` — panic message, thread, and backtrace.
+- `crash-<timestamp>.log` — panic message, thread, and backtrace. The message,
+  location and thread are written and flushed *before* the backtrace is taken,
+  so a crash that dies collecting the backtrace still leaves a readable record
+  with no `backtrace:` section. A `double-panic:` line at the end means a second
+  crash hit while the first was being recorded.
 - `breadcrumbs.log` — a rotating record of lifecycle events (pane/PTY open/close,
   agent spawn/exit, delivery outcomes) with **no prompt content**.
+
+### When there is no crash log at all
+
+Some failures kill the process without any chance to write one — a stack
+overflow, an access violation in a native library, an `abort()`. The next launch
+records a `crash-log-gap` breadcrumb saying so. When you see one, the record
+that *does* exist is Windows':
+
+- `%LOCALAPPDATA%\CrashDumps` — a dump, if local dump collection is enabled
+  (it is off by default; see Microsoft's [Collecting user-mode
+  dumps](https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps)).
+- **Event Viewer → Windows Logs → Application**, source `Application Error` —
+  always written, and it carries the exception code. `0xc0000409` is what a Rust
+  binary's own `abort()` looks like from outside.
 
 Attach these when reporting a bug. Design details:
 [`doc/design/crash-observability.md`](https://github.com/willem445/loomux/blob/main/doc/design/crash-observability.md).
