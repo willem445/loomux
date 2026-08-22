@@ -129,7 +129,7 @@ export interface PersistedPane {
    *  — the close guard's whole point is that the human was asked).
    *
    *  A WORKFLOW pane (#222) rides the same field for the same reason: the workflow file
-   *  it is editing (`.loomux/workflow.yml` by default, or whichever YAML it was opened
+   *  it is editing (the repo's workflow file by default, or whichever YAML it was opened
    *  on from the file browser). Null for every other kind, and absent from any snapshot
    *  written before #217. */
   file: string | null;

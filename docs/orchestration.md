@@ -140,7 +140,7 @@ the model gate above: the model gate hides a suffix that has no defined
 meaning at all, while the entitlement case leaves a meaningful suffix
 selectable and lets the vendor's own check decide.
 
-These same two keys are available per block in `.loomux/workflow.yml`
+These same two keys are available per block in `.orrerix/workflow.yml`
 (`effort:`/`context:`) for the advanced orchestrator. Loading the file
 enforces the closed vocabulary and the per-CLI rule above; the workflow pane
 goes further and also validates `context:` against the block's `model:`,
@@ -196,7 +196,7 @@ What the confirm tells you before anything happens:
   group beside one that's already live (two orchestrators never share a group).
   A toast names the group once it resolves.
 - **The workflow checkbox** appears only when the repo declares a
-  `.loomux/workflow.yml` **that validates**, and runs that roster instead of the
+  `.orrerix/workflow.yml` **that validates**, and runs that roster instead of the
   built-in four roles. If the file is there but broken, you're told so and
   there's no checkbox: a new group runs the built-in roles, the same outcome the
   launcher warns about inline. Either way — valid file, broken file or no file —
@@ -614,7 +614,7 @@ is open — so an orchestrator can pile up ten items waiting on review while che
 starting more. **WIP limits** cap the work instead: how many items may sit in a status at
 one time.
 
-Declare them in `.loomux/workflow.yml` (the file that carries your roster, so this needs the
+Declare them in your workflow file (the file that carries your roster, so this needs the
 **advanced orchestrator** on):
 
 ```yaml
@@ -672,7 +672,7 @@ refusing a move to `blocked` refuses an agent's report that something is stuck. 
 `enforce: true`, leave `blocked` uncapped.
 
 **A bad value fails the whole file, on purpose** — `review: 0`, a misspelt status
-(`in-porgress`), or any key orrerix does not recognise stops `.loomux/workflow.yml` from
+(`in-porgress`), or any key orrerix does not recognise stops the workflow file from
 loading at all, taking your roster and merge gate with it, and the launcher shows you why.
 The error names the statuses you *could* have written. That is deliberate: a repo that wrote
 `review: 0` believes something about how its board paces, and quietly substituting a default
@@ -965,7 +965,7 @@ every core, a GPU, a device on a USB port, a fixed port number, a staging databa
 help, four workers will reach for it at once. **Lock resources** let you declare those things
 once, in your repo, and have agents take turns.
 
-Declare them in `.loomux/workflow.yml` (the same file that carries your roster, so this needs
+Declare them in `.orrerix/workflow.yml` (the same file that carries your roster, so this needs
 the **advanced orchestrator** on):
 
 ```yaml
@@ -988,7 +988,7 @@ rejected rather than quietly rewritten, so the name you type is the name your ag
 
 **A value out of range fails the whole file, on purpose.** `slots: 0` or above 64,
 `max_hold_minutes: 0` or above 480, a name with an illegal character, an unrecognized key inside a
-resource, or more than 32 resources are all **hard errors that stop `.loomux/workflow.yml` from
+resource, or more than 32 resources are all **hard errors that stop `.orrerix/workflow.yml` from
 loading at all** — taking your roster and merge gate down with them, and the launcher will show you
 why. That is deliberate: a repo that wrote `slots: 0` believes its builds are serialized, and
 quietly substituting a default would leave that belief in place while the behaviour changed
@@ -1196,13 +1196,21 @@ From the lifecycle panel you can:
 
 By default a group runs the built-in four-role roster — one orchestrator,
 worker, reviewer, and planner, each on the CLI/model you picked at launch. A
-repo can commit `<repo>/.loomux/workflow.yml` and declare its own instead: any
+repo can commit `<repo>/.orrerix/workflow.yml` and declare its own instead: any
 number of named blocks, each with its own capability class (orchestrator,
 worker, reviewer, or planner), CLI, model, and persona, plus a **merge gate**
 naming which reviewer blocks must record a `pass` verdict — enforced
 mechanically by the `gh` shim — before `gh pr merge` can succeed. See
 [`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
 for the full design.
+
+**On `.orrerix/` and `.loomux/`.** The config dir used to be `.loomux/`, and a repo
+that still has one keeps working with no action: each file — `workflow.yml`,
+`lessons.md`, `workflow.layout.json` — is looked for in `.orrerix/` first and in
+`.loomux/` if it is not there. Orrerix never renames that directory for you; it is
+committed to your repository, on your branches, and moving it is a commit only you
+should make. If both exist, `.orrerix/` wins, so you can migrate one file at a time
+and see each move take effect immediately.
 
 **If your repo squash-merges, consider `also: [body-unchanged]`.** A verdict is
 bound to the commit it reviewed, so a re-push re-opens the gate. The PR *body*
@@ -1349,7 +1357,7 @@ per-block, so nothing stops a reviewer lane from running on a different
 CLI/model than the one that wrote the code — a second model tends to catch a
 different class of defect than the one already primed on its own output.
 Worth considering for any reviewer-heavy workflow; orrerix's own dogfood
-`.loomux/workflow.yml` notes the same above its reviewer blocks.
+`.orrerix/workflow.yml` notes the same above its reviewer blocks.
 
 ### Turning on the merge queue
 
@@ -1458,7 +1466,7 @@ restoring them).
 
 A workflow can declare a **process-pro** block — a worker that runs after a
 PR merges, reads that session's record cold, and opens a normal PR proposing
-a durable lesson (an entry in `.loomux/lessons.md`, a `.claude/skills/` entry,
+a durable lesson (an entry in `.orrerix/lessons.md`, a `.claude/skills/` entry,
 a `CLAUDE.md` rule). Like every other agent it proposes and stops; it never
 merges anything, its own PR included.
 
@@ -1500,7 +1508,7 @@ compare against, so a `0` there means *nothing to compare*, not *never
 happened*; and only a bounded number of recent sessions are read, so on a
 long-running group a count is a floor rather than a total.
 
-### What actually reaches a kickoff from `.loomux/lessons.md`
+### What actually reaches a kickoff from `.orrerix/lessons.md`
 
 The lessons file is injected into every orchestrator kickoff, and only about
 **4 KB of it** is — a deliberate bound on how much repo prose lands in an agent's
@@ -1527,7 +1535,7 @@ other change to the file takes.
 
 ### Watching the merge queue
 
-A repo can turn on a **merge queue** (`merge_queue:` in its `.loomux/workflow.yml`) so a
+A repo can turn on a **merge queue** (`merge_queue:` in its `.orrerix/workflow.yml`) so a
 batch of approved sub-PRs is tested *together* on a scratch ref before any of them reaches
 the integration branch — the combination is what gets a gate, instead of each PR getting one
 and nobody checking the pile. The queue runs in orrerix itself and lands only on an
@@ -1750,7 +1758,7 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
   can run on different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
   The launcher warns inline as you pick, and re-checks on submit — if one of
   those CLIs isn't on `PATH` it refuses the whole launch rather than starting
-  the group. A CLI named by a `.loomux/workflow.yml` block is not checked at
+  the group. A CLI named by a `.orrerix/workflow.yml` block is not checked at
   all, and shows up instead as a pane that opens and immediately exits with the
   shell's not-recognized error.
 - `gh` CLI authenticated for the issue/PR/review workflow.

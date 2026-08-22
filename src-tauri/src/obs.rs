@@ -2,7 +2,8 @@
 //! `src-tauri` still reaches the whole of it through.
 //!
 //! The facilities themselves — the panic hook and its crash logs, the
-//! breadcrumb log and its rotation, the `LOOMUX_DATA_DIR`-aware `data_root()`,
+//! breadcrumb log and its rotation, the `ORRERIX_DATA_DIR`-aware `data_root()`
+//! and its one-time `loomux`→`orrerix` migration ([`init_data_root`], #1153),
 //! the `running.lock` sentinel, and the poison-tolerant [`LockExt`] every
 //! long-lived `Mutex` in this crate locks through — now live in
 //! [`loomux_engine::obs`] (#888 slice A3 batch 7). None of that is
@@ -27,8 +28,8 @@
 //! compiles there. See that function's doc comment for the argument.
 
 pub use loomux_engine::obs::{
-    breadcrumb, check_and_arm, data_root, install_panic_hook, logs_dir, mark_clean_exit, LockExt,
-    StartupCheck,
+    breadcrumb, check_and_arm, data_root, init_data_root, install_panic_hook, logs_dir,
+    mark_clean_exit, LockExt, StartupCheck,
 };
 
 use std::sync::Mutex;

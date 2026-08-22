@@ -188,7 +188,7 @@ created on demand with the description *"Held by the human — full-autonomy age
 must not start this"*, so it reads correctly on GitHub for anyone who's never seen
 orrerix.
 
-**If your repo renamed it** (`intake.labels.hold:` in `.loomux/workflow.yml`),
+**If your repo renamed it** (`intake.labels.hold:` in `.orrerix/workflow.yml`),
 `agent-hold` above is simply not your veto — substitute your own spelling
 throughout this page, including in the hand-typed `gh` command.
 

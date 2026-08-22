@@ -1,4 +1,4 @@
-// Unit tests for the pure workflow model (#222): reading `.loomux/workflow.yml`,
+// Unit tests for the pure workflow model (#222): reading the repo workflow file,
 // writing it back canonically, deriving its graph, and — the part that earns its
 // keep — the PRE-RUN VALIDATION pass that every workflow tool surveyed in the #222
 // investigation skipped.
@@ -37,6 +37,11 @@ import {
   sanitizeAllowPattern,
   roleHintsForKind,
   hasErrors,
+  legacyFallbackFor,
+  WORKFLOW_FILE,
+  LEGACY_WORKFLOW_FILE,
+  CONFIG_DIR,
+  LEGACY_CONFIG_DIR,
   BLOCK_KINDS,
   ROLE_HINTS,
   INTAKE_SOURCES,
@@ -2577,4 +2582,53 @@ test("the identifier rules accept exactly what the engine accepts (#1020)", () =
   assert.equal(isValidResourceName("heavy build"), false);
   assert.equal(isValidResourceName(""), false);
   assert.equal(isValidResourceName("a".repeat(ID_MAX_CHARS)), true);
+});
+
+// ---------- the repo config dir: `.orrerix/` preferred, `.loomux/` still read (#1153 p4) ----------
+
+test("the default workflow path is the preferred one, and it falls back exactly once", () => {
+  assert.equal(WORKFLOW_FILE, `${CONFIG_DIR}/workflow.yml`);
+  assert.equal(LEGACY_WORKFLOW_FILE, `${LEGACY_CONFIG_DIR}/workflow.yml`);
+  // From the default, the legacy path is what to try next…
+  assert.equal(legacyFallbackFor(WORKFLOW_FILE), LEGACY_WORKFLOW_FILE);
+  // …and from there, nothing. Without this the pane would retry forever on a repo that
+  // has neither file — which is where every repo starts.
+  assert.equal(legacyFallbackFor(LEGACY_WORKFLOW_FILE), null);
+});
+
+test("a pane opened on an EXPLICIT file never silently opens a different one", () => {
+  // A restored tab or the editor's `getFile` names the file the human asked for. Falling
+  // back there would mean a pane whose header says one path and whose buffer holds another.
+  assert.equal(legacyFallbackFor("teams/api/.orrerix/workflow.yml"), null);
+  assert.equal(legacyFallbackFor("docs/example-workflow.yml"), null);
+});
+
+test("the legacy config dir is pinned — changing it breaks every existing repo", () => {
+  assert.equal(LEGACY_CONFIG_DIR, ".loomux");
+  assert.equal(CONFIG_DIR, ".orrerix");
+});
+
+test("the scaffold's own header names the file it is about to be written to", () => {
+  // rev-lead round 1, B2 — a real user-facing defect, not a rename nit. The pane writes
+  // this text to `this.rel`, so a hard-coded `.loomux/workflow.yml` header meant pressing
+  // "Create workflow" in a repo with no config dir produced `.orrerix/workflow.yml` whose
+  // FIRST LINE named a path that repo does not have: precisely the "reads one file,
+  // reports another" failure this phase exists to fix.
+  assert.match(scaffoldWorkflowText("1.0.0", WORKFLOW_FILE).split("\n")[0], /^# \.orrerix\/workflow\.yml /);
+  // A repo still on the legacy spelling gets a header naming ITS file...
+  assert.match(
+    scaffoldWorkflowText("1.0.0", LEGACY_WORKFLOW_FILE).split("\n")[0],
+    /^# \.loomux\/workflow\.yml /
+  );
+  // ...and an explicitly-opened path is named too, so the header can never disagree with
+  // the pane's own path label.
+  assert.match(
+    scaffoldWorkflowText("1.0.0", "teams/api/.orrerix/workflow.yml").split("\n")[0],
+    /^# teams\/api\/\.orrerix\/workflow\.yml /
+  );
+  // The default is the preferred spelling — a caller that omits the path never gets the
+  // deprecated one.
+  assert.match(scaffoldWorkflowText("1.0.0").split("\n")[0], /^# \.orrerix\/workflow\.yml /);
+  // And whatever the header says, the body must still parse and validate clean.
+  assert.deepEqual(analyzeWorkflow(scaffoldWorkflowText("1.0.0", LEGACY_WORKFLOW_FILE)).findings, []);
 });

@@ -324,8 +324,8 @@ export interface ContentPaneOptions {
    *  editor on its tree with nothing selected.
    *
    *  WORKFLOW kind (#222): which workflow file to edit, root-relative. Defaults to
-   *  `.loomux/workflow.yml` when absent — the welcome flow's case — and is set when the
-   *  browser opens a *different* YAML as a workflow. */
+   *  the repo's own workflow path when absent — the welcome flow's case — and is set
+   *  when the browser opens a *different* YAML as a workflow. */
   file?: string;
   /** Open without stealing keyboard focus (same contract as PaneOptions). */
   background?: boolean;
@@ -1993,8 +1993,8 @@ export class Pane implements VoiceTargetPane {
 
     if (opts.kind === "workflow") {
       // The workflow file rides in `file`, exactly as the editor's open file does, so the
-      // capture/restore path needed no new field (tabstore.ts). Absent = the default
-      // `.loomux/workflow.yml`, which is what the welcome form creates.
+      // capture/restore path needed no new field (tabstore.ts). Absent = the repo's
+      // default workflow path, which is what the welcome form creates.
       this.workflowPaneView = new WorkflowView({
         getRoot: () => this.contentRoot,
         getFile: () => this.contentFile ?? WORKFLOW_FILE,
@@ -2063,7 +2063,7 @@ export class Pane implements VoiceTargetPane {
    *  a new one cannot be wired into two of the four and forgotten in the others.
    *
    *  THREE can hold a buffer: the editor PANE (#217 — the pane IS the buffer), the
-   *  WORKFLOW pane (#222 — same, over `.loomux/workflow.yml`), and the Alt+F OVERLAY
+   *  WORKFLOW pane (#222 — same, over the workflow file), and the Alt+F OVERLAY
    *  inside any terminal/agent pane (#174) — the likeliest one, because it is the one you
    *  forget you left open. They share the contract (`dirty` / `canDiscard` / `bufferReport`)
    *  rather than a base class: it is three methods, and the shared gate that matters is

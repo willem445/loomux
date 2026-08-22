@@ -103,7 +103,7 @@ export interface OrchestratorConfig {
    *  right after the group is created. */
   autonomyBudgetTokens: number;
   /** The advanced-orchestrator toggle (#222). OFF (the default) = the group
-   *  ignores `<repo>/.loomux/workflow.yml` entirely and runs the four roles above
+   *  ignores the repo's workflow file entirely and runs the four roles above
    *  — loomux's behavior before workflows existed, unchanged. ON = the repo's
    *  workflow file is loaded and validated, and ITS blocks are the roster (the
    *  per-role picks above then apply only as the CLI a block inherits when it
@@ -1008,7 +1008,7 @@ async function confirmPromote(repo: string, workflow: PromoteWorkflow | null): P
       : {
           label: "Run this repo's workflow roster (advanced)",
           checked: advanced,
-          title: "Load .loomux/workflow.yml and run the blocks it declares, instead of the built-in four roles.",
+          title: "Load this repo's workflow file and run the blocks it declares, instead of the built-in four roles.",
           onChange: (v) => {
             advanced = v;
           },
@@ -1389,7 +1389,7 @@ export interface LockWaiter {
   expires_ms: number;
 }
 
-/** One resource the repo declares under `resources:` in `.loomux/workflow.yml`. */
+/** One resource the repo declares under `resources:` in its workflow file. */
 export interface LockResource {
   name: string;
   slots: number;
@@ -1524,7 +1524,7 @@ export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<En
 // ---------- the advanced orchestrator (#222) ----------
 
 /** What turning the advanced orchestrator ON for `repo` would run: the resolved
- *  roster from `<repo>/.loomux/workflow.yml`, or every validation finding if the
+ *  roster from the repo's workflow file, or every validation finding if the
  *  file is broken (in which case the group still launches, on the built-in
  *  roster). Read by the launcher before the human hits Create, so they see the
  *  blocks — and the repo-authored personas — they are enabling.

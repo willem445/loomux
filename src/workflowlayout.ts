@@ -4,8 +4,8 @@
 // with a mouse and hoping.
 //
 // THE SEPARATION THIS MODULE EXISTS TO ENFORCE: where a node sits is NOT part of the
-// workflow. `.loomux/workflow.yml` says what the workflow IS — blocks, edges, gates — and
-// never where anything is drawn; positions live here, in `.loomux/workflow.layout.json`,
+// workflow. `workflow.yml` says what the workflow IS — blocks, edges, gates — and
+// never where anything is drawn; positions live here, in the `workflow.layout.json` beside it,
 // which is gitignorable and which nothing but the canvas ever reads. Dify, ComfyUI and
 // Langflow all embed x/y in the semantic file, so nudging a node churns the diff of the
 // logic — and a teammate pulling your branch gets a "change" that is you having moved a box
@@ -18,8 +18,22 @@
 
 import type { WorkflowGraph } from "./workflowmodel";
 
-/** Where the canvas keeps its positions. Sits beside the workflow, is not part of it. */
-export const LAYOUT_FILE = ".loomux/workflow.layout.json";
+/** The layout file's name. Sits BESIDE the workflow, is not part of it. */
+export const LAYOUT_BASENAME = "workflow.layout.json";
+
+/** The layout file for a given workflow file — its sibling, always.
+ *
+ *  DERIVED rather than a constant (#1153 phase 4), and that is a fix as much as a rename:
+ *  a repo may declare its workflow at `.orrerix/workflow.yml` or at the legacy
+ *  `.loomux/workflow.yml`, and the pane can also be opened on an explicit path — so a
+ *  hard-coded layout path would write the canvas positions for `.loomux/workflow.yml` into
+ *  `.orrerix/`, i.e. into a directory the repo may not even have. Deriving it means the two
+ *  files cannot separate, whichever spelling the repo uses. */
+export function layoutFileFor(workflowRel: string): string {
+  const parts = workflowRel.split(/[\\/]/);
+  parts.pop();
+  return [...parts, LAYOUT_BASENAME].join("/");
+}
 
 export const LAYOUT_VERSION = 1;
 
@@ -285,11 +299,11 @@ export function layoutEquals(a: WorkflowLayout, b: WorkflowLayout): boolean {
 
 // ---------- the layout file ----------
 
-/** Read `.loomux/workflow.layout.json`. NEVER throws and never reports: a layout we can't
- *  read is a layout we compute instead, and the workflow still opens. That asymmetry with the
- *  workflow file is the point — a corrupt `workflow.yml` is a problem the human must see and
- *  fix, while a corrupt `workflow.layout.json` is a picture we can simply redraw. Nothing in
- *  it is anyone's WORK. */
+/** Read the `workflow.layout.json` beside the workflow. NEVER throws and never reports: a
+ *  layout we can't read is a layout we compute instead, and the workflow still opens. That
+ *  asymmetry with the workflow file is the point — a corrupt `workflow.yml` is a problem the
+ *  human must see and fix, while a corrupt `workflow.layout.json` is a picture we can simply
+ *  redraw. Nothing in it is anyone's WORK. */
 export function parseLayout(text: string): WorkflowLayout {
   try {
     const raw = JSON.parse(text) as unknown;

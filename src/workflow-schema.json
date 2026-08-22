@@ -1,6 +1,6 @@
 {
   "note": [
-    "The wire schema of `.loomux/workflow.yml`, as data (#880 slice A).",
+    "The wire schema of a repo's `workflow.yml`, as data (#880 slice A).",
     "",
     "This file is the shared statement of what a workflow file is, and two tests hold each",
     "side to it. What they pin, exactly:",

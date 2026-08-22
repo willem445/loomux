@@ -94,7 +94,7 @@ export const ghIssueCreate = (
 
 /** The label vocabulary this repo's issues view may write (#778). `ready` and
  *  `investigate` are the built-in go-signals; `hold` is the veto, resolved from
- *  the repo's own `.loomux/workflow.yml` — ask, never assume, because a repo can
+ *  the repo's own workflow file — ask, never assume, because a repo can
  *  rename it and a guessed spelling is a veto that silently does nothing. */
 export interface GhLabelVocabulary {
   ready: string;

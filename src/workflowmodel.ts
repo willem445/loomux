@@ -1,4 +1,4 @@
-// Pure model for `.loomux/workflow.yml` — the user-defined agent workflow (#222).
+// Pure model for the repo's `workflow.yml` — the user-defined agent workflow (#222).
 // DOM-free and I/O-free: parse, validate, derive the graph, serialize. The pane
 // (workflowview.ts) is a VIEW over this; the FILE is the source of truth (the
 // Kestra pattern — a form edit rewrites the YAML, it does not become a second,
@@ -13,7 +13,7 @@
 //     touches nothing else.
 //  2. No coordinates, ever. Dify/ComfyUI/Langflow all embed x/y in the semantic file,
 //     so nudging a node churns the logic diff. Layout (if the view ever draws any) goes
-//     in `.loomux/workflow.layout.json`; this file is the workflow.
+//     in the `workflow.layout.json` beside it; this file is the workflow.
 //  3. Validate BEFORE a run, not during one. Flowise, Langflow and Dify discover a
 //     dangling reference at runtime; Dify will happily *publish* a workflow whose node
 //     isn't installed. `validateWorkflow` is the whole pre-run pass, and it is pure
@@ -228,8 +228,32 @@ export function isReviewingBlock(b: { kind?: string; role_hint?: string }): bool
 /** The schema version this build reads and writes. */
 export const WORKFLOW_VERSION = 1;
 
+/** The repo's committed orrerix config dir, relative to the repo root. */
+export const CONFIG_DIR = ".orrerix";
+
+/** The pre-#1153 spelling of {@link CONFIG_DIR}, still read when `.orrerix/` is absent.
+ *  NEVER renamed on the user's behalf — it is a tracked directory in their repository.
+ *  See `doc/design/rebrand-filesystem.md`. */
+export const LEGACY_CONFIG_DIR = ".loomux";
+
 /** Where the workflow lives, relative to the repo root. */
-export const WORKFLOW_FILE = ".loomux/workflow.yml";
+export const WORKFLOW_FILE = `${CONFIG_DIR}/workflow.yml`;
+
+/** The legacy location, tried when {@link WORKFLOW_FILE} is not there. */
+export const LEGACY_WORKFLOW_FILE = `${LEGACY_CONFIG_DIR}/workflow.yml`;
+
+/** After reading `tried` came back NOT-FOUND, the next path worth trying — or null when
+ *  there is nothing left to try.
+ *
+ *  Deliberately narrow: only the DEFAULT workflow path falls back. A pane opened on an
+ *  explicit file (the editor's `getFile`, a restored tab) is showing the file it was asked
+ *  to show, and silently opening a different one because that one is missing would be the
+ *  pane lying about what it has open. And the fallback happens exactly once — `tried` is
+ *  the legacy path on the second call, which returns null — so a repo with neither file
+ *  lands on the "no workflow yet" empty state after two reads, not a loop. */
+export function legacyFallbackFor(tried: string): string | null {
+  return tried === WORKFLOW_FILE ? LEGACY_WORKFLOW_FILE : null;
+}
 
 /** What a `merge` gate can require of its reviewers. `all-pass` = every named reviewer
  *  recorded PASS; `threshold` = at least N of them did. These are the CANONICAL
@@ -3183,9 +3207,14 @@ export function removeBlockAt(w: Workflow, index: number): Workflow {
  *  re-serializes.)
  *
  *  `authoredWith` is stamped in the same one moment `starterWorkflow` stamps it. */
-export function scaffoldWorkflowText(authoredWith?: string): string {
+export function scaffoldWorkflowText(authoredWith?: string, rel: string = WORKFLOW_FILE): string {
   const stamp = authoredWith ? `authored_with: ${authoredWith}\n` : "";
-  return `# .loomux/workflow.yml — this repo's agent workflow (loomux #222).
+  // `rel` is the path this text is ABOUT TO BE WRITTEN TO, threaded in rather than
+  // hard-coded (#1153 phase 4, rev-lead round 1 B2). The header names the file the
+  // reader is looking at: a scaffold written to `.orrerix/workflow.yml` whose first
+  // line says `.loomux/workflow.yml` names a path that repo does not have, which is
+  // exactly the "reads one file, reports another" defect this phase exists to fix.
+  return `# ${rel} — this repo's agent workflow (loomux #222).
 # Committed on purpose: everyone who clones the repo gets the same roster.
 # Orrerix reads it only when "Advanced orchestrator" is ticked in the launcher.
 
@@ -3257,7 +3286,7 @@ gates:
 export const AUTHORED_WITH_KEY = "authored_with";
 
 /** The workflow loomux runs today, as a file: plan → work → review, with the reviewer's
- *  verdict gating the merge. The starting point a repo with no `.loomux/workflow.yml`
+ *  verdict gating the merge. The starting point a repo with no workflow file
  *  opens on, so the pane's empty state is a working example rather than a blank page.
  *
  *  `authoredWith` is the loomux version doing the creating; omit it and the key is simply

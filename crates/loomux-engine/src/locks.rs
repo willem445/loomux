@@ -490,7 +490,7 @@ pub fn unknown_resource_error(name: &str, declared: &[String]) -> String {
     if declared.is_empty() {
         return format!(
             "this repo declares no lock resources, so there is no '{name}' to lock — \
-             a resource has to be declared in .loomux/workflow.yml under `resources:`"
+             a resource has to be declared in this repo's workflow file under `resources:`"
         );
     }
     format!(

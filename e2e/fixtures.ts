@@ -3,7 +3,7 @@
 // Page talking to its main WebView2 webview over CDP.
 //
 // Isolation (issue #394 overlap — deliberately generic, not test-only):
-// - `LOOMUX_DATA_DIR` points loomux's own app-data root (orchestration/,
+// - `ORRERIX_DATA_DIR` points orrerix's own app-data root (orchestration/,
 //   logs/, tabs.json, running.lock) at a fresh temp dir per test run, so an
 //   E2E run never touches — or collides with — a real install's state.
 // - The exe under test must be built with `tauri.e2e.conf.json`'s
@@ -299,7 +299,7 @@ export const test = base.extend<{ appPage: Page }>({
     const proc: ChildProcess = spawn(EXE, [], {
       env: {
         ...process.env,
-        LOOMUX_DATA_DIR: dataDir,
+        ORRERIX_DATA_DIR: dataDir,
         // Only takes effect at Medium integrity level (a normal dev machine):
         // WebView2 Runtime 150+ drops this env var at High IL as LPE hardening
         // (MicrosoftEdge/WebView2Feedback#5640) — the CI job sets an HKLM

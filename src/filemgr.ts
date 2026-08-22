@@ -35,7 +35,7 @@ export const fmNewFolder = (root: string, rel: string, name: string): Promise<st
  *
  *  That refusal is ATOMIC (`create_new(true)`, filemgr.rs), which makes this the way to CLAIM
  *  a path you believe is free without a TOCTOU window — the workflow pane (#222) creates
- *  `.loomux/workflow.yml` through it for exactly that reason, so a workflow that appeared
+ *  the workflow file through it for exactly that reason, so a workflow that appeared
  *  since the pane opened can never be overwritten by a scaffold. */
 export const fmNewFile = (root: string, rel: string, name: string): Promise<string> =>
   invoke("fm_new_file", { root, rel, name });

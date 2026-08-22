@@ -1,4 +1,4 @@
-// The WORKFLOW pane (#222, restructured by #880): `.loomux/workflow.yml`, made configurable.
+// The WORKFLOW pane (#222, restructured by #880): the repo's workflow file, made configurable.
 //
 // ONE buffer, and the buffer is the FILE (the Kestra pattern — an inspector edit rewrites the
 // YAML under the hood; the YAML is never a stale export of some hidden canvas state). What
@@ -63,6 +63,7 @@ import {
   WORKFLOW_CLIS,
   GATE_REQUIRES,
   WORKFLOW_FILE,
+  legacyFallbackFor,
   INTAKE_SOURCES,
   INTAKE_LABEL_KEYS,
   ID_MAX_CHARS,
@@ -92,7 +93,7 @@ import { ModelPicker } from "./modelpicker";
 import { BLOCK_DEFAULT_MODEL_LABEL } from "./modelnames";
 import { BlockKnobFields, type KnobFieldSpec } from "./workflowknobs";
 import {
-  LAYOUT_FILE,
+  layoutFileFor,
   parseLayout,
   serializeLayout,
   emptyLayout,
@@ -117,7 +118,7 @@ import {
   type Rect,
   type WorkflowLayout,
 } from "./workflowlayout";
-import { ftReadFile, ftWriteFile, ftListDir, errorCode, errorMessage } from "./fileapi";
+import { ftReadFile, ftWriteFile, ftListDir, errorCode, errorMessage, type FileRead } from "./fileapi";
 import { fmNewFolder, fmNewFile, fmErrorCode } from "./filemgr";
 import {
   paneSurface,
@@ -146,7 +147,7 @@ import { IDENTITY, SEMANTIC } from "./theme.ts";
 export interface WorkflowHost {
   /** The repo/folder the workflow file lives under (the pane's root). */
   getRoot(): string | null;
-  /** Root-relative path of the workflow file. Defaults to `.loomux/workflow.yml`. */
+  /** Root-relative path of the workflow file. Defaults to `.orrerix/workflow.yml`, falling back to `.loomux/workflow.yml` when only that exists. */
   getFile?(): string;
   /** Never called in embedded mode — the pane's own ✕ closes it (and asks first). */
   onClose(): void;
@@ -188,7 +189,7 @@ export class WorkflowView {
    *  from "there isn't one" — see the error surface. Null when the file loaded (or is simply
    *  absent, which is not an error). */
   private loadError: string | null = null;
-  /** Node positions (`.loomux/workflow.layout.json`). NOT part of the workflow: a drag changes
+  /** Node positions (`workflow.layout.json`, beside the workflow file). NOT part of the workflow: a drag changes
    *  this and nothing else, and it is never serialized into the semantic file (§4). */
   private layout: WorkflowLayout = emptyLayout();
   /** The layout as last written, so a drag that ends where it began writes nothing. */
@@ -230,7 +231,7 @@ export class WorkflowView {
    *  `render()` rather than fixed at construction: the button because being pressable is a
    *  DECISION (`createAllowed`) and not a side-effect of being on screen, and the labels because
    *  this pane opens on any `.yml` the file browser hands it (#217's `file`), so a pane rooted on
-   *  `ci/flow.yml` that says `.loomux/workflow.yml` is telling the human about a file they are
+   *  `ci/flow.yml` that says the default workflow path is telling the human about a file they are
    *  not looking at — which, on the error surface, means naming the wrong file as unreadable. */
   private starterBtn: HTMLButtonElement;
   private startPathEl: HTMLElement;
@@ -408,7 +409,7 @@ export class WorkflowView {
     this.starterBtn = starterBtn;
     starterBtn.className = "wf-btn wf-btn-primary";
     starterBtn.textContent = "Create workflow";
-    starterBtn.title = "Scaffold a commented .loomux/workflow.yml — today's pipeline, ready to edit";
+    starterBtn.title = "";  // set from `this.rel` in render() — see the startPathEl note there
     starterBtn.addEventListener("click", () => void this.scaffold());
 
     // What the button is about to write. A preview is cheaper than a paragraph and it is the
@@ -534,9 +535,7 @@ export class WorkflowView {
       if (!this.disposed) this.appVersion = v;
     });
     this.root = this.host.getRoot();
-    this.rel = this.host.getFile?.() || WORKFLOW_FILE;
-    this.pathLabel.textContent = this.rel;
-    this.pathLabel.title = this.root ? `${this.root} · ${this.rel}` : this.rel;
+    this.retarget(this.host.getFile?.() || WORKFLOW_FILE);
     void this.load();
   }
 
@@ -634,6 +633,32 @@ export class WorkflowView {
     } catch (err) {
       if (this.disposed) return;
       const code = errorCode(err);
+      // #1153 phase 4: the DEFAULT path missing is the one case that means
+      // "maybe this repo still uses the old `.loomux/` spelling". Adopting it is
+      // conditional on the legacy read SUCCEEDING — a repo with neither file
+      // must stay on the preferred path, or the empty state would offer to
+      // create a workflow at the deprecated name. `legacyFallbackFor` returns
+      // null for the legacy path itself and for any explicit host-supplied file,
+      // so at most one extra read happens and only from the default. A
+      // `binary`/permission error is NOT a fallback trigger: that file is there,
+      // and quietly opening a different one would hide it.
+      const legacy = code === "not-found" ? legacyFallbackFor(this.rel) : null;
+      if (legacy) {
+        const found = await this.readLegacy(this.root, legacy);
+        if (this.disposed) return;
+        if (found) {
+          this.retarget(legacy);
+          this.exists = true;
+          this.loadError = null;
+          this.savedHash = found.hash;
+          this.savedText = found.content;
+          this.text = found.content;
+          await this.loadLayout();
+          this.reanalyze();
+          this.render();
+          return;
+        }
+      }
       this.exists = false;
       this.savedHash = "";
       this.savedText = "";
@@ -652,13 +677,32 @@ export class WorkflowView {
     this.render();
   }
 
+  /** Read a fallback workflow path, or null if there is nothing usable there. A read that
+   *  fails for ANY reason returns null: the preferred path's own error is the one the pane
+   *  reports, and a second file's permission problem must not replace it. */
+  private async readLegacy(root: string, rel: string): Promise<FileRead | null> {
+    try {
+      return await ftReadFile(root, rel);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Point this pane at `rel` — the path its header shows, its saves write, and its layout
+   *  sibling is derived from. One setter, so those three cannot drift apart. */
+  private retarget(rel: string): void {
+    this.rel = rel;
+    this.pathLabel.textContent = rel;
+    this.pathLabel.title = this.root ? `${this.root} · ${rel}` : rel;
+  }
+
   /** The canvas positions. A layout that is missing or corrupt is simply COMPUTED instead —
    *  never a finding, never a dialog, never a reason not to open the workflow. Nothing in that
    *  file is anyone's work; it is a picture we can redraw. */
   private async loadLayout(): Promise<void> {
     if (!this.root) return;
     try {
-      const fr = await ftReadFile(this.root, LAYOUT_FILE);
+      const fr = await ftReadFile(this.root, layoutFileFor(this.rel));
       if (this.disposed) return;
       this.layout = parseLayout(fr.content);
     } catch {
@@ -684,7 +728,7 @@ export class WorkflowView {
     // may be mid-edit, and a half-finished workflow on disk is recoverable while a lost
     // one is not. The findings strip is what says it isn't runnable yet.
     try {
-      await this.ensureLoomuxDir();
+      await this.ensureConfigDir();
       // CREATING vs EDITING are different writes, and conflating them destroyed files
       // (rev-15 F2). When we believe there is no file, we cannot write with a null expected
       // hash — `write_file` reads that as "write unconditionally", so a workflow that appeared
@@ -783,11 +827,11 @@ export class WorkflowView {
     return fresh.hash;
   }
 
-  /** Make sure `.loomux/` exists before writing into it.
+  /** Make sure the workflow file's directory exists before writing into it.
    *
    *  THE OTHER HALF OF v2 BUG 1, and it made the pane's headline feature a lie: `ft_write_file`
    *  writes atomically (temp file + rename) and does NOT create parent directories, so in a
-   *  repo with no `.loomux/` — i.e. EVERY repo that has never had a workflow, which is exactly
+   *  repo with no config dir — i.e. EVERY repo that has never had a workflow, which is exactly
    *  the repo the "create a workflow" button exists for — the write failed with a raw io error
    *  ("The system cannot find the path specified"). The button appeared to work, the toast
    *  said "Save failed", and reopening the pane showed the empty state again, because nothing
@@ -798,7 +842,7 @@ export class WorkflowView {
    *  does exactly this, through the same root+rel path safety. An "it already exists" failure
    *  is the success case here, so every error is swallowed and the WRITE is left to be the
    *  thing that reports a real problem — it is the one that knows whether it worked. */
-  private async ensureLoomuxDir(): Promise<void> {
+  private async ensureConfigDir(): Promise<void> {
     if (!this.root) return;
     const dir = this.rel.split(/[\\/]/).slice(0, -1).join("/");
     if (!dir) return; // a workflow file at the repo root needs no directory
@@ -842,8 +886,8 @@ export class WorkflowView {
     this.layout = next;
     if (layoutEquals(next, this.savedLayout)) return;
     try {
-      await this.ensureLoomuxDir();
-      await ftWriteFile(this.root, LAYOUT_FILE, serializeLayout(next), null);
+      await this.ensureConfigDir();
+      await ftWriteFile(this.root, layoutFileFor(this.rel), serializeLayout(next), null);
       this.savedLayout = next;
     } catch {
       // A layout we couldn't save is a picture that comes back computed instead. Not worth a
@@ -871,7 +915,9 @@ export class WorkflowView {
       this.render();
       return;
     }
-    this.setText(scaffoldWorkflowText(this.appVersion));
+    // `this.rel` — the path `save()` is about to write to — not the default, so the
+    // header names the file that will actually exist (#1153 phase 4).
+    this.setText(scaffoldWorkflowText(this.appVersion, this.rel));
     this.render();
     await this.save();
     // Land them on the canvas, looking at the thing they just made. Since #880 that is simply
@@ -1099,9 +1145,14 @@ export class WorkflowView {
     this.emptyEl.hidden = !start;
     this.bodyEl.hidden = error || start;
     this.findingsEl.hidden = error || start;
-    // Both surfaces name the file this pane is actually open on, not the default one.
+    // EVERY surface here names the file this pane is actually open on, not the default
+    // one — including the Create button's tooltip, which used to be a static literal
+    // naming `.loomux/workflow.yml` while the preview beside it read `.orrerix/...`
+    // (#1153 phase 4, rev-lead round 1 B2). The empty state must never advertise the
+    // deprecated spelling as the thing it is about to create.
     this.errorTitleEl.textContent = `Can't read ${this.rel}`;
     this.startPathEl.textContent = this.rel;
+    this.starterBtn.title = `Scaffold a commented ${this.rel} — today's pipeline, ready to edit`;
     // Pressability is the RULE, not a side-effect of being on screen. `hidden` is now honoured
     // (styles.css `[hidden]`), so this is belt and braces — but it is the belt that matters: the
     // live bug was a create button the human could press over a loaded workflow, and the thing

@@ -36,7 +36,7 @@ export const AGENT_MANAGED = "agent-managed";
  *  **This is the FALLBACK spelling, not the answer.** `intake.labels.hold` is
  *  repo-configurable, so the live spelling comes from the backend
  *  (`gh_label_vocabulary`, which resolves it from the repo's own
- *  `.loomux/workflow.yml` and validates writes against the same value). A repo
+ *  workflow file and validates writes against the same value). A repo
  *  that renamed the veto used to get a strike button writing `agent-hold` — a
  *  label its own poller ignored, so the click did nothing and said it had worked.
  *  Use this only until the vocabulary arrives, and never as a comparison against

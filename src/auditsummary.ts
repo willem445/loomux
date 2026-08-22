@@ -150,7 +150,7 @@ export function summarize(e: AuditEntry): string {
     case "lock-wait-cleanup":
       return `${str(d.agent) ?? "?"} left the '${str(d.resource) ?? "?"}' queue — its pane is gone`;
     case "lock-undeclared":
-      return `'${str(d.resource) ?? "?"}' is no longer declared in .loomux/workflow.yml — its holders and queue were dropped`;
+      return `'${str(d.resource) ?? "?"}' is no longer declared in the workflow file — its holders and queue were dropped`;
     // Cross-workspace channels (#271): connect/disconnect are human-initiated (actor
     // "human", mirroring the watch-register/-cancel pattern above); channel-message is
     // agent-initiated. Written to BOTH endpoints' group logs, so each side's timeline

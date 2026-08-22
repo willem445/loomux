@@ -295,7 +295,7 @@ test("the idempotent and withdrawal lock actions read as sentences too", () => {
   );
   assert.match(
     summarize(entry("lock-undeclared", { resource: "build", holders: ["w-1"], queued: [] }, "loomux")),
-    /'build' is no longer declared in \.loomux\/workflow\.yml/
+    /'build' is no longer declared in the workflow file/
   );
 });
 

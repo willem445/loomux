@@ -58,11 +58,21 @@ up automatically.
 
 Run the convenience script from a checkout. It downloads a pinned,
 checksum-verified runtime **plus** the `base.en` model into the location orrerix
-auto-detects (`%LOCALAPPDATA%\loomux\whisper`):
+auto-detects (`%LOCALAPPDATA%\orrerix\whisper`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\stage-whisper.ps1
 ```
+
+> **Already staged under the old name?** Orrerix still finds
+> `%LOCALAPPDATA%\loomux\whisper` and reads it exactly as before — nothing is moved,
+> because what is in there is a runtime and a model *you* downloaded. But the script's
+> default destination is now `%LOCALAPPDATA%\orrerix\whisper`, so re-running it
+> downloads a **second** copy (several hundred MB) rather than updating the one you
+> have. To keep using your existing directory, either pass it explicitly
+> (`-Dest "$env:LOCALAPPDATA\loomux\whisper"`) or just don't re-run the script — your
+> current install keeps working. To move at your own pace, rename the directory by
+> hand once nothing is using it.
 
 Restart orrerix and press `Alt+S`.
 
@@ -84,8 +94,8 @@ Restart orrerix and press `Alt+S`.
 3. Place them where orrerix looks by default:
 
    ```
-   %LOCALAPPDATA%\loomux\whisper\whisper-cli.exe      (with the DLLs beside it)
-   %LOCALAPPDATA%\loomux\whisper\models\ggml-base.en.bin
+   %LOCALAPPDATA%\orrerix\whisper\whisper-cli.exe      (with the DLLs beside it)
+   %LOCALAPPDATA%\orrerix\whisper\models\ggml-base.en.bin
    ```
 
 Restart orrerix and press `Alt+S`.
@@ -94,8 +104,8 @@ Restart orrerix and press `Alt+S`.
 
 To keep the runtime or model elsewhere, point orrerix at them:
 
-- `LOOMUX_WHISPER_CLI` → a `whisper-cli.exe` (with its DLLs beside it)
-- `LOOMUX_WHISPER_MODEL` → any ggml `.bin` (e.g. a larger multilingual model)
+- `ORRERIX_WHISPER_CLI` → a `whisper-cli.exe` (with its DLLs beside it)
+- `ORRERIX_WHISPER_MODEL` → any ggml `.bin` (e.g. a larger multilingual model)
 
 Resolution order is **bundled resources → env vars → `%LOCALAPPDATA%`**. Nothing
 ships in the bundled slot today (voice is opt-in), so in practice it's your env
@@ -112,18 +122,18 @@ locations it checked, so it's actionable.
   default; for noticeably better accuracy at similar speed, use
   **`large-v3-turbo`** quantized — **`q8_0`** is the quality/speed sweet spot
   (`q5_0` is smaller/faster). Drop the `.bin` in `models\` or point
-  `LOOMUX_WHISPER_MODEL` at it.
+  `ORRERIX_WHISPER_MODEL` at it.
 - **GPU.** NVIDIA owners get a large speed-up from a **cuBLAS/CUDA** whisper.cpp
-  build — download a `cublas` release asset and point `LOOMUX_WHISPER_CLI` at it.
-- **Extra flags.** `LOOMUX_WHISPER_ARGS` is appended verbatim to the whisper
+  build — download a `cublas` release asset and point `ORRERIX_WHISPER_CLI` at it.
+- **Extra flags.** `ORRERIX_WHISPER_ARGS` is appended verbatim to the whisper
   command (whitespace-split, no shell quoting) for power users — e.g.
-  `LOOMUX_WHISPER_ARGS="-t 12 -bs 5"`. It comes *after* orrerix's args and whisper
+  `ORRERIX_WHISPER_ARGS="-t 12 -bs 5"`. It comes *after* orrerix's args and whisper
   takes the last value of a flag, so your overrides win.
 
 ## Vocabulary biasing
 
 Bias recognition toward your own jargon with an optional
-`%LOCALAPPDATA%\loomux\whisper\vocab.txt` — one term or phrase per line, `#` for
+`%LOCALAPPDATA%\orrerix\whisper\vocab.txt` — one term or phrase per line, `#` for
 comments. Orrerix assembles it into whisper's `--prompt` (an initial-prompt hint):
 
 ```
@@ -143,7 +153,7 @@ orchestrator
 Keep it a **short curated list**: whisper's initial prompt is capped (~224
 tokens) and only a curated list is reliably honored — orrerix truncates to a
 conservative budget and logs a warning if `vocab.txt` is over-long. Set
-`LOOMUX_WHISPER_PROMPT` to a raw prompt string to override the file entirely.
+`ORRERIX_WHISPER_PROMPT` to a raw prompt string to override the file entirely.
 
 > Fine-tuning a model is out of scope — it needs a GPU, a labeled dataset, and a
 > multi-GB output; `--prompt` gets most of the domain-term benefit for none of
@@ -156,7 +166,7 @@ conservative budget and logs a warning if `vocab.txt` is over-long. Set
 - If the mic can't be opened (no device, or Windows microphone privacy blocks
   it), or the whisper runtime is missing/misconfigured, orrerix surfaces a
   **specific** message rather than failing silently.
-- To debug a capture, set `LOOMUX_VOICE_KEEP_WAV=1` — orrerix keeps the scratch
+- To debug a capture, set `ORRERIX_VOICE_KEEP_WAV=1` — orrerix keeps the scratch
   WAV and logs its path, duration, and level. A near-zero level on a long capture
   is the fingerprint of a silent/starved mic.
 

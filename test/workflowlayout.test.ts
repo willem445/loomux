@@ -32,7 +32,8 @@ import {
   NODE_W,
   NODE_H,
   PAD,
-  LAYOUT_FILE,
+  LAYOUT_BASENAME,
+  layoutFileFor,
   LAYOUT_VERSION,
   type WorkflowLayout,
   type Rect,
@@ -46,9 +47,10 @@ const graph = () => deriveGraph(starterWorkflow());
 
 test("the layout file is a separate, gitignorable file — never the workflow", () => {
   // The commitment from §4, stated as a test so it cannot quietly stop being true: positions
-  // go in .loomux/workflow.layout.json, and NOTHING about them is in the semantic file. Dify,
-  // ComfyUI and Langflow all embed x/y, so a canvas nudge churns the logic diff.
-  assert.equal(LAYOUT_FILE, ".loomux/workflow.layout.json");
+  // go in a workflow.layout.json BESIDE the workflow, and NOTHING about them is in the
+  // semantic file. Dify, ComfyUI and Langflow all embed x/y, so a canvas nudge churns the
+  // logic diff.
+  assert.equal(layoutFileFor(".orrerix/workflow.yml"), ".orrerix/workflow.layout.json");
   const w = starterWorkflow();
   const moved = withPosition(emptyLayout(), "worker", { x: 304, y: 120 });
   // The workflow is untouched by a drag: nothing to re-serialize, nothing to save, no diff.
@@ -298,4 +300,24 @@ test("the layout file STAMPS a version on write and deliberately ignores it on r
   assert.equal(future.version, LAYOUT_VERSION, "read as this build's format…");
   assert.deepEqual(own(future.positions), { a: { x: 8, y: 8 } }, "…and its positions are used anyway");
   assert.match(serializeLayout(emptyLayout()), /"version": 1/);
+});
+
+// ---------- the layout file follows the workflow it belongs to (#1153 phase 4) ----------
+
+test("the layout file is the workflow file's SIBLING, whichever config dir the repo uses", () => {
+  // The defect a hard-coded layout path had: a repo on the legacy `.loomux/` spelling would
+  // have had its canvas positions written into `.orrerix/` — a directory it may not have —
+  // silently separating the two files that only make sense together.
+  assert.equal(layoutFileFor(".loomux/workflow.yml"), ".loomux/workflow.layout.json");
+  assert.equal(layoutFileFor(".orrerix/workflow.yml"), ".orrerix/workflow.layout.json");
+});
+
+test("an explicitly-opened workflow keeps its layout beside IT, at any depth or separator", () => {
+  // The pane can be pointed at any file (a restored tab, the editor's `getFile`), including
+  // one nested or spelled with backslashes on Windows. The layout must follow it there.
+  assert.equal(layoutFileFor("teams/api/.orrerix/workflow.yml"), "teams/api/.orrerix/workflow.layout.json");
+  assert.equal(layoutFileFor(String.raw`.orrerix\workflow.yml`), ".orrerix/workflow.layout.json");
+  // A workflow at the repo root has no directory to sit in — the basename alone, never a
+  // leading "/" that would escape the root.
+  assert.equal(layoutFileFor("workflow.yml"), LAYOUT_BASENAME);
 });
