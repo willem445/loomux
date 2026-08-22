@@ -2918,7 +2918,7 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
         (cmd, line)
     };
 
-    // An OMISSION — nobody writes this meaning "and loomux must not work".
+    // An OMISSION — nobody writes this meaning "and the MCP server must not work".
     // Repaired: `--agent` moves off the user's own handle.
     let (cmd, line) = case("[\"read\", \"edit\"]");
     assert!(!cmd.contains("--agent p "), "an omission is repaired: {cmd}");
@@ -2928,13 +2928,13 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
     let (cmd, line) = case("[]");
     assert!(
         cmd.contains("--agent p"),
-        "an explicit empty list is left exactly as written — loomux does not overrule \"no tools\" \
-         into \"none except loomux\": {cmd}"
+        "an explicit empty list is left exactly as written — this app does not overrule \"no tools\" \
+         into \"none except its own\": {cmd}"
     );
     assert!(line.contains("deliberate no-tools decision"), "and says why: {line}");
 
     // A DECISION: the server is scoped per-tool on purpose.
-    let (cmd, line) = case("[\"read\", \"loomux/report\"]");
+    let (cmd, line) = case("[\"read\", \"orrerix/report\"]");
     assert!(
         cmd.contains("--agent p"),
         "a per-tool scope is left as written — widening it to orrerix/* would be this app granting \
@@ -3208,7 +3208,7 @@ fn a_tools_frontmatter_is_read_in_every_yaml_shape_a_real_agent_file_uses() {
 
     // A per-tool grant is *mentioned* but not a full grant — the warning says
     // something different in that case, and it has to be able to tell.
-    let partial = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"loomux/report\"]\n---\nbody").unwrap();
+    let partial = profiles::parse_profile("a", "---\nname: a\ndescription: d\ntools: [\"orrerix/report\"]\n---\nbody").unwrap();
     assert!(!partial.grants_mcp_server("loomux"));
     assert!(partial.mentions_mcp_server("loomux"));
 
@@ -4847,11 +4847,11 @@ fn a_copilot_blocks_allow_patterns_ride_the_one_allow_tool_value() {
         "a block's own patterns must not add a second occurrence: {cmd}"
     );
     assert!(
-        cmd.contains("--allow-tool \"loomux,shell(git:*),shell(gh:*),shell(make:*)\""),
+        cmd.contains("--allow-tool \"orrerix,shell(git:*),shell(gh:*),shell(make:*)\""),
         "the MCP grant leads the one value and the block's pattern extends it: {cmd}"
     );
     assert!(
-        argv.iter().any(|a| a == "loomux,shell(git:*),shell(gh:*),shell(make:*)"),
+        argv.iter().any(|a| a == "orrerix,shell(git:*),shell(gh:*),shell(make:*)"),
         "and it is one literal argv token: {argv:?}"
     );
 }
@@ -4877,7 +4877,7 @@ fn a_copilot_allow_pattern_containing_a_comma_is_refused_and_audited() {
         "neither the pattern nor either fragment of it may reach the CLI: {cmd}"
     );
     assert!(
-        cmd.contains("--allow-tool \"loomux,shell(git:*),shell(gh:*),shell(make:*)\""),
+        cmd.contains("--allow-tool \"orrerix,shell(git:*),shell(gh:*),shell(make:*)\""),
         "the block's other pattern is unaffected — one bad pattern is not a lost block: {cmd}"
     );
 
