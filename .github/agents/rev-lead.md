@@ -49,7 +49,9 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   not in the diff. Read `list_questions` and require all four: `status:
   answered`; `settled_by` the human's own channel (`webview`), never an agent
   id; the answer text matching the option the body says was chosen; and
-  `settled_ms` BEFORE the commit that records it. Signature: a status line that
+  `settled_ms` BEFORE the commit that records it. A decision attributed to the
+  ORCHESTRATOR is the same check on a different artifact — its directive/task
+  record, never the body's report of it. Signature: a status line that
   flipped from "awaiting ratification" to "RATIFIED" with nothing citable behind
   it (#1205 round 3).
 - **A coverage claim is a claim.** When a body or comment says a specific
