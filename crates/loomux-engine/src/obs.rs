@@ -763,9 +763,11 @@ mod tests {
         assert_eq!(override_root(None), None);
     }
 
-    /// **The escape hatch, pinned.** The PR shipping this policy without the
-    /// human's ratification rests on "reverting is one arm of
-    /// `plan_default_root`". That claim is only true if the dispatch below it
+    /// **The escape hatch, pinned.** The PR shipped this policy ahead of the
+    /// human's answer on the strength of "reverting is one arm of
+    /// `plan_default_root`" (since ratified — #1153 q-4 — which retires the
+    /// urgency, not the guarantee: a ratified policy is still one somebody may
+    /// need to undo). That claim is only true if the dispatch below it
     /// honours `UseLegacy` — and in the first cut it did not: `UseLegacy` was
     /// folded in with `Migrate`, so the documented edit still renamed the
     /// user's data (rev-lead round 1, B1).

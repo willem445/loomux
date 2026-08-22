@@ -27,10 +27,12 @@ and one test to read, rather than something you have to reconstruct from I/O cod
 **Shipped policy: move-on-first-launch.** `<data>/loomux` is renamed to
 `<data>/orrerix` by the first launch that finds the old name and not the new one.
 
-> **Status: the plan's recommended default, awaiting the human's ratification.**
-> Phase 0 flagged the move-vs-fallback choice as a human checkpoint. The human was
-> away and directed autonomous completion, so this ships the plan's own
-> recommendation, built to be reverted in one edit — see *Reverting*, below.
+> **Status: RATIFIED by the human (#1153 q-4).** Phase 0 flagged move-vs-fallback
+> as a human checkpoint, and this shipped as the plan's recommended default while
+> that answer was outstanding; the human has since confirmed move-on-first-launch.
+> The *Reverting* section below stays — a ratified policy is still one somebody may
+> need to undo, and the escape hatch is what made shipping it ahead of the answer
+> defensible in the first place.
 
 ### The decision, in full
 
