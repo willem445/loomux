@@ -356,6 +356,106 @@ pub struct Gate {
     /// Pure repo config (CLAUDE.md constraint 8): loomux never learns what 800
     /// means for this repo, only that this repo said 800.
     pub max_diff_lines: Option<u32>,
+    /// Path-based reviewer routing (#1176) — rules that make the required
+    /// reviewer set a function of the diff. Empty — the key absent — is the
+    /// whole feature off, byte-for-byte the pre-#1176 flow, and
+    /// [`route_reviewers`] never even looks at a changed-file list.
+    ///
+    /// **Additive, and only ever tightening**: the required set is
+    /// [`reviewers`](Self::reviewers) ∪ the reviewers of every rule that
+    /// matched. A rule that matches nothing costs nothing; a rule that matches
+    /// adds a lane. Nothing here can make a gate easier to satisfy, which is
+    /// why `routing:` and `require: threshold` are refused together at parse
+    /// ([`parse_workflow`]) — see [`RoutingRule`].
+    pub routing: Vec<RoutingRule>,
+}
+
+/// One path-based routing rule (#1176): *if this PR touched any of these paths,
+/// these reviewers are required too.*
+///
+/// Deliberately loomux-native globs rather than the repo's own `CODEOWNERS`:
+/// that file names GitHub users and teams, which are not workflow blocks, and
+/// the mapping between them would be repo config anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutingRule {
+    /// Path globs, matched against the PR's changed files with
+    /// [`glob_match`]. Validated at parse through [`sanitize_glob`]; at least
+    /// one, at most [`ROUTING_PATHS_MAX`].
+    pub paths: Vec<String>,
+    /// Block ids required when any path matches. Validated exactly as
+    /// [`Gate::reviewers`] is — the block must exist, be `kind: reviewer`, and
+    /// not be a liaison — because a rule naming anything else could never be
+    /// satisfied.
+    pub reviewers: Vec<BlockId>,
+}
+
+/// How many routing rules one gate may declare.
+///
+/// A bound rather than a preference: the shim evaluates **every** rule against
+/// **every** changed file on **every** merge, in POSIX shell, so an unbounded
+/// rule list is an unbounded cost on the merge path. Past this many lanes the
+/// block has stopped routing and started listing, which is a different feature.
+pub const ROUTING_RULES_MAX: usize = 32;
+
+/// How many path globs one routing rule may carry — the other half of the
+/// product [`ROUTING_RULES_MAX`] bounds.
+pub const ROUTING_PATHS_MAX: usize = 32;
+
+/// Longest path glob accepted. Generous next to [`MAX_ID_CHARS`] because a repo
+/// path legitimately is: `crates/loomux-engine/src/**` is ordinary.
+pub const MAX_GLOB_CHARS: usize = 200;
+
+/// Why a block id may not be named as a gate reviewer — `None` when it may.
+///
+/// **One definition for both lists** (#1176): `gates.merge.reviewers` and every
+/// `gates.merge.routing[].reviewers`. They are the same question — *could a
+/// verdict for this id ever be recorded?* — and answering it twice is how the
+/// static list ends up refusing a manager while a routing rule quietly accepts
+/// one. `ctx` names which list is being read so the message points at the line
+/// the author has to fix.
+fn gate_reviewer_error(gate: &str, ctx: &str, rname: &str, blocks: &[Block]) -> Option<String> {
+    match blocks.iter().find(|b| b.id == rname) {
+        None => Some(format!("gates.{gate}: {ctx} {rname:?} names no block")),
+        // The manager (#1161) is structurally caught by the arm below — it is
+        // not reviewer-kind — but "that block's kind is manager, not a
+        // reviewer" describes the type error and not the mistake. An author who
+        // named the manager on a gate was reaching for "the human signs off",
+        // which is a real thing they wanted and a real thing this gate cannot
+        // express, so say that instead. The pane validator carries the same arm
+        // (`validateWorkflow`, gate-not-a-reviewer), and the liaison arm below
+        // is the shape both are modelled on.
+        Some(b) if b.kind == Role::Manager => Some(format!(
+            "gates.{gate}: {ctx} {:?} is a manager — the manager is the human's \
+             interface, not a reviewer: it records no verdict, so a gate naming it \
+             could never open. A gate reads REVIEWER verdicts; the human's own sign-off \
+             is the merge gate loomux already applies on top of it.",
+            b.id
+        )),
+        // A gate reads reviewer verdicts. Naming a worker would make it
+        // permanently unsatisfiable — nothing would ever record a verdict for
+        // it — which is the "dangling reference the UI happily saves" failure
+        // this validation pass exists to prevent.
+        Some(b) if b.kind != Role::Reviewer => Some(format!(
+            "gates.{gate}: {ctx} {:?} is a {} block, not a reviewer — a gate can only require reviewer verdicts",
+            b.id,
+            b.kind.as_str()
+        )),
+        // The same unsatisfiable gate, one kind further in (#891). A liaison IS
+        // reviewer-kind — it rides that class for its read-only, persistent
+        // posture — but it is denied `review_verdict` at every layer precisely
+        // because it reviews nothing. Naming one here would therefore wait
+        // forever for a verdict no code path can produce, which is exactly the
+        // failure the arm above refuses; caught at parse rather than discovered
+        // as a merge gate that never opens.
+        Some(b) if b.role_hint.as_deref() == Some("liaison") => Some(format!(
+            "gates.{gate}: {ctx} {:?} is a liaison — it is reviewer-kind, but a \
+             liaison never records a verdict (it presents the human's questions and \
+             relays their answers), so a gate naming it could never open. Name a \
+             reviewer that reviews.",
+            b.id
+        )),
+        Some(_) => None,
+    }
 }
 
 // ── resources: named lock resources (#858) ─────────────────────────────────
@@ -848,6 +948,129 @@ pub fn sanitize_condition(s: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// A routing rule's path glob (#1176), on the same reject-never-rewrite
+/// contract as [`sanitize_condition`]: the filtered string comes back, and
+/// `parse_workflow` refuses anything the filter had to change.
+///
+/// **The alphabet is `A-Za-z0-9._-/` plus `*`, and nothing else.** The glob is
+/// interpolated *unquoted into a POSIX `case` pattern* in the `gh` shim, so
+/// every character it may contain has to be one the shell reads as either a
+/// literal or `*`. `[`, `]`, `\`, `{`, `}`, whitespace and quotes are all
+/// shell-pattern or word-splitting syntax, and none of them appears here.
+///
+/// **`?` is excluded deliberately, and it is the interesting omission.** It
+/// would be trivial to allow — and it is the one character whose meaning the
+/// two implementations could not be made to *provably* share: shell `case`
+/// matches one character in the shell's locale (one byte in the C locale that
+/// `sh` usually runs under), while a Rust mirror matches either a byte or a
+/// `char`, and the two answers differ on the first non-ASCII path anybody
+/// commits. With `*` as the only metacharacter, "any run of characters" and
+/// "any run of bytes" are the same set, and the shim/mirror agreement is a
+/// property of the alphabet rather than a claim in a PR body. Nobody routing
+/// reviewers by area needs a single-character wildcard.
+///
+/// Three shapes are refused outright rather than filtered, all for one reason —
+/// **a rule that could never fire is the unsatisfiable-gate failure this file
+/// refuses everywhere else**, and a routing rule that never fires silently
+/// removes a reviewer the repo asked for:
+///
+/// - a **leading `/`** — GitHub reports changed paths repo-relative, so
+///   `/src/**` matches nothing;
+/// - a **trailing `/`** — every changed path names a file, never a directory,
+///   so `src/` matches nothing (`src/**` is what the author meant);
+/// - a **`..` path segment** — no changed path GitHub reports contains one.
+///   (Not a containment check: nothing here is joined onto a root. It is the
+///   same never-fires argument.)
+pub fn sanitize_glob(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.ends_with('/')
+        || trimmed.split('/').any(|seg| seg == "..")
+    {
+        return None;
+    }
+    let cleaned: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '*'))
+        .take(MAX_GLOB_CHARS)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Does one [`sanitize_glob`]-clean pattern match one repo-relative changed
+/// path? **The whole glob contract of #1176, and the thing the shim's `case`
+/// mirrors.**
+///
+/// 1. `*` matches any run of characters, **including `/`**.
+/// 2. Every other character matches itself.
+/// 3. A leading `**/` is **optional**: `**/Cargo.toml` matches `Cargo.toml` as
+///    well as `crates/a/Cargo.toml`.
+/// 4. The match is anchored at both ends — the pattern describes the whole
+///    path, not a substring of it.
+///
+/// **Rule 1 is coarser than gitignore's on purpose**, and the argument is the
+/// direction of the error. Routing decides *which reviewers are required*:
+/// over-matching adds a lane (an extra review nobody needed), under-matching
+/// skips one (a merge the repo said needed that lane). Only one of those is
+/// survivable, so the semantics err toward matching. Coarse also buys the thing
+/// this feature actually has to pay for: `*`-crossing-`/` is exactly what a
+/// POSIX `case` does for free, so the shim and this function are the same
+/// matcher rather than two hand-written ones that agree today.
+///
+/// Rule 3 exists because `**/X` is the natural spelling of "every X" and under
+/// rules 1–2 alone it would silently miss the one at the repo root — a *skipped*
+/// reviewer, the unsurvivable direction. `**` anywhere else is simply `*`
+/// repeated, which matches the same set.
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    if star_match(pattern.as_bytes(), path.as_bytes()) {
+        return true;
+    }
+    // Rule 3. `strip_prefix` rather than a general "collapse `**`" pass: the
+    // ONLY place `**` means more than `*` is this one, and a rule the shim can
+    // state in a two-line `case` is a rule the two implementations can be shown
+    // to share.
+    match pattern.strip_prefix("**/") {
+        Some(rest) => star_match(rest.as_bytes(), path.as_bytes()),
+        None => false,
+    }
+}
+
+/// Anchored `*`-only wildcard match, iterative with one backtrack point — the
+/// classic greedy algorithm, so a pathological pattern cannot blow the stack the
+/// way a naive recursive matcher can. Bytes rather than `char`s because the
+/// alphabet [`sanitize_glob`] permits is ASCII and `*` spans whole runs either
+/// way; see that function for why `?` is not in it.
+fn star_match(pat: &[u8], s: &[u8]) -> bool {
+    let (mut p, mut i) = (0usize, 0usize);
+    // `star` = the last `*` in the pattern we can fall back to; `mark` = the
+    // input position it had consumed up to when we took that branch.
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while i < s.len() {
+        if p < pat.len() && pat[p] == s[i] {
+            p += 1;
+            i += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = p;
+            mark = i;
+            p += 1;
+        } else if star != usize::MAX {
+            // Mismatch after a `*`: let that `*` swallow one more byte.
+            p = star + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `*`s may match nothing; anything else left over is a mismatch,
+    // which is what makes this anchored at the end.
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
 /// Display names are cosmetic (pane title, roster row) and are rendered via
 /// `textContent`, never HTML — so this is hygiene, not a boundary: drop control
 /// characters (a pasted name must not smuggle escape codes into a pane title)
@@ -1160,6 +1383,20 @@ struct RawGate {
     also: Vec<String>,
     #[serde(default)]
     max_diff_lines: Option<u32>,
+    #[serde(default)]
+    routing: Vec<RawRoutingRule>,
+}
+
+/// One `gates.merge.routing[]` entry (#1176). `deny_unknown_fields` like every
+/// other `Raw*` type: a misspelled `path:`/`reviewer:` is a refusal, not a rule
+/// that silently routes nothing.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawRoutingRule {
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    reviewers: Vec<String>,
 }
 
 /// `to: worker` and `to: [rev-a, rev-b]` are both legal — a fan-out reads
@@ -1238,6 +1475,10 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         reviewers: vec!["rev".into()],
         also: vec!["ci-green".into()],
         max_diff_lines: Some(800),
+        routing: vec![RawRoutingRule {
+            paths: vec!["src/**".into()],
+            reviewers: vec!["rev".into()],
+        }],
     };
     let labels = RawIntakeLabels {
         ready: "agent-ready".into(),
@@ -1270,6 +1511,17 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
     out.insert("block".to_string(), keys_of("block", &block));
     out.insert("edge".to_string(), keys_of("edge", &edge));
     out.insert("gate".to_string(), keys_of("gate", &gate));
+    // #1176. Its own section for the same reason `intake.labels` has one: a
+    // routing rule is a mapping with its own field set, and a section that only
+    // said "gate.routing is a list" would leave `paths:`/`reviewers:` outside
+    // every guarantee this manifest exists to give.
+    out.insert(
+        "gate.routing".to_string(),
+        keys_of(
+            "gate.routing",
+            &RawRoutingRule { paths: vec!["src/**".into()], reviewers: vec!["rev".into()] },
+        ),
+    );
     out.insert("intake".to_string(), keys_of("intake", &intake));
     out.insert("intake.labels".to_string(), keys_of("intake.labels", &labels));
     out.insert("merge_queue".to_string(), keys_of("merge_queue", &merge_queue));
@@ -1348,6 +1600,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
         ("workflow", wire_defaults::<RawWorkflow>(r#"{"version":1}"#, &["version"])),
         ("block", wire_defaults::<RawBlock>(r#"{"id":"b","kind":"worker"}"#, &["id", "kind"])),
         ("gate", wire_defaults::<RawGate>("{}", &[])),
+        ("gate.routing", wire_defaults::<RawRoutingRule>("{}", &[])),
         ("intake", wire_defaults::<RawIntake>("{}", &[])),
         ("intake.labels", wire_defaults::<RawIntakeLabels>("{}", &[])),
         ("merge_queue", wire_defaults::<RawMergeQueue>("{}", &[])),
@@ -1422,7 +1675,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("resource.slots", "max", json!(RESOURCE_SLOTS_MAX));
     fact("resource.max_hold_minutes", "min", json!(1));
     fact("resource.max_hold_minutes", "max", json!(RESOURCE_MAX_HOLD_MINUTES_MAX));
-    // Cardinality: the only section with a cap on how many entries it may hold.
+    // Cardinality: the sections with a cap on how many entries they may hold.
     fact("workflow.resources", "max_entries", json!(RESOURCES_MAX));
     // Every WIP cap has the same floor and deliberately no ceiling: a limit
     // above the board's own size degenerates to "no limit", which is what the
@@ -1435,6 +1688,10 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     for status in workflow_schema_keys().get("board.wip").into_iter().flatten() {
         fact(&format!("board.wip.{status}"), "min", json!(WIP_LIMIT_MIN));
     }
+    // #1176. Both are bounds on work the SHIM does on the merge path — every
+    // rule against every changed file, in shell — not on what a form can render.
+    fact("gate.routing", "max_entries", json!(ROUTING_RULES_MAX));
+    fact("gate.routing.paths", "max_entries", json!(ROUTING_PATHS_MAX));
 
     out
 }
@@ -2060,61 +2317,9 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 bad = true;
                 continue;
             }
-            match blocks.iter().find(|b| b.id == rname) {
-                None => {
-                    errs.push(format!("gates.{name}: reviewer {rname:?} names no block"));
-                    bad = true;
-                }
-                // The manager (#1161) is structurally caught by the arm below —
-                // it is not reviewer-kind — but "that block's kind is manager,
-                // not a reviewer" describes the type error and not the mistake.
-                // An author who named the manager on a gate was reaching for
-                // "the human signs off", which is a real thing they wanted and
-                // a real thing this gate cannot express, so say that instead.
-                // The pane validator carries the same arm
-                // (`validateWorkflow`, gate-not-a-reviewer), and the liaison
-                // arm below is the shape both are modelled on.
-                Some(b) if b.kind == Role::Manager => {
-                    errs.push(format!(
-                        "gates.{name}: reviewer {:?} is a manager — the manager is the human's \
-                         interface, not a reviewer: it records no verdict, so a gate naming it \
-                         could never open. A gate reads REVIEWER verdicts; the human's own sign-off \
-                         is the merge gate loomux already applies on top of it.",
-                        b.id
-                    ));
-                    bad = true;
-                }
-                // A gate reads reviewer verdicts. Naming a worker would make it
-                // permanently unsatisfiable — nothing would ever record a
-                // verdict for it — which is the "dangling reference the UI
-                // happily saves" failure this validation pass exists to prevent.
-                Some(b) if b.kind != Role::Reviewer => {
-                    errs.push(format!(
-                        "gates.{name}: reviewer {:?} is a {} block, not a reviewer — a gate can only require reviewer verdicts",
-                        b.id,
-                        b.kind.as_str()
-                    ));
-                    bad = true;
-                }
-                // The same unsatisfiable gate, one kind further in (#891). A
-                // liaison IS reviewer-kind — it rides that class for its
-                // read-only, persistent posture — but it is denied
-                // `review_verdict` at every layer precisely because it reviews
-                // nothing. Naming one here would therefore wait forever for a
-                // verdict no code path can produce, which is exactly the
-                // failure the arm above refuses; caught at parse rather than
-                // discovered as a merge gate that never opens.
-                Some(b) if b.role_hint.as_deref() == Some("liaison") => {
-                    errs.push(format!(
-                        "gates.{name}: reviewer {:?} is a liaison — it is reviewer-kind, but a \
-                         liaison never records a verdict (it presents the human's questions and \
-                         relays their answers), so a gate naming it could never open. Name a \
-                         reviewer that reviews.",
-                        b.id
-                    ));
-                    bad = true;
-                }
-                Some(_) => {}
+            if let Some(e) = gate_reviewer_error(&name, "reviewer", rname, &blocks) {
+                errs.push(e);
+                bad = true;
             }
         }
         if rg.reviewers.is_empty() {
@@ -2160,6 +2365,119 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             errs.push(format!("gates.{name}: max_diff_lines must be a positive number — omit the key to declare no limit"));
             bad = true;
         }
+        // #1176's path-based routing. Every refusal below is LOUD — a rule
+        // loomux could not read is never a rule it quietly drops, because the
+        // whole point of a routing rule is to ADD a required reviewer, and the
+        // failure mode of silently dropping one is a merge that skipped a lane
+        // the repo asked for.
+        let mut routing: Vec<RoutingRule> = Vec::new();
+        if !rg.routing.is_empty() {
+            // `threshold: N` counts votes over a FIXED list; routing makes the
+            // list a function of the diff. Together they have no honest meaning:
+            // adding a lane would also add a candidate that could supply one of
+            // the N passes, so declaring a routing rule could make the gate
+            // EASIER to satisfy — the one direction a gate must never move. The
+            // refusal says what to do instead (#782) rather than picking a
+            // reading and hoping the author meant it.
+            if matches!(require, GateRequire::Threshold(_)) {
+                errs.push(format!(
+                    "gates.{name}: routing: and require: threshold cannot both be declared — a \
+                     threshold counts passes over a fixed reviewer list, and a routing rule makes \
+                     that list depend on the diff, so together they would let an extra lane SUPPLY \
+                     one of the required passes instead of adding one. Use require: all-pass with \
+                     routing:, and let each rule name the lane its paths need."
+                ));
+                bad = true;
+            }
+            if rg.routing.len() > ROUTING_RULES_MAX {
+                errs.push(format!(
+                    "gates.{name}: {} routing rules — at most {ROUTING_RULES_MAX}. The shim \
+                     evaluates every rule against every changed file on every merge; past this \
+                     many lanes the block has stopped routing and started listing.",
+                    rg.routing.len()
+                ));
+                bad = true;
+            }
+        }
+        for (i, rr) in rg.routing.iter().enumerate() {
+            // 1-based, matching the position an author counts to in their own
+            // file — and the number every refusal downstream cites.
+            let idx = i + 1;
+            let ctx = format!("routing rule {idx} reviewer");
+            if rr.paths.is_empty() {
+                errs.push(format!(
+                    "gates.{name}: routing rule {idx} declares no paths — a rule that matches \
+                     nothing can never require anybody. Omit the rule, or give it a path glob."
+                ));
+                bad = true;
+            }
+            if rr.paths.len() > ROUTING_PATHS_MAX {
+                errs.push(format!(
+                    "gates.{name}: routing rule {idx} declares {} paths — at most {ROUTING_PATHS_MAX}.",
+                    rr.paths.len()
+                ));
+                bad = true;
+            }
+            if rr.reviewers.is_empty() {
+                errs.push(format!(
+                    "gates.{name}: routing rule {idx} names no reviewers — a rule that requires \
+                     nobody is not a rule."
+                ));
+                bad = true;
+            }
+            let mut paths: Vec<String> = Vec::new();
+            let mut seen_paths: BTreeSet<String> = BTreeSet::new();
+            for p in &rr.paths {
+                // Rejected, never rewritten — the #225 contract. An author must
+                // be able to reference the glob they actually wrote, and a glob
+                // loomux silently narrowed is a lane loomux silently dropped.
+                match sanitize_glob(p) {
+                    Some(clean) if clean == p.trim() => {
+                        if !seen_paths.insert(clean.clone()) {
+                            errs.push(format!(
+                                "gates.{name}: routing rule {idx} lists the path {p:?} more than \
+                                 once — name each glob once."
+                            ));
+                            bad = true;
+                            continue;
+                        }
+                        paths.push(clean);
+                    }
+                    _ => {
+                        errs.push(format!(
+                            "gates.{name}: routing rule {idx}: {p:?} is not a usable path glob. \
+                             Use letters, digits, '.', '_', '-', '/' and '*' — and write a file \
+                             glob, not a directory: 'src/**', never 'src/', '/src/**' or a '..' \
+                             segment (GitHub reports changed paths repo-relative, so those match \
+                             nothing at all)."
+                        ));
+                        bad = true;
+                    }
+                }
+            }
+            let mut reviewers: Vec<BlockId> = Vec::new();
+            let mut seen_routed: BTreeSet<String> = BTreeSet::new();
+            for r in &rr.reviewers {
+                let rname = r.trim();
+                // Same set-not-sequence rule the static list follows, and for a
+                // milder version of the same reason: a name written twice in one
+                // rule is a typo for a second lane, not an emphasis.
+                if !seen_routed.insert(rname.to_string()) {
+                    errs.push(format!(
+                        "gates.{name}: routing rule {idx} names reviewer {rname:?} more than once"
+                    ));
+                    bad = true;
+                    continue;
+                }
+                if let Some(e) = gate_reviewer_error(&name, &ctx, rname, &blocks) {
+                    errs.push(e);
+                    bad = true;
+                    continue;
+                }
+                reviewers.push(rname.to_string());
+            }
+            routing.push(RoutingRule { paths, reviewers });
+        }
         if bad {
             continue;
         }
@@ -2170,6 +2488,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 reviewers: rg.reviewers.iter().map(|r| r.trim().to_string()).collect(),
                 also,
                 max_diff_lines: rg.max_diff_lines,
+                routing,
             },
         );
     }
@@ -2938,12 +3257,20 @@ pub fn gate_need(gate: &Gate) -> u32 {
 /// the built-in four, so `spawn_agent(block: "rev-orch")` failed with "unknown
 /// block" and the gate could never be satisfied from inside that session). Pure,
 /// so both the arm-time refusal and a live status read share one rule.
+/// **Routed reviewers count too** (#1176). A rule naming a block this roster
+/// cannot spawn makes the gate unsatisfiable for every PR whose paths match it —
+/// which is the same #316 failure the static list is checked for, arriving on a
+/// subset of PRs instead of all of them. Reported here rather than left to be
+/// discovered as "the merge gate stopped opening on frontend PRs only".
 pub fn gate_missing_blocks(gate: &Gate, blocks: &[Block]) -> Vec<BlockId> {
-    gate.reviewers
-        .iter()
-        .filter(|id| !blocks.iter().any(|b| &b.id == *id && b.kind == Role::Reviewer))
-        .cloned()
-        .collect()
+    let mut out: Vec<BlockId> = Vec::new();
+    let named = gate.reviewers.iter().chain(gate.routing.iter().flat_map(|r| r.reviewers.iter()));
+    for id in named {
+        if !blocks.iter().any(|b| &b.id == id && b.kind == Role::Reviewer) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
 }
 
 /// The agent-capacity a declared workflow structurally needs (#255) — derived
@@ -3023,7 +3350,21 @@ pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityReco
     // that under-advises is wrong TODAY; it is not a head start on M3's work.
     let has_manager = blocks.iter().any(|b| b.kind == Role::Manager);
 
-    let reviewers_needed = gate.map_or(reviewers, gate_need);
+    // #1176. A gate that routes by path needs, in the WORST case, its declared
+    // list plus every lane any rule can add — a PR that touches all of them. The
+    // worst case is the one a capacity floor has to be built on: under-advising
+    // here is how #255 happens, an orchestrator discovering two hours in that it
+    // must kill a live agent to complete one review round. Deduped against the
+    // declared list, and against itself, so a lane two rules both name counts once.
+    let reviewers_needed = gate.map_or(reviewers, |g| {
+        let mut extra: Vec<&BlockId> = Vec::new();
+        for id in g.routing.iter().flat_map(|r| r.reviewers.iter()) {
+            if !g.reviewers.contains(id) && !extra.contains(&id) {
+                extra.push(id);
+            }
+        }
+        gate_need(g) + extra.len() as u32
+    });
     let worker_slot = u32::from(workers > 0);
     CapacityRecommendation {
         // `minimum` is deliberately untouched: it is what ONE REVIEW ROUND
@@ -3214,8 +3555,71 @@ pub fn gate_file_text(gate: &Gate) -> String {
         Some(0) => out.push_str(&format!("{POISON_KEY} unusable-max-diff-lines\n")),
         Some(n) => out.push_str(&format!("{MAX_DIFF_LINES_KEY} {n}\n")),
     }
+    // #1176's routing rules, one line per (rule, glob) and one per (rule,
+    // reviewer), each carrying the rule's 1-based index.
+    //
+    // **Why not one line per rule.** The reader is a POSIX `while read -r k v w`
+    // loop with no arrays: a rule packed onto one line would have to be re-split
+    // inside the shell, and every spelling of that (an `IFS` swap, a `set --`)
+    // either clobbers the shim's own positional parameters or introduces a
+    // second delimiter for a glob alphabet to have to avoid. Three fixed fields
+    // fit the loop that is already there, and the index is what stitches the
+    // halves back together — see [`parse_gate_file`], which refuses any file
+    // where they do not stitch.
+    if !gate.routing.is_empty() {
+        if matches!(gate.require, GateRequire::Threshold(_)) {
+            // `parse_workflow` refuses this pair outright, so reaching here means
+            // the parse contract has regressed. Poison rather than write a file
+            // whose two halves would be read as a LAXER gate than either says.
+            out.push_str(&format!("{POISON_KEY} routing-with-threshold\n"));
+        }
+        if gate.routing.len() > ROUTING_RULES_MAX {
+            out.push_str(&format!("{POISON_KEY} too-many-routing-rules\n"));
+        }
+    }
+    for (i, rule) in gate.routing.iter().enumerate() {
+        let idx = i + 1;
+        // A rule missing either half is unsatisfiable-or-vacuous, and both are
+        // refused at parse. Poisoned here for the same reason the tokens below
+        // are: the file must never be a weaker gate than the workflow declared.
+        if rule.paths.is_empty() || rule.reviewers.is_empty() {
+            out.push_str(&format!("{POISON_KEY} incomplete-routing-rule\n"));
+        }
+        // The per-rule path cap, poisoned for the same reason the rule cap above
+        // is (#1176 rev-972 N1): `parse_gate_file` refuses a file past it, so
+        // writing one would emit a file loomux itself calls malformed.
+        if rule.paths.len() > ROUTING_PATHS_MAX {
+            out.push_str(&format!("{POISON_KEY} too-many-routing-paths\n"));
+        }
+        for p in &rule.paths {
+            match sanitize_glob(p) {
+                Some(clean) if clean == *p => {
+                    out.push_str(&format!("{ROUTE_PATH_KEY} {idx} {p}\n"))
+                }
+                _ => out.push_str(&format!("{POISON_KEY} unusable-routing-glob\n")),
+            }
+        }
+        for r in &rule.reviewers {
+            match sanitize_id(r) {
+                Some(clean) if clean == *r => {
+                    out.push_str(&format!("{ROUTE_REVIEWER_KEY} {idx} {r}\n"))
+                }
+                _ => out.push_str(&format!("{POISON_KEY} unusable-routing-reviewer\n")),
+            }
+        }
+    }
     out
 }
+
+/// The [`MERGE_GATE_FILE`] key carrying one routing rule's path glob (#1176):
+/// `route-path <1-based rule index> <glob>`. Hyphenated to match the file's own
+/// spelling convention (`all-pass`, `max-diff-lines`), which is not the YAML
+/// key's.
+pub const ROUTE_PATH_KEY: &str = "route-path";
+
+/// The [`MERGE_GATE_FILE`] key carrying one routing rule's required reviewer:
+/// `route-reviewer <1-based rule index> <block id>`. See [`ROUTE_PATH_KEY`].
+pub const ROUTE_REVIEWER_KEY: &str = "route-reviewer";
 
 /// The [`MERGE_GATE_FILE`] key carrying [`Gate::max_diff_lines`]. Hyphenated to
 /// match `all-pass`/`ci-green` — the file's own spelling convention, which is
@@ -3247,6 +3651,11 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
     let mut reviewers: Vec<BlockId> = Vec::new();
     let mut also: Vec<String> = Vec::new();
     let mut max_diff_lines: Option<u32> = None;
+    // #1176. Halves of a routing rule arrive on separate lines and are stitched
+    // back together by index after the loop; `BTreeMap` so the stitch walks them
+    // in rule order rather than file order.
+    let mut rule_paths: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut rule_reviewers: BTreeMap<u32, Vec<BlockId>> = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -3282,12 +3691,80 @@ pub fn parse_gate_file(text: &str) -> Option<Gate> {
                     None => return None,
                 }
             }
+            // #1176. Same direction as every arm above: a routing line loomux
+            // cannot read makes the whole file unusable, because the thing it
+            // would have added is a REQUIRED reviewer. A dropped one is a merge
+            // that skipped a lane, which is precisely the laxening this reader
+            // refuses to perform.
+            // **Rejected, never rewritten** — and the comparison is what makes
+            // that true. `sanitize_glob`/`sanitize_id` FILTER: `src/[ab]` comes
+            // back as `src/ab`, which is not a refusal, it is a DIFFERENT RULE
+            // silently substituted for the one the file carries. `gate_file_text`
+            // poisons rather than writes such a token, so anything reaching here
+            // is a hand edit or a corruption — exactly the case this reader must
+            // refuse rather than quietly reinterpret.
+            //
+            // A **fourth token** is refused for the same reason: neither
+            // alphabet contains whitespace, so a line that has any has already
+            // been truncated by the word split — `route-path 1 src/a b` reads as
+            // the narrower glob `src/a`, which is clean and wrong. Exactly three
+            // fields, or the file is not a gate.
+            (Some(ROUTE_PATH_KEY), Some(i), Some(g)) => {
+                let idx = routing_index(i)?;
+                let clean = sanitize_glob(g)?;
+                if clean != g || f.next().is_some() {
+                    return None;
+                }
+                rule_paths.entry(idx).or_default().push(clean);
+            }
+            (Some(ROUTE_REVIEWER_KEY), Some(i), Some(r)) => {
+                let idx = routing_index(i)?;
+                let clean = sanitize_id(r)?;
+                if clean != r || f.next().is_some() {
+                    return None;
+                }
+                rule_reviewers.entry(idx).or_default().push(clean);
+            }
             // Anything else — a poison line, a truncated key, a hand edit — makes
             // the whole file unusable. Skipping it would drop a requirement.
             _ => return None,
         }
     }
-    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also, max_diff_lines })
+    // Stitch the two halves. The indices must be exactly 1..=N with BOTH halves
+    // present for every one of them: a gap, a duplicate index that lost its
+    // partner, or a `route-path` with no `route-reviewer` is a file that cannot
+    // be read as the gate someone declared, and an unreadable gate refuses.
+    let n = rule_paths.len().max(rule_reviewers.len());
+    if n > ROUTING_RULES_MAX {
+        return None;
+    }
+    let mut routing: Vec<RoutingRule> = Vec::new();
+    for idx in 1..=n as u32 {
+        let paths = rule_paths.remove(&idx)?;
+        let reviewers = rule_reviewers.remove(&idx)?;
+        if paths.is_empty() || reviewers.is_empty() || paths.len() > ROUTING_PATHS_MAX {
+            return None;
+        }
+        routing.push(RoutingRule { paths, reviewers });
+    }
+    // Anything left over means the indices were not contiguous — an index past
+    // `n`, which nothing above could have consumed.
+    if !rule_paths.is_empty() || !rule_reviewers.is_empty() {
+        return None;
+    }
+    // The pair `parse_workflow` refuses (see there for why). Refused here too,
+    // rather than trusted to be impossible: this reader's whole job is to be the
+    // half that does not assume the other half held.
+    if !routing.is_empty() && matches!(require, GateRequire::Threshold(_)) {
+        return None;
+    }
+    (!reviewers.is_empty()).then_some(Gate { require, reviewers, also, max_diff_lines, routing })
+}
+
+/// A `route-path`/`route-reviewer` line's rule index — 1-based, so `0` is not an
+/// index and is refused with everything else that is not a plain positive number.
+fn routing_index(s: &str) -> Option<u32> {
+    s.parse::<u32>().ok().filter(|n| *n > 0)
 }
 
 /// What the small-batch clause (#1174) says about one PR — the pure decision
@@ -3326,6 +3803,186 @@ pub fn check_diff_size(gate: &Gate, lines: Option<u64>) -> DiffSizeVerdict {
         Some(lines) if lines > u64::from(limit) => DiffSizeVerdict::TooLarge { lines, limit },
         Some(_) => DiffSizeVerdict::Ok,
     }
+}
+
+// ── path-based reviewer routing (#1176) ─────────────────────────────────────
+
+/// One routing rule that MATCHED — the "which rules fired and why" half of the
+/// gate's own report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FiredRule {
+    /// The rule's 1-based position in `gates.merge.routing`, so a refusal can
+    /// name the line the author has to look at.
+    pub index: u32,
+    /// The rule's **declared** globs — all of them, not the one that happened to
+    /// match. Deliberate: the shim streams the changed-file list and tests the
+    /// globs per file, this walks the globs per rule, and "the first glob that
+    /// matched" is therefore a different string on the two sides whenever a rule
+    /// has more than one. The rule's own text is the same on both, and it is
+    /// also the thing the author needs to see.
+    pub paths: Vec<String>,
+    /// The reviewers this rule requires.
+    pub reviewers: Vec<BlockId>,
+}
+
+/// The required-reviewer set for one PR, once routing has been applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutingDecision {
+    /// [`Gate::reviewers`] ∪ every fired rule's reviewers, in that order:
+    /// the static list first, then the rules in declaration order, each new id
+    /// appended once. The `gh` shim appends in exactly this order too, so the
+    /// two produce the same list and not merely the same set.
+    pub required: Vec<BlockId>,
+    /// Which rules fired. Empty when the gate declares no routing, or when it
+    /// declares routing and nothing matched.
+    pub fired: Vec<FiredRule>,
+}
+
+impl RoutingDecision {
+    /// `base` with its reviewer list replaced by [`required`](Self::required)
+    /// and its routing spent — **the effective gate**, which is what everything
+    /// downstream evaluates.
+    ///
+    /// Routing resolves to a reviewer list and then gets out of the way, so
+    /// [`evaluate_merge_gate`], [`gate_need`] and the `body-unchanged` loop stay
+    /// exactly one implementation each. A second gate decision that knew about
+    /// routing would be a third implementation of the gate, which this codebase
+    /// treats as a defect rather than an optimization.
+    pub fn gate(&self, base: &Gate) -> Gate {
+        Gate {
+            require: base.require,
+            reviewers: self.required.clone(),
+            also: base.also.clone(),
+            max_diff_lines: base.max_diff_lines,
+            routing: Vec::new(),
+        }
+    }
+}
+
+/// Apply [`Gate::routing`] to one PR's changed files — **the pure decision the
+/// `gh` shim's shell mirrors and the merge queue re-runs.**
+///
+/// `changed` is the PR's repo-relative changed paths, or `None` when that list
+/// could not be resolved *or could not be shown to be complete* (see
+/// [`ROUTING_FILES_JQ`]).
+///
+/// - A gate that declares **no routing** answers without looking at `changed` at
+///   all — the absent-config no-op that keeps every repo which never wrote the
+///   key on exactly the path it was on before #1176, and the same shape
+///   [`check_diff_size`] takes.
+/// - A gate that **does** declare routing and cannot see the file list answers
+///   `None`: **refuse.** Unknown is never safe here in a particularly sharp way
+///   — the unknown thing is *which reviewers are required*, so guessing "none of
+///   the rules fired" is guessing in favour of merging.
+pub fn route_reviewers(gate: &Gate, changed: Option<&[String]>) -> Option<RoutingDecision> {
+    // RED EVIDENCE (#1176 scratch A): routing does nothing at all.
+    if true {
+        let _ = changed;
+        return Some(RoutingDecision { required: gate.reviewers.clone(), fired: Vec::new() });
+    }
+    if gate.routing.is_empty() {
+        return Some(RoutingDecision { required: gate.reviewers.clone(), fired: Vec::new() });
+    }
+    let changed = changed?;
+    let mut required = gate.reviewers.clone();
+    let mut fired: Vec<FiredRule> = Vec::new();
+    for (i, rule) in gate.routing.iter().enumerate() {
+        if !rule.paths.iter().any(|g| changed.iter().any(|f| glob_match(g, f))) {
+            continue;
+        }
+        for r in &rule.reviewers {
+            if !required.contains(r) {
+                required.push(r.clone());
+            }
+        }
+        fired.push(FiredRule {
+            index: i as u32 + 1,
+            paths: rule.paths.clone(),
+            reviewers: rule.reviewers.clone(),
+        });
+    }
+    Some(RoutingDecision { required, fired })
+}
+
+/// The first line [`ROUTING_FILES_JQ`] emits when — and only when — it can
+/// account for every changed file on the PR.
+pub const ROUTED_FILES_OK: &str = "ok";
+
+/// The prefix on each path line [`ROUTING_FILES_JQ`] emits.
+///
+/// A prefix rather than a bare path so the status word and the data live in
+/// different shapes: without it, a repo containing a file literally named `ok`
+/// would emit a line indistinguishable from the header.
+pub const ROUTED_FILES_PREFIX: &str = "p ";
+
+/// Reduce `gh pr view --json files,changedFiles` to the changed-path list
+/// routing needs — **one definition, two consumers**, the same arrangement
+/// [`BASE_CHECK_RUNS_JQ`] established: the `gh` shim interpolates this constant
+/// into its POSIX body and `mqdriver::pr_files_argv` passes it to `gh --jq`, so
+/// the shim and the merge queue cannot ask GitHub different questions.
+///
+/// Output is a line-oriented protocol read by [`parse_routed_files`] in Rust and
+/// by a `while read` loop in shell: the word [`ROUTED_FILES_OK`], then one
+/// `p <path>` line per changed file. **Anything else is a refusal** — there is
+/// no word for "some of the files", because a partial list is not an answer to
+/// "did this PR touch `src/**`".
+///
+/// **The truncation clause is the whole reason this is a reduction and not a
+/// plain `.files[].path`.** `gh pr view --json files` fetches ONE page: the
+/// GraphQL `files` connection is capped at 100 while `changedFiles` counts them
+/// all. Verified live against this repo — PR #1181 answered
+/// `{changed: 32, listed: 32}` and PR #1018 answered `{changed: 135, listed:
+/// 100}` — so on any PR past a hundred files the list silently omits the tail.
+/// For a *size* gate that omission would be visible; for routing it fails
+/// **open** and invisibly: the one file that would have matched a rule sits on
+/// page two, no rule fires, and the lane the repo asked for is quietly not
+/// required. That is #1181's own pagination finding wearing routing's hat, so it
+/// gets the same answer — a page that cannot account for every file is not an
+/// answer, and `!=` (not `<`) is the comparison, because a count that disagrees
+/// in *either* direction means the payload is not the shape this question rests
+/// on.
+///
+/// The shape it rests on is **checked, not assumed**, for the same reason
+/// `BASE_CHECK_RUNS_JQ` checks its own: `null` sorts below every number in jq,
+/// so an absent `changedFiles` would make a comparison read false and fall
+/// through to the answer that merges. `has(...)` answers "unaccountable"
+/// instead.
+///
+/// A path carrying a **newline or carriage return** is refused too. It cannot be
+/// expressed in a one-path-per-line protocol at all, so a reader would silently
+/// see two files where the repo has one — and the shim's reader is a merge gate
+/// being fed a path that a fork PR's author chose.
+pub const ROUTING_FILES_JQ: &str = "if (has(\"files\")|not) or (has(\"changedFiles\")|not) then \"unaccountable\" elif (.files|length) != .changedFiles then \"unaccountable\" elif any(.files[]; (.path|type) != \"string\" or (.path|length) == 0 or (.path|test(\"[\\n\\r]\"))) then \"unaccountable\" else ([\"ok\"] + (.files|map(\"p \" + .path)))[] end";
+
+/// Read [`ROUTING_FILES_JQ`]'s output back into a changed-path list — the Rust
+/// half of that protocol, mirrored in shell by the `gh` shim.
+///
+/// `None` for **anything** that is not a complete, well-formed answer: the
+/// `unaccountable` word, an empty capture (gh failed, jq errored, the PR is
+/// gone), a line without the [`ROUTED_FILES_PREFIX`], an empty path. Callers
+/// hand that straight to [`route_reviewers`] as `None`, which refuses.
+///
+/// A PR with genuinely zero changed files is `Some(vec![])`, not `None`: that is
+/// a complete answer that happens to be empty, and the distinction is the whole
+/// difference between "no rule matched" and "loomux cannot say".
+pub fn parse_routed_files(out: &str) -> Option<Vec<String>> {
+    let mut lines = out.lines();
+    if lines.next().map(str::trim) != Some(ROUTED_FILES_OK) {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    for line in lines {
+        // A trailing blank line is how a capture ends, not a file.
+        if line.trim().is_empty() {
+            continue;
+        }
+        let path = line.strip_prefix(ROUTED_FILES_PREFIX)?;
+        if path.is_empty() {
+            return None;
+        }
+        files.push(path.to_string());
+    }
+    Some(files)
 }
 
 // ── schema field-inventory pin (#382 P1 rev-26 NB1) ─────────────────────────

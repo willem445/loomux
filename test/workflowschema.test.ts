@@ -198,6 +198,20 @@ function docFor(section: string, field: string, yaml: string): string {
       return (
         ["version: 1", ...roster, "gates:", "  merge:", `    ${field}: ${yaml}`].join("\n") + "\n"
       );
+    // #1176: the field under test is a key on the FIRST routing rule. The rule's
+    // other key is left off deliberately — the emitter has to put it back, which
+    // is what makes this round-trip mean something for a section-list.
+    case "gate.routing":
+      return (
+        [
+          "version: 1",
+          ...roster,
+          "gates:",
+          "  merge:",
+          "    routing:",
+          `      - ${field}: ${yaml}`,
+        ].join("\n") + "\n"
+      );
     case "intake":
       return ["version: 1", ...roster, "intake:", `  ${field}: ${yaml}`].join("\n") + "\n";
     case "intake.labels":
@@ -238,6 +252,8 @@ function readBack(w: Workflow, section: string, field: string): { value: unknown
       return at(w.edges[0] as unknown as Record<string, unknown>);
     case "gate":
       return at(w.gates.merge as unknown as Record<string, unknown>);
+    case "gate.routing":
+      return at(w.gates.merge?.routing?.[0] as unknown as Record<string, unknown>);
     case "intake":
       return at(w.intake as unknown as Record<string, unknown>);
     case "intake.labels":
@@ -341,6 +357,11 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "gate.reviewers",
   "gate.also",
   "gate.max_diff_lines",
+  // #1176. The pane READS, EMITS and VALIDATES these — without which a rule
+  // would be a line the next form edit silently deleted — and shows them
+  // read-only. What it has no control for yet is adding or changing one.
+  "gate.routing.paths",
+  "gate.routing.reviewers",
   "intake.source",
   "intake.labels.ready",
   "intake.labels.investigate",

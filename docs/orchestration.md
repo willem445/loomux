@@ -1266,6 +1266,69 @@ so this only bites a base with more than 100 checks on one commit; if that is
 permanently true of your default branch, `base-green` cannot be enforced for it
 and should not be declared.
 
+**Route reviewers by path: `routing:`.** A gate's `reviewers:` list is the same
+on every PR, which leaves a multi-lane workflow choosing between requiring every
+lane on every PR and leaving the decision to prose. `routing:` makes the required
+set depend on what the PR actually changed:
+
+```yaml
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-lead]
+    routing:
+      - paths: ["src/**"]
+        reviewers: [rev-ui]
+      - paths: ["**/Cargo.toml", "package-lock.json"]
+        reviewers: [rev-deps]
+```
+
+A PR that touches only docs needs `rev-lead`. One that touches `src/` needs
+`rev-lead` and `rev-ui`. One that adds a dependency needs `rev-deps` as well —
+which is the "an agent quietly added a dependency" review you would otherwise be
+relying on someone to remember. **Rules only ever add**: the required set is your
+`reviewers:` list plus every rule that matched, so writing a rule can never make
+a gate easier to satisfy. A routed reviewer is treated exactly like a declared
+one from there on — its pass goes stale on a re-push, its `fail` blocks the
+merge, and the refusal names it and the rule that pulled it in.
+
+The globs are orrerix's own, not your repo's `CODEOWNERS` (that file names
+GitHub users and teams; a gate names workflow blocks). They are deliberately
+simple — one wildcard and one special case:
+
+| You write | It matches |
+| --- | --- |
+| `src/**` | anything under `src/`, at any depth |
+| `src/*.ts` | also anything under `src/` ending `.ts`, at any depth — `*` crosses `/` |
+| `**/Cargo.toml` | every `Cargo.toml`, including the one at the repo root |
+| `package-lock.json` | that exact path, and nothing else |
+
+`*` matches any run of characters *including* `/`, a leading `**/` is optional,
+and the match covers the whole path rather than part of it. That is coarser than
+`.gitignore`, on purpose: a glob that matches too much asks for one review you
+did not need, and a glob that matches too little skips one you did — so the
+simple rule is the one that errs the safe way. Write file globs, not directories:
+`src/**`, never `src/` (and never a leading `/` or a `..` segment) — those match
+nothing at all, so orrerix refuses them at load rather than letting a rule
+silently never fire.
+
+Two things to know before you adopt it:
+
+- **`routing:` and `require: threshold` cannot both be declared.** A threshold
+  counts passes over a fixed list; routing makes the list depend on the diff, so
+  together an extra lane could *supply* one of the required passes instead of
+  adding one. Rather than guess which you meant, orrerix refuses the file. Use
+  `require: all-pass` with `routing:`.
+- **A PR whose changed files orrerix cannot list in full is refused.** GitHub
+  returns a PR's file list one page at a time and orrerix can only ask for 100,
+  so a PR changing more than 100 files cannot be routed — it is refused rather
+  than treated as matching nothing, because "no rule fired" and "we could not
+  look" must never be the same answer for a gate. Split such a PR (which
+  `max_diff_lines` above probably wanted anyway).
+
+The workflow pane shows your rules and preserves them across edits, but does not
+offer a control for adding one yet — edit `.orrerix/workflow.yml` directly.
+
 **Verdict notices are short on purpose.** Recording a verdict also types a
 courtesy notice into the orchestrator's pane, so it learns the review landed
 without polling for it. That notice carries the verdict, the PR, and only the
