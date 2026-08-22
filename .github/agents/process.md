@@ -41,10 +41,12 @@ impression of the session.** Every friction window carries `recurrence`: how man
 OTHER sessions in this group hit the same wall, matched on a normalized key and
 counted once per session, plus `corroborated_by` naming up to five of them.
 
-- `recurrence: 0` — **seen only here.** A one-off. It does not become a durable
-  learning because it was painful, because it cost hours, or because you can write
-  a convincing rule about it. This is the anti-bloat filter, and it is the single
-  most common thing you will be tempted to overrule.
+- `recurrence: 0` — **nothing corroborating in the scan window as it stands right
+  now**, which on a live group is NOT the same as "seen only here" (see the bounds
+  below, and re-read the count before you act on it). Once re-read it is the
+  anti-bloat filter: a wall does not become a durable learning because it was
+  painful, because it cost hours, or because you can write a convincing rule about
+  it, and overruling that is the single most common thing you will be tempted to do.
 - `recurrence >= 1` — a second session independently hit it. That is the evidence
   that a fresh worker would hit it too. Cite the count and the corroborating agent
   ids in your PR body, so a reviewer can check the claim instead of taking it.
@@ -54,7 +56,11 @@ Two numbers bound what those counts are worth, and both are on the digest:
 group with nothing to compare against, NOT a group of one-offs**, and in that case
 say so in the PR rather than proposing on evidence you don't have) and
 `corroboration_capped` (`true` = older sessions went unread, so every `recurrence`
-is a floor, not a total — never write "hit exactly twice" off a capped scan).
+is a floor against history — never write "hit exactly twice" off a capped scan).
+Both are readings at a moment, capped or not: the candidate set is re-derived on
+every call from the group's most-recently-updated sessions, so a FINISHED window's
+count rises as siblings finish beside you, and only once capped does it also fall as
+newer sessions push older ones out. Re-read it at the END of your review (#1215).
 
 **Those two bounds shrink the count; one thing inflates it.** Local `cargo` is banned
 for agents (#488), so every worker reads results through `gh pr checks`, and the DoD
