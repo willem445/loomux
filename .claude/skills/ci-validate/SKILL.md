@@ -336,6 +336,13 @@ five-round wave is **twenty** concurrent jobs. Re-read that list rather than
 this sentence if `ci.yml` gains or loses a job, and don't launch a wave against
 the green run you are waiting on (#1196).
 
+**Bank the base green at the wave's own SHA before you push the wave.** "A red
+only counts against a banked green" (below) is a citation rule for one round; for
+a wave it is a *launch precondition*, because anything broken at the base breaks
+every round identically and a compile error evidences nothing. Signature: a whole
+wave returns failing on one message and none of them is an assertion (#1236 —
+seven rounds, all dead on a `#[global_allocator]` collision the base carried).
+
 **One behaviour per round.** Two at once, or a neuter that stops it compiling,
 and the failures stop being attributable to the behaviour they evidence — a
 compile error proves nothing. Several rounds on one scratch branch is normal.
@@ -376,12 +383,34 @@ merely-diverged bases report a clean all-`=` too (measured), and then the tree
 around your mutation is not the tree you measured on. Name the commit each round
 descends from, never "the current head" (#1182 — rounds F/G/H, four rebases).
 
+**That criterion does not close — and the cheap fix is to stop needing it.**
+Byte-identity covers the region you mutated and the test that reddened; it never
+looks at what that test *calls*. A transitive callee rewritten after the
+measurement — a review fix two frames down — retires the red exactly as silently,
+and again nothing goes red to say so. Extending the check to "identity plus a
+judgement call about the callees" only banks more hand-verified inertness claims,
+which is the shape this loop keeps catching stale. A wave is ONE CI cycle
+whatever its width, so re-cut every carried round from the head and delete the
+transfer argument instead — the head need not move for that, only the body.
+Signature: a round's mutated site is byte-identical at both commits and a
+function it calls is not (#1236 — three of eight rounds reached
+`record_crash_first_phase` / `newest_crash_log_since`, both rewritten by that
+PR's own review fixes).
+
 **A red only counts against a banked green.** Keep the unmutated tree's passing
 run for the same tests: a test that has never passed reddens for its own bug,
 not for your mutation, and the red then evidences nothing about the property.
 And a mutation that **hangs** the suite is a timeout, not a red — the job dies
 without naming an assertion, so there is no failure line to quote. Race a
 watchdog inside the test so the failure arrives as an assertion instead (#744).
+
+**Reconcile every round's test count against the banked green's.** Read passed +
+failed off the round's own log and check the total matches the green run's total
+for that binary. A row that does not reconcile means the mutation had side
+effects, so its red is not attributable to the behaviour it was cut for — and the
+extra reds are the ones you would otherwise quote. Signature: a round reddens
+three tests where one was expected (#1236 — eight rounds, each reconciling to
+376).
 
 ### The frontend half runs its base red locally — build the isolated tree right
 
