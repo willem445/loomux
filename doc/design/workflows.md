@@ -1400,6 +1400,20 @@ reviewer. A token that cannot be serialized safely writes the `unrepresentable`
 poison line rather than vanishing, exactly as a reviewer id or an `also:`
 condition does.
 
+**`ROUTING_RULES_MAX` is enforced in all three readers, and the third one was
+nearly missed.** `parse_workflow` refuses a workflow past the cap and
+`parse_gate_file` refuses a gate *file* past it — so a file with more rules than
+loomux will load is one loomux reports as malformed, and a malformed gate refuses
+every merge. The shim's loop originally had no cap, which made the same file
+unreadable to one half of the gate and perfectly readable to the other. That
+divergence fell on the **strict** side (more rules is more required reviewers),
+which is exactly why it survived review of the code that introduced it: nothing
+went wrong, so nothing looked wrong. The property is *the two halves agree, and
+both fail closed* — not *this particular disagreement is harmless*. The shim now
+carries the cap as the interpolated constant, never a number re-typed in shell,
+and the test drives the real shim at the cap and one past it so it cannot pass
+against a shim that simply refuses both.
+
 #### What this does not do
 
 Rules are evaluated independently and every match is additive; there is no
