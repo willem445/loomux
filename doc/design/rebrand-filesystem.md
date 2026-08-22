@@ -148,11 +148,32 @@ that they cannot drift apart.
 
 ### Reverting
 
-To fall back to read-the-old-one-forever, change one arm in
-`obs::init_data_root()` — `RootPlan::Migrate` resolves to `legacy` instead of
-calling `migrate_default_root` — and update this note. `RootPlan::UseLegacy`
-already exists as a variant, `resolve_default_root()` already implements exactly
-that behaviour for the read-only path, and no caller learns the difference.
+**The procedure, stated once and identically everywhere it appears** (this note,
+the `RootPlan` doc comment, `brand.rs`'s module doc, and the PR body):
+
+> In `obs::plan_default_root`, change the `(false, true)` arm from
+> `RootPlan::Migrate` to `RootPlan::UseLegacy`. Then update this note.
+
+That is the whole edit. `root_action` dispatches `UseLegacy` to
+`RootAction::UseLegacy`, which uses `<data>/loomux` as it stands and renames
+nothing; `resolve_default_root()` already resolves the same way on the read-only
+path, so the two `OnceLock` initializers agree and no caller learns the
+difference.
+
+**Why this section is emphatic about *which* function.** The first cut of this
+change folded `UseLegacy` in with `Migrate` in the dispatch, on the reasoning
+that `plan_default_root` could never return it — which made the documented
+revert **inert**: the edited arm still reached `migrate_default_root`, so a
+maintainer who declined the policy would have shipped a build they believed
+never migrated while every user's data root moved anyway (and the two
+initializers would have disagreed, with the app's startup order picking the
+migrating one). A comment whose premise the documented next edit voids is not a
+guard. `UseLegacy` now has its own dispatch arm, and
+`the_documented_revert_really_stops_the_migration` plus
+`exactly_one_plan_variant_moves_anything` pin it — the first simulating the
+revert at its own seam, the second asserting that the set of variants which move
+anything is exactly `[Migrate]`, so a future arm cannot be quietly folded back
+in. Found in review (rev-lead round 1, B1), not by the author.
 
 ---
 
@@ -209,6 +230,28 @@ effect: the existing backend suite, which creates `.loomux/` fixtures throughout
 now exercises the legacy path end to end without a line of it changing.
 
 ---
+
+### The whisper directory, and what "never moved" costs
+
+`%LOCALAPPDATA%\<name>\whisper\` follows the same rule and the same function
+(`brand::pick_repo_path`): preferred name first, legacy name when only it is
+there, never moved. The plan's Class-C enumeration missed this directory; it is
+filesystem identity, and shipping the voice *env-var* rename while leaving the
+*directory* unmentioned would have been a half-rebrand.
+
+The honest cost, recorded because it is a real user-visible consequence rather
+than a hypothetical: `scripts/stage-whisper.ps1`'s `-Dest` default now points at
+the new name, so a user who already staged under the old one and re-runs the
+script downloads a **second** several-hundred-megabyte copy instead of updating
+the one they have. That is the correct consequence of "never moved" — the
+alternative is relocating files we did not put there — and it is called out in
+`docs/features/voice-prompts.md` with the `-Dest` override that avoids it.
+
+**It has no test of its own.** `local_whisper_dir` lives inside `mod win` and
+resolves against the real `%LOCALAPPDATA%`, so there is nothing to point at a
+temp tree. The *rule* it applies is well covered (`pick_repo_path`, all four
+crossings); what is unpinned is the wiring — that this function calls that rule
+— and that is stated here rather than left for a reader to assume otherwise.
 
 ## 3. Environment variables: presence wins, on both sides alike
 

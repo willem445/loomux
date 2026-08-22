@@ -3207,9 +3207,14 @@ export function removeBlockAt(w: Workflow, index: number): Workflow {
  *  re-serializes.)
  *
  *  `authoredWith` is stamped in the same one moment `starterWorkflow` stamps it. */
-export function scaffoldWorkflowText(authoredWith?: string): string {
+export function scaffoldWorkflowText(authoredWith?: string, rel: string = WORKFLOW_FILE): string {
   const stamp = authoredWith ? `authored_with: ${authoredWith}\n` : "";
-  return `# .loomux/workflow.yml — this repo's agent workflow (loomux #222).
+  // `rel` is the path this text is ABOUT TO BE WRITTEN TO, threaded in rather than
+  // hard-coded (#1153 phase 4, rev-lead round 1 B2). The header names the file the
+  // reader is looking at: a scaffold written to `.orrerix/workflow.yml` whose first
+  // line says `.loomux/workflow.yml` names a path that repo does not have, which is
+  // exactly the "reads one file, reports another" defect this phase exists to fix.
+  return `# ${rel} — this repo's agent workflow (loomux #222).
 # Committed on purpose: everyone who clones the repo gets the same roster.
 # Orrerix reads it only when "Advanced orchestrator" is ticked in the launcher.
 

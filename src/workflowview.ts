@@ -409,7 +409,7 @@ export class WorkflowView {
     this.starterBtn = starterBtn;
     starterBtn.className = "wf-btn wf-btn-primary";
     starterBtn.textContent = "Create workflow";
-    starterBtn.title = "Scaffold a commented .loomux/workflow.yml — today's pipeline, ready to edit";
+    starterBtn.title = "";  // set from `this.rel` in render() — see the startPathEl note there
     starterBtn.addEventListener("click", () => void this.scaffold());
 
     // What the button is about to write. A preview is cheaper than a paragraph and it is the
@@ -915,7 +915,9 @@ export class WorkflowView {
       this.render();
       return;
     }
-    this.setText(scaffoldWorkflowText(this.appVersion));
+    // `this.rel` — the path `save()` is about to write to — not the default, so the
+    // header names the file that will actually exist (#1153 phase 4).
+    this.setText(scaffoldWorkflowText(this.appVersion, this.rel));
     this.render();
     await this.save();
     // Land them on the canvas, looking at the thing they just made. Since #880 that is simply
@@ -1143,9 +1145,14 @@ export class WorkflowView {
     this.emptyEl.hidden = !start;
     this.bodyEl.hidden = error || start;
     this.findingsEl.hidden = error || start;
-    // Both surfaces name the file this pane is actually open on, not the default one.
+    // EVERY surface here names the file this pane is actually open on, not the default
+    // one — including the Create button's tooltip, which used to be a static literal
+    // naming `.loomux/workflow.yml` while the preview beside it read `.orrerix/...`
+    // (#1153 phase 4, rev-lead round 1 B2). The empty state must never advertise the
+    // deprecated spelling as the thing it is about to create.
     this.errorTitleEl.textContent = `Can't read ${this.rel}`;
     this.startPathEl.textContent = this.rel;
+    this.starterBtn.title = `Scaffold a commented ${this.rel} — today's pipeline, ready to edit`;
     // Pressability is the RULE, not a side-effect of being on screen. `hidden` is now honoured
     // (styles.css `[hidden]`), so this is belt and braces — but it is the belt that matters: the
     // live bug was a create button the human could press over a loaded workflow, and the thing
