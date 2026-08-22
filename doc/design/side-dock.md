@@ -85,8 +85,10 @@ here permits a *passive* signal to resize a terminal.
   for anything that displaces the grid. `test/resizeburst.test.ts` measures it
   as exactly one, through the same simulator #1149 used for `#sessions`.
 - **The per-frame *layout* work of the 240 ms animation**, which #1149 did not
-  remove and this does not either. The panel's own contents are lifted out of
-  it (below), so what re-lays-out each frame is the grid, not a git graph.
+  remove and this does not either. On a *toggle* the panel's own contents are
+  lifted out of it (below), so what re-lays-out each frame is the grid and not a
+  git graph — but that exemption is the toggle's, not a property of the panel:
+  a *room* change re-lays-out the contents too (#1203, below).
 - **The grip drag now has terminals on the other side of it** (below).
 - **A narrow window with both side panels open squeezes the dock**, deliberately,
   rather than squeezing the grid — down to the point where a readable dock no
@@ -113,13 +115,24 @@ editor's buffer would still be focusable and still announced. Applied at the
 moment of the toggle rather than on `transitionend` — a dismissed panel should
 stop taking input immediately, and there is nothing to schedule or clean up.
 
-**The contents do not animate; only the column does.** `.sidedock-inner` is
-absolutely positioned at a fixed width (`contentPx`, set from the same
-`dockBoxes` call as the column's own width, so the two cannot disagree) and the
-column clips it. Otherwise every frame of the slide would re-lay-out a git graph
-or a file tree at an intermediate width — cheap for the terminals, expensive for
-the panel. `.sessions-inner` is the same device for the same reason; anchored
-right instead of left, so the collapse wipes from the grid side.
+**The contents do not animate on a toggle; only the column does.**
+`.sidedock-inner` is absolutely positioned at a fixed width (`contentPx`, set
+from the same `dockBoxes` call as the column's own width, so the two cannot
+disagree) and the column clips it. Otherwise every frame of the slide would
+re-lay-out a git graph or a file tree at an intermediate width — cheap for the
+terminals, expensive for the panel. `.sessions-inner` is the same device for the
+same reason; anchored right instead of left, so the collapse wipes from the grid
+side.
+
+**The boundary of that guarantee, because it is narrower than it reads.** The
+width is fixed *per toggle*, not fixed absolutely: when the ROOM moves, the
+panel is re-laid-out to follow it, which is exactly what stops the cropping the
+next section is about. So a room that moves over time — `#sessions` animating
+its own 240 ms slide — does put the panel's contents back into an animation, at
+every intermediate width. You cannot have both: following the room is what makes
+a squeezed dock narrow instead of cropped, and following it *smoothly* is what
+puts the layout work back. That residual is open as **#1203**, with the
+measurement left to the live pass rather than guessed at here.
 
 That fixed width is derived from the room, not from the preference alone
 (`clampDockWidth(width, room)`), so a column the flex row squeezed gets a panel
@@ -170,8 +183,33 @@ exists to keep away from the grid"). Three things make it different:
   room and returns without writing;
 - the expensive half — the collapse class, `inert`, `aria-hidden`, the toggle
   button — runs only when the starve verdict actually flips. A window drag that
-  never crosses 864px costs two style writes per frame, and the geometry change
-  it does cause is coalesced by `resizeburst.ts` like every other one.
+  never crosses 864px costs two style writes per frame.
+
+**What that last sentence does NOT claim, since an earlier revision of it did.**
+It said the geometry change "is coalesced by `resizeburst.ts` like every other
+one". It is coalesced — but the ceiling (`FIT_MAX_WAIT_MS`, 400 ms) is sized for
+ONE 240 ms transition plus a window, and a room-driven write re-targets
+`.sidedock`'s own 240 ms ease rather than suppressing it, the way the grip drag
+does via `.sidedock.resizing`. Chain the two — `#sessions` sliding for 240 ms,
+the dock's re-targeted ease running on past it — and the composite burst can
+outlast the ceiling, taking one mid-slide fit per pane before the settled one.
+
+The band is narrow and worth stating rather than rounding off: `columnPx` only
+moves at all when `room - 240 < width`, so a workspace over ~1004px with the
+session browser open never enters it, and above that the observer computes the
+same boxes and writes the same value, which starts no transition. Inside the
+band the cost is bounded at one extra resize per pane, on a gesture that already
+resizes every PTY.
+
+It is **#1203**, deferred deliberately: the whole chain is a claim about how CSS
+transitions re-target under repeated JS writes, which nothing in this repo's
+test rig can execute, and the cheapest fix — suppressing the transition on the
+room-driven write, the treatment the drag already gets — changes animation
+behaviour on a path no test here can exercise. `test/resizeburst.test.ts` cannot
+see it either: it checks each panel's own transition against the ceiling in
+isolation, so a composite burst is invisible to it. That is a gap in the guard as
+much as in the behaviour, and it is named here rather than left for the next
+reader to rediscover.
 
 **The toggle button says so.** A dock that cannot be shown would otherwise make
 the top-bar control appear dead — click, nothing, click, nothing. `SideDockHost`
