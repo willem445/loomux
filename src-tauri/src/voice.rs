@@ -167,6 +167,7 @@ mod win {
         ChunkedBuffer, WHISPER_PROMPT_MAX_CHARS,
     };
     use crate::pty::JobHandle;
+    use loomux_engine::brand;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -270,7 +271,7 @@ mod win {
             .map_err(|_| "recording thread panicked".to_string())?;
 
         // Diagnostics: duration + RMS of the raw capture. Always cheap; logged
-        // when LOOMUX_VOICE_KEEP_WAV is set so a bad live capture is inspectable.
+        // when ORRERIX_VOICE_KEEP_WAV is set so a bad live capture is inspectable.
         if keep_wav_enabled() {
             eprintln!(
                 "voice: captured {} samples @ {} Hz ({:.1}s), rms={:.5}, capped={}",
@@ -301,13 +302,14 @@ mod win {
         Ok(text)
     }
 
-    /// Debug switch: LOOMUX_VOICE_KEEP_WAV=1 preserves the scratch WAV and logs
+    /// Debug switch: `ORRERIX_VOICE_KEEP_WAV=1` (or the legacy
+    /// `LOOMUX_VOICE_KEEP_WAV`, #1153) preserves the scratch WAV and logs
     /// capture diagnostics — the tool we lacked while chasing the long-recording
     /// bug (#58). Any non-empty, non-"0"/"false" value enables it.
     fn keep_wav_enabled() -> bool {
-        match std::env::var("LOOMUX_VOICE_KEEP_WAV") {
-            Ok(v) => !matches!(v.trim(), "" | "0" | "false" | "False" | "FALSE"),
-            Err(_) => false,
+        match brand::env_string("VOICE_KEEP_WAV") {
+            Some(v) => !matches!(v.trim(), "" | "0" | "false" | "False" | "FALSE"),
+            None => false,
         }
     }
 
@@ -440,9 +442,26 @@ mod win {
         prompt: Option<String>,
     }
 
-    /// The power-user install root: `%LOCALAPPDATA%\loomux\whisper\`.
+    /// The power-user install root: `%LOCALAPPDATA%\orrerix\whisper\`, falling
+    /// back to the pre-#1153 `%LOCALAPPDATA%\loomux\whisper\` when only that
+    /// one is there.
+    ///
+    /// **Discovered, never moved** — unlike the app's own data root, which is
+    /// migrated once (`obs::init_data_root`). Everything in here was put there
+    /// by hand by the user: a whisper.cpp build they unzipped, a ggml model
+    /// they downloaded (hundreds of megabytes), a `vocab.txt` they wrote.
+    /// Silently relocating someone's downloads breaks every note, script and
+    /// shortcut they have pointing at them, and buys nothing — the fallback
+    /// costs one `is_dir()`. Same rule, and the same decision function, as a
+    /// repo's `.loomux/` config dir.
     fn local_whisper_dir() -> Option<PathBuf> {
-        dirs::data_local_dir().map(|d| d.join("loomux").join("whisper"))
+        let local = dirs::data_local_dir()?;
+        let new = local.join(brand::NAME).join("whisper");
+        let legacy = local.join(brand::LEGACY_NAME).join("whisper");
+        Some(match brand::pick_repo_path(new.is_dir(), legacy.is_dir()) {
+            brand::RepoPick::Preferred => new,
+            brand::RepoPick::Legacy => legacy,
+        })
     }
 
     /// CLI names to accept in a whisper dir: the current one, then the legacy
@@ -450,7 +469,7 @@ mod win {
     const CLI_NAMES: [&str; 2] = ["whisper-cli.exe", "main.exe"];
 
     /// Resolve the whisper CLI and model. Resolution order (per the shipped
-    /// design): **bundled resources → `LOOMUX_WHISPER_*` env → %LOCALAPPDATA%**.
+    /// design): **bundled resources → `ORRERIX_WHISPER_*` env → %LOCALAPPDATA%**.
     /// `bundled` is `<resource>/whisper`. Returns an actionable error naming
     /// every place it looked.
     fn resolve_whisper(bundled: &Option<PathBuf>) -> Result<WhisperPaths, String> {
@@ -461,12 +480,12 @@ mod win {
         })
     }
 
-    /// Resolve the `--prompt` biasing text. Precedence: `LOOMUX_WHISPER_PROMPT`
+    /// Resolve the `--prompt` biasing text. Precedence: `ORRERIX_WHISPER_PROMPT`
     /// env (used verbatim — the power-user override) REPLACES the file; else
-    /// assemble it from `%LOCALAPPDATA%\loomux\whisper\vocab.txt`. Returns `None`
+    /// assemble it from `vocab.txt` in [`local_whisper_dir`]. Returns `None`
     /// when neither yields usable text (→ no `--prompt` is passed).
     fn resolve_prompt() -> Option<String> {
-        if let Some(v) = std::env::var_os("LOOMUX_WHISPER_PROMPT") {
+        if let Some(v) = brand::env_os("WHISPER_PROMPT").value {
             let s = v.to_string_lossy().trim().to_string();
             return if s.is_empty() { None } else { Some(s) };
         }
@@ -484,19 +503,28 @@ mod win {
         Some(assembled.text)
     }
 
-    /// whisper-cli.exe: bundled dir → `LOOMUX_WHISPER_CLI` → %LOCALAPPDATA%.
+    /// whisper-cli.exe: bundled dir → `ORRERIX_WHISPER_CLI` → %LOCALAPPDATA%.
+    ///
+    /// Every message here names BOTH env spellings ([`brand::env_names`]): a
+    /// user who set the legacy `LOOMUX_WHISPER_CLI` and got it wrong must not
+    /// be told to check a variable they never set, and a user who set neither
+    /// must be told the current name first.
     fn resolve_cli(bundled: &Option<PathBuf>) -> Result<PathBuf, String> {
         if let Some(b) = bundled {
             if let Some(p) = CLI_NAMES.iter().map(|n| b.join(n)).find(|p| p.is_file()) {
                 return Ok(p);
             }
         }
-        if let Some(p) = std::env::var_os("LOOMUX_WHISPER_CLI") {
+        if let Some(p) = brand::env_os("WHISPER_CLI").value {
             let p = PathBuf::from(p);
             return if p.is_file() {
                 Ok(p)
             } else {
-                Err(format!("LOOMUX_WHISPER_CLI is set but not a file: {}", p.display()))
+                Err(format!(
+                    "{} is set but not a file: {}",
+                    brand::env_names("WHISPER_CLI"),
+                    p.display()
+                ))
             };
         }
         let d = local_whisper_dir().ok_or("cannot resolve %LOCALAPPDATA%")?;
@@ -507,23 +535,28 @@ mod win {
             .ok_or_else(|| {
                 format!(
                     "whisper CLI not found (looked in bundled resources, \
-                     LOOMUX_WHISPER_CLI, and {}). See doc/design/voice.md.",
+                     {}, and {}). See doc/design/voice.md.",
+                    brand::env_names("WHISPER_CLI"),
                     d.display()
                 )
             })
     }
 
-    /// Model: bundled `models/` → `LOOMUX_WHISPER_MODEL` → %LOCALAPPDATA%\models.
+    /// Model: bundled `models/` → `ORRERIX_WHISPER_MODEL` → %LOCALAPPDATA%\models.
     fn resolve_model(bundled: &Option<PathBuf>) -> Result<PathBuf, String> {
         if let Some(p) = bundled.as_ref().and_then(|b| pick_model(&b.join("models"))) {
             return Ok(p);
         }
-        if let Some(p) = std::env::var_os("LOOMUX_WHISPER_MODEL") {
+        if let Some(p) = brand::env_os("WHISPER_MODEL").value {
             let p = PathBuf::from(p);
             return if p.is_file() {
                 Ok(p)
             } else {
-                Err(format!("LOOMUX_WHISPER_MODEL is set but not a file: {}", p.display()))
+                Err(format!(
+                    "{} is set but not a file: {}",
+                    brand::env_names("WHISPER_MODEL"),
+                    p.display()
+                ))
             };
         }
         let models = local_whisper_dir()
@@ -532,7 +565,8 @@ mod win {
         pick_model(&models).ok_or_else(|| {
             format!(
                 "no Whisper model found (looked in bundled resources, \
-                 LOOMUX_WHISPER_MODEL, and {}). See doc/design/voice.md.",
+                 {}, and {}). See doc/design/voice.md.",
+                brand::env_names("WHISPER_MODEL"),
                 models.display()
             )
         })
@@ -615,8 +649,7 @@ mod win {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         );
         // Power-user raw passthrough, appended last so it overrides ours.
-        let extra = std::env::var("LOOMUX_WHISPER_ARGS")
-            .ok()
+        let extra = brand::env_string("WHISPER_ARGS")
             .map(|s| parse_extra_args(&s))
             .unwrap_or_default();
         let args = build_whisper_args(
@@ -872,7 +905,7 @@ impl ChunkedBuffer {
 }
 
 /// Root-mean-square amplitude of `samples` (0.0 for empty). Used by the
-/// LOOMUX_VOICE_KEEP_WAV diagnostic to log how "loud" a capture actually was —
+/// ORRERIX_VOICE_KEEP_WAV diagnostic to log how "loud" a capture actually was —
 /// a near-zero RMS on a long recording is the fingerprint of a silent capture.
 pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -897,7 +930,7 @@ pub fn duration_secs(sample_count: usize, sample_rate: u32) -> f32 {
 /// inference is memory-bandwidth-bound, so throughput flattens past ~8 threads
 /// and oversubscribing logical cores (SMT) contends with the OS/webview for
 /// little gain — so we cap here. Power users can override with
-/// `LOOMUX_WHISPER_ARGS="-t N"` (whisper takes the last `-t`, so it wins).
+/// `ORRERIX_WHISPER_ARGS="-t N"` (whisper takes the last `-t`, so it wins).
 pub const WHISPER_MAX_THREADS: usize = 8;
 
 /// Character budget for the assembled `--prompt`. whisper's initial-prompt cap is
@@ -913,7 +946,7 @@ pub fn whisper_thread_count(available: usize) -> usize {
     available.clamp(1, WHISPER_MAX_THREADS)
 }
 
-/// Split a `LOOMUX_WHISPER_ARGS` string into discrete argv tokens on whitespace.
+/// Split an `ORRERIX_WHISPER_ARGS` string into discrete argv tokens on whitespace.
 /// This is a RAW passthrough: no shell, no quote handling — each whitespace-
 /// separated token becomes one argument. (Tokens reach `Command::arg` directly,
 /// so there is no shell to inject into; the value is the user's own env var.)
@@ -964,7 +997,7 @@ pub fn build_prompt_arg(vocab: &str, max_chars: usize) -> Option<AssembledPrompt
 
 /// Build the full whisper.cpp argument vector in a fixed order:
 /// `-m <model> -f <wav> -nt -l en -t <threads> [--prompt <p>] [<extra>…]`.
-/// loomux's args come FIRST and the `LOOMUX_WHISPER_ARGS` passthrough LAST, so —
+/// loomux's args come FIRST and the `ORRERIX_WHISPER_ARGS` passthrough LAST, so —
 /// because whisper.cpp's parser takes the last occurrence of a scalar flag — a
 /// user override in `extra` wins. Discrete args (no shell). Pure so ordering is
 /// unit-tested without spawning.

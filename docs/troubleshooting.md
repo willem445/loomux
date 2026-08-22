@@ -48,7 +48,7 @@ See [Voice prompts → Set it up](features/voice-prompts.html#set-it-up-windows)
   the mic.
 - **No input device.** "No microphone / input device found" means Windows sees no
   capture device — check it's plugged in and set as default.
-- **Long recording returned nothing.** Set `LOOMUX_VOICE_KEEP_WAV=1` and record
+- **Long recording returned nothing.** Set `ORRERIX_VOICE_KEEP_WAV=1` and record
   again; orrerix logs the kept WAV's path, duration, and level. A near-zero level
   is the fingerprint of a silent/starved capture.
 - Recordings are **capped at 5 minutes**; past that, orrerix appends a "recording
@@ -58,7 +58,7 @@ See [Voice prompts → Set it up](features/voice-prompts.html#set-it-up-windows)
 
 `base.en` is the default. For better accuracy at similar speed, use
 `large-v3-turbo` quantized (`q8_0` is the sweet spot). NVIDIA owners can point
-`LOOMUX_WHISPER_CLI` at a **cuBLAS/CUDA** whisper build for a large speed-up. Full
+`ORRERIX_WHISPER_CLI` at a **cuBLAS/CUDA** whisper build for a large speed-up. Full
 tuning knobs are on the [Voice prompts](features/voice-prompts.html#performance--tuning)
 page.
 

@@ -123,7 +123,7 @@ jobs:
   # webview over CDP (Playwright's native WebView2 support). Windows-only —
   # that's the only platform CDP-over-WebView2 covers, and it's this project's
   # Windows-10 baseline anyway. Runs against an isolated profile
-  # (`tauri.e2e.conf.json`'s `dev.loomux.e2e` identifier + `LOOMUX_DATA_DIR`),
+  # (`tauri.e2e.conf.json`'s `dev.loomux.e2e` identifier + `ORRERIX_DATA_DIR`),
   # never a real install (issue #394 overlap — see e2e/fixtures.ts).
   # continue-on-error while flakiness is unknown: this must never red the
   # merge gate on its own — drop it once the suite has a track record.

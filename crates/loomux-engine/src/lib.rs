@@ -588,6 +588,7 @@
 //! is file-scoped — the flagged `format!` and its proof travel in the same file,
 //! so the row stays proven.
 
+pub mod brand;
 pub mod fsatomic;
 pub mod groupid;
 pub mod intake;

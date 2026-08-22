@@ -139,7 +139,7 @@ enforced at the CLI level.
 - **Agent-aware panes** — alert chips when a CLI needs you, badges per role and
   group, and a session browser that restores Claude Code / Copilot CLI sessions
   straight back into a pane.
-- **Custom agent workflows** — commit a `.loomux/workflow.yml` and your repo
+- **Custom agent workflows** — commit a `.orrerix/workflow.yml` and your repo
   declares its own roster and merge gate: five focused reviewers with five
   prompts and five models, an advisor the orchestrator consults when stuck, a
   process agent that mines a finished session into a proposed lessons PR.
@@ -159,7 +159,7 @@ enforced at the CLI level.
 - **Audit everything** — every prompt, spawn, gate decision and toggle change is
   one filterable row in the group's audit log, or one dot on a progress timeline
   that plots it alongside the repo's issue and PR history.
-- **Lessons that outlive a session** — a committed `.loomux/lessons.md` feeds
+- **Lessons that outlive a session** — a committed `.orrerix/lessons.md` feeds
   hard-won repo knowledge into the next orchestrator's kickoff.
 
 ## Why orrerix over…
@@ -217,9 +217,19 @@ Backend checks (what CI gates on) run from the repo root: `cargo check --locked
   is built the way it is.
 - **E2E** (experimental, `e2e-windows` CI job) — Playwright over CDP against the
   real WebView2 webview: [`doc/design/e2e-testing.md`](doc/design/e2e-testing.md).
-- `LOOMUX_DATA_DIR` redirects the **entire** app-data root to an absolute path,
+- `ORRERIX_DATA_DIR` redirects the **entire** app-data root to an absolute path,
   for a fully isolated second profile (the E2E harness uses it). Empty or relative
-  values are rejected rather than resolved against the working directory.
+  values are rejected rather than resolved against the working directory. The
+  pre-rename `LOOMUX_DATA_DIR` still works: every `ORRERIX_*` variable falls back
+  to its `LOOMUX_*` spelling, and setting both means `ORRERIX_*` wins.
+- Without an override, the root is `<platform data dir>/orrerix`. An install that
+  predates the rename is **moved there once**, from `<platform data dir>/loomux`,
+  on the first launch that finds only the old name — a single directory rename,
+  nothing deleted, with a note left behind at the old location saying where it
+  went. See [`doc/design/rebrand-filesystem.md`](doc/design/rebrand-filesystem.md).
+- A repo's committed config lives in `.orrerix/` (`workflow.yml`, `lessons.md`,
+  `workflow.layout.json`). A repo still using `.loomux/` is read exactly as before
+  and is **never** renamed for you; `.orrerix/` wins if both are present.
 
 The Windows installer ships one prebuilt, MIT-licensed runtime — a modern ConPTY
 host (`conpty.dll` + `OpenConsole.exe`, committed in

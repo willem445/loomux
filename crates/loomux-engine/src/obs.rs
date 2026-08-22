@@ -4,7 +4,7 @@
 //! something to read:
 //!
 //! 1. A **panic hook** that appends a crash log (message + location + thread +
-//!    backtrace) to `<data>/loomux/logs/crash-<ts>.log`. It wraps — and still
+//!    backtrace) to `<data>/orrerix/logs/crash-<ts>.log`. It wraps — and still
 //!    chains to — the default hook, and is written to never panic itself.
 //! 2. A **breadcrumb log** (`breadcrumbs.log`, rotated once at ~2 MB) of
 //!    timestamped one-liners for lifecycle events — pane/PTY open/close/resize,
@@ -30,6 +30,7 @@
 //! aborts the process without unwinding (stack overflow, an FFI access
 //! violation, `abort()`) never runs the hook — see `doc/design/crash-observability.md`.
 
+use crate::brand;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -95,6 +96,12 @@ static WARNED_BAD_DATA_DIR: std::sync::Once = std::sync::Once::new();
 /// recurse). The durable, always-checkable record of what root a run actually
 /// used is the `data_root=` startup breadcrumb (`src-tauri/src/lib.rs`), not
 /// this warning.
+///
+/// An override — under *either* env name (#1153) — is used **exactly as
+/// given**: no rename, no migration, no probing of a sibling. An operator who
+/// names a root has named the root, and an E2E run's isolated profile must
+/// stay isolated. The `loomux`→`orrerix` rename applies only to the *platform
+/// default* below, via [`resolve_default_root`].
 fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
     if let Some(dir) = &env_override {
         let path = PathBuf::from(dir);
@@ -103,25 +110,188 @@ fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
         }
         WARNED_BAD_DATA_DIR.call_once(|| {
             eprintln!(
-                "loomux: LOOMUX_DATA_DIR={dir:?} is empty or not an absolute path — ignoring it \
-                 and using the platform data dir instead"
+                "orrerix: {}={dir:?} is empty or not an absolute path — ignoring it \
+                 and using the platform data dir instead",
+                brand::env_names("DATA_DIR"),
             );
         });
     }
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("loomux")
+    resolve_default_root()
 }
 
-/// `<user data dir>/loomux` (or `$LOOMUX_DATA_DIR` if set) — the root every
-/// persisted-state singleton (`orchestration/`, `logs/`, `tabs.json`, …) lives
-/// under. A dev instance and a production install share this root by default,
-/// which means they also share `running.lock` and every other singleton in it
-/// (#394); the env override lets a dev/test run point at its own tree instead
-/// — e.g. an isolated profile for E2E runs — without touching the platform
-/// data dir at all.
+/// The platform data dir itself — the parent both the current and the legacy
+/// roots sit in. Split out so the migration decision and the roots it acts on
+/// are derived from one expression rather than two that could drift.
+fn platform_data_dir() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// What to do with the two platform-default roots, `<data>/orrerix` and the
+/// pre-#1153 `<data>/loomux`.
+///
+/// **This enum is the migration policy, and it is deliberately the whole of
+/// it.** See `doc/design/rebrand-filesystem.md`: the shipped policy is
+/// move-on-first-launch, and reverting to read-the-old-one-forever is one
+/// `match` arm below (`Migrate` → `UseLegacy`) plus a doc edit — not a
+/// re-architecture. It is stated as a pure decision precisely so that
+/// ratifying, amending or reverting it never requires reading the fs code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPlan {
+    /// `<data>/orrerix` already exists. Use it, and never touch `<data>/loomux`
+    /// again — including when both exist, which is what a *reverted* build or a
+    /// concurrently-running old instance leaves behind.
+    UseNew,
+    /// Only `<data>/loomux` exists: an existing install seeing the new name for
+    /// the first time. Move it, then use the new name.
+    Migrate,
+    /// The move was refused by the OS (see [`migrate_default_root`]). Keep
+    /// using the old root for this run — starting a blank profile because a
+    /// rename failed would look exactly like "all my groups are gone".
+    UseLegacy,
+    /// Neither exists: a first-ever launch. There is nothing to migrate and
+    /// nothing to fall back to.
+    Fresh,
+}
+
+/// The migration decision, pure: the fs probes are the caller's, so every arm
+/// is reachable in a test without a disk.
+pub fn plan_default_root(new_exists: bool, legacy_exists: bool) -> RootPlan {
+    match (new_exists, legacy_exists) {
+        (true, _) => RootPlan::UseNew,
+        (false, true) => RootPlan::Migrate,
+        (false, false) => RootPlan::Fresh,
+    }
+}
+
+/// Cached because the answer must not change under a running process, and
+/// because it costs filesystem probes.
+///
+/// `data_root()` is called on *every breadcrumb write* — a root that re-derived
+/// itself per call would both stat the disk on a hot path and, far worse, be
+/// free to flip mid-run the instant the migration landed, splitting one
+/// session's logs, orchestration state and `running.lock` across two
+/// directories. One resolution per process, taken at the first call.
+static DEFAULT_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Resolve the platform-default root **and perform the one-time
+/// `<data>/loomux` → `<data>/orrerix` move** if this is the first launch that
+/// finds only the old one (#1153 phase 4). Call once, early, from a real app's
+/// startup — `src-tauri/src/lib.rs` and `loomux-server`'s `main`.
+///
+/// The move is deliberately NOT lazy inside `data_root()`. A rename of the
+/// user's live profile is not something a getter called on every breadcrumb
+/// write should be able to trigger, and — the concrete reason — `data_root()`
+/// is reachable from unit and integration tests, from the daemon's config
+/// probing, and from any future tool linking the engine. Making the move an
+/// explicit startup act means running the test suite on a developer's machine
+/// can never rename the profile of the app they have open.
+///
+/// The contract is enforced rather than asked for: both this and the read-only
+/// [`resolve_default_root`] initialize the same `OnceLock`, so whichever ran
+/// first decides, exactly once. If something reads the root before startup gets
+/// here, no move happens *this launch* and the old root keeps being used —
+/// which is the same safe state as a refused rename, and it retries next
+/// launch.
+pub fn init_data_root() {
+    let _ = DEFAULT_ROOT.get_or_init(|| {
+        let (new, legacy) = default_root_pair();
+        match plan_default_root(new.is_dir(), legacy.is_dir()) {
+            RootPlan::UseNew | RootPlan::Fresh => new,
+            // `UseLegacy` is unreachable from `plan_default_root`; it is what a
+            // refused move reports back, and it lands in the same arm.
+            RootPlan::Migrate | RootPlan::UseLegacy => {
+                match migrate_default_root(&legacy, &new) {
+                    RootPlan::UseNew => new,
+                    _ => legacy,
+                }
+            }
+        }
+    });
+}
+
+/// The two platform-default roots, current and legacy, derived from one
+/// expression so the decision and the paths it acts on cannot drift.
+fn default_root_pair() -> (PathBuf, PathBuf) {
+    let parent = platform_data_dir();
+    (parent.join(brand::NAME), parent.join(brand::LEGACY_NAME))
+}
+
+/// The platform-default root, **read-only**: it chooses between the two names
+/// and never moves anything. See [`init_data_root`] for who does the moving.
+fn resolve_default_root() -> PathBuf {
+    DEFAULT_ROOT
+        .get_or_init(|| {
+            let (new, legacy) = default_root_pair();
+            match plan_default_root(new.is_dir(), legacy.is_dir()) {
+                RootPlan::UseNew | RootPlan::Fresh => new,
+                RootPlan::Migrate | RootPlan::UseLegacy => legacy,
+            }
+        })
+        .clone()
+}
+
+/// Perform the one-time move, and leave a signpost behind.
+///
+/// **One `fs::rename` and nothing else.** A directory rename within one volume
+/// is atomic: either the whole profile moved or none of it did, so there is no
+/// half-migrated state to recover from and no copy loop to be interrupted
+/// halfway through someone's orchestration history. If it fails — the old root
+/// is open by a still-running older build (Windows refuses the rename outright,
+/// which is the *good* outcome), a permission problem, a cross-device layout —
+/// we simply keep using the old root. Nothing is deleted here, ever, on any
+/// path.
+///
+/// The signpost is what makes the move reversible by a human rather than only
+/// by us: after a successful rename we recreate the old directory containing a
+/// single text file naming the new location and the one command that undoes
+/// this. A user who goes looking for `<data>/loomux` — because a script points
+/// at it, because they rolled back to an older build, or just because that is
+/// where their data used to be — finds an explanation instead of an absence.
+/// Its failure is ignored: a signpost we could not write is a worse experience,
+/// not a failed migration.
+fn migrate_default_root(legacy: &Path, new: &Path) -> RootPlan {
+    if fs::rename(legacy, new).is_err() {
+        eprintln!(
+            "orrerix: could not move {} to {} — continuing to use the old location. \
+             (Is an older version still running? It will be retried on the next launch.)",
+            legacy.display(),
+            new.display(),
+        );
+        return RootPlan::UseLegacy;
+    }
+    let _ = fs::create_dir_all(legacy);
+    let _ = fs::write(
+        legacy.join(MOVED_MARKER),
+        format!(
+            "loomux is now orrerix.\n\n\
+             This app's data moved to:\n\n    {}\n\n\
+             Nothing was deleted — the whole directory was renamed. To undo it, quit the app, \
+             delete this directory, and rename the one above back to \"{}\".\n\n\
+             To keep using a location of your own instead, set {}.\n",
+            new.display(),
+            brand::LEGACY_NAME,
+            brand::env_names("DATA_DIR"),
+        ),
+    );
+    RootPlan::UseNew
+}
+
+/// Name of the signpost file left in the old data root after a move. A `.txt`
+/// so that double-clicking it on Windows opens something readable.
+pub const MOVED_MARKER: &str = "MOVED-TO-ORRERIX.txt";
+
+/// `<user data dir>/orrerix` (or `$ORRERIX_DATA_DIR` / `$LOOMUX_DATA_DIR` if
+/// set) — the root every persisted-state singleton (`orchestration/`, `logs/`,
+/// `tabs.json`, …) lives under. A dev instance and a production install share
+/// this root by default, which means they also share `running.lock` and every
+/// other singleton in it (#394); the env override lets a dev/test run point at
+/// its own tree instead — e.g. an isolated profile for E2E runs — without
+/// touching the platform data dir at all.
+///
+/// On the platform default, an install that predates #1153 is migrated once
+/// from `<user data dir>/loomux`; see `doc/design/rebrand-filesystem.md`.
 pub fn data_root() -> PathBuf {
-    data_root_from(std::env::var_os("LOOMUX_DATA_DIR"))
+    data_root_from(brand::env_os("DATA_DIR").value)
 }
 
 /// `<data root>/logs`. Mirrors `OrchRegistry::default_root` so crash logs and
@@ -417,23 +587,106 @@ mod tests {
         assert_eq!(overridden, isolated);
     }
 
+    /// The fallback root is whichever of the two names `resolve_default_root`
+    /// settled on for this process — asserted as *one of the pair* rather than
+    /// as `orrerix`, because a developer machine with a pre-#1153
+    /// `<data>/loomux` and a locked-open profile legitimately resolves to the
+    /// legacy name (`RootPlan::UseLegacy`), and a test that demanded the new
+    /// name would be asserting the migration *succeeded* on the test runner's
+    /// own real data dir. The migration policy itself is pinned by
+    /// `plan_default_root` and `a_move_leaves_a_signpost_*` below, which need
+    /// no real data dir at all.
     #[test]
     fn data_root_falls_back_to_platform_data_dir() {
         let default = data_root_from(None);
-        assert_eq!(default.file_name().unwrap(), "loomux");
+        let name = default.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name == brand::NAME || name == brand::LEGACY_NAME,
+            "expected one of the two platform-default roots, got {name}"
+        );
         assert_ne!(default, std::env::temp_dir().join("loomux-isolated-profile-test"));
     }
 
     #[test]
     fn data_root_rejects_empty_override() {
         let result = data_root_from(Some(std::ffi::OsString::from("")));
-        assert_eq!(result.file_name().unwrap(), "loomux", "should fall back, not resolve to CWD");
+        assert_eq!(result, resolve_default_root(), "should fall back, not resolve to CWD");
     }
 
     #[test]
     fn data_root_rejects_relative_override() {
         let result = data_root_from(Some(std::ffi::OsString::from(r"relative\path")));
-        assert_eq!(result.file_name().unwrap(), "loomux", "should fall back, not resolve to CWD");
+        assert_eq!(result, resolve_default_root(), "should fall back, not resolve to CWD");
+    }
+
+    // ---------- the loomux -> orrerix data-root migration (#1153 phase 4) ----------
+
+    #[test]
+    fn the_new_root_existing_means_the_old_one_is_never_touched() {
+        // Both present is the state a *reverted* build, or an old instance that
+        // kept writing during a move, leaves behind. The new one still wins.
+        assert_eq!(plan_default_root(true, true), RootPlan::UseNew);
+        assert_eq!(plan_default_root(true, false), RootPlan::UseNew);
+    }
+
+    #[test]
+    fn only_the_old_root_existing_is_the_one_case_that_migrates() {
+        assert_eq!(plan_default_root(false, true), RootPlan::Migrate);
+    }
+
+    #[test]
+    fn a_first_ever_launch_migrates_nothing() {
+        assert_eq!(plan_default_root(false, false), RootPlan::Fresh);
+    }
+
+    /// The move is a rename, so it must carry the whole profile across — not
+    /// just the top-level entries a shallow copy would have managed.
+    #[test]
+    fn a_move_carries_the_whole_profile_and_leaves_a_signpost() {
+        let tmp = std::env::temp_dir().join(format!("orrerix-migr-{}", now_ms()));
+        let legacy = tmp.join(brand::LEGACY_NAME);
+        let new = tmp.join(brand::NAME);
+        fs::create_dir_all(legacy.join("orchestration").join("g-1")).unwrap();
+        fs::write(legacy.join("orchestration").join("g-1").join("audit.jsonl"), "x").unwrap();
+        fs::write(legacy.join("tabs.json"), "{}").unwrap();
+
+        assert_eq!(migrate_default_root(&legacy, &new), RootPlan::UseNew);
+
+        assert!(new.join("tabs.json").is_file(), "top-level state must move");
+        assert_eq!(
+            fs::read_to_string(new.join("orchestration").join("g-1").join("audit.jsonl")).unwrap(),
+            "x",
+            "nested group state must move, byte for byte"
+        );
+        // Nothing is deleted, and the old location explains itself.
+        let marker = fs::read_to_string(legacy.join(MOVED_MARKER)).unwrap();
+        assert!(marker.contains(&new.display().to_string()), "signpost must name the new root");
+        assert!(
+            marker.contains("ORRERIX_DATA_DIR"),
+            "signpost must name the escape hatch, got: {marker}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A refused rename must NOT start a blank profile — the run keeps using
+    /// the old root. Provoked by making the destination an existing non-empty
+    /// directory, which `rename` refuses on every platform this ships on.
+    #[test]
+    fn a_refused_move_keeps_using_the_old_root() {
+        let tmp = std::env::temp_dir().join(format!("orrerix-migr-block-{}", now_ms()));
+        let legacy = tmp.join(brand::LEGACY_NAME);
+        let new = tmp.join(brand::NAME);
+        fs::create_dir_all(legacy.join("orchestration")).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("occupied"), "in the way").unwrap();
+
+        assert_eq!(migrate_default_root(&legacy, &new), RootPlan::UseLegacy);
+        assert!(legacy.join("orchestration").is_dir(), "the old profile must be left intact");
+        assert!(
+            !legacy.join(MOVED_MARKER).exists(),
+            "no signpost may claim a move that did not happen"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
