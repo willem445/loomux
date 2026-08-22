@@ -3108,7 +3108,7 @@ fn a_repaired_stand_in_carries_every_other_frontmatter_key_verbatim() {
     // NOT survive alongside it (two files claiming one handle is the ambiguity
     // `handle_resolves_to` refuses elsewhere).
     assert_eq!(front["name"].as_str(), Some(handle.as_str()), "{generated}");
-    assert!(front["description"].as_str().unwrap().contains("loomux"), "{generated}");
+    assert!(front["description"].as_str().unwrap().contains("orrerix"), "{generated}");
 }
 
 #[test]
