@@ -28,22 +28,12 @@ pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-teste
 use std::sync::Arc;
 use tauri::Manager;
 
-/// Crash observability for the class the panic hook structurally cannot see
-/// (#1219, after #1218's round-3 diagnosis). A refused allocation goes
-/// `handle_alloc_error` → `abort()` and never enters `std::panicking`, so no
-/// panic hook runs — all three of #1218's production crashes were that, and all
-/// three left nothing. `std::alloc::set_alloc_error_hook` is the matching seam
-/// and is nightly-only; a `#[global_allocator]` wrapper that reports on a null
-/// return is the stable one.
-///
-/// It is declared **here**, not in `loomux-engine`, because a
-/// `#[global_allocator]` may be declared once per artifact: which allocator a
-/// binary uses is the binary's decision, and `loomux-server` links the same
-/// engine without inheriting this one. `obs::install_alloc_error_reporting`
-/// below arms it; until then the wrapper is a pure delegation to `System`.
-/// Every `src-tauri/tests/*` binary links this lib, so they run under it too.
-#[global_allocator]
-static ALLOC: loomux_engine::obs::CrashReportingAlloc = loomux_engine::obs::CrashReportingAlloc;
+// The crash-reporting `#[global_allocator]` (#1219) is declared in `main.rs`,
+// NOT here. A global allocator is inherited by everything that links the crate
+// declaring it, and `tests/usage_memory.rs` declares a counting one of its own
+// (#1218) — two in one artifact is a hard compile error. See `main.rs` for the
+// full argument; `obs::install_alloc_error_reporting` in `run()` below arms it
+// wherever it is declared.
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

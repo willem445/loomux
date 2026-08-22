@@ -196,12 +196,33 @@ unsafe impl GlobalAlloc for CrashReportingAlloc {
 It **adds a record; it does not change what the process does.** The null is
 returned unmodified, so `handle_alloc_error` aborts exactly as before.
 
-**Why it is declared in `src-tauri/src/lib.rs`.** A `#[global_allocator]` may be
-declared once per artifact, and which allocator a binary uses is the binary's
-decision — `loomux-server` links the same engine without inheriting this one.
-The engine owns the *type*; the host owns the *declaration*. Every
-`src-tauri/tests/*` binary links that lib, so the suite runs under it too. No
-new dependency: `System` is std (constraint 2 — nothing here reaches
+**Why it is declared in `src-tauri/src/main.rs`.** A `#[global_allocator]` may
+be declared once per linked artifact, and it is **inherited by everything that
+links the crate declaring it**. The engine owns the *type*; the artifact owns
+the *declaration*, so `loomux-server` links the same engine without inheriting
+this one.
+
+The binary, specifically, and not `lib.rs`: an integration test that needs a
+different allocator has to be able to say so, and `tests/usage_memory.rs` is
+exactly that — its method for proving the streaming parse bounds peak memory
+(#1218) is to declare a **counting** `#[global_allocator]` and assert a
+high-water mark. Declared in the lib, this one is inherited by every
+`src-tauri/tests/*` binary and that test stops compiling outright:
+
+```
+error: the `#[global_allocator]` in this crate conflicts with global allocator in: loomux_lib
+```
+
+In `main.rs` it covers exactly what it should — the shipped `loomux.exe` and
+the E2E build made from the same entry point — and nothing at runtime is lost,
+because the choice is made at link time for the whole process: allocations made
+by code inside `loomux_lib`, which is all of them, go through the wrapper just
+the same. The corollary is that `cargo test` runs under the system allocator, so
+the suite exercises `CrashReportingAlloc` by **calling it directly**
+(`a_refused_allocation_writes_a_record_and_still_returns_null`) rather than by
+being linked against it.
+
+No new dependency: `System` is std (constraint 2 — nothing here reaches
 `getrandom`).
 
 **The discipline of the failure path.** It runs inside `GlobalAlloc::alloc`, on
@@ -248,10 +269,13 @@ that actually localises the site: 64 MiB/align 1 is what identified
    any of the large, unbounded ones this exists to catch.
 
 **What this does not do.** It records the death; it does not prevent it. The
-allocation that failed in #1218 was unbounded by design (`usage.rs` building a
-whole multi-MiB transcript in memory once a second per agent), and the fix for
-*that* is #1218's own, not this. Making the remaining small allocations fallible
-would be a far larger and far less valuable change.
+allocation that failed in #1218 was unbounded by design — `usage.rs` building a
+whole multi-MiB transcript in memory once a second per agent — and the fix for
+*that* is #1218's own, landed separately (`f7962fb5`, which streams the parse).
+The two are complementary and neither subsumes the other: streaming removed the
+one allocation we know about, and this records the next one we do not. Making
+the remaining small allocations fallible would be a far larger and far less
+valuable change than either.
 
 ### 2. Breadcrumb log
 
