@@ -18,6 +18,7 @@ permissions = [
     "allow-orch-workflow-status",
     "allow-orch-group-watches",
     "allow-orch-lock-state",
+    "allow-orch-mailbox-status",
     "allow-orch-questions-list",
     "allow-orch-needs-you-list",
     "allow-orch-channel-list",
