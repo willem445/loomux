@@ -11005,10 +11005,8 @@ impl ResolvedPersona {
     /// [`grants_loomux_tools`](Self::grants_loomux_tools) for why those two
     /// want opposite answers.
     pub fn scopes_mcp_server_per_tool(&self) -> bool {
-        brand::MCP_SERVERS.into_iter().any(|s| {
-            profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), s)
-                && !profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), s)
-        })
+        profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), MCP_SERVER)
+            && !profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), MCP_SERVER)
     }
 
     /// The server spelling this persona's `tools:` list actually names, if
@@ -41965,7 +41963,7 @@ impl OrchRegistry {
             ),
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
-                    "You are \"{name}\" ({id}), a {role} agent in orrerix group {gid} for repository {repo}.\n\
+                    "You are \"{name}\" ({id}), a {role} agent for orrerix group {gid} in repository {repo}.\n\
                      First read your role instructions: {ins}\n{note}\n{delivery}",
                     name = a.name, id = a.id, role = a.role.as_str(),
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,

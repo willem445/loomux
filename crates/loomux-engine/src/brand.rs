@@ -240,7 +240,7 @@ pub const LEGACY_NOTICE_MARKER: &str = "[loomux]";
 /// *is* the forgery hole. `every_accepted_marker_is_also_neutralized` asserts
 /// the two sides against this array rather than against a list written down in
 /// a test, so adding a third spelling to one side alone cannot pass.
-pub const NOTICE_MARKERS: [&str; 2] = [NOTICE_MARKER, LEGACY_NOTICE_MARKER];
+pub const NOTICE_MARKERS: [&str; 2] = [NOTICE_MARKER, NOTICE_MARKER];
 
 /// The marker `text` opens with, in any accepted spelling — `None` if it opens
 /// with none. Case-insensitive, matching the detector's own contract.
@@ -343,7 +343,7 @@ pub const LEGACY_AUDIT_ACTOR: &str = LEGACY_NAME;
 /// and an `== AUDIT_ACTOR` written out by hand at one of the call sites is a
 /// record from before the flag day silently reclassified as somebody else's.
 pub fn is_host_actor(actor: &str) -> bool {
-    actor == AUDIT_ACTOR || actor == LEGACY_AUDIT_ACTOR
+    actor == AUDIT_ACTOR
 }
 
 #[cfg(test)]

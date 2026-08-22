@@ -61,7 +61,7 @@ pub fn detect_orch_signature(text: &str) -> Option<(&'static str, Option<String>
         (" worker agent in ", " group ", "worker"),
         (" reviewer agent in ", " group ", "reviewer"),
     ] {
-        for name in [crate::brand::NAME, crate::brand::LEGACY_NAME] {
+        for name in [crate::brand::NAME, crate::brand::NAME] {
             let phrase = format!("{before}{name}{after}");
             if let Some(i) = text.find(&phrase) {
                 let gid: String = text[i + phrase.len()..]
@@ -583,7 +583,7 @@ mod orch_signature_tests {
         assert_eq!(role, "orchestrator");
         assert!(gid.is_none());
         assert!(detect_orch_signature("please fix the login bug").is_none());
-        for name in [crate::brand::NAME, crate::brand::LEGACY_NAME] {
+        for name in [crate::brand::NAME, crate::brand::NAME] {
             assert!(
                 detect_orch_signature(&format!("the word {name} alone should not match")).is_none(),
                 "prose mentioning {name} must not mark a session"
