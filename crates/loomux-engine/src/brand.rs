@@ -276,6 +276,22 @@ pub const MCP_SERVER: &str = NAME;
 /// the next reader deletes one side believing the other follows.
 pub const LEGACY_MCP_SERVER: &str = LEGACY_NAME;
 
+/// Every server spelling a **repo-authored** `tools:` list may name, in the
+/// order a reader should try them. Same one-array discipline as
+/// [`NOTICE_MARKERS`], and it exists for the same reason: a persona file was
+/// written before the flag day and nobody is going to rewrite it for its
+/// author.
+///
+/// **This set answers "what did the author NAME", never "what may the agent
+/// HAVE"** — and the distinction is the whole of rev-967 B1. Reading a stale
+/// `loomux/*` as a live grant would leave a delegate holding a scope that
+/// matches no server this app declares; reading a stale `loomux/report` as
+/// *nothing* lets the repair path widen a deliberate one-tool scope into the
+/// whole server. Callers use it for the first question only, and
+/// `orchestration::ResolvedPersona` documents which of its two predicates
+/// takes it and why the other must not.
+pub const MCP_SERVERS: [&str; 2] = [MCP_SERVER, LEGACY_MCP_SERVER];
+
 /// The tool-name prefix an agent CLI builds out of [`MCP_SERVER`] — what
 /// claude's `--allowedTools` takes on argv, and what an agent actually types.
 ///

@@ -36,6 +36,17 @@
 //!   `#[cfg(test)]` modules that live INSIDE a scanned file, which is why
 //!   scanning stops at the first one. Allow-listing all of those instead
 //!   would leave the scan enforcing nothing worth the file it lives in.
+//! - **Two accepted spellings are un-bannable, and that is the scan's widest
+//!   hole** (rev-967 N2). `brand::LEGACY_AUDIT_ACTOR` and
+//!   `brand::LEGACY_MCP_SERVER` are both the bare word `loomux`, which also
+//!   names the crate, the launcher binary, the worktree convention and a
+//!   thousand comments — banning it as a literal would be noise, not a
+//!   guard. So a newly hand-written `, "loomux",` audit-actor argument is
+//!   invisible here. That is exactly the shape of the defect this PR caught
+//!   in itself: a bulk sweep put `brand::AUDIT_ACTOR` where a launcher
+//!   FILENAME belonged, and `tests/pathseg.rs` caught it for an unrelated
+//!   reason. Stated so the next reader does not mistake this scan's silence
+//!   on the bare word for coverage of it.
 //! - **Scanning stops at the first `#[cfg(test)]` line and does not resume.**
 //!   True for this repo, where the convention is one trailing test module per
 //!   file, and stated because it is a real limit rather than a proof: a file
@@ -199,8 +210,9 @@ fn every_banned_literal_is_one_the_app_still_accepts() {
     assert_eq!(
         banned.len(),
         3,
-        "LEGACY_LITERALS and the accepted set must stay the same size, or one of them is \
-         carrying an entry the other has never heard of"
+        "these three are the BANNABLE part of the accepted set — the ones distinctive \
+         enough to ban as literals. It is deliberately NOT the whole accepted set (see \
+         the module's blind spots), so this pins the three, never an equality with it"
     );
 }
 
@@ -350,4 +362,22 @@ fn the_frontend_accepts_every_mcp_identity_the_backend_still_mints() {
             );
         }
     }
+}
+
+/// rev-967 N4. `COPILOT_MCP_TOOL_GRANTS`'s wildcard is a second spelling of
+/// the server name, and `brand` argues at length that such a literal may exist
+/// only because a test computes and compares it (that is the whole excuse for
+/// `MCP_TOOL_PREFIX`). This one had no such test.
+///
+/// It earns the pin more than the prefix does: this array is the value a
+/// REPAIRED persona is granted, so a wildcard naming a server nobody declares
+/// is a delegate launched with no orchestration tools — and the repair path is
+/// exactly where rev-967 B1 found a capability being widened, so nothing about
+/// this array should be taken on trust.
+#[test]
+fn the_copilot_grant_wildcard_is_derived_from_the_server_name() {
+    use loomux_lib::orchestration::{COPILOT_MCP_TOOL_GRANTS, MCP_SERVER};
+
+    assert_eq!(COPILOT_MCP_TOOL_GRANTS[0], format!("{MCP_SERVER}/*"));
+    assert_eq!(COPILOT_MCP_TOOL_GRANTS[1], MCP_SERVER);
 }

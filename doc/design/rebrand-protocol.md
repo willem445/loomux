@@ -77,9 +77,42 @@ is missing, and not one of them fails loudly.
   pane boots against a file agent exit already deleted: the exact failure the excision
   exists to prevent, reintroduced for every tab a user had open across the upgrade.
 
+- **`orchestration::refusal_was_resent`** compares two sender names read out of one
+  `audit.jsonl`, and that file spans the flag day. Both of its comparisons go through
+  `same_audit_sender`, and they fail in opposite directions, which is why one rule for
+  both matters: the first would tell an orchestrator to re-send a delivery that landed,
+  the second would drop a genuinely-refused delivery off the roster entirely.
+- **The persona `tools:` reader** (`ResolvedPersona`) — the one surface here where the
+  answer is *not* "accept every spelling", argued in the next section.
+
 `brand::is_host_actor` exists so that last class of question — *did we write this?* — has
 one implementation. A hand-written `== AUDIT_ACTOR` at a call site is a record from before
 the flag day silently reclassified as somebody else's.
+
+## The one reader that must NOT accept every spelling
+
+Every surface above reads a record **this app wrote** and cannot rewrite, so accepting the
+old spelling is simply reading our own past output. A repo's `.github/agents/*.md`
+`tools:` list is a different kind of thing: it is the **user's statement of intent**, and
+the rename moved the ground under it. That makes the accept-both reflex wrong in one
+direction and mandatory in the other, and the split is per-question rather than per-file:
+
+| The file says | Question | Answer | Why |
+| --- | --- | --- | --- |
+| `loomux/*`, or bare `loomux` | *does this GRANT the server?* | **No** — current spelling only | The author asked for the whole server. Reading the stale name as a live grant keeps the native path and hands the delegate a filter matching no server we declare: it launches with **no orchestration tools at all**. Calling it a gap sends it to the repair path, which adds `orrerix/*` — the author's own intent, spelled the way the server is spelled now. |
+| `loomux/report` | *is this a per-tool DECISION?* | **Yes** — every spelling | The author asked for exactly one tool, and that decision did not change when our server's name did. Reading the stale name as "never mentions the server" makes it an omission, and the repair then appends the full-server grant — **this app widening a narrowing nobody widened**, which is the move #222's capability closure forbids. |
+
+So `grants_loomux_tools` takes the current name and `scopes_mcp_server_per_tool` takes
+`brand::MCP_SERVERS`, evaluating `mentions && !grants` **per spelling** — which is exactly
+what separates the two rows. A well-meaning collapse of the two predicates into one
+"accept both everywhere" reintroduces one row's defect whichever way it collapses, so
+both are pinned, including the negative control.
+
+The human-facing half matters as much: from inside the repo that `tools:` line looks
+correct — it names a server and scopes it — and the only thing that changed is a name its
+author never chose and cannot see. The warning says the file names the pre-rename server
+and what to write instead, rather than the bare "does not grant the MCP server" that
+would send them hunting a typo they did not make.
 
 ## The flag day, and what it does and does not promise
 

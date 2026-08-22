@@ -44,7 +44,7 @@ Everything below is the detail — including **Never block a turn on CI** and th
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` / `list_notifications()` /
   `cancel_notification(id)` — register a background watch on a PR's CI or a `gh run` id and
-  get a `[orrerix] …` notice in this pane when it fires, instead of polling yourself. See
+  get an `[orrerix] …` notice in this pane when it fires, instead of polling yourself. See
   **Never block a turn on CI** below — registering it and then waiting in the same turn is
   the one way to make it useless.
 - `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
