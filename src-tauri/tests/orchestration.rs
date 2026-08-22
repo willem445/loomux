@@ -42678,7 +42678,7 @@ fn locate_sh_exe() -> Option<String> {
 fn gh_cmd_shim_still_gates_a_merge_when_sh_is_stripped_from_the_invoking_path() {
     // The live bug (#335): a default Git for Windows install puts git.exe on
     // PATH but NOT sh.exe (`usr\bin` is off PATH) — a PowerShell/cmd
-    // invocation of gh.cmd used to `for %%S in (sh.exe) do set LOOMUX_SH=...`
+    // invocation of gh.cmd used to `for %%S in (sh.exe) do set ORRERIX_SH=...`
     // against the *invoking* shell's PATH, find nothing, and silently exec
     // the real gh with no gate and no audit. The fix bakes an ABSOLUTE
     // sh.exe path into the .cmd at shim-write time; this proves the
@@ -42835,17 +42835,17 @@ fn gh_cmd_shim_audits_loudly_instead_of_silently_bypassing_when_no_sh_is_resolva
 
 #[cfg(windows)]
 #[test]
-fn gh_cmd_shim_ignores_an_inherited_loomux_sh_in_the_degraded_no_sh_case() {
+fn gh_cmd_shim_ignores_an_inherited_sh_override_in_the_degraded_no_sh_case() {
     // rev-10 review finding on #335: `setlocal` makes the .cmd's OWN variable
-    // changes revertible, but it does NOT clear a `LOOMUX_SH` the invoking
+    // changes revertible, but it does NOT clear an sh-override the invoking
     // shell already exported. Before the fix, the degraded (`sh_path: None`)
-    // template never `set` LOOMUX_SH at all — so an inherited value (stray
+    // template never `set` the sh-override at all — so an inherited value (stray
     // env, or an adversarial agent priming its own shell) would satisfy `if
-    // not defined LOOMUX_SH` and route through THAT untrusted binary instead
+    // not defined ORRERIX_SH` and route through THAT untrusted binary instead
     // of taking the audited degraded-fallback branch, defeating the "never a
     // silent bypass" guarantee for exactly the case this delegator exists to
-    // protect. The fix unconditionally clears LOOMUX_SH before the check;
-    // this pins it by simulating the attack: an inherited LOOMUX_SH pointing
+    // protect. The fix unconditionally clears it before the check;
+    // this pins it by simulating the attack: an inherited ORRERIX_SH pointing
     // at a stand-in binary that must NEVER run.
     use std::process::Command;
     let td = tempfile::tempdir().unwrap();
@@ -42877,14 +42877,21 @@ fn gh_cmd_shim_ignores_an_inherited_loomux_sh_in_the_degraded_no_sh_case() {
     let status = Command::new(shim_dir.join("gh.cmd"))
         .args(["pr", "merge", "5"])
         .env("LOOMUX_GROUP_DIR", &group)
-        .env("LOOMUX_SH", &malicious) // simulates an inherited/adversarial value
+        // The variable the .cmd ACTUALLY consults. #1153 phase 3 renamed it,
+        // and setting the old name here would leave this test green while
+        // simulating nothing: the malicious stand-in cannot run if the shim
+        // never looks at the variable pointing to it. (The group dir above
+        // stays on the LEGACY spelling on purpose — the .cmd resolves the
+        // current one from it, so that arm of the dual-accept is exercised
+        // here rather than only asserted.)
+        .env("ORRERIX_SH", &malicious) // simulates an inherited/adversarial value
         .status()
         .unwrap();
 
     assert!(status.success(), "the degraded fallback still runs the real binary, so this exits 0");
     assert!(
         !malicious_log.exists(),
-        "an inherited LOOMUX_SH must NEVER be trusted when shim-write time resolved no sh — the \
+        "an inherited ORRERIX_SH must NEVER be trusted when shim-write time resolved no sh — the \
          malicious stand-in must not have run"
     );
     let gh_log = fs::read_to_string(&log).unwrap_or_default();
@@ -42892,7 +42899,7 @@ fn gh_cmd_shim_ignores_an_inherited_loomux_sh_in_the_degraded_no_sh_case() {
     let audit = fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
     assert!(
         audit.contains("gate-degraded-no-sh"),
-        "the degraded fallback must still be audited even with an inherited LOOMUX_SH present — got audit: {audit:?}"
+        "the degraded fallback must still be audited even with an inherited ORRERIX_SH present — got audit: {audit:?}"
     );
 }
 
