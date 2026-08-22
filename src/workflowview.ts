@@ -2239,7 +2239,11 @@ export class WorkflowView {
         this.field(
           "Reviewers routed by path",
           list,
-          "A PR touching any of a rule's paths requires that rule's reviewers too, on top of the list above. Additive — a rule can only ever make this gate stricter. Edit these in .loomux/workflow.yml; this pane preserves them but does not yet offer a control for them."
+          // `this.rel`, never a literal and not even `WORKFLOW_FILE`: the pane may
+          // have opened the LEGACY path on a repo that still carries it, and a hint
+          // telling someone to edit a file that is not the one in front of them is
+          // the defect this file already fixed once (see the `startPathEl` note).
+          `A PR touching any of a rule's paths requires that rule's reviewers too, on top of the list above. Additive — a rule can only ever make this gate stricter. Edit these in ${this.rel}; this pane preserves them but does not yet offer a control for them.`
         )
       );
     }

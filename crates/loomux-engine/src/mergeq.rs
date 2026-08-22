@@ -769,7 +769,6 @@ pub enum ConditionRefusal {
     Unsupported(String),
 }
 
-
 /// The outcome of re-checking the merge gate for one sub-PR (§6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateRecheck {

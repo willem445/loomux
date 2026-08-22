@@ -3586,6 +3586,12 @@ pub fn gate_file_text(gate: &Gate) -> String {
         if rule.paths.is_empty() || rule.reviewers.is_empty() {
             out.push_str(&format!("{POISON_KEY} incomplete-routing-rule\n"));
         }
+        // The per-rule path cap, poisoned for the same reason the rule cap above
+        // is (#1176 rev-972 N1): `parse_gate_file` refuses a file past it, so
+        // writing one would emit a file loomux itself calls malformed.
+        if rule.paths.len() > ROUTING_PATHS_MAX {
+            out.push_str(&format!("{POISON_KEY} too-many-routing-paths\n"));
+        }
         for p in &rule.paths {
             match sanitize_glob(p) {
                 Some(clean) if clean == *p => {
