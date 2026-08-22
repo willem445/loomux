@@ -79,7 +79,7 @@ pub fn detect_orch_signature(text: &str) -> Option<(&'static str, Option<String>
     let head = text.trim_start();
     if crate::brand::NOTICE_MARKERS
         .iter()
-        .any(|m| head.strip_prefix(m).is_some_and(|rest| rest.starts_with(' ')))
+        .any(|m| head.strip_prefix(*m).is_some_and(|rest| rest.starts_with(' ')))
     {
         return Some(("orchestrator", None));
     }

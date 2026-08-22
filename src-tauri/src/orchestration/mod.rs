@@ -5263,6 +5263,16 @@ fn copilot_tools_with_loomux(tools: &[String]) -> Vec<String> {
 /// `--allowedTools mcp__<server>`) and the name in the file can't drift
 /// apart — every one of those argv spellings is now built from this const or
 /// from [`brand::MCP_TOOL_PREFIX`], which a unit test derives from it.
+/// `{ "<agent token header>": <token> }` — the auth block every CLI's
+/// generated MCP config carries, minted from [`brand::AGENT_TOKEN_HEADER`] so
+/// the name a config PRESENTS cannot drift from the set `mcp.rs` accepts.
+/// Written under one spelling; read under every spelling (#1153 phase 3).
+fn agent_token_headers(token: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(brand::AGENT_TOKEN_HEADER.to_string(), Value::String(token.to_string()));
+    Value::Object(m)
+}
+
 fn one_server_map(server: Value) -> Value {
     let mut m = serde_json::Map::new();
     m.insert(MCP_SERVER.to_string(), server);
@@ -5345,7 +5355,7 @@ pub fn gemini_settings_json(
     let mut cfg = json!({
         "mcpServers": one_server_map(json!({
             "httpUrl": format!("http://127.0.0.1:{port}/mcp"),
-            "headers": { (brand::AGENT_TOKEN_HEADER): token },
+            "headers": agent_token_headers(token),
         }))
     });
     if containment.denies_edits() {
@@ -5682,7 +5692,7 @@ pub fn opencode_config_json(
             "type": "remote",
             "url": format!("http://127.0.0.1:{port}/mcp"),
             "enabled": true,
-            "headers": { (brand::AGENT_TOKEN_HEADER): token },
+            "headers": agent_token_headers(token),
             "oauth": false,
             "timeout": OPENCODE_MCP_TIMEOUT_MS,
         })),
@@ -39056,7 +39066,7 @@ impl OrchRegistry {
         let mut server = json!({
             "type": "http",
             "url": format!("http://127.0.0.1:{port}/mcp"),
-            "headers": { (brand::AGENT_TOKEN_HEADER): token },
+            "headers": agent_token_headers(token),
         });
         if cli == "copilot" {
             server["tools"] = json!(["*"]);
