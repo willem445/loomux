@@ -762,6 +762,13 @@ pin advertised to stop it (rev-11 F1).
   wrong, because `lessons_path` prefers `.orrerix/lessons.md` and never reads
   the entry again.
 
+  **Second round in the same PR (rev-967 N6).** The marker rename left the
+  article wrong — *"a `[orrerix]` notice"* — in roughly twenty places across
+  `orchestrator.md`, `worker.md` and `reviewer.md`. Prose only, and it would
+  normally wait; it is folded in here because fixing it re-blesses this
+  directory again, and one re-bless a reviewer reads beats two they have to
+  correlate. `planner.md` and `manager.md` did not carry the construction.
+
   Two `loomux` spellings survive in `orchestrator.md` on purpose: the
   `loomux-worktrees` path example (a convention derived from the REPO's name,
   not the product's) and the `agent-managed` label description, which mirrors

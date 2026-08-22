@@ -22,7 +22,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, CLI_CAPS, EFFORT_LEVELS,
+    block_contract_text, cli_caps, command_line_length_guard, copilot_tools_gap_warning, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, ToolsGapAction, CLI_CAPS, EFFORT_LEVELS,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -2941,6 +2941,118 @@ fn loomux_repairs_an_omission_but_never_a_deliberate_narrowing() {
          itself more than it was given: {cmd}"
     );
     assert!(line.contains("per-tool"), "and says why: {line}");
+
+    // THE SAME DECISION, WRITTEN BEFORE THE FLAG DAY (rev-967 B1). This is the
+    // row that is red without `scopes_mcp_server_per_tool`'s legacy arm, and it
+    // is the whole reason that arm exists.
+    //
+    // #1153 phase 3 renamed the MCP server, and a persona file in somebody's
+    // repo still says `loomux/report`. The author's decision did not change
+    // when our server's name did: they asked for exactly one tool. Reading the
+    // stale spelling as "never mentions the server" made this an OMISSION, and
+    // the repair path then appended the full-server grant — this app widening a
+    // narrowing nobody widened, which is what #222's capability closure forbids
+    // and what `tools_gap_refusal`'s own doc promises never happens.
+    //
+    // Pinned NEXT TO the current-spelling case rather than replacing it. An
+    // earlier revision of this PR moved this test's specimen to
+    // `orrerix/report`, which left CI green across a live behaviour change
+    // because the only witness had stopped being a member of the class at risk.
+    let (cmd, line) = case("[\"read\", \"loomux/report\"]");
+    assert!(
+        cmd.contains("--agent p"),
+        "a per-tool scope written before the rename is still a DECISION — repairing it would \
+         hand the delegate every tool on the server where its author named one: {cmd}"
+    );
+    assert!(line.contains("per-tool"), "and it is reported as one: {line}");
+    assert!(
+        !line.contains("re-pointed"),
+        "the repair path must not have run at all — running it IS the widening: {line}"
+    );
+    assert!(
+        line.contains("\"names_server_as\":\"loomux\""),
+        "and the record says which spelling the file used, so a human can act on it: {line}"
+    );
+
+    // The NEGATIVE CONTROL for that arm, and the asymmetry it protects. A stale
+    // WHOLE-server grant is deliberately NOT a per-tool scope: `loomux/*` asks
+    // for the whole server, so the repair gives exactly that under the name the
+    // server actually has. Keeping it native instead would hand the delegate a
+    // filter matching nothing — no orchestration tools at all — which is the
+    // regression a well-meaning "accept both spellings everywhere" produces.
+    // Argued in `grants_loomux_tools`'s doc; asserted here so the argument
+    // cannot be undone by someone tidying the two predicates into one.
+    for whole_server in ["[\"read\", \"loomux/*\"]", "[\"read\", \"loomux\"]"] {
+        let (cmd, line) = case(whole_server);
+        assert!(
+            !cmd.contains("--agent p "),
+            "{whole_server}: a stale whole-server grant is a GAP on purpose — the repair spells \
+             the author's own intent the way the server is spelled now: {cmd}"
+        );
+        assert!(line.contains("re-pointed"), "{whole_server}: {line}");
+    }
+}
+
+/// rev-967 B1, the human-facing half: a persona whose scope stopped matching
+/// because the SERVER was renamed must be told that, in those words.
+///
+/// From inside the file nothing looks wrong — the `tools:` line is right there,
+/// naming a server, scoping it to a tool. The only thing that changed is a name
+/// the author never chose and cannot see from their own repo, so a warning that
+/// merely says "does not grant the MCP server" sends them looking for a typo
+/// they did not make.
+#[test]
+fn a_persona_scoping_the_pre_rename_server_is_told_the_name_is_what_went_stale() {
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(&copilot_profile_workflow("w", "p.md")).agent_file(
+        "p.md",
+        "---\nname: p\ndescription: A worker.\ntools: [\"read\", \"loomux/report\"]\n---\nDo the work.",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let b = g.guardrails.block("w").unwrap();
+    let persona = reg.resolve_persona(&g, b).unwrap_or(None).expect("the persona resolves");
+
+    assert!(
+        persona.scopes_mcp_server_per_tool(),
+        "the pre-rename spelling must read as a per-tool scope, or the repair path widens it"
+    );
+    assert_eq!(
+        persona.mcp_server_named_in_tools(),
+        Some("loomux"),
+        "and the file's own spelling is what gets reported back"
+    );
+
+    let warning = copilot_tools_gap_warning("w", &persona, ToolsGapAction::KeptNativeForPerToolScope);
+    assert!(
+        warning.contains("PRE-RENAME server `loomux`"),
+        "the warning must name the stale spelling: {warning}"
+    );
+    assert!(
+        warning.contains("orrerix"),
+        "…and the current one, or the reader still cannot act on it: {warning}"
+    );
+
+    // The negative control: a persona scoping the CURRENT server per-tool is a
+    // plain partial grant and must NOT be told its name went stale.
+    let (reg2, _d2) = test_registry();
+    let repo2 = Repo::new().workflow(&copilot_profile_workflow("w", "p.md")).agent_file(
+        "p.md",
+        "---\nname: p\ndescription: A worker.\ntools: [\"read\", \"orrerix/report\"]\n---\nDo the work.",
+    );
+    let g2 = reg2.create_group(&repo2.path(), rails()).unwrap();
+    let b2 = g2.guardrails.block("w").unwrap();
+    let current = reg2.resolve_persona(&g2, b2).unwrap_or(None).expect("the persona resolves");
+    let warning2 =
+        copilot_tools_gap_warning("w", &current, ToolsGapAction::KeptNativeForPerToolScope);
+    assert!(
+        !warning2.contains("PRE-RENAME"),
+        "a current-spelling scope is not a stale name, and saying so would send a human editing \
+         a file that is already right: {warning2}"
+    );
+    assert!(
+        warning2.contains("grants some orrerix tools but not all"),
+        "it gets the partial-grant wording instead: {warning2}"
+    );
 }
 
 #[test]

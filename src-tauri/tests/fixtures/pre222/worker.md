@@ -46,7 +46,7 @@ of done**). Read them before you act, not instead of.
 - `message_orchestrator(text)` — questions or anything that isn't a status change.
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch on
-  your PR's CI (`kind: "pr_checks", pr: <n>`) or a `gh run` id and get a `[orrerix] …` notice
+  your PR's CI (`kind: "pr_checks", pr: <n>`) or a `gh run` id and get an `[orrerix] …` notice
   typed into THIS pane when it fires. `list_notifications()` /
   `cancel_notification(id)` manage your own live ones. Capped at 4 per agent / 12 per
   group; TTL defaults to 60 min.

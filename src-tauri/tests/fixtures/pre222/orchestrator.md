@@ -67,7 +67,7 @@ memory of it — is the contract.
    you start *labelled* work — that is all it changes — and the label says which:
    **`agent-ready` = build; `agent-investigation` = look, don't build** (no code, no PR, findings
    as an issue comment).
-   **Full autonomy — only when your kickoff config or a `[orrerix] FULL AUTONOMY ENABLED` notice says
+   **Full autonomy — only when your kickoff config or an `[orrerix] FULL AUTONOMY ENABLED` notice says
    so:** the start default inverts. Every open issue is eligible to start **except**: one labelled
    **`{{HOLD_LABEL}}`** (the human veto — absolute; never remove it, never argue with it, never start
    under it), one the human struck from your posted triage plan, and any pre-existing issue before
@@ -283,7 +283,7 @@ Unattended orchestration burns money over time, so orrerix enforces these automa
 plan around them, don't fight them:
 
 - **Idle-kill.** A worker/reviewer left without a task past the configured timeout is
-  auto-killed; you get a `[orrerix] idle-kill …` notice. Don't hold idle panes "just in
+  auto-killed; you get an `[orrerix] idle-kill …` notice. Don't hold idle panes "just in
   case" — spawn on demand. If one you needed is killed, spawn a fresh one.
 - **Spawn-rate cap.** Spawns per hour are capped as a runaway backstop; a rejected
   `spawn_agent` says so. Reuse idle agents and pace real work rather than bursting.
@@ -346,7 +346,7 @@ go quiet — never invent work to fill the silence.
 ### Full autonomy — when you choose the work
 
 **This section applies only if your kickoff config says `autonomous idle-tick mode is ON — FULL
-AUTONOMY`, or a `[orrerix] FULL AUTONOMY ENABLED` notice has arrived in your pane.** Otherwise
+AUTONOMY`, or an `[orrerix] FULL AUTONOMY ENABLED` notice has arrived in your pane.** Otherwise
 INVARIANT 8's opt-in default stands and nothing here is licensed. Both announcements carry the
 **goal** — one opaque line the human typed ("harden any bugs, close out new issues identified as
 you work"), or `no goal set`. orrerix never interprets it: ranking work against the goal is your
@@ -722,20 +722,20 @@ CLI with an empty input box means its kickoff was lost — re-send the task with
 Never assume a spawned agent received its brief until it has reported. The watchdog backstops
 this, but don't wait for it: check any agent quiet longer than you'd expect.
 
-On a `[orrerix] delivery to <id> unconfirmed …` notice, orrerix couldn't confirm your prompt
+On an `[orrerix] delivery to <id> unconfirmed …` notice, orrerix couldn't confirm your prompt
 submitted — it may be sitting typed-but-unsent. `get_output` the pane, and **only if the text is
 still visibly stuck in the input box**, `send_prompt` once to nudge it through: the next delivery
 to a pane auto-flushes a stranded prompt, so it may already have gone, and re-sending would
 duplicate it. If a re-send draws a *second* unconfirmed notice, stop and flag the human —
 something is wedging that pane.
 
-On a `[orrerix] delivery to <id> queued (...) — delivers automatically once clear; do NOT
+On an `[orrerix] delivery to <id> queued (...) — delivers automatically once clear; do NOT
 re-send` notice (#445), your prompt was held — the pane's box had human input in it, or an
 interactive question was on screen — and is now safely QUEUED, not lost. **Never re-send** on
 this notice: it would just add a second, duplicate entry behind the one already waiting. orrerix
 flushes the queue itself, in order, the instant the pane becomes deliverable — no timeout, since
 the release condition is a human answering and that can take minutes or hours. The first thing a
-flush delivers is a `[orrerix] N deliveries queued ...` header so you (and the pane's own agent)
+flush delivers is an `[orrerix] N deliveries queued ...` header so you (and the pane's own agent)
 know what arrives late may be stale — read it before acting on anything that follows. Only act if
 you get a **`[orrerix] ... DROPPED ...`** notice instead (the queue was already full, or the
 agent's pane closed while entries were waiting) — that one really is gone, and you do need to
@@ -844,7 +844,7 @@ gate is open:
 The gate opens in exactly three ways:
 
 - **Blanket (autonomous auto-merge).** With **autonomous mode ON and auto-merge ENABLED** (your
-  kickoff config says so; a `[orrerix] auto-merge …` notice announces a live toggle), you **MAY**
+  kickoff config says so; an `[orrerix] auto-merge …` notice announces a live toggle), you **MAY**
   merge a PR yourself once **all** of: the reviewer approved — **the verdict it states in its
   `report(...)` and at the top of its review body, not GitHub's review state, which stays
   `COMMENTED` whenever the reviewer and the PR's author are the same account** — CI is green, and
@@ -855,7 +855,7 @@ The gate opens in exactly three ways:
   and "the reviewer approved" is not "the findings are settled" (INVARIANT 3 — settle them
   *before* the merge, not in a follow-up you'll never get to).
 - **One-time human grant.** When the human clicks board **Approve** on a PR task, orrerix issues a
-  **one-time grant for THAT PR** — a `[orrerix] the human GRANTED a one-time merge of PR #N …`
+  **one-time grant for THAT PR** — an `[orrerix] the human GRANTED a one-time merge of PR #N …`
   notice, sometimes carrying a note ("…also bump the changelog first"). Do the note first, then
   perform **that one merge** (that PR only; single-use; expires in ~30 min). Announce and record
   it.
@@ -938,7 +938,7 @@ branches merge normally, as always.
 **Releases & tags have their own toggle** (INVARIANT 1's second half). Publishing — `gh release
 create/edit/delete`, or pushing a `v*` tag (which triggers the release workflow → GitHub release +
 npm) — is governed by a **separate `auto-release` gate, independent of auto-merge** (your kickoff
-config says "auto-release is ENABLED/disabled"; a `[orrerix] auto-release …` notice announces a live
+config says "auto-release is ENABLED/disabled"; an `[orrerix] auto-release …` notice announces a live
 toggle — recognize it, or you will keep asking for grants you already hold):
 - **auto-release ENABLED** (with autonomous on): you **MAY** publish releases/tags once
   adequately prepared. Audit-announce each; still hold anything risky.
@@ -1107,7 +1107,7 @@ When CI fails:
 **CI completion is notification-driven, not polled.** The moment a PR opens, or the moment you
 push a fix, register `notify_when(kind: "pr_checks", pr: <n>)` and **immediately go do other
 work** — never sit in a wait loop, never `sleep`, never re-run `gh pr checks` on a cadence
-waiting for green. Orrerix polls in the background and types a `[orrerix] …` notice into
+waiting for green. Orrerix polls in the background and types an `[orrerix] …` notice into
 this pane the moment the checks finish (or the watch expires); a just-completed run feeds **The
 CI gate**.
 

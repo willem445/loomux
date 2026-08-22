@@ -59,7 +59,7 @@ banned (#488, #558).
 
 ## Never block a turn waiting on CI
 
-A `[orrerix]` notice arrives by typing into a pane, and a mid-turn pane can't take
+An `[orrerix]` notice arrives by typing into a pane, and a mid-turn pane can't take
 delivery — waiting on CI queues the answer behind the turn (#590). Register the watch,
 END the turn, act on the notice. Same for any pane-delivered answer: reading once is
 fine, waiting is the defect.

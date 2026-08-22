@@ -1679,8 +1679,8 @@ if [ -z "$base" ] || [ -z "$default" ]; then
   loomux_block "unverifiable-base" "$base" "$sel"
 fi
 
-# ── THE WORKFLOW MERGE GATE (#222, closing the loomux half of #197) ───────────
-# When the repo declares `gates.merge`, loomux writes a `merge_gate` spec file into
+# ── THE WORKFLOW MERGE GATE (#222, closing the orrerix half of #197) ───────────
+# When the repo declares `gates.merge`, orrerix writes a `merge_gate` spec file into
 # the group dir, and every reviewer's `review_verdict` lands in
 # `verdicts/pr-<N>/<block>` with the verdict word (pass|fail|escalate) as line 1.
 #
@@ -1697,7 +1697,7 @@ fi
 if [ -f "$ORX_GD/merge_gate" ]; then
   gatef="$ORX_GD/merge_gate"
   # Without a PR number no verdict can be attributed to this merge → fail closed.
-  [ -n "$num" ] || loomux_block_wf "unresolved-pr" "loomux could not resolve the PR number, so it cannot check the recorded verdicts against it"
+  [ -n "$num" ] || loomux_block_wf "unresolved-pr" "orrerix could not resolve the PR number, so it cannot check the recorded verdicts against it"
   # THE REVISION THIS MERGE WOULD LAND. A verdict binds to a COMMIT, not to a PR
   # number: without this, two reviewers pass #7, the worker pushes "fixed lint",
   # and the gate still reads green over code nobody reviewed — #197's failure class,
@@ -1705,10 +1705,10 @@ if [ -f "$ORX_GD/merge_gate" ]; then
   # refuse, the same fail-safe an undeterminable base takes.
   cur_head=$("$REAL_GH" pr view $rf "$num" --json headRefOid --jq .headRefOid 2>/dev/null)
   cur_head=$(printf '%s' "$cur_head" | tr '[:upper:]' '[:lower:]')
-  [ -n "$cur_head" ] || loomux_block_wf "unresolved-head" "loomux could not resolve the PR's current head commit, so it cannot tell whether the recorded verdicts reviewed the code that would merge"
+  [ -n "$cur_head" ] || loomux_block_wf "unresolved-head" "orrerix could not resolve the PR's current head commit, so it cannot tell whether the recorded verdicts reviewed the code that would merge"
   # No globbing anywhere below: the gate file's tokens are word-split into `for`
   # loops, and a security shim should not leave the next reader working out whether
-  # a `*` could reach a filename. (loomux never writes one — sanitize_id /
+  # a `*` could reach a filename. (orrerix never writes one — sanitize_id /
   # sanitize_condition reject glob characters — so this is belt, not braces.)
   set -f
   g_req="all-pass"; g_thr=0; g_revs=""; g_also=""; g_maxdiff=0
@@ -1726,15 +1726,15 @@ if [ -f "$ORX_GD/merge_gate" ]; then
       # #1174's small-batch clause. A structured key, not an `also:` token,
       # because it carries a NUMBER — see `Gate::max_diff_lines`.
       max-diff-lines) g_maxdiff="$g_v" ;;
-      # An unrecognized key is NOT skipped. loomux writes an `unrepresentable` line
+      # An unrecognized key is NOT skipped. orrerix writes an `unrepresentable` line
       # when it cannot safely serialize a token (rather than dropping the clause),
       # and a hand edit or a truncation lands here too. Skipping any of them would
       # silently drop a requirement from a gate.
-      *) loomux_block_wf "malformed-gate" "the merge gate file contains a line loomux cannot parse ('$g_k') — a gate it cannot read in full is not a gate it will enforce in part. This self-heals on its own (the next background reload regenerates it) if that workflow.yml is well-formed; if the refusal persists, that file is what needs fixing. No relaunch needed either way" ;;
+      *) loomux_block_wf "malformed-gate" "the merge gate file contains a line orrerix cannot parse ('$g_k') — a gate it cannot read in full is not a gate it will enforce in part. This self-heals on its own (the next background reload regenerates it) if that workflow.yml is well-formed; if the refusal persists, that file is what needs fixing. No relaunch needed either way" ;;
     esac
   done < "$gatef"
   # A gate naming nobody, or a threshold with no usable number, is a MALFORMED gate
-  # — refuse rather than wave it through. (loomux only ever writes well-formed gate
+  # — refuse rather than wave it through. (orrerix only ever writes well-formed gate
   # files; this is the hand-edited/truncated case.)
   [ -n "$g_revs" ] || loomux_block_wf "malformed-gate" "the declared merge gate names no reviewers"
   # The gate's RULE, validated up front. An unrecognized `require` is refused, not
@@ -1746,7 +1746,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
     all-pass) : ;;
     threshold) case "$g_thr" in ''|*[!0-9]*) g_thr=0 ;; esac
                [ "$g_thr" -ge 1 ] || loomux_block_wf "malformed-gate" "the declared merge gate says require: threshold but carries no usable threshold number" ;;
-    *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — loomux understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
+    *) loomux_block_wf "malformed-gate" "the merge gate declares an unrecognized require value ('$g_req') — orrerix understands 'all-pass' and 'threshold'. A rule it cannot read is not a rule it will guess at" ;;
   esac
   # THE SMALL-BATCH CLAUSE (#1174), checked BEFORE the verdict counting below —
   # deliberately. Its remedy ("split this PR") does not depend on any verdict, and
@@ -1754,10 +1754,10 @@ if [ -f "$ORX_GD/merge_gate" ]; then
   # is spent; telling an agent to wait for reviewers on a PR it is going to have to
   # split anyway is the wrong first sentence. An unusable number is a MALFORMED
   # gate, never "no limit": the lax reading of a bound the repo wrote down is the
-  # one direction this design never takes. (loomux only writes well-formed values —
+  # one direction this design never takes. (orrerix only writes well-formed values —
   # `parse_workflow` refuses 0 and serde refuses a negative — so this is the
   # hand-edited/truncated case, the same one the `require` arm above covers.)
-  case "$g_maxdiff" in ''|*[!0-9]*) loomux_block_wf "malformed-gate" "the merge gate declares a max-diff-lines value loomux cannot read as a number ('$g_maxdiff')" ;; esac
+  case "$g_maxdiff" in ''|*[!0-9]*) loomux_block_wf "malformed-gate" "the merge gate declares a max-diff-lines value orrerix cannot read as a number ('$g_maxdiff')" ;; esac
   if [ "$g_maxdiff" -gt 0 ]; then
     # additions+deletions over the whole PR, from gh's own JSON — NOT parsed out of
     # `gh pr diff --stat`'s English summary line, whose wording ("1 file changed, 2
@@ -1766,7 +1766,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
     # shim that fails in a new way every time that sentence changes.
     d_lines=$("$REAL_GH" pr view $rf "$num" --json additions,deletions --jq '.additions + .deletions' 2>/dev/null)
     case "$d_lines" in
-      ''|*[!0-9]*) loomux_block_wf "diff-size-unknown" "the gate declares max_diff_lines: $g_maxdiff and loomux could not read this PR's size, so it cannot tell whether it is within the limit — an unmeasurable PR is refused, not waved through" ;;
+      ''|*[!0-9]*) loomux_block_wf "diff-size-unknown" "the gate declares max_diff_lines: $g_maxdiff and orrerix could not read this PR's size, so it cannot tell whether it is within the limit — an unmeasurable PR is refused, not waved through" ;;
     esac
     [ "$d_lines" -le "$g_maxdiff" ] || loomux_block_wf "diff-too-large" "this PR changes $d_lines lines and this repo's merge gate declares max_diff_lines: $g_maxdiff. Split it into PRs that each land under the limit — a review nobody can hold in their head is the failure this gate exists to prevent"
   fi
@@ -1814,7 +1814,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
       [ -z "$g_why" ] || loomux_block_wf "verdict-outstanding" "the PR is now at $cur_head — $g_why" ;;
   esac
   # `also:` conditions. ci-green is checked against the real gh; anything this build
-  # does not know how to check FAILS CLOSED — a clause loomux silently ignored would
+  # does not know how to check FAILS CLOSED — a clause orrerix silently ignored would
   # make a stricter-looking workflow file a weaker one, the worst thing a gate can do.
   for g_c in $g_also; do
     case "$g_c" in
@@ -1835,7 +1835,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
       # can spot an already-fixed finding; nothing acts on it automatically.
       body-unchanged)
         b_raw=$("$REAL_GH" pr view $rf "$num" --json body --jq .body 2>/dev/null) \
-          || loomux_block_wf "unresolved-body" "the gate requires body-unchanged and loomux could not read the PR's body, so it cannot tell whether what would become the squash commit message is what the reviewers passed"
+          || loomux_block_wf "unresolved-body" "the gate requires body-unchanged and orrerix could not read the PR's body, so it cannot tell whether what would become the squash commit message is what the reviewers passed"
         # The canonical form both halves digest, and ALL of it: strip CR (a CRLF and
         # an LF body are the same commit message), then exactly one trailing newline
         # — `$(…)` ate them all, `printf '%s\n'` puts one back. Kept this small on
@@ -1844,7 +1844,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
         b_norm=$(printf '%s' "$b_raw" | tr -d '\r')
         loomux_norm_guard "$b_raw" "$b_norm" "the PR body"
         b_now=$(printf '%s\n' "$b_norm" | loomux_sha256)
-        [ -n "$b_now" ] || loomux_block_wf "no-sha256" "the gate requires body-unchanged but this host has no usable sha256 tool (sha256sum, shasum or openssl), so loomux cannot compare the PR body against the one the reviewers passed — a condition it cannot check refuses the merge"
+        [ -n "$b_now" ] || loomux_block_wf "no-sha256" "the gate requires body-unchanged but this host has no usable sha256 tool (sha256sum, shasum or openssl), so orrerix cannot compare the PR body against the one the reviewers passed — a condition it cannot check refuses the merge"
         b_bad=""
         for b_r in $g_revs; do
           b_vf="$ORX_GD/verdicts/pr-$num/$b_r"
@@ -1881,7 +1881,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
         # (a positional, per #294), and an unresolvable one refuses.
         bg_nwo=$("$REAL_GH" repo view $repo --json nameWithOwner --jq .nameWithOwner 2>/dev/null)
         case "$bg_nwo" in
-          ''|*[!A-Za-z0-9._/-]*) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not resolve which repository this PR belongs to, so it cannot read the base branch's checks" ;;
+          ''|*[!A-Za-z0-9._/-]*) loomux_block_wf "base-unverifiable" "the gate requires base-green and orrerix could not resolve which repository this PR belongs to, so it cannot read the base branch's checks" ;;
         esac
         # ONE definition of each reduction, interpolated from `workflow.rs` — see
         # BASE_CHECK_RUNS_JQ. The first cut kept a COPY here; the two were
@@ -1892,8 +1892,8 @@ if [ -f "$ORX_GD/merge_gate" ]; then
         # own total_count clause is what stops a truncated page reading green.
         bg_runs=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/check-runs?per_page=100" --jq '__BASE_CHECK_RUNS_JQ__' 2>/dev/null)
         bg_stat=$("$REAL_GH" api "repos/$bg_nwo/commits/$base/status" --jq '__BASE_STATUS_JQ__' 2>/dev/null)
-        case "$bg_runs" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
-        case "$bg_stat" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        case "$bg_runs" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and orrerix could not read the check runs on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
+        case "$bg_stat" in none|pending|red|green|truncated) : ;; *) loomux_block_wf "base-unverifiable" "the gate requires base-green and orrerix could not read the commit statuses on '$base' (its HEAD), so it cannot tell whether the branch this PR would land on is healthy — unknown is never treated as green" ;; esac
         # Compared word by word, never as a concatenation (#1181 rev-lead NB4). The
         # concatenated form happened to be right for every pair in today's
         # vocabulary, but it was right by an argument nobody had written down and
@@ -1902,13 +1902,13 @@ if [ -f "$ORX_GD/merge_gate" ]; then
         if [ "$bg_runs" = "red" ] || [ "$bg_stat" = "red" ]; then
           loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' is RED. Fix the base branch first — piling more work onto a broken branch is what this clause exists to stop"
         elif [ "$bg_runs" = "truncated" ] || [ "$bg_stat" = "truncated" ]; then
-          loomux_block_wf "base-unverifiable" "the gate requires base-green and loomux cannot account for all of the checks on the HEAD of '$base' — either it reports more check runs than one API page carries, or a payload arrived without the field that says how many there are. Either way loomux will not guess about the checks it cannot see. Re-run the merge once the run count settles; if this base permanently carries more than 100 checks, base-green cannot be enforced for it and should not be declared"
+          loomux_block_wf "base-unverifiable" "the gate requires base-green and orrerix cannot account for all of the checks on the HEAD of '$base' — either it reports more check runs than one API page carries, or a payload arrived without the field that says how many there are. Either way orrerix will not guess about the checks it cannot see. Re-run the merge once the run count settles; if this base permanently carries more than 100 checks, base-green cannot be enforced for it and should not be declared"
         elif [ "$bg_runs" = "pending" ] || [ "$bg_stat" = "pending" ]; then
           loomux_block_wf "base-not-green" "the gate requires base-green and the checks on the HEAD of '$base' have not finished. Wait for them: a base whose result is not in yet is not a base known to be green"
         elif [ "$bg_runs" = "none" ] && [ "$bg_stat" = "none" ]; then
-          loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so loomux cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green"
+          loomux_block_wf "base-not-green" "the gate requires base-green and the HEAD of '$base' reports no checks or statuses at all, so orrerix cannot tell whether it is healthy — unknown is never treated as green. If this repo's CI legitimately skips some commits, do not declare base-green"
         fi ;;
-      *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
+      *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this orrerix build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade orrerix" ;;
     esac
   done
   set +f
@@ -2137,7 +2137,7 @@ fn shim_cmd_delegator(program: &str, real_bs: &str, sh_path: Option<&str>) -> St
          rem #335: no sh was found when this shim was generated — the merge/\r\n\
          rem release gate is DEGRADED for this call (falling straight through\r\n\
          rem to the real binary). Audit it loudly; never bypass silently.\r\n\
-         if not defined ORRERIX_GROUP_DIR set ORRERIX_GROUP_DIR=%LOOMUX_GROUP_DIR%\r\n\
+         if not defined ORRERIX_GROUP_DIR if defined LOOMUX_GROUP_DIR set \"ORRERIX_GROUP_DIR=%LOOMUX_GROUP_DIR%\"\r\n\
          if defined ORRERIX_GROUP_DIR (\r\n\
          \x20 >>\"%ORRERIX_GROUP_DIR%\\audit.jsonl\" echo {{\"ts_ms\":0,\"actor\":\"{program}-shim-cmd\",\"action\":\"gate-degraded-no-sh\",\"detail\":{{}}}} 2>nul\r\n\
          )\r\n\
@@ -2334,7 +2334,7 @@ pub fn loomux_shim_cmd() -> String {
      rem Self-contained on purpose: a refusal must never degrade into running the\r\n\
      rem real launcher, so there is no sh delegation and no fallback path.\r\n\
      setlocal\r\n\
-     if not defined ORRERIX_GROUP_DIR set ORRERIX_GROUP_DIR=%LOOMUX_GROUP_DIR%\r\n\
+     if not defined ORRERIX_GROUP_DIR if defined LOOMUX_GROUP_DIR set \"ORRERIX_GROUP_DIR=%LOOMUX_GROUP_DIR%\"\r\n\
      if defined ORRERIX_GROUP_DIR (\r\n\
      \x20 >>\"%ORRERIX_GROUP_DIR%\\audit.jsonl\" echo {\"ts_ms\":0,\"actor\":\"orrerix-shim-cmd\",\"action\":\"self-launch-blocked\",\"detail\":{}} 2>nul\r\n\
      )\r\n\
@@ -5240,6 +5240,7 @@ pub const MCP_SERVER: &str = brand::MCP_SERVER;
 /// Copilot honors — the answer is a live observation loomux cannot make for
 /// itself (CLAUDE.md constraint 3).
 pub const COPILOT_MCP_TOOL_GRANTS: [&str; 2] = ["orrerix/*", MCP_SERVER];
+
 
 /// A persona's `tools:` list with [`COPILOT_MCP_TOOL_GRANTS`] appended —
 /// the user's own scoping intent preserved verbatim, widened by exactly the one
@@ -10968,19 +10969,56 @@ pub struct ResolvedPersona {
 }
 
 impl ResolvedPersona {
-    /// Whether this persona's own `tools:` filter would leave loomux's MCP
+    /// Whether this persona's own `tools:` filter would leave this app's MCP
     /// tools available to the agent Copilot launches from it (#802). Always
     /// true for a persona that declares no `tools:` — Copilot's documented
     /// default is every tool.
+    ///
+    /// **The CURRENT server name only, and that asymmetry is argued rather
+    /// than overlooked** (rev-967 B1). Everywhere else in #1153 phase 3 a
+    /// reader accepts every spelling, because it is reading a record this app
+    /// wrote and cannot rewrite. A persona's `tools:` list is not that: it is
+    /// the USER's statement of intent, and a stale `loomux/*` in it grants
+    /// access to a server no longer declared to Copilot. Treating that as a
+    /// live grant would take the native path and hand the delegate a filter
+    /// matching nothing — it would launch with no orchestration tools at all.
+    /// Treating it as a gap sends it to the repair path, which adds
+    /// `orrerix/*`: the author's own intent, spelled the way the server is
+    /// spelled now. So the stale whole-server grant is deliberately a GAP.
     pub fn grants_loomux_tools(&self) -> bool {
         profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), MCP_SERVER)
     }
 
-    /// Whether the `tools:` list names loomux's server at all, including a
-    /// single-tool grant like `loomux/report` (#802). Wording only — see
-    /// [`profiles::AgentProfile::mentions_mcp_server`].
-    pub fn mentions_loomux_tools(&self) -> bool {
-        profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), MCP_SERVER)
+    /// Does the `tools:` list scope this app's MCP server to NAMED TOOLS —
+    /// under any spelling a repo author could have written (#802, rev-967 B1)?
+    ///
+    /// `loomux/report` is a decision, not an omission, and it stays one after
+    /// the rename: the author asked for exactly one tool. Before this arm
+    /// existed the pre-rename spelling read as "never mentions the server",
+    /// so [`tools_gap_refusal`] called it repairable and the repair appended
+    /// the full-server grant — this app widening a deliberate narrowing,
+    /// which is the exact move #222's capability closure forbids.
+    ///
+    /// Per spelling, `mentions && !grants`: that is what makes `loomux/*`
+    /// (whole-server, stale) fall through to the repair path while
+    /// `loomux/report` (one tool, stale) does not. See
+    /// [`grants_loomux_tools`](Self::grants_loomux_tools) for why those two
+    /// want opposite answers.
+    pub fn scopes_mcp_server_per_tool(&self) -> bool {
+        brand::MCP_SERVERS.into_iter().any(|s| {
+            profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), s)
+                && !profiles::tools_grant_mcp_server(self.copilot_tools.as_deref(), s)
+        })
+    }
+
+    /// The server spelling this persona's `tools:` list actually names, if
+    /// any — so a warning can tell a human their file names the PRE-RENAME
+    /// server rather than leaving them to wonder why a scope they can see in
+    /// their own file matches nothing.
+    pub fn mcp_server_named_in_tools(&self) -> Option<&'static str> {
+        brand::MCP_SERVERS
+            .into_iter()
+            .find(|s| profiles::tools_mention_mcp_server(self.copilot_tools.as_deref(), *s))
     }
 }
 
@@ -11039,7 +11077,7 @@ fn tools_gap_refusal(p: &ResolvedPersona) -> Option<ToolsGapAction> {
     if p.copilot_tools.as_deref().is_some_and(|t| t.is_empty()) {
         return Some(ToolsGapAction::KeptNativeForExplicitEmptyList);
     }
-    if p.mentions_loomux_tools() {
+    if p.scopes_mcp_server_per_tool() {
         return Some(ToolsGapAction::KeptNativeForPerToolScope);
     }
     None
@@ -11057,51 +11095,58 @@ pub fn copilot_tools_gap_warning(
     } else {
         format!("[{}]", listed.join(", "))
     };
-    let partial = if persona.mentions_loomux_tools() {
-        format!(
+    let partial = match persona.mcp_server_named_in_tools() {
+        // The pre-rename spelling. Say so plainly: from inside the file this
+        // looks like a working scope, and nothing else here would tell the
+        // author that the name itself is what stopped matching (rev-967 B1).
+        Some(named) if named != MCP_SERVER => format!(
+            " It names the PRE-RENAME server `{named}` — that scope matches nothing now that \
+             the server is `{MCP_SERVER}`, and it is left exactly as written rather than \
+             widened, so edit the file to scope `{MCP_SERVER}` instead."
+        ),
+        Some(_) if persona.scopes_mcp_server_per_tool() => format!(
             " It grants some {MCP_SERVER} tools but not all of them, so the delegate \
              would be missing whichever ones it did not name."
-        )
-    } else {
-        String::new()
+        ),
+        _ => String::new(),
     };
     let tail = match action {
         ToolsGapAction::Repaired => format!(
-            "loomux launched it from a generated copy of that persona carrying the same list \
+            "orrerix launched it from a generated copy of that persona carrying the same list \
              plus \"{}\" instead, so this spawn works — but the repo file is still the one to \
              fix.",
             COPILOT_MCP_TOOL_GRANTS.join("\", \""),
         ),
         ToolsGapAction::KeptNativeForMcpServers => {
-            "loomux did NOT rewrite it, because the persona declares its own `mcp-servers:` \
+            "orrerix did NOT rewrite it, because the persona declares its own `mcp-servers:` \
              block and a generated copy would drop those servers — so THIS DELEGATE CANNOT \
-             CALL loomux until the file is fixed."
+             CALL orrerix until the file is fixed."
                 .to_string()
         }
         ToolsGapAction::KeptNativeForExplicitEmptyList => {
-            "loomux did NOT rewrite it: an empty list is a deliberate \"no tools at all\", not \
-             an omission, and loomux does not overrule it into \"none except loomux\" — so THIS \
-             DELEGATE CANNOT CALL loomux until the file is fixed."
+            "orrerix did NOT rewrite it: an empty list is a deliberate \"no tools at all\", not \
+             an omission, and orrerix does not overrule it into \"none except orrerix\" — so THIS \
+             DELEGATE CANNOT CALL orrerix until the file is fixed."
                 .to_string()
         }
         ToolsGapAction::KeptNativeForPerToolScope => {
-            "loomux did NOT rewrite it: the list scopes the loomux server to named tools on \
-             purpose, and widening that to the whole server would be loomux granting itself \
-             more than it was given — so THIS DELEGATE CAN CALL ONLY the loomux tools that \
+            "orrerix did NOT rewrite it: the list scopes the orrerix server to named tools on \
+             purpose, and widening that to the whole server would be orrerix granting itself \
+             more than it was given — so THIS DELEGATE CAN CALL ONLY the orrerix tools that \
              list names, until a human widens it."
                 .to_string()
         }
         ToolsGapAction::RepairFailed => {
-            "loomux could not write its generated copy, so this delegate launched with no \
-             agent file at all: it keeps its loomux tools, but the persona reached it as \
+            "orrerix could not write its generated copy, so this delegate launched with no \
+             agent file at all: it keeps its orrerix tools, but the persona reached it as \
              kickoff text instead of its system prompt."
                 .to_string()
         }
     };
     format!(
         "block {block_id}: copilot persona \"{}\" declares tools: {shown}, which does not grant \
-         loomux's MCP server. Copilot's `tools:` is a FILTER over built-in AND MCP tools, so the \
-         loomux server loads but none of its tools reach the agent (#802).{partial} Add \
+         orrerix's MCP server. Copilot's `tools:` is a FILTER over built-in AND MCP tools, so the \
+         orrerix server loads but none of its tools reach the agent (#802).{partial} Add \
          \"orrerix/*\" to that file's tools: list. {tail}",
         persona.name,
     )
@@ -14565,6 +14610,20 @@ pub fn refusal_roster(
     }
 }
 
+/// Two sender names, out of two audit rows, that mean the same sender.
+///
+/// `audit.jsonl` spans the #1153 phase 3 flag day: one row can carry the
+/// pre-rename host actor and the next the current one, for deliveries this app
+/// sent minutes apart. A bare `==` between two such rows is a comparison of
+/// spellings where the question is identity, and it answers wrong in both
+/// directions — see the two call sites, which fail opposite ways.
+///
+/// Agent ids are unaffected: they are never host actors, so the second arm
+/// cannot make two different agents compare equal.
+fn same_audit_sender(a: &str, b: &str) -> bool {
+    a == b || (brand::is_host_actor(a) && brand::is_host_actor(b))
+}
+
 /// #658: did `row`'s sender get this same payload through after `entries[at]`
 /// refused it?
 ///
@@ -14600,7 +14659,10 @@ fn refusal_was_resent(entries: &[AuditEntry], at: usize, row: &RefusedDelivery) 
     let mut credit: i64 = 0;
     for e in entries.iter().skip(at + 1) {
         if e.action == "prompt" {
-            if e.actor == row.from && e.detail["to"] == json!(row.to) {
+            // rev-967 N5: across the flag day a bare `==` here fails to
+            // credit a genuine re-send, and the roster tells an orchestrator
+            // to ask again for a delivery that landed.
+            if same_audit_sender(&e.actor, &row.from) && e.detail["to"] == json!(row.to) {
                 if let Some(t) = e.detail["text"].as_str() {
                     if t.len() == bytes && queue::dropped_payload_preview(t) == row.preview {
                         credit += 1;
@@ -14612,7 +14674,13 @@ fn refusal_was_resent(entries: &[AuditEntry], at: usize, row: &RefusedDelivery) 
         let Some(later) = refusal_row(e) else { continue };
         if later.text.is_none()
             && later.to == row.to
-            && later.from == row.from
+            // The SECOND site of rev-967 N5's class, found by sweeping for it
+            // rather than named in the review. It fails the OTHER way: an
+            // unmatched spelling skips this `credit -= 1`, so a delivery that
+            // was refused again reads as one that got through and drops off
+            // the roster entirely — a loss, where the site above only causes
+            // a duplicate ask.
+            && same_audit_sender(&later.from, &row.from)
             && later.bytes == row.bytes
             && later.preview == row.preview
         {
@@ -39979,7 +40047,8 @@ impl OrchRegistry {
                     "persona": p.name,
                     "tools": p.copilot_tools.clone().unwrap_or_default(),
                     "missing": COPILOT_MCP_TOOL_GRANTS,
-                    "mentions_server": p.mentions_loomux_tools(),
+                    "per_tool_scope": p.scopes_mcp_server_per_tool(),
+                    "names_server_as": p.mcp_server_named_in_tools(),
                     "action": match refusal {
                         None => "re-pointed --agent at a loomux-generated stand-in carrying every \
                                  frontmatter key verbatim, with the loomux grant added to tools:",
