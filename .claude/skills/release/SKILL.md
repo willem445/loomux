@@ -92,9 +92,9 @@ order.
   `create-release` is also idempotent: if a release for the tag already
   exists (e.g. a "Re-run all jobs" after a partial failure), it reuses that
   release's id instead of spawning a second draft.
-- `promote` verifies the release's own **asset count** (expects 9) before
+- `promote` verifies the release's own **asset count** (expects 10) before
   flipping it public, and refuses — leaving the release in draft — if short.
-  If `promote` fails with "Only N/9 assets" in the logs, don't just re-run
+  If `promote` fails with "Only N/10 assets" in the logs, don't just re-run
   it: check `gh api repos/OWNER/REPO/releases` for a stray duplicate release
   on the same tag first. If it's a genuinely missing/failed matrix leg
   instead, re-run that leg, then re-run `promote`.
@@ -157,8 +157,10 @@ real notes after the assets are up:
 ## 5. Verify — the release isn't done until all of these pass
 
 - `npm view loomux-desktop version` → X.Y.Z.
-- The GitHub release has **9 assets**: `-setup.exe` + `.msi`, both `.dmg`s,
-  `.AppImage` + `.deb` + `.rpm`, and the two `.app.tar.gz` bundles.
+- The GitHub release has **10 assets**: `-setup.exe` + `.msi`, both `.dmg`s,
+  `.AppImage` + `.deb` + `.rpm`, the two `.app.tar.gz` bundles, and
+  `Loomux_X.Y.Z_x64.pdb.zip` — the Windows debug symbols, which a crash
+  dump from a released build needs to symbolicate (#1218).
 - The release run's conclusion is `success` (not just "the assets exist" —
   publish-npm is the last job and can fail after the assets upload).
 
@@ -192,7 +194,8 @@ What's different from a stable release:
   ("optional pre-release identifier in app version must be numeric-only ...
   for msi target"), so the Windows build leg passes `--bundles nsis` to
   `tauri build` for these tags — NSIS only, MSI skipped. The asset count
-  `promote` checks for is **8**, not 9 (stable minus the `.msi`).
+  `promote` checks for is **9**, not 10 (stable minus the `.msi`; the
+  `.pdb.zip` IS still produced — the same cargo build emits it either way).
 - **`prerelease: true`** on the GitHub release, set at creation and never
   flipped back.
 - **`make_latest: false`** when `promote` publishes it — a beta must never
@@ -208,7 +211,7 @@ What's different from a stable release:
   content (skip mentioning the `.msi` download).
 
 Stable tags (no hyphen) are unaffected by any of the above — same asset
-count (9), same npm publish. `promote`'s "Publish the draft release" step
+count (10), same npm publish. `promote`'s "Publish the draft release" step
 never sends `make_latest` in the same API call as `draft=false`, in either
 direction (a `make_latest=true` sent that way can be silently dropped —
 see the comment above the `gh api` calls for the evidence and why the

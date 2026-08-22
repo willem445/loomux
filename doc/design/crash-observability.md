@@ -100,14 +100,34 @@ effect on loomux's binary, not just std. Since the bundle doesn't ship the PDB,
 the **installer payload is unaffected**; the cost is only the build-tree/CI PDB
 and any future decision to ship it.
 
-We deliberately do **not** ship the PDB in the installer: it exposes symbols and
-would add ~23 MB. Two honest follow-ups (out of scope here): bundle `loomux.pdb`
-next to the exe (a `bundle.resources` entry pointing at the build artifact, or a
-post-build copy step) so installed builds get named frames too; or set up
-server-side symbolication — upload the PDB to a symbol server keyed by module +
-address. With `debug = "line-tables-only"` now in place, the "drop the matching
-`loomux.pdb` beside the installed `loomux.exe`" workaround *does* symbolicate
-loomux frames (it would not have with the old `debug=false` PDB).
+We deliberately do **not** ship the PDB **in the installer**: it exposes symbols
+and would add ~23 MB to every download. That is still true.
+
+**The release itself now carries it** (#1218). `release.yml`'s Windows leg zips
+`target/release/loomux.pdb` to `Loomux_X.Y.Z_x64.pdb.zip` and attaches it to the
+GitHub release beside the installers, so the PDB is no longer discarded with the
+runner. This costs the installer payload nothing — it is a separate asset nobody
+has to download — and it turns the "drop the matching `loomux.pdb` beside the
+installed `loomux.exe`" workaround from hypothetical into a two-step recipe:
+download the `.pdb.zip` **for the exact version that crashed**, unzip it next to
+the installed exe. With `debug = "line-tables-only"` in place that genuinely
+symbolicates loomux frames (it would not have with the old `debug=false` PDB).
+
+Match the version exactly. A PDB is bound to one link: the exe's CodeView record
+names a GUID and age, and a PDB from a different build has a different GUID, so
+a mismatched pair either refuses to load or — worse, with a tool that does not
+check — names the wrong functions.
+
+One honest follow-up remains out of scope here: server-side symbolication —
+upload the PDB to a symbol server keyed by module + address, so no manual
+version-matching is needed at all.
+
+**A dump can be read without any PDB, if it comes to that.** The shipped exe
+carries a `.pdata` exception directory (`RUNTIME_FUNCTION` entries for every
+non-leaf function), which is enough to unwind a minidump's captured stack
+exactly and to bracket each frame to a function's start address. #1218 was
+root-caused that way before its PDB existed. It gives addresses, not names —
+which is why shipping the PDB is worth the two steps above.
 
 ### 2. Breadcrumb log
 
