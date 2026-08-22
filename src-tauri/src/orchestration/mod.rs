@@ -35584,6 +35584,14 @@ impl OrchRegistry {
                 // apart from any number, so the chip never announces a clause
                 // this repo did not write.
                 "max_diff_lines": g.max_diff_lines,
+                // #1176. The rules AS DECLARED — which of them fire is a per-PR
+                // fact and this status has no PR to ask about. An empty list is
+                // "no routing", which the chip must keep apart from "routing
+                // that happened not to match", a sentence it cannot say here.
+                "routing": g.routing.iter().map(|r| serde_json::json!({
+                    "paths": r.paths,
+                    "reviewers": r.reviewers,
+                })).collect::<Vec<_>>(),
                 "satisfiable": missing.is_empty(),
                 "missing_blocks": missing,
             })

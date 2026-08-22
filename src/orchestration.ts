@@ -1569,6 +1569,11 @@ export interface WorkflowGateStatus {
    *  size limit — which is a different statement from a limit of 0, a value the
    *  engine refuses outright. */
   max_diff_lines?: number | null;
+  /** Path-based reviewer routing (#1176) — the rules as declared, NOT resolved
+   *  against any PR. Which of them fire is a per-PR fact this status has no PR to
+   *  ask about; the gate line a reviewer reads (`gate_status_line`) is where a
+   *  resolved answer lives. Absent/empty = no routing. */
+  routing?: { paths: string[]; reviewers: string[] }[];
   satisfiable: boolean;
   missing_blocks: string[];
 }
