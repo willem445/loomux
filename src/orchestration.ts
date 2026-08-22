@@ -583,7 +583,7 @@ export function initOrchestration(wiring: OrchWiring): void {
     // the human never asked for this pane directly, so a toast would be noise.
     if (isSpawnRequestExpired(payload.deadline_ms ?? 0, Date.now())) {
       console.warn(
-        `[loomux] dropped expired spawn request agent=${payload.agent_id} ` +
+        `[orrerix] dropped expired spawn request agent=${payload.agent_id} ` +
           `group=${payload.group_id} deadline_ms=${payload.deadline_ms}`
       );
       return;
@@ -974,10 +974,10 @@ async function killAndAwaitExit(ptyId: number): Promise<void> {
     // recovery paths in relaunchPaneAsOrchestrator to catch a genuinely stuck
     // process; throwing here would strand the pane with no toast at all.
     await killPty(ptyId).catch((err) => {
-      console.warn(`[loomux] promote: killing pty ${ptyId} failed (${String(err)}) — continuing`);
+      console.warn(`[orrerix] promote: killing pty ${ptyId} failed (${String(err)}) — continuing`);
     });
     if ((await withDeadline(exited, PROMOTE_EXIT_WAIT_MS)) === "timeout") {
-      console.warn(`[loomux] promote: pty ${ptyId} did not report an exit within ${PROMOTE_EXIT_WAIT_MS}ms — resuming anyway`);
+      console.warn(`[orrerix] promote: pty ${ptyId} did not report an exit within ${PROMOTE_EXIT_WAIT_MS}ms — resuming anyway`);
     }
   } finally {
     unlisten();
@@ -1131,7 +1131,7 @@ async function runPromotion(pane: Pane, action: Extract<PaneMenuAction, { kind: 
     // no failure mode left where saying nothing is acceptable — including one
     // nobody predicted. Every anticipated failure toasts inside the relaunch;
     // this is the backstop for the rest.
-    console.error("[loomux] promote: relaunch failed", err);
+    console.error("[orrerix] promote: relaunch failed", err);
     showToast(promoteRecoveryNote(req.group_id, "spawn"), "error");
   }
 }

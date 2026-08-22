@@ -512,7 +512,7 @@ const fresh: FeedbackSubmitState = { inFlight: false, findingsLanded: false };
 test("a second submit while the first write is outstanding is a no-op, on BOTH routes", () => {
   // The defect: two concurrent chains for one decision. On a merge-gate row
   // that is two `orch_request_changes` calls — two `Requested changes: …` notes
-  // on one task and two `[loomux]` deliveries the orchestrator must reconcile.
+  // on one task and two `[orrerix]` deliveries the orchestrator must reconcile.
   const busy = { ...fresh, inFlight: true };
   assert.equal(feedbackSubmitStep("merge-gate", busy), "ignore");
   assert.equal(feedbackSubmitStep("note", busy), "ignore");

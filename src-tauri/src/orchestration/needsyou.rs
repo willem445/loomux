@@ -131,7 +131,7 @@ pub const RESOLVED_RETAINED: usize = 20;
 /// mistaken for the whole one.
 pub const LIST_RESOLVED_CAP: usize = 10;
 
-/// Total cap on the composed `[loomux] n-N resolved …` notice, matching
+/// Total cap on the composed `[orrerix] n-N resolved …` notice, matching
 /// [`super::humanq::ANSWER_NOTICE_CAP`]: this one also carries a human's own
 /// words rather than a status line's payload.
 pub const RESOLVE_NOTICE_CAP: usize = 2400;
@@ -529,7 +529,7 @@ pub fn next_id(existing: &[Item]) -> String {
 /// item **with a note**. A note-less resolve delivers nothing: it is the human
 /// tidying their own queue, and a pane notice per tidy is noise.
 ///
-/// **Both `note` and `task` are untrusted text entering a `[loomux]` line.** The
+/// **Both `note` and `task` are untrusted text entering an `[orrerix]` line.** The
 /// note was typed by a human rather than an agent, but the pane cannot tell
 /// those apart and a newline in it would forge a second line reading as its own
 /// legitimate notice. The task ref is worse: nothing validates the string an ask
@@ -542,7 +542,7 @@ pub fn resolve_notice(id: &str, task: Option<&str>, note: &str) -> String {
         Some(t) => format!(" ({})", sanitize_gh_text(t, NOTICE_TASK_MAX)),
         None => String::new(),
     };
-    let text = format!("[loomux] the human resolved needs-you item {id}{about}: {body}");
+    let text = format!("[orrerix] the human resolved needs-you item {id}{about}: {body}");
     text.chars().filter(|c| !c.is_control()).take(RESOLVE_NOTICE_CAP).collect()
 }
 

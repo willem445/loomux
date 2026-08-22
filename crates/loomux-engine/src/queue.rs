@@ -546,7 +546,7 @@ pub fn queue_full_error(agent_id: &str, depth: usize, blocked_reason: &str) -> S
     )
 }
 
-/// The `[loomux]` notice sent to the orchestrator the FIRST time a delivery
+/// The `[orrerix]` notice sent to the orchestrator the FIRST time a delivery
 /// genuinely becomes held: a fresh delivery's OWN pre-paste/pre-Enter hold
 /// (#111/#420) caps out (`BoxOccupied`/`Question` — `mod.rs`'s
 /// `run_queue_drainer` gates this to that entry's very first attempt only,
@@ -603,7 +603,7 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         EnqueueReason::RefusalRoster => "it reports what this pane refused while full",
     };
     format!(
-        "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
+        "[orrerix] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
     )
 }
 
@@ -668,10 +668,10 @@ pub fn flush_header_text(count: usize, coalesced: usize, cause: FlushCause) -> S
     let why = flush_cause_clause(cause);
     if coalesced > 0 {
         format!(
-            "[loomux] {n} {why} ({coalesced} coalesced) {verb} now delivering, oldest first"
+            "[orrerix] {n} {why} ({coalesced} coalesced) {verb} now delivering, oldest first"
         )
     } else {
-        format!("[loomux] {n} {why} {verb} now delivering, oldest first")
+        format!("[orrerix] {n} {why} {verb} now delivering, oldest first")
     }
 }
 
@@ -692,7 +692,7 @@ pub const QUEUE_FLUSH_MAX_BYTES: usize = 24 * 1024;
 /// purpose: the cap exists to bound a paste, and paying a fixed ~120 bytes
 /// per item keeps the budget arithmetic pure (no rendering pass inside the
 /// planner) while staying on the conservative side of the real banner.
-/// (#632's `[loomux] ` prefix added 9 bytes to that banner; the longest one
+/// (#632's `[orrerix] ` prefix added 9 bytes to that banner; the longest one
 /// this can render — every optional clause present — is still comfortably
 /// inside the margin, so the charge is unchanged.)
 const FLUSH_ITEM_OVERHEAD: usize = 120;
@@ -813,7 +813,7 @@ pub fn superseded_entries(entries: &[QueuedDelivery]) -> Vec<Superseded> {
 /// row of loomux prose in the pane's tail, and a `from`/`queued` line
 /// describing a delivery is exactly the text-about-a-question shape #576 is.
 /// The marker must come FIRST because `deframe` strips whitespace and
-/// `│ ┃ | * ● • ◆` and not `-`: `----- [loomux] …` would still lead with the
+/// `│ ┃ | * ● • ◆` and not `-`: `----- [orrerix] …` would still lead with the
 /// dash and survive. The literal matches this module's seven other notice
 /// constructors, which spell the marker out the same way;
 /// `every_framing_row_of_a_coalesced_flush_is_maskable` in
@@ -830,7 +830,7 @@ fn constituent_banner(pos: usize, total: usize, c: &FlushConstituent, now_ms: u6
         String::new()
     };
     format!(
-        "[loomux] ----- {pos}/{total} · from {} · queued {age} (id {}, t={}){repeats} -----",
+        "[orrerix] ----- {pos}/{total} · from {} · queued {age} (id {}, t={}){repeats} -----",
         c.from, c.id, c.enqueued_ms
     )
 }
@@ -906,7 +906,7 @@ pub fn coalesced_flush_text(
     let verb = if n == 1 { "is" } else { "are" };
     let why = flush_cause_clause(cause);
     let mut out = format!(
-        "[loomux] {count} {why} {verb} being delivered TOGETHER, \
+        "[orrerix] {count} {why} {verb} being delivered TOGETHER, \
          as this one prompt, oldest first{more} — they are itemized below with their origin and \
          queue time; nothing was reordered or dropped.{dedup} Treat each item as its own message.",
     );
@@ -976,7 +976,7 @@ pub fn dropped_notice(agent_id: &str, count: usize, reason: DropReason) -> Strin
         DropReason::QueueFull => "queue was already full when a hold expired",
         DropReason::AgentDied => "the agent's pane closed",
     };
-    format!("[loomux] {n} to {agent_id} DROPPED ({why}) — not delivered, not recoverable")
+    format!("[orrerix] {n} to {agent_id} DROPPED ({why}) — not delivered, not recoverable")
 }
 
 /// The one-shot "still queued" visibility notice at
@@ -987,12 +987,12 @@ pub fn dropped_notice(agent_id: &str, count: usize, reason: DropReason) -> Strin
 pub fn still_queued_notice(agent_id: &str, depth: usize, minutes: u64) -> String {
     let entries = if depth == 1 { "1 delivery".to_string() } else { format!("{depth} deliveries") };
     format!(
-        "[loomux] still queued: {entries} to {agent_id}, waiting {minutes} min behind an unanswered \
+        "[orrerix] still queued: {entries} to {agent_id}, waiting {minutes} min behind an unanswered \
          question/input box — nothing lost, delivers automatically once clear"
     )
 }
 
-/// #590: the `from` a delivery carries when **loomux itself** is the sender.
+/// #590: the `from` a delivery carries when **this app itself** is the sender.
 /// `deliver_prompt`'s `from` for every host-originated payload — a fired
 /// `notify_when` notice, a channel note, a compact nudge, a kickoff brief.
 ///
@@ -1000,9 +1000,15 @@ pub fn still_queued_notice(agent_id: &str, depth: usize, minutes: u64) -> String
 /// an MCP-relayed `message_agent` carries the CALLING agent's id here, never
 /// this string, because `mcp.rs` passes `&caller.agent_id` and no tool lets a
 /// caller choose the field.
-pub const LOOMUX_SENDER: &str = "loomux";
+///
+/// This is what a delivery is STAMPED with; asking whether a delivery already
+/// on disk was ours is [`crate::brand::is_host_actor`], which also accepts the
+/// pre-#1153 spelling that every queue file written before the flag day
+/// carries. Writing `from == SENDER` by hand at a call site is the bug that
+/// predicate exists to prevent.
+pub const SENDER: &str = crate::brand::AUDIT_ACTOR;
 
-/// #590: is this queued entry one of loomux's OWN `[loomux] …` notices — the
+/// #590: is this queued entry one of loomux's OWN `[orrerix] …` notices — the
 /// payload class whose entire purpose is to tell the pane's agent something it
 /// cannot learn any other way, and which is therefore the one payload whose
 /// non-delivery can deadlock the agent that is waiting on it?
@@ -1014,24 +1020,29 @@ pub const LOOMUX_SENDER: &str = "loomux";
 ///   subject, with its own recovery, and counting it here would put a
 ///   deadlock diagnosis on an ordinary busy pane.
 /// - The marker alone UNDER-guards. Agent text is relayed verbatim, and
-///   [`crate::text::LOOMUX_NOTICE_MARKER`]'s own doc states the limit in these
+///   [`crate::brand::NOTICE_MARKER`]'s own doc states the limit in these
 ///   words: a marker row is evidence that *someone wrote a notice-shaped
 ///   row*, never proof that loomux wrote this one. An agent that opens a
-///   `message_agent` with `[loomux]` would otherwise be able to make loomux
+///   `message_agent` with `[orrerix]` would otherwise be able to make loomux
 ///   report its own text as a stuck host notice.
 ///
 /// Requiring both means the answer rests on a field an agent cannot set AND a
 /// prefix loomux always writes. A `StrandedSubmit` marker carries no text and
 /// is never a notice.
 pub fn is_loomux_notice(entry: &QueuedDelivery) -> bool {
-    entry.from == LOOMUX_SENDER
+    crate::brand::is_host_actor(&entry.from)
         && entry.payload.text().is_some_and(|t| {
-            // Lowercased and left-trimmed for the same reason
-            // `mask_loomux_notices` de-frames and lowercases: the claim is
-            // "this row leads with the marker", and neither indentation nor a
-            // re-cased prefix changes that. No de-framing, because this is a
-            // payload loomux constructed, not a row read back off a pane.
-            t.trim_start().to_lowercase().starts_with(crate::text::LOOMUX_NOTICE_MARKER)
+            // Lowercased and left-trimmed — `leading_notice_marker`'s own
+            // contract — for the same reason `mask_loomux_notices` de-frames
+            // and lowercases: the claim is "this row leads with the marker",
+            // and neither indentation nor a re-cased prefix changes that. No
+            // de-framing, because this is a payload this app constructed, not
+            // a row read back off a pane. EVERY accepted spelling, because a
+            // queue survives a restart: entries persisted to `queue.json`
+            // before #1153 phase 3 still carry the legacy marker and the
+            // legacy sender, and they are exactly the stuck notices #590's
+            // diagnosis is for.
+            crate::brand::leading_notice_marker(t).is_some()
         })
 }
 
@@ -1167,7 +1178,7 @@ pub fn clamp_preview(one_line: &str, max: usize) -> String {
 /// attention badge, which no role suppresses. See `StrandedBlocker::QueueNearFull`.
 pub fn pressure_notice(agent_id: &str, depth: usize, cap: usize) -> String {
     format!(
-        "[loomux] {agent_id}'s delivery queue is {depth}/{cap} and backing up — deliveries are \
+        "[orrerix] {agent_id}'s delivery queue is {depth}/{cap} and backing up — deliveries are \
          arriving faster than that pane accepts them. If the pane is held (unsubmitted text in \
          the box, or a question on screen), releasing it drains the backlog. At {cap} further \
          deliveries are DROPPED, not queued"
@@ -1186,7 +1197,7 @@ pub fn pressure_notice(agent_id: &str, depth: usize, cap: usize) -> String {
 /// arriving faster than it delivers.
 pub fn at_capacity_notice(agent_id: &str, cap: usize) -> String {
     format!(
-        "[loomux] {agent_id}'s delivery queue is FULL ({cap}/{cap}) — every further delivery \
+        "[orrerix] {agent_id}'s delivery queue is FULL ({cap}/{cap}) — every further delivery \
          to it is DROPPED, not queued, until it drains"
     )
 }
@@ -1809,7 +1820,7 @@ pub fn rebinds_to(entry: &QueuedDelivery, agent_is_orchestrator: bool, agent_ses
     }
 }
 
-/// The `[loomux]` notice announcing that a restart's queued deliveries were
+/// The `[orrerix]` notice announcing that a restart's queued deliveries were
 /// re-admitted to a pane that came back for them (#467). Says how many and
 /// how long they waited, because "delivers automatically" is not enough
 /// information when the wait spanned a restart: the recipient needs to judge
@@ -1819,7 +1830,7 @@ pub fn rebinds_to(entry: &QueuedDelivery, agent_is_orchestrator: bool, agent_ses
 pub fn recovered_notice(agent_id: &str, count: usize, oldest_minutes: u64) -> String {
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     format!(
-        "[loomux] {n} to {agent_id} queued before a loomux restart {oldest_minutes} min ago have been \
+        "[orrerix] {n} to {agent_id} queued before a loomux restart {oldest_minutes} min ago have been \
          re-queued in their original order and are delivering now — judge staleness before acting on them"
     )
 }
@@ -1832,7 +1843,7 @@ pub fn recovered_notice(agent_id: &str, count: usize, oldest_minutes: u64) -> St
 pub fn orphaned_notice(count: usize) -> String {
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     format!(
-        "[loomux] {n} queued before the last loomux restart could not be re-bound to a live pane — \
+        "[orrerix] {n} queued before the last loomux restart could not be re-bound to a live pane — \
          call queue_orphans() to read them (payloads intact) and re-send what still applies"
     )
 }
@@ -1844,7 +1855,7 @@ pub fn orphaned_notice(count: usize) -> String {
 pub fn stranded_lost_notice(count: usize) -> String {
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     format!(
-        "[loomux] {n} had already been typed into a pane and was waiting only for Enter when loomux \
+        "[orrerix] {n} had already been typed into a pane and was waiting only for Enter when loomux \
          restarted — that pane is gone, so the text is NOT recoverable; check the `prompt` audit lines \
          for what it was and re-send if it still applies"
     )

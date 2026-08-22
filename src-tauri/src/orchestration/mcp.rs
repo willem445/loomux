@@ -288,7 +288,7 @@ fn channel_tool_defs() -> [Value; 2] {
     [
         tool("channel_send",
             "Send a message to everyone you're currently connected to in your cross-workspace channel (a human connects panes together; you cannot). It is typed as a visible prompt into each peer's pane, prefixed with your identity so they know it's from you. Directional: the channel's SENDER may call this any time and it broadcasts to every receiver; a RECEIVER may call this only after the sender has messaged it (a one-time reply credit) and it goes to the sender ONLY, never another receiver. Errors if you aren't connected to anyone, or (as a receiver) haven't been messaged yet — check with channel_status().",
-            json!({ "text": { "type": "string", "description": "The message to send. Sanitized before delivery: control characters are stripped and you cannot forge a [loomux] system notice." } }),
+            json!({ "text": { "type": "string", "description": "The message to send. Sanitized before delivery: control characters are stripped and you cannot forge an [orrerix] system notice." } }),
             &["text"]),
         tool("channel_status",
             "Check whether you're connected to a cross-workspace channel: the sender's agent id, who else is in it (agent id, role, name, repo, direction, whether each can currently talk back), and whether YOU can currently channel_send (always true if you're the sender; true for a receiver only while it holds the reply credit). Read-only.",
@@ -350,7 +350,7 @@ fn group_usage_tool() -> Value {
 /// actually reads.
 fn ask_human_tool() -> Value {
     tool("ask_human",
-        "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as a `[loomux] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose — and give each one a `description` when the label alone does not carry the trade-off. THE HUMAN CAN ALWAYS TYPE THEIR OWN ANSWER INSTEAD: your options are the alternatives you thought of, and the one that matters is often the one you did not list, so leave `allow_free_text` at its default unless the options are genuinely exhaustive. Use `select: \"multi\"` only when the ask really is \"which of these\" rather than \"which one\". Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls. \
+        "Put a question to the human WITHOUT BLOCKING, and keep orchestrating. This returns a question id IMMEDIATELY — it does not wait for an answer and never can. USE THIS INSTEAD OF YOUR CLI'S OWN INTERACTIVE QUESTION DIALOG, always: while such a dialog is on your screen this pane cannot take ANY delivery, so every worker report, review verdict and merge request queues behind it — one question asked while the human is away has already stalled a whole fleet overnight, and that incident is why this tool exists. After calling it: mark the affected board task `blocked` citing the returned id, then GO DO OTHER WORK — review, dispatch, merge, everything not gated on this answer. The answer arrives later as an `[orrerix] answer to q-N (via <source>): …` notice typed into this pane, at which point you un-block ONLY the task that was waiting on it. If nothing arrives, the question simply stays pending: read `list_questions` (it survives a /compact and an app restart, so it is your memory of what is outstanding, not your context), re-surface it in your next status update, and keep working. WHAT MAKES A GOOD QUESTION: self-contained — the human may read it away from the machine, with no pane in front of them. State the decision you need and what turns on it; cite the issue or PR by number for the detail rather than pasting diffs, file contents or logs; never include secrets. Give `options` when the decision really is a choice between named alternatives — it is what lets an answering surface offer buttons instead of prose — and give each one a `description` when the label alone does not carry the trade-off. THE HUMAN CAN ALWAYS TYPE THEIR OWN ANSWER INSTEAD: your options are the alternatives you thought of, and the one that matters is often the one you did not list, so leave `allow_free_text` at its default unless the options are genuinely exhaustive. Use `select: \"multi\"` only when the ask really is \"which of these\" rather than \"which one\". Give `task` so the answer can be tied back to the board row it releases. You cannot answer your own question, and neither can any other agent: answers only ever enter through surfaces the human controls. \
          \
          IF YOU ARE THE LIAISON, three of the sentences above are the orchestrator's and not yours, and this is the whole of the difference. (1) You write no board row — say what is outstanding in your own pane instead, and never ask the orchestrator to mark one on your behalf. (2) The answer notice is delivered to the ORCHESTRATOR's pane, not yours, because un-blocking the work is what an answer is for; `list_questions` is how you see what became of a question you asked, and it is durable across your own compact and a restart. (3) You cannot `withdraw_question` — that settles a row, and a row you no longer need is one you tell the orchestrator about. Everything else is yours exactly as written, and this tool is the reason a decision the human should make LATER, away from this pane, does not have to be a line of scrollback they never scroll back to.",
         json!({
@@ -474,7 +474,7 @@ fn tool_defs(
     if role != Role::Planner {
         tools.extend([
             tool("notify_when",
-                "Register a background watch on a CI/run condition and get a [loomux] notice IN THIS PANE the moment it fires — never another agent's. Register and immediately go do other work; do not sleep or re-poll `gh pr checks`/`gh run view` yourself, loomux polls every 30s. kind: \"pr_checks\" (a PR's checks reach SUCCESS/FAILURE — pass pr; if the PR goes CONFLICTING, it resolves immediately with that notice instead — GitHub never creates check-suites for a conflicted PR, so waiting for SUCCESS/FAILURE there would hang until expiry) or \"workflow_run\" (a specific `gh run` id completes — pass run). expires_minutes defaults to 60, clamped to 5-240. Capped at 4 live per agent / 12 per group; cancel one with cancel_notification or let it fire/expire to free a slot.",
+                "Register a background watch on a CI/run condition and get an [orrerix] notice IN THIS PANE the moment it fires — never another agent's. Register and immediately go do other work; do not sleep or re-poll `gh pr checks`/`gh run view` yourself, loomux polls every 30s. kind: \"pr_checks\" (a PR's checks reach SUCCESS/FAILURE — pass pr; if the PR goes CONFLICTING, it resolves immediately with that notice instead — GitHub never creates check-suites for a conflicted PR, so waiting for SUCCESS/FAILURE there would hang until expiry) or \"workflow_run\" (a specific `gh run` id completes — pass run). expires_minutes defaults to 60, clamped to 5-240. Capped at 4 live per agent / 12 per group; cancel one with cancel_notification or let it fire/expire to free a slot.",
                 json!({
                     "kind": { "type": "string", "enum": ["pr_checks", "workflow_run"], "description": "Unrecognized values are rejected, never defaulted" },
                     "pr": { "type": "string", "description": "PR number, #n, or URL — required for pr_checks" },
@@ -516,7 +516,7 @@ fn tool_defs(
                         take turns instead of colliding. THIS CALL NEVER BLOCKS and never fails for \
                         contention: it returns either 'it is yours' or 'you are queued at position \
                         N'. If you are queued, END YOUR TURN — do not sleep, poll, or re-call in a \
-                        loop; loomux types a [loomux] notice into this pane the moment the lock is \
+                        loop; loomux types an [orrerix] notice into this pane the moment the lock is \
                         yours, and a pane sitting mid-turn cannot take that delivery (the same \
                         deadlock a blocking CI wait causes). Calling it again when you already hold \
                         or are already queued for the lock is a harmless no-op that reports where \
@@ -528,7 +528,7 @@ fn tool_defs(
                     json!({
                         "name": { "type": "string", "description": "The resource to lock — one of the names listed above. An unknown name is refused (with the list), never created on the fly." },
                         "note": { "type": "string", "description": "Short label for what you are doing with it, e.g. \"cargo test --locked\". Optional but worth it: it is what tells a human whether a 40-minute hold is progress or a hang. It is shown to the human beside your pane, written to the audit log, AND returned to every agent in this group by list_locks — so treat it as a public label, not a private note. Whitespace is collapsed and it is capped at 200 characters." },
-                        "wait_minutes": { "type": "integer", "description": "How long to keep your place in the queue if the lock is busy. Default 60, clamped to 5-240. On expiry you get a [loomux] notice and are dropped from the queue — you are never left waiting silently." },
+                        "wait_minutes": { "type": "integer", "description": "How long to keep your place in the queue if the lock is busy. Default 60, clamped to 5-240. On expiry you get an [orrerix] notice and are dropped from the queue — you are never left waiting silently." },
                     }),
                     &["name"]),
                 tool("release_lock",
@@ -1216,7 +1216,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     "{} registered — it is in the human's inbox now. DO NOT WAIT FOR IT: carry on \
                      with the human. Two things about it are the orchestrator's and not yours: the \
                      board row (you write none, and do not ask it to write one for you), and the \
-                     [loomux] answer notice, which is delivered to the ORCHESTRATOR's pane because \
+                     [orrerix] answer notice, which is delivered to the ORCHESTRATOR's pane because \
                      un-blocking the work is what an answer is for. list_questions is how you see \
                      what became of {}, across a /compact and across a restart — and if it is \
                      overtaken by events, say so with message_orchestrator, since withdrawing is \
@@ -1227,7 +1227,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 format!(
                     "{} registered — the human will be asked. DO NOT WAIT FOR IT: go on reviewing, \
                      dispatching and merging everything not gated on this answer. Mark the affected \
-                     task blocked citing {}, and expect a [loomux] answer notice in this pane later. \
+                     task blocked citing {}, and expect an [orrerix] answer notice in this pane later. \
                      list_questions has it meanwhile, across a /compact and across a restart.",
                     q.id, q.id
                 )
@@ -2038,7 +2038,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let w = reg.register_notification(&caller.group, &caller.agent_id, condition, note, expires_minutes)?;
             Ok(format!(
                 "registered {} ({}), polled every 30s, expires in {expires_minutes} min. \
-                 You will get a [loomux] notice in this pane when it completes — do other work until then.",
+                 You will get an [orrerix] notice in this pane when it completes — do other work until then.",
                 w.id, w.condition.label(),
             ))
         }
@@ -2156,7 +2156,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 // absent from the other is a bypass exactly the width of that
                 // asymmetry, and both shapes land in the same pane.
                 None => format!(
-                    "[loomux] {} reports {status}: {}",
+                    "[orrerix] {} reports {status}: {}",
                     caller.agent_id,
                     report::relay_payload(note.or(summary).unwrap())
                 ),
@@ -2228,7 +2228,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let _ = reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!(
-                    "[loomux] {} ({}) recorded verdict {} on PR #{}: {}{}",
+                    "[orrerix] {} ({}) recorded verdict {} on PR #{}: {}{}",
                     caller.agent_id,
                     rec.block,
                     rec.verdict.as_str().to_uppercase(),
@@ -2237,7 +2237,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // field that reaches this pane, and it was the one left raw —
                     // `sanitize_summary` (at the durable write) keeps newlines by
                     // design and never touched brackets, so a reviewer's summary
-                    // could carry a forged `[loomux] …` line into the pane that
+                    // could carry a forged `[orrerix] …` line into the pane that
                     // `{{LIAISON_NOTE}}` tells to read such lines as the human.
                     // The gate clause beside it has been scrubbed at source since
                     // #791 (`gh_failure_text`), which is what made this asymmetry
@@ -2248,7 +2248,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // `verdict_notice_summary`'s own marker carries brackets that
                     // a later scrub would neutralize.
                     report::verdict_notice_summary(&report::relay_payload_keeping_lines(&rec.summary)),
-                    gate.as_deref().map(|g| format!("\n[loomux] {g}")).unwrap_or_default(),
+                    gate.as_deref().map(|g| format!("\n[orrerix] {g}")).unwrap_or_default(),
                 ),
                 &caller.agent_id,
             );
@@ -2442,14 +2442,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // the caller's token, never from `args` — but everything after the
             // colon is the agent's, and this line is the one a liaison's relay
             // is recognized BY. Raw, a delegate could put a second
-            // `[loomux] message from <liaison>:` span inside its own text and
+            // `[orrerix] message from <liaison>:` span inside its own text and
             // speak into the orchestrator's directive ledger with the human's
             // standing. Same scrub as `channel_send` and `report`, one hop
             // before loomux adds its own prefix.
             reg.deliver_relayed_to_orchestrator(
                 &caller.group,
                 &format!(
-                    "[loomux] message from {}: {}",
+                    "[orrerix] message from {}: {}",
                     caller.agent_id,
                     report::relay_payload(text)
                 ),

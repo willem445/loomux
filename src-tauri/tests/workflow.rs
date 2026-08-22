@@ -3637,7 +3637,7 @@ fn a_kickoff_persona_is_framed_as_an_addendum_not_a_replacement() {
     let generated = fs::read_to_string(&generated_path).expect("generated wrapper must exist");
     assert!(generated.contains("You are terse."), "the persona is delivered");
     assert!(
-        generated.contains("does not override the loomux mechanics"),
+        generated.contains("does not override the orrerix mechanics"),
         "the persona must be framed as an addendum: {generated}"
     );
 
@@ -3649,7 +3649,7 @@ fn a_kickoff_persona_is_framed_as_an_addendum_not_a_replacement() {
     assert!(k.contains("You are terse."), "the persona is delivered");
     assert!(k.contains("worker.md"), "the loomux contract is still pointed at");
     assert!(
-        k.contains("does not override the loomux mechanics"),
+        k.contains("does not override the orrerix mechanics"),
         "the persona must be framed as an addendum: {k}"
     );
 }

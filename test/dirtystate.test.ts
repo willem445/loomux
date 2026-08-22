@@ -269,7 +269,7 @@ test("keepOpenOnExit: a crash AND a dirty buffer reports the crash — the banne
 test("exitDiagnosticLine: names the DOA-silent-death case, but only when nothing was ever printed (#281)", () => {
   assert.equal(
     exitDiagnosticLine(false),
-    "[loomux] produced no output before exiting — it likely died before printing " +
+    "[orrerix] produced no output before exiting — it likely died before printing " +
       "anything at all (a missing/corrupt session, a rejected resume flag, or a gone " +
       "working directory are the usual causes)"
   );
