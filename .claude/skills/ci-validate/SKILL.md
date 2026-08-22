@@ -313,8 +313,9 @@ own draft PR**, and CI's log is the failure line you quote.
 1. **Commit your real work first** (#493) — the scratch edits are destructive
    and a `git checkout --` to undo them takes everything uncommitted in the
    file with it.
-2. Cut `scratch/<issue>-red` from your branch head, set **one** behaviour
-   aside — leave everything else wired — and push.
+2. Cut `scratch/<issue>-red-<n>` from your branch head, set **one** behaviour
+   aside — leave everything else wired — and push. One branch per behaviour,
+   numbered, so a wave can go out together (see below).
 3. Open it as a draft titled `[scratch] … — do not merge`, body saying which
    single behaviour is neutered and that every failure line will be quoted in
    the real PR.
@@ -328,9 +329,12 @@ and all conclusive 14 min later, against ~64 min of serialised run time. A branc
 per round also keeps each red citable at its own SHA, so when the two rules below
 retire one round's evidence — a watched red is dated to the commit it was watched
 on, and transfers only if you SHOW it does — only that round is re-cut, and the
-others stay citable where they are. Bound it — a round
-is three platforms, so a five-round wave is fifteen concurrent jobs; don't launch
-one against the green run you are waiting on (#1196).
+others stay citable where they are. Bound it by the job list, not by a
+remembered product: `ci.yml` today runs **four** jobs per run — `build` on
+`ubuntu-22.04`, `windows-latest` and `macos-latest`, plus `e2e-windows` — so a
+five-round wave is **twenty** concurrent jobs. Re-read that list rather than
+this sentence if `ci.yml` gains or loses a job, and don't launch a wave against
+the green run you are waiting on (#1196).
 
 **One behaviour per round.** Two at once, or a neuter that stops it compiling,
 and the failures stop being attributable to the behaviour they evidence — a
