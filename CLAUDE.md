@@ -255,7 +255,13 @@ compiles.
   a split test's already-green half, or a companion that also passed broken prove
   nothing — split the test, or say which half moved (#710, #712, #727). A mutation a
   *reviewer* names is still unrun; run it before quoting it into the body, which
-  becomes the squash message (#868).
+  becomes the squash message (#868). A suite green ACROSS a redesign is a
+  control, not coverage — its fixtures were written against the old shape's
+  failure modes. List what the NEW predicate reads and check some fixture varies
+  each; a value every fixture happens to share is an unpinned axis. Signature:
+  the fixtures all carry one incidental constant (four WIP caps, all `review` or
+  `in-progress`, none on the status rows are born into) and the axis the
+  redesign made load-bearing has no witness (#1182).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
@@ -283,6 +289,13 @@ compiles.
   crossings of {which side says X} × {which side says Y} plus the negative
   control, so "refuse everything" cannot pass either. Worked example:
   `sshOrchestrationRefusal` and `doc/design/ssh-panes.md` (#859, #906, #921).
+  The two signals can also be ONE state read at two POINTS: a "before" snapshot
+  taken below any part of the write — the row insertion included — is the same
+  asymmetry, and it leaves the guard inert exactly where before and after
+  coincide. Hoist the snapshot above every mutation rather than subtracting the
+  written row back out in your head, and when a review names one asymmetry
+  re-derive EVERY input — the redesign is where the next one lands. Signature:
+  the fix for a one-rule finding ships a second of the same class (#1182).
 
 ## Refinements & scope increases from the user
 
