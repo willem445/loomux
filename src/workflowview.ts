@@ -2214,6 +2214,35 @@ export class WorkflowView {
         "Refuse a merge whose PR changes more than this many lines (additions + deletions). Leave empty for no limit."
       )
     );
+
+    // #1176's path routing, shown but NOT editable here.
+    //
+    // The pane round-trips these rules — `readGate`/`emitGatesLines` carry them
+    // and `validateWorkflow` checks them — which is the part that matters: without
+    // it, a rule would be a line the next form edit silently DELETED, and what it
+    // deleted would be a required reviewer. What is missing is an affordance to
+    // add or change one, and a row that pretended otherwise would be worse than a
+    // row that says where to go instead.
+    const rules = gate.routing ?? [];
+    if (rules.length) {
+      const list = el("div", "wf-static");
+      for (const [i, rule] of rules.entries()) {
+        list.append(
+          el(
+            "div",
+            "wf-static-row",
+            `${i + 1}. ${rule.paths.join(", ")} → ${rule.reviewers.join(", ")}`
+          )
+        );
+      }
+      box.append(
+        this.field(
+          "Reviewers routed by path",
+          list,
+          "A PR touching any of a rule's paths requires that rule's reviewers too, on top of the list above. Additive — a rule can only ever make this gate stricter. Edit these in .loomux/workflow.yml; this pane preserves them but does not yet offer a control for them."
+        )
+      );
+    }
     return box;
   }
 

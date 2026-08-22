@@ -4281,6 +4281,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-field { display: flex; flex-direction: column; gap: 4px; }
 .wf-label { font-size: 11.5px; color: var(--ink-dim); }
 .wf-hint { font-size: 11px; color: var(--ink-dim); line-height: 1.5; }
+/* #1176: a read-only list inside a form field — the routing rules the pane
+   round-trips but does not yet offer a control for. Styled as data, not as a
+   disabled input, so it does not read as a control that stopped working. */
+.wf-static { display: flex; flex-direction: column; gap: 3px; }
+.wf-static-row { font-family: var(--font-mono); font-size: 11px; color: var(--ink-dim); }
 .wf-note {
   margin: 0; font-size: 11.5px; color: var(--ink-dim); line-height: 1.6;
   border-left: 2px solid var(--line); padding-left: 10px;
