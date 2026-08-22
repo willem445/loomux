@@ -51,7 +51,10 @@ codegen-units = 1
 # `line-tables-only` adds function names + line numbers at a modest size cost;
 # `strip = "debuginfo"` then keeps the *exe* slim (debug info lives in the
 # standalone PDB / split debug, not the shipped binary). Net: build-tree and CI
-# backtraces are genuinely symbolicated; installed bundles stay address-only
-# until the PDB is shipped — see doc/design/crash-observability.md.
+# backtraces are genuinely symbolicated. The INSTALLER still does not bundle the
+# PDB, so an installed build's own backtraces stay address-only — but the PDB is
+# no longer lost: release.yml attaches `loomux-X.Y.Z-x64.pdb.zip` to the GitHub
+# release (#1218), so a dump from a shipped build can be symbolicated after the
+# fact. See doc/design/crash-observability.md.
 debug = "line-tables-only"
 strip = "debuginfo"

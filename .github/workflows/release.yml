@@ -192,6 +192,58 @@ jobs:
           # identical to the pre-beta workflow.
           args: ${{ ((matrix.platform == 'windows-latest') && contains(github.ref_name, '-')) && '--bundles nsis' || matrix.args }}
 
+      # #1218: ship the Windows debug symbols alongside the installers.
+      #
+      # The release build already EMITS `target/release/loomux.pdb` — the
+      # workspace-root `[profile.release]` sets `debug = "line-tables-only"`
+      # for #53, and `strip = "debuginfo"` only keeps the *exe* slim — but
+      # nothing ever uploaded it, so it died with the runner. That is why
+      # #1218 had to be symbolicated by hand off the shipped exe's `.pdata`
+      # exception directory. With the PDB on the release, a minidump from a
+      # released build resolves directly.
+      #
+      # Both steps are `matrix.platform == 'windows-latest'` and purely
+      # additive: they run AFTER the bundles are built and uploaded, nothing
+      # earlier reads their output, and the other three legs skip them
+      # entirely — so every existing artifact is unchanged.
+      - name: Package the Windows debug symbols
+        if: matrix.platform == 'windows-latest'
+        id: pdb
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $name = "loomux-$($env:TAG -replace '^v', '')-x64.pdb.zip"
+          Compress-Archive -Path target/release/loomux.pdb -DestinationPath $name -CompressionLevel Optimal
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      # Uploaded BY RELEASE ID, never by a tag lookup — the draft this run
+      # owns, which is the same anti-ambiguity rule #282 forced on every
+      # other release-touching step here (a tag lookup cannot even see a
+      # draft reliably, and picking the wrong draft is precisely the
+      # incident). tauri-action attaches its bundles to this same id.
+      - name: Attach the debug symbols to the release
+        if: matrix.platform == 'windows-latest'
+        uses: actions/github-script@v7
+        env:
+          ASSET: ${{ steps.pdb.outputs.name }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            const fs = require("fs")
+            const name = process.env.ASSET
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.RELEASE_ID),
+              name,
+              headers: {
+                "content-type": "application/zip",
+                "content-length": fs.statSync(name).size,
+              },
+              data: fs.readFileSync(name),
+            })
+
   # Flips the draft release from `build` to public — the only place `latest`
   # is allowed to start resolving to this release. Runs only if every build
   # matrix leg succeeded (`needs: build` + fail-fast:false means a single
@@ -214,15 +266,24 @@ jobs:
       RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
       # Stable count: setup.exe + msi (Windows) + 2 dmg (macOS) +
       # AppImage + deb + rpm (Linux) + 2 app.tar.gz (macOS updater
-      # bundles) = 9. Keep in lockstep with the SKILL.md release doc's
-      # asset checklist if the matrix ever changes.
-      EXPECTED_ASSETS_STABLE: 9
+      # bundles) + the Windows .pdb.zip (#1218) = 10. Keep in lockstep
+      # with the SKILL.md release doc's asset checklist if the matrix
+      # ever changes.
+      #
+      # The check below is `-lt`, so the new symbols asset would have
+      # passed the old constant unchanged. It is bumped anyway: leaving
+      # it at 9 would have left the gate tolerating one genuinely
+      # missing installer, which is the exact failure #282 exists to
+      # catch.
+      EXPECTED_ASSETS_STABLE: 10
       # Beta count: same as stable minus the Windows .msi, which the build
       # job skips for hyphenated (prerelease) tags — see the `--bundles
-      # nsis` comment on the `build` job. 9 - 1 = 8. Deliberately a second
-      # explicit constant rather than "9 - 1" computed inline, so both
-      # counts stay readable at a glance.
-      EXPECTED_ASSETS_BETA: 8
+      # nsis` comment on the `build` job. The .pdb.zip is NOT skipped for
+      # a beta — it is emitted by the same cargo build either way — so
+      # 10 - 1 = 9. Deliberately a second explicit constant rather than
+      # "10 - 1" computed inline, so both counts stay readable at a
+      # glance.
+      EXPECTED_ASSETS_BETA: 9
     steps:
       - name: Verify asset count before promoting
         env:
