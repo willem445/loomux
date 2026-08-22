@@ -132,7 +132,19 @@ top of that loop.
 
 **An explicit `ORRERIX_DATA_DIR` / `LOOMUX_DATA_DIR` is never migrated** and never
 probed for a sibling. An operator who names a root has named the root, and an E2E
-run's isolated profile must stay isolated.
+run's isolated profile must stay isolated. `init_data_root()` returns immediately
+when one is set — not merely `data_root()`, which is the distinction that matters:
+a startup that resolved the *override* for its own use while still migrating the
+*platform default* would rename the user's real `<data>/loomux` out from under the
+app they have open, which is the one directory #394's override exists to keep its
+hands off.
+
+Both guards read that condition through the **same** function, `override_root` —
+which is also the only place a bad value is rejected and reported. Two guards
+deciding "is an explicit root in force?" by their own slightly different rules
+would be a bypass exactly the width of the difference, so there is one rule and
+one definition, and `a_rejected_override_is_not_treated_as_an_explicit_root` pins
+that they cannot drift apart.
 
 ### Reverting
 
