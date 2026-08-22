@@ -272,6 +272,16 @@ compiles.
   the commit it was derived on, and your own next commit invalidates it as silently as
   a rebase. Cite a SYMBOL (#763); a position that must be recorded is swept in the
   LAST commit touching its source (#752).
+- **A documented escape hatch is a counterfactual — only a test that performs the
+  edit pins it.** When a comment, design note or PR body says a policy can be undone
+  by changing one arm or flag, the dispatch below it must give that variant its own
+  arm, and a test must feed the *reverted* arm's return value to the real dispatch —
+  plus a set assertion that exactly the intended variants take the dangerous branch,
+  so the count fails when one is folded back in. Signature: an arm folding the
+  escape-hatch variant in with the live one, excused by a comment saying that variant
+  is unreachable — which the documented edit is precisely what makes false. Worked
+  example: `obs::root_action`, `the_documented_revert_really_stops_the_migration` and
+  `exactly_one_plan_variant_moves_anything` (#1205 B1).
 - **A per-CLI identity string is read off the source, never branched on it.**
   `source === "claude" ? "claude" : "copilot"` is right only while there are
   exactly two CLIs; a third silently inherits the else-branch and the pane
@@ -339,6 +349,16 @@ narrow their ask back down to the original ticket on your own judgment.
   deltas, diffstats and run ids all go stale on the next commit. Read both
   totals out of the two runs' own logs, and check that the per-file deltas sum
   to the total you are claiming (#859, #862, #889, #907, #914, #921).
+- **A sweep is dated to the base it was run on.** A rename or purge is complete only
+  against the tree it was grepped on: a rebase replays your patches but not your grep,
+  and work merged meanwhile authors fresh instances of the very string you removed —
+  a live defect that did not exist when you looked, not a stale measurement. Re-run
+  the entity grep after every rebase and before the final green, across EVERY root
+  (`crates/`, `src-tauri/`, `src/`, `docs/`, `test/`, `e2e/`); a re-grep scoped to
+  the directory you last edited is the miss. `git log -S` each survivor to name the
+  commit that authored it. Signature: review names N stale sites and the whole-tree
+  grep finds N+1 (#1205 round 2; #1191, where the rebase brought a fourth twin in
+  with `main`).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
