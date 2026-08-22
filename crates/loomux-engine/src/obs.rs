@@ -1006,8 +1006,16 @@ fn write_crash_log(app_version: &str, info: &std::panic::PanicHookInfo<'_>) {
 // `std::panicking`, so no hook of any kind runs. #1218's three production
 // crashes were all exactly this: a `Vec<u8>` grow of 64 MiB and then 128 MiB
 // refused on a machine pinned at its commit limit, `handle_alloc_error` →
-// `abort` → `__fastfail(7)` → `0xc0000409`. A write-first panic hook would
-// still have produced nothing for any of them.
+// `__rust_alloc_error_handler` → `rust_oom` → `__fastfail(7)` → `0xc0000409`.
+// A write-first panic hook would still have produced nothing for any of them.
+//
+// `rust_oom` calls `default_alloc_error_hook` on the way, which writes
+// "memory allocation of N bytes failed" to stderr — so the abort is
+// print-then-die, and a windowed build with no console is what discarded it
+// (#1218 round 4). Our record is written strictly EARLIER in that sequence,
+// here, and carries the alignment, timestamp and app version as well as the
+// size. See `doc/design/crash-observability.md` for the full frame list and
+// for the stderr-capture follow-up.
 //
 // `std::alloc::set_alloc_error_hook` is the matching seam and is nightly-only.
 // The stable one is this: a `#[global_allocator]` that delegates every call to

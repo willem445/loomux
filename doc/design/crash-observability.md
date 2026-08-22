@@ -196,6 +196,53 @@ unsafe impl GlobalAlloc for CrashReportingAlloc {
 It **adds a record; it does not change what the process does.** The null is
 returned unmodified, so `handle_alloc_error` aborts exactly as before.
 
+**Where our record lands in the sequence, and what std was already saying.**
+#1218's round-4 symbolication named the whole abort path, and it is longer than
+"abort" suggests:
+
+```
+CrashReportingAlloc::alloc  →  System.alloc returns null
+    → on_alloc_failure          ← OUR RECORD IS WRITTEN AND FLUSHED HERE
+  ← null returned unchanged
+alloc::raw_vec::handle_error (AllocError arm)
+  → alloc::alloc::handle_alloc_error
+    → std::alloc::_::__rust_alloc_error_handler
+      → std::alloc::rust_oom
+        → std::alloc::default_alloc_error_hook   ← prints to stderr
+        → __fastfail(7)                          ← 0xc0000409
+```
+
+So the abort is **print-then-die, not silent**: std's default hook writes
+`memory allocation of N bytes failed` to **stderr** before the fast-fail. In a
+`windows_subsystem = "windows"` build there is no console attached, so that
+message goes nowhere anyone can read — which is why nothing was ever observed,
+even though something was always being said.
+
+Two things follow. First, our record is written **strictly earlier** in this
+sequence than std's message, so the two do not race and ours is not a
+duplicate: it carries the alignment, the timestamp and the app version as well
+as the size, in a file that survives the process. Second, capturing stderr
+would be a genuinely useful *complement* rather than a substitute — see the
+follow-up below.
+
+**Follow-up — #1219 does not do this; #1255 tracks it: redirect stderr to a
+file at startup.** The value is not the allocation message, which we now record
+better; it is the other things std prints on paths where **no** in-process
+recorder of ours can run:
+
+- `thread panicked while processing panic. aborting.` — the double-panic abort
+  in §1's write-first argument, which by construction never reaches our hook;
+- `panic in a function that cannot unwind`;
+- the guard-page message for a **stack overflow**, which is otherwise the
+  largest remaining hole in *Limitation: abort-level failures* below.
+
+It is out of scope here because it is not the same kind of change: it needs
+`SetStdHandle(STD_ERROR_HANDLE, …)` — Windows FFI, in a crate that is
+deliberately `std`-plus-`dirs` — and it rewires process-wide stdio at startup,
+which is exactly the sort of change that has to be validated on a real windowed
+build rather than reasoned about. Sizing it honestly is the first task, not an
+afterthought.
+
 **Why it is declared in `src-tauri/src/main.rs`.** A `#[global_allocator]` may
 be declared once per linked artifact, and it is **inherited by everything that
 links the crate declaring it**. The engine owns the *type*; the artifact owns
@@ -444,6 +491,14 @@ The panic hook only fires for **unwinding** panics. It will *not* capture:
 - a **panic raised inside the hook itself** — std aborts before the hook is
   re-entered (see *The write is two-phase* above), which is why the ordering
   there matters more than any guard inside the hook body.
+
+For each of these std **does print a message to stderr** first — the guard-page
+notice, `thread panicked while processing panic. aborting.`,
+`panic in a function that cannot unwind` — and a windowed build discards all of
+it. That is the case for the stderr-capture follow-up sketched in §1b and
+tracked as **#1255** (open, not implemented), and it is the honest answer to
+"why can't the hook catch a stack overflow": it cannot, but something else
+already knows and we are throwing it away.
 
 A **refused allocation** used to be on that list and is the one item taken off
 it: `handle_alloc_error` still never runs the panic hook, but the
