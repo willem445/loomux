@@ -182,3 +182,64 @@ fn every_banned_literal_is_one_the_app_still_accepts() {
          carrying an entry the other has never heard of"
     );
 }
+
+/// The self-launch refusal shim (#815) is written to disk under the name of the
+/// program it blocks, and that name is **not** this phase's to rename: the
+/// launcher an agent could actually type is still `loomux` (phase 5 owns the
+/// npm package and the installed exe). A shim written under any other name
+/// blocks nothing while leaving the real launcher runnable — the guard
+/// defeated, with no error anywhere.
+///
+/// This PR's own bulk audit-actor sweep took that argument, because it is a
+/// bare `"loomux"` in the same shape as ~240 actor arguments. `tests/pathseg.rs`
+/// caught it — its allowlist row quotes this call site verbatim as the proof
+/// that `program` is a literal — and it caught it for a reason that has nothing
+/// to do with what the argument MEANS.
+///
+/// So this pins the meaning: whatever name that call passes, it must be a
+/// command the launcher package actually installs. It reddens on the day phase
+/// 5 renames the npm bin without renaming the shim, and on any future sweep
+/// that rewrites the argument to something no user can type.
+///
+/// Scanned rather than called because `write_refusal_shim` and `ensure_shims`
+/// are both private, and `shim_dir` resolves to a sibling of the registry root
+/// — outside a test's own tempdir, i.e. shared — so a filesystem assertion here
+/// would be cross-contaminating rather than isolated. The blind spot that
+/// leaves is stated plainly: this reads the call, not the write.
+#[test]
+fn the_self_launch_shim_is_named_after_a_command_the_launcher_installs() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/orchestration/mod.rs"
+    ))
+    .expect("mod.rs");
+    let call = "write_refusal_shim(&dir, ";
+    let i = src.find(call).expect(
+        "the self-launch refusal shim's call site moved — find it and re-point this test, \
+         because what it pins is the one thing that makes the shim work at all",
+    );
+    let rest = &src[i + call.len()..];
+    let arg: String = rest
+        .strip_prefix('"')
+        .expect("the program argument must stay a literal — `tests/pathseg.rs` allow-lists this call site on exactly that basis")
+        .chars()
+        .take_while(|c| *c != '"')
+        .collect();
+
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../npm/package.json"))
+        .expect("npm/package.json");
+    let pkg: serde_json::Value = serde_json::from_str(&manifest).expect("npm/package.json parses");
+    let bins: Vec<&str> = pkg["bin"]
+        .as_object()
+        .expect("npm/package.json declares a bin map")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+
+    assert!(
+        bins.contains(&arg.as_str()),
+        "the refusal shim is written as `{arg}`, which the launcher package does not install \
+         (its bins are {bins:?}). An agent typing the real launcher name would not be blocked, \
+         and nothing else in this repo would notice."
+    );
+}
