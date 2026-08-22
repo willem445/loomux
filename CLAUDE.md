@@ -41,9 +41,11 @@ opinions — see the `ci-validate` skill.)
   the previous `cd` and fails with `No such file or directory`.
 - **There is no `python3`** — the `WindowsApps` alias stub exits 126
   (`Permission denied`). Use `node -e` for ad-hoc scripting. A scratch script
-  **must be `.cjs`**: `package.json` sets `"type": "module"`, so a `.js` file
-  anywhere in the tree is ESM and `require` is a `ReferenceError: require is
-  not defined in ES module scope` — not a broken script (#1181).
+  **must be `.cjs`**: the root `package.json` sets `"type": "module"`, so a `.js`
+  file in its scope — `./.scratch/` included — is ESM and `require` is a
+  `ReferenceError: require is not defined in ES module scope`, not a broken
+  script. Node resolves `"type"` from the NEAREST `package.json`, so `npm/` (no
+  `"type"`) is CJS and `npm/bin/loomux.js` uses `require` correctly (#1181).
 - **A multi-line shell script is a file, not a `-c` argument.** Inline Bash dies
   on Git Bash quoting (`unexpected EOF while looking for matching '`, reported
   far from the real line). Write it under `./.scratch/` and run the file; pipe

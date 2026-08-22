@@ -116,34 +116,54 @@ what `>/dev/null` is for). So:
 
 ### rustfmt parses the *Rust* — not the shell or jq inside it
 
-`gh_shim_sh` (`src-tauri/src/orchestration/mod.rs`) holds ~850 lines of POSIX
-sh in a `const TPL: &str = r#"…"#`, and `workflow.rs`'s `BASE_*_JQ` consts hold
-jq programs the shim interpolates. To rustfmt those are one string literal: it
-reports nothing, and **no local check parses them at all**. A dropped `;;` or an
+`src-tauri/src/orchestration/mod.rs` holds **three** generated shell scripts, each
+in a `const TPL: &str = r#"…"#`: `gh_shim_sh` (850 lines, the merge gate),
+`git_shim_sh` (101, the release/tag-push gate) and `loomux_shim_sh` (20, the
+self-launch refusal). `workflow.rs`'s `BASE_*_JQ` consts hold jq programs the gh
+shim interpolates. To rustfmt all of these are one string literal: it reports
+nothing, and **no local check parses them at all**. A dropped `;;` or an
 unbalanced quote therefore reaches CI intact, where it does not fail as one
-test — the script stops parsing and every shim test dies at once, so a mutation
-round taken on that push is unattributable and has to be discarded (#1181).
+test — the script stops parsing and every test of that shim dies at once, so a
+mutation round taken on that push is unattributable and has to be discarded
+(#1181).
 
 Extract the literal and run the parser the language has, before pushing:
 
 ```sh
-node .scratch/xtpl.cjs src-tauri/src/orchestration/mod.rs 'const TPL: &str = r#"' \
+node .scratch/xtpl.cjs src-tauri/src/orchestration/mod.rs 'pub fn gh_shim_sh' \
   > .scratch/gh-shim.sh && sh -n .scratch/gh-shim.sh
 ```
 
-(`.cjs`, not `.js` — `package.json` is `"type": "module"`. The extractor is four
-lines: read the file, slice between the `r#"` after the marker and the next
-`"#`.) The `__PLACEHOLDER__` tokens are ordinary words and parse fine, so the
-un-substituted template is checkable as-is. `sh -n` is a parse, not a run —
-nothing in the script executes. Verified both directions: the extracted shim
-passes `sh -n`, and a `case` arm with its `;;` removed fails it with a
-`syntax error near unexpected token` naming that line.
+**Anchor on the function name, never on `const TPL`.** All three shims spell the
+literal identically and the extractor takes the *first* match, so a `const TPL`
+marker returns the **gh** shim whichever one you were editing — you get `sh -n`
+exit 0 on a script you never touched. That is the false green this whole section
+exists to prevent, and on `git_shim_sh` it is a security gate. Use `pub fn
+gh_shim_sh` / `pub fn git_shim_sh` / `pub fn loomux_shim_sh`; all three extract
+clean (850 / 101 / 20 lines, `sh -n` exit 0 each).
+
+(`.cjs`, not `.js` — the root `package.json` is `"type": "module"`. The extractor
+is four lines: read the file, slice between the `r#"` after the marker and the
+next `"#`.) The `__PLACEHOLDER__` tokens are ordinary words and parse fine, so
+the un-substituted template is checkable as-is. `sh -n` is a parse, not a run —
+nothing in the script executes.
+
+**Read the exit code, not the line number.** Dropping the ` ;;` from one inline
+`case` arm in the extracted gh shim was reported **12 lines downstream** of the
+edit when measured — a parser tells you where it gave up, not where you broke
+it, the same way Git Bash reports a quoting error far from the real line.
+Nonzero exit plus `syntax error near unexpected token` is the signal; the line
+is a starting hint. (A three-line synthetic reproducer will point straight at
+the bug and mislead you about this — measure on the real artifact.)
 
 **The jq consts have no local check** — there is no `jq` on this machine, and
 gh's is `gojq`, reachable only through a network call. Their parser of record is
 the CI fixture test (`the_base_green_reductions_reduce_real_payloads_to_the_right_word`),
-which pipes committed payloads through real `jq` on all three platforms. Add a
-fixture there rather than reasoning about what a reduction returns.
+which pipes committed payloads through real `jq`. It opens with a `have_jq()`
+guard that prints `SKIP …` and returns, so it is green on a runner without `jq`
+having parsed nothing — grep the job log for that `SKIP` line before treating it
+as evidence. Add a fixture there rather than reasoning about what a reduction
+returns.
 
 ### Why this is permitted under the ban
 
