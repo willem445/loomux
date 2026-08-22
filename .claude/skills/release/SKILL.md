@@ -159,7 +159,7 @@ real notes after the assets are up:
 - `npm view loomux-desktop version` → X.Y.Z.
 - The GitHub release has **10 assets**: `-setup.exe` + `.msi`, both `.dmg`s,
   `.AppImage` + `.deb` + `.rpm`, the two `.app.tar.gz` bundles, and
-  `loomux-X.Y.Z-x64.pdb.zip` — the Windows debug symbols, which a crash
+  `Loomux_X.Y.Z_x64.pdb.zip` — the Windows debug symbols, which a crash
   dump from a released build needs to symbolicate (#1218).
 - The release run's conclusion is `success` (not just "the assets exist" —
   publish-npm is the last job and can fail after the assets upload).

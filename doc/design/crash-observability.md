@@ -104,7 +104,7 @@ We deliberately do **not** ship the PDB **in the installer**: it exposes symbols
 and would add ~23 MB to every download. That is still true.
 
 **The release itself now carries it** (#1218). `release.yml`'s Windows leg zips
-`target/release/loomux.pdb` to `loomux-X.Y.Z-x64.pdb.zip` and attaches it to the
+`target/release/loomux.pdb` to `Loomux_X.Y.Z_x64.pdb.zip` and attaches it to the
 GitHub release beside the installers, so the PDB is no longer discarded with the
 runner. This costs the installer payload nothing — it is a separate asset nobody
 has to download — and it turns the "drop the matching `loomux.pdb` beside the

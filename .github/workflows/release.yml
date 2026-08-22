@@ -213,7 +213,14 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          $name = "loomux-$($env:TAG -replace '^v', '')-x64.pdb.zip"
+          # House style, matching every other asset on the release:
+          # `Loomux_<version>_<arch>.<ext>` (Loomux_1.2.0-beta1_x64.dmg,
+          # Loomux_1.2.0-beta1_x64-setup.exe, ...). Not cosmetic-only — all
+          # three asset resolvers (install.ps1, install.sh, npm/bin/loomux.js)
+          # match on END-ANCHORED suffixes, so an asset that shares the
+          # family's shape is one a future looser matcher treats the same way
+          # as the installers instead of specially.
+          $name = "Loomux_$($env:TAG -replace '^v', '')_x64.pdb.zip"
           Compress-Archive -Path target/release/loomux.pdb -DestinationPath $name -CompressionLevel Optimal -Force
           "name=$name" >> $env:GITHUB_OUTPUT
 
