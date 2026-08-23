@@ -1,10 +1,10 @@
 # Regenerating this icon set
 
 The whole set here is generated from the committed source art at the repo root
-(`../../orrerix-icon.png`) via:
+(`../orrerix-icon.png`) via:
 
 ```sh
-npx tauri icon ../../orrerix-icon.png
+npx tauri icon ../orrerix-icon.png
 ```
 
 run from `src-tauri/`. This does not invoke `rustc` — safe to run locally.
@@ -23,8 +23,8 @@ every entry from the single source PNG, hand-hinted ones included, without
 warning. After regenerating, re-splice the two small entries back in from
 the committed sources:
 
-- `../../orrerix-icon-16.png`
-- `../../orrerix-icon-24.png`
+- `../orrerix-icon-16.png`
+- `../orrerix-icon-24.png`
 
 There is no committed splice script; the two PNGs need to land back in
 `icon.ico`'s 16×16/24×24 directory entries specifically (every other entry
