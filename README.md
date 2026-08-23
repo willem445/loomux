@@ -43,7 +43,7 @@ npx orrerix            # Node 18+, any platform — downloads and launches
 npm install -g orrerix # …or install it and just run `orrerix`
 ```
 
-> **Coming from Loomux?** `loomux-desktop` is frozen and there is no shim:
+> **Coming from Loomux?** `loomux-desktop` is off npm entirely and there is no shim:
 > `npm uninstall -g loomux-desktop && npm install -g orrerix`. Installing Orrerix
 > leaves your old Loomux app in place rather than replacing it —
 > [Getting started](https://willem445.github.io/loomux/getting-started) has the

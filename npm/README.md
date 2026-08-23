@@ -44,7 +44,10 @@ own version, and now it installs the newest release on your channel.
 ## Upgrading from `loomux-desktop`
 
 This package was called `loomux-desktop`, and the command it installed was
-`loomux`. Both were renamed with the app. There is no compatibility shim, so:
+`loomux`. Both were renamed with the app, and `loomux-desktop` has since been
+removed from npm altogether — there is no compatibility shim and nothing left to
+install under the old name. If you have it globally installed, an unpublish does
+not reach your disk, so remove it yourself:
 
 ```sh
 npm uninstall -g loomux-desktop

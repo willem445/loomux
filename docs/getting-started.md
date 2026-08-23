@@ -79,8 +79,12 @@ launcher itself, and now it installs the newest release on your channel.
 
 The launcher used to be published as `loomux-desktop` and installed a command
 called `loomux`. Both were renamed with the app, and there is no compatibility
-shim — `loomux-desktop` is frozen at its last release and will not see new
-versions:
+shim. `loomux-desktop` has also been removed from npm entirely, so
+`npx loomux-desktop` and `npm install -g loomux-desktop` now fail rather than
+installing anything.
+
+If you installed it globally before that, the `loomux` command is still on your
+machine — removing a package from the registry does not remove it from your disk:
 
 ```sh
 npm uninstall -g loomux-desktop
