@@ -275,11 +275,22 @@ compiles.
   default, a file gaining its "absent" block, a concrete list going stale), relocate
   the property onto a witness that still distinguishes — never relax the assertion to
   fit today's specimen. If the converged case still deserves coverage, give it its own
-  strictly-weaker, explicitly-labelled assertion (#689). The same drift bites outside
-  tests: a hand-derived value a claim rests on (a line cite, a count) is valid only at
-  the commit it was derived on, and your own next commit invalidates it as silently as
-  a rebase. Cite a SYMBOL (#763); a position that must be recorded is swept in the
-  LAST commit touching its source (#752).
+  strictly-weaker, explicitly-labelled assertion (#689). A **mechanical sweep** is the
+  commonest way a specimen leaves its class: a rename that rewrites a test's string
+  literal to the new spelling deletes the witness in the same commit that changes the
+  behaviour, so CI stays green over it (#1225). The same drift bites outside tests: a
+  hand-derived value a claim rests on (a line cite, a count) is valid only at the
+  commit it was derived on, and your own next commit invalidates it as silently as a
+  rebase. Cite a SYMBOL (#763); a position that must be recorded is swept in the LAST
+  commit touching its source (#752).
+- **A rename of an identity string classifies every site as EMIT or ACCEPT before
+  rewriting it.** An emit site takes the new spelling alone; a reader keeps every
+  accepted spelling — and a reader whose question is *what did the author DECIDE*
+  fails by WIDENING a capability grant when it stops recognising the old one, which is
+  the app granting itself capability that #222's closure forbids. Accept-both is not
+  the blanket answer either, so split per question: `doc/design/rebrand-protocol.md`,
+  "The one reader that must NOT accept every spelling". Pin the pre-rename specimen
+  BESIDE the current one (#1225).
 - **A documented escape hatch is a counterfactual — only a test that performs the
   edit pins it.** When a comment, design note or PR body says a policy can be undone
   by changing one arm or flag, the dispatch below it must give that variant its own
@@ -416,6 +427,15 @@ narrow their ask back down to the original ticket on your own judgment.
   body, issue comment or `docs/` page renders a certain way — `gh api -X POST
   markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line silently ends a
   table, and the row you claimed becomes a paragraph of literal pipes (#926).
+- **A claim about the PR body is measured on the POSTED body, never on your
+  draft.** Writing it is not posting it: a body rebuilt from sources destroys any
+  edit made to the assembled file, so edit the sources, assemble, then re-read the
+  result with `gh pr view <n> --json body`. On the READING side the body is unpinned
+  by the head SHA and drifts under a recorded verdict, so re-read it immediately
+  BEFORE recording one — `body-unchanged` refuses a post-pass edit at the merge, but
+  cannot give back a round already spent on stale text (#565). Signature: a re-review
+  quoting a body line as verbatim what it was, on a finding your own response section
+  says was narrowed (#1225).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
   (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this
