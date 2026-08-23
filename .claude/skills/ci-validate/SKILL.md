@@ -280,6 +280,9 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    A run counts as this PR's evidence only when its `headSha` **is** the head
    you are reporting on. A citation that survives a rebase untouched is the
    defect a reviewer catches and its author never does (#571, #588, #596).
+   This step covers the **run** citations only. Commit SHAs quoted in prose go
+   stale on the same rebase and stay locally resolvable, so nothing here catches
+   them — see *Commit SHAs go stale differently from run ids* below (#1327).
 7. **Mark the PR ready once green:**
    ```sh
    gh pr ready <pr>
@@ -301,6 +304,47 @@ present-tense claim about state *outside* your diff — "`main` is red", "merges
 are frozen" — into a body a squash turns into the permanent commit message: past
 tense with the attempt named, or drop it. Signature: a body citing a failure a
 rerun has since cleared (#1196).
+
+### Commit SHAs go stale differently from run ids — check them against the PR ref
+
+Step 6 re-derives run ids because `headSha` makes them checkable. The **commit
+SHAs** a body cites in prose — "all eight addressed in `601594c`", "checking out
+`bed9fe0` reproduces this exactly" — come through a rebase *unchanged and still
+resolvable*, which is why the same worker re-derives one and not the other.
+
+Two checks that look like they would catch it, and do not:
+
+- **`git cat-file -e <sha>` passes for every orphan.** The pre-rebase objects are
+  still in your own object store (and in a reviewer's, if they fetched the earlier
+  heads), so every stale SHA in the body resolves on the two machines that look at
+  it, and on nobody else's.
+- **Ancestry against `main` fails for the good SHAs too.** The PR squashes, so no
+  branch commit is an ancestor of `main` afterwards — a pass/fail split this
+  cannot produce.
+
+The frame that separates them is the PR's own ref, which is what a reader still
+has after the squash:
+
+```sh
+# the LEADING + is load-bearing: the PR ref moves non-fast-forward on every force-push,
+# which is exactly the case this check exists for. Without it a re-run is rejected, the
+# local ref stays at the PRE-rebase head, and the orphans ARE ancestors of that — so the
+# check reports pass on the one defect it was written to catch.
+git fetch origin +refs/pull/<n>/head:refs/tmp/pr<n>
+# every SHA-shaped token in the POSTED body (gh pr view <n> --json body)
+git merge-base --is-ancestor <sha> refs/tmp/pr<n>; echo "  ancestor=$? $(git log -1 --format=%s <sha>)"
+```
+
+Ancestry alone is not enough: a SHA can be reachable and still name the wrong
+commit, so assert the **subject** matches the role the body assigns it. Recover a
+rewritten mapping from `git reflog` (or the pre-rebase head you still have),
+never by position — the rebase may have reordered or squashed.
+
+Do this at the body gate, with the quote check below. Editing the body afterwards
+makes `body-unchanged` refuse a recorded verdict and reopens the gate: that is the
+mechanism working, and the fix is to ping the reviewer to re-record, not to leave the
+SHAs wrong. Signature: run ids re-derived after a rebase, commit SHAs beside them not
+— including the one the body tells a reader to check out (#1327).
 
 ### Body quotes are checked against head, never eyeballed
 
