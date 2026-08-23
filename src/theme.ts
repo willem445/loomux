@@ -30,8 +30,20 @@
  * which holds luminance nearly constant (luminance is 71.52% green), so the elevation ladder
  * and every contrast ratio survived the change while the hue did not — the largest step
  * moved 1.4%. `mist` is the ink, and it is the "silver" half of the black-and-gold identity.
- * The older rule is unchanged and now literally true: **colour enters this palette through
- * the foreground only, never by tinting the ground.**
+ *
+ * THE OLDER RULE SURVIVES, BUT ONLY FOR THE CHANNEL IT WAS EVER TRUE OF: **the INTERACTION
+ * channel enters through the foreground only — the accent paints marks, edges, rings and
+ * carets, never a ground.** That is measured, not asserted: `test/theme.test.ts` ("the accent
+ * paints marks, never grounds") denies `var(--accent)` in a `background` by default.
+ *
+ * The STATE and IDENTITY channels still wash grounds, by design and with the design note's
+ * role table sanctioning it — an awaiting-human task row, an urgent decision card, diff
+ * add/delete lines. So the palette-wide version of this sentence is FALSE, and it used to be
+ * written here as "unchanged and now literally true", which is precisely the claim #1340 was
+ * filed against: the ramp was achromatic while `selectionFill` was gold, and a ground nobody
+ * had measured carried the tint the human could see. Do not restore the universal form. The
+ * whole argument, the still-washed grounds and the open product question live in
+ * doc/design/ui-redesign.md, §The ground.
  *
  * The eight hues serve THREE channels, not one (design note, §The three colour channels):
  * *state* (what an agent is doing), *interaction* (what the human can act on), and
@@ -133,8 +145,9 @@ export const PALETTE = {
   gold: "#f8c93e", //     interaction: the accent, the focus ring, the caret
   spring: "#74d98d", //   state: working / live
   selectionFill: "#323232", // selection fill only — never text, never a border. ACHROMATIC.
-  //     It is a GROUND, so it obeys the ground's one rule (see the ramp doc above): colour
-  //     enters this palette through the foreground only. #1320 broke that — it de-blued the
+  //     It is a GROUND and it belongs to the INTERACTION channel, so it takes that channel's
+  //     rule (see the ramp doc above): the accent paints marks, never grounds. #1320 broke
+  //     that — it de-blued the
   //     ramp and in the same slice made this a deep GOLD wash (#38321f), which is what the
   //     human saw as "the gold hue is tinting everything" (#1340), because this token is the
   //     ground under every selected file row, every open editor row, every active workflow

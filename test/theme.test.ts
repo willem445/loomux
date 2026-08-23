@@ -1151,7 +1151,7 @@ test("every palette entry is a well-formed hex colour", () => {
 
 // --- #1320: the near-black neutral ground, the gold accent, and one font source ----------
 
-test("the neutral ramp carries no hue — nothing in the ground is tinted", () => {
+test("the neutral ramp, the ink and the selection ground carry no hue", () => {
   // The direction (#1320 ask 1): "kill the blue hue ... no blue cast anywhere: backgrounds,
   // panels, borders, chrome". Before this slice every neutral in the app was a COOL grey —
   // blue sat 3-22 points above red at every step of both ramps — which is what read as a
@@ -1162,17 +1162,24 @@ test("the neutral ramp carries no hue — nothing in the ground is tinted", () =
   // each leaning two points the same way is a visible cast even when no single step trips a
   // threshold. Achromatic is a property that cannot drift.
   //
-  // This is every GROUND and the ink. Hues are still hues; `held`/`idle` are listed
-  // because the design calls them achromatic in prose (SEMANTIC, "ACHROMATIC on purpose"),
-  // and prose is exactly what this pins.
+  // SCOPE, because the name used to over-claim and #1340 is a lesson in exactly that. This
+  // pins the tokens the NEUTRAL and INTERACTION channels put on a ground, plus the ink: the
+  // slate ramp, the mist ramp, `ansiBlack`, the terminal's own two ink literals, the two state
+  // dyes the design calls achromatic in prose (`held`/`idle` — and prose is exactly what this
+  // pins), and `selection`. It does NOT say no ground in the app carries a hue: the STATE and
+  // IDENTITY channels wash grounds by design (an awaiting-human task row, an urgent decision
+  // card, diff add/delete), which doc/design/ui-redesign.md §The ground argues and #1340 leaves
+  // to the human. A universal here would be the same false claim this test exists to catch.
   //
   // `selection` is on this list because it is a GROUND, and #1340 is what it cost to leave
   // it off. #1320 de-blued the ramp and in the same slice handed the SELECTED-ROW fill a
-  // deep GOLD wash (#38321f), so the one rule the palette is built on — theme.ts's header,
-  // and the design note's "Nothing below tints the ground" — was false for every selected
-  // file row, every open editor row, every active workflow row and every terminal text
-  // selection at once, while this test stayed green. A list that stopped at the ramp could
-  // not see it: the hole was the POPULATION, not the assertion.
+  // deep GOLD wash (#38321f), so the rule the palette was said to be built on — theme.ts's
+  // ramp doc, and doc/design/ui-redesign.md §The ground — was false for every selected file
+  // row, every open editor row, every active workflow row and every terminal text selection
+  // at once, while this test stayed green. A list that stopped at the ramp could not see it:
+  // the hole was the POPULATION, not the assertion. (Both surfaces are cited by SECTION
+  // rather than by sentence: #1340 rewrote the wording on each, so a quotation here would
+  // send a reader who greps it to verify looking for text that no longer exists.)
   const achromatic: Record<string, string> = {
     "PALETTE.slate000": PALETTE.slate000,
     "PALETTE.slate100": PALETTE.slate100,
