@@ -346,6 +346,33 @@ mechanism working, and the fix is to ping the reviewer to re-record, not to leav
 SHAs wrong. Signature: run ids re-derived after a rebase, commit SHAs beside them not
 — including the one the body tells a reader to check out (#1327).
 
+### A range's baseline is a *different* check from a SHA's ancestry
+
+The check above asks *is this SHA still on the branch*. A body that cites a **range** —
+`git diff <base>..HEAD --stat` as the proof that nothing else bled into the diff — is
+asking a different question, and every check above answers it wrongly. After a second
+rebase the commit you rebased onto the *first* time is still resolvable, still an
+ancestor of the PR ref, and still carries the subject the body names it by. It is simply
+no longer the **merge base**, so the diffstat silently absorbs everything `main` landed
+in between — a number that is freshly measured, obeys `Every number in a PR body`, and
+is wrong.
+
+```sh
+git fetch origin +refs/pull/<n>/head:refs/tmp/pr<n>
+# the second fetch is load-bearing: an explicit refspec does NOT move origin/main, and a
+# long-lived worktree's copy dates from session start. Merge-basing against a stale one
+# returns the PREVIOUS rebase's target — a valid, correctly-subjected ancestor, and the
+# exact wrong baseline this section exists to catch.
+git fetch origin main
+BASE=$(git merge-base refs/tmp/pr<n> origin/main)   # the ONLY baseline an isolation claim may cite
+git diff --stat "$BASE"..refs/tmp/pr<n> | tail -1
+```
+
+Re-run it after **every** rebase, not just the last one, and re-derive the per-file
+deltas beside it so they still sum to the total. Signature: an isolation diffstat whose
+baseline passes ancestry *and* subject and whose file count is two high — 63 files/314+
+against the previous rebase's target, 61/258+ against the merge base (#1324).
+
 ### Body quotes are checked against head, never eyeballed
 
 A body that **quotes** a passage out of a file in its own diff has made a claim a
