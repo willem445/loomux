@@ -24,6 +24,25 @@ export function retainExisting(selected: Iterable<string>, tasks: readonly HasId
   return live;
 }
 
+/** The same prune for KEYED per-row state — the half-typed grounding link the
+ *  board holds for a row (#1273 N1) — returning a fresh map.
+ *
+ *  A sibling of `retainExisting` above rather than a generalization of it: that
+ *  one is called on three sets whose value is the id itself, and widening it to
+ *  entries would make every one of those call sites read worse to save this one
+ *  function. Same rule, same reason — frontend-only state can outlive the row
+ *  it points at, and a draft nobody can ever see again is a leak that grows
+ *  with the session. */
+export function retainExistingKeys<V>(
+  entries: Iterable<readonly [string, V]>,
+  tasks: readonly HasId[]
+): Map<string, V> {
+  const present = new Set(tasks.map((t) => t.id));
+  const live = new Map<string, V>();
+  for (const [id, value] of entries) if (present.has(id)) live.set(id, value);
+  return live;
+}
+
 /** The board's status vocabulary, in picker order. Mirrors the backend's
  *  TASK_STATUSES (validated there) — the frontend only offers these; the
  *  backend rejects anything else on write. Pinned against the Rust source by a

@@ -59,6 +59,7 @@ import {
   PROTOTYPE_STATUS,
   REQUEST_CHANGES_STATUS,
   retainExisting,
+  retainExistingKeys,
   STATUSES,
   taskActivityState,
   unmetDeps,
@@ -2460,4 +2461,28 @@ test("the add affordance goes inert exactly at the cap", () => {
   // and the editor must stay inert there rather than offering an add whose
   // write would be refused for a reason the human did not cause.
   assert.equal(artifactLinksAtCap(fill(MAX_ARTIFACT_LINKS + 5)), true);
+});
+
+test("a half-typed link draft is pruned with its row, and keeps its value while the row lives", () => {
+  // #1273 N1: the board holds the in-progress grounding link per row so a
+  // re-render — a background refresh, or the resync after a refused write —
+  // does not eat it. That state is frontend-only, so it can outlive the row it
+  // points at exactly the way `selected`/`collapsed` can.
+  const drafts = new Map([
+    ["t-1", { type: "spec", target: "#42", label: "the acceptance spec" }],
+    ["t-gone", { type: "doc", target: "README.md", label: "" }],
+  ]);
+  const board = [{ id: "t-1" }, { id: "t-2" }];
+  const live = retainExistingKeys(drafts, board);
+  assert.deepEqual([...live.keys()], ["t-1"], "a draft whose row has gone is dropped");
+  // The VALUE, not just the key. A prune that rebuilt the map from the surviving
+  // ids alone would satisfy the assertion above and silently blank the text this
+  // whole mechanism exists to keep.
+  assert.deepEqual(live.get("t-1"), { type: "spec", target: "#42", label: "the acceptance spec" });
+  assert.equal(drafts.size, 2, "the input map is not mutated");
+  assert.notEqual(live, drafts, "a fresh map is returned");
+  // A row with no draft does not gain one.
+  assert.equal(live.has("t-2"), false);
+  assert.equal(retainExistingKeys(new Map(), board).size, 0);
+  assert.equal(retainExistingKeys(drafts, []).size, 0, "an empty board keeps nothing");
 });

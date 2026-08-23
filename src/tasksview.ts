@@ -55,6 +55,7 @@ import {
   reorderWithSubtree,
   REQUEST_CHANGES_STATUS,
   retainExisting,
+  retainExistingKeys,
   siblingPosition,
   sprintAdvance,
   sprintFilterChoices,
@@ -260,6 +261,25 @@ export class TasksView {
    *  `expanded` it is frontend-only and survives re-renders; an id whose row
    *  has since gone simply never matches. */
   private expandedLinks = new Set<string>();
+  /** The half-typed grounding link per row (#1273 N1), so a re-render never
+   *  eats what the human is in the middle of writing.
+   *
+   *  It has to live HERE rather than in the input elements, because the
+   *  elements do not survive the event this exists for. `mutate` resyncs the
+   *  board after a REFUSED write, and `refreshNow` only defers a render while
+   *  `isEditing()` is true — which reads `document.activeElement`, so it holds
+   *  for Enter (focus still in the field) and NOT for a click on Add link
+   *  (focus on the button). Clearing on success alone would therefore still
+   *  lose the text on exactly the route most people use, and the whole point
+   *  of keeping validation backend-side is that the refusal TEACHES — an error
+   *  naming `deps`/`related` is worth nothing if the target it is about has
+   *  already been wiped out of the box. Pruned to live rows on every refresh,
+   *  like `selected`/`collapsed`. */
+  private linkDrafts = new Map<string, { type: string; target: string; label: string }>();
+  /** The row whose target field should take focus after the next render — the
+   *  same one-shot hook as `pickingFocus`, so adding several links to a row in
+   *  a row does not need a click between each. */
+  private linkFocus: string | null = null;
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
    *  pruned to live rows on every refresh (see retainExisting). */
   private selected = new Set<string>();
@@ -802,6 +822,10 @@ export class TasksView {
     this.collapsed = retainExisting(this.collapsed, this.tasks);
     // Same for an open picker whose row has gone (#582, #958).
     if (this.picking && !this.tasks.some((t) => t.id === this.picking?.id)) this.picking = null;
+    // Same housekeeping for a half-typed grounding link whose row has gone
+    // (#1273): a draft nobody can ever see again is a leak that grows with the
+    // session.
+    this.linkDrafts = retainExistingKeys(this.linkDrafts, this.tasks);
     this.render();
   }
 
@@ -1887,6 +1911,11 @@ export class TasksView {
     }
 
     const add = el("div", "task-grounding-add");
+    // Seeded from the row's draft, so a render that lands mid-typing — a
+    // background board refresh, or the resync after a refused write — puts back
+    // exactly what was in the boxes. `linkDrafts` is the authority; the elements
+    // are a view of it.
+    const draftState = this.linkDrafts.get(t.id);
     const type = document.createElement("select");
     type.className = "task-dep-picker ground";
     for (const lt of LINK_TYPES) {
@@ -1897,14 +1926,19 @@ export class TasksView {
     }
     // The first entry of the vocabulary, never the literal "requirement": that
     // list is read out of the Rust source, so a reorder or a rename there must
-    // not leave this line silently naming nothing.
-    type.value = LINK_TYPES[0];
+    // not leave this line silently naming nothing. A draft's remembered type
+    // wins, unless the vocabulary no longer has it.
+    type.value =
+      draftState && (LINK_TYPES as readonly string[]).includes(draftState.type)
+        ? draftState.type
+        : LINK_TYPES[0];
     type.title = "What kind of grounding this is — it decides nothing, it tells the next agent what it is reading";
 
     const target = document.createElement("input");
     target.className = "dlg-input task-grounding-target-input";
     target.placeholder = "#123, doc/design/x.md, or a URL";
     target.spellcheck = false;
+    target.value = draftState?.target ?? "";
     target.title =
       "What the link points AT. Never checked for existence — the board stays editable offline — " +
       "but a target naming a task on THIS board is refused: that is what dependencies are for.";
@@ -1913,7 +1947,18 @@ export class TasksView {
     label.className = "dlg-input task-grounding-label-input";
     label.placeholder = "label (optional)";
     label.spellcheck = false;
+    label.value = draftState?.label ?? "";
     label.title = "A one-line gloss shown instead of the bare target";
+
+    // Every keystroke and type change writes back, so what the view holds and
+    // what is on screen cannot diverge.
+    const remember = () => {
+      if (!target.value && !label.value) this.linkDrafts.delete(t.id);
+      else this.linkDrafts.set(t.id, { type: type.value, target: target.value, label: label.value });
+    };
+    target.addEventListener("input", remember);
+    label.addEventListener("input", remember);
+    type.addEventListener("change", remember);
 
     const submit = () => {
       const draft = artifactLinkDraft(type.value, target.value, label.value);
@@ -1923,13 +1968,23 @@ export class TasksView {
         target.focus();
         return;
       }
-      target.value = "";
-      label.value = "";
+      // The boxes are emptied ONLY once the write has actually landed. On a
+      // refusal `mutate` toasts the backend's error — which for a target naming
+      // a board task is the sentence that teaches `deps`/`related` — and
+      // resyncs; the draft survives that render, so the human can act on what
+      // they were just told instead of retyping it first.
       void this.mutate(
         invoke("orch_upsert_task", {
           groupId: this.groupId,
           id: t.id,
           links: withArtifactLink(t.links, draft),
+        }).then(() => {
+          this.linkDrafts.delete(t.id);
+          // Render rather than clearing these two elements: the success event
+          // may have rebuilt the form already, and blanking the detached copy
+          // would leave the live one still holding the text. One authority.
+          this.linkFocus = t.id;
+          this.render();
         })
       );
     };
@@ -1942,12 +1997,22 @@ export class TasksView {
         e.stopPropagation();
         if (e.key === "Enter") submit();
         if (e.key === "Escape") {
+          // Esc backs out the whole fold, and takes the unwritten draft with it
+          // — the same "backs out unwritten" the pickers mean by Escape.
+          this.linkDrafts.delete(t.id);
           this.expandedLinks.delete(t.id);
           this.render();
         }
       });
     }
     add.append(type, target, label, btn);
+    // Focus only on the render that follows a successful add, never on a
+    // background refresh — the same one-shot rule `pickingFocus` follows, so a
+    // re-render must not yank focus back from wherever the human has moved.
+    if (this.linkFocus === t.id) {
+      this.linkFocus = null;
+      window.setTimeout(() => target.focus(), 0);
+    }
     box.appendChild(add);
     return box;
   }
