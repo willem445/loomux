@@ -1042,14 +1042,24 @@ const STATE_DYES = {
 test("the four agent states stay separable under colour-vision deficiency", () => {
   // THE LOAD-BEARING MEASUREMENT OF THE THREE-CHANNEL DESIGN.
   //
-  // Eight hues on one dark ground cannot all survive CVD, and this set does not: azure and
-  // violet differ by 2.9 dE to a protanope, rose and orchid are identical to a tritanope.
+  // Eight hues on one dark ground cannot all survive CVD, and this set does not:
+  // azure/violet are 0.0 ΔE to a protanope (genuinely indistinguishable), cyan/azure are
+  // 2.4 ΔE to a tritanope, and rose/orchid are 4.3 ΔE to a tritanope. The identity octet's
+  // closest pair (azure/violet, 15.3 ΔE) is the normal-vision figure behind that.
+  //
+  // Before #1320 de-exoticised the octet this read "azure/violet 2.9 protan, rose/orchid
+  // identical to a tritanope" — both figures moved and the two claims effectively swapped,
+  // which is why the guard at the end of this file re-derives every one of them, INCLUDING
+  // the copies in this file. These sentences are written in that guard's canonical shapes on
+  // purpose: a surface it is told to scan but cannot parse is a surface it does not cover.
   // The design accepts that for IDENTITY — which thing this is, always also carried by
   // position, label and icon shape — and refuses it for STATE, which is the one thing a
   // supervisor has to read correctly at a glance across ten panes.
   //
-  // Measured worst case for the shipped dyes is 10.3 dE (tritan, attention/danger, where
-  // amber and rose both lose their yellow axis). The floor is 9: low enough that a
+  // Measured: the state worst case is 10.8 ΔE (tritan, attention/danger, where amber and
+  // rose both lose their yellow axis) — it was 10.3 before #1320 retuned the scale, so the
+  // change improved the load-bearing measurement. Separately, the accent sits 12.8 ΔE from
+  // the nearest state dye at its worst. The floor is 9: low enough that a
   // legitimate nudge to a dye does not trip it, high enough that two states merging does.
   for (const kind of [null, ...CVD_KINDS]) {
     const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
@@ -1065,7 +1075,8 @@ test("the four agent states stay separable under colour-vision deficiency", () =
 test("no identity-only hue may fill a state role", () => {
   // The channel rule, enforced where a token could actually break it.
   //
-  // Four of the eight hues carry a state role as well as an identity one; the other four —
+  // Three of the eight hues carry a state role as well as an identity one (it was four until
+  // #1320 moved `working` off azure onto its own `spring`); the other four —
   // lime, cyan, violet, orchid — are identity ONLY. Promoting one into a state position is
   // the specific regression the three-channel design fears, and it is not something a
   // contrast or a distance check can catch: `stateOk = cyan` measures perfectly fine and is
@@ -1136,4 +1147,315 @@ test("every palette entry is a well-formed hex colour", () => {
   for (const [name, value] of Object.entries(PALETTE)) {
     assert.match(value, HEX, `PALETTE.${name} is not a 6-digit lowercase hex: ${value}`);
   }
+});
+
+// --- #1320: the near-black neutral ground, the gold accent, and one font source ----------
+
+test("the neutral ramp carries no hue — nothing in the ground is tinted", () => {
+  // The direction (#1320 ask 1): "kill the blue hue ... no blue cast anywhere: backgrounds,
+  // panels, borders, chrome". Before this slice every neutral in the app was a COOL grey —
+  // blue sat 3-22 points above red at every step of both ramps — which is what read as a
+  // blue tint across the whole UI.
+  //
+  // Measured as R === G === B rather than as "blue is not much above red", because a
+  // tolerance is a slope: it invites the next value to sit just inside it, and eight steps
+  // each leaning two points the same way is a visible cast even when no single step trips a
+  // threshold. Achromatic is a property that cannot drift.
+  //
+  // This is the ground and the ink ONLY. Hues are still hues; `held`/`idle` are listed
+  // because the design calls them achromatic in prose (SEMANTIC, "ACHROMATIC on purpose"),
+  // and prose is exactly what this pins.
+  const achromatic: Record<string, string> = {
+    "PALETTE.slate000": PALETTE.slate000,
+    "PALETTE.slate100": PALETTE.slate100,
+    "PALETTE.slate200": PALETTE.slate200,
+    "PALETTE.slate300": PALETTE.slate300,
+    "PALETTE.slate400": PALETTE.slate400,
+    "PALETTE.slate500": PALETTE.slate500,
+    "PALETTE.mist000": PALETTE.mist000,
+    "PALETTE.mist200": PALETTE.mist200,
+    "PALETTE.mist400": PALETTE.mist400,
+    "PALETTE.ansiBlack": PALETTE.ansiBlack,
+    "SEMANTIC.stateHeld": SEMANTIC.stateHeld,
+    "SEMANTIC.stateIdle": SEMANTIC.stateIdle,
+    "TERMINAL_THEME.foreground": TERMINAL_THEME.foreground,
+    "TERMINAL_THEME.brightWhite": TERMINAL_THEME.brightWhite,
+  };
+  for (const [name, hex] of Object.entries(achromatic)) {
+    const n = Number.parseInt(hex.slice(1), 16);
+    const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    assert.ok(
+      r === g && g === b,
+      `${name} is ${hex} — r=${r} g=${g} b=${b}. The ground and the ink are achromatic ` +
+        `(#1320 ask 1); this one leans ${b > r ? "blue" : b < r ? "warm" : "off-grey"}.`
+    );
+  }
+});
+
+test("the brand accent is not a state dye", () => {
+  // #1320 ask 2 and ask 3 together: gold is THE interaction accent, and the semantic scale
+  // must stay "distinct from the gold brand accent".
+  //
+  // Before this slice they were the SAME PIGMENT — `accent`, `focus` and `stateWorking` all
+  // resolved to `azure`, deliberately (the old SEMANTIC comment argued the live agent and
+  // the actionable thing "are the same idea"). That made "is this running, or is this what I
+  // can click?" unanswerable by colour, and it is the specific thing this test refuses: on
+  // the pre-#1320 palette the nearest state dye to the accent is 0.0 dE away, because it IS
+  // the accent.
+  //
+  // Floor 9 matches the state channel's own floor for the same reason — it is the distance
+  // at which two marks stop being confusable — and is measured under CVD too, since an
+  // accent that merges with `attention` for a deuteranope is exactly as broken as one that
+  // merges for everyone.
+  const dyes: Record<string, string> = {
+    working: SEMANTIC.stateWorking,
+    attention: SEMANTIC.stateAttention,
+    ok: SEMANTIC.stateOk,
+    danger: SEMANTIC.stateDanger,
+  };
+  for (const kind of [null, ...CVD_KINDS]) {
+    const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+    for (const [name, hex] of Object.entries(dyes)) {
+      const d = deltaE(view(SEMANTIC.accent), view(hex));
+      assert.ok(
+        d >= 9,
+        `${kind ?? "normal vision"}: the accent (${SEMANTIC.accent}) is ${d.toFixed(1)} dE ` +
+          `from state "${name}" (${hex}) — "what can I click" and "what is this doing" ` +
+          "must not be the same colour (#1320)"
+      );
+    }
+  }
+  // `focus` is the same decision as `accent` and must not drift into a state either.
+  assert.equal(
+    SEMANTIC.focus,
+    SEMANTIC.accent,
+    "focus and accent are one interaction colour — if they split, this test stops covering focus"
+  );
+});
+
+test("no rule below :root hand-writes a font stack", () => {
+  // #1320 ask 4 (the font pass). `--font-mono` and `--font-ui` are the type roles, and they
+  // were being bypassed: 37 of the 49 `font-family` declarations in this stylesheet spelled
+  // a chain out by hand, in FOUR mutually-inconsistent mono spellings, so "the mono face"
+  // was four slightly different faces depending on which panel you were looking at.
+  //
+  // Same shape as the raw-colour ban above, and for the same reason: a token nothing is
+  // forced to use is a suggestion. `inherit` is allowed — it names no face — and so is
+  // anything inside `:root`, which is where the two chains are DEFINED.
+  const css = read("../src/styles.css");
+  const { below } = splitAtRoot(stripCssComments(css));
+  const offenders: string[] = [];
+  //
+  // BOTH SPELLINGS, because this stylesheet uses both. An earlier cut of this test matched
+  // only `font-family:` and was blind to the `font:` shorthand — which sets the family too,
+  // and which styles.css already carries 20 of. Reproduced before fixing: appending
+  // `.probe { font: 12px "Menlo", monospace; }` below :root left this test GREEN, while the
+  // identical declaration written as `font-family:` reddened it as designed.
+  //
+  // The two spellings need different rules. `font-family` names ONLY a family, so its value
+  // must be a role token outright. The shorthand also carries size and line-height, so it is
+  // judged on its family PORTION: a generic keyword or a quoted face name means a
+  // hand-written stack, while `font: inherit` and `font: 12px var(--font-mono)` name no face
+  // of their own.
+  //
+  // Blind spots, stated rather than implied (the source-scanning-guard convention): a family
+  // named entirely by unquoted single-word identifiers with no generic fallback
+  // (`font-family: Consolas` — invalid in practice and absent here), a stack assembled by a
+  // custom property other than the two role tokens, and any stylesheet other than
+  // styles.css (there is none; index.html carries no <style> block).
+  const GENERIC = /\b(monospace|sans-serif|serif|system-ui|ui-monospace|cursive|fantasy)\b/;
+  const QUOTED = /["']/;
+  for (const m of below.matchAll(/(^|[;{\s])(font-family|font)\s*:\s*([^;}]+)/g)) {
+    const prop = m[2];
+    const value = m[3].trim();
+    if (value === "inherit") continue;
+    if (prop === "font-family" && /^var\(--font-(mono|ui)\)$/.test(value)) continue;
+    if (prop === "font" && /var\(--font-(mono|ui)\)/.test(value)) continue;
+    if (prop === "font" && !GENERIC.test(value) && !QUOTED.test(value)) continue;
+    const line = below.slice(0, m.index).split("\n").length;
+    offenders.push(`  (approx. line ${line} below :root) ${prop}: ${value}`);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} rule(s) name a font face directly instead of var(--font-mono) / ` +
+      `var(--font-ui):\n${offenders.join("\n")}`
+  );
+});
+
+test("no module outside theme.ts spells a font stack of its own", () => {
+  // The CSS scan above is structurally blind to the frontend's other half, and that is
+  // exactly where the widest drift was: `editorwidget.ts` carried a NINTH chain — JetBrains
+  // Mono, Fira Code, SF Mono and Menlo ahead of the faces FONT.mono names — so the file
+  // editor rendered in a different face from every other mono surface for anyone who had one
+  // of them installed. Consolidating the stylesheet while leaving that literal in place
+  // would have left the guard green over the drift it was written for.
+  //
+  // Default-deny on a SHAPE, not on a binding's name (CLAUDE.md, source-scanning guards): a
+  // generic font keyword is the one thing a CSS font stack cannot be written without, so a
+  // rename cannot step over this. theme.ts is the single permitted site because it is where
+  // the two roles are DEFINED.
+  //
+  // Known blind spots, stated rather than implied: a chain assembled by concatenation, one
+  // that names only specific families with no generic fallback (invalid CSS in practice, and
+  // xterm would reject it too), and any font set from a .css file other than styles.css
+  // (there is none). None of these exists today.
+  const GENERIC = /\b(monospace|sans-serif|serif|system-ui|ui-monospace|cursive|fantasy)\b/;
+  const ALLOWED = new Map([
+    ["theme.ts", "defines FONT.mono and FONT.ui — the two type roles every other module consumes"],
+  ]);
+  const dir = new URL("../src/", import.meta.url);
+  const offenders: string[] = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts")).sort()) {
+    if (ALLOWED.has(file)) continue;
+    const src = readFileSync(new URL(file, dir), "utf8");
+    src.split("\n").forEach((line, i) => {
+      const code = line.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, "");
+      // a string literal in real code that names a generic font family
+      for (const m of code.matchAll(/(["'])((?:(?!\1).)*)\1/g)) {
+        if (GENERIC.test(m[2])) offenders.push(`  src/${file}:${i + 1}  ${m[0].slice(0, 90)}`);
+      }
+    });
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} module(s) name a font face directly instead of importing FONT from ` +
+      `theme.ts:\n${offenders.join("\n")}\n(allowed: ${[...ALLOWED.keys()].join(", ")})`
+  );
+});
+
+test("every surface that quotes an identity/state ΔE figure re-derives it", () => {
+  // THE SIBLING OF THE PER-CLI GUARD ABOVE, AND #1320 IS ITS DEMONSTRATION.
+  //
+  // That test was written because a measurement in prose is a measurement nothing re-runs.
+  // It covers the per-CLI figures only, so when #1320 retuned the identity octet and split
+  // the accent off the state channel, FIVE quoted figures went stale across three files and
+  // every one had to be found by a human reading the diff: the identity closest pair (30.4
+  // -> 15.3), the state worst case (10.3 -> 10.8), the two dichromat pairs, and the CLI
+  // set's "better than the eight's own 30.4" comparison, which the retune REVERSED.
+  //
+  // THIS FILE IS ONE OF THE SCANNED SURFACES, deliberately. The #1320 round corrected the
+  // CVD figures in theme.ts and the design note and missed the copies in these test
+  // comments — the same claim alive on a third surface (CLAUDE.md, #878). A guard that
+  // cannot see its own prose is a guard with a blind spot exactly where the last one was.
+  // Backticks are removed OUTRIGHT — not turned into spaces like pipes and bold markers.
+  // Markdown wraps these hue names in code spans (rose/orchid), and replacing a backtick with
+  // a space yields "rose / orchid", which the dichromat regex does not match either. The
+  // design note is the one surface B3 actually went stale on, so a normaliser that cannot
+  // parse it covers nothing there. Both cuts were caught by mutating the note and watching
+  const flatten = (s: string) =>
+    s.replace(/`/g, "").replace(/[|*]/g, " ").replace(/\s+/g, " ");
+  const SURFACES = [
+    { what: "doc/design/ui-redesign.md", text: flatten(read("../doc/design/ui-redesign.md")) },
+    { what: "src/theme.ts", text: flatten(read("../src/theme.ts")) },
+    { what: "test/theme.test.ts", text: flatten(read("./theme.test.ts")) },
+  ];
+  const STATE_SET = {
+    working: SEMANTIC.stateWorking,
+    attention: SEMANTIC.stateAttention,
+    ok: SEMANTIC.stateOk,
+    danger: SEMANTIC.stateDanger,
+  };
+
+  // Each claim is (a) the shape it is written in, and (b) how to re-derive it. A surface is
+  // free not to make a claim; if it makes one, the number has to be right.
+  const idNormal = closestPair({ ...IDENTITY }, (h) => h);
+  const stateWorst = CVD_KINDS.concat()
+    .map((k) => closestPair(STATE_SET, (h) => simulate(h, k)).distance)
+    .concat(closestPair(STATE_SET, (h) => h).distance)
+    .reduce((a, b) => Math.min(a, b));
+  let accentWorst = Infinity;
+  for (const kind of [null, ...CVD_KINDS]) {
+    const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+    for (const hex of Object.values(STATE_SET)) {
+      accentWorst = Math.min(accentWorst, deltaE(view(SEMANTIC.accent), view(hex)));
+    }
+  }
+  const CLAIMS = [
+    {
+      label: "the identity octet's closest pair",
+      re: /closest pair \(([a-z]+\/[a-z]+), ([0-9]+\.[0-9]) ΔE\)/g,
+      pair: `${idNormal.a}/${idNormal.b}`,
+      value: idNormal.distance.toFixed(1),
+    },
+    {
+      label: "the state channel's worst case",
+      re: /state worst case is ([0-9]+\.[0-9]) ΔE/g,
+      value: stateWorst.toFixed(1),
+    },
+    {
+      label: "the accent-to-nearest-state margin",
+      re: /accent sits ([0-9]+\.[0-9]) ΔE from the nearest state/g,
+      value: accentWorst.toFixed(1),
+    },
+    {
+      // The figure that has now gone stale TWICE — the design note kept "rose/orchid are
+      // identical to a tritanope" through a round in which the other two figures of its own
+      // sentence were corrected. Generic over pair and simulation, so any dichromat claim
+      // on any scanned surface is re-derived rather than only the three named today.
+      label: "a named dichromat pair",
+      re: /([a-z]+)\/([a-z]+) are ([0-9]+\.[0-9]) ΔE to a (protanope|deuteranope|tritanope)/g,
+      dichromat: true,
+    },
+  ];
+  const wrong: string[] = [];
+  const seenPerClaim = new Map<string, number>(CLAIMS.map((c) => [c.label, 0]));
+  const seenPerSurface = new Map<string, number>(SURFACES.map((s) => [s.what, 0]));
+  const KINDS: Record<string, Cvd> = {
+    protanope: "protan",
+    deuteranope: "deutan",
+    tritanope: "tritan",
+  };
+  const ID = IDENTITY as Record<string, string>;
+  for (const { what, text } of SURFACES) {
+    for (const claim of CLAIMS) {
+      for (const m of text.matchAll(claim.re)) {
+        seenPerClaim.set(claim.label, (seenPerClaim.get(claim.label) ?? 0) + 1);
+        seenPerSurface.set(what, (seenPerSurface.get(what) ?? 0) + 1);
+        if (claim.dichromat) {
+          const [a, b, stated, kindWord] = [m[1], m[2], m[3], m[4]];
+          if (ID[a] === undefined || ID[b] === undefined) continue; // not an identity pair
+          const actual = deltaE(
+            simulate(ID[a], KINDS[kindWord]),
+            simulate(ID[b], KINDS[kindWord])
+          ).toFixed(1);
+          if (stated !== actual) {
+            wrong.push(`${what}: ${a}/${b} to a ${kindWord} is stated ${stated} ΔE; it is ${actual}`);
+          }
+        } else if (claim.pair !== undefined) {
+          if (m[1] !== claim.pair) wrong.push(`${what}: ${claim.label} names ${m[1]}; it is ${claim.pair}`);
+          if (m[2] !== claim.value) wrong.push(`${what}: ${claim.label} says ${m[2]} ΔE; it is ${claim.value}`);
+        } else if (m[1] !== claim.value) {
+          wrong.push(`${what}: ${claim.label} says ${m[1]} ΔE; it is ${claim.value}`);
+        }
+      }
+    }
+  }
+  // TWO POSITIVE CONTROLS, ON DIFFERENT AXES, because each is blind where the other sees.
+  //
+  // Per CLAIM: a figure reworded out of existence reddens the claim it silenced instead of
+  // being absorbed by its neighbours. (The first cut summed across claims and passed while
+  // two of three regexes matched nothing.)
+  //
+  // Per SURFACE: a control that only proves the mechanism RAN never proves it SAW every
+  // subject. This guard listed test/theme.test.ts as a scanned surface and its own comment
+  // boasted about doing so, while matching ZERO of three claims there — the figures were
+  // spelled "dE" and in other sentence forms, so nothing bound them and mutating one left
+  // the suite green. That is the exact blind-instrument shape CLAUDE.md names. A surface
+  // listed here must now carry at least one figure this guard can parse, or it reddens.
+  const unseenClaims = [...seenPerClaim].filter(([, n]) => n === 0).map(([l]) => l);
+  assert.deepEqual(
+    unseenClaims,
+    [],
+    `no surface states: ${unseenClaims.join("; ")} — reworded out from under this guard`
+  );
+  const blindSurfaces = [...seenPerSurface].filter(([, n]) => n === 0).map(([l]) => l);
+  assert.deepEqual(
+    blindSurfaces,
+    [],
+    `scanned but matched nothing: ${blindSurfaces.join("; ")} — listed as covered while ` +
+      "contributing no checkable figure, so a stale number there would go unnoticed"
+  );
+  assert.deepEqual(wrong, [], `stale figures:\n${wrong.join("\n")}`);
 });

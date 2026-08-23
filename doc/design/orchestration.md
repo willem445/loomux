@@ -11626,7 +11626,7 @@ edge, and an id naming no live task counts as **unmet**, never satisfied.
 **The blocked/ready pair is the whole visual point, and it is deliberately quiet.** A `queued`
 task with an unfinished dep recedes (opacity), and a `queued` task whose deps are all done gets a
 `▸ ready` chip next to ▶ Start. No new accent color was introduced: the board already spends
-amber on "waiting on YOU" (`awaiting-human`) and blue on live work, and a third accent competing
+amber on "waiting on YOU" (`awaiting-human`) and green on live work, and a third accent competing
 with those would cost more than it explains — the chips on the line below name *what* a row is
 waiting for, which is the part prose in `set_state` could never do.
 

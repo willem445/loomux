@@ -103,7 +103,8 @@ export type IconRole =
  * Role → the identity token that dyes it. Values are CSS custom-property NAMES, not hexes:
  * the pigment lives in src/theme.ts and `:root`, and this module never learns one.
  *
- * Four of these hues are also state pigments (amber, jade, rose, azure). That duplication is
+ * Three of these hues are also state pigments (amber, jade, rose) — it was four until #1320
+ * moved `working` off azure onto its own `spring`. That duplication is
  * the brief's, not a slip — loomux has one palette and POSITION separates the channels — so
  * what matters is the token a surface NAMES, and every name below is `--id-*`.
  */

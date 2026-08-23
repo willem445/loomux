@@ -25,26 +25,26 @@
   /* Dark-only app: keeps native widgets (select popups, scrollbars) dark too. */
   color-scheme: dark;
 
-  /* --- the elevation ladder: a deep, cool neutral ground and three steps above it.
+  /* --- the elevation ladder: an achromatic near-black ground and three steps above it.
          Height means "closer to the human" — app ground, then panels and the rail, then
          cards and popovers. The surface steps are tiny (1.04-1.09:1) because surfaces
          separate by elevation and a hairline, never by a contrast block; the border steps
          open up, because an edge has to be seen. */
-  --surface-term: #0a0b0d;
-  --surface-0: #0f1114;
-  --surface-1: #15171c;
-  --surface-2: #1c1f26;
-  --line: #262a32;
-  --line-strong: #343945;
+  --surface-term: #0b0b0b;
+  --surface-0: #111111;
+  --surface-1: #171717;
+  --surface-2: #1f1f1f;
+  --line: #2a2a2a;
+  --line-strong: #393939;
 
   /* --- ink. `--ink-faint` is below AA by design: non-essential meta and rules only.
          Anything a user must read takes --ink-dim or better. `--ink` was toned down from
          15.6:1 to ~12.5:1 on the app ground at the human's request (#1020 item 11) — the
          candidate matrix and the value's provenance live on PALETTE.mist000 in theme.ts,
          the source of truth this token is pinned to. */
-  --ink: #cfd2d9;
-  --ink-dim: #9ba3b1;
-  --ink-faint: #656d7b;
+  --ink: #d2d2d2;
+  --ink-dim: #a3a3a3;
+  --ink-faint: #6d6d6d;
 
   /* --- CHANNEL 1: agent state. These six values are the only things allowed in a STATE
          POSITION — the warp thread, the status chip, the state dot. `held` and `idle` are
@@ -52,41 +52,43 @@
          not by hue. No --id-* token may appear in a state position; that rule is what keeps
          the fleet readable to a supervisor with colour-vision deficiency, and
          test/theme.test.ts measures it rather than trusting it. */
-  --state-working: #5590d9;
-  --state-attention: #e8a94a;
-  --state-ok: #45c08a;
-  --state-danger: #e8636f;
-  --state-held: #656d7b;
-  --state-idle: #343945;
+  --state-working: #74d98d;
+  --state-attention: #e89c3c;
+  --state-ok: #35a86b;
+  --state-danger: #e35a5a;
+  --state-held: #6d6d6d;
+  --state-idle: #393939;
 
   /* --- CHANNEL 2: interaction. ONE accent, used sparingly: focus ring, caret, active tab,
-         primary action. It is the working dye, because the live agent and the thing the
-         human is acting on are the same idea; form separates them (state is an edge,
-         interaction is a fill or a ring). It stays one colour no matter how many hues the
-         identity channel holds. */
-  --accent: #5590d9;
-  --focus: #5590d9;
-  --selection: #24344a;
+         primary action. It is the BRAND GOLD, and it is NOT any state dye (#1320 ask 2).
+         It used to be the working dye, on the argument that the live agent and the thing
+         the human is acting on are the same idea — they are not, and while one pigment
+         served both, "is this running, or is this what I can click?" had no answer in
+         colour. Form still separates them (state is an edge, interaction is a fill or a
+         ring). It stays one colour no matter how many hues the identity channel holds. */
+  --accent: #f8c93e;
+  --focus: #f8c93e;
+  --selection: #38321f;
 
   /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
          family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
          and their role table, git-graph lanes, diff add/delete, task-board
          columns, workflow-mode chrome, project tabs, resource meters, the syntax
-         sub-palette. Four of these carry the same pigment as a --state-* token above and
+         sub-palette. Three of these carry the same pigment as a --state-* token above and
          that is deliberate: orrerix has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
          documented role mapping; "it needed a different blue" is still refused. Reserved
          by slice A; slice B (#957) was the first consumer, mapping the bulk of surfaces, and
          the icon role table directly below is a later one. The full map is
          doc/design/ui-redesign.md, §What slice B migrated. */
-  --id-rose: #e8636f;
-  --id-amber: #e8a94a;
-  --id-lime: #a9cc5a;
-  --id-jade: #45c08a;
-  --id-cyan: #46bcd4;
-  --id-azure: #5590d9;
-  --id-violet: #a97fd6;
-  --id-orchid: #e767a8;
+  --id-rose: #e35a5a;
+  --id-amber: #e89c3c;
+  --id-lime: #b5bf62;
+  --id-jade: #35a86b;
+  --id-cyan: #5aa8b5;
+  --id-azure: #6f93c4;
+  --id-violet: #9a8fc4;
+  --id-orchid: #c47f9e;
 
   /* --- CHANNEL 3, the per-CLI sub-table: WHICH AGENT PROGRAM is this pane running. One
          question, one closed roster, and exactly two positions — the agent-type mark in a
@@ -108,8 +110,8 @@
   --cli-codex: #3ec2a8;
   --cli-copilot: #7fa8d8;
   --cli-opencode: #5fc873;
-  --cli-gemini: #8b8ff0;
-  --cli-hermes: #e072c0;
+  --cli-gemini: #9677c5;
+  --cli-hermes: #b67c94;
   --cli-ante: #c3c455;
 
   /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
@@ -251,7 +253,7 @@ html, body {
   height: 100%;
   background: var(--surface-0);
   color: var(--ink);
-  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-ui);
   font-size: 13px;
   overflow: hidden;
   user-select: none;
@@ -502,7 +504,7 @@ body.dragging-tab, body.dragging-tab * { cursor: grabbing !important; }
 .mini-pane-scaler { position: absolute; top: 3px; left: 5px; transform-origin: top left; }
 .mini-pane-note { color: var(--ink-dim); font-size: 11px; font-style: italic; padding: 6px; }
 .mini-term {
-  font-family: "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 13px; line-height: 1.2; color: var(--ink);
 }
 .mini-term-row { white-space: pre; }
@@ -1417,7 +1419,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 #hintbar::-webkit-scrollbar { display: none; } /* WebKit / Blink (WebView2) */
 #hintbar > * { flex: none; } /* keep each hint at its natural width */
 #hintbar kbd {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 9.5px; color: var(--ink);
   background: var(--surface-2);
   border: 1px solid var(--line);
@@ -1453,7 +1455,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   transition: width 0.5s var(--ease), background 0.5s var(--ease);
 }
 .metric-val {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10.5px; color: var(--ink);
   min-width: 34px;
 }
@@ -1574,7 +1576,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 .fileexp-input {
   background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  font-family: var(--font-mono); font-size: 13px;
   padding: 4px 8px; border-radius: 5px;
 }
 .fileexp-input:focus { outline: none; border-color: var(--line-strong); }
@@ -1687,7 +1689,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    reflow as digests stream in (the row would jitter under the cursor). */
 .fileexp-hash {
   flex: none; width: 104px; text-align: right;
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px; font-variant-numeric: tabular-nums;
   color: var(--ink-dim);
   overflow: hidden; white-space: nowrap;
@@ -1744,7 +1746,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    a monospace, wrapping, SELECTABLE treatment rather than prose styling — a 128-char
    SHA-512 you can't select is one you have to transcribe by hand. */
 .dlg-mono {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px; line-height: 1.6;
   color: var(--ink);
   word-break: break-all; user-select: text;
@@ -2513,7 +2515,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   .task-row.task-row-active, .task-active-badge { animation: none; }
 }
 /* "● ACTIVE — <agent id>" — reuses .pane-attn's pulse shape/timing (styles.css
-   attn-pulse) recolored to the in-progress blue so it never gets mistaken for
+   attn-pulse) recolored to the in-progress green so it never gets mistaken for
    the amber "needs YOUR attention" signal that same shape means elsewhere. */
 .task-active-badge {
   flex: none; font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px;
@@ -2552,7 +2554,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-main { flex: 1; min-width: 0; }
 .task-top { display: flex; align-items: center; gap: 7px; min-height: 22px; }
 .task-id {
-  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  flex: none; font-family: var(--font-mono);
   font-size: 10px; color: var(--ink-dim);
 }
 .task-title {
@@ -2583,7 +2585,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   background: var(--surface-2); color: var(--ink-dim);
   max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.task-chip.session { font-family: "Cascadia Mono", Consolas, monospace; }
+.task-chip.session { font-family: var(--font-mono); }
 /* Archived (#1152) — plain and quiet: it explains why a row is in this view,
    it is not a state anyone needs to act on. */
 .task-chip.cleared { font-style: italic; }
@@ -2591,7 +2593,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    so an old assignee on a done/reopened/stalled task can never read as
    current work — the human's exact complaint about the first cut of this. */
 .task-chip.agent {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 .task-chip.agent.live {
   background: color-mix(in srgb, var(--state-working) 14%, transparent); color: var(--state-working); font-weight: 600;
@@ -2632,7 +2634,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .task-chip.dep {
   display: inline-flex; align-items: center; gap: 3px; max-width: none;
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 /* Satisfied / still-blocking / names-nothing. Green and amber are the same
    done/waiting language the status chips already use; the ⚠ red is for a link
@@ -2643,7 +2645,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-chip.dep.missing { background: color-mix(in srgb, var(--state-danger) 16%, transparent); color: var(--state-danger); }
 .task-chip.dep .dep-mark { font-size: 9px; opacity: 0.9; }
 .task-chip.related {
-  font-family: "Cascadia Mono", Consolas, monospace; font-style: italic; opacity: 0.75;
+  font-family: var(--font-mono); font-style: italic; opacity: 0.75;
 }
 /* Per-chip remove (✕): dim until the chip is hovered, so a row of deps reads
    as information first and controls second. */
@@ -2662,14 +2664,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-dep-picker option { background: var(--surface-2); color: var(--ink); }
 .task-btn.deplink { font-size: 9px; }
 /* "▸ ready" (#582): a queued item whose deps are all done — shown only on a
-   board that uses deps at all. Blue, matching the ▶ Start button it sits next
+   board that uses deps at all. Teal, matching the ▶ Start button it sits next
    to, because it marks the same thing: this one can begin now. */
 .task-chip.ready {
   flex: none; background: color-mix(in srgb, var(--id-cyan) 14%, transparent); color: var(--id-cyan); font-weight: 600;
 }
 /* The counterpart: a queued item waiting on an unfinished dep recedes, so it
    can't be mistaken for work anyone could pick up. No new accent color — the
-   amber left-accent already means "waiting on YOU" and the blue one "live
+   amber left-accent already means "waiting on YOU" and the green one "live
    work"; the chips below name what this one is actually waiting for. */
 .task-row.task-row-dep-blocked { opacity: 0.68; }
 .task-row.task-row-dep-blocked:hover { opacity: 0.92; }
@@ -2727,7 +2729,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Direct-child rollup: the same two numbers the orchestrator's list_tasks row
    carries. Neutral — a count is information, not a state. */
 .task-chip.children {
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 9px;
+  font-family: var(--font-mono); font-size: 9px;
 }
 /* Everything inside is done but this row's own status lags. Green like `done`,
    because that is what it is reporting; it is a prompt, never a write. */
@@ -2736,7 +2738,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    dep chip, and the same red, because the fix is the same shape: re-point it. */
 .task-chip.parent-missing {
   background: color-mix(in srgb, var(--state-danger) 16%, transparent); color: var(--state-danger);
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 .task-btn.nest { font-size: 10px; }
 /* Set-kind picker (#958 slice K): a separate entry point from ⤵ above — a
@@ -3145,7 +3147,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   flex: none; width: 10px; color: var(--ink-dim); font-size: 9px;
 }
 .audit-time {
-  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  flex: none; font-family: var(--font-mono);
   font-size: 10px; color: var(--ink-dim);
 }
 .audit-actor {
@@ -3156,7 +3158,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .audit-actor.actor-loomux { background: color-mix(in srgb, var(--id-azure) 14%, transparent); color: var(--id-azure); }
 .audit-actor.actor-human { background: color-mix(in srgb, var(--id-lime) 16%, transparent); color: var(--id-lime); }
 .audit-action {
-  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  flex: none; font-family: var(--font-mono);
   font-size: 10px; color: var(--accent); white-space: nowrap;
 }
 .audit-action.act-prompt-failed, .audit-action.act-submit-retries-skipped { color: var(--state-danger); }
@@ -3167,7 +3169,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .audit-detail {
   margin: 2px 0 6px 28px; padding: 8px 10px;
   background: var(--surface-1); border-radius: 6px;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px;
+  font-family: var(--font-mono); font-size: 11px;
   line-height: 1.45; color: var(--ink);
   white-space: pre-wrap; word-break: break-word; user-select: text;
   max-height: 320px; overflow: auto;
@@ -3382,7 +3384,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .group-auto-fill.warn { background: var(--state-attention); }
 .group-auto-fill.over { background: var(--state-danger); }
 .group-auto-mlabel {
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px; color: var(--ink-dim); white-space: nowrap;
 }
 /* Row C: idle-tick knobs + live status, a slim line. */
@@ -3493,7 +3495,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    role — i.e. never for the built-in roster. */
 .group-block {
   flex: none; max-width: 96px;
-  font-size: 9.5px; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 9.5px; font-family: var(--font-mono);
   color: var(--ink-dim); background: var(--surface-2);
   border-radius: 4px; padding: 1px 5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -3504,7 +3506,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .group-state { flex: none; color: var(--ink-dim); font-size: 10.5px; }
 .group-uptime, .group-agent-cost {
-  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  flex: none; font-family: var(--font-mono);
   font-size: 10px; color: var(--ink-dim); min-width: 42px; text-align: right;
 }
 .group-agent-cost { min-width: 96px; }
@@ -3513,7 +3515,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    to them rather than its own line, since it's shown for nearly every
    Claude agent, not just an exceptional case. */
 .group-context {
-  flex: none; font-family: "Cascadia Mono", Consolas, monospace;
+  flex: none; font-family: var(--font-mono);
   font-size: 10px; color: var(--ink-dim); min-width: 88px; text-align: right;
 }
 .group-actions {
@@ -3634,7 +3636,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .git-rev {
   flex: none; color: var(--ink-dim); font-size: 10.5px;
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 .git-when { flex: none; color: var(--ink-dim); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .git-more {
@@ -3657,7 +3659,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .git-diff-path {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px;
+  font-family: var(--font-mono); font-size: 11.5px;
 }
 .git-diff-mode {
   flex: none; font-size: 9px; font-weight: 700; letter-spacing: 0.8px;
@@ -3666,7 +3668,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .git-diff-body {
   flex: 1; overflow: auto;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+  font-family: var(--font-mono); font-size: 12px;
   line-height: 1.45;
   user-select: text; /* page default is none — diffs must be copyable */
   padding-bottom: 12px;
@@ -3706,7 +3708,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .git-empty {
   padding: 26px 18px; color: var(--ink-dim); font-size: 12px;
-  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-ui);
   text-align: center;
 }
 
@@ -3750,7 +3752,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-file-row.selected { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
 .git-st {
   flex: none; width: 14px; text-align: center;
-  font-family: "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px; font-weight: 700;
 }
 .git-st.st-M { color: var(--id-amber); }
@@ -3806,7 +3808,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .git-meta-subject { font-size: 12.5px; color: var(--ink); }
 .git-meta-line { font-size: 11px; color: var(--ink-dim); }
 .git-meta-line.hash {
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 10.5px;
+  font-family: var(--font-mono); font-size: 10.5px;
   user-select: text;
 }
 
@@ -3835,13 +3837,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-root-path {
   color: var(--ink-dim); max-width: 240px; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+  font-family: var(--font-mono); font-size: 12px;
 }
 .fileedit-spacer { flex: 1 1 auto; }
 .fileedit-file {
   color: var(--ink); max-width: 340px; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left;
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+  font-family: var(--font-mono); font-size: 12px;
 }
 .fileedit-dirty { color: var(--accent); font-size: 15px; line-height: 1; }
 .fileedit-dirty[hidden] { display: none; }
@@ -3935,7 +3937,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-search-input {
   flex: 1 1 auto; min-width: 0;
   background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  font-family: var(--font-mono); font-size: 13px;
   padding: 5px 9px; border-radius: 5px;
 }
 .fileedit-search-input:focus { outline: none; border-color: var(--line-strong); }
@@ -4011,7 +4013,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-find-input {
   flex: 1 1 auto; min-width: 0;
   background: var(--surface-1); border: 1px solid var(--line); color: var(--ink);
-  font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px;
+  font-family: var(--font-mono); font-size: 13px;
   padding: 4px 8px; border-radius: 5px;
 }
 .fileedit-find-input:focus { outline: none; border-color: var(--line-strong); }
@@ -4055,7 +4057,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .fileedit-textarea {
   flex: 1 1 0; resize: none; border: none; outline: none;
   background: var(--surface-0); color: var(--ink);
-  font-family: "Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 13px; line-height: 1.55;
   padding: 6px 8px; white-space: pre; tab-size: 2;
 }
@@ -4227,7 +4229,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 6px 8px; border-bottom: 1px solid var(--line);
   background: var(--surface-1);
 }
-.wf-path { color: var(--ink); font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.wf-path { color: var(--ink); font-family: var(--font-mono); }
 .wf-dirty { color: var(--accent); font-size: 10px; }
 .wf-spacer { flex: 1; }
 .wf-status { font-size: 11.5px; }
@@ -4267,7 +4269,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-start-title { font-size: 14px; font-weight: 650; color: var(--ink); }
 .wf-start-path {
   font-size: 11.5px; color: var(--ink-dim);
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 .wf-start-body { font-size: 12.5px; color: var(--ink-dim); line-height: 1.6; max-width: 74ch; }
 .wf-start-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
@@ -4336,7 +4338,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .wf-insp-sub {
   font-size: 11px; color: var(--ink-dim);
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
@@ -4364,7 +4366,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .wf-input:disabled { opacity: 0.6; }
 .wf-textarea {
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   line-height: 1.5; resize: vertical;
 }
 .wf-checks { display: flex; flex-direction: column; gap: 4px; }
@@ -4390,7 +4392,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-yaml-area {
   flex: 1; border: none; outline: none; resize: none; padding: 12px 14px;
   background: var(--surface-term); color: var(--ink);
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12.5px; line-height: 1.55; tab-size: 2;
 }
 
@@ -4473,7 +4475,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 button.wf-finding:hover { background: var(--surface-2); }
 .wf-finding-where {
   flex: none; min-width: 76px; color: var(--ink-dim); font-size: 11px;
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-family: var(--font-mono);
 }
 .wf-finding.wf-error .wf-finding-msg { color: var(--state-danger); }
 .wf-finding.wf-warning .wf-finding-msg { color: var(--state-attention); }

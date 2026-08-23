@@ -28,6 +28,7 @@ import {
   formatMatchCount,
   type FindFlags,
 } from "./findwidget";
+import { FONT } from "./theme.ts";
 
 /** Minimal contract the overlay depends on. Keeping it this small is what makes
  *  the CM6-vs-textarea decision a one-line swap. */
@@ -469,10 +470,17 @@ interface CmModules {
   oneDark: typeof import("@codemirror/theme-one-dark");
 }
 
-/** A modern IDE monospace stack, tried in order. No bundled font files — these
- *  are the fonts developers already have installed (or the OS ships). */
-const EDITOR_FONT =
-  '"Cascadia Code", "JetBrains Mono", "Fira Code", "Cascadia Mono", "SF Mono", Menlo, Consolas, ui-monospace, monospace';
+/** The editor takes the app's mono role, not a stack of its own (#1320 ask 4).
+ *
+ *  It used to carry a ninth, wider chain — JetBrains Mono, Fira Code, SF Mono and Menlo
+ *  ahead of the faces `FONT.mono` names — on the reasoning that these are fonts developers
+ *  already have installed. The effect was that the file editor rendered in a different face
+ *  from every other mono surface in the app for anyone who had one of them, which is the
+ *  drift the type roles exist to prevent: "the mono face" has to mean one face.
+ *
+ *  This is CodeMirror's own scroller, NOT xterm — it cannot move a terminal cell metric
+ *  (hard constraint 1). `pane.ts` passes `FONT.mono` to xterm separately and is untouched. */
+const EDITOR_FONT = FONT.mono;
 
 /** Font + sizing layered over One Dark (which sets the colours but no font). */
 function editorChrome(cm: CmModules): import("@codemirror/state").Extension {

@@ -454,7 +454,7 @@ difference unmistakable rather than subtle:
   confused with real live work.
 
 The assignee chip itself carries the same distinction: a **live** agent gets its
-own blue tint, while a **history** chip (an assignee that isn't currently live)
+own green tint, while a **history** chip (an assignee that isn't currently live)
 reads dimmed and in italics — so an old assignee on a done, reopened, or stalled
 task never looks like the same agent is still sitting there. `done` items dim
 further still, receding behind whatever's still active.

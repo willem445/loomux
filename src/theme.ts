@@ -24,10 +24,14 @@
  * Two neutral ramps, eight named hues, and a seven-pigment per-CLI set that answers one
  * closed question in one position (see `CLI_HUES`).
  *
- * `slate` is a deep, cool neutral — blue sits a few points above red at every step, so the
- * ground reads cool and recedes behind terminal output rather than tinting it. `mist` is
- * the ink. Both are unchanged from the direction the human approved: **colour enters this
- * palette through the foreground only, never by tinting the ground.**
+ * `slate` is ACHROMATIC — `r === g === b` at every step, and so is `mist`. It used to lean
+ * cool (blue 3-17 points above red as the ramp climbed), which read as a blue cast across
+ * the whole chrome; #1320 ask 1 removed it. Each step was collapsed to its own GREEN channel,
+ * which holds luminance nearly constant (luminance is 71.52% green), so the elevation ladder
+ * and every contrast ratio survived the change while the hue did not — the largest step
+ * moved 1.4%. `mist` is the ink, and it is the "silver" half of the black-and-gold identity.
+ * The older rule is unchanged and now literally true: **colour enters this palette through
+ * the foreground only, never by tinting the ground.**
  *
  * The eight hues serve THREE channels, not one (design note, §The three colour channels):
  * *state* (what an agent is doing), *interaction* (what the human can act on), and
@@ -40,12 +44,12 @@ export const PALETTE = {
   //     are deliberately tiny — 1.041, 1.055, 1.087:1 between neighbours — because surfaces
   //     separate by elevation and a hairline, never by a contrast block. The two BORDER
   //     steps above them open up (1.146, 1.245:1): an edge has to be seen to do its job.
-  slate000: "#0a0b0d", // terminal ground — the deepest surface in the app
-  slate100: "#0f1114", // app ground (html/body, and the pre-paint hex in index.html)
-  slate200: "#15171c", // panels, bars, headers, the rail
-  slate300: "#1c1f26", // raised: cards, inputs, hovered rows, popovers
-  slate400: "#262a32", // hairline borders
-  slate500: "#343945", // strong borders, idle threads, disabled edges
+  slate000: "#0b0b0b", // terminal ground — the deepest surface in the app
+  slate100: "#111111", // app ground (html/body, and the pre-paint hex in index.html)
+  slate200: "#171717", // panels, bars, headers, the rail
+  slate300: "#1f1f1f", // raised: cards, inputs, hovered rows, popovers
+  slate400: "#2a2a2a", // hairline borders
+  slate500: "#393939", // strong borders, idle threads, disabled edges
 
   // --- mist: the ink. `mist400` is BELOW 4.5:1 on every ground by design — it is for
   //     non-essential meta and rules only. Anything a user must read uses mist200 or better.
@@ -57,10 +61,15 @@ export const PALETTE = {
   //     (>=7:1 on every ground, test: "the ink ramp keeps the contrast the design note
   //     promises") with room to spare even on slate300, the lightest ground it sits on:
   //
+  //     The candidates below are the #1020 set carried through #1320's de-blueing — each
+  //     collapsed to its own green channel, which is what held the ramp's luminance while
+  //     the hue left. That the ratios barely moved (13.50 -> 13.51, 12.49 -> 12.49,
+  //     11.53 -> 11.52) IS the evidence for that claim, not a coincidence:
+  //
   //       candidate      hex        surface0   surface1   surface2   surfaceTerm
-  //       mild trim      #d7dae0    13.50:1    12.80:1    11.78:1    14.06:1
-  //       DEFAULT (mid)  #cfd2d9    12.49:1    11.85:1    10.90:1    13.01:1   <- shipped
-  //       strong trim    #c7cad2    11.53:1    10.94:1    10.06:1    12.01:1
+  //       mild trim      #dadada    13.51:1    12.82:1    11.79:1    14.08:1
+  //       DEFAULT (mid)  #d2d2d2    12.49:1    11.86:1    10.90:1    13.02:1   <- shipped
+  //       strong trim    #cacaca    11.52:1    10.94:1    10.06:1    12.01:1
   //
   //     Terminal consequence: none of these candidates touch TERMINAL_THEME.brightWhite
   //     (below) — it is its own literal, not PALETTE.mist000, precisely so that swapping the
@@ -78,34 +87,60 @@ export const PALETTE = {
   //     so softening it further either does nothing visible or risks breaking the strictly-
   //     increasing elevation order for no perceptible gain — a call for a design slice with
   //     room to re-derive the whole ladder, not a same-day tone-down.
-  mist000: "#cfd2d9", // primary ink            (12.5:1 on slate100)
-  mist200: "#9ba3b1", // secondary ink          (7.4:1)
-  mist400: "#656d7b", // faint meta / dividers  (3.2-3.8:1 — non-text use only)
+  mist000: "#d2d2d2", // primary ink            (12.5:1 on slate100)
+  mist200: "#a3a3a3", // secondary ink          (7.4:1)
+  mist400: "#6d6d6d", // faint meta / dividers  (3.2-3.8:1 — non-text use only)
 
   // --- the eight hues, warm to cool around the wheel. Every one clears AA (4.5:1) as text
   //     on every slate ground including slate300, so a hue is legible on any surface
-  //     without a per-surface exception; the worst case is azure at 5.01:1. Each carries a
+  //     without a per-surface exception; the worst case is rose at 4.61:1. Each carries a
   //     `Lit` step — the brighter companion used for ANSI bright, for hover emphasis, and
   //     for chip text sitting on a hairline of the same hue. There is deliberately no
   //     per-hue FILL: on this ground a chip is the ground plus a hairline, so a third
   //     value per hue would be a token nothing paints (design note, §The Lit step).
-  rose: "#e8636f", //     state: danger / error / deletions
-  roseLit: "#f4808a",
-  amber: "#e8a94a", //    state: attention — this one needs you
-  amberLit: "#f4c06a",
-  lime: "#a9cc5a", //     identity only
-  limeLit: "#c0dd7f",
-  jade: "#45c08a", //     state: ok / done / additions
-  jadeLit: "#6fd3a6",
-  cyan: "#46bcd4", //     identity, and ANSI cyan
-  cyanLit: "#74d3e5",
-  azure: "#5590d9", //    state: working / live — and the one interaction accent
-  azureLit: "#7fb0e8",
-  azureDeep: "#24344a", // selection fill only — never text, never a border
-  violet: "#a97fd6", //   identity, and ANSI magenta
-  violetLit: "#c39ce8",
-  orchid: "#e767a8", //   identity only
-  orchidLit: "#f08cbd",
+  rose: "#e35a5a", //     state: danger / error / deletions — a TRUE red (hue 0), not the
+  roseLit: "#ee8080", //   pink-leaning rose it replaces (#1320 ask 3, "red = error/dead")
+  amber: "#e89c3c", //    state: attention — pulled toward orange from its old yellow-orange,
+  amberLit: "#f2b45f", //  as far toward it as tritanopia allows (see SEMANTIC.stateAttention)
+  lime: "#b5bf62", //     identity only — brass, down from a candy yellow-green
+  limeLit: "#cbd486",
+  jade: "#35a86b", //     state: ok / done / additions
+  jadeLit: "#56c48c",
+  cyan: "#5aa8b5", //     identity, and ANSI cyan — muted teal, not the old bright cyan
+  cyanLit: "#7ec3ce",
+  azure: "#6f93c4", //    identity, and ANSI blue. NO LONGER a state dye nor the accent:
+  azureLit: "#95b3d8", //  after #1320 this pigment never paints chrome, only a lane or glyph
+  violet: "#9a8fc4", //   identity, and ANSI magenta — slate-violet, down from a lilac
+  violetLit: "#b7aed8",
+  orchid: "#c47f9e", //   identity only — dusty rose, down from a hot pink
+  orchidLit: "#d8a2bb",
+
+  // --- the interaction pigment, and the one state pigment that is not also an identity hue.
+  //
+  //     gold is the BRAND accent (#1320 ask 2): black + gold/silver is the post-rebrand
+  //     identity, and this is the orrery gold off the logo, tempered a little off its
+  //     #ffc82a core so that a caret and a focus ring are not the brightest thing on the
+  //     screen. Before #1320 the interaction channel had no pigment of its own — it
+  //     borrowed `azure` from the state channel, which is why "what can I click" and "what
+  //     is this doing" were the same colour. There is no `silver` token: the silver half of
+  //     the identity IS the `mist` ramp, which is now genuinely achromatic.
+  //
+  //     spring is `working`. It exists because the direction puts BOTH running and done on
+  //     green, and two states may never share a pigment — so `jade` keeps `ok` and the
+  //     brighter, mintier `spring` takes the live thread. It sits 10.1 dE from `ansiGreen`
+  //     below: two near-identical greens in one palette is the smell the token layer exists
+  //     to prevent, so this one is far enough away to be its own pigment.
+  gold: "#f8c93e", //     interaction: the accent, the focus ring, the caret
+  spring: "#74d98d", //   state: working / live
+  selectionFill: "#38321f", // selection fill only — never text, never a border.
+  //     It was `azureDeep`, sitting inside the azure block; #1320 made it a deep GOLD wash,
+  //     and a name is what the next person greps. A future azure re-tune must not find this.
+  //     Its LEVEL is set by the two jobs a selection has, and both were measured against the
+  //     value it replaces rather than eyeballed: it must be visible as a fill on the app
+  //     ground (1.48:1, against the old 1.50:1) AND text must stay readable on top of it
+  //     (ink 8.45:1, against the old 8.33:1). The first draft was #2e2a1c, which kept the
+  //     text side but dropped the fill to 1.32:1 — a selection you can read but can barely
+  //     see is still a regression.
 
   // --- the per-CLI brand hues (#1020 wave 2). Seven pigments that exist for ONE position —
   //     the agent-type mark and the session list's CLI chip — and answer one closed
@@ -131,8 +166,8 @@ export const PALETTE = {
   fern: "#5fc873", //     opencode — a true green
   teal: "#3ec2a8", //     codex    — green-cyan
   steel: "#7fa8d8", //    copilot  — a cool desaturated blue
-  indigo: "#8b8ff0", //   gemini   — blue-violet
-  fuchsia: "#e072c0", //  hermes   — magenta
+  indigo: "#9677c5", //   gemini   — blue-violet, muted at #1320 ask 3
+  fuchsia: "#b67c94", //  hermes   — dusty mauve, muted at #1320 ask 3
 
   // --- terminal-only. ANSI wants a true green in a slot where the app's greens are a teal
   //     (jade) and a yellow-green (lime); neither reads as "green" to a CLI, so ANSI green
@@ -141,7 +176,7 @@ export const PALETTE = {
   //     which is why it is now three names rather than seven.
   ansiGreen: "#57bd77",
   ansiGreenLit: "#74d190",
-  ansiBlack: "#1e222a", //  above slate300 — dim, but visible on the terminal ground
+  ansiBlack: "#222222", //  above slate300 — dim, but visible on the terminal ground
 } as const;
 
 /**
@@ -150,16 +185,20 @@ export const PALETTE = {
  * Surfaces that consume this: coloured icons and their role table, per-CLI marks, git-graph
  * lanes, diff add/delete, task-board columns, workflow-mode chrome, project tabs, resource
  * meters, and the syntax sub-palette. All eight hues are available to it, including the
- * four that also carry a state role — loomux has ONE palette, not two, and minting a second
- * near-identical blue so that "identity blue" could differ from "working blue" is exactly
- * the failure the token layer exists to prevent.
+ * three that also carry a state role — loomux has ONE palette, not two, and minting a second
+ * near-identical pigment so that the identity copy could differ from the state copy is
+ * exactly the failure the token layer exists to prevent. (The rule is stated without naming
+ * a hue on purpose: it used to read "identity blue" versus "working blue", which #1320
+ * falsified when `working` moved off azure onto `spring`. The failure mode is not about
+ * blue.)
  *
  * WHAT KEEPS THE TWO CHANNELS APART IS POSITION, AND IT IS LOAD-BEARING. The state dyes
  * hold an exclusive claim to the state POSITIONS — the warp thread, the status chip, the
  * state dot — and an identity hue may never appear in one. That is not tidiness: under
- * simulated colour-vision deficiency this eight-hue set collapses (azure and violet differ
- * by 2.9 ΔE to a protanope; rose and orchid are identical to a tritanope), while the four
- * state dyes stay the most separable set under all three simulations. A supervisor who
+ * simulated colour-vision deficiency this eight-hue set collapses — azure/violet are 0.0 ΔE
+ * to a protanope (genuinely indistinguishable), cyan/azure are 2.4 ΔE to a tritanope, and
+ * rose/orchid are 4.3 ΔE to a tritanope — while the four state dyes stay the most separable
+ * set under all three simulations: the state worst case is 10.8 ΔE. A supervisor who
  * cannot tell violet from azure still reads the fleet correctly, because nothing they must
  * act on was ever encoded in the channel that collapsed. `test/theme.test.ts` measures
  * exactly that and fails if identity ever becomes the more robust of the two.
@@ -215,15 +254,25 @@ export const IDENTITY_LIT = {
  *
  * WHY SEVEN MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
  * for hues that must be told apart ACROSS THE WHOLE APP — a ninth would have landed closer to
- * an existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE). These seven
+ * an existing hue than the eight-set's own closest pair (azure/violet, 15.3 ΔE). These seven
  * never have to survive that comparison, because they only ever appear in ONE position
  * against each other: the agent mark and the session list's CLI chip. Measured on their own
- * terms they are the tighter set — closest pair 31.5 ΔE (codex/opencode), better than the
- * eight's own 30.4 — and test/theme.test.ts holds them to that floor.
+ * terms they are legible — closest pair 31.5 ΔE (codex/opencode) — and test/theme.test.ts
+ * holds them to a floor derived from the eight rather than hard-coded.
+ *
+ * THAT COMPARISON REVERSED AT #1320, and the argument has to be restated rather than have its
+ * number swapped. It used to read "tighter than the eight's own 30.4", which was a licence:
+ * seven extra pigments were justified BECAUSE they were the more legible set. De-exoticising
+ * the octet dropped its closest pair to 15.3, so the CLI set is now the LOOSER comparison —
+ * 31.5 clears 15.3 with room, but it clears it the way any adequate set clears a lowered bar,
+ * not by being exemplary. What still justifies the seven is the narrower claim underneath:
+ * they answer one closed question in two positions and never have to be told apart from the
+ * eight, only from each other. If a future round tightens the octet back up, this paragraph
+ * is the one to re-derive.
  *
  * COLOUR-VISION DEFICIENCY, HONESTLY — AND THE WORST CASE IS TRITAN, NOT THE RED-GREEN ONES.
  * Seven hues on one ground do not survive CVD and these do not. Closest pair per simulation:
- * protan copilot/hermes 12.5, deutan claude/opencode 10.5, and tritan codex/copilot **1.4** —
+ * protan opencode/ante 15.6, deutan codex/hermes 9.5, and tritan codex/copilot **1.4** —
  * which is the honest headline, because a tritanope sees those two as one colour. (Every
  * figure here and below is CIE76 over the Viénot LMS simulation in test/theme.test.ts; that
  * is the only method quoted anywhere in this feature, so two surfaces cannot disagree by
@@ -278,7 +327,15 @@ export const SEMANTIC = {
   // hues in the app, scarcity is no longer what makes these four mean something; POSITION
   // is. These six values are the only things allowed in a state position, and no identity
   // hue may enter one (see IDENTITY above).
-  stateWorking: PALETTE.azure,
+  // The scale is the standard one a supervisor already knows (#1320 ask 3): green is
+  // running and green is done, orange needs you, red is broken, and a stopped agent has no
+  // hue at all. `attention` is as far toward a true orange as it can go: past roughly hue
+  // 34 it converges with `danger` for a tritanope (both lose the yellow axis), and the
+  // 9 dE floor below is the thing that actually has to hold, so the last few degrees of
+  // orange are spent on staying distinguishable rather than on being more orange.
+  // Measured: the state worst case is 10.8 ΔE (tritan, attention/danger). It was 10.3 before
+  // #1320, so retuning the scale improved the load-bearing measurement rather than spending it.
+  stateWorking: PALETTE.spring,
   stateAttention: PALETTE.amber,
   stateOk: PALETTE.jade,
   stateDanger: PALETTE.rose,
@@ -286,14 +343,25 @@ export const SEMANTIC = {
   stateIdle: PALETTE.slate500,
 
   // Interaction. One accent, used sparingly: the focus ring, the caret, the active tab, the
-  // primary action. It is `azure` — the working dye — because the live agent and the thing
-  // the human is acting on are the same idea, and a ninth hue would be a ninth meaning to
-  // learn. Form separates them: state is an edge, interaction is a fill or a ring. The
+  // primary action. It is `gold` — the brand pigment — and it is NOT any state dye.
+  //
+  // It used to be `azure`, which was also `stateWorking`, on the argument that the live
+  // agent and the thing the human is acting on "are the same idea". They are not: a pane
+  // can be working while the thing you may click is somewhere else entirely, and sharing
+  // one pigment made that unaskable in colour. Splitting them is what #1320 ask 2 and ask 3
+  // require of each other — a gold accent is only legible AS an accent if the semantic
+  // scale it sits beside is something else. `test/theme.test.ts` ("the brand accent is not
+  // a state dye") holds the two apart at the state channel's own 9 dE floor, under CVD too.
+  //
+  // Form still separates as before: state is an edge, interaction is a fill or a ring. The
   // accent stays ONE colour however many hues the identity channel gains: "what can I
-  // click" must never become a hue-matching exercise.
-  accent: PALETTE.azure,
-  focus: PALETTE.azure,
-  selection: PALETTE.azureDeep,
+  // click" must never become a hue-matching exercise. Used SPARINGLY is part of the token:
+  // gold on every surface is not an accent, it is a theme.
+  // Measured: the accent sits 12.8 ΔE from the nearest state dye at its worst (tritan,
+  // against attention). On the pre-#1320 palette that distance was 0.0 — it WAS the dye.
+  accent: PALETTE.gold,
+  focus: PALETTE.gold,
+  selection: PALETTE.selectionFill,
 } as const;
 
 /**
@@ -324,10 +392,10 @@ export const TERM_METRICS = { fontSize: 14, lineHeight: 1.1 } as const;
  */
 export const TERMINAL_THEME = {
   background: PALETTE.slate000,
-  foreground: "#d5d9e1", // independent literal, not derived from mist000 — read for hours at a time
-  cursor: PALETTE.azure, // the caret is interaction, so it takes the accent (SEMANTIC.focus)
+  foreground: "#d9d9d9", // independent literal, not derived from mist000 — read for hours at a time
+  cursor: PALETTE.gold, // the caret is interaction, so it takes the accent (SEMANTIC.focus)
   cursorAccent: PALETTE.slate000,
-  selectionBackground: PALETTE.azureDeep,
+  selectionBackground: PALETTE.selectionFill,
   // xterm.js 6.0 replaced the native viewport scrollbar with its own widget
   // (see styles.css); these are the only scrollbar knobs it exposes.
   scrollbarSliderBackground: PALETTE.slate300,
@@ -360,7 +428,7 @@ export const TERMINAL_THEME = {
   // mist000 once did (L 0.6437 < 0.6921), inverting bright-white emphasis in every pane
   // (#1033 review). Kept at mist000's pre-tone-down value so brightWhite stays the brightest
   // thing a CLI can print.
-  brightWhite: "#e7e9ee",
+  brightWhite: "#e9e9e9",
 } as const;
 
 /** The 16 ANSI slot names, in wire order. Exported so the test names what it checks. */
@@ -411,7 +479,7 @@ export const CSS_TOKENS = {
   "--accent": SEMANTIC.accent,
   "--focus": SEMANTIC.focus,
   "--selection": SEMANTIC.selection,
-  // The identity channel. Four of these carry the same pigment as a `--state-*` token
+  // The identity channel. Three of these carry the same pigment as a `--state-*` token
   // above, and that duplication is the point: which token a surface names declares which
   // QUESTION it is answering, so a reviewer can see a channel violation in the diff without
   // knowing the hex. The `Lit` steps stay in theme.ts until a slice paints one — `:root`

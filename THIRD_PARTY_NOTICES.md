@@ -5,7 +5,7 @@ host, below). It also documents an **opt-in** component — the whisper.cpp voic
 runtime — which loomux does **not** distribute: users install it themselves if
 they want voice input. A third class is **shipped in-repo**: content vendored
 verbatim into this repository (the Lucide and Primer Octicons icon artwork and the
-frontend-design agent skill, below). Each component is used under its own license.
+frontend-design and impeccable agent skills, below). Each component is used under its own license.
 
 ## whisper.cpp voice runtime — MIT (opt-in; not shipped)
 
@@ -94,3 +94,28 @@ it is a vendored copy, not an npm dependency, and it ships inside the frontend b
 (`skills/frontend-design/`: `SKILL.md` + `LICENSE.txt`). The license ships
 alongside the skill. Do not edit these files in place — re-vendor from
 upstream and update the pin here (see the sibling `README.md`).
+
+## impeccable agent skill — Apache-2.0 (shipped in-repo)
+
+`.claude/skills/impeccable/` and the four `.claude/agents/impeccable-*.md`
+subagent definitions are vendored verbatim from
+[pbakaus/impeccable](https://github.com/pbakaus/impeccable)
+@ tag `skill-v4.1.1`
+([`5a149f3fdb1b5793f10567233b1dcab98fc305fd`](https://github.com/pbakaus/impeccable/commit/5a149f3fdb1b5793f10567233b1dcab98fc305fd)) —
+154 blobs: the whole of that tag's `.claude/skills/impeccable/**` tree (148 files),
+its four `.claude/agents/impeccable-*.md` siblings, and upstream's `LICENSE` and `NOTICE.md`. It is a design-review skill (`shape`,
+`audit`, `critique`, `polish`) plus a standalone deterministic anti-pattern
+detector, and is itself derived from the `frontend-design` skill vendored above.
+
+- **Not** vendored from the `impeccable` npm package: that package ships only
+  the `detect` CLI and downloads the skill content from `impeccable.style` at
+  install time, which pins nothing a reviewer can re-derive. The git tag above
+  is byte-verifiable with `gh api`. `npx impeccable detect` still runs the npm
+  CLI (**3.6.0**), which is invoked ad hoc and is not a repo dependency — it is
+  absent from `package.json` on purpose.
+- License: **Apache-2.0** (Copyright (c) Paul Bakaus), full text in
+  `.claude/skills/impeccable/LICENSE.txt`; upstream's own third-party notice is
+  carried beside it as `NOTICE.md`, per Apache-2.0 §4(d).
+- Upstream's `.claude/settings.json` is deliberately **not** vendored — it arms
+  a `PostToolUse`/`Stop` hook on every session. Rationale in the sibling
+  `README.md`, which also carries the re-vendoring procedure.
