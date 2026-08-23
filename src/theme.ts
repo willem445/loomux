@@ -110,16 +110,6 @@ export const PALETTE = {
   cyanLit: "#7ec3ce",
   azure: "#6f93c4", //    identity, and ANSI blue. NO LONGER a state dye nor the accent:
   azureLit: "#95b3d8", //  after #1320 this pigment never paints chrome, only a lane or glyph
-  azureDeep: "#38321f", // selection fill only — never text, never a border. Now a deep gold
-                        //  wash rather than a deep blue one, so a selection reads as the
-                        //  accent it belongs to. Its LEVEL is set by the two jobs a
-                        //  selection has, and both were measured against the value this
-                        //  replaces rather than eyeballed: it must be visible as a fill on
-                        //  the app ground (1.48:1, against the old 1.50:1) and text must
-                        //  stay readable on top of it (ink 8.45:1, against the old 8.33:1).
-                        //  The first draft of this de-blueing was #2e2a1c, which kept the
-                        //  text side but dropped the fill to 1.32:1 — a selection you can
-                        //  read but can barely see is still a regression.
   violet: "#9a8fc4", //   identity, and ANSI magenta — slate-violet, down from a lilac
   violetLit: "#b7aed8",
   orchid: "#c47f9e", //   identity only — dusty rose, down from a hot pink
@@ -142,6 +132,15 @@ export const PALETTE = {
   //     to prevent, so this one is far enough away to be its own pigment.
   gold: "#f8c93e", //     interaction: the accent, the focus ring, the caret
   spring: "#74d98d", //   state: working / live
+  selectionFill: "#38321f", // selection fill only — never text, never a border.
+  //     It was `azureDeep`, sitting inside the azure block; #1320 made it a deep GOLD wash,
+  //     and a name is what the next person greps. A future azure re-tune must not find this.
+  //     Its LEVEL is set by the two jobs a selection has, and both were measured against the
+  //     value it replaces rather than eyeballed: it must be visible as a fill on the app
+  //     ground (1.48:1, against the old 1.50:1) AND text must stay readable on top of it
+  //     (ink 8.45:1, against the old 8.33:1). The first draft was #2e2a1c, which kept the
+  //     text side but dropped the fill to 1.32:1 — a selection you can read but can barely
+  //     see is still a regression.
 
   // --- the per-CLI brand hues (#1020 wave 2). Seven pigments that exist for ONE position —
   //     the agent-type mark and the session list's CLI chip — and answer one closed
@@ -167,8 +166,8 @@ export const PALETTE = {
   fern: "#5fc873", //     opencode — a true green
   teal: "#3ec2a8", //     codex    — green-cyan
   steel: "#7fa8d8", //    copilot  — a cool desaturated blue
-  indigo: "#8b8ff0", //   gemini   — blue-violet
-  fuchsia: "#e072c0", //  hermes   — magenta
+  indigo: "#9677c5", //   gemini   — blue-violet, muted at #1320 ask 3
+  fuchsia: "#b67c94", //  hermes   — dusty mauve, muted at #1320 ask 3
 
   // --- terminal-only. ANSI wants a true green in a slot where the app's greens are a teal
   //     (jade) and a yellow-green (lime); neither reads as "green" to a CLI, so ANSI green
@@ -186,9 +185,12 @@ export const PALETTE = {
  * Surfaces that consume this: coloured icons and their role table, per-CLI marks, git-graph
  * lanes, diff add/delete, task-board columns, workflow-mode chrome, project tabs, resource
  * meters, and the syntax sub-palette. All eight hues are available to it, including the
- * four that also carry a state role — loomux has ONE palette, not two, and minting a second
- * near-identical blue so that "identity blue" could differ from "working blue" is exactly
- * the failure the token layer exists to prevent.
+ * three that also carry a state role — loomux has ONE palette, not two, and minting a second
+ * near-identical pigment so that the identity copy could differ from the state copy is
+ * exactly the failure the token layer exists to prevent. (The rule is stated without naming
+ * a hue on purpose: it used to read "identity blue" versus "working blue", which #1320
+ * falsified when `working` moved off azure onto `spring`. The failure mode is not about
+ * blue.)
  *
  * WHAT KEEPS THE TWO CHANNELS APART IS POSITION, AND IT IS LOAD-BEARING. The state dyes
  * hold an exclusive claim to the state POSITIONS — the warp thread, the status chip, the
@@ -252,15 +254,25 @@ export const IDENTITY_LIT = {
  *
  * WHY SEVEN MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
  * for hues that must be told apart ACROSS THE WHOLE APP — a ninth would have landed closer to
- * an existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE). These seven
+ * an existing hue than the eight-set's own closest pair (azure/violet, 15.3 ΔE). These seven
  * never have to survive that comparison, because they only ever appear in ONE position
  * against each other: the agent mark and the session list's CLI chip. Measured on their own
- * terms they are the tighter set — closest pair 31.5 ΔE (codex/opencode), better than the
- * eight's own 30.4 — and test/theme.test.ts holds them to that floor.
+ * terms they are legible — closest pair 31.5 ΔE (codex/opencode) — and test/theme.test.ts
+ * holds them to a floor derived from the eight rather than hard-coded.
+ *
+ * THAT COMPARISON REVERSED AT #1320, and the argument has to be restated rather than have its
+ * number swapped. It used to read "tighter than the eight's own 30.4", which was a licence:
+ * seven extra pigments were justified BECAUSE they were the more legible set. De-exoticising
+ * the octet dropped its closest pair to 15.3, so the CLI set is now the LOOSER comparison —
+ * 31.5 clears 15.3 with room, but it clears it the way any adequate set clears a lowered bar,
+ * not by being exemplary. What still justifies the seven is the narrower claim underneath:
+ * they answer one closed question in two positions and never have to be told apart from the
+ * eight, only from each other. If a future round tightens the octet back up, this paragraph
+ * is the one to re-derive.
  *
  * COLOUR-VISION DEFICIENCY, HONESTLY — AND THE WORST CASE IS TRITAN, NOT THE RED-GREEN ONES.
  * Seven hues on one ground do not survive CVD and these do not. Closest pair per simulation:
- * protan copilot/hermes 12.5, deutan claude/opencode 10.5, and tritan codex/copilot **1.4** —
+ * protan opencode/ante 15.6, deutan codex/hermes 9.5, and tritan codex/copilot **1.4** —
  * which is the honest headline, because a tritanope sees those two as one colour. (Every
  * figure here and below is CIE76 over the Viénot LMS simulation in test/theme.test.ts; that
  * is the only method quoted anywhere in this feature, so two surfaces cannot disagree by
@@ -321,6 +333,8 @@ export const SEMANTIC = {
   // 34 it converges with `danger` for a tritanope (both lose the yellow axis), and the
   // 9 dE floor below is the thing that actually has to hold, so the last few degrees of
   // orange are spent on staying distinguishable rather than on being more orange.
+  // Measured: the state worst case is 10.8 ΔE (tritan, attention/danger). It was 10.3 before
+  // #1320, so retuning the scale improved the load-bearing measurement rather than spending it.
   stateWorking: PALETTE.spring,
   stateAttention: PALETTE.amber,
   stateOk: PALETTE.jade,
@@ -343,9 +357,11 @@ export const SEMANTIC = {
   // accent stays ONE colour however many hues the identity channel gains: "what can I
   // click" must never become a hue-matching exercise. Used SPARINGLY is part of the token:
   // gold on every surface is not an accent, it is a theme.
+  // Measured: the accent sits 12.8 ΔE from the nearest state dye at its worst (tritan,
+  // against attention). On the pre-#1320 palette that distance was 0.0 — it WAS the dye.
   accent: PALETTE.gold,
   focus: PALETTE.gold,
-  selection: PALETTE.azureDeep,
+  selection: PALETTE.selectionFill,
 } as const;
 
 /**
@@ -379,7 +395,7 @@ export const TERMINAL_THEME = {
   foreground: "#d9d9d9", // independent literal, not derived from mist000 — read for hours at a time
   cursor: PALETTE.gold, // the caret is interaction, so it takes the accent (SEMANTIC.focus)
   cursorAccent: PALETTE.slate000,
-  selectionBackground: PALETTE.azureDeep,
+  selectionBackground: PALETTE.selectionFill,
   // xterm.js 6.0 replaced the native viewport scrollbar with its own widget
   // (see styles.css); these are the only scrollbar knobs it exposes.
   scrollbarSliderBackground: PALETTE.slate300,
@@ -463,7 +479,7 @@ export const CSS_TOKENS = {
   "--accent": SEMANTIC.accent,
   "--focus": SEMANTIC.focus,
   "--selection": SEMANTIC.selection,
-  // The identity channel. Four of these carry the same pigment as a `--state-*` token
+  // The identity channel. Three of these carry the same pigment as a `--state-*` token
   // above, and that duplication is the point: which token a surface names declares which
   // QUESTION it is answering, so a reviewer can see a channel violation in the diff without
   // knowing the hex. The `Lit` steps stay in theme.ts until a slice paints one — `:root`

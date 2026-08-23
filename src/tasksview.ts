@@ -1725,7 +1725,7 @@ export class TasksView {
     // A queued task waiting on an unfinished dep recedes, so it can't be read
     // as work anyone could pick up right now (#582's core ask: blocked-queued
     // must not look like plain queued). Deliberately no new accent color —
-    // the chips below name the blockers, and the amber/blue accents already
+    // the chips below name the blockers, and the amber/green accents already
     // mean "waiting on YOU" and "live work".
     //
     // A row whose CONTAINER is the one waiting recedes identically (#958 slice

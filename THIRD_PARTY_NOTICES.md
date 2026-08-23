@@ -102,8 +102,8 @@ subagent definitions are vendored verbatim from
 [pbakaus/impeccable](https://github.com/pbakaus/impeccable)
 @ tag `skill-v4.1.1`
 ([`5a149f3fdb1b5793f10567233b1dcab98fc305fd`](https://github.com/pbakaus/impeccable/commit/5a149f3fdb1b5793f10567233b1dcab98fc305fd)) —
-153 files, the whole of that tag's `.claude/skills/impeccable/**` tree plus its
-`.claude/agents/impeccable-*.md` siblings. It is a design-review skill (`shape`,
+154 blobs: the whole of that tag's `.claude/skills/impeccable/**` tree (148 files),
+its four `.claude/agents/impeccable-*.md` siblings, and upstream's `LICENSE` and `NOTICE.md`. It is a design-review skill (`shape`,
 `audit`, `critique`, `polish`) plus a standalone deterministic anti-pattern
 detector, and is itself derived from the `frontend-design` skill vendored above.
 

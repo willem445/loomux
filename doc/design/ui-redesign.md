@@ -23,7 +23,8 @@ The direction is set by the human, twice over. The issue names **ORCA** (onorca.
 different direction — a warm, undyed-flax ground — was **rejected at the direction gate**:
 *"the UI color scheme is terrible. Not a fan of the yellowish black color. I'm looking for a
 similar look and feel to ORCA + T3 … not just a color refresh but also a redesign on the
-experience."* So this revision is cool-neutral, and it covers experience as well as colour.
+experience."* So this revision is neutral-ground, and it covers experience as well as colour.
+(It was *cool*-neutral until #1320 took the last of the blue out; see §The palette.)
 
 Six principles come out of the references — from their public pages, docs, public design
 discussion, and a demo screenshot of ORCA the human supplied as the target:
@@ -138,9 +139,10 @@ terminal-only value survives: ANSI green (`#57bd77`), because the app's greens a
 target was 8–10, and a ninth hue was tried in all three gaps the wheel still had; every
 candidate landed closer to an existing hue than the eight-set's own closest pair. That
 argument still holds, but the figure it quoted does not: the set's closest pair used to be
-rose/orchid at 30.4 ΔE, and after the #1320 de-exoticising it is **azure/violet at 15.3 ΔE**
-(CIE76). Pulling four hues down in chroma moved them toward each other as well as toward the
-grey, and that is the honest cost of the change.
+rose/orchid at 30.4 ΔE; after the #1320 de-exoticising, the eight's own closest pair
+(azure/violet, 15.3 ΔE) is what a ninth candidate would now have to beat (CIE76). Pulling
+four hues down in chroma moved them toward each other as well as toward the grey, and that
+is the honest cost of the change.
 
 15.3 ΔE is still far above a just-noticeable difference (~2.3) and these hues never carry
 meaning alone — an identity hue is always accompanied by position, label and icon shape, and
@@ -207,9 +209,10 @@ which *thing* you are looking at — a surface, an action family, a CLI, a git l
 opposed to what state that thing is in.
 
 **Three hues carry both a state role and an identity role, and that is deliberate.** loomux
-has one palette, not two. Minting a second near-identical blue so "identity blue" could
-differ from "working blue" is precisely the *"it needed a slightly different blue"* failure
-rule 2 refuses. What separates the channels is **position**, not pigment: the state dyes hold
+has one palette, not two. Minting a second near-identical pigment so an identity copy could
+differ from a state copy is precisely the *"it needed a slightly different blue"* failure
+rule 2 refuses. (Stated without a hue on purpose — it read "identity blue" versus "working
+blue" until #1320 moved `working` off azure.) What separates the channels is **position**, not pigment: the state dyes hold
 an exclusive claim to the state positions, and an identity hue may never enter one. Which
 token a surface *names* — `--state-ok` or `--id-jade` — declares which question it is
 answering, so a reviewer can see a channel violation in the diff without knowing a hex.
@@ -229,7 +232,9 @@ simulation `azure` and `violet` are 0.0 ΔE apart to a protanope — identical �
 always also carried by position, by a label, and by an icon's shape — and refuses it for
 state, which is the one thing a supervisor must read correctly at a glance across ten panes.
 The four state dyes stay at least **10.3 ΔE** apart under all three dichromacies (the worst
-case is tritan `attention`/`danger`, where amber and rose both lose their yellow axis).
+case is tritan `attention`/`danger`, where amber and rose both lose their yellow axis): the
+state worst case is 10.8 ΔE, up from 10.3 before #1320. And the accent sits 12.8 ΔE from the
+nearest state dye at its worst, where before #1320 it was 0.0 — it *was* that dye.
 `test/theme.test.ts` asserts a floor of 9 on that, and separately refuses any identity-only
 hue in a state role. So a supervisor who genuinely cannot tell violet from azure still reads
 the fleet correctly — nothing they must act on was ever encoded in the channel that
@@ -421,8 +426,8 @@ means a new prefix:
 | **codex** | `--cli-codex` | `#3ec2a8` | OpenAI's green |
 | **copilot** | `--cli-copilot` | `#7fa8d8` | GitHub's blue |
 | **opencode** | `--cli-opencode` | `#5fc873` | — loomux's own pick |
-| **gemini** | `--cli-gemini` | `#8b8ff0` | Gemini's blue-violet |
-| **hermes** | `--cli-hermes` | `#e072c0` | — loomux's own pick |
+| **gemini** | `--cli-gemini` | `#9677c5` | Gemini's blue-violet |
+| **hermes** | `--cli-hermes` | `#b67c94` | — loomux's own pick |
 | **ante** | `--cli-ante` | `#c3c455` | — loomux's own pick |
 
 **Evocation, never replication.** Not one value above is a vendor's own hex, and none is
@@ -442,10 +447,12 @@ identity in the position-mixing check, so that is measured rather than asserted.
 
 **Seven more pigments does not reopen "eight is a measurement".** That ceiling (§The palette)
 was measured for hues that must be told apart *across the whole app*, where a ninth candidate
-landed closer to an existing hue than the eight-set's own closest pair (rose/orchid,
-30.4 ΔE). These seven never face that comparison: they appear in exactly **two positions** —
+landed closer to an existing hue than the eight-set's own closest pair (azure/violet,
+15.3 ΔE). These seven never face that comparison: they appear in exactly **two positions** —
 the agent mark and the session list's CLI chip — and only ever against each other. Measured
-on their own terms they are the tighter set, closest pair **31.5 ΔE** (codex/opencode), and
+on their own terms they remain legible, closest pair **31.5 ΔE** (codex/opencode) — a
+comparison that *reversed* at #1320, since the octet they are measured against is now the
+looser of the two (see `theme.ts` §CLI_HUES) — and
 the test derives the bar from `IDENTITY`'s own closest pair rather than hard-coding it, so
 seven extra pigments stay justified only while they remain the more legible set.
 
@@ -459,8 +466,8 @@ hues on one dark ground do not survive CVD and these do not. Closest pair per si
 
 | Simulation | Closest pair | ΔE |
 | --- | --- | --- |
-| protan | copilot/hermes | 12.5 |
-| deutan | claude/opencode | 10.5 |
+| protan | opencode/ante | 15.6 |
+| deutan | codex/hermes | 9.5 |
 | tritan | codex/copilot | **1.4** |
 
 1.4 ΔE is the honest headline: a tritanope sees codex and copilot as *one colour*. That is
@@ -755,14 +762,18 @@ have.
 
 Three specific things were revised away:
 
-**The warm ground is gone, entirely.** Not neutralised — inverted. `B−R` is positive at every
-step of the slate ramp where it was negative at every step of the old one.
+**The warm ground is gone, entirely.** It was first inverted — `B−R` positive at every step of
+the slate ramp where the old one was negative at every step — and then, at #1320, neutralised
+outright: `B−R` is now `0` at every step. See §The palette, which is the current statement.
 
 **The no-accent position was softened to one restrained accent.** Round 1 abolished the
 chrome accent to make the state dyes mean something; the human asked for restrained accent
 usage, not none, and a UI with no interactive colour at all makes "what can I click" a
 guessing game. The scarcity argument is preserved a cheaper way: one accent, reused from the
-state palette rather than added to it, with form separating the two meanings.
+state palette rather than added to it, with form separating the two meanings. #1320 reversed
+the *reuse* half of that: the accent is now `gold`, a pigment of its own, because sharing one
+hex with `--state-working` made "running" and "clickable" the same colour. The scarcity
+argument survives — there is still exactly one accent.
 
 **The textile vocabulary is gone.** Round 1 named its palette fibre, linen, indigo, saffron,
 verdigris and madder. In a plain grey cockpit those words would be a costume — and dressing a

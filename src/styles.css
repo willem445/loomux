@@ -30,21 +30,21 @@
          cards and popovers. The surface steps are tiny (1.04-1.09:1) because surfaces
          separate by elevation and a hairline, never by a contrast block; the border steps
          open up, because an edge has to be seen. */
-  --surface-term:#0b0b0b;
-  --surface-0:#111111;
-  --surface-1:#171717;
-  --surface-2:#1f1f1f;
-  --line:#2a2a2a;
-  --line-strong:#393939;
+  --surface-term: #0b0b0b;
+  --surface-0: #111111;
+  --surface-1: #171717;
+  --surface-2: #1f1f1f;
+  --line: #2a2a2a;
+  --line-strong: #393939;
 
   /* --- ink. `--ink-faint` is below AA by design: non-essential meta and rules only.
          Anything a user must read takes --ink-dim or better. `--ink` was toned down from
          15.6:1 to ~12.5:1 on the app ground at the human's request (#1020 item 11) — the
          candidate matrix and the value's provenance live on PALETTE.mist000 in theme.ts,
          the source of truth this token is pinned to. */
-  --ink:#d2d2d2;
-  --ink-dim:#a3a3a3;
-  --ink-faint:#6d6d6d;
+  --ink: #d2d2d2;
+  --ink-dim: #a3a3a3;
+  --ink-faint: #6d6d6d;
 
   /* --- CHANNEL 1: agent state. These six values are the only things allowed in a STATE
          POSITION — the warp thread, the status chip, the state dot. `held` and `idle` are
@@ -52,41 +52,43 @@
          not by hue. No --id-* token may appear in a state position; that rule is what keeps
          the fleet readable to a supervisor with colour-vision deficiency, and
          test/theme.test.ts measures it rather than trusting it. */
-  --state-working:#74d98d;
-  --state-attention:#e89c3c;
-  --state-ok:#35a86b;
-  --state-danger:#e35a5a;
-  --state-held:#6d6d6d;
-  --state-idle:#393939;
+  --state-working: #74d98d;
+  --state-attention: #e89c3c;
+  --state-ok: #35a86b;
+  --state-danger: #e35a5a;
+  --state-held: #6d6d6d;
+  --state-idle: #393939;
 
   /* --- CHANNEL 2: interaction. ONE accent, used sparingly: focus ring, caret, active tab,
-         primary action. It is the working dye, because the live agent and the thing the
-         human is acting on are the same idea; form separates them (state is an edge,
-         interaction is a fill or a ring). It stays one colour no matter how many hues the
-         identity channel holds. */
-  --accent:#f8c93e;
-  --focus:#f8c93e;
-  --selection:#38321f;
+         primary action. It is the BRAND GOLD, and it is NOT any state dye (#1320 ask 2).
+         It used to be the working dye, on the argument that the live agent and the thing
+         the human is acting on are the same idea — they are not, and while one pigment
+         served both, "is this running, or is this what I can click?" had no answer in
+         colour. Form still separates them (state is an edge, interaction is a fill or a
+         ring). It stays one colour no matter how many hues the identity channel holds. */
+  --accent: #f8c93e;
+  --focus: #f8c93e;
+  --selection: #38321f;
 
   /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
          family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
          and their role table, git-graph lanes, diff add/delete, task-board
          columns, workflow-mode chrome, project tabs, resource meters, the syntax
-         sub-palette. Four of these carry the same pigment as a --state-* token above and
+         sub-palette. Three of these carry the same pigment as a --state-* token above and
          that is deliberate: orrerix has one palette, and the token a surface NAMES is what
          declares which question it is answering. An --id-* token may only be used through a
          documented role mapping; "it needed a different blue" is still refused. Reserved
          by slice A; slice B (#957) was the first consumer, mapping the bulk of surfaces, and
          the icon role table directly below is a later one. The full map is
          doc/design/ui-redesign.md, §What slice B migrated. */
-  --id-rose:#e35a5a;
-  --id-amber:#e89c3c;
-  --id-lime:#b5bf62;
-  --id-jade:#35a86b;
-  --id-cyan:#5aa8b5;
-  --id-azure:#6f93c4;
-  --id-violet:#9a8fc4;
-  --id-orchid:#c47f9e;
+  --id-rose: #e35a5a;
+  --id-amber: #e89c3c;
+  --id-lime: #b5bf62;
+  --id-jade: #35a86b;
+  --id-cyan: #5aa8b5;
+  --id-azure: #6f93c4;
+  --id-violet: #9a8fc4;
+  --id-orchid: #c47f9e;
 
   /* --- CHANNEL 3, the per-CLI sub-table: WHICH AGENT PROGRAM is this pane running. One
          question, one closed roster, and exactly two positions — the agent-type mark in a
@@ -104,21 +106,21 @@
          no --cli-* token may enter one either. Values, provenance (evocation, never a
          vendor's own hex) and the separation measurements are theme.ts §CLI_HUES and
          doc/design/ui-redesign.md §The per-CLI hues. */
-  --cli-claude:#e08a5f;
-  --cli-codex:#3ec2a8;
-  --cli-copilot:#7fa8d8;
-  --cli-opencode:#5fc873;
-  --cli-gemini:#8b8ff0;
-  --cli-hermes:#e072c0;
-  --cli-ante:#c3c455;
+  --cli-claude: #e08a5f;
+  --cli-codex: #3ec2a8;
+  --cli-copilot: #7fa8d8;
+  --cli-opencode: #5fc873;
+  --cli-gemini: #9677c5;
+  --cli-hermes: #b67c94;
+  --cli-ante: #c3c455;
 
   /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
          IDENTIFIERS — paths, branches, ids, counts, timings — so the mono face always
          means "a literal string the machine gave you".
          --font-mono is byte-identical to the chain pane.ts passes to xterm; changing it
          changes cell metrics and forces a refit. */
-  --font-mono:"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
-  --font-ui:"Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --text-eyebrow: 10px;
   --text-xs: 10.5px;
   --text-s: 11.5px;
@@ -2513,7 +2515,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   .task-row.task-row-active, .task-active-badge { animation: none; }
 }
 /* "● ACTIVE — <agent id>" — reuses .pane-attn's pulse shape/timing (styles.css
-   attn-pulse) recolored to the in-progress blue so it never gets mistaken for
+   attn-pulse) recolored to the in-progress green so it never gets mistaken for
    the amber "needs YOUR attention" signal that same shape means elsewhere. */
 .task-active-badge {
   flex: none; font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px;
@@ -2662,7 +2664,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-dep-picker option { background: var(--surface-2); color: var(--ink); }
 .task-btn.deplink { font-size: 9px; }
 /* "▸ ready" (#582): a queued item whose deps are all done — shown only on a
-   board that uses deps at all. Blue, matching the ▶ Start button it sits next
+   board that uses deps at all. Teal, matching the ▶ Start button it sits next
    to, because it marks the same thing: this one can begin now. */
 .task-chip.ready {
   flex: none; background: color-mix(in srgb, var(--id-cyan) 14%, transparent); color: var(--id-cyan); font-weight: 600;

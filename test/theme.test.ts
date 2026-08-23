@@ -1043,13 +1043,17 @@ test("the four agent states stay separable under colour-vision deficiency", () =
   // THE LOAD-BEARING MEASUREMENT OF THE THREE-CHANNEL DESIGN.
   //
   // Eight hues on one dark ground cannot all survive CVD, and this set does not: azure and
-  // violet differ by 2.9 dE to a protanope, rose and orchid are identical to a tritanope.
+  // violet are INDISTINGUISHABLE to a protanope (0.0 dE), and cyan/azure are 2.4 dE to a
+  // tritanope, where rose/orchid are 4.3. (Before #1320 de-exoticised the octet these read
+  // "azure/violet 2.9 protan, rose/orchid identical to a tritanope" — both figures moved and
+  // the two claims effectively swapped, which is why the guard below now re-derives them.)
   // The design accepts that for IDENTITY — which thing this is, always also carried by
   // position, label and icon shape — and refuses it for STATE, which is the one thing a
   // supervisor has to read correctly at a glance across ten panes.
   //
-  // Measured worst case for the shipped dyes is 10.3 dE (tritan, attention/danger, where
-  // amber and rose both lose their yellow axis). The floor is 9: low enough that a
+  // Measured state worst case is 10.8 dE (tritan, attention/danger, where amber and rose
+  // both lose their yellow axis) — it was 10.3 before #1320 retuned the scale, so the
+  // change improved the load-bearing measurement. The floor is 9: low enough that a
   // legitimate nudge to a dye does not trip it, high enough that two states merging does.
   for (const kind of [null, ...CVD_KINDS]) {
     const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
@@ -1065,7 +1069,8 @@ test("the four agent states stay separable under colour-vision deficiency", () =
 test("no identity-only hue may fill a state role", () => {
   // The channel rule, enforced where a token could actually break it.
   //
-  // Four of the eight hues carry a state role as well as an identity one; the other four —
+  // Three of the eight hues carry a state role as well as an identity one (it was four until
+  // #1320 moved `working` off azure onto its own `spring`); the other four —
   // lime, cyan, violet, orchid — are identity ONLY. Promoting one into a state position is
   // the specific regression the three-channel design fears, and it is not something a
   // contrast or a distance check can catch: `stateOk = cyan` measures perfectly fine and is
@@ -1234,12 +1239,35 @@ test("no rule below :root hand-writes a font stack", () => {
   const css = read("../src/styles.css");
   const { below } = splitAtRoot(stripCssComments(css));
   const offenders: string[] = [];
-  for (const m of below.matchAll(/font-family:\s*([^;}]+)/g)) {
-    const value = m[1].trim();
+  //
+  // BOTH SPELLINGS, because this stylesheet uses both. An earlier cut of this test matched
+  // only `font-family:` and was blind to the `font:` shorthand — which sets the family too,
+  // and which styles.css already carries 20 of. Reproduced before fixing: appending
+  // `.probe { font: 12px "Menlo", monospace; }` below :root left this test GREEN, while the
+  // identical declaration written as `font-family:` reddened it as designed.
+  //
+  // The two spellings need different rules. `font-family` names ONLY a family, so its value
+  // must be a role token outright. The shorthand also carries size and line-height, so it is
+  // judged on its family PORTION: a generic keyword or a quoted face name means a
+  // hand-written stack, while `font: inherit` and `font: 12px var(--font-mono)` name no face
+  // of their own.
+  //
+  // Blind spots, stated rather than implied (the source-scanning-guard convention): a family
+  // named entirely by unquoted single-word identifiers with no generic fallback
+  // (`font-family: Consolas` — invalid in practice and absent here), a stack assembled by a
+  // custom property other than the two role tokens, and any stylesheet other than
+  // styles.css (there is none; index.html carries no <style> block).
+  const GENERIC = /\b(monospace|sans-serif|serif|system-ui|ui-monospace|cursive|fantasy)\b/;
+  const QUOTED = /["']/;
+  for (const m of below.matchAll(/(^|[;{\s])(font-family|font)\s*:\s*([^;}]+)/g)) {
+    const prop = m[2];
+    const value = m[3].trim();
     if (value === "inherit") continue;
-    if (/^var\(--font-(mono|ui)\)$/.test(value)) continue;
+    if (prop === "font-family" && /^var\(--font-(mono|ui)\)$/.test(value)) continue;
+    if (prop === "font" && /var\(--font-(mono|ui)\)/.test(value)) continue;
+    if (prop === "font" && !GENERIC.test(value) && !QUOTED.test(value)) continue;
     const line = below.slice(0, m.index).split("\n").length;
-    offenders.push(`  (approx. line ${line} below :root) font-family: ${value}`);
+    offenders.push(`  (approx. line ${line} below :root) ${prop}: ${value}`);
   }
   assert.deepEqual(
     offenders,
@@ -1289,4 +1317,96 @@ test("no module outside theme.ts spells a font stack of its own", () => {
     `${offenders.length} module(s) name a font face directly instead of importing FONT from ` +
       `theme.ts:\n${offenders.join("\n")}\n(allowed: ${[...ALLOWED.keys()].join(", ")})`
   );
+});
+
+test("every surface that quotes an identity/state ΔE figure re-derives it", () => {
+  // THE SIBLING OF THE PER-CLI GUARD ABOVE, AND #1320 IS ITS DEMONSTRATION.
+  //
+  // That test was written because a measurement in prose is a measurement nothing re-runs.
+  // It covers the per-CLI figures only, so when #1320 retuned the identity octet and split
+  // the accent off the state channel, FIVE quoted figures went stale across three files and
+  // every one had to be found by a human reading the diff: the identity closest pair (30.4
+  // -> 15.3), the state worst case (10.3 -> 10.8), the two dichromat pairs, and the CLI
+  // set's "better than the eight's own 30.4" comparison, which the retune REVERSED.
+  //
+  // THIS FILE IS ONE OF THE SCANNED SURFACES, deliberately. The #1320 round corrected the
+  // CVD figures in theme.ts and the design note and missed the copies in these test
+  // comments — the same claim alive on a third surface (CLAUDE.md, #878). A guard that
+  // cannot see its own prose is a guard with a blind spot exactly where the last one was.
+  const flatten = (s: string) => s.replace(/[|*]/g, " ").replace(/\s+/g, " ");
+  const SURFACES = [
+    { what: "doc/design/ui-redesign.md", text: flatten(read("../doc/design/ui-redesign.md")) },
+    { what: "src/theme.ts", text: flatten(read("../src/theme.ts")) },
+    { what: "test/theme.test.ts", text: flatten(read("./theme.test.ts")) },
+  ];
+  const STATE_SET = {
+    working: SEMANTIC.stateWorking,
+    attention: SEMANTIC.stateAttention,
+    ok: SEMANTIC.stateOk,
+    danger: SEMANTIC.stateDanger,
+  };
+
+  // Each claim is (a) the shape it is written in, and (b) how to re-derive it. A surface is
+  // free not to make a claim; if it makes one, the number has to be right.
+  const idNormal = closestPair({ ...IDENTITY }, (h) => h);
+  const stateWorst = CVD_KINDS.concat()
+    .map((k) => closestPair(STATE_SET, (h) => simulate(h, k)).distance)
+    .concat(closestPair(STATE_SET, (h) => h).distance)
+    .reduce((a, b) => Math.min(a, b));
+  let accentWorst = Infinity;
+  for (const kind of [null, ...CVD_KINDS]) {
+    const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+    for (const hex of Object.values(STATE_SET)) {
+      accentWorst = Math.min(accentWorst, deltaE(view(SEMANTIC.accent), view(hex)));
+    }
+  }
+  const CLAIMS = [
+    {
+      label: "the identity octet's closest pair",
+      re: /closest pair \(([a-z]+\/[a-z]+), ([0-9]+\.[0-9]) ΔE\)/g,
+      pair: `${idNormal.a}/${idNormal.b}`,
+      value: idNormal.distance.toFixed(1),
+    },
+    {
+      label: "the state channel's worst case",
+      re: /state worst case is ([0-9]+\.[0-9]) ΔE/g,
+      value: stateWorst.toFixed(1),
+    },
+    {
+      label: "the accent-to-nearest-state margin",
+      re: /accent sits ([0-9]+\.[0-9]) ΔE from the nearest state/g,
+      value: accentWorst.toFixed(1),
+    },
+  ];
+  const wrong: string[] = [];
+  const seenPerClaim = new Map<string, number>(CLAIMS.map((c) => [c.label, 0]));
+  for (const { what, text } of SURFACES) {
+    for (const claim of CLAIMS) {
+      for (const m of text.matchAll(claim.re)) {
+        seenPerClaim.set(claim.label, (seenPerClaim.get(claim.label) ?? 0) + 1);
+        if (claim.pair !== undefined) {
+          if (m[1] !== claim.pair) wrong.push(`${what}: ${claim.label} names ${m[1]}; it is ${claim.pair}`);
+          if (m[2] !== claim.value) wrong.push(`${what}: ${claim.label} says ${m[2]} ΔE; it is ${claim.value}`);
+        } else if (m[1] !== claim.value) {
+          wrong.push(`${what}: ${claim.label} says ${m[1]} ΔE; it is ${claim.value}`);
+        }
+      }
+    }
+  }
+  // POSITIVE CONTROL, PER CLAIM — not a total.
+  //
+  // The first cut counted every match across every claim and asserted the SUM was at least
+  // the number of claims. That passes when one claim matches three times and the other two
+  // match nothing, which is exactly the vacuity it exists to exclude — and it really did:
+  // two of these three figures were unchecked while this test reported green. Each claim now
+  // has to be found somewhere, so rewording one out of existence reddens the claim it
+  // silenced instead of being absorbed by its neighbours.
+  const unseen = [...seenPerClaim].filter(([, n]) => n === 0).map(([l]) => l);
+  assert.deepEqual(
+    unseen,
+    [],
+    `no surface states: ${unseen.join("; ")} — the prose was reworded out from under this ` +
+      "guard, so those figures are checked by nothing"
+  );
+  assert.deepEqual(wrong, [], `stale figures:\n${wrong.join("\n")}`);
 });
