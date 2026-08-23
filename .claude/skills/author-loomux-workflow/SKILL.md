@@ -1,14 +1,14 @@
 ---
 name: author-loomux-workflow
-description: When a human describes an agent-orchestration workflow in natural language for a repo that uses orrerix (roles needed, review rigor, special personas, model/cost tiers), use this skill to author a correct `.loomux/workflow.yml` (+ persona files) against orrerix's actual parser contract — never by pattern-matching another tool's YAML or guessing field names.
+description: When a human describes an agent-orchestration workflow in natural language for a repo that uses orrerix (roles needed, review rigor, special personas, model/cost tiers), use this skill to author a correct `.orrerix/workflow.yml` (+ persona files) against orrerix's actual parser contract — never by pattern-matching another tool's YAML or guessing field names.
 ---
 
-# Author an orrerix `.loomux/workflow.yml`
+# Author an orrerix `.orrerix/workflow.yml`
 
 This skill is for an agent working **inside a repo that orrerix orchestrates**,
 asked to turn a human's plain-language description of a workflow ("I want a
 cheap worker tier, a strict security reviewer, and a database expert on call")
-into a working `.loomux/workflow.yml` plus any persona files it references.
+into a working `.orrerix/workflow.yml` plus any persona files it references.
 
 **Ground every schema claim in the parser, not in this document's prose.**
 `crates/loomux-engine/src/workflow.rs`'s `RawWorkflow`/`RawBlock`/`RawEdge`/`RawGate`
@@ -21,7 +21,7 @@ that discipline applied to orrerix's own schema.
 
 ## Before you write anything: the one-line context check
 
-`.loomux/workflow.yml` only does anything if the human turns on the
+`.orrerix/workflow.yml` only does anything if the human turns on the
 **advanced orchestrator** toggle for that repo (at launch, or live from the
 group lifecycle panel) — off (the default), orrerix never even opens the
 file. Say this to the human once, in your summary: writing the file is not
@@ -243,7 +243,7 @@ One gate, keyed by name in the `gates:` map (`RawGate`, `deny_unknown_fields`)
 
 A small team: one cheap worker tier, one strong reviewer, and a
 domain-expert advisor spawned on demand. (Distinct from this repo's own
-dogfood `.loomux/workflow.yml`, which runs two worker tiers and three
+dogfood `.orrerix/workflow.yml`, which runs two worker tiers and three
 lane-scoped reviewers — that file is worth reading as a second, larger
 example, but don't copy its `all-pass`-over-three-lanes shape onto a team
 that only asked for one reviewer.)
@@ -404,7 +404,7 @@ As an authoring agent you cannot invoke either directly, so:
   survive (`serializeWorkflowPreserving` reuses the original text's own lines
   per top-level piece it didn't touch). This means it's safe to leave
   explanatory comments in the file you author — including per-block
-  rationale, the way this repo's own dogfood `.loomux/workflow.yml` does —
+  rationale, the way this repo's own dogfood `.orrerix/workflow.yml` does —
   they won't get silently stripped on the next GUI save. They *will* be
   fully rewritten if the edit changes that same piece, so don't rely on a
   comment surviving an edit to the exact block/gate it's attached to.
@@ -429,7 +429,7 @@ As an authoring agent you cannot invoke either directly, so:
   reaches a shell's single-quoted `--agents` payload, so `"don't"` in a
   `prompt:` reads fine as written.
 - **Resume-pinning: a workflow change mid-group doesn't apply until
-  relaunch.** Only a **fresh** launch reads `.loomux/workflow.yml` — a
+  relaunch.** Only a **fresh** launch reads `.orrerix/workflow.yml` — a
   **resumed** group keeps running the roster (and gate) it was launched
   with, even if you've since edited the file, because a resume is not a
   consent moment (nobody's looking at a preview). orrerix detects the drift

@@ -1,5 +1,5 @@
 // Repo-file pin on `.github/workflows/release.yml`'s `promote` job — same
-// species as `workflowdogfood.test.ts`'s pin on `.loomux/workflow.yml`: read
+// species as `workflowdogfood.test.ts`'s pin on `.orrerix/workflow.yml`: read
 // the real file straight off disk (not a fixture, which would drift the
 // moment someone edits the workflow) and assert on the exact invariant a
 // live incident cost us, so the next "simplify these two calls back into

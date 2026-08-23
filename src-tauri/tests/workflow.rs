@@ -1352,7 +1352,7 @@ fn the_shipped_process_persona_treats_session_digest_windows_as_untrusted_data()
 #[test]
 fn the_shipped_process_persona_dedups_against_committed_destinations_before_proposing() {
     // #250/#324 slice D item 3: the process-pro must read what's already
-    // committed — `.loomux/lessons.md`, `.claude/skills/`, and the other
+    // committed — `.orrerix/lessons.md`, `.claude/skills/`, and the other
     // destinations from its own categorization table — before it proposes
     // anything, so it patches something stale or writes something new,
     // never a fifth copy of a lesson already recorded (plan §2, "Dedup
@@ -1366,7 +1366,7 @@ fn the_shipped_process_persona_dedups_against_committed_destinations_before_prop
         "process.md must instruct deduping before proposing: {process_doc}"
     );
     assert!(
-        process_doc.contains(".loomux/lessons.md") && process_doc.contains(".claude/skills/"),
+        process_doc.contains(".orrerix/lessons.md") && process_doc.contains(".claude/skills/"),
         "the dedup instruction must name the actual committed destinations to check: {process_doc}"
     );
     assert!(

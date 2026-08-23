@@ -198,7 +198,7 @@ compiles.
    here" as repo config, the way the resource guard's `resources:` block does)
    and no operator-setup assumptions (paths, core counts, installed tools). A
    behavior that only makes sense for developing orrerix itself belongs in
-   `.loomux/` config or the dev docs, not the product (precedent: #263).
+   `.orrerix/` config or the dev docs, not the product (precedent: #263).
 9. **Never self-approve a security/install gate** (npm's `allow-scripts`
    review, a `gh` shim confirmation, anything else that exists to make a
    human or the orchestrator decide). If one fires, stop and
@@ -373,7 +373,7 @@ narrow their ask back down to the original ticket on your own judgment.
   dot.** `git rev-parse origin/main:.github/x` is rewritten to
   `origin\main;.github\x` and errors, while `origin/main:src/x` works — so a
   blob-by-blob sweep silently reports exactly the dot-directory files
-  (`.claude/`, `.github/`, `.loomux/`) as mismatched, and an error string
+  (`.claude/`, `.github/`, `.orrerix/`) as mismatched, and an error string
   compared as a blob reads as a real difference. Prefix `MSYS_NO_PATHCONV=1`
   on any `git`/`gh` invocation whose argument carries a ref-colon-path (#841).
 - **An end-of-file append conflicts on its shared trailing tokens, not on its
@@ -472,12 +472,12 @@ narrow their ask back down to the original ticket on your own judgment.
   says was narrowed (#1225).
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
-  (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this
+  (`.github/agents/`, `.claude/skills/`, `.orrerix/workflow.yml`), or this
   file.** Incident stories, superseded rules, dates, and "how we got here"
   narratives pollute every future reader's context. Reader-facing text
   carries the current rule and its operational why, with at most a bare
   issue/PR ref as provenance; strip any such narrative you find when
-  editing these surfaces — including `.loomux/lessons.md`, which carries
+  editing these surfaces — including `.orrerix/lessons.md`, which carries
   the rule and fix only, with refs as provenance. Out of scope: code
   comments (the "comments explain *why*" convention), the shipped
   agent-role templates (`src-tauri/src/orchestration/templates/`, governed

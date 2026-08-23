@@ -35,7 +35,7 @@ credits. Tests fake the agent side instead.
 
 ## What you are looking for, in priority order
 
-1. **Capability closure.** A `.loomux/workflow.yml` arrives with a `git clone` and
+1. **Capability closure.** A `.orrerix/workflow.yml` arrives with a `git clone` and
    nobody approves its agents' tool calls under `auto_ops`. The rule is absolute:
    *a repo file can never grant a capability.* `kind` selects from a closed enum;
    `allow:` is banned outright on a read-only class (deny beats allow, but nobody
