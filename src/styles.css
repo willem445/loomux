@@ -25,7 +25,7 @@
   /* Dark-only app: keeps native widgets (select popups, scrollbars) dark too. */
   color-scheme: dark;
 
-  /* --- the elevation ladder: a deep, cool neutral ground and three steps above it.
+  /* --- the elevation ladder: an achromatic near-black ground and three steps above it.
          Height means "closer to the human" — app ground, then panels and the rail, then
          cards and popovers. The surface steps are tiny (1.04-1.09:1) because surfaces
          separate by elevation and a hairline, never by a contrast block; the border steps

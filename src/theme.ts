@@ -61,10 +61,15 @@ export const PALETTE = {
   //     (>=7:1 on every ground, test: "the ink ramp keeps the contrast the design note
   //     promises") with room to spare even on slate300, the lightest ground it sits on:
   //
+  //     The candidates below are the #1020 set carried through #1320's de-blueing — each
+  //     collapsed to its own green channel, which is what held the ramp's luminance while
+  //     the hue left. That the ratios barely moved (13.50 -> 13.51, 12.49 -> 12.49,
+  //     11.53 -> 11.52) IS the evidence for that claim, not a coincidence:
+  //
   //       candidate      hex        surface0   surface1   surface2   surfaceTerm
-  //       mild trim      #d7dae0    13.50:1    12.80:1    11.78:1    14.06:1
-  //       DEFAULT (mid)  #cfd2d9    12.49:1    11.85:1    10.90:1    13.01:1   <- shipped
-  //       strong trim    #c7cad2    11.53:1    10.94:1    10.06:1    12.01:1
+  //       mild trim      #dadada    13.51:1    12.82:1    11.79:1    14.08:1
+  //       DEFAULT (mid)  #d2d2d2    12.49:1    11.86:1    10.90:1    13.02:1   <- shipped
+  //       strong trim    #cacaca    11.52:1    10.94:1    10.06:1    12.01:1
   //
   //     Terminal consequence: none of these candidates touch TERMINAL_THEME.brightWhite
   //     (below) — it is its own literal, not PALETTE.mist000, precisely so that swapping the
