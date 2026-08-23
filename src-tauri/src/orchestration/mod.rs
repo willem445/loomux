@@ -10712,6 +10712,7 @@ fn strip_deleted_links(tasks: &mut [Task], removed: &HashSet<&str>) -> Vec<Strin
         let before = t.deps.len() + t.related.len();
         t.deps.retain(|id| !removed.contains(id.as_str()));
         t.related.retain(|id| !removed.contains(id.as_str()));
+        t.links.retain(|l| !removed.contains(l.target.as_str()));
         if t.deps.len() + t.related.len() != before {
             rewritten.push(t.id.clone());
         }
