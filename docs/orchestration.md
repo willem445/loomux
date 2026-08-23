@@ -291,29 +291,6 @@ even on the same repository — pair up at a glance. When the orchestrator spawn
 an agent it opens that pane in the **background**: your keyboard focus stays
 exactly where you were typing.
 
-### Workflow diagram source
-
-The README shows a designed graphic of this same flow (you define the vision,
-the orchestrator grooms it into issues and board tasks, spawns a planner where
-warranted and workers in isolated worktrees, routes work through adversarial
-review gates and CI, and only a verdict-gated merge reaches `main`). This
-Mermaid source is the maintainable copy — edit it here and re-export the
-README's graphic to match:
-
-```mermaid
-flowchart LR
-    You(["You"]) -->|"label an issue<br/>agent-ready"| Board["Task board"]
-    Board --> Orch["Orchestrator"]
-    Orch -->|"spawns"| Plan["Planner<br/>read-only · posts a plan"]
-    Orch -->|"spawns"| Work["Workers<br/>one git worktree each"]
-    Plan -.->|"plan comment"| Work
-    Work -->|"branch → tests → PR"| Rev["Reviewers<br/>gh pr review"]
-    Rev --> Gate{"Merge gate<br/>toggles and grants you set"}
-    Gate -->|"refused unless<br/>you authorize"| You
-    You ==>|"merge"| Main["main"]
-    Orch -.->|"every prompt, visible<br/>in a pane you can steer"| You
-```
-
 ## The label handshake
 
 You can hand the orchestrator work without typing in its pane — just label a
