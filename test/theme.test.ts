@@ -1137,3 +1137,114 @@ test("every palette entry is a well-formed hex colour", () => {
     assert.match(value, HEX, `PALETTE.${name} is not a 6-digit lowercase hex: ${value}`);
   }
 });
+
+// --- #1320: the near-black neutral ground, the gold accent, and one font source ----------
+
+test("the neutral ramp carries no hue — nothing in the ground is tinted", () => {
+  // The direction (#1320 ask 1): "kill the blue hue ... no blue cast anywhere: backgrounds,
+  // panels, borders, chrome". Before this slice every neutral in the app was a COOL grey —
+  // blue sat 3-22 points above red at every step of both ramps — which is what read as a
+  // blue tint across the whole UI.
+  //
+  // Measured as R === G === B rather than as "blue is not much above red", because a
+  // tolerance is a slope: it invites the next value to sit just inside it, and eight steps
+  // each leaning two points the same way is a visible cast even when no single step trips a
+  // threshold. Achromatic is a property that cannot drift.
+  //
+  // This is the ground and the ink ONLY. Hues are still hues; `held`/`idle` are listed
+  // because the design calls them achromatic in prose (SEMANTIC, "ACHROMATIC on purpose"),
+  // and prose is exactly what this pins.
+  const achromatic: Record<string, string> = {
+    "PALETTE.slate000": PALETTE.slate000,
+    "PALETTE.slate100": PALETTE.slate100,
+    "PALETTE.slate200": PALETTE.slate200,
+    "PALETTE.slate300": PALETTE.slate300,
+    "PALETTE.slate400": PALETTE.slate400,
+    "PALETTE.slate500": PALETTE.slate500,
+    "PALETTE.mist000": PALETTE.mist000,
+    "PALETTE.mist200": PALETTE.mist200,
+    "PALETTE.mist400": PALETTE.mist400,
+    "PALETTE.ansiBlack": PALETTE.ansiBlack,
+    "SEMANTIC.stateHeld": SEMANTIC.stateHeld,
+    "SEMANTIC.stateIdle": SEMANTIC.stateIdle,
+    "TERMINAL_THEME.foreground": TERMINAL_THEME.foreground,
+    "TERMINAL_THEME.brightWhite": TERMINAL_THEME.brightWhite,
+  };
+  for (const [name, hex] of Object.entries(achromatic)) {
+    const n = Number.parseInt(hex.slice(1), 16);
+    const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    assert.ok(
+      r === g && g === b,
+      `${name} is ${hex} — r=${r} g=${g} b=${b}. The ground and the ink are achromatic ` +
+        `(#1320 ask 1); this one leans ${b > r ? "blue" : b < r ? "warm" : "off-grey"}.`
+    );
+  }
+});
+
+test("the brand accent is not a state dye", () => {
+  // #1320 ask 2 and ask 3 together: gold is THE interaction accent, and the semantic scale
+  // must stay "distinct from the gold brand accent".
+  //
+  // Before this slice they were the SAME PIGMENT — `accent`, `focus` and `stateWorking` all
+  // resolved to `azure`, deliberately (the old SEMANTIC comment argued the live agent and
+  // the actionable thing "are the same idea"). That made "is this running, or is this what I
+  // can click?" unanswerable by colour, and it is the specific thing this test refuses: on
+  // the pre-#1320 palette the nearest state dye to the accent is 0.0 dE away, because it IS
+  // the accent.
+  //
+  // Floor 9 matches the state channel's own floor for the same reason — it is the distance
+  // at which two marks stop being confusable — and is measured under CVD too, since an
+  // accent that merges with `attention` for a deuteranope is exactly as broken as one that
+  // merges for everyone.
+  const dyes: Record<string, string> = {
+    working: SEMANTIC.stateWorking,
+    attention: SEMANTIC.stateAttention,
+    ok: SEMANTIC.stateOk,
+    danger: SEMANTIC.stateDanger,
+  };
+  for (const kind of [null, ...CVD_KINDS]) {
+    const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
+    for (const [name, hex] of Object.entries(dyes)) {
+      const d = deltaE(view(SEMANTIC.accent), view(hex));
+      assert.ok(
+        d >= 9,
+        `${kind ?? "normal vision"}: the accent (${SEMANTIC.accent}) is ${d.toFixed(1)} dE ` +
+          `from state "${name}" (${hex}) — "what can I click" and "what is this doing" ` +
+          "must not be the same colour (#1320)"
+      );
+    }
+  }
+  // `focus` is the same decision as `accent` and must not drift into a state either.
+  assert.equal(
+    SEMANTIC.focus,
+    SEMANTIC.accent,
+    "focus and accent are one interaction colour — if they split, this test stops covering focus"
+  );
+});
+
+test("no rule below :root hand-writes a font stack", () => {
+  // #1320 ask 4 (the font pass). `--font-mono` and `--font-ui` are the type roles, and they
+  // were being bypassed: 37 of the 49 `font-family` declarations in this stylesheet spelled
+  // a chain out by hand, in FOUR mutually-inconsistent mono spellings, so "the mono face"
+  // was four slightly different faces depending on which panel you were looking at.
+  //
+  // Same shape as the raw-colour ban above, and for the same reason: a token nothing is
+  // forced to use is a suggestion. `inherit` is allowed — it names no face — and so is
+  // anything inside `:root`, which is where the two chains are DEFINED.
+  const css = read("../src/styles.css");
+  const { below } = splitAtRoot(stripCssComments(css));
+  const offenders: string[] = [];
+  for (const m of below.matchAll(/font-family:\s*([^;}]+)/g)) {
+    const value = m[1].trim();
+    if (value === "inherit") continue;
+    if (/^var\(--font-(mono|ui)\)$/.test(value)) continue;
+    const line = below.slice(0, m.index).split("\n").length;
+    offenders.push(`  (approx. line ${line} below :root) font-family: ${value}`);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} rule(s) name a font face directly instead of var(--font-mono) / ` +
+      `var(--font-ui):\n${offenders.join("\n")}`
+  );
+});
