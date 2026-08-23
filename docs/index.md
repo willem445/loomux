@@ -4,11 +4,20 @@ layout: default
 nav_order: 1
 ---
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/willem445/orrerix/main/orrerix-logo.png" alt="Orrerix" width="400">
+</p>
+
 # Orrerix documentation
 {: .no_toc }
 
-A dead-simple terminal multiplexer for AI agent management — without the bloat.
+Define the vision. Walk away. Come back to shipped software.
 {: .fs-6 .fw-300 }
+
+Orrerix runs fleets of AI coding agents unsupervised, on real software discipline:
+review gates and green CI before anything merges, work tracked on GitHub and a
+live task board, your own CLIs and custom workflows — agents follow the process,
+not the other way around.
 
 [Get started](getting-started.html){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [Download the latest release](https://github.com/willem445/orrerix/releases/latest){: .btn .fs-5 .mb-4 .mb-md-0 }

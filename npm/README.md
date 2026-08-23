@@ -1,7 +1,13 @@
 # orrerix
 
-Installer/launcher for [**Orrerix**](https://github.com/willem445/orrerix) — a
-sleek terminal multiplexer for AI agent management.
+Installer/launcher for [**Orrerix**](https://github.com/willem445/orrerix).
+
+**Define the vision. Walk away. Come back to shipped software.**
+
+Orrerix runs fleets of AI coding agents unsupervised, on real software
+discipline: review gates and green CI before anything merges, work tracked on
+GitHub and a live task board, your own CLIs and custom workflows — agents
+follow the process, not the other way around.
 
 ```sh
 npx orrerix            # download + launch in one shot

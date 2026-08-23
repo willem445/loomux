@@ -1,7 +1,15 @@
+<p align="center">
+  <img src="orrerix-logo.png" alt="Orrerix" width="400">
+</p>
+
 # Orrerix
 
-**A terminal multiplexer for AI coding agents — hand it a goal and a queue of
-work, and let it run.**
+**Define the vision. Walk away. Come back to shipped software.**
+
+Orrerix runs fleets of AI coding agents unsupervised, on real software
+discipline: review gates and green CI before anything merges, work tracked on
+GitHub and a live task board, your own CLIs and custom workflows — agents
+follow the process, not the other way around.
 
 [![CI](https://github.com/willem445/orrerix/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/orrerix/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/orrerix/)
@@ -119,19 +127,10 @@ orchestrator then only acts when you or a worker poke it.
 
 ## How a group works
 
-```mermaid
-flowchart LR
-    You(["You"]) -->|"label an issue<br/>agent-ready"| Board["Task board"]
-    Board --> Orch["Orchestrator"]
-    Orch -->|"spawns"| Plan["Planner<br/>read-only · posts a plan"]
-    Orch -->|"spawns"| Work["Workers<br/>one git worktree each"]
-    Plan -.->|"plan comment"| Work
-    Work -->|"branch → tests → PR"| Rev["Reviewers<br/>gh pr review"]
-    Rev --> Gate{"Merge gate<br/>toggles and grants you set"}
-    Gate -->|"refused unless<br/>you authorize"| You
-    You ==>|"merge"| Main["main"]
-    Orch -.->|"every prompt, visible<br/>in a pane you can steer"| You
-```
+![How work moves through Orrerix: a human sets the vision, the orchestrator grooms it into
+issues and board tasks, a planner plans where warranted, workers build in isolated worktrees,
+an adversarial reviewer and CI gate the result, and a human-gated verdict merge lands it on
+main.](docs/img/workflow-diagram.svg)
 
 Workers and reviewers *always* get their own dedicated git worktree — cut fresh
 from the default branch — so your own clone is never checked out, branched or
