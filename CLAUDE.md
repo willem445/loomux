@@ -294,6 +294,12 @@ compiles.
   a PR body* in the assertion itself, where it fires on a blind instrument without anyone
   thinking to mutate the one subject it cannot see. Signature: one field renamable alone
   while a guard already carrying a vacuity control stays green (#1297, `test/reposlug.test.ts`).
+- **A population control counts at the VERIFIED site, never at the MATCH site.** A subject
+  the guard matched and then `continue`d past — unknown name, shape its branch cannot judge —
+  still incremented the counter, so the control certifies coverage that was never delivered;
+  assert `matched == verified` per surface and name what was skipped. Signature: a false
+  figure in the guard's own canonical shape rides a scanned surface green, while blinding
+  that surface's real figures reddens the same guard (#1327, `test/theme.test.ts`).
 - **A non-interference pin is fail-able only when its two operands COLLIDE.** A test
   asserting operation X leaves Y alone must build the fixture so X's key IS Y's subject —
   disjoint literals hold under every implementation, the symmetric one the pin forbids
@@ -457,6 +463,12 @@ narrow their ask back down to the original ticket on your own judgment.
   of its own subjects is not a census (#1209). Build the pattern from what a token may
   CONTAIN (a fact), never from what may FOLLOW it (unbounded prose): the second instance
   was a follow-class omitting `#`, blinding a guard to `…/loomux#readme` (#1297).
+- **A commit SHA in a PR body is re-resolved against the PR's own ref, never your worktree.**
+  A rebase rewrites every SHA the body cites while the prose survives untouched; the orphans
+  still `git cat-file -e` locally, so existence proves nothing, and ancestry against `main`
+  fails for EVERY branch commit once the PR squashes. Signature: the run ids were re-derived
+  after the rebase and the commit SHAs beside them were not — the reproduction SHA the body
+  tells a reader to check out included (#1327; recipe in `.claude/skills/ci-validate/SKILL.md`).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
   and work merged meanwhile authors fresh instances of the string you removed — a live
