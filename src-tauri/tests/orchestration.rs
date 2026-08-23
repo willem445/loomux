@@ -53994,13 +53994,38 @@ fn the_rust_gate_status_names_the_routing_rules_that_fired_and_refuses_what_the_
          \x20       reviewers: [rev-lead]\n",
     );
     let (reg2, _d2, gid2) = group_for(&selfrouted);
-    reg2.set_pr_files_override(Some(vec!["src/app.ts".into()]));
+    let changed = vec!["src/app.ts".to_string()];
+    reg2.set_pr_files_override(Some(changed.clone()));
     let lead2 = reviewer_caller(&reg2, &gid2, "rev-lead");
     recorded(&reg2, &lead2, "7", "pass", "reviewed");
+
+    // POSITIVE CONTROL FIRST (rev-972 N10). Every assertion below is an
+    // ABSENCE, and an absence passes just as well when the rule never fired at
+    // all — a broken glob, a routing lookup that stopped happening, a fixture
+    // whose paths silently stopped matching would all keep this test green
+    // while proving nothing. So the two halves of the case are pinned
+    // explicitly on the parsed gate this group is actually running: the rule
+    // DOES match, and it adds nobody.
+    let g2 = reg2.merge_gate(&gid2).expect("the fixture's gate must parse");
+    let d2 = workflow::route_reviewers(&g2, Some(&changed)).expect("a resolvable list");
+    assert_eq!(
+        d2.fired.len(),
+        1,
+        "the rule must actually FIRE on this diff — otherwise the absences below are vacuous"
+    );
+    assert_eq!(
+        d2.required,
+        vec!["rev-lead".to_string()],
+        "…and add nobody new, which is the case under test"
+    );
+
     let s = reg2.gate_status_line(&gid2, 7).expect("a declared gate");
     assert!(s.contains("SATISFIED"), "{s}");
     assert!(!s.contains("Path routing"), "a rule that added nobody says nothing: {s}");
-    assert!(!s.contains("  "), "and leaves no hole where the names would go: {s}");
+    // The defect's literal signature — the note rendered with a hole where the
+    // names go. Subsumed by the line above, and kept because it is what a
+    // regression would actually look like in the text a human reads.
+    assert!(!s.contains("required  "), "and leaves no hole where the names would go: {s}");
 
     // And a list loomux cannot account for refuses HERE too — never SATISFIED,
     // which is the one thing the two halves must never disagree about.
@@ -54040,6 +54065,7 @@ fn the_gh_shim_never_puts_a_case_inside_a_command_substitution() {
     let b = sh.as_bytes();
     let mut i = 0usize;
     let mut findings: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
     while i + 1 < b.len() {
         if !(b[i] == b'$' && b[i + 1] == b'(') {
             i += 1;
@@ -54073,8 +54099,21 @@ fn the_gh_shim_never_puts_a_case_inside_a_command_substitution() {
             let end = (start + 160).min(b.len());
             findings.push(String::from_utf8_lossy(&b[start..end]).replace('\n', " / "));
         }
+        scanned += 1;
         i = start + 2;
     }
+    // POSITIVE CONTROL, the same one the schema manifest pin carries ("this test
+    // must actually compare something"). `findings.is_empty()` is an ABSENCE:
+    // it passes exactly as well when the scan examined nothing at all — an empty
+    // shim, a `$(` detection that stopped matching, a template that grew a new
+    // spelling of command substitution. The floor is deliberately loose (this
+    // asserts the scan HAPPENED, not how many substitutions the shim should
+    // have) so it does not turn into a second, brittle pin on the shim's shape.
+    assert!(
+        scanned > 0,
+        "the scan found no command substitutions in the generated shim at all — it is enforcing \
+         nothing, and would stay green through exactly the defect it exists to catch"
+    );
     assert!(
         findings.is_empty(),
         "a `case` inside `$( … )` is a shim that parses on this machine and is a SYNTAX ERROR \
