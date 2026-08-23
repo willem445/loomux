@@ -5,7 +5,7 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_152`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_<N>`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
