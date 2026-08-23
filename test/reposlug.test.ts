@@ -116,9 +116,8 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
     // `install.sh` and `npm/bin/orrerix.js` each spell the slug they hand to
     // the GitHub REST API, with no `github.com/` prefix in sight. Quoted, not
     // just "immediately after the owner", so this does not also fire on a
-    // prose mention like the design note's `` `willem445/loomux` `` — those
-    // are backticked, not quoted, and are deliberately outside this census
-    // (see doc/design/rebrand-external.md, "The human runbook").
+    // prose mention like this file's own header comment, above — `` `willem445/loomux` ``
+    // there is backticked, not quoted, and is deliberately outside this census.
     ["quoted owner/repo literal", new RegExp(`"${owner}/([A-Za-z0-9._-]+)"`, "g")],
   ];
 
