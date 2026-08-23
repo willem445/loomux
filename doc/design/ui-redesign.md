@@ -99,21 +99,38 @@ above red, because a tolerance is a slope: it invites the next value to sit just
 and eight steps each leaning two points the same way is a visible cast with no single step
 tripping a threshold.
 
-**Colour still enters this design through the foreground only.** Nothing below tints the
-ground — that rule is unchanged, and as of #1340 it is finally true of every ground rather
-than only of the ramp.
+**The INTERACTION channel enters through the foreground only.** As of #1340 the accent — the
+brand gold — paints marks, edges, rings and carets, and never a ground. That half of the old
+rule is now measured rather than asserted; the guard is described below.
 
-It was not true when #1320 wrote that sentence, and the gap is worth keeping written down
-because of the shape of it. #1320 de-blued `slate` and `mist`, pinned `r === g === b` on
-every step of both, and in the same slice handed `--selection` a deep **gold** wash
-(`#38321f`) — and `--selection` is a ground: it is what sits under every selected file row,
-every open editor row, every active workflow row, the find-panel chips, and every text
-selection in every terminal. Three chrome rules did the same thing a different way, painting
-the accent straight into a `background` (two icon-button hovers, the side dock's
-full-height resize grip, and the chosen decision card's fill). The pin stayed green through
-all of it because its POPULATION stopped at the ramp — the assertion was right and the list
-it ran over was short. That is what the human saw: *"I don't like how the gold hue is
-tinting everything."*
+**It is not yet true of the palette as a whole, and this paragraph says so rather than
+rounding up.** The state and identity channels still wash grounds, by design and with the
+role table below sanctioning it — that table already lists "an awaiting-human task row" as a
+`--state-*` consumer. Live examples at the commit this was measured on:
+`.task-row.awaiting-human` is attention at 7% (12% on hover), `.decisions-card.urgent` at 8% over
+`--surface-2`, `.diff-line.add`/`.del` jade and rose at 8%, `.tab.needs-attention` attention
+at 10%, `.wf-blocked` danger at 8%. Of 388 `background`/`background-color` declarations below
+`:root`, 25 carry the accent — all of them marks, all argued in the guard's allow-list — and
+107 carry a `--state-*`/`--id-*`/`--cli-*` hue, most of those chips and pills rather than
+grounds under content. (Counted as DECLARATIONS, not matching lines, with `@`-prelude rules
+skipped; by matching lines the second figure is 110. The claim does not rest on which.)
+
+Whether those washes are also part of what the human meant by *"any tint or hue applied to
+everything"* is a product call made on screen, and #1340 is open for it. What must not happen
+again is this paragraph claiming more than it measured — which is exactly how the previous
+version of it read.
+
+That previous version said the rule was "now literally true rather than nearly true", and it
+was false the day it shipped. The gap is worth keeping written down because of the shape of
+it. #1320 de-blued `slate` and `mist`, pinned `r === g === b` on every step of both, and in
+the same slice handed `--selection` a deep **gold** wash (`#38321f`) — and `--selection` is a
+ground: it is what sits under every selected file row, every open editor row, every active
+workflow row, the find-panel chips, and every text selection in every terminal. Four chrome
+rules did the same thing a different way, painting the accent straight into a `background`:
+two icon-button hovers, the side dock's full-height resize grip, and the chosen decision
+card's fill. The pin stayed green through all of it because its POPULATION stopped at the
+ramp — the assertion was right and the list it ran over was short. That is what the human
+saw: *"I don't like how the gold hue is tinting everything."*
 
 `--selection` is now `#323232`, reached by the same method as the ramp — collapse to the
 **green channel** (`0x32`), since luminance is 71.52% green — so all three contrasts the
@@ -125,7 +142,7 @@ matches the gold it replaces, so the *lift* is unchanged and only the pigment le
 **The accent may paint a mark, never a ground**, and that is now measured rather than
 stated: `test/theme.test.ts` ("the accent paints marks, never grounds") scans every
 `background`/`background-color` in the stylesheet and denies `var(--accent)` by default. The
-twenty-five rules that keep it are enumerated with a reason each and fall into four kinds —
+twenty-five rules that keep it are enumerated with a reason each and fall into five kinds —
 a drag affordance that only exists mid-gesture, a chip whose whole area *is* the mark, a
 primary action, an on-state toggle, and a search match. A row whose rule stops painting an
 accent background fails too, so the list cannot decay into exemptions for rules nobody kept.

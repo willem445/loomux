@@ -1224,11 +1224,18 @@ test("the accent paints marks, never grounds — every gold background is argued
   //
   // WHAT THIS CANNOT SEE, stated rather than implied: only `background`/`background-color` in
   // styles.css. A ring (`box-shadow`), an edge (`border`), a glyph (`color`) and an outline
-  // are the accent's own positions and are deliberately out of scope. An inline background
-  // written from TypeScript is invisible to it (no module does this today — the four
+  // are the accent's own positions and are deliberately out of scope.
+  //
+  // AN INLINE BACKGROUND WRITTEN FROM TYPESCRIPT IS INVISIBLE TO IT, AND TWO MODULES WRITE
+  // ONE: `src/statusbar.ts` (`m.fill.style.background = hueFor(p)`, an hsl() load ramp) and
+  // `src/tabbar.ts` (`dot.style.background = color`, one of the six `TAB_COLORS`, which are
+  // `IDENTITY` hues). Neither can resolve to the accent, so there is no live hole today — but
+  // the honest statement is that the shape EXISTS and is unguarded, not that nobody does it.
+  // A third such site that reached for gold would ship green. Separately, the four
   // `--group-color`/`--connect-color`/`--tab-color`/`--dock-accent` setters pass an identity
-  // colour and reach the accent only as the CSS-side fallback, which IS caught below), and so
-  // is an accent reached through a custom property this file does not resolve.
+  // colour from TypeScript and reach the accent only as the CSS-side fallback, which IS
+  // caught below. So is nothing else: an accent reached through a custom property this file
+  // does not resolve is invisible too.
   const ALLOWED: Record<string, string> = {
     // --- the drag/drop affordances, which exist only while a gesture is in flight.
     ".drop-indicator": "the wash IS the affordance — you read the pane under it to see where the drop lands",
