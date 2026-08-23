@@ -27289,7 +27289,7 @@ impl OrchRegistry {
         // through `filter` rather than a branch so the clear and the set are
         // one expression, the way `kind` above does it.
         if patch.sprint.is_some() {
-            task.sprint = patch.sprint.filter(|n| *n != 0);
+            task.sprint = patch.sprint;
         }
         // #1152. Applied after `status` above, deliberately: a patch that
         // reopens a row and clears its archive stamp in one call must end with
