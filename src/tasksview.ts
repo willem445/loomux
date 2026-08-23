@@ -9,17 +9,20 @@ import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,
+  BACKLOG_SPRINT,
   blockedTaskMap,
   blockingAncestor,
   boardMarker,
   boardUsesDeps,
   boardUsesHierarchy,
+  boardUsesSprints,
   canApprove,
   canProceed,
   childCounts,
   clearableCount,
   clearedIds,
   containerIds,
+  currentSprint,
   filterActive,
   focusMiss,
   settledIds,
@@ -45,6 +48,10 @@ import {
   REQUEST_CHANGES_STATUS,
   retainExisting,
   siblingPosition,
+  sprintAdvance,
+  sprintFilterChoices,
+  sprintPickerChoices,
+  sprintProgress,
   STATUSES,
   subtreeAllDone,
   taskActivityState,
@@ -196,6 +203,12 @@ export class TasksView {
   private approveSelectedBtn: HTMLButtonElement;
   /** The board's WIP chips (#1175) — hidden when the repo declares no caps. */
   private wipEl: HTMLElement;
+  /** The header sprint lens (#1272) — `sprint 2 · 3/7 done`, doubling as the
+   *  one-click filter for the current sprint, with the advance affordance
+   *  beside it. Hidden entirely on a board that runs no sprints. */
+  private sprintEl: HTMLElement;
+  private sprintLensBtn: HTMLButtonElement;
+  private sprintAdvanceBtn: HTMLButtonElement;
   /** The tree-view control strip (#1270): collapse-all/expand-all, search, the
    *  kind/status chips, the needs-you toggle, and the "showing N of M" hint. */
   private filterEl: HTMLElement;
@@ -342,6 +355,27 @@ export class TasksView {
     this.wipEl = el("span", "tasks-wip");
     this.wipEl.hidden = true;
     head.append(this.wipEl);
+
+    // The sprint lens (#1272). Header CHROME, like the WIP chips beside it —
+    // it is inside the board overlay and nothing about it is a layout sibling
+    // of #grid-area, so hard constraint 1 is untouched.
+    //
+    // Hidden — and empty — on every board that runs no sprints, which is most
+    // of them: the header keeps exactly the shape it had. `boardUsesSprints`
+    // is the same pay-for-what-you-use gate the collapse gutter and the kind
+    // chips already apply.
+    this.sprintEl = el("span", "tasks-sprint");
+    this.sprintEl.hidden = true;
+    // The lens itself is the label: clicking it arms the sprint filter on the
+    // CURRENT sprint number and clicking again clears it. It writes a concrete
+    // number rather than a "current" sentinel, deliberately — see
+    // `renderSprintLens`.
+    this.sprintLensBtn = el("button", "pane-btn sprint-lens", "") as HTMLButtonElement;
+    this.sprintLensBtn.addEventListener("click", () => this.toggleSprintLens());
+    this.sprintAdvanceBtn = el("button", "pane-btn sprint-advance", "⏭") as HTMLButtonElement;
+    this.sprintAdvanceBtn.addEventListener("click", () => this.onAdvanceSprint());
+    this.sprintEl.append(this.sprintLensBtn, this.sprintAdvanceBtn);
+    head.append(this.sprintEl);
 
     // Archive every done row out of the working view in one action (#1152).
     // NOTHING is deleted — the rows keep their notes, links and place in
@@ -1148,6 +1182,7 @@ export class TasksView {
     this.updateDeleteSelected();
     this.updateApproveSelected();
     this.renderWipChips();
+    this.renderSprintLens();
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
       // An empty board has nothing to collapse and nothing to filter, so the
@@ -1178,6 +1213,10 @@ export class TasksView {
     // above: which rows are finished subtrees (#1152). Each row's ▲/▼ needs it,
     // and re-deriving it per row would walk the tree once per row.
     const settled = settledIds(this.tasks);
+    // The current sprint (#1272), board-level and computed once like the three
+    // above — the row badges all ask the same question, and re-deriving it per
+    // row would scan the board once per row.
+    const current = currentSprint(this.tasks);
     // The ids the `needs you` quick-filter matches — the SAME rule the ❓/👀
     // marker chip is drawn from (`boardMarker`), not a second spelling of it,
     // so the toggle and the chips can never disagree about which rows are
@@ -1229,7 +1268,9 @@ export class TasksView {
       return;
     }
     for (const row of rows) {
-      this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked, settled));
+      this.listEl.appendChild(
+        this.renderTask(row, usesDeps, usesHierarchy, blocked, settled, current)
+      );
     }
     this.drainFocus();
   }
@@ -1298,6 +1339,19 @@ export class TasksView {
     this.filterChipsEl.append(el("span", "filter-label", "status"));
     for (const s of STATUSES) this.filterChipsEl.append(this.familyChip(s, s, "status"));
 
+    // Sprint chips (#1272), on the same board-level gate the kind chips use:
+    // a board that runs no sprints would get a row where every chip but
+    // `backlog` matches nothing, which is noise. An armed sprint keeps its
+    // chips regardless, so a persisted filter can always be seen and cleared.
+    if (boardUsesSprints(this.tasks) || this.filter.sprint.length > 0) {
+      this.filterChipsEl.append(el("span", "filter-label", "sprint"));
+      for (const s of sprintFilterChoices(this.tasks)) {
+        this.filterChipsEl.append(
+          this.familyChip(s, s === BACKLOG_SPRINT ? "backlog" : `#${s}`, "sprint")
+        );
+      }
+    }
+
     this.clearFilterBtn.hidden = !active;
     this.filterCountEl.hidden = !active;
     this.filterCountEl.textContent = active ? `${shown} of ${universe}` : "";
@@ -1307,11 +1361,18 @@ export class TasksView {
   }
 
   /** One toggle chip in a filter family. */
-  private familyChip(value: string, label: string, family: "kind" | "status"): HTMLElement {
+  private familyChip(
+    value: string,
+    label: string,
+    family: "kind" | "status" | "sprint"
+  ): HTMLElement {
     const on = this.filter[family].includes(value);
     const chip = el("button", `pane-btn filter-chip f-${family}`, label) as HTMLButtonElement;
     if (on) chip.classList.add("on");
-    chip.title = on ? `Stop filtering by ${label}` : `Show only ${label} items`;
+    // "sprint #2" and "backlog" read better than "#2 items" / "backlog items",
+    // and the sprint family is the one whose labels are not already nouns.
+    const what = family === "sprint" ? (value === BACKLOG_SPRINT ? "the backlog" : `sprint ${value}`) : `${label} items`;
+    chip.title = on ? `Stop filtering by ${label}` : `Show only ${what}`;
     chip.addEventListener("click", () => {
       const cur = this.filter[family];
       const next = on ? cur.filter((v) => v !== value) : [...cur, value];
@@ -1336,6 +1397,177 @@ export class TasksView {
    *  under it, the same best-effort enrichment the live-agent set and the
    *  question markers already are. It is a count beside a board that is itself
    *  live; it authorizes nothing. */
+  /** The header sprint lens (#1272): which sprint the board is on, how far it
+   *  has got, and the two things a human does about it.
+   *
+   *  Every number here is DERIVED from the rows, never stored — the board has
+   *  no sprint state of its own, and design note §5 is explicit that there
+   *  must not be a second authority the rows can disagree with. So this is
+   *  `currentSprint` + `sprintProgress` read on every render, exactly as the
+   *  backend derives `current_sprint` on every read.
+   *
+   *  The progress denominator counts the sprint's WHOLE scope, archived rows
+   *  included. A cleared row is still on the board and still in its sprint
+   *  (`clearedIds` hides rows from the working view, it does not remove them),
+   *  so excluding them would make the fraction disagree with `currentSprint`
+   *  about which rows a sprint contains — the one-rule asymmetry, in the one
+   *  place a human reads the sprint's state off a single line. */
+  private renderSprintLens(): void {
+    const uses = boardUsesSprints(this.tasks);
+    this.sprintEl.hidden = !uses;
+    if (!uses) return;
+    const current = currentSprint(this.tasks);
+    if (current === null) {
+      // Rows carry sprints, but every one of them is done. Say so rather than
+      // hiding the lens: "this board finished its sprints" is a real state and
+      // a different one from "this board runs no sprints".
+      this.sprintLensBtn.textContent = "sprints — all done";
+      this.sprintLensBtn.classList.remove("on");
+      this.sprintLensBtn.disabled = true;
+      this.sprintLensBtn.title =
+        "Every item carrying a sprint is done. Use the sprint chips below to look back at one, " +
+        "or put an item in a new sprint to start the next.";
+      this.sprintAdvanceBtn.hidden = true;
+      return;
+    }
+    const { done, total } = sprintProgress(this.tasks, current);
+    const armed = this.sprintLensArmed(current);
+    this.sprintLensBtn.disabled = false;
+    this.sprintLensBtn.textContent = `sprint ${current} — ${done}/${total} done`;
+    this.sprintLensBtn.classList.toggle("on", armed);
+    this.sprintLensBtn.title = armed
+      ? `Showing only sprint ${current} — click to show the whole board again`
+      : `Sprint ${current} is the lowest sprint with unfinished work in it (${done} of ${total} ` +
+        `items done, archived ones counted). Click to show only its items.`;
+
+    const plan = sprintAdvance(this.tasks, current);
+    this.sprintAdvanceBtn.hidden = false;
+    this.sprintAdvanceBtn.disabled = plan.to === null;
+    this.sprintAdvanceBtn.title =
+      plan.to === null
+        ? `Sprint ${current} is the highest number a sprint can have, so there is nothing to ` +
+          "move its remaining items into."
+        : `Move the ${plan.rows.length} unfinished item${plan.rows.length === 1 ? "" : "s"} in ` +
+          `sprint ${current} into sprint ${plan.to} — you will see exactly which ones first, ` +
+          "and each is written on its own";
+  }
+
+  /** Is the sprint lens the ONLY thing the sprint family is filtering on?
+   *  Reading it as "contains the current sprint" would light the lens up while
+   *  three other sprints were also showing, and clicking it would then clear
+   *  them without the human asking. */
+  private sprintLensArmed(current: number): boolean {
+    return this.filter.sprint.length === 1 && this.filter.sprint[0] === String(current);
+  }
+
+  /** The lens click: show only the current sprint, or stop.
+   *
+   *  It writes the concrete NUMBER, not a "current sprint" sentinel, and that
+   *  is a decision rather than a shortcut. The filter is persisted per group
+   *  (`boardprefs.ts`), and a stored `current` would silently change what the
+   *  board shows the moment a sprint completed — the human would come back to
+   *  a board they never re-aimed, with the rows they were working on gone.
+   *  That is the same never-silent posture design note §5 takes on roll-over.
+   *  Re-clicking the lens after an advance re-aims it, which is a gesture. */
+  private toggleSprintLens(): void {
+    const current = currentSprint(this.tasks);
+    if (current === null) return;
+    this.filter = {
+      ...this.filter,
+      sprint: this.sprintLensArmed(current) ? [] : [String(current)],
+    };
+    this.onViewChanged();
+  }
+
+  /** The advance affordance (#1272 §5): move every unfinished row out of the
+   *  current sprint and into the next one.
+   *
+   *  Never silent, and never a bulk operation. The dialog names each row that
+   *  would move — `blocked` ones included, since they are exactly what a silent
+   *  roll-over would sweep up — and confirming performs ONE `orch_upsert_task`
+   *  per row, so every move lands in the audit log on its own. There is no
+   *  `advance_sprint` backend call to invoke: per-row upsert already expresses
+   *  it, and a bulk one would be a second way to write `sprint`.
+   *
+   *  The list and the target number both come from `sprintAdvance`, one call,
+   *  so what the human approved cannot differ from what is written. */
+  private onAdvanceSprint(): void {
+    if (this.dialogEl) return; // one dialog at a time
+    const current = currentSprint(this.tasks);
+    if (current === null) return;
+    const { to, rows } = sprintAdvance(this.tasks, current);
+    if (to === null || rows.length === 0) return;
+
+    const overlay = el("div", "tasks-dialog");
+    const box = el("div", "tasks-dialog-box");
+    box.append(
+      el(
+        "div",
+        "tasks-dialog-title",
+        `Move ${rows.length} unfinished item${rows.length === 1 ? "" : "s"} from sprint ${current} to sprint ${to}`
+      )
+    );
+    box.append(
+      el(
+        "div",
+        "tasks-dialog-note",
+        `Sprint ${current} stays current until its last unfinished item leaves it — this is ` +
+          `what moves them. Each item below is written on its own, so each shows up in the ` +
+          `audit log separately, and the orchestrator sees the board change. Nothing else on ` +
+          `the board is touched, and done items keep sprint ${current}.`
+      )
+    );
+    const list = el("div", "tasks-dialog-list");
+    for (const t of rows) {
+      const row = el("div", "tasks-dialog-row");
+      row.append(el("div", "tasks-dialog-row-title", `${t.id} — ${t.title} (${t.status})`));
+      list.append(row);
+    }
+
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
+    const confirm = el("button", "dlg-btn primary", `Move ${rows.length} to sprint ${to}`) as HTMLButtonElement;
+    actions.append(cancel, confirm);
+    box.append(list, actions);
+    overlay.append(box);
+
+    const close = () => {
+      overlay.remove();
+      this.dialogEl = null;
+    };
+    const submit = () => {
+      close();
+      // One write per row, in board order. Sequential and not `Promise.all`:
+      // `tasks_lock` serializes board writes anyway, and a failure part-way
+      // through must leave the rows it already moved moved — a half-applied
+      // roll-over is recoverable and visible, where a racing batch would make
+      // the audit order meaningless.
+      void this.mutate(
+        rows.reduce(
+          (chain, t) =>
+            chain.then(() =>
+              invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, sprint: to })
+            ),
+          Promise.resolve() as Promise<unknown>
+        )
+      );
+    };
+    cancel.addEventListener("click", close);
+    confirm.addEventListener("click", submit);
+    box.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+      if (e.key === "Enter") submit();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    this.dialogEl = overlay;
+    this.el.appendChild(overlay);
+    confirm.focus();
+  }
+
   private renderWipChips(): void {
     const chips = wipChips(this.workflow?.wip);
     this.wipEl.replaceChildren();
@@ -1474,7 +1706,9 @@ export class TasksView {
           ? this.renderParentPicker(t)
           : field === "kind"
             ? this.renderKindPicker(t)
-            : this.renderDepPicker(t)
+            : field === "sprint"
+              ? this.renderSprintPicker(t)
+              : this.renderDepPicker(t)
       );
     }
     return line;
@@ -1482,8 +1716,8 @@ export class TasksView {
 
   /** Open (or close) one of the row pickers. One at a time across the whole
    *  board and across every field, so the human is never choosing a
-   *  dependency, a container, and an Agile level at the same time in three
-   *  places. */
+   *  dependency, a container, an Agile level and a sprint at the same time in
+   *  four places. */
   private togglePicker(id: string, field: PickerField): void {
     this.picking = nextPicker(this.picking, id, field);
     // Focus only when this click OPENED one — a close has nothing to focus.
@@ -1637,6 +1871,70 @@ export class TasksView {
     return sel;
   }
 
+  /** The "🎯 sprint…" picker (#1272): the sprints this board runs, the next
+   *  unused number so a new one can be started, and — on a row that is in one —
+   *  the way back to the backlog.
+   *
+   *  Unlike the parent picker there is no legality question to mirror or get
+   *  wrong: a sprint gates nothing, and the backend validates only the type.
+   *  The single refusal that exists is `MAX_SPRINT`, and `sprintPickerChoices`
+   *  is where it lives, so this method reads a list and renders it. */
+  private renderSprintPicker(t: OrchTask): HTMLElement {
+    const { options, clear: mayClear } = sprintPickerChoices(t, this.tasks);
+    if (options.length === 0 && !mayClear) {
+      return el("span", "task-links-label", "no sprint this row can move to");
+    }
+    const sel = document.createElement("select");
+    sel.className = "task-dep-picker sprint";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "🎯 set sprint…";
+    sel.appendChild(placeholder);
+    if (mayClear) {
+      // `0` IS the clear on the wire (§8) — the numeric counterpart of the
+      // empty string on `pr`/`kind`. No frontend sentinel is needed, and
+      // `sprintPickerChoices` keeps 0 out of the real options so this option
+      // and a sprint can never be the same value.
+      const back = document.createElement("option");
+      back.value = "0";
+      back.textContent = "— back to the backlog";
+      sel.appendChild(back);
+    }
+    for (const s of options) {
+      const opt = document.createElement("option");
+      opt.value = String(s);
+      opt.textContent = `sprint ${s}`;
+      sel.appendChild(opt);
+    }
+    sel.value = "";
+
+    const close = () => this.closePicker(t.id, "sprint");
+    sel.addEventListener("change", () => {
+      const pick = sel.value;
+      if (!pick) return;
+      const sprint = Number(pick);
+      this.picking = null;
+      // Close on our own rather than waiting for the board-change event, the
+      // same as every picker here: if the write is refused, mutate() toasts the
+      // backend's own error and resyncs.
+      this.render();
+      void this.mutate(
+        invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, sprint })
+      );
+    });
+    // Keep keystrokes off the terminal underneath; Esc backs out unwritten.
+    sel.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+    });
+    sel.addEventListener("blur", () => window.setTimeout(close, 0));
+    if (this.pickingFocus) {
+      this.pickingFocus = false;
+      window.setTimeout(() => sel.focus(), 0);
+    }
+    return sel;
+  }
+
   /** The "＋ depends on…" picker: every other task on the board, minus the ones
    *  this one already depends on. Cycle-closing choices are deliberately NOT
    *  filtered out here — the backend rejects those inside its lock with an
@@ -1697,7 +1995,11 @@ export class TasksView {
     usesDeps: boolean,
     usesHierarchy: boolean,
     blocked: ReadonlyMap<string, string>,
-    settled: ReadonlySet<string>
+    settled: ReadonlySet<string>,
+    /** The board's current sprint (#1272), derived once for the whole render
+     *  like `usesDeps`/`settled` above rather than re-scanned per row. `null`
+     *  on a board with no open sprint work. */
+    current: number | null
   ): HTMLElement {
     const t = boardRow.task;
     const row = el("div", "task-row");
@@ -1890,6 +2192,25 @@ export class TasksView {
         ? `Agile level: ${t.kind} — ${levelRuleText(t.kind)}`
         : `${t.kind} is not one of ${KINDS.join(" | ")} — only a hand-edited tasks.json can hold it`;
       top.appendChild(kind);
+    }
+
+    // The sprint badge (#1272). Metadata like the level beside it: nothing
+    // outside the board reads a sprint — not readiness, not the claim guard,
+    // not WIP — so this says which batch the row is in and nothing more.
+    //
+    // Only on a row that HAS one. A backlog badge on every unbatched row would
+    // put a chip on most of the board to say "no", where the absence already
+    // says it; the `backlog` filter chip is how the backlog is asked for.
+    if (typeof t.sprint === "number") {
+      const chip = el("span", "task-chip sprint", `sprint ${t.sprint}`);
+      if (t.sprint === current) chip.classList.add("current");
+      chip.title =
+        t.sprint === current
+          ? `Sprint ${t.sprint} — the current sprint, so this is work the orchestrator picks up ahead of anything else`
+          : current !== null && t.sprint < current
+            ? `Sprint ${t.sprint} — an earlier sprint than the current one (${current})`
+            : `Sprint ${t.sprint} — a later sprint${current === null ? "" : ` than the current one (${current})`}, so it waits behind it`;
+      top.appendChild(chip);
     }
 
     const status = document.createElement("select");
@@ -2130,6 +2451,18 @@ export class TasksView {
       : "Set this row's Agile level — epic (top level) ⊃ feature ⊃ story ⊃ task; a row with no level may sit anywhere";
     kindBtn.addEventListener("click", () => this.togglePicker(t.id, "kind"));
     top.appendChild(kindBtn);
+
+    // Set sprint (#1272): the fourth picker, in the same place as the three
+    // above and present on every row for the same reason — the badge is absent
+    // on a backlog row, so making the badge the way in would leave the backlog
+    // with no way out of it.
+    const sprintBtn = el("button", "task-btn sprintpick", "🎯") as HTMLButtonElement;
+    sprintBtn.title =
+      typeof t.sprint === "number"
+        ? `Move this item to another sprint, or back to the backlog (it is in sprint ${t.sprint})`
+        : "Put this item in a sprint — a numbered batch that says what gets picked up first; it changes nothing else about the item";
+    sprintBtn.addEventListener("click", () => this.togglePicker(t.id, "sprint"));
+    top.appendChild(sprintBtn);
 
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
     notesBtn.title = "Notes";

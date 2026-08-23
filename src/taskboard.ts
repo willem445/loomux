@@ -488,7 +488,7 @@ export function levelRuleText(kind: string | null | undefined): string {
 
 /** Which of a row's pickers is open: the dependency one (ordering), the
  *  container one (nesting), or the Agile-level one (#958 slice K). */
-export type PickerField = "dep" | "parent" | "kind";
+export type PickerField = "dep" | "parent" | "kind" | "sprint";
 
 /** The board's single open picker, if any — one at a time across every row and
  *  every field. */
@@ -1610,6 +1610,48 @@ export function sprintAdvance<T extends HasStatus & HasSprint>(
   return {
     to: Number.isInteger(from) && from >= 1 && from < MAX_SPRINT ? from + 1 : null,
     rows: rollOverSet(board, from),
+  };
+}
+
+/** What the row's sprint picker offers: the sprints this board already runs,
+ *  plus the next unused number, plus whether a clear is on the menu.
+ *
+ *  Derived from the board for `sprintFilterChoices`' reason — a `1..max` range
+ *  would offer numbers nobody uses — with ONE addition the filter chips
+ *  deliberately do not make: the next number after the highest, so a board can
+ *  start a sprint at all. Without it the first sprint could only ever be set
+ *  through the orchestrator, and a board whose sprints were all finished could
+ *  never open another.
+ *
+ *  The row's OWN sprint is excluded: picking it is a write that changes
+ *  nothing, and every other picker in this module (`depCandidates`,
+ *  `parentPickerChoices`, `kindPickerChoices`) omits the no-op choice too.
+ *
+ *  `clear` is whether the row carries a sprint at all — the backlog is the
+ *  absence of one, so there is nothing to clear on a row already in it. The
+ *  caller sends `0`, the backend's numeric CLEAR (§8 of the design note), and
+ *  `0` is therefore filtered OUT of `options` even when a hand-edited board
+ *  carries a row in it: offering it would be a menu entry reading "sprint 0"
+ *  that silently performs the clear instead. The row keeps its `0` badge and
+ *  its filter chip — nothing becomes unreachable — it just is not a sprint
+ *  anything can be moved INTO.
+ *
+ *  Nothing here is a legality check. A sprint gates nothing and validates
+ *  against nothing but its type, so unlike the parent picker there is no
+ *  backend rule this could disagree with — the only refusal that exists is
+ *  `MAX_SPRINT`, which is why the "next" entry is the one thing bounded. */
+export function sprintPickerChoices<T extends HasSprint>(
+  task: T,
+  board: readonly T[]
+): { options: number[]; clear: boolean } {
+  const seen = new Set<number>();
+  for (const t of board) if (typeof t.sprint === "number") seen.add(t.sprint);
+  const highest = seen.size > 0 ? Math.max(...seen) : 0;
+  if (highest < MAX_SPRINT) seen.add(highest + 1);
+  const mine = typeof task.sprint === "number" ? task.sprint : null;
+  return {
+    options: [...seen].filter((s) => s >= 1 && s !== mine).sort((a, b) => a - b),
+    clear: mine !== null,
   };
 }
 

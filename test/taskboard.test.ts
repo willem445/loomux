@@ -74,6 +74,7 @@ import {
   rollOverSet,
   sprintAdvance,
   sprintFilterChoices,
+  sprintPickerChoices,
   sprintProgress,
 } from "../src/taskboard.ts";
 
@@ -1545,6 +1546,72 @@ test("rollOverSet is every NON-done row in the sprint, in board order", () => {
     "a blocked row must appear in the confirm list"
   );
   assert.deepEqual(rollOverSet(board, 3), [], "a sprint with nothing open moves nothing");
+});
+
+test("the sprint picker offers the board's sprints plus the next unused one", () => {
+  const board = [
+    sprintRow("t-1", "queued", 1),
+    sprintRow("t-2", "queued", 3),
+    sprintRow("t-3", "queued"),
+  ];
+  // The row's own sprint is not on its own menu — picking it writes nothing.
+  assert.deepEqual(sprintPickerChoices(board[0], board), {
+    options: [3, 4],
+    clear: true,
+  });
+  // A backlog row sees every sprint including the next one, and has nothing to
+  // clear: the backlog IS the absence of a sprint.
+  assert.deepEqual(sprintPickerChoices(board[2], board), {
+    options: [1, 3, 4],
+    clear: false,
+  });
+});
+
+test("the sprint picker can start the first sprint on a board that runs none", () => {
+  // Without the next-number entry the first sprint could only ever be set by
+  // the orchestrator, and a board whose sprints were all finished could never
+  // open another — the picker would be a control that does nothing on exactly
+  // the boards a human most wants to use it on.
+  const fresh = [sprintRow("t-1", "queued"), sprintRow("t-2", "queued")];
+  assert.deepEqual(sprintPickerChoices(fresh[0], fresh), { options: [1], clear: false });
+  // …including when every sprint on the board is finished: the numbers stay on
+  // the menu (a done row's sprint is still a real batch) and 3 opens the next.
+  const finished = [sprintRow("t-1", "done", 1), sprintRow("t-2", "done", 2)];
+  assert.deepEqual(sprintPickerChoices(finished[0], finished), { options: [2, 3], clear: true });
+});
+
+test("the sprint picker never offers 0 — that value is the backend's CLEAR", () => {
+  // A hand-edited board can carry `sprint: 0`. Listing it would be a menu entry
+  // reading "sprint 0" that performs the clear instead (§8: 0 is the numeric
+  // counterpart of the empty string on `pr`/`kind`), which is a control doing
+  // something other than what it says.
+  const board = [sprintRow("t-1", "queued", 0), sprintRow("t-2", "queued", 2)];
+  const choices = sprintPickerChoices(board[1], board);
+  assert.equal(choices.options.includes(0), false, "0 is not a sprint anything moves into");
+  // The board's own 0 still contributes to the numbering (`highest + 1` is 3),
+  // and the row keeps its badge and its filter chip — nothing is unreachable.
+  assert.deepEqual(choices.options, [3]);
+  assert.deepEqual(sprintFilterChoices(board), ["0", "2", BACKLOG_SPRINT]);
+  // The clear is still on the menu for a row in sprint 0: it is in *a* sprint,
+  // so it has one to leave.
+  assert.equal(sprintPickerChoices(board[0], board).clear, true);
+});
+
+test("the sprint picker stops at the last sprint a u32 can hold", () => {
+  // Fail closed at the boundary, exactly as `sprintAdvance` does: MAX_SPRINT + 1
+  // cannot be stored, so it must not be offered.
+  const board = [sprintRow("t-1", "queued", MAX_SPRINT), sprintRow("t-2", "queued", 4)];
+  assert.deepEqual(sprintPickerChoices(board[1], board), {
+    options: [MAX_SPRINT],
+    clear: true,
+  });
+  // The positive control for that assertion: one below the cap DOES yield a
+  // next number, so the empty tail above is the bound and not a broken derive.
+  const under = [sprintRow("t-1", "queued", MAX_SPRINT - 1), sprintRow("t-2", "queued", 4)];
+  assert.deepEqual(sprintPickerChoices(under[1], under), {
+    options: [MAX_SPRINT - 1, MAX_SPRINT],
+    clear: true,
+  });
 });
 
 test("sprintAdvance reports the SAME rows the dialog shows and the number it names", () => {
