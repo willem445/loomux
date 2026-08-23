@@ -22,7 +22,7 @@
 // An entry either becomes a plotted event, becomes an `ops` event (a real
 // event in a default-OFF lane), is parked as undatable, or is counted as
 // malformed. A chart that looks complete when it isn't is the defect class
-// this repo has been burned by (.loomux/lessons.md, "no silent caps").
+// this repo has been burned by (.orrerix/lessons.md, "no silent caps").
 
 /** One orchestration audit record. Mirrors `AuditEntry` in auditsummary.ts,
  *  which is what `orch_audit` serves. Fields are typed as they arrive over
