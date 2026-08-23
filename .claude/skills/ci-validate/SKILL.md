@@ -311,7 +311,7 @@ Whitespace-normalise both sides before matching — the body rewraps, the file
 carries its own hand-wrap and CRLF — and read the file with
 `git show <head>:<path>`, blob-to-blob, never against a worktree copy.
 
-Two things keep it from being decorative:
+Three things keep it from being decorative:
 
 - **Scope it to the section describing the shipped text** (*What changed*).
   Evidence sections legitimately quote strings that are absent from head by
@@ -323,6 +323,13 @@ Two things keep it from being decorative:
   and proves nothing, and a check nobody has seen redden is not evidence. Splice
   the superseded phrasing back into a copy of the body and confirm it reddens on
   that quote and only that quote.
+- **Harvest blockquotes, and report what you did not harvest.** The blockquote is
+  the form to scope to. An *inline* quotation — a phrase in parentheses, a clause
+  folded into a sentence of your own — is out of the harvest on purpose: inlining
+  licenses a re-casing or an elision that no matcher can tell from drift, so
+  `An orrery` quoted mid-sentence as `an orrery` is a true claim that reddens.
+  Check those by hand and name them, because `1 passage checked` where the
+  section held three is a scope claim, not a pass.
 
 Signature that you needed this: the body's *What changed* quotes the exact
 phrasing a later commit on the same branch removed, and the squash then
