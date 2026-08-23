@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import {
   PtyRouter,
   MAX_PREATTACH_BYTES,
+  MAX_PREATTACH_ENTRIES,
   MAX_PREATTACH_IDS,
   MAX_RETIRED_IDS,
 } from "../src/ptyroute.ts";
@@ -161,6 +162,62 @@ test("overflow sheds the OLDEST chunks and keeps the newest", () => {
   // A terminal's screen is its most recent bytes: shedding the newest would
   // leave the pane replaying a stale frame forever.
   assert.deepEqual(r.takeHeld<string>(1), ["second", "third"]);
+});
+
+test("held ENTRIES for one id never exceed the ceiling, however small the chunks", () => {
+  // The cap the byte cap does not imply. Each held chunk costs a wrapper whose
+  // size is independent of its payload, so a drip of 1-byte writes can hold
+  // hundreds of thousands of entries while the byte total sits far under
+  // MAX_PREATTACH_BYTES and nothing ever sheds. Deliberately driven with
+  // 1-byte chunks: at this size the byte cap provably cannot be what stops it
+  // (MAX_PREATTACH_ENTRIES * 1 byte is orders below MAX_PREATTACH_BYTES), so a
+  // pass here is the entry cap doing the work and nothing else.
+  const r = new PtyRouter<() => void>();
+  for (let i = 0; i < MAX_PREATTACH_ENTRIES * 4; i++) r.hold(1, chunk(1), 1);
+
+  assert.equal(r.heldBytes(1) < MAX_PREATTACH_BYTES, true, "the byte cap must not be what bound this");
+  assert.equal(r.takeHeld(1).length, MAX_PREATTACH_ENTRIES);
+});
+
+test("the entry cap sheds oldest-first too, keeping the newest chunk", () => {
+  const r = new PtyRouter<() => void>();
+  for (let i = 0; i < MAX_PREATTACH_ENTRIES; i++) r.hold(1, `old${i}`, 1);
+  const overflowing = r.hold(1, "newest", 1);
+
+  assert.equal(overflowing.kind, "hold");
+  assert.equal(overflowing.kind === "hold" && overflowing.shed, 1);
+  const held = r.takeHeld<string>(1);
+  assert.equal(held.length, MAX_PREATTACH_ENTRIES);
+  assert.equal(held[held.length - 1], "newest");
+  assert.equal(held[0], "old1", "the oldest chunk is the one that went");
+});
+
+test("the router-wide worst case counts entries as well as bytes", () => {
+  // The stated bound is per-id (MAX_PREATTACH_BYTES payload + MAX_PREATTACH_ENTRIES
+  // wrappers) times MAX_PREATTACH_IDS. Both terms are driven PAST their caps on
+  // purpose: an earlier draft of this test held 40 chunks per id, which kept the
+  // total under the ceiling no matter what the entry cap did — it passed with the
+  // cap deleted, which is not a test of the cap but a restatement of the input.
+  // Each id therefore gets twice MAX_PREATTACH_ENTRIES, so the entry cap is the
+  // only thing that can make this hold.
+  const ids = MAX_PREATTACH_IDS + 4;
+  const r = new PtyRouter<() => void>();
+  for (let id = 1; id <= ids; id++) {
+    for (let i = 0; i < MAX_PREATTACH_ENTRIES * 2; i++) r.hold(id, chunk(1), 1);
+  }
+  let entries = 0;
+  let atCap = 0;
+  for (let id = 1; id <= ids; id++) {
+    const held = r.heldEntries(id);
+    entries += held;
+    if (held === MAX_PREATTACH_ENTRIES) atCap++;
+  }
+
+  // Positive control first: without it every assertion below passes just as well
+  // on a router that held nothing at all.
+  assert.equal(r.heldIds(), MAX_PREATTACH_IDS, "the id cap must be saturated, not merely respected");
+  assert.equal(atCap, MAX_PREATTACH_IDS, "every surviving id must be pinned AT the entry cap");
+  assert.equal(entries, MAX_PREATTACH_IDS * MAX_PREATTACH_ENTRIES);
 });
 
 test("a single chunk larger than the ceiling is refused outright", () => {

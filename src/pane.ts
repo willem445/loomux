@@ -1707,10 +1707,13 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** Throw held output away and return the pane to quiet (#720). The ONLY
-   *  caller is `respawnFresh`, where `term.reset()` is about to erase these
-   *  bytes regardless — see the call site for why dropping beats flushing
-   *  there. Everywhere else, held output is flushed. */
+  /** Throw held output away and return the pane to quiet (#720). Dropping,
+   *  not flushing, and both callers have the same reason: nothing downstream
+   *  will ever render these bytes, so queueing them to `term.write` would only
+   *  schedule a parse against a terminal that is about to be wiped or is
+   *  already gone. `respawnFresh` is about to `term.reset()` (see the call
+   *  site); `dispose` is about to `term.dispose()` and drop the pane. Anywhere
+   *  else, held output is flushed. */
   private discardOutput(): void {
     if (this.flushTimer !== undefined) {
       clearTimeout(this.flushTimer);

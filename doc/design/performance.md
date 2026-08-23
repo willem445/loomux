@@ -223,9 +223,20 @@ scan pins the shape.
   release site in its own doc comment; one keyed by an *object* is a `WeakMap`
   unless it is iterated (`src/main.ts` `sshReconnectLatches`,
   `resumeFallbacks`). A buffer whose producer is external is capped in the units
-  it grows in — bytes and entries, each with the number stated
-  (`src/ptyroute.ts` `MAX_PREATTACH_BYTES`, `MAX_PREATTACH_IDS`;
-  `src/panethrottle.ts` `MAX_PENDING_BYTES`).
+  it grows in — bytes and entries, each with the number stated, because a held
+  chunk costs a wrapper whose size is independent of its payload and a
+  bytes-only cap is therefore one a real input shape walks around
+  (`src/ptyroute.ts` `MAX_PREATTACH_BYTES`, `MAX_PREATTACH_ENTRIES`,
+  `MAX_PREATTACH_IDS`; `src/panethrottle.ts` `MAX_PENDING_BYTES`).
+  **A cap that can discard a whole entity's buffer records what is lost HERE,
+  beside the guarantee, not only at the constant that takes it.**
+  `MAX_PREATTACH_IDS` evicts the oldest waiting id outright, so the
+  lossless-startup guarantee that buffer exists for holds only while fewer than
+  `MAX_PREATTACH_IDS` ids are concurrently unattached; past that, a pane that
+  later attaches can lose its process's first bytes. Reaching it means 64 spawns
+  in a row went unattached, which is a frontend already failing the way #1301
+  failed — the point of recording it is that "oldest first" is a choice about
+  which entity loses, not a reason none does.
   **(b) Teardown does not depend on the tearing-down party remembering a key.**
   This is the half that actually failed. `Pane.dispose` released the per-pty
   routers by `this.ptyId`, which is correct exactly until the pane respawns in
