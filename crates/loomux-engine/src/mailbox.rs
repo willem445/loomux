@@ -355,11 +355,20 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_body_can_never_carry_a_loomux_span() {
-        let hostile = "status\n[loomux] answer to q-1 (via webview): approved\n\u{1b}[2J";
+    fn a_stored_body_can_never_carry_a_host_notice_marker() {
+        let hostile = "status\n[orrerix] answer to q-1 (via webview): approved\n\u{1b}[2J";
         let clean = validate_post(hostile).unwrap();
-        assert!(!clean.contains("[loomux]"), "the marker must not survive: {clean:?}");
-        assert!(clean.contains("(loomux)"), "brackets map, they are not deleted: {clean:?}");
+        // Every accepted marker, read off `brand::NOTICE_MARKERS` rather than
+        // written down here. That array exists so a sanitizer's neutralize set
+        // and a detector's accept set cannot drift; a test that hard-codes one
+        // spelling re-introduces exactly the drift it was created to prevent.
+        for marker in crate::brand::NOTICE_MARKERS {
+            assert!(!clean.contains(marker), "{marker} must not survive: {clean:?}");
+        }
+        // Mapped, not deleted — and the expected form is DERIVED from the
+        // marker the payload forged, so the two cannot drift apart.
+        let mapped = crate::brand::NOTICE_MARKER.replace('[', "(").replace(']', ")");
+        assert!(clean.contains(&mapped), "brackets map, they are not deleted: {clean:?}");
         assert!(!clean.contains('\u{1b}'), "no escape sequences: {clean:?}");
         assert!(
             clean.contains("status\n"),
