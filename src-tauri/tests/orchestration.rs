@@ -144,6 +144,7 @@ use loomux_lib::orchestration::{
     // projection both new fields had to be classified into, and the
     // closed link vocabulary the tool schema is pinned against.
     agent_task_view, current_sprint, TaskLink, TASK_LINK_TYPES,
+    MAX_TASK_LINKS, MAX_TASK_LINK_TARGET, MAX_TASK_LINK_LABEL,
     TASK_STATUSES,
     // #1156: the strict Agile ladder, pinned against Rust literals here
     // (`the_ladder_table_is_pinned_on_the_rust_side`) and against the board's
@@ -54900,8 +54901,12 @@ fn pre_1272_boards_load_unchanged_and_sprintless_linkless_boards_stay_that_way()
     assert!(!cleared.contains("\"links\""), "...for both: {cleared}");
 }
 
-/// Sprint set / clear-via-0 / refuse the values that are not sprints, and
-/// persist across a reload.
+/// Sprint set, clear-via-0, omit-untouched, and persistence across a reload.
+///
+/// REFUSALS ARE NOT HERE. Rejecting a negative, a fraction or a string happens
+/// at the wire and is pinned by
+/// `wrong_typed_sprint_and_link_args_are_refused_not_silently_dropped`; this
+/// test only exercises values that are legal to store.
 #[test]
 fn sprint_writes_set_clear_and_survive_a_reload() {
     let (reg, _d) = test_registry();
@@ -55133,11 +55138,30 @@ fn a_links_target_naming_a_live_board_task_is_refused_and_names_deps_related() {
     // deleted — `links` is deliberately outside the #582 delete-strip, because
     // an external target that coincidentally looks like a task id still points
     // where it always pointed.
-    reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("doc", "#7", None)])).unwrap();
-    reg.delete_task(&gid, "orch", "t-2").unwrap();
+    //
+    // The deleted id must be EXACTLY this link's target, or the assertion is
+    // unfailable: a target the delete never names survives under every
+    // implementation, including one that strips `links` symmetrically with
+    // `deps`/`related`. Getting there takes two steps, because the misuse
+    // guard above refuses a link written at a LIVE task — so point the link at
+    // an id that does not exist yet, THEN bring it into existence.
+    reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("doc", "t-3", None)])).unwrap();
+    let born = reg.upsert_task(&gid, "orch", None, patch(Some("transient"), None, None)).unwrap();
+    assert_eq!(
+        born.id,
+        "t-3",
+        "this fixture needs the new row to be the id linked above — if the minting rule changed, \
+         re-point the link rather than relaxing the assertion below"
+    );
+    reg.delete_task(&gid, "orch", &born.id).unwrap();
     let t = reg.get_task(&gid, "t-1").unwrap();
     assert_eq!(t.links.len(), 1, "a delete does not touch grounding links");
-    assert_eq!(t.links[0].target, "#7");
+    assert_eq!(
+        t.links[0].target,
+        "t-3",
+        "the deleted id was EXACTLY this target and the link still survived — `links` is outside \
+         the delete-strip, which is what lets the misuse guard stay advisory"
+    );
 }
 
 /// `list_tasks` rows carry both fields (skipped when unused), the reply gains a
@@ -55328,4 +55352,27 @@ fn the_upsert_task_schema_admits_the_sprint_clear_it_documents() {
         TASK_LINK_TYPES.to_vec(),
         "the schema's vocabulary must BE the backend's TASK_LINK_TYPES, not a copy that can drift"
     );
+
+    // The CAPS are advertised in two places on this tool — `maxItems` and the
+    // prose description — and both were literals while only the vocabulary was
+    // pinned. Raising MAX_TASK_LINKS would then leave the schema promising the
+    // old cap with nothing red, which is the same drift the enum check exists
+    // to prevent. Pin all three against the consts themselves.
+    assert_eq!(
+        links["maxItems"],
+        json!(MAX_TASK_LINKS),
+        "the schema's maxItems must BE MAX_TASK_LINKS"
+    );
+    let ldesc = links["description"].as_str().unwrap_or_default();
+    for (label, n) in [
+        ("links", MAX_TASK_LINKS),
+        ("target", MAX_TASK_LINK_TARGET),
+        ("label", MAX_TASK_LINK_LABEL),
+    ] {
+        assert!(
+            ldesc.contains(&n.to_string()),
+            "the description must state the live {label} cap ({n}), or it teaches a cap the \
+             backend no longer enforces: {ldesc}"
+        );
+    }
 }

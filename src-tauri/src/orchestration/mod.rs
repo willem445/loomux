@@ -10572,6 +10572,12 @@ fn normalize_links(raw: Vec<String>, self_id: &str, board: &[Task], field: &str)
 /// external target that coincidentally looks like a task id still points
 /// exactly where it always pointed, and silently deleting it would be worse
 /// than leaving it.
+///
+/// That non-strip is held by
+/// `a_links_target_naming_a_live_board_task_is_refused_and_names_deps_related`,
+/// which deletes a row whose id IS a live link target. If you ever make
+/// `strip_deleted_links` symmetric across all three arrays, that test is the
+/// one that will tell you — it is written to go red for exactly that change.
 fn normalize_task_links(raw: Vec<TaskLink>, board: &[Task], field: &str) -> Result<Vec<TaskLink>, String> {
     if raw.len() > MAX_TASK_LINKS {
         return Err(format!("{field}: too many links ({}) — at most {MAX_TASK_LINKS} per task", raw.len()));
@@ -26916,13 +26922,19 @@ impl OrchRegistry {
                 return Err(format!("invalid kind {k:?} — use one of {}", TASK_KINDS.join(" | ")));
             }
         }
-        // A sprint is >= 1 (#1272). ZERO is not an invalid sprint, it is the
-        // CLEAR — the numeric counterpart of the empty string on `pr`/`kind` —
-        // so like the empty kind above it has to pass here to reach the apply.
-        // Negatives and fractions never get this far: the wire parsers refuse
-        // them (`as_u64` in mcp.rs, serde`s u32 on the human command), so this
-        // arm is about the one value that IS representable and still not a
-        // sprint.
+        // NO sprint check sits here, beside the status and kind ones, and that
+        // is deliberate rather than an omission (#1272). Nothing is left to
+        // check by the time a patch reaches this method:
+        //
+        //  - negatives and fractions cannot be represented — `TaskPatch::sprint`
+        //    is `Option<u32>`, and the wire parsers refuse them before that
+        //    (`arg_sprint`'s `as_u64` in mcp.rs; serde's own `u32` decode on the
+        //    human command). A caller that typo'd gets an error naming the
+        //    shape, not a silent no-op;
+        //  - 0 is the one representable value that is not a legal sprint, and it
+        //    is not invalid — it is the CLEAR, the numeric counterpart of the
+        //    empty string on `pr`/`kind`. It is consumed by the `.filter` at the
+        //    apply below, which is the only place that needs to know.
         //
         // Nothing else about a sprint is validated, here or anywhere: sprint
         // numbers need not be contiguous, need not start at 1, and a row may
@@ -27284,10 +27296,14 @@ impl OrchRegistry {
         if let Some(l) = links {
             task.links = l;
         }
-        // Sprint (#1272): 0 is the clear, anything else is already known to be
-        // >= 1 from the vocabulary check at the top of this method. Written
-        // through `filter` rather than a branch so the clear and the set are
-        // one expression, the way `kind` above does it.
+        // Sprint (#1272): 0 is the clear. Anything else is already known to be
+        // >= 1 from the TYPE — `TaskPatch::sprint` is `Option<u32>`, so a
+        // negative or fractional value was refused at the wire before it could
+        // reach a patch (see the note beside the status/kind checks above;
+        // there is deliberately no sprint check there). This `filter` is the
+        // one place that has to know 0 is special, and it is written as a
+        // filter rather than a branch so the clear and the set stay one
+        // expression, the way `kind` above does it.
         if patch.sprint.is_some() {
             task.sprint = patch.sprint.filter(|n| *n != 0);
         }

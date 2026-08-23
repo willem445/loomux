@@ -80,7 +80,12 @@ having fired, and this is deliberate: `strip_deleted_links` does **not** touch `
 an external target that merely looks like a task id (`t-404` naming nothing, a path that
 happens to collide) is never silently rewritten or deleted by an unrelated board edit.
 Pinned by `a_links_target_naming_a_live_board_task_is_refused_and_names_deps_related`,
-which asserts the refusal *and* both non-refusals.
+which asserts the refusal *and* both non-refusals. The non-strip half is only worth
+anything if the deleted id is **exactly** the link's target — a link naming something the
+delete never mentions survives under every possible implementation — so the test writes
+the link at an id that does not exist yet (legal: the guard refuses only *live* ids),
+then creates that row and deletes it. Mutation-tested: adding a `links` retain to
+`strip_deleted_links` reddens it.
 
 ## 4. Target validation: shape only, never existence (#1273 Q2)
 

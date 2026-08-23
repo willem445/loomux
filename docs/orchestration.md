@@ -615,18 +615,28 @@ and no duration anywhere. The point is only to say **which work comes first**: t
 orchestrator finishes the current sprint before starting the next, and tasks with no sprint
 at all — the backlog — sit behind everything that has one.
 
-- Both you and the orchestrator can assign a sprint, and either of you can change or clear
-  it. It's an ordinary board edit, not a privileged one.
-- The board shows the **current sprint** and how far it has got — the lowest sprint number
-  that still has unfinished work in it. When its last item is done, the next sprint becomes
-  current on its own; there's no button to press and no marker to keep in step.
+> **What's here now, and what's coming.** This release ships the sprint itself: tasks store
+> it, the orchestrator reads it when choosing what to pick up, and it survives restarts. The
+> **board's own sprint controls** — the current-sprint indicator, the per-row sprint badge,
+> and the roll-over confirmation described below — land in a later slice, so for now sprints
+> are something you ask the orchestrator to set and it reports back on, not something you
+> click. Nothing below changes when those controls arrive; you'll just be able to do it
+> yourself.
+
+- Ask the orchestrator to put an item in a sprint, move it, or take it out again. It's an
+  ordinary board edit, not a privileged one — nothing about a sprint is locked down.
+- The **current sprint** is the lowest sprint number that still has unfinished work in it.
+  It isn't stored anywhere and there's no button to advance it: when a sprint's last item is
+  done, the next one becomes current by itself, so there's no marker that can drift out of
+  step with the board.
 - **A blocked item keeps its sprint open.** That's deliberate: a sprint quietly ending
-  because the work left in it looked stuck is exactly the thing you'd want to be told
-  about. It stays current until you resolve that item or move it on.
-- Moving unfinished work into the next sprint is always **explicit**. The board shows you
-  the exact list of items that would move and asks first, then moves them one at a time so
-  each shows up in the audit log on its own. Nothing rolls over silently, whether you do it
-  or the orchestrator does.
+  because the work left in it looked stuck is exactly the thing you'd want to be told about.
+  It stays current until that item is resolved or moved on.
+- Moving unfinished work into the next sprint is always **explicit**. The orchestrator moves
+  such items one at a time, so each shows up in the audit log on its own, and says in its
+  pane which ones it moved. Nothing rolls over silently. (When the board controls land,
+  they'll show you the exact list of items that would move and ask first — same rule, done
+  by hand.)
 
 Sprint numbers don't have to be tidy — they needn't be contiguous and needn't start at 1, so
 you can leave gaps for planned work without the board minding.
@@ -636,9 +646,9 @@ item startable or unstartable, it doesn't stop the orchestrator claiming somethi
 doesn't interact with WIP limits. An item outside the current sprint is still perfectly
 ready to start if its dependencies are met — the sprint says what *should* come first, not
 what *may* happen. And the board itself is never re-sorted: it stays in the order you put it
-in, with the sprint shown on the row.
+in.
 
-**On a board that uses no sprints, none of this appears** and nothing changes.
+**On a board that uses no sprints, nothing changes at all.**
 
 ### Grounding links — what an agent should read first
 
@@ -653,27 +663,31 @@ requirement, guessing which design note applies — and the real risk isn't wast
 **missing a relevant requirement entirely**. A task that carries its grounding as data hands
 the next agent what governs the work instead of hoping they find it.
 
+> **What's here now, and what's coming.** This release ships the links themselves: tasks
+> store them, agents read them, and the orchestrator and planners record them. Showing them
+> **on the board**, and adding or removing them by hand, land in a later slice — as does
+> feeding a task's links into a worker's opening brief automatically, which is the point of
+> the whole feature.
+
 - Each link has a **type** (requirement, spec, design note, test case, doc, or a plain
   link), a **target**, and an optional one-line label to show instead of a bare target.
 - A target can be an **issue or PR ref** (`#123`), a **file in the repo**
   (`doc/design/x.md`, a test file), or a **URL** — the surfaces grounding actually lives on.
-- Both you and the orchestrator can add and remove them. Planners record them as part of a
-  plan, so the artifacts a plan names become something the next agent reads rather than
-  prose someone has to re-parse.
+- The orchestrator records them, typically when it creates the task, and planners record
+  them as part of a plan — so the artifacts a plan names become something the next agent
+  reads rather than prose someone has to re-parse.
 
 Two things links deliberately don't do. They **never affect readiness or ordering** — a link
 is context, not structure; if you mean "this must finish first", that's a dependency. And
 targets are **never checked for existence**: the board doesn't go and look, so it keeps
 working offline and a board edit never fails because GitHub was slow. A link pointing at
-something that has moved is shown as it is, the same as a dependency naming a task that
-isn't there — visible, and yours to fix.
+something that has moved is kept as it is, the same as a dependency naming a task that isn't
+there — yours to fix, never silently dropped.
 
 One thing *is* checked: a link whose target names another **task on this board** is refused,
 with an error saying so. That's what dependencies and see-also links are for, and the two
 kinds of link are kept apart on purpose — one points inside the board, the other points out
 of it.
-
-**On a board with no links recorded, none of this appears.**
 
 ### WIP limits (finish before you start)
 

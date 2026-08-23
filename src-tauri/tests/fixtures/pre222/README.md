@@ -803,6 +803,7 @@ pin advertised to stop it (rev-11 F1).
   `worker.md`, `reviewer.md`, `planner.md` and `manager.md` did not move. Grounding reaches a
   worker through the task row rather than through its instructions, so there was nothing to
   tell them here.
+
 ## If this test fails
 
 It is telling you that **the text every agent in every default group reads has
