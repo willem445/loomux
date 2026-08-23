@@ -1,7 +1,15 @@
+<p align="center">
+  <img src="orrerix-logo.png" alt="Orrerix" width="400">
+</p>
+
 # Orrerix
 
-**A terminal multiplexer for AI coding agents — hand it a goal and a queue of
-work, and let it run.**
+**Define the vision. Walk away. Come back to shipped software.**
+
+Orrerix runs fleets of AI coding agents unsupervised, on real software
+discipline: review gates and green CI before anything merges, work tracked on
+GitHub and a live task board, your own CLIs and custom workflows — agents
+follow the process, not the other way around.
 
 [![CI](https://github.com/willem445/orrerix/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/orrerix/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/orrerix/)
