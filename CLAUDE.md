@@ -417,6 +417,13 @@ narrow their ask back down to the original ticket on your own judgment.
   number to re-derive, no test to redden — and a reviewer's list of sites is a
   sample, not the set (#1189: a module header falsified by that PR's own later
   commit, and 6 sites named against 11 found; #1215).
+  Where the claim is a **quotation** rather than a paraphrase it is checkable,
+  so check it instead of sweeping: every passage a PR body quotes out of a file
+  in its own diff must appear verbatim in that file at head, matched
+  mechanically. Signature: the body's *What changed* quotes the exact phrasing a
+  later commit on the same branch removed, and the squash republishes it on the
+  one surface nobody can edit afterwards (#1271). Recipe, and the blind spot it
+  is scoped to: `.claude/skills/ci-validate/SKILL.md`.
 - **A doc naming a file or test that hasn't landed must say so in its tense
   and name the slice** — `` `tests/perf_dispatch.rs` *will* enforce … (#743
   S2/S3) `` — or the pointer waits for that slice. Present tense beside a
