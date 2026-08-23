@@ -32,14 +32,14 @@ test("a group with nothing persisted opens at the pre-#1270 board", () => {
 test("a write survives an encode/decode round trip, field for field", () => {
   const prefs = writeGroupView(
     new Map(),
-    "loomux-abc",
+    "orrerix-abc",
     view({
       collapsed: ["e-1", "f-2"],
       filter: { kind: ["story", "unlabelled"], status: ["blocked"], text: "auth", attention: true },
     }),
     1_700_000_000_000
   );
-  const back = readGroupView(decodeBoardPrefs(encodeBoardPrefs(prefs)), "loomux-abc");
+  const back = readGroupView(decodeBoardPrefs(encodeBoardPrefs(prefs)), "orrerix-abc");
   assert.deepEqual(back.collapsed, ["e-1", "f-2"]);
   assert.deepEqual(back.filter, {
     kind: ["story", "unlabelled"],

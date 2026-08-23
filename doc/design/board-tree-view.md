@@ -60,7 +60,7 @@ Two smaller decisions inside that:
   one class of row the level filter cannot name. An empty-string `kind` reads as
   unlabelled too (`||`, not `??`) rather than becoming an invisible fifth class.
 - **`kindFilterChoices` derives its tail from the board.** `ladderRule` exempts
-  an out-of-vocabulary kind on purpose (CLAUDE.md constraint 8 — orrerix must not
+  an out-of-vocabulary kind on purpose (CLAUDE.md constraint 8 — Orrerix must not
   require a methodology), so a hand-edited `tasks.json` may legitimately carry
   `saga`. A fixed chip row would leave such a row matching neither a ladder level
   nor `unlabelled` — it *is* labelled — and reachable only by clearing the level

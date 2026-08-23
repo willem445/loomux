@@ -1675,7 +1675,7 @@ test("the unlabelled chip catches a row with no kind — and one hand-edited to 
 
 test("a hand-edited out-of-vocabulary kind still gets a chip, so no row is unreachable", () => {
   // ladderRule exempts an unknown kind on purpose (CLAUDE.md constraint 8 —
-  // loomux must not require a methodology), so `saga` is legal. If the chip row
+  // Orrerix must not require a methodology), so `saga` is legal. If the chip row
   // were the fixed vocabulary, a `saga` row would match neither a ladder level
   // nor `unlabelled` (it IS labelled) and could only be seen by clearing the
   // kind filter entirely.

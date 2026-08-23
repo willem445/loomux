@@ -962,7 +962,7 @@ export function filterActive(filter: BoardFilter): boolean {
  *  OTHER kind the board actually carries.
  *
  *  That tail is not decoration. `ladderRule` exempts an out-of-vocabulary kind
- *  on purpose (CLAUDE.md constraint 8 — loomux must not require a
+ *  on purpose (CLAUDE.md constraint 8 — Orrerix must not require a
  *  methodology), so a hand-edited `tasks.json` may legitimately carry `saga`.
  *  Without a chip for it, such a row would match NO kind selection — neither a
  *  ladder level nor `unlabelled`, since it is labelled — and the only way to
