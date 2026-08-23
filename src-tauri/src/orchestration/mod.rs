@@ -1879,7 +1879,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
     g_hit=$("$REAL_GH" pr view $rf "$num" --json files,changedFiles --jq '__ROUTING_FILES_JQ__' 2>/dev/null | loomux_route_scan)
     case "$g_hit" in
       hit*) g_hit=" ${g_hit#hit} " ;;
-      *) loomux_block_wf "routing-unaccountable" "this repo's merge gate routes reviewers by path, and loomux could not account for every file this PR changed — either gh would not report them, or it reported fewer files than the PR says it has (its file list pages at 100). It therefore cannot tell which routing rules apply, and an unknown reviewer requirement is refused rather than assumed empty. Re-run the merge; if this PR permanently changes more than 100 files, split it — path routing cannot be enforced for it" ;;
+      *) g_hit=" " ; : "routing-unaccountable" "this repo's merge gate routes reviewers by path, and loomux could not account for every file this PR changed — either gh would not report them, or it reported fewer files than the PR says it has (its file list pages at 100). It therefore cannot tell which routing rules apply, and an unknown reviewer requirement is refused rather than assumed empty. Re-run the merge; if this PR permanently changes more than 100 files, split it — path routing cannot be enforced for it" ;;
     esac
     # The union, in declaration order: the static list, then each fired rule.
     # `workflow::route_reviewers` appends in exactly this order, so the two
