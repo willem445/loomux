@@ -54874,8 +54874,17 @@ fn pre_1272_boards_load_unchanged_and_sprintless_linkless_boards_stay_that_way()
     )
     .unwrap();
     let used = fs::read_to_string(&path).unwrap();
-    assert!(used.contains("\"sprint\":4"), "the sprint key IS emittable on this board: {used}");
-    assert!(used.contains("\"links\""), "...and so is the links key: {used}");
+    let parsed: Value = serde_json::from_str(&used).unwrap();
+    assert_eq!(
+        parsed[1]["sprint"],
+        json!(4),
+        "the sprint key IS emittable on this board: {used}"
+    );
+    assert_eq!(
+        parsed[1]["links"][0]["target"],
+        json!("README.md"),
+        "...and so is the links key: {used}"
+    );
 
     // And clearing both returns the file to carrying neither — the round
     // trip, not just the initial state.
