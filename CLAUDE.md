@@ -469,6 +469,13 @@ narrow their ask back down to the original ticket on your own judgment.
   fails for EVERY branch commit once the PR squashes. Signature: the run ids were re-derived
   after the rebase and the commit SHAs beside them were not — the reproduction SHA the body
   tells a reader to check out included (#1327; recipe in `.claude/skills/ci-validate/SKILL.md`).
+- **A range's BASELINE is re-derived with `git merge-base`, never checked for ancestry.**
+  A rebase moves the merge base while leaving the commit you rebased onto LAST time a
+  perfectly valid ancestor — resolvable, right subject, passing every check the SHA rule
+  above applies — so an isolation diffstat re-run against it is freshly measured and still
+  wrong. Signature: `git diff <base>..HEAD --stat` cited as proof nothing else bled in,
+  where `<base>` is the previous rebase's target (#1324: 63 files/314+ against it, 61/258+
+  against the real merge base; recipe in `.claude/skills/ci-validate/SKILL.md`).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
   and work merged meanwhile authors fresh instances of the string you removed — a live
@@ -534,6 +541,14 @@ narrow their ask back down to the original ticket on your own judgment.
   body, issue comment or `docs/` page renders a certain way — `gh api -X POST
   markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line silently ends a
   table, and the row you claimed becomes a paragraph of literal pipes (#926).
+  **That endpoint is blind to a `mermaid` fence**, and so is a browser: GFM returns every
+  such fence as a syntax-highlighted `<pre>` — byte-for-byte the raw-DSL failure you are
+  checking for — while GitHub's own file viewer renders it in a cross-origin sandboxed
+  iframe a signed-out headless run cannot reliably see (two runs, opposite readings). Decide
+  a mermaid claim from the SURFACE instead: GitHub's file viewer renders one natively, the
+  published site does not while `docs/_config.yml` has no `mermaid:` key; corroborate with
+  byte-identity against a fence already rendering there. Signature: a fence moved between
+  files and its rendering "measured" (#1324, `doc/design/group-workflow-diagram.md`).
 - **A claim about the PR body is measured on the POSTED body, never on your
   draft.** Writing it is not posting it: a body rebuilt from sources destroys any
   edit made to the assembled file, so edit the sources, assemble, then re-read the
