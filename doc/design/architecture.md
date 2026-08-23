@@ -181,7 +181,7 @@ src/
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
   main.ts           composition root (owns the TabManager + OrchWiring router)
 e2e/                Playwright E2E PoC (experimental, `e2e-windows` CI job) — see doc/design/e2e-testing.md
-npm/bin/loomux.js   the whole `loomux-desktop` npm package: a dependency-free Node launcher that fetches/installs/launches the desktop app. Command-based (#845) — plain `loomux` never installs over an existing install, only `loomux update` does; `update` is channel-aware, orders releases by semver itself (never GitHub's mutable `latest` pointer) and refuses a downgrade outright (#815/#816/#846). Pure logic unit-tested in test/launcher.test.ts. See doc/design/npm-launcher.md
+npm/bin/orrerix.js  the whole `orrerix` npm package: a dependency-free Node launcher that fetches/installs/launches the desktop app. Command-based (#845) — plain `orrerix` never installs over an existing install, only `orrerix update` does; `update` is channel-aware, orders releases by semver itself (never GitHub's mutable `latest` pointer) and refuses a downgrade outright (#815/#816/#846). Renamed from `loomux-desktop`/`loomux.js` in #1153 phase 5, which is also why it reads TWO name axes: the product (`Orrerix.app`, the install dir, the NSIS uninstall key, the asset prefix) and the main binary (`loomux`, cargo's output, unrenamed) — every reading surface accepts both product spellings, doc/design/rebrand-external.md. Pure logic unit-tested in test/launcher.test.ts. See doc/design/npm-launcher.md
 ```
 
 ## Extension seams

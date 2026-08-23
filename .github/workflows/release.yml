@@ -90,12 +90,12 @@ jobs:
               owner,
               repo,
               tag_name: tag,
-              name: `Loomux ${tag}`,
+              name: `Orrerix ${tag}`,
               body: [
                 "Download the asset for your platform below.",
                 "",
                 "- **Windows**: `*-setup.exe` (installer)" + (isPrerelease ? "" : " or `*.msi`"),
-                "- **macOS**: `*_aarch64.dmg` (Apple Silicon) or `*_x64.dmg` (Intel) — unsigned; if macOS reports the app as damaged, run `xattr -cr /Applications/Loomux.app`",
+                "- **macOS**: `*_aarch64.dmg` (Apple Silicon) or `*_x64.dmg` (Intel) — unsigned; if macOS reports the app as damaged, run `xattr -cr /Applications/Orrerix.app`",
                 "- **Linux**: `*.AppImage` (portable), `*.deb`, or `*.rpm`",
                 "",
                 "Or use the one-liner installers in the README.",
@@ -214,13 +214,23 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           # House style, matching every other asset on the release:
-          # `Loomux_<version>_<arch>.<ext>` (Loomux_1.2.0-beta1_x64.dmg,
-          # Loomux_1.2.0-beta1_x64-setup.exe, ...). Not cosmetic-only — all
-          # three asset resolvers (install.ps1, install.sh, npm/bin/loomux.js)
-          # match on END-ANCHORED suffixes, so an asset that shares the
-          # family's shape is one a future looser matcher treats the same way
-          # as the installers instead of specially.
-          $name = "Loomux_$($env:TAG -replace '^v', '')_x64.pdb.zip"
+          # `Orrerix_<version>_<arch>.<ext>` (Orrerix_1.3.0_x64.dmg,
+          # Orrerix_1.3.0_x64-setup.exe, ...). The prefix is Tauri's
+          # `productName`, renamed in #1153 phase 5 — this line is the one
+          # asset name the bundler does not generate for us, so it is the one
+          # that has to be kept in step by hand.
+          #
+          # Not cosmetic-only — all three asset resolvers (install.ps1,
+          # install.sh, npm/bin/orrerix.js) match on END-ANCHORED suffixes, so
+          # an asset that shares the family's shape is one a future looser
+          # matcher treats the same way as the installers instead of
+          # specially. (Those resolvers are indifferent to the prefix by
+          # construction, which is why the rename needed no fallback list in
+          # any of them.)
+          #
+          # The SOURCE path stays `loomux.pdb`: that name comes from the cargo
+          # crate, not from productName, and the rebrand did not move it.
+          $name = "Orrerix_$($env:TAG -replace '^v', '')_x64.pdb.zip"
           Compress-Archive -Path target/release/loomux.pdb -DestinationPath $name -CompressionLevel Optimal -Force
           "name=$name" >> $env:GITHUB_OUTPUT
 
@@ -423,7 +433,7 @@ jobs:
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f make_latest=false
           fi
 
-  # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
+  # Publish the tiny npm launcher (`npx orrerix`). It just downloads
   # the release asset built above, but must wait for `promote` (not just
   # `build`) — GitHub does not serve assets off a draft release to anonymous
   # downloads, so a launcher published while the release is still a draft
@@ -435,7 +445,7 @@ jobs:
   # npm exchanges for publish rights — no NPM_TOKEN secret involved. Requires
   # npm >= 11.5.1 (Node 22 bundles an older one, hence the upgrade step).
   # Skipped entirely for beta/RC (hyphenated) tags: the npm launcher
-  # (`npx loomux-desktop`) stays pinned to the latest stable release rather
+  # (`npx orrerix`) stays pinned to the latest stable release rather
   # than ever resolving a beta build. There's no npm equivalent of GitHub's
   # prerelease/make_latest flags to keep a beta version installed-but-not-
   # default, so the simplest correct behavior is not publishing it at all.

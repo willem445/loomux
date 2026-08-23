@@ -1,18 +1,18 @@
-# The npm launcher: what `loomux` on your PATH is allowed to do
+# The npm launcher: what `orrerix` on your PATH is allowed to do
 
-`npm/bin/loomux.js` is the whole of the `loomux-desktop` package. Loomux is a
+`npm/bin/orrerix.js` is the whole of the `orrerix` package. Orrerix is a
 native Tauri app, so the package ships no binary — the launcher fetches the
 right GitHub release asset for the host, installs or caches it, and launches it.
 
 It is under 600 lines of dependency-free Node, and almost all of the design in
 it exists to answer one question: **when is this program allowed to run an
 installer?** Getting that wrong is not a cosmetic bug. The Windows and macOS
-installers are silent, and a silent install terminates the running `Loomux.exe`
+installers are silent, and a silent install terminates the running app
 to replace its files — taking down the app, every pane, and every agent working
 inside it, mid-task, with no shutdown path and no crash report. That is #815, as
 it actually happened.
 
-## Plain `loomux` never installs over an existing install (#845)
+## Plain `orrerix` never installs over an existing install (#845)
 
 The original launcher auto-updated: it compared the installed app's version
 against its own on every run and reinstalled on any mismatch. Two failure modes
@@ -24,17 +24,17 @@ saw a newer prerelease install as a difference and reinstalled it — a
 the ordering fix only narrowed the window.
 
 The second is the real one: **an update is a decision, and it was being made by
-whatever process happened to type `loomux`.** A user launching the app is not
+whatever process happened to type `orrerix`.** A user launching the app is not
 consenting to have it replaced, and there is no ordering rule clever enough to
 make an unrequested install safe when the install kills a live session.
 
 So the command surface splits the two intents:
 
 ```
-loomux            launch the installed app; install only if there is nothing to launch
-loomux update     install/refresh — the only path that fetches when something exists
-loomux version    print the launcher's version
-loomux help       usage
+orrerix            launch the installed app; install only if there is nothing to launch
+orrerix update     install/refresh — the only path that fetches when something exists
+orrerix version    print the launcher's version
+orrerix help       usage
 ```
 
 The launch-or-install decision is one pure exported function, `planAction`,
@@ -44,12 +44,12 @@ testable; one function is pinned by `test/launcher.test.ts` in both directions �
 a plain launch over an existing install must launch, and an `update` over an
 existing install must install.
 
-`loomux --reinstall` survives as a deprecated alias, and the launcher says so on
+`orrerix --reinstall` survives as a deprecated alias, and the launcher says so on
 stderr when it is used: the flag's *meaning* changed (it used to install the
 release matching the launcher's own version), so a script that relied on the old
 behaviour deserves to be told rather than silently rerouted.
 
-## `loomux update` never reads GitHub's `latest` pointer (#846)
+## `orrerix update` never reads GitHub's `latest` pointer (#846)
 
 The obvious implementation of "install the latest release" is
 `GET /repos/:owner/:repo/releases/latest`. It is wrong here, and not marginally.
@@ -83,7 +83,7 @@ stable-only rule makes `update` a permanent no-op for the entire beta train.
 
 `update` therefore stays on the channel of the build that is actually installed:
 
-| Installed | `loomux update` resolves |
+| Installed | `orrerix update` resolves |
 | --- | --- |
 | stable (`1.0.0`) | newest **stable** release |
 | prerelease (`1.1.0-beta11`) | newest release of **either** kind |
@@ -103,7 +103,7 @@ can:
   downgrade of a newer per-user install.
 - **macOS** — `CFBundleShortVersionString` from the bundle's `Info.plist`.
 - **Linux** — the cached AppImage's filename. There is no installer and no
-  registry, so `Loomux_1.1.0-beta11_amd64.AppImage` is the only version record
+  registry, so `Orrerix_1.3.0_amd64.AppImage` is the only version record
   that exists.
 
 ## Unknown is not safe (`updateBaseline`)
@@ -167,8 +167,8 @@ unaffected.
 
 ## The running-instance guard
 
-Independent of versions: `refuseIfRunning()` refuses to install while Loomux is
-running, **including** under `loomux update`. An explicit update is a request to
+Independent of versions: `refuseIfRunning()` refuses to install while the app is
+running, **including** under `orrerix update`. An explicit update is a request to
 reinstall, not consent to kill a live instance; quitting first is the user's call.
 
 The probe is `tasklist` on Windows and `pgrep` on macOS. An unknown answer (no
@@ -184,10 +184,35 @@ errno into the same advice the other two platforms give rather than letting a ra
 
 ## Agents never run this
 
-`loomux` on an agent pane's PATH is shimmed to refuse unconditionally
-(`orchestration::loomux_shim_sh` / `loomux_shim_cmd`). There is no grant path, no
+`orrerix` on an agent pane's PATH is shimmed to refuse unconditionally, and so is
+the pre-rename `loomux` a stale global install leaves behind
+(`orchestration::loomux_shim_sh` / `loomux_shim_cmd` — Rust symbols on the cargo
+axis, which #1153 does not rename). There is no grant path, no
 delegation and no fallback — unlike the `gh`/`git` gates, there is no authorized
-agent use of the launcher at all, because agents reach Loomux through its MCP
+agent use of the launcher at all, because agents reach Orrerix through its MCP
 tools. The shim's refusal message describes what the launcher does, so it is
 pinned by a test: a message that goes stale is a false claim in the one place an
 agent is guaranteed to read.
+
+## The rename (#1153 phase 5)
+
+The package and its command became `orrerix`, with no `loomux-desktop` shim. The
+launcher is the one program that has to work across that flip in BOTH directions
+— an old install under a new launcher, and a pre-rename release under a launcher
+nobody has updated — so it follows `rebrand-protocol.md`'s rule verbatim: emit one
+spelling, accept every spelling on every reading surface, write the accepted set
+down exactly once (`PRODUCT_NAMES`, `CLI_NAMES`, `EXE_NAMES`).
+
+Two things a reader of this file needs and cannot infer from the code alone:
+
+- **Release-asset resolution needed no fallback and gained none.** The patterns
+  were always end-anchored suffixes (`-setup\.exe$`, `_amd64\.AppImage$`), which
+  are indifferent to the product-name prefix in both directions. They are now one
+  pure `assetPattern(platform, arch)`, pinned against both spellings.
+- **The product name and the binary name are different strings** — the bundle is
+  `Orrerix.app` and the executable inside it is `loomux`, because `mainBinaryName`
+  is unset and Tauri then takes cargo's output. The install and running-app probes
+  read one of each (#1294).
+
+Full argument, including why an Orrerix install lands *beside* a Loomux one
+rather than replacing it: `doc/design/rebrand-external.md`.

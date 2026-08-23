@@ -21764,12 +21764,21 @@ fn loomux_shim_refuses_outright_with_no_path_that_runs_the_launcher() {
 fn loomux_shim_messages_describe_the_post_845_command_surface() {
     for (name, text) in [("sh", loomux_shim_sh()), ("cmd", loomux_shim_cmd())] {
         // The one command that can still reinstall is named, so the human the
-        // agent escalates to knows what they are being asked to run.
-        assert!(text.contains("loomux update reinstalls it"),
-            "the {name} refusal must name `loomux update` as the reinstall path: {text}");
-        // ...and plain `loomux` is described as installing only a MISSING app.
+        // agent escalates to knows what they are being asked to run. The EMITTED
+        // spelling only (#1153 phase 5): this is text we write, not text we read,
+        // and telling an agent to escalate `loomux update` names a command the
+        // human may no longer have.
+        assert!(text.contains("orrerix update reinstalls it"),
+            "the {name} refusal must name `orrerix update` as the reinstall path: {text}");
+        // ...and plain `orrerix` is described as installing only a MISSING app.
         assert!(text.contains("when it is missing"),
-            "the {name} refusal must say plain loomux only installs a missing app: {text}");
+            "the {name} refusal must say plain orrerix only installs a missing app: {text}");
+        // The pre-rename launcher is blocked by the same shim, and the message
+        // has to say so: an agent that reaches this refusal after typing `loomux`
+        // otherwise reads a message about a command it did not run and concludes
+        // the block was for something else.
+        assert!(text.contains("loomux"),
+            "the {name} refusal must still name the pre-rename launcher it also blocks: {text}");
         // The removed autoupdate claim must not survive in either shim.
         assert!(!text.contains("version differs"),
             "the {name} refusal still carries the pre-#845 autoupdate claim: {text}");

@@ -217,28 +217,36 @@ fn every_banned_literal_is_one_the_app_still_accepts() {
 }
 
 /// The self-launch refusal shim (#815) is written to disk under the name of the
-/// program it blocks, and that name is **not** this phase's to rename: the
-/// launcher an agent could actually type is still `loomux` (phase 5 owns the
-/// npm package and the installed exe). A shim written under any other name
-/// blocks nothing while leaving the real launcher runnable — the guard
-/// defeated, with no error anywhere.
+/// program it blocks. A shim written under any other name blocks nothing while
+/// leaving the real launcher runnable — the guard defeated, with no error
+/// anywhere — so what this pins is the one thing that makes the shim work at
+/// all: **every command the launcher package installs has a shim named after
+/// it.**
 ///
-/// This PR's own bulk audit-actor sweep took that argument, because it is a
-/// bare `"loomux"` in the same shape as ~240 actor arguments. `tests/pathseg.rs`
-/// caught it — its allowlist row quotes this call site verbatim as the proof
-/// that `program` is a literal — and it caught it for a reason that has nothing
-/// to do with what the argument MEANS.
+/// #1153 phase 3's bulk audit-actor sweep took that argument once, because it
+/// is a bare `"loomux"` in the same shape as ~240 actor arguments.
+/// `tests/pathseg.rs` caught it — its allowlist row quotes a call site verbatim
+/// as the proof that `program` is a literal — and it caught it for a reason that
+/// has nothing to do with what the argument MEANS. Hence this test.
 ///
-/// So this pins the meaning: whatever name that call passes, it must be a
-/// command the launcher package actually installs. It reddens on the day phase
-/// 5 renames the npm bin without renaming the shim, and on any future sweep
-/// that rewrites the argument to something no user can type.
+/// Phase 5 then renamed the npm bin to `orrerix`, which is exactly the day this
+/// was written to redden on. The answer is not to swap one name for the other:
+/// npm does not uninstall `loomux-desktop` when you install `orrerix`, so a
+/// `loomux` on PATH outlives the rename indefinitely. Both are shimmed, and the
+/// two halves below are different claims:
+///
+///   - every CURRENT bin is covered — the load-bearing one, and the half that
+///     reddens on the next rename;
+///   - the pre-rename `loomux` is still covered — which the first half cannot
+///     say, because `loomux` is deliberately no longer in the bin map. Asserting
+///     only that every shim name is a current bin would make DELETING that
+///     coverage the way to go green.
 ///
 /// Scanned rather than called because `write_refusal_shim` and `ensure_shims`
 /// are both private, and `shim_dir` resolves to a sibling of the registry root
 /// — outside a test's own tempdir, i.e. shared — so a filesystem assertion here
 /// would be cross-contaminating rather than isolated. The blind spot that
-/// leaves is stated plainly: this reads the call, not the write.
+/// leaves is stated plainly: this reads the calls, not the writes.
 #[test]
 fn the_self_launch_shim_is_named_after_a_command_the_launcher_installs() {
     let src = std::fs::read_to_string(concat!(
@@ -247,17 +255,27 @@ fn the_self_launch_shim_is_named_after_a_command_the_launcher_installs() {
     ))
     .expect("mod.rs");
     let call = "write_refusal_shim(&dir, ";
-    let i = src.find(call).expect(
+
+    // Every call site, not just the first: a second one that shimmed something
+    // no user can type would be invisible to a `find`-the-first read.
+    let mut shimmed: Vec<String> = Vec::new();
+    for (n, chunk) in src.split(call).enumerate() {
+        if n == 0 {
+            continue; // text before the first call
+        }
+        let arg: String = chunk
+            .strip_prefix('"')
+            .expect("the program argument must stay a literal — `tests/pathseg.rs` allow-lists this call site on exactly that basis")
+            .chars()
+            .take_while(|c| *c != '"')
+            .collect();
+        shimmed.push(arg);
+    }
+    assert!(
+        !shimmed.is_empty(),
         "the self-launch refusal shim's call site moved — find it and re-point this test, \
-         because what it pins is the one thing that makes the shim work at all",
+         because what it pins is the one thing that makes the shim work at all"
     );
-    let rest = &src[i + call.len()..];
-    let arg: String = rest
-        .strip_prefix('"')
-        .expect("the program argument must stay a literal — `tests/pathseg.rs` allow-lists this call site on exactly that basis")
-        .chars()
-        .take_while(|c| *c != '"')
-        .collect();
 
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../npm/package.json"))
         .expect("npm/package.json");
@@ -268,12 +286,26 @@ fn the_self_launch_shim_is_named_after_a_command_the_launcher_installs() {
         .keys()
         .map(|k| k.as_str())
         .collect();
+    assert!(!bins.is_empty(), "the launcher package must declare at least one bin");
 
+    for bin in &bins {
+        assert!(
+            shimmed.iter().any(|s| s == bin),
+            "the launcher package installs `{bin}`, but no refusal shim is written under \
+             that name (the shims are {shimmed:?}). An agent typing the real launcher name \
+             would not be blocked, and nothing else in this repo would notice."
+        );
+    }
+
+    // The pre-rename command, which `npm install -g orrerix` does not remove
+    // from a machine that ran `npm install -g loomux-desktop`. It is not in the
+    // bin map any more and never will be again, so the loop above cannot see
+    // it — and without this line, deleting its shim is a way to stay green.
     assert!(
-        bins.contains(&arg.as_str()),
-        "the refusal shim is written as `{arg}`, which the launcher package does not install \
-         (its bins are {bins:?}). An agent typing the real launcher name would not be blocked, \
-         and nothing else in this repo would notice."
+        shimmed.iter().any(|s| s == "loomux"),
+        "the pre-rename `loomux` launcher is no longer shimmed (the shims are {shimmed:?}). \
+         A global install of `loomux-desktop` survives the #1153 rename on PATH, and \
+         running it from an agent pane still installs over the running app."
     );
 }
 

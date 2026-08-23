@@ -53,7 +53,7 @@ codegen-units = 1
 # standalone PDB / split debug, not the shipped binary). Net: build-tree and CI
 # backtraces are genuinely symbolicated. The INSTALLER still does not bundle the
 # PDB, so an installed build's own backtraces stay address-only — but the PDB is
-# no longer lost: release.yml attaches `Loomux_X.Y.Z_x64.pdb.zip` to the GitHub
+# no longer lost: release.yml attaches `Orrerix_X.Y.Z_x64.pdb.zip` to the GitHub
 # release (#1218), so a dump from a shipped build can be symbolicated after the
 # fact. See doc/design/crash-observability.md.
 debug = "line-tables-only"

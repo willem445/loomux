@@ -440,8 +440,8 @@ fn no_raw_identifier_is_interpolated_into_a_file_name() {
         ),
         (
             "let _ = fs::write(dir.join(format!(\"{program}.cmd\")), cmd.as_bytes());",
-            "write_refusal_shim — `program` is a literal at its call site",
-            "self.write_refusal_shim(&dir, \"loomux\", loomux_shim_sh(), loomux_shim_cmd());",
+            "write_refusal_shim — `program` is a literal at both call sites",
+            "self.write_refusal_shim(&dir, \"orrerix\", loomux_shim_sh(), loomux_shim_cmd());",
         ),
         // Guarded by the predicate that now delegates to `check_segment`, and
         // guarded in the BUILDER rather than by the caller — the structural

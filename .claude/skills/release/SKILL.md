@@ -7,7 +7,7 @@ description: Cut an orrerix release — version bump across all five files (incl
 
 Releases are tag-driven: pushing a `v*` tag runs `.github/workflows/release.yml`,
 which builds installers for Windows / macOS (arm64 + x64) / Linux, creates the
-GitHub release, and then publishes the `loomux-desktop` npm launcher.
+GitHub release, and then publishes the `orrerix` npm launcher.
 
 **The workflow runs from the tag's commit, not from main.** Any fix to
 `release.yml` only takes effect for a tag that points at (or after) the fixed
@@ -156,10 +156,10 @@ real notes after the assets are up:
 
 ## 5. Verify — the release isn't done until all of these pass
 
-- `npm view loomux-desktop version` → X.Y.Z.
+- `npm view orrerix version` → X.Y.Z.
 - The GitHub release has **10 assets**: `-setup.exe` + `.msi`, both `.dmg`s,
   `.AppImage` + `.deb` + `.rpm`, the two `.app.tar.gz` bundles, and
-  `Loomux_X.Y.Z_x64.pdb.zip` — the Windows debug symbols, which a crash
+  `Orrerix_X.Y.Z_x64.pdb.zip` — the Windows debug symbols, which a crash
   dump from a released build needs to symbolicate (#1218).
 - The release run's conclusion is `success` (not just "the assets exist" —
   publish-npm is the last job and can fail after the assets upload).
@@ -203,7 +203,7 @@ What's different from a stable release:
   `install.sh` / `install.ps1` one-liners resolve `latest` and must keep
   landing users on the newest **stable** build.
 - **`publish-npm` doesn't run at all** (job-level `if`) — the npm launcher
-  (`npx loomux-desktop`) stays pinned to the latest stable version; there's
+  (`npx orrerix`) stays pinned to the latest stable version; there's
   no npm-side "prerelease" concept to keep a beta installable-but-not-default,
   so the simplest correct behavior is not publishing it.
 - Release notes still apply to the canonical `release_id` exactly as in step

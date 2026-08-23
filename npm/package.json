@@ -1,9 +1,9 @@
 {
-  "name": "loomux-desktop",
+  "name": "orrerix",
   "version": "1.2.0-beta2",
-  "description": "Installer/launcher for Loomux — a sleek terminal multiplexer for AI agent management. (`loomux` on npm is an unrelated tmux tool.)",
+  "description": "Installer/launcher for Orrerix — a sleek terminal multiplexer for AI agent management.",
   "bin": {
-    "loomux": "bin/loomux.js"
+    "orrerix": "bin/orrerix.js"
   },
   "files": [
     "bin/"
@@ -17,6 +17,7 @@
     "win32"
   ],
   "keywords": [
+    "orrerix",
     "terminal",
     "multiplexer",
     "tmux",
