@@ -142,16 +142,12 @@ enforced at the CLI level.
 - **Agent-aware panes** — alert chips when a CLI needs you, badges per role and
   group, and a session browser that restores Claude Code / Copilot CLI sessions
   straight back into a pane.
-- **Crashes don't cost you the session** — resumable agent sessions aren't
-  common, and orrerix leans on it: kill the app mid-run and every agent pane
-  comes back with full conversation context, the whole fleet re-bound onto
-  fresh panes. The task board, delivery queue, question registry and the rest
-  of a group's state all live on disk, so a queued delivery survives the
-  restart and redelivers in order instead of vanishing. An orchestrator that
-  compacts re-grounds itself from a persisted directive ledger instead of
-  losing the thread, and crash logs plus startup breadcrumbs ship in every
-  build. Resuming after a crash isn't a recovery mode here — it's how the app
-  always behaves.
+- **Group state survives a restart** — a closed group comes back as one Resume
+  card: click it and the members that were open at close relaunch live, each
+  rejoining its persona and worktree. Queued deliveries live on disk and
+  redeliver in order to a pane that rebinds; the rest surface as an explicit
+  to-do list instead of vanishing. Crash logs and startup breadcrumbs ship in
+  every build.
 - **Custom agent workflows** — commit a `.orrerix/workflow.yml` and your repo
   declares its own roster and merge gate: five focused reviewers with five
   prompts and five models, an advisor the orchestrator consults when stuck, a

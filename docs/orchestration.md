@@ -1800,12 +1800,16 @@ records its session id. Follow-ups on a finished task *resume* that worker's
 session (same context, same workspace) instead of cold-starting a new agent or
 disturbing a busy one.
 
-**The delivery queue (above) is in-memory only.** If orrerix restarts while a
-prompt is queued behind a blocked pane, that queued prompt is lost — every
-enqueue is still recorded in `audit.jsonl`, so the loss is visible after the
-fact, but nothing replays it automatically **yet** — a replay is a planned
-follow-up, and `doc/design/orchestration.md`'s "Delivery queue (#445)" section
-carries the argument for why it isn't there today.
+**The delivery queue (above) persists to disk.** A restart doesn't drop a
+queued prompt: an entry addressed to the group's orchestrator, or carrying the
+same CLI session id as a pane that comes back, redelivers automatically in its
+original order. Everything else is surfaced rather than replayed — the
+orchestrator's session-start re-sync lists it with the payload intact so it
+can re-derive and re-send what still applies, rather than the prompt silently
+vanishing. The one true loss is a delivery caught mid-submit when orrerix went
+down: that text is not recoverable, and the recovery notice says so plainly.
+`doc/design/orchestration.md`'s "Delivery queue (#445)" section carries the
+full design.
 
 ## Autonomous mode
 {: #autonomous-mode }
