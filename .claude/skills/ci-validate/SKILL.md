@@ -391,6 +391,17 @@ in the merge of the two, from a sibling that landed four minutes earlier).
 and the failures stop being attributable to the behaviour they evidence — a
 compile error proves nothing. Several rounds on one scratch branch is normal.
 
+**A neuter that removes the mechanism outright cannot evidence a HARDENING of the
+assertion.** Both the old wording and the new one redden under it, so the row
+evidences that the mechanism runs at all — never that your stronger specimen or
+wider loop catches something the previous version missed. The hardening's
+counterfactual is a *different* neuter: one that leaves the mechanism in place and
+breaks only the case you hardened for. Cut that round, or say in the body which
+counterfactual the hardening closes and that no round here neuters it. Signature:
+the same table carries a sibling row proving the mechanism was removed wholesale
+(`unwrap_err()` on an `Ok` — output == input) beside a claim that the pre-hardening
+assertion "would have gone green against this same neuter" (#1229 round 2 B1).
+
 **Your mutation must not leave the token a source-shape pin greps for.** Several
 guards here assert on the *text* of a generated artifact (`sh.contains("diff-too-large")`,
 the scans in `tests/groupid.rs` / `tests/pathseg.rs` / `tests/perf_dispatch.rs`).
