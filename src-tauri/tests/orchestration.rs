@@ -54856,6 +54856,39 @@ fn pre_1272_boards_load_unchanged_and_sprintless_linkless_boards_stay_that_way()
     assert!(text.contains("in-progress"), "the edit itself landed");
     assert!(!text.contains("\"sprint\""), "a sprintless board must not gain a sprint key:\n{text}");
     assert!(!text.contains("\"links\""), "...nor a links key:\n{text}");
+
+    // POSITIVE CONTROL for the two assertions above. Both are absence-only,
+    // and an absence passes just as well when the mechanism never ran — if
+    // this serializer could not emit either key at all, or the write never
+    // reached the file, the two `!contains` would be green over nothing.
+    // So make the SAME board emit both, then take them away again.
+    reg.upsert_task(
+        &g.id,
+        "orch",
+        Some("t-2"),
+        TaskPatch {
+            sprint: Some(4),
+            links: Some(vec![link("doc", "README.md", None)]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let used = fs::read_to_string(&path).unwrap();
+    assert!(used.contains("\"sprint\":4"), "the sprint key IS emittable on this board: {used}");
+    assert!(used.contains("\"links\""), "...and so is the links key: {used}");
+
+    // And clearing both returns the file to carrying neither — the round
+    // trip, not just the initial state.
+    reg.upsert_task(
+        &g.id,
+        "orch",
+        Some("t-2"),
+        TaskPatch { sprint: Some(0), links: Some(vec![]), ..Default::default() },
+    )
+    .unwrap();
+    let cleared = fs::read_to_string(&path).unwrap();
+    assert!(!cleared.contains("\"sprint\""), "cleared back to no key at all: {cleared}");
+    assert!(!cleared.contains("\"links\""), "...for both: {cleared}");
 }
 
 /// Sprint set / clear-via-0 / refuse the values that are not sprints, and
@@ -55028,11 +55061,26 @@ fn link_writes_are_validated_normalized_and_replace_wholesale() {
     let err = reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(many)).unwrap_err();
     assert!(err.contains("too many links"), "the cap is enforced: {err}");
 
-    // Nothing a rejection touched was written.
-    assert!(
-        reg.get_task(&gid, "t-1").unwrap().links.is_empty(),
-        "a refused link write must leave the board exactly as it was"
-    );
+    // Nothing a rejection touched was written. Asserted against a KNOWN-GOOD
+    // value rather than `is_empty()`: an emptiness check passes just as well
+    // if the writes never happened at all, where a surviving prior value can
+    // only be green if the board really was left alone (CLAUDE.md, #1209).
+    let keeper = vec![link("spec", "#999", Some("survivor"))];
+    reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(keeper)).unwrap();
+    for bad in [
+        vec![link("blueprint", "#1", None)],
+        vec![link("doc", "   ", None)],
+        vec![link("doc", &"x".repeat(513), None)],
+    ] {
+        assert!(reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(bad)).is_err());
+    }
+    let after = reg.get_task(&gid, "t-1").unwrap();
+    assert_eq!(after.links.len(), 1, "the prior value is still there");
+    assert_eq!(after.links[0].target, "#999", "a refused link write leaves the board EXACTLY as it was");
+    assert_eq!(after.links[0].label.as_deref(), Some("survivor"));
+
+    // Back to empty for the normalization checks below.
+    reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![])).unwrap();
 
     // Normalization: trim, and an empty label stores as ABSENT rather than "".
     let t = reg
@@ -55206,7 +55254,12 @@ fn wrong_typed_sprint_and_link_args_are_refused_not_silently_dropped() {
             "sprint {v} must be refused, not dropped"
         );
     }
+    // Positive control: the field is writable on this row right now, so the
+    // `is_none` above is the refusals working and not the row being
+    // unreachable (CLAUDE.md, #1209).
     assert!(reg.get_task(&co.group, "t-1").unwrap().sprint.is_none(), "no refused write landed");
+    assert_eq!(call(json!({ "id": "t-1", "sprint": 5 }))["isError"], false, "...and a GOOD value does land");
+    assert_eq!(reg.get_task(&co.group, "t-1").unwrap().sprint, Some(5));
 
     // Zero is NOT wrong-typed — it is the documented clear, and must pass the
     // parser to reach the registry.
@@ -55223,6 +55276,13 @@ fn wrong_typed_sprint_and_link_args_are_refused_not_silently_dropped() {
         assert_eq!(call(json!({ "id": "t-1", "links": v }))["isError"], true, "links {v} must be refused");
     }
     assert!(reg.get_task(&co.group, "t-1").unwrap().links.is_empty(), "no refused link write landed");
+    // Same positive control for the array.
+    assert_eq!(
+        call(json!({ "id": "t-1", "links": [{ "type": "doc", "target": "README.md" }] }))["isError"],
+        false,
+        "...and a WELL-FORMED links array does land"
+    );
+    assert_eq!(reg.get_task(&co.group, "t-1").unwrap().links.len(), 1);
 }
 
 /// The tool schema has to ADMIT the clear it documents — the same guard
