@@ -418,10 +418,10 @@ narrow their ask back down to the original ticket on your own judgment.
   went stale: a sibling refactor routing a second list through one shared refusal
   leaves every test enumerating that rule covering only the list that existed when
   it was written. Re-read each shared helper the new base put your tests' rules
-  behind, and perform the edit on every site it serves. Signature: the helper's own
-  doc names the divergence it prevents — "static list ends up refusing a manager
-  while a routing rule quietly accepts one" — and no test builds the second list
-  (#1229).
+  behind, and perform the edit on every site it serves. Signature: the shared helper's
+  own doc names the divergence it prevents — `gate_reviewer_error`, "static list ends
+  up refusing a manager while a routing rule quietly accepts one" — and no test builds
+  the second list (#1229).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
