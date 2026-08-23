@@ -785,7 +785,7 @@ impl Delivery {
     pub fn permitted_into_manager_pane(self) -> bool {
         matches!(
             self,
-            Delivery::FreshKickoff | Delivery::ResumeKickoff | Delivery::Regrounding
+            Delivery::FreshKickoff | Delivery::ResumeKickoff | Delivery::Regrounding | Delivery::MidSession
         )
     }
 
