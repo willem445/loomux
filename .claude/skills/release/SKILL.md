@@ -101,6 +101,14 @@ order.
 - npm auth is **trusted publishing (OIDC)** — no `NPM_TOKEN` secret exists; if
   publish fails with an *auth* error, the fix is in npm's trusted-publisher
   config for the repo, not in secrets.
+- **Trusted publishing cannot create a package**, and `orrerix` does not exist on the
+  registry yet (`loomux-desktop` was fully unpublished, so nothing is installable under
+  either name). The first publish is a human `npm publish` by hand, done *after* the
+  next stable bump PR merges so the hand-published version IS that release's version —
+  `publish-npm`'s already-published skip then makes that release's automatic publish a
+  deliberate no-op, and the release after it is the first real OIDC publish. Until that
+  runbook lands, expect `publish-npm` to fail on a stable tag. Steps, ordering and the
+  quoted npm prerequisites: `doc/design/rebrand-external.md` (#1153, #1297).
 - The publish step installs a **pinned npm version** (see the comment in
   `release.yml`). Do not switch it back to `@latest` casually: npm 12.0.0
   shipped missing its own `sigstore` bundle, and trusted publishing
