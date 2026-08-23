@@ -5,7 +5,7 @@ nav_order: 1
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/willem445/loomux/main/orrerix-logo.png" alt="Orrerix" width="400">
+  <img src="https://raw.githubusercontent.com/willem445/orrerix/main/orrerix-logo.png" alt="Orrerix" width="400">
 </p>
 
 # Orrerix documentation
