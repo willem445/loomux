@@ -799,6 +799,19 @@ function setPending(next: PendingConnect | null, source: Pane | null): void {
   pendingPane?.setPendingConnect(true);
 }
 
+/** Release the armed connect source when its pane is torn down (#1301).
+ *
+ *  `dropStalePending` below already drops a disposed pane — but only when
+ *  something re-reads the pending state, i.e. the next time a human opens a
+ *  pane menu. Arm a connect, close that pane, and open no menu again, and the
+ *  module holds the disposed `Pane` (terminal buffer and all) indefinitely.
+ *  Bounded at one pane, which is still tens of MB of xterm buffer, and the fix
+ *  is a call the pane already makes for `voiceController`. Named for that
+ *  precedent so the two teardown notifications read as one pattern. */
+export function notifyPaneDisposed(pane: Pane): void {
+  if (pendingPane === pane) setPending(null, null);
+}
+
 /** Drop a stale armed source (review finding #286-1) before it can render a
  *  menu label naming a pane that's gone. `channel.ts`'s `dropIfStale` is the
  *  pure decision (unit-tested: alive → unchanged, dead → null); this is just

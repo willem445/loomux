@@ -18,9 +18,11 @@ import {
   ensureOutputRouter,
   attachOutput,
   detachOutput,
+  detachOutputOwner,
+  detachGitWatchOwner,
+  stopGitWatch,
   attachGitWatch,
   setGitWatch,
-  detachGitWatch,
   ptyBackendInfo,
 } from "./pty";
 import { admitRoot } from "./fileapi";
@@ -49,7 +51,7 @@ import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation, attentionDismiss, attentionChanged } from "./attention";
-import { dismissStranded } from "./orchestration";
+import { dismissStranded, notifyPaneDisposed } from "./orchestration";
 import { heldPresentation } from "./heldbadge";
 import { queuePresentation, type QueueDepthReading } from "./queuebadge";
 import { makeRenameCommit } from "./panerename";
@@ -1559,6 +1561,11 @@ export class Pane implements VoiceTargetPane {
         shellKind: opts.shellKind,
       });
       if (this.disposed) {
+        // Retire the id as well as killing it (#1301). The backend may already
+        // have drained bytes for this pty, and without this they sit in the
+        // router's pre-attach buffer for a handler that is never coming —
+        // `dispose` already ran, so nothing else will ever name this id.
+        detachOutput(ptyId);
         killPty(ptyId).catch(() => {});
         return;
       }
@@ -1567,7 +1574,11 @@ export class Pane implements VoiceTargetPane {
       // Reconcile: if the pane was resized while the spawn was in flight,
       // the debounced fit will notice the size drifted and resend once.
       this.applyFit();
-      attachOutput(ptyId, (bytes) => {
+      // `this` is the OWNER, not decoration: the router releases whatever this
+      // pane was attached to before, so a respawn cannot leave the previous
+      // id's closure — which captures this pane, its terminal and its whole
+      // buffer — stranded in a module-level map (#1301, see ptyroute.ts).
+      attachOutput(this, ptyId, (bytes) => {
         // Latched on ARRIVAL, never on flush: this is "did the process ever
         // print anything" (the DOA-revival signature, #281/#280), a fact about
         // the pty, not about when we chose to render it.
@@ -1584,7 +1595,7 @@ export class Pane implements VoiceTargetPane {
       // locally — report changes from a completely unrelated local repo as
       // though they were the remote one's.
       if (!this.isSshPane) {
-        attachGitWatch(ptyId, () => this.onExternalGitChange());
+        attachGitWatch(this, ptyId, () => this.onExternalGitChange());
         if (this.cwdRaw) {
           this.watchedPath = this.cwdRaw;
           setGitWatch(ptyId, this.cwdRaw);
@@ -1696,10 +1707,13 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
-  /** Throw held output away and return the pane to quiet (#720). The ONLY
-   *  caller is `respawnFresh`, where `term.reset()` is about to erase these
-   *  bytes regardless — see the call site for why dropping beats flushing
-   *  there. Everywhere else, held output is flushed. */
+  /** Throw held output away and return the pane to quiet (#720). Dropping,
+   *  not flushing, and both callers have the same reason: nothing downstream
+   *  will ever render these bytes, so queueing them to `term.write` would only
+   *  schedule a parse against a terminal that is about to be wiped or is
+   *  already gone. `respawnFresh` is about to `term.reset()` (see the call
+   *  site); `dispose` is about to `term.dispose()` and drop the pane. Anywhere
+   *  else, held output is flushed. */
   private discardOutput(): void {
     if (this.flushTimer !== undefined) {
       clearTimeout(this.flushTimer);
@@ -1754,6 +1768,17 @@ export class Pane implements VoiceTargetPane {
     // to reconnect a pane that just did.
     this.clearReconnectCard();
     this.exited = false;
+    // Release the OUTGOING pty's router attachments before the id is forgotten
+    // (#1301). Two things go wrong without it. The router keeps a handler
+    // closure over this pane under an id `dispose` will never name again — a
+    // whole retained pane, terminal buffer included — and the backend keeps
+    // polling the old id's repo, because `git_unwatch` is only ever sent for
+    // an id someone still remembers. `attach` would release the old id on its
+    // own when the new pty arrives, but that is one `await` later and only if
+    // the spawn succeeds: a failed respawn must not be the case that leaks.
+    detachOutputOwner(this);
+    detachGitWatchOwner(this);
+    if (this.ptyId !== null) stopGitWatch(this.ptyId);
     this.ptyId = null;
     if (opts.name) this.setName(opts.name);
     this.launchedCommand = !!opts.command?.trim();
@@ -5031,6 +5056,9 @@ export class Pane implements VoiceTargetPane {
     clearTimeout(this.webglRetryTimer); // #720 WebGL re-acquire
     // Abort any in-flight voice capture aimed at this pane (releases the mic).
     voiceController.notifyPaneDisposed(this);
+    // Same shape, different module-level holder: an armed cross-workspace
+    // connect keeps a reference to its source pane (#1301).
+    notifyPaneDisposed(this);
     this.voiceIndicator?.remove();
     this.clearAttachments(); // revoke any lingering thumbnail object URLs
     this.gitView?.dispose();
@@ -5050,9 +5078,24 @@ export class Pane implements VoiceTargetPane {
     this.editorPaneView?.dispose();
     this.gitPaneView?.dispose();
     this.workflowPaneView?.dispose();
+    // Drop anything the #720 throttle was holding. Cheap on its own, and it
+    // matters exactly when something else has gone wrong: a pane that is still
+    // reachable from somewhere should at least not be dragging its output
+    // backlog along with it (#1301).
+    this.discardOutput();
+    // By OWNER, not by `this.ptyId` (#1301). A pane that respawned in place has
+    // already forgotten the ids it used to hold, so an id-aimed detach here can
+    // only ever release the last one — which is how a module-level map came to
+    // hold panes the grid had closed. The owner-keyed release needs no such
+    // memory, and `respawnFresh` keeps the set to one by releasing as it goes.
+    detachOutputOwner(this);
+    detachGitWatchOwner(this);
+    // The backend poll is stopped by ID as well, and that is not redundant: an
+    // ssh pane never attaches a git-watch HANDLER (#887 S3) but can still have
+    // pointed the backend at a repo from an OSC-7 cwd report, so an owner-only
+    // teardown would narrow what `dispose` used to unwatch.
     if (this.ptyId !== null) {
-      detachOutput(this.ptyId);
-      detachGitWatch(this.ptyId);
+      stopGitWatch(this.ptyId);
       if (killBackend) killPty(this.ptyId).catch(() => {});
     }
     this.term.dispose();

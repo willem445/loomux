@@ -213,6 +213,47 @@ scan pins the shape.
   stateless argument that carries `gh.rs` (#724) does not carry `git.rs`
   (#726/#744, residual #754). *Enforced: review.*
 
+- **INV-8 — What a long session RETAINS is bounded, and released by a rule that
+  needs no memory.** INV-3 and INV-4 bound how *often* the webview pays; neither
+  says anything about how long what a handler captured stays reachable, and
+  #1301 is the gap between them — a many-hour session hit a webview OOM with
+  every stream correctly rate-bounded. Two halves.
+  **(a) Per-entity state declares where it is released.** A module-level
+  collection keyed by a pane, pty id, agent id, group id or task id names its
+  release site in its own doc comment; one keyed by an *object* is a `WeakMap`
+  unless it is iterated (`src/main.ts` `sshReconnectLatches`,
+  `resumeFallbacks`). A buffer whose producer is external is capped in the units
+  it grows in — bytes and entries, each with the number stated, because a held
+  chunk costs a wrapper whose size is independent of its payload and a
+  bytes-only cap is therefore one a real input shape walks around
+  (`src/ptyroute.ts` `MAX_PREATTACH_BYTES`, `MAX_PREATTACH_ENTRIES`,
+  `MAX_PREATTACH_IDS`; `src/panethrottle.ts` `MAX_PENDING_BYTES`).
+  **A cap that can discard a whole entity's buffer records what is lost HERE,
+  beside the guarantee, not only at the constant that takes it.**
+  `MAX_PREATTACH_IDS` evicts the oldest waiting id outright, so the
+  lossless-startup guarantee that buffer exists for holds only while fewer than
+  `MAX_PREATTACH_IDS` ids are concurrently unattached; past that, a pane that
+  later attaches can lose its process's first bytes. Reaching it means 64 spawns
+  in a row went unattached, which is a frontend already failing the way #1301
+  failed — the point of recording it is that "oldest first" is a choice about
+  which entity loses, not a reason none does.
+  **(b) Teardown does not depend on the tearing-down party remembering a key.**
+  This is the half that actually failed. `Pane.dispose` released the per-pty
+  routers by `this.ptyId`, which is correct exactly until the pane respawns in
+  place and forgets the id it used to hold — after which a module-level map held
+  that pane, its terminal and its whole scrollback permanently, with nothing
+  left in the app able to name it. The fix is not a remembered extra detach: it
+  is keying on the OWNER, so binding to a new id releases the old one and there
+  is nowhere for a stale entry to be left (`src/ptyroute.ts`
+  `PtyRouter::attach`, `PtyRouter::releaseOwner`).
+  *Enforced: the type system for (b) on this router — `attachOutput` takes an
+  owner, so no call site can omit it — plus `test/ptyroute.test.ts` and
+  `test/transport.test.ts`'s respawn case for the policy; review for (a).*
+  A source scan is deliberately NOT claimed: deciding which of `src/`'s maps are
+  entity-keyed is a reading job, not a regex, the same residue E2's own doc
+  states for self-rescheduling timers. The standing debt this invariant names
+  but does not close is in §5.
+
 ## 4. Argued exceptions
 
 These are deliberate and stay. Each is argued **in code** at the cite; an E1/E2
@@ -248,6 +289,10 @@ Owning issues:
 | area | issue |
 |---|---|
 | 16 sync git-shelling commands | #726 |
+| xterm scrollback: 13-25 MB per pane, never trimmed for an exited or docked one (INV-8a) | #1315 |
+| six module-level collections with no prune (INV-8a) | #1316 |
+| whole-of-session payloads on a poll: lifetime roster, uncapped board, triple-held audit log (INV-8a) | #1317 |
+| event-driven embed views refetch and re-render off-screen (INV-4's rule, stated for polls only) | #1318 |
 | `tasks_lock` architecture — file IO out from under the board family's lock | #747 |
 | `mq_state_lock` / single gh-poll-thread decoupling (fleet latency; §4 X4) | #748 |
 | `orch_session_roles` unbounded fan-out | #749 |
