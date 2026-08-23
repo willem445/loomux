@@ -953,13 +953,14 @@ export interface HasTitle {
   title?: string;
 }
 
-/** The board's active view filter (#1270). Four families, evaluated as AND
+/** The board's active view filter (#1270). Five families, evaluated as AND
  *  across families and OR within one.
  *
  *  Deliberately a flat bag of families rather than a predicate: it is the thing
  *  that gets PERSISTED (`src/boardprefs.ts`), so it has to survive a JSON round
- *  trip, and a future family — #1272's sprint, #1273's typed links — is then a
- *  new key here plus one clause in `matchesFilter`, not a migration. */
+ *  trip, and a future family — #1273's typed links — is then a new key here
+ *  plus one clause in `matchesFilter`, not a migration. #1272's `sprint` was
+ *  the first to arrive that way and cost exactly that. */
 export interface BoardFilter {
   /** Members of `kindFilterChoices` — `KINDS` entries plus `UNLABELLED_KIND`,
    *  plus any out-of-vocabulary kind the board actually carries. */

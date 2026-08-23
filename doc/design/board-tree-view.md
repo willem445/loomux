@@ -3,7 +3,8 @@
 The board that prompted #1152 carried 400+ rows. Sinking and the cleared archive
 answered *"most of this is finished"*; they do not answer *"where is the auth
 thing"* or *"show me the blocked stories"*. #1270 adds the tree-view controls
-that do — collapse-all/expand-all, four filter families, and a search box — and
+that do — collapse-all/expand-all, four filter families (a fifth, `sprint`,
+arrived with #1272's board UI), and a search box — and
 makes the collapse state and the filters **durable**, which is the part with a
 design decision in it.
 
@@ -168,11 +169,19 @@ clause in `matchesFilter`; no version bump, no migration.
 held as designed**: they added `sprint` and `links` to the board MODEL (on the
 task, which is where assignment belongs — the same line #1152 drew) and neither
 opened a second per-group view-state store, which is the collision this change's
-plan comment flagged in advance. Neither ships a filter, so the extension point
-is still unspent. That is only true in *both* directions if a build
-that does not know a key hands it back unchanged, so `decodeBoardPrefs` keeps
-unknown families verbatim and `encodeBoardPrefs` writes them back **before** the
-validated ones, where they cannot shadow a family this build owns.
+plan comment flagged in advance. That is only true in *both* directions if a
+build that does not know a key hands it back unchanged, so `decodeBoardPrefs`
+keeps unknown families verbatim and `encodeBoardPrefs` writes them back
+**before** the validated ones, where they cannot shadow a family this build owns.
+
+**The extension point has since been spent once, and it cost what it claimed.**
+#1272's board UI added `sprint` as the fifth family: one key on `BoardFilter`,
+one clause in `matchesFilter`, the four persistence sites the `EncodedGroups`
+type forces together, and nothing else — no version bump, no migration, no
+second store. The one thing that did NOT follow the compiler was the tests that
+had used `sprint` as their *specimen* for an unknown family; shipping the family
+moved that specimen out of the class it was witnessing, and it was relocated
+onto a name no `BoardFilter` key can take (`test/boardprefs.test.ts`).
 
 The corollary for whoever builds sprint grouping: **sprint *assignment* is board
 data and belongs on the task, like `status`; sprint *view state* belongs in this
