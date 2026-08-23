@@ -1248,3 +1248,45 @@ test("no rule below :root hand-writes a font stack", () => {
       `var(--font-ui):\n${offenders.join("\n")}`
   );
 });
+
+test("no module outside theme.ts spells a font stack of its own", () => {
+  // The CSS scan above is structurally blind to the frontend's other half, and that is
+  // exactly where the widest drift was: `editorwidget.ts` carried a NINTH chain — JetBrains
+  // Mono, Fira Code, SF Mono and Menlo ahead of the faces FONT.mono names — so the file
+  // editor rendered in a different face from every other mono surface for anyone who had one
+  // of them installed. Consolidating the stylesheet while leaving that literal in place
+  // would have left the guard green over the drift it was written for.
+  //
+  // Default-deny on a SHAPE, not on a binding's name (CLAUDE.md, source-scanning guards): a
+  // generic font keyword is the one thing a CSS font stack cannot be written without, so a
+  // rename cannot step over this. theme.ts is the single permitted site because it is where
+  // the two roles are DEFINED.
+  //
+  // Known blind spots, stated rather than implied: a chain assembled by concatenation, one
+  // that names only specific families with no generic fallback (invalid CSS in practice, and
+  // xterm would reject it too), and any font set from a .css file other than styles.css
+  // (there is none). None of these exists today.
+  const GENERIC = /\b(monospace|sans-serif|serif|system-ui|ui-monospace|cursive|fantasy)\b/;
+  const ALLOWED = new Map([
+    ["theme.ts", "defines FONT.mono and FONT.ui — the two type roles every other module consumes"],
+  ]);
+  const dir = new URL("../src/", import.meta.url);
+  const offenders: string[] = [];
+  for (const file of readdirSync(dir).filter((f) => f.endsWith(".ts")).sort()) {
+    if (ALLOWED.has(file)) continue;
+    const src = readFileSync(new URL(file, dir), "utf8");
+    src.split("\n").forEach((line, i) => {
+      const code = line.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, "");
+      // a string literal in real code that names a generic font family
+      for (const m of code.matchAll(/(["'])((?:(?!\1).)*)\1/g)) {
+        if (GENERIC.test(m[2])) offenders.push(`  src/${file}:${i + 1}  ${m[0].slice(0, 90)}`);
+      }
+    });
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `${offenders.length} module(s) name a font face directly instead of importing FONT from ` +
+      `theme.ts:\n${offenders.join("\n")}\n(allowed: ${[...ALLOWED.keys()].join(", ")})`
+  );
+});
