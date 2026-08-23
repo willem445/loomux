@@ -1237,10 +1237,10 @@ mod tests {
        "number":120,"state":"OPEN",
        "title":"Add a task board \"delete all done\" button",
        "updatedAt":"2026-07-07T04:09:31Z",
-       "url":"https://github.com/willem445/loomux/issues/120"},
+       "url":"https://github.com/willem445/orrerix/issues/120"},
       {"labels":[],"number":117,"state":"OPEN","title":"A spawned agent takes focus",
        "updatedAt":"2026-07-07T04:09:25Z",
-       "url":"https://github.com/willem445/loomux/issues/117"}
+       "url":"https://github.com/willem445/orrerix/issues/117"}
     ]"#;
 
     #[test]
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(issues[0].labels, vec!["agent-managed", "agent-ready"]);
         assert_eq!(issues[0].state, "OPEN");
         assert_eq!(issues[0].updated_at, "2026-07-07T04:09:31Z");
-        assert_eq!(issues[0].url, "https://github.com/willem445/loomux/issues/120");
+        assert_eq!(issues[0].url, "https://github.com/willem445/orrerix/issues/120");
         // An issue with no labels yields an empty vec, not a parse error.
         assert!(issues[1].labels.is_empty());
     }
@@ -1271,13 +1271,13 @@ mod tests {
     #[test]
     fn parse_issue_ref_extracts_number_and_url() {
         // gh prints the URL, sometimes after a tip line.
-        let stdout = "\nhttps://github.com/willem445/loomux/issues/456\n";
+        let stdout = "\nhttps://github.com/willem445/orrerix/issues/456\n";
         let r = parse_issue_ref(stdout).unwrap();
         assert_eq!(
             r,
             GhIssueRef {
                 number: 456,
-                url: "https://github.com/willem445/loomux/issues/456".to_string(),
+                url: "https://github.com/willem445/orrerix/issues/456".to_string(),
             }
         );
     }
@@ -1343,11 +1343,11 @@ mod tests {
       {"number":130,"title":"Umbrella PR","state":"OPEN",
        "labels":[{"name":"agent-managed"}],
        "updatedAt":"2026-07-07T04:09:31Z",
-       "url":"https://github.com/willem445/loomux/pull/130",
+       "url":"https://github.com/willem445/orrerix/pull/130",
        "headRefName":"orch/82-gh-issues"},
       {"number":128,"title":"Backend gh commands","state":"OPEN","labels":[],
        "updatedAt":"2026-07-07T03:00:00Z",
-       "url":"https://github.com/willem445/loomux/pull/128",
+       "url":"https://github.com/willem445/orrerix/pull/128",
        "headRefName":"feat/82-backend"}
     ]"#;
 
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(prs[0].title, "Umbrella PR");
         assert_eq!(prs[0].labels, vec!["agent-managed"]);
         assert_eq!(prs[0].head_ref, "orch/82-gh-issues");
-        assert_eq!(prs[0].url, "https://github.com/willem445/loomux/pull/130");
+        assert_eq!(prs[0].url, "https://github.com/willem445/orrerix/pull/130");
         assert!(prs[1].labels.is_empty());
         assert_eq!(prs[1].head_ref, "feat/82-backend");
     }
@@ -1878,11 +1878,11 @@ mod tests {
       {"number":608,"title":"Workflow visualization pane","state":"OPEN",
        "createdAt":"2026-07-31T12:00:00Z","closedAt":null,
        "updatedAt":"2026-08-01T17:00:00Z",
-       "url":"https://github.com/willem445/loomux/issues/608"},
+       "url":"https://github.com/willem445/orrerix/issues/608"},
       {"number":590,"title":"A pane cannot take a notice","state":"CLOSED",
        "createdAt":"2026-07-30T09:00:00Z","closedAt":"2026-08-01T16:30:00Z",
        "updatedAt":"2026-08-01T16:30:00Z",
-       "url":"https://github.com/willem445/loomux/issues/590"}
+       "url":"https://github.com/willem445/orrerix/issues/590"}
     ]"#;
 
     #[test]
@@ -1907,15 +1907,15 @@ mod tests {
       {"number":643,"title":"Slice A","state":"OPEN",
        "createdAt":"2026-08-01T17:00:00Z","closedAt":null,"mergedAt":null,
        "updatedAt":"2026-08-01T17:51:30Z",
-       "url":"https://github.com/willem445/loomux/pull/643","headRefName":"feat/608-viz-slice-a"},
+       "url":"https://github.com/willem445/orrerix/pull/643","headRefName":"feat/608-viz-slice-a"},
       {"number":638,"title":"multi-row mask","state":"MERGED",
        "createdAt":"2026-08-01T15:00:00Z","closedAt":"2026-08-01T17:31:40Z",
        "mergedAt":"2026-08-01T17:31:40Z","updatedAt":"2026-08-01T17:31:40Z",
-       "url":"https://github.com/willem445/loomux/pull/638","headRefName":"harden/632"},
+       "url":"https://github.com/willem445/orrerix/pull/638","headRefName":"harden/632"},
       {"number":639,"title":"abandoned attempt","state":"CLOSED",
        "createdAt":"2026-08-01T14:00:00Z","closedAt":"2026-08-01T17:00:55Z",
        "mergedAt":null,"updatedAt":"2026-08-01T17:01:04Z",
-       "url":"https://github.com/willem445/loomux/pull/639","headRefName":"spike/639"}
+       "url":"https://github.com/willem445/orrerix/pull/639","headRefName":"spike/639"}
     ]"#;
 
     #[test]

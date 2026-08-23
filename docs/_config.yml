@@ -13,9 +13,9 @@ description: >-
   splits, native agent-session restore, and a built-in orchestrator/worker
   workflow.
 
-# Project-pages hosting: https://willem445.github.io/loomux/
+# Project-pages hosting: https://willem445.github.io/orrerix/
 url: https://willem445.github.io
-baseurl: /loomux
+baseurl: /orrerix
 
 # Theme is fetched at build time by the github-pages gem's jekyll-remote-theme
 # plugin (bundled into actions/jekyll-build-pages). Pinned to a release tag so a
@@ -30,12 +30,12 @@ color_scheme: dark
 
 aux_links:
   "Orrerix on GitHub":
-    - "https://github.com/willem445/loomux"
+    - "https://github.com/willem445/orrerix"
 aux_links_new_tab: true
 
 nav_external_links:
   - title: Download the latest release
-    url: https://github.com/willem445/loomux/releases/latest
+    url: https://github.com/willem445/orrerix/releases/latest
 
 footer_content: >-
   Orrerix is MIT-licensed. This site documents what ships on

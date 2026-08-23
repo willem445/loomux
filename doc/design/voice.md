@@ -4,7 +4,7 @@ Local, open-source speech-to-text into any focused target. Push-to-talk mic
 capture → on-device [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
 transcription → text dropped at the current focus point, never auto-submitted.
 User-facing usage lives in the user docs
-([Voice prompts](https://willem445.github.io/loomux/features/voice-prompts), source:
+([Voice prompts](https://willem445.github.io/orrerix/features/voice-prompts), source:
 [`docs/features/voice-prompts.md`](../../docs/features/voice-prompts.md));
 this note is the architecture and the decisions behind it.
 

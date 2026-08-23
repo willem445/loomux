@@ -14,7 +14,7 @@ fn main() {
     // `is_local_url` alone exempts every app command from ACL for every
     // window regardless of capability grants — capability-based per-window
     // command denial does nothing (see the #360 Phase-0.5 spike findings,
-    // https://github.com/willem445/loomux/issues/360#issuecomment-4992837152,
+    // https://github.com/willem445/orrerix/issues/360#issuecomment-4992837152,
     // and doc/design/acl-manifest.md).
     //
     // This flip is all-or-nothing: from this line on, every command in

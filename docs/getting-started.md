@@ -66,7 +66,7 @@ from a downgrade, so it does neither. Installing your preferred build once from
 the releases page clears it.
 
 To move from stable onto the beta train (or back), install that build yourself
-from [the releases page](https://github.com/willem445/loomux/releases) — the
+from [the releases page](https://github.com/willem445/orrerix/releases) — the
 launcher will not switch channels for you. On Linux the app is a cached
 AppImage, so `orrerix update` refreshes the cache; quit the running AppImage
 first, since it cannot be overwritten while it is running.
@@ -102,19 +102,19 @@ What it does **not** do is replace a Loomux install in place — see
 ### Windows (one-liner)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/loomux/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/orrerix/main/install.ps1 | iex"
 ```
 
 ### macOS / Linux (one-liner)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/willem445/loomux/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/willem445/orrerix/main/install.sh | sh
 ```
 
 ### Release assets (manual)
 
 Prefer to grab an installer yourself? Every build is published to
-[the GitHub releases page](https://github.com/willem445/loomux/releases) —
+[the GitHub releases page](https://github.com/willem445/orrerix/releases) —
 beta/RC builds included, which the `latest` link does not show:
 
 | Platform | Asset |

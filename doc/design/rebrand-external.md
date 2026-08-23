@@ -181,8 +181,8 @@ is free:
 
 | Class | Sites | Does the rename break it? |
 | --- | --- | --- |
-| `github.com/willem445/loomux/…` links, outside `npm/package.json` | 58 | **No.** Redirected. May lag. |
-| `willem445.github.io/loomux/…`, plus `docs/_config.yml`'s `baseurl: /loomux` | 16 + 1 | **Yes, immediately.** Project site URLs are the documented exception, so every one 404s the moment the repo is renamed. |
+| `github.com/willem445/orrerix/…` links, outside `npm/package.json` | 58 | **No.** Redirected. May lag. |
+| `willem445.github.io/orrerix/…`, plus `docs/_config.yml`'s `baseurl: /orrerix` | 16 + 1 | **Yes, immediately.** Project site URLs are the documented exception, so every one 404s the moment the repo is renamed. |
 | `npm/package.json`'s `repository.url` | 1 | **Yes, at publish time.** The only publish-blocker here — npm matches it exactly, and `npm trust` falls back to it. See step 3. |
 | `npm/package.json`'s `homepage` and `bugs.url` | 2 | **No** — metadata, absorbed by the same redirect as row 1. They move anyway, because the guard sweeps them with everything else. |
 

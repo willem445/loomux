@@ -29,11 +29,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/willem445/loomux.git"
+    "url": "git+https://github.com/willem445/orrerix.git"
   },
-  "homepage": "https://github.com/willem445/loomux#readme",
+  "homepage": "https://github.com/willem445/orrerix#readme",
   "bugs": {
-    "url": "https://github.com/willem445/loomux/issues"
+    "url": "https://github.com/willem445/orrerix/issues"
   },
   "author": "willem445"
 }

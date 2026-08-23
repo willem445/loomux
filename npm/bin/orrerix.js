@@ -42,7 +42,7 @@ const { spawn, spawnSync } = require("child_process");
 // REST API and on release-asset downloads alike, so the launcher keeps working
 // on either side of that button. When the rename happens this line is the
 // whole edit.
-const REPO = "willem445/loomux";
+const REPO = "willem445/orrerix";
 const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
 
 // ---------- brand identity (#1153 phase 5) ----------

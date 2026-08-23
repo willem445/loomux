@@ -1,7 +1,7 @@
 # Design: progress timeline (issue #608)
 
 Status: **landed** — built up slice by slice against the accepted plan on
-[#608](https://github.com/willem445/loomux/issues/608#issuecomment-5151585803):
+[#608](https://github.com/willem445/orrerix/issues/608#issuecomment-5151585803):
 
 - **Slice A:** the `gh_activity` backend command and its coverage contract.
 - **Slice B:** the pure event model + layout math (`timelinemodel.ts`,

@@ -16,7 +16,7 @@ check in the loop at all.
 
 This was surfaced by the #360 pane-plugins Phase-0.5 isolation spike
 (`spike/360-sandbox-proof`, findings on
-[#360](https://github.com/willem445/loomux/issues/360#issuecomment-4992837152)):
+[#360](https://github.com/willem445/orrerix/issues/360#issuecomment-4992837152)):
 a plugin webview bound to a capability with `"permissions": []` invoked
 `git_push` exactly as freely as `main`, for this reason. It is the same root
 cause — no ACL layer actually gating loomux's commands — already logged as

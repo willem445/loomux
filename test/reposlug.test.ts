@@ -12,7 +12,7 @@
 //   - **GitHub Pages does not redirect.** GitHub's own rename docs: "All
 //     existing information, with the exception of project site URLs, is
 //     automatically redirected to the new name." So every
-//     `willem445.github.io/loomux/...` link and `docs/_config.yml`'s `baseurl`
+//     `willem445.github.io/orrerix/...` link and `docs/_config.yml`'s `baseurl`
 //     404 the instant the repo is renamed. Nothing errors at rename time; the
 //     published docs site just breaks.
 //   - **npm checks `repository.url` for an exact match.** From npm's
@@ -73,7 +73,7 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** `git+https://github.com/willem445/loomux.git` -> `willem445` / `loomux`. */
+/** `git+https://github.com/willem445/orrerix.git` -> `willem445` / `orrerix`. */
 function sourceOfTruth(): { owner: string; slug: string } {
   const pkg = JSON.parse(readFileSync(join(ROOT, "npm/package.json"), "utf8"));
   const url: string = pkg.repository?.url ?? "";

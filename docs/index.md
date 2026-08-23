@@ -11,7 +11,7 @@ A dead-simple terminal multiplexer for AI agent management — without the bloat
 {: .fs-6 .fw-300 }
 
 [Get started](getting-started.html){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
-[Download the latest release](https://github.com/willem445/loomux/releases/latest){: .btn .fs-5 .mb-4 .mb-md-0 }
+[Download the latest release](https://github.com/willem445/orrerix/releases/latest){: .btn .fs-5 .mb-4 .mb-md-0 }
 
 ---
 
@@ -29,7 +29,7 @@ straight into a pane, and — the headline feature — a built-in
 **orchestrator/worker** workflow for running a small fleet of AI agents, each
 in its own visible pane, that you gatekeep only at review and merge.
 
-![An orrerix window with several agent panes](https://raw.githubusercontent.com/willem445/loomux/main/sample.jpg)
+![An orrerix window with several agent panes](https://raw.githubusercontent.com/willem445/orrerix/main/sample.jpg)
 
 ## What's here
 
@@ -55,13 +55,13 @@ in its own visible pane, that you gatekeep only at review and merge.
 This site is the **user** guide. If you want to build on orrerix, the developer
 docs stay in the repository:
 
-- [`README.md`](https://github.com/willem445/loomux/blob/main/README.md) — the
+- [`README.md`](https://github.com/willem445/orrerix/blob/main/README.md) — the
   pitch, the stack, and the build/run commands.
-- [`doc/design/architecture.md`](https://github.com/willem445/loomux/blob/main/doc/design/architecture.md)
+- [`doc/design/architecture.md`](https://github.com/willem445/orrerix/blob/main/doc/design/architecture.md)
   — the source tree, module by module, and the extension seams.
-- [`CLAUDE.md`](https://github.com/willem445/loomux/blob/main/CLAUDE.md) — the
+- [`CLAUDE.md`](https://github.com/willem445/orrerix/blob/main/CLAUDE.md) — the
   hard constraints and code conventions for working in this codebase.
-- [`doc/design/`](https://github.com/willem445/loomux/tree/main/doc/design) —
+- [`doc/design/`](https://github.com/willem445/orrerix/tree/main/doc/design) —
   per-feature design notes (why things are built the way they are).
 
 > This documentation describes only what ships on `main` today. Where a feature

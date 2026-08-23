@@ -3748,7 +3748,7 @@ ever" invariant is unaffected).
 
 **Filed, not implemented this round:** the testbed agent observed that an orchestration-RESTORE
 kickoff doesn't embed the directive ledger the way a `/compact` reinjection does — filed as
-[#411](https://github.com/willem445/loomux/issues/411), a known scope boundary (a different code
+[#411](https://github.com/willem445/orrerix/issues/411), a known scope boundary (a different code
 path, `spawn_agent_ex`'s resume branch, not `compact_nudge_tick`).
 
 ### #416/#417: a durable system-prompt contract, and compact hooks as a trusted evidence source

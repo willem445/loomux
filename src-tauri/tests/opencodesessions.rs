@@ -73,9 +73,11 @@ fn insert(conn: &Connection, r: &Row) {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             r.id,
-            // sha1("git-remote:github.com/willem445/loomux") — the real project
-            // id for this repo. Every loomux worktree shares it, which is the
-            // whole reason identification cannot key on the project.
+            // sha1("git-remote:" + this repo's pre-#1153-rename GitHub remote)
+            // — the real project id for this repo (see tests/opencodeusage.rs
+            // for why it is frozen rather than recomputed for the new slug).
+            // Every loomux worktree shares it, which is the whole reason
+            // identification cannot key on the project.
             "f9dd9fcdf18a51fa9de041f787210d1ce5e0d1e7",
             r.parent,
             "loomux",

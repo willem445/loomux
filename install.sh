@@ -1,13 +1,12 @@
 #!/bin/sh
 # Orrerix installer for macOS and Linux.
-#   curl -fsSL https://raw.githubusercontent.com/willem445/loomux/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/willem445/orrerix/main/install.sh | sh
 #
-# The repo slug stays as-is until the GitHub rename, which is a separate
-# human step; GitHub redirects both raw.githubusercontent.com and the REST
-# API afterwards, so this script keeps working on either side of it.
+# GitHub redirects both raw.githubusercontent.com and the REST API from the
+# pre-rename slug, so this script keeps working on either side of it.
 set -eu
 
-REPO="willem445/loomux"
+REPO="willem445/orrerix"
 API="https://api.github.com/repos/$REPO/releases/latest"
 
 say() { printf '\033[1;34morrerix\033[0m %s\n' "$1"; }

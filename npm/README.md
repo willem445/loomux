@@ -1,6 +1,6 @@
 # orrerix
 
-Installer/launcher for [**Orrerix**](https://github.com/willem445/loomux) — a
+Installer/launcher for [**Orrerix**](https://github.com/willem445/orrerix) — a
 sleek terminal multiplexer for AI agent management.
 
 ```sh
@@ -9,7 +9,7 @@ npm install -g orrerix # then run `orrerix` anytime
 ```
 
 Orrerix is a native (Tauri) desktop app, so this package doesn't contain the
-app itself — it fetches the matching [GitHub release](https://github.com/willem445/loomux/releases)
+app itself — it fetches the matching [GitHub release](https://github.com/willem445/orrerix/releases)
 asset for your platform (Windows installer, macOS `.dmg`, or Linux
 `AppImage`), installs/caches it, and launches it.
 
@@ -30,7 +30,7 @@ kills a running app, so the update decision belongs to you: run
 — a stable install gets the newest stable, a beta/RC install gets the newest
 build of either kind — and it refuses to install an older build over a newer
 one. To switch channels, install that build yourself from the
-[releases page](https://github.com/willem445/loomux/releases). If it cannot read
+[releases page](https://github.com/willem445/orrerix/releases). If it cannot read
 the version you have installed, it stops and says so rather than guessing.
 
 On Linux the app is a cached AppImage: plain `orrerix` launches the newest

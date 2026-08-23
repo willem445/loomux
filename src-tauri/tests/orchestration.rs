@@ -12377,10 +12377,10 @@ fn task_board_tracks_sessions_for_followups() {
 fn remote_web_base_normalizes_every_git_url_shape() {
     // scp-like, https (with/without .git), ssh with a port, trailing slash.
     let cases = [
-        ("git@github.com:willem445/loomux.git", "https://github.com/willem445/loomux"),
-        ("https://github.com/willem445/loomux.git", "https://github.com/willem445/loomux"),
-        ("https://github.com/willem445/loomux", "https://github.com/willem445/loomux"),
-        ("ssh://git@github.com:22/willem445/loomux.git", "https://github.com/willem445/loomux"),
+        ("git@github.com:willem445/orrerix.git", "https://github.com/willem445/orrerix"),
+        ("https://github.com/willem445/orrerix.git", "https://github.com/willem445/orrerix"),
+        ("https://github.com/willem445/orrerix", "https://github.com/willem445/orrerix"),
+        ("ssh://git@github.com:22/willem445/orrerix.git", "https://github.com/willem445/orrerix"),
         ("https://token@github.com/o/r/", "https://github.com/o/r"),
         // Self-hosted host survives (GitHub path scheme is assumed downstream).
         ("git@git.example.com:team/app.git", "https://git.example.com/team/app"),

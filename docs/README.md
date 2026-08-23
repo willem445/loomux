@@ -1,7 +1,7 @@
 # Orrerix documentation site
 
 The user-facing documentation for orrerix, published to **GitHub Pages** at
-<https://willem445.github.io/loomux/>. This folder is the whole site: Markdown
+<https://willem445.github.io/orrerix/>. This folder is the whole site: Markdown
 pages plus one `_config.yml`.
 
 > This `README.md` is a **contributor** note — it is excluded from the published
@@ -69,7 +69,7 @@ automatically.
   values sane so the sidebar orders correctly.
 - Cross-page links use **relative paths with `.html`** (e.g.
   `[git view](features/git-view.html)`) — that's what every existing page uses
-  and what Jekyll + `baseurl` resolve on the published `/loomux/` site
+  and what Jekyll + `baseurl` resolve on the published `/orrerix/` site
   (extensionless paths do not route on GitHub Pages' static hosting).
 - **Honesty rule:** document only what ships on `main`. Verify every flag,
   shortcut, and behavior against the code/README before writing it. No invented
