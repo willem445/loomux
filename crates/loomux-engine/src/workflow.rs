@@ -3879,7 +3879,8 @@ pub fn route_reviewers(gate: &Gate, changed: Option<&[String]>) -> Option<Routin
     if gate.routing.is_empty() {
         return Some(RoutingDecision { required: gate.reviewers.clone(), fired: Vec::new() });
     }
-    let changed = changed?;
+    // RED EVIDENCE (#1176 scratch B): unknown is treated as safe.
+    let changed = changed.unwrap_or(&[]);
     let mut required = gate.reviewers.clone();
     let mut fired: Vec<FiredRule> = Vec::new();
     for (i, rule) in gate.routing.iter().enumerate() {
