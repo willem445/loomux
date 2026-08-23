@@ -128,7 +128,7 @@ phase 4 and is not keyed on the product name.
 
 | | Why |
 | --- | --- |
-| The GitHub repo slug (`willem445/loomux`) | A human button, coordinated separately, and its new value is not recorded anywhere this branch can read — #1153 calls the repo rename "a human-only action" and never names the target. Changing it speculatively would break things *before* the rename for no gain. Which of the ~73 in-tree occurrences are free to lag and which are not is classified in the runbook below; `test/reposlug.test.ts` is what stops a partial rename from shipping. |
+| The GitHub repo slug (`willem445/loomux`) | A human button, coordinated separately, and its new value is not recorded anywhere this branch can read — #1153 calls the repo rename "a human-only action" and never names the target. Changing it speculatively would break things *before* the rename for no gain. Which of the 78 in-tree occurrences are free to lag and which are not is classified in the runbook below; `test/reposlug.test.ts` is what stops a partial rename from shipping. |
 | npm trusted-publishing config | A human button on npmjs.com, and a security-relevant one. `release.yml` already reads `PKG` out of `package.json` rather than hardcoding it, so the workflow needed no edit for the package rename. It does need the runbook's step 2 to have happened first. |
 | The bundle identifier `dev.loomux.app` | It keys the WebView2 user-data folder and the macOS bundle ID. Moving it orphans every user's webview profile, and no one outside the repo ever sees it. |
 | Cargo crate names (`loomux`, `loomux_lib`, `loomux-engine`, `loomux-server`) | Internal. `symbolicate.yml`, `ci.yml`'s E2E exe path, and the `.pdb` filename all name the cargo axis, and none of them is an external identity. |
@@ -181,9 +181,22 @@ is free:
 
 | Class | Sites | Does the rename break it? |
 | --- | --- | --- |
-| `github.com/willem445/loomux/…` links | 57, in docs and design notes | **No.** Redirected. Sweep at leisure. |
-| `willem445.github.io/loomux/…` links, plus `docs/_config.yml`'s `baseurl: /loomux` | 14 + 1 | **Yes, immediately.** Project site URLs are the documented exception, so every one of these 404s the moment the repo is renamed. They move in the same change. |
-| `npm/package.json`'s `repository.url` (and `homepage`, `bugs`) | 3 | **Yes, at publish time.** See step 3. |
+| `github.com/willem445/loomux/…` links, outside `npm/package.json` | 58 | **No.** Redirected. May lag. |
+| `willem445.github.io/loomux/…`, plus `docs/_config.yml`'s `baseurl: /loomux` | 16 + 1 | **Yes, immediately.** Project site URLs are the documented exception, so every one 404s the moment the repo is renamed. |
+| `npm/package.json`'s `repository.url` | 1 | **Yes, at publish time.** The only publish-blocker here — npm matches it exactly, and `npm trust` falls back to it. See step 3. |
+| `npm/package.json`'s `homepage` and `bugs.url` | 2 | **No** — metadata, absorbed by the same redirect as row 1. They move anyway, because the guard sweeps them with everything else. |
+
+**How those are counted**, so the table is re-derivable rather than asserted:
+occurrences — not files, not distinct URLs — of the literal prefixes
+`github.com/willem445/` and `willem445.github.io/`, in every tracked text file
+`test/reposlug.test.ts` scans. That deliberately includes mentions in comments, in
+doc examples, and in the `#[cfg(test)]` `gh`-output fixtures in `src-tauri/src/gh.rs`
+(13 of them): the guard flags those too, and a fixture standing in for real `gh`
+output stops being a faithful specimen the moment the real output would carry a
+different slug. A count that excludes non-link mentions will come out lower; this one
+does not, because the guard does not. By root: `src-tauri/` 22, `docs/` 20, `doc/` 8,
+`npm/` 6, `README.md` 4, `test/` 1 = 61 `github.com`; `README.md` 10, `doc/` 3,
+`docs/` 2, `test/` 1 = 16 Pages; 1 `baseurl`. **78 sites.**
 
 GitHub's docs carry one further exception — *"GitHub will not redirect calls to an
 action hosted by a renamed repository"* — which does not apply here: no workflow in
@@ -192,6 +205,16 @@ this repo `uses:` an action hosted in it. Checked, not assumed.
 `test/reposlug.test.ts` fails until every one of those sites names the same slug, so a
 half-done rename cannot ship quietly. That test is the reason this list does not have
 to be remembered.
+
+It only earns that sentence because of how it counts. Its first version matched a slug
+lazily and required a following character drawn from a hand-written class — a guess
+about the alphabet of arbitrary prose, and the guess omitted `#`. So
+`…/loomux#readme`, which is `homepage`, matched nothing: that field could be renamed
+on its own and the test stayed green, while the sentence above claimed otherwise. It
+now matches a greedy run of the characters a repo name may *contain* — a fact rather
+than a guess — and asserts its own match count equals a raw count of each literal
+prefix, so a pattern that cannot see one of its own subjects fails as a miscount
+instead of passing as a clean bill of health.
 
 ### 2. Publish `orrerix` to npm once, by hand
 

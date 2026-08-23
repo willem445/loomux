@@ -92,13 +92,42 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
 
   // Three shapes, tracked separately so a pattern that stops matching anything
   // is caught as a vacuous scan rather than passing as "no offenders".
+  //
+  // Each captures a greedy run of the characters a repo name may CONTAIN, and
+  // stops wherever one is not. It used to be a lazy match plus a lookahead
+  // listing the characters that may FOLLOW a slug — and that list was a guess
+  // about the alphabet of arbitrary surrounding prose, which is exactly the
+  // kind of census instrument CLAUDE.md warns cannot see one of its own
+  // subjects. It omitted `#`, so `…/loomux#readme` — npm/package.json's
+  // `homepage`, one of the three publish-blocking fields this test exists for —
+  // matched nothing and could be renamed on its own while this stayed green.
+  //
+  // What a GitHub repo name may contain is a fact; what may follow it is
+  // unbounded. So the alphabet is the fact, and the trailing `.git` (and any
+  // sentence-final period) is stripped afterwards rather than anticipated.
   const patterns: Array<[kind: string, re: RegExp]> = [
-    ["github.com link", new RegExp(`github\\.com/${owner}/([A-Za-z0-9._-]+?)(?=[.\\s/)"'\`,;]|\\.git\\b|$)`, "g")],
+    ["github.com link", new RegExp(`github\\.com/${owner}/([A-Za-z0-9._-]+)`, "g")],
     ["Pages link", new RegExp(`${owner}\\.github\\.io/([A-Za-z0-9._-]+)`, "g")],
     ["Jekyll baseurl", /^\s*baseurl:\s*\/([A-Za-z0-9._-]+)/gm],
   ];
 
-  const seen = new Map<string, number>(); // kind -> count
+  // The literal prefix each URL shape starts with, for the cross-check below:
+  // a regex that cannot see one of its own subjects is not a census, so the
+  // count it produces is checked against a raw count of the container.
+  //
+  // A prefix must be followed by at least one repo-name character to be a site.
+  // A bare `github.com/<owner>/` quoted in prose — which the design note does,
+  // stating this very rule — names no repo and has nothing to rename, so it is
+  // not something the pattern is failing to see.
+  const RAW_PREFIX: Record<string, string> = {
+    "github.com link": `github.com/${owner}/`,
+    "Pages link": `${owner}.github.io/`,
+  };
+  const rawCounter = (prefix: string) =>
+    new RegExp(prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[A-Za-z0-9._-]", "g");
+
+  const seen = new Map<string, number>(); // kind -> matches the pattern made
+  const raw = new Map<string, number>(); // kind -> raw occurrences of its prefix
   const offenders: string[] = [];
   const allowedHit = new Set<string>();
 
@@ -106,12 +135,21 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
     const rel = relative(ROOT, file).replace(/\\/g, "/");
     const src = readFileSync(file, "utf8");
     const lines = src.split(/\r?\n/);
+    for (const [kind, prefix] of Object.entries(RAW_PREFIX)) {
+      raw.set(kind, (raw.get(kind) ?? 0) + (src.match(rawCounter(prefix)) ?? []).length);
+    }
     for (const [kind, re] of patterns) {
       // `baseurl` is a Jekyll config key; only _config.yml declares one.
       if (kind === "Jekyll baseurl" && !rel.endsWith("_config.yml")) continue;
       lines.forEach((line, i) => {
         for (const m of line.matchAll(new RegExp(re.source, re.flags.replace("m", "")))) {
-          const found = m[1].replace(/\.git$/, "");
+          // `…/loomux.git` and `…/loomux.` both name `loomux`; a trailing dot is
+          // punctuation, not part of the name. Dots first, so `…/loomux.git.`
+          // (a sentence ending in a clone URL) resolves too.
+          const found = m[1]
+            .replace(/\.+$/, "")
+            .replace(/\.git$/, "")
+            .replace(/\.+$/, "");
           seen.set(kind, (seen.get(kind) ?? 0) + 1);
           const allow = ALLOW.find(([s]) => s === found);
           if (allow) {
@@ -134,6 +172,21 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
       (seen.get(kind) ?? 0) > 0,
       `the "${kind}" pattern matched nothing at all — the scan is vacuous on the shape ` +
         `it exists to police, so a mismatch there would pass silently`
+    );
+  }
+
+  // The instrument, checked against a raw count of its own container. Every
+  // literal `github.com/<owner>/` in the tree must have produced a match; a
+  // shortfall means the pattern cannot see one of its own subjects, which is
+  // how `homepage` sat unguarded behind a green test. Equality, not a floor —
+  // the two scale together as links are added, so this does not rot.
+  for (const [kind, prefix] of Object.entries(RAW_PREFIX)) {
+    assert.equal(
+      seen.get(kind) ?? 0,
+      raw.get(kind) ?? 0,
+      `the "${kind}" pattern matched ${seen.get(kind) ?? 0} of the ${raw.get(kind) ?? 0} ` +
+        `literal "${prefix}" occurrences in the tree. The ones it cannot see are ` +
+        `unguarded: they can be renamed alone and this test will still pass.`
     );
   }
 
