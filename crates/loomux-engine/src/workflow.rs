@@ -3875,6 +3875,11 @@ impl RoutingDecision {
 ///   — the unknown thing is *which reviewers are required*, so guessing "none of
 ///   the rules fired" is guessing in favour of merging.
 pub fn route_reviewers(gate: &Gate, changed: Option<&[String]>) -> Option<RoutingDecision> {
+    // RED EVIDENCE (#1176 scratch A): routing does nothing at all.
+    if true {
+        let _ = changed;
+        return Some(RoutingDecision { required: gate.reviewers.clone(), fired: Vec::new() });
+    }
     if gate.routing.is_empty() {
         return Some(RoutingDecision { required: gate.reviewers.clone(), fired: Vec::new() });
     }
