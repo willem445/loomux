@@ -2438,13 +2438,21 @@ pub fn git_shim_cmd(real_git: &str, sh_path: Option<&str>) -> String {
     shim_cmd_delegator("git", &real_git.replace('/', "\\"), sh_path)
 }
 
-/// The POSIX `loomux` shim (#815): refuse, always. `loomux` on an agent's PATH is
-/// the npm launcher, and that launcher is an INSTALLER — plain `loomux` installs
-/// the desktop app when none is present and `loomux update` reinstalls it (#845),
-/// and either way the install runs silently. Run from an agent pane, that install
-/// terminates the running `Loomux.exe` to replace it, killing the app and every
-/// agent in it mid-task — including the shell that invoked it, which is why the
-/// evidence is a process that vanishes with no shutdown path and no crash report.
+/// The POSIX launcher shim (#815): refuse, always. `orrerix` on an agent's PATH
+/// is the npm launcher, and that launcher is an INSTALLER — plain `orrerix`
+/// installs the desktop app when none is present and `orrerix update` reinstalls
+/// it (#845), and either way the install runs silently. Run from an agent pane,
+/// that install terminates the running app to replace it, killing every agent in
+/// it mid-task — including the shell that invoked it, which is why the evidence
+/// is a process that vanishes with no shutdown path and no crash report.
+///
+/// One body serves both spellings. #1153 phase 5 renamed the npm package and its
+/// bin to `orrerix`, but a global install of the old `loomux-desktop` survives
+/// that rename on PATH, so `ensure_shims` writes this script under BOTH names —
+/// the script itself resolves nothing and reads no argv, so it does not care
+/// which one invoked it. The function keeps its `loomux_` prefix because that is
+/// the cargo-crate axis (`loomux_lib`, `-p loomux`), which the rebrand
+/// deliberately left alone; see doc/design/rebrand-external.md.
 ///
 /// Unlike the gh/git shims this is not a gate: there is no agent use of the
 /// launcher to authorize (agents reach loomux through its MCP tools), so there is
@@ -2475,14 +2483,14 @@ if [ -n "$ORX_GD" ]; then
   printf '{"ts_ms":%s,"actor":"orrerix-shim","action":"self-launch-blocked","detail":{"agent":"%s"}}\n' \
     "$ts" "$ORX_AID" >> "$ORX_GD/audit.jsonl" 2>/dev/null || true
 fi
-printf '%s\n' "loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher: plain loomux installs the desktop app when it is missing and loomux update reinstalls it, and the silent install kills the running Loomux — terminating this pane and every other agent mid-task. Loomux is reachable from here through its MCP tools only. If the app needs restarting or updating, ask the human (message_orchestrator, or report blocked); never run it yourself." >&2
+printf '%s\n' "orrerix: running the desktop launcher from an agent pane is blocked. It is an installer, not a window switcher: plain orrerix installs the desktop app when it is missing and orrerix update reinstalls it, and the silent install kills the running app — terminating this pane and every other agent mid-task. The pre-rename loomux launcher is blocked by this same shim. Orrerix is reachable from here through its MCP tools only. If the app needs restarting or updating, ask the human (message_orchestrator, or report blocked); never run it yourself." >&2
 exit 1
 "#;
     // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
     TPL.replace("\r\n", "\n")
 }
 
-/// The Windows `loomux.cmd`: the same flat refusal, self-contained. It does NOT
+/// The Windows `.cmd` twin — written as both `orrerix.cmd` and `loomux.cmd`: the
 /// delegate through `sh` the way `gh.cmd`/`git.cmd` do — those delegate because
 /// the gate logic is worth keeping in one place, and they fall through to the real
 /// binary when no `sh` exists. Both reasons invert here: there is no logic to
@@ -2500,7 +2508,7 @@ pub fn loomux_shim_cmd() -> String {
      if defined ORRERIX_GROUP_DIR (\r\n\
      \x20 >>\"%ORRERIX_GROUP_DIR%\\audit.jsonl\" echo {\"ts_ms\":0,\"actor\":\"orrerix-shim-cmd\",\"action\":\"self-launch-blocked\",\"detail\":{}} 2>nul\r\n\
      )\r\n\
-     >&2 echo loomux: running the loomux launcher from an agent pane is blocked. It is an installer, not a window switcher - plain loomux installs the app when it is missing and loomux update reinstalls it, and the silent install kills the running Loomux, terminating this pane and every other agent mid-task. Use the orrerix MCP tools; ask the human to restart or update the app.\r\n\
+     >&2 echo orrerix: running the desktop launcher from an agent pane is blocked. It is an installer, not a window switcher - plain orrerix installs the app when it is missing and orrerix update reinstalls it, and the silent install kills the running app, terminating this pane and every other agent mid-task. The pre-rename loomux launcher is blocked by this same shim. Use the orrerix MCP tools; ask the human to restart or update the app.\r\n\
      exit /b 1\r\n"
         .to_string()
 }
@@ -38910,15 +38918,25 @@ impl OrchRegistry {
         // participate in the return below: whether an agent pane gets a PATH at all
         // stays a gh/git question, and a machine with neither has no shim dir on PATH
         // for this to live on anyway.
-        // NOT the audit actor, and not renameable with the rest of #1153
-        // phase 3: this argument is the FILE NAME the refusal shim is written
-        // under, so it must be the name of the launcher an agent could
-        // actually type. The launcher is still `loomux` (phase 5 owns the npm
-        // package and the installed exe), and a shim written as `orrerix`
-        // blocks nothing while leaving `loomux` runnable — #815's guard
-        // defeated, silently. `tests/pathseg.rs` pins this call site verbatim
-        // as the proof that `program` is a literal here; a bulk sweep took it
-        // once and that guard is what caught it.
+        // NOT the audit actor: this argument is the FILE NAME the refusal shim
+        // is written under, so it must be the name of a launcher an agent could
+        // actually type, and a shim written under any other name blocks nothing
+        // while leaving the real launcher runnable — #815's guard defeated,
+        // silently.
+        //
+        // BOTH names, because after #1153 phase 5 two of them can be on PATH:
+        // `orrerix` is what the launcher package installs now, and `loomux` is
+        // what a global install of the old `loomux-desktop` left behind. npm
+        // does not uninstall the old package for you, and this is a refusal —
+        // covering a name nobody has costs an unused file, while missing one
+        // somebody does have costs the whole group. Ordered current-first so
+        // `tests/rebrand.rs` reads the live spelling out of the first call.
+        //
+        // `tests/pathseg.rs` pins a call site verbatim as the proof that
+        // `program` is a literal here; a bulk sweep took this argument once and
+        // that guard is what caught it. Two literal calls, not a loop over a
+        // slice, so that property stays true by inspection.
+        self.write_refusal_shim(&dir, "orrerix", loomux_shim_sh(), loomux_shim_cmd());
         self.write_refusal_shim(&dir, "loomux", loomux_shim_sh(), loomux_shim_cmd());
         (gh || git).then_some(dir)
     }

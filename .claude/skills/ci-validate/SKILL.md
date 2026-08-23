@@ -117,8 +117,8 @@ what `>/dev/null` is for). So:
 ### rustfmt parses the *Rust* — not the shell or jq inside it
 
 `src-tauri/src/orchestration/mod.rs` holds **three** generated shell scripts, each
-in a `const TPL: &str = r#"…"#`: `gh_shim_sh` (850 lines, the merge gate),
-`git_shim_sh` (101, the release/tag-push gate) and `loomux_shim_sh` (20, the
+in a `const TPL: &str = r#"…"#`: `gh_shim_sh` (1007 lines, the merge gate),
+`git_shim_sh` (106, the release/tag-push gate) and `loomux_shim_sh` (25, the
 self-launch refusal). `workflow.rs`'s `BASE_*_JQ` consts hold jq programs the gh
 shim interpolates. To rustfmt all of these are one string literal: it reports
 nothing, and **no local check parses them at all**. A dropped `;;` or an
@@ -140,7 +140,7 @@ marker returns the **gh** shim whichever one you were editing — you get `sh -n
 exit 0 on a script you never touched. That is the false green this whole section
 exists to prevent, and on `git_shim_sh` it is a security gate. Use `pub fn
 gh_shim_sh` / `pub fn git_shim_sh` / `pub fn loomux_shim_sh`; all three extract
-clean (850 / 101 / 20 lines, `sh -n` exit 0 each).
+clean (1007 / 106 / 25 lines, `sh -n` exit 0 each).
 
 (`.cjs`, not `.js` — the root `package.json` is `"type": "module"`. The extractor
 is four lines: read the file, slice between the `r#"` after the marker and the
