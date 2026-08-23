@@ -10642,7 +10642,7 @@ fn normalize_task_links(raw: Vec<TaskLink>, board: &[Task], field: &str) -> Resu
 /// `done` is the only status that stops holding a sprint, matching
 /// `dep_satisfied`: it is the bar the human has signed off on.
 pub fn current_sprint(tasks: &[Task]) -> Option<u32> {
-    tasks.iter().filter(|t| t.status != "done").filter_map(|t| t.sprint).min()
+    tasks.iter().filter(|t| t.status != "done" && t.status != "blocked").filter_map(|t| t.sprint).min()
 }
 
 /// Depth-first search for a dependency cycle reachable from `start` (#582),
