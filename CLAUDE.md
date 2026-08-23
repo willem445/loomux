@@ -315,6 +315,16 @@ compiles.
   assert `matched == verified` per surface and name what was skipped. Signature: a false
   figure in the guard's own canonical shape rides a scanned surface green, while blinding
   that surface's real figures reddens the same guard (#1327, `test/theme.test.ts`).
+- **A guard's green is evidence about its POPULATION, not about its property.** When a
+  human's on-screen report contradicts a suite that pins exactly the reported property,
+  the suspect is the list the assertion runs over — not the assertion, and not the report.
+  The site the report NAMES is a symptom, not a location: measure the property there first,
+  since a perceived GLOBAL cast is routinely carried by interaction-state surfaces (one
+  selection fill, three hover washes, one chosen fill) while every token called "ground" is
+  provably clean. Widen the population by ROLE, not by the names you happen to recall.
+  Signature: "gold is tinting everything" against `r === g === b` green on all nine ramp
+  steps, with `SEMANTIC.selection` never in the list (#1344 — a second population defect in
+  `test/theme.test.ts`, in a different guard from #1327's).
 - **A non-interference pin is fail-able only when its two operands COLLIDE.** A test
   asserting operation X leaves Y alone must build the fixture so X's key IS Y's subject —
   disjoint literals hold under every implementation, the symmetric one the pin forbids
@@ -517,6 +527,16 @@ narrow their ask back down to the original ticket on your own judgment.
   and re-check your own diff against each bullet the base gained. Signature: an all-`=`
   range-diff and a green suite over a diff that matches a convention younger than your
   branch point (#1300).
+- **A sweep whose success shape is ZERO needs a positive control.** Every sweep this file
+  mandates reports success as an empty result — byte-identical to the instrument never
+  having run. Two forms produce that silently, measured on GNU grep 3.1: `grep -rn "a|b"`
+  is a BASIC regex, so `|` is a literal and the alternation matches nothing; splitting one
+  across `grep "PAT1" -e "PAT2"` makes grep read `PAT1` as a FILENAME and match `PAT2`
+  alone. Both do signal (exit 1; exit 2 plus stderr) — but `| wc -l`, the form a receipt
+  quotes, discards both and prints a number. Quote the sweep without the pipeline, and run
+  the same string against a specimen that MUST match (`git show <base>:<file>`) before
+  citing a zero. Signature: a clean-sweep receipt of `0` whose pattern carries an
+  alternation and whose command ends in `| wc -l` (#1344).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
