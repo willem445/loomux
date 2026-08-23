@@ -355,6 +355,12 @@ render time, because a **hand-edited `tasks.json`** goes through no write path a
 one surface where a newline is structural rather than cosmetic — it would forge a section
 boundary and let board prose present as loomux's own lines.
 
+**The manager arm is deliberately not included.** `kickoff_body` has a separate arm for
+`Role::Manager` (#1161) and it composes no grounding section. A manager has no assigned
+task — the human's first message is the task — so there is nothing for a board row to
+ground, and the MCP tool refuses `kind: "manager"` outright anyway. If M3's launch path
+ever binds one, that arm is where the decision gets made, not here.
+
 **Still metadata (§6).** The binding authorizes nothing and claims nothing: it does not set
 `assignee`, does not move the row's status, and nothing reads `AgentEntry::task_id` except the
 kickoff composer. Auto-recording assignee/session from it stays the noted follow-up.

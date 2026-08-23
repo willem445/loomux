@@ -42641,6 +42641,11 @@ impl OrchRegistry {
             "agent": agent_id, "role": role, "name": display, "cwd": cwd,
             "cli": cli, "model": model, "worktree": use_worktree, "branch": branch_name, "task": task,
             "base": base, "session": session_id, "resume": resume,
+            // #1273: WHICH board row this agent was told to read. The binding
+            // changes the text a delegate is handed, so it belongs in the record
+            // of what orrerix did — beside block/session/resume, which are there
+            // for the same reason. `null` for an unbound spawn.
+            "task_id": task_id,
             // #222: which block this agent is, and how its persona reached the
             // CLI — so a run stays reproducible after the workflow file changes.
             "block": block.id,
