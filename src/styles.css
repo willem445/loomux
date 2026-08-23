@@ -66,7 +66,7 @@
          identity channel holds. */
   --accent:#f8c93e;
   --focus:#f8c93e;
-  --selection:#2e2a1c;
+  --selection:#38321f;
 
   /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
          family, a CLI, a git lane — never what state it is in. Consumers: coloured icons

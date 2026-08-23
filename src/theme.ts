@@ -105,9 +105,16 @@ export const PALETTE = {
   cyanLit: "#7ec3ce",
   azure: "#6f93c4", //    identity, and ANSI blue. NO LONGER a state dye nor the accent:
   azureLit: "#95b3d8", //  after #1320 this pigment never paints chrome, only a lane or glyph
-  azureDeep: "#2e2a1c", // selection fill only — never text, never a border. Now a deep gold
+  azureDeep: "#38321f", // selection fill only — never text, never a border. Now a deep gold
                         //  wash rather than a deep blue one, so a selection reads as the
-                        //  accent it belongs to.
+                        //  accent it belongs to. Its LEVEL is set by the two jobs a
+                        //  selection has, and both were measured against the value this
+                        //  replaces rather than eyeballed: it must be visible as a fill on
+                        //  the app ground (1.48:1, against the old 1.50:1) and text must
+                        //  stay readable on top of it (ink 8.45:1, against the old 8.33:1).
+                        //  The first draft of this de-blueing was #2e2a1c, which kept the
+                        //  text side but dropped the fill to 1.32:1 — a selection you can
+                        //  read but can barely see is still a regression.
   violet: "#9a8fc4", //   identity, and ANSI magenta — slate-violet, down from a lilac
   violetLit: "#b7aed8",
   orchid: "#c47f9e", //   identity only — dusty rose, down from a hot pink
