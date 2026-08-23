@@ -10035,7 +10035,7 @@ pub struct Task {
     /// drift from these rows.
     ///
     /// Additive and skipped when absent, like `parent`/`kind`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub sprint: Option<u32>,
     /// Worktree path where a demo of this item lives (#1091 slice B) — set on
     /// a `prototype`/`human-testing` row so the panel/board can tell the human
