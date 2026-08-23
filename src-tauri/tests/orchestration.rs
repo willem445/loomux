@@ -53929,11 +53929,10 @@ fn the_rust_gate_status_names_the_routing_rules_that_fired_and_refuses_what_the_
     // too. Asserted on the ADDED-set being empty, not on the rule not firing:
     // the rule does fire, and that is the whole point of the case.
     let selfrouted = routed_repo_with(
-        "    reviewers: [rev-lead]
-             routing:
-               - paths: [src/**]
-                 reviewers: [rev-lead]
-",
+        "    reviewers: [rev-lead]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [rev-lead]\n",
     );
     let (reg2, _d2, gid2) = group_for(&selfrouted);
     reg2.set_pr_files_override(Some(vec!["src/app.ts".into()]));
@@ -54076,15 +54075,11 @@ fn gh_shim_harness_refuses_a_routing_gate_file_rust_could_not_read_back() {
     // was the half left open when the rule cap was closed. Same two assertions:
     // Rust's answer first, then the shim's, so neither is taken on trust.
     let paths = |n: usize| {
-        let mut s = String::from("require all-pass
-reviewer rev-lead
-");
+        let mut s = String::from("require all-pass\nreviewer rev-lead\n");
         for i in 1..=n {
-            s.push_str(&format!("route-path 1 d{i}/**
-"));
+            s.push_str(&format!("route-path 1 d{i}/**\n"));
         }
-        s.push_str("route-reviewer 1 rev-lead
-");
+        s.push_str("route-reviewer 1 rev-lead\n");
         s
     };
     fs::write(&gate_file, paths(workflow::ROUTING_PATHS_MAX)).unwrap();
