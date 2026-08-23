@@ -270,6 +270,13 @@ compiles.
   the fixtures all carry one incidental constant (four WIP caps, all `review` or
   `in-progress`, none on the status rows are born into) and the axis the
   redesign made load-bearing has no witness (#1182).
+- **An absence-only assertion needs a positive control, and the vacuity is a SHAPE.**
+  `is_empty()`, `!contains(…)`, "renders nothing" — each passes just as well when the
+  mechanism never ran at all. Pin first that it DID (`fired.len() == 1`, `scanned > 0`
+  — a loose floor, not a second brittle pin on the thing's shape), then grep the suite
+  for the same shape: the site a review names is rarely the only one. Signature: fixing
+  a vacuous-test finding uncovers its twin one test over, green against an empty scan
+  (#1209).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
@@ -385,6 +392,12 @@ narrow their ask back down to the original ticket on your own judgment.
   deltas, diffstats and run ids all go stale on the next commit. Read both
   totals out of the two runs' own logs, and check that the per-file deltas sum
   to the total you are claiming (#859, #862, #889, #907, #914, #921).
+  A number is also only as good as the instrument that produced it: a regex character
+  class is a GUESS about the alphabet of its own subjects, so census by walking the real
+  delimiters and cross-check the total against a raw count of the container. Signature:
+  two totals stated confidently and both light by exactly one, from a `([a-z-]+)` that
+  stops dead at the digit in a real value (`no-sha256`) — a census that cannot see one
+  of its own subjects is not a census (#1209).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
   and work merged meanwhile authors fresh instances of the string you removed — a live

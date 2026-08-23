@@ -220,6 +220,50 @@ somebody else's filename does not.**
   Copilot agent file's `description:`, the merge-queue PR body and the shim refusals
   moved with it.
 
+## A branch in flight when the flag day lands
+
+A feature branch rebased across a phase boundary is authoring NEW strings into surfaces
+this phase has already split. It does not get to guess which side they belong on, and it
+does not get to flip its whole diff either: the class is the phase's, not the branch's.
+So the branch **measures its own surface on `main` and matches what it finds** — and says
+so in the PR, because a silent divergence in either direction is unreviewable.
+
+#1176's routing feature (#1209) landed just after this phase and did exactly that, with
+**opposite answers on two surfaces of one feature**:
+
+- **Its new `gh` shim refusals joined the renamed class** — the five *branded* ones, of
+  nine new call sites; the other four name no product at all. On `main` every branded
+  refusal message already said `orrerix` and none said `loomux`, so those five moved with
+  it.
+- **Its two new Rust status strings did not** — and they reached that answer by different
+  routes, which is the part to take from this, because the sibling is only the easy case:
+  - One sits in `gate_status_line_with`, directly beside `main`'s own *"loomux cannot
+    resolve the PR's current head commit"*. Its sibling answered for it.
+  - The other is in `pr_changed_files`, **a function this feature created**. There was no
+    sibling to read, so the *surface* answered instead: the Rust gate-status line is not
+    this phase's renamed class, and a string authored onto a surface joins the surface it
+    is on, not the diff that carries it.
+
+  Both had been renamed first and were then reverted, on the governing observation:
+  **a function emitting two spellings of its own product name is worse than a surface
+  uniformly on the old one.** A surface moves as a surface, when its phase comes — so
+  where there is no sibling, the question is what the SURFACE says, never what the
+  branch would prefer.
+
+Identifiers were untouched on both sides (`loomux_block_wf`, `loomux_audit`,
+`LOOMUX_GROUP_DIR`, `loomux_route_scan`) — this phase renamed strings, not symbols.
+
+### The census that decides it is a measurement, and a blind one is easy to take
+
+#1209 first reported that census as **32 call sites / 18 saying `orrerix`**, and it was
+wrong on both figures. The counting regex captured the refusal code as `([a-z-]+)` — an
+alphabet with no digit in it — so `loomux_block_wf "no-sha256" …` never matched at all,
+and that site is one of the ones whose message says `orrerix`, which is exactly why both
+numbers were light by one rather than only the total. Recount by walking the real quotes
+and cross-check against a raw occurrence count of the call itself. The measured answer,
+still true at `6b521ae4`: **33 call sites, 19 `orrerix`, 0 `loomux`, 14 mentioning
+neither.** A census that cannot see one of its own subjects is not a census.
+
 ## Where the vocabulary lives
 
 `crates/loomux-engine/src/brand.rs`, beside phase 4's filesystem and environment seam,
