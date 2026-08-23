@@ -172,19 +172,43 @@ data and belongs on the task, like `status`; sprint *view state* belongs in this
 record.** A second per-group UI-prefs store keyed the same way would be the drift
 #1152 warned about, arriving through a different door.
 
+### Nothing is published before the file has been read
+
+The blob is ONE file for every group, so a save built from a store that was never
+read publishes an empty map as the whole truth. That is not hypothetical: it is
+what the first version of this change did, and it would have destroyed up to
+`MAX_GROUPS` other groups' collapse sets and filters, silently, on nothing worse
+than a cold start plus a fast click (#1270 review B1).
+
+`BoardPrefsStore` holds the ordering, in `boardprefs.ts` with injected IO rather
+than in the view — the invariant IS an ordering between two async calls, so
+there is no single value to assert about, and a race parked in DOM wiring is a
+race nobody can test. Precedent for the shape: `CoalescingRefresh`
+(`refreshgate.ts`).
+
+- Every `write` awaits the read.
+- A read that **failed** declines the write outright rather than treating "I
+  could not look" as "there was nothing there".
+- That failure is **not latched** — the next gesture retries, so one transient
+  rejection does not disable persistence for the life of the view.
+- `read` answers `null` for an unreadable file, which a caller must not collapse
+  into `defaultGroupView()`. Adopting defaults there would show an expanded,
+  unfiltered board and then let the next gesture save that over what the human
+  actually left.
+
 ### A live gesture beats the file
 
-`loadPrefs` runs once, fire-and-forget, and adopts nothing if the human has
-already changed the view in this window. The disk copy is what they left last
-session; a chevron clicked in this one is newer, and adopting the file over it
-would look like the click was ignored. The whole store is kept either way, so a
-later save cannot drop the other groups' records.
+`loadPrefs` runs once and adopts nothing if the human has already changed the
+view in this window. The disk copy is what they left last session; a chevron
+clicked in this one is newer, and adopting the file over it would look like the
+click was ignored.
 
 Saves are debounced (400ms) and fire-and-forget — the `persistTabs` contract: a
-failed write just means the last gesture is not durable until the next one. The
-one exception is `dispose`, which flushes a pending save, for the reason
-`flushTabs` awaits the quit path: closing the board is the commonest way a
-session ends, and there is no next gesture to retry on.
+failed write just means the last gesture is not durable until the next one, and
+the store keeps the newer value so the next gesture re-offers it. The one
+exception is `dispose`, which flushes a pending save, for the reason `flushTabs`
+awaits the quit path: closing the board is the commonest way a session ends, and
+there is no next gesture to retry on.
 
 ## What the count chip says now
 
