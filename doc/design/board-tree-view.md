@@ -208,13 +208,22 @@ it cannot disagree with what is actually on the screen.
 
 ## What is not here
 
-**Keyboard navigation of the tree** was on #1270's candidate list and was cut to
-its own issue. Its cost is not in the pure module: a roving-tabindex focus model
-has to compose with the multi-select tickboxes, inline title editing, the four
-pickers, the request-changes modal, the two-click delete confirms and
+**Keyboard navigation of the tree** was on #1270's candidate list and is tracked
+separately as **#1314**. Its cost is not in the pure module: a roving-tabindex
+focus model has to compose with the multi-select tickboxes, inline title editing,
+the four pickers, the request-changes modal, the two-click delete confirms and
 `shortcuts.ts`'s global keybindings — all DOM wiring, which this repo validates by
 hand. That is a large, low-coverage surface, and bolting it onto a change whose
 value is a testable pure projection would have made both harder to review.
+
+What this change leaves in place for it, so the split costs nothing:
+`visibleRows` already returns the rendered rows **in display order** with
+`depth`/`hasChildren`/`collapsed`/`shownKids` — the sequence arrow-key movement
+has to walk, derived and tested; `containerIds` names every foldable row; each
+row carries the `data-item-id` anchor `drainFocus` already scrolls to; and
+collapse is durable per group, so a fold made from the keyboard persists like a
+clicked one with no new persistence work. The open question #1314 records is what
+left/right should mean while a filter is armed, since folding is inert then.
 
 **Nothing here resizes a PTY.** The control strip is a flex child of
 `.tasks-view`, inside the overlay (or the embed slot) the board already occupied;

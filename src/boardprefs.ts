@@ -4,8 +4,14 @@
 //
 // Pure encode/decode + validation, DOM-free and unit-tested, modelled on
 // tabstore.ts / settings.ts / sshprofile.ts. `uistate.rs` stores the blob
-// atomically as `boardview.json` and never parses it beyond "is it JSON at
+// atomically as `boardprefs.json` and never parses it beyond "is it JSON at
 // all"; this module owns the schema.
+//
+// `BoardPrefsStore` at the bottom owns the one thing the schema cannot express:
+// the blob is a SINGLE file shared by every group, so a save must never publish
+// a store that has not been read back yet. That lives here, with injected IO,
+// rather than in the view — it is the part with a race in it, and the view is
+// where this repo deliberately does not write tests.
 //
 // ---------------------------------------------------------------------------
 // Why a sibling blob and not the task
@@ -130,6 +136,32 @@ export function writeGroupView(
   return next;
 }
 
+/** The encoder's accumulator, spelled out as a TYPE rather than left as
+ *  `Record<string, unknown>` (#1270 review N2).
+ *
+ *  `readGroupView`, `writeGroupView` and `decodeBoardPrefs` each construct or
+ *  destructure a `BoardFilter`, so adding a family to it stops all three
+ *  compiling until they handle it. The encoder was the one persistence site the
+ *  compiler could not see, because its object literal was only ever checked
+ *  against `unknown`. Someone adding #1272's `sprint` and fixing everything
+ *  `tsc` named would have shipped a filter that arms in the UI, round-trips in
+ *  memory, and is **dropped at every save** — worse than a plain omission,
+ *  because `...unknownFilters` would have PRESERVED a `sprint` written by a
+ *  newer build, so the half-added family actively deletes what an unaware build
+ *  keeps.
+ *
+ *  `BoardFilter &` is what makes the four sites move together; the
+ *  `Record<string, unknown>` intersected onto it is what still admits the
+ *  unknown-family spread below. */
+type EncodedGroups = Record<
+  string,
+  {
+    touched: number;
+    collapsed: string[];
+    filters: BoardFilter & Record<string, unknown>;
+  }
+>;
+
 /** Serialize for `saveBoardPrefs`, keeping the `MAX_GROUPS` most recently
  *  touched groups and dropping the rest.
  *
@@ -142,7 +174,16 @@ export function encodeBoardPrefs(prefs: BoardPrefs): string {
   const kept = [...prefs.entries()]
     .sort((a, b) => b[1].touched - a[1].touched)
     .slice(0, MAX_GROUPS);
-  const groups: Record<string, unknown> = {};
+  // `Object.create(null)`, not `{}` (#1270 review N3). Assigning `__proto__`
+  // on an ordinary object literal does not create an own property — it reaches
+  // the setter on `Object.prototype` — so a group whose id is exactly
+  // `__proto__` was silently dropped here while every other prototype-member
+  // name (`toString`, `constructor`) round-tripped fine. `GroupId` accepts
+  // `__proto__`, so it is a legal id, and "this one board never persists
+  // anything, with no error" is not a state that should be reachable. The store
+  // is a `Map` for exactly this reason; this was the one place a group id left
+  // that Map and needed the same care.
+  const groups: EncodedGroups = Object.create(null);
   for (const [id, v] of kept) {
     groups[id] = {
       touched: v.touched,
@@ -216,4 +257,109 @@ export function decodeBoardPrefs(raw: string | null): BoardPrefs {
 function stringList(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   return v.filter((x): x is string => typeof x === "string" && x.length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// The one ordering rule the schema cannot express (#1270 review B1)
+// ---------------------------------------------------------------------------
+
+/** The two IPC calls the store needs, injected so the ordering below is
+ *  exercisable without a backend (`src/pty.ts` supplies the real pair). */
+export interface BoardPrefsIo {
+  load: () => Promise<string | null>;
+  save: (contents: string) => Promise<void>;
+}
+
+/** What a `write` did. `declined-unread` is the interesting one: the store
+ *  refused to publish because it has never successfully read the file, so it
+ *  does not know what it would be overwriting. */
+export type BoardPrefsWrite = "saved" | "declined-unread" | "failed";
+
+/** Reads and writes the whole `boardprefs.json` blob, holding the invariant
+ *  that makes one shared file safe for many boards.
+ *
+ *  **A save publishes the WHOLE blob, so it must never run against a store
+ *  nobody has read.** A view starts with an empty map and fills it when `load`
+ *  resolves; a write that beats that — the human folding a container within the
+ *  save debounce of opening a board on a cold start, or closing the board that
+ *  fast — would serialize the empty map as the entire file and silently destroy
+ *  up to `MAX_GROUPS` other groups' collapse sets and filters. No error
+ *  anywhere, because every individual step succeeded. LRU eviction drops other
+ *  groups too, but that is designed and bounded; this is neither.
+ *
+ *  So every `write` awaits the read first, and a read that FAILED declines the
+ *  write outright rather than treating "I could not look" as "there was nothing
+ *  there". The failure is not latched: the next write retries the read, so one
+ *  transient IPC rejection does not disable persistence for the life of the
+ *  view.
+ *
+ *  This is a class with injected IO rather than a pure function because the
+ *  invariant IS an ordering between two async calls — there is nothing to
+ *  assert about a single value. Precedent: `CoalescingRefresh`
+ *  (`refreshgate.ts`). Keeping it out of `tasksview.ts` is what makes it
+ *  testable at all: DOM wiring is validated by hand here, and this is the part
+ *  with a race in it. */
+export class BoardPrefsStore {
+  private prefs: BoardPrefs = new Map();
+  /** The blob has been read back at least once — including "the file is not
+   *  there", which is a complete answer (an empty store), not a gap. */
+  private loaded = false;
+  /** The read in flight, shared by every concurrent caller so a burst of
+   *  gestures cannot start several. Cleared on failure so a later call retries. */
+  private reading: Promise<boolean> | null = null;
+  /** An explicit field, not a constructor parameter property: node's
+   *  strip-only TypeScript (what `npm test` runs) rejects those outright, so
+   *  the terser form would make this module untestable in this repo. */
+  private readonly io: BoardPrefsIo;
+
+  constructor(io: BoardPrefsIo) {
+    this.io = io;
+  }
+
+  /** Whether the store now reflects the file. Never throws. */
+  private ensureLoaded(): Promise<boolean> {
+    if (this.loaded) return Promise.resolve(true);
+    if (!this.reading) {
+      this.reading = this.io.load().then(
+        (raw) => {
+          this.prefs = decodeBoardPrefs(raw);
+          this.loaded = true;
+          this.reading = null;
+          return true;
+        },
+        () => {
+          this.reading = null;
+          return false;
+        }
+      );
+    }
+    return this.reading;
+  }
+
+  /** This group's stored view, or `null` if the file could not be read — which
+   *  a caller must NOT collapse into `defaultGroupView()`. Adopting defaults on
+   *  an unreadable file would show an expanded, unfiltered board and then let
+   *  the next gesture save that over whatever the human actually left. */
+  async read(groupId: string): Promise<GroupBoardView | null> {
+    if (!(await this.ensureLoaded())) return null;
+    return readGroupView(this.prefs, groupId);
+  }
+
+  /** Record this group's view and publish the whole blob. */
+  async write(
+    groupId: string,
+    view: Omit<GroupBoardView, "touched">,
+    nowMs: number
+  ): Promise<BoardPrefsWrite> {
+    if (!(await this.ensureLoaded())) return "declined-unread";
+    this.prefs = writeGroupView(this.prefs, groupId, view, nowMs);
+    try {
+      await this.io.save(encodeBoardPrefs(this.prefs));
+      return "saved";
+    } catch {
+      // Best-effort, the `persistTabs` contract: the in-memory store keeps the
+      // newer value, so the next gesture re-offers it.
+      return "failed";
+    }
+  }
 }

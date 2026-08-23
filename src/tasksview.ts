@@ -73,13 +73,7 @@ import { normalizeComment } from "./autonomy";
 import { CoalescingRefresh } from "./refreshgate";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
 import { wipChips } from "./wipchips";
-import {
-  decodeBoardPrefs,
-  encodeBoardPrefs,
-  readGroupView,
-  writeGroupView,
-  type BoardPrefs,
-} from "./boardprefs.ts";
+import { BoardPrefsStore } from "./boardprefs.ts";
 import { loadBoardPrefs, saveBoardPrefs } from "./pty.ts";
 
 export interface OrchTaskNote {
@@ -252,9 +246,16 @@ export class TasksView {
   /** The armed view filter (#1270). Frontend state like `collapsed` above —
    *  and, since #1270, persisted alongside it. */
   private filter: BoardFilter = { ...NO_FILTER };
-  /** Every group's persisted board view, so saving THIS group's record cannot
-   *  drop the others (the blob is one file for all of them). */
-  private prefs: BoardPrefs = new Map();
+  /** The durable board-view store (#1270). Owns the read-before-publish
+   *  ordering, because `boardprefs.json` is ONE file for every group: a save
+   *  built from a store that was never read would publish an empty map as the
+   *  whole truth and silently destroy every other group's record. That
+   *  invariant is a race between two async calls, so it lives in a tested
+   *  module rather than in this file — see `BoardPrefsStore`. */
+  private readonly prefsStore = new BoardPrefsStore({
+    load: loadBoardPrefs,
+    save: saveBoardPrefs,
+  });
   /** Filter families a future build wrote that this one does not know — held so
    *  a save from here round-trips them instead of deleting them. */
   private unknownFilters: Record<string, unknown> = {};
@@ -617,29 +618,26 @@ export class TasksView {
 
   /** Read this group's durable board view (#1270) and adopt it.
    *
-   *  Best-effort, like every other enrichment this view loads: a missing,
-   *  corrupt or unreadable blob just means the board opens expanded and
-   *  unfiltered, which is exactly the pre-#1270 board.
+   *  Best-effort, like every other enrichment this view loads: a missing or
+   *  corrupt blob just means the board opens expanded and unfiltered, which is
+   *  exactly the pre-#1270 board.
+   *
+   *  `read` answers `null` only when the file could not be READ, which is not
+   *  the same as a group having nothing stored — so this changes nothing rather
+   *  than adopting defaults. Adopting them would show an expanded, unfiltered
+   *  board and then let the next gesture save that over what the human actually
+   *  left; the store declines to publish in that state for the same reason.
    *
    *  A gesture that beat the load WINS. The disk copy is what the human left
    *  last session; a chevron they have already clicked in this one is newer,
-   *  and adopting the file over it would look like the click was ignored. The
-   *  whole store is kept either way, so a later save cannot drop the other
-   *  groups' records.
+   *  and adopting the file over it would look like the click was ignored.
    *
    *  Never re-run: `show()` can fire many times as the overlay is toggled, and
    *  re-adopting the file each time would undo the session's own gestures. */
   private async loadPrefs(): Promise<void> {
-    let raw: string | null = null;
-    try {
-      raw = await loadBoardPrefs();
-    } catch {
-      return; // no durable view available — the defaults already stand
-    }
-    if (this.disposed) return;
-    this.prefs = decodeBoardPrefs(raw);
+    const view = await this.prefsStore.read(this.groupId);
+    if (!view || this.disposed) return;
     if (this.prefsTouched) return;
-    const view = readGroupView(this.prefs, this.groupId);
     this.collapsed = new Set(view.collapsed);
     this.filter = view.filter;
     this.unknownFilters = view.unknownFilters;
@@ -672,15 +670,15 @@ export class TasksView {
     }, 400);
   }
 
-  /** Write this group's record into the store and persist the whole blob.
+  /** Hand this group's view to the store, which publishes the whole blob.
    *
    *  Fire-and-forget, the same best-effort contract `persistTabs` takes: a
-   *  failed write just means this gesture is not durable until the next one.
-   *  `this.prefs` is updated regardless, so the in-memory store stays the
-   *  freshest thing anybody has even when the disk write loses. */
+   *  failed write just means this gesture is not durable until the next one,
+   *  and the store keeps the newer value so the next one re-offers it. The
+   *  store also DECLINES the write outright if it has not managed to read the
+   *  file yet — see `BoardPrefsStore`, which is where that ordering is tested. */
   private savePrefsNow(): void {
-    this.prefs = writeGroupView(
-      this.prefs,
+    void this.prefsStore.write(
       this.groupId,
       {
         collapsed: [...this.collapsed],
@@ -689,7 +687,6 @@ export class TasksView {
       },
       Date.now()
     );
-    void saveBoardPrefs(encodeBoardPrefs(this.prefs)).catch(() => {});
   }
 
   /** One board refresh. Only `refresher` calls this. */
@@ -1141,7 +1138,7 @@ export class TasksView {
     if (this.tasks.length === 0) {
       // An empty board has nothing to collapse and nothing to filter, so the
       // strip goes away entirely rather than offering controls over nothing.
-      this.renderFilterStrip(0, 0);
+      this.renderFilterStrip(0, 0, 0);
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
       return;
     }
@@ -1178,7 +1175,18 @@ export class TasksView {
       filter: this.filter,
       attention,
     });
-    this.renderFilterStrip(attention.size, rows.length);
+    // The universe the FILTER is choosing from — every row except the ones the
+    // archive is hiding for its own unrelated reason (#1270 review N4). With
+    // 300 of 400 rows cleared and the archive off screen, `tasks.length` made
+    // the hint read "12 of 400" when there were only 100 rows to match against.
+    // The no-matches line lost the same number in self-review; fixing one site
+    // of a pair and leaving the other is the shape the one-rule convention
+    // names, so it is the same rule here. `clearedIds` is the SAME closure the
+    // archive itself renders from, so the two cannot disagree.
+    const universe = this.showCleared
+      ? this.tasks.length
+      : this.tasks.length - clearedIds(this.tasks).size;
+    this.renderFilterStrip(attention.size, rows.length, universe);
     if (rows.length === 0 && filterActive(this.filter)) {
       // Distinct from both empty states below: the board has rows and they are
       // not archived — this filter simply matches none of them. Saying "no
@@ -1220,10 +1228,11 @@ export class TasksView {
    *  from the one `visibleRows` just produced. The search box is NOT rebuilt:
    *  it holds focus and a caret while the human types.
    *
-   *  `shown` is the row count `visibleRows` actually returned, threaded in
-   *  rather than recomputed, so the hint cannot claim a number the list does
-   *  not have. */
-  private renderFilterStrip(attentionCount: number, shown: number): void {
+   *  `shown` is the row count `visibleRows` actually returned and `universe`
+   *  the number of rows the filter had to choose from, both threaded in rather
+   *  than recomputed, so the hint cannot claim a number the list does not
+   *  have. */
+  private renderFilterStrip(attentionCount: number, shown: number, universe: number): void {
     // Nothing to collapse and nothing to filter on an empty board.
     this.filterEl.hidden = this.tasks.length === 0;
     if (this.tasks.length === 0) return;
@@ -1277,9 +1286,10 @@ export class TasksView {
 
     this.clearFilterBtn.hidden = !active;
     this.filterCountEl.hidden = !active;
-    this.filterCountEl.textContent = active ? `${shown} of ${this.tasks.length}` : "";
-    this.filterCountEl.title =
-      "Rows on screen — matches plus the containers above them — out of every item on the board";
+    this.filterCountEl.textContent = active ? `${shown} of ${universe}` : "";
+    this.filterCountEl.title = this.showCleared
+      ? "Rows on screen — matches plus the containers above them — out of every item on the board"
+      : "Rows on screen — matches plus the containers above them — out of the items this board is currently showing (cleared items are not counted; 👁 brings them back)";
   }
 
   /** One toggle chip in a filter family. */

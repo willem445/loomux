@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   BOARD_PREFS_VERSION,
+  BoardPrefsStore,
   decodeBoardPrefs,
   defaultGroupView,
   encodeBoardPrefs,
@@ -11,6 +12,7 @@ import {
   readGroupView,
   writeGroupView,
   type BoardPrefs,
+  type BoardPrefsIo,
 } from "../src/boardprefs.ts";
 import { NO_FILTER } from "../src/taskboard.ts";
 
@@ -180,16 +182,36 @@ test("only a real `true` arms the attention toggle", () => {
   assert.equal(readGroupView(decodeBoardPrefs(MALFORMED), "g-1").filter.attention, false);
 });
 
-test("a group id that names an Object.prototype member is stored, not swallowed", () => {
-  // Why the store is a Map. With a plain object, `prefs["toString"]` reads a
+test("a group id that names an Object.prototype member survives a round trip", () => {
+  // Why the store is a Map, and why the ENCODER's accumulator is
+  // `Object.create(null)`. With a plain object, `prefs["toString"]` reads a
   // function on every group that has no record, and `"constructor" in prefs` is
   // true for a group nobody ever saved — either of which turns a normal-looking
   // group id into a board that cannot persist anything.
-  const prefs = writeGroupView(new Map(), "toString", view({ collapsed: ["e-1"] }), 1);
-  assert.deepEqual(readGroupView(prefs, "toString").collapsed, ["e-1"]);
-  const back = decodeBoardPrefs(encodeBoardPrefs(prefs));
-  assert.deepEqual(readGroupView(back, "toString").collapsed, ["e-1"]);
-  assert.deepEqual(readGroupView(back, "constructor").collapsed, [], "and an absent one is empty");
+  //
+  // `__proto__` leads, because it is the member of this class that actually
+  // BROKE (#1270 review N3): assigning it on an object literal reaches the
+  // prototype setter instead of creating an own property, so it was the one id
+  // silently dropped at encode time while `toString` and `constructor` — which
+  // this test used to be written on — round-tripped fine. A specimen that
+  // cannot distinguish is not a witness.
+  for (const id of ["__proto__", "toString", "constructor"]) {
+    const prefs = writeGroupView(new Map(), id, view({ collapsed: ["e-1"] }), 1);
+    assert.deepEqual(readGroupView(prefs, id).collapsed, ["e-1"], `in-memory: ${id}`);
+    const encoded = encodeBoardPrefs(prefs);
+    assert.deepEqual(
+      Object.keys(JSON.parse(encoded).groups),
+      [id],
+      `the encoded blob must carry ${id} as its own key`
+    );
+    assert.deepEqual(
+      readGroupView(decodeBoardPrefs(encoded), id).collapsed,
+      ["e-1"],
+      `round trip: ${id}`
+    );
+  }
+  const empty = decodeBoardPrefs(encodeBoardPrefs(new Map()));
+  assert.deepEqual(readGroupView(empty, "constructor").collapsed, [], "an absent id is empty");
 });
 
 test("readGroupView and writeGroupView hand out copies, never the store's interior", () => {
@@ -225,4 +247,133 @@ test("a future version number is read rather than refused", () => {
     groups: { "g-1": { touched: 3, collapsed: ["e-1"], filters: { text: "auth" } } },
   });
   assert.deepEqual(readGroupView(decodeBoardPrefs(stored), "g-1").collapsed, ["e-1"]);
+});
+
+// ---------------------------------------------------------------------------
+// BoardPrefsStore — the read-before-publish ordering (#1270 review B1).
+//
+// The blob is ONE file for every group, so a save built from a store that was
+// never read publishes an empty map as the whole truth and destroys every other
+// group's view. These are the tests that fail on the racy order.
+// ---------------------------------------------------------------------------
+
+/** A view payload for `write`. */
+const wrote = (collapsed: string[]) => ({
+  collapsed,
+  filter: { ...NO_FILTER },
+  unknownFilters: {},
+});
+
+/** A blob holding one OTHER group's view — the thing a premature save destroys. */
+const OTHERS = JSON.stringify({
+  v: 1,
+  groups: { "g-other": { touched: 1, collapsed: ["e-9"], filters: { text: "auth" } } },
+});
+
+/** Records what reached the backend, and lets the test decide when the read
+ *  resolves. */
+function fakeIo(load: () => Promise<string | null>): BoardPrefsIo & { saved: string[] } {
+  const saved: string[] = [];
+  return {
+    saved,
+    load,
+    save: async (contents: string) => {
+      saved.push(contents);
+    },
+  };
+}
+
+/** Let every already-scheduled microtask/timer run. */
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+test("a write that beats the read does not publish a store nobody has read", async () => {
+  // THE B1 PIN. The human folds a container before the load has come back. A
+  // store that writes straight from its empty map publishes a blob containing
+  // only this group — silently deleting up to MAX_GROUPS other records.
+  let release: (v: string | null) => void = () => {};
+  const io = fakeIo(() => new Promise<string | null>((res) => (release = res)));
+  const store = new BoardPrefsStore(io);
+
+  const writing = store.write("g-mine", wrote(["e-1"]), 5);
+  await settle();
+  assert.deepEqual(io.saved, [], "nothing may reach disk while the file is still unread");
+
+  release(OTHERS); // the file finally arrives, holding someone else's view
+  assert.equal(await writing, "saved");
+  assert.equal(io.saved.length, 1);
+
+  const back = decodeBoardPrefs(io.saved[0]);
+  assert.deepEqual(
+    readGroupView(back, "g-other").collapsed,
+    ["e-9"],
+    "the other group's collapse set survived the write that raced it"
+  );
+  assert.equal(readGroupView(back, "g-other").filter.text, "auth", "…and its filter");
+  assert.deepEqual(readGroupView(back, "g-mine").collapsed, ["e-1"], "…beside the new one");
+});
+
+test("a write is declined outright when the file could not be read", async () => {
+  // "I could not look" is not "there was nothing there". Publishing here would
+  // turn one transient IPC rejection into permanent data loss.
+  const io = fakeIo(() => Promise.reject(new Error("ipc rejected")));
+  const store = new BoardPrefsStore(io);
+  assert.equal(await store.write("g-mine", wrote(["e-1"]), 5), "declined-unread");
+  assert.deepEqual(io.saved, [], "a store that was never read is never published");
+});
+
+test("a failed read is retried by the next gesture, not latched for the session", async () => {
+  // The other direction, so the guard cannot pass by refusing everything: one
+  // rejection must not disable persistence for as long as the board is open.
+  let attempt = 0;
+  const io = fakeIo(() => {
+    attempt += 1;
+    return attempt === 1 ? Promise.reject(new Error("transient")) : Promise.resolve(OTHERS);
+  });
+  const store = new BoardPrefsStore(io);
+
+  assert.equal(await store.write("g-mine", wrote(["e-1"]), 5), "declined-unread");
+  assert.equal(await store.write("g-mine", wrote(["e-1"]), 6), "saved", "the retry lands");
+  assert.equal(attempt, 2);
+  const back = decodeBoardPrefs(io.saved[0]);
+  assert.deepEqual(readGroupView(back, "g-other").collapsed, ["e-9"]);
+  assert.deepEqual(readGroupView(back, "g-mine").collapsed, ["e-1"]);
+});
+
+test("an unreadable file reads as null, never as a group with nothing stored", async () => {
+  // The caller must be able to tell "no record for this group" (adopt defaults)
+  // from "I cannot see the file" (change nothing). Collapsing the two would show
+  // an expanded, unfiltered board and then let the next gesture save that over
+  // what the human actually left.
+  const bad = new BoardPrefsStore(fakeIo(() => Promise.reject(new Error("nope"))));
+  assert.equal(await bad.read("g-1"), null);
+
+  const absent = new BoardPrefsStore(fakeIo(() => Promise.resolve(null)));
+  const view = await absent.read("g-1");
+  assert.notEqual(view, null, "an ABSENT file is a complete answer, not a failure");
+  assert.deepEqual(view?.collapsed, []);
+});
+
+test("the file is read once however many gestures arrive", async () => {
+  let reads = 0;
+  const io = fakeIo(() => {
+    reads += 1;
+    return Promise.resolve(OTHERS);
+  });
+  const store = new BoardPrefsStore(io);
+  // Concurrent, then sequential — one shared in-flight read, then the memo.
+  await Promise.all([store.read("a"), store.read("b"), store.write("c", wrote([]), 1)]);
+  await store.write("d", wrote([]), 2);
+  assert.equal(reads, 1, "a burst of gestures must not each re-read the blob");
+});
+
+test("a save that fails leaves the newer value in memory for the next gesture", async () => {
+  const io: BoardPrefsIo = {
+    load: () => Promise.resolve(OTHERS),
+    save: () => Promise.reject(new Error("disk full")),
+  };
+  const store = new BoardPrefsStore(io);
+  assert.equal(await store.write("g-mine", wrote(["e-1"]), 5), "failed");
+  // Not "declined-unread": the read succeeded, so the failure is the write's.
+  // The store keeps the value, which is what makes the next gesture re-offer it.
+  assert.deepEqual((await store.read("g-mine"))?.collapsed, ["e-1"]);
 });
