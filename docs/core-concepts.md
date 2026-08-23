@@ -331,7 +331,9 @@ be rearranged in place:
 > workspace (folders, paths, the file actions), amber for code you edit, jade
 > for data and documents you read, lime for git, violet for agents in general,
 > orchid for the group's boards (tasks, issues, audit, timeline),
-> rose for anything destructive, azure while the mic is capturing. Agent *state*
+> rose for anything destructive, azure while the mic is capturing. These hues are
+> deliberately restrained — a muted, near-monochrome family beside the near-black
+> ground rather than the saturated set they replace. Agent *state*
 > is deliberately never carried by an icon — it has its own signals, so the two
 > never compete for your attention. This legend is about **icon** marks
 > specifically, and the one exception is the agent mark: it wears its *own CLI's*

@@ -2669,7 +2669,7 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 /* The counterpart: a queued item waiting on an unfinished dep recedes, so it
    can't be mistaken for work anyone could pick up. No new accent color — the
-   amber left-accent already means "waiting on YOU" and the blue one "live
+   amber left-accent already means "waiting on YOU" and the green one "live
    work"; the chips below name what this one is actually waiting for. */
 .task-row.task-row-dep-blocked { opacity: 0.68; }
 .task-row.task-row-dep-blocked:hover { opacity: 0.92; }
