@@ -10418,7 +10418,8 @@ pub fn blocking_ancestor<'a>(task: &Task, board: &'a [Task]) -> Option<&'a str> 
 /// `upsert_task`'s `claim` guard — still reads `deps` alone, so a hand-edited
 /// container can dim a row on the board but can never refuse a write.
 pub fn task_ready(task: &Task, board: &[Task]) -> bool {
-    task.status == "queued"
+    !task.sprint.is_some_and(|s| s > 1)
+        && task.status == "queued"
         && unmet_deps(task, board).is_empty()
         && blocking_ancestor(task, board).is_none()
 }
