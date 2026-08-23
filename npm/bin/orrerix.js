@@ -47,11 +47,23 @@ const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
 
 // ---------- brand identity (#1153 phase 5) ----------
 //
-// PRODUCT_NAMES is Tauri's `productName`. It names everything the BUNDLER
-// creates, which is everything this launcher has to recognise on a user's
-// machine: the macOS bundle (`Orrerix.app`), the Windows install directory,
-// its Add/Remove key (tauri-bundler's nsis/installer.nsi defines UNINSTKEY off
-// ${PRODUCTNAME}), and every release asset filename. #1153 flipped it.
+// Two axes, and conflating them is the trap this block exists to stop.
+//
+//   PRODUCT_NAMES  Tauri's `productName`. It names everything the BUNDLER
+//                  creates, which is everything this launcher has to
+//                  recognise on a user's machine: the macOS bundle
+//                  (`Orrerix.app`), the Windows install directory, its
+//                  Add/Remove key (tauri-bundler's nsis/installer.nsi defines
+//                  UNINSTKEY off ${PRODUCTNAME}), and every release asset
+//                  filename. #1153 flipped it.
+//
+//   MAIN_BINARY    Tauri's `mainBinaryName`, which this app does not set. The
+//                  config schema is explicit that it then "uses the output
+//                  binary from cargo" — the `loomux` crate — so the executable
+//                  INSIDE the bundle is `loomux.exe` / `Contents/MacOS/loomux`
+//                  and the rebrand did NOT move it. Reading it as though it
+//                  followed the product name is how a probe ends up matching
+//                  nothing at all (#1294).
 //
 // The rule from doc/design/rebrand-protocol.md applies here verbatim: emit
 // exactly one spelling, accept every spelling on every reading surface, and
@@ -70,6 +82,17 @@ const PRODUCT = PRODUCT_NAMES[0];
 // The same set as one regex alternation, built FROM the array rather than
 // retyped, so no reader can fall out of step with it.
 const NAME_ALT = PRODUCT_NAMES.join("|");
+
+// The cargo crate name, which is what Tauri ships as the bundle's executable.
+// Not part of the external rebrand, and unchanged by it.
+const MAIN_BINARY = "loomux";
+
+// Executable basenames an install can carry, most likely first. MAIN_BINARY is
+// what today's bundler writes; the product names follow because a bundle built
+// under a config that renamed the binary to the product would carry one of
+// those instead, and an install this launcher cannot find is an install it
+// cannot protect.
+const EXE_NAMES = [MAIN_BINARY, ...PRODUCT_NAMES];
 
 // The command this package installs, and the launcher's own cache directory
 // name. That cache is ours alone — nothing but this launcher writes it — so by
@@ -548,13 +571,60 @@ function appImageVersion(file) {
 
 // ---------- running-instance guard ----------
 
+/** Escape a literal string for use inside a RegExp. */
+function escapeRe(literal) {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// The executable names the running-app guard asks the OS about, most likely
+// first — `.exe`-suffixed on Windows, bare on macOS, where the process name is
+// the bundle's CFBundleExecutable.
+//
+// This is the EXE axis, not the product axis (#1294), and the difference is the
+// whole bug this function exists to close. tauri-bundler writes the bundle's
+// binary under `mainBinaryName`, which this app leaves unset, so it is cargo's
+// output (MAIN_BINARY) — the process is `loomux` while the bundle around it is
+// `Orrerix.app`. Windows never noticed, because `tasklist`'s IMAGENAME filter
+// is case-insensitive and the old product spelling differed only in case;
+// macOS's `pgrep -x` is not, so the guard matched nothing there and `update`
+// was free to `rm -rf` a running /Applications bundle. Post-rename the product
+// spelling stops matching on BOTH platforms, since `Orrerix` and `loomux` do
+// not differ by case.
+//
+// Pure and parameterised on the platform so the derivation is pinned by a test
+// rather than by this comment.
+function processNames(platform) {
+  return platform === "win32" ? EXE_NAMES.map((n) => `${n}.exe`) : EXE_NAMES;
+}
+
+// Ask the OS whether a process of exactly this name is running. Split out from
+// the caller so the name rule above is testable without a live app, the same
+// seam `installedWindowsVersion`'s injectable `query` uses.
+function osProcessProbe(platform, name) {
+  if (platform === "win32") {
+    // A filter that matches nothing still exits 0 ("INFO: No tasks…"), so test
+    // the output rather than the status.
+    const out = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH"], {
+      encoding: "utf8",
+    });
+    return new RegExp(escapeRe(name), "i").test(out.stdout || "");
+  }
+  if (platform === "darwin") {
+    const out = spawnSync("pgrep", ["-x", name], { encoding: "utf8" });
+    return out.status === 0 && (out.stdout || "").trim() !== "";
+  }
+  // Linux runs an AppImage in place; nothing is replaced under it, and an
+  // overwrite of the running image is caught as ETXTBSY in download().
+  return false;
+}
+
 // Is the desktop app running right now? Installing over one is what makes the
 // launcher lethal: the silent installer terminates the running process to
 // replace its files, taking down the app and anything running inside it.
 //
-// Every accepted product name is probed, not just the current one: the app a
-// user has open across the rename is the pre-rename build, and that is
-// precisely the install `update` is about to overwrite.
+// Every accepted name is probed, not just the current one: the app a user has
+// open across the rename is the pre-rename build, and that is precisely the
+// install `update` is about to overwrite.
 //
 // Unknown (no probe, or the probe failed) is reported as "not running": on both
 // platforms the probe ships with the OS, so a failure means something exotic, and
@@ -562,26 +632,13 @@ function appImageVersion(file) {
 // that installs. Plain launch only reaches this guard when it found nothing to
 // launch and must install; its real job is protecting `orrerix update` from an
 // install-over-running-app.
-function appIsRunning() {
-  if (process.platform === "win32") {
-    // A filter that matches nothing still exits 0 ("INFO: No tasks…"), so test
-    // the output rather than the status.
-    return PRODUCT_NAMES.some((name) => {
-      const out = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}.exe`, "/NH"], {
-        encoding: "utf8",
-      });
-      return new RegExp(`${name}\\.exe`, "i").test(out.stdout || "");
-    });
-  }
-  if (process.platform === "darwin") {
-    return PRODUCT_NAMES.some((name) => {
-      const out = spawnSync("pgrep", ["-x", name], { encoding: "utf8" });
-      return out.status === 0 && (out.stdout || "").trim() !== "";
-    });
-  }
+function appIsRunning(platform = process.platform, probe = osProcessProbe) {
   // Linux runs an AppImage in place; nothing is replaced under it, and an
-  // overwrite of the running image is caught as ETXTBSY in download().
-  return false;
+  // overwrite of the running image is caught as ETXTBSY in download(). That is
+  // a platform policy rather than a property of any one probe, so it lives
+  // here — an injected probe must not be able to turn it on.
+  if (platform !== "win32" && platform !== "darwin") return false;
+  return processNames(platform).some((name) => probe(platform, name));
 }
 
 // Refuse to install while the app is running — including under `orrerix update`,
@@ -710,24 +767,39 @@ async function runMac(getRelease, command) {
   spawnSync("open", ["-a", dest], { stdio: "ignore" });
 }
 
-// Common install locations for the Tauri NSIS build (per-user by default).
+// Where a Tauri NSIS install puts its executable, most likely first.
+//
+// Two different names, one path (#1294): the DIRECTORY is the product
+// (`installer.nsi` sets `$INSTDIR` to `$LOCALAPPDATA\${PRODUCTNAME}` per-user,
+// `$PROGRAMFILES\${PRODUCTNAME}` per-machine) and the EXECUTABLE inside it is
+// `${MAINBINARYNAME}.exe`, which is cargo's output and did not move with the
+// rebrand. `Programs\` is kept as a root because older Tauri installers used
+// it and those installs are still out there.
 //
 // Product-major, not root-major: a machine carrying both a pre-rename and a
 // post-rename install must launch the CURRENT one wherever it sits, rather than
 // whichever happens to live under the root that got listed first.
-function findWindowsExe() {
+//
+// `env` is a parameter so the ordering rule is testable without a real machine.
+function windowsExeCandidates(env = process.env) {
   const roots = [];
-  if (process.env.LOCALAPPDATA) {
-    roots.push(path.join(process.env.LOCALAPPDATA, "Programs"), process.env.LOCALAPPDATA);
+  if (env.LOCALAPPDATA) {
+    roots.push(path.join(env.LOCALAPPDATA, "Programs"), env.LOCALAPPDATA);
   }
-  if (process.env.PROGRAMFILES) roots.push(process.env.PROGRAMFILES);
+  if (env.PROGRAMFILES) roots.push(env.PROGRAMFILES);
   const candidates = [];
   for (const product of PRODUCT_NAMES) {
     for (const root of roots) {
-      candidates.push(path.join(root, product, `${product}.exe`));
+      for (const exe of EXE_NAMES) {
+        candidates.push(path.join(root, product, `${exe}.exe`));
+      }
     }
   }
-  return candidates.find((p) => fs.existsSync(p)) || null;
+  return candidates;
+}
+
+function findWindowsExe() {
+  return windowsExeCandidates().find((p) => fs.existsSync(p)) || null;
 }
 
 // Every hive, registry view and product spelling a Tauri/NSIS install can have
@@ -899,6 +971,7 @@ if (require.main === module) {
 module.exports = {
   PRODUCT_NAMES,
   CLI_NAMES,
+  EXE_NAMES,
   parseArgs,
   planAction,
   parseVersion,
@@ -909,10 +982,12 @@ module.exports = {
   updateBaseline,
   newestVersion,
   installedWindowsVersion,
+  windowsExeCandidates,
   windowsVersionProbes,
   pickCachedAppImage,
   appImageVersion,
   assetPattern,
   pickAsset,
+  processNames,
   appIsRunning,
 };

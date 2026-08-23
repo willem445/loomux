@@ -18,7 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { mkdtempSync, writeFileSync, utimesSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const require = createRequire(import.meta.url);
@@ -33,10 +33,13 @@ const {
   updateBaseline,
   newestVersion,
   installedWindowsVersion,
+  windowsExeCandidates,
   pickCachedAppImage,
   appImageVersion,
   assetPattern,
   pickAsset,
+  processNames,
+  appIsRunning,
 } = require("../npm/bin/orrerix.js");
 const { version: PKG_VERSION } = require("../npm/package.json");
 
@@ -543,4 +546,98 @@ test("the uninstall key carries the product name, so both spellings are probed",
     "side by side is the normal post-flip state, and the NEWEST is the baseline"
   );
   assert.equal(installedWindowsVersion(byKey({})), null, "no key anywhere → unknown");
+});
+
+// ---------- the install/running probes read two different names (#1294) ----------
+
+test("the Windows install probe takes the directory from the product and the exe from cargo", () => {
+  // installer.nsi installs `$INSTDIR\${MAINBINARYNAME}.exe` into
+  // `$LOCALAPPDATA\${PRODUCTNAME}`, and `mainBinaryName` is unset in
+  // tauri.conf.json — the schema says it then "uses the output binary from
+  // cargo", which is `loomux`. Deriving the exe from the PRODUCT found the
+  // pre-rename install only because Windows is case-insensitive; after the flip
+  // `Orrerix\Orrerix.exe` exists nowhere and plain launch stops finding its own
+  // install.
+  const local = join("C:", "Users", "u", "AppData", "Local");
+  const progfiles = join("C:", "Program Files");
+  const candidates = windowsExeCandidates({
+    LOCALAPPDATA: local,
+    PROGRAMFILES: progfiles,
+  });
+
+  assert.ok(
+    candidates.includes(join(local, "Orrerix", "loomux.exe")),
+    "the real post-rename per-user path must be probed"
+  );
+  assert.ok(
+    candidates.includes(join(progfiles, "Orrerix", "loomux.exe")),
+    "...and the per-machine one"
+  );
+  assert.ok(
+    candidates.includes(join(local, "Loomux", "loomux.exe")),
+    "a pre-rename install must still be findable, or update loses its baseline"
+  );
+
+  // Product-major, not root-major: every current-product candidate is ordered
+  // ahead of every legacy one, so a machine carrying both launches the current
+  // app rather than whichever root happens to be listed first.
+  const product = (p: string) => basename(dirname(p));
+  const firstLegacy = candidates.findIndex((p: string) => product(p) === "Loomux");
+  const lastCurrent = candidates
+    .map((p: string) => product(p) === "Orrerix")
+    .lastIndexOf(true);
+  assert.ok(firstLegacy > 0, "the legacy product must appear at all");
+  assert.ok(lastCurrent < firstLegacy, "product-major ordering, not root-major");
+
+  // An unset environment contributes no relative candidates: `Programs\...`
+  // resolved against the process CWD is a path that could match anything.
+  assert.deepEqual(windowsExeCandidates({}), []);
+});
+
+/** A fake OS probe: only the exact names listed are 'running'. */
+const fakeProc =
+  (...running: string[]) =>
+  (_platform: string, name: string) =>
+    running.includes(name);
+
+test("the running-app guard probes the executable's name, not the product's", () => {
+  // #1294. The bundle is `Orrerix.app` but the process inside it is `loomux`,
+  // because tauri-bundler takes CFBundleExecutable from `mainBinaryName`.
+  // macOS `pgrep -x` is case-sensitive, so a product-named probe matched
+  // nothing there and `update` was free to `rm -rf` a running bundle — the
+  // #815 class, on the one platform with no other backstop.
+  assert.ok(processNames("darwin").includes("loomux"), "macOS reports CFBundleExecutable");
+  assert.ok(processNames("win32").includes("loomux.exe"), "Windows reports the installed exe");
+  assert.equal(
+    appIsRunning("darwin", fakeProc("loomux")),
+    true,
+    "a running app must be SEEN — refusing is this guard's only job"
+  );
+  assert.equal(appIsRunning("win32", fakeProc("loomux.exe")), true);
+});
+
+test("...and still sees a bundle whose binary was named after the product", () => {
+  // A build made under a config that set mainBinaryName to the product carries
+  // that name instead. The guard's only action is to refuse, so being generous
+  // here costs a user one avoidable 'quit the app' message and saves the other
+  // direction a killed session.
+  assert.equal(appIsRunning("darwin", fakeProc("Orrerix")), true);
+  assert.equal(appIsRunning("darwin", fakeProc("Loomux")), true);
+});
+
+test("nothing running is not a refusal", () => {
+  // The negative control. A guard that answered `true` unconditionally would
+  // pass both tests above and make `update` permanently impossible.
+  assert.equal(appIsRunning("darwin", fakeProc()), false);
+  assert.equal(appIsRunning("win32", fakeProc()), false);
+  assert.equal(
+    appIsRunning("win32", fakeProc("chrome.exe")),
+    false,
+    "an unrelated process is not this app"
+  );
+  assert.equal(
+    appIsRunning("linux", fakeProc("loomux")),
+    false,
+    "Linux has no probe at all; download()'s ETXTBSY is the backstop there"
+  );
 });
