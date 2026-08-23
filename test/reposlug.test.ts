@@ -109,6 +109,17 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
     ["github.com link", new RegExp(`github\\.com/${owner}/([A-Za-z0-9._-]+)`, "g")],
     ["Pages link", new RegExp(`${owner}\\.github\\.io/([A-Za-z0-9._-]+)`, "g")],
     ["Jekyll baseurl", /^\s*baseurl:\s*\/([A-Za-z0-9._-]+)/gm],
+    // Raw-content link: `raw.githubusercontent.com/<owner>/<repo>/...` — a
+    // fourth URL host, not covered by the `github.com` pattern above.
+    ["raw.githubusercontent.com link", new RegExp(`raw\\.githubusercontent\\.com/${owner}/([A-Za-z0-9._-]+)`, "g")],
+    // A bare `owner/repo` literal in double quotes — how `install.ps1`,
+    // `install.sh` and `npm/bin/orrerix.js` each spell the slug they hand to
+    // the GitHub REST API, with no `github.com/` prefix in sight. Quoted, not
+    // just "immediately after the owner", so this does not also fire on a
+    // prose mention like the design note's `` `willem445/loomux` `` — those
+    // are backticked, not quoted, and are deliberately outside this census
+    // (see doc/design/rebrand-external.md, "The human runbook").
+    ["quoted owner/repo literal", new RegExp(`"${owner}/([A-Za-z0-9._-]+)"`, "g")],
   ];
 
   // The literal prefix each URL shape starts with, for the cross-check below:
@@ -122,6 +133,8 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
   const RAW_PREFIX: Record<string, string> = {
     "github.com link": `github.com/${owner}/`,
     "Pages link": `${owner}.github.io/`,
+    "raw.githubusercontent.com link": `raw.githubusercontent.com/${owner}/`,
+    "quoted owner/repo literal": `"${owner}/`,
   };
   const rawCounter = (prefix: string) =>
     new RegExp(prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[A-Za-z0-9._-]", "g");

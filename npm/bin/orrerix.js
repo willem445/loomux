@@ -36,12 +36,10 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
-// The repo releases are fetched from. Renaming the GitHub repo is a separate,
-// human-coordinated step (#1153), and this slug is deliberately not changed
-// ahead of it: GitHub serves permanent redirects for a renamed repo on the
-// REST API and on release-asset downloads alike, so the launcher keeps working
-// on either side of that button. When the rename happens this line is the
-// whole edit.
+// The repo releases are fetched from. GitHub serves permanent redirects for
+// a renamed repo on the REST API and on release-asset downloads alike, so
+// the launcher keeps working against either the pre- or post-#1153-rename
+// slug.
 const REPO = "willem445/orrerix";
 const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
 

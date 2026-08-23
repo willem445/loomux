@@ -47,7 +47,7 @@ npm install -g orrerix # …or install it and just run `orrerix`
 > `npm uninstall -g loomux-desktop && npm install -g orrerix`. Installing Orrerix
 > leaves your old Loomux app in place rather than replacing it —
 > [Getting started](https://willem445.github.io/orrerix/getting-started) has the
-> uninstall commands. This repo's URL is the last identity still to move (#1153).
+> uninstall commands.
 
 <details>
 <summary>Other install paths — Windows / macOS / Linux one-liners, release assets, betas</summary>

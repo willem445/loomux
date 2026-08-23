@@ -23,9 +23,7 @@ whichever install path suits you — they all land on the same app.
 
 > **Coming from Loomux?** The npm package (`loomux-desktop`), the command
 > (`loomux`) and the installed app have all been renamed, with no compatibility
-> shim — see [Upgrading from Loomux](#upgrading-from-loomux) below. This repo's
-> URL is the last thing still to move; the links on this page keep working
-> either way, because GitHub redirects a renamed repo.
+> shim — see [Upgrading from Loomux](#upgrading-from-loomux) below.
 
 ### npm (any platform)
 
