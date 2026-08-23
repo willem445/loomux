@@ -54974,8 +54974,16 @@ fn current_sprint_is_derived_and_a_blocked_row_holds_it_open() {
     ];
     assert_eq!(current_sprint(&held), Some(1), "a blocked row keeps sprint 1 current");
 
-    // Every non-done status holds it, not just `blocked`.
-    for status in ["queued", "in-progress", "review", "pr", "prototype", "human-testing", "blocked"] {
+    // EVERY non-done status holds it, not just `blocked` — and the set is read
+    // off TASK_STATUSES rather than transcribed, so a status added later is
+    // inside this claim automatically instead of silently outside it.
+    let non_done: Vec<&str> = TASK_STATUSES.iter().copied().filter(|s| *s != "done").collect();
+    assert_eq!(
+        non_done.len(),
+        TASK_STATUSES.len() - 1,
+        "exactly one status (`done`) is expected to release a sprint"
+    );
+    for status in non_done {
         let b = vec![sprinted("t-1", status, Some(1)), sprinted("t-2", "queued", Some(2))];
         assert_eq!(current_sprint(&b), Some(1), "a row at {status} must hold sprint 1 current");
     }
