@@ -494,6 +494,11 @@ written to the board file the orchestrator reads.
 - **✕** clears every filter at once, and the count beside it (**"7 of 412"**) says how much of the
   board is on screen.
 
+There is deliberately **no sprint filter yet**. [Sprints](#sprints--batches-of-work-in-order) landed
+after these controls were built, and the strip is designed so adding one is a chip row rather than a
+rebuild — but a chip that does not exist should not be hunted for, so it is named here as absent
+rather than left to be discovered.
+
 Two things about filtering a *tree* that are worth knowing, because they are what keeps the board
 readable as a tree rather than collapsing it into a flat list of hits:
 

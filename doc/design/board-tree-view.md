@@ -160,9 +160,16 @@ authored.
 
 ### A new filter family is a key, not a migration
 
-The persisted `filters` object is keyed by family. Adding one — #1272's sprint
-filter, #1273's typed links — is a new key plus one clause in `matchesFilter`; no
-version bump, no migration. That is only true in *both* directions if a build
+The persisted `filters` object is keyed by family. Adding one — a sprint filter
+over #1272's `sprint`, a filter over #1273's `links` — is a new key plus one
+clause in `matchesFilter`; no version bump, no migration.
+
+**Both of those landed on `main` while this change was in review, and the seam
+held as designed**: they added `sprint` and `links` to the board MODEL (on the
+task, which is where assignment belongs — the same line #1152 drew) and neither
+opened a second per-group view-state store, which is the collision this change's
+plan comment flagged in advance. Neither ships a filter, so the extension point
+is still unspent. That is only true in *both* directions if a build
 that does not know a key hands it back unchanged, so `decodeBoardPrefs` keeps
 unknown families verbatim and `encodeBoardPrefs` writes them back **before** the
 validated ones, where they cannot shadow a family this build owns.
