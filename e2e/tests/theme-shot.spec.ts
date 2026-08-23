@@ -20,7 +20,7 @@
 //      the source; this pins what the browser actually paints after the
 //      cascade, which is the claim "#1320 killed the blue cast" really makes.
 import { test, expect } from "../fixtures";
-import { createTerminalPane } from "../helpers";
+import { createTerminalPane, paneByName } from "../helpers";
 import { SEMANTIC, PALETTE } from "../../src/theme.ts";
 
 /** `rgb(r, g, b)` / `rgba(...)` -> [r,g,b]. Throws rather than returning a
@@ -37,9 +37,13 @@ const hexOf = (v: string) =>
 test("the themed shell paints theme.ts's own tokens, and its ground is achromatic", async ({
   appPage: page,
 }, testInfo) => {
-  await createTerminalPane(page, "theme-shot");
-  // Let the pane settle so the shot is not caught mid-fit.
-  await expect(page.locator(".pane").first()).toBeVisible();
+  const NAME = "theme-shot";
+  await createTerminalPane(page, { name: NAME });
+  // Address the pane BY NAME rather than `.pane` first: the shell can hold more
+  // than one pane and "first" would be whichever the layout happened to order
+  // first, which is not necessarily the one this spec created.
+  const pane = paneByName(page, NAME);
+  await expect(pane).toBeVisible();
 
   const tokens = await page.evaluate(() => {
     const s = getComputedStyle(document.documentElement);
@@ -80,15 +84,12 @@ test("the themed shell paints theme.ts's own tokens, and its ground is achromati
     body: await page.screenshot(),
     contentType: "image/png",
   });
-  const header = page.locator(".topbar, .top-bar, header").first();
-  if (await header.count()) {
-    await testInfo.attach("themed-chrome.png", {
-      body: await header.screenshot(),
-      contentType: "image/png",
-    });
-  }
+  await testInfo.attach("themed-chrome.png", {
+    body: await page.locator("#topbar").screenshot(),
+    contentType: "image/png",
+  });
   await testInfo.attach("themed-pane.png", {
-    body: await page.locator(".pane").first().screenshot(),
+    body: await pane.screenshot(),
     contentType: "image/png",
   });
 });
