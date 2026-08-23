@@ -1594,6 +1594,19 @@ test("the board's link-type vocabulary is the backend's, read out of the Rust so
     rust.length > 0,
     `no link types could be parsed out of TASK_LINK_TYPES. Body was:\n${body}`
   );
+  // Cross-check the census against the container's own declared length, because
+  // the character class above is a GUESS about the alphabet of its own subjects:
+  // `[a-z-]+` stops dead at a digit or an underscore, so a future type like
+  // `adr-2` would be silently dropped and this guard would compare a short list
+  // to a short list and pass. The declared count cannot be fooled that way.
+  const declared = body.match(/\[&str;\s*(\d+)\]/);
+  assert.ok(declared, `could not read TASK_LINK_TYPES' declared length. Body was:\n${body}`);
+  assert.equal(
+    rust.length,
+    Number(declared[1]),
+    `the parser found ${rust.length} link types but the Rust array declares ${declared[1]} — ` +
+      `the regex cannot see one of its own subjects, so this guard is not comparing what it thinks`
+  );
   assert.deepEqual(
     [...LINK_TYPES],
     rust,
