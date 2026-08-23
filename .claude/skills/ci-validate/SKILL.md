@@ -302,6 +302,39 @@ are frozen" — into a body a squash turns into the permanent commit message: pa
 tense with the attempt named, or drop it. Signature: a body citing a failure a
 rerun has since cleared (#1196).
 
+### Body quotes are checked against head, never eyeballed
+
+A body that **quotes** a passage out of a file in its own diff has made a claim a
+machine can settle, unlike a paraphrase: pull each quoted passage out of the
+*posted* body and assert it appears in the file the body names it from, at head.
+Whitespace-normalise both sides before matching — the body rewraps, the file
+carries its own hand-wrap and CRLF — and read the file with
+`git show <head>:<path>`, blob-to-blob, never against a worktree copy.
+
+Three things keep it from being decorative:
+
+- **Scope it to the section describing the shipped text** (*What changed*).
+  Evidence sections legitimately quote strings that are absent from head by
+  design — a mutation that was reverted, a phrase the PR removed, a check's own
+  label — so a whole-body match reddens on exactly the disclosure you want
+  people to write. State where the scope ends wherever you report the run.
+- **Print the passage count, and mutation-test the check** before citing it, per
+  *a coverage claim is a claim*: a parser that matched zero passages exits green
+  and proves nothing, and a check nobody has seen redden is not evidence. Splice
+  the superseded phrasing back into a copy of the body and confirm it reddens on
+  that quote and only that quote.
+- **Harvest blockquotes, and report what you did not harvest.** The blockquote is
+  the form to scope to. An *inline* quotation — a phrase in parentheses, a clause
+  folded into a sentence of your own — is out of the harvest on purpose: inlining
+  licenses a re-casing or an elision that no matcher can tell from drift, so
+  `An orrery` quoted mid-sentence as `an orrery` is a true claim that reddens.
+  Check those by hand and name them, because `1 passage checked` where the
+  section held three is a scope claim, not a pass.
+
+Signature that you needed this: the body's *What changed* quotes the exact
+phrasing a later commit on the same branch removed, and the squash then
+republishes it permanently (#1271).
+
 ## Red-before-green evidence goes through CI too
 
 Every PR owes its new tests seen *failing* without the change. With local
