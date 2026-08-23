@@ -1,4 +1,4 @@
-// The repo's OWN `.loomux/workflow.yml` (#222), checked against the pane's reader
+// The repo's OWN `.orrerix/workflow.yml` (#222), checked against the pane's reader
 // and validator — the two things a human sees when they open it in loomux.
 //
 // loomux dogfoods its own feature, which is only worth anything if the file it ships
@@ -32,7 +32,7 @@ import { rewriteImpact, rewriteImpactMessage } from "../src/workflowpane.ts";
 // of what platform the suite runs on. `serializeWorkflow` (the fully canonical rewrite Format
 // uses) always emits `\n` — no original text to take a convention from — so tests that compare
 // against ITS output use `lfText` instead.
-const text = readFileSync(new URL("../.loomux/workflow.yml", import.meta.url), "utf8");
+const text = readFileSync(new URL("../.orrerix/workflow.yml", import.meta.url), "utf8");
 const lfText = text.replace(/\r\n/g, "\n");
 
 test("the repo's own workflow opens in the pane with no findings", () => {
@@ -187,7 +187,7 @@ test("the EXPLICIT Format action still rewrites this file wholesale — and stil
     impact.droppedComments >= 20,
     `…and it drops the comments (${impact.droppedComments} lines)`
   );
-  assert.match(rewriteImpactMessage(impact, ".loomux/workflow.yml"), /comments on \d+ lines/);
+  assert.match(rewriteImpactMessage(impact, ".orrerix/workflow.yml"), /comments on \d+ lines/);
 
   // And the case that must stay SILENT: a file loomux itself wrote is already canonical, so
   // formatting it costs nothing and asks nothing.
