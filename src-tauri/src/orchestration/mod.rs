@@ -9429,6 +9429,36 @@ pub fn is_demo_gated(status: &str) -> bool {
 /// already has — fully functional.
 pub const TASK_KINDS: [&str; 4] = ["epic", "feature", "story", "task"];
 
+/// Grounding-artifact link types (#1273) — a closed vocabulary, validated on
+/// every write exactly like `status` and `kind`. Strings rather than an enum
+/// for the same reason those are: the wire/JSON form stays obvious.
+///
+/// `link` is the deliberate escape hatch — a grounding pointer that is none of
+/// the named kinds still belongs on the task, and forcing it into a wrong one
+/// would make the type field lie. Constraint 8 applies: a group that runs no
+/// requirements process at all uses `link` and `doc` and nothing else.
+pub const TASK_LINK_TYPES: [&str; 6] = [
+    "requirement",  // the spec clause this work must satisfy
+    "spec",         // an acceptance spec or API contract
+    "design-note",  // a doc/design/*.md argument governing the approach
+    "test-case",    // a test that pins the behaviour (a review input too)
+    "doc",          // user-facing documentation this work must keep true
+    "link",         // anything else worth reading first
+];
+
+/// Caps on the `links` array (#1273), enforced at write. These bound BOTH
+/// `tasks.json` growth and the `list_tasks` payload every orchestrator turn
+/// pays for — the whole array rides the row projection, which is what makes a
+/// cap a correctness concern here rather than a tidiness one.
+///
+/// Chosen to be generous enough that no honest task hits them: 32 grounding
+/// pointers is already far more reading than one brief can carry.
+pub const MAX_TASK_LINKS: usize = 32;
+/// Max `target` length — a URL with a query string fits comfortably.
+pub const MAX_TASK_LINK_TARGET: usize = 512;
+/// Max `label` length — a one-line gloss, not a description.
+pub const MAX_TASK_LINK_LABEL: usize = 120;
+
 /// Where a row of a given kind is allowed to sit (#1156) — the whole ladder,
 /// as data. `ladder_rule` is the ONLY place this table exists on this
 /// side, so the write path and every error string it produces cannot drift
@@ -9813,6 +9843,47 @@ pub fn wip_breaches(
 }
 
 
+/// One typed pointer from a task to a grounding artifact (#1273) — the
+/// requirement, spec, design note, test case or doc that GOVERNS the work.
+///
+/// The point is that a brief starts complete: an agent reads what governs the
+/// task instead of rediscovering it per session, which is how a relevant
+/// requirement gets missed entirely.
+///
+/// **Deliberately NOT `deps`/`related`.** Those name task ids on THIS board and
+/// carry the whole #582 machinery — existence-checked at write, deduped,
+/// stripped from survivors on delete. A `target` here names something OUTSIDE
+/// the board (an issue/PR ref, a repo path, a URL), where none of that applies
+/// and none of it would mean anything. Folding the two together would make one
+/// field straddle two target domains under two validation regimes; keeping them
+/// apart is what lets each stay strict about its own.
+///
+/// **Validated for SHAPE only, never for existence** — non-empty, length-capped,
+/// no control characters. A target is never resolved, fetched or checked at
+/// write: the board must stay editable offline, and a network round trip per
+/// board write would make writes flaky for a field that gates nothing. A
+/// dangling path renders tolerate-and-show, the same posture as a missing-dep
+/// chip.
+///
+/// **CONTEXT METADATA ONLY — NOTHING MAY GATE ON IT.** Same line as `pr_base`,
+/// `parent` and `kind`: the board is agent-writable, so a check that trusted a
+/// link would be a check the thing being checked gets to answer. Links are
+/// read by humans and injected into briefs; they decide nothing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct TaskLink {
+    /// One of `TASK_LINK_TYPES`. `type` is a Rust keyword, so the field is
+    /// renamed for the wire rather than spelled `r#type` at every use site.
+    #[serde(rename = "type")]
+    pub link_type: String,
+    /// What the link points AT — an issue/PR ref (`#123`), a repo-relative
+    /// path (`doc/design/x.md`), or a URL. Free-form on purpose (see above).
+    pub target: String,
+    /// Optional one-line gloss shown instead of a bare target. Skipped when
+    /// absent so a label-less link costs no bytes and no board gains the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskNote {
     pub ts_ms: u64,
@@ -9877,6 +9948,21 @@ pub struct Task {
     /// dependency cycle is always a bug.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<String>,
+    /// Typed pointers to the GROUNDING ARTIFACTS this work must honour (#1273)
+    /// — requirements, specs, design notes, test cases, docs. See `TaskLink`
+    /// for why these are a separate field from `deps`/`related` rather than an
+    /// extension of them: those name task ids on this board, these name things
+    /// outside it.
+    ///
+    /// Order is the author's and is preserved — it is the reading order a brief
+    /// presents. Capped at `MAX_TASK_LINKS` per task.
+    ///
+    /// Never consulted by readiness, ordering, WIP or any permission: context,
+    /// not structure. Additive and skipped when empty, so a pre-#1273
+    /// `tasks.json` loads with no links and a board that uses none rewrites
+    /// without gaining the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TaskLink>,
     /// The id of the task this one sits INSIDE (#958) — containment, where
     /// `deps` is ordering. Orthogonal on purpose: a dep may cross subtrees or
     /// link two containers, and none of the #582 link machinery consults this.
@@ -9927,6 +10013,30 @@ pub struct Task {
     /// STORE, the same kind of check `status` and `deps` have always had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Which numbered sprint this row belongs to (#1272), or `None` for the
+    /// backlog. A sprint is a BATCH, not a timebox: numbering replaces the
+    /// calendar deliberately, so there is no start date, end date or duration
+    /// here and never will be.
+    ///
+    /// `>= 1` always — 0 is not a sprint, it is the wire spelling of "clear
+    /// this" (see `TaskPatch::sprint`), so it can never be stored.
+    ///
+    /// **Board-only truth.** There is no GitHub-milestone mirror: a mirror
+    /// would need a sync subsystem loomux does not have, two writable
+    /// authorities to reconcile, and could not be the truth even in principle
+    /// — a board row with no `issue` is routine and must still be sprintable.
+    /// See `doc/design/board-sprints-and-links.md`.
+    ///
+    /// **Nothing gates on it.** Not readiness, not `claim`, not WIP, not any
+    /// permission — a sprint reorders what the orchestrator SHOULD pick up
+    /// next (`orchestrator.md`'s selection ladder), which is a hint it reads,
+    /// exactly like `ready`. The current sprint itself is DERIVED at read time
+    /// (`current_sprint`) and never stored, so there is no board-level state to
+    /// drift from these rows.
+    ///
+    /// Additive and skipped when absent, like `parent`/`kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<u32>,
     /// Worktree path where a demo of this item lives (#1091 slice B) — set on
     /// a `prototype`/`human-testing` row so the panel/board can tell the human
     /// exactly where to run it, instead of guessing from an assignee's roster
@@ -10029,6 +10139,27 @@ pub struct TaskSummary {
     pub parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// This row's sprint (#1272), skipped when absent so a board that runs no
+    /// sprints pays nothing — the same pay-for-what-you-use rule as `parent`.
+    ///
+    /// The reply's top-level `current_sprint` says which one is CURRENT; this
+    /// says which one the row is in. Ordering is a hint the orchestrator reads
+    /// from the two together (`orchestrator.md`), never a re-sort of these rows
+    /// — `list_tasks` returns the board in stored array order exactly as it
+    /// always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<u32>,
+    /// Grounding artifacts for this row (#1273), skipped when empty.
+    ///
+    /// Carried IN FULL rather than as a count, unlike `note_count` above. The
+    /// two cases differ in the way that matters: note text is unbounded and
+    /// grows without limit, which is what blew the payload #245 was cut for,
+    /// while a link is three short capped strings and there are at most
+    /// `MAX_TASK_LINKS` of them. And the whole point of #1273 is that grounding
+    /// is visible at SELECTION time — a count would mean a `get_task` round
+    /// trip per candidate row to learn what a task is even about.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TaskLink>,
     /// DIRECT children of this row, and how many of them are `done` (#958) —
     /// derived at read time in `board_summaries`, never stored. Counts ONLY,
     /// and only one level: a nested child list is exactly the expansion #245
@@ -10114,6 +10245,15 @@ pub struct AgentTaskView<'a> {
     pub parent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'a str>,
+    /// AGENT-VISIBLE (#1272): the orchestrator selects work by sprint, so
+    /// withholding it would make the selection ladder unfollowable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<u32>,
+    /// AGENT-VISIBLE (#1273), and the single most load-bearing field here:
+    /// grounding links exist SO an agent reads them. Withholding them would
+    /// defeat the feature outright.
+    #[serde(skip_serializing_if = "borrowed_slice_is_empty")]
+    pub links: &'a [TaskLink],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demo_path: Option<&'a str>,
     pub updated_ms: u64,
@@ -10139,6 +10279,11 @@ pub fn agent_task_view(task: &Task) -> AgentTaskView<'_> {
         parent,
         kind,
         demo_path,
+        // AGENT-VISIBLE (#1272/#1273): both are read BY agents by design —
+        // the sprint drives the orchestrator's selection ladder, and the
+        // links are grounding a worker is meant to open before starting.
+        sprint,
+        links,
         // HUMAN-ONLY (#1152): the human's archive stamp on their own board.
         // Withheld here, not merely undocumented — `docs/orchestration.md`
         // promises the human that no agent can see they cleared a row, and this
@@ -10161,6 +10306,8 @@ pub fn agent_task_view(task: &Task) -> AgentTaskView<'_> {
         parent: parent.as_deref(),
         kind: kind.as_deref(),
         demo_path: demo_path.as_deref(),
+        sprint: *sprint,
+        links,
         updated_ms: *updated_ms,
     }
 }
@@ -10292,6 +10439,8 @@ pub fn task_summary(t: &Task, ready: bool, children: usize, children_done: usize
         related: t.related.clone(),
         parent: t.parent.clone(),
         kind: t.kind.clone(),
+        sprint: t.sprint,
+        links: t.links.clone(),
         children,
         children_done,
         ready,
@@ -10399,6 +10548,96 @@ fn normalize_links(raw: Vec<String>, self_id: &str, board: &[Task], field: &str)
         }
     }
     Ok(out)
+}
+
+/// Normalize and validate the grounding-link array on write (#1273).
+///
+/// SHAPE ONLY — deliberately. A target is never resolved, fetched or checked
+/// for existence: the board must stay editable offline, a network round trip
+/// per board write would make writes flaky, and validating existence would
+/// imply the field is trustworthy when nothing may gate on it. See `TaskLink`.
+///
+/// The ONE board-aware check is the misuse guard: a target that names a live
+/// task id is refused, pointing the caller at `deps`/`related`. That is a
+/// TEACHING check, not an invariant — it fires at the moment of the mistake,
+/// where an error can still explain the distinction between the two link
+/// domains. Nothing downstream depends on it having fired, which is why a link
+/// is NOT stripped when some later task happens to be created with a matching
+/// id (`strip_deleted_links` deliberately does not touch this field): an
+/// external target that coincidentally looks like a task id still points
+/// exactly where it always pointed, and silently deleting it would be worse
+/// than leaving it.
+fn normalize_task_links(raw: Vec<TaskLink>, board: &[Task], field: &str) -> Result<Vec<TaskLink>, String> {
+    if raw.len() > MAX_TASK_LINKS {
+        return Err(format!("{field}: too many links ({}) — at most {MAX_TASK_LINKS} per task", raw.len()));
+    }
+    let mut out: Vec<TaskLink> = Vec::with_capacity(raw.len());
+    for link in raw {
+        let link_type = link.link_type.trim().to_string();
+        if !TASK_LINK_TYPES.contains(&link_type.as_str()) {
+            return Err(format!("{field}: invalid type {link_type:?} — use one of {}", TASK_LINK_TYPES.join(" | ")));
+        }
+        let target = link.target.trim().to_string();
+        if target.is_empty() {
+            return Err(format!("{field}: a {link_type} link needs a non-empty target"));
+        }
+        if target.chars().count() > MAX_TASK_LINK_TARGET {
+            return Err(format!("{field}: target too long ({} chars) — at most {MAX_TASK_LINK_TARGET}", target.chars().count()));
+        }
+        // Control characters would corrupt every surface that renders a link as
+        // one line — the board row, the audit detail, an injected brief.
+        if target.chars().any(char::is_control) {
+            return Err(format!("{field}: target must not contain control characters"));
+        }
+        // The misuse guard, worded to TEACH: a caller reaching for `links` to
+        // express a board relationship wanted `deps` or `related`.
+        if board.iter().any(|t| t.id == target) {
+            return Err(format!("{field}: {target} names a task on this board — use `deps` (blocking) or `related` (see-also) for links between board tasks; `links` is for external grounding artifacts (issue/PR refs, repo paths, URLs)"));
+        }
+        let label = match link.label {
+            None => None,
+            Some(l) => {
+                let l = l.trim().to_string();
+                if l.chars().count() > MAX_TASK_LINK_LABEL {
+                    return Err(format!("{field}: label too long ({} chars) — at most {MAX_TASK_LINK_LABEL}", l.chars().count()));
+                }
+                if l.chars().any(char::is_control) {
+                    return Err(format!("{field}: label must not contain control characters"));
+                }
+                // An empty label is stored as ABSENT rather than as `""`: one
+                // spelling for "no label", so no renderer has to tell the two
+                // apart. Same instinct as the empty-string-clears rule.
+                if l.is_empty() { None } else { Some(l) }
+            }
+        };
+        out.push(TaskLink { link_type, target, label });
+    }
+    Ok(out)
+}
+
+/// The board's CURRENT sprint (#1272) — the lowest sprint number carried by any
+/// row that is not `done`, or `None` when no open row carries one.
+///
+/// **Derived at read time and never stored.** That is the whole design: there is
+/// no board-level sprint state, no stored `current_sprint` marker, and therefore
+/// no second authority that can drift from the rows. `tasks.json` stays the flat
+/// array it has always been — storing a board-level integer would mean either an
+/// array-to-object migration for one number, or a sidecar file that can go stale
+/// (the failure `doc/design/board-order-and-archive.md` already documents
+/// rejecting).
+///
+/// **A sprint therefore completes only as a consequence of its rows completing**,
+/// and roll-over is never automatic: an open row — `blocked` very much included —
+/// HOLDS its sprint current until someone explicitly resolves it or reassigns its
+/// sprint. A blocked row silently ceasing to count would be the board quietly
+/// deciding a sprint had finished when it had not, which is exactly the
+/// never-silent failure #1272 asks to avoid. Moving work to the next sprint is N
+/// ordinary audited row writes, by the human or the orchestrator.
+///
+/// `done` is the only status that stops holding a sprint, matching
+/// `dep_satisfied`: it is the bar the human has signed off on.
+pub fn current_sprint(tasks: &[Task]) -> Option<u32> {
+    tasks.iter().filter(|t| t.status != "done").filter_map(|t| t.sprint).min()
 }
 
 /// Depth-first search for a dependency cycle reachable from `start` (#582),
@@ -10700,6 +10939,31 @@ pub struct TaskPatch {
     pub deps: Option<Vec<String>>,
     /// Non-blocking links (#582); same replace-or-untouched rule as `deps`.
     pub related: Option<Vec<String>>,
+    /// Grounding-artifact links (#1273) — same replace / omit-untouched /
+    /// empty-clears rule as `deps`, deliberately, so there is one rule for
+    /// every array field on this patch rather than a second convention to
+    /// learn. `None` leaves the array untouched, `Some(vec![])` clears it.
+    ///
+    /// Validated for shape and caps (`normalize_task_links`) before anything
+    /// is written; unlike `deps`/`related` the targets are never resolved
+    /// against the board, because they do not name board rows.
+    pub links: Option<Vec<TaskLink>>,
+    /// Sprint assignment (#1272). `None` leaves it untouched; `Some(0)` CLEARS
+    /// it back to the backlog; `Some(n)` with `n >= 1` sets it.
+    ///
+    /// Zero is the sentinel because the alternatives do not work here: absent
+    /// and `null` already both mean "untouched" under the #582 arg convention
+    /// this patch shares with `deps`/`related`, so neither is available to
+    /// mean "clear". A numeric field cannot borrow the empty-string sentinel
+    /// `pr`/`parent`/`kind` use, so it needs the numeric equivalent — and 0 is
+    /// exactly the value that is not a legal sprint (`Task::sprint` is `>= 1`),
+    /// which is what makes it unambiguous rather than merely conventional.
+    ///
+    /// A NEGATIVE or fractional value never reaches this field: the wire
+    /// parsers refuse it (`as_u64` in `mcp.rs`, serde's `u32` on the human
+    /// command), so a caller that typo'd gets an error naming the shape
+    /// instead of a silent no-op.
+    pub sprint: Option<u32>,
     /// This task's container (#958). `None` leaves it untouched; an EMPTY
     /// string clears it (promoting the row to top level) — the `pr` rule, so
     /// "no longer inside anything" is expressible without hand-editing the
@@ -26327,6 +26591,16 @@ impl OrchRegistry {
             filter_done_rows(rows, LIST_TASKS_DONE_CAP)
         }
     }
+    /// The group's derived current sprint (#1272) — see `current_sprint`.
+    ///
+    /// Reads the WHOLE board deliberately, not the rows `list_tasks` is about
+    /// to return: those are capped for done rows (`LIST_TASKS_DONE_CAP`), and
+    /// deriving a board-level answer from a deliberately partial view is the
+    /// kind of coupling that is correct today and silently wrong the first time
+    /// the cap changes what it drops.
+    pub fn current_sprint_for(&self, group: &GroupId) -> Option<u32> {
+        current_sprint(&self.tasks(group))
+    }
 
     /// One full task (including its capped note history) by id — the detail
     /// view `list_tasks`'s compact rows point at (#245).
@@ -26637,6 +26911,19 @@ impl OrchRegistry {
                 return Err(format!("invalid kind {k:?} — use one of {}", TASK_KINDS.join(" | ")));
             }
         }
+        // A sprint is >= 1 (#1272). ZERO is not an invalid sprint, it is the
+        // CLEAR — the numeric counterpart of the empty string on `pr`/`kind` —
+        // so like the empty kind above it has to pass here to reach the apply.
+        // Negatives and fractions never get this far: the wire parsers refuse
+        // them (`as_u64` in mcp.rs, serde`s u32 on the human command), so this
+        // arm is about the one value that IS representable and still not a
+        // sprint.
+        //
+        // Nothing else about a sprint is validated, here or anywhere: sprint
+        // numbers need not be contiguous, need not start at 1, and a row may
+        // sit in a sprint far ahead of every other. `current_sprint` derives
+        // from whatever the rows say, so there is no board-level invariant to
+        // keep and no ordering the board could be wrong about.
         if patch.claim {
             // A claim is a guarded transition on an EXISTING row: the guards
             // (queued, unclaimed-or-mine, deps met) are the whole point, and a
@@ -26725,6 +27012,11 @@ impl OrchRegistry {
                     related: vec![],
                     parent: None,
                     kind: None,
+                    // Born in the backlog with no grounding (#1272/#1273); both
+                    // are applied below by the generic patch application, so a
+                    // create-with-sprint is one code path with an update.
+                    sprint: None,
+                    links: vec![],
                     demo_path: None,
                     cleared_ms: None,
                     updated_ms: 0,
@@ -26743,6 +27035,11 @@ impl OrchRegistry {
         // then reject a write that would close a dependency cycle.
         let deps = patch.deps.map(|v| normalize_links(v, &this_id, &tasks, "deps")).transpose()?;
         let related = patch.related.map(|v| normalize_links(v, &this_id, &tasks, "related")).transpose()?;
+        // ---- grounding links (#1273): shape + caps only, plus the misuse
+        // guard that refuses a target naming a live board task. Validated in
+        // the same pre-write phase as the #582 arrays above, so a refusal here
+        // leaves the board exactly as it was.
+        let links = patch.links.map(|v| normalize_task_links(v, &tasks, "links")).transpose()?;
         if let Some(new_deps) = deps.as_ref() {
             let mut edges: HashMap<String, Vec<String>> =
                 tasks.iter().map(|t| (t.id.clone(), t.deps.clone())).collect();
@@ -26976,6 +27273,18 @@ impl OrchRegistry {
         }
         if patch.kind.is_some() {
             task.kind = patch.kind.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        // Grounding links REPLACE, like `deps`/`related` above — one rule for
+        // every array on this patch (#1273).
+        if let Some(l) = links {
+            task.links = l;
+        }
+        // Sprint (#1272): 0 is the clear, anything else is already known to be
+        // >= 1 from the vocabulary check at the top of this method. Written
+        // through `filter` rather than a branch so the clear and the set are
+        // one expression, the way `kind` above does it.
+        if patch.sprint.is_some() {
+            task.sprint = patch.sprint.filter(|n| *n != 0);
         }
         // #1152. Applied after `status` above, deliberately: a patch that
         // reopens a row and clears its archive stamp in one call must end with
@@ -51127,6 +51436,13 @@ pub async fn orch_upsert_task(
     // demo_path edits (the orchestrator sets it through the MCP `upsert_task`
     // tool's own arm — see `mcp.rs`).
     demo_path: Option<String>,
+    // #1272/#1273: same additive contract again, so the human board can set a
+    // row's sprint (including the sprint-advance affordance, which is N of
+    // these writes and never a bulk operation) and edit its grounding links.
+    // Both are validated in the registry, identically to the MCP path — the
+    // rules do not depend on who wrote them.
+    sprint: Option<u32>,
+    links: Option<Vec<TaskLink>>,
     // #1152: the human's archive stamp. Same additive contract; absent means
     // "leave it alone". Human-only by construction — no MCP tool takes it.
     cleared: Option<bool>,
@@ -51147,6 +51463,8 @@ pub async fn orch_upsert_task(
                 kind,
                 demo_path,
                 cleared,
+                sprint,
+                links,
                 ..Default::default()
             },
         )?;
