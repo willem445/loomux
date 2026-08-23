@@ -690,7 +690,7 @@ of it.
 
 ### Grounding in the brief — the links reach the agent by themselves
 
-Recording grounding only pays off if somebody reads it, so loomux delivers it rather than
+Recording grounding only pays off if somebody reads it, so orrerix delivers it rather than
 hoping. When the orchestrator opens an agent **against a task** — the same "open a worker"
 call, plus the task's id — that task's links are composed into the top of the agent's opening
 brief, above the task it was given:

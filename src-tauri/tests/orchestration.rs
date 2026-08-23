@@ -55663,3 +55663,56 @@ fn a_hand_edited_link_cannot_forge_a_line_of_the_kickoff() {
         "no part of a link may start a line of its own: {k}"
     );
 }
+
+/// The idle arm of `kickoff_body` is a SEPARATE `format!` from the one that
+/// carries a brief, so "the section is placed correctly" proves nothing about
+/// it. An agent opened against a row before it has a brief is exactly the case
+/// where reading the grounding first is most useful.
+#[test]
+fn a_bound_spawn_with_no_brief_still_gets_its_grounding() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let (tid, links) = grounded_row(&reg, &g.id);
+
+    let w = spawn_bound(&reg, &g.id, Role::Worker, "w", "", Some(&tid)).unwrap();
+    let k = reg.kickoff_prompt(&w, &g, "note", None);
+    let mut unbound = w.clone();
+    unbound.task_id = None;
+    let plain = reg.kickoff_prompt(&unbound, &g, "note", None);
+    let (head, rest) = plain
+        .split_once("\nNo task is assigned yet.")
+        .expect("an idle delegate kickoff says so");
+    assert_eq!(
+        k,
+        format!("{head}{}\nNo task is assigned yet.{rest}", grounding_section(&tid, &links)),
+        "the idle arm takes the same section in the same place — it is a second `format!`, \
+         not the same one"
+    );
+}
+
+/// The audit is the record of what orrerix did, and this binding changes the
+/// text a delegate is handed — so it is the same class of fact as `block`,
+/// `session` and `resume`, which the `agent-spawn` record already carries.
+#[test]
+fn the_agent_spawn_audit_records_which_board_row_grounded_it() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let (tid, _) = grounded_row(&reg, &g.id);
+
+    spawn_bound(&reg, &g.id, Role::Worker, "w", "Ship it", Some(&tid)).unwrap();
+    spawn_bound(&reg, &g.id, Role::Worker, "w2", "Ship it", None).unwrap();
+    let spawns: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "agent-spawn").collect();
+    assert_eq!(spawns.len(), 2, "both spawns are audited");
+    assert_eq!(
+        spawns[0].detail["task_id"],
+        json!(tid),
+        "the bound spawn's record names the row it read"
+    );
+    assert_eq!(
+        spawns[1].detail["task_id"],
+        json!(null),
+        "an unbound spawn records the absence rather than omitting the key — the two are \
+         different facts and the log has to be able to say which"
+    );
+}
