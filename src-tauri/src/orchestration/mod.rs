@@ -1794,13 +1794,13 @@ if [ -f "$ORX_GD/merge_gate" ]; then
     # `threshold` + routing is refused at parse and unrepresentable in the gate
     # file. Reaching here means a hand edit or a regressed writer, so: malformed,
     # never "read it as a threshold gate and hope" — that reading is the laxer one.
-    [ "$g_req" = "all-pass" ] || loomux_block_wf "malformed-gate" "the merge gate declares path routing together with require: '$g_req'. Routing makes the required reviewer set depend on the diff and a threshold counts votes over a fixed list; loomux will not guess which of the two this gate meant"
+    [ "$g_req" = "all-pass" ] || loomux_block_wf "malformed-gate" "the merge gate declares path routing together with require: '$g_req'. Routing makes the required reviewer set depend on the diff and a threshold counts votes over a fixed list; orrerix will not guess which of the two this gate meant"
     # Shape first: every token must be <positive index>:<non-empty value>. A
     # token this cannot read is a rule half, and a dropped rule half is a
     # required reviewer that silently stops being required.
     g_rmax=0
     for g_t in $g_rpaths $g_rrevs; do
-      case "$g_t" in *:*) : ;; *) loomux_block_wf "malformed-gate" "the merge gate carries a routing line loomux cannot read ('$g_t')" ;; esac
+      case "$g_t" in *:*) : ;; *) loomux_block_wf "malformed-gate" "the merge gate carries a routing line orrerix cannot read ('$g_t')" ;; esac
       g_i=${g_t%%:*}
       case "$g_i" in ''|*[!0-9]*) loomux_block_wf "malformed-gate" "the merge gate carries a routing line whose rule number is not a number ('$g_t')" ;; esac
       [ "$g_i" -ge 1 ] || loomux_block_wf "malformed-gate" "the merge gate carries a routing line numbered 0 — routing rules are numbered from 1"
@@ -1815,7 +1815,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
     # (more rules is more required reviewers), which is exactly why it would
     # never have been noticed; "the two halves agree, and both fail closed" is
     # the property, not "the disagreement is harmless this time".
-    [ "$g_rmax" -le __ROUTING_RULES_MAX__ ] || loomux_block_wf "malformed-gate" "the merge gate declares routing rule $g_rmax, past the __ROUTING_RULES_MAX__-rule limit loomux will load — so this file is one loomux cannot read back, and an unreadable gate refuses every merge"
+    [ "$g_rmax" -le __ROUTING_RULES_MAX__ ] || loomux_block_wf "malformed-gate" "the merge gate declares routing rule $g_rmax, past the __ROUTING_RULES_MAX__-rule limit orrerix will load — so this file is one orrerix cannot read back, and an unreadable gate refuses every merge"
     # …then completeness: rules are numbered 1..N and each needs BOTH halves. A
     # rule with paths and no reviewers requires nobody; one with reviewers and no
     # paths can never fire. Both are the same laxening in different clothes.
@@ -1830,7 +1830,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
       # `parse_gate_file` — malformed, every merge refused — and perfectly
       # readable here: the same two-halves divergence the rule cap above closed,
       # one bound over, and no more harmless for falling on the strict side.
-      [ "$g_hasp" -le __ROUTING_PATHS_MAX__ ] || loomux_block_wf "malformed-gate" "the merge gate declares $g_hasp paths on routing rule $g_i, past the __ROUTING_PATHS_MAX__-path limit loomux will load — so this file is one loomux cannot read back, and an unreadable gate refuses every merge"
+      [ "$g_hasp" -le __ROUTING_PATHS_MAX__ ] || loomux_block_wf "malformed-gate" "the merge gate declares $g_hasp paths on routing rule $g_i, past the __ROUTING_PATHS_MAX__-path limit orrerix will load — so this file is one orrerix cannot read back, and an unreadable gate refuses every merge"
       g_i=$((g_i+1))
     done
     # THE CHANGED-FILE LIST. `__ROUTING_FILES_JQ__` is interpolated from
@@ -1890,7 +1890,7 @@ if [ -f "$ORX_GD/merge_gate" ]; then
     g_hit=$("$REAL_GH" pr view $rf "$num" --json files,changedFiles --jq '__ROUTING_FILES_JQ__' 2>/dev/null | loomux_route_scan)
     case "$g_hit" in
       hit*) g_hit=" ${g_hit#hit} " ;;
-      *) loomux_block_wf "routing-unaccountable" "this repo's merge gate routes reviewers by path, and loomux could not account for every file this PR changed — either gh would not report them, or it reported fewer files than the PR says it has (its file list pages at 100). It therefore cannot tell which routing rules apply, and an unknown reviewer requirement is refused rather than assumed empty. Re-run the merge; if this PR permanently changes more than 100 files, split it — path routing cannot be enforced for it" ;;
+      *) loomux_block_wf "routing-unaccountable" "this repo's merge gate routes reviewers by path, and orrerix could not account for every file this PR changed — either gh would not report them, or it reported fewer files than the PR says it has (its file list pages at 100). It therefore cannot tell which routing rules apply, and an unknown reviewer requirement is refused rather than assumed empty. Re-run the merge; if this PR permanently changes more than 100 files, split it — path routing cannot be enforced for it" ;;
     esac
     # The union, in declaration order: the static list, then each fired rule.
     # `workflow::route_reviewers` appends in exactly this order, so the two
