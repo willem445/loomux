@@ -35,7 +35,16 @@ test("a write survives an encode/decode round trip, field for field", () => {
     "orrerix-abc",
     view({
       collapsed: ["e-1", "f-2"],
-      filter: { kind: ["story", "unlabelled"], status: ["blocked"], text: "auth", attention: true },
+      filter: {
+        kind: ["story", "unlabelled"],
+        status: ["blocked"],
+        // Both spellings the sprint family can hold — a decimal number and the
+        // backlog sentinel — so the round trip is exercised on the sentinel
+        // too, which is the one value a numeric decoder would have eaten.
+        sprint: ["2", "backlog"],
+        text: "auth",
+        attention: true,
+      },
     }),
     1_700_000_000_000
   );
@@ -44,6 +53,7 @@ test("a write survives an encode/decode round trip, field for field", () => {
   assert.deepEqual(back.filter, {
     kind: ["story", "unlabelled"],
     status: ["blocked"],
+    sprint: ["2", "backlog"],
     text: "auth",
     attention: true,
   });
@@ -51,31 +61,52 @@ test("a write survives an encode/decode round trip, field for field", () => {
   assert.equal(JSON.parse(encodeBoardPrefs(prefs)).v, BOARD_PREFS_VERSION);
 });
 
+/** The witness for "a family this build does not know".
+ *
+ *  Deliberately a name no `BoardFilter` key can ever take — the real ones are
+ *  single lowercase identifiers — rather than a plausible future family. These
+ *  tests were originally written with `sprint` as the specimen, and #1272
+ *  shipped that family: the specimen left the class it was witnessing, and the
+ *  assertions went red on a build where nothing about forward compatibility had
+ *  changed. Relocating onto a name that can never be adopted is what keeps the
+ *  property pinned instead of decaying into a list of what has not landed yet. */
+const FUTURE_FAMILY = "family-from-a-newer-build";
+
 test("a filter family this build does not know is preserved verbatim", () => {
-  // The forward-compat claim the schema is built on (#1272's sprint filter,
-  // #1273's typed links): a new family is a KEY, not a migration. That is only
-  // true in both directions if a build that does not know the key hands it back
-  // unchanged — otherwise opening the board once on an older build silently
-  // deletes the newer one's state.
+  // The forward-compat claim the schema is built on: a new family is a KEY, not
+  // a migration. That is only true in both directions if a build that does not
+  // know the key hands it back unchanged — otherwise opening the board once on
+  // an older build silently deletes the newer one's state.
   const stored = JSON.stringify({
     v: 1,
     groups: {
       "g-1": {
         touched: 7,
         collapsed: [],
-        filters: { kind: ["epic"], sprint: ["s-4"], someFutureFlag: true },
+        filters: { kind: ["epic"], [FUTURE_FAMILY]: ["s-4"], someFutureFlag: true },
       },
     },
   });
   const prefs = decodeBoardPrefs(stored);
   assert.deepEqual(readGroupView(prefs, "g-1").unknownFilters, {
-    sprint: ["s-4"],
+    [FUTURE_FAMILY]: ["s-4"],
     someFutureFlag: true,
   });
   const filters = JSON.parse(encodeBoardPrefs(prefs)).groups["g-1"].filters;
-  assert.deepEqual(filters.sprint, ["s-4"]);
+  assert.deepEqual(filters[FUTURE_FAMILY], ["s-4"]);
   assert.equal(filters.someFutureFlag, true);
   assert.deepEqual(filters.kind, ["epic"], "the known family still round-trips beside it");
+  // The other half of the same guarantee, and the half #1272 actually
+  // exercised: a family this build DOES know is decoded into `filter`, never
+  // left in the unknown bag where a later write would treat it as passthrough.
+  const known = decodeBoardPrefs(
+    JSON.stringify({
+      v: 1,
+      groups: { "g-2": { touched: 7, collapsed: [], filters: { sprint: ["3", "backlog"] } } },
+    })
+  );
+  assert.deepEqual(readGroupView(known, "g-2").filter.sprint, ["3", "backlog"]);
+  assert.deepEqual(readGroupView(known, "g-2").unknownFilters, {});
 });
 
 test("an unknown family cannot shadow a known one", () => {
@@ -87,14 +118,18 @@ test("an unknown family cannot shadow a known one", () => {
     [
       "g-1",
       view({
-        filter: { kind: ["epic"], status: [], text: "", attention: false },
-        unknownFilters: { kind: "nonsense", status: 42 },
+        filter: { kind: ["epic"], status: [], sprint: ["2"], text: "", attention: false },
+        unknownFilters: { kind: "nonsense", status: 42, sprint: ["99"] },
       }),
     ],
   ]);
   const filters = JSON.parse(encodeBoardPrefs(prefs)).groups["g-1"].filters;
   assert.deepEqual(filters.kind, ["epic"]);
   assert.deepEqual(filters.status, []);
+  // Every family this build owns, not just the two that existed when the rule
+  // was written: the spread order has to cover the whole set, and a family
+  // added below it in the literal would be the one that could be shadowed.
+  assert.deepEqual(filters.sprint, ["2"]);
 });
 
 test("the store keeps the most recently touched groups and evicts the rest", () => {
@@ -408,7 +443,7 @@ test("a write carries over unknown families the caller never saw", async () => {
       JSON.stringify({
         v: 1,
         groups: {
-          "g-mine": { touched: 1, collapsed: ["e-1"], filters: { sprint: ["s-7"], kind: ["story"] } },
+          "g-mine": { touched: 1, collapsed: ["e-1"], filters: { [FUTURE_FAMILY]: ["s-7"], kind: ["story"] } },
         },
       })
     )
@@ -420,7 +455,7 @@ test("a write carries over unknown families the caller never saw", async () => {
   assert.deepEqual(back.filter.kind, [], "…including clearing one");
   assert.deepEqual(
     back.unknownFilters,
-    { sprint: ["s-7"] },
+    { [FUTURE_FAMILY]: ["s-7"] },
     "…but a newer build's family survives a write that never mentioned it"
   );
 });
@@ -438,7 +473,7 @@ test("a first gesture after a FAILED boot read does not delete this group's unkn
           JSON.stringify({
             v: 1,
             groups: {
-              "g-mine": { touched: 1, collapsed: ["e-1"], filters: { sprint: ["s-7"] } },
+              "g-mine": { touched: 1, collapsed: ["e-1"], filters: { [FUTURE_FAMILY]: ["s-7"] } },
               "g-other": { touched: 2, collapsed: ["e-9"], filters: {} },
             },
           })
@@ -454,7 +489,7 @@ test("a first gesture after a FAILED boot read does not delete this group's unkn
   const back = decodeBoardPrefs(io.saved[0]);
   assert.deepEqual(
     readGroupView(back, "g-mine").unknownFilters,
-    { sprint: ["s-7"] },
+    { [FUTURE_FAMILY]: ["s-7"] },
     "the newer build's family survived the unhappy path, which is the guarantee #1272 is told to build on"
   );
   assert.deepEqual(

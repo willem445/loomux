@@ -488,16 +488,16 @@ written to the board file the orchestrator reads.
   the two rows narrow each other (`story` **and** `blocked`). The level chips are hidden on a
   board that doesn't use levels. If your board file has been hand-edited to use a level orrerix
   doesn't know, that level gets a chip too, so nothing on the board can become unreachable.
+- **sprint** chips filter by [sprint](#sprints--batches-of-work-in-order) — one chip per sprint
+  number your board actually uses (they're never invented, so a board that jumps from 1 to 5
+  offers `#1` and `#5` and nothing in between), plus **backlog** for everything with no sprint
+  at all. They behave like the rows above them: *any of these* within the row, and they narrow
+  the other rows. The whole row is hidden on a board that doesn't use sprints.
 - **❗ needs you (N)** is the shortcut for the question the board is usually opened with: show
   only the items blocked on a decision or parked for a demo — exactly the rows wearing the
   **❓** / **👀** marker chips. It hides itself when nothing is waiting.
 - **✕** clears every filter at once, and the count beside it (**"7 of 412"**) says how much of the
   board is on screen.
-
-There is deliberately **no sprint filter yet**. [Sprints](#sprints--batches-of-work-in-order) landed
-after these controls were built, and the strip is designed so adding one is a chip row rather than a
-rebuild — but a chip that does not exist should not be hunted for, so it is named here as absent
-rather than left to be discovered.
 
 Two things about filtering a *tree* that are worth knowing, because they are what keeps the board
 readable as a tree rather than collapsing it into a flat list of hits:
@@ -666,28 +666,31 @@ and no duration anywhere. The point is only to say **which work comes first**: t
 orchestrator finishes the current sprint before starting the next, and tasks with no sprint
 at all — the backlog — sit behind everything that has one.
 
-> **What's here now, and what's coming.** This release ships the sprint itself: tasks store
-> it, the orchestrator reads it when choosing what to pick up, and it survives restarts. The
-> **board's own sprint controls** — the current-sprint indicator, the per-row sprint badge,
-> and the roll-over confirmation described below — land in a later slice, so for now sprints
-> are something you ask the orchestrator to set and it reports back on, not something you
-> click. Nothing below changes when those controls arrive; you'll just be able to do it
-> yourself.
-
-- Ask the orchestrator to put an item in a sprint, move it, or take it out again. It's an
-  ordinary board edit, not a privileged one — nothing about a sprint is locked down.
-- The **current sprint** is the lowest sprint number that still has unfinished work in it.
-  It isn't stored anywhere and there's no button to advance it: when a sprint's last item is
-  done, the next one becomes current by itself, so there's no marker that can drift out of
-  step with the board.
+- Put an item in a sprint yourself with the **🎯** button on its row, or ask the orchestrator
+  to. It's an ordinary board edit either way, not a privileged one — nothing about a sprint is
+  locked down, and the same picker takes an item back to the backlog.
+- An item in a sprint wears a **`sprint N`** badge, brightened when N is the current sprint.
+  Items with no sprint wear nothing: the backlog is the absence of a badge, not another one.
+- The board header carries **`sprint 2 — 3/7 done`** whenever the board uses sprints at all.
+  It counts everything in that sprint, cleared items included, and clicking it shows *only*
+  that sprint's items (click again for the whole board). It's a shortcut for the sprint chips
+  in the strip, and it arms the number — so when the sprint later completes, the board you
+  come back to is still the one you aimed it at, rather than having silently re-pointed itself
+  at the next sprint while you weren't looking.
+- The **current sprint** is the lowest sprint number that still has unfinished work in it. It
+  isn't stored anywhere: when a sprint's last item is done, the next one becomes current by
+  itself, so there's no marker that can drift out of step with the board. Nothing you click
+  flips it — the **⏭** button beside the header moves *items*, and the current sprint follows
+  from where the items ended up.
 - **A blocked item keeps its sprint open.** That's deliberate: a sprint quietly ending
   because the work left in it looked stuck is exactly the thing you'd want to be told about.
   It stays current until that item is resolved or moved on.
-- Moving unfinished work into the next sprint is always **explicit**. The orchestrator moves
-  such items one at a time, so each shows up in the audit log on its own, and says in its
-  pane which ones it moved. Nothing rolls over silently. (When the board controls land,
-  they'll show you the exact list of items that would move and ask first — same rule, done
-  by hand.)
+- Moving unfinished work into the next sprint is always **explicit**. **⏭** shows you the
+  exact list of items that would move — blocked ones included, since those are precisely what
+  a silent roll-over would sweep up — and asks before writing anything. Confirming moves them
+  one at a time, so each shows up in the audit log on its own and the orchestrator sees the
+  board change. Done items keep the sprint they finished in. The orchestrator does the same
+  thing the same way, and says in its pane which items it moved. Nothing rolls over silently.
 
 Sprint numbers don't have to be tidy — they needn't be contiguous and needn't start at 1, so
 you can leave gaps for planned work without the board minding.

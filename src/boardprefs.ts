@@ -46,9 +46,10 @@
 import { NO_FILTER, type BoardFilter } from "./taskboard.ts";
 
 /** Schema version of the persisted blob. Bumped only when an existing key
- *  changes MEANING — adding a filter family (#1272's sprint, #1273's typed
- *  links) is a new key inside `filters`, which older builds preserve and
- *  ignore, so it needs no bump and no migration. */
+ *  changes MEANING — adding a filter family is a new key inside `filters`,
+ *  which older builds preserve and ignore, so it needs no bump and no
+ *  migration. #1272's `sprint` was the first family added after this was
+ *  written and did exactly that: a new key, version untouched. */
 export const BOARD_PREFS_VERSION = 1;
 
 /** How many groups' view state to keep. Keyed by group, so without a cap this
@@ -102,6 +103,7 @@ export function readGroupView(prefs: BoardPrefs, groupId: string): GroupBoardVie
     filter: {
       kind: [...found.filter.kind],
       status: [...found.filter.status],
+      sprint: [...found.filter.sprint],
       text: found.filter.text,
       attention: found.filter.attention,
     },
@@ -128,6 +130,7 @@ export function writeGroupView(
     filter: {
       kind: [...view.filter.kind],
       status: [...view.filter.status],
+      sprint: [...view.filter.sprint],
       text: view.filter.text,
       attention: view.filter.attention,
     },
@@ -148,7 +151,19 @@ export function writeGroupView(
  *  memory, and is **dropped at every save** — worse than a plain omission,
  *  because `...unknownFilters` would have PRESERVED a `sprint` written by a
  *  newer build, so the half-added family actively deletes what an unaware build
- *  keeps.
+ *  keeps. That family has since landed, and this site behaved as designed:
+ *  adding `sprint` to `BoardFilter` made this literal fail to compile
+ *  (`TS2322: Property 'sprint' is missing`) until the line below was written.
+ *
+ *  BOTH guards catch the omission, measured by deleting that line and running
+ *  each: `tsc` refuses it with the `TS2322` above, and
+ *  `test/boardprefs.test.ts` reddens on `a write survives an encode/decode
+ *  round trip` and `an unknown family cannot shadow a known one`. Neither is
+ *  spare. What sees only one of them is a mutation harness running `node
+ *  --test` alone — type stripping is not typechecking — so a run that reports
+ *  which tests reddened has still not asked whether the compiler had an
+ *  opinion. Worth knowing before concluding anything about what protects this
+ *  literal.
  *
  *  `BoardFilter &` is what makes the four sites move together; the
  *  `Record<string, unknown>` intersected onto it is what still admits the
@@ -195,6 +210,7 @@ export function encodeBoardPrefs(prefs: BoardPrefs): string {
         ...v.unknownFilters,
         kind: [...v.filter.kind],
         status: [...v.filter.status],
+        sprint: [...v.filter.sprint],
         text: v.filter.text,
         attention: v.filter.attention,
       },
@@ -232,13 +248,14 @@ export function decodeBoardPrefs(raw: string | null): BoardPrefs {
       rec.filters && typeof rec.filters === "object" && !Array.isArray(rec.filters)
         ? (rec.filters as Record<string, unknown>)
         : {};
-    const { kind, status, text, attention, ...unknownFilters } = rawFilters;
+    const { kind, status, sprint, text, attention, ...unknownFilters } = rawFilters;
     out.set(id, {
       touched: typeof rec.touched === "number" && Number.isFinite(rec.touched) ? rec.touched : 0,
       collapsed: stringList(rec.collapsed),
       filter: {
         kind: stringList(kind),
         status: stringList(status),
+        sprint: stringList(sprint),
         text: typeof text === "string" ? text : "",
         attention: attention === true,
       },

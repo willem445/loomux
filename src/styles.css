@@ -2381,6 +2381,33 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    somewhere a cap says it should not be. Under the cap is deliberately quiet:
    a limit nobody is near should not draw the eye every time the board
    repaints. */
+/* The header sprint lens (#1272) — `sprint 2 — 3/7 done`, which is also the
+   one-click filter for the current sprint, plus the roll-over affordance.
+   Absent entirely on a board that runs no sprints, so the header keeps the
+   shape it had.
+
+   Deliberately NOT on a semantic channel: a sprint number answers "which batch
+   is this", which is neither a state of the work nor an identity, so the lens
+   sits on the neutral surface/ink ramp and takes the accent only when ARMED —
+   the same "this is what you have switched on" the filter chips use. */
+.tasks-sprint { display: flex; align-items: center; gap: 3px; flex: none; }
+.tasks-head .pane-btn.sprint-lens,
+.tasks-head .pane-btn.sprint-advance {
+  flex: none; width: auto; padding: 0 7px; height: 20px; font-size: 10.5px;
+  border-radius: 4px; background: var(--surface-2); color: var(--ink-dim);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.tasks-head .pane-btn.sprint-lens:hover:not(:disabled),
+.tasks-head .pane-btn.sprint-advance:hover:not(:disabled) { color: var(--ink); }
+.tasks-head .pane-btn.sprint-lens.on {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--ink); font-weight: 600;
+}
+/* Advancing is reversible — it moves rows between batches and each move is its
+   own audited write — so it is not painted like the destructive batch buttons
+   beside it. Disabled only at the top of the number range, where there is
+   nothing to move into. */
+.tasks-head .pane-btn.sprint-advance:disabled { opacity: 0.35; cursor: default; }
 .tasks-wip { display: flex; align-items: center; gap: 4px; flex: none; }
 .wip-chip {
   flex: none; font-size: 9.5px; border-radius: 4px; padding: 1px 6px;
@@ -2726,6 +2753,20 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-chip.kind.k-unknown {
   background: color-mix(in srgb, var(--state-danger) 16%, transparent); color: var(--state-danger); text-transform: none;
 }
+/* The row's sprint badge (#1272). Neutral for the same reason the header lens
+   is: "which batch is this in" is an ordering fact, not a state of the work and
+   not an identity, and spending a semantic hue on it would say the row was
+   doing something. Only the CURRENT sprint is lifted, and it is lifted along
+   the ink ramp — emphasis on the same neutral, not a second channel. */
+.task-chip.sprint {
+  font-size: 9px; letter-spacing: 0.3px;
+  background: var(--surface-2); color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+.task-chip.sprint.current {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink-dim); font-weight: 600;
+}
 /* Direct-child rollup: the same two numbers the orchestrator's list_tasks row
    carries. Neutral — a count is information, not a state. */
 .task-chip.children {
@@ -2744,6 +2785,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 /* Set-kind picker (#958 slice K): a separate entry point from ⤵ above — a
    container's Agile level and what it sits inside are independent choices. */
 .task-btn.kindpick { font-size: 10px; }
+/* Set-sprint picker (#1272): the fourth row picker, its own entry point beside
+   🏷 for the same reason that one is separate from ⤵ — which batch a row is in
+   and what it is a level of are independent choices. */
+.task-btn.sprintpick { font-size: 10px; }
 
 /* Merge-gate action buttons (approve / request changes) and the queued-task
    start button share the same compact pill shape. */

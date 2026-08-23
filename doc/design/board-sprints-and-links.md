@@ -1,10 +1,11 @@
 # Design: board sprints and typed grounding links (#1272, #1273)
 
-Status: **backend implemented** (PR A); **grounding injected at spawn** (PR B, §12). Two
-human-requested features that touch the same persisted structure, landed as ONE additive
-board-model revision rather than two: the schema change, its validation, the derived
-projections, the MCP surface, and the one role-template edit. The board UI for both is a
-later slice — §9 says which. Symbols are the durable reference.
+Status: **backend implemented** (PR A); **grounding injected at spawn** (PR B, §12); **the
+board's sprint UI implemented** (PR C, §13). Two human-requested features that touch the same
+persisted structure, landed as ONE additive board-model revision rather than two: the schema
+change, its validation, the derived projections, the MCP surface, and the one role-template
+edit. The board UI for **links** is still a later slice — §9 says which. Symbols are the
+durable reference.
 
 ## 1. Problem & thesis
 
@@ -241,15 +242,13 @@ through its own `Serialize`, so both fields appear in the audit log automaticall
 
 ## 9. Out of scope here — the later slices
 
-- **Board UI for sprints** — a badge, a filter family, and a header `Sprint N — x/y done`
-  indicator with the advance affordance of §5. Sprint *sections* were rejected: a subtree can
-  legitimately span sprints (a feature in no sprint, its stories in sprint 2), so sections
-  must break either the grouping or the hierarchy rendering, where a filter shows the lens
-  without lying about structure. The filter family composes into #1270's `BoardFilter` —
-  **one** predicate, whose own design already reserves a sprint key. PR A ships the pure
-  helpers (`currentSprint`, `sprintProgress`, `rollOverSet`, `linkTargetKind`) and
-  deliberately **no** `BoardFilter`, since #1270's richer seam landed first and a second
-  weaker one would defeat the point of having a seam.
+- **Board UI for sprints** — no longer deferred: it shipped as PR C and is specified in §13.
+  Sprint *sections* stayed rejected there: a subtree can legitimately span sprints (a feature
+  in no sprint, its stories in sprint 2), so sections must break either the grouping or the
+  hierarchy rendering, where a filter shows the lens without lying about structure. PR A
+  shipped the pure helpers (`currentSprint`, `sprintProgress`, `rollOverSet`,
+  `linkTargetKind`) and deliberately **no** `BoardFilter`, since #1270's richer seam landed
+  first and a second weaker one would defeat the point of having a seam.
 - **Board UI for links** — a count chip on the row, a typed list in the detail, an add/remove
   editor.
 - **Brief injection (`spawn_agent.task_id`)** — no longer deferred: it shipped as PR B and
@@ -385,7 +384,82 @@ re-spawns with no binding and its kickoff carries no grounding section. A rejoin
 of a conversation that already read the section once, so the cost is nil; persisting the
 binding would mean a roster-record schema change that buys nothing today.
 
-## 13. Symbols
+## 13. The board's sprint UI (PR C)
+
+Four surfaces, all of them chrome inside the existing board overlay: nothing here is a layout
+sibling of `#grid-area` and nothing resizes a PTY (hard constraint 1).
+
+**A filter FAMILY, not a second filter.** #1270's `BoardFilter` is one predicate that the
+board persists per group, and its own design reserves the shape a new family takes: a key
+plus one clause in `matchesFilter`. `sprint` is that key. Nothing about the sprint lens has
+its own filtering path, which is what makes ancestor visibility — a story in sprint 2 keeps
+the unbatched feature above it, marked as context — true for sprints without a line of code:
+it is #1270's rule, unchanged.
+
+**The family is `readonly string[]`, and the plan said `number | "current" | "backlog"`.**
+Both halves of that are deliberate deviations, argued rather than drifted into:
+
+- *Strings, one array.* The plan's shape predates #1270's landing. Every shipped family is an
+  array of strings — persisted through `boardprefs.ts`'s `stringList`, rendered by one
+  `familyChip`, spread through one `unknownFilters` passthrough. A number family would have
+  needed its own decoder, its own chip builder, and would still have had to invent a value
+  for "no sprint". `BACKLOG_SPRINT` is that value, and it is `UNLABELLED_KIND`'s argument
+  applied to the other optional field.
+- *No `"current"` value, and this is the substantive one.* A stored `"current"` is a filter
+  whose MEANING moves without a gesture: the moment a sprint's last item is done, a board
+  armed on `current` silently re-points itself at the next sprint, and the human returns to a
+  view they never aimed — the rows they were working on simply gone. That is the same failure
+  §5 refuses for roll-over, one surface over. The header lens gives the identical one-click
+  gesture and arms the concrete number instead, so the board changes only when someone clicks
+  it. Re-clicking after an advance re-aims it, which is a gesture.
+
+**The badge is on rows that HAVE a sprint, and nothing else.** A `backlog` badge on every
+unbatched row would put a chip on most of the board to say "no"; the absence already says it,
+and the `backlog` filter chip is how the backlog is asked for. The current sprint's badge is
+lifted along the ink ramp rather than dyed: "which batch is this in" is an ordering fact, not
+a state of the work and not an identity, so it takes no semantic channel (#1320).
+
+**The header lens is derived on every render**, `currentSprint` + `sprintProgress`, never
+cached and never stored — §5's no-second-authority rule, applied to the one line a human reads
+the sprint's state off. Its progress fraction counts the sprint's whole scope, **archived rows
+included**: `clearedIds` hides rows from the working view, it does not remove them from their
+sprint, so excluding them would make the fraction disagree with `currentSprint` about what a
+sprint contains. On a board whose sprints have all finished the lens says so rather than
+vanishing — "this board finished its sprints" and "this board runs no sprints" are different
+states.
+
+**The advance affordance is `sprintAdvance`, one function feeding both the dialog and the
+writes.** The rows the human is shown and the number in the sentence come from the same call,
+so what was approved cannot differ from what is recorded; a view computing `from + 1` beside
+its own `rollOverSet` call is the one-rule asymmetry, and it fails in the worst direction.
+Confirming performs one `orch_upsert_task` per row, sequentially, in board order — §5's "N
+audited writes, never a bulk operation". `to` is `from + 1` and never "the next number already
+in use": gaps are deliberate (a human parking planned work in sprint 5), and landing
+rolled-over rows in an existing later batch would silently redefine that batch's scope.
+
+**Two edges, both pinned.** `MAX_SPRINT` (`u32::MAX`, the bound both wire parsers already
+impose) is the only thing that makes `sprintAdvance` refuse on a reachable board: there is no
+sprint after it, so the affordance goes inert rather than composing a write the backend must
+reject. And `sprintPickerChoices` filters `0` out of its options even when a hand-edited board
+carries a row in it: `0` is the numeric CLEAR of §8, so offering it would be a menu entry
+reading "sprint 0" that performs the clear instead. Such a row keeps its badge and its filter
+chip — nothing becomes unreachable — it is simply not a sprint anything moves INTO. It can
+still be moved OUT of: `sprintAdvance(board, 0)` rolls to sprint 1, because refusing there
+would leave a hand-edited board with a dead ⏭ whose tooltip claimed it had run out of numbers.
+
+**No new backend surface.** Everything above rides `orch_upsert_task`'s existing `sprint`
+argument from PR A. There is no advance command, no bulk write, and no board-level state.
+
+**This slice went through the demo gate** (#1027's precedent, which the plan asked PR C to
+consider). It qualifies on every count the gate is for: visible chrome on the human's primary
+surface, a human-requested feature, and — unlike PR A and PR B — a slice whose payload is DOM
+wiring, which this repo validates by hand rather than by test. So `t-469` **parks** at
+`human-testing` with the branch worktree as its `demo_path` once review settles, and the merge
+**waits** on the human's own look rather than on more code. Recorded here because "was the demo
+gate considered?" is a question the next UI slice will ask, and a silent skip reads the same
+as a decision not to.
+
+## 14. Symbols
 
 Backend (`src-tauri/src/orchestration/mod.rs` unless noted):
 `Task::sprint`, `Task::links`, `TaskLink`, `TASK_LINK_TYPES`, `MAX_TASK_LINKS`,
@@ -402,5 +476,11 @@ Frontend (`src/taskboard.ts`): `currentSprint`, `sprintProgress`, `rollOverSet`,
 `linkTargetKind`, `LINK_TYPES`, `TaskArtifactLink`, `HasSprint`, `HasArtifactLinks`,
 `boardUsesSprints`, `boardUsesLinks`.
 
+PR C (the sprint UI, §13) — `src/taskboard.ts`: `BoardFilter.sprint`, `BACKLOG_SPRINT`,
+`sprintFilterValue`, `sprintFilterChoices`, `sprintPickerChoices`, `sprintAdvance`,
+`MAX_SPRINT`, and `PickerField`'s `"sprint"` arm. `src/tasksview.ts`:
+`TasksView.renderSprintLens`, `sprintLensArmed`, `toggleSprintLens`, `onAdvanceSprint`,
+`renderSprintPicker`. `src/boardprefs.ts` carries `sprint` at its four persistence sites.
+
 Tests: `src-tauri/tests/orchestration.rs` (the `#1272`/`#1273` block),
-`test/taskboard.test.ts`.
+`test/taskboard.test.ts`, `test/boardprefs.test.ts`.
