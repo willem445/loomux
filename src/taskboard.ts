@@ -1601,15 +1601,24 @@ export const MAX_SPRINT = 0xffff_ffff;
  *  and the dialog names the number, so nothing about where it lands is
  *  inferred.
  *
- *  `to: null` is the refusal: there is no sprint after [`MAX_SPRINT`], and a
- *  caller must hide the affordance rather than offer a write that cannot
- *  land. `rows` is still reported, so a caller can say what is stuck. */
+ *  `to: null` is the refusal, and [`MAX_SPRINT`] is the ONLY thing that
+ *  triggers it on any board a caller can actually reach: there is no sprint
+ *  after the last one a `u32` holds, so the affordance must go inert rather
+ *  than offer a write that cannot land. `rows` is still reported, so a caller
+ *  can say what is stuck.
+ *
+ *  `from` of `0` is accepted, deliberately. `0` is not a sprint anything can
+ *  be moved INTO (it is the CLEAR — see [`sprintPickerChoices`]), but a
+ *  hand-edited `tasks.json` can put a row in it, `currentSprint` will then
+ *  report `0`, and refusing here would leave that board with a dead advance
+ *  button and a tooltip claiming it had run out of numbers. Rolling those rows
+ *  into sprint 1 is exactly what the affordance is for. */
 export function sprintAdvance<T extends HasStatus & HasSprint>(
   board: readonly T[],
   from: number
 ): { to: number | null; rows: T[] } {
   return {
-    to: Number.isInteger(from) && from >= 1 && from < MAX_SPRINT ? from + 1 : null,
+    to: Number.isInteger(from) && from >= 0 && from < MAX_SPRINT ? from + 1 : null,
     rows: rollOverSet(board, from),
   };
 }

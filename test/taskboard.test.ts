@@ -1652,13 +1652,23 @@ test("sprintAdvance refuses when there is no next sprint to land in", () => {
   // One below the cap still advances — the refusal is the boundary, not a
   // band of numbers near it.
   assert.equal(sprintAdvance([sprintRow("t-1", "queued", MAX_SPRINT - 1)], MAX_SPRINT - 1).to, MAX_SPRINT);
-  // A `from` that is not a sprint at all cannot produce one. Unreachable from
-  // the board (the caller passes `currentSprint`'s own output), which is why it
-  // is pinned: an unreachable path that silently returned `1` would put rows
-  // into a sprint nobody asked for the first time it became reachable.
-  assert.equal(sprintAdvance([], 0).to, null);
+  // A `from` that could never be a sprint produces no target either. Not
+  // reachable from the board — `currentSprint`'s own output is what the caller
+  // passes, and serde refuses a negative or fractional `sprint` at load — but
+  // pinned so an unreachable path cannot silently start returning `1` and put
+  // rows into a sprint nobody asked for the first time it becomes reachable.
   assert.equal(sprintAdvance([], -3).to, null);
   assert.equal(sprintAdvance([], 1.5).to, null);
+});
+
+test("sprintAdvance rolls a hand-edited sprint-0 row forward rather than going inert", () => {
+  // `0` is not a sprint anything moves INTO (it is the backend's CLEAR), but a
+  // hand-edited tasks.json can put a row IN it, and `currentSprint` then reports
+  // 0. Refusing here would leave that board with a dead ⏭ and a tooltip claiming
+  // it had run out of sprint numbers — a control that lies about why it is off.
+  const board = [sprintRow("t-1", "queued", 0), sprintRow("t-2", "done", 0)];
+  assert.equal(currentSprint(board), 0, "the board really is on sprint 0");
+  assert.deepEqual(sprintAdvance(board, 0), { to: 1, rows: [board[0]] });
 });
 
 test("linkTargetKind classifies issue refs, URLs and repo paths", () => {

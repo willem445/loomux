@@ -437,13 +437,15 @@ audited writes, never a bulk operation". `to` is `from + 1` and never "the next 
 in use": gaps are deliberate (a human parking planned work in sprint 5), and landing
 rolled-over rows in an existing later batch would silently redefine that batch's scope.
 
-**Two fail-closed edges, both pinned.** `MAX_SPRINT` (`u32::MAX`, the bound both wire parsers
-already impose) is where `sprintAdvance` returns `to: null` and the affordance goes inert
-rather than composing a write the backend must refuse. And `sprintPickerChoices` filters `0`
-out of its options even when a hand-edited board carries a row in it: `0` is the numeric CLEAR
-of §8, so offering it would be a menu entry reading "sprint 0" that performs the clear
-instead. Such a row keeps its badge and its filter chip — nothing becomes unreachable — it is
-simply not a sprint anything moves INTO.
+**Two edges, both pinned.** `MAX_SPRINT` (`u32::MAX`, the bound both wire parsers already
+impose) is the only thing that makes `sprintAdvance` refuse on a reachable board: there is no
+sprint after it, so the affordance goes inert rather than composing a write the backend must
+reject. And `sprintPickerChoices` filters `0` out of its options even when a hand-edited board
+carries a row in it: `0` is the numeric CLEAR of §8, so offering it would be a menu entry
+reading "sprint 0" that performs the clear instead. Such a row keeps its badge and its filter
+chip — nothing becomes unreachable — it is simply not a sprint anything moves INTO. It can
+still be moved OUT of: `sprintAdvance(board, 0)` rolls to sprint 1, because refusing there
+would leave a hand-edited board with a dead ⏭ whose tooltip claimed it had run out of numbers.
 
 **No new backend surface.** Everything above rides `orch_upsert_task`'s existing `sprint`
 argument from PR A. There is no advance command, no bulk write, and no board-level state.

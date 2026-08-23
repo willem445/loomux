@@ -1517,10 +1517,22 @@ export class TasksView {
           `the board is touched, and done items keep sprint ${current}.`
       )
     );
+    // An ARCHIVED row that is not done is on this list, and has to be: it is
+    // open work, so `currentSprint` counts it and it holds the sprint open —
+    // leaving it behind would make the advance fail to advance anything. It is
+    // labelled rather than left looking like a live row, since the human is not
+    // otherwise looking at it (#1152).
+    const cleared = clearedIds(this.tasks);
     const list = el("div", "tasks-dialog-list");
     for (const t of rows) {
       const row = el("div", "tasks-dialog-row");
-      row.append(el("div", "tasks-dialog-row-title", `${t.id} — ${t.title} (${t.status})`));
+      row.append(
+        el(
+          "div",
+          "tasks-dialog-row-title",
+          `${t.id} — ${t.title} (${t.status}${cleared.has(t.id) ? ", cleared" : ""})`
+        )
+      );
       list.append(row);
     }
 
@@ -1535,7 +1547,17 @@ export class TasksView {
       overlay.remove();
       this.dialogEl = null;
     };
+    // Guarded, and this is not belt-and-braces: the confirm button holds focus,
+    // so pressing Enter on it fires the button's own click AND any Enter
+    // handler on the box — two calls, two rounds of writes, and a roll-over
+    // recorded twice in the audit log. The keydown below therefore handles
+    // Escape only, and this flag closes the same door for any other double
+    // path. (The approve dialog next door needs Ctrl+Enter instead because it
+    // has text fields; this one has none.)
+    let submitted = false;
     const submit = () => {
+      if (submitted) return;
+      submitted = true;
       close();
       // One write per row, in board order. Sequential and not `Promise.all`:
       // `tasks_lock` serializes board writes anyway, and a failure part-way
@@ -1554,10 +1576,11 @@ export class TasksView {
     };
     cancel.addEventListener("click", close);
     confirm.addEventListener("click", submit);
+    // Keep keystrokes off the terminal underneath. Escape only — Enter is the
+    // focused confirm button's own business (see `submitted` above).
     box.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Escape") close();
-      if (e.key === "Enter") submit();
     });
     overlay.addEventListener("mousedown", (e) => {
       if (e.target === overlay) close();
