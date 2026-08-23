@@ -20,6 +20,7 @@ import {
   detachOutput,
   detachOutputOwner,
   detachGitWatchOwner,
+  stopGitWatch,
   attachGitWatch,
   setGitWatch,
   ptyBackendInfo,
@@ -1774,6 +1775,7 @@ export class Pane implements VoiceTargetPane {
     // the spawn succeeds: a failed respawn must not be the case that leaks.
     detachOutputOwner(this);
     detachGitWatchOwner(this);
+    if (this.ptyId !== null) stopGitWatch(this.ptyId);
     this.ptyId = null;
     if (opts.name) this.setName(opts.name);
     this.launchedCommand = !!opts.command?.trim();
@@ -5078,7 +5080,6 @@ export class Pane implements VoiceTargetPane {
     // reachable from somewhere should at least not be dragging its output
     // backlog along with it (#1301).
     this.discardOutput();
-    if (this.ptyId !== null && killBackend) killPty(this.ptyId).catch(() => {});
     // By OWNER, not by `this.ptyId` (#1301). A pane that respawned in place has
     // already forgotten the ids it used to hold, so an id-aimed detach here can
     // only ever release the last one — which is how a module-level map came to
@@ -5086,6 +5087,14 @@ export class Pane implements VoiceTargetPane {
     // memory, and `respawnFresh` keeps the set to one by releasing as it goes.
     detachOutputOwner(this);
     detachGitWatchOwner(this);
+    // The backend poll is stopped by ID as well, and that is not redundant: an
+    // ssh pane never attaches a git-watch HANDLER (#887 S3) but can still have
+    // pointed the backend at a repo from an OSC-7 cwd report, so an owner-only
+    // teardown would narrow what `dispose` used to unwatch.
+    if (this.ptyId !== null) {
+      stopGitWatch(this.ptyId);
+      if (killBackend) killPty(this.ptyId).catch(() => {});
+    }
     this.term.dispose();
     this.el.remove();
   }

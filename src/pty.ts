@@ -443,7 +443,19 @@ export function setGitWatch(id: number, cwd: string): void {
  *  hold panes the grid had already closed. */
 export function detachGitWatchOwner(owner: RouteOwner): void {
   const released = gitRouter.releaseOwner(owner);
-  if (released !== null) invoke("git_unwatch", { id: released }).catch(() => {});
+  if (released !== null) stopGitWatch(released);
+}
+
+/** Stop the BACKEND poll for pty `id`, without touching any handler.
+ *
+ *  Split from the owner-keyed release above because the two are not the same
+ *  set. `setGitWatch` is called on every OSC-7 cwd report and is NOT gated on
+ *  `isSshPane`, while `attachGitWatch` is — so an ssh pane can have pointed the
+ *  backend at a repo while holding no handler at all, and an owner-only
+ *  teardown would leave that poll running for the life of the app. Idempotent
+ *  and cheap: unwatching an id the backend isn't watching is a no-op there. */
+export function stopGitWatch(id: number): void {
+  invoke("git_unwatch", { id }).catch(() => {});
 }
 
 /** Live git-watch attachments — invariant test only, like its output twin. */

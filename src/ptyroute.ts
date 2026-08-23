@@ -158,7 +158,13 @@ export class PtyRouter<H> {
 
   /** Offer a payload for an id with no handler attached. Returns what
    *  happened — the whole not-attached policy, so a test drives the real
-   *  decision rather than a paraphrase of it. */
+   *  decision rather than a paraphrase of it.
+   *
+   *  Callers ask `handler` first and only reach here when it answered
+   *  undefined, so an attached id never arrives; holding for one would be
+   *  buffering nobody ever drains. Not defended against, because the one
+   *  caller (pty.ts's `pty-output` listener) is where the check lives and a
+   *  second copy of it here would be a second thing to keep in step. */
   hold(id: number, chunk: unknown, bytes: number): HoldResult {
     if (this.retiredSet.has(id)) return { kind: "drop", reason: "retired" };
     if (bytes > MAX_PREATTACH_BYTES) return { kind: "drop", reason: "oversize" };
