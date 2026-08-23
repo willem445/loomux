@@ -1032,6 +1032,46 @@ fn a_gate_may_not_name_the_manager_as_one_of_its_reviewers() {
          gates:\n  merge:\n    reviewers: [rev]\n",
     )
     .expect("a manager beside a gated reviewer is an ordinary workflow");
+
+    // ...AND the same refusal on a ROUTING rule (#1176/#1209). `routing:` is a
+    // second place a gate names reviewers, and it arrived after this test was
+    // written; `gate_reviewer_error` is shared across both lists precisely so
+    // the static one cannot refuse a manager while a routed one quietly
+    // accepts it. That sharing is the kind of property a comment can assert
+    // and only a test can hold, so the edit is performed here rather than
+    // trusted.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: manager\n    kind: manager\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev\n    kind: reviewer\n\
+         gates:\n  merge:\n    reviewers: [rev]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [manager]\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("manager") && e.contains("could never open")),
+        "a ROUTING rule naming the manager must be refused with the same reason as the \
+         static list, not with a bare type error: {errs:?}"
+    );
+
+    // The control for THIS half: the identical routed gate with a real
+    // reviewer parses clean, so the refusal above is about the manager and not
+    // about the routing block being malformed.
+    workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: manager\n    kind: manager\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev\n    kind: reviewer\n\
+         \x20 - id: rev-ui\n    kind: reviewer\n\
+         gates:\n  merge:\n    reviewers: [rev]\n\
+         \x20   routing:\n\
+         \x20     - paths: [src/**]\n\
+         \x20       reviewers: [rev-ui]\n",
+    )
+    .expect("a routed gate naming a real reviewer is an ordinary workflow");
 }
 
 /// The built-in four, spelled out, plus one manager — the roster that makes

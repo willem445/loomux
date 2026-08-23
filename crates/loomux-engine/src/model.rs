@@ -725,9 +725,106 @@ pub enum Delivery {
     /// to the kind that takes none of them.
     #[default]
     MidSession,
+    /// The mandatory post-compact re-grounding notice, and **nothing else**
+    /// (#1161 M2).
+    ///
+    /// Behaviourally this is a `MidSession` delivery in every existing respect
+    /// — no readiness wait, no consent dialog, no lost-kickoff recovery — and
+    /// `the_regrounding_delivery_answers_every_lifecycle_predicate_like_midsession`
+    /// pins that, so the variant cannot quietly acquire a boot treatment by
+    /// being added to one of the `matches!` lists above.
+    ///
+    /// It exists for exactly one reason: it is the **only** mid-session text
+    /// loomux may type into a `Role::Manager` pane
+    /// ([`Delivery::permitted_into_manager_pane`], decision D2 on #1161). That
+    /// pane's transcript is a human's conversation, so the guarantee is that
+    /// nothing is injected into it; the sole carve-out is this notice, because
+    /// without it the directive-ledger survival mechanism — the one thing that
+    /// carries the human's own instructions across a compact nobody saw coming
+    /// — is dead for the one pane whose context IS the record of what the
+    /// human said.
+    ///
+    /// **Why a variant and not a private back door.** A guard reads every one
+    /// of its inputs by one rule; a carve-out spelled as a `Delivery` variant
+    /// for the kickoff and as a bypassing function call for the re-grounding is
+    /// two rules, and the second is invisible to any test that enumerates the
+    /// first. Here the whole permitted set is a property of this enum, so one
+    /// exhaustive set assertion covers it and a fourth carve-out cannot be
+    /// added without failing that count.
+    ///
+    /// **Downgrade note:** this is a persisted kind
+    /// (`queue::QueuedDelivery::delivery_kind`), so a `"regrounding"` entry
+    /// held through a pause and then read by an older build fails that entry's
+    /// parse. Downgrade safety was never on offer for this file — the same
+    /// posture `humanq::OptionSpec` states — and the alternative, reusing
+    /// `MidSession`, is the asymmetry this variant exists to avoid.
+    Regrounding,
 }
 
 impl Delivery {
+    /// **Whether loomux may type this into a [`Role::Manager`] pane** — the
+    /// structural no-injection guarantee, as one pure predicate (#1161 M2).
+    ///
+    /// `true` for the two kickoffs and for [`Delivery::Regrounding`]; `false`
+    /// for [`Delivery::MidSession`], which is what every other producer in the
+    /// codebase sends: `channel_send`, `send_prompt`, watchdog and stall
+    /// notices, `[loomux] answer to q-N`, lock grants, watch notices, the
+    /// compact nudge. All of them funnel through `deliver_prompt`, so all of
+    /// them are refused by this one answer rather than by N conventions at N
+    /// call sites.
+    ///
+    /// The kickoff is permitted because it is delivered *before* the pane is a
+    /// conversation — it is how every agent learns what it is — and the
+    /// re-grounding for the reason its own variant doc gives.
+    ///
+    /// **This is a counterfactual, so it is pinned as one.** The permitted set
+    /// is asserted as a SET over every variant
+    /// (`exactly_three_delivery_kinds_may_enter_a_manager_pane`), not as three
+    /// separate `assert!`s: a fourth carve-out folded in later fails the count,
+    /// which is the failure a per-variant test would not produce.
+    pub fn permitted_into_manager_pane(self) -> bool {
+        matches!(
+            self,
+            Delivery::FreshKickoff | Delivery::ResumeKickoff | Delivery::Regrounding
+        )
+    }
+
+    /// Every variant, for the set assertions that pin the predicates above.
+    ///
+    /// Hand-listed and therefore capable of going stale — so the one thing it
+    /// must not do is go stale **silently**. [`Delivery::all_index`] below is a
+    /// non-exhaustive-match tripwire that makes a fifth variant a compile
+    /// error until this array grows with it, which is what lets a test read
+    /// `ALL` and honestly claim to have covered every kind.
+    pub const ALL: [Delivery; 4] = [
+        Delivery::FreshKickoff,
+        Delivery::ResumeKickoff,
+        Delivery::MidSession,
+        Delivery::Regrounding,
+    ];
+
+    /// This variant's position in [`Delivery::ALL`] — a compile-time
+    /// completeness proof for that array, not a useful accessor.
+    ///
+    /// The `match` is exhaustive, so **adding a variant without an arm here
+    /// does not compile**; adding the arm forces an index, and the only correct
+    /// one is past the end of a four-element array, so `ALL` must grow too.
+    /// `the_all_list_holds_every_delivery_kind_exactly_once` walks `ALL` and
+    /// asserts each row reports its own position, which catches the remaining
+    /// mistake — an arm given a duplicate or wrong index to make it compile.
+    ///
+    /// This is the convention CLAUDE.md states for a guard that must not be
+    /// steppable: decide on an axis a rename or an addition cannot dodge (here,
+    /// the compiler's own exhaustiveness), never on a name.
+    pub const fn all_index(self) -> usize {
+        match self {
+            Delivery::FreshKickoff => 0,
+            Delivery::ResumeKickoff => 1,
+            Delivery::MidSession => 2,
+            Delivery::Regrounding => 3,
+        }
+    }
+
     /// Whether to hold the paste until the CLI has painted its UI — true for
     /// either kickoff (the CLI has just been launched), false mid-session.
     ///
@@ -896,4 +993,79 @@ mod tests {
     // — and it can never be the FIRST thing to fail, since cargo runs the
     // `src-tauri` targets before this crate's and stops at the first failing
     // one.
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    #[test]
+    fn the_all_list_holds_every_delivery_kind_exactly_once() {
+        // `all_index`'s match is exhaustive, so a FIFTH variant is a compile
+        // error until it is given an arm — and the only index left is past the
+        // end of this array, so the array must grow with it. That is what makes
+        // "every kind" below an honest claim rather than a hopeful one.
+        for (i, d) in Delivery::ALL.iter().enumerate() {
+            assert_eq!(d.all_index(), i, "{d:?} is not where ALL says it is");
+        }
+        assert_eq!(Delivery::ALL.len(), 4);
+    }
+
+    #[test]
+    fn exactly_three_delivery_kinds_may_enter_a_manager_pane() {
+        // A SET assertion, deliberately, not three `assert!`s (#1161 M2): the
+        // carve-outs in the no-injection guarantee are a counterfactual — a
+        // later slice folding a fourth kind in "just for this one notice" is
+        // exactly the edit this pin exists to catch, and only a count catches
+        // it.
+        let permitted: Vec<Delivery> =
+            Delivery::ALL.into_iter().filter(|d| d.permitted_into_manager_pane()).collect();
+        assert_eq!(
+            permitted,
+            vec![Delivery::FreshKickoff, Delivery::ResumeKickoff, Delivery::Regrounding],
+            "the manager pane's permitted deliveries are the two kickoffs and the post-compact \
+             re-grounding notice, and nothing else — see doc/design/manager.md"
+        );
+        // The negative control, named rather than implied: MidSession is what
+        // channel_send, send_prompt, every watchdog/stall notice, the answer
+        // notice and the lock/watch notices all send.
+        assert!(
+            !Delivery::MidSession.permitted_into_manager_pane(),
+            "a mid-session delivery is the whole class this guarantee refuses"
+        );
+    }
+
+    #[test]
+    fn the_regrounding_delivery_answers_every_lifecycle_predicate_like_midsession() {
+        // The variant exists to be distinguishable AT THE MANAGER GATE and
+        // nowhere else. If it ever picks up a boot treatment — a readiness
+        // wait, the copilot consent Enter, #517 re-delivery — that is a change
+        // to how a compacted pane is re-grounded in EVERY group, which is not
+        // what #1161 asked for and would arrive silently by someone adding it
+        // to one of the `matches!` lists.
+        for probe in [
+            (Delivery::wait_ready as fn(Delivery) -> bool, "wait_ready"),
+            (Delivery::confirms_autopilot_dialog, "confirms_autopilot_dialog"),
+            (Delivery::recovers_lost_kickoff, "recovers_lost_kickoff"),
+        ] {
+            let (f, name) = probe;
+            assert_eq!(
+                f(Delivery::Regrounding),
+                f(Delivery::MidSession),
+                "{name} must treat a re-grounding exactly as it treats a mid-session delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn the_regrounding_kind_round_trips_its_persisted_wire_name() {
+        // It rides `queue::QueuedDelivery::delivery_kind` into queue.json, so
+        // the kebab-case name is a persisted contract from the first write.
+        let json = serde_json::to_string(&Delivery::Regrounding).unwrap();
+        assert_eq!(json, "\"regrounding\"");
+        assert_eq!(
+            serde_json::from_str::<Delivery>("\"regrounding\"").unwrap(),
+            Delivery::Regrounding
+        );
+    }
 }
