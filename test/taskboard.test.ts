@@ -1614,6 +1614,35 @@ test("the sprint picker stops at the last sprint a u32 can hold", () => {
   });
 });
 
+test("the sprint picker always has SOMETHING to offer — the property that lets its empty branch go", () => {
+  // `renderSprintPicker` carries no empty-state branch, unlike the other three
+  // pickers, because this one cannot be empty. That is a claim about
+  // `sprintPickerChoices`, so it is pinned here rather than left to a branch no
+  // test could reach: a row must always have either an option or the clear.
+  const boards: [string, ReturnType<typeof sprintRow>[]][] = [
+    ["no sprints at all", [sprintRow("t-1", "queued")]],
+    ["one sprint", [sprintRow("t-1", "queued", 1)]],
+    ["every sprint done", [sprintRow("t-1", "done", 1), sprintRow("t-2", "done", 2)]],
+    ["a hand-edited 0", [sprintRow("t-1", "queued", 0)]],
+    ["sitting on the cap", [sprintRow("t-1", "queued", MAX_SPRINT)]],
+    ["cap plus a backlog row", [sprintRow("t-1", "queued", MAX_SPRINT), sprintRow("t-2", "queued")]],
+    ["a gap", [sprintRow("t-1", "queued", 2), sprintRow("t-2", "queued", 9)]],
+  ];
+  for (const [name, board] of boards) {
+    for (const row of board) {
+      const { options, clear } = sprintPickerChoices(row, board);
+      assert.ok(
+        options.length > 0 || clear,
+        `${name}: ${row.id} would open an empty picker — the deleted empty-state branch was load-bearing after all`
+      );
+    }
+  }
+  // The positive control: this loop must actually be judging rows, not sailing
+  // over an empty board. Seven boards, and every one of them has rows.
+  assert.equal(boards.length, 7);
+  assert.ok(boards.every(([, b]) => b.length > 0), "every board in the table carries rows to judge");
+});
+
 test("sprintAdvance reports the SAME rows the dialog shows and the number it names", () => {
   // One function feeds both the confirm list and the writes, so the list the
   // human approved cannot differ from what is recorded. This test is the
@@ -1899,6 +1928,26 @@ test("the sprint chips are the numbers the board carries, ascending, with backlo
   // current occupancy. Same rule `unlabelled` follows for kinds.
   assert.deepEqual(sprintFilterChoices([frow("t-1", { sprint: 2 })]), ["2", BACKLOG_SPRINT]);
   assert.deepEqual(sprintFilterChoices([]), [BACKLOG_SPRINT]);
+});
+
+test("an ARMED sprint keeps its chip after its last row is gone", () => {
+  // Delete the last row of sprint 5 while the filter is armed on it and the
+  // board empties. Without a lit chip the strip shows only unlit ones and a
+  // `0 of M` count, so nothing on screen says WHICH constraint is doing it and
+  // the only way out is the blanket ✕. The chip you turn off has to be there.
+  const board = [frow("t-1", { sprint: 1 }), frow("t-2", { sprint: 2 })];
+  assert.deepEqual(sprintFilterChoices(board, ["5"]), ["1", "2", "5", BACKLOG_SPRINT]);
+  // Sorted IN, not appended: a chip must not jump to the end of the row the
+  // moment its last row is deleted.
+  assert.deepEqual(sprintFilterChoices(board, ["0"]), ["0", "1", "2", BACKLOG_SPRINT]);
+  // An armed value a row still carries contributes no duplicate.
+  assert.deepEqual(sprintFilterChoices(board, ["2"]), ["1", "2", BACKLOG_SPRINT]);
+  // `backlog` is already unconditional, and a non-numeric value a hand-edited
+  // prefs file holds is not a sprint — neither mints a stray chip.
+  assert.deepEqual(sprintFilterChoices(board, [BACKLOG_SPRINT]), ["1", "2", BACKLOG_SPRINT]);
+  assert.deepEqual(sprintFilterChoices(board, ["nonsense", ""]), ["1", "2", BACKLOG_SPRINT]);
+  // The default is the pre-N3 behaviour, so every other caller is unchanged.
+  assert.deepEqual(sprintFilterChoices(board), ["1", "2", BACKLOG_SPRINT]);
 });
 
 test("the backlog chip catches every row the backend serializes without a sprint", () => {

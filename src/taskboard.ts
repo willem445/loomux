@@ -26,7 +26,12 @@ export function retainExisting(selected: Iterable<string>, tasks: readonly HasId
 
 /** The board's status vocabulary, in picker order. Mirrors the backend's
  *  TASK_STATUSES (validated there) — the frontend only offers these; the
- *  backend rejects anything else on write. */
+ *  backend rejects anything else on write. Pinned against the Rust source by a
+ *  test, the way `KINDS` and `LINK_TYPES` are (#1321): add a status on one side
+ *  only and `the board's status vocabulary is the backend's, read out of the
+ *  Rust source` reddens. It is the ONLY test that does — the sweeps over this
+ *  list (`isAwaitingHuman`, `isDemoGated`, `canApprove`, `taskActivityState`)
+ *  just iterate one entry fewer and stay green. */
 export const STATUSES = [
   "queued",
   "in-progress",
@@ -939,10 +944,28 @@ export function sprintFilterValue<T extends HasSprint>(task: T): string {
  *
  *  The backlog chip comes last, and unconditionally: it is the "not batched"
  *  bucket, which exists on every board whether or not a row is in it right
- *  now, exactly as `unlabelled` does for kinds. */
-export function sprintFilterChoices<T extends HasSprint>(board: readonly T[]): string[] {
+ *  now, exactly as `unlabelled` does for kinds.
+ *
+ *  `armed` is the sprint values the filter currently holds, and they get a chip
+ *  even when no row carries them any more. Without it, deleting the last row of
+ *  sprint 5 while the filter is armed on it leaves a strip of unlit chips, a
+ *  `0 of M` count, and no way to see WHICH constraint is emptying the board —
+ *  the human has to infer it and reach for the blanket ✕. A lit chip is the
+ *  thing you turn off. Sorted in with the rest rather than appended, so the
+ *  numbers stay in sprint order and a chip does not move when its last row
+ *  goes. */
+export function sprintFilterChoices<T extends HasSprint>(
+  board: readonly T[],
+  armed: readonly string[] = []
+): string[] {
   const seen = new Set<number>();
   for (const t of board) if (typeof t.sprint === "number") seen.add(t.sprint);
+  // Only numeric armed values join the numeric list; `backlog` is already
+  // unconditional below, and anything else a hand-edited prefs file holds is
+  // not a sprint and gets no chip here.
+  for (const a of armed) {
+    if (/^-?\d+$/.test(a)) seen.add(Number(a));
+  }
   return [...[...seen].sort((a, b) => a - b).map(String), BACKLOG_SPRINT];
 }
 

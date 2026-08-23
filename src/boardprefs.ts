@@ -151,8 +151,11 @@ export function writeGroupView(
  *  memory, and is **dropped at every save** — worse than a plain omission,
  *  because `...unknownFilters` would have PRESERVED a `sprint` written by a
  *  newer build, so the half-added family actively deletes what an unaware build
- *  keeps. That family has since landed, and this is the site that had to be
- *  edited by hand rather than by following the compiler.
+ *  keeps. That family has since landed, and this site behaved as designed:
+ *  adding `sprint` to `BoardFilter` made this literal fail to compile
+ *  (`TS2322: Property 'sprint' is missing`) until the line below was written.
+ *  Note that only `tsc` catches it — `node --test` strips types without
+ *  checking them, so the suite alone would have gone green on the omission.
  *
  *  `BoardFilter &` is what makes the four sites move together; the
  *  `Record<string, unknown>` intersected onto it is what still admits the

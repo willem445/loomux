@@ -1345,7 +1345,10 @@ export class TasksView {
     // chips regardless, so a persisted filter can always be seen and cleared.
     if (boardUsesSprints(this.tasks) || this.filter.sprint.length > 0) {
       this.filterChipsEl.append(el("span", "filter-label", "sprint"));
-      for (const s of sprintFilterChoices(this.tasks)) {
+      // The armed values are threaded in so a chip the filter is holding
+      // survives its last row being deleted — otherwise the board empties with
+      // every chip unlit and nothing to click but the blanket ✕.
+      for (const s of sprintFilterChoices(this.tasks, this.filter.sprint)) {
         this.filterChipsEl.append(
           this.familyChip(s, s === BACKLOG_SPRINT ? "backlog" : `#${s}`, "sprint")
         );
@@ -1382,21 +1385,6 @@ export class TasksView {
     return chip;
   }
 
-  /** The board's WIP chips (#1175) — `review 3/3` on the header, one per cap
-   *  the repo declares.
-   *
-   *  On the HEADER and not on a per-status column, because this board has no
-   *  status columns: it is one priority-ordered list whose order is meaning
-   *  (top = next). Inventing columns to hang a chip on would reorder the board
-   *  around a feature most repos never turn on. #1105's kanban view is where
-   *  the columns arrive, and `wipChips` already returns exactly what a column
-   *  header needs.
-   *
-   *  Rendered from `this.workflow`, which `refresh()` reads in the same pass as
-   *  the rows — so a chip is at most one refresh out of step with the list
-   *  under it, the same best-effort enrichment the live-agent set and the
-   *  question markers already are. It is a count beside a board that is itself
-   *  live; it authorizes nothing. */
   /** The header sprint lens (#1272): which sprint the board is on, how far it
    *  has got, and the two things a human does about it.
    *
@@ -1591,6 +1579,21 @@ export class TasksView {
     confirm.focus();
   }
 
+  /** The board's WIP chips (#1175) — `review 3/3` on the header, one per cap
+   *  the repo declares.
+   *
+   *  On the HEADER and not on a per-status column, because this board has no
+   *  status columns: it is one priority-ordered list whose order is meaning
+   *  (top = next). Inventing columns to hang a chip on would reorder the board
+   *  around a feature most repos never turn on. #1105's kanban view is where
+   *  the columns arrive, and `wipChips` already returns exactly what a column
+   *  header needs.
+   *
+   *  Rendered from `this.workflow`, which `refresh()` reads in the same pass as
+   *  the rows — so a chip is at most one refresh out of step with the list
+   *  under it, the same best-effort enrichment the live-agent set and the
+   *  question markers already are. It is a count beside a board that is itself
+   *  live; it authorizes nothing. */
   private renderWipChips(): void {
     const chips = wipChips(this.workflow?.wip);
     this.wipEl.replaceChildren();
@@ -1903,10 +1906,15 @@ export class TasksView {
    *  The single refusal that exists is `MAX_SPRINT`, and `sprintPickerChoices`
    *  is where it lives, so this method reads a list and renders it. */
   private renderSprintPicker(t: OrchTask): HTMLElement {
+    // No empty-state branch, unlike the other three pickers: this one can never
+    // have nothing to offer. `sprintPickerChoices` always adds `highest + 1`
+    // unless the board is at `MAX_SPRINT`, and there the row either carries a
+    // sprint (so the clear is on the menu) or `MAX_SPRINT` itself is an option.
+    // A branch guarding an unreachable state reads as though the state were
+    // reachable, and no test could ever reach it to say otherwise — so the
+    // invariant is pinned in `test/taskboard.test.ts` instead, where a future
+    // change that made it false would redden.
     const { options, clear: mayClear } = sprintPickerChoices(t, this.tasks);
-    if (options.length === 0 && !mayClear) {
-      return el("span", "task-links-label", "no sprint this row can move to");
-    }
     const sel = document.createElement("select");
     sel.className = "task-dep-picker sprint";
     const placeholder = document.createElement("option");
