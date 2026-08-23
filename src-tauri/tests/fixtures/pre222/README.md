@@ -783,6 +783,27 @@ pin advertised to stop it (rev-11 F1).
   `gh.rs`'s label table verbatim and would orphan every existing label if only
   one side moved.
 
+- **#1272/#1273, sprints and grounding links** — `orchestrator.md` only, in two places.
+  The **selection procedure** gains a `current sprint` rung, and it sits ABOVE board order
+  rather than below it: the ladder takes the first rung that decides, and board order always
+  decides, so a sprint rung underneath it could never be reached. The sprint rung narrows
+  WHICH rows are candidates (current sprint, then later sprints ascending, then the backlog)
+  and board order became the tiebreak *within* a sprint — which is what the design says the
+  two mean. Below it, two new paragraphs: sprint completion is DERIVED so nothing rolls over
+  on its own, a `blocked` row HOLDS its sprint open, and moving work forward is one audited
+  `upsert_task` per row and never silent; plus a flat statement that sprint gates nothing and
+  does not re-sort `list_tasks`.
+
+  The **task board** section gains the same ordering rule in its own words, and an
+  instruction to record a task's `links` — the requirement, spec, design note, test case or
+  doc that governs it — at creation rather than on request, since a worker rediscovering its
+  grounding from scratch is how a real requirement gets missed. Both are teaching only: the
+  agent gains no capability it did not have, and nothing on the board gates anything.
+
+  `worker.md`, `reviewer.md`, `planner.md` and `manager.md` did not move. Grounding reaches a
+  worker through the task row rather than through its instructions, so there was nothing to
+  tell them here.
+
 ## If this test fails
 
 It is telling you that **the text every agent in every default group reads has

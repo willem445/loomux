@@ -607,6 +607,88 @@ Nesting is still board metadata everywhere it counts: it never affects whether a
 allowed, and it never blocks the orchestrator from *assigning* a subtask — readiness is a
 signal for reading the board, not a lock.
 
+### Sprints — batches of work, in order
+
+A task can carry a **sprint number**: Sprint 1, Sprint 2, and so on. A sprint is a *batch*,
+not a calendar — the number replaces the timebox, so there are no start dates, no end dates
+and no duration anywhere. The point is only to say **which work comes first**: the
+orchestrator finishes the current sprint before starting the next, and tasks with no sprint
+at all — the backlog — sit behind everything that has one.
+
+> **What's here now, and what's coming.** This release ships the sprint itself: tasks store
+> it, the orchestrator reads it when choosing what to pick up, and it survives restarts. The
+> **board's own sprint controls** — the current-sprint indicator, the per-row sprint badge,
+> and the roll-over confirmation described below — land in a later slice, so for now sprints
+> are something you ask the orchestrator to set and it reports back on, not something you
+> click. Nothing below changes when those controls arrive; you'll just be able to do it
+> yourself.
+
+- Ask the orchestrator to put an item in a sprint, move it, or take it out again. It's an
+  ordinary board edit, not a privileged one — nothing about a sprint is locked down.
+- The **current sprint** is the lowest sprint number that still has unfinished work in it.
+  It isn't stored anywhere and there's no button to advance it: when a sprint's last item is
+  done, the next one becomes current by itself, so there's no marker that can drift out of
+  step with the board.
+- **A blocked item keeps its sprint open.** That's deliberate: a sprint quietly ending
+  because the work left in it looked stuck is exactly the thing you'd want to be told about.
+  It stays current until that item is resolved or moved on.
+- Moving unfinished work into the next sprint is always **explicit**. The orchestrator moves
+  such items one at a time, so each shows up in the audit log on its own, and says in its
+  pane which ones it moved. Nothing rolls over silently. (When the board controls land,
+  they'll show you the exact list of items that would move and ask first — same rule, done
+  by hand.)
+
+Sprint numbers don't have to be tidy — they needn't be contiguous and needn't start at 1, so
+you can leave gaps for planned work without the board minding.
+
+**A sprint changes nothing except the order things get picked up in.** It doesn't make an
+item startable or unstartable, it doesn't stop the orchestrator claiming something, and it
+doesn't interact with WIP limits. An item outside the current sprint is still perfectly
+ready to start if its dependencies are met — the sprint says what *should* come first, not
+what *may* happen. And the board itself is never re-sorted: it stays in the order you put it
+in.
+
+**On a board that uses no sprints, nothing changes at all.**
+
+### Grounding links — what an agent should read first
+
+Beyond dependencies, a task can carry **links to the things that govern the work**: the
+requirement it has to satisfy, an acceptance spec, the design note that constrains the
+approach, a test case that pins the behaviour, a doc it has to keep true — or just a plain
+link worth reading.
+
+This exists to fix a specific failure. An agent picking up a task otherwise has to
+rediscover its context from scratch every session — hunting through an issue thread for the
+requirement, guessing which design note applies — and the real risk isn't wasted time, it's
+**missing a relevant requirement entirely**. A task that carries its grounding as data hands
+the next agent what governs the work instead of hoping they find it.
+
+> **What's here now, and what's coming.** This release ships the links themselves: tasks
+> store them, agents read them, and the orchestrator and planners record them. Showing them
+> **on the board**, and adding or removing them by hand, land in a later slice — as does
+> feeding a task's links into a worker's opening brief automatically, which is the point of
+> the whole feature.
+
+- Each link has a **type** (requirement, spec, design note, test case, doc, or a plain
+  link), a **target**, and an optional one-line label to show instead of a bare target.
+- A target can be an **issue or PR ref** (`#123`), a **file in the repo**
+  (`doc/design/x.md`, a test file), or a **URL** — the surfaces grounding actually lives on.
+- The orchestrator records them, typically when it creates the task, and planners record
+  them as part of a plan — so the artifacts a plan names become something the next agent
+  reads rather than prose someone has to re-parse.
+
+Two things links deliberately don't do. They **never affect readiness or ordering** — a link
+is context, not structure; if you mean "this must finish first", that's a dependency. And
+targets are **never checked for existence**: the board doesn't go and look, so it keeps
+working offline and a board edit never fails because GitHub was slow. A link pointing at
+something that has moved is kept as it is, the same as a dependency naming a task that isn't
+there — yours to fix, never silently dropped.
+
+One thing *is* checked: a link whose target names another **task on this board** is refused,
+with an error saying so. That's what dependencies and see-also links are for, and the two
+kinds of link are kept apart on purpose — one points inside the board, the other points out
+of it.
+
 ### WIP limits (finish before you start)
 
 **Max live agents** caps how many agents run at once. It says nothing about how much *work*

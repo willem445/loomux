@@ -52,6 +52,7 @@ import {
   type BoardRow,
   type PickerField,
   type PickerTarget,
+  type TaskArtifactLink,
 } from "./taskboard";
 import {
   approveTask,
@@ -106,6 +107,23 @@ export interface OrchTask {
    *  the nest and level pickers may offer. Absent = no level, which is exempt
    *  from the ladder and legal anywhere. */
   kind?: string | null;
+  /** Numbered work batch this row belongs to (#1272) — an ordering/grouping
+   *  construct with no dates attached. Optional on the wire like `parent`/
+   *  `kind`: the backend omits the key when absent, so a board that runs no
+   *  sprints arrives with no key at all and ABSENT must read as backlog,
+   *  never as sprint 0. Always >= 1 when present. Nothing gates on it — it
+   *  ranks what the orchestrator should pick up next, and that is all. */
+  sprint?: number | null;
+  /** Grounding artifacts governing this row (#1273) — requirements, specs,
+   *  design notes, test cases, docs. Optional and omitted when empty, like
+   *  the #582 link arrays.
+   *
+   *  Distinct from `deps`/`related` in what they POINT AT: those name task
+   *  ids on this board, these name things outside it (issue/PR refs, repo
+   *  paths, URLs), which is why the backend validates the two differently
+   *  and never existence-checks these. Context, never structure: they affect
+   *  no readiness and no ordering. */
+  links?: TaskArtifactLink[];
   /** Worktree path where a demo of this row lives (#1091 slice B) — recorded
    *  by the orchestrator on a `prototype`/`human-testing` row so the NEEDS-YOU
    *  panel can tell the human where to go run it. Optional on the wire like
