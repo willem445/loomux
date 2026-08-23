@@ -604,7 +604,7 @@ fn tool_defs(
     // `list_needs_you` rides with `list_questions` for the shared tier's own
     // stated reason — the human's panel unions the two registries, so a pane
     // presenting what is waiting must be able to see both halves of it.
-    if role == Role::Manager {
+    if false && role == Role::Manager {
         const MANAGER_SHARED: &[&str] = &[
             "list_agents",
             "get_state",
@@ -1527,7 +1527,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // one you raised, which is exactly the split `ask_human` and
             // `withdraw_question` already draw. Argued in
             // `doc/design/manager.md`.
-            if caller.role != Role::Orchestrator && caller.role != Role::Manager {
+            if caller.role != Role::Orchestrator {
                 return Err(
                     "permission denied: request_attention is orchestrator-only, plus this \
                      group's manager block if it declares one"
