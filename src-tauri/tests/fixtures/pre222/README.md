@@ -696,8 +696,9 @@ so far:
   or the code *parses* moved, and that is the whole review question here: the `[loomux]`
   notice marker, `.loomux/` paths, `LOOMUX_*` env vars, the `gh` shim's refusal text, the
   `from`-`loomux` audit sender and the `agent-managed` label description (which mirrors
-  `gh.rs`'s `label_spec` arm for it verbatim) are all still spelled the way the shipping code
-  spells them, because they name identities that flip in phases 3 and 4 rather than
+  `gh.rs`'s `label_spec` arm for it verbatim) were **at that point** all still spelled the
+  way the shipping code spelled them, because they named identities that flipped in phases
+  3 and 4 rather than
   here. So a delta review of this directory should read every hunk as a brand noun and
   find no surviving technical literal on the `+` side that is not on the `-` side. The
   one that is easy to misread as a missed rename is
@@ -740,6 +741,47 @@ with the advanced orchestrator **off** gets exactly that text. They are the
 version of the test built its expected value out of the live template, so both sides
 moved together and unconditional prose added to a template sailed through the very
 pin advertised to stop it (rev-11 F1).
+
+- **#1153 phase 3, the protocol strings** — all four files, plus `manager.md`
+  unchanged. The notice marker every template teaches an agent to recognise is
+  now `[orrerix]`; the merge-gate refusal an orchestrator is told to expect,
+  the audit `from` it is told to look for, and the restart notice it is told to
+  tell apart from two similar ones all moved with the code strings that emit
+  them, in the same commit — a template quoting a string the code never says is
+  the defect #1191 avoided by deliberately NOT renaming that last one while the
+  code still said `loomux`.
+
+  **The half that is a behaviour fix, not a rename**: the lessons file is now
+  `{{LESSONS_PATH}}`, a per-group VALUE variable (like `{{HOLD_LABEL}}`, so it
+  stays literal here and `render_with_legacy_vars` renders it), resolved by
+  `lessons::lessons_path(repo)`. Phase 4 made repo config resolve per file —
+  `.orrerix/` preferred, `.loomux/` read when it is the only one there — and
+  left these four templates hard-coding the legacy spelling because a re-bless
+  wants its own round. In a repo that has moved, the old text sent a reader to
+  a file that repo does not have; at `orchestrator.md`'s learning loop it sent
+  a **writer** there, and that one is silently ignored rather than merely
+  wrong, because `lessons_path` prefers `.orrerix/lessons.md` and never reads
+  the entry again.
+
+  **Reading the entries above this one:** every round before phase 3 quotes the notice
+  marker as `[loomux]`, because that is what it was when they were written. It is
+  `[orrerix]` now. The entries are the record of what each round changed, not a
+  description of today's templates — the templates themselves are the description of
+  those, and `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` is what
+  keeps them honest.
+
+  **Second round in the same PR (rev-967 N6).** The marker rename left the
+  article wrong — *"a `[orrerix]` notice"* — in roughly twenty places across
+  `orchestrator.md`, `worker.md` and `reviewer.md`. Prose only, and it would
+  normally wait; it is folded in here because fixing it re-blesses this
+  directory again, and one re-bless a reviewer reads beats two they have to
+  correlate. `planner.md` and `manager.md` did not carry the construction.
+
+  Two `loomux` spellings survive in `orchestrator.md` on purpose: the
+  `loomux-worktrees` path example (a convention derived from the REPO's name,
+  not the product's) and the `agent-managed` label description, which mirrors
+  `gh.rs`'s label table verbatim and would orphan every existing label if only
+  one side moved.
 
 ## If this test fails
 

@@ -18,7 +18,7 @@ your PR" without relaying the message through themselves.
 
 Loomux is **one OS window, one process, one `OrchRegistry`, one MCP server** —
 `mcp::serve()` binds a single `127.0.0.1:0` port; every group's agents hit the same `/mcp`
-and are told apart only by their `X-Loomux-Agent` token (`Caller{agent_id, group, role}`).
+and are told apart only by their `X-Orrerix-Agent` token (`Caller{agent_id, group, role}`).
 A "workspace" is a **project tab**, and each tab owns at most one orchestration group. So
 "cross-workspace" means **cross-group inside this one process**, not cross-OS-process. That
 rules out a shared-broker-file/poller design (the obvious "two processes talking" shape):
@@ -73,13 +73,13 @@ only from the trusted webview (constraint 5), never MCP tools. There is no `chan
   reaches a cross-group lookup; `channel_send`'s only argument is the message body.
 - Every crossing text is scrubbed with `notify::sanitize_gh_text` (#243) before it enters a
   peer's pane: control characters (including newlines) are stripped so an embedded newline
-  can't forge a second `[loomux] …`-prefixed line, and `[`/`]` are mapped to `(`/`)` so the
-  literal token `[loomux]` can't survive even mid-line. Same sanitizer every other
+  can't forge a second `[orrerix] …`-prefixed line, and `[`/`]` are mapped to `(`/`)` so the
+  literal token `[orrerix]` can't survive even mid-line. Same sanitizer every other
   crossing-text boundary in this codebase uses — no new mechanism. (It is
   `notify::sanitize_pane_text` since #891, which is what `sanitize_gh_text` has always
   been: one rule, with a `Lines` policy for the one boundary — a recorded verdict's
   summary — whose multi-line structure is content rather than an injection vector.)
-- The identity line prefixed to every delivered message (`[loomux] channel chan-3 - w-2
+- The identity line prefixed to every delivered message (`[orrerix] channel chan-3 - w-2
   (worker, C:/repo): <text>`) is built by loomux from the **caller's own backend-resolved**
   identity (`OrchRegistry::channel_member_label`) — name, role, and repo — never from
   agent-supplied text. A peer can neutralize/garble its own message with hostile input, but
@@ -190,7 +190,7 @@ directly for connect/disconnect (Tauri-command-backed, exactly like `pause_group
 `mark_dead` elsewhere in that file):
 
 - cross-group connect + `channel_send` delivery, with a hostile payload (embedded newline +
-  literal `[loomux]` marker + raw ESC byte) pinning that the delivered text is sanitized and
+  literal `[orrerix]` marker + raw ESC byte) pinning that the delivered text is sanitized and
   the sender line cannot be forged.
 - the one-channel-per-pane invariant: join vs. reject-different-channels vs. idempotent
   same-channel.
@@ -358,7 +358,7 @@ trip but launcher-initiated with no orchestrator involved:
   environment variable only a loomux-spawned pane can be given) it writes the config via the
   **existing** `write_mcp_config(__solo__, solo-N, token, cli, containment)` and returns the exact per-CLI flag
   string built in Rust (claude: `--mcp-config "<cfg>" --strict-mcp-config --allowedTools
-  mcp__loomux`; copilot: `--additional-mcp-config "@<cfg>" --allow-tool loomux`) — one
+  mcp__orrerix`; copilot: `--additional-mcp-config "@<cfg>" --allow-tool orrerix`) — one
   place per-CLI knowledge lives, next to `write_mcp_config`. For any other CLI it mints NO
   token and returns `delivery_only: true, mcp_args: ""` — the `AgentEntry` still exists.
 - **`orch_solo_bind(agent_id, pty_id)`** — binds the pty (mirrors `bind_agent`, but direct

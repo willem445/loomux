@@ -3186,9 +3186,10 @@ pub fn gate_file_text(gate: &Gate) -> String {
         // declare its workflow at `.orrerix/workflow.yml` or the legacy
         // `.loomux/workflow.yml`, this function has no repo to resolve which,
         // and a header naming the wrong one would send a human editing a file
-        // that isn't there. The `loomux` brand word in the first phrase is
-        // protocol text and flips with #1153 phase 3, not here.
-        "# loomux merge gate — generated from this repo's workflow file (#222). Do not edit.\n",
+        // that isn't there. The brand word in the first phrase IS protocol
+        // text, and flipped with #1153 phase 3. No parser reads it — the shim
+        // skips `#` lines — but an agent opening the file does.
+        "# orrerix merge gate — generated from this repo's workflow file (#222). Do not edit.\n",
     );
     match gate.require {
         GateRequire::AllPass => out.push_str("require all-pass\n"),

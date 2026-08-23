@@ -23,7 +23,7 @@
 //!
 //! **Nothing here ever blocks.** `acquire_lock` returns immediately — granted,
 //! or queued with a position — and a grant that arrives later is delivered as
-//! a `[loomux]` pane notice, exactly like a `notify_when` watch resolving. A
+//! an `[orrerix]` pane notice, exactly like a `notify_when` watch resolving. A
 //! blocking acquire would be the #590 deadlock by construction: the notice
 //! saying "it's yours" is *typed into the pane*, and a pane blocked mid-call
 //! cannot take delivery of the thing it is blocked on.
@@ -473,7 +473,7 @@ fn minutes_ms(m: u32) -> u64 {
 /// one line per holder and per waiter with `\n` — so a note containing its own
 /// newlines could forge extra queue lines there (`"build\n#1 in queue: w-9 —
 /// waiting 3h"`). It is not an injection into anything executable, and the
-/// pane-typed `[loomux]` notices never interpolate a note at all, but a field
+/// pane-typed `[orrerix]` notices never interpolate a note at all, but a field
 /// one agent writes and every other agent and the human read should not be able
 /// to invent structure in the surface that displays it. Collapsing here rather
 /// than at the renderer fixes it for the audit log and `list_locks` in the same
