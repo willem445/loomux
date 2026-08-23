@@ -9959,6 +9959,8 @@ fn done_row(id: &str, status: &str, updated_ms: u64) -> TaskSummary {
         related: vec![],
         parent: None,
         kind: None,
+        sprint: None,
+        links: vec![],
         children: 0,
         children_done: 0,
         ready: false,
@@ -54881,7 +54883,7 @@ fn sprint_writes_set_clear_and_survive_a_reload() {
     reg.upsert_task(&gid, "orch", Some("t-2"), sprint_patch(42)).unwrap();
 
     // Survives a restart — it is stored on the row, not derived.
-    let reg2 = relaunch_registry(reg.state_root());
+    let reg2 = relaunch_registry(&reg.state_root());
     let tasks = reg2.tasks(&gid);
     assert_eq!(tasks[0].sprint, Some(7));
     assert_eq!(tasks[1].sprint, Some(42));
