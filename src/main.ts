@@ -1704,7 +1704,18 @@ const earlyExits = new Map<number, PtyExit>();
 // strand a dead pane. Keyed by pane, with the spawn time so we only treat an
 // IMMEDIATE failure as a resume failure — a resume that succeeded and was worked
 // in for a while before exiting must NOT be clobbered. Consumed one-shot.
-const resumeFallbacks = new Map<Pane, { opts: PaneOptions; at: number }>();
+//
+// A WeakMap, for the same reason `sshReconnectLatches` above is one: "consumed
+// one-shot" is true of the path that FIRES, and the entry is only removed by
+// `tryResumeFallback`, which the exit reaper reaches only via
+// `findPaneAcrossTabs` — i.e. only while the pane is still in a live grid. A
+// restored agent pane the human simply CLOSES therefore exits after it has left
+// every grid, the reaper parks the exit in `earlyExits` and nothing ever
+// consumes the fallback: under a strong Map that pane, its terminal and its
+// whole scrollback stayed reachable for the life of the process (#1301). The
+// map is only ever get/set/deleted by pane, never iterated, so weak keys cost
+// nothing here.
+const resumeFallbacks = new WeakMap<Pane, { opts: PaneOptions; at: number }>();
 
 /** How soon after a `--resume` spawn a failure exit still counts as "the resume
  *  itself failed" (the CLI rejects a missing conversation at startup, within a

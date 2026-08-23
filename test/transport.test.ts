@@ -163,8 +163,10 @@ test("the pty-output router subscribes through the seam and demultiplexes by pty
   await pty.ensureOutputRouter();
   assert.ok(fake.subscribers.has("pty-output"), "the router must subscribe through the transport");
 
+  const paneA = { id: "A" };
+  const paneB = { id: "B" };
   const seen: string[] = [];
-  pty.attachOutput(3, (bytes) => seen.push(Buffer.from(bytes).toString("utf8")));
+  pty.attachOutput(paneA, 3, (bytes) => seen.push(Buffer.from(bytes).toString("utf8")));
 
   fake.emit("pty-output", { id: 3, data: Buffer.from("hello", "utf8").toString("base64") });
   fake.emit("pty-output", { id: 4, data: Buffer.from("other pane", "utf8").toString("base64") });
@@ -174,8 +176,40 @@ test("the pty-output router subscribes through the seam and demultiplexes by pty
   // ...and output that arrived before a pane attached is still flushed on attach,
   // which is the invariant the router exists for.
   const late: string[] = [];
-  pty.attachOutput(4, (bytes) => late.push(Buffer.from(bytes).toString("utf8")));
+  pty.attachOutput(paneB, 4, (bytes) => late.push(Buffer.from(bytes).toString("utf8")));
   assert.deepEqual(late, ["other pane"]);
+});
+
+test("a pane that respawns in place leaves no attachment behind on its old pty id", async () => {
+  // #1301 end-to-end, through the real wiring rather than the pure module:
+  // `Pane.respawnFresh` attaches the SAME pane under a NEW pty id, and the old
+  // id's handler is a closure over that pane — its terminal, its scrollback and
+  // its DOM. Under the id-keyed map this test's second `attachOutput` left the
+  // first handler live forever, and `Pane.dispose` (which only ever knew the
+  // current id) could not reach it. Counting attachments is how that is visible
+  // without a DOM.
+  await pty.ensureOutputRouter();
+  const before = pty.attachedOutputCount();
+  const pane = { id: "respawner" };
+
+  const first: string[] = [];
+  pty.attachOutput(pane, 11, (bytes) => first.push(Buffer.from(bytes).toString("utf8")));
+  const second: string[] = [];
+  pty.attachOutput(pane, 12, (bytes) => second.push(Buffer.from(bytes).toString("utf8")));
+
+  assert.equal(pty.attachedOutputCount(), before + 1, "one pane, one live attachment");
+
+  // The dead pty's trailing bytes must reach nothing at all — not the old
+  // handler, and not a fresh pre-attach buffer that nothing will ever drain.
+  fake.emit("pty-output", { id: 11, data: Buffer.from("tail", "utf8").toString("base64") });
+  fake.emit("pty-output", { id: 12, data: Buffer.from("live", "utf8").toString("base64") });
+  assert.deepEqual(first, []);
+  assert.deepEqual(second, ["live"]);
+
+  // And the teardown a disposing pane actually makes needs no record of which
+  // ids it used.
+  pty.detachOutputOwner(pane);
+  assert.equal(pty.attachedOutputCount(), before);
 });
 
 test("setEngineTransport returns the transport it displaced, so a swap is reversible", () => {

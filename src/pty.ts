@@ -16,6 +16,7 @@ import type { ShellKind } from "./panesetup";
 import type { CliKnobs } from "./selectorknobs";
 import type { CliProbe } from "./modelcatalog";
 import type { CliModelReply } from "./modelwire";
+import { PtyRouter, type RouteOwner } from "./ptyroute.ts";
 
 export interface SpawnOptions {
   cols: number;
@@ -324,8 +325,11 @@ export const voiceCancel = (): Promise<void> => invoke("voice_cancel");
 
 type OutputHandler = (data: Uint8Array) => void;
 
-const handlers = new Map<number, OutputHandler>();
-const pending = new Map<number, Uint8Array[]>();
+/** Owner-keyed, bounded (#1301). See ptyroute.ts for what each rule is for;
+ *  the short version is that an entry here pins a whole `Pane` — terminal
+ *  buffer, DOM and views — so "who releases it, and when" is the difference
+ *  between a demultiplexer and a heap leak. */
+const outputRouter = new PtyRouter<OutputHandler>();
 let routerReady: Promise<void> | null = null;
 
 function decodeB64(b64: string): Uint8Array {
@@ -339,32 +343,54 @@ function decodeB64(b64: string): Uint8Array {
  *  Must complete before the first spawn to guarantee lossless startup. */
 export function ensureOutputRouter(): Promise<void> {
   routerReady ??= listen<{ id: number; data: string }>("pty-output", (event) => {
-    const bytes = decodeB64(event.payload.data);
-    const handler = handlers.get(event.payload.id);
+    const { id, data } = event.payload;
+    const handler = outputRouter.handler(id);
     if (handler) {
-      handler(bytes);
-    } else {
-      const queue = pending.get(event.payload.id);
-      if (queue) queue.push(bytes);
-      else pending.set(event.payload.id, [bytes]);
+      handler(decodeB64(data));
+      return;
     }
+    // No handler. A RETIRED id is the common case here — bytes the backend
+    // had already drained racing the kill `detachOutput` issued a tick ago —
+    // and it is checked before the decode so the tail of a closed pane costs
+    // an integer lookup rather than an `atob` plus a copy. The router refuses
+    // a retired id on its own too (`hold`); this is the cheap path, not the
+    // rule. Everything else is the lossless-startup buffer: the pane's
+    // `attachOutput` is a microtask away and will flush it.
+    if (outputRouter.isRetired(id)) return;
+    const bytes = decodeB64(data);
+    outputRouter.hold(id, bytes, bytes.length);
   }).then(() => undefined);
   return routerReady;
 }
 
-/** Attach a pane's output handler, flushing anything buffered for it. */
-export function attachOutput(id: number, handler: OutputHandler): void {
-  handlers.set(id, handler);
-  const queued = pending.get(id);
-  if (queued) {
-    pending.delete(id);
-    for (const bytes of queued) handler(bytes);
-  }
+/** Attach `owner`'s output handler for pty `id`, flushing anything buffered
+ *  for it.
+ *
+ *  `owner` is the pane, and passing it is what makes an in-place respawn safe:
+ *  the router releases whatever this owner was attached to before, so the old
+ *  pty id's closure — which captures the pane — cannot be stranded in a
+ *  module-level map that `dispose` has no way to reach (#1301). */
+export function attachOutput(owner: RouteOwner, id: number, handler: OutputHandler): void {
+  outputRouter.attach(owner, id, handler);
+  for (const bytes of outputRouter.takeHeld<Uint8Array>(id)) handler(bytes);
 }
 
+/** Release one pty id's output handler and buffer, retiring the id. */
 export function detachOutput(id: number): void {
-  handlers.delete(id);
-  pending.delete(id);
+  outputRouter.release(id);
+}
+
+/** Release whatever output attachment `owner` holds, whichever pty id it
+ *  ended up on. The teardown call that cannot be made against a stale id. */
+export function detachOutputOwner(owner: RouteOwner): void {
+  outputRouter.releaseOwner(owner);
+}
+
+/** Live output attachments — for the invariant test only (nothing in the app
+ *  reads it). It must track the number of live panes with a pty, and used to
+ *  grow past it on every respawn. */
+export function attachedOutputCount(): number {
+  return outputRouter.attachedCount();
 }
 
 export const onPtyExit = (handler: (exit: PtyExit) => void): Promise<UnlistenFn> =>
@@ -380,20 +406,24 @@ export const onPtyExit = (handler: (exit: PtyExit) => void): Promise<UnlistenFn>
 
 type GitChangeHandler = () => void;
 
-const gitChangeHandlers = new Map<number, GitChangeHandler>();
+/** Same owner-keyed router as the output side, and for the same reason: the
+ *  handler is `() => this.onExternalGitChange()`, which captures the pane.
+ *  Never holds anything — a change event is a signal, not a payload, so one
+ *  that arrives before an attach costs a refresh nobody notices missing. */
+const gitRouter = new PtyRouter<GitChangeHandler>();
 let gitWatchRouter: Promise<void> | null = null;
 
 function ensureGitWatchRouter(): Promise<void> {
   gitWatchRouter ??= listen<{ id: number }>("git-changed", (event) => {
-    gitChangeHandlers.get(event.payload.id)?.();
+    gitRouter.handler(event.payload.id)?.();
   }).then(() => undefined);
   return gitWatchRouter;
 }
 
 /** Register `handler` to fire when pane `id`'s repository changes on disk. Call
  *  once per pane; use setGitWatch to (re)point it at the current cwd. */
-export function attachGitWatch(id: number, handler: GitChangeHandler): void {
-  gitChangeHandlers.set(id, handler);
+export function attachGitWatch(owner: RouteOwner, id: number, handler: GitChangeHandler): void {
+  gitRouter.attach(owner, id, handler);
   void ensureGitWatchRouter();
 }
 
@@ -404,8 +434,19 @@ export function setGitWatch(id: number, cwd: string): void {
   invoke("git_watch", { id, cwd }).catch(() => {});
 }
 
-/** Stop watching pane `id` and drop its handler (called on pane dispose). */
-export function detachGitWatch(id: number): void {
-  gitChangeHandlers.delete(id);
-  invoke("git_unwatch", { id }).catch(() => {});
+/** Release whatever git watch `owner` holds, whichever pty id it ended up on,
+ *  and tell the backend to stop polling that repo.
+ *
+ *  Owner-aimed, and the only teardown this router offers (#1301): an id-aimed
+ *  one can be pointed only at an id the caller still remembers, and a pane
+ *  that respawned in place does not — which is how a module-level map came to
+ *  hold panes the grid had already closed. */
+export function detachGitWatchOwner(owner: RouteOwner): void {
+  const released = gitRouter.releaseOwner(owner);
+  if (released !== null) invoke("git_unwatch", { id: released }).catch(() => {});
+}
+
+/** Live git-watch attachments — invariant test only, like its output twin. */
+export function attachedGitWatchCount(): number {
+  return gitRouter.attachedCount();
 }
