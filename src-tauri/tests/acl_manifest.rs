@@ -197,7 +197,7 @@ fn app_commands_len_is_153() {
          non-destructive clear-completed archive and its undo, added in #1152, \
          +3 for orch_needs_you_list/orch_needs_you_resolve/orch_needs_you_clear — the trusted \
          read, human close-out and clear-completed surfaces onto the needs-you item registry \
-         added in #1151 slice A, +1 for orch_mailbox_status — the manager mailbox's unread count, \r
+         added in #1151 slice A, +1 for orch_mailbox_status — the manager mailbox's unread count, \
          read by the pane chip, added in #1161 slice M2) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
