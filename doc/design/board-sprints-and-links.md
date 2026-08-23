@@ -541,6 +541,14 @@ unknown-type fallback. Only the hand-edited case takes a semantic colour: the sa
 `missing` dep and `k-unknown` chips, because it means the same thing — this could not have
 been written through the product.
 
+**The demo gate, considered again.** §13 asked the next UI slice this question outright, so:
+PR D qualifies on the same three counts PR C did — visible chrome on the human’s primary
+surface, a human-requested feature, and a payload that is DOM wiring, which this repo
+validates by hand rather than by test. The pure half carries a mutation table; the fold, the
+click and the form do not and cannot. So `t-470` takes the same treatment as `t-469`: it parks
+at `human-testing` with the branch worktree as its `demo_path` once review settles, and the
+merge waits on the human’s own look rather than on more code.
+
 **What this slice does NOT add.** No links filter family (`BoardFilter` gains no key — #1270's
 seam stays as it is), no bulk edit, no reordering of a row's links, and no existence checking
 of any kind. Grounding still reaches an agent through PR B's spawn-time injection; this slice

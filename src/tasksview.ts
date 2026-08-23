@@ -1786,7 +1786,7 @@ export class TasksView {
   private openLink(target: string): void {
     const plan = linkOpenPlan(target);
     if (plan.action === "open") {
-      this.openRef(plan.kind === "issue" ? "issue" : "link", plan.value);
+      this.openRef(plan.kind, plan.value);
       return;
     }
     void writeClipboard(plan.text).then((ok) =>
@@ -1895,7 +1895,10 @@ export class TasksView {
       opt.textContent = `${linkTypeIcon(lt)} ${lt}`;
       type.appendChild(opt);
     }
-    type.value = "requirement";
+    // The first entry of the vocabulary, never the literal "requirement": that
+    // list is read out of the Rust source, so a reorder or a rename there must
+    // not leave this line silently naming nothing.
+    type.value = LINK_TYPES[0];
     type.title = "What kind of grounding this is — it decides nothing, it tells the next agent what it is reading";
 
     const target = document.createElement("input");
@@ -1934,8 +1937,8 @@ export class TasksView {
     btn.addEventListener("click", submit);
     // Keep keystrokes off the terminal underneath — every inline editor in this
     // view does this — and let Enter commit from either field.
-    for (const field of [target, label]) {
-      field.addEventListener("keydown", (e) => {
+    for (const field of [type, target, label] as HTMLElement[]) {
+      field.addEventListener("keydown", (e: KeyboardEvent) => {
         e.stopPropagation();
         if (e.key === "Enter") submit();
         if (e.key === "Escape") {
@@ -1944,7 +1947,6 @@ export class TasksView {
         }
       });
     }
-    type.addEventListener("keydown", (e) => e.stopPropagation());
     add.append(type, target, label, btn);
     box.appendChild(add);
     return box;
