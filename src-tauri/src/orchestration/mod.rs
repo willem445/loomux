@@ -2491,6 +2491,7 @@ exit 1
 }
 
 /// The Windows `.cmd` twin — written as both `orrerix.cmd` and `loomux.cmd`: the
+/// same flat refusal, self-contained. It does NOT
 /// delegate through `sh` the way `gh.cmd`/`git.cmd` do — those delegate because
 /// the gate logic is worth keeping in one place, and they fall through to the real
 /// binary when no `sh` exists. Both reasons invert here: there is no logic to
