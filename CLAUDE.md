@@ -294,6 +294,17 @@ compiles.
   a PR body* in the assertion itself, where it fires on a blind instrument without anyone
   thinking to mutate the one subject it cannot see. Signature: one field renamable alone
   while a guard already carrying a vacuity control stays green (#1297, `test/reposlug.test.ts`).
+- **A non-interference pin is fail-able only when its two operands COLLIDE.** A test
+  asserting that operation X leaves Y alone must construct the fixture so X's key IS Y's
+  subject; disjoint literals hold under every implementation, the symmetric one the pin
+  exists to forbid included. Where a guard refuses the colliding fixture at write time,
+  build it before the collision exists — write the link at an id that does not exist yet,
+  then mint and delete that row — rather than weakening the assertion to fit. And count
+  mutation rounds against the properties CLAIMED, not the tests reddened: a round that
+  neutered the neighbouring property in the same test covers that one only. Signature: the
+  assertion's two literals never meet (links `"#7"`, deletes `"t-2"`) while body, design
+  note and doc comment all say the non-interference is pinned (#1300 B1,
+  `doc/design/board-sprints-and-links.md` §3).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
@@ -369,6 +380,25 @@ while watching the work land — that's a refinement, not drift. Only defer to a
 issue when the user explicitly says to ("later", "follow-up issue", "separate PR"). Don't
 narrow their ask back down to the original ticket on your own judgment.
 
+## When the brief can't be followed as written
+
+- **A self-contradicting instruction is not implementable — say which half you dropped.**
+  Where a plan states a rule twice and the two readings differ, never silently pick one:
+  name the contradiction, implement the reading it states first and argues for at length,
+  get the deviation approved, and record it where the plan's NEXT implementer looks — the
+  design-note section and, for a role-template edit, the `pre222` re-bless log — not only in
+  a PR body nobody re-reads. Signature: a "take the first that decides it" ladder given a
+  rung BELOW one that always decides (board order over an array never ties), so the new rung
+  is unreachable text (`doc/design/board-sprints-and-links.md` §7,
+  `src-tauri/tests/fixtures/pre222/README.md`, #1300).
+- **A slice told to create a shared seam yields to an in-flight branch that already built it
+  richer — and ships none of it.** A third, weaker shape defeats the seam it was meant to
+  honour, and extending an unmerged branch breaks "this slice waits on nothing"; leave the
+  seam where it is and let the later slice add the one key it owes. Confirm with the
+  orchestrator before proceeding. Signature: the plan's composition contract says "whichever
+  PR lands first creates it" while the richer implementation is unmerged, its own doc comment
+  already reserving your key (#1300, `BoardFilter`).
+
 ## Git & GitHub workflow
 
 - Commits: `type(scope): imperative subject (#issue)` — e.g.
@@ -436,6 +466,13 @@ narrow their ask back down to the original ticket on your own judgment.
   own doc names the divergence it prevents — `gate_reviewer_error`, "static list ends
   up refusing a manager while a routing rule quietly accepts one" — and no test builds
   the second list (#1229).
+  A rebase imports RULES as well as code, and those apply retroactively to your OPEN diff
+  with nothing mechanical pointing at what you now violate — no red, no stale grep hit, no
+  range-diff row. Diff the convention surfaces across the rebase span (`git diff
+  <old-base>..<new-base> -- CLAUDE.md .claude/skills/ .orrerix/lessons.md`) and re-check
+  your own diff against each bullet the base gained. Signature: an all-`=` range-diff and a
+  green suite over a diff that matches a convention younger than your branch point; #1300
+  found its own set-widening defect that way, unprompted by review.
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
