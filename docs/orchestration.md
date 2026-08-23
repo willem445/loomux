@@ -1804,10 +1804,11 @@ disturbing a busy one.
 queued prompt: an entry addressed to the group's orchestrator, or carrying the
 same CLI session id as a pane that comes back, redelivers automatically in its
 original order. Everything else is surfaced rather than replayed — the
-orchestrator's session-start re-sync lists it with the payload intact so it
-can re-derive and re-send what still applies, rather than the prompt silently
-vanishing. The one true loss is a delivery caught mid-submit when orrerix went
-down: that text is not recoverable, and the recovery notice says so plainly.
+orchestrator's session-start re-sync lists it with the payload intact where
+one was recorded, so it can re-derive and re-send what still applies, rather
+than the prompt silently vanishing. The one true loss is a delivery caught
+mid-submit when orrerix went down: that text is not recoverable, and the
+recovery notice says so plainly.
 `doc/design/orchestration.md`'s "Delivery queue (#445)" section carries the
 full design.
 
