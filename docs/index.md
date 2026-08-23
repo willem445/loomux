@@ -18,9 +18,9 @@ A dead-simple terminal multiplexer for AI agent management — without the bloat
 The name comes from the **orrery**: a desk-sized geared model of the solar
 system, like the Whipple Museum's [Grand Orrery](https://www.whipplemuseum.cam.ac.uk/explore-whipple-collections/astronomy/grand-orrery) — George Adams, London,
 c. 1750 — where every planet and moon runs its own track at its own period, and
-the whole sky stays in phase because one mechanism drives all of it. Here that
-mechanism is a matrix of terminal panes, each carrying an agent (or just a
-shell), with one orchestrator holding them in phase.
+the whole model stays in phase because one mechanism drives all of it. Here it
+is a matrix of terminal panes, each carrying an agent (or just a shell), with
+one orchestrator holding them in phase.
 
 Orrerix gives you Windows Terminal–class smoothness with the multiplexing
 features it lacks: instant matrix splits, nameable panes, a native session

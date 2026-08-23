@@ -427,8 +427,9 @@ layer.
 
 **The object it points at.** The provenance the branding cites is the Whipple
 Museum's [Grand Orrery](https://www.whipplemuseum.cam.ac.uk/explore-whipple-collections/astronomy/grand-orrery) — George Adams, London, c. 1750: the Sun at the
-centre, the six planets then known and their moons, each running its own track
-at its own period, the whole thing held in phase by one mechanism. Naming a
+centre, the six planets then known, and the Jovian and Saturnian moons, each
+running its own track at its own period, the whole thing held in phase by one
+mechanism. Naming a
 specific object in a named collection is what makes the story checkable instead
 of a vague appeal to astronomy, so the README pitch and the docs landing page
 each carry one short paragraph of it and link out; neither retells the history.

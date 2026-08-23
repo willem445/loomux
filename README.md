@@ -33,7 +33,7 @@ agent merges: that button stays yours.
 The name comes from the **orrery**: a desk-sized geared model of the solar
 system, like the Whipple Museum's [Grand Orrery](https://www.whipplemuseum.cam.ac.uk/explore-whipple-collections/astronomy/grand-orrery) — George Adams, London,
 c. 1750 — where every planet and moon runs its own track at its own period, and
-the whole sky stays in phase because one mechanism drives all of it. That is the
+the whole model stays in phase because one mechanism drives all of it. That is the
 product: agents each working their own track in their own pane, one orchestrator
 holding the phase, and you watching the whole mechanism at once.
 
