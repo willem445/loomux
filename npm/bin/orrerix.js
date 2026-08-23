@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Loomux npm launcher.
+// Orrerix npm launcher.
 //
-//   npm install -g loomux   # then run `loomux`
-//   npx loomux              # download + launch in one shot
+//   npm install -g orrerix   # then run `orrerix`
+//   npx orrerix              # download + launch in one shot
 //
-// Loomux itself is a native (Tauri) desktop app, not a JS program — so this
+// Orrerix itself is a native (Tauri) desktop app, not a JS program — so this
 // package ships no binary. Instead it fetches the matching GitHub release
 // asset for the host platform, installs/caches it, and launches it. The
 // per-platform logic mirrors install.sh / install.ps1 so all three install
@@ -12,21 +12,21 @@
 //
 // The command has three subcommands (#845):
 //
-//   loomux            launch the installed app; install it only if missing
-//   loomux update     install/refresh the app from the newest release on the
+//   orrerix           launch the installed app; install it only if missing
+//   orrerix update    install/refresh the app from the newest release on the
 //                     installed build's channel — the only path that fetches
 //                     when something is already installed or cached
-//   loomux version    print this launcher's version
-//   loomux help       print usage
+//   orrerix version   print this launcher's version
+//   orrerix help      print usage
 //
-// Plain `loomux` deliberately never upgrades: the silent installers terminate
-// a running Loomux to replace its files, so autoupdate killed live agents
-// (#815) and the update decision belongs to the human as `loomux update`.
+// Plain `orrerix` deliberately never upgrades: the silent installers terminate
+// a running app to replace its files, so autoupdate killed live agents (#815)
+// and the update decision belongs to the human as `orrerix update`.
 //
-// `loomux update` is channel-aware and never downgrades (#815/#816/#846) —
+// `orrerix update` is channel-aware and never downgrades (#815/#816/#846) —
 // see the "update resolution" section for why both halves are load-bearing.
 //
-// Dependency-free on purpose: `npx loomux` should have nothing to compile
+// Dependency-free on purpose: `npx orrerix` should have nothing to compile
 // and nothing to trust beyond Node's own stdlib (Node >=18 for global fetch).
 
 "use strict";
@@ -36,8 +36,50 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
+// The repo releases are fetched from. Renaming the GitHub repo is a separate,
+// human-coordinated step (#1153), and this slug is deliberately not changed
+// ahead of it: GitHub serves permanent redirects for a renamed repo on the
+// REST API and on release-asset downloads alike, so the launcher keeps working
+// on either side of that button. When the rename happens this line is the
+// whole edit.
 const REPO = "willem445/loomux";
 const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
+
+// ---------- brand identity (#1153 phase 5) ----------
+//
+// PRODUCT_NAMES is Tauri's `productName`. It names everything the BUNDLER
+// creates, which is everything this launcher has to recognise on a user's
+// machine: the macOS bundle (`Orrerix.app`), the Windows install directory,
+// its Add/Remove key (tauri-bundler's nsis/installer.nsi defines UNINSTKEY off
+// ${PRODUCTNAME}), and every release asset filename. #1153 flipped it.
+//
+// The rule from doc/design/rebrand-protocol.md applies here verbatim: emit
+// exactly one spelling, accept every spelling on every reading surface, and
+// write the accepted set down exactly once. These arrays are that one place —
+// index 0 is the emit spelling, and every reader iterates the whole array
+// newest-first, so a machine carrying both installs resolves the current one.
+//
+// Dropping the old spelling would be a silent regression, never a compile
+// error: an `orrerix update` that cannot see a pre-rename install reports
+// "nothing installed", which is the exact input `updateBaseline` treats as
+// safe to order against this launcher's own version — #816's downgrade guard
+// disarmed by a rename.
+const PRODUCT_NAMES = ["Orrerix", "Loomux"];
+const PRODUCT = PRODUCT_NAMES[0];
+
+// The same set as one regex alternation, built FROM the array rather than
+// retyped, so no reader can fall out of step with it.
+const NAME_ALT = PRODUCT_NAMES.join("|");
+
+// The command this package installs, and the launcher's own cache directory
+// name. That cache is ours alone — nothing but this launcher writes it — so by
+// the ownership rule in doc/design/rebrand-filesystem.md it is ours to rename.
+// It is renamed but never MOVED: a cached AppImage may be the running process
+// and this launcher has no way to know. CLI_NAMES[0] is the only directory
+// ever written; the rest are read, so a pre-rename cache stays launchable and
+// ages out on its own.
+const CLI_NAMES = ["orrerix", "loomux"];
+const CLI = CLI_NAMES[0];
 
 const BLUE = "\x1b[1;34m";
 const GREEN = "\x1b[1;32m";
@@ -47,32 +89,32 @@ const tty = process.stderr.isTTY;
 const paint = (c, s) => (tty ? `${c}${s}${RESET}` : s);
 
 function say(msg) {
-  process.stderr.write(`${paint(BLUE, "loomux")} ${msg}\n`);
+  process.stderr.write(`${paint(BLUE, CLI)} ${msg}\n`);
 }
 function die(msg) {
-  process.stderr.write(`${paint(RED, "loomux")} ${msg}\n`);
+  process.stderr.write(`${paint(RED, CLI)} ${msg}\n`);
   process.exit(1);
 }
 
 // ---------- CLI ----------
 
-const HELP = `loomux ${PKG_VERSION} — Loomux desktop launcher
+const HELP = `${CLI} ${PKG_VERSION} — ${PRODUCT} desktop launcher
 
-Launches the Loomux desktop app (installing it first if needed). Run
-\`loomux\` with no arguments to launch.
+Launches the ${PRODUCT} desktop app (installing it first if needed). Run
+\`${CLI}\` with no arguments to launch.
 
 USAGE
-  loomux            Launch the installed app, or install it if missing. Never
+  ${CLI}            Launch the installed app, or install it if missing. Never
                     updates an existing install.
-  loomux update     Install/refresh the app from the newest GitHub release on
+  ${CLI} update     Install/refresh the app from the newest GitHub release on
                     your channel: a stable install stays on stable, a beta
                     install takes the newest build of either kind. Never
                     downgrades. On Windows and macOS the launcher refuses while
-                    Loomux is running — the installer would close the running app.
-  loomux version    Print this launcher's version.
-  loomux help       Show this help.
-  loomux --help, -h Same as \`loomux help\`.
-  loomux --version  Same as \`loomux version\`.
+                    the app is running — the installer would close it.
+  ${CLI} version    Print this launcher's version.
+  ${CLI} help       Show this help.
+  ${CLI} --help, -h Same as \`${CLI} help\`.
+  ${CLI} --version  Same as \`${CLI} version\`.
 
 Requires Node 18+.
 `;
@@ -82,8 +124,8 @@ Requires Node 18+.
 // with a hint instead of guessing what the user meant.
 //
 // The desktop app takes no argv of its own (src-tauri/src/main.rs is a bare
-// `loomux_lib::run()`), so there is nothing to forward and every extra token is
-// a mistake worth reporting rather than passing along.
+// `loomux_lib::run()`, the cargo crate name), so there is nothing to forward and
+// every extra token is a mistake worth reporting rather than passing along.
 function parseArgs(argv) {
   if (argv.length === 0) return { command: "launch" };
   if (argv.length !== 1) {
@@ -118,9 +160,9 @@ function parseArgs(argv) {
 // place so it can be pinned by a test — the #815 failure mode lived exactly
 // here, and a wrong answer costs a running app and every agent inside it.
 //
-//   plain `loomux` + something installed  -> launch it, never install (#815)
-//   plain `loomux` + nothing installed    -> install (first run)
-//   `loomux update`                       -> install, always (that is the ask)
+//   plain `orrerix` + something installed  -> launch it, never install (#815)
+//   plain `orrerix` + nothing installed    -> install (first run)
+//   `orrerix update`                       -> install, always (that is the ask)
 //
 // Kept as one function rather than an `existing && !force` repeated in each
 // platform runner: three copies of a safety rule is three places to get it
@@ -136,7 +178,7 @@ function planAction(command, hasExisting) {
 async function ghJson(url) {
   const res = await fetch(url, {
     headers: {
-      "User-Agent": "loomux-npm-launcher",
+      "User-Agent": `${CLI}-npm-launcher`,
       Accept: "application/vnd.github+json",
     },
   });
@@ -148,7 +190,7 @@ async function ghJson(url) {
   return res.json();
 }
 
-// Prefer the release matching this package's version (so `npx loomux@X`
+// Prefer the release matching this package's version (so `npx orrerix@X`
 // installs app vX); fall back to whatever the latest release is. Used by plain
 // launch's first install only — that path only ever runs when there is nothing
 // installed, so it cannot downgrade anything.
@@ -274,7 +316,7 @@ function newestOnChannel(releases, current) {
   return best;
 }
 
-// The entire `loomux update` decision, pure so it can be pinned by tests:
+// The entire `orrerix update` decision, pure so it can be pinned by tests:
 //
 //   {action:"install"}   a genuinely newer build on this channel — go
 //   {action:"reinstall"} the newest build IS what's installed — reinstall it
@@ -296,7 +338,7 @@ function updateVerdict(releases, current) {
   return { action, channel, current, release };
 }
 
-// What `loomux update` orders against — the version of the app actually
+// What `orrerix update` orders against — the version of the app actually
 // installed, since that is the thing an installer would overwrite. Three cases,
 // and the difference between the last two is the whole guard:
 //
@@ -323,11 +365,11 @@ async function resolveUpdateRelease(hasExisting, detected) {
   const current = updateBaseline(hasExisting, detected);
   if (current === null) {
     die(
-      `refusing to update: Loomux is installed but its version can't be read` +
+      `refusing to update: ${PRODUCT} is installed but its version can't be read` +
         (detected ? ` ("${detected}" doesn't parse)` : "") +
         `, so there is no way to tell an update from a downgrade. Install the ` +
         `build you want directly from ` +
-        `https://github.com/${REPO}/releases and \`loomux update\` will work ` +
+        `https://github.com/${REPO}/releases and \`${CLI} update\` will work ` +
         `from there.`
     );
   }
@@ -355,6 +397,42 @@ async function resolveUpdateRelease(hasExisting, detected) {
   return v.release;
 }
 
+// `amd64` / `aarch64` — the arch token Tauri puts in a Linux asset name and in
+// the cached AppImage's filename. null for an arch we ship no build for.
+function linuxSuffix(arch) {
+  return arch === "arm64" ? "aarch64" : arch === "x64" ? "amd64" : null;
+}
+
+// The release asset to install, as an END-ANCHORED filename suffix.
+//
+// Deliberately brand-free, and that is the whole reason a rename costs this
+// launcher nothing on the network side. Tauri names every bundle
+// `<productName>_<version>_<arch>.<ext>`, so #1153 changed the PREFIX of every
+// asset filename from the first post-rename release onward. A resolver that
+// matched the prefix would need a fallback list, and would silently stop being
+// able to install any release published before the flip — which is every
+// release a pinned or stable user can currently be asked to install. Matching
+// only the suffix is indifferent to the brand in both directions, so there is
+// no list to keep in sync and nothing to forget when the next name changes.
+//
+// The suffixes stay tight enough to exclude the non-installer assets that share
+// the family's shape: `Orrerix_1.3.0_x64.pdb.zip` (release.yml's "House style"
+// note) ends `.zip`, matching neither `-setup.exe` nor `_x64.dmg`.
+function assetPattern(platform, arch) {
+  switch (platform) {
+    case "linux": {
+      const suffix = linuxSuffix(arch);
+      return suffix ? new RegExp(`_${suffix}\\.AppImage$`) : null;
+    }
+    case "darwin":
+      return arch === "arm64" ? /_aarch64\.dmg$/ : /_x64\.dmg$/;
+    case "win32":
+      return /-setup\.exe$/;
+    default:
+      return null;
+  }
+}
+
 /** First asset whose name matches `re`, or null. */
 function pickAsset(release, re) {
   const assets = release.assets || [];
@@ -362,64 +440,93 @@ function pickAsset(release, re) {
 }
 
 async function download(url, dest) {
-  const res = await fetch(url, { headers: { "User-Agent": "loomux-npm-launcher" } });
+  const res = await fetch(url, {
+    headers: { "User-Agent": `${CLI}-npm-launcher` },
+  });
   if (!res.ok || !res.body) die(`download failed (${res.status}): ${url}`);
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const buf = Buffer.from(await res.arrayBuffer());
   try {
     fs.writeFileSync(dest, buf);
   } catch (e) {
-    // Linux has no running-instance probe (loomuxIsRunning is false there), so
+    // Linux has no running-instance probe (appIsRunning is false there), so
     // the kernel is the one that catches "you are overwriting a running
     // AppImage" — as a raw ETXTBSY errno. Translate it into the same advice
     // refuseIfRunning() gives on the other two platforms.
     if (e && e.code === "ETXTBSY") {
       die(
         `${path.basename(dest)} is running — refusing to overwrite it. Quit ` +
-          `that Loomux window, then run this again.`
+          `that ${PRODUCT} window, then run this again.`
       );
     }
     throw e;
   }
 }
 
+function cacheBase() {
+  return process.platform === "win32"
+    ? process.env.LOCALAPPDATA || os.tmpdir()
+    : process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+}
+
+/** The one cache directory this launcher ever WRITES. */
 function cacheDir() {
-  const base =
-    process.platform === "win32"
-      ? process.env.LOCALAPPDATA || os.tmpdir()
-      : process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
-  return path.join(base, "loomux");
+  return path.join(cacheBase(), CLI);
+}
+
+// Every cache directory this launcher READS, current spelling first. The
+// pre-rename directory is still full of perfectly launchable AppImages, and
+// nothing moves or deletes them (see CLI_NAMES): a Linux user who upgrades the
+// launcher and runs plain `orrerix` must still get the build they already have
+// rather than a surprise download, and `orrerix update` must still be able to
+// read its version to order against.
+function cacheDirs() {
+  const base = cacheBase();
+  return CLI_NAMES.map((name) => path.join(base, name));
 }
 
 // ---------- Linux AppImage cache ----------
 
 // The newest cached AppImage for this platform wins, on every platform's rule.
-// On Linux the cached AppImage IS the install, so plain `loomux` launches the
-// newest cached build and never downloads — `loomux update` is the only path
+// On Linux the cached AppImage IS the install, so plain `orrerix` launches the
+// newest cached build and never downloads — `orrerix update` is the only path
 // that fetches again (#845). Download recency is a fine stand-in for version
 // recency: cache files are only ever created by a download, never touched
 // after. Deliberately no "prefer the launcher's own version" bias — update can
 // install a build NEWER than the launcher, and plain launch must surface it.
 //
+// `dirs` is a list because the rename gave the cache a second directory to read
+// (cacheDirs). Recency is compared ACROSS them rather than per-directory: the
+// question is "what is the newest build on this machine", and answering it
+// per-directory would let a stale pre-rename build beat a newer one purely for
+// sitting under the older name.
+//
+// The filename is matched against every accepted product name, since a cached
+// AppImage's name is whatever the release it came from was called. On Linux
+// that name is also the ONLY version record there is (appImageVersion), so a
+// spelling this misses is a build `update` cannot order against.
+//
 // stat once per file into a pair, then sort: statting inside the comparator ran
 // it O(n log n) times, and threw uncaught if a cache file vanished between the
 // readdir and the sort.
-function pickCachedAppImage(dir, suffix) {
-  let entries;
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return null;
-  }
-  const re = new RegExp(`^Loomux_.+_${suffix}\\.AppImage$`);
+function pickCachedAppImage(dirs, suffix) {
+  const re = new RegExp(`^(?:${NAME_ALT})_.+_${suffix}\\.AppImage$`);
   const hits = [];
-  for (const e of entries) {
-    if (!e.isFile() || !re.test(e.name)) continue;
-    const file = path.join(dir, e.name);
+  for (const dir of dirs) {
+    let entries;
     try {
-      hits.push({ file, mtime: fs.statSync(file).mtimeMs });
+      entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
-      // Vanished between readdir and stat — it is not a launchable install.
+      continue; // a cache directory that does not exist is simply empty
+    }
+    for (const e of entries) {
+      if (!e.isFile() || !re.test(e.name)) continue;
+      const file = path.join(dir, e.name);
+      try {
+        hits.push({ file, mtime: fs.statSync(file).mtimeMs });
+      } catch {
+        // Vanished between readdir and stat — not a launchable install.
+      }
     }
   }
   hits.sort((a, b) => b.mtime - a.mtime);
@@ -428,52 +535,65 @@ function pickCachedAppImage(dir, suffix) {
 
 // The version of a cached AppImage, read off its filename: Linux has no
 // installer and no registry, so the asset name is the only version record there
-// is. `Loomux_1.1.0-beta11_amd64.AppImage` → "1.1.0-beta11".
+// is. `Orrerix_1.3.0_amd64.AppImage` → "1.3.0", and the pre-rename
+// `Loomux_1.1.0-beta11_amd64.AppImage` → "1.1.0-beta11" — a spelling dropped
+// here is a cached build `update` silently cannot order against, which lands on
+// updateBaseline's null arm and refuses outright.
 function appImageVersion(file) {
   if (!file) return null;
-  const m = /^Loomux_(.+)_(?:amd64|aarch64)\.AppImage$/.exec(path.basename(file));
+  const re = new RegExp(`^(?:${NAME_ALT})_(.+)_(?:amd64|aarch64)\\.AppImage$`);
+  const m = re.exec(path.basename(file));
   return m ? m[1] : null;
 }
 
 // ---------- running-instance guard ----------
 
-// Is a Loomux desktop app running right now? Installing over one is what makes
-// the launcher lethal: the silent installer terminates the running process to
+// Is the desktop app running right now? Installing over one is what makes the
+// launcher lethal: the silent installer terminates the running process to
 // replace its files, taking down the app and anything running inside it.
+//
+// Every accepted product name is probed, not just the current one: the app a
+// user has open across the rename is the pre-rename build, and that is
+// precisely the install `update` is about to overwrite.
 //
 // Unknown (no probe, or the probe failed) is reported as "not running": on both
 // platforms the probe ships with the OS, so a failure means something exotic, and
 // a launcher that refuses to install on such a machine is a worse bug than one
 // that installs. Plain launch only reaches this guard when it found nothing to
-// launch and must install; its real job is protecting `loomux update` from an
+// launch and must install; its real job is protecting `orrerix update` from an
 // install-over-running-app.
-function loomuxIsRunning() {
+function appIsRunning() {
   if (process.platform === "win32") {
     // A filter that matches nothing still exits 0 ("INFO: No tasks…"), so test
     // the output rather than the status.
-    const out = spawnSync("tasklist", ["/FI", "IMAGENAME eq Loomux.exe", "/NH"], {
-      encoding: "utf8",
+    return PRODUCT_NAMES.some((name) => {
+      const out = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}.exe`, "/NH"], {
+        encoding: "utf8",
+      });
+      return new RegExp(`${name}\\.exe`, "i").test(out.stdout || "");
     });
-    return /Loomux\.exe/i.test(out.stdout || "");
   }
   if (process.platform === "darwin") {
-    const out = spawnSync("pgrep", ["-x", "Loomux"], { encoding: "utf8" });
-    return out.status === 0 && (out.stdout || "").trim() !== "";
+    return PRODUCT_NAMES.some((name) => {
+      const out = spawnSync("pgrep", ["-x", name], { encoding: "utf8" });
+      return out.status === 0 && (out.stdout || "").trim() !== "";
+    });
   }
   // Linux runs an AppImage in place; nothing is replaced under it, and an
   // overwrite of the running image is caught as ETXTBSY in download().
   return false;
 }
 
-// Refuse to install while the app is running — including under `loomux update`,
+// Refuse to install while the app is running — including under `orrerix update`,
 // which is an explicit ask to reinstall, not consent to kill a live instance.
 // Quitting first is always the user's call to make, never the launcher's.
 function refuseIfRunning() {
-  if (!loomuxIsRunning()) return;
+  if (!appIsRunning()) return;
   die(
-    "Loomux is running — refusing to install over it. The installer would " +
-      "terminate the running app to replace its files, closing every window and " +
-      "anything running inside it. Quit Loomux, then run this again."
+    `${PRODUCT_NAMES.join(" or ")} is running — refusing to install over it. ` +
+      "The installer would terminate the running app to replace its files, " +
+      "closing every window and anything running inside it. Quit it, then run " +
+      "this again."
   );
 }
 
@@ -481,12 +601,12 @@ function refuseIfRunning() {
 
 async function runLinux(getRelease, command) {
   const arch = process.arch;
-  const suffix = arch === "arm64" ? "aarch64" : arch === "x64" ? "amd64" : null;
+  const suffix = linuxSuffix(arch);
   if (!suffix) die(`unsupported Linux architecture: ${arch}`);
 
   // Plain launch reuses whatever AppImage is cached — never a fresh download —
   // and `update` forces one.
-  const cached = pickCachedAppImage(cacheDir(), suffix);
+  const cached = pickCachedAppImage(cacheDirs(), suffix);
   if (planAction(command, Boolean(cached)) === "launch") {
     say(`launching ${path.basename(cached)}`);
     const child = spawn(cached, [], { detached: true, stdio: "ignore" });
@@ -495,7 +615,7 @@ async function runLinux(getRelease, command) {
   }
 
   const release = await getRelease(Boolean(cached), appImageVersion(cached));
-  const asset = pickAsset(release, new RegExp(`_${suffix}\\.AppImage$`));
+  const asset = pickAsset(release, assetPattern("linux", arch));
   if (!asset) die(`no Linux (${arch}) AppImage in release ${release.tag_name}`);
   const dest = path.join(cacheDir(), asset.name);
   say(`downloading ${asset.name}`);
@@ -507,11 +627,26 @@ async function runLinux(getRelease, command) {
   child.unref();
 }
 
-// The version macOS recorded for the installed bundle.
-function installedMacVersion() {
+// The installed application bundle, or null. Product-major: a machine that
+// carries both a pre-rename and a post-rename bundle launches the current one.
+// Nothing here removes the other — the rename leaves the two installed side by
+// side (the NSIS uninstall key and the bundle directory are both named after
+// the product), and deleting an app the user still has is not the launcher's
+// call.
+function findMacApp() {
+  for (const name of PRODUCT_NAMES) {
+    const appPath = `/Applications/${name}.app`;
+    if (fs.existsSync(appPath)) return appPath;
+  }
+  return null;
+}
+
+// The version macOS recorded for an installed bundle.
+function installedMacVersion(appPath) {
+  if (!appPath) return null;
   const out = spawnSync(
     "defaults",
-    ["read", "/Applications/Loomux.app/Contents/Info", "CFBundleShortVersionString"],
+    ["read", `${appPath}/Contents/Info`, "CFBundleShortVersionString"],
     { encoding: "utf8" }
   );
   if (out.status !== 0 || !out.stdout) return null;
@@ -519,18 +654,19 @@ function installedMacVersion() {
 }
 
 async function runMac(getRelease, command) {
-  const appPath = "/Applications/Loomux.app";
-  const existing = fs.existsSync(appPath);
-  if (planAction(command, existing) === "launch") {
-    say("launching installed Loomux.app");
-    spawnSync("open", ["-a", "Loomux"], { stdio: "ignore" });
+  const existingApp = findMacApp();
+  if (planAction(command, Boolean(existingApp)) === "launch") {
+    say(`launching installed ${path.basename(existingApp)}`);
+    spawnSync("open", ["-a", existingApp], { stdio: "ignore" });
     return;
   }
 
   refuseIfRunning();
-  const release = await getRelease(existing, existing ? installedMacVersion() : null);
-  const re = process.arch === "arm64" ? /_aarch64\.dmg$/ : /_x64\.dmg$/;
-  const asset = pickAsset(release, re);
+  const release = await getRelease(
+    Boolean(existingApp),
+    installedMacVersion(existingApp)
+  );
+  const asset = pickAsset(release, assetPattern("darwin", process.arch));
   if (!asset) die(`no macOS (${process.arch}) build in release ${release.tag_name}`);
 
   const dmg = path.join(os.tmpdir(), asset.name);
@@ -548,47 +684,85 @@ async function runMac(getRelease, command) {
   const lines = attach.stdout.trim().split("\n");
   const mount = lines[lines.length - 1].split("\t").pop().trim();
 
+  // Install whatever bundle the image actually carries rather than a hardcoded
+  // name: it is `Orrerix.app` from the first post-rename release onward and
+  // `Loomux.app` on every release before that, and a launcher pinned to one of
+  // them cannot install the other. The destination takes the same name, so an
+  // install replaces its own predecessor and never touches a differently-named
+  // bundle sitting beside it.
+  let dest;
   try {
-    spawnSync("rm", ["-rf", appPath]);
-    const cp = spawnSync("cp", ["-R", path.join(mount, "Loomux.app"), "/Applications/"]);
-    if (cp.status !== 0) die("could not copy Loomux.app into /Applications");
+    const bundle = PRODUCT_NAMES.map((n) => `${n}.app`).find((n) =>
+      fs.existsSync(path.join(mount, n))
+    );
+    if (!bundle) die(`no application bundle inside ${asset.name}`);
+    dest = path.join("/Applications", bundle);
+    spawnSync("rm", ["-rf", dest]);
+    const cp = spawnSync("cp", ["-R", path.join(mount, bundle), "/Applications/"]);
+    if (cp.status !== 0) die(`could not copy ${bundle} into /Applications`);
   } finally {
     spawnSync("hdiutil", ["detach", mount, "-quiet"]);
     fs.rmSync(dmg, { force: true });
   }
   // Builds are unsigned; clear quarantine so Gatekeeper won't flag it.
-  spawnSync("xattr", ["-cr", appPath]);
-  say("launching Loomux.app");
-  spawnSync("open", ["-a", "Loomux"], { stdio: "ignore" });
+  spawnSync("xattr", ["-cr", dest]);
+  say(`launching ${path.basename(dest)}`);
+  spawnSync("open", ["-a", dest], { stdio: "ignore" });
 }
 
 // Common install locations for the Tauri NSIS build (per-user by default).
+//
+// Product-major, not root-major: a machine carrying both a pre-rename and a
+// post-rename install must launch the CURRENT one wherever it sits, rather than
+// whichever happens to live under the root that got listed first.
 function findWindowsExe() {
-  const candidates = [
-    path.join(process.env.LOCALAPPDATA || "", "Programs", "Loomux", "Loomux.exe"),
-    path.join(process.env.LOCALAPPDATA || "", "Loomux", "Loomux.exe"),
-    path.join(process.env.PROGRAMFILES || "", "Loomux", "Loomux.exe"),
-  ];
-  return candidates.find((p) => p && fs.existsSync(p)) || null;
+  const roots = [];
+  if (process.env.LOCALAPPDATA) {
+    roots.push(path.join(process.env.LOCALAPPDATA, "Programs"), process.env.LOCALAPPDATA);
+  }
+  if (process.env.PROGRAMFILES) roots.push(process.env.PROGRAMFILES);
+  const candidates = [];
+  for (const product of PRODUCT_NAMES) {
+    for (const root of roots) {
+      candidates.push(path.join(root, product, `${product}.exe`));
+    }
+  }
+  return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
-const UNINSTALL_KEY = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Loomux";
-
-// Every hive and registry view a Tauri/NSIS install of Loomux can record its
-// version in. HKCU is a per-user install (the Tauri default); HKLM is a
-// per-machine one — which is exactly the `%PROGRAMFILES%\Loomux\Loomux.exe`
-// candidate findWindowsExe already looks for — and on 64-bit Windows a 32-bit
-// installer writes its keys into the WOW6432Node view, which `reg query
-// /reg:32` selects (`/reg:64` selects the native one).
+// Every hive, registry view and product spelling a Tauri/NSIS install can have
+// recorded its version under.
+//
+// The product spelling is in the KEY: `installer.nsi` defines UNINSTKEY as
+// `Software\...\Uninstall\${PRODUCTNAME}`, so the rename moved it, and the new
+// installer does not read the old one — which is exactly why the two installs
+// coexist instead of upgrading. Reading both spellings is what keeps #816's
+// downgrade guard armed across the flip, and `newestVersion` below already does
+// the right thing with two answers.
+//
+// HKCU is a per-user install (the Tauri default); HKLM is a per-machine one —
+// which is exactly the `%PROGRAMFILES%\<product>` root windowsExeCandidates
+// already looks under — and on 64-bit Windows a 32-bit installer writes its
+// keys into the WOW6432Node view, which `reg query /reg:32` selects (`/reg:64`
+// selects the native one).
 //
 // Probing HKCU alone left every per-machine install unreadable, and an install
 // the guard cannot read is an install it cannot protect: see updateBaseline.
-// The three probes are cheap and the answer must be complete, so all three run.
-const WINDOWS_VERSION_PROBES = [
-  [`HKCU\\${UNINSTALL_KEY}`, null],
-  [`HKLM\\${UNINSTALL_KEY}`, "/reg:64"],
-  [`HKLM\\${UNINSTALL_KEY}`, "/reg:32"],
-];
+// The probes are cheap and the answer must be complete, so all of them run.
+function uninstallKey(product) {
+  return `Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${product}`;
+}
+
+function windowsVersionProbes() {
+  const probes = [];
+  for (const product of PRODUCT_NAMES) {
+    const key = uninstallKey(product);
+    probes.push([`HKCU\\${key}`, null]);
+    probes.push([`HKLM\\${key}`, "/reg:64"]);
+    probes.push([`HKLM\\${key}`, "/reg:32"]);
+  }
+  return probes;
+}
 
 /** The DisplayVersion in `reg query` output, or null. */
 function parseDisplayVersion(out) {
@@ -624,7 +798,7 @@ function regQuery(key, view) {
 // testable without a Windows registry.
 function installedWindowsVersion(query = regQuery) {
   const found = [];
-  for (const [key, view] of WINDOWS_VERSION_PROBES) {
+  for (const [key, view] of windowsVersionProbes()) {
     const v = parseDisplayVersion(query(key, view));
     if (v) found.push(v);
   }
@@ -634,14 +808,15 @@ function installedWindowsVersion(query = regQuery) {
 async function runWindows(getRelease, command) {
   const existing = findWindowsExe();
   if (planAction(command, Boolean(existing)) === "launch") {
-    say("launching installed Loomux");
+    // Name the install we actually found — it may be the pre-rename one.
+    say(`launching installed ${path.basename(path.dirname(existing))}`);
     spawn(existing, [], { detached: true, stdio: "ignore" }).unref();
     return;
   }
 
   refuseIfRunning();
   const release = await getRelease(Boolean(existing), existing ? installedWindowsVersion() : null);
-  const asset = pickAsset(release, /-setup\.exe$/);
+  const asset = pickAsset(release, assetPattern("win32", process.arch));
   if (!asset) die(`no Windows installer in release ${release.tag_name}`);
 
   const dest = path.join(os.tmpdir(), asset.name);
@@ -655,10 +830,10 @@ async function runWindows(getRelease, command) {
 
   const exe = findWindowsExe();
   if (exe) {
-    say("launching Loomux");
+    say(`launching ${PRODUCT}`);
     spawn(exe, [], { detached: true, stdio: "ignore" }).unref();
   } else {
-    say(paint(GREEN, "installed — find Loomux in the Start menu"));
+    say(paint(GREEN, `installed — find ${PRODUCT} in the Start menu`));
   }
 }
 
@@ -675,17 +850,17 @@ async function main() {
     return;
   }
   if (command === null) {
-    die(`unexpected argument "${arg}" — try \`loomux help\``);
+    die(`unexpected argument "${arg}" — try \`${CLI} help\``);
   }
   if (deprecated) {
-    say(`${deprecated} is a deprecated alias for \`loomux update\` — and it no longer means "install this launcher's own version"; it installs the newest release on your channel, and refuses to go backwards.`);
+    say(`${deprecated} is a deprecated alias for \`${CLI} update\` — and it no longer means "install this launcher's own version"; it installs the newest release on your channel, and refuses to go backwards.`);
   }
   if (typeof fetch !== "function") {
     die("Node 18+ is required (global fetch is unavailable in this runtime)");
   }
   // `update` resolves the newest release on the installed build's channel and
   // refuses a downgrade; a plain launch only installs when there is nothing to
-  // launch, and resolves the release matching this launcher (so `npx loomux@X`
+  // launch, and resolves the release matching this launcher (so `npx orrerix@X`
   // installs app vX). The platform runner supplies BOTH whether something is
   // installed and what version it reads, because only it knows how to probe —
   // and the two are separate answers on purpose: "nothing there" is safe to
@@ -714,14 +889,16 @@ async function main() {
   }
 }
 
-// Only run when invoked as the `loomux` bin — `require`d (by test/launcher.test.ts)
-// this file just exposes the pure logic, which is where a wrong answer costs a
-// running install.
+// Only run when invoked as the `orrerix` bin — `require`d (by
+// test/launcher.test.ts) this file just exposes the pure logic, which is where
+// a wrong answer costs a running install.
 if (require.main === module) {
   main().catch((e) => die(e && e.message ? e.message : String(e)));
 }
 
 module.exports = {
+  PRODUCT_NAMES,
+  CLI_NAMES,
   parseArgs,
   planAction,
   parseVersion,
@@ -732,7 +909,10 @@ module.exports = {
   updateBaseline,
   newestVersion,
   installedWindowsVersion,
+  windowsVersionProbes,
   pickCachedAppImage,
   appImageVersion,
-  loomuxIsRunning,
+  assetPattern,
+  pickAsset,
+  appIsRunning,
 };
