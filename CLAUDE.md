@@ -282,6 +282,21 @@ compiles.
   produce; the CRLF trap under *Running these in an agent worktree* is one way the
   anchor silently misses. Signature: the pre- and post-mutation runs report identical
   pass counts (#1297).
+  A mutation table is only as wide as its INSTRUMENT: `npm test` is `node --test` over `.ts`,
+  which strips types without checking them, so a row reading "no test reddened" has not asked
+  whether the compiler had an opinion — run `tsc --noEmit` on every row, and never state which
+  of the suite and the compiler catches an omission until both have been run against it.
+  Signature: a real `TS2322` in a heavily-tested module leaves `npm test` 2230/2230 green,
+  while a sentence assigns the catch to one side off a table produced by `node --test` alone
+  (#1337 round 1; caught in review there, so its merged table carries a `tsc` column on every
+  row).
+  And only as wide as its SCOPE: a per-file mutation run licenses a per-file sentence, nothing
+  more. "The only test that reddens" is a whole-suite claim — measure it there, and on a
+  permanent surface most of all, since a code comment outlives the body it was copied from.
+  Signature: a whole-suite superlative stated off a per-file run — "deleting `blocked` reddens
+  exactly ONE test" beside that file's own `130→129` row, where the whole suite reddens two
+  (#1337: `test/decisions.test.ts` also goes red, pinning the set difference instead of
+  iterating the list).
 - **An absence-only assertion needs a positive control, and the vacuity is a SHAPE.**
   `is_empty()`, `!contains(…)`, "renders nothing" — each passes just as well when the
   mechanism never ran at all. Pin first that it DID (`fired.len() == 1`, `scanned > 0`
