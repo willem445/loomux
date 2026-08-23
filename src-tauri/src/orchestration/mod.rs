@@ -10596,9 +10596,6 @@ fn normalize_task_links(raw: Vec<TaskLink>, board: &[Task], field: &str) -> Resu
         }
         // The misuse guard, worded to TEACH: a caller reaching for `links` to
         // express a board relationship wanted `deps` or `related`.
-        if board.iter().any(|t| t.id == target) {
-            return Err(format!("{field}: {target} names a task on this board — use `deps` (blocking) or `related` (see-also) for links between board tasks; `links` is for external grounding artifacts (issue/PR refs, repo paths, URLs)"));
-        }
         let label = match link.label {
             None => None,
             Some(l) => {
