@@ -78,6 +78,8 @@ import {
   sprintPickerChoices,
   sprintProgress,
   artifactLinkDraft,
+  DEFAULT_LINK_TYPE,
+  linkDraftIsPristine,
   artifactLinksAtCap,
   linkDisplayText,
   linkOpenPlan,
@@ -2485,4 +2487,48 @@ test("a half-typed link draft is pruned with its row, and keeps its value while 
   assert.equal(live.has("t-2"), false);
   assert.equal(retainExistingKeys(new Map(), board).size, 0);
   assert.equal(retainExistingKeys(drafts, []).size, 0, "an empty board keeps nothing");
+});
+
+test("a link draft counts as touched when the TYPE alone was chosen", () => {
+  // #1273 N4. The type control is a `<select>`, which is neither an INPUT nor a
+  // TEXTAREA — so `isEditing()` never holds for it and a background render (any
+  // agent board write raises one) is never deferred on its account. If a chosen
+  // type does not count as a touched draft, the picker silently snaps back to
+  // the default and the target typed next is stored under a type nobody chose.
+  const pristine = { type: DEFAULT_LINK_TYPE, target: "", label: "" };
+  assert.equal(linkDraftIsPristine(pristine), true, "an untouched form is not worth keeping");
+
+  // The defect this test exists for.
+  assert.equal(
+    linkDraftIsPristine({ ...pristine, type: "test-case" }),
+    false,
+    "a type chosen before anything is typed must survive a render"
+  );
+
+  // Parameterised on the vocabulary rather than on the literal "requirement",
+  // so a reorder of LINK_TYPES cannot leave the predicate comparing against a
+  // default the form no longer seeds — that drift between the two answers to
+  // one question IS the defect above, one level up.
+  assert.equal(
+    linkDraftIsPristine({ type: LINK_TYPES[0], target: "", label: "" }),
+    true,
+    "the vocabulary's first entry is what the form starts on"
+  );
+  for (const t of LINK_TYPES.slice(1)) {
+    assert.equal(
+      linkDraftIsPristine({ type: t, target: "", label: "" }),
+      false,
+      `${t} is a choice, not the default`
+    );
+  }
+
+  // The two text fields, each on its own.
+  assert.equal(linkDraftIsPristine({ ...pristine, target: "#42" }), false);
+  assert.equal(linkDraftIsPristine({ ...pristine, label: "the acceptance spec" }), false);
+  // Not trimmed: a lone space is something the human typed, and handing it back
+  // is more honest than deciding it did not happen. Submitting it is still
+  // refused — `artifactLinkDraft` is what answers "send it", this answers
+  // "keep it" — so the two are not in conflict.
+  assert.equal(linkDraftIsPristine({ ...pristine, target: " " }), false);
+  assert.equal(artifactLinkDraft(DEFAULT_LINK_TYPE, " ", ""), null, "and it still cannot be submitted");
 });

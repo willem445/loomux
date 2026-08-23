@@ -1732,6 +1732,42 @@ export const LINK_TYPES = [
 
 export type LinkType = (typeof LINK_TYPES)[number];
 
+/** The type the add form starts on, and the one the pristine test below
+ *  compares against — ONE spelling, deliberately.
+ *
+ *  The renderer seeding a default and the predicate deciding "nothing has been
+ *  chosen yet" are the same question asked twice, and #1273 N4 is what it looks
+ *  like when the two answers drift: the form seeded a default the predicate did
+ *  not know about, so a type the human had picked read as no choice at all and
+ *  was thrown away by the next render. Both now read this. */
+export const DEFAULT_LINK_TYPE: LinkType = LINK_TYPES[0];
+
+/** The half-typed grounding link a row is holding, as the board keeps it. */
+export interface LinkDraft {
+  type: string;
+  target: string;
+  label: string;
+}
+
+/** Has the human touched the add form at all?
+ *
+ *  This is the whole rule for whether a row's draft is worth keeping across a
+ *  render, and it has to read EVERY field the form has — including the type,
+ *  which is the one control that cannot announce itself: a `<select>` is
+ *  neither an `INPUT` nor a `TEXTAREA`, so focusing it never makes the view's
+ *  `isEditing()` true and never defers the background refresh that agents
+ *  trigger constantly. A choice made there and not remembered here is silently
+ *  reverted on screen, and a target typed afterwards is stored under a type the
+ *  human did not pick.
+ *
+ *  Not trimmed, on purpose: a lone space is something the human typed, and
+ *  handing it back is more honest than deciding it did not happen. The empty
+ *  target is still refused at submit by `artifactLinkDraft` — this predicate
+ *  answers "keep it", never "send it". */
+export function linkDraftIsPristine(draft: LinkDraft): boolean {
+  return !draft.target && !draft.label && draft.type === DEFAULT_LINK_TYPE;
+}
+
 /** One grounding link as it arrives over `orch_tasks`.
  *
  *  Named `TaskArtifactLink`, not `TaskLink`, because `HasLinks` in this module

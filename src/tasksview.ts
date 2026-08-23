@@ -41,9 +41,11 @@ import {
   KINDS,
   kindFilterChoices,
   kindPickerChoices,
+  DEFAULT_LINK_TYPE,
   levelRuleText,
   LINK_TYPES,
   linkDisplayText,
+  linkDraftIsPristine,
   linkOpenPlan,
   linkTypeIcon,
   MAX_ARTIFACT_LINKS,
@@ -76,6 +78,7 @@ import {
   type BoardRow,
   type PickerField,
   type PickerTarget,
+  type LinkDraft,
   type TaskArtifactLink,
 } from "./taskboard";
 import {
@@ -275,7 +278,7 @@ export class TasksView {
    *  naming `deps`/`related` is worth nothing if the target it is about has
    *  already been wiped out of the box. Pruned to live rows on every refresh,
    *  like `selected`/`collapsed`. */
-  private linkDrafts = new Map<string, { type: string; target: string; label: string }>();
+  private linkDrafts = new Map<string, LinkDraft>();
   /** The row whose target field should take focus after the next render — the
    *  same one-shot hook as `pickingFocus`, so adding several links to a row in
    *  a row does not need a click between each. */
@@ -1924,14 +1927,16 @@ export class TasksView {
       opt.textContent = `${linkTypeIcon(lt)} ${lt}`;
       type.appendChild(opt);
     }
-    // The first entry of the vocabulary, never the literal "requirement": that
-    // list is read out of the Rust source, so a reorder or a rename there must
-    // not leave this line silently naming nothing. A draft's remembered type
-    // wins, unless the vocabulary no longer has it.
+    // `DEFAULT_LINK_TYPE`, never the literal "requirement": the vocabulary is
+    // read out of the Rust source, so a reorder or a rename there must not leave
+    // this line silently naming nothing — and the pristine test below compares
+    // against the SAME const, because a default seeded here and a default
+    // assumed there drifting apart is exactly what #1273 N4 was. A draft's
+    // remembered type wins, unless the vocabulary no longer has it.
     type.value =
       draftState && (LINK_TYPES as readonly string[]).includes(draftState.type)
         ? draftState.type
-        : LINK_TYPES[0];
+        : DEFAULT_LINK_TYPE;
     type.title = "What kind of grounding this is — it decides nothing, it tells the next agent what it is reading";
 
     const target = document.createElement("input");
@@ -1953,8 +1958,13 @@ export class TasksView {
     // Every keystroke and type change writes back, so what the view holds and
     // what is on screen cannot diverge.
     const remember = () => {
-      if (!target.value && !label.value) this.linkDrafts.delete(t.id);
-      else this.linkDrafts.set(t.id, { type: type.value, target: target.value, label: label.value });
+      const draft = { type: type.value, target: target.value, label: label.value };
+      // Every field, not just the two text ones. A `<select>` raises no
+      // `isEditing()`, so a type picked and not remembered here is reverted on
+      // screen by the next background render and the link then lands under a
+      // type nobody chose (#1273 N4). `linkDraftIsPristine` is the one rule.
+      if (linkDraftIsPristine(draft)) this.linkDrafts.delete(t.id);
+      else this.linkDrafts.set(t.id, draft);
     };
     target.addEventListener("input", remember);
     label.addEventListener("input", remember);
