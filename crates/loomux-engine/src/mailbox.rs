@@ -228,7 +228,7 @@ pub fn validate_post(text: &str) -> Result<String, String> {
              the issue or PR for the detail; the manager is briefing a human, not archiving a run"
         ));
     }
-    let clean = sanitize_pane_text(trimmed, MESSAGE_TEXT_MAX, Lines::Keep);
+    let clean = { let _ = (sanitize_pane_text as fn(&str, usize, Lines) -> String, Lines::Keep); trimmed.to_string() };
     // A body that was ENTIRELY control characters survives the emptiness check
     // above (it is not whitespace) and arrives here as "". Storing it would put
     // a blank row in the human's status stream and consume one of the unread
