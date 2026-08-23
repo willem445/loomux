@@ -717,11 +717,6 @@ requirement, guessing which design note applies — and the real risk isn't wast
 **missing a relevant requirement entirely**. A task that carries its grounding as data hands
 the next agent what governs the work instead of hoping they find it.
 
-> **What's here now, and what's coming.** This release ships the links themselves *and* the
-> part that pays for them: an agent opened against a task gets that task's links in its
-> opening brief (next section). Showing them **on the board**, and adding or removing them
-> by hand, land in a later slice.
-
 - Each link has a **type** (requirement, spec, design note, test case, doc, or a plain
   link), a **target**, and an optional one-line label to show instead of a bare target.
 - A target can be an **issue or PR ref** (`#123`), a **file in the repo**
@@ -741,6 +736,26 @@ One thing *is* checked: a link whose target names another **task on this board**
 with an error saying so. That's what dependencies and see-also links are for, and the two
 kinds of link are kept apart on purpose — one points inside the board, the other points out
 of it.
+
+**On the board** — where you read and edit them by hand:
+
+- **📎 on a row** is the way in, on every row. It carries the row's link count, so you can
+  see how much grounding an item has without opening anything — on a board where nothing has
+  links yet it's just **📎**, and clicking it is how a row gets its first one.
+- Unfolding it lists the links, each with its type and its label (or its target when it has
+  no label, with the raw target beside a labelled one — a gloss shouldn't hide what it points
+  at). **✕** on an entry removes that one entry, even if another link on the row points at
+  the same thing.
+- **Clicking a link acts on it.** An issue or PR ref and an `http(s)` URL open in your
+  browser; everything else — a repo path, anything the board can't recognise — is **copied to
+  the clipboard** instead. That's deliberate: a target is free text that an agent may have
+  written, so only the two shapes orrerix can name are ever launched. The tooltip says which
+  it will be before you click.
+- **Adding one** is the row at the bottom of the list: pick a type, type the target, add a
+  label if it helps, Enter or **Add link**. Nothing is checked for existence (see above), so
+  a link you record now against a doc you're about to write is fine.
+- A task holds at most **32** links. At the limit the add form is replaced by a line saying
+  so, rather than letting you fill in a form that can't be submitted.
 
 ### Grounding in the brief — the links reach the agent by themselves
 

@@ -9,12 +9,15 @@ import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,
+  artifactLinkDraft,
+  artifactLinksAtCap,
   BACKLOG_SPRINT,
   blockedTaskMap,
   blockingAncestor,
   boardMarker,
   boardUsesDeps,
   boardUsesHierarchy,
+  boardUsesLinks,
   boardUsesSprints,
   canApprove,
   canProceed,
@@ -38,7 +41,14 @@ import {
   KINDS,
   kindFilterChoices,
   kindPickerChoices,
+  DEFAULT_LINK_TYPE,
   levelRuleText,
+  LINK_TYPES,
+  linkDisplayText,
+  linkDraftIsPristine,
+  linkOpenPlan,
+  linkTypeIcon,
+  MAX_ARTIFACT_LINKS,
   nextPicker,
   NO_FILTER,
   parentPickerChoices,
@@ -47,6 +57,7 @@ import {
   reorderWithSubtree,
   REQUEST_CHANGES_STATUS,
   retainExisting,
+  retainExistingKeys,
   siblingPosition,
   sprintAdvance,
   sprintFilterChoices,
@@ -58,13 +69,16 @@ import {
   UNLABELLED_KIND,
   unmetDeps,
   visibleRows,
+  withArtifactLink,
   withDep,
+  withoutArtifactLinkAt,
   withoutDep,
   type BoardFilter,
   type BoardMarker,
   type BoardRow,
   type PickerField,
   type PickerTarget,
+  type LinkDraft,
   type TaskArtifactLink,
 } from "./taskboard";
 import {
@@ -75,6 +89,7 @@ import {
   workflowStatus,
   type WorkflowStatus,
 } from "./orchestration";
+import { writeClipboard } from "./clipboard";
 import { isPending, type OrchQuestion } from "./decisions";
 import { normalizeComment } from "./autonomy";
 import { CoalescingRefresh } from "./refreshgate";
@@ -241,6 +256,33 @@ export class TasksView {
   private workflow: WorkflowStatus | null = null;
   /** Task ids with their notes section expanded (survives re-renders). */
   private expanded = new Set<string>();
+  /** Task ids with their GROUNDING section expanded (#1273) — its own set,
+   *  not a second meaning for `expanded` above. The two sections answer
+   *  different questions ("what was said about this" / "what governs this")
+   *  and a human reading one is routinely not done with the other, so folding
+   *  them into one toggle would close the notes to open the links. Like
+   *  `expanded` it is frontend-only and survives re-renders; an id whose row
+   *  has since gone simply never matches. */
+  private expandedLinks = new Set<string>();
+  /** The half-typed grounding link per row (#1273 N1), so a re-render never
+   *  eats what the human is in the middle of writing.
+   *
+   *  It has to live HERE rather than in the input elements, because the
+   *  elements do not survive the event this exists for. `mutate` resyncs the
+   *  board after a REFUSED write, and `refreshNow` only defers a render while
+   *  `isEditing()` is true — which reads `document.activeElement`, so it holds
+   *  for Enter (focus still in the field) and NOT for a click on Add link
+   *  (focus on the button). Clearing on success alone would therefore still
+   *  lose the text on exactly the route most people use, and the whole point
+   *  of keeping validation backend-side is that the refusal TEACHES — an error
+   *  naming `deps`/`related` is worth nothing if the target it is about has
+   *  already been wiped out of the box. Pruned to live rows on every refresh,
+   *  like `selected`/`collapsed`. */
+  private linkDrafts = new Map<string, LinkDraft>();
+  /** The row whose target field should take focus after the next render — the
+   *  same one-shot hook as `pickingFocus`, so adding several links to a row in
+   *  a row does not need a click between each. */
+  private linkFocus: string | null = null;
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
    *  pruned to live rows on every refresh (see retainExisting). */
   private selected = new Set<string>();
@@ -783,6 +825,10 @@ export class TasksView {
     this.collapsed = retainExisting(this.collapsed, this.tasks);
     // Same for an open picker whose row has gone (#582, #958).
     if (this.picking && !this.tasks.some((t) => t.id === this.picking?.id)) this.picking = null;
+    // Same housekeeping for a half-typed grounding link whose row has gone
+    // (#1273): a draft nobody can ever see again is a leak that grows with the
+    // session.
+    this.linkDrafts = retainExistingKeys(this.linkDrafts, this.tasks);
     this.render();
   }
 
@@ -1036,8 +1082,15 @@ export class TasksView {
     inputs.values().next().value?.focus();
   }
 
-  /** Open a task's issue/PR reference in the default browser. */
-  private openRef(kind: "issue" | "pr", value: string): void {
+  /** Open a task's issue/PR reference — or a grounding link's URL (#1273) — in
+   *  the default browser.
+   *
+   *  `kind` only ever picks between the `/issues/N` and `/pull/N` path segments
+   *  backend-side, and `resolve_ref_url` returns an http(s) value VERBATIM
+   *  before it consults `kind` at all. So a URL passes `"link"`: it changes
+   *  nothing about where the click lands, and it keeps the audit line honest
+   *  rather than filing every grounding URL as an issue open. */
+  private openRef(kind: "issue" | "pr" | "link", value: string): void {
     invoke("orch_open_ref", { groupId: this.groupId, kind, value }).catch((err) =>
       this.toast(String(err))
     );
@@ -1199,6 +1252,12 @@ export class TasksView {
     // Same board-level gate for the nesting chrome (#958): a board that nests
     // nothing keeps exactly the rows it has today, with no collapse gutter.
     const usesHierarchy = boardUsesHierarchy(this.tasks);
+    // Same board-level gate again, for the grounding-link COUNT (#1273): on a
+    // board carrying no links at all, a column of `📎 0` down every row would
+    // be chrome saying "no" — the pay-for-what-you-use rule the two gates above
+    // already apply. The 📎 button itself stays on every row regardless, since
+    // it is the only way a link-free board ever gains its first link.
+    const usesLinks = boardUsesLinks(this.tasks);
     // t-N → q-N for every row a PENDING question cites (#1091 slice G) —
     // computed once for the whole render, like usesDeps/usesHierarchy above.
     // `isPending` is decisions.ts's own rule (never re-spelled here — see
@@ -1269,7 +1328,7 @@ export class TasksView {
     }
     for (const row of rows) {
       this.listEl.appendChild(
-        this.renderTask(row, usesDeps, usesHierarchy, blocked, settled, current)
+        this.renderTask(row, usesDeps, usesHierarchy, usesLinks, blocked, settled, current)
       );
     }
     this.drainFocus();
@@ -1740,6 +1799,234 @@ export class TasksView {
     return line;
   }
 
+
+  /** Act on a click on one grounding link (#1273).
+   *
+   *  The decision is `linkOpenPlan`'s, not this method's: an issue/PR ref and
+   *  an http(s) URL go to `orch_open_ref` — the only path to the external
+   *  opener, which refuses a non-http(s) URL itself — and EVERYTHING else is
+   *  copied instead. A link target is agent-writable free text (design note
+   *  §4 validates its shape and never its meaning), so "copy unless it is one
+   *  of the two shapes the board can name" is the safe default rather than a
+   *  gap; copying a repo path is also what the NEEDS-YOU panel already does
+   *  with a `demo_path`, and it is the plan's own stated fallback. */
+  private openLink(target: string): void {
+    const plan = linkOpenPlan(target);
+    if (plan.action === "open") {
+      this.openRef(plan.kind, plan.value);
+      return;
+    }
+    void writeClipboard(plan.text).then((ok) =>
+      this.toast(
+        ok
+          ? `Copied ${plan.text}`
+          : "Copy failed — the clipboard is unavailable, so this target could not be copied."
+      )
+    );
+  }
+
+  /** The grounding-link detail (#1273): the typed list, and the editor that
+   *  adds and removes entries.
+   *
+   *  Every write goes through `orch_upsert_task`'s `links` argument, which
+   *  REPLACES the whole array — so both edits compose the new list from the one
+   *  that was rendered (`withArtifactLink` / `withoutArtifactLinkAt`) and send
+   *  it whole. That is the same replace-or-untouched contract `deps` already
+   *  has on this view, and it inherits the same error surfacing: the type
+   *  vocabulary, the length caps, control characters and the refusal when a
+   *  target names a live board task are all validated inside the backend's
+   *  lock, and their errors reach the human through `mutate`'s toast. None of
+   *  those rules is re-spelled here — a second copy could only ever disagree
+   *  with the one that teaches. */
+  private renderGroundings(t: OrchTask): HTMLElement {
+    const links = t.links ?? [];
+    const box = el("div", "task-groundings");
+    const head = el("div", "task-groundings-head");
+    head.appendChild(el("span", "task-links-label", "grounding"));
+    head.appendChild(
+      el(
+        "span",
+        "task-groundings-hint",
+        links.length > 0
+          ? "read first by any agent opened against this task"
+          : "nothing recorded yet — an agent opened against this task gets no grounding section"
+      )
+    );
+    box.appendChild(head);
+
+    for (const [i, link] of links.entries()) {
+      const row = el("div", "task-grounding");
+      const known = (LINK_TYPES as readonly string[]).includes(link.type);
+      const type = el("span", `task-chip ground-type lt-${known ? link.type : "unknown"}`);
+      type.appendChild(el("span", "ground-glyph", linkTypeIcon(link.type)));
+      type.appendChild(el("span", "ground-type-name", link.type));
+      type.title = known
+        ? `A ${link.type} link`
+        : `${link.type} is not one of ${LINK_TYPES.join(" | ")} — only a hand-edited tasks.json can hold it`;
+      row.appendChild(type);
+
+      // The target is the payload, so the whole entry is the click target.
+      // `linkOpenPlan` decides what that click does, and the tooltip says which
+      // it will be — a click that silently copies when the human expected a
+      // browser is the confusing half of a tolerate-everything target field.
+      const plan = linkOpenPlan(link.target);
+      const open = el("button", "task-grounding-open", linkDisplayText(link)) as HTMLButtonElement;
+      open.title =
+        (link.label ? `${link.label}\n${link.target}` : link.target) +
+        (plan.action === "open" ? "\n\nClick to open it" : "\n\nClick to copy it");
+      open.addEventListener("click", () => this.openLink(link.target));
+      row.appendChild(open);
+      // The raw target beside a labelled link: a label is a gloss, and a gloss
+      // that hides what it points at makes the human unfold nothing to find out.
+      if ((link.label ?? "").trim()) row.appendChild(el("span", "task-grounding-target", link.target));
+
+      const rm = el("button", "task-dep-remove", "✕") as HTMLButtonElement;
+      rm.title = `Remove this ${link.type} link`;
+      rm.addEventListener("click", () =>
+        void this.mutate(
+          invoke("orch_upsert_task", {
+            groupId: this.groupId,
+            id: t.id,
+            // BY INDEX — a row may carry one target twice (nothing dedupes
+            // this array), and the human clicked exactly one ✕.
+            links: withoutArtifactLinkAt(t.links, i),
+          })
+        )
+      );
+      row.appendChild(rm);
+      box.appendChild(row);
+    }
+
+    // At the cap the editor goes INERT and says why, rather than offering an
+    // add whose write the backend must reject — `MAX_SPRINT` and the ⏭ button
+    // take the same position for the same reason. A hand-edited board can sit
+    // ABOVE the cap; `artifactLinksAtCap` covers that too, so the human is told
+    // to remove one rather than shown a form that cannot succeed.
+    if (artifactLinksAtCap(links)) {
+      box.appendChild(
+        el(
+          "div",
+          "task-groundings-full",
+          `This task is at the ${MAX_ARTIFACT_LINKS}-link limit — remove one to add another.`
+        )
+      );
+      return box;
+    }
+
+    const add = el("div", "task-grounding-add");
+    // Seeded from the row's draft, so a render that lands mid-typing — a
+    // background board refresh, or the resync after a refused write — puts back
+    // exactly what was in the boxes. `linkDrafts` is the authority; the elements
+    // are a view of it.
+    const draftState = this.linkDrafts.get(t.id);
+    const type = document.createElement("select");
+    type.className = "task-dep-picker ground";
+    for (const lt of LINK_TYPES) {
+      const opt = document.createElement("option");
+      opt.value = lt;
+      opt.textContent = `${linkTypeIcon(lt)} ${lt}`;
+      type.appendChild(opt);
+    }
+    // `DEFAULT_LINK_TYPE`, never the literal "requirement": the vocabulary is
+    // read out of the Rust source, so a reorder or a rename there must not leave
+    // this line silently naming nothing — and the pristine test below compares
+    // against the SAME const, because a default seeded here and a default
+    // assumed there drifting apart is exactly what #1273 N4 was. A draft's
+    // remembered type wins, unless the vocabulary no longer has it.
+    type.value =
+      draftState && (LINK_TYPES as readonly string[]).includes(draftState.type)
+        ? draftState.type
+        : DEFAULT_LINK_TYPE;
+    type.title = "What kind of grounding this is — it decides nothing, it tells the next agent what it is reading";
+
+    const target = document.createElement("input");
+    target.className = "dlg-input task-grounding-target-input";
+    target.placeholder = "#123, doc/design/x.md, or a URL";
+    target.spellcheck = false;
+    target.value = draftState?.target ?? "";
+    target.title =
+      "What the link points AT. Never checked for existence — the board stays editable offline — " +
+      "but a target naming a task on THIS board is refused: that is what dependencies are for.";
+
+    const label = document.createElement("input");
+    label.className = "dlg-input task-grounding-label-input";
+    label.placeholder = "label (optional)";
+    label.spellcheck = false;
+    label.value = draftState?.label ?? "";
+    label.title = "A one-line gloss shown instead of the bare target";
+
+    // Every keystroke and type change writes back, so what the view holds and
+    // what is on screen cannot diverge.
+    const remember = () => {
+      const draft = { type: type.value, target: target.value, label: label.value };
+      // Every field, not just the two text ones. A `<select>` raises no
+      // `isEditing()`, so a type picked and not remembered here is reverted on
+      // screen by the next background render and the link then lands under a
+      // type nobody chose (#1273 N4). `linkDraftIsPristine` is the one rule.
+      if (linkDraftIsPristine(draft)) this.linkDrafts.delete(t.id);
+      else this.linkDrafts.set(t.id, draft);
+    };
+    target.addEventListener("input", remember);
+    label.addEventListener("input", remember);
+    type.addEventListener("change", remember);
+
+    const submit = () => {
+      const draft = artifactLinkDraft(type.value, target.value, label.value);
+      // No target typed yet is not an error, it is an unfinished form — say
+      // nothing and leave the caret where it is.
+      if (!draft) {
+        target.focus();
+        return;
+      }
+      // The boxes are emptied ONLY once the write has actually landed. On a
+      // refusal `mutate` toasts the backend's error — which for a target naming
+      // a board task is the sentence that teaches `deps`/`related` — and
+      // resyncs; the draft survives that render, so the human can act on what
+      // they were just told instead of retyping it first.
+      void this.mutate(
+        invoke("orch_upsert_task", {
+          groupId: this.groupId,
+          id: t.id,
+          links: withArtifactLink(t.links, draft),
+        }).then(() => {
+          this.linkDrafts.delete(t.id);
+          // Render rather than clearing these two elements: the success event
+          // may have rebuilt the form already, and blanking the detached copy
+          // would leave the live one still holding the text. One authority.
+          this.linkFocus = t.id;
+          this.render();
+        })
+      );
+    };
+    const btn = el("button", "dlg-btn", "Add link") as HTMLButtonElement;
+    btn.addEventListener("click", submit);
+    // Keep keystrokes off the terminal underneath — every inline editor in this
+    // view does this — and let Enter commit from either field.
+    for (const field of [type, target, label] as HTMLElement[]) {
+      field.addEventListener("keydown", (e: KeyboardEvent) => {
+        e.stopPropagation();
+        if (e.key === "Enter") submit();
+        if (e.key === "Escape") {
+          // Esc backs out the whole fold, and takes the unwritten draft with it
+          // — the same "backs out unwritten" the pickers mean by Escape.
+          this.linkDrafts.delete(t.id);
+          this.expandedLinks.delete(t.id);
+          this.render();
+        }
+      });
+    }
+    add.append(type, target, label, btn);
+    // Focus only on the render that follows a successful add, never on a
+    // background refresh — the same one-shot rule `pickingFocus` follows, so a
+    // re-render must not yank focus back from wherever the human has moved.
+    if (this.linkFocus === t.id) {
+      this.linkFocus = null;
+      window.setTimeout(() => target.focus(), 0);
+    }
+    box.appendChild(add);
+    return box;
+  }
+
   /** Open (or close) one of the row pickers. One at a time across the whole
    *  board and across every field, so the human is never choosing a
    *  dependency, a container, an Agile level and a sprint at the same time in
@@ -2025,6 +2312,9 @@ export class TasksView {
     boardRow: BoardRow<OrchTask>,
     usesDeps: boolean,
     usesHierarchy: boolean,
+    /** Does ANY row on this board carry grounding links (#1273)? Decides
+     *  whether the 📎 button carries a count — see `render`. */
+    usesLinks: boolean,
     blocked: ReadonlyMap<string, string>,
     settled: ReadonlySet<string>,
     /** The board's current sprint (#1272), derived once for the whole render
@@ -2495,6 +2785,34 @@ export class TasksView {
     sprintBtn.addEventListener("click", () => this.togglePicker(t.id, "sprint"));
     top.appendChild(sprintBtn);
 
+    // Grounding links (#1273): the fifth per-row entry point, in the same slot
+    // as the four above and present on every row for the same reason the 🎯
+    // picker is — a row with no links has no chip to click, so making a chip
+    // the way in would leave it with no way to gain its first one.
+    //
+    // It carries the COUNT, exactly like 🗨 beside it, so the row says how much
+    // grounding it has without anything being unfolded. The count is dropped on
+    // a board that uses no links at all (`usesLinks`): a column of `📎 0` says
+    // nothing, and the absence already says it — the same argument the sprint
+    // badge makes for the backlog.
+    const linkCount = t.links?.length ?? 0;
+    const groundBtn = el(
+      "button",
+      "task-btn ground",
+      usesLinks ? `📎 ${linkCount}` : "📎"
+    ) as HTMLButtonElement;
+    if (linkCount > 0) groundBtn.classList.add("has-links");
+    groundBtn.title =
+      linkCount > 0
+        ? `${linkCount} grounding link${linkCount === 1 ? "" : "s"} — what an agent opened against this task is told to read first. Click to see, open, add or remove them.`
+        : "Grounding links — record what governs this work (a requirement, a spec, a design note, a test case, a doc) so an agent opened against it reads them first";
+    groundBtn.addEventListener("click", () => {
+      if (this.expandedLinks.has(t.id)) this.expandedLinks.delete(t.id);
+      else this.expandedLinks.add(t.id);
+      this.render();
+    });
+    top.appendChild(groundBtn);
+
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
     notesBtn.title = "Notes";
     notesBtn.addEventListener("click", () => {
@@ -2537,6 +2855,11 @@ export class TasksView {
 
     const links = this.renderLinks(t);
     if (links) main.appendChild(links);
+
+    // The grounding detail (#1273) sits between the dep chips and the notes:
+    // above the conversation, below the structure, which is the order a human
+    // reads a row in.
+    if (this.expandedLinks.has(t.id)) main.appendChild(this.renderGroundings(t));
 
     if (this.expanded.has(t.id)) {
       const notes = el("div", "task-notes");

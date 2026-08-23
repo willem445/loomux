@@ -1,11 +1,11 @@
 # Design: board sprints and typed grounding links (#1272, #1273)
 
 Status: **backend implemented** (PR A); **grounding injected at spawn** (PR B, §12); **the
-board's sprint UI implemented** (PR C, §13). Two human-requested features that touch the same
+board's sprint UI implemented** (PR C, §13); **the board's links UI implemented** (PR D, §14).
+Two human-requested features that touch the same
 persisted structure, landed as ONE additive board-model revision rather than two: the schema
 change, its validation, the derived projections, the MCP surface, and the one role-template
-edit. The board UI for **links** is still a later slice — §9 says which. Symbols are the
-durable reference.
+edit. Symbols are the durable reference.
 
 ## 1. Problem & thesis
 
@@ -249,8 +249,7 @@ through its own `Serialize`, so both fields appear in the audit log automaticall
   shipped the pure helpers (`currentSprint`, `sprintProgress`, `rollOverSet`,
   `linkTargetKind`) and deliberately **no** `BoardFilter`, since #1270's richer seam landed
   first and a second weaker one would defeat the point of having a seam.
-- **Board UI for links** — a count chip on the row, a typed list in the detail, an add/remove
-  editor.
+- **Board UI for links** — no longer deferred: it shipped as PR D and is specified in §14.
 - **Brief injection (`spawn_agent.task_id`)** — no longer deferred: it shipped as PR B and
   is specified in §12.
 - **GitHub milestone mirroring** — rejected outright, not deferred; see §10.
@@ -459,7 +458,103 @@ wiring, which this repo validates by hand rather than by test. So `t-469` **park
 gate considered?" is a question the next UI slice will ask, and a silent skip reads the same
 as a decision not to.
 
-## 14. Symbols
+## 14. The board's links UI (PR D)
+
+Three surfaces, all of them chrome inside the existing board overlay — nothing here is a
+layout sibling of `#grid-area` and nothing resizes a PTY (hard constraint 1). **No new
+backend surface either**: both edits ride `orch_upsert_task`'s existing `links` argument
+from PR A, which replaces the whole array, so each one composes the new list from the one
+that was rendered and sends it whole.
+
+**One entry point per row, carrying the count.** 📎 sits in the same slot as 🔗/⤵/🏷/🎯 and
+is present on every row, for the reason the sprint picker is: a row with no links has no
+chip to click, so making a chip the way in would leave a link-free row with no way to gain
+its first one. It carries the count the way 🗨 carries the note count — the row says how
+much grounding it has without anything being unfolded. On a board where **no** row carries a
+link, the count is dropped and the button reads bare 📎: a column of `📎 0` is chrome saying
+"no", which is `boardUsesDeps`/`boardUsesHierarchy`'s pay-for-what-you-use rule and the same
+argument the sprint badge makes for the backlog.
+
+**The detail is its own fold, not a second meaning for the notes fold.** `expandedLinks` is a
+separate set from `expanded`. The two sections answer different questions — what was *said*
+about this row, and what *governs* it — and a human reading one is routinely not done with
+the other, so one shared toggle would close the notes to open the links. It renders between
+the dep chips and the notes: structure, then grounding, then conversation.
+
+**A click OPENS two shapes and COPIES everything else, and that asymmetry is the design.**
+`linkOpenPlan` decides, `tasksview` only obeys:
+
+- an issue/PR ref (`#123`) opens with `kind: "issue"`, which is what selects the `/issues/N`
+  segment backend-side — GitHub redirects to `/pull/N`, so one kind covers both;
+- an `http(s)` URL opens with `kind: "link"`. That kind is not a new backend concept:
+  `resolve_ref_url` returns an http(s) value **verbatim before it consults `kind` at all**, so
+  the value decides where the click lands and the kind only keeps the audit line honest
+  rather than filing every grounding URL as an issue open;
+- **everything else is copied** — repo paths (which is what the NEEDS-YOU panel already does
+  with a `demo_path`), absolute paths, and anything the board cannot classify.
+
+The copy arm is the safe *default*, not a gap. §4 validates a target's shape and never its
+meaning, and the board is agent-writable, so the set of shapes that may reach an external
+opener has to be an allow-list of two — not "everything that isn't a path". Two things
+already guard the same line behind it (`open_external_url` refuses a non-http(s) URL,
+`resolve_ref_url` passes through only http(s)), and `anything the board cannot classify is
+copied, never launched` sweeps `javascript:`, `file:`, `data:` and `ftp:` against the plan.
+
+**The scheme is lowercased on the way out, and that is a real defect being closed rather than
+tidiness.** `linkTargetKind` matches a URL scheme case-insensitively; `resolve_ref_url`'s
+passthrough tests it case-**sensitively** and then falls through to a digit scan. An
+untouched `HTTP://host/123` therefore misses the passthrough and opens
+`<this repo>/pull/123` — a different page on a different site, with no error anywhere. Only
+the scheme is touched; the rest of a URL is case-sensitive.
+
+**Removal is by INDEX.** `links` is not deduped (§3), so one row can legitimately carry the
+same target twice under two types — the spec that is also the requirement. Removing by target
+would take both, and the human clicked exactly one ✕. `withoutArtifactLinkAt` also returns the
+list unchanged for an out-of-range index, because a stale render whose row has already changed
+underneath is the reachable way one arrives.
+
+**The editor re-spells none of the backend's rules.** Its only refusal is an empty target,
+and that is "the form is not filled in yet", not validation. The type vocabulary, the length
+caps, control characters, and the refusal when a target names a live board task all stay in
+`normalize_task_links` inside the backend's lock, and their errors reach the human through the
+board's toast. The last of those is the one that matters: it is a **teaching** check whose
+error explains the `deps`/`related` distinction, and a copy of it here would swallow the write
+silently — the human would never read the sentence they needed. This is the dep picker's
+position (cycles are the backend's to refuse), not the parent picker's (which mirrors the
+ladder and says why).
+
+One rule *is* mirrored, and it is the one that decides an affordance rather than a write:
+`MAX_ARTIFACT_LINKS`. At the cap the add form is replaced by a line saying so, rather than
+offering an add whose write the backend must reject — §13's `MAX_SPRINT` argument, one
+surface over. A hand-edited board can sit *above* the cap and `artifactLinksAtCap` covers
+that too. Because the mirror can drift, it is read out of the Rust source by a test: raised
+backend-side alone the editor would refuse links the backend would have taken, lowered
+backend-side alone it would compose writes that are refused, and neither shows as a compile
+error.
+
+**Colour: neutral, and the glyph carries the type.** Six link types would need six hues — a
+whole second colour language for a field naming a *kind of document*, which is not a state of
+the work and not an identity the eye tracks across rows (#1320). Every type gets its own
+glyph instead, pinned distinct by a test that sweeps `LINK_TYPES` (itself read out of the
+Rust source), so a type added on the backend cannot reach the board wearing the
+unknown-type fallback. Only the hand-edited case takes a semantic colour: the same red as the
+`missing` dep and `k-unknown` chips, because it means the same thing — this could not have
+been written through the product.
+
+**The demo gate, considered again.** §13 asked the next UI slice this question outright, so:
+PR D qualifies on the same three counts PR C did — visible chrome on the human’s primary
+surface, a human-requested feature, and a payload that is DOM wiring, which this repo
+validates by hand rather than by test. The pure half carries a mutation table; the fold, the
+click and the form do not and cannot. So `t-470` takes the same treatment as `t-469`: it parks
+at `human-testing` with the branch worktree as its `demo_path` once review settles, and the
+merge waits on the human’s own look rather than on more code.
+
+**What this slice does NOT add.** No links filter family (`BoardFilter` gains no key — #1270's
+seam stays as it is), no bulk edit, no reordering of a row's links, and no existence checking
+of any kind. Grounding still reaches an agent through PR B's spawn-time injection; this slice
+only lets a human see and edit what will be injected.
+
+## 15. Symbols
 
 Backend (`src-tauri/src/orchestration/mod.rs` unless noted):
 `Task::sprint`, `Task::links`, `TaskLink`, `TASK_LINK_TYPES`, `MAX_TASK_LINKS`,
@@ -481,6 +576,11 @@ PR C (the sprint UI, §13) — `src/taskboard.ts`: `BoardFilter.sprint`, `BACKLO
 `MAX_SPRINT`, and `PickerField`'s `"sprint"` arm. `src/tasksview.ts`:
 `TasksView.renderSprintLens`, `sprintLensArmed`, `toggleSprintLens`, `onAdvanceSprint`,
 `renderSprintPicker`. `src/boardprefs.ts` carries `sprint` at its four persistence sites.
+
+PR D (the links UI, §14) — `src/taskboard.ts`: `MAX_ARTIFACT_LINKS`, `artifactLinksAtCap`,
+`linkTypeIcon`, `linkDisplayText`, `LinkOpenPlan`, `linkOpenPlan`, `artifactLinkDraft`,
+`withArtifactLink`, `withoutArtifactLinkAt`. `src/tasksview.ts`: `TasksView.renderGroundings`,
+`openLink`, `expandedLinks`, and `openRef`’s widened `kind`.
 
 Tests: `src-tauri/tests/orchestration.rs` (the `#1272`/`#1273` block),
 `test/taskboard.test.ts`, `test/boardprefs.test.ts`.

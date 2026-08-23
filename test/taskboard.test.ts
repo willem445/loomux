@@ -59,6 +59,7 @@ import {
   PROTOTYPE_STATUS,
   REQUEST_CHANGES_STATUS,
   retainExisting,
+  retainExistingKeys,
   STATUSES,
   taskActivityState,
   unmetDeps,
@@ -76,6 +77,17 @@ import {
   sprintFilterChoices,
   sprintPickerChoices,
   sprintProgress,
+  artifactLinkDraft,
+  DEFAULT_LINK_TYPE,
+  linkDraftIsPristine,
+  artifactLinksAtCap,
+  linkDisplayText,
+  linkOpenPlan,
+  linkTypeIcon,
+  MAX_ARTIFACT_LINKS,
+  withArtifactLink,
+  withoutArtifactLinkAt,
+  type TaskArtifactLink,
 } from "../src/taskboard.ts";
 
 test("counts only tasks in the exact `done` status", () => {
@@ -2239,4 +2251,284 @@ test("collapse-all names every container and nothing else, in board order", () =
     ["e-1", "t-9"]
   );
   assert.deepEqual(containerIds([frow("t-1"), frow("t-2")]), [], "a flat board has no containers");
+});
+
+// ---------------------------------------------------------------------------
+// The grounding-links UI (#1273, PR D) — the count chip, the typed detail list
+// and the add/remove editor, exercised through their DOM-free half.
+// ---------------------------------------------------------------------------
+
+const alink = (type: string, target: string, label?: string): TaskArtifactLink =>
+  label === undefined ? { type, target } : { type, target, label };
+
+test("the board's link cap is the backend's MAX_TASK_LINKS, read out of the Rust source", () => {
+  // Same guard shape as the vocabulary scans above, and it earns its place for
+  // a reason the vocabularies do not have: this number is what makes the add
+  // affordance go INERT. Raised backend-side alone, the editor would keep
+  // refusing links the backend would happily have taken, with nothing red to
+  // say so; lowered backend-side alone, the editor would keep composing writes
+  // that are refused. Neither shows up as a compile error.
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const m = src.match(/pub const MAX_TASK_LINKS:\s*usize\s*=\s*(\d+)\s*;/);
+  assert.ok(
+    m,
+    "MAX_TASK_LINKS is gone, renamed or reshaped in mod.rs — this guard reads it by name, so " +
+      "update it here rather than deleting the only thing pinning the two caps together"
+  );
+  assert.equal(
+    MAX_ARTIFACT_LINKS,
+    Number(m[1]),
+    "the board's MAX_ARTIFACT_LINKS must equal the backend's MAX_TASK_LINKS — the editor goes " +
+      "inert at this number, so a drift makes the affordance lie in one direction or the other"
+  );
+});
+
+test("every link type in the vocabulary has its own glyph", () => {
+  // A sweep over LINK_TYPES, which is itself read out of the Rust source by the
+  // guard above it: a type added on the backend reaches this list, and reaching
+  // it without a glyph here reddens rather than silently rendering the
+  // unknown-type fallback, which is supposed to mean "hand-edited board".
+  const icons = LINK_TYPES.map((t) => linkTypeIcon(t));
+  for (const [i, t] of LINK_TYPES.entries()) {
+    assert.notEqual(icons[i], "", `${t} has no glyph`);
+    assert.notEqual(
+      icons[i],
+      linkTypeIcon("nonsense-type"),
+      `${t} renders the unknown-type fallback, so a legal type looks like a hand-edited one`
+    );
+  }
+  assert.equal(
+    new Set(icons).size,
+    LINK_TYPES.length,
+    `two link types share a glyph, so the detail list cannot tell them apart: ${icons.join(" ")}`
+  );
+  // Not the dep button's glyph: that one already means "add a dependency" on
+  // every row of this board, and the whole point of the TaskArtifactLink /
+  // HasLinks split (design note §11) is that the two senses of "link" never get
+  // confused on screen.
+  assert.notEqual(linkTypeIcon("link"), "\u{1F517}", "the generic link type must not wear the dep button's glyph");
+  assert.equal(linkTypeIcon("adr"), "\u2022", "an out-of-vocabulary type still renders");
+});
+
+test("a link shows its label when it has one and its target when it does not", () => {
+  assert.equal(linkDisplayText(alink("spec", "#42", "Retry budget")), "Retry budget");
+  assert.equal(linkDisplayText(alink("spec", "#42")), "#42");
+  // The backend stores a blank label as ABSENT, so these two only ever arrive
+  // off a hand-edited board — and both must read as "no label", never as an
+  // empty line where the target should have been.
+  assert.equal(linkDisplayText({ type: "doc", target: "README.md", label: "" }), "README.md");
+  assert.equal(linkDisplayText({ type: "doc", target: "README.md", label: "   " }), "README.md");
+});
+
+test("clicking an issue ref opens it, and only an issue ref asks for the issue path", () => {
+  assert.deepEqual(linkOpenPlan("#123"), { action: "open", kind: "issue", value: "#123" });
+  assert.deepEqual(linkOpenPlan("  #7  "), { action: "open", kind: "issue", value: "#7" }, "trimmed");
+  // `kind: "issue"` is what picks the `/issues/N` segment backend-side. Any
+  // other target reaching that arm would be turned into an issue URL on this
+  // repo — a page that has nothing to do with what the link pointed at.
+  for (const other of ["https://example.com/a", "doc/design/x.md", "README", "", "#foo"]) {
+    const plan = linkOpenPlan(other);
+    assert.notEqual(
+      plan.action === "open" ? plan.kind : null,
+      "issue",
+      `${JSON.stringify(other)} must not be resolved as an issue ref`
+    );
+  }
+});
+
+test("a URL opens with its scheme lowercased, so it cannot be misread as an issue number", () => {
+  assert.deepEqual(linkOpenPlan("https://example.com/a/b"), {
+    action: "open",
+    kind: "link",
+    value: "https://example.com/a/b",
+  });
+  // The one that matters. `linkTargetKind` matches the scheme case-insensitively
+  // but the backend's passthrough (`resolve_ref_url`) tests it case-SENSITIVELY,
+  // then falls through to a digit scan: an untouched `HTTP://host/123` opens
+  // `<this repo>/pull/123` instead — a different page on a different site, with
+  // no error anywhere. Lowercasing the scheme is what keeps it on the
+  // passthrough; nothing after the scheme may be touched, since the rest of a
+  // URL is case-sensitive.
+  assert.deepEqual(linkOpenPlan("HTTP://Example.COM/Path/123"), {
+    action: "open",
+    kind: "link",
+    value: "http://Example.COM/Path/123",
+  });
+  assert.deepEqual(linkOpenPlan("HTTPS://Example.COM/X"), {
+    action: "open",
+    kind: "link",
+    value: "https://Example.COM/X",
+  });
+});
+
+test("anything the board cannot classify is copied, never launched", () => {
+  // Paths are the plan's own fallback (the NEEDS-YOU panel already copies a
+  // demo_path rather than opening it). The rest of this list is the safety
+  // half: a link target is agent-writable, so the only shapes that may reach
+  // an opener are the two above — everything else lands on the clipboard.
+  for (const target of [
+    "doc/design/x.md",
+    "README.md",
+    "/etc/passwd",
+    "C:/Windows/system32",
+    "javascript:alert(1)",
+    "file:///c:/secrets.txt",
+    "data:text/html,<script>",
+    "ftp://host/x",
+    "README",
+    "",
+  ]) {
+    assert.deepEqual(
+      linkOpenPlan(target),
+      { action: "copy", text: target.trim() },
+      `${JSON.stringify(target)} must be copied, not opened`
+    );
+  }
+});
+
+test("the editor composes a link only once the target is filled in", () => {
+  assert.deepEqual(artifactLinkDraft("spec", "  #42  ", "  Retry budget  "), {
+    type: "spec",
+    target: "#42",
+    label: "Retry budget",
+  });
+  // A blank label is stored ABSENT by the backend, so the draft must not invent
+  // a `label: ""` the round trip would then not produce.
+  assert.deepEqual(artifactLinkDraft("doc", "README.md", ""), { type: "doc", target: "README.md" });
+  assert.deepEqual(artifactLinkDraft("doc", "README.md", "   "), { type: "doc", target: "README.md" });
+  assert.ok(!("label" in artifactLinkDraft("doc", "README.md", "")!), "no empty label key");
+  // The only refusal: nothing typed yet.
+  assert.equal(artifactLinkDraft("doc", "", "a label"), null);
+  assert.equal(artifactLinkDraft("doc", "   ", "a label"), null);
+  // NOT refused here, deliberately: a target naming a board task is the one
+  // board-aware rule, and it lives in `normalize_task_links` where the error
+  // can TEACH the deps/related distinction. A copy of it here would silently
+  // swallow the write instead, and the human would never read the sentence
+  // that explains what they wanted.
+  assert.deepEqual(artifactLinkDraft("link", "t-3", ""), { type: "link", target: "t-3" });
+});
+
+test("adding a link keeps the author's reading order and never dedupes", () => {
+  const first = alink("requirement", "#1", "must be bounded");
+  const one = withArtifactLink(undefined, first);
+  assert.deepEqual(one, [first], "a row with no links yet takes the first one");
+  const two = withArtifactLink(one, alink("doc", "README.md"));
+  assert.deepEqual(two.map((l) => l.target), ["#1", "README.md"], "appended at the end");
+  assert.deepEqual(one.map((l) => l.target), ["#1"], "the input array is not mutated");
+  // Design note §3: `links` is not deduped and not sorted — one target can
+  // legitimately appear twice under two types (the spec that is also the
+  // requirement).
+  const dup = withArtifactLink(two, alink("spec", "#1", "the acceptance spec"));
+  assert.deepEqual(dup.map((l) => l.target), ["#1", "README.md", "#1"]);
+  assert.deepEqual(dup.map((l) => l.type), ["requirement", "doc", "spec"]);
+});
+
+test("removing a link takes the one that was clicked, not every copy of its target", () => {
+  const links = [
+    alink("requirement", "#1", "must be bounded"),
+    alink("doc", "README.md"),
+    alink("spec", "#1", "the acceptance spec"),
+  ];
+  // The intent: removal is BY INDEX. Removing by target would take both `#1`
+  // rows — a row can carry one target twice (nothing dedupes this array), and
+  // the human clicked exactly one remove button.
+  const gone = withoutArtifactLinkAt(links, 0);
+  assert.deepEqual(gone.map((l) => l.type), ["doc", "spec"]);
+  assert.deepEqual(
+    gone.map((l) => l.target),
+    ["README.md", "#1"],
+    "the other link on the same target survives"
+  );
+  assert.deepEqual(withoutArtifactLinkAt(links, 2).map((l) => l.type), ["requirement", "doc"]);
+  assert.equal(links.length, 3, "the input array is not mutated");
+  // A stale render (the row changed underneath between paint and click) must
+  // compose a write that changes nothing, never one that drops a different link.
+  for (const bad of [-1, 3, 99, 1.5, NaN]) {
+    assert.deepEqual(
+      withoutArtifactLinkAt(links, bad),
+      links,
+      `index ${bad} must leave the list alone`
+    );
+  }
+  assert.deepEqual(withoutArtifactLinkAt(undefined, 0), []);
+});
+
+test("the add affordance goes inert exactly at the cap", () => {
+  const fill = (n: number) => Array.from({ length: n }, (_, i) => alink("doc", `d${i}.md`));
+  assert.equal(artifactLinksAtCap(undefined), false);
+  assert.equal(artifactLinksAtCap([]), false);
+  assert.equal(artifactLinksAtCap(fill(MAX_ARTIFACT_LINKS - 1)), false, "one short is still open");
+  assert.equal(artifactLinksAtCap(fill(MAX_ARTIFACT_LINKS)), true);
+  // A hand-edited board can sit ABOVE the cap (the backend only checks writes),
+  // and the editor must stay inert there rather than offering an add whose
+  // write would be refused for a reason the human did not cause.
+  assert.equal(artifactLinksAtCap(fill(MAX_ARTIFACT_LINKS + 5)), true);
+});
+
+test("a half-typed link draft is pruned with its row, and keeps its value while the row lives", () => {
+  // #1273 N1: the board holds the in-progress grounding link per row so a
+  // re-render — a background refresh, or the resync after a refused write —
+  // does not eat it. That state is frontend-only, so it can outlive the row it
+  // points at exactly the way `selected`/`collapsed` can.
+  const drafts = new Map([
+    ["t-1", { type: "spec", target: "#42", label: "the acceptance spec" }],
+    ["t-gone", { type: "doc", target: "README.md", label: "" }],
+  ]);
+  const board = [{ id: "t-1" }, { id: "t-2" }];
+  const live = retainExistingKeys(drafts, board);
+  assert.deepEqual([...live.keys()], ["t-1"], "a draft whose row has gone is dropped");
+  // The VALUE, not just the key. A prune that rebuilt the map from the surviving
+  // ids alone would satisfy the assertion above and silently blank the text this
+  // whole mechanism exists to keep.
+  assert.deepEqual(live.get("t-1"), { type: "spec", target: "#42", label: "the acceptance spec" });
+  assert.equal(drafts.size, 2, "the input map is not mutated");
+  assert.notEqual(live, drafts, "a fresh map is returned");
+  // A row with no draft does not gain one.
+  assert.equal(live.has("t-2"), false);
+  assert.equal(retainExistingKeys(new Map(), board).size, 0);
+  assert.equal(retainExistingKeys(drafts, []).size, 0, "an empty board keeps nothing");
+});
+
+test("a link draft counts as touched when the TYPE alone was chosen", () => {
+  // #1273 N4. The type control is a `<select>`, which is neither an INPUT nor a
+  // TEXTAREA — so `isEditing()` never holds for it and a background render (any
+  // agent board write raises one) is never deferred on its account. If a chosen
+  // type does not count as a touched draft, the picker silently snaps back to
+  // the default and the target typed next is stored under a type nobody chose.
+  const pristine = { type: DEFAULT_LINK_TYPE, target: "", label: "" };
+  assert.equal(linkDraftIsPristine(pristine), true, "an untouched form is not worth keeping");
+
+  // The defect this test exists for.
+  assert.equal(
+    linkDraftIsPristine({ ...pristine, type: "test-case" }),
+    false,
+    "a type chosen before anything is typed must survive a render"
+  );
+
+  // Parameterised on the vocabulary rather than on the literal "requirement",
+  // so a reorder of LINK_TYPES cannot leave the predicate comparing against a
+  // default the form no longer seeds — that drift between the two answers to
+  // one question IS the defect above, one level up.
+  assert.equal(
+    linkDraftIsPristine({ type: LINK_TYPES[0], target: "", label: "" }),
+    true,
+    "the vocabulary's first entry is what the form starts on"
+  );
+  for (const t of LINK_TYPES.slice(1)) {
+    assert.equal(
+      linkDraftIsPristine({ type: t, target: "", label: "" }),
+      false,
+      `${t} is a choice, not the default`
+    );
+  }
+
+  // The two text fields, each on its own.
+  assert.equal(linkDraftIsPristine({ ...pristine, target: "#42" }), false);
+  assert.equal(linkDraftIsPristine({ ...pristine, label: "the acceptance spec" }), false);
+  // Not trimmed: a lone space is something the human typed, and handing it back
+  // is more honest than deciding it did not happen. Submitting it is still
+  // refused — `artifactLinkDraft` is what answers "send it", this answers
+  // "keep it" — so the two are not in conflict.
+  assert.equal(linkDraftIsPristine({ ...pristine, target: " " }), false);
+  assert.equal(artifactLinkDraft(DEFAULT_LINK_TYPE, " ", ""), null, "and it still cannot be submitted");
 });
