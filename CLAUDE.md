@@ -289,14 +289,11 @@ compiles.
   for the same shape: the site a review names is rarely the only one. Signature: fixing
   a vacuous-test finding uncovers its twin one test over, green against an empty scan
   (#1209).
-  A positive control proves the mechanism RAN, never that it SAW every subject —
-  vacuity is not completeness. Where it is a pattern over a population, assert the
-  match count equals an independent raw count of that population: that fires on a
-  blind instrument by itself, without anyone thinking to mutate the one subject it
-  cannot see. Build the pattern from what a token may CONTAIN (a documented fact),
-  never from what may FOLLOW it (unbounded prose). Signature: a review finds one
-  field renamable alone while a guard that already carries a vacuity control stays
-  green (#1297, `test/reposlug.test.ts`).
+  A positive control proves the mechanism RAN, never that it SAW every subject: where it
+  guards a pattern over a population, put the raw-count cross-check under *Every number in
+  a PR body* in the assertion itself, where it fires on a blind instrument without anyone
+  thinking to mutate the one subject it cannot see. Signature: one field renamable alone
+  while a guard already carrying a vacuity control stays green (#1297, `test/reposlug.test.ts`).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
@@ -417,7 +414,9 @@ narrow their ask back down to the original ticket on your own judgment.
   delimiters and cross-check the total against a raw count of the container. Signature:
   two totals stated confidently and both light by exactly one, from a `([a-z-]+)` that
   stops dead at the digit in a real value (`no-sha256`) — a census that cannot see one
-  of its own subjects is not a census (#1209).
+  of its own subjects is not a census (#1209). Build the pattern from what a token may
+  CONTAIN (a fact), never from what may FOLLOW it (unbounded prose): the second instance
+  was a follow-class omitting `#`, blinding a guard to `…/loomux#readme` (#1297).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
   and work merged meanwhile authors fresh instances of the string you removed — a live
