@@ -54290,9 +54290,9 @@ fn manager_tool_surface_is_exactly_the_enumerated_set() {
             "list_agents",
             "get_state",
             "list_tasks",
-            "get_task",
             "list_questions",
             "list_needs_you",
+            "get_task",
             "list_verdicts",
             "request_compact",
             "note_directive",
@@ -54462,10 +54462,18 @@ fn nothing_loomux_sends_mid_session_can_reach_a_manager_pane() {
         (Delivery::FreshKickoff, "the kickoff is how the manager learns what it is"),
         (Delivery::Regrounding, "D2: the post-compact re-grounding notice"),
     ] {
-        reg.deliver_prompt(&mgr.id, "loomux text", "loomux", kind)
+        // DISTINCT text per delivery, deliberately: the queue COALESCES
+        // identical payloads to the same pane, so two copies of one string
+        // would land as a single entry and the depth below would be measuring
+        // the coalescer rather than this gate.
+        reg.deliver_prompt(&mgr.id, what, "loomux", kind)
             .unwrap_or_else(|e| panic!("{what} must still be delivered, got: {e}"));
     }
-    assert_eq!(reg.queue_depth(7301), 2, "both permitted deliveries were admitted");
+    assert_eq!(
+        reg.queue_depth(7301),
+        2,
+        "both permitted deliveries were admitted — the kickoff and the D2 re-grounding notice"
+    );
 
     // 5 — and a mid-session delivery is STILL refused while paused, which is
     // what keeps `flush_paused_queues` from being a second, unguarded door: it
