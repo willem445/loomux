@@ -249,6 +249,20 @@ export const loadSshProfiles = (): Promise<string | null> =>
 export const saveSshProfiles = (contents: string): Promise<void> =>
   invoke("save_ssh_profiles", { contents });
 
+/** Load the persisted task-board view preferences (#1270) — which containers
+ *  each group's board has collapsed and which filters it has armed — or null on
+ *  first run / after a corrupt file was quarantined backend-side (the caller
+ *  then opens every board expanded and unfiltered). Opaque JSON:
+ *  `boardprefs.ts` owns the schema, and nothing in it is board data. */
+export const loadBoardPrefs = (): Promise<string | null> =>
+  invoke<string | null>("load_board_prefs");
+
+/** Persist task-board view preferences atomically. Same best-effort contract as
+ *  `saveUiTabs`: a failed write just means the last collapse or filter change is
+ *  not durable until the next one. */
+export const saveBoardPrefs = (contents: string): Promise<void> =>
+  invoke("save_board_prefs", { contents });
+
 // ---------- window lifecycle (#219) ----------
 
 /** This build's version, as declared in `tauri.conf.json` / `package.json`.

@@ -19,6 +19,8 @@ import {
   childCounts,
   clearableCount,
   clearedIds,
+  containerIds,
+  filterActive,
   focusMiss,
   settledIds,
   depCandidates,
@@ -31,9 +33,11 @@ import {
   isAwaitingHuman,
   isReady,
   KINDS,
+  kindFilterChoices,
   kindPickerChoices,
   levelRuleText,
   nextPicker,
+  NO_FILTER,
   parentPickerChoices,
   pickerIsOpen,
   QUEUED_STATUS,
@@ -44,10 +48,12 @@ import {
   STATUSES,
   subtreeAllDone,
   taskActivityState,
+  UNLABELLED_KIND,
   unmetDeps,
   visibleRows,
   withDep,
   withoutDep,
+  type BoardFilter,
   type BoardMarker,
   type BoardRow,
   type PickerField,
@@ -67,6 +73,8 @@ import { normalizeComment } from "./autonomy";
 import { CoalescingRefresh } from "./refreshgate";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
 import { wipChips } from "./wipchips";
+import { BoardPrefsStore } from "./boardprefs.ts";
+import { loadBoardPrefs, saveBoardPrefs } from "./pty.ts";
 
 export interface OrchTaskNote {
   ts_ms: number;
@@ -188,6 +196,16 @@ export class TasksView {
   private approveSelectedBtn: HTMLButtonElement;
   /** The board's WIP chips (#1175) — hidden when the repo declares no caps. */
   private wipEl: HTMLElement;
+  /** The tree-view control strip (#1270): collapse-all/expand-all, search, the
+   *  kind/status chips, the needs-you toggle, and the "showing N of M" hint. */
+  private filterEl: HTMLElement;
+  private collapseAllBtn: HTMLButtonElement;
+  private expandAllBtn: HTMLButtonElement;
+  private searchInput: HTMLInputElement;
+  private attentionBtn: HTMLButtonElement;
+  private clearFilterBtn: HTMLButtonElement;
+  private filterChipsEl: HTMLElement;
+  private filterCountEl: HTMLElement;
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
@@ -213,17 +231,54 @@ export class TasksView {
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
    *  pruned to live rows on every refresh (see retainExisting). */
   private selected = new Set<string>();
-  /** Containers the human has collapsed (#958). Frontend-only and deliberately
-   *  not persisted — the same shape as `expanded` above: a view preference
-   *  that survives re-renders but never becomes board data (the board is the
-   *  orchestrator's queue, not this window's UI state). Pruned to live rows on
-   *  every refresh, like `selected`. */
+  /** Containers the human has collapsed (#958). Frontend-OWNED — a view
+   *  preference that never becomes board data (the board is the orchestrator's
+   *  queue, not this window's UI state) — but, since #1270, durable: it is
+   *  persisted per group in `boardprefs.json`, a sibling blob no agent reads,
+   *  NOT on the task. See doc/design/board-tree-view.md for why the drift
+   *  objection #1152 raised against a sidecar does not carry over.
+   *
+   *  That is what separates it from `expanded` and `selected` above, which
+   *  remain per-session. Pruned to live rows on every refresh, like
+   *  `selected` — a stale id here is inert (it names no container), and the
+   *  pruning is what keeps the saved set from accumulating them. */
   private collapsed = new Set<string>();
+  /** The armed view filter (#1270). Frontend state like `collapsed` above —
+   *  and, since #1270, persisted alongside it. */
+  private filter: BoardFilter = { ...NO_FILTER };
+  /** The durable board-view store (#1270). Owns the read-before-publish
+   *  ordering, because `boardprefs.json` is ONE file for every group: a save
+   *  built from a store that was never read would publish an empty map as the
+   *  whole truth and silently destroy every other group's record. That
+   *  invariant is a race between two async calls, so it lives in a tested
+   *  module rather than in this file — see `BoardPrefsStore`. */
+  private readonly prefsStore = new BoardPrefsStore({
+    load: loadBoardPrefs,
+    save: saveBoardPrefs,
+  });
+  /** The human has changed the collapse set or the filter in this window. The
+   *  boot load must not overwrite a click that beat it: the disk copy is what
+   *  they left LAST session, and a live gesture always wins. */
+  private prefsTouched = false;
+  /** The stored view for this group has been read and adopted. Distinct from
+   *  `prefsTouched`: if the boot read FAILED this stays false, and `show()`
+   *  re-attempts adoption on a later open (#1270 review N5) — a transient IPC
+   *  rejection at boot should not cost the human their folds for the rest of the
+   *  session, and it must not let a later gesture publish this view's defaults
+   *  over a record nobody has looked at. */
+  private prefsAdopted = false;
+  private prefsSaveTimer: number | undefined;
+  /** Re-render debounce for the search box only. Every other control is one
+   *  discrete click; typing is a burst, and a 400-row board re-rendered per
+   *  keystroke is the one place this view can feel slow. */
+  private searchTimer: number | undefined;
   /** Whether the archived (cleared) rows are on screen right now (#1152).
-   *  Frontend-only and deliberately not persisted, exactly like `collapsed`
-   *  above: WHICH rows are archived is durable board data (`cleared_ms`, written
-   *  by the human's own command), but whether this particular window is
-   *  currently looking at them is a view preference and belongs nowhere else. */
+   *  Frontend-only and deliberately NOT persisted — unlike `collapsed` and
+   *  `filter`, which #1270 made durable. WHICH rows are archived is board data
+   *  (`cleared_ms`, written by the human's own command); whether this window is
+   *  currently looking at them is a momentary act of inspection, not a shape
+   *  the human arranged and would want back. Reopening the board on a working
+   *  view is the right default, and 👁 is one click. */
   private showCleared = false;
   /** The task whose picker is open, if any (#582, #958) — one at a time across
    *  EVERY picker, and kept here rather than in the DOM so a background
@@ -299,8 +354,9 @@ export class TasksView {
     head.append(this.clearDoneBtn);
 
     // Show/hide the archive. A per-window view preference, so it lives in
-    // `showCleared` and is not persisted; hidden entirely while there is
-    // nothing archived to look at.
+    // `showCleared` and is not persisted — see that field for why it stayed
+    // per-session when #1270 made collapse and the filters durable. Hidden
+    // entirely while there is nothing archived to look at.
     this.showClearedBtn = el("button", "pane-btn show-cleared", "") as HTMLButtonElement;
     this.showClearedBtn.hidden = true;
     this.showClearedBtn.addEventListener("click", () => {
@@ -363,6 +419,81 @@ export class TasksView {
     // Now that both buttons `setPanelActive` touches exist.
     this.setPanelActive(false);
 
+    // ---- tree-view control strip (#1270) ----
+    //
+    // Board CHROME, inside the overlay: it is a flex child of `.tasks-view`,
+    // which floats over (or docks beside) the terminal exactly as it did
+    // before. Nothing here is a sibling of #grid-area and nothing resizes a
+    // PTY (hard constraint 1).
+    this.filterEl = el("div", "tasks-filter");
+
+    this.collapseAllBtn = el("button", "pane-btn tree-btn", "⊟") as HTMLButtonElement;
+    this.collapseAllBtn.addEventListener("click", () => {
+      this.collapsed = new Set(containerIds(this.tasks));
+      this.onViewChanged();
+    });
+    this.expandAllBtn = el("button", "pane-btn tree-btn", "⊞") as HTMLButtonElement;
+    this.expandAllBtn.addEventListener("click", () => {
+      this.collapsed = new Set();
+      this.onViewChanged();
+    });
+    this.filterEl.append(this.collapseAllBtn, this.expandAllBtn);
+
+    this.searchInput = document.createElement("input");
+    this.searchInput.className = "dlg-input tasks-search";
+    this.searchInput.placeholder = "Find in this board…";
+    this.searchInput.spellcheck = false;
+    // stopPropagation for the same reason the Add field does it: the pane's
+    // global keydown handler must not read typing here as a shortcut.
+    this.searchInput.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape" && this.searchInput.value !== "") {
+        // Cancel the in-flight debounce first: without this, a clear within
+        // 120ms of the last keystroke is undone by the timer that was already
+        // scheduled with the old text.
+        clearTimeout(this.searchTimer);
+        this.searchInput.value = "";
+        this.filter = { ...this.filter, text: "" };
+        this.onViewChanged();
+      }
+    });
+    this.searchInput.addEventListener("input", () => {
+      const text = this.searchInput.value;
+      clearTimeout(this.searchTimer);
+      this.searchTimer = window.setTimeout(() => {
+        this.filter = { ...this.filter, text };
+        this.onViewChanged();
+      }, 120);
+    });
+    this.filterEl.append(this.searchInput);
+
+    // The one quick-filter that is not a family: rows waiting on the human,
+    // which is the question this board is usually opened with. Same set the
+    // ❓/👀 marker chips are drawn from, so the toggle can never disagree with
+    // what the rows themselves say.
+    this.attentionBtn = el("button", "pane-btn filter-chip attention", "❗ needs you") as HTMLButtonElement;
+    this.attentionBtn.addEventListener("click", () => {
+      this.filter = { ...this.filter, attention: !this.filter.attention };
+      this.onViewChanged();
+    });
+    this.filterEl.append(this.attentionBtn);
+
+    this.filterChipsEl = el("span", "tasks-filter-chips");
+    this.filterEl.append(this.filterChipsEl);
+
+    this.filterCountEl = el("span", "tasks-filter-count");
+    this.filterEl.append(this.filterCountEl);
+
+    this.clearFilterBtn = el("button", "pane-btn tree-btn clear-filter", "✕") as HTMLButtonElement;
+    this.clearFilterBtn.title = "Clear every filter";
+    this.clearFilterBtn.addEventListener("click", () => {
+      clearTimeout(this.searchTimer); // see the Escape handler above
+      this.filter = { ...NO_FILTER };
+      this.searchInput.value = "";
+      this.onViewChanged();
+    });
+    this.filterEl.append(this.clearFilterBtn);
+
     this.listEl = el("div", "tasks-list");
 
     const foot = el("div", "tasks-add");
@@ -381,7 +512,9 @@ export class TasksView {
     this.toastEl = el("div", "git-toast");
     this.toastEl.hidden = true;
 
-    this.el.append(head, this.listEl, foot, this.toastEl);
+    this.el.append(head, this.filterEl, this.listEl, foot, this.toastEl);
+
+    void this.loadPrefs();
 
     // Deferred refreshes (see refresh()) run once the editor loses focus.
     this.listEl.addEventListener("focusout", () => {
@@ -411,6 +544,11 @@ export class TasksView {
 
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
+    // Re-attempt a boot read that failed (#1270 review N5), but only while the
+    // human has changed nothing — once they have, their gesture is newer than
+    // the file and adopting over it would look like the click was ignored. The
+    // store memoises a SUCCESSFUL read, so this is a no-op in the normal case.
+    if (!this.prefsAdopted && !this.prefsTouched) void this.loadPrefs();
     this.refresh();
   }
 
@@ -441,6 +579,16 @@ export class TasksView {
     clearTimeout(this.toastTimer);
     clearTimeout(this.deleteDoneTimer);
     clearTimeout(this.deleteSelectedTimer);
+    clearTimeout(this.searchTimer);
+    // A pending save is FLUSHED rather than dropped (#1270): closing the board
+    // is the commonest way a session ends, and a debounce timer cancelled here
+    // would lose the last gesture — the same argument `flushTabs` makes for the
+    // quit path. Fire-and-forget: nothing may block a close on a disk write.
+    if (this.prefsSaveTimer !== undefined) {
+      clearTimeout(this.prefsSaveTimer);
+      this.prefsSaveTimer = undefined;
+      this.savePrefsNow();
+    }
     this.unlistenTasks?.();
     this.unlistenQuestions?.();
     this.el.remove();
@@ -475,6 +623,84 @@ export class TasksView {
    *  event handler and the human's own actions share one in-flight run. */
   private refresh(): void {
     this.refresher.request();
+  }
+
+  /** Read this group's durable board view (#1270) and adopt it.
+   *
+   *  Best-effort, like every other enrichment this view loads: a missing or
+   *  corrupt blob just means the board opens expanded and unfiltered, which is
+   *  exactly the pre-#1270 board.
+   *
+   *  `read` answers `null` only when the file could not be READ, which is not
+   *  the same as a group having nothing stored — so this changes nothing and,
+   *  crucially, does not mark the view adopted. `show()` retries on the next
+   *  open, and until one succeeds a save is skipped entirely, so this view's
+   *  defaults can never be published over a record nobody has read.
+   *
+   *  A gesture that beat the load WINS. The disk copy is what the human left
+   *  last session; a chevron they have already clicked in this one is newer,
+   *  and adopting the file over it would look like the click was ignored.
+   *
+   *  Never re-run: `show()` can fire many times as the overlay is toggled, and
+   *  re-adopting the file each time would undo the session's own gestures. */
+  private async loadPrefs(): Promise<void> {
+    const view = await this.prefsStore.read(this.groupId);
+    if (!view || this.disposed) return;
+    // The read succeeded, so the record is known even if a gesture already beat
+    // us to the view: the flag is what stops `show()` retrying forever, and it
+    // is set before the touched check for exactly that reason.
+    this.prefsAdopted = true;
+    if (this.prefsTouched) return;
+    this.collapsed = new Set(view.collapsed);
+    this.filter = view.filter;
+    this.searchInput.value = this.filter.text;
+    // Only if there is something on screen to re-lay-out. Resolving before the
+    // first `orch_tasks` would otherwise paint the "No tasks yet" empty state
+    // on a board that simply has not loaded — and the first refresh renders
+    // with the adopted view regardless.
+    if (this.tasks.length > 0) this.render();
+  }
+
+  /** The collapse set or the filter changed: re-render now, persist shortly.
+   *
+   *  One path for every control, so no affordance can change the view without
+   *  also marking it dirty and scheduling the save — the failure mode where a
+   *  new button is added and its state silently stops persisting. */
+  private onViewChanged(): void {
+    this.prefsTouched = true;
+    this.render();
+    this.schedulePrefsSave();
+  }
+
+  /** Coalesce a burst of view gestures into one write. Ticking four status
+   *  chips is four gestures and one file. */
+  private schedulePrefsSave(): void {
+    clearTimeout(this.prefsSaveTimer);
+    this.prefsSaveTimer = window.setTimeout(() => {
+      this.prefsSaveTimer = undefined;
+      this.savePrefsNow();
+    }, 400);
+  }
+
+  /** Hand this group's view to the store, which publishes the whole blob.
+   *
+   *  Fire-and-forget, the same best-effort contract `persistTabs` takes: a
+   *  failed write just means this gesture is not durable until the next one,
+   *  and the store keeps the newer value so the next one re-offers it. The
+   *  store also DECLINES the write outright if it has not managed to read the
+   *  file yet, and carries this record's unknown filter families over from disk
+   *  rather than from here — see `BoardPrefsStore`, where both are tested. */
+  private savePrefsNow(): void {
+    // Nothing the human did, nothing to persist (#1270 review N5). Without this
+    // the dispose flush publishes whatever the view happens to hold — which,
+    // after a boot read that failed, is the constructed defaults, landing on top
+    // of this group's real record.
+    if (!this.prefsTouched) return;
+    void this.prefsStore.write(
+      this.groupId,
+      { collapsed: [...this.collapsed], filter: this.filter },
+      Date.now()
+    );
   }
 
   /** One board refresh. Only `refresher` calls this. */
@@ -924,6 +1150,9 @@ export class TasksView {
     this.renderWipChips();
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
+      // An empty board has nothing to collapse and nothing to filter, so the
+      // strip goes away entirely rather than offering controls over nothing.
+      this.renderFilterStrip(0, 0, 0);
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
       return;
     }
@@ -949,7 +1178,43 @@ export class TasksView {
     // above: which rows are finished subtrees (#1152). Each row's ▲/▼ needs it,
     // and re-deriving it per row would walk the tree once per row.
     const settled = settledIds(this.tasks);
-    const rows = visibleRows(this.tasks, this.collapsed, this.showCleared);
+    // The ids the `needs you` quick-filter matches — the SAME rule the ❓/👀
+    // marker chip is drawn from (`boardMarker`), not a second spelling of it,
+    // so the toggle and the chips can never disagree about which rows are
+    // waiting on the human.
+    const attention = new Set(
+      this.tasks.filter((t) => boardMarker(t, blocked) !== null).map((t) => t.id)
+    );
+    const rows = visibleRows(this.tasks, this.collapsed, this.showCleared, {
+      filter: this.filter,
+      attention,
+    });
+    // The universe the FILTER is choosing from — every row except the ones the
+    // archive is hiding for its own unrelated reason (#1270 review N4). With
+    // 300 of 400 rows cleared and the archive off screen, `tasks.length` made
+    // the hint read "12 of 400" when there were only 100 rows to match against.
+    // The no-matches line lost the same number in self-review; fixing one site
+    // of a pair and leaving the other is the shape the one-rule convention
+    // names, so it is the same rule here. `clearedIds` is the SAME closure the
+    // archive itself renders from, so the two cannot disagree.
+    const universe = this.showCleared
+      ? this.tasks.length
+      : this.tasks.length - clearedIds(this.tasks).size;
+    this.renderFilterStrip(attention.size, rows.length, universe);
+    if (rows.length === 0 && filterActive(this.filter)) {
+      // Distinct from both empty states below: the board has rows and they are
+      // not archived — this filter simply matches none of them. Saying "no
+      // tasks yet" here would read as data loss, and saying "everything is
+      // cleared" would send the human to the wrong affordance.
+      this.listEl.appendChild(
+        el(
+          "div",
+          "tasks-empty",
+          "Nothing on this board matches the current filter. Clear it with ✕ above."
+        )
+      );
+      return;
+    }
     if (rows.length === 0) {
       // The board is not empty — everything on it is archived. Say that,
       // rather than showing the "no tasks yet" line for a board with 400 rows
@@ -967,6 +1232,93 @@ export class TasksView {
       this.listEl.appendChild(this.renderTask(row, usesDeps, usesHierarchy, blocked, settled));
     }
     this.drainFocus();
+  }
+
+  /** Reflect the board on the tree-view strip (#1270): which chips are lit,
+   *  what the collapse buttons can do, and how much the filter is hiding.
+   *
+   *  Rebuilt per render rather than diffed — it is at most ~15 small elements,
+   *  and the alternative is a second model of what is on screen that can drift
+   *  from the one `visibleRows` just produced. The search box is NOT rebuilt:
+   *  it holds focus and a caret while the human types.
+   *
+   *  `shown` is the row count `visibleRows` actually returned and `universe`
+   *  the number of rows the filter had to choose from, both threaded in rather
+   *  than recomputed, so the hint cannot claim a number the list does not
+   *  have. */
+  private renderFilterStrip(attentionCount: number, shown: number, universe: number): void {
+    // Nothing to collapse and nothing to filter on an empty board.
+    this.filterEl.hidden = this.tasks.length === 0;
+    if (this.tasks.length === 0) return;
+
+    const containers = containerIds(this.tasks);
+    const active = filterActive(this.filter);
+
+    // Collapse-all/expand-all exist only on a board that nests something — the
+    // same board-level gate the collapse gutter itself uses. While a filter is
+    // armed they are OFF, because collapse has no observable effect then (see
+    // taskboard.ts's filter rules): a kept container either holds a match, and
+    // must expand to show it, or has nothing kept under it at all.
+    const noTree = containers.length === 0;
+    this.collapseAllBtn.hidden = noTree;
+    this.expandAllBtn.hidden = noTree;
+    this.collapseAllBtn.disabled = active;
+    this.expandAllBtn.disabled = active;
+    const frozen = " — collapse resumes when the filter is cleared";
+    this.collapseAllBtn.title = active
+      ? `Collapse everything${frozen}`
+      : `Fold up all ${containers.length} container${containers.length === 1 ? "" : "s"}`;
+    this.expandAllBtn.title = active ? `Expand everything${frozen}` : "Unfold everything";
+
+    // The needs-you toggle hides itself when nothing is waiting: a quick filter
+    // that can only ever empty the board is worse than absent.
+    this.attentionBtn.hidden = attentionCount === 0 && !this.filter.attention;
+    this.attentionBtn.classList.toggle("on", this.filter.attention);
+    this.attentionBtn.textContent = `❗ needs you (${attentionCount})`;
+    this.attentionBtn.title = this.filter.attention
+      ? "Showing only items blocked on a decision or parked for a demo — click to show everything"
+      : "Show only items blocked on a decision or parked for a demo";
+
+    this.filterChipsEl.replaceChildren();
+    // Kind chips only on a board that levels anything (`boardUsesHierarchy`'s
+    // argument, applied to the other #1156 field): on a flat board of plain
+    // rows every chip but `unlabelled` would match nothing, so the row of them
+    // would be pure noise. A kind ALREADY selected keeps its chip regardless,
+    // so a persisted filter can always be seen and turned off.
+    const kinds = kindFilterChoices(this.tasks);
+    const boardHasKinds = this.tasks.some((t) => !!t.kind);
+    if (boardHasKinds || this.filter.kind.length > 0) {
+      this.filterChipsEl.append(el("span", "filter-label", "level"));
+      for (const k of kinds) {
+        this.filterChipsEl.append(
+          this.familyChip(k, k === UNLABELLED_KIND ? "none" : k, "kind")
+        );
+      }
+    }
+    this.filterChipsEl.append(el("span", "filter-label", "status"));
+    for (const s of STATUSES) this.filterChipsEl.append(this.familyChip(s, s, "status"));
+
+    this.clearFilterBtn.hidden = !active;
+    this.filterCountEl.hidden = !active;
+    this.filterCountEl.textContent = active ? `${shown} of ${universe}` : "";
+    this.filterCountEl.title = this.showCleared
+      ? "Rows on screen — matches plus the containers above them — out of every item on the board"
+      : "Rows on screen — matches plus the containers above them — out of the items this board is currently showing (cleared items are not counted; 👁 brings them back)";
+  }
+
+  /** One toggle chip in a filter family. */
+  private familyChip(value: string, label: string, family: "kind" | "status"): HTMLElement {
+    const on = this.filter[family].includes(value);
+    const chip = el("button", `pane-btn filter-chip f-${family}`, label) as HTMLButtonElement;
+    if (on) chip.classList.add("on");
+    chip.title = on ? `Stop filtering by ${label}` : `Show only ${label} items`;
+    chip.addEventListener("click", () => {
+      const cur = this.filter[family];
+      const next = on ? cur.filter((v) => v !== value) : [...cur, value];
+      this.filter = { ...this.filter, [family]: next };
+      this.onViewChanged();
+    });
+    return chip;
   }
 
   /** The board's WIP chips (#1175) — `review 3/3` on the header, one per cap
@@ -1366,6 +1718,10 @@ export class TasksView {
     // hidden (`clearedIds` is a whole-subtree closure), so it can carry this
     // class with the toggle off. See `BoardRow.cleared`.
     if (boardRow.cleared) row.classList.add("task-row-cleared");
+    // A container on screen only because a match sits under it (#1270) reads as
+    // scaffolding, not as a hit — otherwise a filtered board looks like it
+    // matched every epic on it.
+    if (boardRow.context) row.classList.add("task-row-context");
     // A queued task waiting on an unfinished dep recedes, so it can't be read
     // as work anyone could pick up right now (#582's core ask: blocked-queued
     // must not look like plain queued). Deliberately no new accent color —
@@ -1443,19 +1799,27 @@ export class TasksView {
     // chevron's tooltip and the rollup chip below) — they are the same two
     // numbers, and computing them twice scanned the board twice per container.
     const counts = boardRow.hasChildren ? childCounts(t.id, this.tasks) : null;
+    const filtering = filterActive(this.filter);
     if (boardRow.hasChildren && counts) {
       const chevron = el(
         "button",
         "task-collapse",
         boardRow.collapsed ? "▸" : "▾"
       ) as HTMLButtonElement;
-      chevron.title = boardRow.collapsed
-        ? `Show what is inside (${counts.total} task${counts.total === 1 ? "" : "s"})`
-        : "Hide what is inside";
+      // Inert while a filter is armed (#1270), rather than a button whose click
+      // does nothing: under the filter rules a kept container is either holding
+      // a match — so it must stay open — or has nothing kept under it, so
+      // folding it changes nothing either way. Saying so beats a dead click.
+      chevron.disabled = filtering;
+      chevron.title = filtering
+        ? "Collapse resumes when the filter is cleared"
+        : boardRow.collapsed
+          ? `Show what is inside (${counts.total} task${counts.total === 1 ? "" : "s"})`
+          : "Hide what is inside";
       chevron.addEventListener("click", () => {
         if (this.collapsed.has(t.id)) this.collapsed.delete(t.id);
         else this.collapsed.add(t.id);
-        this.render();
+        this.onViewChanged();
       });
       top.appendChild(chevron);
     } else if (usesHierarchy) {
@@ -1607,9 +1971,22 @@ export class TasksView {
     // for the same thing.
     if (counts) {
       const chip = el("span", "task-chip children", `${counts.done}/${counts.total}`);
+      // What #1270 adds to this chip, and the only thing it adds: whether any
+      // of those children are currently OFF SCREEN. The counts themselves are
+      // unchanged and still the orchestrator's own `children`/`children_done`.
+      //
+      // Folding a container up used to hide its contents AND every trace of how
+      // much it hid — "3/7" reads identically whether all seven rows are under
+      // it or none are. `shownKids` comes from the projection that just ran, so
+      // this cannot disagree with what is actually on the screen.
+      const withheld = counts.total - boardRow.shownKids;
+      if (withheld > 0) chip.classList.add("hiding");
       chip.title =
         `${counts.done} of ${counts.total} task${counts.total === 1 ? "" : "s"} directly inside ` +
-        `this one ${counts.total === 1 ? "is" : "are"} done`;
+        `this one ${counts.total === 1 ? "is" : "are"} done` +
+        (withheld > 0
+          ? ` — ${withheld} not on screen (${boardRow.collapsed ? "this row is folded up" : "hidden by the filter"})`
+          : "");
       top.appendChild(chip);
       // The nudge (#958): everything underneath is finished but this row's own
       // status hasn't caught up. A PROMPT, never a write — a derived status

@@ -1,17 +1,19 @@
 //! Durable UI state persisted across launches — the project-tab set (#63),
-//! since #370 app-wide terminal settings, and since #887 the user's SSH
-//! connection profiles. All three are app-global (not per-group), so they live
+//! since #370 app-wide terminal settings, since #887 the user's SSH
+//! connection profiles, and since #1270 the task board's view preferences. All
+//! four are app-global — `boardprefs.json` holds one record PER GROUP, but the
+//! group id is a map key inside the blob and never a path — so they live
 //! directly under the app data dir as
-//! `tabs.json`/`settings.json`/`sshprofiles.json`, siblings of
+//! `tabs.json`/`settings.json`/`sshprofiles.json`/`boardprefs.json`, siblings of
 //! `orchestration/` and `logs/` — the same `<data dir>/loomux/…` tree the rest
 //! of the app's durable state uses (see `OrchRegistry::default_root`,
 //! `obs::logs_dir`).
 //!
 //! Each blob is an OPAQUE JSON string the frontend owns the schema for
-//! (`src/tabstore.ts` / `src/settings.ts` / `src/sshprofile.ts` encode/decode
-//! and validate their own shape — this file never parses any of them beyond
-//! "is it JSON at all"). The backend's job here is narrow but critical, and
-//! identical for all three:
+//! (`src/tabstore.ts` / `src/settings.ts` / `src/sshprofile.ts` /
+//! `src/boardprefs.ts` encode/decode and validate their own shape — this file
+//! never parses any of them beyond "is it JSON at all"). The backend's job here
+//! is narrow but critical, and identical for all four:
 //!
 //!  1. **Atomic writes.** Serialize to a sibling temp file, then rename over the
 //!     target. A bare `fs::write` truncates the file in place, so a crash / kill
@@ -24,8 +26,8 @@
 //!     inspect it — and `None` is returned so the caller degrades to defaults
 //!     WITHOUT silently losing the user's tabs or the evidence.
 //!
-//! Frontend never touches Tauri IPC directly (CLAUDE.md constraint 5): the two
-//! `#[tauri::command]`s below are wrapped by typed helpers in `src/pty.ts`.
+//! Frontend never touches Tauri IPC directly (CLAUDE.md constraint 5): every
+//! `#[tauri::command]` below is wrapped by a typed helper in `src/pty.ts`.
 
 use std::fs;
 use std::io::Write;
@@ -49,10 +51,10 @@ static WRITE_TICKET: AtomicU64 = AtomicU64::new(0);
 
 /// The newest ticket already durably written, per path — the high-water mark
 /// [`write_atomic_seq`] compares against. Keyed by path because `tabs.json`,
-/// `settings.json` and `sshprofiles.json` are independent files with
-/// independent save gestures; a slow settings write must not make a tab save
-/// look stale. A `Vec` and not a `HashMap`: it holds three entries in
-/// production, and a linear scan of three is not worth a hasher.
+/// `settings.json`, `sshprofiles.json` and `boardprefs.json` are independent
+/// files with independent save gestures; a slow settings write must not make a
+/// tab save look stale. A `Vec` and not a `HashMap`: it holds four entries in
+/// production, and a linear scan of four is not worth a hasher.
 static WRITE_HIGH_WATER: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
 
 /// Take the next dispatch ticket. Called by a save command **before** its first
@@ -147,6 +149,28 @@ fn settings_path() -> PathBuf {
 /// the user's ssh_config/ssh-agent's job, mirroring `gh.rs`'s no-token posture.
 fn ssh_profiles_path() -> PathBuf {
     state_dir().join("sshprofiles.json")
+}
+
+/// Absolute path of the persisted task-board view preferences (#1270).
+///
+/// A sibling file for the same reason `sshprofiles.json` is one: a multi-entry
+/// structure with its own lifecycle (one record per orchestration group, evicted
+/// LRU by `src/boardprefs.ts`) does not belong inside `settings.json`'s flat bag
+/// of app-wide scalars.
+///
+/// **What it is not.** It holds which containers the human collapsed and which
+/// filters they armed — a view preference, on the far side of the line #1152
+/// drew when it put the archive stamp on the task instead. "I have acknowledged
+/// this item and want it out of my working set" is a human-authored decision
+/// about the work item, and belongs in `tasks.json`; "I have this epic folded
+/// up" is not, and belongs here. Nothing in this file is board data, no agent
+/// reads it, and no MCP tool can reach it.
+///
+/// **The group id is a JSON map key inside the blob and never a path.** This
+/// function takes no argument and joins one constant file name, so the
+/// single-assembly-point rule (CLAUDE.md constraint 6) is untouched by it.
+fn board_prefs_path() -> PathBuf {
+    state_dir().join("boardprefs.json")
 }
 
 /// Atomically write `contents` to `path`: create the parent dir, write a unique
@@ -283,6 +307,31 @@ pub async fn load_ssh_profiles() -> Option<String> {
 pub async fn save_ssh_profiles(contents: String) -> Result<(), String> {
     let ticket = next_write_ticket();
     crate::blocking::run_blocking(move || write_atomic_seq(&ssh_profiles_path(), &contents, ticket))
+        .await
+}
+
+/// Read the persisted task-board view preferences (#1270) as an opaque JSON
+/// string, or `null` on first run / a quarantined corrupt file —
+/// `src/boardprefs.ts` degrades that to an empty store, so every board opens
+/// expanded and unfiltered, exactly like `load_ui_tabs`/`tabstore.ts`.
+///
+/// **Reentrancy.** Identical to [`load_ui_tabs`], on its own sibling file.
+#[tauri::command]
+pub async fn load_board_prefs() -> Option<String> {
+    crate::blocking::run_blocking(|| load_or_quarantine(&board_prefs_path())).await
+}
+
+/// Persist task-board view preferences (an opaque JSON string produced by
+/// `src/boardprefs.ts`), atomically. Same best-effort contract as
+/// `save_ui_tabs`: a failed write just means the last collapse or filter change
+/// is not durable until the next one.
+///
+/// **Reentrancy.** Same ticket as [`save_ui_tabs`], against its own path's
+/// high-water mark — none of the four files gate each other.
+#[tauri::command]
+pub async fn save_board_prefs(contents: String) -> Result<(), String> {
+    let ticket = next_write_ticket();
+    crate::blocking::run_blocking(move || write_atomic_seq(&board_prefs_path(), &contents, ticket))
         .await
 }
 
@@ -423,13 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn the_three_state_files_are_distinct_siblings() {
+    fn the_four_state_files_are_distinct_siblings() {
         // The failure this catches is a copy-paste one, and it is destructive:
         // `ssh_profiles_path` was written by duplicating `settings_path`, and a
         // duplicate that kept the old file name would make every profile save
         // silently overwrite the user's `settings.json` (atomically, durably,
         // with no error anywhere). Pure path math — nothing is read or written.
-        let (tabs, settings, ssh) = (tabs_path(), settings_path(), ssh_profiles_path());
+        let (tabs, settings, ssh, board) =
+            (tabs_path(), settings_path(), ssh_profiles_path(), board_prefs_path());
         assert_eq!(ssh.file_name().unwrap(), "sshprofiles.json");
         assert_ne!(ssh, tabs, "profiles must not write over the tab set");
         assert_ne!(ssh, settings, "profiles must not write over app settings");
@@ -437,6 +487,14 @@ mod tests {
         // makes the per-path write ordering above the whole story for them.
         assert_eq!(ssh.parent(), tabs.parent());
         assert_eq!(ssh.parent(), settings.parent());
+        // #1270's fourth file, added the same way and so exposed to the same
+        // copy-paste failure: a duplicated path fn that kept the old name would
+        // make every collapse click silently overwrite the user's SSH profiles.
+        assert_eq!(board.file_name().unwrap(), "boardprefs.json");
+        assert_ne!(board, tabs, "board view must not write over the tab set");
+        assert_ne!(board, settings, "board view must not write over app settings");
+        assert_ne!(board, ssh, "board view must not write over the SSH profiles");
+        assert_eq!(board.parent(), tabs.parent());
     }
 
     #[test]

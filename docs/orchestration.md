@@ -468,6 +468,53 @@ only the decision chip — it's the more specific, more blocking ask). Click it
 to jump straight to that item in the [NEEDS-YOU panel](#steering-attention-and-audit)
 (`Alt+Q`).
 
+### Finding things: search, filters, and folding the tree
+
+A long-lived group's board is mostly history — hundreds of rows, most of them finished — so the
+board has a control strip under its header for narrowing it down. **Everything the strip
+remembers is remembered per group and survives a restart:** which containers you folded up and
+which filters you armed come back exactly as you left them the next time you open orrerix. It is
+*your* view and nothing else — no agent can see it, no agent can set it, and none of it is
+written to the board file the orchestrator reads.
+
+- **⊟ / ⊞ collapse all / expand all** fold or unfold every container in one click. (They appear
+  only on a board that nests something.) The per-row **collapse chevron** still works the way it
+  always has, and both are now remembered.
+- **Find in this board…** filters by a case-insensitive substring of an item's **title or id**, so
+  `auth` and `t-142` both work. Escape clears it.
+- **level** and **status** chips filter by [level](#parent-tasks-and-subtasks) (epic / feature /
+  story / task, plus **none** for items with no level) and by status. Click chips to add them:
+  within one row of chips they're an *any of these* (tick `blocked` and `pr` to see both), and
+  the two rows narrow each other (`story` **and** `blocked`). The level chips are hidden on a
+  board that doesn't use levels. If your board file has been hand-edited to use a level orrerix
+  doesn't know, that level gets a chip too, so nothing on the board can become unreachable.
+- **❗ needs you (N)** is the shortcut for the question the board is usually opened with: show
+  only the items blocked on a decision or parked for a demo — exactly the rows wearing the
+  **❓** / **👀** marker chips. It hides itself when nothing is waiting.
+- **✕** clears every filter at once, and the count beside it (**"7 of 412"**) says how much of the
+  board is on screen.
+
+There is deliberately **no sprint filter yet**. [Sprints](#sprints--batches-of-work-in-order) landed
+after these controls were built, and the strip is designed so adding one is a chip row rather than a
+rebuild — but a chip that does not exist should not be hunted for, so it is named here as absent
+rather than left to be discovered.
+
+Two things about filtering a *tree* that are worth knowing, because they are what keeps the board
+readable as a tree rather than collapsing it into a flat list of hits:
+
+- **A match brings its containers with it.** Filter to `story` and you still see the epic and
+  feature each matching story lives in, dimmed, because they are context rather than matches. The
+  reverse doesn't happen: filtering to `epic` shows the epics *alone*, not everything inside
+  them.
+- **A filter reveals matches inside folded containers, and doesn't disturb your folding.** While
+  any filter is armed, containers open up far enough to show what matched, and the collapse
+  controls go quiet (they'd have nothing to do — a container is either holding a match, and has
+  to stay open, or has nothing showing under it anyway). Clear the filter and the board is folded
+  exactly the way you left it.
+
+A container's **done/total** chip picks up a dashed outline whenever some of its items are off
+screen — folded up or filtered out — so a collapsed row still tells you how much is inside it.
+
 ### Dependencies — what's actually startable
 
 A task can declare that it waits on other tasks on the same board. The
@@ -573,7 +620,9 @@ Board controls for nesting:
   epic-shaped rule would refuse.
 - Rows nest visually under their container, indented one step per level, with a **collapse
   chevron** on any row that has subtasks — collapsing hides the whole subtree, not just its
-  direct children, so a grandchild is never left stranded above its own container.
+  direct children, so a grandchild is never left stranded above its own container. What you have
+  folded up is remembered per group across restarts, and **⊟ / ⊞** in the strip above the list do
+  the whole board at once — see [Finding things](#finding-things-search-filters-and-folding-the-tree).
 - The **level** shows on the row as a badge, so you can see at a glance which rows are containers
   and at what level. A **🏷** picker next to the nest control lets you set or change it directly —
   offering only the levels this row could legally take where it sits, plus the clear when that is
@@ -585,7 +634,9 @@ Board controls for nesting:
   even though there are rows higher up the board. Moving a container moves everything inside it
   along with it, so re-prioritising a feature never scatters its subtasks.
 - A container shows a **done/total** chip counting its *direct* subtasks — the same count you'd
-  see if you asked the orchestrator for the board. A container whose entire subtree is done but
+  see if you asked the orchestrator for the board. The chip is outlined while some of those
+  subtasks are off screen (the row is folded up, or a filter cut them), so a collapsed container
+  never hides how much is inside it. A container whose entire subtree is done but
   whose own status hasn't caught up gets a nudge badge — it's a prompt for you, never something
   that flips the container's status on its own; only you or the orchestrator ever change a
   task's status.

@@ -582,6 +582,21 @@ export interface BoardRow<T extends HasParent> {
    *  `clearedIds`, so both can read 0 and be hidden entirely while such a row
    *  is on screen. */
   cleared: boolean;
+  /** This row is on screen only because a match sits somewhere under it
+   *  (#1270): it did NOT satisfy the active filter itself. Always `false`
+   *  while no filter is active, so a board with the strip untouched is
+   *  unchanged. The view renders these as scaffolding — dimmed, not as hits —
+   *  which is what keeps a filtered board readable AS a tree instead of as a
+   *  flat list of matches that lost their containment. */
+  context: boolean;
+  /** How many of this row's direct children the current projection actually
+   *  rendered. Below `childCounts(id).total` whenever something is being
+   *  withheld — the row is collapsed, or the filter cut its children — and the
+   *  view shows the `done/total` badge exactly then. Collapsing a container
+   *  used to hide its contents AND the only evidence of how much it hid; this
+   *  is the number that fixes that, for both causes at once rather than for
+   *  collapse alone. */
+  shownKids: number;
 }
 
 /** How many indent steps the board actually draws. The backend caps writes at
@@ -855,6 +870,219 @@ export function positionAmong<T extends HasId>(
   return index < 0 ? { index: -1, count: 0 } : { index, count: manual.length };
 }
 
+// ---------------------------------------------------------------------------
+// Tree-view filtering (#1270).
+//
+// The board is a tree, so a filter cannot simply be `board.filter(pred)`: a
+// flat list of matches throws away the containment the whole #1156 hierarchy
+// model exists to show. Three rules, all here, all pinned:
+//
+//  1. **A match keeps its ancestor chain.** Matches render, and so does every
+//     container above them, marked `context` so the view can render them as
+//     scaffolding rather than as hits. Descendants of a match are NOT pulled in
+//     — an epic matching `kind=epic` renders alone, and `shownKids` beside
+//     `childCounts` is what tells the human what is inside it.
+//  2. **An active filter overrides collapse, and never mutates it.** Standard
+//     tree-view behaviour: a search that finds a row and then hides it inside a
+//     collapsed container is worse than no search. The stored collapsed set is
+//     untouched, so clearing the filter restores the exact shape the human
+//     left. Note this is not merely a preference — under rule 1 a kept
+//     container either has a kept descendant (so it MUST expand) or is a match
+//     whose whole subtree was filtered out (so collapsing it changes nothing).
+//     Collapse has no observable effect while a filter is active, and the view
+//     renders the chevron inert to say so rather than offering a dead click.
+//  3. **AND across families, OR within one.** An empty family constrains
+//     nothing; it never means "match nothing".
+// ---------------------------------------------------------------------------
+
+/** The kind-filter chip standing for a row with no `kind` at all — legal and
+ *  permanently exempt from the ladder (#1156), so it needs a chip of its own or
+ *  it would be the one class of row the kind filter cannot name. A sentinel,
+ *  never a stored value: `KINDS` are plain words, so no real kind collides with
+ *  it (the same trick `CLEAR_KIND_CHOICE` plays in tasksview.ts). */
+export const UNLABELLED_KIND = "unlabelled";
+
+/** The title the text filter reads. Optional like every other additive board
+ *  field, so the pure helpers stay exercisable with minimal rows; absent reads
+ *  as an empty title, never as "matches everything". */
+export interface HasTitle {
+  title?: string;
+}
+
+/** The board's active view filter (#1270). Four families, evaluated as AND
+ *  across families and OR within one.
+ *
+ *  Deliberately a flat bag of families rather than a predicate: it is the thing
+ *  that gets PERSISTED (`src/boardprefs.ts`), so it has to survive a JSON round
+ *  trip, and a future family — #1272's sprint, #1273's typed links — is then a
+ *  new key here plus one clause in `matchesFilter`, not a migration. */
+export interface BoardFilter {
+  /** Members of `kindFilterChoices` — `KINDS` entries plus `UNLABELLED_KIND`,
+   *  plus any out-of-vocabulary kind the board actually carries. */
+  kind: readonly string[];
+  /** Members of `STATUSES`. */
+  status: readonly string[];
+  /** Case-insensitive substring over a row's id and title. Blank = no
+   *  constraint. */
+  text: string;
+  /** Only rows the view says are waiting on the human (decision-blocked or
+   *  demo-gated — the ids behind the board's ❓/👀 marker chips). */
+  attention: boolean;
+}
+
+/** The filter that constrains nothing — the board as it renders with the strip
+ *  untouched. Frozen because it is a shared default: a caller mutating it would
+ *  silently arm a filter on every other board. */
+export const NO_FILTER: BoardFilter = Object.freeze({
+  kind: Object.freeze([]) as readonly string[],
+  status: Object.freeze([]) as readonly string[],
+  text: "",
+  attention: false,
+});
+
+/** No attention ids known — the default when a caller filters without
+ *  supplying the set. With `attention: true` this correctly matches nothing:
+ *  the toggle asks for rows the view flagged, and a view that flagged none has
+ *  none to show. */
+const NO_ATTENTION: ReadonlySet<string> = new Set<string>();
+
+/** Is any family constraining anything? Drives whether the board filters at
+ *  all — and, in the view, whether the collapse affordances go inert (rule 2)
+ *  and the "showing N of M" hint appears. */
+export function filterActive(filter: BoardFilter): boolean {
+  return (
+    filter.kind.length > 0 ||
+    filter.status.length > 0 ||
+    filter.text.trim() !== "" ||
+    filter.attention
+  );
+}
+
+/** The kind chips to offer: the four ladder levels, then `unlabelled`, then any
+ *  OTHER kind the board actually carries.
+ *
+ *  That tail is not decoration. `ladderRule` exempts an out-of-vocabulary kind
+ *  on purpose (CLAUDE.md constraint 8 — Orrerix must not require a
+ *  methodology), so a hand-edited `tasks.json` may legitimately carry `saga`.
+ *  Without a chip for it, such a row would match NO kind selection — neither a
+ *  ladder level nor `unlabelled`, since it is labelled — and the only way to
+ *  see it again would be to clear the kind filter entirely. Deriving the tail
+ *  from the board keeps every row reachable. Deduped, and stable: ladder order
+ *  first, then the extras in the order the board presents them. */
+export function kindFilterChoices<T extends HasParent>(board: readonly T[]): string[] {
+  const out: string[] = [...KINDS, UNLABELLED_KIND];
+  const known = new Set(out);
+  for (const t of board) {
+    const k = t.kind || UNLABELLED_KIND;
+    if (!known.has(k)) {
+      known.add(k);
+      out.push(k);
+    }
+  }
+  return out;
+}
+
+/** Does this ONE row satisfy the filter? Containment is not consulted here —
+ *  `visibleRows` is what adds a match's ancestors back as context.
+ *
+ *  `attention` is an opaque id set the view derives (`blockedTaskMap` +
+ *  `boardMarker`) and threads in, so this module never learns what a question
+ *  or a demo gate is. */
+export function matchesFilter<T extends HasParent & HasStatus & HasTitle>(
+  task: T,
+  filter: BoardFilter,
+  attention: ReadonlySet<string> = NO_ATTENTION
+): boolean {
+  // `||`, not `??`: a hand-edited empty-string kind is "no level", the same as
+  // the key being absent, and must land on the `unlabelled` chip rather than
+  // becoming an invisible fifth class.
+  if (filter.kind.length > 0 && !filter.kind.includes(task.kind || UNLABELLED_KIND)) return false;
+  if (filter.status.length > 0 && !filter.status.includes(task.status)) return false;
+  if (filter.attention && !attention.has(task.id)) return false;
+  const needle = filter.text.trim().toLowerCase();
+  if (needle) {
+    const inId = task.id.toLowerCase().includes(needle);
+    // Id and title are tested SEPARATELY rather than as one joined haystack, so
+    // a needle can never match across the seam between them ("1 fix" hitting
+    // `t-1` + "fix the thing").
+    const inTitle = (task.title ?? "").toLowerCase().includes(needle);
+    if (!inId && !inTitle) return false;
+  }
+  return true;
+}
+
+/** Which rows survive the filter, and which of those are actual hits. `keep` is
+ *  the matches plus every container above them; `matched` is the hits alone. */
+interface FilterSieve {
+  keep: ReadonlySet<string>;
+  matched: ReadonlySet<string>;
+}
+
+/** Build the sieve for one render.
+ *
+ *  `archived` is passed IN rather than re-derived, and that is the point: this
+ *  and `visibleRows` must read "is this row hidden by the archive" by one rule,
+ *  or the two disagree exactly where they differ (CLAUDE.md's one-rule guard
+ *  convention). It is why there is no exported `filterSieve(board, filter,
+ *  attention, showCleared)` for the view to call — two callers passing
+ *  `showCleared` to two places is precisely the asymmetry.
+ *
+ *  An archived row cannot MATCH. **That line is defence in depth, and has no
+ *  observable effect today** — stated rather than left to look load-bearing:
+ *  `visibleRows` refuses to render an archived row anyway, and `clearedIds`
+ *  only archives a row whose whole subtree is cleared too, so an archived
+ *  container can never sit above an un-archived match whose ancestors this
+ *  would otherwise pull in. It is kept because `matched` and `keep` should mean
+ *  what they say to any future reader of them, not because a test can redden it
+ *  — removing it reddens nothing, and the PR says so. What DOES pin the
+ *  property is `visibleRows`' own archive check (#1152). */
+function buildSieve<T extends OrderedRow>(
+  board: readonly T[],
+  filter: BoardFilter,
+  attention: ReadonlySet<string>,
+  archived: ReadonlySet<string>
+): FilterSieve {
+  const byId = new Map(board.map((t) => [t.id, t]));
+  const matched = new Set<string>();
+  for (const t of board) {
+    if (archived.has(t.id)) continue;
+    if (matchesFilter(t, filter, attention)) matched.add(t.id);
+  }
+  const keep = new Set(matched);
+  for (const id of matched) {
+    const t = byId.get(id);
+    if (!t) continue;
+    // The same ancestor walk `blockingAncestor` and `buildTree` use, so a
+    // hand-edited cycle terminates here for free rather than needing its own
+    // guard.
+    for (const anc of ancestorChain(t, byId).chain) keep.add(anc.id);
+  }
+  return { keep, matched };
+}
+
+/** The view-level inputs `visibleRows` needs beyond the board itself (#1270).
+ *  Optional as a whole, so every pre-#1270 call site renders exactly what it
+ *  rendered before. */
+export interface BoardView {
+  filter?: BoardFilter;
+  /** Ids the `attention` family matches — the view derives these from the
+   *  pending questions and demo gates it already reads, and threads them in. */
+  attention?: ReadonlySet<string>;
+}
+
+/** Every row that contains something — what **collapse all** collapses (#1270).
+ *  Leaves are omitted: a collapsed id that names no container is inert, but
+ *  storing hundreds of them would persist noise `retainExisting` cannot prune
+ *  (they name live rows) and make the saved blob grow with the board rather
+ *  than with the tree.
+ *
+ *  Board order, so the persisted set is stable across renders that changed
+ *  nothing. **Expand all** is the empty set, which needs no helper. */
+export function containerIds<T extends HasParent>(board: readonly T[]): string[] {
+  const { children } = buildTree(board);
+  return board.filter((t) => (children.get(t.id)?.length ?? 0) > 0).map((t) => t.id);
+}
+
 /** The rows to render, in display order: roots first, each followed by its own
  *  subtree (recursively), with the depth each row should be indented to.
  *
@@ -871,11 +1099,19 @@ export function positionAmong<T extends HasId>(
 export function visibleRows<T extends OrderedRow>(
   board: readonly T[],
   collapsed: Iterable<string> = [],
-  showCleared = false
+  showCleared = false,
+  view: BoardView = {}
 ): BoardRow<T>[] {
   const hidden = new Set(collapsed);
   const settled = settledIds(board);
   const archived = showCleared ? new Set<string>() : clearedIds(board);
+  // The sieve is built HERE, off the one `archived` value above, rather than
+  // being handed in by the caller — see `buildSieve`'s doc for why splitting
+  // `showCleared` across two call sites is the bug this shape refuses to allow.
+  const filter = view.filter ?? NO_FILTER;
+  const sieve = filterActive(filter)
+    ? buildSieve(board, filter, view.attention ?? NO_ATTENTION, archived)
+    : null;
   const { roots, children } = buildTree(board);
   const rows: BoardRow<T>[] = [];
   const seen = new Set<string>();
@@ -887,8 +1123,10 @@ export function visibleRows<T extends OrderedRow>(
     if (seen.has(task.id)) return;
     seen.add(task.id);
     const kids = orderSiblings(children.get(task.id) ?? [], settled).ordered;
-    const isCollapsed = kids.length > 0 && hidden.has(task.id);
-    const show = visible && !archived.has(task.id);
+    // Rule 2: an active filter overrides collapse without touching the stored
+    // set, so clearing the filter restores the shape the human left.
+    const isCollapsed = kids.length > 0 && hidden.has(task.id) && !sieve;
+    const show = visible && !archived.has(task.id) && (!sieve || sieve.keep.has(task.id));
     if (show) {
       rows.push({
         task,
@@ -897,6 +1135,8 @@ export function visibleRows<T extends OrderedRow>(
         collapsed: isCollapsed,
         settled: settled.has(task.id),
         cleared: isCleared(task),
+        context: !!sieve && !sieve.matched.has(task.id),
+        shownKids: 0, // filled in below, once the whole projection is known
       });
     }
     for (const k of kids) walk(k, depth + 1, show && !isCollapsed);
@@ -906,6 +1146,18 @@ export function visibleRows<T extends OrderedRow>(
   // — but a row that fell out of the board would be work made invisible, so it
   // renders at top level instead of being trusted away.
   for (const t of board) walk(t, 0, true);
+  // `shownKids` can only be counted once every row's fate is settled — a
+  // child renders or not depending on collapse, the archive AND the filter, and
+  // this is the one place that knows all three. Counted off the rendered set
+  // rather than re-deriving those three rules, so it cannot disagree with what
+  // is actually on screen.
+  const shown = new Set(rows.map((r) => r.task.id));
+  for (const r of rows) {
+    r.shownKids = (children.get(r.task.id) ?? []).reduce(
+      (n, k) => (shown.has(k.id) ? n + 1 : n),
+      0
+    );
+  }
   return rows;
 }
 

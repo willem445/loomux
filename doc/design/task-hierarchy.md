@@ -375,10 +375,14 @@ is what shipped.
 - **Collapse.** A chevron appears on containers only (a leaf gets an inert spacer, so the
   affordance itself communicates "there is something inside here"). Collapsing hides the whole
   subtree, not just the direct children — leaving a grandchild rendered at the top level would
-  read as data loss. Collapse state is frontend-only: not persisted, the same shape as the
-  existing `expanded` (note-expansion) state, and pruned to currently-live rows on each
-  refresh, the same way the existing `selected` (tick-box) state already is — two different
-  existing behaviours, not one.
+  read as data loss. Collapse state is frontend-OWNED and never board data — but since #1270
+  it is durable: persisted per group in `boardprefs.json`, a sibling blob no agent reads (see
+  board-tree-view.md). That is what separates it from the `expanded` (note-expansion) state it
+  was modelled on, which stays per-session. It is still pruned to currently-live rows on each
+  refresh, the same way the existing `selected` (tick-box) state already is — and that pruning
+  is now what keeps the SAVED set from accumulating ids of deleted rows.
+- **Collapse all / expand all.** ⊟/⊞ in the board's control strip, over every container at
+  once (#1270). Off while a filter is armed, because collapse has no observable effect then.
 - **Kind badge.** The Agile level, shown beside the row's id — and since #1156 the *authority* on
   what the row is, where the id prefix is only where it started (§2.2). Its tooltip is derived
   from `ladderRule` rather than written out beside it, so the sentence cannot go stale the way
