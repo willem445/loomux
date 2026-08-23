@@ -143,6 +143,12 @@ publishes.
    hardcoded slugs in `install.sh`, `install.ps1` and `npm/bin/orrerix.js` working, so
    this can happen before or after this PR merges. Updating those three lines afterwards
    is cosmetic.
+
+   **One thing here is not cosmetic**: GitHub Pages moves with the repo, so
+   `docs/_config.yml`'s `baseurl: /loomux` has to become the new slug in the same
+   change or every internal link on the published docs site 404s. That file is
+   left alone here for the same reason as the slugs — changing it before the
+   rename breaks the site that is live today.
 2. **Bind the npm trusted publisher for `orrerix` to the new slug** on npmjs.com. The
    existing binding names `loomux-desktop` on the old slug and grants nothing to the new
    package; publishing a *new* package name over OIDC requires the binding to exist

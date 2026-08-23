@@ -80,8 +80,11 @@ const PRODUCT_NAMES = ["Orrerix", "Loomux"];
 const PRODUCT = PRODUCT_NAMES[0];
 
 // The same set as one regex alternation, built FROM the array rather than
-// retyped, so no reader can fall out of step with it.
-const NAME_ALT = PRODUCT_NAMES.join("|");
+// retyped, so no reader can fall out of step with it. Escaped on the way
+// through: today's names are alphanumeric, but a future product name carrying
+// a `.` or a `-` would otherwise turn a filename matcher into a wildcard
+// silently, and this is the only place that would have to notice.
+const NAME_ALT = PRODUCT_NAMES.map(escapeRe).join("|");
 
 // The cargo crate name, which is what Tauri ships as the bundle's executable.
 // Not part of the external rebrand, and unchanged by it.

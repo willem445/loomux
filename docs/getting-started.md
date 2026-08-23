@@ -143,6 +143,14 @@ whenever you are ready — Add/Remove Programs on Windows, or
 `rm -rf /Applications/Loomux.app` on macOS. On Linux there is nothing to do:
 the AppImage is a single file, and the one on your PATH is simply replaced.
 
+**Until you do, plain `orrerix` launches the Loomux you already have.** That is
+the same rule as always — a plain launch never installs anything over an
+existing install, on any platform — and the launcher counts your Loomux as an
+existing install on purpose, because that is what keeps it from downgrading you.
+Run `orrerix update` to get the Orrerix build; after that, plain `orrerix`
+launches Orrerix, because the launcher prefers the current app when both are
+there.
+
 Your data is not duplicated and nothing needs migrating — both builds read the
 same profile directory, which moved separately and earlier.
 
