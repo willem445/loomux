@@ -320,11 +320,11 @@ compiles.
   the suspect is the list the assertion runs over — not the assertion, and not the report.
   The site the report NAMES is a symptom, not a location: measure the property there first,
   since a perceived GLOBAL cast is routinely carried by interaction-state surfaces (one
-  selection fill, four hover washes) while every token called "ground" is provably clean.
-  Widen the population by ROLE, not by the names you happen to recall. Signature: "gold is
-  tinting everything" against `r === g === b` green on all nine ramp steps, with
-  `SEMANTIC.selection` never in the list (#1344 — the second population defect in the same
-  guard after #1327).
+  selection fill, three hover washes, one chosen fill) while every token called "ground" is
+  provably clean. Widen the population by ROLE, not by the names you happen to recall.
+  Signature: "gold is tinting everything" against `r === g === b` green on all nine ramp
+  steps, with `SEMANTIC.selection` never in the list (#1344 — a second population defect in
+  `test/theme.test.ts`, in a different guard from #1327's).
 - **A non-interference pin is fail-able only when its two operands COLLIDE.** A test
   asserting operation X leaves Y alone must build the fixture so X's key IS Y's subject —
   disjoint literals hold under every implementation, the symmetric one the pin forbids
