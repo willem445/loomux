@@ -429,10 +429,10 @@ layer.
 Museum's [Grand Orrery](https://www.whipplemuseum.cam.ac.uk/explore-whipple-collections/astronomy/grand-orrery) — George Adams, London, c. 1750: the Sun at the
 centre, the six planets then known, and the Jovian and Saturnian moons, each
 running its own track at its own period, the whole thing held in phase by one
-mechanism. Naming a
-specific object in a named collection is what makes the story checkable instead
-of a vague appeal to astronomy, so the README pitch and the docs landing page
-each carry one short paragraph of it and link out; neither retells the history.
+mechanism. Naming a specific object in a named collection is what makes the
+story checkable instead of a vague appeal to astronomy. The README pitch
+carries one short paragraph of it and links out; the docs landing page
+carries the same paragraph plus the maker and date. The history stays here.
 
 **Availability evidence — recorded here as OWED, not as done.** The name was
 checked and reported **CLEAR ON ALL 8 SURFACES**, but that check exists as a
