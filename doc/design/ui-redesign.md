@@ -100,7 +100,37 @@ and eight steps each leaning two points the same way is a visible cast with no s
 tripping a threshold.
 
 **Colour still enters this design through the foreground only.** Nothing below tints the
-ground — that rule is unchanged, and it is now literally true rather than nearly true.
+ground — that rule is unchanged, and as of #1340 it is finally true of every ground rather
+than only of the ramp.
+
+It was not true when #1320 wrote that sentence, and the gap is worth keeping written down
+because of the shape of it. #1320 de-blued `slate` and `mist`, pinned `r === g === b` on
+every step of both, and in the same slice handed `--selection` a deep **gold** wash
+(`#38321f`) — and `--selection` is a ground: it is what sits under every selected file row,
+every open editor row, every active workflow row, the find-panel chips, and every text
+selection in every terminal. Three chrome rules did the same thing a different way, painting
+the accent straight into a `background` (two icon-button hovers, the side dock's
+full-height resize grip, and the chosen decision card's fill). The pin stayed green through
+all of it because its POPULATION stopped at the ramp — the assertion was right and the list
+it ran over was short. That is what the human saw: *"I don't like how the gold hue is
+tinting everything."*
+
+`--selection` is now `#323232`, reached by the same method as the ramp — collapse to the
+**green channel** (`0x32`), since luminance is 71.52% green — so all three contrasts the
+token's level was set by survive: the fill stays visible on the app ground (1.478 → 1.473:1),
+the ink stays readable on it (8.448 → 8.480:1), and so does the accent (8.159 → 8.191:1).
+The four rules move from the accent to an `--ink` wash at the alpha whose blended luminance
+matches the gold it replaces, so the *lift* is unchanged and only the pigment left.
+
+**The accent may paint a mark, never a ground**, and that is now measured rather than
+stated: `test/theme.test.ts` ("the accent paints marks, never grounds") scans every
+`background`/`background-color` in the stylesheet and denies `var(--accent)` by default. The
+twenty-five rules that keep it are enumerated with a reason each and fall into four kinds —
+a drag affordance that only exists mid-gesture, a chip whose whole area *is* the mark, a
+primary action, an on-state toggle, and a search match. A row whose rule stops painting an
+accent background fails too, so the list cannot decay into exemptions for rules nobody kept.
+Rings, edges, glyphs, carets and outlines are out of scope on purpose: those are the
+positions the accent exists for.
 
 Above the ground sit eight named hues, warm to cool around the wheel:
 
@@ -937,7 +967,7 @@ they were asked of every literal:
 | If the colour means… | it takes | examples migrated |
 | --- | --- | --- |
 | something failed, needs you, finished, or is live | `--state-*` | error banners and toasts, the attention chip and its pulse, blocked findings, an awaiting-human task row, a running agent's row edge |
-| something the human can act on | `--accent` / `--selection` / `--focus` | the active pane's ring, primary buttons, keyboard-selected rows, on-state toggles, the drop indicator, editor search matches |
+| something the human can act on | `--accent` / `--focus` (a mark, an edge, a ring — never a ground), or `--selection` for the ground under the chosen row (achromatic, #1340) | the active pane's ring, primary buttons, keyboard-selected rows, on-state toggles, the drop indicator, editor search matches |
 | *which* thing this is | `--id-*` | git-graph lanes, per-CLI and per-role badges, task-board columns, timeline lanes, workflow node kinds, action families, project-tab and channel colours, diff add/delete, the git status letters |
 
 **One role table, applied everywhere.** The four agent roles were coloured by two surfaces
