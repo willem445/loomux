@@ -132,15 +132,23 @@ export const PALETTE = {
   //     to prevent, so this one is far enough away to be its own pigment.
   gold: "#f8c93e", //     interaction: the accent, the focus ring, the caret
   spring: "#74d98d", //   state: working / live
-  selectionFill: "#38321f", // selection fill only — never text, never a border.
-  //     It was `azureDeep`, sitting inside the azure block; #1320 made it a deep GOLD wash,
-  //     and a name is what the next person greps. A future azure re-tune must not find this.
-  //     Its LEVEL is set by the two jobs a selection has, and both were measured against the
-  //     value it replaces rather than eyeballed: it must be visible as a fill on the app
-  //     ground (1.48:1, against the old 1.50:1) AND text must stay readable on top of it
-  //     (ink 8.45:1, against the old 8.33:1). The first draft was #2e2a1c, which kept the
-  //     text side but dropped the fill to 1.32:1 — a selection you can read but can barely
-  //     see is still a regression.
+  selectionFill: "#323232", // selection fill only — never text, never a border. ACHROMATIC.
+  //     It is a GROUND, so it obeys the ground's one rule (see the ramp doc above): colour
+  //     enters this palette through the foreground only. #1320 broke that — it de-blued the
+  //     ramp and in the same slice made this a deep GOLD wash (#38321f), which is what the
+  //     human saw as "the gold hue is tinting everything" (#1340), because this token is the
+  //     ground under every selected file row, every open editor row, every active workflow
+  //     row and every terminal text selection. Gold is the accent; an accent does not paint
+  //     the floor.
+  //
+  //     De-tinted by the SAME method the ramp itself was de-blued with, not by eye:
+  //     collapsed to its own GREEN channel (0x32), which is 71.52% of luminance, so the two
+  //     jobs a selection has both survive to three decimal places. It must be visible as a
+  //     fill on the app ground (1.473:1, against the gold's 1.478:1) AND text must stay
+  //     readable on top of it (ink 8.480:1, against 8.448:1; the accent itself 8.191:1,
+  //     against 8.159:1). Contrast is what sets its LEVEL and that has not moved: the
+  //     rejected #2e2a1c draft dropped the fill to 1.32:1, and a selection you can read but
+  //     can barely see is still a regression.
 
   // --- the per-CLI brand hues (#1020 wave 2). Seven pigments that exist for ONE position —
   //     the agent-type mark and the session list's CLI chip — and answer one closed

@@ -1162,9 +1162,17 @@ test("the neutral ramp carries no hue — nothing in the ground is tinted", () =
   // each leaning two points the same way is a visible cast even when no single step trips a
   // threshold. Achromatic is a property that cannot drift.
   //
-  // This is the ground and the ink ONLY. Hues are still hues; `held`/`idle` are listed
+  // This is every GROUND and the ink. Hues are still hues; `held`/`idle` are listed
   // because the design calls them achromatic in prose (SEMANTIC, "ACHROMATIC on purpose"),
   // and prose is exactly what this pins.
+  //
+  // `selection` is on this list because it is a GROUND, and #1340 is what it cost to leave
+  // it off. #1320 de-blued the ramp and in the same slice handed the SELECTED-ROW fill a
+  // deep GOLD wash (#38321f), so the one rule the palette is built on — theme.ts's header,
+  // and the design note's "Nothing below tints the ground" — was false for every selected
+  // file row, every open editor row, every active workflow row and every terminal text
+  // selection at once, while this test stayed green. A list that stopped at the ramp could
+  // not see it: the hole was the POPULATION, not the assertion.
   const achromatic: Record<string, string> = {
     "PALETTE.slate000": PALETTE.slate000,
     "PALETTE.slate100": PALETTE.slate100,
@@ -1178,6 +1186,7 @@ test("the neutral ramp carries no hue — nothing in the ground is tinted", () =
     "PALETTE.ansiBlack": PALETTE.ansiBlack,
     "SEMANTIC.stateHeld": SEMANTIC.stateHeld,
     "SEMANTIC.stateIdle": SEMANTIC.stateIdle,
+    "SEMANTIC.selection": SEMANTIC.selection,
     "TERMINAL_THEME.foreground": TERMINAL_THEME.foreground,
     "TERMINAL_THEME.brightWhite": TERMINAL_THEME.brightWhite,
   };

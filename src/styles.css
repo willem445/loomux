@@ -61,6 +61,11 @@
 
   /* --- CHANNEL 2: interaction. ONE accent, used sparingly: focus ring, caret, active tab,
          primary action. It is the BRAND GOLD, and it is NOT any state dye (#1320 ask 2).
+         --selection is the odd one out and is deliberately ACHROMATIC (#1340): it is the
+         GROUND a selected row sits on, not a mark on one, and gold in a ground is a tint
+         over the whole app rather than an accent in it. It stays in this block because the
+         POSITION is still the interaction channel's — "the one you picked" — and grouping it
+         with the surfaces would invite a later slice to treat it as a fourth elevation rung.
          It used to be the working dye, on the argument that the live agent and the thing
          the human is acting on are the same idea — they are not, and while one pigment
          served both, "is this running, or is this what I can click?" had no answer in
@@ -68,7 +73,7 @@
          ring). It stays one colour no matter how many hues the identity channel holds. */
   --accent: #f8c93e;
   --focus: #f8c93e;
-  --selection: #38321f;
+  --selection: #323232;
 
   /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
          family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
@@ -2443,8 +2448,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    strip's whole reason to exist, not chrome that gets out of the way. */
 .tasks-filter .pane-btn { opacity: 1; }
 .tasks-filter .pane-btn.tree-btn { width: 20px; height: 20px; font-size: 11px; }
+/* Hover is a LIFT, not a dye (#1340): a plain icon button going gold under the pointer put
+   the accent on a ground, and "the pointer is here" is not something the interaction channel
+   needs to say in hue. The ink wash is the neutral this stylesheet already uses for the same
+   job (.restore-splash-btn). 27% is not a taste call: it is the alpha at which the ink wash
+   matches the luminance of the 28% gold it replaces over this ground (0.0675 vs 0.0684), so
+   the lift the human sees is the one that was there. */
 .tasks-filter .pane-btn.tree-btn:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 28%, transparent); color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 27%, transparent); color: var(--ink);
 }
 /* Collapse is inert while a filter is armed — see taskboard.ts's filter rules.
    Dimmed rather than hidden, so the affordance does not jump around as the
@@ -2729,11 +2740,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   color: var(--ink); font-size: 11px; line-height: 1; cursor: pointer;
 }
 /* --surface-2 is already the elevation ladder's top step, so hovering to
-   another rung would be a no-op; the accent tint the other compact icon
-   buttons use is the next step up. Matched to .dormant-btn:hover at 28% — the
-   dock's resize grip is the same tint but deliberately stronger (35%), being a
-   drag handle rather than a click target. */
-.task-collapse:hover { background: color-mix(in srgb, var(--accent) 28%, transparent); color: var(--ink); }
+   another rung would be a no-op; the wash the other compact icon buttons use is
+   the next step up. It is an INK wash, not an accent one (#1340): a hover is a
+   lift, and gold on a ground is a tint on the app rather than an accent in it.
+   27% is the alpha whose luminance matches the 28% gold it replaces over this
+   ground (0.0789 vs 0.0795). .dormant-btn:hover keeps its accent wash and is no
+   longer this rule's twin — that one is a PRIMARY ACTION whose resting state is
+   already gold, so its hover deepens a colour the button already owns. */
+.task-collapse:hover { background: color-mix(in srgb, var(--ink) 27%, transparent); color: var(--ink); }
 .task-collapse-spacer { flex: none; width: 18px; }
 /* The Agile level (#1156: enforced, and the authority on what a row is — the
    id prefix only says where it started). Purple → blue → cyan → dim reads as
@@ -2967,11 +2981,15 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .decisions-option:hover { border-color: var(--line-strong); background: var(--surface-0); }
 /* The chosen option carries the accent RING — the interaction channel, and a
-   ring rather than a fill so the label keeps its full contrast. */
+   ring rather than a fill so the label keeps its full contrast. The lift under
+   the label is a ground, so it is an INK wash rather than the gold one it used to
+   be (#1340): the ring already says which option this is, and the fill was saying
+   it a second time in a channel grounds do not get. Same 12%, same luminance to
+   three decimals (0.0267 vs 0.0259) — only the pigment left. */
 .decisions-option.chosen {
   border-color: var(--accent);
   box-shadow: inset 0 0 0 1px var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, var(--surface-1));
+  background: color-mix(in srgb, var(--ink) 12%, var(--surface-1));
 }
 .decisions-option-label { font-size: 12px; }
 .decisions-option-desc { font-size: 10.5px; line-height: 1.35; color: var(--ink-dim); }
@@ -4645,7 +4663,12 @@ button.wf-finding:hover { background: var(--surface-2); }
   width: var(--space-3);
   cursor: ew-resize; z-index: 1;
 }
-.sidedock-grip:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+/* An ink wash, not gold (#1340): this is a full-height strip down the side of the dock, so
+   it was the widest single area of accent-on-a-ground in the app. 34% matches the luminance
+   of the 35% gold it replaces over this ground (0.0944 vs 0.0949) — still stronger than the
+   icon buttons' 27%, which is the distinction the old comment drew and this keeps: a drag
+   handle asks for a grab, a click target only acknowledges the pointer. */
+.sidedock-grip:hover { background: color-mix(in srgb, var(--ink) 34%, transparent); }
 
 .sidedock-head {
   flex: none; display: flex; align-items: center; gap: var(--space-2);
