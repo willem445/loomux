@@ -3053,6 +3053,26 @@ fn a_persona_scoping_the_pre_rename_server_is_told_the_name_is_what_went_stale()
         warning2.contains("grants some orrerix tools but not all"),
         "it gets the partial-grant wording instead: {warning2}"
     );
+
+    // rev-967 N7. The two cases must not promise the same thing. The tail is
+    // per-ACTION, so it lands right after the sentence above — and for a stale
+    // spelling that sentence has just said the scope matches nothing, which
+    // makes "CAN CALL ONLY the tools that list names" read as though some of
+    // them still work. The set is empty.
+    assert!(
+        warning.contains("CAN CALL NONE OF THEM"),
+        "a stale scope names tools on a server this app no longer declares, so the delegate \
+         can call nothing — the warning must not imply a working subset: {warning}"
+    );
+    assert!(
+        !warning.contains("CAN CALL ONLY"),
+        "…and must not carry the current-spelling promise as well: {warning}"
+    );
+    assert!(
+        warning2.contains("CAN CALL ONLY the orrerix tools that list names"),
+        "while a CURRENT-spelling per-tool scope really does leave a working subset, and saying \
+         it can call none would send a human editing a file that is already right: {warning2}"
+    );
 }
 
 #[test]

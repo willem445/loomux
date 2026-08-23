@@ -200,16 +200,25 @@ somebody else's filename does not.**
   this diff unreviewable for no agent-visible gain.
 - **`localStorage` keys** (`loomux.defaultAgent`, …) and the workflow file's
   `authored_with:` stamp. Persisted user state — phase 4's class.
-- **Brand prose in Rust doc and code comments** — roughly a thousand mentions across
-  `src-tauri`, none of it reaching an agent. Phase 0 called for a lazy rename of
-  narrative surfaces, and a sweep here would bury the protocol diff.
+- **Brand prose that is not matched on** — roughly a thousand mentions across
+  `src-tauri`. Phase 0 called for a lazy rename of narrative surfaces, and a sweep
+  here would bury the protocol diff.
 
-  The line is *reaches an agent*, not *is in Rust*: `mcp.rs` is agent-facing end to end
-  — its module doc and every tool `description:` is text a delegate reads — so its 42
-  mentions moved with the identities. The audit-actor rename had made one of them
-  actively wrong: `queue_orphans` told an orchestrator to look for a `from` value this
-  app no longer stamps. Same test for the generated Copilot agent file's
-  `description:`, the merge-queue PR body, and the shim refusals.
+  **This includes agent-facing prose, and saying otherwise would be false.** Some of
+  what is left is read by a delegate on every spawn: `copilot_agent_body`'s system
+  prompt (*"the worker for this loomux-orchestrated group"*), `queued_text`'s
+  lock-queue MCP reply (*"loomux types an `[orrerix]` notice into this pane"* — both
+  brands in one sentence), and the delivery- and queue-notice text around
+  `mod.rs:13912`, `:14103`, `:17352-17416` and `:18502`. Nothing matches on any of
+  it, which is why it is out of scope under the governing line at the top of this
+  list — not because an agent never sees it.
+
+  `mcp.rs` moved under that same line rather than an extra one: it is agent-facing
+  end to end, and the audit-actor rename had made one of its tool descriptions
+  **actively wrong** — `queue_orphans` told an orchestrator to look for a `from`
+  value this app no longer stamps, which is a string an agent acts on. The generated
+  Copilot agent file's `description:`, the merge-queue PR body and the shim refusals
+  moved with it.
 
 ## Where the vocabulary lives
 

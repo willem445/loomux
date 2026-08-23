@@ -11130,11 +11130,26 @@ pub fn copilot_tools_gap_warning(
                 .to_string()
         }
         ToolsGapAction::KeptNativeForPerToolScope => {
-            "orrerix did NOT rewrite it: the list scopes the orrerix server to named tools on \
-             purpose, and widening that to the whole server would be orrerix granting itself \
-             more than it was given — so THIS DELEGATE CAN CALL ONLY the orrerix tools that \
-             list names, until a human widens it."
-                .to_string()
+            // rev-967 N7. This tail is per-ACTION, so it lands directly after the
+            // `partial` sentence — and for a stale spelling that sentence has just
+            // said the scope matches nothing. "CAN CALL ONLY the tools that list
+            // names" then reads as though some of them still work, when the set is
+            // empty. The refusal is identical in both cases; only what it promises
+            // differs, so each says its own consequence.
+            let stale = persona.mcp_server_named_in_tools().is_some_and(|n| n != MCP_SERVER);
+            let consequence = if stale {
+                "so THIS DELEGATE CAN CALL NONE OF THEM: the tools that list names belong to a \
+                 server this app no longer declares, and the scope is left as written rather \
+                 than widened — a human has to edit the file"
+            } else {
+                "so THIS DELEGATE CAN CALL ONLY the orrerix tools that list names, until a \
+                 human widens it"
+            };
+            format!(
+                "orrerix did NOT rewrite it: the list scopes the orrerix server to named tools \
+                 on purpose, and widening that to the whole server would be orrerix granting \
+                 itself more than it was given — {consequence}."
+            )
         }
         ToolsGapAction::RepairFailed => {
             "orrerix could not write its generated copy, so this delegate launched with no \
