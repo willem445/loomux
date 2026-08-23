@@ -127,19 +127,10 @@ orchestrator then only acts when you or a worker poke it.
 
 ## How a group works
 
-```mermaid
-flowchart LR
-    You(["You"]) -->|"label an issue<br/>agent-ready"| Board["Task board"]
-    Board --> Orch["Orchestrator"]
-    Orch -->|"spawns"| Plan["Planner<br/>read-only · posts a plan"]
-    Orch -->|"spawns"| Work["Workers<br/>one git worktree each"]
-    Plan -.->|"plan comment"| Work
-    Work -->|"branch → tests → PR"| Rev["Reviewers<br/>gh pr review"]
-    Rev --> Gate{"Merge gate<br/>toggles and grants you set"}
-    Gate -->|"refused unless<br/>you authorize"| You
-    You ==>|"merge"| Main["main"]
-    Orch -.->|"every prompt, visible<br/>in a pane you can steer"| You
-```
+![How work moves through Orrerix: a human sets the vision, the orchestrator grooms it into
+issues and board tasks, a planner plans where warranted, workers build in isolated worktrees,
+an adversarial reviewer and CI gate the result, and a human-gated verdict merge lands it on
+main.](docs/img/workflow-diagram.svg)
 
 Workers and reviewers *always* get their own dedicated git worktree — cut fresh
 from the default branch — so your own clone is never checked out, branched or
