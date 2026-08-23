@@ -41,7 +41,18 @@ case "$os" in
     # every release before that, and this script always resolves /latest, so it
     # has to handle both. The destination takes the same name, so an install
     # replaces its own predecessor and never touches a bundle beside it.
-    app=$(ls -d "$mount"/*.app 2>/dev/null | head -n 1)
+    #
+    # Current name first, then the pre-rename one, then anything else — the same
+    # order npm/bin/orrerix.js uses, and for the same reason: if an image ever
+    # carried two bundles, the current product is the one to install. A bare
+    # `ls | head -1` answers that alphabetically, which is a different rule
+    # dressed as the same one. Unreachable today (the bundler puts one .app in a
+    # DMG) and cheap to keep aligned.
+    app=
+    for candidate in Orrerix.app Loomux.app; do
+      if [ -d "$mount/$candidate" ]; then app="$mount/$candidate"; break; fi
+    done
+    if [ -z "$app" ]; then app=$(ls -d "$mount"/*.app 2>/dev/null | head -n 1); fi
     [ -n "$app" ] || die "no application bundle inside the disk image"
     dest="/Applications/$(basename "$app")"
     rm -rf "$dest"
