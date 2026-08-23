@@ -176,13 +176,15 @@ pub const APP_COMMANDS: &[&str] = &[
     "admit_root",
     // obs (1)
     "take_startup_notice",
-    // uistate (6)
+    // uistate (8)
     "load_ui_tabs",
     "save_ui_tabs",
     "load_settings",
     "save_settings",
     "load_ssh_profiles",
     "save_ssh_profiles",
+    "load_board_prefs",
+    "save_board_prefs",
     // voice (3)
     "voice_start",
     "voice_stop",

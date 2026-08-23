@@ -2398,6 +2398,74 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    spending a second colour channel on it. */
 .wip-chip.wip-enforced.wip-full,
 .wip-chip.wip-enforced.wip-over { outline: 1px solid currentColor; outline-offset: -1px; }
+
+/* ---------- tree-view control strip (#1270) ---------- */
+/* Board CHROME inside the overlay: a flex child of .tasks-view, like the
+   header above it. It never becomes a sibling of #grid-area and never resizes
+   a PTY (hard constraint 1). Wraps rather than scrolls, because a docked board
+   can be narrow and a control the human cannot see is a control they do not
+   have. */
+.tasks-filter {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px; flex: none;
+  padding: 4px 8px 4px 12px;
+  border-bottom: 1px solid var(--surface-2); background: var(--surface-1);
+}
+/* Always visible, unlike the pane buttons that fade in on hover: these are the
+   strip's whole reason to exist, not chrome that gets out of the way. */
+.tasks-filter .pane-btn { opacity: 1; }
+.tasks-filter .pane-btn.tree-btn { width: 20px; height: 20px; font-size: 11px; }
+.tasks-filter .pane-btn.tree-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 28%, transparent); color: var(--ink);
+}
+/* Collapse is inert while a filter is armed — see taskboard.ts's filter rules.
+   Dimmed rather than hidden, so the affordance does not jump around as the
+   human types. */
+.tasks-filter .pane-btn:disabled { opacity: 0.35; cursor: default; }
+.tasks-search {
+  flex: 1 1 130px; min-width: 90px; max-width: 240px;
+  height: 20px; font-size: 10.5px; padding: 0 6px;
+}
+.tasks-filter-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 3px; }
+.filter-label {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--ink-faint); margin: 0 1px 0 5px;
+}
+/* One toggle per filter value. Same chip vocabulary the WIP chips and the row
+   chips already use — a lit chip is the accent tint, which is the only new
+   state the strip introduces. */
+.tasks-filter .pane-btn.filter-chip {
+  width: auto; height: 18px; padding: 0 6px;
+  font-size: 9.5px; border-radius: 4px;
+  background: var(--surface-2); color: var(--ink-dim); white-space: nowrap;
+}
+.tasks-filter .pane-btn.filter-chip:hover { color: var(--ink); }
+.tasks-filter .pane-btn.filter-chip.on {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--ink); font-weight: 600;
+}
+/* The needs-you quick filter lights amber, not accent: it selects the rows the
+   board already marks as waiting on the human, and reusing that channel says
+   so without a legend. */
+.tasks-filter .pane-btn.filter-chip.attention.on {
+  background: color-mix(in srgb, var(--state-attention) 20%, transparent);
+  color: var(--state-attention);
+}
+.tasks-filter-count {
+  margin-left: auto; font-size: 9.5px; color: var(--ink-dim);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* The #958 done/total chip, marked when some of those children are currently
+   OFF SCREEN — folded up, or cut by the filter (#1270). An outline rather than
+   a colour: the numbers have not changed meaning, so this is a note about the
+   VIEW, not a new state of the work. */
+.task-chip.children.hiding {
+  outline: 1px dashed color-mix(in srgb, var(--ink-dim) 55%, transparent);
+  outline-offset: -1px;
+}
+/* A container on screen only because a match sits under it. It recedes so a
+   filtered board reads as "these matched, inside these" rather than as if
+   every epic on the board had matched too. */
+.task-row-context { opacity: 0.62; }
 .tasks-list { flex: 1; overflow-y: auto; padding: 4px 6px 8px; }
 .tasks-list::-webkit-scrollbar { width: 9px; }
 .tasks-list::-webkit-scrollbar-thumb {

@@ -67,13 +67,24 @@ things that matter here:
 
 The usual objection is that this puts *view state* into board data, which the
 board deliberately avoids: `expanded`, `collapsed`, `selected` and the
-show-cleared toggle itself are all frontend-only, "a view preference that
-survives re-renders but never becomes board data". The distinction is durability
-and scope, not taste. Those four are per-window and per-session — which rows
-*this* window is currently showing. "I have acknowledged this item and want it
-out of my working set" is neither: it is a human-authored decision about the
+show-cleared toggle itself are all frontend-owned, "a view preference that
+survives re-renders but never becomes board data". The distinction is **who
+authored it and what it is about**, not durability. Those four are facts about
+what *this* window is currently showing. "I have acknowledged this item and want
+it out of my working set" is neither: it is a human-authored decision about the
 work item, it must survive a restart, and it must be the same in every window
 and pane that shows the board. That is board data by the same test `status` is.
+
+> **Amended by #1270.** This paragraph originally said the distinction was
+> "durability and scope", and that all four preferences are "per-window and
+> per-session". Two of them no longer are: collapse state and the board's
+> filters are now persisted per group in `boardprefs.json` — a frontend-owned
+> sibling blob, still not board data, still invisible to every agent. Durability
+> was never the load-bearing half of the argument, and #1270 is what proves it:
+> a view preference can be durable without becoming board data, as long as it is
+> stored somewhere the orchestrator does not read. What remains true unchanged
+> is the rest — a human-authored decision *about the work item* belongs on the
+> item. See `board-tree-view.md`.
 
 ### What it deliberately does not touch
 

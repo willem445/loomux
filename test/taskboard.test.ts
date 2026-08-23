@@ -16,16 +16,23 @@ import {
   canApprove,
   canProceed,
   childCounts,
+  containerIds,
   clearableCount,
   clearedIds,
   DEMO_STATUSES,
   depCandidates,
   depState,
   doneCount,
+  filterActive,
   focusMiss,
   isCleared,
+  kindFilterChoices,
+  matchesFilter,
+  NO_FILTER,
   orderSiblings,
   positionAmong,
+  UNLABELLED_KIND,
+  type BoardFilter,
   settledIds,
   grantableCount,
   hasMissingParent,
@@ -1612,4 +1619,268 @@ test("the board's link-type vocabulary is the backend's, read out of the Rust so
     rust,
     "the board's LINK_TYPES must equal the backend's TASK_LINK_TYPES, in the same order"
   );
+});
+// Tree-view filtering (#1270) — the three rules in taskboard.ts's filter
+// section, plus the two projection fields (`context`, `shownKids`) the strip
+// and the count badges read.
+// ---------------------------------------------------------------------------
+
+/** A board row for the filter helpers: the hierarchy fields `row` already
+ *  carries, plus the title the text filter reads. Named so the two never get
+ *  confused — `row` deliberately has no title, and several tests below rely on
+ *  a title-less row still being filterable. */
+const frow = (
+  id: string,
+  fields: { status?: string; parent?: string; kind?: string; title?: string } = {}
+) => ({
+  id,
+  status: fields.status ?? "queued",
+  ...(fields.parent === undefined ? {} : { parent: fields.parent }),
+  ...(fields.kind === undefined ? {} : { kind: fields.kind }),
+  ...(fields.title === undefined ? {} : { title: fields.title }),
+});
+
+/** `NO_FILTER` with one family armed — so each test states only the family it
+ *  is about, and a new family added to `BoardFilter` cannot silently leave
+ *  these specimens under-specified (the object spread would fail to compile). */
+const filterOf = (over: Partial<BoardFilter>): BoardFilter => ({ ...NO_FILTER, ...over });
+
+test("every filter family arms the board, and blank text does not", () => {
+  assert.equal(filterActive(NO_FILTER), false);
+  assert.equal(filterActive(filterOf({ kind: ["epic"] })), true);
+  assert.equal(filterActive(filterOf({ status: ["blocked"] })), true);
+  assert.equal(filterActive(filterOf({ text: "auth" })), true);
+  assert.equal(filterActive(filterOf({ attention: true })), true);
+  // A search box the human tabbed through and left holding spaces must not
+  // silently empty the board — every row would fail a whitespace substring
+  // test against nothing, and the strip would read as "no results" for a
+  // filter nobody set.
+  assert.equal(filterActive(filterOf({ text: "   " })), false);
+});
+
+test("the unlabelled chip catches a row with no kind — and one hand-edited to empty", () => {
+  const none = frow("t-1");
+  const empty = frow("t-2", { kind: "" });
+  const epic = frow("t-3", { kind: "epic" });
+  const unlabelled = filterOf({ kind: [UNLABELLED_KIND] });
+  assert.equal(matchesFilter(none, unlabelled), true);
+  // `||` and not `??` in matchesFilter: an empty-string kind is "no level",
+  // exactly like the key being absent. Reading it with `??` would make it a
+  // fifth, invisible class — matched by no chip at all.
+  assert.equal(matchesFilter(empty, unlabelled), true);
+  assert.equal(matchesFilter(epic, unlabelled), false);
+  assert.equal(matchesFilter(epic, filterOf({ kind: ["epic"] })), true);
+  assert.equal(matchesFilter(none, filterOf({ kind: ["epic"] })), false);
+});
+
+test("a hand-edited out-of-vocabulary kind still gets a chip, so no row is unreachable", () => {
+  // ladderRule exempts an unknown kind on purpose (CLAUDE.md constraint 8 —
+  // loomux must not require a methodology), so `saga` is legal. If the chip row
+  // were the fixed vocabulary, a `saga` row would match neither a ladder level
+  // nor `unlabelled` (it IS labelled) and could only be seen by clearing the
+  // kind filter entirely.
+  const board = [frow("t-1", { kind: "epic" }), frow("t-2", { kind: "saga" }), frow("t-3")];
+  assert.deepEqual(kindFilterChoices(board), [...KINDS, UNLABELLED_KIND, "saga"]);
+  assert.equal(matchesFilter(board[1], filterOf({ kind: ["saga"] })), true);
+  assert.equal(matchesFilter(board[1], filterOf({ kind: [UNLABELLED_KIND] })), false);
+  // A board using only the vocabulary gets exactly the vocabulary — no
+  // duplicate `epic` chip from the row that carries one.
+  assert.deepEqual(kindFilterChoices([frow("t-9", { kind: "epic" })]), [
+    ...KINDS,
+    UNLABELLED_KIND,
+  ]);
+});
+
+test("text search reads the id and the title, case-insensitively, but never across the seam", () => {
+  const t = frow("t-14", { title: "Fix the auth redirect" });
+  assert.equal(matchesFilter(t, filterOf({ text: "AUTH" })), true);
+  assert.equal(matchesFilter(t, filterOf({ text: "t-14" })), true);
+  assert.equal(matchesFilter(t, filterOf({ text: "T-14" })), true);
+  assert.equal(matchesFilter(t, filterOf({ text: "  auth  " })), true, "the needle is trimmed");
+  assert.equal(matchesFilter(t, filterOf({ text: "logout" })), false);
+  // Id and title are tested separately. Joined into one haystack they would
+  // share a seam, and a needle spanning it would report a match no human could
+  // see anywhere on the row.
+  assert.equal(matchesFilter(t, filterOf({ text: "14 fix" })), false);
+  // A row with no title at all is still searchable by id, and never matches a
+  // title needle by defaulting to something permissive.
+  const untitled = frow("t-15");
+  assert.equal(matchesFilter(untitled, filterOf({ text: "t-15" })), true);
+  assert.equal(matchesFilter(untitled, filterOf({ text: "auth" })), false);
+});
+
+test("the attention toggle matches only the ids the view supplied", () => {
+  const a = frow("t-1");
+  const b = frow("t-2");
+  const armed = filterOf({ attention: true });
+  assert.equal(matchesFilter(a, armed, new Set(["t-1"])), true);
+  assert.equal(matchesFilter(b, armed, new Set(["t-1"])), false);
+  // No set supplied: the toggle asks for rows the view flagged, and a view that
+  // flagged none has none to show. The dangerous default is the other one —
+  // "no set known" reading as "everything qualifies" would make the quick
+  // filter a no-op exactly when the data behind it failed to load.
+  assert.equal(matchesFilter(a, armed), false);
+});
+
+test("families are ANDed and members are ORed", () => {
+  const board = [
+    frow("t-1", { kind: "story", status: "blocked" }),
+    frow("t-2", { kind: "story", status: "queued" }),
+    frow("t-3", { kind: "task", status: "blocked" }),
+  ];
+  const f = filterOf({ kind: ["story", "task"], status: ["blocked"] });
+  assert.deepEqual(board.map((t) => matchesFilter(t, f)), [true, false, true]);
+  // An empty family constrains nothing — it never means "match nothing".
+  const statusOnly = filterOf({ status: ["blocked"] });
+  assert.deepEqual(board.map((t) => matchesFilter(t, statusOnly)), [true, false, true]);
+});
+
+test("a match keeps its whole ancestor chain, and the chain is marked as context", () => {
+  // Rule 1. Without this the tree stops being a tree: a `kind=story` filter
+  // would return a flat list and the containment the #1156 hierarchy model
+  // exists to show would be gone from the one view that shows it.
+  const board = [
+    frow("e-1", { kind: "epic", title: "Billing" }),
+    frow("f-1", { kind: "feature", parent: "e-1", title: "Invoices" }),
+    frow("s-1", { kind: "story", parent: "f-1", title: "PDF export" }),
+    frow("e-2", { kind: "epic", title: "Auth" }),
+  ];
+  const rows = visibleRows(board, [], false, { filter: filterOf({ kind: ["story"] }) });
+  assert.deepEqual(
+    rows.map((r) => [r.task.id, r.depth, r.context]),
+    [["e-1", 0, true], ["f-1", 1, true], ["s-1", 2, false]],
+    "the two containers render as scaffolding at their real depths; e-2 has no match under it"
+  );
+});
+
+test("a match does not drag its descendants back in — the badge is what names them", () => {
+  // The other half of rule 1, and the reason `shownKids` exists: an epic
+  // matching `kind=epic` renders ALONE, so without a count the human cannot
+  // tell it from an empty epic.
+  const board = [
+    frow("e-1", { kind: "epic" }),
+    frow("f-1", { kind: "feature", parent: "e-1" }),
+    frow("f-2", { kind: "feature", parent: "e-1", status: "done" }),
+  ];
+  const rows = visibleRows(board, [], false, { filter: filterOf({ kind: ["epic"] }) });
+  assert.deepEqual(rows.map((r) => r.task.id), ["e-1"]);
+  assert.equal(rows[0].hasChildren, true, "it still reports that it contains something");
+  assert.equal(rows[0].shownKids, 0, "…and that none of it is on screen");
+  assert.deepEqual(childCounts("e-1", board), { total: 2, done: 1 });
+});
+
+test("an active filter reveals a match inside a collapsed container, without mutating collapse", () => {
+  // Rule 2. A search that finds a row and then hides it is worse than no
+  // search. The stored set is the human's, so the filter reads past it rather
+  // than rewriting it — and the proof is that the SAME set re-collapses the
+  // moment the filter clears.
+  const board = [
+    frow("e-1", { kind: "epic" }),
+    frow("s-1", { kind: "story", parent: "e-1", title: "auth redirect" }),
+    frow("s-2", { kind: "story", parent: "e-1", title: "invoice pdf" }),
+  ];
+  const collapsed = ["e-1"];
+  assert.deepEqual(
+    visibleRows(board, collapsed).map((r) => r.task.id),
+    ["e-1"],
+    "baseline: collapsed hides both children"
+  );
+  const filtered = visibleRows(board, collapsed, false, { filter: filterOf({ text: "auth" }) });
+  assert.deepEqual(filtered.map((r) => r.task.id), ["e-1", "s-1"]);
+  assert.equal(filtered[0].collapsed, false, "the container reports itself expanded while filtering");
+  // Same array, filter cleared: back to exactly the shape the human left.
+  assert.deepEqual(visibleRows(board, collapsed).map((r) => r.task.id), ["e-1"]);
+  assert.deepEqual(collapsed, ["e-1"], "the caller's own set was never touched");
+});
+
+test("shownKids counts what is on screen, for a collapsed row and a filtered one alike", () => {
+  const board = [
+    frow("e-1", { kind: "epic" }),
+    frow("s-1", { kind: "story", parent: "e-1", title: "auth" }),
+    frow("s-2", { kind: "story", parent: "e-1", title: "pdf" }),
+    frow("s-3", { kind: "story", parent: "e-1", title: "email" }),
+  ];
+  const all = visibleRows(board);
+  assert.equal(all[0].shownKids, 3, "nothing withheld: every child is on screen");
+  assert.equal(visibleRows(board, ["e-1"])[0].shownKids, 0, "collapsed: none of them are");
+  const filtered = visibleRows(board, [], false, { filter: filterOf({ text: "auth" }) });
+  assert.equal(filtered[0].shownKids, 1, "filtered: one of three survived");
+  assert.equal(filtered[0].hasChildren, true);
+  // A leaf never claims to be withholding anything.
+  assert.equal(all[1].shownKids, 0);
+  assert.equal(all[1].hasChildren, false);
+});
+
+test("an archived row cannot match a filter while the archive is off screen", () => {
+  // Filtering is a view and clearing is board data (#1152); the two compose
+  // rather than overriding each other. A `text` hit inside the archive must not
+  // drag the archive back onto the board behind the human's back — 👁 is what
+  // does that, and the same needle finds it once they click it.
+  const board = [
+    frow("t-1", { title: "auth redirect" }),
+    { ...frow("t-2", { status: "done", title: "auth cleanup" }), cleared_ms: 5 },
+  ];
+  const f = filterOf({ text: "auth" });
+  assert.deepEqual(
+    visibleRows(board, [], false, { filter: f }).map((r) => r.task.id),
+    ["t-1"]
+  );
+  assert.deepEqual(
+    visibleRows(board, [], true, { filter: f }).map((r) => [r.task.id, r.context]),
+    [["t-1", false], ["t-2", false]],
+    "with the archive on screen it is an ordinary row and matches like one"
+  );
+});
+
+test("filtering a hand-edited containment cycle terminates, rendering each row once", () => {
+  // The invariant every walk over `tasks.json` owes, applied to the new one:
+  // buildSieve climbs ancestors from every match, and a cycle would otherwise
+  // climb forever.
+  const board = [
+    frow("t-1", { parent: "t-3", title: "auth" }),
+    frow("t-2", { parent: "t-1", title: "auth" }),
+    frow("t-3", { parent: "t-2", title: "auth" }),
+  ];
+  const ids = visibleRows(board, [], false, { filter: filterOf({ text: "auth" }) }).map(
+    (r) => r.task.id
+  );
+  assert.deepEqual([...new Set(ids)].sort(), ["t-1", "t-2", "t-3"]);
+  assert.equal(ids.length, 3, "each row renders exactly once");
+});
+
+test("an unfiltered board is byte-for-byte the projection it always was", () => {
+  // The regression pin for every pre-#1270 caller: no filter means no context
+  // marking anywhere, and shownKids simply reports what rendered.
+  const board = [
+    frow("e-1", { kind: "epic" }),
+    frow("s-1", { kind: "story", parent: "e-1" }),
+    frow("t-9"),
+  ];
+  const rows = visibleRows(board);
+  assert.deepEqual(
+    rows.map((r) => [r.task.id, r.depth, r.context, r.shownKids]),
+    [["e-1", 0, false, 1], ["s-1", 1, false, 0], ["t-9", 0, false, 0]]
+  );
+  // …and an EMPTY filter object is the same thing as no filter at all.
+  assert.deepEqual(
+    visibleRows(board, [], false, { filter: NO_FILTER }).map((r) => [r.task.id, r.context]),
+    [["e-1", false], ["s-1", false], ["t-9", false]]
+  );
+});
+
+test("collapse-all names every container and nothing else, in board order", () => {
+  const board = [
+    frow("e-1", { kind: "epic" }),
+    frow("f-1", { kind: "feature", parent: "e-1" }),
+    frow("s-1", { kind: "story", parent: "f-1" }),
+    frow("t-9"),
+  ];
+  assert.deepEqual(containerIds(board), ["e-1", "f-1"]);
+  // Collapsing that set leaves exactly the roots on screen, which is what the
+  // button promises; expand-all is the empty set and needs no helper.
+  assert.deepEqual(
+    visibleRows(board, containerIds(board)).map((r) => r.task.id),
+    ["e-1", "t-9"]
+  );
+  assert.deepEqual(containerIds([frow("t-1"), frow("t-2")]), [], "a flat board has no containers");
 });
