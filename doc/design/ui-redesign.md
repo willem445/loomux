@@ -79,29 +79,53 @@ not one value has moved:
 
 | Name | Value | Role |
 | --- | --- | --- |
-| **slate** | `#0a0b0d` → `#343945` | the ground and the elevation ladder; every surface and border |
-| **mist** | `#cfd2d9` / `#9ba3b1` / `#656d7b` | the ink: primary, secondary, faint |
+| **slate** | `#0b0b0b` → `#393939` | the ground and the elevation ladder; every surface and border |
+| **mist** | `#d2d2d2` / `#a3a3a3` / `#6d6d6d` | the ink: primary, secondary, faint |
 
-**The ground is a deep cool neutral.** Blue sits a few points above red at every step of the
-slate ramp (`B−R` = 3, 5, 7, 10, 12, 17 as it climbs), so the chrome reads cool and recedes
-behind terminal output instead of tinting it. This is the correction the direction gate
-asked for, and it is the *opposite* of the rejected proposal, which warmed the same channel
-in the other direction. **Colour enters this design through the foreground only.** Nothing
-below tints the ground, and that is the rule that lets the palette get much more colourful
-without touching the black the human approved.
+**The ground carries no hue at all.** `B−R` is `0, 0, 0, 0, 0, 0` across the slate ramp and
+`0, 0, 0` across mist: every step is literally `r === g === b`. This *replaces* the earlier
+cool-neutral ground, which leaned blue by 3 to 17 points as it climbed — read across a whole
+window that came out as a blue cast on the chrome, which is what #1320 ask 1 asked to kill.
+
+The ramp was not re-picked by eye. Relative luminance is 71.52% green, so collapsing each
+old step to its own **green channel** yields a grey of nearly identical luminance: the whole
+ladder moved by at most 1.4% (`slate200`, `slate300`, `slate500` and `mist000` by under
+0.3%). Every contrast ratio, the elevation order, and the AA/AAA headroom the tests below
+measure therefore survive the de-blueing unchanged — the hue left and nothing else did.
+
+Achromatic is pinned as `r === g === b` rather than as a tolerance on how far blue may sit
+above red, because a tolerance is a slope: it invites the next value to sit just inside it,
+and eight steps each leaning two points the same way is a visible cast with no single step
+tripping a threshold.
+
+**Colour still enters this design through the foreground only.** Nothing below tints the
+ground — that rule is unchanged, and it is now literally true rather than nearly true.
 
 Above the ground sit eight named hues, warm to cool around the wheel:
 
 | Name | Value | Lit | Channels |
 | --- | --- | --- | --- |
-| **rose** | `#e8636f` | `#f4808a` | **state:** danger, error, deletions · identity |
-| **amber** | `#e8a94a` | `#f4c06a` | **state:** attention — this one needs you · identity |
-| **lime** | `#a9cc5a` | `#c0dd7f` | identity only |
-| **jade** | `#45c08a` | `#6fd3a6` | **state:** ok, done, additions · identity |
-| **cyan** | `#46bcd4` | `#74d3e5` | identity only · ANSI cyan |
-| **azure** | `#5590d9` | `#7fb0e8` | **state:** working · **interaction:** the one accent · identity |
-| **violet** | `#a97fd6` | `#c39ce8` | identity only · ANSI magenta |
-| **orchid** | `#e767a8` | `#f08cbd` | identity only |
+| **rose** | `#e35a5a` | `#ee8080` | **state:** danger, error, deletions · identity |
+| **amber** | `#e89c3c` | `#f2b45f` | **state:** attention — this one needs you · identity |
+| **lime** | `#b5bf62` | `#cbd486` | identity only |
+| **jade** | `#35a86b` | `#56c48c` | **state:** ok, done, additions · identity |
+| **cyan** | `#5aa8b5` | `#7ec3ce` | identity only · ANSI cyan |
+| **azure** | `#6f93c4` | `#95b3d8` | identity only · ANSI blue |
+| **violet** | `#9a8fc4` | `#b7aed8` | identity only · ANSI magenta |
+| **orchid** | `#c47f9e` | `#d8a2bb` | identity only |
+
+Two pigments sit outside that table because they answer questions the eight do not:
+
+| Name | Value | Channel |
+| --- | --- | --- |
+| **gold** | `#f8c93e` | **interaction:** the accent, the focus ring, the caret |
+| **spring** | `#74d98d` | **state:** working / live |
+
+The eight were also pulled down in chroma at #1320 ask 3 ("the pane icon colours are too
+exotic"). `orchid` was a hot pink and is now a dusty rose, `violet` a lilac and is now a
+slate-violet, `cyan` a bright cyan and is now a muted teal, `lime` a candy yellow-green and
+is now brass. They remain eight distinct, AA-legible hues; they no longer read as candy
+beside a near-black ground. The cost is measured and accepted below.
 
 `cyan` and `violet` were terminal-only in the previous round — values that existed so the
 sixteen ANSI slots stayed coherent, which no UI surface was allowed to touch. They are now
@@ -110,13 +134,22 @@ terminal-only value survives: ANSI green (`#57bd77`), because the app's greens a
 (jade) and a yellow-green (lime) and a CLI printing "green" means neither. `lime` and
 `orchid` have no ANSI slot at all — app-only hues, the reverse of the old arrangement.
 
-**Eight is a measurement, not a preference.** The revision's target was 8–10, and a ninth
-hue was tried in all three gaps the wheel still had. Every candidate landed closer to an
-existing hue than the eight-set's own closest pair (rose/orchid, 30.4 ΔE in CIE76): a
-tangerine came out 20–29 ΔE from amber, an indigo 13–23 from azure and violet, a fern 10–24
-from ANSI green. The warm arc is the crowded one because two *state* dyes already live there
-and neither may move, so a third warm hue costs exactly the state legibility the palette
-exists to protect. Ten hues would have been the padded answer; eight is the honest one.
+**Eight is a measurement, not a preference — and #1320 narrowed the margin.** The revision's
+target was 8–10, and a ninth hue was tried in all three gaps the wheel still had; every
+candidate landed closer to an existing hue than the eight-set's own closest pair. That
+argument still holds, but the figure it quoted does not: the set's closest pair used to be
+rose/orchid at 30.4 ΔE, and after the #1320 de-exoticising it is **azure/violet at 15.3 ΔE**
+(CIE76). Pulling four hues down in chroma moved them toward each other as well as toward the
+grey, and that is the honest cost of the change.
+
+15.3 ΔE is still far above a just-noticeable difference (~2.3) and these hues never carry
+meaning alone — an identity hue is always accompanied by position, label and icon shape, and
+the channel is *allowed* to collapse under CVD (below). But a future ninth hue can no longer
+be refused by pointing at a 30 ΔE floor. If one is proposed, re-run the measurement rather
+than quoting this paragraph.
+
+The warm arc remains the crowded one, because two *state* dyes live there and neither may
+move, so a third warm hue still costs exactly the state legibility the palette protects.
 
 **The Lit step, and why there is no third value per hue.** Each hue carries one brighter
 companion, used for the ANSI bright slots, for hover emphasis, and for chip text. There is
@@ -124,13 +157,26 @@ deliberately **no per-hue fill**: on a ground this dark a chip is the ground plu
 in its hue, not a tinted block, so a fill token would be a third value per hue that nothing
 paints. A slice that genuinely needs one mints it and pins it like everything else.
 
-**One accent, and it is the working dye.** `--accent` is azure — the same colour as an agent
-in flight — because in loomux the live thing and the thing the human is acting on are the
-same thing, and a ninth hue would be a ninth meaning to learn. Form keeps them apart: state
-is an *edge*, interaction is a *fill or a ring*. The accent appears on the focus ring, the
-caret, the active tab and the primary action, and nowhere else. It stays **one** colour
-however many hues the identity channel holds — "what can I click" must never become a
-hue-matching exercise.
+**One accent, and it is the brand gold.** `--accent` is `gold` (`#f8c93e`) — the orrery gold
+off the logo, tempered a little off its `#ffc82a` core so a caret is not the brightest thing
+on screen. It appears on the focus ring, the caret, the active tab and the primary action,
+and nowhere else. It stays **one** colour however many hues the identity channel holds —
+"what can I click" must never become a hue-matching exercise — and *sparingly* is part of
+the token's meaning: gold on every surface is not an accent, it is a theme.
+
+This reverses an earlier decision here, and the reversal is the point of #1320 ask 2. The
+accent used to be `azure`, which was *also* `--state-working`, on the argument that "the
+live thing and the thing the human is acting on are the same thing". They are not. A pane
+can be working while the thing you may click is somewhere else entirely, and while one
+pigment served both, the question "is this running, or is this what I can click?" had no
+answer in colour — the two were not merely similar, they were the same hex. Form (edge
+versus fill) was carrying a distinction that hue was actively denying.
+
+Splitting them is also what makes ask 3 expressible: a gold accent only reads AS an accent
+if the semantic scale beside it is something else. `test/theme.test.ts` ("the brand accent is
+not a state dye") holds them apart at the state channel's own 9 ΔE floor under normal vision
+and all three CVD simulations; the shipped margin is **12.8 ΔE** (tritan, against
+`attention`, the nearest). On the pre-#1320 palette that same test measures **0.0**.
 
 **Stopped agents get no dye.** `held` is faint mist and `idle` is a slate hairline. A held
 agent is not running, so it carries no dye; it is marked by *form* — a dashed thread — not
@@ -139,7 +185,7 @@ by hue.
 **Contrast is measured, not claimed.** `test/theme.test.ts` computes WCAG ratios over these
 values on every run: primary ink clears AAA (7:1) on all four grounds, dim ink clears AA,
 **every one of the eight hues clears AA (4.5:1) as text on every surface it can appear on** —
-the worst case is azure at 5.01:1 on `--surface-2` — and each hue and its Lit step clear the
+the worst case is rose at 4.61:1 on `--surface-2` — and each hue and its Lit step clear the
 WCAG 1.4.11 non-text floor (3:1) on the terminal ground, where an icon or a badge can sit but
 a label never does. Faint mist is *held* between 3:1 and 4.5:1, deliberately below AA,
 because its role is non-essential meta. If a future edit makes faint ink readable, it has
@@ -160,17 +206,25 @@ Identity is the channel this revision adds, and it is what makes the app colourf
 which *thing* you are looking at — a surface, an action family, a CLI, a git lane — as
 opposed to what state that thing is in.
 
-**Four hues carry both a state role and an identity role, and that is deliberate.** loomux
+**Three hues carry both a state role and an identity role, and that is deliberate.** loomux
 has one palette, not two. Minting a second near-identical blue so "identity blue" could
 differ from "working blue" is precisely the *"it needed a slightly different blue"* failure
 rule 2 refuses. What separates the channels is **position**, not pigment: the state dyes hold
 an exclusive claim to the state positions, and an identity hue may never enter one. Which
-token a surface *names* — `--state-working` or `--id-azure` — declares which question it is
+token a surface *names* — `--state-ok` or `--id-jade` — declares which question it is
 answering, so a reviewer can see a channel violation in the diff without knowing a hex.
+
+It was four until #1320. `azure` was the fourth, carrying `working` *and* the accent *and* an
+identity role; it now carries identity and ANSI blue only, and `spring` — a state-only
+pigment, in the channel but not in `IDENTITY` — took the live thread. `gold` is likewise
+interaction-only. So the two pigments this revision added are each single-channel, which is
+the shape the rule above actually wants: sharing is for hues that genuinely answer two
+questions, not a way to avoid minting a value.
 
 **The position rule is load-bearing, and here is the measurement that proves it.** Eight hues
 on one dark ground cannot all survive colour-vision deficiency, and this set does not: under
-simulation `azure` and `violet` are 2.9 ΔE apart to a protanope, and `rose` and `orchid` are
+simulation `azure` and `violet` are 0.0 ΔE apart to a protanope — identical — and `cyan` and
+`azure` are 2.4 ΔE to a tritanope, where `rose` and `orchid` are
 *identical* to a tritanope. The design accepts that for identity — which thing this is, is
 always also carried by position, by a label, and by an icon's shape — and refuses it for
 state, which is the one thing a supervisor must read correctly at a glance across ten panes.
@@ -573,7 +627,7 @@ cards get `--space-7` inside.
 One signature element, and the argument for keeping it through a change of visual language.
 
 **The selvedge.** Every pane frame carries a 2px vertical thread down its left edge,
-continuing through the pane header. Its colour is the pane's live agent state — azure
+continuing through the pane header. Its colour is the pane's live agent state — spring
 working, amber needs-you, jade done, rose failed, dashed faint mist held, a slate hairline
 idle. Because panes tile side by side, the threads of adjacent panes stand parallel across
 the whole grid: the fleet's state *is* a warp, read left to right, without a single badge.
@@ -711,7 +765,7 @@ guessing game. The scarcity argument is preserved a cheaper way: one accent, reu
 state palette rather than added to it, with form separating the two meanings.
 
 **The textile vocabulary is gone.** Round 1 named its palette fibre, linen, indigo, saffron,
-verdigris and madder. In a cool grey cockpit those words would be a costume — and dressing a
+verdigris and madder. In a plain grey cockpit those words would be a costume — and dressing a
 motif in vocabulary rather than in structure is the exact failure round 1's own critique
 identified in *its* first draft. The names are now plain (slate, mist, azure, amber, jade,
 rose) and the loom idea survives only where it does structural work: the warp, which encodes

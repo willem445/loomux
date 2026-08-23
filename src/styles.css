@@ -30,21 +30,21 @@
          cards and popovers. The surface steps are tiny (1.04-1.09:1) because surfaces
          separate by elevation and a hairline, never by a contrast block; the border steps
          open up, because an edge has to be seen. */
-  --surface-term: #0a0b0d;
-  --surface-0: #0f1114;
-  --surface-1: #15171c;
-  --surface-2: #1c1f26;
-  --line: #262a32;
-  --line-strong: #343945;
+  --surface-term:#0b0b0b;
+  --surface-0:#111111;
+  --surface-1:#171717;
+  --surface-2:#1f1f1f;
+  --line:#2a2a2a;
+  --line-strong:#393939;
 
   /* --- ink. `--ink-faint` is below AA by design: non-essential meta and rules only.
          Anything a user must read takes --ink-dim or better. `--ink` was toned down from
          15.6:1 to ~12.5:1 on the app ground at the human's request (#1020 item 11) — the
          candidate matrix and the value's provenance live on PALETTE.mist000 in theme.ts,
          the source of truth this token is pinned to. */
-  --ink: #cfd2d9;
-  --ink-dim: #9ba3b1;
-  --ink-faint: #656d7b;
+  --ink:#d2d2d2;
+  --ink-dim:#a3a3a3;
+  --ink-faint:#6d6d6d;
 
   /* --- CHANNEL 1: agent state. These six values are the only things allowed in a STATE
          POSITION — the warp thread, the status chip, the state dot. `held` and `idle` are
@@ -52,21 +52,21 @@
          not by hue. No --id-* token may appear in a state position; that rule is what keeps
          the fleet readable to a supervisor with colour-vision deficiency, and
          test/theme.test.ts measures it rather than trusting it. */
-  --state-working: #5590d9;
-  --state-attention: #e8a94a;
-  --state-ok: #45c08a;
-  --state-danger: #e8636f;
-  --state-held: #656d7b;
-  --state-idle: #343945;
+  --state-working:#74d98d;
+  --state-attention:#e89c3c;
+  --state-ok:#35a86b;
+  --state-danger:#e35a5a;
+  --state-held:#6d6d6d;
+  --state-idle:#393939;
 
   /* --- CHANNEL 2: interaction. ONE accent, used sparingly: focus ring, caret, active tab,
          primary action. It is the working dye, because the live agent and the thing the
          human is acting on are the same idea; form separates them (state is an edge,
          interaction is a fill or a ring). It stays one colour no matter how many hues the
          identity channel holds. */
-  --accent: #5590d9;
-  --focus: #5590d9;
-  --selection: #24344a;
+  --accent:#f8c93e;
+  --focus:#f8c93e;
+  --selection:#2e2a1c;
 
   /* --- CHANNEL 3: identity. Hue that says WHICH thing this is — a surface, an action
          family, a CLI, a git lane — never what state it is in. Consumers: coloured icons
@@ -79,14 +79,14 @@
          by slice A; slice B (#957) was the first consumer, mapping the bulk of surfaces, and
          the icon role table directly below is a later one. The full map is
          doc/design/ui-redesign.md, §What slice B migrated. */
-  --id-rose: #e8636f;
-  --id-amber: #e8a94a;
-  --id-lime: #a9cc5a;
-  --id-jade: #45c08a;
-  --id-cyan: #46bcd4;
-  --id-azure: #5590d9;
-  --id-violet: #a97fd6;
-  --id-orchid: #e767a8;
+  --id-rose:#e35a5a;
+  --id-amber:#e89c3c;
+  --id-lime:#b5bf62;
+  --id-jade:#35a86b;
+  --id-cyan:#5aa8b5;
+  --id-azure:#6f93c4;
+  --id-violet:#9a8fc4;
+  --id-orchid:#c47f9e;
 
   /* --- CHANNEL 3, the per-CLI sub-table: WHICH AGENT PROGRAM is this pane running. One
          question, one closed roster, and exactly two positions — the agent-type mark in a
@@ -104,21 +104,21 @@
          no --cli-* token may enter one either. Values, provenance (evocation, never a
          vendor's own hex) and the separation measurements are theme.ts §CLI_HUES and
          doc/design/ui-redesign.md §The per-CLI hues. */
-  --cli-claude: #e08a5f;
-  --cli-codex: #3ec2a8;
-  --cli-copilot: #7fa8d8;
-  --cli-opencode: #5fc873;
-  --cli-gemini: #8b8ff0;
-  --cli-hermes: #e072c0;
-  --cli-ante: #c3c455;
+  --cli-claude:#e08a5f;
+  --cli-codex:#3ec2a8;
+  --cli-copilot:#7fa8d8;
+  --cli-opencode:#5fc873;
+  --cli-gemini:#8b8ff0;
+  --cli-hermes:#e072c0;
+  --cli-ante:#c3c455;
 
   /* --- type roles. Sans carries labels and titles; mono is reserved for MACHINE
          IDENTIFIERS — paths, branches, ids, counts, timings — so the mono face always
          means "a literal string the machine gave you".
          --font-mono is byte-identical to the chain pane.ts passes to xterm; changing it
          changes cell metrics and forces a refit. */
-  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
-  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono:"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace;
+  --font-ui:"Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --text-eyebrow: 10px;
   --text-xs: 10.5px;
   --text-s: 11.5px;
