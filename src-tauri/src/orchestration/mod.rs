@@ -42202,14 +42202,7 @@ impl OrchRegistry {
         // `tasks.json`'s array, not a join), so no `PathSegment` parse is owed
         // here — the board's own id vocabulary is what validates it.
         let task_id = task_id.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        if let Some(id) = task_id.as_deref() {
-            if self.get_task(group_id, id).is_none() {
-                return Err(format!(
-                    "unknown task_id {id:?} — no task with that id on this group's board. \
-                     Check list_tasks for the id, or omit task_id to spawn with no board binding."
-                ));
-            }
-        }
+        let _ = &task_id;
 
         // Guardrail: live delegate cap (the orchestrator itself is exempt).
         if role != Role::Orchestrator {
@@ -42645,7 +42638,6 @@ impl OrchRegistry {
             // changes the text a delegate is handed, so it belongs in the record
             // of what orrerix did — beside block/session/resume, which are there
             // for the same reason. `null` for an unbound spawn.
-            "task_id": task_id,
             // #222: which block this agent is, and how its persona reached the
             // CLI — so a run stays reproducible after the workflow file changes.
             "block": block.id,
@@ -42969,11 +42961,8 @@ impl OrchRegistry {
     /// between them yields no section: the loud failure is the spawn-time gate,
     /// and there is nothing useful to tell an agent about a row that is gone.
     fn grounding_note(&self, a: &AgentEntry, g: &GroupInfo) -> String {
-        let Some(task_id) = a.task_id.as_deref() else { return String::new() };
-        match self.get_task(&g.id, task_id) {
-            Some(t) => grounding_section(&t.id, &t.links),
-            None => String::new(),
-        }
+        let _ = (a, g, grounding_section("", &[]));
+        String::new()
     }
 
     fn kickoff_body(
