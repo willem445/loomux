@@ -147,6 +147,18 @@ test("held bytes for one id never exceed the ceiling", () => {
   const each = 64 * 1024;
   for (let i = 0; i < 40; i++) r.hold(1, chunk(each), each);
 
+  // Positive control BEFORE the bound. A lone `<=` here passes just as well on
+  // a router that held nothing at all, so it would stay green against a bug
+  // that dropped everything — it can only catch over-retention, never under-.
+  // The floor is deliberately loose rather than `=== MAX_PREATTACH_BYTES`: the
+  // shed loop stops the moment the buffer fits, so what is actually guaranteed
+  // is "within one chunk of the cap", and pinning the exact figure would only
+  // add a way for this to break when `each` stops dividing the cap evenly.
+  assert.equal(
+    r.heldBytes(1) > MAX_PREATTACH_BYTES - each,
+    true,
+    "the buffer must be SATURATED, not merely under the cap"
+  );
   assert.equal(r.heldBytes(1) <= MAX_PREATTACH_BYTES, true);
 });
 
@@ -251,6 +263,21 @@ test("a session of spawns nobody ever attaches stays inside the stated worst cas
   let total = 0;
   for (let id = 1; id <= 500; id++) total += r.heldBytes(id);
 
+  // Positive control BEFORE the bounds, for the reason the review gives: two
+  // `<=` assertions pass identically on a router holding nothing, so on their
+  // own they catch over-retention and are blind to under-retention. This input
+  // saturates the id cap, so the floor is what the input already guarantees
+  // rather than a second brittle pin.
+  assert.equal(
+    r.heldIds(),
+    MAX_PREATTACH_IDS,
+    "the id cap must be SATURATED — 500 unattached ids cannot leave it under 64"
+  );
+  assert.equal(
+    total > MAX_PREATTACH_IDS * (MAX_PREATTACH_BYTES - each),
+    true,
+    "every surviving id must be holding within one chunk of its own cap"
+  );
   assert.equal(r.heldIds() <= MAX_PREATTACH_IDS, true);
   assert.equal(total <= MAX_PREATTACH_IDS * MAX_PREATTACH_BYTES, true);
 });

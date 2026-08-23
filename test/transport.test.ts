@@ -203,6 +203,10 @@ test("a pane that respawns in place leaves no attachment behind on its old pty i
   // handler, and not a fresh pre-attach buffer that nothing will ever drain.
   fake.emit("pty-output", { id: 11, data: Buffer.from("tail", "utf8").toString("base64") });
   fake.emit("pty-output", { id: 12, data: Buffer.from("live", "utf8").toString("base64") });
+  // `second` is `first`'s positive control, not a second case: an empty `first`
+  // would pass on its own even if the emit path were broken and NOTHING was
+  // routed anywhere. Seeing the live id's bytes land proves the mechanism ran,
+  // which is what makes the dead id's silence evidence rather than absence.
   assert.deepEqual(first, []);
   assert.deepEqual(second, ["live"]);
 
