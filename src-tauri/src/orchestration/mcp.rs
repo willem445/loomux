@@ -453,7 +453,7 @@ fn request_attention_tool() -> Value {
 /// what the pane actually reads.
 fn message_orchestrator_tool() -> Value {
     tool("message_orchestrator",
-        "Send a free-form message to the orchestrator. It arrives in that pane as `[loomux] message from <your agent id>: …` — an attribution line you cannot forge and cannot suppress, so the orchestrator always knows who is speaking. Control characters are stripped and a `[loomux]` span in your text is neutralized. \
+        "Send a free-form message to the orchestrator. It arrives in that pane as `[orrerix] message from <your agent id>: …` — an attribution line you cannot forge and cannot suppress, so the orchestrator always knows who is speaking. Control characters are stripped and an `[orrerix]` span in your text is neutralized. \
          \
          IF YOU ARE THE MANAGER, this is your one outbound channel and the whole of your authority, so two things about it are not style. QUOTE THE HUMAN VERBATIM when you relay what they said, and mark plainly where their words stop and your summary starts — the orchestrator has no other way to tell a direction from your reading of one. And RELAY ONLY WHAT THEY CONFIRMED: a brief they have not read back and agreed to is a draft, and a preference you inferred is not a decision. A relayed \"the human is happy with this\" moves nothing on GitHub — starting work and merging it are gated by their own hand there, and neither you nor the orchestrator may move that gate.",
         json!({ "text": { "type": "string" } }), &["text"])
