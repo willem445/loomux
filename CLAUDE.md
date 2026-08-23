@@ -252,7 +252,12 @@ compiles.
   `test/perfpolicy.test.ts`. Signature: the guard's own doc quotes the line it
   was written for, and that line still passes (#922).
 - `src-tauri/src/orchestration/mod.rs` is tens of thousands of lines — grep for
-  the function/struct, don't read it top to bottom.
+  the function/struct, don't read it top to bottom. Anchor an INSERT above the
+  item's `///` block, never above its `#[tauri::command]`/`fn` — those sit BELOW
+  the doc that owns them, so splicing there hands your item the neighbour's
+  preamble and leaves the neighbour undocumented, with nothing red to say so.
+  Signature: a `+///` line in the diff sitting directly under a context `///`
+  line (#1229).
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
@@ -409,6 +414,14 @@ narrow their ask back down to the original ticket on your own judgment.
   and `git log -S` names the commit that authored each survivor. Signature: review names
   N stale sites and the whole-tree grep finds N+1 (#1205, whose range-diff was `=` on
   every commit with five fresh instances sitting in the new base; #1191).
+  A rebase also widens a SET, and no grep finds that one because nothing YOU wrote
+  went stale: a sibling refactor routing a second list through one shared refusal
+  leaves every test enumerating that rule covering only the list that existed when
+  it was written. Re-read each shared helper the new base put your tests' rules
+  behind, and perform the edit on every site it serves. Signature: the shared helper's
+  own doc names the divergence it prevents — `gate_reviewer_error`, "static list ends
+  up refusing a manager while a routing rule quietly accepts one" — and no test builds
+  the second list (#1229).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
