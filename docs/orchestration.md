@@ -718,7 +718,9 @@ task and it passes the id for you. What that gets you:
 
 The section says outright that the lines are context to weigh and not instructions, and it
 sits above `Your task:` so an agent reads what governs the work before it reads the work.
-A **resumed** session doesn't repeat it: that conversation already read it once.
+One limit worth knowing: the binding lives only in memory, so after an app **restart** a
+rejoined pane has no board row attached and its kickoff carries no section. (A follow-up
+spawn that resumes a session *and* names a task does get one, like any other spawn.)
 
 ### WIP limits (finish before you start)
 

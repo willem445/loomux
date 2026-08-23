@@ -349,11 +349,19 @@ there is nothing useful to tell an agent about a row that is gone.
 **Provenance framing (#189).** Labels and targets are prose written by whoever wrote the
 board row — the same trust tier as the author of the brief itself, which is why this gets one
 framing line rather than the sentinel sandwich `lessons_note` needs for repo-authored text.
-Structurally, `normalize_task_links` already refuses control characters in both fields, so no
-link written through any loomux path can carry a newline; `one_line` collapses them anyway at
-render time, because a **hand-edited `tasks.json`** goes through no write path and this is the
-one surface where a newline is structural rather than cosmetic — it would forge a section
-boundary and let board prose present as loomux's own lines.
+Structurally, **every value this section renders goes through `one_line`** — the row's `id` as
+much as a link's type, target and label. Round 1 of review found the id being read by a
+different rule than the other three, and the bypass was exactly the width of that asymmetry: a
+newline in the id forged a `Your task:` line *above* the framing sentence, outside the region
+that sentence opens — and a second `Your task:` is the placement argument's own closer
+duplicated, which is the same as not having one.
+
+The write path is not the guarantee. `normalize_task_links` does refuse control characters in a
+link, so no link written through any loomux path carries a newline — but a **hand-edited**
+`tasks.json` goes through no write path at all, and an `id` has none to go through in the first
+place: nothing can ask to set one, and `tasks()` deserializes without validating any. This is
+the one surface where a newline is structural rather than cosmetic, so the rule lives where the
+value is rendered, not where it is written.
 
 **The manager arm is deliberately not included.** `kickoff_body` has a separate arm for
 `Role::Manager` (#1161) and it composes no grounding section. A manager has no assigned
