@@ -469,7 +469,7 @@ narrow their ask back down to the original ticket on your own judgment.
   fails for EVERY branch commit once the PR squashes. Signature: the run ids were re-derived
   after the rebase and the commit SHAs beside them were not — the reproduction SHA the body
   tells a reader to check out included (#1327; recipe in `.claude/skills/ci-validate/SKILL.md`).
-- **A range's BASELINE is re-derived with `git merge-base`, never checked for ancestry.**
+- **A range's BASELINE is re-derived with `git merge-base`, never inferred from an ancestry check.**
   A rebase moves the merge base while leaving the commit you rebased onto LAST time a
   perfectly valid ancestor — resolvable, right subject, passing every check the SHA rule
   above applies — so an isolation diffstat re-run against it is freshly measured and still
@@ -536,11 +536,12 @@ narrow their ask back down to the original ticket on your own judgment.
   S2/S3) `` — or the pointer waits for that slice. Present tense beside a
   shipped guarantee in the same construction reads as shipped, and the reader
   who acts on it gets silent green (#750).
-- **A claim about how markdown RENDERS is measured, never read off the
-  source.** Put the text through GitHub's own GFM endpoint before claiming a PR
-  body, issue comment or `docs/` page renders a certain way — `gh api -X POST
-  markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line silently ends a
-  table, and the row you claimed becomes a paragraph of literal pipes (#926).
+- **A claim about how markdown RENDERS is measured or decided from the surface,
+  never read off the source.** Put the text through GitHub's own GFM endpoint
+  before claiming a PR body, issue comment or `docs/` page renders a certain way
+  — `gh api -X POST markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line
+  silently ends a table, and the row you claimed becomes a paragraph of literal
+  pipes (#926).
   **That endpoint is blind to a `mermaid` fence**, and so is a browser: GFM returns every
   such fence as a syntax-highlighted `<pre>` — byte-for-byte the raw-DSL failure you are
   checking for — while GitHub's own file viewer renders it in a cross-origin sandboxed

@@ -359,6 +359,11 @@ is wrong.
 
 ```sh
 git fetch origin +refs/pull/<n>/head:refs/tmp/pr<n>
+# the second fetch is load-bearing: an explicit refspec does NOT move origin/main, and a
+# long-lived worktree's copy dates from session start. Merge-basing against a stale one
+# returns the PREVIOUS rebase's target — a valid, correctly-subjected ancestor, and the
+# exact wrong baseline this section exists to catch.
+git fetch origin main
 BASE=$(git merge-base refs/tmp/pr<n> origin/main)   # the ONLY baseline an isolation claim may cite
 git diff --stat "$BASE"..refs/tmp/pr<n> | tail -1
 ```
