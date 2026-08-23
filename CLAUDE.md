@@ -275,6 +275,13 @@ compiles.
   the fixtures all carry one incidental constant (four WIP caps, all `review` or
   `in-progress`, none on the status rows are born into) and the axis the
   redesign made load-bearing has no witness (#1182).
+  A mutation is evidence only if it LANDED: a `sed`/`node -e` edit whose anchor
+  matches nothing exits 0 and the suite then passes for the wrong reason, which reads
+  exactly like coverage. Assert the mutation is present — anchor count, or a diff
+  against the pre-mutation blob — and abort rather than record a run you did not
+  produce; the CRLF trap under *Running these in an agent worktree* is one way the
+  anchor silently misses. Signature: the pre- and post-mutation runs report identical
+  pass counts (#1297).
 - **An absence-only assertion needs a positive control, and the vacuity is a SHAPE.**
   `is_empty()`, `!contains(…)`, "renders nothing" — each passes just as well when the
   mechanism never ran at all. Pin first that it DID (`fired.len() == 1`, `scanned > 0`
@@ -282,6 +289,11 @@ compiles.
   for the same shape: the site a review names is rarely the only one. Signature: fixing
   a vacuous-test finding uncovers its twin one test over, green against an empty scan
   (#1209).
+  A positive control proves the mechanism RAN, never that it SAW every subject: where it
+  guards a pattern over a population, put the raw-count cross-check under *Every number in
+  a PR body* in the assertion itself, where it fires on a blind instrument without anyone
+  thinking to mutate the one subject it cannot see. Signature: one field renamable alone
+  while a guard already carrying a vacuity control stays green (#1297, `test/reposlug.test.ts`).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
@@ -402,7 +414,9 @@ narrow their ask back down to the original ticket on your own judgment.
   delimiters and cross-check the total against a raw count of the container. Signature:
   two totals stated confidently and both light by exactly one, from a `([a-z-]+)` that
   stops dead at the digit in a real value (`no-sha256`) — a census that cannot see one
-  of its own subjects is not a census (#1209).
+  of its own subjects is not a census (#1209). Build the pattern from what a token may
+  CONTAIN (a fact), never from what may FOLLOW it (unbounded prose): the second instance
+  was a follow-class omitting `#`, blinding a guard to `…/loomux#readme` (#1297).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
   and work merged meanwhile authors fresh instances of the string you removed — a live
