@@ -140,6 +140,10 @@ use loomux_lib::orchestration::{
     attention_tail, ATTENTION_SCAN_BYTES,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     blocking_ancestor, board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
+    // #1272/#1273: the derived board-level sprint, the agent-facing
+    // projection both new fields had to be classified into, and the
+    // closed link vocabulary the tool schema is pinned against.
+    agent_task_view, current_sprint, TaskLink, TASK_LINK_TYPES,
     TASK_STATUSES,
     // #1156: the strict Agile ladder, pinned against Rust literals here
     // (`the_ladder_table_is_pinned_on_the_rust_side`) and against the board's
@@ -9639,6 +9643,8 @@ fn task_summary_drops_notes_but_counts_them() {
         related: vec![],
         parent: None,
         kind: None,
+        sprint: None,
+        links: vec![],
         demo_path: None,
         cleared_ms: None,
         updated_ms: 42,
@@ -10102,6 +10108,8 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
         related: related.iter().map(|s| s.to_string()).collect(),
         parent: None,
         kind: None,
+        sprint: None,
+        links: vec![],
         demo_path: None,
         cleared_ms: None,
         updated_ms: 0,
@@ -54774,3 +54782,479 @@ fn a_manager_may_raise_a_needs_you_item_but_may_not_withdraw_one() {
     assert!(q_text(&denied).contains("orchestrator-only"), "{}", q_text(&denied));
 }
 
+
+// ---------------------------------------------------------------------------
+// Sprints (#1272) and typed grounding links (#1273) — one combined additive
+// board-model revision. See doc/design/board-sprints-and-links.md.
+// ---------------------------------------------------------------------------
+
+/// A `sprint`-only patch, the shape most sprint edits take.
+fn sprint_patch(sprint: u32) -> TaskPatch {
+    TaskPatch { sprint: Some(sprint), ..Default::default() }
+}
+
+/// A `links`-only patch.
+fn links_patch(links: Vec<TaskLink>) -> TaskPatch {
+    TaskPatch { links: Some(links), ..Default::default() }
+}
+
+/// One link, spelled compactly.
+fn link(link_type: &str, target: &str, label: Option<&str>) -> TaskLink {
+    TaskLink {
+        link_type: link_type.into(),
+        target: target.into(),
+        label: label.map(String::from),
+    }
+}
+
+/// A `Task` literal carrying a sprint, for the pure `current_sprint` function.
+fn sprinted(id: &str, status: &str, sprint: Option<u32>) -> Task {
+    let mut t = linked(id, status, &[], &[]);
+    t.sprint = sprint;
+    t
+}
+
+/// The #582 byte-compat guarantee, EXTENDED to #1272/#1273: both new fields are
+/// additive, so a board written before they existed loads unchanged, and a
+/// board that uses neither never grows the keys on rewrite.
+///
+/// This test IS the migration story. There is no migration pass and none is
+/// planned — the documented compat edge is an OLDER loomux reading a newer file
+/// and dropping the unknown fields on its next write, which is only acceptable
+/// while a board not using them is byte-identical either way.
+#[test]
+fn pre_1272_boards_load_unchanged_and_sprintless_linkless_boards_stay_that_way() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(g.id.as_str()).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Exactly what loomux wrote before #1272/#1273 — no sprint key, no links key.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"done","issue":"#7","pr":null,"assignee":"w-2","session":null,"notes":[],"updated_ms":11},
+  {"id":"t-2","title":"Wire it up","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"updated_ms":12}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 2, "a pre-#1272 board must still load — a parse failure reads as an EMPTY board");
+    assert!(
+        tasks.iter().all(|t| t.sprint.is_none() && t.links.is_empty()),
+        "absent sprint/links deserialize to None/empty, not an error"
+    );
+    // The derived board-level answer on a board that never heard of sprints.
+    assert_eq!(current_sprint(&tasks), None, "a sprintless board has no current sprint");
+
+    // A rewrite must not GAIN either key — that is what keeps an older loomux
+    // (and a human reading the file) seeing exactly what it saw before.
+    reg.upsert_task(&g.id, "orch", Some("t-2"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"sprint\""), "a sprintless board must not gain a sprint key:\n{text}");
+    assert!(!text.contains("\"links\""), "...nor a links key:\n{text}");
+}
+
+/// Sprint set / clear-via-0 / refuse the values that are not sprints, and
+/// persist across a reload.
+#[test]
+fn sprint_writes_set_clear_and_survive_a_reload() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b"]);
+
+    let t = reg.upsert_task(&gid, "orch", Some("t-1"), sprint_patch(3)).unwrap();
+    assert_eq!(t.sprint, Some(3), "an integer >= 1 assigns");
+
+    // Omitting the field leaves it alone — the #582 untouched rule.
+    let t = reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, None, Some("unrelated"))).unwrap();
+    assert_eq!(t.sprint, Some(3), "a patch that omits sprint must not clear it");
+
+    // ZERO is the clear, not an invalid sprint: the numeric counterpart of the
+    // empty string on `pr`/`kind`.
+    let t = reg.upsert_task(&gid, "orch", Some("t-1"), sprint_patch(0)).unwrap();
+    assert_eq!(t.sprint, None, "0 clears the row back to the backlog");
+
+    // Non-contiguous and not-starting-at-1 are both legal: there is no
+    // board-level invariant about which numbers are in use.
+    reg.upsert_task(&gid, "orch", Some("t-1"), sprint_patch(7)).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-2"), sprint_patch(42)).unwrap();
+
+    // Survives a restart — it is stored on the row, not derived.
+    let reg2 = relaunch_registry(reg.state_root());
+    let tasks = reg2.tasks(&gid);
+    assert_eq!(tasks[0].sprint, Some(7));
+    assert_eq!(tasks[1].sprint, Some(42));
+    assert_eq!(current_sprint(&tasks), Some(7));
+}
+
+/// `current_sprint` is derived, and the roll-over-is-explicit rule is the part
+/// that has to be pinned: a BLOCKED row holds its sprint open.
+#[test]
+fn current_sprint_is_derived_and_a_blocked_row_holds_it_open() {
+    // Lowest sprint on a non-done row.
+    let board = vec![
+        sprinted("t-1", "done", Some(1)),
+        sprinted("t-2", "queued", Some(2)),
+        sprinted("t-3", "queued", Some(3)),
+    ];
+    assert_eq!(current_sprint(&board), Some(2), "sprint 1 is fully done, so 2 is current");
+
+    // None when unused — three distinct ways, all of which must read None.
+    assert_eq!(current_sprint(&[]), None, "an empty board");
+    assert_eq!(
+        current_sprint(&[sprinted("t-1", "queued", None), sprinted("t-2", "blocked", None)]),
+        None,
+        "a board that runs no sprints"
+    );
+    assert_eq!(
+        current_sprint(&[sprinted("t-1", "done", Some(1)), sprinted("t-2", "done", Some(2))]),
+        None,
+        "every sprint finished — None, not the highest number seen"
+    );
+
+    // THE LOAD-BEARING CASE (#1272): a blocked sprint-1 row HOLDS the sprint at
+    // 1. A sprint completes only when its last open row LEAVES it, never
+    // because the remaining work looked stuck — roll-over is always an
+    // explicit, audited row write. If this ever reads 2, the board has silently
+    // decided a sprint was over.
+    let held = vec![
+        sprinted("t-1", "done", Some(1)),
+        sprinted("t-2", "blocked", Some(1)),
+        sprinted("t-3", "queued", Some(2)),
+    ];
+    assert_eq!(current_sprint(&held), Some(1), "a blocked row keeps sprint 1 current");
+
+    // Every non-done status holds it, not just `blocked`.
+    for status in ["queued", "in-progress", "review", "pr", "prototype", "human-testing", "blocked"] {
+        let b = vec![sprinted("t-1", status, Some(1)), sprinted("t-2", "queued", Some(2))];
+        assert_eq!(current_sprint(&b), Some(1), "a row at {status} must hold sprint 1 current");
+    }
+    // `done` — and only `done` — releases it, matching `dep_satisfied`.
+    let released = vec![sprinted("t-1", "done", Some(1)), sprinted("t-2", "queued", Some(2))];
+    assert_eq!(current_sprint(&released), Some(2), "done releases the sprint");
+}
+
+/// SPRINT GATES NOTHING. `ready` is a projection of status + deps + ancestors'
+/// deps, and no sprint value on any row may change it.
+#[test]
+fn ready_is_unchanged_by_every_sprint_value() {
+    // A queued, dep-free row is ready whatever sprint it sits in — including
+    // none, a low one, and one far ahead of the rest of the board.
+    for sprint in [None, Some(1), Some(2), Some(99)] {
+        let board = vec![sprinted("t-1", "queued", sprint)];
+        assert!(task_ready(&board[0], &board), "sprint {sprint:?} must not gate readiness");
+    }
+
+    // And a row blocked by an unmet dep stays blocked whatever sprint it is in
+    // — a sprint assignment can never RELEASE work either, which is the
+    // direction that would actually be dangerous.
+    for sprint in [None, Some(1), Some(99)] {
+        let mut dep = linked("t-1", "queued", &[], &[]);
+        dep.sprint = Some(1);
+        let mut row = linked("t-2", "queued", &["t-1"], &[]);
+        row.sprint = sprint;
+        let board = vec![dep, row];
+        assert!(
+            !task_ready(&board[1], &board),
+            "sprint {sprint:?} must not release a row whose dep is unmet"
+        );
+    }
+
+    // The sprint the row is in vs. the board's current sprint: neither being
+    // "the current sprint" nor being far ahead of it changes readiness.
+    let board = vec![sprinted("t-1", "queued", Some(1)), sprinted("t-2", "queued", Some(9))];
+    assert_eq!(current_sprint(&board), Some(1));
+    assert!(task_ready(&board[1], &board), "a row outside the current sprint is still READY — sprint is a hint, not a gate");
+}
+
+/// Link writes: replace / untouched / clear, the closed vocabulary, the caps,
+/// and the board-task misuse guard.
+#[test]
+fn link_writes_are_validated_normalized_and_replace_wholesale() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b"]);
+
+    let ok = reg
+        .upsert_task(
+            &gid,
+            "orch",
+            Some("t-1"),
+            links_patch(vec![
+                link("requirement", "#1272", Some("the sprint ask")),
+                link("design-note", "doc/design/board-sprints-and-links.md", None),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(ok.links.len(), 2);
+    assert_eq!(ok.links[0].link_type, "requirement");
+    assert_eq!(ok.links[0].target, "#1272");
+    assert_eq!(ok.links[0].label.as_deref(), Some("the sprint ask"));
+    assert_eq!(ok.links[1].label, None, "a link may carry no label");
+
+    // Omit = untouched; [] = clear. The #582 array rule, unchanged.
+    let t = reg.upsert_task(&gid, "orch", Some("t-1"), patch(None, None, Some("unrelated"))).unwrap();
+    assert_eq!(t.links.len(), 2, "a patch that omits links must not clear them");
+    let t = reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![])).unwrap();
+    assert!(t.links.is_empty(), "[] clears the array");
+
+    // Closed vocabulary, validated like `status`/`kind`.
+    let err = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("blueprint", "#1", None)]))
+        .unwrap_err();
+    assert!(err.contains("blueprint"), "the rejection names the bad type: {err}");
+    assert!(err.contains("requirement"), "...and lists the vocabulary: {err}");
+
+    // Empty and oversize targets.
+    let err = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("doc", "   ", None)]))
+        .unwrap_err();
+    assert!(err.contains("non-empty target"), "an empty target is refused: {err}");
+    let long = "x".repeat(513);
+    let err = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("doc", &long, None)]))
+        .unwrap_err();
+    assert!(err.contains("too long"), "an oversize target is refused: {err}");
+    let long_label = "y".repeat(121);
+    let err = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("doc", "README.md", Some(&long_label))]))
+        .unwrap_err();
+    assert!(err.contains("label too long"), "an oversize label is refused: {err}");
+
+    // Over the per-task cap.
+    let many: Vec<TaskLink> = (0..33).map(|i| link("link", &format!("#{i}"), None)).collect();
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(many)).unwrap_err();
+    assert!(err.contains("too many links"), "the cap is enforced: {err}");
+
+    // Nothing a rejection touched was written.
+    assert!(
+        reg.get_task(&gid, "t-1").unwrap().links.is_empty(),
+        "a refused link write must leave the board exactly as it was"
+    );
+
+    // Normalization: trim, and an empty label stores as ABSENT rather than "".
+    let t = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("spec", "  README.md  ", Some("  "))]))
+        .unwrap();
+    assert_eq!(t.links[0].target, "README.md", "target is trimmed");
+    assert_eq!(t.links[0].label, None, "a blank label is stored as absent, one spelling for 'no label'");
+}
+
+/// The misuse guard: a `links` target naming a live task on THIS board is
+/// refused, and the error TEACHES — it names `deps`/`related`, which is what
+/// the caller actually wanted.
+#[test]
+fn a_links_target_naming_a_live_board_task_is_refused_and_names_deps_related() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b"]);
+
+    let err = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("link", "t-2", None)]))
+        .unwrap_err();
+    assert!(err.contains("t-2"), "the rejection names the offending target: {err}");
+    assert!(err.contains("deps"), "the error points at `deps`: {err}");
+    assert!(err.contains("related"), "...and at `related`: {err}");
+
+    // A self-reference is the same mistake and is refused by the same rule —
+    // no separate self-link check is needed, because the row is on the board.
+    let err = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("link", "t-1", None)]))
+        .unwrap_err();
+    assert!(err.contains("t-1"), "a self-referencing link target is refused too: {err}");
+
+    // A target that merely LOOKS like a task id but names no live task is
+    // fine: links are external, and this guard is about steering a real
+    // misuse, not about reserving a string shape.
+    let t = reg
+        .upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("link", "t-404", None)]))
+        .unwrap();
+    assert_eq!(t.links[0].target, "t-404", "an id-shaped target naming nothing is not the misuse this guards");
+
+    // And a link is NOT stripped when the task it accidentally names is later
+    // deleted — `links` is deliberately outside the #582 delete-strip, because
+    // an external target that coincidentally looks like a task id still points
+    // where it always pointed.
+    reg.upsert_task(&gid, "orch", Some("t-1"), links_patch(vec![link("doc", "#7", None)])).unwrap();
+    reg.delete_task(&gid, "orch", "t-2").unwrap();
+    let t = reg.get_task(&gid, "t-1").unwrap();
+    assert_eq!(t.links.len(), 1, "a delete does not touch grounding links");
+    assert_eq!(t.links[0].target, "#7");
+}
+
+/// `list_tasks` rows carry both fields (skipped when unused), the reply gains a
+/// top-level `current_sprint`, and `get_task` carries both.
+#[test]
+fn list_and_get_carry_sprint_and_links_and_skip_them_when_unused() {
+    let board = vec![
+        {
+            let mut t = linked("t-1", "queued", &[], &[]);
+            t.sprint = Some(2);
+            t.links = vec![link("requirement", "#1273", Some("the ask"))];
+            t
+        },
+        linked("t-2", "queued", &[], &[]),
+    ];
+    let rows = board_summaries(&board);
+
+    let row = serde_json::to_value(&rows[0]).unwrap();
+    assert_eq!(row["sprint"], json!(2));
+    assert_eq!(row["links"][0]["type"], json!("requirement"), "the wire spelling is `type`, not `link_type`");
+    assert_eq!(row["links"][0]["target"], json!("#1273"));
+    assert_eq!(row["links"][0]["label"], json!("the ask"));
+
+    // A row using neither pays for neither.
+    let plain = serde_json::to_value(&rows[1]).unwrap();
+    assert!(
+        plain.get("sprint").is_none() && plain.get("links").is_none(),
+        "an unused sprint/links must be omitted entirely: {plain}"
+    );
+
+    // A label-less link omits the key rather than writing null.
+    let one = vec![{
+        let mut t = linked("t-3", "queued", &[], &[]);
+        t.links = vec![link("doc", "README.md", None)];
+        t
+    }];
+    let r = serde_json::to_value(&board_summaries(&one)[0]).unwrap();
+    assert!(r["links"][0].get("label").is_none(), "an absent label is omitted, not null: {r}");
+
+    // get_task's projection carries both — the AgentTaskView exhaustive
+    // destructure is what forced them to be classified at all (#1160).
+    let view = serde_json::to_value(agent_task_view(&board[0])).unwrap();
+    assert_eq!(view["sprint"], json!(2), "get_task exposes the sprint");
+    assert_eq!(view["links"][0]["type"], json!("requirement"), "get_task exposes the links");
+    let plain_view = serde_json::to_value(agent_task_view(&board[1])).unwrap();
+    assert!(
+        plain_view.get("sprint").is_none() && plain_view.get("links").is_none(),
+        "and skips both when unused: {plain_view}"
+    );
+}
+
+/// The MCP surface end to end: the strict parsers refuse wrong-typed values
+/// rather than silently dropping them, the write lands, and the `list_tasks`
+/// reply carries the derived `current_sprint`.
+#[test]
+fn sprint_and_links_round_trip_through_the_mcp_shim() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let call = |c: &Caller, args: Value| {
+        dispatch(&reg, c, "tools/call", &json!({ "name": "upsert_task", "arguments": args })).unwrap()
+    };
+    let text_of = |r: &Value| r["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    call(&co, json!({ "title": "migrate schema" }));
+    call(&co, json!({ "title": "consume schema" }));
+
+    // Both fields parse and land in one call.
+    let ok = call(
+        &co,
+        json!({
+            "id": "t-1",
+            "sprint": 2,
+            "links": [
+                { "type": "requirement", "target": "#1272", "label": "the sprint ask" },
+                { "type": "doc", "target": "docs/orchestration.md" }
+            ]
+        }),
+    );
+    assert_eq!(ok["isError"], false, "the write should land: {}", text_of(&ok));
+    let t = reg.get_task(&co.group, "t-1").unwrap();
+    assert_eq!(t.sprint, Some(2));
+    assert_eq!(t.links.len(), 2);
+    assert_eq!(t.links[0].link_type, "requirement");
+    assert_eq!(t.links[1].label, None, "a link may carry no label");
+
+    // list_tasks — readable by ANY role — carries both on the row and the
+    // derived current_sprint at the top level.
+    let listed = dispatch(&reg, &cw, "tools/call", &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let rows = text_of(&listed);
+    assert!(rows.contains(r#""sprint":2"#), "compact rows carry the sprint: {rows}");
+    assert!(rows.contains(r#""type":"requirement""#), "...and the links, spelled `type` on the wire: {rows}");
+    assert!(rows.contains(r#""current_sprint":2"#), "the reply carries the derived current sprint: {rows}");
+
+    // The key is ALWAYS present, so "no sprints" never has to be told apart
+    // from "the field is missing" — the `wip` precedent.
+    call(&co, json!({ "id": "t-1", "sprint": 0 }));
+    let listed = dispatch(&reg, &cw, "tools/call", &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let rows = text_of(&listed);
+    assert!(rows.contains(r#""current_sprint":null"#), "null when no open row carries a sprint: {rows}");
+    assert!(!rows.contains(r#""sprint":0"#), "0 is the clear — it is never stored: {rows}");
+
+    // A registry rejection surfaces as a tool error WITH the reason.
+    let misuse = call(&co, json!({ "id": "t-1", "links": [{ "type": "link", "target": "t-2" }] }));
+    assert_eq!(misuse["isError"], true);
+    let msg = text_of(&misuse);
+    assert!(msg.contains("deps"), "the teaching error survives the shim: {msg}");
+    assert!(msg.contains("related"), "...naming both board-link fields: {msg}");
+}
+
+/// Wrong-typed sprint/links args are REFUSED, not silently dropped — the same
+/// call `parent`/`kind` made, for the same reason: a caller told the write
+/// worked while the board disagrees is the worse failure of the two.
+#[test]
+fn wrong_typed_sprint_and_link_args_are_refused_not_silently_dropped() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let call = |args: Value| {
+        dispatch(&reg, &co, "tools/call", &json!({ "name": "upsert_task", "arguments": args })).unwrap()
+    };
+    call(json!({ "title": "a" }));
+
+    for v in [json!(-1), json!(1.5), json!("3"), json!(true), json!([1])] {
+        assert_eq!(
+            call(json!({ "id": "t-1", "sprint": v }))["isError"],
+            true,
+            "sprint {v} must be refused, not dropped"
+        );
+    }
+    assert!(reg.get_task(&co.group, "t-1").unwrap().sprint.is_none(), "no refused write landed");
+
+    // Zero is NOT wrong-typed — it is the documented clear, and must pass the
+    // parser to reach the registry.
+    assert_eq!(call(json!({ "id": "t-1", "sprint": 0 }))["isError"], false, "0 is the clear, not a type error");
+
+    for v in [
+        json!("#1"),                                            // not an array
+        json!([1]),                                             // not an object
+        json!(["#1"]),                                          // a bare string is not a link
+        json!([{ "target": "#1" }]),                            // missing type
+        json!([{ "type": "doc" }]),                             // missing target
+        json!([{ "type": "doc", "target": "#1", "label": 7 }]), // non-string label
+    ] {
+        assert_eq!(call(json!({ "id": "t-1", "links": v }))["isError"], true, "links {v} must be refused");
+    }
+    assert!(reg.get_task(&co.group, "t-1").unwrap().links.is_empty(), "no refused link write landed");
+}
+
+/// The tool schema has to ADMIT the clear it documents — the same guard
+/// `the_upsert_task_schema_admits_the_kind_clear_it_documents` applies to
+/// `kind`'s empty string. A schema whose `minimum` excluded 0 would make the
+/// documented affordance unreachable for a client that enforces the schema.
+#[test]
+fn the_upsert_task_schema_admits_the_sprint_clear_it_documents() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let tools = listed["tools"].as_array().expect("tools array");
+    let upsert = tools
+        .iter()
+        .find(|t| t["name"] == json!("upsert_task"))
+        .expect("upsert_task is listed for an orchestrator");
+
+    let sprint = &upsert["inputSchema"]["properties"]["sprint"];
+    assert_eq!(sprint["type"], json!("integer"), "an integer, so 1.5 is refused by the schema too");
+    assert_eq!(
+        sprint["minimum"],
+        json!(0),
+        "minimum must be 0, not 1: 0 is the CLEAR, and a client enforcing the schema could \
+         otherwise never reach the affordance the description documents"
+    );
+    let desc = sprint["description"].as_str().unwrap_or_default();
+    assert!(desc.contains("CLEARS"), "the description documents the clear: {desc}");
+
+    let links = &upsert["inputSchema"]["properties"]["links"];
+    assert_eq!(links["type"], json!("array"));
+    let vocab = links["items"]["properties"]["type"]["enum"].as_array().expect("a closed type vocabulary");
+    let vocab: Vec<&str> = vocab.iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(
+        vocab,
+        TASK_LINK_TYPES.to_vec(),
+        "the schema's vocabulary must BE the backend's TASK_LINK_TYPES, not a copy that can drift"
+    );
+}
