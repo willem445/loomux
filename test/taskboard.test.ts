@@ -67,9 +67,13 @@ import {
   boardUsesLinks,
   boardUsesSprints,
   currentSprint,
+  BACKLOG_SPRINT,
   LINK_TYPES,
   linkTargetKind,
+  MAX_SPRINT,
   rollOverSet,
+  sprintAdvance,
+  sprintFilterChoices,
   sprintProgress,
 } from "../src/taskboard.ts";
 
@@ -1543,6 +1547,53 @@ test("rollOverSet is every NON-done row in the sprint, in board order", () => {
   assert.deepEqual(rollOverSet(board, 3), [], "a sprint with nothing open moves nothing");
 });
 
+test("sprintAdvance reports the SAME rows the dialog shows and the number it names", () => {
+  // One function feeds both the confirm list and the writes, so the list the
+  // human approved cannot differ from what is recorded. This test is the
+  // statement of that: `rows` is `rollOverSet` and `to` travels with it.
+  const board = [
+    sprintRow("t-1", "done", 2),
+    sprintRow("t-2", "blocked", 2),
+    sprintRow("t-3", "queued", 2),
+    sprintRow("t-4", "queued", 5),
+  ];
+  const plan = sprintAdvance(board, 2);
+  assert.equal(plan.to, 3, "one step on, never the next number already in use");
+  assert.deepEqual(
+    plan.rows.map((t) => t.id),
+    rollOverSet(board, 2).map((t) => t.id),
+    "the rows are rollOverSet's, not a second reading of the board"
+  );
+  // The gap case, stated on its own because it is the tempting alternative:
+  // sprint 5 exists and is NOT where sprint 2's leftovers land. Parking planned
+  // work in a later number must not make that number absorb a roll-over.
+  assert.equal(sprintAdvance(board, 2).to, 3);
+  assert.deepEqual(sprintAdvance(board, 5).to, 6);
+});
+
+test("sprintAdvance refuses when there is no next sprint to land in", () => {
+  // Fail closed rather than composing a write the backend must reject: `sprint`
+  // is a u32 on both wire paths, so MAX_SPRINT + 1 cannot be stored.
+  const stuck = [sprintRow("t-1", "queued", MAX_SPRINT)];
+  const plan = sprintAdvance(stuck, MAX_SPRINT);
+  assert.equal(plan.to, null, "no sprint exists after the last one a u32 can hold");
+  assert.deepEqual(
+    plan.rows.map((t) => t.id),
+    ["t-1"],
+    "the stuck rows are still reported, so a caller can say what cannot move"
+  );
+  // One below the cap still advances — the refusal is the boundary, not a
+  // band of numbers near it.
+  assert.equal(sprintAdvance([sprintRow("t-1", "queued", MAX_SPRINT - 1)], MAX_SPRINT - 1).to, MAX_SPRINT);
+  // A `from` that is not a sprint at all cannot produce one. Unreachable from
+  // the board (the caller passes `currentSprint`'s own output), which is why it
+  // is pinned: an unreachable path that silently returned `1` would put rows
+  // into a sprint nobody asked for the first time it became reachable.
+  assert.equal(sprintAdvance([], 0).to, null);
+  assert.equal(sprintAdvance([], -3).to, null);
+  assert.equal(sprintAdvance([], 1.5).to, null);
+});
+
 test("linkTargetKind classifies issue refs, URLs and repo paths", () => {
   assert.equal(linkTargetKind("#123"), "issue");
   assert.equal(linkTargetKind("  #7  "), "issue", "trimmed");
@@ -1578,6 +1629,55 @@ test("boardUsesSprints / boardUsesLinks gate the chrome on actual use", () => {
   assert.equal(
     boardUsesLinks([{ id: "t-1", status: "queued", links: [{ type: "doc", target: "README.md" }] }]),
     true
+  );
+});
+
+test("the board's status vocabulary is the backend's, read out of the Rust source", () => {
+  // #1321, the twin #1300's review named: `STATUSES` was a TRANSCRIPTION of
+  // `TASK_STATUSES`, so a ninth status added on the backend would have been
+  // refused by no test and offered by no picker — the frontend half of the
+  // set-widening hazard #1300 closed on its own side. Same guard shape as
+  // `TASK_LINK_TYPES` below and the ladder table above: read the Rust const,
+  // never restate it.
+  //
+  // This vocabulary is load-bearing in more places than the pickers it feeds:
+  // `isAwaitingHuman`, `isDemoGated`, `canApprove` and `taskActivityState` are
+  // all swept over `STATUSES` by the tests in this file, so a status the board
+  // has never heard of is a status none of those sweeps ever judges.
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const start = src.indexOf("pub const TASK_STATUSES");
+  assert.notEqual(
+    start,
+    -1,
+    "TASK_STATUSES is gone or renamed in mod.rs — this guard reads it by name, so update it " +
+      "here rather than deleting the only thing pinning the two vocabularies together"
+  );
+  const end = src.indexOf("];", start);
+  assert.notEqual(end, -1, "could not find the end of TASK_STATUSES");
+  const body = src.slice(start, end);
+  // Quoted strings only. The declaration's trailing `//` comments are prose
+  // ("planned, not started") and carry no quotes, so they cannot contribute a
+  // phantom status.
+  const rust = [...body.matchAll(/"([a-z-]+)"/g)].map(([, s]) => s);
+  assert.ok(rust.length > 0, `no statuses could be parsed out of TASK_STATUSES. Body was:\n${body}`);
+  // The same cross-check the link-type guard carries, for the same reason: the
+  // character class is a GUESS about the alphabet of its own subjects, and a
+  // future status carrying a digit or an underscore would be dropped silently,
+  // leaving a short list compared against a short list. The declared length
+  // cannot be fooled that way.
+  const declared = body.match(/\[&str;\s*(\d+)\]/);
+  assert.ok(declared, `could not read TASK_STATUSES' declared length. Body was:\n${body}`);
+  assert.equal(
+    rust.length,
+    Number(declared[1]),
+    `the parser found ${rust.length} statuses but the Rust array declares ${declared[1]} — ` +
+      `the regex cannot see one of its own subjects, so this guard is not comparing what it thinks`
+  );
+  assert.deepEqual(
+    [...STATUSES],
+    rust,
+    "the board's STATUSES must equal the backend's TASK_STATUSES, in the same order — the " +
+      "order is the picker's order, so a reshuffle on one side is a reshuffle in the UI"
   );
 });
 
@@ -1633,13 +1733,22 @@ test("the board's link-type vocabulary is the backend's, read out of the Rust so
  *  a title-less row still being filterable. */
 const frow = (
   id: string,
-  fields: { status?: string; parent?: string; kind?: string; title?: string } = {}
+  fields: {
+    status?: string;
+    parent?: string;
+    kind?: string;
+    title?: string;
+    sprint?: number;
+  } = {}
 ) => ({
   id,
   status: fields.status ?? "queued",
   ...(fields.parent === undefined ? {} : { parent: fields.parent }),
   ...(fields.kind === undefined ? {} : { kind: fields.kind }),
   ...(fields.title === undefined ? {} : { title: fields.title }),
+  // Omitted, not null, on a backlog row — the shape the backend serializes,
+  // and the one `sprintFilterValue` has to read as the backlog.
+  ...(fields.sprint === undefined ? {} : { sprint: fields.sprint }),
 });
 
 /** `NO_FILTER` with one family armed — so each test states only the family it
@@ -1651,6 +1760,8 @@ test("every filter family arms the board, and blank text does not", () => {
   assert.equal(filterActive(NO_FILTER), false);
   assert.equal(filterActive(filterOf({ kind: ["epic"] })), true);
   assert.equal(filterActive(filterOf({ status: ["blocked"] })), true);
+  assert.equal(filterActive(filterOf({ sprint: ["2"] })), true);
+  assert.equal(filterActive(filterOf({ sprint: [BACKLOG_SPRINT] })), true);
   assert.equal(filterActive(filterOf({ text: "auth" })), true);
   assert.equal(filterActive(filterOf({ attention: true })), true);
   // A search box the human tabbed through and left holding spaces must not
@@ -1691,6 +1802,97 @@ test("a hand-edited out-of-vocabulary kind still gets a chip, so no row is unrea
     ...KINDS,
     UNLABELLED_KIND,
   ]);
+});
+
+test("the sprint chips are the numbers the board carries, ascending, with backlog last", () => {
+  // Derived from the board and not from `1..max`, for `current_sprint`'s own
+  // reason (design note §5): numbers need not be contiguous or start at 1, so a
+  // range would offer chips matching nothing. Ascending because a sprint number
+  // IS an ordering — board order would shuffle `1 2 3` by whichever row is on
+  // top.
+  const board = [
+    frow("t-1", { sprint: 3 }),
+    frow("t-2", { sprint: 1 }),
+    frow("t-3"),
+    frow("t-4", { sprint: 3 }),
+  ];
+  assert.deepEqual(sprintFilterChoices(board), ["1", "3", BACKLOG_SPRINT]);
+  // The backlog chip exists on every board, including one where no row is in
+  // the backlog right now — the bucket is what the chip names, not its
+  // current occupancy. Same rule `unlabelled` follows for kinds.
+  assert.deepEqual(sprintFilterChoices([frow("t-1", { sprint: 2 })]), ["2", BACKLOG_SPRINT]);
+  assert.deepEqual(sprintFilterChoices([]), [BACKLOG_SPRINT]);
+});
+
+test("the backlog chip catches every row the backend serializes without a sprint", () => {
+  // Three spellings of "no sprint" reach this predicate: the key absent (what
+  // `skip_serializing_if` writes), an explicit null, and a hand-edited
+  // non-number. All are the backlog — and absent must NEVER read as sprint 0,
+  // which is the backend's CLEAR and not a sprint anybody can be in.
+  const absent = frow("t-1");
+  const nulled = { id: "t-2", status: "queued", sprint: null };
+  const junk = { id: "t-3", status: "queued", sprint: "2" as unknown as number };
+  const backlog = filterOf({ sprint: [BACKLOG_SPRINT] });
+  assert.equal(matchesFilter(absent, backlog), true);
+  assert.equal(matchesFilter(nulled, backlog), true);
+  assert.equal(matchesFilter(junk, backlog), true, "a hand-edited string is not sprint 2");
+  assert.equal(matchesFilter(junk, filterOf({ sprint: ["2"] })), false);
+  // And the counter-direction: `0` on a row would be a value no chip offers, so
+  // it must not silently land on the backlog either — it renders as its own
+  // chip and stays reachable, the way an out-of-vocabulary kind does.
+  const zero = frow("t-4", { sprint: 0 });
+  assert.equal(matchesFilter(zero, backlog), false);
+  assert.deepEqual(sprintFilterChoices([zero]), ["0", BACKLOG_SPRINT]);
+});
+
+test("the sprint family is OR within itself and AND across the others", () => {
+  const board = [
+    frow("t-1", { sprint: 1, status: "queued" }),
+    frow("t-2", { sprint: 2, status: "blocked" }),
+    frow("t-3", { sprint: 2, status: "queued" }),
+    frow("t-4", { status: "blocked" }),
+  ];
+  const matching = (f: BoardFilter) => board.filter((t) => matchesFilter(t, f)).map((t) => t.id);
+  assert.deepEqual(matching(filterOf({ sprint: ["1", "2"] })), ["t-1", "t-2", "t-3"], "OR within");
+  assert.deepEqual(
+    matching(filterOf({ sprint: ["2"], status: ["blocked"] })),
+    ["t-2"],
+    "AND across: sprint 2 AND blocked, not either"
+  );
+  assert.deepEqual(
+    matching(filterOf({ sprint: [BACKLOG_SPRINT], status: ["blocked"] })),
+    ["t-4"]
+  );
+  // The negative control: a filter cannot pass by simply not being consulted.
+  // If the sprint clause were dropped from `matchesFilter`, this would return
+  // the whole board rather than nothing.
+  assert.deepEqual(matching(filterOf({ sprint: ["9"] })), []);
+});
+
+test("a sprint match brings its containers with it, through the one filter seam", () => {
+  // The sprint family is a key in `BoardFilter`, not a second mechanism, so it
+  // inherits #1270's ancestor-visibility rule for free. That is the property
+  // worth pinning: a story in sprint 2 inside a feature in no sprint at all
+  // still renders under its feature, with the feature marked as context rather
+  // than as a hit. A parallel sprint-only filter path would have had to
+  // re-implement this, and would have got it subtly different.
+  const board = [
+    frow("t-1", { kind: "epic" }),
+    frow("t-2", { kind: "feature", parent: "t-1" }),
+    frow("t-3", { kind: "story", parent: "t-2", sprint: 2 }),
+    frow("t-4", { kind: "story", parent: "t-2", sprint: 3 }),
+  ];
+  assert.deepEqual(
+    visibleRows(board, [], false, { filter: filterOf({ sprint: ["2"] }) }).map((r) => [
+      r.task.id,
+      r.context,
+    ]),
+    [
+      ["t-1", true],
+      ["t-2", true],
+      ["t-3", false],
+    ]
+  );
 });
 
 test("text search reads the id and the title, case-insensitively, but never across the seam", () => {

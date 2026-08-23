@@ -902,6 +902,50 @@ export function positionAmong<T extends HasId>(
  *  it (the same trick `CLEAR_KIND_CHOICE` plays in tasksview.ts). */
 export const UNLABELLED_KIND = "unlabelled";
 
+/** The `sprint` family's chip for the rows carrying no sprint at all — the
+ *  backlog (#1272). Exactly [`UNLABELLED_KIND`]'s argument, applied to the
+ *  other optional field: without it the backlog would be the one class of row
+ *  the sprint filter cannot name, and "everything that is not yet batched" is
+ *  the question a sprint board is most often asked.
+ *
+ *  A sentinel that no real value can collide with, because every real one is a
+ *  decimal number rendered by [`sprintFilterValue`] and `backlog` is not a
+ *  decimal number. Never stored on a row — the absence of `sprint` IS the
+ *  backlog, and 0 is the backend's CLEAR, not a sprint. */
+export const BACKLOG_SPRINT = "backlog";
+
+/** Which sprint chip a row answers to. The whole mapping from the wire's
+ *  `sprint?: number | null` onto the family's string vocabulary, in one place
+ *  so the chip list and the predicate cannot spell it differently.
+ *
+ *  Absent, null and a non-number all read as the backlog — the same
+ *  tolerate-and-show posture the rest of this module takes toward a
+ *  hand-edited `tasks.json`, and the reading `HasSprint`'s own doc requires:
+ *  absent is the backlog, never sprint 0. */
+export function sprintFilterValue<T extends HasSprint>(task: T): string {
+  return typeof task.sprint === "number" ? String(task.sprint) : BACKLOG_SPRINT;
+}
+
+/** The sprint chips to offer: every sprint number the board actually carries,
+ *  ascending, then [`BACKLOG_SPRINT`].
+ *
+ *  Derived from the board rather than from a range, for the reason §5 of
+ *  `board-sprints-and-links.md` gives for deriving `current_sprint`: sprint
+ *  numbers need not be contiguous and need not start at 1, so `1..max` would
+ *  offer chips that match nothing and hide nothing. Ascending and not board
+ *  order because a sprint number IS an ordering — chips reading `1 2 3` are
+ *  the sequence the board is worked in, where board order would shuffle them
+ *  by whichever row happens to sit on top.
+ *
+ *  The backlog chip comes last, and unconditionally: it is the "not batched"
+ *  bucket, which exists on every board whether or not a row is in it right
+ *  now, exactly as `unlabelled` does for kinds. */
+export function sprintFilterChoices<T extends HasSprint>(board: readonly T[]): string[] {
+  const seen = new Set<number>();
+  for (const t of board) if (typeof t.sprint === "number") seen.add(t.sprint);
+  return [...[...seen].sort((a, b) => a - b).map(String), BACKLOG_SPRINT];
+}
+
 /** The title the text filter reads. Optional like every other additive board
  *  field, so the pure helpers stay exercisable with minimal rows; absent reads
  *  as an empty title, never as "matches everything". */
@@ -922,6 +966,16 @@ export interface BoardFilter {
   kind: readonly string[];
   /** Members of `STATUSES`. */
   status: readonly string[];
+  /** Members of `sprintFilterChoices` — the decimal sprint numbers this board
+   *  actually carries, as strings, plus [`BACKLOG_SPRINT`] for the rows that
+   *  carry none (#1272).
+   *
+   *  Strings and not numbers so the family is shaped exactly like `kind` and
+   *  `status`: one array per family, persisted through `boardprefs.ts`'s
+   *  `stringList`, rendered by one `familyChip`. A number array would need its
+   *  own decoder and its own chip builder for no gain, and would still have to
+   *  invent a value for "no sprint". */
+  sprint: readonly string[];
   /** Case-insensitive substring over a row's id and title. Blank = no
    *  constraint. */
   text: string;
@@ -936,6 +990,7 @@ export interface BoardFilter {
 export const NO_FILTER: BoardFilter = Object.freeze({
   kind: Object.freeze([]) as readonly string[],
   status: Object.freeze([]) as readonly string[],
+  sprint: Object.freeze([]) as readonly string[],
   text: "",
   attention: false,
 });
@@ -953,6 +1008,7 @@ export function filterActive(filter: BoardFilter): boolean {
   return (
     filter.kind.length > 0 ||
     filter.status.length > 0 ||
+    filter.sprint.length > 0 ||
     filter.text.trim() !== "" ||
     filter.attention
   );
@@ -988,7 +1044,7 @@ export function kindFilterChoices<T extends HasParent>(board: readonly T[]): str
  *  `attention` is an opaque id set the view derives (`blockedTaskMap` +
  *  `boardMarker`) and threads in, so this module never learns what a question
  *  or a demo gate is. */
-export function matchesFilter<T extends HasParent & HasStatus & HasTitle>(
+export function matchesFilter<T extends HasParent & HasStatus & HasTitle & HasSprint>(
   task: T,
   filter: BoardFilter,
   attention: ReadonlySet<string> = NO_ATTENTION
@@ -998,6 +1054,10 @@ export function matchesFilter<T extends HasParent & HasStatus & HasTitle>(
   // becoming an invisible fifth class.
   if (filter.kind.length > 0 && !filter.kind.includes(task.kind || UNLABELLED_KIND)) return false;
   if (filter.status.length > 0 && !filter.status.includes(task.status)) return false;
+  // #1272. `sprintFilterValue`, not a second reading of the field here: the
+  // chip list is built from the same function, so a row can never answer to a
+  // chip the strip does not offer, nor fall through every chip it does.
+  if (filter.sprint.length > 0 && !filter.sprint.includes(sprintFilterValue(task))) return false;
   if (filter.attention && !attention.has(task.id)) return false;
   const needle = filter.text.trim().toLowerCase();
   if (needle) {
@@ -1514,6 +1574,43 @@ export function rollOverSet<T extends HasStatus & HasSprint>(
   sprint: number
 ): T[] {
   return board.filter((t) => t.sprint === sprint && t.status !== DONE_STATUS);
+}
+
+/** The largest sprint the backend can store: `Task::sprint` is a `u32`, and
+ *  both wire parsers decode into one (`arg_sprint`'s `as_u64` bound in mcp.rs,
+ *  serde's own `u32` decode on `orch_upsert_task`). A board sitting on it has
+ *  no next sprint to roll into, and [`sprintAdvance`] says so rather than
+ *  composing a write the backend will refuse. */
+export const MAX_SPRINT = 0xffff_ffff;
+
+/** What advancing past `from` would do: which rows move, and where they land.
+ *
+ *  ONE function, because the confirm dialog and the writes must not be able to
+ *  disagree: the list the human is shown is the list that is written, and the
+ *  number in the sentence is the number in the patch. A view deriving `to` on
+ *  its own — `from + 1` inline beside a `rollOverSet` call — is the shape the
+ *  one-rule convention names, and it fails silently in the worst direction:
+ *  the human confirms one thing and the board records another.
+ *
+ *  `to` is `from + 1` and not "the next sprint number already in use". Gaps in
+ *  the numbering are deliberate (§5 of `board-sprints-and-links.md`: numbers
+ *  need not be contiguous, so a human can park planned work in sprint 5), and
+ *  landing rolled-over rows in an existing later batch would silently redefine
+ *  that batch's scope. `from + 1` moves the work one step and nowhere else,
+ *  and the dialog names the number, so nothing about where it lands is
+ *  inferred.
+ *
+ *  `to: null` is the refusal: there is no sprint after [`MAX_SPRINT`], and a
+ *  caller must hide the affordance rather than offer a write that cannot
+ *  land. `rows` is still reported, so a caller can say what is stuck. */
+export function sprintAdvance<T extends HasStatus & HasSprint>(
+  board: readonly T[],
+  from: number
+): { to: number | null; rows: T[] } {
+  return {
+    to: Number.isInteger(from) && from >= 1 && from < MAX_SPRINT ? from + 1 : null,
+    rows: rollOverSet(board, from),
+  };
 }
 
 /** The grounding-link types, mirroring the backend's `TASK_LINK_TYPES`. Pinned
