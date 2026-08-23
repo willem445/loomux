@@ -15,9 +15,12 @@ A dead-simple terminal multiplexer for AI agent management — without the bloat
 
 ---
 
-*Loom* + *mux*: a loom is the frame that holds every thread in place while the
-fabric is woven — here, the frame holding a matrix of terminal panes, each one
-carrying an agent (or just a shell).
+The name comes from the **orrery**: a desk-sized geared model of the solar
+system where every planet and moon runs its own track at its own period, and the
+whole model stays in phase because one mechanism drives all of it — like the
+Whipple Museum's [Grand Orrery](https://www.whipplemuseum.cam.ac.uk/explore-whipple-collections/astronomy/grand-orrery), George Adams, London, c. 1750. Here it is
+a matrix of terminal panes, each carrying an agent (or just a shell), with one
+orchestrator holding them in phase.
 
 Orrerix gives you Windows Terminal–class smoothness with the multiplexing
 features it lacks: instant matrix splits, nameable panes, a native session
