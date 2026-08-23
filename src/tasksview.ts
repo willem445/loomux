@@ -256,13 +256,17 @@ export class TasksView {
     load: loadBoardPrefs,
     save: saveBoardPrefs,
   });
-  /** Filter families a future build wrote that this one does not know — held so
-   *  a save from here round-trips them instead of deleting them. */
-  private unknownFilters: Record<string, unknown> = {};
   /** The human has changed the collapse set or the filter in this window. The
    *  boot load must not overwrite a click that beat it: the disk copy is what
    *  they left LAST session, and a live gesture always wins. */
   private prefsTouched = false;
+  /** The stored view for this group has been read and adopted. Distinct from
+   *  `prefsTouched`: if the boot read FAILED this stays false, and `show()`
+   *  re-attempts adoption on a later open (#1270 review N5) — a transient IPC
+   *  rejection at boot should not cost the human their folds for the rest of the
+   *  session, and it must not let a later gesture publish this view's defaults
+   *  over a record nobody has looked at. */
+  private prefsAdopted = false;
   private prefsSaveTimer: number | undefined;
   /** Re-render debounce for the search box only. Every other control is one
    *  discrete click; typing is a burst, and a 400-row board re-rendered per
@@ -540,6 +544,11 @@ export class TasksView {
 
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
+    // Re-attempt a boot read that failed (#1270 review N5), but only while the
+    // human has changed nothing — once they have, their gesture is newer than
+    // the file and adopting over it would look like the click was ignored. The
+    // store memoises a SUCCESSFUL read, so this is a no-op in the normal case.
+    if (!this.prefsAdopted && !this.prefsTouched) void this.loadPrefs();
     this.refresh();
   }
 
@@ -623,10 +632,10 @@ export class TasksView {
    *  exactly the pre-#1270 board.
    *
    *  `read` answers `null` only when the file could not be READ, which is not
-   *  the same as a group having nothing stored — so this changes nothing rather
-   *  than adopting defaults. Adopting them would show an expanded, unfiltered
-   *  board and then let the next gesture save that over what the human actually
-   *  left; the store declines to publish in that state for the same reason.
+   *  the same as a group having nothing stored — so this changes nothing and,
+   *  crucially, does not mark the view adopted. `show()` retries on the next
+   *  open, and until one succeeds a save is skipped entirely, so this view's
+   *  defaults can never be published over a record nobody has read.
    *
    *  A gesture that beat the load WINS. The disk copy is what the human left
    *  last session; a chevron they have already clicked in this one is newer,
@@ -637,10 +646,13 @@ export class TasksView {
   private async loadPrefs(): Promise<void> {
     const view = await this.prefsStore.read(this.groupId);
     if (!view || this.disposed) return;
+    // The read succeeded, so the record is known even if a gesture already beat
+    // us to the view: the flag is what stops `show()` retrying forever, and it
+    // is set before the touched check for exactly that reason.
+    this.prefsAdopted = true;
     if (this.prefsTouched) return;
     this.collapsed = new Set(view.collapsed);
     this.filter = view.filter;
-    this.unknownFilters = view.unknownFilters;
     this.searchInput.value = this.filter.text;
     // Only if there is something on screen to re-lay-out. Resolving before the
     // first `orch_tasks` would otherwise paint the "No tasks yet" empty state
@@ -676,15 +688,17 @@ export class TasksView {
    *  failed write just means this gesture is not durable until the next one,
    *  and the store keeps the newer value so the next one re-offers it. The
    *  store also DECLINES the write outright if it has not managed to read the
-   *  file yet — see `BoardPrefsStore`, which is where that ordering is tested. */
+   *  file yet, and carries this record's unknown filter families over from disk
+   *  rather than from here — see `BoardPrefsStore`, where both are tested. */
   private savePrefsNow(): void {
+    // Nothing the human did, nothing to persist (#1270 review N5). Without this
+    // the dispose flush publishes whatever the view happens to hold — which,
+    // after a boot read that failed, is the constructed defaults, landing on top
+    // of this group's real record.
+    if (!this.prefsTouched) return;
     void this.prefsStore.write(
       this.groupId,
-      {
-        collapsed: [...this.collapsed],
-        filter: this.filter,
-        unknownFilters: this.unknownFilters,
-      },
+      { collapsed: [...this.collapsed], filter: this.filter },
       Date.now()
     );
   }

@@ -358,9 +358,10 @@ test("a failed read is retried by the next gesture, not latched for the session"
 
 test("an unreadable file reads as null, never as a group with nothing stored", async () => {
   // The caller must be able to tell "no record for this group" (adopt defaults)
-  // from "I cannot see the file" (change nothing). Collapsing the two would show
-  // an expanded, unfiltered board and then let the next gesture save that over
-  // what the human actually left.
+  // from "I cannot see the file" (do not adopt, and retry later). This pins the
+  // DISTINCTION only — what the caller does with it, and what protects the
+  // record in the meantime, is the write-side behaviour pinned below (#1270
+  // review N5).
   const bad = new BoardPrefsStore(fakeIo(() => Promise.reject(new Error("nope"))));
   assert.equal(await bad.read("g-1"), null);
 
@@ -393,4 +394,77 @@ test("a save that fails leaves the newer value in memory for the next gesture", 
   // Not "declined-unread": the read succeeded, so the failure is the write's.
   // The store keeps the value, which is what makes the next gesture re-offer it.
   assert.deepEqual((await store.read("g-mine"))?.collapsed, ["e-1"]);
+});
+
+test("a write carries over unknown families the caller never saw", async () => {
+  // #1270 review N5, and the sharpest edge of it: `unknownFilters` is a NEWER
+  // build's state (#1272's `sprint`), and the round-trip guarantee this schema
+  // sells is that an older build preserves it. A caller supplying the families
+  // could hand back an empty set — which is exactly what a view whose boot read
+  // failed holds — and delete them. The store reads them off the record instead,
+  // so the caller has nothing to get wrong.
+  const io = fakeIo(() =>
+    Promise.resolve(
+      JSON.stringify({
+        v: 1,
+        groups: {
+          "g-mine": { touched: 1, collapsed: ["e-1"], filters: { sprint: ["s-7"], kind: ["story"] } },
+        },
+      })
+    )
+  );
+  const store = new BoardPrefsStore(io);
+  assert.equal(await store.write("g-mine", { collapsed: ["e-9"], filter: { ...NO_FILTER } }, 5), "saved");
+  const back = readGroupView(decodeBoardPrefs(io.saved[0]), "g-mine");
+  assert.deepEqual(back.collapsed, ["e-9"], "the caller's own fields are what it set");
+  assert.deepEqual(back.filter.kind, [], "…including clearing one");
+  assert.deepEqual(
+    back.unknownFilters,
+    { sprint: ["s-7"] },
+    "…but a newer build's family survives a write that never mentioned it"
+  );
+});
+
+test("a first gesture after a FAILED boot read does not delete this group's unknown families", async () => {
+  // The end-to-end shape of N5: boot read rejects, the view is left at its
+  // defaults, then the human folds something. The write retries the read (by
+  // design) and publishes — and the question is what it publishes over.
+  let attempt = 0;
+  const io = fakeIo(() => {
+    attempt += 1;
+    return attempt === 1
+      ? Promise.reject(new Error("transient at boot"))
+      : Promise.resolve(
+          JSON.stringify({
+            v: 1,
+            groups: {
+              "g-mine": { touched: 1, collapsed: ["e-1"], filters: { sprint: ["s-7"] } },
+              "g-other": { touched: 2, collapsed: ["e-9"], filters: {} },
+            },
+          })
+        );
+  });
+  const store = new BoardPrefsStore(io);
+
+  assert.equal(await store.read("g-mine"), null, "the boot read failed");
+  assert.deepEqual(io.saved, [], "and nothing was published on the strength of it");
+
+  // The human's gesture, made against defaults because nothing could be adopted.
+  assert.equal(await store.write("g-mine", { collapsed: ["e-5"], filter: { ...NO_FILTER } }, 9), "saved");
+  const back = decodeBoardPrefs(io.saved[0]);
+  assert.deepEqual(
+    readGroupView(back, "g-mine").unknownFilters,
+    { sprint: ["s-7"] },
+    "the newer build's family survived the unhappy path, which is the guarantee #1272 is told to build on"
+  );
+  assert.deepEqual(
+    readGroupView(back, "g-mine").collapsed,
+    ["e-5"],
+    "the human's own gesture wins over a file nobody could read — the accepted residue"
+  );
+  assert.deepEqual(
+    readGroupView(back, "g-other").collapsed,
+    ["e-9"],
+    "and B1's guarantee still holds: other groups are untouched"
+  );
 });

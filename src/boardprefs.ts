@@ -275,6 +275,18 @@ export interface BoardPrefsIo {
  *  does not know what it would be overwriting. */
 export type BoardPrefsWrite = "saved" | "declined-unread" | "failed";
 
+/** What a caller may actually SET on a group's record: the two things the human
+ *  operates. Deliberately not the whole `GroupBoardView` (#1270 review N5).
+ *
+ *  `unknownFilters` is absent because it is not the caller's to supply. It is
+ *  opaque passthrough — filter families a NEWER build wrote that this one cannot
+ *  interpret — and the only correct source for it is the stored record itself.
+ *  A view that carried a copy could hand back a stale one (an empty one, if its
+ *  boot read failed) and silently delete a future build's state, which is the
+ *  exact opposite of the round-trip guarantee `decodeBoardPrefs` exists to make.
+ *  `touched` is absent for the same class of reason: the store stamps it. */
+export type GroupBoardEdit = Pick<GroupBoardView, "collapsed" | "filter">;
+
 /** Reads and writes the whole `boardprefs.json` blob, holding the invariant
  *  that makes one shared file safe for many boards.
  *
@@ -337,22 +349,50 @@ export class BoardPrefsStore {
   }
 
   /** This group's stored view, or `null` if the file could not be read — which
-   *  a caller must NOT collapse into `defaultGroupView()`. Adopting defaults on
-   *  an unreadable file would show an expanded, unfiltered board and then let
-   *  the next gesture save that over whatever the human actually left. */
+   *  a caller must NOT collapse into `defaultGroupView()`. "I could not look" is
+   *  not "there is nothing stored", and the two lead to opposite actions.
+   *
+   *  What `null` buys, precisely (#1270 review N5 — the earlier wording here
+   *  claimed more than the one caller got). The view is already sitting at its
+   *  constructed defaults, so declining to adopt changes nothing it displays;
+   *  the protection is in what happens NEXT, and it is three things, none of
+   *  them this line alone:
+   *
+   *   - `write` carries unknown filter families over from the stored record, so
+   *     a caller that never saw them cannot delete them;
+   *   - the view skips the save entirely while the human has changed nothing,
+   *     so defaults are never published for their own sake;
+   *   - the view re-attempts adoption on a later open, so a transient failure
+   *     is not permanent.
+   *
+   *  What remains, and is accepted: if the boot read fails AND the human folds
+   *  something before any retry succeeds, that gesture is saved against
+   *  defaults, and this group's stored collapse set and filter are replaced by
+   *  it. Their own gesture wins over a file nobody could read — which is the
+   *  documented rule for a live gesture, arrived at down an unhappy path. */
   async read(groupId: string): Promise<GroupBoardView | null> {
     if (!(await this.ensureLoaded())) return null;
     return readGroupView(this.prefs, groupId);
   }
 
-  /** Record this group's view and publish the whole blob. */
+  /** Record this group's view and publish the whole blob.
+   *
+   *  Unknown filter families are carried over from the STORED record rather than
+   *  taken from the caller (#1270 review N5) — see `GroupBoardEdit`. This is
+   *  what makes the forward-compat guarantee hold on the path that used to break
+   *  it: a boot read that failed leaves the view at its defaults, and a first
+   *  gesture then publishing those defaults would have taken a newer build's
+   *  `sprint` down with it. The store has re-read the file by the time it gets
+   *  here — `ensureLoaded` above guarantees exactly that — so the families it
+   *  merges are the current ones on disk, not a snapshot from boot. */
   async write(
     groupId: string,
-    view: Omit<GroupBoardView, "touched">,
+    view: GroupBoardEdit,
     nowMs: number
   ): Promise<BoardPrefsWrite> {
     if (!(await this.ensureLoaded())) return "declined-unread";
-    this.prefs = writeGroupView(this.prefs, groupId, view, nowMs);
+    const carried = this.prefs.get(groupId)?.unknownFilters ?? {};
+    this.prefs = writeGroupView(this.prefs, groupId, { ...view, unknownFilters: carried }, nowMs);
     try {
       await this.io.save(encodeBoardPrefs(this.prefs));
       return "saved";

@@ -1620,6 +1620,8 @@ test("the board's link-type vocabulary is the backend's, read out of the Rust so
     "the board's LINK_TYPES must equal the backend's TASK_LINK_TYPES, in the same order"
   );
 });
+
+// ---------------------------------------------------------------------------
 // Tree-view filtering (#1270) — the three rules in taskboard.ts's filter
 // section, plus the two projection fields (`context`, `shownKids`) the strip
 // and the count badges read.
