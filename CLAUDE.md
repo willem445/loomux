@@ -358,6 +358,19 @@ compiles.
   written row back out in your head, and when a review names one asymmetry
   re-derive EVERY input — the redesign is where the next one lands. Signature:
   the fix for a one-rule finding ships a second of the same class (#1182).
+- **A multi-tenant whole-file store never publishes from a handle it has not read.**
+  An in-memory map initialised empty and serialised whole erases every OTHER tenant's
+  record the first time a gesture beats the load — and forever after a read that
+  REJECTED, since "I could not look" is not "there was nothing there". Every write awaits
+  the read; a failed read declines the write rather than defaulting, and is not latched,
+  so one transient rejection does not disable persistence for the session. Narrow the
+  payload to the fields the caller OWNS and merge passthrough off the record just re-read
+  — a caller cannot lose what it never carries, and the cousin (this tenant's own record
+  overwritten from the view's constructed defaults) lands a review round later otherwise.
+  Signature: `save(encode(this.store))` where `this.store` is seeded by an `await` that a
+  gesture can beat, or by a `.catch(() => empty())`; every individual step succeeds, so
+  the loss is silent. Worked example: `BoardPrefsStore` (`src/boardprefs.ts`) and
+  `doc/design/board-tree-view.md` (#1299 B1/N5).
 - **A `Mutex` that serialises tests is locked with `lock_safe`, never
   `.lock().unwrap()`.** One failing test panics under the guard and poisons it,
   so every later test on that lock dies of `PoisonError` — one genuine failure
@@ -417,7 +430,13 @@ narrow their ask back down to the original ticket on your own judgment.
   parse-checking it: the base blob must be a verbatim **prefix** of the resolved
   one (`startsWith` over `git show <ref>:<file>` for both), with a single append
   hunk in `git diff -U0`. Signature: a conflict whose two sides are each
-  syntactically incomplete (#1196).
+  syntactically incomplete (#1196). That prefix proof is valid only when exactly ONE
+  side appended: where both did — or your side also edits elsewhere in the file — the
+  checkable statements are that the resolution DELETES nothing of the other side's blob,
+  and that a census of the file's named units matches at both ends — measured once, at
+  #1299's own resolution: 102 test names at the base, 116 at the head, 0 lost. A splice
+  is silently GREEN — one side's block nested inside the other's final assertion still
+  parses and still runs — so parsing the result proves nothing (#1299).
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,
