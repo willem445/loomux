@@ -142,12 +142,13 @@ enforced at the CLI level.
 - **Agent-aware panes** — alert chips when a CLI needs you, badges per role and
   group, and a session browser that restores Claude Code / Copilot CLI sessions
   straight back into a pane.
-- **Group state survives a restart** — a closed group comes back as one Resume
-  card: click it and the members that were open at close relaunch live, each
-  rejoining its persona and worktree. Queued deliveries live on disk and
-  redeliver in order to a pane that rebinds; the rest surface as an explicit
-  to-do list instead of vanishing. Crash logs and startup breadcrumbs ship in
-  every build.
+- **Restart it and pick up exactly where you left off** — click a closed
+  group's Resume card and every member that was open at close relaunches on
+  its own resumed CLI session, full conversation history and all, with
+  persona and worktree restored too. The task board, delivery queue and
+  question registry were on disk the whole time: queued deliveries redeliver
+  in order to a pane that rebinds, and surface as an explicit to-do list for
+  the rest. Crash logs and startup breadcrumbs ship in every build.
 - **Custom agent workflows** — commit a `.orrerix/workflow.yml` and your repo
   declares its own roster and merge gate: five focused reviewers with five
   prompts and five models, an advisor the orchestrator consults when stuck, a
