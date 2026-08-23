@@ -1771,3 +1771,157 @@ export function boardUsesLinks<T extends HasArtifactLinks>(board: readonly T[]):
 export function boardUsesSprints<T extends HasSprint>(board: readonly T[]): boolean {
   return board.some((t) => typeof t.sprint === "number");
 }
+
+// ---------------------------------------------------------------------------
+// The board's grounding-links UI (#1273, PR D) — the pure half of the count
+// chip, the typed detail list and the add/remove editor. Everything here is
+// DOM-free so `test/taskboard.test.ts` can exercise it; `tasksview.ts` renders
+// the result and owns the `orch_upsert_task` writes.
+// ---------------------------------------------------------------------------
+
+/** How many grounding links one row may carry, mirroring the backend's
+ *  `MAX_TASK_LINKS`. The add affordance goes INERT here rather than composing
+ *  a write the backend must reject — the same argument `MAX_SPRINT` makes for
+ *  `sprintAdvance`. Pinned against the Rust constant by a test, so a cap
+ *  raised on one side alone reddens instead of quietly leaving the editor
+ *  refusing writes the backend would have taken. */
+export const MAX_ARTIFACT_LINKS = 32;
+
+/** Is this row's link list full? A separate predicate rather than a `>=` at
+ *  the call site so the editor and its tooltip cannot disagree about it. */
+export function artifactLinksAtCap(links: readonly TaskArtifactLink[] | null | undefined): boolean {
+  return (links?.length ?? 0) >= MAX_ARTIFACT_LINKS;
+}
+
+/** The glyph a link type wears in the detail list.
+ *
+ *  Every `LINK_TYPES` entry has one, and `linkTypeIcon` is swept over that
+ *  vocabulary by a test — a type added to `LINK_TYPES` (which is itself read
+ *  out of the Rust source) without a glyph here reddens rather than rendering
+ *  the fallback and looking deliberate. Deliberately NOT 🔗 for `link`: that
+ *  glyph already means "add a dependency" on every row of this board, and two
+ *  senses of one icon on one row is how the #582/#1273 naming collision would
+ *  reach the screen. */
+export function linkTypeIcon(type: string): string {
+  switch (type) {
+    case "requirement":
+      return "📋";
+    case "spec":
+      return "📐";
+    case "design-note":
+      return "✎";
+    case "test-case":
+      return "🧪";
+    case "doc":
+      return "📘";
+    case "link":
+      return "↗";
+    // Only a hand-edited tasks.json can hold a type outside the vocabulary
+    // (the backend validates on write) — tolerate-and-show, the posture the
+    // ⚠ missing-dep chip already takes, rather than dropping the row's link.
+    default:
+      return "•";
+  }
+}
+
+/** What the detail list shows for a link: its label when it has one, its raw
+ *  target otherwise. A blank label is stored as ABSENT by the backend, so this
+ *  never has to tell `""` and `undefined` apart — but it still trims, because
+ *  a hand-edited board can hold either. */
+export function linkDisplayText(link: TaskArtifactLink): string {
+  const label = (link.label ?? "").trim();
+  return label || (link.target ?? "").trim();
+}
+
+/** What clicking a link should DO.
+ *
+ *  `open` routes to `orch_open_ref`, which is the only path to the external
+ *  opener; `copy` puts the target on the clipboard, which is what the NEEDS-YOU
+ *  panel already does with a `demo_path`. Nothing here resolves or verifies a
+ *  target — §4's shape-only stance means a link can point at anything, so this
+ *  decides an ACTION and never a validity. */
+export type LinkOpenPlan =
+  | { action: "open"; kind: "issue" | "link"; value: string }
+  | { action: "copy"; text: string };
+
+/** Plan the click for one link target.
+ *
+ *  Three rules, and the second one is the substantive one:
+ *
+ *  - An issue/PR ref opens with `kind: "issue"`, which is what selects the
+ *    `/issues/N` path segment backend-side (GitHub redirects to `/pull/N` when
+ *    it is really a PR, so one kind covers both).
+ *  - A URL opens with `kind: "link"` — an honest audit line, since
+ *    `resolve_ref_url` returns an http(s) value verbatim BEFORE it consults
+ *    `kind` at all. Its passthrough test is case-SENSITIVE, though, while
+ *    `linkTargetKind` classifies the scheme case-insensitively, so the scheme
+ *    is lowercased here. Without that, `HTTP://host/123` misses the passthrough,
+ *    falls into the digit scan below it and opens `<repo>/pull/123` — a
+ *    different page entirely, on a different site. Only the scheme is touched:
+ *    the rest of a URL is case-sensitive.
+ *  - Everything else — a repo path, an absolute path, an unclassifiable string —
+ *    is COPIED, never opened. That is the safe direction by construction: the
+ *    external opener refuses a non-http(s) URL anyway, and a target the board
+ *    cannot classify is one nothing should be launched from.
+ */
+export function linkOpenPlan(target: string): LinkOpenPlan {
+  const t = (target ?? "").trim();
+  const kind = linkTargetKind(t);
+  if (kind === "issue") return { action: "open", kind: "issue", value: t };
+  if (kind === "url") {
+    return { action: "open", kind: "link", value: t.replace(/^https?:\/\//i, (m) => m.toLowerCase()) };
+  }
+  return { action: "copy", text: t };
+}
+
+/** Compose the link the editor is about to write, or `null` when there is
+ *  nothing to write.
+ *
+ *  The ONLY refusal here is an empty target, and that is not a validation rule
+ *  — it is "the form is not filled in yet". Every real rule (the type
+ *  vocabulary, the length caps, control characters, and the teaching refusal
+ *  when a target names a live board task) lives in `normalize_task_links`
+ *  inside the backend's lock, and its errors reach the human through the
+ *  board's toast. A second copy here could only ever disagree with it, and the
+ *  one that teaches is the one that must be heard — so a target naming a board
+ *  row composes fine and the backend explains why it will not take it.
+ *
+ *  A blank label becomes ABSENT rather than `""`, matching what the backend
+ *  stores, so a link written here and a link read back are the same shape. */
+export function artifactLinkDraft(type: string, target: string, label: string): TaskArtifactLink | null {
+  const t = (target ?? "").trim();
+  if (!t) return null;
+  const l = (label ?? "").trim();
+  const link: TaskArtifactLink = { type: (type ?? "").trim(), target: t };
+  if (l) link.label = l;
+  return link;
+}
+
+/** Append one link, preserving the author's reading order (§3: `links` is not
+ *  deduped and not sorted — the order IS the reading order). Returns a fresh
+ *  array; `orch_upsert_task`'s `links` argument replaces the whole list. */
+export function withArtifactLink(
+  links: readonly TaskArtifactLink[] | null | undefined,
+  link: TaskArtifactLink
+): TaskArtifactLink[] {
+  return [...(links ?? []), link];
+}
+
+/** Drop the link at `index`.
+ *
+ *  BY INDEX, deliberately — not by target and not by any other value. Nothing
+ *  dedupes this array (§3), so one row can legitimately carry the same target
+ *  twice under two types (a spec that is also the requirement) or twice with
+ *  different labels; removing by value would delete both and the human would
+ *  have asked for one. An out-of-range index returns the list unchanged rather
+ *  than composing a write that silently drops nothing or everything — a stale
+ *  render whose row has already changed underneath is the reachable way in. */
+export function withoutArtifactLinkAt(
+  links: readonly TaskArtifactLink[] | null | undefined,
+  index: number
+): TaskArtifactLink[] {
+  const all = [...(links ?? [])];
+  if (!Number.isInteger(index) || index < 0 || index >= all.length) return all;
+  all.splice(index, 1);
+  return all;
+}
