@@ -127,7 +127,7 @@ pane stays open showing the status).
 
 | tool | orchestrator | worker/reviewer/planner |
 | --- | --- | --- |
-| `spawn_agent(name, kind, task, worktree?, branch?, base?)` — `kind` (or `block`) is required on a fresh spawn, [#544](#a-capability-class-is-never-acquired-by-omission-544) | ✓ (guardrailed) | ✗ |
+| `spawn_agent(name, kind, task, worktree?, branch?, base?, task_id?)` — `kind` (or `block`) is required on a fresh spawn, [#544](#a-capability-class-is-never-acquired-by-omission-544); `task_id` binds the spawn to a board row, whose grounding links are then composed into the kickoff (see `board-sprints-and-links.md` §12) | ✓ (guardrailed) | ✗ |
 | `send_prompt(agent_id, text)` | ✓ | ✗ |
 | `report(status?, summary?, outcome?, ref?, detail_url?, note?)` / `message_orchestrator(text)` | ✗ | ✓ |
 | `list_agents()` | ✓ | ✓ |
