@@ -128,6 +128,14 @@ test("re-saving an old group lifts it clear of eviction", () => {
 });
 
 test("a corrupt or absent blob degrades to an empty store, never a throw", () => {
+  // Positive control FIRST (CLAUDE.md, #1209): "every one of these decodes to
+  // nothing" is satisfied just as well by a decoder that returns nothing for
+  // everything, which would make the whole loop below vacuous.
+  assert.deepEqual(
+    [...decodeBoardPrefs(JSON.stringify({ v: 1, groups: { "g-1": { touched: 1 } } })).keys()],
+    ["g-1"],
+    "the decoder does read a good blob — without this the loop below proves nothing"
+  );
   for (const bad of [null, "", "not json", "[1,2,3]", '"a string"', "42", "{}"]) {
     assert.deepEqual([...decodeBoardPrefs(bad).keys()], [], `input: ${JSON.stringify(bad)}`);
   }
@@ -291,12 +299,21 @@ test("a write that beats the read does not publish a store nobody has read", asy
   // store that writes straight from its empty map publishes a blob containing
   // only this group — silently deleting up to MAX_GROUPS other records.
   let release: (v: string | null) => void = () => {};
-  const io = fakeIo(() => new Promise<string | null>((res) => (release = res)));
+  let reads = 0;
+  const io = fakeIo(() => {
+    reads += 1;
+    return new Promise<string | null>((res) => (release = res));
+  });
   const store = new BoardPrefsStore(io);
 
   const writing = store.write("g-mine", wrote(["e-1"]), 5);
   await settle();
-  assert.deepEqual(io.saved, [], "nothing may reach disk while the file is still unread");
+  // Positive control before the absence (CLAUDE.md, #1209): the write really is
+  // in flight and really did ask for the file. Without this, "nothing reached
+  // disk" is also what a write that threw on entry, or a broken fake, looks
+  // like — and the interesting assertion below would be vacuous.
+  assert.equal(reads, 1, "the write asked for the file");
+  assert.deepEqual(io.saved, [], "…and published nothing while that read was outstanding");
 
   release(OTHERS); // the file finally arrives, holding someone else's view
   assert.equal(await writing, "saved");
