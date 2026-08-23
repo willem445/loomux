@@ -381,11 +381,31 @@ triage trigger. Two things it does not tell you:
 
 **Selection procedure**, in strict priority order — take the first that decides it:
 
-1. the human's **board order** (top = next; they reordered it for a reason);
-2. a **milestone** or priority label, where the repo uses them;
-3. **`agent-ready`** — under full autonomy it is no longer a permission, but it is still the human
+1. the **current sprint**, where the board uses sprints — `list_tasks` reports it as
+   `current_sprint`. This one NARROWS the field rather than picking a row: current-sprint items
+   rank ahead of everything else, then later sprints ascending, then the backlog (no sprint).
+   Everything below ranks rows *within* that bucket. A sprint assignment is the human explicitly
+   batching the work, which is a stronger signal than residual array position;
+2. the human's **board order** (top = next; they reordered it for a reason) — and inside a sprint
+   it is the tiebreak, so the top row OF THE CURRENT SPRINT is the one you take;
+3. a **milestone** or priority label, where the repo uses them;
+4. **`agent-ready`** — under full autonomy it is no longer a permission, but it is still the human
    saying *this one is groomed*;
-4. your own **stated value judgment against the goal**.
+5. your own **stated value judgment against the goal**.
+
+**Sprint completion, and why nothing rolls over on its own.** `current_sprint` is DERIVED on every
+read — the lowest sprint carried by any row that is not `done` — so a sprint completes exactly when
+its last open row leaves it, and the next sprint becomes current by itself. There is no stored
+marker, and no tool that advances one. **A `blocked` row HOLDS its sprint open**, deliberately: a
+sprint quietly ending because the work in it looked stuck is the one failure this design refuses.
+So when the current sprint is down to rows that cannot move, do not leave it hanging and do not
+sweep it up — either resolve them, or roll them forward EXPLICITLY with one `upsert_task(sprint:
+N+1)` per row, each individually audited, and say in your pane which rows you moved and why. Never
+move a row's sprint silently.
+
+**Sprint gates nothing.** Not `ready`, not `claim`, not WIP, not any permission — it is a hint you
+read, exactly like `ready`. `list_tasks` rows are NOT re-sorted by sprint; the board stays in the
+human's order and you apply the ranking above yourself.
 
 **Announce every pickup, in one line and on the board.** "full-autonomy pickup: #N — <why this one,
 against the goal>" in your pane, and the same sentence as the first note on that issue's board task.
@@ -435,6 +455,19 @@ can add, edit, annotate, reorder, and delete tasks; orrerix notifies you when th
   already done.
 - Board order (top = next) is the priority order; respect it when scheduling unless the
   human says otherwise.
+- **Where the board uses sprints, the current sprint comes first and board order ranks within
+  it.** `list_tasks` reports `current_sprint` (derived: the lowest sprint on any non-`done` row,
+  `null` when unused). Work it to completion before starting later sprints; backlog rows — the
+  ones carrying no sprint at all — sit behind every sprint-assigned item. Set a row's sprint with
+  `upsert_task(sprint: N)`, and `sprint: 0` to send it back to the backlog. A sprint is a numbered
+  BATCH, not a timebox: there are no dates on it, and none are coming.
+- **Record a task's grounding when you create it, not when someone asks.** `links` carries the
+  artifacts that GOVERN the work — `requirement`, `spec`, `design-note`, `test-case`, `doc`, or a
+  plain `link` — each an issue/PR ref, repo path or URL with an optional one-line label. A worker
+  or reviewer that has to rediscover what governs a task from scratch is how a real requirement
+  gets missed, and that is the failure these exist to remove. They are EXTERNAL pointers: a target
+  naming a live task on this board is refused, because that is `deps` or `related`. Links never
+  affect readiness or ordering — they are context, not structure.
 - **Record `pr_base` in the same call you record `pr`.** `upsert_task(id: "t-9", pr: "#712",
   pr_base: "integration/581")` — the branch that PR targets, exactly as gh names it
   (`gh pr view 712 --json baseRefName`). The human's board reads it to tell a merge into the
