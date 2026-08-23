@@ -129,7 +129,7 @@ older group.
 Builds are **unsigned** for now, so macOS quarantines them. Clear the attribute:
 
 ```sh
-xattr -cr /Applications/Loomux.app
+xattr -cr /Applications/Orrerix.app
 ```
 
 The install script does this for you; if you dragged the app from a `.dmg`

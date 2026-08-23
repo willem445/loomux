@@ -39,13 +39,15 @@ their own track in their own pane, one orchestrator holding the phase.
 ## Quickstart
 
 ```sh
-npx loomux-desktop            # Node 18+, any platform — downloads and launches
-npm install -g loomux-desktop # …or install it and just run `loomux`
+npx orrerix            # Node 18+, any platform — downloads and launches
+npm install -g orrerix # …or install it and just run `orrerix`
 ```
 
-> The published package, the installers, the app binary and this repo are still
-> named **loomux** — the rename to Orrerix is landing in phases and the shipping
-> identities move last, so the commands above are the current ones (#1153).
+> **Coming from Loomux?** `loomux-desktop` is frozen and there is no shim:
+> `npm uninstall -g loomux-desktop && npm install -g orrerix`. Installing Orrerix
+> leaves your old Loomux app in place rather than replacing it —
+> [Getting started](https://willem445.github.io/loomux/getting-started) has the
+> uninstall commands. This repo's URL is the last identity still to move (#1153).
 
 <details>
 <summary>Other install paths — Windows / macOS / Linux one-liners, release assets, betas</summary>
@@ -66,12 +68,12 @@ Or grab an installer from the
 [latest release](https://github.com/willem445/loomux/releases/latest) (`.exe`/`.msi`,
 `.dmg`, `.AppImage`/`.deb`/`.rpm`).
 
-`npx loomux-desktop` and both one-liners always resolve the latest **stable**
+`npx orrerix` and both one-liners always resolve the latest **stable**
 release — beta/RC builds are published as GitHub prereleases only, so grab those
 from [the releases page](https://github.com/willem445/loomux/releases) directly.
 
 Builds are unsigned for now — on macOS, if the app is reported as damaged, run
-`xattr -cr /Applications/Loomux.app` (the install script does this for you).
+`xattr -cr /Applications/Orrerix.app` (the install script does this for you).
 
 </details>
 
@@ -248,6 +250,13 @@ Backend checks (what CI gates on) run from the repo root: `cargo check --locked
   tab saved before the rename still resolves. Let a running agent group finish
   before upgrading, though: its agents were briefed with the old vocabulary. See
   [`doc/design/rebrand-protocol.md`](doc/design/rebrand-protocol.md).
+- The published identities — the npm package and its command (both now `orrerix`),
+  the installed app, and the `Orrerix_*` release-asset filenames — moved together,
+  with no `loomux-desktop` shim. The launcher still recognises an app installed
+  under the old name, so `orrerix update` reads its version and will not downgrade
+  it; what no installer can do is replace it in place, so **Orrerix installs beside**
+  **Loomux rather than over it** and the old app is yours to uninstall when you are
+  ready. See [`doc/design/rebrand-external.md`](doc/design/rebrand-external.md).
 
 The Windows installer ships one prebuilt, MIT-licensed runtime — a modern ConPTY
 host (`conpty.dll` + `OpenConsole.exe`, committed in

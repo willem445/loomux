@@ -21,10 +21,11 @@ nav_order: 2
 Orrerix ships as a native desktop app for Windows, macOS, and Linux. Pick
 whichever install path suits you — they all land on the same app.
 
-> The npm package, the installers, the installed app and this repo are still
-> named **loomux**: the rename to Orrerix is landing in phases and the shipping
-> identities move last, so every command on this page is the current one. The
-> app's own taskbar and Start-menu entry still read *Loomux* too.
+> **Coming from Loomux?** The npm package (`loomux-desktop`), the command
+> (`loomux`) and the installed app have all been renamed, with no compatibility
+> shim — see [Upgrading from Loomux](#upgrading-from-loomux) below. This repo's
+> URL is the last thing still to move; the links on this page keep working
+> either way, because GitHub redirects a renamed repo.
 
 ### npm (any platform)
 
@@ -32,34 +33,34 @@ If you already have **Node 18+**, the quickest path is the tiny launcher
 package:
 
 ```sh
-npx loomux-desktop            # download + launch in one shot
-npm install -g loomux-desktop # then run `loomux` anytime
+npx orrerix            # download + launch in one shot
+npm install -g orrerix # then run `orrerix` anytime
 ```
 
-`loomux-desktop` is a small, dependency-free launcher: it fetches the matching
+`orrerix` is a small, dependency-free launcher: it fetches the matching
 release asset for your platform (Windows installer, macOS `.dmg`, or Linux
 `AppImage`), installs/caches it, and launches it.
 
 ```sh
-loomux            # launch the installed app (installs it first if missing)
-loomux update     # install/refresh the app from the newest release on your channel
-loomux version    # print the launcher's version
-loomux help       # full usage
+orrerix            # launch the installed app (installs it first if missing)
+orrerix update     # install/refresh the app from the newest release on your channel
+orrerix version    # print the launcher's version
+orrerix help       # full usage
 ```
 
-Plain `loomux` **never** updates an existing install. Installing over a running
+Plain `orrerix` **never** updates an existing install. Installing over a running
 Orrerix closes it — and everything running inside it — so when you update is your
 call, not the launcher's.
 
-`loomux update` picks the newest release **on the channel you are already on**
+`orrerix update` picks the newest release **on the channel you are already on**
 and never installs an older build over a newer one:
 
-| You have installed | `loomux update` gives you |
+| You have installed | `orrerix update` gives you |
 | --- | --- |
 | a stable release (`1.0.0`) | the newest **stable** release |
 | a beta/RC (`1.1.0-beta11`) | the newest release of either kind |
 
-If the launcher cannot read the version of your installed Orrerix, `loomux
+If the launcher cannot read the version of your installed Orrerix, `orrerix
 update` stops and says so rather than guessing — it has no way to tell an update
 from a downgrade, so it does neither. Installing your preferred build once from
 the releases page clears it.
@@ -67,16 +68,32 @@ the releases page clears it.
 To move from stable onto the beta train (or back), install that build yourself
 from [the releases page](https://github.com/willem445/loomux/releases) — the
 launcher will not switch channels for you. On Linux the app is a cached
-AppImage, so `loomux update` refreshes the cache; quit the running AppImage
+AppImage, so `orrerix update` refreshes the cache; quit the running AppImage
 first, since it cannot be overwritten while it is running.
 
-`loomux --reinstall` still works as a deprecated alias for `loomux update`, but
+`orrerix --reinstall` still works as a deprecated alias for `orrerix update`, but
 its meaning changed in v1.1: it used to install the version matching the
 launcher itself, and now it installs the newest release on your channel.
 
-> The package is named `loomux-desktop` because the bare `loomux` name on npm
-> belongs to an unrelated tmux tool — but the command it installs is still
-> `loomux`.
+### Upgrading from Loomux
+
+The launcher used to be published as `loomux-desktop` and installed a command
+called `loomux`. Both were renamed with the app, and there is no compatibility
+shim — `loomux-desktop` is frozen at its last release and will not see new
+versions:
+
+```sh
+npm uninstall -g loomux-desktop
+npm install -g orrerix
+```
+
+The new launcher still recognises an app installed under the old name, so
+`orrerix update` sees the version you already have and will not downgrade it,
+and a Linux AppImage the old launcher cached is launched rather than
+re-downloaded.
+
+What it does **not** do is replace a Loomux install in place — see
+[Loomux and Orrerix install side by side](#loomux-and-orrerix-install-side-by-side).
 
 ### Windows (one-liner)
 
@@ -107,10 +124,27 @@ Builds are **unsigned** for now. On macOS, if the app is reported as damaged,
 clear the quarantine attribute:
 
 ```sh
-xattr -cr /Applications/Loomux.app
+xattr -cr /Applications/Orrerix.app
 ```
 
 (The install script does this for you.)
+
+### Loomux and Orrerix install side by side
+
+If you already had Loomux, installing Orrerix leaves **both** apps on your
+machine. That is not something the installer can avoid: it identifies an
+existing install by the product name — the Windows Add/Remove entry and install
+directory, and the macOS bundle directory, are all named after it — so a
+renamed app has nothing to recognise and installs fresh.
+
+Nothing removes the old one for you, deliberately: it is a working app you
+installed, and quietly deleting it is not the installer's call. Uninstall Loomux
+whenever you are ready — Add/Remove Programs on Windows, or
+`rm -rf /Applications/Loomux.app` on macOS. On Linux there is nothing to do:
+the AppImage is a single file, and the one on your PATH is simply replaced.
+
+Your data is not duplicated and nothing needs migrating — both builds read the
+same profile directory, which moved separately and earlier.
 
 ## First launch
 
