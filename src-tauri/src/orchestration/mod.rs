@@ -50503,30 +50503,6 @@ fn open_external_url(url: &str) -> Result<(), String> {
 /// shows nothing rather than throwing, exactly as `orch_tasks` does for an
 /// unparseable board. Nothing WRITES through this path, so the loud read that
 /// protects the file is untouched.
-/// How many mailbox messages this group's manager has not read (#1161 M2) —
-/// what the pane's unread chip renders (M5).
-///
-/// `0` for every group that declares no manager, which is nearly all of them:
-/// no manager means no mailbox file, and an absent file reads as empty.
-///
-/// **A read failure reads as 0**, on `orch_questions_list`'s reasoning applied
-/// to chrome: this command has no error channel and its caller renders a badge,
-/// so an unreadable file hides the chip rather than throwing. The registry's
-/// own loud read (`mailbox`) is untouched, and every path that WRITES the file
-/// still goes through it — see `OrchRegistry::mailbox_unread`.
-///
-/// Off-thread (#743 S4c), like every other fs-touching command. Read-only and
-/// takes no lock: writers replace `mailbox.json` through `atomic_write`, so a
-/// concurrent reader sees the whole old file or the whole new one.
-#[tauri::command]
-pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
-    let reg = reg_of(&app);
-    // #904: no error channel, so an unvalidated id yields the same 0 a group
-    // with no mail does. See `command_group`.
-    let Ok(group_id) = command_group(&group_id) else { return 0 };
-    run_blocking(move || reg.mailbox_unread(&group_id)).await
-}
-
 #[tauri::command]
 pub async fn orch_questions_list(app: AppHandle, group_id: String) -> Vec<humanq::Question> {
     let reg = reg_of(&app);
@@ -50556,6 +50532,35 @@ pub async fn orch_question_answer(
         reg.answer_question(&group_id, &id, &answer, humanq::AnswerSource::Webview).map(|_| ())
     })
     .await
+}
+
+// ---------- the manager mailbox (human side, #1161 M2) ----------
+// One read, for the pane's unread chip (M5). The WRITE side is an agent
+// surface only (`message_manager`), so there is no trusted-webview twin of it
+// here: a human does not post into the mailbox, they talk to the manager.
+
+/// How many mailbox messages this group's manager has not read (#1161 M2) —
+/// what the pane's unread chip renders (M5).
+///
+/// `0` for every group that declares no manager, which is nearly all of them:
+/// no manager means no mailbox file, and an absent file reads as empty.
+///
+/// **A read failure reads as 0**, on `orch_questions_list`'s reasoning applied
+/// to chrome: this command has no error channel and its caller renders a badge,
+/// so an unreadable file hides the chip rather than throwing. The registry's
+/// own loud read (`mailbox`) is untouched, and every path that WRITES the file
+/// still goes through it — see `OrchRegistry::mailbox_unread`.
+///
+/// Off-thread (#743 S4c), like every other fs-touching command. Read-only and
+/// takes no lock: writers replace `mailbox.json` through `atomic_write`, so a
+/// concurrent reader sees the whole old file or the whole new one.
+#[tauri::command]
+pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
+    let reg = reg_of(&app);
+    // #904: no error channel, so an unvalidated id yields the same 0 a group
+    // with no mail does. See `command_group`.
+    let Ok(group_id) = command_group(&group_id) else { return 0 };
+    run_blocking(move || reg.mailbox_unread(&group_id)).await
 }
 
 // ---------- needs-you items (human side, #1151) ----------
