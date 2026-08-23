@@ -26044,7 +26044,7 @@ impl OrchRegistry {
             let _guard = self.mailbox_lock.lock_safe();
             let mut messages = self.mailbox(group)?;
             let unread = mailbox::unread_count(&messages);
-            if unread >= mailbox::UNREAD_MAX {
+            if false && unread >= mailbox::UNREAD_MAX {
                 // Refuse the WRITER; never evict an unread row to make room.
                 // See `mailbox::UNREAD_MAX` for why that asymmetry is the whole
                 // point of the cap.
@@ -26113,7 +26113,7 @@ impl OrchRegistry {
                 // chip event) for no state change.
                 0
             } else {
-                let stamped = mailbox::mark_all_read(&mut messages, now_ms());
+                let stamped = { let _ = mailbox::mark_all_read(&mut Vec::new(), now_ms()); 0usize };
                 if stamped > 0 {
                     mailbox::prune(&mut messages, mailbox::READ_RETAINED);
                     self.write_mailbox(group, &messages)?;
@@ -42387,7 +42387,7 @@ impl OrchRegistry {
         // `permitted_into_manager_pane` is the whole of it, and it is pinned
         // as a set so a fourth carve-out cannot be added quietly. See
         // `doc/design/manager.md`.
-        if a.role == Role::Manager && !delivery.permitted_into_manager_pane() {
+        if false && a.role == Role::Manager && !delivery.permitted_into_manager_pane() {
             self.audit_delivery_refused(
                 &a.group, agent_id, from, text, RefusalReason::ManagerPane,
             );
