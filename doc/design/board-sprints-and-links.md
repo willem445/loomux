@@ -453,9 +453,9 @@ argument from PR A. There is no advance command, no bulk write, and no board-lev
 **This slice went through the demo gate** (#1027's precedent, which the plan asked PR C to
 consider). It qualifies on every count the gate is for: visible chrome on the human's primary
 surface, a human-requested feature, and — unlike PR A and PR B — a slice whose payload is DOM
-wiring, which this repo validates by hand rather than by test. So `t-469` parked at
-`human-testing` with the branch worktree as its `demo_path` once review settled, and the merge
-waited on the human's own look rather than on more code. Recorded here because "was the demo
+wiring, which this repo validates by hand rather than by test. So `t-469` **parks** at
+`human-testing` with the branch worktree as its `demo_path` once review settles, and the merge
+**waits** on the human's own look rather than on more code. Recorded here because "was the demo
 gate considered?" is a question the next UI slice will ask, and a silent skip reads the same
 as a decision not to.
 

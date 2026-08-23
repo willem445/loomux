@@ -960,11 +960,23 @@ export function sprintFilterChoices<T extends HasSprint>(
 ): string[] {
   const seen = new Set<number>();
   for (const t of board) if (typeof t.sprint === "number") seen.add(t.sprint);
-  // Only numeric armed values join the numeric list; `backlog` is already
-  // unconditional below, and anything else a hand-edited prefs file holds is
-  // not a sprint and gets no chip here.
+  // Only armed values whose decimal spelling is CANONICAL join the numeric
+  // list. The round-trip test is the rule, not a digits-only character class:
+  // this list is rendered back through `String`, so `"007"` admitted as `7`
+  // would mint a `#7` chip while the value the filter actually holds — `"007"`
+  // — still had none. That is verbatim the failure the `armed` parameter
+  // exists to prevent, with a phantom chip added on top.
+  //
+  // What remains after this, stated rather than implied: a non-canonical armed
+  // value gets no chip at all. It is unreachable from the UI (the chips and
+  // the lens only ever write canonical decimals, so only a hand-edited or
+  // foreign-build prefs file can hold one), and it can match no row either,
+  // because `sprintFilterValue` also renders through `String`. So it is a
+  // constraint that matches nothing by construction, and ✕ is the honest exit;
+  // a `#007` chip would claim the board was filtered to a sprint no row can
+  // ever answer to.
   for (const a of armed) {
-    if (/^-?\d+$/.test(a)) seen.add(Number(a));
+    if (String(Number(a)) === a) seen.add(Number(a));
   }
   return [...[...seen].sort((a, b) => a - b).map(String), BACKLOG_SPRINT];
 }

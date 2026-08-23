@@ -154,8 +154,16 @@ export function writeGroupView(
  *  keeps. That family has since landed, and this site behaved as designed:
  *  adding `sprint` to `BoardFilter` made this literal fail to compile
  *  (`TS2322: Property 'sprint' is missing`) until the line below was written.
- *  Note that only `tsc` catches it — `node --test` strips types without
- *  checking them, so the suite alone would have gone green on the omission.
+ *
+ *  BOTH guards catch the omission, measured by deleting that line and running
+ *  each: `tsc` refuses it with the `TS2322` above, and
+ *  `test/boardprefs.test.ts` reddens on `a write survives an encode/decode
+ *  round trip` and `an unknown family cannot shadow a known one`. Neither is
+ *  spare. What sees only one of them is a mutation harness running `node
+ *  --test` alone — type stripping is not typechecking — so a run that reports
+ *  which tests reddened has still not asked whether the compiler had an
+ *  opinion. Worth knowing before concluding anything about what protects this
+ *  literal.
  *
  *  `BoardFilter &` is what makes the four sites move together; the
  *  `Record<string, unknown>` intersected onto it is what still admits the

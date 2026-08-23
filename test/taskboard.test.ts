@@ -1946,6 +1946,32 @@ test("an ARMED sprint keeps its chip after its last row is gone", () => {
   // prefs file holds is not a sprint — neither mints a stray chip.
   assert.deepEqual(sprintFilterChoices(board, [BACKLOG_SPRINT]), ["1", "2", BACKLOG_SPRINT]);
   assert.deepEqual(sprintFilterChoices(board, ["nonsense", ""]), ["1", "2", BACKLOG_SPRINT]);
+  // The CANONICALISATION side, which the digits-only version of this got wrong
+  // (#1337 review N6). These are the values that pass a `\d`-shaped test and
+  // then come back as a DIFFERENT string through `String(Number(a))`, so
+  // admitting them mints a chip for a sprint the filter is not holding —
+  // exactly the failure `armed` exists to prevent, plus a phantom.
+  //
+  // `-0` and `007` are the pair that slip a digits-only class; `+3` and `1e1`
+  // are the ones it already excluded, kept here so the round-trip rule is
+  // pinned across both halves rather than only where it changed behaviour.
+  for (const bad of ["-0", "007", "+3", "1e1", " 5", "5 ", "0x2"]) {
+    assert.deepEqual(
+      sprintFilterChoices(board, [bad]),
+      ["1", "2", BACKLOG_SPRINT],
+      `an armed ${JSON.stringify(bad)} must mint no chip — a chip for a value the filter does not hold is worse than none`
+    );
+  }
+  // The positive control for that loop: the same call shape with a CANONICAL
+  // value does add a chip, so the loop above is not passing because
+  // `sprintFilterChoices` ignores `armed` outright.
+  assert.deepEqual(sprintFilterChoices(board, ["7"]), ["1", "2", "7", BACKLOG_SPRINT]);
+  // Canonical values that are easy to get wrong the other way still work.
+  assert.deepEqual(sprintFilterChoices(board, ["0"]), ["0", "1", "2", BACKLOG_SPRINT]);
+  assert.deepEqual(
+    sprintFilterChoices(board, ["4294967295"]),
+    ["1", "2", "4294967295", BACKLOG_SPRINT]
+  );
   // The default is the pre-N3 behaviour, so every other caller is unchanged.
   assert.deepEqual(sprintFilterChoices(board), ["1", "2", BACKLOG_SPRINT]);
 });
