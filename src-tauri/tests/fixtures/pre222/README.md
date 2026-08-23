@@ -696,8 +696,9 @@ so far:
   or the code *parses* moved, and that is the whole review question here: the `[loomux]`
   notice marker, `.loomux/` paths, `LOOMUX_*` env vars, the `gh` shim's refusal text, the
   `from`-`loomux` audit sender and the `agent-managed` label description (which mirrors
-  `gh.rs`'s `label_spec` arm for it verbatim) are all still spelled the way the shipping code
-  spells them, because they name identities that flip in phases 3 and 4 rather than
+  `gh.rs`'s `label_spec` arm for it verbatim) were **at that point** all still spelled the
+  way the shipping code spelled them, because they named identities that flipped in phases
+  3 and 4 rather than
   here. So a delta review of this directory should read every hunk as a brand noun and
   find no surviving technical literal on the `+` side that is not on the `-` side. The
   one that is easy to misread as a missed rename is
@@ -761,6 +762,13 @@ pin advertised to stop it (rev-11 F1).
   a **writer** there, and that one is silently ignored rather than merely
   wrong, because `lessons_path` prefers `.orrerix/lessons.md` and never reads
   the entry again.
+
+  **Reading the entries above this one:** every round before phase 3 quotes the notice
+  marker as `[loomux]`, because that is what it was when they were written. It is
+  `[orrerix]` now. The entries are the record of what each round changed, not a
+  description of today's templates — the templates themselves are the description of
+  those, and `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` is what
+  keeps them honest.
 
   **Second round in the same PR (rev-967 N6).** The marker rename left the
   article wrong — *"a `[orrerix]` notice"* — in roughly twenty places across
