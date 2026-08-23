@@ -231,15 +231,24 @@ so in the PR, because a silent divergence in either direction is unreviewable.
 #1176's routing feature (#1209) landed just after this phase and did exactly that, with
 **opposite answers on two surfaces of one feature**:
 
-- **Its five new `gh` shim refusals joined the renamed class.** On `main` every branded
-  refusal message already said `orrerix` and none said `loomux`; the new ones were the
-  only holdouts, so they moved.
-- **Its two new Rust gate-status strings did not.** `main`'s own message in that same
-  function still reads *"loomux cannot resolve the PR's current head commit"*, so the new
-  siblings stayed `loomux` and matched it. They had been renamed first and were then
-  reverted, on the governing observation: **a function emitting two spellings of its own
-  product name is worse than a surface uniformly on the old one.** A surface moves as a
-  surface, when its phase comes.
+- **Its new `gh` shim refusals joined the renamed class** — the five *branded* ones, of
+  nine new call sites; the other four name no product at all. On `main` every branded
+  refusal message already said `orrerix` and none said `loomux`, so those five moved with
+  it.
+- **Its two new Rust status strings did not** — and they reached that answer by different
+  routes, which is the part to take from this, because the sibling is only the easy case:
+  - One sits in `gate_status_line_with`, directly beside `main`'s own *"loomux cannot
+    resolve the PR's current head commit"*. Its sibling answered for it.
+  - The other is in `pr_changed_files`, **a function this feature created**. There was no
+    sibling to read, so the *surface* answered instead: the Rust gate-status line is not
+    this phase's renamed class, and a string authored onto a surface joins the surface it
+    is on, not the diff that carries it.
+
+  Both had been renamed first and were then reverted, on the governing observation:
+  **a function emitting two spellings of its own product name is worse than a surface
+  uniformly on the old one.** A surface moves as a surface, when its phase comes — so
+  where there is no sibling, the question is what the SURFACE says, never what the
+  branch would prefer.
 
 Identifiers were untouched on both sides (`loomux_block_wf`, `loomux_audit`,
 `LOOMUX_GROUP_DIR`, `loomux_route_scan`) — this phase renamed strings, not symbols.
