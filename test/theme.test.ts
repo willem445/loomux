@@ -1151,7 +1151,7 @@ test("every palette entry is a well-formed hex colour", () => {
 
 // --- #1320: the near-black neutral ground, the gold accent, and one font source ----------
 
-test("the neutral ramp carries no hue — nothing in the ground is tinted", () => {
+test("the neutral ramp, the ink and the selection ground carry no hue", () => {
   // The direction (#1320 ask 1): "kill the blue hue ... no blue cast anywhere: backgrounds,
   // panels, borders, chrome". Before this slice every neutral in the app was a COOL grey —
   // blue sat 3-22 points above red at every step of both ramps — which is what read as a
@@ -1162,9 +1162,24 @@ test("the neutral ramp carries no hue — nothing in the ground is tinted", () =
   // each leaning two points the same way is a visible cast even when no single step trips a
   // threshold. Achromatic is a property that cannot drift.
   //
-  // This is the ground and the ink ONLY. Hues are still hues; `held`/`idle` are listed
-  // because the design calls them achromatic in prose (SEMANTIC, "ACHROMATIC on purpose"),
-  // and prose is exactly what this pins.
+  // SCOPE, because the name used to over-claim and #1340 is a lesson in exactly that. This
+  // pins the tokens the NEUTRAL and INTERACTION channels put on a ground, plus the ink: the
+  // slate ramp, the mist ramp, `ansiBlack`, the terminal's own two ink literals, the two state
+  // dyes the design calls achromatic in prose (`held`/`idle` — and prose is exactly what this
+  // pins), and `selection`. It does NOT say no ground in the app carries a hue: the STATE and
+  // IDENTITY channels wash grounds by design (an awaiting-human task row, an urgent decision
+  // card, diff add/delete), which doc/design/ui-redesign.md §The ground argues and #1340 leaves
+  // to the human. A universal here would be the same false claim this test exists to catch.
+  //
+  // `selection` is on this list because it is a GROUND, and #1340 is what it cost to leave
+  // it off. #1320 de-blued the ramp and in the same slice handed the SELECTED-ROW fill a
+  // deep GOLD wash (#38321f), so the rule the palette was said to be built on — theme.ts's
+  // ramp doc, and doc/design/ui-redesign.md §The ground — was false for every selected file
+  // row, every open editor row, every active workflow row and every terminal text selection
+  // at once, while this test stayed green. A list that stopped at the ramp could not see it:
+  // the hole was the POPULATION, not the assertion. (Both surfaces are cited by SECTION
+  // rather than by sentence: #1340 rewrote the wording on each, so a quotation here would
+  // send a reader who greps it to verify looking for text that no longer exists.)
   const achromatic: Record<string, string> = {
     "PALETTE.slate000": PALETTE.slate000,
     "PALETTE.slate100": PALETTE.slate100,
@@ -1178,6 +1193,7 @@ test("the neutral ramp carries no hue — nothing in the ground is tinted", () =
     "PALETTE.ansiBlack": PALETTE.ansiBlack,
     "SEMANTIC.stateHeld": SEMANTIC.stateHeld,
     "SEMANTIC.stateIdle": SEMANTIC.stateIdle,
+    "SEMANTIC.selection": SEMANTIC.selection,
     "TERMINAL_THEME.foreground": TERMINAL_THEME.foreground,
     "TERMINAL_THEME.brightWhite": TERMINAL_THEME.brightWhite,
   };
@@ -1192,6 +1208,122 @@ test("the neutral ramp carries no hue — nothing in the ground is tinted", () =
   }
 });
 
+test("the accent paints marks, never grounds — every gold background is argued for", () => {
+  // #1340, the human on the shipped #1320/#1327 theme: "I don't like how the gold hue is
+  // tinting everything. I'm fine with gold being an accent color but I want just the straight
+  // black that orca has without any tint or hue applied to everything."
+  //
+  // The ramp was not the problem — #1320 left every slate and mist step achromatic and the
+  // test above pins that. What tinted the app was the accent reaching the one property that
+  // turns a pigment into a CAST: `background`. A gold ring, edge, glyph or caret is an accent
+  // in the design; a gold GROUND is the design, and enough of them is a theme the human never
+  // asked for. So the property is the axis, and the default is NO.
+  //
+  // Default-deny with an argued allow-list, and both halves are load-bearing: an unlisted
+  // gold background fails, and a row whose rule stopped painting one ALSO fails, so the list
+  // cannot rot into exemptions for rules nobody kept. Measured, not assumed — renaming
+  // `.wf-btn-primary` reddens the UNLISTED assertion (the renamed rule is a gold background
+  // nothing argued for, and that assertion throws first, so the stale row it also creates is
+  // never reached); neutralising `.git-chip.head`'s background reddens the STALE one. Which
+  // is also why keying on the selector is not the name-heuristic this repo refuses (CLAUDE.md,
+  // source-scanning guards): the decision is the PROPERTY, and a rename cannot step over it
+  // quietly — it lands on the deny side either way.
+  //
+  // WHAT THIS CANNOT SEE, stated rather than implied: only `background`/`background-color` in
+  // styles.css. A ring (`box-shadow`), an edge (`border`), a glyph (`color`) and an outline
+  // are the accent's own positions and are deliberately out of scope.
+  //
+  // AN INLINE BACKGROUND WRITTEN FROM TYPESCRIPT IS INVISIBLE TO IT, AND TWO MODULES WRITE
+  // ONE: `src/statusbar.ts` (`m.fill.style.background = hueFor(p)`, an hsl() load ramp) and
+  // `src/tabbar.ts` (`dot.style.background = color`, one of the six `TAB_COLORS`, which are
+  // `IDENTITY` hues). Neither can resolve to the accent, so there is no live hole today — but
+  // the honest statement is that the shape EXISTS and is unguarded, not that nobody does it.
+  // A third such site that reached for gold would ship green. Separately, the four
+  // `--group-color`/`--connect-color`/`--tab-color`/`--dock-accent` setters pass an identity
+  // colour from TypeScript and reach the accent only as the CSS-side fallback, which IS
+  // caught below. So is nothing else: an accent reached through a custom property this file
+  // does not resolve is invisible too.
+  const ALLOWED: Record<string, string> = {
+    // --- the drag/drop affordances, which exist only while a gesture is in flight.
+    ".drop-indicator": "the wash IS the affordance — you read the pane under it to see where the drop lands",
+    ".divider.dragging": "a divider being dragged, for the length of the drag",
+    ".pane-embed-divider.dragging": "same, inside a pane",
+    // --- marks whose whole area IS the mark. A chip this small is a glyph with a box round
+    //     it, not a surface something else sits on.
+    ".pane-badge": "the group role chip; gold is only its FALLBACK — a grouped pane paints --group-color",
+    ".pane-channel": "the cross-pane channel chip, same fallback shape",
+    ".git-chip.head": "the HEAD chip in the git bar — one word on a pill",
+    ".fileedit-hit-badge": "the per-file match count, a two-digit pill",
+    // --- primary actions: the one button in a dialog that does the thing.
+    ".dlg-btn.primary:hover:not(:disabled)": "primary action, hover",
+    ".git-modal-btn.primary": "primary action",
+    ".git-commit-btn:hover:not(:disabled)": "primary action, hover",
+    ".fileedit-save:hover:not(:disabled)": "primary action, hover",
+    ".fileedit-find-icon:hover": "opens the find panel — the action this toolbar exists for",
+    ".dormant-btn": "the resume-group button, the only control on an otherwise empty pane",
+    ".dormant-btn:hover": "same button, hover — it deepens a colour the button already owns",
+    ".restore-splash-btn.primary": "restore-the-session, on the splash",
+    ".restore-splash-btn.primary:hover": "same button, hover",
+    ".wf-btn-primary": "primary action in the workflow editor",
+    // --- on-states: the human turned this on, and the fill is the answer to "is it on?".
+    ".issues-toggle.on": "filter toggle, on",
+    ".issues-mode-tab.on": "mode tab, on",
+    ".tasks-head .pane-btn.sprint-lens.on": "sprint lens, on",
+    ".tasks-filter .pane-btn.filter-chip.on": "board filter chip, on",
+    ".audit-follow.on": "follow-the-tail, on",
+    ".timeline-follow.on": "follow-the-tail, on",
+    // --- search matches: highlighting the thing you searched for is the accent's job.
+    ".fileedit-editor-host .cm-wsMatch, .fileedit-editor-host .cm-searchMatch":
+      "occurrences of the query in the open file",
+    ".fileedit-editor-host .cm-searchMatch-selected": "the occurrence the cursor is on",
+  };
+
+  const css = stripCssComments(read("../src/styles.css"));
+  const { below } = splitAtRoot(css);
+  let scanned = 0;
+  const seen = new Set<string>();
+  const unlisted: string[] = [];
+  for (const [, sel, body] of below.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = sel.trim().replace(/\s+/g, " ");
+    if (selector.startsWith("@")) continue;
+    for (const decl of body.split(";")) {
+      const i = decl.indexOf(":");
+      if (i < 0) continue;
+      if (!/^background(-color)?$/.test(decl.slice(0, i).trim())) continue;
+      scanned++;
+      const value = decl.slice(i + 1).trim();
+      if (!/var\(\s*--(accent|focus)\b/.test(value)) continue;
+      // Every gold background is JUDGED here — none is skipped — so `seen` really is the set
+      // the allow-list was checked against, and the stale-row assertion below means what it says.
+      if (selector in ALLOWED) seen.add(selector);
+      else unlisted.push(`${selector} { background: ${value} }`);
+    }
+  }
+
+  // The instrument, before its findings: a parse that matched nothing would report a clean
+  // app. 388 background declarations at the commit this floor was measured on — a loose floor,
+  // not a pin on a number that moves with every UI slice.
+  assert.ok(
+    scanned > 300,
+    `only ${scanned} background declarations found in styles.css — the scan is blind, not the app clean`
+  );
+
+  assert.deepEqual(
+    unlisted,
+    [],
+    "these rules paint the brand accent onto a GROUND, which is what #1340 asked to stop. If " +
+      "one of them is genuinely a mark, a primary action, an on-state or a live drag, add it to " +
+      `ALLOWED above with the reason; otherwise use an --ink wash:\n${unlisted.join("\n")}`
+  );
+
+  const stale = Object.keys(ALLOWED).filter((sel) => !seen.has(sel));
+  assert.deepEqual(
+    stale,
+    [],
+    "these selectors are excused from the ground rule but no longer paint an accent background " +
+      `— the exemption outlived the rule it was written for:\n${stale.join("\n")}`
+  );
+});
 test("the brand accent is not a state dye", () => {
   // #1320 ask 2 and ask 3 together: gold is THE interaction accent, and the semantic scale
   // must stay "distinct from the gold brand accent".
