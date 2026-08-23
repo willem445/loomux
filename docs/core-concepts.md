@@ -316,7 +316,7 @@ be rearranged in place:
   so you can tell a Copilot pane from a Claude one across a wall of terminals
   without reading the titles. Each CLI orrerix ships support for has its own hue
   (Claude terracotta, Codex teal, Copilot blue, opencode green, Gemini indigo,
-  Hermes magenta, Ante citron); anything else keeps the violet that just means
+  Hermes mauve, Ante citron); anything else keeps the violet that just means
   "an agent". The same colours mark the CLI chips in the session list. Agents with
   a recognisable mark show it; everything else shows a
   lettered badge with the program's initial (`C` for Claude, `O` for opencode),

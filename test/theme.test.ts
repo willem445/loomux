@@ -1042,18 +1042,24 @@ const STATE_DYES = {
 test("the four agent states stay separable under colour-vision deficiency", () => {
   // THE LOAD-BEARING MEASUREMENT OF THE THREE-CHANNEL DESIGN.
   //
-  // Eight hues on one dark ground cannot all survive CVD, and this set does not: azure and
-  // violet are INDISTINGUISHABLE to a protanope (0.0 dE), and cyan/azure are 2.4 dE to a
-  // tritanope, where rose/orchid are 4.3. (Before #1320 de-exoticised the octet these read
-  // "azure/violet 2.9 protan, rose/orchid identical to a tritanope" — both figures moved and
-  // the two claims effectively swapped, which is why the guard below now re-derives them.)
+  // Eight hues on one dark ground cannot all survive CVD, and this set does not:
+  // azure/violet are 0.0 ΔE to a protanope (genuinely indistinguishable), cyan/azure are
+  // 2.4 ΔE to a tritanope, and rose/orchid are 4.3 ΔE to a tritanope. The identity octet's
+  // closest pair (azure/violet, 15.3 ΔE) is the normal-vision figure behind that.
+  //
+  // Before #1320 de-exoticised the octet this read "azure/violet 2.9 protan, rose/orchid
+  // identical to a tritanope" — both figures moved and the two claims effectively swapped,
+  // which is why the guard at the end of this file re-derives every one of them, INCLUDING
+  // the copies in this file. These sentences are written in that guard's canonical shapes on
+  // purpose: a surface it is told to scan but cannot parse is a surface it does not cover.
   // The design accepts that for IDENTITY — which thing this is, always also carried by
   // position, label and icon shape — and refuses it for STATE, which is the one thing a
   // supervisor has to read correctly at a glance across ten panes.
   //
-  // Measured state worst case is 10.8 dE (tritan, attention/danger, where amber and rose
-  // both lose their yellow axis) — it was 10.3 before #1320 retuned the scale, so the
-  // change improved the load-bearing measurement. The floor is 9: low enough that a
+  // Measured: the state worst case is 10.8 ΔE (tritan, attention/danger, where amber and
+  // rose both lose their yellow axis) — it was 10.3 before #1320 retuned the scale, so the
+  // change improved the load-bearing measurement. Separately, the accent sits 12.8 ΔE from
+  // the nearest state dye at its worst. The floor is 9: low enough that a
   // legitimate nudge to a dye does not trip it, high enough that two states merging does.
   for (const kind of [null, ...CVD_KINDS]) {
     const view = (hex: string) => (kind === null ? hex : simulate(hex, kind));
@@ -1333,7 +1339,13 @@ test("every surface that quotes an identity/state ΔE figure re-derives it", () 
   // CVD figures in theme.ts and the design note and missed the copies in these test
   // comments — the same claim alive on a third surface (CLAUDE.md, #878). A guard that
   // cannot see its own prose is a guard with a blind spot exactly where the last one was.
-  const flatten = (s: string) => s.replace(/[|*]/g, " ").replace(/\s+/g, " ");
+  // Backticks are removed OUTRIGHT — not turned into spaces like pipes and bold markers.
+  // Markdown wraps these hue names in code spans (rose/orchid), and replacing a backtick with
+  // a space yields "rose / orchid", which the dichromat regex does not match either. The
+  // design note is the one surface B3 actually went stale on, so a normaliser that cannot
+  // parse it covers nothing there. Both cuts were caught by mutating the note and watching
+  const flatten = (s: string) =>
+    s.replace(/`/g, "").replace(/[|*]/g, " ").replace(/\s+/g, " ");
   const SURFACES = [
     { what: "doc/design/ui-redesign.md", text: flatten(read("../doc/design/ui-redesign.md")) },
     { what: "src/theme.ts", text: flatten(read("../src/theme.ts")) },
@@ -1377,14 +1389,41 @@ test("every surface that quotes an identity/state ΔE figure re-derives it", () 
       re: /accent sits ([0-9]+\.[0-9]) ΔE from the nearest state/g,
       value: accentWorst.toFixed(1),
     },
+    {
+      // The figure that has now gone stale TWICE — the design note kept "rose/orchid are
+      // identical to a tritanope" through a round in which the other two figures of its own
+      // sentence were corrected. Generic over pair and simulation, so any dichromat claim
+      // on any scanned surface is re-derived rather than only the three named today.
+      label: "a named dichromat pair",
+      re: /([a-z]+)\/([a-z]+) are ([0-9]+\.[0-9]) ΔE to a (protanope|deuteranope|tritanope)/g,
+      dichromat: true,
+    },
   ];
   const wrong: string[] = [];
   const seenPerClaim = new Map<string, number>(CLAIMS.map((c) => [c.label, 0]));
+  const seenPerSurface = new Map<string, number>(SURFACES.map((s) => [s.what, 0]));
+  const KINDS: Record<string, Cvd> = {
+    protanope: "protan",
+    deuteranope: "deutan",
+    tritanope: "tritan",
+  };
+  const ID = IDENTITY as Record<string, string>;
   for (const { what, text } of SURFACES) {
     for (const claim of CLAIMS) {
       for (const m of text.matchAll(claim.re)) {
         seenPerClaim.set(claim.label, (seenPerClaim.get(claim.label) ?? 0) + 1);
-        if (claim.pair !== undefined) {
+        seenPerSurface.set(what, (seenPerSurface.get(what) ?? 0) + 1);
+        if (claim.dichromat) {
+          const [a, b, stated, kindWord] = [m[1], m[2], m[3], m[4]];
+          if (ID[a] === undefined || ID[b] === undefined) continue; // not an identity pair
+          const actual = deltaE(
+            simulate(ID[a], KINDS[kindWord]),
+            simulate(ID[b], KINDS[kindWord])
+          ).toFixed(1);
+          if (stated !== actual) {
+            wrong.push(`${what}: ${a}/${b} to a ${kindWord} is stated ${stated} ΔE; it is ${actual}`);
+          }
+        } else if (claim.pair !== undefined) {
           if (m[1] !== claim.pair) wrong.push(`${what}: ${claim.label} names ${m[1]}; it is ${claim.pair}`);
           if (m[2] !== claim.value) wrong.push(`${what}: ${claim.label} says ${m[2]} ΔE; it is ${claim.value}`);
         } else if (m[1] !== claim.value) {
@@ -1393,20 +1432,30 @@ test("every surface that quotes an identity/state ΔE figure re-derives it", () 
       }
     }
   }
-  // POSITIVE CONTROL, PER CLAIM — not a total.
+  // TWO POSITIVE CONTROLS, ON DIFFERENT AXES, because each is blind where the other sees.
   //
-  // The first cut counted every match across every claim and asserted the SUM was at least
-  // the number of claims. That passes when one claim matches three times and the other two
-  // match nothing, which is exactly the vacuity it exists to exclude — and it really did:
-  // two of these three figures were unchecked while this test reported green. Each claim now
-  // has to be found somewhere, so rewording one out of existence reddens the claim it
-  // silenced instead of being absorbed by its neighbours.
-  const unseen = [...seenPerClaim].filter(([, n]) => n === 0).map(([l]) => l);
+  // Per CLAIM: a figure reworded out of existence reddens the claim it silenced instead of
+  // being absorbed by its neighbours. (The first cut summed across claims and passed while
+  // two of three regexes matched nothing.)
+  //
+  // Per SURFACE: a control that only proves the mechanism RAN never proves it SAW every
+  // subject. This guard listed test/theme.test.ts as a scanned surface and its own comment
+  // boasted about doing so, while matching ZERO of three claims there — the figures were
+  // spelled "dE" and in other sentence forms, so nothing bound them and mutating one left
+  // the suite green. That is the exact blind-instrument shape CLAUDE.md names. A surface
+  // listed here must now carry at least one figure this guard can parse, or it reddens.
+  const unseenClaims = [...seenPerClaim].filter(([, n]) => n === 0).map(([l]) => l);
   assert.deepEqual(
-    unseen,
+    unseenClaims,
     [],
-    `no surface states: ${unseen.join("; ")} — the prose was reworded out from under this ` +
-      "guard, so those figures are checked by nothing"
+    `no surface states: ${unseenClaims.join("; ")} — reworded out from under this guard`
+  );
+  const blindSurfaces = [...seenPerSurface].filter(([, n]) => n === 0).map(([l]) => l);
+  assert.deepEqual(
+    blindSurfaces,
+    [],
+    `scanned but matched nothing: ${blindSurfaces.join("; ")} — listed as covered while ` +
+      "contributing no checkable figure, so a stale number there would go unnoticed"
   );
   assert.deepEqual(wrong, [], `stale figures:\n${wrong.join("\n")}`);
 });

@@ -226,12 +226,12 @@ questions, not a way to avoid minting a value.
 
 **The position rule is load-bearing, and here is the measurement that proves it.** Eight hues
 on one dark ground cannot all survive colour-vision deficiency, and this set does not: under
-simulation `azure` and `violet` are 0.0 ΔE apart to a protanope — identical — and `cyan` and
-`azure` are 2.4 ΔE to a tritanope, where `rose` and `orchid` are
-*identical* to a tritanope. The design accepts that for identity — which thing this is, is
+simulation `azure`/`violet` are 0.0 ΔE to a protanope — genuinely identical — `cyan`/`azure`
+are 2.4 ΔE to a tritanope, and `rose`/`orchid` are 4.3 ΔE to a tritanope. The design accepts
+that for identity — which thing this is, is
 always also carried by position, by a label, and by an icon's shape — and refuses it for
 state, which is the one thing a supervisor must read correctly at a glance across ten panes.
-The four state dyes stay at least **10.3 ΔE** apart under all three dichromacies (the worst
+The four state dyes stay well clear of each other under all three dichromacies (the worst
 case is tritan `attention`/`danger`, where amber and rose both lose their yellow axis): the
 state worst case is 10.8 ΔE, up from 10.3 before #1320. And the accent sits 12.8 ΔE from the
 nearest state dye at its worst, where before #1320 it was 0.0 — it *was* that dye.
@@ -814,7 +814,8 @@ things answer it, and they are checkable rather than tasteful:
   may never enter one. So more colour cannot dilute the signal a supervisor reads.
 - **The collapse is measured, not hoped for.** The eight-hue set genuinely fails under
   colour-vision deficiency, and the design places nothing load-bearing on it — the four state
-  dyes stay ≥ 10.3 ΔE apart under all three dichromacies and the test enforces a floor.
+  dyes stay far apart under all three dichromacies — the state worst case is 10.8 ΔE — and
+  the test enforces a floor of 9.
 - **Eight is where the measurements stopped, not where enthusiasm stopped.** Every candidate
   ninth hue was closer to a neighbour than the set's own tightest pair, so it was refused.
 

@@ -195,10 +195,10 @@ export const PALETTE = {
  * WHAT KEEPS THE TWO CHANNELS APART IS POSITION, AND IT IS LOAD-BEARING. The state dyes
  * hold an exclusive claim to the state POSITIONS — the warp thread, the status chip, the
  * state dot — and an identity hue may never appear in one. That is not tidiness: under
- * simulated colour-vision deficiency this eight-hue set collapses (azure and violet are
- * INDISTINGUISHABLE to a protanope at 0.0 ΔE; cyan and azure are 2.4 ΔE to a tritanope, and
- * rose and orchid 4.3 ΔE), while the four state dyes stay the most separable set under all
- * three simulations — their own worst case is 10.8 ΔE. A supervisor who
+ * simulated colour-vision deficiency this eight-hue set collapses — azure/violet are 0.0 ΔE
+ * to a protanope (genuinely indistinguishable), cyan/azure are 2.4 ΔE to a tritanope, and
+ * rose/orchid are 4.3 ΔE to a tritanope — while the four state dyes stay the most separable
+ * set under all three simulations: the state worst case is 10.8 ΔE. A supervisor who
  * cannot tell violet from azure still reads the fleet correctly, because nothing they must
  * act on was ever encoded in the channel that collapsed. `test/theme.test.ts` measures
  * exactly that and fails if identity ever becomes the more robust of the two.
