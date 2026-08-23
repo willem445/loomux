@@ -26,6 +26,11 @@ swimlane view would need, though that view is explicitly out of scope here (§10
 
 ## 2. Model: containment is orthogonal to ordering
 
+> **Sprints are a third, orthogonal axis** (#1272). Containment is *where work belongs*,
+> `deps` are *what must land first*, and a `sprint` is *which batch it is in* — a flat
+> numbered grouping that cuts across the tree, so a subtree may legitimately span sprints.
+> It is not a hierarchy level and never becomes one. See `board-sprints-and-links.md`.
+
 `Task` gains two additive fields, both `#[serde(default, skip_serializing_if =
 "Option::is_none")]` so a pre-#958 `tasks.json` loads unchanged and a board that never nests
 anything never gains either key — the same zero-migration shape #582 shipped for `deps`/
@@ -465,3 +470,10 @@ Filed as follow-ups rather than built here, each for a stated reason:
   about its subtree. It is the human's to opt into.
 - **Role-template edits** — none were needed for this feature; the MCP tool descriptions are the
   teaching surface for the orchestrator, so no `pre222` fixture re-bless was owed by this work.
+
+  That reason is about the KIND of thing being taught, and it does not generalise to every
+  board-model addition. #1272's sprints did owe a template edit and a re-bless: a *selection*
+  rule — the order in which the orchestrator picks up its own work — is not something a tool
+  description can carry, because it is not about how to call a tool. A field's semantics can
+  live in the tool description (as `parent`/`kind` do); a rule about what to do first cannot.
+  See `board-sprints-and-links.md` §7.

@@ -607,6 +607,74 @@ Nesting is still board metadata everywhere it counts: it never affects whether a
 allowed, and it never blocks the orchestrator from *assigning* a subtask — readiness is a
 signal for reading the board, not a lock.
 
+### Sprints — batches of work, in order
+
+A task can carry a **sprint number**: Sprint 1, Sprint 2, and so on. A sprint is a *batch*,
+not a calendar — the number replaces the timebox, so there are no start dates, no end dates
+and no duration anywhere. The point is only to say **which work comes first**: the
+orchestrator finishes the current sprint before starting the next, and tasks with no sprint
+at all — the backlog — sit behind everything that has one.
+
+- Both you and the orchestrator can assign a sprint, and either of you can change or clear
+  it. It's an ordinary board edit, not a privileged one.
+- The board shows the **current sprint** and how far it has got — the lowest sprint number
+  that still has unfinished work in it. When its last item is done, the next sprint becomes
+  current on its own; there's no button to press and no marker to keep in step.
+- **A blocked item keeps its sprint open.** That's deliberate: a sprint quietly ending
+  because the work left in it looked stuck is exactly the thing you'd want to be told
+  about. It stays current until you resolve that item or move it on.
+- Moving unfinished work into the next sprint is always **explicit**. The board shows you
+  the exact list of items that would move and asks first, then moves them one at a time so
+  each shows up in the audit log on its own. Nothing rolls over silently, whether you do it
+  or the orchestrator does.
+
+Sprint numbers don't have to be tidy — they needn't be contiguous and needn't start at 1, so
+you can leave gaps for planned work without the board minding.
+
+**A sprint changes nothing except the order things get picked up in.** It doesn't make an
+item startable or unstartable, it doesn't stop the orchestrator claiming something, and it
+doesn't interact with WIP limits. An item outside the current sprint is still perfectly
+ready to start if its dependencies are met — the sprint says what *should* come first, not
+what *may* happen. And the board itself is never re-sorted: it stays in the order you put it
+in, with the sprint shown on the row.
+
+**On a board that uses no sprints, none of this appears** and nothing changes.
+
+### Grounding links — what an agent should read first
+
+Beyond dependencies, a task can carry **links to the things that govern the work**: the
+requirement it has to satisfy, an acceptance spec, the design note that constrains the
+approach, a test case that pins the behaviour, a doc it has to keep true — or just a plain
+link worth reading.
+
+This exists to fix a specific failure. An agent picking up a task otherwise has to
+rediscover its context from scratch every session — hunting through an issue thread for the
+requirement, guessing which design note applies — and the real risk isn't wasted time, it's
+**missing a relevant requirement entirely**. A task that carries its grounding as data hands
+the next agent what governs the work instead of hoping they find it.
+
+- Each link has a **type** (requirement, spec, design note, test case, doc, or a plain
+  link), a **target**, and an optional one-line label to show instead of a bare target.
+- A target can be an **issue or PR ref** (`#123`), a **file in the repo**
+  (`doc/design/x.md`, a test file), or a **URL** — the surfaces grounding actually lives on.
+- Both you and the orchestrator can add and remove them. Planners record them as part of a
+  plan, so the artifacts a plan names become something the next agent reads rather than
+  prose someone has to re-parse.
+
+Two things links deliberately don't do. They **never affect readiness or ordering** — a link
+is context, not structure; if you mean "this must finish first", that's a dependency. And
+targets are **never checked for existence**: the board doesn't go and look, so it keeps
+working offline and a board edit never fails because GitHub was slow. A link pointing at
+something that has moved is shown as it is, the same as a dependency naming a task that
+isn't there — visible, and yours to fix.
+
+One thing *is* checked: a link whose target names another **task on this board** is refused,
+with an error saying so. That's what dependencies and see-also links are for, and the two
+kinds of link are kept apart on purpose — one points inside the board, the other points out
+of it.
+
+**On a board with no links recorded, none of this appears.**
+
 ### WIP limits (finish before you start)
 
 **Max live agents** caps how many agents run at once. It says nothing about how much *work*
