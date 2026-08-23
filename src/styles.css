@@ -2855,6 +2855,67 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* Grounding links (#1273): the typed detail list and its add/remove editor,
+   unfolded by 📎 on the row. Indented to the same gutter as the notes below,
+   because they are the row's other detail section and a second indent would
+   read as a third level of nesting.
+
+   Deliberately NEUTRAL, unlike the Agile-level chips above. Six link types
+   would need six hues, which is a whole second colour language for a field
+   that names a KIND OF DOCUMENT — not a state of the work and not an identity
+   the eye has to track across rows (#1320). The glyph carries the type, and a
+   test pins every type to a distinct one; only the hand-edited case takes a
+   semantic colour, the same red the `missing` dep and `k-unknown` chips use,
+   because it means the same thing: this cannot have been written through the
+   product. */
+.task-groundings { padding: 2px 4px 4px 26px; }
+.task-groundings-head { display: flex; align-items: baseline; gap: 6px; padding-bottom: 2px; }
+.task-groundings-hint { font-size: 9px; color: var(--ink-faint); }
+.task-grounding {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 1px 0; font-size: 11px;
+}
+.task-chip.ground-type {
+  display: inline-flex; align-items: center; gap: 3px; flex: none;
+  font-size: 9px; letter-spacing: 0.3px;
+  background: var(--surface-2); color: var(--ink-dim);
+}
+.task-chip.ground-type .ground-glyph { font-size: 9.5px; }
+.task-chip.ground-type.lt-unknown {
+  background: color-mix(in srgb, var(--state-danger) 16%, transparent); color: var(--state-danger);
+}
+/* The target is the payload, so it is the click target and reads as one. No
+   underline until hover: a list of eight links all underlined is a wall. */
+.task-grounding-open {
+  min-width: 0; flex: 0 1 auto; text-align: left;
+  background: none; border: none; padding: 0; margin: 0;
+  font: inherit; font-size: 11px; color: var(--ink-dim); cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Lifted along the INK ramp on hover, never the accent: "the pointer is here"
+   is not what the one interaction accent is for, and the issue/PR chip beside
+   it (.task-chip.link) already answers this question the same way. */
+.task-grounding-open:hover { color: var(--ink); text-decoration: underline; }
+/* The raw target beside a LABELLED link — a gloss that hides what it points at
+   makes the human open it to find out. */
+.task-grounding-target {
+  min-width: 0; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Same dim-until-hovered ✕ as the dep chips, for the same reason: the list
+   reads as information first and controls second. */
+.task-grounding:hover .task-dep-remove { opacity: 0.7; }
+.task-groundings-full { padding: 3px 0 1px; font-size: 10px; color: var(--ink-faint); }
+.task-grounding-add { display: flex; gap: 6px; margin-top: 5px; align-items: center; }
+.task-grounding-add .task-dep-picker { flex: none; }
+.task-grounding-add input { min-width: 0; padding: 3px 8px; font-size: 11px; }
+.task-grounding-target-input { flex: 2 1 0; }
+.task-grounding-label-input { flex: 1 1 0; }
+.task-btn.ground { font-size: 9px; }
+/* A row that HAS grounding lifts its 📎 along the ink ramp — the same "count
+   that is not zero" emphasis the children rollup gets, not a second channel. */
+.task-btn.ground.has-links { color: var(--ink-dim); }
+
 .task-notes { padding: 3px 4px 5px 26px; }
 .task-note { display: flex; gap: 8px; padding: 2px 0; font-size: 11px; }
 .task-note-meta { flex: none; color: var(--ink-dim); font-size: 10px; padding-top: 1px; }
