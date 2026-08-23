@@ -1189,3 +1189,149 @@ export function hasMissingParent<T extends HasParent>(task: T, board: readonly T
   return !!task.parent && !board.some((t) => t.id === task.parent);
 }
 
+
+// ---------------------------------------------------------------------------
+// Sprints (#1272) and grounding links (#1273) — the board's mirror of the
+// backend model. Every rule here is the backend's (mod.rs `current_sprint`,
+// `normalize_task_links`); these exist because the human's board reads full
+// `Task`s via `orch_tasks` and derives its own view, exactly as it already does
+// for readiness. The two sides are pinned against each other by tests.
+// ---------------------------------------------------------------------------
+
+/** A row as far as sprints care. Optional on the wire like every other additive
+ *  field — the backend skips it when absent, so a sprintless board's rows
+ *  simply have no key, and absent must read as "backlog", never as sprint 0. */
+export interface HasSprint {
+  sprint?: number | null;
+}
+
+/** The board's CURRENT sprint — the lowest sprint on any row that is not
+ *  `done`, or `null` when no open row carries one.
+ *
+ *  Mirrors the backend's `current_sprint` exactly, including the part that
+ *  looks like an omission and is not: a `blocked` row still HOLDS its sprint.
+ *  Only `done` stops counting, so a sprint is finished only when its last open
+ *  row leaves it — never because the remaining work looked stuck. Roll-over is
+ *  always an explicit, audited row write. */
+export function currentSprint<T extends HasStatus & HasSprint>(
+  board: readonly T[]
+): number | null {
+  let lowest: number | null = null;
+  for (const t of board) {
+    if (t.status === DONE_STATUS) continue;
+    const s = t.sprint;
+    if (typeof s !== "number") continue;
+    if (lowest === null || s < lowest) lowest = s;
+  }
+  return lowest;
+}
+
+/** How far one sprint has got: `done` of `total` rows carrying that number.
+ *
+ *  Counts EVERY row in the sprint including done ones — the denominator is the
+ *  sprint's whole scope, which is what makes "3/7 done" mean anything. A sprint
+ *  nobody has assigned reads `{ done: 0, total: 0 }`, and a caller rendering a
+ *  header is expected to check `total` rather than divide by it. */
+export function sprintProgress<T extends HasStatus & HasSprint>(
+  board: readonly T[],
+  sprint: number
+): { done: number; total: number } {
+  let done = 0;
+  let total = 0;
+  for (const t of board) {
+    if (t.sprint !== sprint) continue;
+    total++;
+    if (t.status === DONE_STATUS) done++;
+  }
+  return { done, total };
+}
+
+/** The rows that would MOVE if the human advanced past `sprint` — every row in
+ *  it that is not `done`.
+ *
+ *  This is the never-silent surface: #1272 requires that rolling work forward
+ *  is explicit, so the board shows exactly this list before it writes anything,
+ *  and then performs one audited `upsert_task` per row. `blocked` rows are
+ *  INCLUDED deliberately — they are precisely the ones a silent roll-over would
+ *  sweep up, and the ones the human most needs to see named.
+ *
+ *  Board order is preserved, so the confirm list reads in the same order as the
+ *  board the human is looking at. */
+export function rollOverSet<T extends HasStatus & HasSprint>(
+  board: readonly T[],
+  sprint: number
+): T[] {
+  return board.filter((t) => t.sprint === sprint && t.status !== DONE_STATUS);
+}
+
+/** The grounding-link types, mirroring the backend's `TASK_LINK_TYPES`. Pinned
+ *  against the Rust source by a test, the way `KINDS` is. */
+export const LINK_TYPES = [
+  "requirement",
+  "spec",
+  "design-note",
+  "test-case",
+  "doc",
+  "link",
+] as const;
+
+export type LinkType = (typeof LINK_TYPES)[number];
+
+/** One grounding link as it arrives over `orch_tasks`.
+ *
+ *  Named `TaskArtifactLink`, not `TaskLink`, because `HasLinks` in this module
+ *  already means the #582 `deps`/`related` arrays — two unrelated senses of
+ *  "link" live in this file and the names have to keep them apart. */
+export interface TaskArtifactLink {
+  type: string;
+  target: string;
+  label?: string | null;
+}
+
+/** A row as far as grounding links care. */
+export interface HasArtifactLinks {
+  links?: readonly TaskArtifactLink[] | null;
+}
+
+/** What a link target points at, for choosing how to OPEN it.
+ *
+ *  Display-side only: the backend validates shape and never resolves a target,
+ *  so this classification decides an icon and a click action, never whether the
+ *  link is valid. An unrecognised shape is `"other"` and still renders — the
+ *  same tolerate-and-show posture as the missing-dep chip. */
+export type LinkTargetKind = "issue" | "url" | "path" | "other";
+
+/** Classify a link target. Order matters: an issue ref is checked before a URL
+ *  because `#123` cannot be one, and a URL before a path because a URL contains
+ *  slashes too and would otherwise be misread as a repo path. */
+export function linkTargetKind(target: string): LinkTargetKind {
+  const t = (target ?? "").trim();
+  if (!t) return "other";
+  // `#123` — an issue or PR ref on the repo this group is for. Digits only, so
+  // `#foo` (a fragment, an anchor) is not mistaken for one.
+  if (/^#\d+$/.test(t)) return "issue";
+  // Only http(s). A bare `example.com` is deliberately NOT a URL here: it is
+  // indistinguishable from a file name, and guessing wrong sends a click to the
+  // browser instead of the editor.
+  if (/^https?:\/\//i.test(t)) return "url";
+  // A repo-relative path. Must contain a separator or a file extension —
+  // otherwise a bare word like `README` would claim every unclassified target.
+  // A leading slash or a drive letter is NOT a repo path: those are absolute,
+  // and this classification exists to open things inside the repo.
+  if (/^[A-Za-z]:[\/]/.test(t) || t.startsWith("/") || t.startsWith("\\")) return "other";
+  if (t.includes("/") || /\.[A-Za-z0-9]{1,10}$/.test(t)) return "path";
+  return "other";
+}
+
+/** Does any row on the board carry grounding links? Drives whether the board
+ *  shows link affordances at all — the same pay-for-what-you-use rule
+ *  `boardUsesDeps`/`boardUsesHierarchy` already apply. */
+export function boardUsesLinks<T extends HasArtifactLinks>(board: readonly T[]): boolean {
+  return board.some((t) => (t.links?.length ?? 0) > 0);
+}
+
+/** Does any row carry a sprint? Same rule: a board that runs no sprints shows
+ *  no sprint chrome, so the feature costs nothing to a group not using it. */
+export function boardUsesSprints<T extends HasSprint>(board: readonly T[]): boolean {
+  return board.some((t) => typeof t.sprint === "number");
+}

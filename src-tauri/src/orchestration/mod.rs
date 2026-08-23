@@ -10188,10 +10188,15 @@ fn count_is_zero(n: &usize) -> bool {
     *n == 0
 }
 
-/// `skip_serializing_if` for `AgentTaskView`'s borrowed link slices — the
-/// borrowed form of `Vec::is_empty`, which serde cannot use through a `&[T]`
-/// field (it passes `&&[T]`).
-fn borrowed_slice_is_empty(v: &&[String]) -> bool {
+/// `skip_serializing_if` for `AgentTaskView`'s borrowed slices — the borrowed
+/// form of `Vec::is_empty`, which serde cannot use through a `&[T]` field (it
+/// passes `&&[T]`).
+///
+/// Generic over the element type since #1273: the view now borrows a slice of
+/// `TaskLink` alongside the two `String` link arrays, and a second monomorphic
+/// copy of a one-line predicate is exactly the kind of drift-prone duplication
+/// that ends with the two disagreeing about what empty means.
+fn borrowed_slice_is_empty<T>(v: &&[T]) -> bool {
     v.is_empty()
 }
 

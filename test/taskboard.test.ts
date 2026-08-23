@@ -57,6 +57,13 @@ import {
   unmetDeps,
   withDep,
   withoutDep,
+  boardUsesLinks,
+  boardUsesSprints,
+  currentSprint,
+  LINK_TYPES,
+  linkTargetKind,
+  rollOverSet,
+  sprintProgress,
 } from "../src/taskboard.ts";
 
 test("counts only tasks in the exact `done` status", () => {
@@ -1415,4 +1422,181 @@ test("orderSiblings splits one sibling list without mutating the tree's own arra
   assert.deepEqual(siblings.map((t) => t.id), before, "siblingRows hands back the tree's own array");
   assert.deepEqual(positionAmong(manual, "t-2"), { index: 0, count: 1 });
   assert.deepEqual(positionAmong(manual, "t-3"), { index: -1, count: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Sprints (#1272) and grounding links (#1273).
+// The backend owns every rule (mod.rs `current_sprint`, `normalize_task_links`);
+// these pin that the board says the SAME thing, since the human's board reads
+// full Tasks via orch_tasks and derives its own view.
+// ---------------------------------------------------------------------------
+
+/** A board row with a sprint. `sprint` is omitted (not null) on backlog rows,
+ *  exactly as the backend serializes them. */
+const sprintRow = (id: string, status: string, sprint?: number) =>
+  sprint === undefined ? { id, status } : { id, status, sprint };
+
+test("currentSprint is the lowest sprint on any NON-done row", () => {
+  const board = [
+    sprintRow("t-1", "done", 1),
+    sprintRow("t-2", "queued", 2),
+    sprintRow("t-3", "queued", 3),
+  ];
+  assert.equal(currentSprint(board), 2, "sprint 1 is fully done, so 2 is current");
+});
+
+test("currentSprint is null when no open row carries a sprint", () => {
+  // Three distinct cases that must all read null — never 0, never undefined.
+  assert.equal(currentSprint([]), null, "an empty board has no current sprint");
+  assert.equal(
+    currentSprint([sprintRow("t-1", "queued"), sprintRow("t-2", "blocked")]),
+    null,
+    "a board that runs no sprints has no current sprint"
+  );
+  assert.equal(
+    currentSprint([sprintRow("t-1", "done", 1), sprintRow("t-2", "done", 2)]),
+    null,
+    "every sprint finished — null, not the highest number seen"
+  );
+});
+
+test("a BLOCKED row HOLDS its sprint current — roll-over is never automatic", () => {
+  // The load-bearing case of #1272: a sprint is finished only when its last
+  // open row LEAVES it, never because the remaining work looked stuck. If this
+  // ever reads 2, the board has silently decided a sprint was over.
+  const board = [
+    sprintRow("t-1", "done", 1),
+    sprintRow("t-2", "blocked", 1),
+    sprintRow("t-3", "queued", 2),
+  ];
+  assert.equal(currentSprint(board), 1, "a blocked row keeps sprint 1 current");
+
+  // Every non-done status holds it, not just `blocked`.
+  for (const status of [
+    "queued",
+    "in-progress",
+    "review",
+    "pr",
+    "prototype",
+    "human-testing",
+    "blocked",
+  ]) {
+    const b = [sprintRow("t-1", status, 1), sprintRow("t-2", "queued", 2)];
+    assert.equal(currentSprint(b), 1, `a row at ${status} must hold sprint 1 current`);
+  }
+  // `done` — and only `done` — releases it.
+  const released = [sprintRow("t-1", "done", 1), sprintRow("t-2", "queued", 2)];
+  assert.equal(currentSprint(released), 2, "done releases the sprint");
+});
+
+test("sprint numbers need not be contiguous or start at 1", () => {
+  const board = [sprintRow("t-1", "queued", 7), sprintRow("t-2", "queued", 42)];
+  assert.equal(currentSprint(board), 7);
+});
+
+test("sprintProgress counts the sprint's WHOLE scope as the denominator", () => {
+  const board = [
+    sprintRow("t-1", "done", 1),
+    sprintRow("t-2", "done", 1),
+    sprintRow("t-3", "blocked", 1),
+    sprintRow("t-4", "queued", 2),
+    sprintRow("t-5", "queued"),
+  ];
+  assert.deepEqual(
+    sprintProgress(board, 1),
+    { done: 2, total: 3 },
+    "done rows stay in the denominator"
+  );
+  assert.deepEqual(sprintProgress(board, 2), { done: 0, total: 1 });
+  assert.deepEqual(
+    sprintProgress(board, 9),
+    { done: 0, total: 0 },
+    "an unused sprint is 0/0, not a throw"
+  );
+});
+
+test("rollOverSet is every NON-done row in the sprint, in board order", () => {
+  const board = [
+    sprintRow("t-1", "done", 1),
+    sprintRow("t-2", "blocked", 1),
+    sprintRow("t-3", "queued", 1),
+    sprintRow("t-4", "queued", 2),
+  ];
+  assert.deepEqual(
+    rollOverSet(board, 1).map((t) => t.id),
+    ["t-2", "t-3"],
+    "done rows excluded, blocked INCLUDED, board order preserved"
+  );
+  // The blocked row is exactly what a silent roll-over would sweep up, so it is
+  // the one the confirm list most needs to name.
+  assert.ok(
+    rollOverSet(board, 1).some((t) => t.status === "blocked"),
+    "a blocked row must appear in the confirm list"
+  );
+  assert.deepEqual(rollOverSet(board, 3), [], "a sprint with nothing open moves nothing");
+});
+
+test("linkTargetKind classifies issue refs, URLs and repo paths", () => {
+  assert.equal(linkTargetKind("#123"), "issue");
+  assert.equal(linkTargetKind("  #7  "), "issue", "trimmed");
+  assert.equal(linkTargetKind("#foo"), "other", "a fragment is not an issue ref");
+  assert.equal(linkTargetKind("https://example.com/a/b"), "url");
+  assert.equal(linkTargetKind("HTTP://EXAMPLE.COM"), "url", "scheme match is case-insensitive");
+  assert.equal(linkTargetKind("doc/design/x.md"), "path");
+  assert.equal(linkTargetKind("README.md"), "path", "an extension alone is enough");
+  assert.equal(linkTargetKind("src-tauri/tests/orchestration.rs"), "path");
+  // A bare word claims nothing — otherwise it would swallow every unclassified
+  // target and send clicks to the editor for things that are not files.
+  assert.equal(linkTargetKind("README"), "other");
+  assert.equal(linkTargetKind(""), "other");
+  assert.equal(linkTargetKind("   "), "other");
+  // Absolute paths are not REPO paths: this classification exists to open
+  // things inside the repo, so an absolute one must not claim to be one.
+  assert.equal(linkTargetKind("C:/Windows/system32"), "other");
+  assert.equal(linkTargetKind("/etc/passwd"), "other");
+  // A URL is checked before a path — it contains slashes and would otherwise be
+  // misread as a repo path and handed to the editor.
+  assert.equal(linkTargetKind("https://github.com/o/r/issues/1"), "url");
+});
+
+test("boardUsesSprints / boardUsesLinks gate the chrome on actual use", () => {
+  assert.equal(boardUsesSprints([sprintRow("t-1", "queued")]), false);
+  assert.equal(boardUsesSprints([sprintRow("t-1", "queued", 1)]), true);
+  assert.equal(boardUsesLinks([{ id: "t-1", status: "queued" }]), false);
+  assert.equal(
+    boardUsesLinks([{ id: "t-1", status: "queued", links: [] }]),
+    false,
+    "an empty array is not use"
+  );
+  assert.equal(
+    boardUsesLinks([{ id: "t-1", status: "queued", links: [{ type: "doc", target: "README.md" }] }]),
+    true
+  );
+});
+
+test("the board's link-type vocabulary is the backend's, read out of the Rust source", () => {
+  // Same guard shape as the ladder table above: read the Rust const rather than
+  // restating it here, so a vocabulary added on one side and not the other is a
+  // red test and not a silently divergent picker.
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const start = src.indexOf("pub const TASK_LINK_TYPES");
+  assert.notEqual(
+    start,
+    -1,
+    "TASK_LINK_TYPES is gone or renamed in mod.rs — this guard reads it by name, so update it " +
+      "here rather than deleting the only thing pinning the two vocabularies together"
+  );
+  const end = src.indexOf("];", start);
+  assert.notEqual(end, -1, "could not find the end of TASK_LINK_TYPES");
+  const body = src.slice(start, end);
+  const rust = [...body.matchAll(/"([a-z-]+)"/g)].map(([, t]) => t);
+  assert.ok(
+    rust.length > 0,
+    `no link types could be parsed out of TASK_LINK_TYPES. Body was:\n${body}`
+  );
+  assert.deepEqual(
+    [...LINK_TYPES],
+    rust,
+    "the board's LINK_TYPES must equal the backend's TASK_LINK_TYPES, in the same order"
+  );
 });
