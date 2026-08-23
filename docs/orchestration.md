@@ -151,7 +151,7 @@ pane's block form the two controls follow the model **as you change it**,
 including a model id you type by hand: pick `sonnet` over `haiku` and the
 context window becomes selectable in the same keystroke, with no need to
 click away from the block and back. See
-[`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
+[`doc/design/workflows.md`](https://github.com/willem445/orrerix/blob/main/doc/design/workflows.md)
 and the `author-loomux-workflow` skill.
 
 **Permissions** are either *Auto* (Claude Code's native auto permission mode plus
@@ -1377,7 +1377,7 @@ number of named blocks, each with its own capability class (orchestrator,
 worker, reviewer, or planner), CLI, model, and persona, plus a **merge gate**
 naming which reviewer blocks must record a `pass` verdict — enforced
 mechanically by the `gh` shim — before `gh pr merge` can succeed. See
-[`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
+[`doc/design/workflows.md`](https://github.com/willem445/orrerix/blob/main/doc/design/workflows.md)
 for the full design.
 
 **On `.orrerix/` and `.loomux/`.** The config dir used to be `.loomux/`, and a repo
@@ -1779,7 +1779,7 @@ batch of approved sub-PRs is tested *together* on a scratch ref before any of th
 the integration branch — the combination is what gets a gate, instead of each PR getting one
 and nobody checking the pile. The queue runs in orrerix itself and lands only on an
 integration branch, never on your default branch; see
-[`doc/design/merge-queue.md`](https://github.com/willem445/loomux/blob/main/doc/design/merge-queue.md)
+[`doc/design/merge-queue.md`](https://github.com/willem445/orrerix/blob/main/doc/design/merge-queue.md)
 for the design.
 
 The lifecycle panel shows what it is doing, and nothing more — **the row is read-only**.

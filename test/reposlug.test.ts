@@ -12,7 +12,7 @@
 //   - **GitHub Pages does not redirect.** GitHub's own rename docs: "All
 //     existing information, with the exception of project site URLs, is
 //     automatically redirected to the new name." So every
-//     `willem445.github.io/loomux/...` link and `docs/_config.yml`'s `baseurl`
+//     `willem445.github.io/orrerix/...` link and `docs/_config.yml`'s `baseurl`
 //     404 the instant the repo is renamed. Nothing errors at rename time; the
 //     published docs site just breaks.
 //   - **npm checks `repository.url` for an exact match.** From npm's
@@ -73,7 +73,7 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** `git+https://github.com/willem445/loomux.git` -> `willem445` / `loomux`. */
+/** `git+https://github.com/willem445/orrerix.git` -> `willem445` / `orrerix`. */
 function sourceOfTruth(): { owner: string; slug: string } {
   const pkg = JSON.parse(readFileSync(join(ROOT, "npm/package.json"), "utf8"));
   const url: string = pkg.repository?.url ?? "";
@@ -109,6 +109,16 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
     ["github.com link", new RegExp(`github\\.com/${owner}/([A-Za-z0-9._-]+)`, "g")],
     ["Pages link", new RegExp(`${owner}\\.github\\.io/([A-Za-z0-9._-]+)`, "g")],
     ["Jekyll baseurl", /^\s*baseurl:\s*\/([A-Za-z0-9._-]+)/gm],
+    // Raw-content link: `raw.githubusercontent.com/<owner>/<repo>/...` — a
+    // fourth URL host, not covered by the `github.com` pattern above.
+    ["raw.githubusercontent.com link", new RegExp(`raw\\.githubusercontent\\.com/${owner}/([A-Za-z0-9._-]+)`, "g")],
+    // A bare `owner/repo` literal in double quotes — how `install.ps1`,
+    // `install.sh` and `npm/bin/orrerix.js` each spell the slug they hand to
+    // the GitHub REST API, with no `github.com/` prefix in sight. Quoted, not
+    // just "immediately after the owner", so this does not also fire on a
+    // prose mention like this file's own header comment, above — `` `willem445/loomux` ``
+    // there is backticked, not quoted, and is deliberately outside this census.
+    ["quoted owner/repo literal", new RegExp(`"${owner}/([A-Za-z0-9._-]+)"`, "g")],
   ];
 
   // The literal prefix each URL shape starts with, for the cross-check below:
@@ -122,6 +132,8 @@ test("every hardcoded repo slug agrees with npm/package.json's repository.url", 
   const RAW_PREFIX: Record<string, string> = {
     "github.com link": `github.com/${owner}/`,
     "Pages link": `${owner}.github.io/`,
+    "raw.githubusercontent.com link": `raw.githubusercontent.com/${owner}/`,
+    "quoted owner/repo literal": `"${owner}/`,
   };
   const rawCounter = (prefix: string) =>
     new RegExp(prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[A-Za-z0-9._-]", "g");

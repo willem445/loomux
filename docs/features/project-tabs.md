@@ -189,4 +189,4 @@ Everything is saved to durable app storage (not the browser's), so clearing
 webview data doesn't lose it. What is *never* captured is the live terminal
 buffer/scrollback or the process itself — a pane is re-created or resumed from
 its record, so its on-screen history from last session is gone (the process died
-with the app). See the [design note](https://github.com/willem445/loomux/blob/main/doc/design/session-restore.md).
+with the app). See the [design note](https://github.com/willem445/orrerix/blob/main/doc/design/session-restore.md).

@@ -3,8 +3,8 @@
 **A terminal multiplexer for AI coding agents — hand it a goal and a queue of
 work, and let it run.**
 
-[![CI](https://github.com/willem445/loomux/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/loomux/actions/workflows/ci.yml)
-[![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/loomux/)
+[![CI](https://github.com/willem445/orrerix/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/orrerix/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/orrerix/)
 
 ![An orrerix window running an orchestrator and several agent panes](sample.jpg)
 
@@ -46,8 +46,8 @@ npm install -g orrerix # …or install it and just run `orrerix`
 > **Coming from Loomux?** `loomux-desktop` is off npm entirely and there is no shim:
 > `npm uninstall -g loomux-desktop && npm install -g orrerix`. Installing Orrerix
 > leaves your old Loomux app in place rather than replacing it —
-> [Getting started](https://willem445.github.io/loomux/getting-started) has the
-> uninstall commands. This repo's URL is the last identity still to move (#1153).
+> [Getting started](https://willem445.github.io/orrerix/getting-started) has the
+> uninstall commands.
 
 <details>
 <summary>Other install paths — Windows / macOS / Linux one-liners, release assets, betas</summary>
@@ -55,22 +55,22 @@ npm install -g orrerix # …or install it and just run `orrerix`
 **Windows**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/loomux/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/orrerix/main/install.ps1 | iex"
 ```
 
 **macOS / Linux**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/willem445/loomux/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/willem445/orrerix/main/install.sh | sh
 ```
 
 Or grab an installer from the
-[latest release](https://github.com/willem445/loomux/releases/latest) (`.exe`/`.msi`,
+[latest release](https://github.com/willem445/orrerix/releases/latest) (`.exe`/`.msi`,
 `.dmg`, `.AppImage`/`.deb`/`.rpm`).
 
 `npx orrerix` and both one-liners always resolve the latest **stable**
 release — beta/RC builds are published as GitHub prereleases only, so grab those
-from [the releases page](https://github.com/willem445/loomux/releases) directly.
+from [the releases page](https://github.com/willem445/orrerix/releases) directly.
 
 Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 `xattr -cr /Applications/Orrerix.app` (the install script does this for you).
@@ -80,7 +80,7 @@ Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 Then, in the app: open a pane → **Orchestrator + workers** → pick the repo, an
 agent CLI and model per role, and how many workers to start with. You'll need the
 `claude` or `copilot` CLI on `PATH`, and an authenticated `gh` for the issue/PR
-flow. Full walkthrough in [Getting started](https://willem445.github.io/loomux/getting-started).
+flow. Full walkthrough in [Getting started](https://willem445.github.io/orrerix/getting-started).
 
 ## Hand it a batch of work and walk away
 
@@ -101,7 +101,7 @@ process — not in a prompt asking an agent nicely:
   shell access can still route around a client-side check. For a boundary nothing
   can talk past, give your agents a machine account with no merge rights on the
   default branch and no tag-push rights — the two layers compose, and
-  [the docs walk through both](https://willem445.github.io/loomux/autonomous-mode#the-merge--release-gate).
+  [the docs walk through both](https://willem445.github.io/orrerix/autonomous-mode#the-merge--release-gate).
 - **It can't overspend.** Crossing the token budget suspends autonomous mode
   unconditionally — even if the state file can't be written — and the suspension
   survives a restart.
@@ -195,13 +195,13 @@ enforced at the CLI level.
 
 ## Documentation
 
-**User docs → <https://willem445.github.io/loomux/>**
+**User docs → <https://willem445.github.io/orrerix/>**
 
-- [Getting started](https://willem445.github.io/loomux/getting-started) — install, first launch, first agent pane
-- [Core concepts](https://willem445.github.io/loomux/core-concepts) — pane kinds, the split grid, the shortcut table
-- [Orchestration guide](https://willem445.github.io/loomux/orchestration) — groups, the task board, the label handshake, cross-workspace channels
-- [Autonomous & supervised modes](https://willem445.github.io/loomux/autonomous-mode) — idle ticks, token budget, auto-merge/release, dangerous mode
-- [Troubleshooting](https://willem445.github.io/loomux/troubleshooting) — whisper DLLs, `gh` auth, mic permission, disk
+- [Getting started](https://willem445.github.io/orrerix/getting-started) — install, first launch, first agent pane
+- [Core concepts](https://willem445.github.io/orrerix/core-concepts) — pane kinds, the split grid, the shortcut table
+- [Orchestration guide](https://willem445.github.io/orrerix/orchestration) — groups, the task board, the label handshake, cross-workspace channels
+- [Autonomous & supervised modes](https://willem445.github.io/orrerix/autonomous-mode) — idle ticks, token budget, auto-merge/release, dangerous mode
+- [Troubleshooting](https://willem445.github.io/orrerix/troubleshooting) — whisper DLLs, `gh` auth, mic permission, disk
 
 The site is built from Markdown under [`docs/`](docs/) and published on each
 release by [`.github/workflows/docs.yml`](.github/workflows/docs.yml).

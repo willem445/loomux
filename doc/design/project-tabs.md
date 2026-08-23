@@ -4,7 +4,7 @@ Project-scoped **tabs**: each project's panes (plain terminals, agent panes,
 orchestrator + worker groups) live in their own tab; switching tabs swaps the
 whole workspace; tabs are renamable, colorable, show a live status + attention
 alert + hover preview, and persist across restarts. User-facing usage lives in
-the user docs ([Project tabs](https://willem445.github.io/loomux/features/project-tabs),
+the user docs ([Project tabs](https://willem445.github.io/orrerix/features/project-tabs),
 source: [`docs/features/project-tabs.md`](../../docs/features/project-tabs.md));
 this note is the architecture and the decisions behind it.
 

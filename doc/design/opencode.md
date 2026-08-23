@@ -15,9 +15,9 @@ https://opencode.ai/docs/ (indexed in the `agent-cli-reference` skill).
 Constraint 3 holds throughout: **no `opencode` process was run by an agent**
 to establish any of it. The full verification pass, with per-file line
 citations and the local-observation half, is #722's slice-V memo
-([1](https://github.com/willem445/loomux/issues/722#issuecomment-5161943081),
-[2](https://github.com/willem445/loomux/issues/722#issuecomment-5161943414),
-[3](https://github.com/willem445/loomux/issues/722#issuecomment-5161943777));
+([1](https://github.com/willem445/orrerix/issues/722#issuecomment-5161943081),
+[2](https://github.com/willem445/orrerix/issues/722#issuecomment-5161943414),
+[3](https://github.com/willem445/orrerix/issues/722#issuecomment-5161943777));
 this note carries the conclusions loomux's code rests on, and its citations,
 rather than reproducing the memo — a design note is an argument, and the memo
 is the evidence behind it.

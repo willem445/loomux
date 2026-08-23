@@ -128,7 +128,7 @@ phase 4 and is not keyed on the product name.
 
 | | Why |
 | --- | --- |
-| The GitHub repo slug (`willem445/loomux`) | A human button, coordinated separately, and its new value is not recorded anywhere this branch can read — #1153 calls the repo rename "a human-only action" and never names the target. Changing it speculatively would break things *before* the rename for no gain. Which of the 78 in-tree occurrences are free to lag and which are not is classified in the runbook below; `test/reposlug.test.ts` is what stops a partial rename from shipping. |
+| The GitHub repo slug | A human button, coordinated separately from *this* phase's product/binary rename — #1153 called the repo rename "a human-only action" and this phase's edits did not speculate about its target ahead of time. The human has since renamed the repo and #1334 swept every in-tree occurrence; see "The human runbook" below for the classification that guided that sweep. `test/reposlug.test.ts` is what stopped a partial rename from shipping. |
 | npm trusted-publishing config | A human button on npmjs.com, and a security-relevant one. `release.yml` already reads `PKG` out of `package.json` rather than hardcoding it, so the workflow needed no edit for the package rename. It does need the runbook's step 2 to have happened first. |
 | The bundle identifier `dev.loomux.app` | It keys the WebView2 user-data folder and the macOS bundle ID. Moving it orphans every user's webview profile, and no one outside the repo ever sees it. |
 | Cargo crate names (`loomux`, `loomux_lib`, `loomux-engine`, `loomux-server`) | Internal. `symbolicate.yml`, `ci.yml`'s E2E exe path, and the `.pdb` filename all name the cargo axis, and none of them is an external identity. |
@@ -168,53 +168,61 @@ the self-launch shim still refuses `loomux` as well as `orrerix`.
 Four steps, strictly ordered. Step 2 is the one that is easy to leave out, and without
 it step 4 fails.
 
-### 1. Rename the GitHub repo
+### 1. Rename the GitHub repo — done
 
-`willem445/loomux` → the new slug. GitHub redirects almost everything, but not quite
+`willem445/<old slug>` → `willem445/orrerix`, done by hand, then swept across every
+in-tree occurrence in #1334. GitHub redirects almost everything, but not quite
 everything — from GitHub's own docs on renaming a repository:
 
 > All existing information, **with the exception of project site URLs**, is
 > automatically redirected to the new name
 
-So the ~73 in-tree occurrences of the slug fall into three classes, and only the first
-is free:
+So the ~73 in-tree occurrences of the slug fell, at analysis time, into three classes,
+and only the first was free to lag:
 
-| Class | Sites | Does the rename break it? |
+| Class | Sites (at analysis time) | Did the rename break it? |
 | --- | --- | --- |
-| `github.com/willem445/loomux/…` links, outside `npm/package.json` | 58 | **No.** Redirected. May lag. |
-| `willem445.github.io/loomux/…`, plus `docs/_config.yml`'s `baseurl: /loomux` | 16 + 1 | **Yes, immediately.** Project site URLs are the documented exception, so every one 404s the moment the repo is renamed. |
-| `npm/package.json`'s `repository.url` | 1 | **Yes, at publish time.** The only publish-blocker here — npm matches it exactly, and `npm trust` falls back to it. See step 3. |
-| `npm/package.json`'s `homepage` and `bugs.url` | 2 | **No** — metadata, absorbed by the same redirect as row 1. They move anyway, because the guard sweeps them with everything else. |
+| `github.com/willem445/<old slug>/…` links, outside `npm/package.json` | 58 | **No.** Redirected. Free to lag — moved anyway in #1334. |
+| `willem445.github.io/<old slug>/…`, plus `docs/_config.yml`'s old `baseurl` | 16 + 1 | **Yes, immediately.** Project site URLs are the documented exception — every one 404'd from the moment the repo was renamed until #1334 landed. |
+| `npm/package.json`'s `repository.url` | 1 | **Yes, at publish time.** The only publish-blocker — npm matches it exactly, and `npm trust` falls back to it. See step 3. |
+| `npm/package.json`'s `homepage` and `bugs.url` | 2 | **No** — metadata, absorbed by the same redirect as row 1. Moved anyway, because the guard sweeps them with everything else. |
 
-**How those are counted**, so the table is re-derivable rather than asserted:
+**How those were counted**, so the table is re-derivable rather than asserted:
 occurrences — not files, not distinct URLs — of the literal prefixes
 `github.com/willem445/` and `willem445.github.io/`, in every tracked text file
-`test/reposlug.test.ts` scans. That deliberately includes mentions in comments, in
+`test/reposlug.test.ts` scanned. That deliberately included mentions in comments, in
 doc examples, and in the `#[cfg(test)]` `gh`-output fixtures in `src-tauri/src/gh.rs`
 (13 of them): the guard flags those too, and a fixture standing in for real `gh`
 output stops being a faithful specimen the moment the real output would carry a
-different slug. A count that excludes non-link mentions will come out lower; this one
-does not, because the guard does not. By root: `src-tauri/` 22, `docs/` 20, `doc/` 8,
+different slug. A count that excludes non-link mentions comes out lower; this one
+did not, because the guard does not. By root: `src-tauri/` 22, `docs/` 20, `doc/` 8,
 `npm/` 6, `README.md` 4, `test/` 1 = 61 `github.com`; `README.md` 10, `doc/` 3,
-`docs/` 2, `test/` 1 = 16 Pages; 1 `baseurl`. **78 sites.**
+`docs/` 2, `test/` 1 = 16 Pages; 1 `baseurl`. **78 sites at analysis time.**
 
 GitHub's docs carry one further exception — *"GitHub will not redirect calls to an
-action hosted by a renamed repository"* — which does not apply here: no workflow in
+action hosted by a renamed repository"* — which did not apply here: no workflow in
 this repo `uses:` an action hosted in it. Checked, not assumed.
 
-`test/reposlug.test.ts` fails until every one of those sites names the same slug, so a
-half-done rename cannot ship quietly. That test is the reason this list does not have
-to be remembered.
+`test/reposlug.test.ts` failed until every one of those sites named the same slug, so
+a half-done rename could not ship quietly. That test is the reason this list did not
+have to be remembered — and it is why #1334, re-measuring rather than carrying this
+count, landed on **76**: the two sites lost are the `src-tauri/tests/opencode{usage,
+sessions}.rs` `sha1()` fixture comments, reworded during that PR's review to describe
+a verified pre-rename hash without embedding a `github.com/…` link the guard would
+otherwise force to move (see that PR's body for why recomputing the hash itself was
+not an option). Also added in that review round: a `raw.githubusercontent.com/…`
+pattern and a quoted bare `"willem445/<repo>"` pattern, closing two gaps the census
+did not cover at #1334's initial landing.
 
-It only earns that sentence because of how it counts. Its first version matched a slug
-lazily and required a following character drawn from a hand-written class — a guess
-about the alphabet of arbitrary prose, and the guess omitted `#`. So
-`…/loomux#readme`, which is `homepage`, matched nothing: that field could be renamed
-on its own and the test stayed green, while the sentence above claimed otherwise. It
-now matches a greedy run of the characters a repo name may *contain* — a fact rather
-than a guess — and asserts its own match count equals a raw count of each literal
-prefix, so a pattern that cannot see one of its own subjects fails as a miscount
-instead of passing as a clean bill of health.
+It only earns that "did not have to be remembered" sentence because of how it counts.
+Its first version matched a slug lazily and required a following character drawn from
+a hand-written class — a guess about the alphabet of arbitrary prose, and the guess
+omitted `#`. So `…/loomux#readme`, which is `homepage`, matched nothing: that field
+could have been renamed on its own and the test would have stayed green, contradicting
+the sentence above. It now matches a greedy run of the characters a repo name may
+*contain* — a fact rather than a guess — and asserts its own match count equals a raw
+count of each literal prefix, so a pattern that cannot see one of its own subjects
+fails as a miscount instead of passing as a clean bill of health.
 
 ### 2. Publish `orrerix` to npm once, by hand
 

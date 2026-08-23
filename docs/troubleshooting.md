@@ -157,7 +157,7 @@ Each worker worktree keeps its own build cache (e.g. a multi-GB `target/` in a
 Rust repo) — orrerix does not share or dedup build caches across worktrees, and
 warns each group's orchestrator once when the workspace drive drops below ~5 GB
 free. Details in
-[doc/design/durability-and-disk.md](https://github.com/willem445/loomux/blob/main/doc/design/durability-and-disk.md).
+[doc/design/durability-and-disk.md](https://github.com/willem445/orrerix/blob/main/doc/design/durability-and-disk.md).
 
 ## Crash logs
 
@@ -191,10 +191,10 @@ that *does* exist is Windows':
   binary's own `abort()` looks like from outside.
 
 Attach these when reporting a bug. Design details:
-[`doc/design/crash-observability.md`](https://github.com/willem445/loomux/blob/main/doc/design/crash-observability.md).
+[`doc/design/crash-observability.md`](https://github.com/willem445/orrerix/blob/main/doc/design/crash-observability.md).
 
 ## Still stuck?
 
 Open an issue at
-[github.com/willem445/loomux/issues](https://github.com/willem445/loomux/issues)
+[github.com/willem445/orrerix/issues](https://github.com/willem445/orrerix/issues)
 with your platform, what you did, and any crash-log or breadcrumb output.

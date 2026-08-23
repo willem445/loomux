@@ -1,13 +1,13 @@
 # Orrerix installer for Windows.
-#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/loomux/main/install.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/willem445/orrerix/main/install.ps1 | iex"
 #
-# The repo slug stays as-is until the GitHub rename, which is a separate human
-# step; GitHub redirects raw.githubusercontent.com and the REST API afterwards,
-# so this script keeps working on either side of it. The asset is matched on an
-# END-ANCHORED suffix, so the productName change does not touch it either.
+# GitHub redirects raw.githubusercontent.com and the REST API from the
+# pre-rename slug, so this script keeps working on either side of it. The
+# asset is matched on an END-ANCHORED suffix, so the productName change does
+# not touch it either.
 $ErrorActionPreference = "Stop"
 
-$repo = "willem445/loomux"
+$repo = "willem445/orrerix"
 $api = "https://api.github.com/repos/$repo/releases/latest"
 
 Write-Host "orrerix " -ForegroundColor Blue -NoNewline

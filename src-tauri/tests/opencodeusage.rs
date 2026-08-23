@@ -85,9 +85,13 @@ fn insert(conn: &Connection, r: &Row) {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             r.id,
-            // sha1("git-remote:github.com/willem445/loomux") — the real project
-            // id for this repo, verified in the slice-V memo. Every loomux
-            // worktree shares it; `directory` is what separates panes.
+            // sha1("git-remote:" + this repo's pre-#1153-rename GitHub remote)
+            // — the real project id for this repo, verified in the slice-V
+            // memo. Every loomux worktree shares it; `directory` is what
+            // separates panes. Frozen at the pre-rename value rather than
+            // recomputed for the new slug: constraint 3 bans running opencode
+            // live to re-verify it, and the id only needs to be consistent
+            // across worktree rows here, not equal to today's real hash.
             "f9dd9fcdf18a51fa9de041f787210d1ce5e0d1e7",
             r.parent,
             "loomux",

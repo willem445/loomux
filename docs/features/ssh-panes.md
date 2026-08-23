@@ -300,4 +300,4 @@ Every "make *X* work remotely" follow-up (remote sessions in the browser, remote
 usage, remote orchestration members, a tunnelled MCP server) needs an orrerix
 process on the far end, which is the **remote engine** ([#888]), not this feature.
 
-[#888]: https://github.com/willem445/loomux/issues/888
+[#888]: https://github.com/willem445/orrerix/issues/888
