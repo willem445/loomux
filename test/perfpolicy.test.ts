@@ -452,10 +452,12 @@ const TIMERS: TimerRow[] = [
     cadenceMs: 1500,
     policy: "gated",
     reason:
-      "Opt-in: armed only by the follow toggle, cleared by the toggle and by dispose(), so it " +
-      "cannot outlive the view — and gated within that, so an armed follow behind a hidden window " +
+      "Opt-in: armed only by the follow toggle, cleared by the toggle, by a close/eviction " +
+      "(AuditView.hide, #1318) and by dispose(), so it outlives neither the view nor the panel " +
+      "being on screen — and gated within that, so an armed follow behind a hidden window " +
       "refetches nothing and re-renders nothing until the window is back, then catches up once " +
-      "(#743 S6).",
+      "(#743 S6). Until #1318 the close was the missing one: PollGate pauses this behind a hidden " +
+      "WINDOW, and nothing stopped it behind a closed PANEL.",
     debt: null,
   },
   {
@@ -464,7 +466,8 @@ const TIMERS: TimerRow[] = [
     policy: "gated",
     reason:
       "The timeline's follow toggle, same shape and same gate as auditview's: armed on toggle, " +
-      "cleared on toggle and dispose, suppressed while the window is hidden (#743 S6). Its gh " +
+      "cleared on toggle, on close (hide()) and on dispose, suppressed while the window is " +
+      "hidden (#743 S6) — the view that had the close half right first. Its gh " +
       "half is separately self-gated to GH_REFRESH_MS (60 s) in timelinechrome.ts, so a tick is " +
       "one orch_audit refetch, not two shell-outs.",
     debt: null,

@@ -683,9 +683,16 @@ survives the move untouched. Verified per view, not assumed:
 - **`IssuesView`** — no internal ResizeObserver at all (a plain list; its
   CSS is `flex: 1`, filling whichever host it's in). `hide()` closes any
   open create-issue form or detail pane first, preserved the same way.
-- **`AuditView`** — a live-follow poll timer (`followTimer`), gated by an
-  explicit toggle button, not by open/close — unaffected by which host or
-  edge it's in, and already stopped by `dispose()` regardless.
+- **`AuditView`** — a live-follow poll timer (`followTimer`), armed by an
+  explicit toggle button and unaffected by which host or edge it's in.
+  `dispose()` has always stopped it; a CLOSE did not, until #1318 gave it the
+  same `hide()` the timeline has (`stopFollow()` plus resetting the toggle).
+  It is the third instance of the one rule below and the one that reads least
+  like it: the poll is opt-in and it is cleared on dispose, but neither of
+  those is the panel being closed, and `PollGate` only pauses it while the
+  whole WINDOW is hidden — so a panel closed with follow on kept polling
+  `orch_audit` every 1.5 s, behind a fully visible window, for the rest of the
+  session.
 - **`GroupView`** — see *Layout* above for its one real piece of mode-aware
   logic (the floor). Its own poll timer (`pollTimer`, started in `show()`)
   had a pre-existing quirk: `show()` fires on every open in ANY mode, but
@@ -727,6 +734,17 @@ The rule, restated in terms of what wakes the view:
 > **If something outside a view can make that view do work, its `hide` hook is
 > where it says what happens when nobody is looking at it.** Whether the waker
 > is a `setInterval` or a `listen()` is an implementation detail of the waking.
+
+`test/embedwake.test.ts` enforces it rather than leaving it as prose a second
+time: it parses every `embedRegistry.set` entry out of `pane.ts` and requires a
+`hide` key on every kind its manifest declares woken, with the declaration
+itself kept honest by a scan of each view's own source — the scan may only ever
+ADD to the woken set, so a view that grows a `listen()` or a `setInterval` while
+declared quiet fails. The manifest is authoritative rather than the scan because
+one waker is structurally invisible to it: `FileEditView`'s `ft-search`
+subscription goes through `fileapi.ts`'s `onSearchBatch` wrapper, so no
+`listen(` appears in its file. That row carries `indirectWaker`, and the test
+requires every uncorroborated woken row to.
 
 `src/wakegate.ts` is the DOM-free policy behind the two event-driven views, the
 sibling of `src/pollgate.ts` for the timer-driven ones. Three things about it

@@ -198,6 +198,29 @@ export class AuditView {
     void this.load();
   }
 
+  /** Called by the pane whenever the view is about to be hidden, in either
+   *  mode — a close, a slot eviction, an un-dock (#1318).
+   *
+   *  The third instance of one rule, and the one that reads least like it:
+   *  follow IS opt-in and IS cleared on `dispose()`, but neither of those is
+   *  the panel being closed, and `PollGate` only pauses it while the whole
+   *  WINDOW is hidden. So a panel closed with follow on kept polling
+   *  `orch_audit` every 1.5 s — behind a fully visible window, for the rest of
+   *  the session. `TimelineView.hide()` is the same four lines for the same
+   *  toggle; this is that, wired the same way.
+   *
+   *  Follow is turned OFF rather than merely paused, and the button says so:
+   *  reopening to a "⏸ following" toggle that is not following would be the
+   *  worse of the two lies, and `show()` above reloads on every open anyway. */
+  hide(): void {
+    this.stopFollow();
+    if (this.follow) {
+      this.follow = false;
+      this.followBtn.classList.remove("on");
+      this.followBtn.textContent = "▶ follow";
+    }
+  }
+
   /** Reflect whether the pane currently has this view in its embed-panel
    *  slot (#361) — pure display state on the header's toggle button. */
   setPanelActive(active: boolean): void {

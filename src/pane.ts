@@ -3943,6 +3943,10 @@ export class Pane implements VoiceTargetPane {
       overlayEl: this.auditOverlay,
       viewEl: this.auditView.el,
       show: () => this.auditView!.show(),
+      // Stops a live-follow poll that a close/eviction otherwise left running
+      // for the rest of the session (#1318) — the same wiring the timeline's
+      // identical follow toggle has always had.
+      hide: () => this.auditView!.hide(),
       setPanelActive: (active) => this.auditView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
     });
