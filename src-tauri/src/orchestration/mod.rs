@@ -23048,7 +23048,7 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
         // dressed as a check. The shape plus the multi-line term is what is
         // actually known.
         if claimed.is_none()
-            && pasted.len() > 1
+            && !pasted.is_empty()
             && collapsed_paste_row(rows[i])
             && !dialog_header_above(&rows, &norm, &keep, i)
         {
