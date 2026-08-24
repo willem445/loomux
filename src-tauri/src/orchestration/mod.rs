@@ -23223,9 +23223,7 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
         // a pane that can print `[orrerix] …` can already print it and get that
         // single row claimed. Adding a chevron in front of it buys the pane
         // nothing it did not have.
-        if leads_with_notice_marker(rows[i])
-            || strip_leading_pointer(rows[i]).is_some_and(leads_with_notice_marker)
-        {
+        if leads_with_notice_marker(rows[i]) {
             keep[i] = false;
         }
         let mut claimed = record_claim(&norm, &recorded, first_row, i);
