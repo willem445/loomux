@@ -152,11 +152,18 @@ that this reading is wrong — and aborted with the text already in the box. The
 strictly worse than never overriding: a stranded paste that every later delivery queues
 behind, and a pane a human has to kill. That is what the live incident did, twice.
 
-So `preenter_override_admits` now lets an attempt the drainer granted an override to press
-its Enter, on three terms: the grant is the caller's (never re-derived here), the evidence
-is a **fresh** sample taken twice at that moment (never a latched flag), and the bar is the
-**weak** idleness reading — the same one the grant was decided on, because the strong one is
-exactly what is wrong on this pane class and requiring it would make the code unreachable.
+So an attempt the drainer granted an override to now presses its Enter, on three terms: the
+grant is the caller's (never re-derived at this site), the evidence is a **fresh** sample
+taken twice at that moment (never a latched flag), and the bar is the **weak** idleness
+reading — the same one the grant was decided on, because the strong one is exactly what is
+wrong on this pane class and requiring it would make the code unreachable.
+
+The decision is `override_enter_admits`, split from the pane reading
+(`preenter_override_admits`) for the reason `question_hold_predicate_sampled`'s own doc gives
+about rev-15 B4: a rule welded to a live `PtyManager` is one no test here can drive, so it
+ends up pinned by nothing. Its two terms — *enough* reads, and *every* read admitting — are
+pinned in both orders by `j9`, so an implementation that consulted only the first or only the
+last read fails.
 
 **The residual this leaves, stated as its own thing.** A dialog painted *above* a composer
 that holds our paste, showing no menu-structure token evidence, inside the override window,
