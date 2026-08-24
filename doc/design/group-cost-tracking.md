@@ -104,7 +104,15 @@ is cumulative.
 
 `group_usage` returns `{ live_cost_usd, lifetime_cost_usd, live_cost_basis,
 lifetime_cost_basis, live_tokens, lifetime_tokens, agents:[…] }`. Lifetime sums
-all snapshots; live sums only currently-live agents. Each total's `*_cost_basis`
+all snapshots; live sums only currently-live agents.
+
+**That whole-roster `agents` array is what the MCP tool and the internal
+callers see. The POLLED Tauri command answers a projection of it** —
+`live_agents` + `agent_count`, one row per live agent instead of one per agent
+the group has ever had, with every lifetime total unchanged (#1317). `agents`
+is O(agents-EVER), so on a long session the GUI was re-serializing and
+re-indexing a roster that grew with the clock to render rows for the handful of
+panes actually running. See doc/design/polled-payload-shapes.md §1. Each total's `*_cost_basis`
 is `estimated` (all token-derived), `reported` (all CLI statusline), `mixed`, or
 `null` — so a total that blends estimated and reported dollars is never hidden
 under one label. Each agent row carries its token breakdown, `source`

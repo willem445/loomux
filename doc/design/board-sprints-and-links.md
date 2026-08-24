@@ -783,8 +783,10 @@ board simply stops recovering from the one error it was built to recover from.
   and this is not that.
 - **`orch_upsert_task`** gains the same optional parameter. Validation lives in the registry
   for both callers: the rule does not depend on who wrote it.
-- **`orch_tasks`** returns `BoardTask` — every `Task` field flattened, plus `link_etag`. A
+- **`orch_tasks`** returns `BoardTask` — a projection of `Task`, plus `link_etag`. A
   wrapper rather than a field on `Task`, because `Task` is what `write_tasks` persists.
+  (It flattened `Task` wholesale until #1317 split the note bodies out of the polled
+  read; see doc/design/polled-payload-shapes.md §2 for the shape it has now.)
 - No ACL or manifest change: `command_manifest.rs` and `tests/acl_manifest.rs` pin command
   *names*, never signatures.
 - The refusal is not audited. Nothing is written, and an audit entry for a write that did not
