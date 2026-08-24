@@ -930,13 +930,13 @@ impl TranscriptCursors {
                 work.revalidated = true;
                 StatVerdict::Reset
             }
-            Some(c) => match c.stat_verdict(len, modified, created) {
-                StatVerdict::Serve => {
-                    work.served_cached = true;
-                    return Some((c.fold.usage(), work));
-                }
-                other => other,
-            },
+            // [scratch] #1239 round 8: a cursor, once built, is never advanced
+            // again — the staleness regression this design could introduce.
+            Some(c) => {
+                let _ = c.stat_verdict(len, modified, created);
+                work.served_cached = true;
+                return Some((c.fold.usage(), work));
+            }
         };
 
         if verdict == StatVerdict::Extend {
