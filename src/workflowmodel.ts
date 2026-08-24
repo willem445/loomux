@@ -2440,7 +2440,24 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
     return gate;
   }
   const r = raw as Record<string, YamlValue>;
-  gate.require = asString(r.require ?? "all-pass") ?? "all-pass";
+  // `threshold: N` with NO `require:` key is a threshold gate — the engine's own rule
+  // ("`threshold: N` alone implies a threshold gate; spelling `require: threshold` as well is
+  // allowed but redundant", workflow.rs `(Some("threshold") | None, Some(n))`). Defaulting the
+  // absent key to "all-pass" here made the pane read such a file as an all-pass gate that
+  // happens to carry a number, with three consequences, all silent: the threshold rules below
+  // never ran on it, `withGateReviewers` never clamped it, and — worst — the next gate edit
+  // re-serialized it as `require: all-pass` + `threshold: N`, a PAIR the engine refuses
+  // outright, so the group fell back to the built-in roster over an unrelated edit.
+  //
+  // ONLY when the key is absent. An empty or non-string `require:` is left exactly as it was:
+  // the engine refuses `require: ""` as an unknown value, and quietly reading it as something
+  // else is the same lie in the other direction.
+  gate.require =
+    r.require === undefined
+      ? typeof r.threshold === "number"
+        ? "threshold"
+        : "all-pass"
+      : asString(r.require) ?? "all-pass";
   if (typeof r.threshold === "number") gate.threshold = r.threshold;
   else if (r.threshold !== undefined) {
     findings.push({
@@ -2867,8 +2884,23 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         });
       }
     }
+    // The other half of "which gate is a threshold gate" (#1388 review N1). With the
+    // shorthand normalised in `readGate`, a model that says all-pass AND carries a number got
+    // there by spelling both out — or by the gate form's picker being switched to all-pass
+    // over a threshold that is still in the file — and the engine refuses that pair outright
+    // ("require: all-pass takes no threshold — drop it, or use require: threshold"). A pane
+    // that stayed quiet would be blessing a workflow that will not load. Scoped to the two
+    // accepted all-pass spellings so an UNKNOWN require still gets one finding, not two.
+    if ((gate.require === "all-pass" || gate.require === "all") && gate.threshold !== undefined) {
+      findings.push({
+        severity: "error",
+        code: "gate-bad-threshold",
+        message: `The merge gate says require: ${gate.require} and also names threshold: ${gate.threshold} — the engine refuses the pair outright. Drop the threshold, or use require: threshold.`,
+      });
+    }
     if (gate.require === "threshold") {
       const t = gate.threshold;
+
       if (t === undefined || !Number.isInteger(t) || t < GATE_THRESHOLD_MIN) {
         findings.push({
           severity: "error",
@@ -3355,8 +3387,20 @@ export function gateConnectionError(w: Workflow, from: string): string | null {
 
 /** Wire a reviewer to the merge gate: append its id to `gates.merge.reviewers`, which is the
  *  shape `parse_workflow` already reads (a list of block ids — no new backend surface).
- *  Appended rather than inserted in sorted order, because the list is the human's and its
- *  order is theirs to keep; a refused or duplicate drop is a no-op, like `connectBlocks`. */
+ *  A refused or duplicate drop is a no-op, like `connectBlocks`.
+ *
+ *  SEAT ORDER IS NOT THE HUMAN'S, and this is the place to say so because it is the place
+ *  someone will come looking. The append is only the cheapest way to add an entry: every
+ *  write goes through `emitGatesLines`, which emits `sortByBlocks(gate.reviewers, order)` —
+ *  so the file always lists the seats in ROSTER order, whatever order the model's array is
+ *  in, on the canvas's `serializeWorkflowPreserving` path as much as on the canonical one.
+ *  That is deliberate and pre-dates this: it is the same canonical-form rule that groups
+ *  edges by source, so two people who wire the same gate in a different order get the same
+ *  file and neither sees a diff from the other's clicking sequence.
+ *
+ *  The consequence worth writing down: a reorder affordance on this list — drag-to-reorder,
+ *  up/down buttons — would appear to work and change nothing in the file. If seat order is
+ *  ever meant to MEAN something, `sortByBlocks` is what has to change first. */
 export function connectToGate(w: Workflow, from: string): Workflow {
   if (gateConnectionError(w, from)) return w;
   const gate = w.gates.merge!;

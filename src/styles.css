@@ -4565,6 +4565,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    target and it is what the pointer is over — while the ok/bad ANSWER is on its in-port dot,
    in exactly the same green/red a block's dot uses. One visual language for every drop
    target, which is the point: the gate accepts a line the way a block does. */
+/* A ghost is a drop target that can only ever refuse, so it gets the "you are over me" half
+   of the cue and never the green one — its stroke is already --state-danger, which IS the
+   answer. There is deliberately no .wf-node-ghost.wf-drop-ok: nothing can make one legal. */
+.wf-node-ghost.wf-drop-bad { stroke-width: 2.5; }
 .wf-gate-box.wf-drop-ok { stroke-width: 2.5; stroke-dasharray: none; }
 .wf-gate-box.wf-drop-bad { stroke-width: 2.5; }
 .wf-node { fill: var(--surface-2); stroke: var(--line); stroke-width: 1; }

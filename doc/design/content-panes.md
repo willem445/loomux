@@ -411,10 +411,26 @@ after spawning two agents" and "block `rev-perf` doesn't exist — the merge gat
 | edge to a nonexistent block | The dangling-reference class Dify ships. |
 | gate names a nonexistent block, or one that isn't a reviewer | **A gate that could never open.** Only a reviewer records a verdict. |
 | threshold > reviewers | Same thing, arithmetically. |
+| `require: all-pass` **and** a `threshold` | The engine refuses the pair outright, so the file does not load at all — see *One reader answers "is this a threshold gate"* below. |
 | isolated / unreachable block | A *warning*, not an error — edges are advisory, so this is a workflow that still runs. It is just almost certainly a fan-out you forgot to wire. |
 
 A cycle is **not** a finding: worker ⇄ reviewer is the rework loop, and it is how loomux
 actually works. What *is* a finding is a graph with nowhere to start.
+
+**One reader answers "is this a threshold gate"** (#1388 review N1). `parse_workflow` reads
+`threshold: N` with no `require:` key as a threshold gate — *"`threshold: N` alone implies a
+threshold gate; spelling `require: threshold` as well is allowed but redundant"* — and it
+refuses `require: all-pass` beside a threshold outright. `readGate` used to default the absent
+key to `all-pass`, so the pane and the engine disagreed about which gate was which, and the
+disagreement was silent in three places at once: the threshold findings above never ran on a
+shorthand gate, the seat-removal clamp never protected one, and — the live one — the next gate
+edit re-serialized it as `require: all-pass` **plus** `threshold: N`, which is the pair the
+engine refuses, so an unrelated edit dropped the repo back to the built-in roster with nothing
+on screen to say why. The pane now applies the engine's rule when the key is *absent* (and only
+then: `require: ""` is an unknown value to the engine, and quietly reading it as something else
+would be the same lie pointing the other way), and flags the explicit pair as an error. This is
+the #1176 shape one level up — two definitions of a question, drifting — and the fix is the same
+one: leave exactly one.
 
 ### Two rules the file keeps, both earned from someone else's scar
 
@@ -564,6 +580,13 @@ Three rules keep that from becoming "the gate is a block after all":
   asks — so a drop the canvas turns away is turned away in the validator's own words. A worker,
   a manager, a liaison and a name no block answers to are all refused with the reason, on
   release, rather than silently.
+- **Seat ORDER is not the human's, and the canvas must not imply that it is.** `connectToGate`
+  appends, but `emitGatesLines` writes `sortByBlocks(gate.reviewers, order)`, so the file always
+  lists seats in **roster** order — the same canonical rule as *references ordered by the roster*
+  above, and the reason two people who wire the same gate in a different order get the same file.
+  The consequence to write down rather than rediscover: a reorder affordance on this list (drag
+  to reorder, up/down buttons) would appear to work and change nothing on disk. If seat order is
+  ever meant to mean something, `sortByBlocks` is what has to change first.
 - **A seat is erased like an edge, because it is the same gesture on the same kind of line** —
   select it, ✕ or Delete, `disconnectFromGate`. What differs is what it MEANS, and that is
   carried by the colour, the dashes and the inspector panel ("gate seat · enforced" against the

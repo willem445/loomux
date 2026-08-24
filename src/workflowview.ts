@@ -3009,7 +3009,9 @@ export class WorkflowView {
         nodeGroup(rects.get(blockKey(n.index))!, n, selected, dropClass(blockKey(n.index)))
       );
     }
-    for (const id of ghosts) root.append(ghostGroup(rects.get(ghostKey(id))!, id));
+    for (const id of ghosts) {
+      root.append(ghostGroup(rects.get(ghostKey(id))!, id, dropClass(ghostKey(id))));
+    }
 
     // ---- the ENFORCED gate ----
     if (gate && gr) {
@@ -3380,8 +3382,17 @@ function nodeGroup(r: Rect, n: GraphNode, selected: boolean, drop = ""): SVGElem
 
 /** A name an edge mentions that no block answers to. Dashed, unmovable, unconnectable — it is
  *  not a block, it is the ABSENCE of one, and it disappears the moment the file stops
- *  mentioning it. */
-function ghostGroup(r: Rect, id: string): SVGElement {
+ *  mentioning it.
+ *
+ *  It still ANSWERS a rubber band held over it (rev-lead round 1, N3), because it is a drop
+ *  target — it sits in `dropRects()` with the same in-port tolerance a real node has — and a
+ *  target that stays dark while you hover it and then refuses on release is the quiet half of
+ *  the same broken promise #1387 is about. The answer is only ever "no": `dropError` asks
+ *  `connectionError` about a name no block answers to, which cannot return null (pinned in
+ *  test/workflowmodel.test.ts, "an edge that would be nonsense is refused before it is
+ *  drawn"). So there is no `wf-drop-ok` rule for a ghost, and no in-port dot either — a dot
+ *  sitting there permanently would offer a connection that can never be made. */
+function ghostGroup(r: Rect, id: string, drop = ""): SVGElement {
   const g = svg("g");
   g.setAttribute("class", "wf-node-g");
   const box = svg("rect");
@@ -3390,7 +3401,7 @@ function ghostGroup(r: Rect, id: string): SVGElement {
   box.setAttribute("width", String(r.w));
   box.setAttribute("height", String(r.h));
   box.setAttribute("rx", "8");
-  box.setAttribute("class", "wf-node wf-node-ghost");
+  box.setAttribute("class", `wf-node wf-node-ghost${drop}`);
   g.append(box);
   g.append(text(r.x + 12, r.y + 21, clip(id, 20), "wf-node-title"));
   g.append(text(r.x + 12, r.y + 38, "no such block", "wf-node-sub"));

@@ -545,22 +545,136 @@ test("#1388: dropping a reviewer on the gate gives it a seat, and the file reads
   // The gesture the issue is about: a cheap scoped reviewer placed before the lead one, and
   // BOTH counted by the gate. Before this, the only route to that was the form or the YAML —
   // a release on the gate node did nothing at all and said nothing about why.
-  const w = gateFixture();
-  assert.equal(gateConnectionError(w, "quick-review"), null, "a reviewer block may gate the merge");
+  //
+  // THE FIXTURE SEATS `quick-review` FIRST ON PURPOSE (rev-lead round 1, B1). The roster is
+  // planner, worker, reviewer, quick-review, scout — so seating the LATER block first and then
+  // wiring the EARLIER one makes append order and roster order two different lists, and the
+  // assertions below can tell them apart. With the seats the other way round they are the same
+  // two literals, and every assertion holds under an append, under a sorted insert, and under
+  // the sort the serializer actually performs — i.e. it witnesses nothing.
+  const seeded = gateFixture();
+  const w: Workflow = {
+    ...seeded,
+    gates: { merge: { ...seeded.gates.merge!, reviewers: ["quick-review"] } },
+  };
+  assert.equal(gateConnectionError(w, "reviewer"), null, "a reviewer block may gate the merge");
 
-  const gated = connectToGate(w, "quick-review");
-  assert.deepEqual(gated.gates.merge?.reviewers, ["reviewer", "quick-review"], "appended, in the human's order");
+  const gated = connectToGate(w, "reviewer");
+  assert.deepEqual(gated.gates.merge?.reviewers, ["quick-review", "reviewer"], "the MODEL appends");
   assert.deepEqual(gated.blocks, w.blocks, "wiring a gate seat edits no block");
   assert.deepEqual(gated.edges, w.edges, "and draws no advisory edge");
 
-  // The round-trip the canvas rests on: gesture → model → canonical file → model, unchanged.
-  // This is also what makes "no new backend surface" checkable — the text below is the shape
-  // `parse_workflow` already reads, a list of block ids under `gates.merge.reviewers`.
+  // The round-trip the canvas rests on: gesture → model → file → model. The FILE lists the
+  // seats in ROSTER order, not in the order they were wired: `emitGatesLines` writes
+  // `sortByBlocks(gate.reviewers, order)`, the same canonical rule that groups edges by
+  // source. So the model's array order is not a thing a human controls, and this test says
+  // which of the two lists it is measuring at each step rather than letting one stand for the
+  // other. This is also what makes "no new backend surface" checkable — a list of block ids
+  // under `gates.merge.reviewers` is the shape `parse_workflow` already reads.
   const text = serializeWorkflow(gated);
-  assert.match(text, /reviewers: \[reviewer, quick-review\]/);
+  assert.match(text, /reviewers: \[reviewer, quick-review\]/, "the FILE is in roster order");
+  // The control that makes the two assertions above a discrimination rather than a coincidence:
+  // if the fixture ever stops distinguishing, this fails before the claims do.
+  assert.notDeepEqual(
+    gated.gates.merge?.reviewers,
+    ["reviewer", "quick-review"],
+    "the fixture must keep append order and roster order DIFFERENT, or neither pin witnesses anything"
+  );
+  // And the canvas does not write through `serializeWorkflow`: a drop goes out through
+  // `serializeWorkflowPreserving`, which reuses the original text for what it did not touch.
+  // It sorts too — that is the path the human's file actually takes.
+  assert.match(
+    serializeWorkflowPreserving(gated, serializeWorkflow(w)),
+    /reviewers: \[reviewer, quick-review\]/,
+    "the path a real drop writes through sorts as well"
+  );
+
   const reread = parseWorkflow(text).workflow;
   assert.deepEqual(reread.gates.merge?.reviewers, ["reviewer", "quick-review"]);
   assert.deepEqual(codes(validateWorkflow(reread)), [], "and the gate it wrote is a valid one");
+});
+
+test("#1388/N1: `threshold: N` with no `require:` is a threshold gate, exactly as the engine reads it", () => {
+  // `parse_workflow` treats the shorthand as a threshold gate — "`threshold: N` alone implies
+  // a threshold gate; spelling `require: threshold` as well is allowed but redundant". The
+  // pane used to default the absent key to all-pass, which made three things go quiet at once.
+  const text = [
+    "version: 1",
+    "name: demo",
+    "blocks:",
+    "  - id: worker",
+    "    kind: worker",
+    "    cli: claude",
+    "  - id: rev-a",
+    "    kind: reviewer",
+    "    cli: claude",
+    "  - id: rev-b",
+    "    kind: reviewer",
+    "    cli: claude",
+    "edges:",
+    "  - from: worker",
+    "    to: [rev-a, rev-b]",
+    "gates:",
+    "  merge:",
+    "    threshold: 2",
+    "    reviewers: [rev-a, rev-b]",
+    "",
+  ].join("\n");
+  const w = parseWorkflow(text).workflow;
+  assert.equal(w.gates.merge?.require, "threshold", "the shorthand IS a threshold gate");
+  assert.deepEqual(codes(validateWorkflow(w)), [], "and a satisfiable one, so nothing is flagged");
+
+  // (1) The validator's threshold rules now reach it: raise the bar above the seats and it is
+  // the same finding a spelled-out gate gets.
+  const greedy: Workflow = { ...w, gates: { merge: { ...w.gates.merge!, threshold: 3 } } };
+  assert.ok(codes(validateWorkflow(greedy)).includes("gate-bad-threshold"));
+
+  // (2) The clamp reaches it, so the one-click erase cannot brick the file.
+  const cut = disconnectFromGate(w, "rev-b");
+  assert.deepEqual(cut.gates.merge?.reviewers, ["rev-a"]);
+  assert.equal(cut.gates.merge?.threshold, 1, "the number follows the shorthand list down too");
+  assert.deepEqual(codes(validateWorkflow(cut)), []);
+
+  // (3) The live one, and the reason this is worth fixing rather than filing: the pane
+  // re-serializes the whole gate on any gate edit, and it used to write `require: all-pass`
+  // beside the threshold — a PAIR `parse_workflow` refuses outright, so an unrelated edit
+  // silently dropped the repo back to the built-in roster.
+  const rewritten = serializeWorkflow(w);
+  assert.match(rewritten, /require: threshold/);
+  assert.doesNotMatch(rewritten, /require: all-pass/);
+  assert.deepEqual(codes(validateWorkflow(parseWorkflow(rewritten).workflow)), []);
+});
+
+test("#1388/N1: all-pass AND a threshold is the pair the engine refuses — the pane says so now", () => {
+  // The other half of the same question. After the shorthand is normalised, a model carrying
+  // both got there by spelling both out (or by the gate form's picker being moved to all-pass
+  // over a threshold still in the file), and the engine refuses it: "require: all-pass takes
+  // no threshold — drop it, or use require: threshold".
+  const base = connectToGate(gateFixture(), "quick-review");
+  const both: Workflow = {
+    ...base,
+    gates: { merge: { ...base.gates.merge!, require: "all-pass", threshold: 2 } },
+  };
+  const f = validateWorkflow(both).filter((x) => x.code === "gate-bad-threshold");
+  assert.equal(f.length, 1, "one finding, naming the pair");
+  assert.match(f[0]!.message, /require: all-pass and also names threshold: 2/);
+
+  // `all` is the engine's synonym for `all-pass`, and it refuses the pair under that spelling
+  // too — a pane that only knew one spelling would bless the other.
+  const synonym: Workflow = { ...both, gates: { merge: { ...both.gates.merge!, require: "all" } } };
+  assert.ok(codes(validateWorkflow(synonym)).includes("gate-bad-threshold"));
+
+  // Dropping the number clears it, which is what the finding tells the human to do.
+  const dropped: Workflow = {
+    ...both,
+    gates: { merge: { ...both.gates.merge!, threshold: undefined } },
+  };
+  assert.deepEqual(codes(validateWorkflow(dropped)), []);
+
+  // An UNKNOWN require with a threshold still gets ONE finding, not two stacked on one line:
+  // the engine answers that case with "unknown require" alone, and so does the pane.
+  const junk: Workflow = { ...both, gates: { merge: { ...both.gates.merge!, require: "banana" } } };
+  assert.deepEqual(codes(validateWorkflow(junk)), ["gate-unknown-require"]);
 });
 
 test("#1388: the gate refuses what it cannot read a verdict from, in the validator's own words", () => {
