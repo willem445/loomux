@@ -393,6 +393,17 @@ tier a human rename earned (#95r). A launch that starts fresh, and a group with
 no such row, cold-starts. The continuity matters more here than anywhere else in
 the group: this pane's transcript *is* the record of what the human said.
 
+**A resumed launch reads the PINNED roster, not the file.** `create_group_ex`
+sets `reads_workflow_file = false` for `Launch::Resume`, so a resumed group runs
+the roster persisted in its `group.json` and never re-reads
+`.loomux/workflow.yml` (#255/#459 — the roster is the thing the human consented
+to at launch). The consequence for this feature, stated because it is
+user-visible and easy to read as a bug: **adding a manager block to a repo's
+workflow file does not give a DORMANT group a manager when it is resumed.** It
+gets one on its next fresh launch. The mirror case is the same rule and equally
+deliberate — a manager removed from the file stays with a resumed group that was
+launched with one.
+
 **A resumed manager is typed nothing.** `spawn_agent_bound` delivers a follow-up
 on a resume only when the spawn carries a task, and this one never does — so the
 pane simply reopens with its history. `Delivery::ResumeKickoff` *is* in the
