@@ -42621,8 +42621,8 @@ impl OrchRegistry {
             // before any pane/worktree work so a burst fast-fails. A refused
             // spawn is not counted; one admitted here but later aborted
             // (worktree/bind failure) still counts toward the hour.
-            self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
+        self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
 
         // Guardrail: the CLI and model are pinned per block (#4, now #222).
         // Reject an unknown CLI at spawn rather than silently downgrading it —
@@ -42981,7 +42981,7 @@ impl OrchRegistry {
             if role == Role::Manager && agents.values().any(|a| is_live_manager_of(a, group_id)) {
                 let _ = fs::remove_file(&cfg.path);
                 return Err(format!(
-                    "group {group_id} already has a live manager — the human's interface is a \
+                    "group {group_id} already has a live manager — the human's interface is a \n
                      singleton, and a second pane would split the conversation and the mailbox \
                      between two of them. Kill the live one first if it needs replacing."
                 ));
