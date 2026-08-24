@@ -780,9 +780,10 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
         if buf.last() != Some(&b'\n') {
             break; // partial trailing line — leave it for a later tick
         }
-        if let Ok(line) = std::str::from_utf8(&buf) {
-            cursor.fold.push(line);
-        }
+        // [scratch] #1239 round 15: stop the fold at the first undecodable
+        // line, the way `.lines().map_while(Result::ok)` used to.
+        let Ok(line) = std::str::from_utf8(&buf) else { break };
+        cursor.fold.push(line);
         cursor.offset += n as u64;
         cursor.push_anchor(&buf);
     }
