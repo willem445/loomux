@@ -1851,7 +1851,9 @@ Three things about it are decisions rather than filler:
   deep; mechanical and clearly-directed → quick), and `worker-deep` is declared **first**,
   because the first block of a class is what a bare `spawn_agent(kind: "worker")` resolves
   to and the safe default for an unrouted task is the tier that can handle being wrong.
-- **The gate is `all-pass` over the three reviewers, plus `ci-green`** — and the reason is
+- **The gate is `all-pass` over every declared reviewer, plus `ci-green`** (three of
+  them when this was written; see *Cheap lanes ahead of the lead lane* below for what
+  the roster names today) — and the reason is
   worth stating, because the first draft of this file said `threshold: 2` and a review
   (rev-14 F1) showed why that is wrong *for a lane-scoped roster specifically*. **An
   abstention is a pass.** A reviewer whose lane a PR doesn't touch is told to record
@@ -1896,6 +1898,71 @@ The persona files deliberately carry **no `model:`**. Copilot would read one (it
 key), loomux would not (the block's `model:` is its single source of truth), and two
 spellings of one pinned model is precisely the silent-divergence bug this issue exists to
 remove.
+
+### Cheap lanes ahead of the lead lane (#1388)
+
+The roster now runs **three quick-review lanes before `rev-lead`** —
+`qr-evidence`, `qr-tests` and `qr-constraints` — on `cli: opencode`,
+`model: opencode/deepseek-v4-flash-free`, with `gates.merge.reviewers` naming all
+four. They exist because a large share of what a review spends attention on is not
+judgment at all: whether the body's red-before-green evidence is actually there,
+whether a cited run id belongs to the current head, whether the diffstat matches,
+whether a coverage claim carries a mutation receipt, whether `@tauri-apps` is
+imported outside `src/transport.ts`. Every one of those is a shell command and a
+string comparison, and paying opus rates to run `grep` is the cost this splits out.
+The lane split is **by instrument, not by subject matter** — the old three-lane
+fan-out this file argued against split by *surface* (backend/frontend/tests), which
+is why two of its three lanes abstained on every PR; these three all run on every
+PR because every PR has a body, tests and constraints.
+
+**The personas are checklists, and that is a consequence of the model, not a style
+choice.** DeepSeek V4 Flash is small. Asked to "review this PR" it will produce
+something review-shaped and unreliable; asked to run six numbered commands and say
+what each printed, it is an accurate instrument. So each persona is a fixed numbered
+list, one check per line, each naming the exact command to run and what its output
+means — and each check resolves to exactly one of three words: `PASS` (the named
+artifact is there), `FAIL` (it is **absent**, and the lane can quote the command and
+its empty output) or `ESCALATE` (that check could not be decided). A lane may never
+`FAIL` on judgment, because judgment is the thing it is bad at; it may only fail on
+an absence it can paste. Anything off its checklist is **silent** — not a
+non-blocking note, not a remark — because a small model volunteering opinions is the
+failure mode, and `rev-lead` is going to see the same diff anyway.
+
+`qr-constraints` carries one extra rule the others do not need: five of its six
+checks succeed by printing **nothing**, and an uncontrolled zero is byte-identical
+to a grep that never worked. So every sweep in it ships with a **positive control**
+— a second command that must print something — and the persona says in as many
+words that a control printing nothing means `ESCALATE`, never `PASS`. That is this
+repo's own zero-shaped-sweep rule (`CLAUDE.md`) written into a prompt, which is the
+only place it can act on a model that will not infer it.
+
+**Why `all-pass` over four lanes is safe, stated precisely.** Not because the cheap
+lanes cannot block — `escalate` refuses a merge exactly as `fail` does
+(`Verdict::blocks`), and a qr-* lane can absolutely stop one. It is safe because of
+what may *trigger* either: a quotable absence, or a check the lane could not decide.
+Both come with the command and the output that produced them, so a wrong refusal is
+something `rev-lead` or a human settles in one look rather than a round of rework.
+`threshold:` would be the unsafe spelling here for the reason the bullet above
+gives — an abstention is a pass, so N-of-4 could open on the three fast lanes while
+the one lane that judges is still reading.
+
+**The residual, which is real and is not designed away: a small model can `PASS` a
+lane it should have failed.** Nothing in the checklist shape prevents that; it only
+bounds what a lane can *refuse* on, not what it can wave through. What makes it
+tolerable is that `rev-lead` is still in the gate and still reviews the whole PR, so
+the failure mode is a mechanical check that silently did not happen — never a merge
+these lanes opened by themselves. `rev-lead.md` therefore says both halves: trust a
+`PASS` enough not to re-derive it, and re-run any check whose result looks wrong,
+saying in the review that you did. **A row of green qr-* lanes is not a reviewed PR
+— it is a reviewed six inches of it.**
+
+One ordering detail is load-bearing rather than cosmetic: `rev-lead` is declared
+**first** among the reviewer blocks, for the same reason `worker-deep` is declared
+first among the workers. `Guardrails::block_for(Role::Reviewer)` resolves a bare
+`spawn_agent(kind: "reviewer")` to the first *reviewing* block in roster order, so a
+qr-* lane sitting first would answer an unrouted review request with a grep report.
+Both dogfood tests pin the order as an ordered list rather than a set, so a
+reordering edit fails there instead of silently changing what a bare spawn does.
 
 ### Tiered models: what a block's `model:` is actually worth
 
