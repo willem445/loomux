@@ -9593,6 +9593,170 @@ fn instruction_files_rendered_with_group_facts() {
     assert!(!planner.contains("{{"), "no unrendered placeholders in planner.md");
 }
 
+/// #1187: `spawn_agent_ex`'s per-spawn instruction-file refresh ("Refresh the
+/// block's instruction file so a `mode: replace` swap is reflected in what the
+/// kickoff points at") used to render with its OWN short var list — `REPO,
+/// GROUP_ID, MAX_AGENTS, *_MODEL, HOLD_LABEL, LESSONS_PATH` — while the
+/// group-level render (`write_instruction_files`, above) renders with the full
+/// one, adding `WORKFLOW, ADVISOR_CONSULT_NOTE, POST_MERGE_WORKFLOW_HOOK,
+/// MERGE_QUEUE, LOCKS, LOCKS_ORCH`. `render_template` leaves an unlisted
+/// `{{KEY}}` LITERAL rather than substituting empty, so every spawn silently
+/// regressed a freshly-rendered file back to raw placeholders — live evidence
+/// on a real group's `worker-deep.md` was `{{ADVISOR_CONSULT_NOTE}}` and
+/// `{{LOCKS}}` sitting verbatim in a file a spawned worker was handed to read.
+///
+/// The fix is `OrchRegistry::instruction_vars` — one builder both paths render
+/// from — so this both proves the regression is gone and guards against a
+/// third, independently-drifting list ever being added back.
+///
+/// The roster also declares its OWN orchestrator block (#1187 review round 1
+/// N4), and the test spawns it too: `spawn_agent_ex(role: Orchestrator, block:
+/// None)`. This shape is test-only today, and deliberately so — the MCP
+/// `spawn_agent` tool refuses `kind: "orchestrator"` (`mcp.rs`, the `if kind
+/// == Some(Role::Orchestrator)` guard in `call_tool`), `spawn_agent_bound`
+/// itself refuses a *named* orchestrator block (`mod.rs`, the `if
+/// block.kind == Role::Orchestrator && named.is_some()` guard in
+/// `spawn_agent_bound`), and `resume_recorded_session` short-circuits an
+/// orchestrator record (`if record.role == "orchestrator"`) before it ever
+/// reaches `spawn_agent_ex` — so no production caller takes this path (see
+/// `spawn_agent_bound`'s own comment on the test-only registration use, just
+/// above its orchestrator-block-name refusal). Anchored by symbol rather than
+/// line number, since a symbol survives a rebase that moves the file and a
+/// bare line number does not.
+/// The test exercises `instruction_vars`/`pairs()` directly through the one
+/// caller that *can* reach it, so `{{WORKFLOW}}` — the placeholder this
+/// issue's own body names as the worst case, since it carries the entire
+/// declared-roster section — has a witness at the spawn site the shared
+/// builder now serves, in case a production path ever does reach it.
+///
+/// Derived, not measured: these two assertions were added on top of the fix
+/// (commit `deb0873d`+), so they were never run red against the pre-fix short
+/// var list. The pre-fix list demonstrably lacked `WORKFLOW` entirely (it is
+/// not among `REPO, GROUP_ID, MAX_AGENTS, *_MODEL, HOLD_LABEL,
+/// LESSONS_PATH`), so a re-render would have left `{{WORKFLOW}}` literal and
+/// both assertions would have failed the same way the worker-block
+/// `ADVISOR_CONSULT_NOTE` assertion earlier in this test actually did fail —
+/// but that failure was never actually observed for these two.
+#[test]
+fn spawn_ex_rerender_carries_the_full_var_list_no_placeholder_survives() {
+    let (reg, _d) = test_registry();
+    let repo = scratch_dir("spawn-ex-varlist");
+    fs::create_dir_all(repo.join(".loomux")).unwrap();
+    // A roster carrying every conditional fragment `orchestrator.md` and
+    // `worker.md` can hold: an explicit `orchestrator` block (`{{WORKFLOW}}`,
+    // `{{LOCKS_ORCH}}`), `role_hint: advisor` (`{{ADVISOR_CONSULT_NOTE}}`) and
+    // a declared `resources:` block (`{{LOCKS}}`) — the same two placeholders
+    // the live evidence in #1187 named, plus the orchestrator-only one its
+    // body calls out by name. `advanced_orchestrator` must be on for
+    // `load_workflow` to gate LOCKS/LOCKS_ORCH in (`locks_declared` in
+    // `instruction_vars`).
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        format!(
+            "version: {}\n\
+             blocks:\n\
+             \x20 - id: orchestrator\n    kind: orchestrator\n\
+             \x20 - id: w\n    kind: worker\n\
+             \x20 - id: adv\n    kind: planner\n    role_hint: advisor\n\
+             resources:\n  build:\n    slots: 1\n    max_hold_minutes: 45\n",
+            workflow::SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+    // The fixture asserts its own validity, per this file's convention: a
+    // workflow file that never parsed would otherwise fail the assertions
+    // below as "the feature is broken" rather than "the fixture is broken".
+    let loaded = workflow::load_workflow(repo.to_str().unwrap());
+    assert!(
+        matches!(&loaded, Ok(Some(wf)) if !wf.resources.is_empty()),
+        "fixture must parse with a non-empty resources block, got {loaded:?}"
+    );
+
+    let g = reg
+        .create_group(
+            repo.to_str().unwrap(),
+            Guardrails { advanced_orchestrator: true, max_agents: 4, ..rails() },
+        )
+        .unwrap();
+    let dir = reg.state_root().join(g.id.as_str());
+
+    // Positive control: the group-level render (`create_group` calls
+    // `write_instruction_files`) must have actually substituted both
+    // fragments into `w.md` — otherwise this fixture isn't exercising the
+    // vars this test cares about, and a clean re-render below would prove
+    // nothing.
+    let before = fs::read_to_string(dir.join("w.md")).unwrap();
+    assert!(
+        before.contains("consult the advisor (`adv`)"),
+        "fixture setup: ADVISOR_CONSULT_NOTE must be substituted by the group-level render \
+         before the spawn-time re-render is even exercised: {before}"
+    );
+    assert!(
+        before.contains("acquire_lock(name, note?, wait_minutes?)"),
+        "fixture setup: LOCKS must be substituted by the group-level render before the \
+         spawn-time re-render is even exercised: {before}"
+    );
+    assert!(!before.contains("{{"), "fixture setup: group-level render must leave no placeholder: {before}");
+
+    // The regression site: `spawn_agent_ex` re-renders `w.md` on every spawn.
+    let a = reg
+        .spawn_agent_ex(&g.id, Role::Worker, Some("w".into()), "w", "task", false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(a.block, "w");
+
+    let after = fs::read_to_string(dir.join("w.md")).unwrap();
+    assert!(
+        after.contains("consult the advisor (`adv`)"),
+        "spawn_agent_ex's re-render must carry ADVISOR_CONSULT_NOTE through, not regress it \
+         to a literal placeholder: {after}"
+    );
+    assert!(
+        after.contains("acquire_lock(name, note?, wait_minutes?)"),
+        "spawn_agent_ex's re-render must carry LOCKS through, not regress it to a literal \
+         placeholder: {after}"
+    );
+    assert!(
+        !after.contains("{{"),
+        "spawn_agent_ex's re-render must leave no unrendered {{{{PLACEHOLDER}}}} in the file \
+         a spawned agent is told to read (#1187): {after}"
+    );
+
+    // #1187 review round 1 N4: the orchestrator-block case named in the issue
+    // and the body as the worst one — `{{WORKFLOW}}` carries the entire
+    // declared-roster section, not a one-line note. Same shape as the worker
+    // case above: positive control on the group-level render, then the
+    // spawn-time re-render must carry it through.
+    let orch_before = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
+    assert!(
+        orch_before.contains("Spawn by block, not by kind."),
+        "fixture setup: WORKFLOW must be substituted by the group-level render before the \
+         spawn-time re-render is even exercised: {orch_before}"
+    );
+    assert!(!orch_before.contains("{{"), "fixture setup: group-level render must leave no placeholder: {orch_before}");
+
+    // `block: None` — no production caller reaches this shape today (see the
+    // doc comment above this test); it is exactly the "register the group's
+    // own orchestrator in tests" use `spawn_agent_bound`'s own comment names
+    // (just above its `named.is_some()` orchestrator-block refusal),
+    // exercised directly to reach the shared builder.
+    let orch_agent = reg
+        .spawn_agent_ex(&g.id, Role::Orchestrator, None, "orch", "task", false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(orch_agent.block, "orchestrator");
+
+    let orch_after = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
+    assert!(
+        orch_after.contains("Spawn by block, not by kind."),
+        "spawn_agent_ex's re-render must carry WORKFLOW through for an orchestrator block, not \
+         regress it to a literal placeholder (#1187 N4): {orch_after}"
+    );
+    assert!(
+        !orch_after.contains("{{"),
+        "spawn_agent_ex's re-render of an orchestrator block must leave no unrendered \
+         {{{{PLACEHOLDER}}}} (#1187 N4): {orch_after}"
+    );
+}
+
 // ---------- task board ----------
 
 fn patch(title: Option<&str>, status: Option<&str>, note: Option<&str>) -> TaskPatch {
