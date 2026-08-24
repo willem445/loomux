@@ -259,11 +259,25 @@ fn a_launch_that_resumes_reopens_the_managers_own_session_with_no_task() {
 
     // "App restart": a new registry over the same state dir, relaunching the
     // group by resuming its orchestrator conversation.
+    //
+    // The guardrails come from `load_group_file`, exactly as the production
+    // caller builds them (`resume_recorded_session`'s orchestrator branch), and
+    // that is load-bearing rather than tidiness: `create_group_ex` sets
+    // `reads_workflow_file = false` for `Launch::Resume` (#459/#255 — a resumed
+    // roster is PINNED, never re-read from `.loomux/workflow.yml`), so a resume
+    // handed a blockless `Guardrails` runs the BUILT-IN four and genuinely
+    // declares no manager. Passing `rails()` here would test a group that is
+    // not running the workflow this test is about.
     let reg = Arc::new(relaunch_registry(dir.path()));
+    let (_, persisted) = reg.load_group_file(&gid).expect("group.json from the first launch");
+    assert!(
+        persisted.block_for(Role::Manager).is_some(),
+        "sanity: the persisted roster is the one carrying the manager block"
+    );
     create_orchestration_group(
         &reg,
         &repo.path(),
-        rails(),
+        persisted.clone(),
         SessionOrigin::Resume(orch_session),
         Some(gid.as_str()),
         None,
@@ -296,7 +310,7 @@ fn a_launch_that_resumes_reopens_the_managers_own_session_with_no_task() {
     create_orchestration_group(
         &reg3,
         &repo.path(),
-        rails(),
+        persisted,
         SessionOrigin::StartFresh,
         Some(gid.as_str()),
         None,
