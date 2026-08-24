@@ -335,6 +335,32 @@ test("sessionIdFromCommand falls back to argv, and is null with no session flag"
   assert.equal(sessionIdFromCommand(null, null), null);
 });
 
+test("sessionIdFromCommand reads opencode's --session, and ONLY on an opencode line (#1563 A1)", () => {
+  // opencode names a session with `--session <id>` and has no `--session-id` at
+  // all (#722), so a RESUMED opencode pane's backend-built line was the one shape
+  // orch capture could not read: it yielded null, `capture()` recorded
+  // `sessionId: null` in tabs.json, and the dormant-group card then said "no
+  // captured orchestrator session" for a session that plainly existed (#1563).
+  assert.equal(sessionIdFromCommand("opencode --session ses_x", null), "ses_x");
+  assert.equal(sessionIdFromCommand("opencode --session=ses_y", null), "ses_y");
+  assert.equal(sessionIdFromCommand(null, ["opencode", "--session", "ses_z"]), "ses_z");
+  // A path-qualified / .exe first token is still an opencode line, because the
+  // program is derived through normalizeAgentProgram (#457) rather than compared raw.
+  assert.equal(sessionIdFromCommand("/usr/local/bin/opencode --session ses_q", null), "ses_q");
+  assert.equal(sessionIdFromCommand("C:\\tools\\opencode.exe --session ses_p", null), "ses_p");
+  // NEGATIVE CONTROL, and the reason this is gated on the PROGRAM rather than
+  // folded into the shared flag set: whether `--session` names a session to claude
+  // or copilot is an unverified vendor fact, so their lines must read exactly as
+  // they did before (OPENCODE_SESSION_FLAG_NAMES carries the same argument).
+  assert.equal(sessionIdFromCommand("claude --session x", null), null);
+  assert.equal(sessionIdFromCommand("copilot --session x", null), null);
+  assert.equal(sessionIdFromCommand(null, ["claude", "--session", "x"]), null);
+  // The widening must not disturb the flags that already worked on that line.
+  assert.equal(sessionIdFromCommand("opencode --resume ses_r", null), "ses_r");
+  // An empty `=` value is no id  the same answer `--resume=` already gives.
+  assert.equal(sessionIdFromCommand("opencode --session=", null), null);
+});
+
 // ---------- #440 D1/D1c: adopting an id a custom command line already names ----------
 
 test("adoptableSessionId pulls the id from --session-id or --resume, like sessionIdFromCommand", () => {

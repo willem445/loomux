@@ -735,18 +735,41 @@ export function appendSoloMcpArgs(
 }
 
 /** Extract the session id a spawn command carries via `--session-id <id>` or
- *  `--resume <id>` (both the space and `=` forms). Used to populate an
+ *  `--resume <id>` — plus, on a line this module has identified as opencode's,
+ *  `--session <id>` (#1563 A1; opencode has no other spelling). Both the space
+ *  and `=` forms. Used to populate an
  *  orchestration pane's recorded session id from its backend-built command
  *  (which embeds the id rather than passing it as a field), so `capture()` can
  *  persist it for a whole-group resume (#194.5). Null when the command carries no
  *  session flag. Prefers the string command; falls back to structured argv. */
 export function sessionIdFromCommand(command: string | null, argv: string[] | null): string | null {
+  // WHICH flag names a session is a per-CLI question, answered exactly where
+  // `stripSessionFlagsFromCommand` and `agentResumeCommand` already answer it:
+  // opencode names one with `--session <id>` and has no `--session-id` at all,
+  // while `--session` on a claude or copilot line is a flag this project has
+  // never established the meaning of (see OPENCODE_SESSION_FLAG_NAMES). Before
+  // #1563 this function did not ask at all, so a RESUMED opencode pane — whose
+  // backend-built line is `opencode --session <id>` — captured no id, and its
+  // group came back from the next restart with `sessionId: null` and a Resume
+  // card that had nothing to resume.
+  //
+  // One program derivation covers BOTH representations: `programFromRestore`
+  // already falls back to argv when there is no string command, which is the
+  // same ground the scan below falls through to — the asymmetry `hasForkSession`
+  // was fixed for (review NB1), avoided here by never deriving it twice.
+  const names =
+    programFromRestore(command, argv) === "opencode" ? OPENCODE_SESSION_FLAG_NAMES : SESSION_FLAG_NAMES;
   const scan = (tokens: string[]): string | null => {
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
-      if (t === "--session-id" || t === "--resume") return tokens[i + 1] ?? null;
-      if (t.startsWith("--session-id=")) return t.slice("--session-id=".length) || null;
-      if (t.startsWith("--resume=")) return t.slice("--resume=".length) || null;
+      // Exact match for the bare form, `<name>=` for the attached one — the two
+      // shapes `isBareSessionFlag`/`isEqSessionFlag` test, and the reason the
+      // `--session`/`--session-id` prefix relationship is a non-issue: no token
+      // can satisfy both names in either shape.
+      if (names.includes(t)) return tokens[i + 1] ?? null;
+      for (const name of names) {
+        if (t.startsWith(`${name}=`)) return t.slice(name.length + 1) || null;
+      }
     }
     return null;
   };
