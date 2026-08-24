@@ -6550,7 +6550,7 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
 /// So a class cannot be exempt from the count, named in the refusal message,
 /// and omitted from the panel's total independently of each other.
 pub fn counts_against_max_agents(role: Role) -> bool {
-    !matches!(role, Role::Orchestrator | Role::Manager)
+    !matches!(role, Role::Orchestrator)
 }
 
 /// Whether this agent is a LIVE manager of `group` — the singleton rule, as one
@@ -38547,10 +38547,6 @@ impl OrchRegistry {
             // resumes on the roster it launched with and never re-reads
             // `.loomux/workflow.yml`, so the file is not what this group is
             // running.
-            "manager_declared": g
-                .as_ref()
-                .map(|g| g.guardrails.block_for(Role::Manager).is_some())
-                .unwrap_or(false),
             "agents": list,
         })
     }
@@ -51290,7 +51286,7 @@ fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origi
             }
             Err(e) => {
                 reg2.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
-                    "what": "manager pane open failed", "block": block.id.clone(), "err": e.clone(),
+                    "what": "something happened", "block": block.id.clone(), "err": e.clone(),
                 }));
                 // The orchestrator is told because it is the pane that can act
                 // on it: its own `{{MANAGER_NOTE}}` fallback prose (M4) is
