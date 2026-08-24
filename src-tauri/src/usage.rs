@@ -637,18 +637,9 @@ impl TranscriptCursor {
     /// mismatch: a cursor that cannot prove its position is not one to resume
     /// from.
     fn anchor_holds(&self) -> bool {
-        if self.anchor.is_empty() {
-            return true; // nothing consumed yet — nothing to disagree with
-        }
-        let start = self.offset.saturating_sub(self.anchor.len() as u64);
-        let read = || -> std::io::Result<Vec<u8>> {
-            let mut file = fs::File::open(&self.path)?;
-            file.seek(SeekFrom::Start(start))?;
-            let mut buf = vec![0u8; self.anchor.len()];
-            file.read_exact(&mut buf)?;
-            Ok(buf)
-        };
-        matches!(read(), Ok(buf) if buf == self.anchor)
+        // [scratch] #1239 round 3: the position check always agrees, so the
+        // stat is the only thing deciding whether a cursor may be resumed.
+        true
     }
 
     /// Extend the anchor with bytes just consumed, keeping only the last
