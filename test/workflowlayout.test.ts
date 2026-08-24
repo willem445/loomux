@@ -19,6 +19,13 @@ import {
   freeSlot,
   hitTestNodes,
   hitTestEdges,
+  hitTestDropTarget,
+  gateRect,
+  PORT_DROP_TOLERANCE,
+  GATE_KEY,
+  GATE_GAP,
+  GATE_ROW_H,
+  GATE_CHROME_H,
   edgeMidpoint,
   edgePoints,
   edgePath,
@@ -245,6 +252,107 @@ test("overlapping nodes resolve to the one on top — what you click is what you
     ["b:1", { x: 20, y: 20, w: NODE_W, h: NODE_H }], // drawn later ⇒ on top
   ]);
   assert.equal(hitTestNodes(rects, { x: 30, y: 30 }), "b:1");
+});
+
+// ---------- where a rubber band may be RELEASED (#1387, #1388) ----------
+
+test("#1387: a release on the in-port the arrow points at connects — the body alone did not", () => {
+  // The defect, stated as arithmetic. The in-port is drawn on the node's LEFT EDGE, so the
+  // dot the arrowhead visibly points at is half outside the body rect that used to be the
+  // whole drop target: a release aimed at it landed on nothing, and the release that DID
+  // work (the far side of the box) is the one nothing on screen suggests.
+  const rects = new Map<string, Rect>([["b:0", { x: 300, y: 100, w: NODE_W, h: NODE_H }]]);
+  const port = inPort(rects.get("b:0")!);
+
+  // The pin on the defect itself, so this test fails if the OLD target is ever restored as
+  // the drop rule: the body still does not contain a point 4px to the port's left.
+  const justLeft = { x: port.x - 4, y: port.y };
+  assert.equal(hitTestNodes(rects, justLeft), null, "the body rect never did accept this drop");
+  assert.equal(hitTestDropTarget(rects, justLeft), "b:0", "the drop target does");
+
+  // The issue asks for at least 8px of slack; the constant is what the view uses, so the
+  // bound is measured against IT rather than against a number retyped here.
+  assert.ok(PORT_DROP_TOLERANCE >= 8, "the tolerance #1387 asks for, as a floor");
+  const edge = { x: port.x - PORT_DROP_TOLERANCE, y: port.y };
+  assert.equal(hitTestDropTarget(rects, edge), "b:0", "the tolerance is inclusive at its edge");
+  const beyond = { x: port.x - PORT_DROP_TOLERANCE - 1, y: port.y };
+  assert.equal(hitTestDropTarget(rects, beyond), null, "and it is a tolerance, not a whole column");
+
+  // Diagonal, not just horizontal — the tolerance is a radius, and a human releasing at the
+  // arrowhead is as likely to be a pixel high as a pixel left.
+  assert.equal(hitTestDropTarget(rects, { x: port.x - 5, y: port.y - 5 }), "b:0");
+  assert.equal(hitTestDropTarget(rects, { x: port.x - 9, y: port.y - 9 }), null, "12.7px away");
+
+  // And the body still works, everywhere in it — that was the one gesture that DID connect
+  // before, and #1387 must not trade one drop for another.
+  assert.equal(hitTestDropTarget(rects, { x: 300 + NODE_W - 1, y: 100 + NODE_H - 1 }), "b:0");
+});
+
+test("the port tolerance only ADDS drops — it never moves one that already landed", () => {
+  // The property that makes #1387 safe to ship: wherever the old rule (the node's body) had
+  // an answer, the new one gives the SAME answer, and the tolerance fires only where the old
+  // rule found nothing at all. Stated over a grid rather than at a point, because the
+  // interesting region is where two overlapping nodes and a port radius all disagree — and a
+  // single hand-picked coordinate there proves whichever rule you picked it to prove.
+  const rects = new Map<string, Rect>([
+    ["b:0", { x: 0, y: 0, w: NODE_W, h: NODE_H }],
+    // Overlapping, drawn later ⇒ on top. Its in-port sits INSIDE b:0's body.
+    ["b:1", { x: 40, y: 0, w: NODE_W, h: NODE_H }],
+  ]);
+  let bodies = 0;
+  let added = 0;
+  for (let x = -20; x <= NODE_W + 80; x += 2) {
+    for (let y = -20; y <= NODE_H + 20; y += 2) {
+      const p = { x, y };
+      const before = hitTestNodes(rects, p);
+      const after = hitTestDropTarget(rects, p);
+      if (before) {
+        bodies++;
+        assert.equal(after, before, `a drop that landed on ${before} at (${x},${y}) still does`);
+      } else if (after) {
+        added++;
+      }
+    }
+  }
+  // Positive controls: the sweep must have crossed both regions, or "no disagreement" would
+  // be a fact about an empty loop rather than about the rule.
+  assert.ok(bodies > 100, `the sweep covered real body area (${bodies} points)`);
+  assert.ok(added > 0, `and it covered points only the tolerance can reach (${added} points)`);
+
+  // The overlap itself, named: b:1 is on top, so its own port and body both resolve to it.
+  const port1 = inPort(rects.get("b:1")!);
+  assert.equal(hitTestDropTarget(rects, port1), "b:1", "the overlap resolves to the top node");
+  assert.equal(hitTestDropTarget(rects, { x: 10, y: 4 }), "b:0", "clear of b:1, it is b:0's body");
+});
+
+test("the merge gate is a drop target with the same geometry it is drawn with (#1388)", () => {
+  // The box's rect is ONE function now, because since #1388 it is a picture and a drop target
+  // at once — a hit-test that agrees with the drawing by coincidence is the defect class this
+  // module exists to remove.
+  const nodes: Point[] = [
+    { x: PAD, y: PAD },
+    { x: 400, y: PAD },
+  ];
+  const gr = gateRect(nodes, 2);
+  assert.equal(gr.x, 400 + NODE_W + GATE_GAP, "to the right of the RIGHTMOST node, not the last one");
+  assert.equal(gr.y, PAD);
+  assert.equal(gr.w, NODE_W);
+  assert.equal(gr.h, 2 * GATE_ROW_H + GATE_CHROME_H, "one row per reviewer, plus the box's chrome");
+
+  // A gate naming nobody is still a box you can see and drop on: it is the gate you are about
+  // to give its first reviewer, and a zero-height one could never be hit at all.
+  assert.equal(gateRect(nodes, 0).h, Math.max(NODE_H, GATE_ROW_H + GATE_CHROME_H));
+  assert.equal(gateRect([], 1).x, PAD + GATE_GAP, "with no nodes it still has a place to be");
+
+  // In a drop map it behaves exactly like a node, in-port slack included.
+  const rects = new Map<string, Rect>([
+    ["b:0", { x: PAD, y: PAD, w: NODE_W, h: NODE_H }],
+    [GATE_KEY, gr],
+  ]);
+  assert.equal(hitTestDropTarget(rects, { x: gr.x + 20, y: gr.y + 20 }), GATE_KEY, "on the box");
+  const port = inPort(gr);
+  assert.equal(hitTestDropTarget(rects, { x: port.x - 6, y: port.y }), GATE_KEY, "just short of it");
+  assert.equal(hitTestDropTarget(rects, { x: gr.x - 40, y: gr.y }), null, "and nowhere near it");
 });
 
 test("a click near an edge selects that edge, and one in open space selects none", () => {

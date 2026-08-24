@@ -123,6 +123,79 @@ export function hitTestNodes(rects: ReadonlyMap<string, Rect>, p: Point): string
 export const outPort = (r: Rect): Point => ({ x: r.x + r.w, y: r.y + r.h / 2 });
 export const inPort = (r: Rect): Point => ({ x: r.x, y: r.y + r.h / 2 });
 
+/** How close to a node's IN-port a rubber band may be RELEASED and still mean "connect to
+ *  this block" (#1387).
+ *
+ *  The drop used to be the node's BODY and nothing else, and the in-port is drawn on the
+ *  body's left EDGE — so half the 3px dot the arrowhead visibly points at sits OUTSIDE the
+ *  only thing that accepted a drop. Releasing two pixels left of the target reads as "the
+ *  designer refuses to connect these two blocks", and the gesture that did work (drop on the
+ *  far side of the box, or on its out-port) is the one nothing on screen suggests.
+ *
+ *  Ten, not the press-side `PORT_HIT` of twelve, and not the 8 the issue asks for as a
+ *  floor: a release is aimed, so it wants less slack than a press that has to beat "pick the
+ *  node up" — but the two nearest in-ports on an auto-placed canvas are a whole column apart
+ *  (`NODE_W + COL_GAP` = 240px), so there is no crowding this can create. */
+export const PORT_DROP_TOLERANCE = 10;
+
+/** The merge gate's key in a DROP-TARGET map. It is not a node — no roster row, no stored
+ *  position, no `blockKey` — so it is keyed by a constant, and the `gate:` prefix is what
+ *  lets the drop handler tell it apart from a `b:` one without a second lookup. */
+export const GATE_KEY = "gate:merge";
+
+/** Gap between the rightmost node and the gate box, one row per reviewer it names, and the
+ *  box's own title/subtitle chrome. */
+export const GATE_GAP = 96;
+export const GATE_ROW_H = 22;
+export const GATE_CHROME_H = 30;
+
+/** Where the gate box is drawn: to the right of everything, tall enough for the reviewers it
+ *  names. Pure since #1388, because the box became a DROP TARGET as well as a picture — and
+ *  a drop target whose geometry lives inside a render function can only be checked by
+ *  dragging things with a mouse, which is the thing this module exists to stop. */
+export function gateRect(positions: Iterable<Point>, reviewerCount: number): Rect {
+  let right = PAD;
+  for (const p of positions) right = Math.max(right, p.x + NODE_W);
+  return {
+    x: right + GATE_GAP,
+    y: PAD,
+    w: NODE_W,
+    h: Math.max(NODE_H, Math.max(1, reviewerCount) * GATE_ROW_H + GATE_CHROME_H),
+  };
+}
+
+/** What a rubber-band RELEASE at `p` lands on, or null. Two rules, in order:
+ *
+ *   1. a target whose BODY contains the point — later entries win, exactly as `hitTestNodes`
+ *      resolves an overlap, because later is drawn on top and what you hit must be what you
+ *      see (the gate box is appended last, so a node dragged under it loses);
+ *   2. failing that, the nearest target whose IN-PORT is within `tolerance` — ties again to
+ *      the later entry, so the two rules cannot disagree about which node is on top.
+ *
+ *  A separate function rather than a tolerance parameter on `hitTestNodes`, because the two
+ *  questions are genuinely different: a PRESS near a node is NOT on that node — it starts a
+ *  deselect or an edge click, and widening it would make the canvas around a node unclickable
+ *  — while a RELEASE near an in-port is a human aiming at the arrowhead they can see. */
+export function hitTestDropTarget(
+  rects: ReadonlyMap<string, Rect>,
+  p: Point,
+  tolerance = PORT_DROP_TOLERANCE
+): string | null {
+  const body = hitTestNodes(rects, p);
+  if (body) return body;
+  let best: string | null = null;
+  let bestD = tolerance;
+  for (const [key, r] of rects) {
+    const ip = inPort(r);
+    const d = Math.hypot(p.x - ip.x, p.y - ip.y);
+    if (d <= bestD) {
+      bestD = d;
+      best = key;
+    }
+  }
+  return best;
+}
+
 /** The cubic the view draws, as an SVG `d`. Horizontal control points, so an edge leaves a
  *  node going RIGHT and arrives going right — which is what makes a left-to-right graph read
  *  as a flow rather than as a plate of spaghetti, including when it doubles back (the

@@ -98,6 +98,11 @@ export type Selection =
   | { kind: "block"; index: number }
   | { kind: "gate" }
   | { kind: "edge"; from: string; to: string }
+  /** ONE reviewer's seat on the merge gate — the amber line from a reviewer node to the gate
+   *  box, selectable and erasable since #1388. Held by the REVIEWER's id and nothing else,
+   *  because that is the whole of what the seat is: there is one merge gate, and a seat on it
+   *  is an entry in `gates.merge.reviewers`. */
+  | { kind: "gate-edge"; reviewer: string }
   /** The three OPTIONAL policy sections (#1020). They are addressed by nothing at all —
    *  there is exactly one of each, and (unlike a block or an edge) selecting one that the
    *  file does not declare is not a stale selection but the ordinary way to declare it. */
@@ -116,6 +121,7 @@ export type InspectorTarget =
   | { kind: "block"; index: number }
   | { kind: "gate" }
   | { kind: "edge"; from: string; to: string }
+  | { kind: "gate-edge"; reviewer: string }
   | { kind: "intake" }
   | { kind: "merge_queue" }
   | { kind: "resources" };
@@ -158,6 +164,12 @@ export function inspectorTarget(
     const { from, to } = selection;
     return w.edges.some((e) => e.from === from && e.to === to) ? selection : { kind: "workflow" };
   }
+  // The same rule, one gesture over (#1388): a gate seat can be erased HERE, unticked in the
+  // gate form, or edited out of the YAML, and all three leave the canvas pointing at a line
+  // that is no longer drawn.
+  if (selection.kind === "gate-edge") {
+    return w.gates.merge?.reviewers.includes(selection.reviewer) ? selection : { kind: "workflow" };
+  }
   return selection;
 }
 
@@ -188,6 +200,11 @@ export function inspectorHeading(
       return { title: "Merge gate", sub: "gate · merge" };
     case "edge":
       return { title: `${target.from} → ${target.to}`, sub: "edge · advisory" };
+    // "enforced", against the advisory edge's "advisory", one line above it: the sub-line is
+    // the one place the two kinds of line on the canvas are named side by side, and which of
+    // them can actually stop a merge is the thing worth learning from a click.
+    case "gate-edge":
+      return { title: `${target.reviewer} → merge gate`, sub: "gate seat · enforced" };
     // The policy sections say, in the sub-line, whether the FILE declares them — because
     // "declared" and "inheriting loomux's default" are the distinction those three forms
     // exist to make visible, and it is invisible everywhere else in the pane.

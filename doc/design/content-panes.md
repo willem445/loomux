@@ -411,10 +411,26 @@ after spawning two agents" and "block `rev-perf` doesn't exist — the merge gat
 | edge to a nonexistent block | The dangling-reference class Dify ships. |
 | gate names a nonexistent block, or one that isn't a reviewer | **A gate that could never open.** Only a reviewer records a verdict. |
 | threshold > reviewers | Same thing, arithmetically. |
+| `require: all-pass` **and** a `threshold` | The engine refuses the pair outright, so the file does not load at all — see *One reader answers "is this a threshold gate"* below. |
 | isolated / unreachable block | A *warning*, not an error — edges are advisory, so this is a workflow that still runs. It is just almost certainly a fan-out you forgot to wire. |
 
 A cycle is **not** a finding: worker ⇄ reviewer is the rework loop, and it is how loomux
 actually works. What *is* a finding is a graph with nowhere to start.
+
+**One reader answers "is this a threshold gate"** (#1388 review N1). `parse_workflow` reads
+`threshold: N` with no `require:` key as a threshold gate — *"`threshold: N` alone implies a
+threshold gate; spelling `require: threshold` as well is allowed but redundant"* — and it
+refuses `require: all-pass` beside a threshold outright. `readGate` used to default the absent
+key to `all-pass`, so the pane and the engine disagreed about which gate was which, and the
+disagreement was silent in three places at once: the threshold findings above never ran on a
+shorthand gate, the seat-removal clamp never protected one, and — the live one — the next gate
+edit re-serialized it as `require: all-pass` **plus** `threshold: N`, which is the pair the
+engine refuses, so an unrelated edit dropped the repo back to the built-in roster with nothing
+on screen to say why. The pane now applies the engine's rule when the key is *absent* (and only
+then: `require: ""` is an unknown value to the engine, and quietly reading it as something else
+would be the same lie pointing the other way), and flags the explicit pair as an error. This is
+the #1176 shape one level up — two definitions of a question, drifting — and the fix is the same
+one: leave exactly one.
 
 ### Two rules the file keeps, both earned from someone else's scar
 
@@ -503,7 +519,9 @@ is answered rather than abandoned:
 ```
   drag a node        → .loomux/workflow.layout.json          (never the workflow)
   drag port → node   → connectBlocks()   → canonical YAML    (the pure model, same as a form edit)
+  drag port → gate   → connectToGate()   → gates.merge.reviewers      (#1388)
   click edge, ✕      → disconnectBlocks() → canonical YAML
+  click gate line, ✕ → disconnectFromGate() → canonical YAML          (#1388)
   + Block            → asks for the ID   → addBlock()
   Delete             → removeBlockAt()   → takes its edges and its gate seat with it
 ```
@@ -533,9 +551,55 @@ Three commitments the canvas keeps, each because someone else broke it:
   get wrong but the wiring. (The edge hit-tolerance is why an edge is clickable at all: it is a
   1.5px line, and nobody hits that.)
 
-And the gate is still not a node you can drag or wire. It is not a block — it is a *rule about*
-blocks — and making it draggable would imply it can be rewired, which is the single most
-important thing about it that isn't true.
+**Where a drop may land** (#1387). The drop target used to be a node's BODY rect and nothing
+else — while the in-port the arrowhead visibly points at is drawn on that body's left EDGE, so
+half of it sits outside the only thing that accepted a release. Aiming at the target the picture
+offers therefore connected nothing, and the release that did work (the far side of the box, or
+its out-port) is the one nothing on screen suggests. `hitTestDropTarget` adds a tolerance around
+each in-port, and it is *additive by construction*: wherever the body rule had an answer it gives
+the same one, so #1387 buys drops that used to fail and moves none that used to work
+(`test/workflowlayout.test.ts` sweeps a grid over two overlapping nodes to say so). The
+affordance is the other half — the in-port lights up while a band is over it, green or red from
+the same `connectionError` the release itself will ask, because a canvas that lights a target up
+and then refuses the drop has made a promise.
+
+**The gate is not draggable, and since #1388 it is wireable — one way.** Those are two different
+claims and only the first was ever the point. It is not a block: it is a *rule about* blocks, so
+it has no position of its own, no roster row, and no place in the layout file, and dragging it
+around like a node would imply it can be *moved* in a graph it is not part of. What a human can
+now do is drop a reviewer's out-port on it, which adds that block's id to
+`gates.merge.reviewers` — the same list the gate form's checkboxes write and the same one
+`parse_workflow` already reads. Before that, the one ENFORCED thing on the canvas was the one
+thing you could not point at: the amber lines were drawn, un-clickable and un-erasable, and the
+only route to gating a second reviewer was the form or the YAML.
+
+Three rules keep that from becoming "the gate is a block after all":
+
+- **It only accepts what could ever open it.** The refusal is `gateReviewerFinding` — the same
+  function the findings strip uses and the same question the engine's `gate_reviewer_error`
+  asks — so a drop the canvas turns away is turned away in the validator's own words. A worker,
+  a manager, a liaison and a name no block answers to are all refused with the reason, on
+  release, rather than silently.
+- **Seat ORDER is not the human's, and the canvas must not imply that it is.** `connectToGate`
+  appends, but `emitGatesLines` writes `sortByBlocks(gate.reviewers, order)`, so the file always
+  lists seats in **roster** order — the same canonical rule as *references ordered by the roster*
+  above, and the reason two people who wire the same gate in a different order get the same file.
+  The consequence to write down rather than rediscover: a reorder affordance on this list (drag
+  to reorder, up/down buttons) would appear to work and change nothing on disk. If seat order is
+  ever meant to mean something, `sortByBlocks` is what has to change first.
+- **A seat is erased like an edge, because it is the same gesture on the same kind of line** —
+  select it, ✕ or Delete, `disconnectFromGate`. What differs is what it MEANS, and that is
+  carried by the colour, the dashes and the inspector panel ("gate seat · enforced" against the
+  advisory edge's "edge · advisory"), not by making one of them unclickable.
+- **A `threshold` follows its list down.** `threshold: 2` over two reviewers is valid; erase one
+  seat and "2 passes from 1 reviewer" is a file `parse_workflow` refuses *whole*, so the group
+  falls back to the built-in roster over a single click on a ✕. `withGateReviewers` lowers the
+  number instead — to `GATE_THRESHOLD_MIN` and no further, so emptying the gate leaves the
+  human's own gate recoverable by re-seating a reviewer rather than a zero to retype — and the
+  view says so in a toast, because a policy number that changes itself silently is one the human
+  finds in `git diff` later and cannot account for. `removeBlockAt` goes through the same
+  helper: there is no reading on which deleting a block may leave the file unloadable while
+  deleting its gate edge doesn't.
 
 ### Comments, and the save that used to eat them (#233)
 

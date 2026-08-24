@@ -2440,7 +2440,24 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
     return gate;
   }
   const r = raw as Record<string, YamlValue>;
-  gate.require = asString(r.require ?? "all-pass") ?? "all-pass";
+  // `threshold: N` with NO `require:` key is a threshold gate — the engine's own rule
+  // ("`threshold: N` alone implies a threshold gate; spelling `require: threshold` as well is
+  // allowed but redundant", workflow.rs `(Some("threshold") | None, Some(n))`). Defaulting the
+  // absent key to "all-pass" here made the pane read such a file as an all-pass gate that
+  // happens to carry a number, with three consequences, all silent: the threshold rules below
+  // never ran on it, `withGateReviewers` never clamped it, and — worst — the next gate edit
+  // re-serialized it as `require: all-pass` + `threshold: N`, a PAIR the engine refuses
+  // outright, so the group fell back to the built-in roster over an unrelated edit.
+  //
+  // ONLY when the key is absent. An empty or non-string `require:` is left exactly as it was:
+  // the engine refuses `require: ""` as an unknown value, and quietly reading it as something
+  // else is the same lie in the other direction.
+  gate.require =
+    r.require === undefined
+      ? typeof r.threshold === "number"
+        ? "threshold"
+        : "all-pass"
+      : asString(r.require) ?? "all-pass";
   if (typeof r.threshold === "number") gate.threshold = r.threshold;
   else if (r.threshold !== undefined) {
     findings.push({
@@ -2555,6 +2572,65 @@ function knobFindings(b: WorkflowBlock, where: string, lookup: KnobLookup | unde
     });
   }
   return out;
+}
+
+// ONE definition for both reviewer lists — the gate's own and every routing
+// rule's (#1176). They ask the same question ("could a verdict for this id
+// ever be recorded?"), and answering it twice is how the static list ends up
+// refusing a manager while a routing rule quietly accepts one. `subject`
+// names which list, so the finding points at the line to fix; the backend's
+// `gate_reviewer_error` is the same function on the other side. It sits at module
+// scope rather than inside `validateWorkflow` because the CANVAS asks it too, before
+// it lets a rubber band land on the gate (`gateConnectionError`, #1388) — the pane
+// refusing a drop for a different reason than it reports a finding for is the same
+// drift, one gesture earlier.
+function gateReviewerFinding(
+  byId: ReadonlyMap<string, WorkflowBlock>,
+  subject: string,
+  id: string
+): Finding | null {
+  const b = byId.get(id);
+  if (!b) {
+    return {
+      severity: "error",
+      code: "gate-unknown-reviewer",
+      message: `${subject} requires a verdict from "${id}", but no block has that id — the gate could never open.`,
+    };
+  }
+  if (b.kind === "manager") {
+    // Reached before the generic kind arm below, which would otherwise
+    // describe this as a type error ("that block's kind is manager").
+    // An author who named the manager on a gate meant "the human signs
+    // off", which is real and which this gate cannot express — so say
+    // that. Mirrors the backend's own arm in `parse_workflow` (#1161).
+    return {
+      severity: "error",
+      code: "gate-not-a-reviewer",
+      message: `${subject} names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate orrerix already applies on top of it.`,
+      blockId: id,
+    };
+  }
+  if (b.kind !== "reviewer") {
+    return {
+      severity: "error",
+      code: "gate-not-a-reviewer",
+      message: `${subject} names "${id}" as a reviewer, but that block's kind is "${b.kind || "(none)"}" — only a reviewer records a verdict.`,
+      blockId: id,
+    };
+  }
+  if (b.role_hint?.trim().toLowerCase() === "liaison") {
+    // Reviewer-KIND, but a liaison never records a verdict (#891) — so a
+    // gate naming one waits on something no code path can produce. Same
+    // unsatisfiable-gate finding as the arm above, one kind further in;
+    // mirrors the backend's own refusal in `parse_workflow`.
+    return {
+      severity: "error",
+      code: "gate-not-a-reviewer",
+      message: `${subject} names "${id}" as a reviewer, but that block is a liaison — it presents the human's questions and never records a verdict, so the gate could never open.`,
+      blockId: id,
+    };
+  }
+  return null;
 }
 
 /** Everything that is wrong with this workflow, before a single agent is spawned.
@@ -2724,56 +2800,11 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         message: "The merge gate names no reviewers — a gate with nothing to wait for gates nothing.",
       });
     }
-    // ONE definition for both reviewer lists — the gate's own and every routing
-    // rule's (#1176). They ask the same question ("could a verdict for this id
-    // ever be recorded?"), and answering it twice is how the static list ends up
-    // refusing a manager while a routing rule quietly accepts one. `subject`
-    // names which list, so the finding points at the line to fix; the backend's
-    // `gate_reviewer_error` is the same function on the other side.
-    const reviewerFinding = (subject: string, id: string): Finding | null => {
-      const b = byId.get(id);
-      if (!b) {
-        return {
-          severity: "error",
-          code: "gate-unknown-reviewer",
-          message: `${subject} requires a verdict from "${id}", but no block has that id — the gate could never open.`,
-        };
-      }
-      if (b.kind === "manager") {
-        // Reached before the generic kind arm below, which would otherwise
-        // describe this as a type error ("that block's kind is manager").
-        // An author who named the manager on a gate meant "the human signs
-        // off", which is real and which this gate cannot express — so say
-        // that. Mirrors the backend's own arm in `parse_workflow` (#1161).
-        return {
-          severity: "error",
-          code: "gate-not-a-reviewer",
-          message: `${subject} names "${id}" as a reviewer, but that block is the manager — the human's interface, which records no verdict, so the gate could never open. A gate reads reviewer verdicts; the human's own sign-off is the merge gate orrerix already applies on top of it.`,
-          blockId: id,
-        };
-      }
-      if (b.kind !== "reviewer") {
-        return {
-          severity: "error",
-          code: "gate-not-a-reviewer",
-          message: `${subject} names "${id}" as a reviewer, but that block's kind is "${b.kind || "(none)"}" — only a reviewer records a verdict.`,
-          blockId: id,
-        };
-      }
-      if (b.role_hint?.trim().toLowerCase() === "liaison") {
-        // Reviewer-KIND, but a liaison never records a verdict (#891) — so a
-        // gate naming one waits on something no code path can produce. Same
-        // unsatisfiable-gate finding as the arm above, one kind further in;
-        // mirrors the backend's own refusal in `parse_workflow`.
-        return {
-          severity: "error",
-          code: "gate-not-a-reviewer",
-          message: `${subject} names "${id}" as a reviewer, but that block is a liaison — it presents the human's questions and never records a verdict, so the gate could never open.`,
-          blockId: id,
-        };
-      }
-      return null;
-    };
+    // `gateReviewerFinding` (module scope, above) is the ONE definition — the canvas's
+    // `gateConnectionError` asks it the same question before it lets a rubber band land
+    // on the gate (#1388), and a second copy here is how the two would drift apart.
+    const reviewerFinding = (subject: string, id: string): Finding | null =>
+      gateReviewerFinding(byId, subject, id);
     for (const id of gate.reviewers) {
       const f = reviewerFinding("The merge gate", id);
       if (f) findings.push(f);
@@ -2853,8 +2884,23 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         });
       }
     }
+    // The other half of "which gate is a threshold gate" (#1388 review N1). With the
+    // shorthand normalised in `readGate`, a model that says all-pass AND carries a number got
+    // there by spelling both out — or by the gate form's picker being switched to all-pass
+    // over a threshold that is still in the file — and the engine refuses that pair outright
+    // ("require: all-pass takes no threshold — drop it, or use require: threshold"). A pane
+    // that stayed quiet would be blessing a workflow that will not load. Scoped to the two
+    // accepted all-pass spellings so an UNKNOWN require still gets one finding, not two.
+    if ((gate.require === "all-pass" || gate.require === "all") && gate.threshold !== undefined) {
+      findings.push({
+        severity: "error",
+        code: "gate-bad-threshold",
+        message: `The merge gate says require: ${gate.require} and also names threshold: ${gate.threshold} — the engine refuses the pair outright. Drop the threshold, or use require: threshold.`,
+      });
+    }
     if (gate.require === "threshold") {
       const t = gate.threshold;
+
       if (t === undefined || !Number.isInteger(t) || t < GATE_THRESHOLD_MIN) {
         findings.push({
           severity: "error",
@@ -3309,6 +3355,98 @@ export function disconnectBlocks(w: Workflow, from: string, to: string): Workflo
   return { ...w, edges: w.edges.filter((e) => !(e.from === from && e.to === to)) };
 }
 
+/** Why a reviewer block can't be wired to the merge gate, or null when it can (#1388).
+ *  The gate half of `connectionError`, and asked at the same moment for the same reason: a
+ *  canvas that completes the gesture and only then says the drop was invalid has wasted it.
+ *
+ *  The one refusal that is NOT re-stated here is "that block's kind can't record a verdict" —
+ *  `gateReviewerFinding` already answers that for the validator and for the engine's
+ *  `gate_reviewer_error`, so it answers it here too. A gate that refuses a drop for a
+ *  different reason than the findings strip gives for the same block is two definitions of
+ *  the same rule, which is exactly what #1176 collapsed.
+ *
+ *  A DUPLICATE is a reason, not a silent no-op, and that mirrors `connectionError`'s "that
+ *  edge already exists": the human made a gesture, and a gesture that changes nothing and
+ *  says nothing is indistinguishable from one the canvas dropped on the floor — which is the
+ *  whole complaint #1387 and #1388 were opened about. `connectToGate` is still a no-op on
+ *  it, so the file cannot grow a duplicate seat whatever the view does. */
+export function gateConnectionError(w: Workflow, from: string): string | null {
+  if (!from) return "A block needs an id before the merge gate can name it.";
+  const gate = w.gates.merge;
+  if (!gate) {
+    return "There is no merge gate yet — turn it on in the gate's settings, then wire reviewers to it.";
+  }
+  if (gate.reviewers.includes(from)) return `"${from}" already gates the merge.`;
+  // First id wins, exactly as `validateWorkflow` resolves a duplicate: the gate would name
+  // one of them ambiguously either way, and that is already its own finding.
+  const byId = new Map<string, WorkflowBlock>();
+  for (const b of w.blocks) if (b.id && !byId.has(b.id)) byId.set(b.id, b);
+  const finding = gateReviewerFinding(byId, "The merge gate", from);
+  return finding ? finding.message : null;
+}
+
+/** Wire a reviewer to the merge gate: append its id to `gates.merge.reviewers`, which is the
+ *  shape `parse_workflow` already reads (a list of block ids — no new backend surface).
+ *  A refused or duplicate drop is a no-op, like `connectBlocks`.
+ *
+ *  SEAT ORDER IS NOT THE HUMAN'S, and this is the place to say so because it is the place
+ *  someone will come looking. The append is only the cheapest way to add an entry: every
+ *  write goes through `emitGatesLines`, which emits `sortByBlocks(gate.reviewers, order)` —
+ *  so the file always lists the seats in ROSTER order, whatever order the model's array is
+ *  in, on the canvas's `serializeWorkflowPreserving` path as much as on the canonical one.
+ *  That is deliberate and pre-dates this: it is the same canonical-form rule that groups
+ *  edges by source, so two people who wire the same gate in a different order get the same
+ *  file and neither sees a diff from the other's clicking sequence.
+ *
+ *  The consequence worth writing down: a reorder affordance on this list — drag-to-reorder,
+ *  up/down buttons — would appear to work and change nothing in the file. If seat order is
+ *  ever meant to MEAN something, `sortByBlocks` is what has to change first. */
+export function connectToGate(w: Workflow, from: string): Workflow {
+  if (gateConnectionError(w, from)) return w;
+  const gate = w.gates.merge!;
+  return { ...w, gates: { ...w.gates, merge: { ...gate, reviewers: [...gate.reviewers, from] } } };
+}
+
+/** Take a reviewer's seat off the merge gate — the gate-edge mirror of `disconnectBlocks`.
+ *  Only the seat: the block, its edges and the rest of the gate's policy are untouched. */
+export function disconnectFromGate(w: Workflow, from: string): Workflow {
+  const gate = w.gates.merge;
+  if (!gate || !gate.reviewers.includes(from)) return w;
+  return {
+    ...w,
+    gates: { ...w.gates, merge: withGateReviewers(gate, gate.reviewers.filter((r) => r !== from)) },
+  };
+}
+
+/** A gate with a new reviewer list, and its `threshold` kept SATISFIABLE — the one derived
+ *  number that a shorter list can invalidate.
+ *
+ *  `threshold: 3` over three reviewers is a legal file the engine loads; drop one reviewer
+ *  and it becomes "3 passes from 2 reviewers", which `parse_workflow` refuses OUTRIGHT —
+ *  not the gate, the whole `workflow.yml`, so the group silently falls back to the built-in
+ *  roster. A one-click gesture on the canvas must not be able to do that, so the threshold
+ *  follows the list down.
+ *
+ *  It follows it down to `GATE_THRESHOLD_MIN` and no further, which is the difference
+ *  between clamping a number and destroying one: removing the LAST reviewer leaves
+ *  `threshold: 1` over an empty list — already `gate-no-reviewers`, loudly, whatever we do
+ *  with the number — and re-wiring one reviewer makes the gate valid again with the human's
+ *  own intent intact. Clamping to 0 would trade one finding for two and lose the number.
+ *
+ *  The clamp is deliberately silent about the OTHER direction: adding a reviewer never
+ *  touches the threshold, because "2 of 3 must pass" is a policy, not a proportion. */
+function withGateReviewers(gate: MergeGate, reviewers: string[]): MergeGate {
+  const next: MergeGate = { ...gate, reviewers };
+  if (
+    gate.require === "threshold" &&
+    typeof gate.threshold === "number" &&
+    gate.threshold > reviewers.length
+  ) {
+    next.threshold = Math.max(GATE_THRESHOLD_MIN, reviewers.length);
+  }
+  return next;
+}
+
 /** Add a block. The caller supplies the ID — the canvas asks the human for it, because §4's
  *  first commitment is that an id is human-meaningful and immutable, and a canvas that mints
  *  `node_1720794829558` (Dify's actual behaviour) makes every edge in the file unreadable
@@ -3346,8 +3484,14 @@ export function removeBlockAt(w: Workflow, index: number): Workflow {
     edges: gone ? w.edges.filter((e) => e.from !== id && e.to !== id) : w.edges,
     gates: {
       ...w.gates,
+      // Through `withGateReviewers` for the same reason `disconnectFromGate` is (#1388):
+      // a threshold left above the reviewer count is a file `parse_workflow` refuses
+      // WHOLE, and there is no reading on which deleting a block should do that while
+      // deleting its gate edge doesn't. One rule, both paths to the same empty seat.
       merge: gate
-        ? { ...gate, reviewers: gone ? gate.reviewers.filter((r) => r !== id) : gate.reviewers }
+        ? gone
+          ? withGateReviewers(gate, gate.reviewers.filter((r) => r !== id))
+          : gate
         : undefined,
     },
   };
