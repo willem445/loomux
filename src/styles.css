@@ -3636,6 +3636,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    side: it is the hue furthest from azure/jade/violet/amber. Rose is the
    destructive-action dye and lime sits too close to the worker's jade. */
 .group-role.role-manager { background: color-mix(in srgb, var(--id-orchid) 16%, transparent); color: var(--id-orchid); }
+/* "manager declared · not open" (#1433): a state of affairs the human should
+   see, not an alarm — the pane may be closed because they closed it. The
+   manager's own identity color rather than the attention palette, for the
+   reason `.pane-mail` uses it. */
+.group-manager-absent { color: var(--id-orchid); }
 /* The workflow block an agent IS (#222). Only rendered when it differs from the
    role — i.e. never for the built-in roster. */
 .group-block {

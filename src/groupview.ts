@@ -68,6 +68,7 @@ import { gateSatisfiabilityWarning, gateSummaryLine, workflowModeLabel } from ".
 import { MERGE_QUEUE_HELP, mergeQueueView, type MergeQueueView } from "./mergequeue";
 import { compactionStatusLabel, compactionStatusTitle, contextUsageLabel } from "./compactionstatus";
 import { roleLabel } from "./orchbadge";
+import { managerAbsenceNotice } from "./group";
 import { getDefaultAgent } from "./agents";
 import { confirmModal } from "./modal";
 import { PollGate } from "./pollgate";
@@ -1199,6 +1200,18 @@ export class GroupView {
         ` · up ${fmtUptime(s.uptime_ms)}`
     );
     this.summaryEl.append(line);
+
+    // The manager pane is declared and is not there (#1433). Stated, never
+    // repaired: nothing reopens it automatically, because closing it is
+    // something the human is allowed to do and orrerix cannot tell that apart
+    // from a crash. `managerAbsenceNotice` carries the whole argument and the
+    // route back; this renders it and adds nothing of its own.
+    const absent = managerAbsenceNotice(s.manager_declared, s.roles.manager);
+    if (absent) {
+      const note = el("div", "group-line group-manager-absent", absent.text);
+      note.title = absent.title;
+      this.summaryEl.append(note);
+    }
 
     // Cost line: tokens are the honest metric (exact, and non-zero even on
     // Max plans where the CLI reports $0.00); dollars are a labelled estimate.

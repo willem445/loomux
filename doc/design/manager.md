@@ -555,6 +555,65 @@ review round costs, and a review round does not involve the manager.
   kickoff is now reachable in production for the first time, where M2 could only
   reach it through a hand-registered agent.
 
+### Why nothing reopens a dead manager (#1433)
+
+M3 left two premortem items filed rather than absorbed: the launch-time manager
+spawn can fail with the human told nothing, and nothing reopens a manager pane
+that dies. Both reduce to one question — *the pane is not there; who says so, and
+does anything put it back?*
+
+**Nothing puts it back, and that is a decision, not a smaller scope.** The
+user-facing page already promises, in `docs/features/manager.md`:
+
+> Nothing is taken away. The orchestrator pane, the steering strip, the task
+> board, the NEEDS-YOU panel and the questions you answer there all work exactly
+> as they did — and if you close the manager pane, the group behaves as it always
+> has. Talking to the orchestrator directly is never removed.
+
+So closing that pane is a legitimate act the human is invited to perform. And
+nothing in the registry can tell a deliberate close from a crash: both arrive as
+the same pty exit and the same `Dead` row. An automatic reopen would therefore
+have to guess, and half its guesses would reopen a pane its human had just shut —
+contradicting a shipped promise on the strength of an inference. The rejected
+alternative is worth stating plainly because it is the obvious one: a one-shot
+respawn keyed on the manager going `Dead`. It fails on the same point regardless
+of how the shot is bounded, and it adds a second failure mode of its own (a CLI
+that cannot start respawning against a retry policy nobody asked for).
+
+**What ships instead is a notice.** `group_summary` gains `manager_declared` —
+whether the roster this group is RUNNING declares a manager block — beside the
+existing `roles.manager`, which counts live ones. `roles.manager` alone cannot
+answer the human's question, because it is `0` both for a group whose manager is
+missing and for the overwhelming majority of groups, which declare none at all.
+The pair is what carries the fact, and `src/group.ts`'s `managerAbsenceNotice`
+turns it into the group panel's line: *manager declared · not open*, with a
+tooltip that says why nothing is coming and names the route back — the session
+browser, which is the human-side opener `spawn_agent_bound`'s manager refusal
+already points at.
+
+One surface covers both of #1433's items deliberately. From the panel they are
+the same fact: the pane is not there. *Which* of the two happened — a refused
+open at launch, or a death since — is exactly what the audit trail records
+(`manager-opened`, `manager-already-live`, or an `error` carrying the refusal),
+and putting it in a chrome line would be a second copy of the trail, free to
+drift from it.
+
+**`manager_declared` reads the resolved roster, never the repo's file.** A group
+resumes on the roster it launched with and never re-reads
+`.loomux/workflow.yml`, so the file is not what a running group is running —
+the same rule that makes "adding a manager block does not give a dormant group
+one on resume" true (see *The resume path* above).
+
+**The failed-open arm is reachable in tests now.** `spawn_agent_bound` refuses a
+block whose `cli` no build supports, and its own comment says where such a block
+comes from: "an unsupported one here means a hand-edited group.json". A launch
+with no workflow file falls back to the caller's roster, so a test can hand in
+exactly that roster and reach the arm. The refusal lands on a string several
+steps before any process would start, so constraint 3 (never run a real agent
+CLI) holds by construction rather than by care — nothing is executed, and the
+test asserts the group still launches, that no manager row exists, and that the
+audit carries both the failure and its reason.
+
 ## M4 — the prose, and why it lands on three surfaces at once
 
 M2 shipped a channel nothing was told to use. M4 is what tells the two ends,

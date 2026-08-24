@@ -38223,6 +38223,24 @@ impl OrchRegistry {
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
             "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner, "manager": manager },
+            // Whether the roster this group is RUNNING declares a manager block
+            // at all (#1433, #1161 M5). Beside `roles.manager`, which counts LIVE
+            // ones, because the panel's question is the difference between the
+            // two: a group that declares one and has none is a human whose own
+            // interface to this group is not there — because the launch open
+            // failed, or because the pane died or was closed — and nothing
+            // automatic reopens it, deliberately (see `doc/design/manager.md`).
+            // A group that declares none is the overwhelmingly common case and
+            // has nothing to say.
+            //
+            // Read off the RESOLVED roster rather than the repo's file: a group
+            // resumes on the roster it launched with and never re-reads
+            // `.loomux/workflow.yml`, so the file is not what this group is
+            // running.
+            "manager_declared": self
+                .group(group)
+                .map(|g| g.guardrails.block_for(Role::Manager).is_some())
+                .unwrap_or(false),
             "agents": list,
         })
     }
