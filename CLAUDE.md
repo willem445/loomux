@@ -361,6 +361,13 @@ compiles.
   if deleted" still standing after a later round's fix, whose inverted gate reverts that very
   fix with `tsc --noEmit` at exit 0 and the suite green throughout (#1487 N2/N4 — four such
   mutations, two of them polarity or placement rather than deletion).
+  That enumeration is a SAMPLE, not a span, and it is sampled twice over: the mode list
+  omits operator SWAP (`&&`→`||`) and operand SUBSTITUTION (one field for its sibling),
+  each landing the very failure the gate exists to stop; and a mode measured on ONE of two
+  sibling gates generalises from whichever the instrument happens to be blind on. So state a
+  residual STRUCTURALLY — "these modules have no test file" — never as a list of N invisible
+  mutations. Signature: "all four are invisible" beside a twin gate whose identical hoist IS
+  caught, by `TS6133` on the field its condition reads (#1470 round 3).
 - **An absence-only assertion needs a positive control, and the vacuity is a SHAPE.**
   `is_empty()`, `!contains(…)`, "renders nothing" — each passes just as well when the
   mechanism never ran at all. Pin first that it DID (`fired.len() == 1`, `scanned > 0`
@@ -426,7 +433,11 @@ compiles.
   hand-derived value a claim rests on (a line cite, a count) is valid only at the
   commit it was derived on, and your own next commit invalidates it as silently as a
   rebase. Cite a SYMBOL (#763); a position that must be recorded is swept in the LAST
-  commit touching its source (#752).
+  commit touching its source (#752). A hand-derived COUNT dates to the BLOB of the one file
+  that can move it (`git rev-parse HEAD:<file>`), never to a commit: a rebase invalidates
+  every SHA a body cites while leaving that blob — and so the count — checkable, and when the
+  blob DOES move the anchor says which rebase to re-measure on (#1470 B1, census 56/32 on
+  `src/tasksview.ts` blob `71c0d0b9` across three rebases).
 - **A rename of an identity string classifies every site as EMIT or ACCEPT before
   rewriting it.** An emit site takes the new spelling alone; a reader keeps every
   accepted spelling — and a reader whose question is *what did the author DECIDE*
