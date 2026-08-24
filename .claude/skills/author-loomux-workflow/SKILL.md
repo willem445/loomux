@@ -76,6 +76,14 @@ Read the human's description and extract, explicitly, before writing YAML:
   two ready-made personas (`design-review.md`, `premortem.md`) — including
   the caveat that `role_hint: advisor` gives you the shape, not an automatic
   trigger for *when* to spawn one.
+- **A mechanical checklist lane that SHOULD run on every PR.** The mirror of the
+  bullet above, and the one case where `kind: reviewer` in the gate is right:
+  a cheap lane on a small/fast model that runs a fixed checklist of shell
+  commands (evidence present? run id at the head? forbidden import?) ahead of
+  the strong reviewer. The deciding question is never how important the opinion
+  is — it is **does this run on every PR?** On demand → `planner` + `advisor`;
+  every PR → `reviewer`, in the gate. See `docs/orchestration.md` → "Cheap
+  lanes ahead of the expensive one".
 - **What stays default.** If the human didn't ask for something (a planner,
   a second worker tier, a merge gate at all), don't invent it. A workflow
   file that declares only what it's for is easier to read and easier for the

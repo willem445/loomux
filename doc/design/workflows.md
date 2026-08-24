@@ -85,7 +85,7 @@ inert text or a choice from a value set loomux already ships:
 | Block field | What it can do | Why it's safe |
 |---|---|---|
 | `kind` | select a class from the closed set (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) | closed enum; unknown values are **rejected**, not coerced (see below) |
-| `cli` | select `claude` \| `copilot` \| `gemini` | validated against `SUPPORTED_CLIS` at parse *and* at spawn — and, since #267, against `CLI_CAPS`: a CLI that cannot enforce the class's containment tier is refused at both ends too |
+| `cli` | select `claude` \| `copilot` \| `gemini` \| `opencode` | validated against `SUPPORTED_CLIS` at parse *and* at spawn — and, since #267, against `CLI_CAPS`: a CLI that cannot enforce the class's containment tier is refused at both ends too |
 | `model` | name a model | `sanitize_model` — the pre-existing allowlist filter |
 | `effort` | select a thinking level | closed enum (`low`/`medium`/`high`/`xhigh`/`max`); rejected outright if it isn't in the vocabulary, **and** if the block's `cli:` has no `effort_levels` in `CLI_CAPS` |
 | `context` | select a context window | closed enum (`1m`); same two-stage check. Composed into the model alias (`sonnet[1m]`) at emit, never stored in `model:` — `sanitize_model` strips brackets, so a `sonnet[1m]` written as a model id would silently become `sonnet1m` |
@@ -219,6 +219,18 @@ the team is stuck," not to plan intake or PR risk, and a workflow file cannot
 widen that (no field lets it re-author the orchestrator's persona); see
 `docs/orchestration.md` → "Adding a second
 lens".
+
+**The mirror case, and the question that separates them.** *Cheap lanes ahead of
+the lead lane* below adds three blocks that ARE `kind: reviewer` and ARE named in
+the merge gate — the shape this section has just spent four paragraphs arguing
+against. Both are right, and the deciding question is **does this run on every
+PR?** A design-review or premortem lens is defined by *not* running on every PR,
+so reviewer-kind is wrong for it twice over: it would run anyway, and gating it
+would hold every merge shut. A mechanical checklist lane is defined by running on
+*every* PR — every PR has a body, tests and constraints — so reviewer-kind is
+exactly right, and gating it is what makes its silence expensive rather than
+free. Same enum, opposite answers, because the question is about frequency and
+not about how important the opinion is.
 
 ### Sanitization
 
@@ -1992,6 +2004,11 @@ these lanes opened by themselves. `rev-lead.md` therefore says both halves: trus
 `PASS` enough not to re-derive it, and re-run any check whose result looks wrong,
 saying in the review that you did. **A row of green qr-* lanes is not a reviewed PR
 — it is a reviewed six inches of it.**
+
+These three are `kind: reviewer` and sit in the merge gate, which is the shape
+*Why a second lens didn't get a new mechanism* above argues against — and both
+hold, because the deciding question is **does this run on every PR?** A lens is
+defined by not; a checklist is defined by doing.
 
 **The alternative this rejected, argued rather than assumed: advisory lanes.** The
 same three blocks in `edges:` but *not* in `gates.merge.reviewers` deliver the entire

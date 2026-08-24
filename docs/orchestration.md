@@ -1644,6 +1644,14 @@ carry its verdict. orrerix's own `.orrerix/workflow.yml` runs three of them
 (`qr-evidence`, `qr-tests`, `qr-constraints`) ahead of its lead reviewer, and their
 persona files in `.github/agents/` are worth reading as worked examples.
 
+If what you want instead is an opinion on *some* PRs — a design review before code
+is written, a premortem on something risky — that is the opposite shape and wants
+`kind: planner` + `role_hint: advisor`, not a reviewer block. See **Adding a second
+lens** below. The question that separates them is not how valuable the opinion is,
+it is **does this run on every PR?** A checklist does, and belongs in the gate; a
+lens does not, and a reviewer block would both run it every time and hold every
+merge shut waiting for it.
+
 ### Turning on the merge queue
 
 A `merge_queue:` block, beside `gates:`, opts the repo in:
