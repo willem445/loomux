@@ -99,7 +99,7 @@ helpers**, and several of those structurally need the rows the renderer HIDES �
 which a server-side row cap would take away rather than merely leave
 unrendered.
 
-That count is dated to `src/tasksview.ts` **blob `a2a32d7b`**, not to a
+That count is dated to `src/tasksview.ts` **blob `71c0d0b9`**, not to a
 commit, and deliberately so: a hand-derived count is valid only for the file it
 was derived from, and dating it to a tree makes any later commit — including a
 sibling that never touches this file — silently invalidate it. This figure was
@@ -169,6 +169,13 @@ previous read) is what makes the second view's tick free. It is
 `USAGE_POLL_MAX_AGE`'s shape, applied on the frontend because this read has no
 backend memo.
 
+**That "strictly under" is a pin, not a note.** `test/perfpolicy.test.ts`
+already asserts both follow cadences against source, so it asserts the window
+below the smallest of them too — otherwise a reviewer lowering a cadence gets a
+green suite and a window that silently halves the rate the manifest advertises.
+The assertion is a minimum over a filtered list, so it carries its own control:
+an empty list would make `Math.min()` Infinity and the check vacuously true.
+
 **The two views answer "is this gesture worth a fresh read?" differently, and
 that is deliberate.** The audit viewer forces (passes 0) on all three of its
 gestures — opening the panel, the ⟳ button, returning to a visible window. The
@@ -195,6 +202,14 @@ would additionally skip the re-extraction on a tick where the log did not grow;
 that is deliberately not taken, because "same length and same last timestamp"
 is only sound while the log is append-and-drop-front, which the rotation across
 `audit.1.jsonl` makes a claim rather than an obvious fact.
+
+**Three states, because `loaded` alone answers two.** "Nothing happened", "I
+could not look" and "I have not looked yet" are different things to put on
+screen, and the third is not hypothetical: `TimelineView`'s `ResizeObserver`
+fires a render before the read `show()` starts has landed, so a fresh pane on
+a healthy group would flash the failure text if the views gated on `loaded`
+alone. `attempted` — set on BOTH paths of a read, where `loaded` is set on
+one — is what separates them.
 
 **Failure posture.** The store keeps the last good rows on a failed read and
 does not throw: both callers already rendered an unreadable log as an
