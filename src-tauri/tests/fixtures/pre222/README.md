@@ -982,7 +982,7 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   after a compact it will receive the other.
 
   The re-bless is warranted because the sentence is *operational* for its reader, not
-  decorative. A manager told nothing is ever typed here has no way to classify a re-grounding
+  decorative. A manager told "nothing is ever typed here" has no way to classify a re-grounding
   notice when one appears: the honest readings available to it are "the human wrote this" or
   "my instructions are wrong", and both are worse than being told. The replacement states what
   is true and what to do with it — no traffic from the FLEET is ever typed here; exactly two

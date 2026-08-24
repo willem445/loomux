@@ -113,7 +113,7 @@ Read the human's description and extract, explicitly, before writing YAML:
 | "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner/**manager** — the reasoning-heavy classes — and `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
 | "a domain expert, consulted on demand" | `kind: planner` + `role_hint: advisor` — read-only, spawned only when stuck on a specific question, exits the moment it reports. |
 | "a design-review or premortem second opinion, not on every PR" | Same `kind: planner` + `role_hint: advisor` shape — never `kind: reviewer`, which the merge gate would need to pass on every PR or run on every PR to avoid holding it shut. See `docs/orchestration.md` → "Adding a second lens". |
-| "a pane I talk to" / "turn my idea into a ticket" / "status as a conversation" | `kind: manager` — the human's own interface. At most one per file (a second is a parse error); never spawned by an agent and never typed into; reaches the orchestrator through a durable mailbox and `message_orchestrator`. Not `kind: reviewer` + `role_hint: liaison`, which is the superseded shape. |
+| "a pane I talk to" / "turn my idea into a ticket" / "status as a conversation" | `kind: manager` — the human's own interface. At most one per file (a second is a parse error); never spawned by an agent, and no fleet traffic is ever delivered into it — see the elicitation bullet above for the two things orrerix itself writes there. Reaches the orchestrator through a durable mailbox and `message_orchestrator`. Not `kind: reviewer` + `role_hint: liaison`, which is the superseded shape. |
 | "someone who writes up lessons after a PR merges" | `kind: worker` + `role_hint: process` — opens a normal PR and never merges it. Its PRs are a standing-authorized merge class the orchestrator dispositions itself rather than deferring to the human (#1021); the bar (review, green CI, findings settled) is unchanged. |
 | "must all pass" / "any 2 of these 3" | `gates.merge.require: all-pass` (the default) or `require: threshold` + `threshold: N` |
 | "also needs CI green" | `gates.merge.also: [ci-green]` — the only condition the shim can check today (see Step 5) |
@@ -387,12 +387,19 @@ gates:
 
 What changes for the human, and what does not:
 
-- The manager pane opens with the group and is **never typed into** by orrerix.
-  It learns what happened by reading a durable mailbox the orchestrator posts
+- The manager pane opens with the group, and **no fleet traffic is ever
+  delivered into it** — no notices, no relays, no status lines. The only two
+  things orrerix itself writes there are the kickoff that starts the
+  conversation and, if the CLI compacts mid-session, one re-grounding notice.
+  It learns what *happened* by reading a durable mailbox the orchestrator posts
   to, at the start of each of its turns — which is the next time its human
   speaks to it.
-- It holds **no authority the human has not used themselves**: no repo writes,
-  no spawns, no kills, no verdicts. It relays; the orchestrator decides.
+- It holds **no authority the human has not used themselves**: no spawns, no
+  kills and no verdicts, which are structural; and no branches, commits or PRs,
+  because its containment tier denies the editing tools. The shell survives that
+  tier, so "it never files the issue" is its instructions rather than a wall —
+  which is why the designed path has the *orchestrator* file the issue a brief
+  becomes. It relays; the orchestrator decides.
 - It does **not** start work. A brief it grooms becomes a GitHub issue, and the
   human's own label is still the only thing that hands that issue to the fleet.
 - The manager is exempt from `max_agents` and from the idle reaper, so it does
