@@ -2511,6 +2511,81 @@ fn a_broken_workflow_file_is_audited_and_skipped_never_fatal() {
 
 // ─────────────────────────── persistence round-trip ─────────────────────────
 
+/// #1457 review, premortem 2. `read_blocks` re-derives all three `remote:`
+/// rules defensively and DROPS a label that fails any of them, silently —
+/// there is no human at that layer to show a parse error to. That is the right
+/// posture and it has one consequence worth a test of its own: a remote block
+/// that loses its label is indistinguishable, everywhere downstream, from a
+/// block that never had one.
+///
+/// So the round trip is pinned in both directions: a legal label survives
+/// `blocks_json` -> `read_blocks` unchanged, and a `group.json` hand-edited
+/// into a state the parser would have refused loses the label rather than
+/// keeping it. Without the first half, a future normalization could start
+/// eating labels with nothing red to say so; without the second, the
+/// defensive re-check could be deleted with nothing red either.
+#[test]
+fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
+    let (reg, dir) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: builder\n    kind: worker\n    cli: claude\n    remote: buildbox\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(
+        g.guardrails.block("builder").unwrap().remote.as_deref(),
+        Some("buildbox"),
+        "the parsed roster carries the label"
+    );
+
+    // It is on disk as a plain JSON string — no path, no interpolation.
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+    let gj: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let on_disk = gj["guardrails"]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == "builder")
+        .unwrap()
+        .clone();
+    assert_eq!(on_disk["remote"], "buildbox");
+
+    // A restart reads it back identically. This is the half that would go
+    // quietly wrong: `blocks_json` rewrites the whole roster on every change, so
+    // a field it forgot would vanish on the next resume with nothing to see.
+    let reg2 = relaunch_registry(dir.path());
+    reg2.set_port(45999);
+    let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g2.id, g.id, "the restart resumes the same group");
+    assert_eq!(
+        g2.guardrails.block("builder").unwrap().remote.as_deref(),
+        Some("buildbox"),
+        "the label must survive the round trip"
+    );
+
+    // …and the fail-closed half, on the one input `parse_workflow` never sees.
+    // `read_blocks` compares the block's cli UNTRIMMED, so `"claude "` is not
+    // claude: the label is dropped and the block comes back local. Anything
+    // else would let a hand-edited group.json hold a remote label the parser
+    // would have refused.
+    let mut edited: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for b in edited["guardrails"]["blocks"].as_array_mut().unwrap() {
+        if b["id"] == "builder" {
+            b["cli"] = Value::String("claude ".into());
+        }
+    }
+    fs::write(&path, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+
+    let reg3 = relaunch_registry(dir.path());
+    reg3.set_port(45999);
+    let g3 = reg3.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(
+        g3.guardrails.block("builder").unwrap().remote,
+        None,
+        "a group.json the parser would have refused must lose the label, not keep it"
+    );
+}
+
 #[test]
 fn block_map_round_trips_through_group_json() {
     let (reg, dir) = test_registry();
