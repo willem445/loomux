@@ -153,7 +153,7 @@ One `stat`, then:
 | Observation | Action |
 | --- | --- |
 | `len` and mtime both unchanged | serve the cursor's totals; the file is not opened |
-| grew, or mtime moved forward | verify the anchor, seek to the offset, fold the appended **complete** lines on |
+| grew, or mtime moved forward | re-read the anchor and, if it matches, fold the appended **complete** lines on — through one handle |
 | shorter than the last stat | reset: discard the cursor, re-parse from byte zero |
 | creation time differs | reset — a different file at the same path |
 | mtime moved **backwards** | reset — restored over from a copy, a sync, a checkout |
@@ -174,6 +174,14 @@ them to what was folded there can: any edit to that region, or any
 replacement that shifts the content, changes them. It is 64 bytes on a path
 whose entire point is a work bound, and a transcript line is hundreds of bytes
 at minimum, so the anchor never spans more than the tail of one record.
+
+The anchor is read through the **same file handle** the fold then reads from,
+and that is a correctness requirement rather than a saved syscall. Verifying
+through a handle of its own would leave a window in which the file is replaced
+between the proof and the read — the cursor would verify one file and resume
+into another, which is the one way this design could produce a *wrong* total
+rather than a slow tick. Reading the anchor also leaves the handle at exactly
+the offset, so the check costs one seek and 64 bytes.
 
 The residual blind spot, stated rather than hidden: a rewrite landing on the
 same length **and** the same mtime **and** leaving those 64 bytes identical.

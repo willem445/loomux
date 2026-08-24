@@ -475,7 +475,7 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
     let session = PathSegment::parse(session_id).ok()?;
     let path = claude_transcript_path(root, &session)?;
     let mut cursor = TranscriptCursor::new(path);
-    fold_appended(&mut cursor).ok()?;
+    fold_appended(&mut cursor, false).ok()?;
     Some(cursor.fold.usage())
 }
 
@@ -632,25 +632,6 @@ impl TranscriptCursor {
         StatVerdict::Extend
     }
 
-    /// Re-read the [`ANCHOR_BYTES`] immediately before `offset` and report
-    /// whether they are still what this cursor folded. An I/O failure is a
-    /// mismatch: a cursor that cannot prove its position is not one to resume
-    /// from.
-    fn anchor_holds(&self) -> bool {
-        if self.anchor.is_empty() {
-            return true; // nothing consumed yet — nothing to disagree with
-        }
-        let start = self.offset.saturating_sub(self.anchor.len() as u64);
-        let read = || -> std::io::Result<Vec<u8>> {
-            let mut file = fs::File::open(&self.path)?;
-            file.seek(SeekFrom::Start(start))?;
-            let mut buf = vec![0u8; self.anchor.len()];
-            file.read_exact(&mut buf)?;
-            Ok(buf)
-        };
-        matches!(read(), Ok(buf) if buf == self.anchor)
-    }
-
     /// Extend the anchor with bytes just consumed, keeping only the last
     /// [`ANCHOR_BYTES`].
     fn push_anchor(&mut self, bytes: &[u8]) {
@@ -662,8 +643,33 @@ impl TranscriptCursor {
     }
 }
 
+/// What an attempt to advance a cursor produced.
+enum Advance {
+    /// The appended complete lines were folded on; the payload is the bytes
+    /// read off disk.
+    Folded(u64),
+    /// The anchor re-read did not match what the cursor folded there, so the
+    /// consumed region has changed under us and NOTHING was folded. The
+    /// caller discards the cursor and re-parses from zero.
+    AnchorMismatch(u64),
+}
+
 /// Fold every COMPLETE line from `cursor.offset` to end-of-file into the
-/// cursor, advancing its offset and anchor. Returns the bytes read off disk.
+/// cursor, advancing its offset and anchor.
+///
+/// **`verify_anchor` reads the proof through the SAME handle as the fold, and
+/// that is a correctness requirement, not a saved syscall.** Checking the
+/// anchor through a handle of its own would leave a window in which the file
+/// is replaced between the proof and the read — the cursor would verify one
+/// file and then resume into another, which is the one way this design could
+/// produce a WRONG total rather than merely a slow tick. Reading the anchor
+/// also leaves the handle sitting at exactly `offset`, so the check costs one
+/// seek and [`ANCHOR_BYTES`].
+///
+/// An I/O failure on the anchor read is a mismatch, not an error: a cursor
+/// that cannot prove its position is not one to resume from. A cursor with no
+/// anchor yet (nothing consumed) has nothing to disagree with and never
+/// reports one.
 ///
 /// **A partial trailing line is read but NOT consumed.** A JSONL writer
 /// appends a record and its newline as separate bytes, so a poll can land
@@ -683,14 +689,23 @@ impl TranscriptCursor {
 ///
 /// Streaming, per #1218: one reusable line buffer, never the file. Peak live
 /// bytes are the longest single line plus the fold's message-id set.
-fn fold_appended(cursor: &mut TranscriptCursor) -> std::io::Result<u64> {
+fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io::Result<Advance> {
     let mut file = fs::File::open(&cursor.path)?;
-    if cursor.offset > 0 {
+    let mut bytes_read = 0u64;
+    if verify_anchor && !cursor.anchor.is_empty() {
+        let start = cursor.offset.saturating_sub(cursor.anchor.len() as u64);
+        let mut got = vec![0u8; cursor.anchor.len()];
+        let read = file.seek(SeekFrom::Start(start)).is_ok() && file.read_exact(&mut got).is_ok();
+        bytes_read += got.len() as u64;
+        if !read || got != cursor.anchor {
+            return Ok(Advance::AnchorMismatch(bytes_read));
+        }
+        // The handle now sits at exactly `cursor.offset`.
+    } else if cursor.offset > 0 {
         file.seek(SeekFrom::Start(cursor.offset))?;
     }
     let mut reader = BufReader::new(file);
     let mut buf: Vec<u8> = Vec::new();
-    let mut bytes_read = 0u64;
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
@@ -707,7 +722,7 @@ fn fold_appended(cursor: &mut TranscriptCursor) -> std::io::Result<u64> {
         cursor.offset += n as u64;
         cursor.push_anchor(&buf);
     }
-    Ok(bytes_read)
+    Ok(Advance::Folded(bytes_read))
 }
 
 /// Per-transcript parse cursors, so a usage poll parses only what an agent
@@ -729,8 +744,8 @@ fn fold_appended(cursor: &mut TranscriptCursor) -> std::io::Result<u64> {
 ///
 /// - unchanged `len` and `mtime` → the cached totals, with the file not
 ///   opened at all;
-/// - grown → seek to the offset, verify the anchor, fold the appended
-///   complete lines on;
+/// - grown → through ONE handle: re-read the anchor, and if it still matches,
+///   fold the appended complete lines on from where that read left off;
 /// - replaced, truncated or rewritten → discard the cursor and re-parse from
 ///   zero, which is exactly the pre-#1239 cost. The failure mode of every
 ///   guard here is "as slow as it used to be", never a wrong total.
@@ -808,30 +823,42 @@ impl TranscriptCursors {
         let meta = fs::metadata(&path).ok()?;
         let (len, modified, created) = (meta.len(), meta.modified().ok(), meta.created().ok());
 
-        // Decide from the stat, then let the anchor overrule an `Extend`.
-        let verdict = match slot.as_ref() {
+        // Decide from the stat; the anchor then gets to overrule an `Extend`,
+        // from inside the same read that would have folded onto it.
+        let mut verdict = match slot.as_ref() {
             None => StatVerdict::Reset,
             Some(c) => match c.stat_verdict(len, modified, created) {
                 StatVerdict::Serve => {
                     work.served_cached = true;
                     return Some((c.fold.usage(), work));
                 }
-                StatVerdict::Extend if c.anchor_holds() => {
-                    work.bytes_read += c.anchor.len() as u64;
-                    StatVerdict::Extend
-                }
-                _ => StatVerdict::Reset,
+                other => other,
             },
         };
+
+        if verdict == StatVerdict::Extend {
+            match fold_appended(slot.as_mut()?, true).ok()? {
+                Advance::Folded(n) => work.bytes_read += n,
+                Advance::AnchorMismatch(n) => {
+                    work.bytes_read += n;
+                    verdict = StatVerdict::Reset;
+                }
+            }
+        }
 
         if verdict == StatVerdict::Reset {
             // `reset` is "a cursor was thrown away", so a first-ever read —
             // which also parses from zero — is not one.
             work.reset = had_cursor;
             *slot = Some(TranscriptCursor::new(path));
+            // A fresh cursor has no anchor, so this call cannot report a
+            // mismatch; both arms mean the same thing here.
+            work.bytes_read += match fold_appended(slot.as_mut()?, false).ok()? {
+                Advance::Folded(n) | Advance::AnchorMismatch(n) => n,
+            };
         }
+
         let cursor = slot.as_mut()?;
-        work.bytes_read += fold_appended(cursor).ok()?;
         cursor.len = len;
         cursor.modified = modified;
         cursor.created = created;
