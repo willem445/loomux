@@ -2283,7 +2283,7 @@ instructions in that same re-grounding notice, so a directive survives a compact
 nothing warned anyone first. `note_directive(text, replace: true)` rewrites the whole ledger
 in one shot — how an agent curates it after being shown its own tail, dropping anything
 already done or no longer relevant. The ledger lives at
-`<data dir>/loomux/orchestration/<group>/ledger-<agent-id>.log` — a plain, human-readable
+`<data dir>/orrerix/orchestration/<group>/ledger-<agent-id>.log` — a plain, human-readable
 file, one entry per line, that a human can open directly.
 
 **Lifecycle panel.** The group lifecycle panel (`Alt+O`) shows each Claude agent's current
@@ -2318,7 +2318,7 @@ draws any sign of life gets bounded retries and then a visible lost-outcome reco
 ## Persistence & restart
 
 Each group keeps durable state under
-`<data dir>/loomux/orchestration/<group>/`:
+`<data dir>/orrerix/orchestration/<group>/`:
 
 - `state.json` — the orchestrator's queue/plan memory (written via a tool after
   every change);
@@ -2331,17 +2331,35 @@ The group id is derived from the repo path, so relaunching an orchestrator on th
 same repo resumes its state; GitHub issues remain the source of truth for the
 work queue.
 
-**Restart after orrerix closes:** orchestration sessions are marked in the
-[session browser](features/session-browser.html) (`ORCH` / `W` / `REV` chips).
-Clicking a dead group's orchestrator session restores the *whole* orchestration
-— same group id, state, task board, and audit history, with fresh MCP identity
-wired into the resumed conversation — whether that orchestrator runs Claude
-Code, Copilot CLI, or OpenCode. A plain `claude --resume` / `copilot --resume`
-(or opencode's `--session <id>`) would come back powerless (no MCP tools, no
-task board); this path never does. Whether a clicked row takes it is decided
-by the recorded membership the chip itself reflects, never by which CLI wrote
-the session — a chipped row restores its group on every agent CLI, and a row
-with no chip is a plain session and restores as one.
+**Restart after orrerix closes:** open the
+[session browser](features/session-browser.html) (**`Ctrl+Shift+P`**). Its
+**Orchestrations** section, at the top, lists every group orrerix has a record
+of — on every agent CLI — and **Resume** there restores the *whole*
+orchestration: same group id, state, task board, and audit history, with fresh
+MCP identity wired into the resumed conversation. A plain `claude --resume` /
+`copilot --resume` (or opencode's `--session <id>`) would come back powerless
+(no MCP tools, no task board); this path never does.
+
+That section reads orrerix's own record of the group (`group.json` plus the
+orchestrator row of `agents.json`), not any CLI's session store — which is why
+it is the route to use. The session list *below* it is a scan of each CLI's own
+store, and an orchestration group's OpenCode sessions are deliberately not in
+it: they live in the group's own store, never your global one (see
+[Session browser](features/session-browser.html)). Orchestration sessions that
+*are* in that list still carry `ORCH` / `W` / `REV` chips and still restore
+their group when clicked — the route is decided by recorded membership, never
+by which CLI wrote the session — and a worker/reviewer row rejoins its group
+once the group is running.
+
+A row that cannot be resumed says why, instead of offering a button that
+fails:
+
+| What the row says | What happened | What to do |
+| --- | --- | --- |
+| *Running now* | The group has live agents in this window | Focus its orchestrator pane |
+| *Session not yet identified* | Copilot and OpenCode mint their own session ids after boot, and orrerix has not learned this one yet (or its watcher timed out) | Wait for it, or resume the orchestrator once by hand from the session list |
+| *Recorded session is no longer in the … store* | The CLI's own history no longer holds that conversation | Start a fresh orchestrator — it reattaches to this group's existing board and roster |
+| *This group's record could not be read* | The group's `group.json` is missing or damaged | Repair or remove that file; nothing can be resumed safely until orrerix can tell which CLI ran it |
 
 **Per-task sessions:** each worker is scoped to exactly one work item, and orrerix
 records its session id. Follow-ups on a finished task *resume* that worker's

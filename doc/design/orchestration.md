@@ -450,6 +450,61 @@ plan/notes) and `audit.jsonl` carry over. The orchestrator template instructs it
 `get_state` at session start and `set_state` + update GitHub issues after every planning
 change, keeping issues (label `agent-managed`) the durable source of truth.
 
+### The Orchestrations list (`orch_list_recorded`, #1563)
+
+**The gap it closes.** Every route into a recorded orchestration went through a
+CLI's own session store: the session browser lists what
+`sessions::list_sessions` scanned, and a row's `ORCH` chip is what turns a click
+into `resume_recorded_session`. For OpenCode that scan reads the human's
+*global* store only, and deliberately — a group's OpenCode sessions live in
+`<group>/opencode/opencode.db` (`OPENCODE_DB`), and a bare `opencode --session
+<id>` pane restored from one would have no MCP tools and no board (see
+`opencode.md`). The consequence nobody had named: a fresh OpenCode orchestrator
+had **no UI route to `resume_recorded_session` at all**, on any path. Copilot's
+was reachable only once its watcher bound an id inside `COPILOT_SESSION_TIMEOUT`.
+The backend resume itself was already CLI-correct (#722); nothing could call it.
+
+**The shape.** `orch_list_recorded` → `OrchRegistry::recorded_orchestrations`
+reads loomux's OWN record of each group — `group.json` for the repo and the
+orchestrator block's CLI, the orchestrator row of `agents.json` for the session
+id — and nothing else. No transcript scan, no CLI-store enumeration, and
+explicitly **not** `merged_records`, which parses both audit generations (up to
+~16 MB per group): `orch_session_roles` already pays that fan-out per group and
+#743's F4 row owns converting it, so a second such read on the same surface
+would double the cost of opening the sidebar. This command is `async` over
+`run_blocking` from the start for the same reason.
+
+**`resumable` asks the resume path's own question.** It calls the same
+`session_cwd_in_store(cli, sid, Some(opencode_db_path(group)))` that
+`resume_recorded_session`'s orchestrator branch calls, with the same per-group
+store, resolving the CLI the same way (the orchestrator BLOCK's cli, falling
+back to the group default). So a row offering Resume is one the backend will
+accept; a row that would be refused says so instead. An unreadable store
+degrades to `false` rather than erroring — this is a listing, and one broken
+group must not blank it.
+
+**Why every CLI, not just OpenCode.** The section lists Claude groups too, in
+one shape. That makes it the primary restart surface the user docs can point at,
+rather than a workaround with its own rules; it also means the "what if the CLI's
+store lost the conversation" copy is exercised on every CLI instead of only the
+one that motivated it.
+
+**A damaged group is listed, not hidden.** A directory with a `group.json` that
+will not parse yields a row with `repo: None` and an empty `cli` — never a
+guessed default, which would name the wrong CLI. Hiding it is how "my
+orchestration vanished" (#1563's own report) happens a second time. The
+enumeration gate is the same one `session_roles` uses — a `group.json` file must
+exist — so the two agree on what a group is.
+
+**The frontend half.** `src/orchlist.ts` is the pure model (ordering, filter,
+and one sentence per state); `sessions.ts` renders it and `main.ts` resumes
+through `restoreRecordedSession`, the extraction of what `restoreSession`'s
+orchestration branch already did — so the tab-binding rule and the start-fresh
+affordance exist once. Only a resumable row is a `<button>`: the hover
+affordance keys off the element, so a row that cannot act can never look like a
+control that failed. Liveness suppresses the button independently of
+`resumable`, because `resume_recorded_session` refuses a live group outright.
+
 ## Audit log
 
 `audit.jsonl`, one JSON object per line: every tool call (actor, tool, args, result),
