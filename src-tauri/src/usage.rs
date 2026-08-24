@@ -788,6 +788,10 @@ impl TranscriptCursors {
         };
         let mut slot = cell.lock_safe();
         let mut work = CursorWork::default();
+        // Captured BEFORE the path re-resolution below, which drops a cursor of
+        // its own when the remembered file has gone: `reset` means "a cursor was
+        // discarded", and reading it off `slot` afterwards would miss that one.
+        let had_cursor = slot.is_some();
 
         // Resolve the transcript path once and keep it; one `is_file()` per
         // tick replaces a scan of every project folder under the root.
@@ -823,7 +827,7 @@ impl TranscriptCursors {
         if verdict == StatVerdict::Reset {
             // `reset` is "a cursor was thrown away", so a first-ever read —
             // which also parses from zero — is not one.
-            work.reset = slot.is_some();
+            work.reset = had_cursor;
             *slot = Some(TranscriptCursor::new(path));
         }
         let cursor = slot.as_mut()?;
@@ -894,7 +898,6 @@ const TRANSCRIPT_TAIL_READ_BYTES: u64 = 256 * 1024;
 /// start of the file, in which case there's nothing to truncate). `None` on
 /// any I/O failure.
 fn read_transcript_tail(path: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(TRANSCRIPT_TAIL_READ_BYTES);
