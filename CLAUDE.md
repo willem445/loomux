@@ -233,16 +233,17 @@ compiles.
   elements.** The board re-renders on every agent write (`orch-tasks-changed`
   fires on EVERY `write_tasks`) and `refreshNow` defers only while
   `isEditing()` — `document.activeElement` being an `INPUT`/`TEXTAREA` inside
-  the list. A `<select>`, a checkbox, and the click on the form's own commit
-  button all sit outside that, so the render proceeds and rebuilds the controls
-  from their seeds. Hold the draft in a `Map<rowId, …>` the elements are a view
-  of, prune it beside `selected`/`collapsed`, and put "is this draft untouched"
-  in ONE pure predicate reading EVERY field the form has — the renderer's seed
-  and the predicate's default are one question asked twice. Clearing on success
-  alone discharges it on the Enter route and leaves it on the button route,
-  which is the one most people use. Signature: a control whose value is read at
-  submit rather than written on `change`, seeded from a literal instead of from
-  view state (#1348 N1/N4; `TasksView.linkDrafts`, `linkDraftIsPristine`).
+  the list. It reads tagName, never `type`, so a focused checkbox DOES defer,
+  while a `<select>` and the click on the form's own commit button do not and
+  the render rebuilds the controls from their seeds. Hold the draft in a
+  `Map<rowId, …>` the elements are a view of, prune it beside
+  `selected`/`collapsed`, and put "is this draft untouched" in ONE pure
+  predicate reading EVERY field the form has — the renderer's seed and the
+  predicate's default are one question asked twice. Clearing on success alone
+  discharges it on the Enter route and leaves it on the button route, which is
+  the one most people use. Signature: a control whose value is read at submit
+  rather than written on `change`, seeded from a literal instead of from view
+  state (#1348 N1/N4; `TasksView.linkDrafts`, `linkDraftIsPristine`).
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
