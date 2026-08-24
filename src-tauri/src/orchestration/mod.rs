@@ -10709,7 +10709,7 @@ pub fn board_task(task: Task, with_notes: bool) -> BoardTask {
         assignee,
         session,
         note_count: notes.len(),
-        notes: with_notes.then_some(notes),
+        notes: Some(notes),
         deps,
         related,
         links,
