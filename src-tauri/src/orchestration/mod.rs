@@ -25238,6 +25238,73 @@ pub fn group_record_scans_for_test() -> usize {
     GROUP_RECORD_SCANS.with(|c| c.get())
 }
 
+/// The computed (non-`GroupInfo`-borrowed) half of the full render var list —
+/// see `OrchRegistry::instruction_vars`, the single builder both
+/// `write_instruction_files` and `spawn_agent_bound` render from (#1187).
+/// Owns the `String`s it computes so `pairs` can hand out borrows that live as
+/// long as this value does, alongside the borrows `pairs` takes straight off
+/// `GroupInfo`.
+struct InstructionVars {
+    max: String,
+    workflow_section: String,
+    advisor_consult_note: String,
+    post_merge_workflow_hook: String,
+    merge_queue_note: String,
+    locks_note: &'static str,
+    locks_orch_note: &'static str,
+}
+
+impl InstructionVars {
+    /// The complete `render_template` var list — every key any of the four
+    /// role templates or a custom block's persona may reference. `g` supplies
+    /// the values that are plain fields/lookups on `GroupInfo`; `self` supplies
+    /// the ones that need computing (workflow section, conditional notes).
+    /// `BLOCK_NOTE` defaults to empty here — `write_block_instructions`
+    /// overrides it per block — so a class-fallback file (no matching block)
+    /// never keeps a literal `{{BLOCK_NOTE}}`.
+    fn pairs<'a>(&'a self, g: &'a GroupInfo) -> Vec<(&'a str, &'a str)> {
+        vec![
+            ("REPO", g.repo.as_str()),
+            ("GROUP_ID", g.id.as_str()),
+            ("MAX_AGENTS", self.max.as_str()),
+            ("WORKER_MODEL", g.guardrails.model_for(Role::Worker)),
+            ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer)),
+            ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
+            // #778: the veto's spelling, from the SAME resolved profile
+            // `poll_intake` reads. The contract is the consent boundary under
+            // full autonomy (nothing host-side blocks a start), so a template
+            // naming a label the poller does not honor would tell the
+            // orchestrator to build its triage plan around an exclusion that
+            // never fires. Threaded like MAX_AGENTS / WORKER_MODEL rather than
+            // conditionally injected: it is a per-group VALUE, not
+            // workflow-conditional prose, and it renders for every group.
+            ("HOLD_LABEL", g.guardrails.intake.hold.as_str()),
+            // #1153 phase 3, and the PRIORITY half of it: the four role
+            // templates name the repo's lessons file, and orchestrator.md's
+            // learning loop tells its reader to WRITE one. A hard-coded
+            // `.loomux/lessons.md` is wrong in a repo that has moved to
+            // `.orrerix/` — and wrong in the one way phase 4's per-file
+            // resolution cannot forgive, because `lessons_path` prefers the
+            // new spelling: an entry committed to the old path is never read
+            // again. Threaded as a per-group VALUE, like HOLD_LABEL, because
+            // it resolves to a real path for every group.
+            ("LESSONS_PATH", lessons::lessons_path(&g.repo)),
+            ("WORKFLOW", self.workflow_section.as_str()),
+            ("ADVISOR_CONSULT_NOTE", self.advisor_consult_note.as_str()),
+            ("POST_MERGE_WORKFLOW_HOOK", self.post_merge_workflow_hook.as_str()),
+            // Beside the other loomux-authored conditional fragment. Both are
+            // fixed consts carrying no `{{…}}` of their own, so their position
+            // among the earlier vars is inert — unlike the repo-authored
+            // `BLOCK_NAME`, which the caller (`render_block_instructions`)
+            // keeps last on purpose.
+            ("MERGE_QUEUE", self.merge_queue_note.as_str()),
+            ("LOCKS", self.locks_note),
+            ("LOCKS_ORCH", self.locks_orch_note),
+            ("BLOCK_NOTE", ""),
+        ]
+    }
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -38706,16 +38773,18 @@ impl OrchRegistry {
         )
     }
 
-    /// Render every block's role-instruction doc into the group dir so kickoff
-    /// prompts can reference them by path instead of pasting pages of text.
-    ///
-    /// One file per **block** now, not per role (#222) — `worker.md` for the
-    /// built-in roster (unchanged), `<block-id>.md` for a custom block. All four
-    /// built-in files are always written even when a workflow file has replaced
-    /// the roster, because they are also what a `mode: replace` persona is
-    /// measured against and what a rejoined legacy session may still reference.
-    fn write_instruction_files(&self, g: &GroupInfo) -> Result<(), String> {
-        let max = g.guardrails.max_agents.to_string();
+    /// The full render var list for a block/role instruction file (#1187) — the
+    /// SINGLE builder for every var `render_template` may need, shared by
+    /// `write_instruction_files` (the group-level render) and
+    /// `spawn_agent_bound`'s per-spawn refresh. Before this, the two paths each
+    /// carried their own hand-written list; `render_template` leaves an unlisted
+    /// `{{KEY}}` LITERAL rather than substituting empty, so the spawn-time
+    /// refresh's shorter list was silently shipping raw placeholders — up to and
+    /// including the entire `{{WORKFLOW}}` roster section for an orchestrator
+    /// block — instead of what the group render had just computed. One builder
+    /// means a var added here reaches both call sites by construction; there is
+    /// no second list left to drift.
+    fn instruction_vars(&self, g: &GroupInfo) -> InstructionVars {
         // The orchestrator's workflow section (#222) — EMPTY for the default
         // roster, which is what keeps every no-workflow group's instruction files
         // byte-for-byte what they were. `BLOCK_NOTE` is per-block, so the base
@@ -38799,46 +38868,28 @@ impl OrchRegistry {
                 .flatten()
                 .map(|wf| !wf.resources.is_empty())
                 .unwrap_or(false);
-        let locks_note = if locks_declared { LOCKS_NOTE } else { "" };
-        let locks_orch_note = if locks_declared { LOCKS_ORCH_NOTE } else { "" };
-        let vars: Vec<(&str, &str)> = vec![
-            ("REPO", g.repo.as_str()),
-            ("GROUP_ID", g.id.as_str()),
-            ("MAX_AGENTS", max.as_str()),
-            ("WORKER_MODEL", g.guardrails.model_for(Role::Worker)),
-            ("REVIEWER_MODEL", g.guardrails.model_for(Role::Reviewer)),
-            ("PLANNER_MODEL", g.guardrails.model_for(Role::Planner)),
-            // #778: the veto's spelling, from the SAME resolved profile
-            // `poll_intake` reads. The contract is the consent boundary under
-            // full autonomy (nothing host-side blocks a start), so a template
-            // naming a label the poller does not honor would tell the
-            // orchestrator to build its triage plan around an exclusion that
-            // never fires. Threaded like MAX_AGENTS / WORKER_MODEL rather than
-            // conditionally injected: it is a per-group VALUE, not
-            // workflow-conditional prose, and it renders for every group.
-            ("HOLD_LABEL", g.guardrails.intake.hold.as_str()),
-            // #1153 phase 3, and the PRIORITY half of it: the four role
-            // templates name the repo's lessons file, and orchestrator.md's
-            // learning loop tells its reader to WRITE one. A hard-coded
-            // `.loomux/lessons.md` is wrong in a repo that has moved to
-            // `.orrerix/` — and wrong in the one way phase 4's per-file
-            // resolution cannot forgive, because `lessons_path` prefers the
-            // new spelling: an entry committed to the old path is never read
-            // again. Threaded as a per-group VALUE, like HOLD_LABEL, because
-            // it resolves to a real path for every group.
-            ("LESSONS_PATH", lessons::lessons_path(&g.repo)),
-            ("WORKFLOW", workflow_section.as_str()),
-            ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
-            ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
-            // Beside the other loomux-authored conditional fragment. Both are
-            // fixed consts carrying no `{{…}}` of their own, so their position
-            // among the earlier vars is inert — unlike the repo-authored
-            // `BLOCK_NAME`, which the comment above keeps last on purpose.
-            ("MERGE_QUEUE", merge_queue_note.as_str()),
-            ("LOCKS", locks_note),
-            ("LOCKS_ORCH", locks_orch_note),
-            ("BLOCK_NOTE", ""),
-        ];
+        InstructionVars {
+            max: g.guardrails.max_agents.to_string(),
+            workflow_section,
+            advisor_consult_note,
+            post_merge_workflow_hook,
+            merge_queue_note,
+            locks_note: if locks_declared { LOCKS_NOTE } else { "" },
+            locks_orch_note: if locks_declared { LOCKS_ORCH_NOTE } else { "" },
+        }
+    }
+
+    /// Render every block's role-instruction doc into the group dir so kickoff
+    /// prompts can reference them by path instead of pasting pages of text.
+    ///
+    /// One file per **block** now, not per role (#222) — `worker.md` for the
+    /// built-in roster (unchanged), `<block-id>.md` for a custom block. All four
+    /// built-in files are always written even when a workflow file has replaced
+    /// the roster, because they are also what a `mode: replace` persona is
+    /// measured against and what a rejoined legacy session may still reference.
+    fn write_instruction_files(&self, g: &GroupInfo) -> Result<(), String> {
+        let ivars = self.instruction_vars(g);
+        let vars = ivars.pairs(g);
         let dir = self.group_dir(&g.id);
         // #423: the authoritative set of instruction filenames this roster
         // owns, built up alongside the writes below — the sweep at the end
@@ -42653,26 +42704,14 @@ impl OrchRegistry {
         // edited persona applies to the next agent without restarting the group.
         let persona = self.resolve_persona_or_audit(&group, &block);
         // Refresh the block's instruction file so a `mode: replace` swap (or a
-        // persona edit) is reflected in what the kickoff points at.
-        let max = group.guardrails.max_agents.to_string();
-        let vars: Vec<(&str, &str)> = vec![
-            ("REPO", group.repo.as_str()),
-            ("GROUP_ID", group.id.as_str()),
-            ("MAX_AGENTS", max.as_str()),
-            ("WORKER_MODEL", group.guardrails.model_for(Role::Worker)),
-            ("REVIEWER_MODEL", group.guardrails.model_for(Role::Reviewer)),
-            ("PLANNER_MODEL", group.guardrails.model_for(Role::Planner)),
-            // #778, same value and same reason as the group-render list above:
-            // an orchestrator BLOCK re-renders its instruction file here on
-            // every spawn, so a var missing from this list would leave a live
-            // `{{HOLD_LABEL}}` in the file the agent actually reads.
-            ("HOLD_LABEL", group.guardrails.intake.hold.as_str()),
-            // Same value and same reason as the group-render list above: a
-            // block re-renders its instruction file on every spawn, so a var
-            // missing here would leave a live `{{LESSONS_PATH}}` in the file
-            // the agent actually reads.
-            ("LESSONS_PATH", lessons::lessons_path(&group.repo)),
-        ];
+        // persona edit) is reflected in what the kickoff points at. #1187: the
+        // SAME builder `write_instruction_files` uses for the group-level
+        // render, not a second hand-written list — a var this omits is left as
+        // a literal `{{KEY}}` by `render_template` rather than substituted, so
+        // a second, shorter list here was the defect (dropped `{{WORKFLOW}}`,
+        // `{{ADVISOR_CONSULT_NOTE}}`, `{{LOCKS}}`, …) rather than a fix.
+        let ivars = self.instruction_vars(&group);
+        let vars = ivars.pairs(&group);
         // Audited, not swallowed: the kickoff below hands the agent this file's
         // path as "read your role instructions", so a failed write means an agent
         // booting against a stale or missing loomux contract. Not fatal (the
