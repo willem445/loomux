@@ -373,6 +373,30 @@ deltas beside it so they still sum to the total. Signature: an isolation diffsta
 baseline passes ancestry *and* subject and whose file count is two high — 63 files/314+
 against the previous rebase's target, 61/258+ against the merge base (#1324).
 
+### `gh pr diff --patch` is the wrong instrument for a diffstat
+
+Measure a PR's diffstat from the **plain** `gh pr diff <n>` (its net diff) or from the
+merge-base `git diff --stat` above. `--patch` emits the **commit series** — `git
+format-patch` form, one patch per commit — so `git apply --stat` counts a file once per
+commit that touches it and adds back every line an intermediate commit wrote and a later
+one removed. `gh pr diff <n> --stat` is not a flag at all (`unknown flag: --stat`, gh
+2.95.0), and Step-0-style "stop on any error" rules turn that into a refusal.
+
+```sh
+gh pr diff <n> > diff.txt && git apply --stat diff.txt | tail -1        # net — correct
+gh pr diff <n> --patch | grep -c '^diff --git'                          # entries: per commit
+gh pr diff <n> --patch | grep '^diff --git' | sed 's|.* b/||' | sort -u | wc -l   # real files
+```
+
+Signature: a diffstat several times the PR's real size, stated confidently because the
+command ran clean. Measured on #1395's head `cebb64c2` (9 commits, 10 files):
+`--patch | git apply --stat` reports **27 files / 1400+ / 112-** where the plain diff
+reports **10 / 1320+ / 32-** — 27 entries over 10 unique paths. The control is a branch
+whose commits touch **disjoint** files: merged #1352 (2 commits, 3 files) gives
+`3 files changed, 5 insertions(+), 7 deletions(-)` from **both** forms, which is why the
+mistake survives a small-PR test. Inflation tracks per-file overlap, not commit count
+(#1395 B1).
+
 ### Body quotes are checked against head, never eyeballed
 
 A body that **quotes** a passage out of a file in its own diff has made a claim a

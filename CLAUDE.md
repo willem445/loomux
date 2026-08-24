@@ -266,6 +266,15 @@ compiles.
   scan is implemented. Precedents: `tests/groupid.rs`, `tests/perf_dispatch.rs`,
   `test/perfpolicy.test.ts`. Signature: the guard's own doc quotes the line it
   was written for, and that line still passes (#922).
+- **A guard that REFUSES ships only after it has run clean over known-good subjects.**
+  Reading a check never finds a false block; running it against real already-merged PRs
+  (or the current tree) does, and the refusals cluster on the artifacts this repo
+  MANDATES — a base run id, a pasted Windows panic path, a second diffstat quoted about
+  another PR. The harness that runs the corpus must not share a pattern or an extractor
+  with the check under test, or an instrument carrying the check's own bug reports the
+  corpus clean. Signature: five of six defects found by RUNNING checklists that had
+  survived every read of them, and a sixth the harness could not see (#1395 B1-B6; the
+  false-NEGATIVE direction is the positive-control bullets above).
 - `src-tauri/src/orchestration/mod.rs` is tens of thousands of lines — grep for
   the function/struct, don't read it top to bottom. Anchor an INSERT above the
   item's `///` block, never above its `#[tauri::command]`/`fn` — those sit BELOW
