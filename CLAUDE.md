@@ -284,8 +284,24 @@ compiles.
   preamble and leaves the neighbour undocumented, with nothing red to say so.
   Signature: a `+///` line in the diff sitting directly under a context `///`
   line (#1229).
+  That signature is a FILE-STATE shape, and the diff-shaped sweep for it is blind
+  wherever the neighbouring doc block is ALSO new in the same diff — the insert has no
+  *context* `///` above it — so the sweep returns an IDENTICAL hit set on the defective
+  and the fixed blob while a match-somewhere positive control still passes. Decide it
+  with a name-keyed doc census blob-vs-blob, and read every doc block the diff ADDS
+  against the `fn` it now sits on (#1426 B3; recipe in
+  `.claude/skills/ci-validate/SKILL.md`).
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
+- **A user-facing message is ONE paragraph, and the leak has TWO shapes.** `\n` plus
+  indentation in a Rust literal ships the source's leading spaces to the reader; a `\`
+  line-continuation avoids that only if it survived the authoring path, and one that
+  collapsed leaves the same run of spaces with no `\n` at all. A test pinning the message
+  with `.contains(<substring>)` sees neither, since no asserted substring straddles the
+  break — it survives a fully green suite. Pin the SHAPE beside the content, as
+  `is_one_paragraph` does (`src-tauri/tests/manager_lifecycle.rs`): no `\n` AND no
+  ten-space run. Signature: `cat -A` shows a >=10-space run mid-literal, with or without
+  a preceding `\n` (#1426 B2; #1457 is the collapse form).
 - Write tests that test intent, not implementation echoes.
 - **A coverage claim is a claim.** When a PR body or comment says a test or mechanism
   polices a property, run the one mutation that removes it and watch WHICH tests
