@@ -38707,13 +38707,21 @@ impl OrchRegistry {
         // - `deliver_prompt` refuses a `Role::Manager` target and `send_prompt`
         //   names `message_manager` in its own refusal (M2) — so the note tells
         //   the orchestrator the tool rather than letting it discover the refusal.
-        // - It does NOT claim the reaper or `max_agents` exempt the manager. That
-        //   is M3's (decision D3) and is not true on this branch; a fragment
-        //   asserting it would be prose about a mechanism the reader does not yet
-        //   have. What it says instead — never `kill_agent` it — is an instruction,
-        //   true whether or not M3 has landed, and it is the rule that matters
-        //   either way: the orchestrator is the one thing in this group that can
-        //   end the human's own pane.
+        // - It does NOT claim the reaper, the watchdog or `max_agents` exempt the
+        //   manager, even though M3 (decision D3) has landed and all three now do.
+        //   That omission is deliberate, and the reason is not "the reader lacks the
+        //   mechanism" — it is that this fragment is an OPERATING-INSTRUCTIONS
+        //   surface. It says what the orchestrator must DO (the manager is not in
+        //   its delegate list; never `kill_agent` it), not what orrerix does
+        //   underneath. The exemptions are enforced in code —
+        //   `counts_against_max_agents`, the reaper's role-keyed skip and the
+        //   watchdog's own `Role::Manager` arm — so an orchestrator acting on this
+        //   note cannot violate them, and a second surface ASSERTING them would be
+        //   a copy free to drift from the predicates. `doc/design/manager.md`'s
+        //   Lifecycle table is where they are documented. The instruction here —
+        //   never `kill_agent` it — is the rule that matters to this reader either
+        //   way: the orchestrator is the one thing in this group that can end the
+        //   human's own pane.
         let manager_note = match g.guardrails.blocks.iter().find(|b| b.kind == Role::Manager) {
             Some(b) => format!(
                 "\n\n**You have a manager.** `{id}` is the pane the HUMAN talks to — their \

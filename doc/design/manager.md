@@ -681,11 +681,18 @@ actually shipped, deliberately (the #1026 line): `spawn_agent` refuses a manager
 by `kind` and by `block`, so "you do not open it, and you cannot" is a fact
 about code; `deliver_prompt` refuses the pane, so the fragment names
 `message_manager` rather than letting the orchestrator discover a `send_prompt`
-error. It does **not** assert the reaper, watchdog or `max_agents` exemptions —
-those are M3's (decision D3) and asserting them early would be prose about a
-mechanism the reader may not have. What it says instead is an *instruction* that
-holds either way: never `kill_agent` the manager. Inside the group the
-orchestrator is the one thing that can end the human's own pane.
+error. It does **not** assert the reaper, watchdog or `max_agents` exemptions,
+although M3 (decision D3) has landed and the table above records all three as
+`exempt`. That is deliberate and it is a *separation* argument, not a sequencing
+one: the fragment is an operating-instructions surface — what the orchestrator
+must DO — while the exemptions are enforced in code (`counts_against_max_agents`,
+the reaper's role-keyed skip, the watchdog's `Role::Manager` arm) and documented
+in the table above. An orchestrator acting on the note cannot violate them, and a
+second surface asserting them would be a copy free to drift from the predicates —
+with nothing pinning it, since no test reads the note for exemption claims. What
+the fragment says instead is an *instruction*: never `kill_agent` the manager.
+Inside the group the orchestrator is the one thing that can end the human's own
+pane.
 
 The brief hand-off is the fragment's other half. The manager's containment keeps
 `gh`, so "the manager never files the issue" is instruction-backed rather than
