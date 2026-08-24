@@ -20569,23 +20569,65 @@ fn deliver_now(
         }
         PasteDecision::Paste { .. } => {}
         PasteDecision::Abort { held_ms } => {
-            append_audit(&root, &group, brand::AUDIT_ACTOR, "delivery-aborted-question", json!({
-                "to": agent, "stage": "pre-enter", "held_ms": held_ms,
-                "matched": witness_audit(question_seen_preenter.as_ref()),
-            }));
-            // #420 rev-15 B3: unlike the pre-paste abort, the text IS
-            // already pasted at this point — only the Enter was
-            // withheld. It's sitting unsubmitted in the box, exactly
-            // the shape the stranded-text flush (#81/#84) exists to
-            // clear on the NEXT delivery — but only if that delivery
-            // can see it. Recording nothing here would leave
-            // `last_delivery` holding whatever outcome (or none) an
-            // EARLIER delivery left, so the next delivery's flush
-            // could wrongly conclude nothing needs clearing and
-            // append its own paste onto this one's abandoned text.
-            record_aborted_preenter_outcome(
-                &last_delivery, pty_id, delivery_from, Some(pasted_text.clone()));
-            return DeliverOutcome::AbortedPreEnter(queue::EnqueueReason::Question);
+            // #903 B2: an attempt the drainer GRANTED an override to carries
+            // that grant to its Enter, re-proved here on a FRESH read.
+            //
+            // **Why this arm existed as a dead end.** The grant's own
+            // precondition is that the question gate has been reading a false
+            // positive for fifteen minutes on a pane whose screen never changes.
+            // Nothing about pasting into it changes that, so this checkpoint
+            // re-reads the same screen, gets the same false positive by
+            // construction, and aborts with the text already in the box. The
+            // override therefore converted a bounded hold into an unrecoverable
+            // wedge — a stranded paste every later delivery queues behind, which
+            // is strictly worse than never having overridden at all. That is what
+            // the live incident did, twice, before the pane was killed by hand.
+            //
+            // **What it is re-proved on, and what it is NOT.** The override's own
+            // standard: the WEAK idleness reading
+            // ([`idle_prompt_row_rendered`]), on a fresh sample, twice —
+            // never a flag the drainer set minutes ago. The strong reading is not
+            // used here for the reason [`QUESTION_HOLD_OVERRIDE_AFTER`] gives for
+            // the grant itself: on the pane this exists for, the strong reading is
+            // exactly the thing that is wrong, so requiring it would make this
+            // code unreachable. The residual that leaves — a dialog painted above
+            // a composer holding our paste, showing no token evidence, inside the
+            // override window — is argued in
+            // `doc/design/question-gate-authorship.md`; `h13`'s dialog is caught
+            // by the menu-structure TOKEN clause and is not in it.
+            if question_overridden
+                && preenter_override_admits(
+                    &ptys,
+                    pty_id,
+                    &pasted_text,
+                    delivered_lines(&reg, pty_id),
+                )
+            {
+                append_audit(&root, &group, brand::AUDIT_ACTOR, "delivery-question-override-enter", json!({
+                    "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                    "matched": witness_audit(question_seen_preenter.as_ref()),
+                    "reads": QUESTION_OVERRIDE_CONSECUTIVE_READS,
+                    "reason": "granted a question override; the composer still holds this paste",
+                }));
+            } else {
+                append_audit(&root, &group, brand::AUDIT_ACTOR, "delivery-aborted-question", json!({
+                    "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                    "matched": witness_audit(question_seen_preenter.as_ref()),
+                }));
+                // #420 rev-15 B3: unlike the pre-paste abort, the text IS
+                // already pasted at this point — only the Enter was
+                // withheld. It's sitting unsubmitted in the box, exactly
+                // the shape the stranded-text flush (#81/#84) exists to
+                // clear on the NEXT delivery — but only if that delivery
+                // can see it. Recording nothing here would leave
+                // `last_delivery` holding whatever outcome (or none) an
+                // EARLIER delivery left, so the next delivery's flush
+                // could wrongly conclude nothing needs clearing and
+                // append its own paste onto this one's abandoned text.
+                record_aborted_preenter_outcome(
+                    &last_delivery, pty_id, delivery_from, Some(pasted_text.clone()));
+                return DeliverOutcome::AbortedPreEnter(queue::EnqueueReason::Question);
+            }
         }
     }
     // #532: the LAST gate before the Enter, and the one that was missing.
@@ -24689,6 +24731,49 @@ pub fn question_override_admits(
         return false;
     }
     held_since_ms.is_some_and(|since| hold_bound_elapsed(since, now_ms, bound_ms))
+}
+
+/// #903 B2: may an attempt the drainer already granted a question override to
+/// press its ENTER?
+///
+/// [`question_override_admits`] decides the PASTE, minutes earlier, on the
+/// drainer's poll. This decides the Enter, here, now — and the split is the whole
+/// of what makes the grant worth anything. Skipping only the pre-paste gate left
+/// this checkpoint to re-read an unchanged screen, reach the same false positive
+/// the grant was issued because of, and abort with the text already in the box.
+///
+/// **Three terms, and each is the narrow one available:**
+///
+/// - **The grant is the caller's**, passed in as `question_overridden` rather
+///   than re-derived, for the reason `deliver_now`'s own parameter doc gives: the
+///   decision belongs to the poll that observed the pane.
+/// - **The evidence is FRESH and re-proved, never latched.** Each round takes a
+///   new sample; a pane that painted a dialog since the grant fails on the very
+///   next read with no memory of having been eligible. Two rounds, spaced by the
+///   guard's own poll interval, matching [`QUESTION_OVERRIDE_CONSECUTIVE_READS`]
+///   and for its reason: one reading of a composed screen can catch a mid-redraw
+///   instant, and this one licenses an Enter.
+/// - **The bar is the WEAK idleness reading**, the same one the grant was
+///   decided on. The strong reading would make this unreachable on exactly the
+///   pane class it exists for — see [`QUESTION_HOLD_OVERRIDE_AFTER`].
+///
+/// `!r.active` admits too, and it is not a widening: a round where the gate has
+/// simply gone clear is a round the ordinary checkpoint would have released on.
+/// Without it a screen that repainted between the abort and this re-read would
+/// strand the paste for having got BETTER.
+fn preenter_override_admits(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    pasted_text: &str,
+    delivered: Vec<String>,
+) -> bool {
+    (0..QUESTION_OVERRIDE_CONSECUTIVE_READS).all(|round| {
+        if round > 0 {
+            std::thread::sleep(QUESTION_HOLD_POLL);
+        }
+        let r = question_active_witnessed(ptys, pty_id, Some(pasted_text), delivered.clone());
+        !r.active || r.idle_prompt
+    })
 }
 
 /// What the drainer should do about a pane it is not yet allowed to write to
@@ -45762,11 +45847,16 @@ impl OrchRegistry {
     /// the `agents` lock alone — see [`OrchRegistry::delivered_prompts`] for the
     /// order that matters.
     fn session_for_pty(&self, pty_id: u32) -> Option<String> {
-        self.agents
-            .lock_safe()
-            .values()
-            .find(|a| a.pty_id == Some(pty_id))
-            .and_then(|a| a.session_id.clone())
+        // Through the EXISTING reverse index, never a fresh scan of `agents`:
+        // `by_pty` is already maintained beside every `pty_id` write, and a
+        // second way of answering "who holds this pane" is a second thing that
+        // can drift from the first.
+        //
+        // A STALE entry — a pane whose agent has since been replaced by a resume
+        // of the same session — resolves to the same session id, which is the
+        // answer this function wants anyway.
+        let agent = self.by_pty.lock_safe().get(&pty_id).cloned()?;
+        self.agents.lock_safe().get(&agent).and_then(|a| a.session_id.clone())
     }
 
     /// #903: these bytes just went to `pty_id` as a PROMPT. Record the
@@ -47004,6 +47094,16 @@ impl OrchRegistry {
         }
         self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
     }
+    /// Test-only companion to [`OrchRegistry::set_pty_for_test`]: give an agent
+    /// the CLI session id a real spawn would have assigned it, so the
+    /// session-keyed prompt record (#903) is reachable from a headless test.
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_session_for_test(&self, agent_id: &str, session_id: &str) {
+        if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
+            a.session_id = Some(session_id.to_string());
+        }
+    }
+
 
     /// Path of `group`'s durable queue snapshot (#468). Sits beside
     /// `state.json`/`tasks.json`/`audit.jsonl` in the group dir, because it
