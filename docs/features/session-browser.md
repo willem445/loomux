@@ -20,7 +20,34 @@ nav_order: 5
 ## Session browser
 
 Press **`Ctrl+Shift+P`** (or the *sessions* button) to open the session browser.
-It scans the local machine for resumable agent sessions:
+It has two parts: an **Orchestrations** list at the top, and a list of individual
+agent sessions below it.
+
+### Orchestrations
+
+Every orchestration group orrerix has a record of, on every agent CLI, newest
+activity first with running groups at the top. **Resume** brings the whole group
+back — same group id, state, task board and audit history, with fresh MCP
+identity wired into the resumed orchestrator conversation.
+
+This list is built from orrerix's own record of each group (`group.json` plus the
+orchestrator row of `agents.json`), not from any CLI's session store. That is why
+it is the reliable restart route: an OpenCode group's orchestrator session is
+never in the session list below (see below), and Copilot's is there only once
+orrerix has learned its session id.
+
+A row without a **Resume** button says why it has none:
+
+| What the row says | What happened | What to do |
+| --- | --- | --- |
+| *Running now* | The group has live agents in this window | Focus its orchestrator pane |
+| *Session not yet identified* | Copilot and OpenCode mint their session ids after boot, and orrerix has not learned this one yet (or its watcher timed out) | Wait for it, or resume that orchestrator once by hand from the session list |
+| *Recorded session is no longer in the … store* | The CLI's own history no longer holds that conversation | Start a fresh orchestrator — it reattaches to this group's existing board and roster |
+| *This group's record could not be read* | The group's `group.json` is missing or damaged | Repair or remove that file; until then orrerix cannot tell which CLI ran the group |
+
+### Sessions
+
+Below that, the individual agent sessions orrerix found on this machine:
 
 - **Claude Code** — `~/.claude/projects/*/*.jsonl` (titled by the first real
   prompt, resumed with `claude --resume <id>`).
@@ -32,16 +59,20 @@ It scans the local machine for resumable agent sessions:
 
 Only *your own* opencode sessions are listed — the ones a solo pane or your own
 terminal created. Sessions belonging to an orchestration group live in that
-group's own store and are reopened by restoring the group, not as standalone
-panes.
+group's own store and are reopened by restoring the group from the
+**Orchestrations** list above, not as standalone panes: a bare
+`opencode --session <id>` pane would come back with no MCP tools and no task
+board.
 
 Clicking a session opens a new pane in the session's original working directory
 and resumes it there. The pane is auto-named from the session.
 
-**Orchestration sessions** are marked with `ORCH` / `W` / `REV` chips. Clicking a
-dead group's orchestrator session restores the *whole* orchestration — same group
-id, state, task board, and audit history — with fresh MCP identity wired in.
-Worker/reviewer sessions rejoin their group when it's running. See
+**Orchestration sessions** in this list are marked with `ORCH` / `W` / `REV`
+chips. Clicking a dead group's orchestrator session restores the *whole*
+orchestration, exactly as the **Orchestrations** list does; worker/reviewer
+sessions rejoin their group once it is running. Which route a click takes is
+decided by the recorded membership the chip reflects, never by which CLI wrote
+the session. See
 [Restart after orrerix closes](../orchestration.html#persistence--restart).
 
 ## Open in editor
