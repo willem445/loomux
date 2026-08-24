@@ -565,6 +565,14 @@ narrow their ask back down to the original ticket on your own judgment.
   the same string against a specimen that MUST match (`git show <base>:<file>`) before
   citing a zero. Signature: a clean-sweep receipt of `0` whose pattern carries an
   alternation and whose command ends in `| wc -l` (#1344).
+  A third form never runs at all: on this machine's GNU grep 3.1, `-i` combined with `-F`
+  ABORTS — `SIGABRT`, exit 134, zero bytes on stdout AND stderr — so `grep -riF` over a tree
+  that DOES contain the term prints an empty result indistinguishable from a clean one. The
+  trigger is the C/POSIX locale, never the pattern: an unset locale env resolves to it and
+  `LC_ALL=C`, the reflex spelling for a deterministic sweep, asks for it, while any other
+  locale clears it. Use `-rni`, or `LC_ALL=C.UTF-8`. Signature: a case-insensitive literal
+  sweep returns zero for EVERY pattern, one you can see in the tree included (#1369 review;
+  repro: `grep -niF vacuity` on a file holding `Vacuity`).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
