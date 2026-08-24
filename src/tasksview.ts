@@ -930,10 +930,12 @@ export class TasksView {
     // NOTE (#1316): `expanded` (notes-expand toggle) belongs on this list too
     // — it's the same never-pruned shape as its siblings above — but is
     // deliberately NOT fixed here. PR #1470 (open, `perf/1317-polled-read-payloads`,
-    // commit 4c831f34) already prunes it with this exact call, plus
-    // `expandedLinks` alongside it, because that PR makes `expanded` a wire
-    // parameter (`withNotes`) and needed the prune for correctness, not just
-    // hygiene. Landing this comment costs a trivial textual conflict with
+    // commit "fix(tasks): prune the expanded-row sets" — cited by subject, not
+    // SHA, since #1470 rebases and a subject survives that where a hash does
+    // not) already prunes it with this exact call, plus `expandedLinks`
+    // alongside it, because that PR makes `expanded` a wire parameter
+    // (`withNotes`) and needed the prune for correctness, not just hygiene.
+    // Landing this comment costs a trivial textual conflict with
     // #1470 at this exact insertion point — worth it, since the alternative
     // is silently duplicating that PR's fix with no pointer explaining why one
     // of the six #1316 rows is missing from this one. See this PR's body for
