@@ -122,13 +122,14 @@ grep -nE '^(uuid|rand|getrandom|ring|tempfile) *=' src-tauri/Cargo.toml
 ### 3. No new PTY resize on a UI path
 
 ```
-grep -rn 'resizePty(' src/ --include=*.ts
+grep -rn 'resizePty' src/ --include=*.ts
 grep -rn 'resizePty(' src/ --include=*.ts | grep -vE '^src/(pane|pty|resizeburst)\.ts:'
 ```
 
-- **ESCALATE** if the first command prints nothing — `src/pty.ts` defines
-  `resizePty` and `src/pane.ts` calls it, so an empty control means the sweep is
-  broken.
+- **ESCALATE** if the first command prints nothing. The control deliberately has
+  NO `(` so it matches the definition, the import, the call and the comment —
+  six lines over three files today. An empty control means the sweep is broken.
+  (The SWEEP keeps its `(` so it only ever matches an actual call.)
 - **PASS** if the control prints lines and the sweep prints nothing.
 - **FAIL** if the sweep prints any line. Quote it — a resize outside those three
   modules repaints ConPTY and pollutes the user's scrollback.
@@ -137,7 +138,7 @@ grep -rn 'resizePty(' src/ --include=*.ts | grep -vE '^src/(pane|pty|resizeburst
 
 ```
 grep -n 'fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place' src-tauri/tests/groupid.rs
-grep -rn 'impl AsRef<Path> for GroupId' crates/loomux-engine/src src-tauri/src
+grep -rnE '^[[:space:]]*impl[[:space:]]+AsRef<Path>[[:space:]]+for[[:space:]]+GroupId' crates/loomux-engine/src src-tauri/src
 grep -rn 'GroupId' crates/loomux-engine/src/groupid.rs
 ```
 
@@ -147,6 +148,11 @@ grep -rn 'GroupId' crates/loomux-engine/src/groupid.rs
 - **FAIL** if the first command prints nothing (the guard test was deleted or
   renamed) or the second prints a line (an `AsRef<Path>` impl would let a
   `GroupId` reach a `.join` as a value). Quote whichever fired.
+
+  The second pattern anchors `impl` at the START of the line on purpose. The
+  unanchored spelling matches a DOC COMMENT in `groupid.rs` that discusses the
+  absence of such an impl, so it prints a line on a clean tree — a lane that
+  FAILED a healthy PR on prose. Never loosen it back.
 
 ### 5. A role-template edit re-blesses the pre222 fixtures in the same PR
 

@@ -80,19 +80,26 @@ compiles anything.
 ```
 grep -cE '^\+.*#\[test\]' .scratch/diff.txt
 grep -cE '^\+[[:space:]]*(test|it)\(' .scratch/diff.txt
+grep -cE '^\+.*(assert|expect\()' .scratch/diff.txt
 grep -nEi 'docs.only|comment.only|a revert|pure rename|pure move|re.blessed|golden|snapshot fixture' .scratch/body.md
 grep -cvE '\.(md|txt)$' .scratch/files.txt
 ```
 
-- **PASS** if the first or second count is 1 or more. Quote the counts.
-- **PASS** if the fourth count is 0 — the PR touches only `.md`/`.txt` files, so
+- **PASS** if the first, second **or third** count is 1 or more. Quote the counts.
+  The THIRD count is what stops this check failing a PR that strengthens existing
+  tests instead of adding new ones: new assertions inside an existing test are
+  test material, and a change covered that way is not an untested change. That
+  count is deliberately loose (it can pick up prose in a `.md` hunk); this check
+  only ever FAILS on ZERO, so over-counting errs in the safe direction, while
+  under-counting would block a healthy PR.
+- **PASS** if the fifth count is 0 — the PR touches only `.md`/`.txt` files, so
   there is no behaviour to test.
-- **PASS** if the third grep prints a line naming one of the four exemptions
+- **PASS** if the fourth grep prints a line naming one of the four exemptions
   (docs/comment-only, a revert, a pure rename/move, a re-blessed golden or
   snapshot fixture) **and** that line says why no new test exists. Quote it.
-- **FAIL** if the first two counts are both 0, the fourth count is 1 or more, and
-  the third grep prints nothing. Quote all four command outputs.
-- **ESCALATE** if the third grep prints a line but you cannot tell whether it is a
+- **FAIL** if the first THREE counts are all 0, the fifth count is 1 or more, and
+  the fourth grep prints nothing. Quote all five command outputs.
+- **ESCALATE** if the fourth grep prints a line but you cannot tell whether it is a
   stated exemption or an incidental mention of one of those words.
 
 ### 2. Every coverage claim in the body carries a mutation receipt
@@ -133,10 +140,14 @@ Net = added minus removed.
   body's number and your net, side by side.
 - **FAIL** if a stated delta differs from the net. Quote both numbers and the four
   counts you derived the net from.
-- **ESCALATE** if the body states a total test count (for example `2230 → 2233`)
-  from a suite run rather than a delta you can derive from the diff. That number
-  comes from an instrument you are not allowed to run; say so and let `rev-lead`
-  check it.
+- **PASS** if the body states suite TOTALS rather than a delta (for example
+  `2262 tests / 2254 pass`) **and** cites at least one CI run id. That number
+  belongs to a run, `qr-evidence` check 2 already ties cited runs to the head,
+  and `rev-lead` can read it there. Escalating here would block almost every
+  well-evidenced PR in this repo, which is the opposite of this lane's job.
+- **ESCALATE** if the body states a suite total and cites NO run id at all —
+  then the number came from an instrument nobody can check, and you may not run
+  it yourself.
 
 ### 4. Every test name the body mentions exists at the head
 
