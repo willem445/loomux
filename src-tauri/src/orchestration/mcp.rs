@@ -2178,7 +2178,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind));
                 if effective_kind == Some(Role::Manager) {
                     return Err(format!(
-                        "that session belongs to this group's manager (block {id:?}) — the \n                         human's own interface, opened for them at launch and never spawned or \n                         resumed by you, however it is spelled. A manager pane comes back \n                         through the session browser, which is the human's own surface. To put \n                         something to the human, use ask_human; to send them status, use \n                         message_manager."
+                        "that session belongs to this group's manager (block {id:?}) — the \
+                         human's own interface, opened for them at launch and never spawned or \
+                         resumed by you, however it is spelled. A manager pane comes back \
+                         through the session browser, which is the human's own surface. To put \
+                         something to the human, use ask_human; to send them status, use \
+                         message_manager."
                     ));
                 }
             }

@@ -1492,9 +1492,10 @@ export interface GroupSummary {
    *  which is workers + reviewers + planners. TWO classes are exempt on both
    *  sides: the orchestrator, and a declared manager (#1161 M3, decision D3 —
    *  the human's interface is not a delegate slot the orchestrator competes
-   *  for). The backend sums exactly this set in `group_summary`, mirroring
-   *  `counts_against_max_agents`, which is the predicate enforcement actually
-   *  reads. Lowering the cap below this blocks new spawns; a live manager still
+   *  for). The backend derives this in `group_summary` by CALLING
+   *  `counts_against_max_agents` — the same predicate enforcement reads, not a
+   *  parallel sum that happens to agree — so the panel cannot drift from the
+   *  guardrail it describes. Lowering the cap below this blocks new spawns; a live manager still
    *  appears in `roles.manager` below, so the panel shows the pane and shows
    *  that it is not spending a slot. */
   live_delegates: number;
