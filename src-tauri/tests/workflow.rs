@@ -3912,11 +3912,18 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
     let g2 = reg2.create_group(&plain.path(), plain_rails()).unwrap();
     let builtin = instructions_lf(&reg2, &g2.id, "reviewer.md");
 
-    // These three strings are pinned AS STRINGS, deliberately (rev-19 F8). `non-blocking`
+    // These five strings are pinned AS STRINGS, deliberately (rev-19 F8). `non-blocking`
     // is no longer prose — it is the label `orchestrator.md` tells the orchestrator to READ,
-    // so the literal token IS the contract; the other two are the phrasings that carry the
+    // so the literal token IS the contract; the next two are the phrasings that carry the
     // duty. A meaning-preserving reword therefore turns this red on purpose: reword the
     // templates and this test together, as one decision, rather than reading the red as noise.
+    //
+    // The last two are #1292's, and they ride this loop for exactly the reason the duty
+    // above does: the review body's `## Premortem` section and the resource triple are
+    // question GENERATION, the half of review that red-before-green cannot reach — the
+    // property nobody thought to test is the one no evidence discipline will ever demand.
+    // A `mode: replace` reviewer never reads `reviewer.md`, so a premortem duty living only
+    // there is one the repo that wrote its own reviewer persona never hears.
     for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
         assert!(
             doc.contains("non-blocking"),
@@ -3932,6 +3939,19 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
             doc.contains("findings still open"),
             "{surface} must forbid the silent approval: a pass that hides what it left \
              behind is how the feedback dies at the merge: {doc}"
+        );
+        assert!(
+            doc.contains("## Premortem"),
+            "{surface} must make every review body carry a `## Premortem` section — two ways \
+             the change fails in production that no test in the PR would catch. A question \
+             asked only when a reviewer happens to think of it is the one that was not asked \
+             on the review that needed it: {doc}"
+        );
+        assert!(
+            doc.contains("largest realistic input"),
+            "{surface} must ask the RESOURCE question for unbounded input — largest realistic \
+             input × how often it runs × what it allocates or reads per run. Cost review that \
+             asks only about TIME is how a whole-file read ships behind a green suite: {doc}"
         );
     }
 
