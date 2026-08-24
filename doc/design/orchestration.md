@@ -7474,10 +7474,14 @@ expensive failure.
 
 **The expensive failure is not a stray paste — it is a stray Enter.** A delivery into a live dialog
 does not merge text; the Enter *selects* whatever is highlighted, and no dedup rule can undo a
-selected option. What stops that is `deliver_now`'s **pre-Enter** `wait_for_question_clear`, which
-the override does **not** skip: it runs against the screen masked with this delivery's own paste,
-and on a genuinely live dialog it holds, caps, and returns `AbortedPreEnter` with the Enter
-withheld. The human then finds the brief sitting in the box — untidy, and recoverable.
+selected option. What stops that is `deliver_now`'s **pre-Enter** `wait_for_question_clear`. For every
+delivery that was NOT granted an override it runs unskipped: against the screen masked with this
+delivery's own paste, and on a genuinely live dialog it holds, caps, and returns `AbortedPreEnter`
+with the Enter withheld. The human then finds the brief sitting in the box — untidy, and
+recoverable. **For a delivery that WAS granted one, #903 lets the grant carry to the Enter**
+(`override_enter_admits`), re-proved on fresh re-reads at the override's own weak-idleness
+standard — see `doc/design/question-gate-authorship.md` for why leaving it unoverridden withheld
+no Enter from any dialog and instead stranded a paste on a pane that had none.
 
 That defence is only real because of rev-427 B1's fix. Before it, the pre-Enter reading could not
 see a composer holding our own paste (the mask deletes the row), so it answered `StillRendered` for
@@ -7514,10 +7518,13 @@ absolute is untouched — a human's own typed line is never overridden, at any a
   Layer 3's term has no
   menu-absent conjunct (see the section above for why the strong reading would make it dead code),
   so a CLI that paints a dialog *above* a live composer would satisfy it. What that costs is bounded
-  by the pre-Enter checkpoint, which is not overridden and which `h8` pins in both directions — not
-  by the idleness reading. Stated as a limit rather than left in the safety argument's shadow,
-  because a reader deciding whether to widen the override needs to know which gate is actually
-  holding the line.
+  by the pre-Enter checkpoint — which `h8` pins in both directions, and which #903 lets a GRANTED
+  override carry through on the same weak-idleness standard rather than abort against. So for an
+  overridden delivery the bound is that standard, re-proved on fresh reads, and not a second
+  unconditional gate; the residual that leaves is named in
+  `doc/design/question-gate-authorship.md`. Stated as a limit rather than left in the safety
+  argument's shadow, because a reader deciding whether to widen the override needs to know which
+  gate is actually holding the line.
 - **The idleness reading is inferred from authorship, not observed.** "The composer is on screen
   holding only our own text" is inferred from the paste mask having claimed a row in the tail window.
   A CLI that echoed our text somewhere *other* than its composer — a transcript echo low on the

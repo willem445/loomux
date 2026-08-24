@@ -20027,6 +20027,10 @@ fn deliver_now(
     // admitted the write, the same reason `wait_for_question_clear` returns its
     // witness rather than letting the abort site re-read.
     question_overridden: bool,
+    // #903 B1: which `Delivery` kind admitted this entry, threaded from the
+    // queue front rather than re-derived, so the record's admission decision and
+    // the queue's own record of what this delivery IS cannot drift.
+    delivery_kind: Delivery,
 ) -> DeliverOutcome {
     // ⚠ #561 — READ THIS BEFORE ADDING A STAGE BELOW.
     //
@@ -20461,7 +20465,7 @@ fn deliver_now(
             // same bytes and at the same instant. Separate call rather than a
             // widening of the one above because the two records admit different
             // things for different reasons — see `delivered_prompt_lines`.
-            r.record_delivered_prompt(pty_id, &pasted_text);
+            r.record_delivered_prompt(pty_id, &pasted_text, delivery_kind);
         }
         let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
         while std::time::Instant::now() < echo_deadline {
@@ -22019,9 +22023,14 @@ fn run_queue_drainer(
             // keeps showing an empty input prompt is not a question — it is the
             // detector being wrong about a pane nobody is being asked anything
             // by, and the human has already been badged about it for five
-            // minutes (`QUESTION_HOLD_STALE_AFTER`). Paste — and only paste: the
-            // pre-Enter checkpoint below is not overridden, so a genuinely live
-            // dialog still gets the Enter withheld.
+            // minutes (`QUESTION_HOLD_STALE_AFTER`). Paste — and, since this
+            // grant now CARRIES to the Enter, deliver: the pre-Enter checkpoint
+            // re-proves the pane on fresh reads at this same weak-idleness
+            // standard (`override_enter_admits`) rather than aborting against a
+            // reading the grant exists because loomux has stopped believing. It
+            // was the abort that stranded the paste and wedged the queue behind
+            // it; the residual that carrying leaves is named in
+            // `doc/design/question-gate-authorship.md`.
             //
             // The chip is NOT lowered here: the pane is still held as far as
             // every gate is concerned, and a successful delivery lowers it below
@@ -22201,6 +22210,7 @@ fn run_queue_drainer(
                     reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
                     fresh_kickoff.then(|| text.clone()),
                     question_overridden,
+                    front.delivery_kind,
                 );
                 if matches!(out, DeliverOutcome::Done) {
                     header_pending = false;
@@ -23189,11 +23199,25 @@ fn dialog_header_above(rows: &[&str], norm: &[String], keep: &[bool], from: usiz
     let mut j = from;
     while j > 0 {
         j -= 1;
-        if !keep[j] {
-            continue;
-        }
+        // #903 B2: the header test runs BEFORE the `keep` check, and the order is
+        // the whole finding. Testing `keep` first let a claimed row be stepped
+        // over — so two recorded lines were enough to walk this scan past the
+        // very question row it vetoes on: claim the dialog's question row with
+        // the first, and the second's option row then reads as having no header
+        // above it, masks, and the gate releases an Enter into a live dialog.
+        //
+        // "Is a dialog's question row above this one" is a fact about the
+        // SCREEN, and consulting the mask to answer it let the mask decide its
+        // own bound. A header now vetoes whether or not its row was claimed,
+        // which is a term the record cannot buy at any number of claims.
         if is_dialog_header(&norm[j]) {
             return true;
+        }
+        // Claimed NON-header rows are still stepped over, unchanged: a loomux
+        // notice interleaved above an option block must not end the scan, which
+        // is what this clause was for before it was asked to do more.
+        if !keep[j] {
+            continue;
         }
         if option_block_row(rows[j]) {
             continue;
@@ -23380,7 +23404,14 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 ///   line of its own choosing into its own pane's record via
 ///   `notify_when(note:)` — stays exactly as closed as it is today. What is
 ///   admitted is a kickoff brief or an orchestrator's `send_prompt` body, and no
-///   agent can address one of those to itself.
+///   agent can address one of those to itself — and that is now ENFORCED rather
+///   than observed: `send_prompt` refuses `a.id == caller.agent_id` outright
+///   ("cannot send a prompt to yourself"), and a kickoff's target is an agent
+///   `spawn_agent` has just created, which the caller cannot be. The two routes
+///   that DID let an agent reach its own pane — the post-compact re-grounding
+///   notice and `resume_kickoff_notice`, both of which paste the agent's own
+///   directive ledger — are refused by [`prompt_record_admits_kind`] and by
+///   [`delivered_prompt_lines`]'s first-line rule respectively.
 /// - **Every record claim now owes `dialog_header_above`**, not only the
 ///   pointer-stripped ones. That is a strictly smaller set of claims than the
 ///   pre-#903 rule made, so the widening cannot reach a row the old rule would
@@ -23550,6 +23581,16 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
         // party controls.
         if claimed.is_some() && dialog_header_above(&rows, &norm, &keep, i) {
             claimed = None;
+            // N3: put the row back the way the pointer-stripped attempt found
+            // it. That attempt rewrites `norm[i]` in place and only restores it
+            // on ITS own miss, so a claim it made and this veto then nulled left
+            // the stripped form behind for every later reader of `norm` — the
+            // upward scans above included. It was inert only by coincidence
+            // before B2; now that those scans test `is_dialog_header(&norm[j])`
+            // on rows regardless of `keep`, a row left stripped of its leading
+            // glyph is a row this function reads differently than the screen
+            // shows it.
+            norm[i] = wrap_normalize(deframe(rows[i]));
         }
         match claimed {
             Some(end) => {
@@ -23647,7 +23688,9 @@ pub fn loomux_authored_lines(text: &str) -> Vec<String> {
 /// What is left is text that reached a pane because loomux was asked to deliver
 /// a PROMPT there — a kickoff brief, or an orchestrator's `send_prompt` body
 /// (and a coalesced flush's constituent payloads, which are themselves prompt
-/// bodies). No agent can address one of those to itself: `send_prompt` is the
+/// bodies). No agent can address one of those to itself — `send_prompt` refuses
+/// a caller that names its own id, and a kickoff goes to an agent that did not
+/// exist when the caller asked for it. `send_prompt` is the
 /// orchestrator's tool, so the residual this admits is an orchestrator writing
 /// into somebody else's pane — a party that already holds spawn and prompt
 /// powers over that pane. The design note argues that asymmetry at length; it is
@@ -23657,12 +23700,72 @@ pub fn loomux_authored_lines(text: &str) -> Vec<String> {
 /// see that constant for why a prefix would be a claim whose meaning depends on
 /// the pane's width.
 pub fn delivered_prompt_lines(text: &str) -> Vec<String> {
+    // #903 B1 — TERM 1, and the finding that forced it. Filtering marker-led
+    // lines ONE AT A TIME is not the same rule as excluding notices: a loomux
+    // notice is one marker-led first line followed by a body that is not, so
+    // every continuation row of a multi-line notice was entering this record.
+    //
+    // That is a one-party hole, not a cosmetic one. `note_directive(text,
+    // replace: true)` writes the ledger RAW — no sanitize, no cap, no `[ts]`
+    // prefix, and it is self-scoped by construction — and both
+    // `compact_reinjection_notice` (via the self-callable `request_compact`) and
+    // `resume_kickoff_notice` paste that ledger VERBATIM into the SAME agent's
+    // pane, below their marker-led first line. So one agent, with two tool calls
+    // it makes itself, could put a line of its own choosing into its own
+    // session's record — exactly the capability
+    // [`OrchRegistry::mark_notice_maskable`] is default-closed to withhold.
+    //
+    // The rule is therefore about the authorship of the DELIVERY, not of each
+    // line: if loomux wrote the first non-empty line as a notice, loomux is
+    // relaying whatever follows rather than originating it. That generalises to
+    // every future embed, because a loomux notice is marker-led by producer
+    // convention (#624/#632 enforce it at the producer), where a content
+    // blocklist would need editing for each new one.
+    //
+    // Unforgeable in the direction that matters: this text is what loomux
+    // pasted, and an agent controls only the block BELOW that first line. An
+    // orchestrator prefixing its own `send_prompt` with the marker only
+    // downgrades its own masking, which is the safe direction.
+    if text.lines().find(|l| !l.trim().is_empty()).is_some_and(leads_with_notice_marker) {
+        return Vec::new();
+    }
     text.lines()
         .filter(|l| !leads_with_notice_marker(l))
         .map(|l| deframe(l).trim())
         .filter(|l| !l.is_empty() && l.chars().count() <= DELIVERED_PROMPT_CHARS)
         .map(str::to_string)
         .collect()
+}
+
+/// #903 B1 — TERM 2: may a delivery of this KIND contribute to the session
+/// prompt record at all?
+///
+/// Spelled as an exhaustive match with **no wildcard arm**, for the reason
+/// [`question_shown`] spells its `GridEvidence` reading the same way: a fifth
+/// [`Delivery`] variant added later must decide which side it is on at the
+/// compiler's insistence, instead of inheriting admission from a `_ => true`
+/// nobody re-reads.
+///
+/// - `FreshKickoff` / `ResumeKickoff` — the brief an orchestrator wrote for a
+///   spawn. `ResumeKickoff` in particular is the incident's OWN payload: the
+///   `[orch] Round 3 (cap) re-record…` that wedged `rev-1277` reached `rev-1262`
+///   on this kind, so refusing it would close the door by regressing #903.
+/// - `MidSession` — a `send_prompt` body, orchestrator-authored. The accepted
+///   two-party residual, argued in `doc/design/question-gate-authorship.md`.
+/// - `Regrounding` — REFUSED. Its entire payload is the post-compact notice
+///   whose body is the agent's own directive ledger.
+///
+/// This is the SECOND of two independent terms, and neither is redundant:
+/// `ResumeKickoff` carries both an orchestrator brief (admitted here) and, at
+/// the promoted-orchestrator call site, `resume_kickoff_notice`'s ledger embed —
+/// which only TERM 1 refuses. Kind alone would let that through; content alone
+/// would let a future non-marker-led embed through.
+#[doc(hidden)] // pub for integration tests
+pub fn prompt_record_admits_kind(kind: Delivery) -> bool {
+    match kind {
+        Delivery::FreshKickoff | Delivery::ResumeKickoff | Delivery::MidSession => true,
+        Delivery::Regrounding => false,
+    }
 }
 
 /// One pane's delivery record, or empty when there is no registry to ask.
@@ -24669,10 +24772,15 @@ pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> boo
 /// #903: how long a pane's delivery may be held by the QUESTION gate alone
 /// before loomux stops believing its own detector and **pastes** anyway.
 ///
-/// Pastes, not delivers, and the distinction is the override's whole safety
-/// argument rather than a nicety: the pre-Enter checkpoint is not overridden, so
-/// on a genuinely live dialog the Enter is still withheld and the brief is left
-/// in the box for a human. See [`question_override_admits`].
+/// Pasted, and — since #903 B2 — delivered: a granted override carries to the
+/// Enter rather than stopping at the paste. The earlier version of this doc said
+/// the pre-Enter checkpoint is not overridden and rested the safety argument on
+/// that; it is no longer true and the argument now rests elsewhere. What
+/// withholds the Enter from a live dialog is [`override_enter_admits`]: fresh
+/// re-reads, every one of which must show this pane's own composer holding this
+/// delivery's paste. What that does NOT bound is written up in
+/// `doc/design/question-gate-authorship.md` rather than left implicit here. See
+/// [`question_override_admits`] for the grant itself.
 ///
 /// **Sized between the two clocks that already exist**, which is the whole of
 /// the choice: longer than [`QUESTION_HOLD_STALE_AFTER`] (10 min), so the human
@@ -45911,13 +46019,17 @@ impl OrchRegistry {
     pub fn delivered_notice_lines(&self, pty_id: u32) -> Vec<String> {
         self.delivered_notices.lock_safe().get(&pty_id).map(|d| d.claimable()).unwrap_or_default()
     }
-/// #903: the CLI session id of whichever agent currently holds `pty_id`.
+
+    /// #903: the CLI session id of whichever agent currently holds `pty_id`.
     ///
-    /// A scan rather than a reverse index: the fleet is a handful of agents, the
-    /// callers are a 2s drainer poll and a 250ms checkpoint, and an index would
-    /// be a second thing to keep true across every rebind. Takes and releases
-    /// the `agents` lock alone — see [`OrchRegistry::delivered_prompts`] for the
-    /// order that matters.
+    /// Through `by_pty`, the reverse index this registry already maintains
+    /// beside every `pty_id` write — not a fresh scan of `agents`, because a
+    /// second way of answering "who holds this pane" is a second thing that can
+    /// drift from the first.
+    ///
+    /// **Lock order**: `by_pty` is taken and RELEASED before `agents`, and
+    /// neither is held while reaching for [`OrchRegistry::delivered_prompts`] —
+    /// see that field for the order that matters.
     fn session_for_pty(&self, pty_id: u32) -> Option<String> {
         // Through the EXISTING reverse index, never a fresh scan of `agents`:
         // `by_pty` is already maintained beside every `pty_id` write, and a
@@ -45944,7 +46056,12 @@ impl OrchRegistry {
     /// — records nothing. That is the same "nothing known" an untouched pane
     /// has, and it costs a hold, never a release.
     #[doc(hidden)] // pub for integration tests
-    pub fn record_delivered_prompt(&self, pty_id: u32, text: &str) {
+    pub fn record_delivered_prompt(&self, pty_id: u32, text: &str, kind: Delivery) {
+        // #903 B1: both terms, and the kind is checked FIRST so a refused kind
+        // never pays for the line scan.
+        if !prompt_record_admits_kind(kind) {
+            return;
+        }
         if delivered_prompt_lines(text).is_empty() {
             return;
         }
@@ -47175,7 +47292,6 @@ impl OrchRegistry {
             a.session_id = Some(session_id.to_string());
         }
     }
-
 
     /// Path of `group`'s durable queue snapshot (#468). Sits beside
     /// `state.json`/`tasks.json`/`audit.jsonl` in the group dir, because it

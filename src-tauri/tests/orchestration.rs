@@ -51235,6 +51235,169 @@ fn j10_a_collapsed_paste_under_a_dialog_header_is_not_claimed() {
     );
 }
 
+#[test]
+fn j11_a_loomux_notice_contributes_nothing_to_the_prompt_record() {
+    // B1 TERM 1, and the hole it closes. Filtering marker-led lines one at a
+    // time is not the same rule as excluding notices: a notice is one marker-led
+    // first line followed by a body that is not, so every continuation row was
+    // entering the prompt record — and the body of the two re-grounding notices
+    // is the agent's OWN directive ledger, written raw by
+    // `note_directive(replace: true)` and pasted back into that same agent's
+    // pane on a self-callable `request_compact`. One party, on demand.
+    let ledger_notice = "[orrerix] Context was compacted. Re-grounding you in your role \
+                         instructions before you continue.\n\
+                         Your directive ledger:\n\
+                         ? Do you want to proceed with this command\n\
+                         1. Yes, and do not ask again for git commit commands in this project";
+
+    // Precondition — this text really is multi-line and really does carry rows a
+    // per-line filter would have admitted, or the assertion below is vacuous.
+    assert!(
+        ledger_notice.lines().skip(1).any(|l| !l.trim().is_empty()),
+        "precondition: the notice has a body below its marker-led first line"
+    );
+    let body_only = ledger_notice.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        delivered_prompt_lines(&body_only).len(),
+        3,
+        "precondition: those body lines are EXACTLY what the per-line filter admitted, so the \
+         assertion below is about the notice's first line excluding them"
+    );
+
+    assert!(
+        delivered_prompt_lines(ledger_notice).is_empty(),
+        "a delivery whose FIRST non-empty line is a loomux notice contributes NOTHING — \
+         not its marker row, and not one line of the body it is relaying"
+    );
+
+    // The same body, delivered as an ordinary prompt, IS admitted — so the
+    // exclusion is keyed on the delivery being a notice, not on the body's
+    // content, and this test cannot pass by the record being empty for everyone.
+    let as_a_prompt = "[orch] please re-read the findings\nthen report when CI is green";
+    assert_eq!(
+        delivered_prompt_lines(as_a_prompt).len(),
+        2,
+        "control: an orchestrator's own multi-line prompt still enters the record whole"
+    );
+}
+
+#[test]
+fn j12_the_delivery_kind_gate_is_default_closed() {
+    // B1 TERM 2. Independent of term 1, and neither is redundant: `ResumeKickoff`
+    // carries BOTH an orchestrator brief (admitted here) and, at the
+    // promoted-orchestrator call site, `resume_kickoff_notice`'s ledger embed —
+    // which only term 1 refuses.
+    assert!(
+        !prompt_record_admits_kind(Delivery::Regrounding),
+        "the post-compact re-grounding delivery exists to paste the agent's own ledger"
+    );
+    for kind in [Delivery::FreshKickoff, Delivery::ResumeKickoff, Delivery::MidSession] {
+        assert!(
+            prompt_record_admits_kind(kind),
+            "{kind:?} carries a brief the orchestrator wrote, and ResumeKickoff in particular \
+             is the incident's OWN payload — refusing it would close the door by regressing #903"
+        );
+    }
+
+    // The set, not the list: exactly one variant is refused. A fifth variant
+    // added later fails the `match` at compile time AND this count, so it cannot
+    // acquire admission by being forgotten in either place.
+    let all = [
+        Delivery::FreshKickoff,
+        Delivery::ResumeKickoff,
+        Delivery::MidSession,
+        Delivery::Regrounding,
+    ];
+    assert_eq!(
+        all.iter().filter(|k| !prompt_record_admits_kind(**k)).count(),
+        1,
+        "exactly one delivery kind is refused; if that changed, the design note's argument did too"
+    );
+}
+
+#[test]
+fn j13_excluding_notices_does_not_uncover_their_own_wrapped_rows() {
+    // The mirror risk of term 1, closed here rather than asserted in prose: if
+    // the prompt record had been the only thing masking a notice's continuation
+    // rows, excluding notices from it would trade a leak for a false-positive
+    // gap on loomux's own wrapped text.
+    //
+    // It was not. A multi-row notice's wrap is masked by the NOTICE record
+    // (#576/#661, `mark_notice_maskable` — opt-in per producer), and that path is
+    // untouched by term 1.
+    let notice = "[orrerix] w-7 reports blocked: the CLI asked do you want to proceed with \
+                  this command before it would run the suite";
+    // As the CLI wraps it: marker-led first row, continuation carrying the tokens.
+    let wrapped = "[orrerix] w-7 reports blocked: the CLI asked do you want to proceed\n\
+                   with this command before it would run the suite";
+
+    // Precondition — the continuation alone is what the detector fires on, so
+    // masking only the first row would leave the pane latched.
+    assert!(
+        prompt_wait_match(&mask_loomux_notices(wrapped)).is_some(),
+        "precondition: the marker rule alone leaves this notice's continuation matching"
+    );
+
+    // With the NOTICE record — the mechanism that actually covers this — the run
+    // masks whole and the gate reads clear.
+    let record = loomux_authored_lines(notice);
+    assert_eq!(record.len(), 1, "precondition: the notice is one recordable line");
+    assert!(
+        prompt_wait_match(&mask_loomux_notices_with_record(wrapped, &record)).is_none(),
+        "the notice record masks the whole wrap run — this is #661's coverage, and term 1 \
+         does not touch it"
+    );
+
+    // And term 1 confirms the prompt record was never the mechanism: this notice
+    // cannot enter it at all.
+    assert!(
+        delivered_prompt_lines(wrapped).is_empty(),
+        "so nothing is traded away — the prompt record never held these rows to begin with"
+    );
+}
+
+#[test]
+fn j14_a_claimed_question_row_still_vetoes_the_row_below_it() {
+    // B2. The upward scan used to consult `keep` BEFORE testing for a header, so
+    // a row that had already been claimed was stepped over — and two recorded
+    // lines were therefore enough to walk the scan past the very question row it
+    // vetoes on. `j3` could not see it: its record holds ONE line, so nothing
+    // above the option row was ever claimed.
+    let header = "? Do you want to proceed with this command";
+    let option = "1. Yes, and do not ask again for git commit commands in this project";
+    let screen = format!("{header}\n❯ {option}\n  2. No\n─────────\n❯");
+
+    // ONE recorded line — `j3`'s shape. The header is not claimed, so it vetoes.
+    let single = vec![option.to_string()];
+    assert!(
+        mask_loomux_notices_with_record(&screen, &single).contains(option),
+        "precondition (j3's case): with the header unclaimed, the option survives"
+    );
+
+    // TWO recorded lines, chained: the first claims the header row itself.
+    let chained = vec![header.to_string(), option.to_string()];
+    let masked = mask_loomux_notices_with_record(&screen, &chained);
+    assert!(
+        masked.contains(option),
+        "a claimed question row still vetoes the claim below it — the mask must not be \
+         allowed to decide its own bound: {masked:?}"
+    );
+    let m = prompt_wait_match(&masked).expect("and the dialog is still a question");
+    assert!(
+        question_shown(Some(&m), Some(Composed::plain(&masked))),
+        "…so the Enter is still withheld (#420)"
+    );
+
+    // The control that keeps this honest: the chain's FIRST line really is
+    // claimable, so the assertion above is the veto working and not the header
+    // simply failing to match.
+    let header_only = format!("{header}\nsome ordinary transcript row");
+    assert!(
+        !mask_loomux_notices_with_record(&header_only, &chained).contains(header),
+        "control: with nothing below it to protect, the recorded header row IS claimed"
+    );
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The human-question registry (#946 slice Q1)

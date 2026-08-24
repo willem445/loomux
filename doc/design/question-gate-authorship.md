@@ -79,8 +79,26 @@ dialog rows are masked away, the gate reads clear, and loomux presses Enter into
 question. **One party, no coincidences, deterministic.**
 
 `delivered_prompt_lines` closes that route by construction: it drops every marker-led line,
-so notice text — the only text an agent can address to itself — never enters the prompt
-record. `j6` pins it, with a positive control so the assertion cannot pass by the record
+so notice text never enters the prompt record.
+
+**What makes that sufficient, checkably.** The claim the record rests on is that no agent can
+address an admitted delivery to its own pane, and it is enforced in three independent places
+rather than observed:
+
+| admitted delivery | why an agent cannot aim it at itself |
+| --- | --- |
+| `send_prompt` body (`MidSession`) | the dispatch refuses `a.id == caller.agent_id` — *"cannot send a prompt to yourself"* |
+| kickoff brief (`FreshKickoff`/`ResumeKickoff`) | its target is an agent `spawn_agent` has just created; the caller cannot be it |
+| everything else | refused by `prompt_record_admits_kind`, which has no wildcard arm |
+
+The two routes that really did reach an agent's own pane — the post-compact re-grounding notice
+and `resume_kickoff_notice`, both of which paste that agent's own directive ledger verbatim, and
+both reachable on demand through the self-callable `request_compact` — are refused by the
+delivery-kind term and by the first-line term respectively. `note_directive(text, replace: true)`
+writes the ledger **raw**: no sanitize, no cap, not even the `[ts]` prefix its append branch adds.
+That is what made this a one-party capability rather than a two-party coincidence, and it is the
+reason the rule is about the authorship of the DELIVERY rather than of each line — a notice is one
+marker-led line above a body that is not, so a per-line filter admitted every continuation row. `j6` pins it, with a positive control so the assertion cannot pass by the record
 simply always being empty.
 
 ## The attack shape that is bounded, not closed
@@ -105,12 +123,31 @@ loomux's own and the gate can read clear.
   asking, the masked-away option cannot be one a human is being asked about. `j3` is the
   pin, with a control proving the same line IS claimed without the header — so the refusal
   is the guard and not an accident.
+
+  **A chain of claims can no longer walk that scan past the header.** The scan used to test
+  `keep` before testing for a header, so a row already claimed was stepped over — and two
+  recorded lines were enough to defeat the bound: claim the dialog's question row with the
+  first, and the second's option row then reads as having nothing above it. The header test
+  now runs first, so a header vetoes whether or not its own row was claimed, which is a term
+  the record cannot buy at any number of claims. `j14` pins it with the two-line chain, and
+  `j3`'s single-line record is exactly why that gap survived the first round.
 - **The trust asymmetry.** `send_prompt` is the orchestrator's tool. The party this residual
   is available to already holds spawn and prompt powers over the pane in question: it can
   start the agent, replace it, and dictate what it is told to do. A capability to influence
   one masking decision in that pane is not a new tier of authority for it — which is
   precisely what the `notify_when` route WOULD have been, since it is available to any
-  agent about itself. That asymmetry, not a probability argument, is why one was taken and
+  agent about itself.
+
+  **One more admitted route, and it is not one-party either — stated because it is the kind of
+  thing a residual section is for.** `review_verdict`'s multi-line `summary` reaches the
+  ORCHESTRATOR's pane through the relay, and its continuation lines are `Lines::Keep`, so a
+  reviewer's own words can enter the orchestrator's session record. It is two-party in the same
+  sense as the row above: the reviewer chooses the text, but it lands in somebody else's pane,
+  and the harm needs that pane's CLI to paint a dialog whose rows the reviewer also chose. What
+  it is NOT is symmetrical with `notify_when` — a reviewer cannot aim it at its own pane, which
+  is the property the whole record now rests on.
+
+  That asymmetry, not a probability argument, is why one was taken and
   the other refused.
 
 **What it does NOT bound, honestly.** Two gaps, both real:
