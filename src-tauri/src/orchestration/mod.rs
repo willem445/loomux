@@ -12557,6 +12557,11 @@ pub struct OrchRegistry {
     /// without a Tauri app handle can reach. The uncovered branch is one line
     /// long and takes the SAME payload value as the covered one, built above
     /// the branch precisely so the two cannot disagree.
+    ///
+    /// Bounded even if an `AppHandle`-less build ever ran for real:
+    /// `associate_session` binds an id only while the roster record has none,
+    /// so this appends at most one entry per agent ever spawned, never one per
+    /// watcher poll.
     test_session_learned: Mutex<Vec<serde_json::Value>>,
     port: AtomicU16,
     /// Agent-id counter: `w-3`, `rev-8`, `solo-2`, `orch-1` all mint their
@@ -29886,7 +29891,13 @@ impl OrchRegistry {
             "agent_id": agent_id,
             "session_id": session_id,
         });
-        match self.app.lock_safe().clone() {
+        // Bound BEFORE the match: a match scrutinee's temporaries live for the
+        // whole match, so branching on `self.app.lock_safe().clone()` directly
+        // would hold that guard across both `emit` and a second registry lock —
+        // the lock-order hazard `associate_session` above is explicitly shaped to
+        // avoid. `spawn_agent_ex` binds first for the same reason.
+        let app = self.app.lock_safe().clone();
+        match app {
             // Best-effort: a webview that has gone away must not fail the
             // binding, which is already durable in `agents.json` by now.
             Some(app) => { let _ = app.emit("orch-session-learned", &payload); }
@@ -49776,6 +49787,7 @@ impl OrchRegistry {
     pub fn spawn_request_for_test(&self, agent_id: &str) -> Option<SpawnRequest> {
         self.test_spawn_requests.lock_safe().get(agent_id).cloned()
     }
+
     /// Every `orch-session-learned` payload this registry produced with no
     /// frontend to emit to, oldest first. Empty in production; see
     /// [`Self::test_session_learned`] for what it does and does not pin.
