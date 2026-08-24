@@ -820,7 +820,12 @@ pin advertised to stop it (rev-11 F1).
   than asked in the abstract. **The brief**: a named nine-part shape it hands over, a
   read-back that must get an explicit yes before anything is relayed, and — decision D5,
   stated where it can be acted on — that the yes licenses *filing the issue* and nothing
-  more, because the start-work label is the human's own hand on GitHub. Around them:
+  more. D5 is split along its own seam rather than stated flat: the manager's authority is
+  UNCONDITIONAL (it never starts work, never applies a label, never asks for one), while
+  what the start-work label MEANS is mode-dependent — the sole start-work consent under the
+  opt-in default and plain autonomous mode, a priority hint under full autonomy, where
+  invariant 8 inverts the start default. Flat in every mode: full autonomy widens what may
+  be STARTED, never what may be SHIPPED. Around them:
   relaying quotes the human verbatim and keeps the manager's own reading separate; a relay
   carries the human's words and never their authority; questions are presented, never
   answered; `ask_human` / `request_attention` / `group_usage` are named with what each is

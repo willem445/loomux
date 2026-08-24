@@ -580,9 +580,11 @@ pins the template and the arm against the same anchors so the two cannot drift.
 
 `templates/orchestrator.md` is **not** touched, and that is the same discipline
 `{{LIAISON_NOTE}}` established: a group that declares no manager must not read
-one word about one, which is what keeps all five goldened role templates
-byte-identical through this slice. `manager_prose_stays_silent_unless_a_roster_declares_one`
-asserts it directly rather than leaving it to the golden diff.
+one word about one, which is what keeps the OTHER FOUR goldened role
+templates byte-identical through this slice — `manager.md` is the fifth golden
+and it IS re-blessed here, which the `pre222/README.md` log entry records.
+`manager_prose_stays_silent_unless_a_roster_declares_one` asserts the silence
+directly rather than leaving it to the golden diff.
 
 ### What the manager is told, and why each rule is load-bearing
 
@@ -616,11 +618,22 @@ asserts it directly rather than leaving it to the golden diff.
   one. And a relay carries the human's **words**, never their **authority** —
   `{{MANAGER_NOTE}}` states the same rule to the side that would be the one able
   to act on a grant it never got.
-- **Decision D5, on both sides.** The in-conversation yes licenses *filing the
-  issue* and nothing more. The start-work label is the human's own hand on
-  GitHub: the manager never moves it, never asks the orchestrator to, and the
-  orchestrator is told that a relayed yes does not reach it. Stated twice on
-  purpose — one side could otherwise honour it while the other did the thing.
+- **Decision D5, on both sides — and split along the right seam.** The
+  in-conversation yes licenses *filing the issue* and nothing more. What is
+  UNCONDITIONAL is the manager's own authority: it never starts work, never
+  applies a label, never asks the orchestrator to treat a relayed yes as one.
+  What is MODE-DEPENDENT is the funnel — under the opt-in default and plain
+  autonomous mode the start-work label is the sole start-work consent, while
+  `orchestrator.md`'s invariant 8 inverts that default under **full autonomy**
+  and demotes the labels to priority hints. A manager group can be in full
+  autonomy (`full_autonomy_groups` is independent of `advanced_orchestrator`),
+  so prose stating the funnel unconditionally is false there — and it is false
+  in the direction that matters, telling the human their label is a gate the
+  orchestrator is not in fact waiting on. Both prose surfaces state the
+  manager's half flatly and the funnel conditionally; what stays flat in every
+  mode is that full autonomy widens what may be STARTED and never what may be
+  SHIPPED. Stated on both sides on purpose — one could otherwise honour it
+  while the other did the thing.
 
 ### What the orchestrator is told
 
@@ -676,7 +689,11 @@ Stated so no surface here reads as advertising a mechanism that does not exist
   shipping a channel before the templates named it, and stays the floor for a
   manager whose instructions file it never read.
 - **No unread chip.** M5.
-- **No `role_hint: liaison` deprecation and no user-facing docs page.** M6.
+- **No `role_hint: liaison` deprecation warning, and no page for the workflow
+  AUTHOR.** M6. The user-facing page for the human who *talks* to the manager
+  (`docs/features/manager.md`) ships in M4; what M6 still owes is the
+  `author-loomux-workflow` skill row, the worked `kind: manager` example and
+  the supersession note.
 
 ## What M4 does not ship
 

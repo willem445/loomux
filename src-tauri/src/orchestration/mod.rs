@@ -3881,6 +3881,19 @@ channel; keep the human oriented with short summaries."
         // template is a rule such a manager was never told. `manager_prose.rs`
         // pins both surfaces against the same anchors for exactly that reason.
         //
+        // What it deliberately does NOT carry, so the gap is a decision rather
+        // than an oversight: the elicitation axes in full (it compresses them and
+        // drops "rationale worth keeping"), and the brief's nine-part SHAPE. That
+        // second one is the one with a cost — `{{MANAGER_NOTE}}` tells the
+        // orchestrator to file "the brief" verbatim, so a replace-mode manager
+        // would relay an unstructured ask against a note promising a structured
+        // one. Accepted for now because D1 makes that pane unreachable through the
+        // parser; if D1 is ever relaxed, the shape comes here too. The structural
+        // fix for the whole duplication is the one this function's own doc already
+        // names — splitting each template into `mechanics + body` so both surfaces
+        // interpolate ONE source — and until then the duplication is deliberate and
+        // bounded by the lockstep pins.
+        //
         // Reachable only through a hand-edited `group.json` today —
         // `persona_allowed` denies a manager a persona, so the parser can never
         // produce a replace-mode manager — but written as a real contract
@@ -3916,9 +3929,14 @@ grounded in what is actually there.\n\
 - You relay; you do not decide. A direction the human gives you goes to the orchestrator \
 as THEIR direction, quoted verbatim and kept plainly apart from your own summary of it — \
 and it carries the human's WORDS, never the human's AUTHORITY. Their yes to a brief \
-licenses filing the issue and nothing more: the start-work label is the human's own hand \
-on GitHub, which you never move and never ask the orchestrator to move, and the human's \
-own sign-off there remains the only thing that starts or merges work."
+licenses filing the issue and nothing more. Your own side of that is unconditional: you \
+never start work, and the start-work label is the human's own hand on GitHub, which you \
+never apply and never ask the orchestrator to apply. What the label MEANS is not — under \
+the opt-in default and plain autonomous mode it is the only thing that starts work, while \
+full autonomy inverts that default and makes the labels priority hints — so tell the human \
+which mode this group is in rather than promising them the default. In every mode, full \
+autonomy widens what may be STARTED and never what may be SHIPPED: merge, release and \
+review gates do not loosen, and nothing you relay opens one."
             .to_string(),
         // A solo pane never gets a kickoff/persona — it's an arbitrary
         // human-launched CLI, not a orrerix delegate. Never reached.
@@ -38675,7 +38693,7 @@ impl OrchRegistry {
         // liaison note above, for exactly the same reason — the WHOLE of the
         // orchestrator-side behaviour change. `orchestrator.md` is not touched: a
         // group with no manager must not read one word about one, which is what
-        // `manager_prose_stays_silent_unless_a_block_declares_one` enforces and what
+        // `manager_prose_stays_silent_unless_a_roster_declares_one` enforces and what
         // keeps the four goldened role templates byte-identical.
         //
         // Every claim here is scoped to what M1 and M2 SHIPPED, deliberately (the
