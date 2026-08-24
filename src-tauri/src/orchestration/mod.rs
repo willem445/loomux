@@ -23532,7 +23532,7 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
         // bound is stated in `doc/design/question-gate-authorship.md`: a dialog
         // with no question row of its own, and a header whose text the same
         // party controls.
-        if claimed.is_some() && dialog_header_above(&rows, &norm, &keep, i) {
+        if claimed.is_some() && !dialog_header_above(&rows, &norm, &keep, i) {
             claimed = None;
         }
         match claimed {
