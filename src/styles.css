@@ -276,14 +276,12 @@ html, body {
   flex: none;
 }
 #brand {
-  font-weight: 600; letter-spacing: 3px; font-size: 13.5px;
   color: var(--ink);
 }
-.brand-mark { color: var(--accent); margin-right: 4px; }
 .brand-version {
   color: var(--ink-dim); font-weight: 500;
   letter-spacing: 0; font-size: 10.5px;
-  margin-left: 6px; vertical-align: middle;
+  vertical-align: middle;
 }
 #actions { display: flex; gap: 8px; }
 .bar-btn {

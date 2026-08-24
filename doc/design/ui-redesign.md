@@ -654,7 +654,7 @@ cards get `--space-7` inside.
 
 ```
 ┌──────┬────────────────────────────────────────────────────────┐
-│      │ ▤ loomux                          ⟲ sessions   ◫   ⬓   │
+│      │ v1.2.0                            ⟲ sessions   ◫   ⬓   │
 │ rail ├────────────────────────────────────────────────────────┤
 │      │ tabs ················································· │
 │ (see │ ┃ orchestrator        ⋯ │ ┃ w-386  ui/879-tokens    ⋯ │
@@ -698,8 +698,9 @@ budget (it *is* the state colour), no space, and no geometry.
 
 **If the rail ships (X10), the rail carries the aggregate view** — one thread per agent row,
 in the same colours, so the rail and the grid read as the same warp at two scales. Until
-then, a short strip of threads beside the brand mark in the top bar does that job. The strip
-is a fallback, not a second signature; if the rail lands, the strip goes.
+then, a short strip of threads beside the version badge in the top bar's left slot (#1351)
+does that job. The strip is a fallback, not a second signature; if the rail lands, the strip
+goes.
 
 Three rules keep it safe and one keeps it honest:
 
