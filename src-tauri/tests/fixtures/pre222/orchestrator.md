@@ -812,7 +812,7 @@ When a worker reports a PR:
    *for*, and a PR that merges with them dropped is procedurally green and materially worse. So
    an approval opens one more step, not the merge: decide each open finding's disposition, and
    say what you decided.
-   - **A review with no `## Premortem` section is an incomplete review, not an approval.** Send
+   - **A review that skipped its premortem is an incomplete review, not an approval.** Send
      the reviewer back for the section rather than dispositioning what it did say. That section
      is where the ways the change fails in production that no test in the PR would catch get
      named, and its absence is exactly the silence a review exists to break: a green suite is
