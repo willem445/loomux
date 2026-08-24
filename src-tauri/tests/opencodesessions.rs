@@ -640,7 +640,7 @@ fn an_opencode_resume_reads_its_own_store_and_not_claudes() {
 /// than an opencode workaround).
 #[test]
 fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_the_group_store() {
-    let (reg, _d) = test_registry();
+    let (reg, dir) = test_registry();
 
     // A claude session id resolves against `~/.claude/projects`; point that at
     // an empty directory for this thread so the claude row below is decided by
@@ -670,7 +670,14 @@ fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_th
     let claude = reg.create_group("C:/tmp/claude-repo", rails("claude")).unwrap();
     let o4 = reg.spawn_agent(&claude.id, Role::Orchestrator, "orch", "", false, None).unwrap();
 
-    let rows = reg.recorded_orchestrations();
+    // Read the list back through a SECOND registry over the same root: that is
+    // the state #1563 reports (orrerix restarted, no agents in memory), and it is
+    // the only state in which any of these rows is resumable at all, since a live
+    // group's orchestrator resume is refused outright. The first registry's own
+    // view is asserted at the end, where every group IS live.
+    let restarted = OrchRegistry::new(dir.path().to_path_buf());
+    let rows = restarted.recorded_orchestrations();
+    let live_now = reg.recorded_orchestrations();
     loomux_lib::sessions::set_claude_projects_root_for_test(None);
 
     let by = |g: &loomux_lib::orchestration::GroupId| {
@@ -687,7 +694,7 @@ fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_th
          sidebar's global-store scan cannot see, and the whole reason this list exists (#1563)"
     );
     assert_eq!(r1.repo.as_deref(), Some("C:/tmp/opencode-found"));
-    assert!(!r1.group_live, "no agent is bound to a pty in this test, so nothing is live");
+    assert!(!r1.group_live, "after a restart no agent is in memory, so the group is dormant");
     assert!(r1.last_seen_ms > 0, "the ordering key comes off the roster, never fabricated");
 
     let r2 = by(&missing.id);
@@ -710,6 +717,16 @@ fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_th
         !r4.resumable,
         "an empty claude projects root holds no transcript for this id, so it is honestly \
          unresumable — the router asked claude's store, not opencode's"
+    );
+
+    // Same records, read while the agents ARE registered: every group reports
+    // live. `orchlist.ts` suppresses the button on exactly this bit, because
+    // `resume_recorded_session` refuses a live group. Without this half the field
+    // is constant across every fixture above, and nothing pins that it moves.
+    assert!(
+        live_now.iter().all(|r| r.group_live),
+        "a group with a registered, not-dead agent is live: {:?}",
+        live_now.iter().map(|r| (r.group_id.as_str(), r.group_live)).collect::<Vec<_>>()
     );
 }
 
