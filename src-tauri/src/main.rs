@@ -20,7 +20,7 @@
 /// (#1218). Two declarations in one artifact is a hard compile error
 /// ("the `#[global_allocator]` in this crate conflicts with global allocator
 /// in: loomux_lib"), so the lib placement broke that test outright. Here it
-/// covers exactly what it should: the shipped `loomux.exe`, and the E2E build
+/// covers exactly what it should: the shipped `orrerix.exe`, and the E2E build
 /// made from this same entry point. A test that needs a different allocator
 /// keeps the right to say so.
 ///

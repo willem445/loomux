@@ -1935,32 +1935,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "loomux"
-version = "1.2.0-beta3"
-dependencies = [
- "base64 0.22.1",
- "cpal",
- "crc",
- "dirs",
- "loomux-engine",
- "portable-pty",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_norway",
- "sha1",
- "sha2",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tempfile",
- "tiny_http",
- "windows 0.57.0",
- "winreg 0.55.0",
-]
-
-[[package]]
 name = "loomux-engine"
 version = "0.0.0"
 dependencies = [
@@ -2440,6 +2414,32 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "orrerix"
+version = "1.2.0-beta3"
+dependencies = [
+ "base64 0.22.1",
+ "cpal",
+ "crc",
+ "dirs",
+ "loomux-engine",
+ "portable-pty",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha1",
+ "sha2",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tempfile",
+ "tiny_http",
+ "windows 0.57.0",
+ "winreg 0.55.0",
+]
 
 [[package]]
 name = "pango"

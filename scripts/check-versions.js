@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Mechanical backstop for release bumps (#274): asserts every file that
-// carries the loomux version string agrees. v0.8.0 shipped with a stale
+// carries the orrerix version string agrees. v0.8.0 shipped with a stale
 // 0.7.1 package-lock.json (#224) because that step was checklist-only —
 // this makes drift a CI failure instead of relying on discipline.
 //
@@ -28,7 +28,7 @@ function readText(relPath) {
 // `version = "..."` field.
 //
 // The repo became a Cargo workspace in #888 slice A1, so there are now other
-// package manifests in the tree. Only src-tauri's carries the loomux release
+// package manifests in the tree. Only src-tauri's carries the orrerix release
 // version: every `crates/loomux-*` member is `publish = false` and pinned at
 // 0.0.0 on purpose (see each Cargo.toml), so none of them is in this check.
 // Written as the rule rather than as a list of the members that exist today —
@@ -51,26 +51,32 @@ function cargoTomlVersion(relPath) {
   throw new Error(`could not find [package] version in ${relPath}`);
 }
 
-// Finds the `version = "X.Y.Z"` line inside the `name = "loomux"` package
+// Finds the `version = "X.Y.Z"` line inside the `name = "orrerix"` package
 // entry in Cargo.lock.
 //
-// The exact-equality test (not `startsWith`/`includes`) is load-bearing since
-// the workspace conversion: `loomux` is a strict PREFIX of every sibling entry
-// in the same file (`loomux-engine`, `loomux-server`, and whatever joins next),
-// and a looser match would read ONE OF THEIR versions — a permanent 0.0.0 — and
-// report a mismatch on every correctly-bumped release. test/workspacelayout.test.ts
-// re-implements this rule and asserts it over each sibling, so the hazard grows
-// with the workspace instead of with this comment.
+// The exact-equality test (not `startsWith`/`includes`) is load-bearing, and
+// the reason has to be stated as a RULE rather than as today's names. Before
+// the binary rename (#1562) this package was `loomux`, a strict prefix of every
+// sibling entry in the same file (`loomux-engine`, `loomux-server`), so a
+// looser match would have read ONE OF THEIR versions — a permanent 0.0.0 — and
+// reported a mismatch on every correctly-bumped release. `orrerix` is a prefix
+// of neither, so as the workspace stands today that collision is simply gone —
+// which is exactly the kind of silent removal that makes relaxing a match look
+// safe. It is not: the next member to join is another chance for one, and
+// nothing warns. So the entry is found by exact name, whatever the members
+// happen to be called. test/workspacelayout.test.ts re-implements this rule and
+// exercises the prefix case against a synthetic lockfile — a witness that still
+// distinguishes, rather than one whose class this rename moved it out of.
 function cargoLockVersion(relPath) {
   const text = readText(relPath);
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === 'name = "loomux"') {
+    if (lines[i].trim() === 'name = "orrerix"') {
       const m = lines[i + 1] && lines[i + 1].match(/^version\s*=\s*"([^"]+)"/);
       if (m) return m[1];
     }
   }
-  throw new Error(`could not find the loomux package entry in ${relPath}`);
+  throw new Error(`could not find the orrerix package entry in ${relPath}`);
 }
 
 function collectVersions() {
@@ -101,7 +107,7 @@ function collectVersions() {
       // and this check would happily read; test/workspacelayout.test.ts
       // asserts it is gone.
       file: 'Cargo.lock',
-      field: 'loomux package version',
+      field: 'orrerix package version',
       version: cargoLockVersion('Cargo.lock'),
     },
   ];

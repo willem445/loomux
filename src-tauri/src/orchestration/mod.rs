@@ -2451,8 +2451,9 @@ pub fn git_shim_cmd(real_git: &str, sh_path: Option<&str>) -> String {
 /// that rename on PATH, so `ensure_shims` writes this script under BOTH names —
 /// the script itself resolves nothing and reads no argv, so it does not care
 /// which one invoked it. The function keeps its `loomux_` prefix because that is
-/// the cargo-crate axis (`loomux_lib`, `-p loomux`), which the rebrand
-/// deliberately left alone; see doc/design/rebrand-external.md.
+/// the cargo-crate axis, whose LIBRARY half (`loomux_lib`) the rebrand
+/// deliberately left alone even after #1562 renamed the binary to
+/// `orrerix`; see doc/design/rebrand-bundle.md.
 ///
 /// Unlike the gh/git shims this is not a gate: there is no agent use of the
 /// launcher to authorize (agents reach loomux through its MCP tools), so there is

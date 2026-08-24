@@ -738,7 +738,7 @@ to evidence produces no output, and the round is wasted. Split by target:
 - To redden a **unit test in `crates/loomux-engine/src/`** (e.g.
   `workflow.rs`) **or in `crates/loomux-server/src/`**, the same move works but
   the ordering is against you. The observed order of a `cargo test --locked
-  --workspace` run is: `loomux_lib` unit tests → `loomux` bin → **every**
+  --workspace` run is: `loomux_lib` unit tests → `orrerix` bin → **every**
   `src-tauri/tests/*` integration binary → `loomux_engine` unit tests →
   `loomux_server` lib unit tests → `loomux_server` bin unit tests → doc-tests.
   So the two `crates/` members run **last**, with `loomux-server` last of all,

@@ -1,5 +1,5 @@
 [package]
-name = "loomux"
+name = "orrerix"
 version = "1.2.0-beta3"
 description = "A sleek terminal multiplexer for AI agent management"
 edition = "2021"
@@ -62,7 +62,7 @@ sysinfo = "0.33"
 # none of them ours (this is what the commands actually print, verbatim shape):
 #
 #   cargo tree -e normal --target all -i getrandom@0.2.17
-#     → getrandom v0.2.17 └── redox_users → dirs-sys → dirs → {loomux, tauri, wry}
+#     → getrandom v0.2.17 └── redox_users → dirs-sys → dirs → {orrerix, tauri, wry}
 #       REDOX-ONLY. `dirs` gates redox_users behind cfg(target_os = "redox"), so this edge
 #       exists only under `--target all`; it is not compiled on Windows/macOS/Linux.
 #   cargo tree -e normal --target all -i getrandom@0.3.4
@@ -131,11 +131,11 @@ serde_norway = "0.9.42"
 # the commands below (all are resolution/graph queries — none compiles).
 #
 # WHAT THE BAN ACTUALLY TESTS, because this entry is the one that gets copied:
-# the 0xc0000139 failure is a **load-time import of the shipped loomux.exe**.
+# the 0xc0000139 failure is a **load-time import of the shipped orrerix.exe**.
 # So the question is only ever "can this crate's code end up LINKED INTO that
 # binary". Three kinds of edge cannot, whatever `cargo tree` shows:
 #   - **build-dependencies** — they compile and RUN ON THE HOST during the
-#     build (build scripts, proc macros). Nothing they link reaches loomux.exe.
+#     build (build scripts, proc macros). Nothing they link reaches orrerix.exe.
 #   - **dev-dependencies of a dependency** — never built for a downstream crate.
 #   - **edges gated to a target we do not ship**, e.g. redox-only.
 # "No getrandom in `-e normal,build`" is NOT the bar and this dependency does
@@ -161,7 +161,7 @@ serde_norway = "0.9.42"
 # declares that dependency `[target."cfg(windows)".dependencies]` — i.e.
 # specifically on the target this ban is about. It is fine, twice over:
 #   1. `cc`/`jobserver` are BUILD-dependencies (libsqlite3-sys's build script).
-#      Host-side; never linked into loomux.exe. See the rule above.
+#      Host-side; never linked into orrerix.exe. See the rule above.
 #   2. It is PRE-EXISTING. `cc` and `jobserver` are both already in the base
 #      lock, so this dependency adds no getrandom path — it adds a new
 #      *consumer* of a build-dep that already pulled one. `git diff` on
