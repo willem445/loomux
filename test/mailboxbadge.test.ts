@@ -115,10 +115,17 @@ test("the push reaches the manager pane and no other pane in its group", () => {
 // ── the seed latch, scanned as text (#1502 review N6) ──
 //
 // `src/pane.ts` has no test file of its own — this repo hand-validates DOM
-// wiring rather than simulating a DOM — so the seed latch's residual would
-// otherwise rest on `tsc --noEmit` alone, which sees a DELETED call and not an
-// INVERTED guard. That is precisely the operator set CLAUDE.md says a deletion-
-// only residual does not span.
+// wiring rather than simulating a DOM — so without this scan every claim about
+// the seed latch would rest on `tsc --noEmit` alone.
+//
+// That residual is stated STRUCTURALLY, and deliberately not as a list of which
+// mutation modes a type-checker misses (CLAUDE.md): an enumeration of modes is a
+// SAMPLE of an open set — deletion, polarity, placement, operator swap, operand
+// substitution, and whatever the next round names — so "the compiler catches A
+// and B but not C" generalises from whichever cases somebody happened to try.
+// The checkable statement is the structural one: THIS MODULE HAS NO TEST FILE,
+// nothing executes it, and so every claim about it rests on what a type-checker
+// and a text scan can see between them.
 //
 // A source scan closes the polarity half, and it has direct precedent here:
 // `test/agenticons.test.ts` scans `pane.ts` as text and scopes the scan to ONE
@@ -126,7 +133,7 @@ test("the push reaches the manager pane and no other pane in its group", () => {
 // be satisfied by the wrong line elsewhere in a ten-thousand-line file is a pin
 // that reads like coverage and isn't.
 //
-// Its residual, stated because it cuts against the technique: this decides
+// This scan's own residual, stated because it cuts against the technique: it decides
 // partly on a binding's NAME, which CLAUDE.md warns is a shape a rename steps
 // over. It is benign only because a PARTIAL rename fails `tsc` — `mailPushed` is
 // read here and written in `setMailUnread`, so renaming one and not the other
