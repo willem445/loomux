@@ -692,6 +692,18 @@ red already has (#1361 round 11, #1358). Signature: a wave table with an empty "
 reddened" cell, or a row whose count is the mutation's blast radius rather than the
 property's — the reconcile rule above catches the arithmetic, not the attribution.
 
+**A decision the wave cannot DRIVE never becomes a row — and the table still reconciles.**
+Every rule above diagnoses a round you *cut*; none of them catches the round you could not cut.
+A decision welded into an I/O seam — inside a function taking `AppHandle`, or a method on the
+drainer — has no surface a test here can call, so no round is cut for it, no zero-red row
+appears, and the counts reconcile exactly. Enumerate the decisions the diff makes BEFORE
+cutting the wave and check each has a callable surface; extract the ones that do not into a
+pure function (the `worker-deep.md` §3 convention — a precondition of this evidence, not only
+a readability one) and give each its own round. Signature: a complete, reconciling N-round
+table in which no row names a decision the diff plainly makes (#1501 — a coverage regression
+shipped under TWELVE green rounds, `record_contributions_for` then extracted pure, round 13
+and `j16` following).
+
 ### The frontend half runs its base red locally — build the isolated tree right
 
 Everything above is the Rust path. Node commands are not banned, so a frontend PR
