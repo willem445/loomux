@@ -355,6 +355,16 @@ compiles.
   Signature: "gold is tinting everything" against `r === g === b` green on all nine ramp
   steps, with `SEMANTIC.selection` never in the list (#1344 — a second population defect in
   `test/theme.test.ts`, in a different guard from #1327's).
+- **A validity check is evidence about the bytes it READS, never about the region it
+  licenses.** Ask of every guard "what is the smallest edit that PASSES this?", not "what
+  does it catch" — a fixed-width fingerprint clears its own window, so the promise above it
+  is narrowed to that window or the residual is BOUNDED in code (a revalidation ceiling).
+  Then pin the blind spot ITSELF as a property beside its bound: a note disclosing a
+  residual while the suite pins only the arms that work lets the disclosure go false with
+  nothing red to say so. Signature: a "fails toward slow, never toward wrong" promise
+  beside a 64-byte anchor, the residual written as an AND of three conditions the real
+  failure needs none of (#1361 B1; `an_edit_below_the_anchor_window_is_not_detected_by_any_guard`
+  + `the_revalidation_timer_bounds_that_blind_spot`).
 - **A non-interference pin is fail-able only when its two operands COLLIDE.** A test
   asserting operation X leaves Y alone must build the fixture so X's key IS Y's subject —
   disjoint literals hold under every implementation, the symmetric one the pin forbids
@@ -590,6 +600,13 @@ narrow their ask back down to the original ticket on your own judgment.
   locale clears it. Use `-rni`, or `LC_ALL=C.UTF-8`. Signature: a case-insensitive literal
   sweep returns zero for EVERY pattern, one you can see in the tree included (#1369 review;
   repro: `grep -niF vacuity` on a file holding `Vacuity`).
+  A fourth form is the one a CENSUS reaches for: `grep -oP` refuses under that same
+  locale (`-P supports only unibyte and UTF-8 locales`, exit 2, nothing on stdout), so
+  `grep -oP … > a.txt` writes an EMPTY file and a before/after diff of two of them reports
+  `0 lost, 0 added` — a clean receipt from an instrument that never ran. Same trigger and
+  same fix (`LC_ALL=C.UTF-8`), or use `-oE`/`sed`. Signature: a census whose two operands
+  are both zero-byte files (#1361 review round 1, which caught its own and re-ran it with
+  a positive control).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
   `doc/design/*.md` note, the PR body (which becomes the squash message), and
@@ -630,6 +647,13 @@ narrow their ask back down to the original ticket on your own judgment.
   — `gh api -X POST markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line
   silently ends a table, and the row you claimed becomes a paragraph of literal
   pipes (#926).
+  The trigger is EDITING a table, list or fence — not claiming anything about it. The
+  commonest miss is rendering the PR body and never rendering the `doc/design/*.md` note
+  it mirrors, a `docs/` page, or a test-fixtures README nobody filed under "rendered
+  surface" (#926 B1 and #1361 B2, both design notes; #1140 B4; #1196 N1). A blank line is
+  also only one of the two forms: a MISSING one makes the following paragraph or row a
+  lazy continuation of the list item above it, so it renders swallowed into that bullet
+  with no literal pipes to notice (#1140, #1196).
   **That endpoint is blind to a `mermaid` fence**, and so is a browser: GFM returns every
   such fence as a syntax-highlighted `<pre>` — byte-for-byte the raw-DSL failure you are
   checking for — while GitHub's own file viewer renders it in a cross-origin sandboxed

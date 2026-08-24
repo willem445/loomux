@@ -549,6 +549,18 @@ function it calls is not (#1236 — three of eight rounds reached
 `record_crash_first_phase` / `newest_crash_log_since`, both rewritten by that
 PR's own review fixes).
 
+**A re-cut wave needs its own OPEN PRs — a pushed scratch branch builds nothing.**
+`ci.yml` is `on: push: branches: [main]` plus `pull_request`, so a branch is built only
+while a PR is open on it: measured over the last 400 runs, every `push` run is on `main`
+or a `v*` tag and all 356 others are `pull_request`. Step 4 above closes the scratch PR
+and deletes its branch once cited, which is what makes the second wave the dangerous one
+— re-pushing those branches and reusing their PR numbers builds nothing at all, and
+`gh pr checks` keeps answering for the round you already quoted. Assert `state == OPEN`
+before reusing a scratch PR and open fresh ones otherwise; step 6's `headSha` cross-check
+is what catches the miss. Signature: no run newer than the previous round for a branch you
+just pushed (#1361 round 2 — 17 branches pushed and silently unbuilt against closed PRs
+whose head refs were already deleted).
+
 **A red only counts against a banked green.** Keep the unmutated tree's passing
 run for the same tests: a test that has never passed reddens for its own bug,
 not for your mutation, and the red then evidences nothing about the property.
@@ -564,6 +576,22 @@ with side effects, a flake, a test added or removed between the two runs, or the
 fail-fast truncation that stops a red run reaching later binaries. The extra reds
 are the ones you would otherwise quote. Signature: a round reddens three tests
 where one was expected (#1236 — eight rounds, each reconciling to 376).
+
+**A round that reddens NOTHING is a finding; a round that reddens EVERYTHING is not
+evidence.** Publish the zero-red row rather than dropping it — a dropped row leaves the
+reader believing every arm has its own counterfactual — then diagnose it, because the
+remedies diverge. The property is defended TWICE, so removing one arm changes nothing —
+cut the follow-up round that removes *both* (#1361 rounds 4→5, #1299 M10→M10b, and #889,
+where the surviving half of a compound guard caught it and dropping the whole line reddened
+three). Or the mutation landed textually somewhere it can never fire — re-place it, and
+assert non-inertness structurally rather than trusting the edit (#1426 round 2). Or the
+production code is genuinely dead behind a comment claiming otherwise, and the answer is to
+delete it (#664, corrected in #686). At the other end, one mutation
+reddening many tests attributes to none of them — narrow it to a single red where you can
+(#1300, 9→1), and where you cannot, say so and name the per-property witness each broad
+red already has (#1361 round 11, #1358). Signature: a wave table with an empty "test
+reddened" cell, or a row whose count is the mutation's blast radius rather than the
+property's — the reconcile rule above catches the arithmetic, not the attribution.
 
 ### The frontend half runs its base red locally — build the isolated tree right
 
