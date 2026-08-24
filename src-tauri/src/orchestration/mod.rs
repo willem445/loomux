@@ -24926,7 +24926,7 @@ impl QuestionReread {
 #[doc(hidden)] // pub for integration tests
 pub fn override_enter_admits(reads: &[QuestionReread]) -> bool {
     reads.len() as u32 >= QUESTION_OVERRIDE_CONSECUTIVE_READS
-        && reads.iter().all(QuestionReread::admits)
+        && reads.iter().any(QuestionReread::admits)
 }
 
 /// The production half of [`override_enter_admits`]: take the fresh reads this
