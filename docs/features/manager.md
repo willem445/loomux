@@ -82,23 +82,33 @@ has. Talking to the orchestrator directly is never removed.
 5. **It relays your brief to the orchestrator**, quoting you, and the
    orchestrator files it as a **GitHub issue** with your brief in the body. The
    manager tells you the issue number.
-6. **You start it — or don't.** The issue sits there until *you* put the
-   start-work label on it yourself, on GitHub, exactly as with any other issue.
+6. **It gets started the way work is started in your group.** In the default
+   setup, and in plain autonomous mode, that means the issue waits until *you*
+   put the start-work label on it yourself, on GitHub, exactly as with any other
+   issue. If you are running the group in **full autonomy**, the default is the
+   other way round — the orchestrator may pick up any open issue that is not held
+   back, and labels rank work rather than release it. Same issue either way; what
+   differs is whether it waits for your label.
 
-That last step is the point of the whole design, so it is worth being blunt
-about: **saying yes to a brief does not start any work.** It authorises writing
-the ticket. Nothing an agent says to another agent, and nothing you say to the
-manager, can move the label — that is your hand on your own record, and it stays
-the only thing that starts work. The same is true at the other end: merging is
-still gated on your own approval, and "the human said merge it" relayed from
-this pane grants nothing.
+The point of the whole design is the part that does *not* vary, so it is worth
+being blunt about: **saying yes to a brief does not start any work, in any mode.**
+It authorises writing the ticket. The manager cannot start work, cannot apply a
+label, and cannot ask the orchestrator to treat your yes as one — nothing it says
+to another agent carries your authority, only your words. What varies between the
+modes is the *funnel* the issue then goes through, not what the manager is allowed
+to do to it, and if you are unsure which mode your group is in, ask the manager and
+it will tell you.
+
+Shipping does not vary at all. Full autonomy widens what may be **started**, never
+what may be **shipped**: merging is still gated on your own approval in every mode,
+and "the human said merge it" relayed from this pane grants nothing.
 
 ## What it will not do
 
 It holds no authority you have not used yourself. Specifically:
 
 - **It never writes your repository.** No branches, no commits, no PRs, no edits
-  — orrerix denies its editing tools outright. It reads your code so its
+  — orrerix denies its editing tools at the CLI level. It reads your code so its
   questions are grounded in it.
 - **It never runs the fleet.** It does not open panes, hand out tasks, kill
   anything, or record a review verdict. If something needs doing it says so to

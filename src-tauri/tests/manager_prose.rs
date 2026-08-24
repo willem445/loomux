@@ -256,6 +256,25 @@ fn the_managers_contract_carries_the_rules_the_role_is_made_of() {
     pinned(at, brief, "the start-work label",
         "D5's other half — the label is the human's own hand on their own record, and the manager \
          neither moves it nor asks for it to be moved");
+    // D5 SPLIT ALONG ITS SEAM (review round 1, B4). Stating the funnel flatly
+    // is false under full autonomy, where `orchestrator.md`'s invariant 8
+    // inverts the start default and demotes the labels to priority hints — and
+    // false in the direction that matters, promising the human a gate the
+    // orchestrator is not waiting on. Three pins, because the sentence has
+    // three separable halves and a regression would drop one of them: the
+    // manager's own authority (unconditional), the funnel (conditional), and
+    // the shipping line (unconditional again). Nothing MECHANICAL ties this
+    // prose to invariant 8 — it lives in another template with no shared
+    // anchor — so these pins are what a future edit to either side hits.
+    pinned(at, brief, "you never start work, you never apply a label",
+        "the UNCONDITIONAL half: whatever the mode, the manager itself neither starts work nor \
+         labels — collapsing this into the funnel claim is what made the original false");
+    pinned(at, brief, "the start default inverts",
+        "the CONDITIONAL half: full autonomy makes every open issue eligible, so prose promising \
+         the human that their label is the gate is wrong exactly where it matters most");
+    pinned(at, brief, "never what may be shipped",
+        "full autonomy widens what may be STARTED and never what may be SHIPPED — the one line \
+         that keeps the mode caveat from reading as \"the gates are off in autonomy\"");
 
     // 4. Relay fidelity and the authority line. `message_orchestrator` is the
     //    manager's only outbound channel, so these two rules are the entire
@@ -430,6 +449,13 @@ fn a_replace_mode_manager_still_gets_the_rules_the_template_carries() {
     pinned(at, &core, "the start-work label",
         "decision D5 rides in the core for the reason red-before-green does: the persona is the \
          swappable half, and a manager that thought a relayed yes started work would start it");
+    // The same seam, in the arm (review round 1, B4). A replace-mode manager
+    // reads only this text, so the mode caveat has to be here too or that pane
+    // is the one telling a full-autonomy human their label is the gate.
+    pinned(at, &core, "full autonomy inverts that default",
+        "the funnel is mode-dependent and this arm is the only copy a replace-mode manager reads");
+    pinned(at, &core, "never what may be shipped",
+        "the shipping line, so the mode caveat above cannot be read as the gates loosening");
     pinned(at, &core, "you never write the repository",
         "the containment posture in words — the CLI-level edit deny is the structure, this is the \
          instruction that stops it trying");
