@@ -818,7 +818,7 @@ When a worker reports a PR:
      say. That section is where the ways the change fails in production that no test in the PR
      would catch get named, and its absence is exactly the silence a review exists to break: a
      green suite is not evidence about a property nobody stated. **A section whose answer is an
-     unargued "none" is the same as a missing one**, and it is the likelier failure: the heading
+     bare "none" with no argument at all is the same as a missing one**, and it is the likelier failure: the heading
      makes an omission visible only while somebody reads it for content, so "none obvious" buys
      a complete-looking review at the lowest price on offer. A premortem entry that names an
      input, or the sequence, that triggers it is dispositioned like any other finding, below;
