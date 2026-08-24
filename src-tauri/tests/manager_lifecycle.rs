@@ -302,6 +302,15 @@ fn a_launch_that_resumes_reopens_the_managers_own_session_with_no_task() {
     // pane waiting to be told what it is" true rather than merely intended.
     // `Delivery::ResumeKickoff` is in the permitted set and this path declines
     // to use it — see `doc/design/manager.md`.
+    //
+    // **What this assertion pins, exactly** (#1161 M3 review N5): the INPUT that
+    // makes the resume arm deliver nothing, not the absence of a delivery. A
+    // no-frontend registry cannot type into any pane, so no assertion made here
+    // could tell "declines `ResumeKickoff`" apart from "had no pane to type
+    // into". A delivery-side pin — that no `ResumeKickoff` is PRODUCED for this
+    // spawn — would be the fail-able one and needs a seam this slice does not
+    // add. Stated rather than implied, so nobody reads the line below as more
+    // than it is.
     assert_eq!(m["task"], json!(""), "a resumed manager carries no task to be delivered");
 
     // THE CONTROL for the resume half: a launch that does NOT resume
@@ -462,6 +471,15 @@ fn the_stall_watchdog_never_notifies_about_a_manager() {
     // unfailable in the wrong direction (it would fire on a correct build).
     // `watchdog-suppressed` is included because it is the watchdog's OTHER
     // record, and a manager reaching it would be just as wrong.
+    //
+    // **This loop is not independently fail-able, and that is fine** (#1161 M3
+    // review N6). Removing `Role::Manager` from the watchdog guard reddens the
+    // `assert_eq!(watchdog_tick(...), vec![w.id])` above FIRST, and the audit
+    // records are written from that same selection — so the state this loop
+    // catches (tick excluded the manager, audit named it anyway) is unreachable
+    // while one selection feeds both. It is a cheap guard against the two
+    // diverging later, not the pin for the exemption; the `assert_eq!` above is
+    // the pin. Said out loud so a future reader does not mistake which is which.
     let watchdog_lines: Vec<&str> =
         log.lines().filter(|l| l.contains("watchdog-stall") || l.contains("watchdog-suppressed")).collect();
     assert!(!watchdog_lines.is_empty(), "control: the watchdog wrote something");
@@ -702,4 +720,147 @@ fn a_group_may_not_hold_two_live_managers() {
         .spawn_agent_ex(&gid, Role::Manager, None, "second", "", false, None, None, None, None, None)
         .expect("a dead manager may be replaced");
     assert_ne!(replacement.id, mid, "a genuinely new pane");
+}
+
+// ------------------------------------------------ the copy, and the rate cap ----
+
+/// Every refusal this slice adds is a **sentence** — the `mcp.rs` arm's entire
+/// stated justification is the copy, not the enforcement — so the copy is pinned
+/// (#1161 M3 review B2).
+///
+/// The defect this exists for shipped green: all three messages carried a
+/// literal `\n` escape plus the source indentation that followed it, so a
+/// caller received hard line breaks with 17-25 spaces baked in. Every
+/// assertion in this file was blind to it, because each checks a `contains(…)`
+/// substring and no such substring straddled an inserted break — which is
+/// exactly why the check has to be on the SHAPE of the whole string rather than
+/// on any phrase inside it.
+/// The predicate, split out from the assertion so the control below can exercise
+/// it as a VALUE — wrapping a failing assert in `catch_unwind` would work too,
+/// but it prints a panic to stderr from a PASSING test, which is its own small
+/// lie to whoever reads the log.
+///
+/// Two conditions, not one: the break is what a reader sees, and the run of
+/// indentation is what makes it unmistakably a source artefact rather than
+/// deliberate formatting. Checking both means the half-fix — dropping the `n`
+/// but leaving the spaces behind — still fails.
+fn is_one_paragraph(msg: &str) -> bool {
+    !msg.contains('\n') && !msg.contains("          ")
+}
+
+fn assert_one_paragraph(what: &str, msg: &str) {
+    assert!(
+        is_one_paragraph(msg),
+        "{what}: a refusal is one paragraph — the house idiom is a `\\` line \
+         continuation, which strips the newline AND the indentation. This one \
+         ships a hard break or leaked indentation: {msg:?}"
+    );
+}
+
+#[test]
+fn the_three_manager_refusals_each_render_as_one_paragraph() {
+    let (reg, _d, repo, gid) = launch(WITH_MANAGER, rails());
+    let caller = orch_caller(&reg, &gid);
+    let manager_session = the_manager(&reg, &gid)["session"].as_str().unwrap().to_string();
+
+    // 1. `spawn_agent_bound`'s named-block refusal — the enforcement.
+    let (reg2, _d2) = test_registry();
+    let repo2 = Repo::new(Some(WITH_MANAGER));
+    let g2 = reg2.create_group(&repo2.path(), rails()).unwrap();
+    let named = reg2
+        .spawn_agent_ex(&g2.id, Role::Worker, Some("manager".into()), "m", "", false, None, None, None, None, None)
+        .expect_err("a named manager block is refused");
+    assert_one_paragraph("the named-block refusal", &named);
+
+    // 2. The singleton refusal.
+    let singleton = reg
+        .spawn_agent_ex(&gid, Role::Manager, None, "second", "", false, None, None, None, None, None)
+        .expect_err("a second live manager is refused");
+    assert_one_paragraph("the singleton refusal", &singleton);
+
+    // 3. The `mcp.rs` bare-resume sentence — the one whose whole reason for
+    //    existing is that it says something better than the generic refusal.
+    let out = dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": {
+            "resume_session": manager_session, "task": "t", "cwd": repo.path(),
+        }}),
+    )
+    .unwrap();
+    assert_eq!(out["isError"], json!(true));
+    assert_one_paragraph("the bare-resume sentence", out["content"][0]["text"].as_str().unwrap());
+
+    // THE POSITIVE CONTROL for the check itself: it must reject the shape the
+    // defect had, or all three assertions above are decoration. Built the way
+    // the bug actually was — a newline plus the source indentation that followed
+    // it — and then each half on its own, so neither condition can be dropped
+    // without this failing. Plus the negative: it accepts the shape the three
+    // real messages now have, so it is not simply refusing everything.
+    let mangled = "a refusal that ships a hard break — the human's own\n                 interface, opened at launch.";
+    assert!(!is_one_paragraph(mangled), "the check must reject a mangled message");
+    assert!(!is_one_paragraph("break only\nhere"), "...a bare hard break");
+    assert!(!is_one_paragraph("leaked           indentation"), "...and leaked indentation");
+    assert!(
+        is_one_paragraph("one paragraph — as every refusal above renders"),
+        "...while accepting the shape the three real messages have"
+    );
+}
+
+#[test]
+fn a_manager_opens_even_when_the_spawn_rate_backstop_is_exhausted() {
+    // #1161 M3 review N1. `check_and_record_spawn` sits INSIDE
+    // `if counts_against_max_agents(role)`, so a manager open skips the
+    // spawn-rate backstop and records no timestamp against the hour. That is a
+    // documented exemption (the design note's table says so), and CLAUDE.md's
+    // escape-hatch rule is that a documented counterfactual is only pinned by a
+    // test that performs it.
+    //
+    // The reason it is the right exemption: the backstop guards against a
+    // RUNAWAY ORCHESTRATOR, and the manager is opened once per group by the
+    // launch path, which no agent can reach.
+    let rails = Guardrails { max_spawns_per_hour: 2, max_agents: 8, ..rails() };
+    let (reg, _d) = test_registry();
+    let repo = Repo::new(Some(WITH_MANAGER));
+    let g = reg.create_group(&repo.path(), rails).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // Burn the hour's budget with ordinary delegates.
+    for i in 0..2 {
+        reg.spawn_agent(&g.id, Role::Worker, &format!("w{i}"), "", false, None)
+            .unwrap_or_else(|e| panic!("delegate {i} must fit inside the budget: {e}"));
+    }
+
+    // THE CONTROL, and it runs FIRST so the exemption below cannot be read as
+    // "the limit was never reached": the very next delegate is refused, by the
+    // rate backstop specifically and not by the cap (max_agents is 8, and only
+    // three panes are live).
+    let refused = reg
+        .spawn_agent(&g.id, Role::Worker, "w3", "", false, None)
+        .expect_err("the spawn-rate backstop must bite");
+    assert!(
+        refused.contains("spawn-rate"),
+        "refused by the rate backstop, not by something else: {refused}"
+    );
+
+    // ...and the manager opens anyway, through the same call the launch path makes.
+    let m = reg
+        .spawn_agent_ex(&g.id, Role::Manager, None, "", "", false, None, None, None, None, None)
+        .expect("a manager is exempt from the spawn-rate backstop");
+    assert_eq!(m.role, Role::Manager);
+
+    // It also did not CONSUME a slot in the hour — the exemption is both
+    // directions, or a manager open would silently cost the next delegate its
+    // turn. Proven by the refusal message's own count staying put: still the
+    // same limit, still refusing, with no fourth delegate admitted in between.
+    let after = reg
+        .spawn_agent(&g.id, Role::Worker, "w4", "", false, None)
+        .expect_err("still refused");
+    assert!(after.contains("spawn-rate"), "{after}");
+    assert_eq!(
+        rows_of(&reg, &g.id, "manager").len(),
+        1,
+        "and exactly one manager exists — the exempt open really happened"
+    );
 }

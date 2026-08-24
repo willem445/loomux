@@ -373,12 +373,35 @@ one it exists to relay to.
 A group whose roster declares no manager block — which is every default
 (no-workflow) group — opens nothing and says nothing.
 
-If the open fails, the launch still succeeds. The failure is audited and told to
-the orchestrator, because the orchestrator is the party that can act on it: its
-fallback is to take the human's input in its own pane, exactly as the base rules
-say, and it cannot take that branch on a fact it was never given. A group without
-a manager pane is a degraded group, not a broken one — direct human access to the
-orchestrator was never removed.
+If the open fails, the launch still succeeds. A group without a manager pane is a
+degraded group, not a broken one — direct human access to the orchestrator was
+never removed.
+
+**The failure arm has two cases, and they are not the same event.**
+
+- **"One is already open."** The singleton refusal is genuinely reachable here:
+  `resume_recorded_session` documents a double-restore race where two restores of
+  one session can both pass its liveness pre-check (#799). This case is audited
+  (`manager-already-live`) and **nothing is delivered** — the human has their
+  pane, and the degrade notice below is precisely the text that triggers the
+  orchestrator's "manager not live" fallback. Telling it the human is unreachable
+  while they are typing into a live manager is worse than saying nothing. Decided
+  by re-asking the registry (`has_live_manager`), never by matching refusal text.
+- **"It could not open."** Audited as an `error`, and told to the orchestrator,
+  because the orchestrator is the party that can act on it: its fallback is to
+  take the human's input in its own pane, and it cannot take that branch on a
+  fact it was never given. That notice's **delivery outcome is itself audited**
+  rather than discarded: this arm runs on a background thread racing the
+  orchestrator's own bind, so the notice can arrive before that pane has a
+  terminal and be refused. The whole degradation story rests on the orchestrator
+  having been told, so a dropped notice has to be findable in the trail rather
+  than inferred from its absence.
+
+The singleton rule itself is one expression (`is_live_manager_of`), shared by
+`has_live_manager` and by `spawn_agent_bound`'s check under the already-held
+agents guard — two hand-written copies of "same group, `Role::Manager`, not
+dead" would be the same divergence `counts_against_max_agents` exists to prevent
+for the cap.
 
 **The pane opens expanded** (`spawn_opens_minimized` exempts `Role::Manager`,
 M1), in the repo root with no worktree, with `Containment::NoEdits`.
@@ -485,11 +508,27 @@ idle-clock clause. Those are two different rules that agree today: the idle clau
 says "nothing is assigned", which is a fact about which paths exist, while "loomux
 never nags the orchestrator about the human's own pane" is the rule.
 
-`counts_against_max_agents` is one pure predicate read by all five sites that had
-independently spelled `role != Role::Orchestrator`: `live_delegate_count`, the
-cap-refusal roster, `spawn_agent_bound`'s fast-path check and its race-safe
-re-check, and `group_summary`'s `live_delegates` sum. A class cannot now be exempt
-from the count and named in the refusal message.
+`counts_against_max_agents` is one pure predicate, and **every site that decides
+this question calls it** — five reading sites in four functions:
+`live_delegate_count` (the value enforcement reads), the cap-refusal roster (the
+names in the message), `spawn_agent_bound` twice (its fast-path check and its
+race-safe re-check), and `group_summary`'s `live_delegates` (the number the
+lifecycle panel shows).
+
+Four of those sites had independently spelled `role != Role::Orchestrator`.
+`group_summary` had spelled the rule a *third* way again — a hand-sum of
+per-class tallies (`worker + reviewer + planner`) — and was converted in the same
+edit even though that sum already produced the right number. The reason is the
+failure it would otherwise wait for: a sixth `Role` forces a new arm in
+`group_summary`'s exhaustive `match` (the compiler sees to that) but is silently
+missing from the sum, so the panel would under-report the number
+`spawn_agent_bound` enforces, and the cap-below-live warning the panel exists to
+give would go quiet at exactly the cap where spawns start failing. The predicate
+defaults a new class to COUNTED, so routing through it makes that drift
+impossible rather than merely unlikely.
+
+A class therefore cannot be exempt from the count, named in the refusal message,
+and omitted from the panel's total independently of each other.
 
 `recommend_capacity` **inverts** M1's `+1`. `recommended` answers "what must the
 cap be for every declared tier to be live at once", and a class the cap does not

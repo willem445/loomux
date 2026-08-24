@@ -6389,14 +6389,40 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
 /// rather than a hand-list of the counted ones that a sixth class would join
 /// silently.
 ///
-/// Pure, and the one expression: `live_delegate_count`, `live_delegate_roster`,
-/// `spawn_agent_bound`'s fast-path cap check and its race-safe re-check under
-/// the agents lock, and `group_summary`'s `live_delegates` sum all read THIS —
-/// so a class cannot be exempt from the count and named in the refusal
-/// message, which is the asymmetry four independently-written `role !=
-/// Role::Orchestrator` filters were one edit away from producing.
+/// Pure, and the one expression. **Every site that decides this question calls
+/// it rather than re-spelling the rule** — five reading sites in four
+/// functions: [`OrchRegistry::live_delegate_count`] (the value enforcement
+/// reads), [`OrchRegistry::live_delegate_roster`] (the names in the refusal
+/// message), `spawn_agent_bound` twice (its fast-path cap check and its
+/// race-safe re-check under the agents lock), and
+/// [`OrchRegistry::group_summary`]'s `live_delegates` (the number the lifecycle
+/// panel shows).
+///
+/// Four of those sites had independently spelled `role != Role::Orchestrator`.
+/// `group_summary` had spelled the rule a THIRD way again — a hand-sum of
+/// per-class tallies — and was converted in the same edit even though that sum
+/// already produced the right number, because a reader that re-spells the rule
+/// is the drift this predicate exists to remove whether or not its spelling
+/// happens to agree today (#1161 M3 review B1).
+///
+/// So a class cannot be exempt from the count, named in the refusal message,
+/// and omitted from the panel's total independently of each other.
 pub fn counts_against_max_agents(role: Role) -> bool {
     !matches!(role, Role::Orchestrator | Role::Manager)
+}
+
+/// Whether this agent is a LIVE manager of `group` — the singleton rule, as one
+/// expression (#1161 M3, review N2).
+///
+/// Pure over a single entry so the two places that ask are one rule rather than
+/// two spellings: `spawn_agent_bound`'s check under the already-held agents
+/// guard (which cannot call a lock-taking method), and
+/// [`OrchRegistry::has_live_manager`], which takes the lock for callers that do
+/// not hold it. Two hand-written copies of "same group, `Role::Manager`, not
+/// dead" is precisely the divergence `counts_against_max_agents` exists to
+/// prevent for the cap, and this rule deserves the same treatment.
+fn is_live_manager_of(a: &AgentEntry, group: &GroupId) -> bool {
+    a.group == group && a.role == Role::Manager && a.status != AgentStatus::Dead
 }
 
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
@@ -38023,16 +38049,26 @@ impl OrchRegistry {
             // The current adjustable cap and how many delegates count against
             // it, so the UI can show the stepper's value and warn when a lower
             // cap would (harmlessly) block spawns until attrition. Must match
-            // `live_delegate_count` (the value enforcement actually reads):
-            // planners count too (#47), so a cap-below-live warning stays honest.
-            // A manager is NOT summed (#1161 M3, decision D3) — the same edit
-            // that gave `live_delegate_count` its `Role::Manager` exemption, so
-            // the panel keeps describing the number the guardrail enforces
-            // rather than one it computed independently. The per-class
-            // breakdown below still reports `manager`: the human is told the
-            // pane is live, and told it is not spending a slot.
+            // `live_delegate_count` (the value enforcement actually reads).
+            //
+            // Derived through `counts_against_max_agents`, NOT by summing the
+            // per-class tallies below (#1161 M3 review B1). The two spellings
+            // agree today, and that is exactly why the hand-sum was wrong to
+            // keep: a sixth `Role` would force a new arm in the exhaustive
+            // `match` above — the compiler sees to that — while
+            // `worker + reviewer + planner` silently omitted it, so this panel
+            // would under-report the number `spawn_agent_bound` enforces and
+            // the cap-below-live warning would go quiet at exactly the cap
+            // where spawns start failing. The predicate defaults a new class to
+            // COUNTED, so routing through it makes the drift impossible rather
+            // than merely unlikely. Same `live` set and same filter as
+            // `live_delegate_count`, so the panel cannot disagree with the
+            // guardrail it describes.
+            //
+            // The per-class breakdown below still reports `manager`: the human
+            // is told the pane is live, and told it is not spending a slot.
             "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
-            "live_delegates": worker + reviewer + planner,
+            "live_delegates": live.iter().filter(|a| counts_against_max_agents(a.role)).count(),
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
             "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner, "manager": manager },
@@ -40322,6 +40358,18 @@ impl OrchRegistry {
     ///
     /// [`counts_against_max_agents`] is the one expression; every reader of
     /// this rule calls it rather than re-spelling the pair.
+    /// Does this group already have a live manager pane? (#1161 M3, review N2.)
+    ///
+    /// Takes the agents lock, so it is for callers that do not already hold it —
+    /// `open_manager_pane_at_launch`'s failure arm, which uses it to tell "could
+    /// not open" apart from "one is already open" without matching refusal text.
+    /// `spawn_agent_bound`'s own singleton check runs under its already-held
+    /// guard and shares the rule through [`is_live_manager_of`], not through
+    /// this wrapper.
+    fn has_live_manager(&self, group: &GroupId) -> bool {
+        self.agents.lock_safe().values().any(|a| is_live_manager_of(a, group))
+    }
+
     fn live_delegate_count(&self, group: &GroupId) -> u32 {
         self.agents
             .lock_safe()
@@ -42508,7 +42556,11 @@ impl OrchRegistry {
         // SENTENCE (#243's double gate); this one is the enforcement.
         if block.kind == Role::Manager && named.is_some() {
             return Err(format!(
-                "block {:?} is this group's manager — the human's own interface, declared in the \n                 repo's workflow file and opened for them at launch, never spawned by an agent. \n                 That includes resuming its session: a manager pane comes back through the \n                 session browser, not through spawn_agent. To put something to the human, use \n                 ask_human; to send them status, use message_manager.",
+                "block {:?} is this group's manager — the human's own interface, declared in the \
+                 repo's workflow file and opened for them at launch, never spawned by an agent. \
+                 That includes resuming its session: a manager pane comes back through the \
+                 session browser, not through spawn_agent. To put something to the human, use \
+                 ask_human; to send them status, use message_manager.",
                 block.id
             ));
         }
@@ -42918,16 +42970,12 @@ impl OrchRegistry {
             // Two manager panes would be two conversations the human has to
             // notice are different, and one mailbox drained by whichever read
             // it first.
-            if role == Role::Manager
-                && agents.values().any(|a| {
-                    a.group == group_id
-                        && a.role == Role::Manager
-                        && a.status != AgentStatus::Dead
-                })
-            {
+            if role == Role::Manager && agents.values().any(|a| is_live_manager_of(a, group_id)) {
                 let _ = fs::remove_file(&cfg.path);
                 return Err(format!(
-                    "group {group_id} already has a live manager — the human's interface is a \n                     singleton, and a second pane would split the conversation and the mailbox \n                     between two of them. Kill the live one first if it needs replacing."
+                    "group {group_id} already has a live manager — the human's interface is a \
+                     singleton, and a second pane would split the conversation and the mailbox \
+                     between two of them. Kill the live one first if it needs replacing."
                 ));
             }
             if counts_against_max_agents(role) {
@@ -50565,6 +50613,17 @@ pub fn create_orchestration_group(
 /// launch: a group whose manager could not open is degraded (the human talks to
 /// the orchestrator directly, exactly as they did before this feature), while a
 /// launch that refused to happen is a group the human does not have at all.
+///
+/// **"Could not open" and "one is already open" are different events** (#1161 M3
+/// review N2), and only the first is a degraded group. The singleton refusal is
+/// genuinely reachable here — `resume_recorded_session` documents a
+/// double-restore race where two restores of one session can both pass its
+/// liveness pre-check (#799) — and the degrade notice is exactly the text that
+/// triggers the orchestrator's "manager not live" fallback. Telling it the human
+/// is unreachable while the human is typing into a live manager pane is worse
+/// than saying nothing at all, so that case is audited and nothing is delivered.
+/// Decided by RE-ASKING the registry ([`OrchRegistry::has_live_manager`]), never
+/// by matching the refusal text.
 fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origin: &SessionOrigin) {
     let Some(block) = group.guardrails.block_for(Role::Manager).cloned() else {
         // No manager declared — the overwhelmingly common case, including every
@@ -50597,6 +50656,14 @@ fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origi
                     "agent": a.id, "block": a.block, "resumed": a.session_id.is_some() && prior.is_some(),
                 }));
             }
+            Err(e) if reg2.has_live_manager(&group_id) => {
+                // #1161 M3 review N2. A manager IS live, so this open lost a
+                // race it did not need to win — the human has their pane. Not
+                // an `error` record, because nothing is wrong.
+                reg2.audit(&group_id, brand::AUDIT_ACTOR, "manager-already-live", json!({
+                    "block": block.id.clone(), "refusal": e,
+                }));
+            }
             Err(e) => {
                 reg2.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
                     "what": "manager pane open failed", "block": block.id.clone(), "err": e.clone(),
@@ -50605,7 +50672,14 @@ fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origi
                 // on it: its own `{{MANAGER_NOTE}}` fallback prose (M4) is
                 // "manager not live — take the human's input in your own pane",
                 // and it cannot take that branch on a fact it was never given.
-                let _ = reg2.deliver_to_orchestrator(
+                // #1161 M3 review N3: the delivery OUTCOME is audited, not
+                // discarded. This runs on a background thread racing the
+                // orchestrator's own bind, so the notice can arrive before that
+                // pane has a terminal and be refused (`no-terminal-at-call`) —
+                // and the orchestrator's degradation fallback is premised on
+                // having been told. A dropped notice must be findable in the
+                // trail rather than inferred from its absence.
+                if let Err(undelivered) = reg2.deliver_to_orchestrator(
                     &group_id,
                     &format!(
                         "[orrerix] this group's workflow declares a manager block ({}), but its \
@@ -50615,7 +50689,14 @@ fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origi
                         block.id
                     ),
                     brand::AUDIT_ACTOR,
-                );
+                ) {
+                    reg2.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
+                        "what": "manager-degraded notice was not delivered to the orchestrator",
+                        "block": block.id.clone(),
+                        "err": undelivered,
+                        "consequence": "the orchestrator was never told the manager is absent, so its not-live fallback will not have been triggered",
+                    }));
+                }
             }
         }
     };
