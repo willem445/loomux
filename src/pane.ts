@@ -51,9 +51,10 @@ import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation, attentionDismiss, attentionChanged } from "./attention";
-import { dismissStranded, notifyPaneDisposed } from "./orchestration";
+import { dismissStranded, notifyPaneDisposed, seedMailUnread } from "./orchestration";
 import { heldPresentation } from "./heldbadge";
 import { queuePresentation, type QueueDepthReading } from "./queuebadge";
+import { mailboxPresentation } from "./mailboxbadge";
 import { makeRenameCommit } from "./panerename";
 import { shouldResizePty } from "./panefit";
 import { planFit, FIT_WINDOW_MS, FIT_MAX_WAIT_MS } from "./resizeburst";
@@ -744,6 +745,15 @@ export class Pane implements VoiceTargetPane {
    *  by this pane's absence from it, never by a frontend timer. */
   private queueChip: HTMLElement;
   private queueReading: QueueDepthReading | null = null;
+  /** "unread mail" chip in the header (#1161 M5): how many messages the
+   *  orchestrator has posted that this MANAGER pane has not read yet. Worn by no
+   *  other role — a group's mailbox belongs to exactly one pane (`MANAGER_MAX`
+   *  is 1, enforced at parse), and `mailboxPanes` is the single gate deciding
+   *  which pane that is. Informational like `queueChip`, and for a sharper
+   *  reason: nothing a click here could do would make the manager read its mail.
+   *  The thing that makes it read is the human speaking to it. */
+  private mailChip: HTMLElement;
+  private mailUnread = 0;
   /** Cross-workspace channel chip (#271): shown when this pane is a live channel
    *  member. Clicking it disconnects — the "easy close from the indicator itself"
    *  requirement — separate from the pane-menu Disconnect item, same destination. */
@@ -932,6 +942,18 @@ export class Pane implements VoiceTargetPane {
     this.queueChip.className = "pane-queue";
     this.queueChip.hidden = true;
     header.appendChild(this.queueChip);
+
+    // "Unread mail" chip (#1161 M5): header chrome beside the queue chip, on
+    // the same terms — it floats in the header and never touches the terminal's
+    // geometry, so constraint 1 (never resize the PTY for a UI feature) holds
+    // trivially. No click handler, and here that is not a default: the manager
+    // reads its mail when its human speaks to it, so a click that "marked it
+    // read" would be the app answering for the human on the one pane whose
+    // whole contract is that it never does.
+    this.mailChip = document.createElement("span");
+    this.mailChip.className = "pane-mail";
+    this.mailChip.hidden = true;
+    header.appendChild(this.mailChip);
 
     // Cross-workspace channel chip (#271): shown only while this pane is a live
     // channel member. Clicking it disconnects directly — the "easy close from the
@@ -1558,6 +1580,11 @@ export class Pane implements VoiceTargetPane {
     // second application (a promotion of a pane that somehow already had one)
     // can't stack two strips.
     if (opts.orchRole === "orchestrator" && !this.composeInput) this.buildComposeStrip();
+    // Unread-mail chip (#1161 M5): the push says nothing about mail that was
+    // already waiting when this pane opened, so the chip is seeded here — the
+    // one place a pane learns it is the manager. `seedMailUnread` is a no-op for
+    // every other role, decided by the same gate the push uses.
+    seedMailUnread(this);
   }
 
   /** Spawn (or respawn) the PTY for this already-open terminal and wire output /
@@ -2736,6 +2763,43 @@ export class Pane implements VoiceTargetPane {
    *  same shape as the `attention` and `channelBadge` getters. */
   get queueDepth(): QueueDepthReading | null {
     return this.queueReading;
+  }
+
+  /** Set (or clear) the unread-mail count on a MANAGER pane's header (#1161 M5).
+   *
+   *  `0` hides the chip, which is how an emptied mailbox is reported: the
+   *  backend emits the whole current count on every write, so there is no paired
+   *  "cleared" event to miss and a dropped push self-corrects on the next one.
+   *
+   *  Idempotent on the count, like `setQueueDepth`: the seed read and the push
+   *  can both land on one pane in the same breath, and re-writing identical text
+   *  would churn the DOM for nothing. Header chrome only — never touches the
+   *  pane's size. */
+  setMailUnread(unread: number): void {
+    const p = mailboxPresentation(unread);
+    const next = p ? unread : 0;
+    if (next === this.mailUnread) return;
+    this.mailUnread = next;
+    if (!p) {
+      this.mailChip.hidden = true;
+      this.mailChip.textContent = "";
+      this.mailChip.title = "";
+    } else {
+      this.mailChip.textContent = p.label;
+      this.mailChip.title = p.title;
+      this.mailChip.hidden = false;
+    }
+    // A minimized pane's header is detached, so the chip above is invisible —
+    // the grid mirrors this onto the dock chip. Same listener setAttention,
+    // setConnected and setQueueDepth use.
+    this.dockSyncListener?.();
+  }
+
+  /** This pane's unread-mail count (0 when there is none). Lets the grid put an
+   *  equivalent marker on the dock chip while the pane is minimized
+   *  (`dockChipMail`), the same shape as the `queueDepth` getter above. */
+  get mailUnreadCount(): number {
+    return this.mailUnread;
   }
 
   /** Mark (or clear) this pane's cross-workspace channel membership (#271): a
