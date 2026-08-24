@@ -40451,6 +40451,22 @@ impl OrchRegistry {
             .unwrap_or_else(|| "claude".to_string())
     }
 
+    /// Does this group already have a live manager pane? (#1161 M3, review N2.)
+    ///
+    /// Takes the agents lock, so it is for callers that do not already hold it —
+    /// `open_manager_pane_at_launch`'s failure arm, which uses it to tell "could
+    /// not open" apart from "one is already open" without matching refusal text.
+    /// `spawn_agent_bound`'s own singleton check runs under its already-held
+    /// guard and shares the rule through [`is_live_manager_of`], not through
+    /// this wrapper.
+    ///
+    /// Nothing to do with `max_agents`: a manager is EXEMPT from the cap
+    /// (`counts_against_max_agents`), so this asks a different question of a
+    /// different rule, and the two must not be read as one.
+    fn has_live_manager(&self, group: &GroupId) -> bool {
+        self.agents.lock_safe().values().any(|a| is_live_manager_of(a, group))
+    }
+
     /// How many live panes count against this group's `max_agents`.
     ///
     /// **Two classes are exempt, and they are the two panes the orchestrator
@@ -40464,18 +40480,6 @@ impl OrchRegistry {
     ///
     /// [`counts_against_max_agents`] is the one expression; every reader of
     /// this rule calls it rather than re-spelling the pair.
-    /// Does this group already have a live manager pane? (#1161 M3, review N2.)
-    ///
-    /// Takes the agents lock, so it is for callers that do not already hold it —
-    /// `open_manager_pane_at_launch`'s failure arm, which uses it to tell "could
-    /// not open" apart from "one is already open" without matching refusal text.
-    /// `spawn_agent_bound`'s own singleton check runs under its already-held
-    /// guard and shares the rule through [`is_live_manager_of`], not through
-    /// this wrapper.
-    fn has_live_manager(&self, group: &GroupId) -> bool {
-        self.agents.lock_safe().values().any(|a| is_live_manager_of(a, group))
-    }
-
     fn live_delegate_count(&self, group: &GroupId) -> u32 {
         self.agents
             .lock_safe()

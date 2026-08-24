@@ -582,6 +582,16 @@ fn no_agent_reachable_route_can_open_a_manager_pane() {
         bare.contains("manager") && bare.contains("ask_human"),
         "the refusal must name what it is and where to go instead: {bare}"
     );
+    // ...and it must be the `mcp.rs` sentence SPECIFICALLY (#1161 M3 review N8).
+    // Both refusals contain "manager" and "ask_human", so the assertion above
+    // cannot tell them apart: delete the `mcp.rs` arm and `spawn_agent_bound`'s
+    // refusal comes back instead, still satisfying it. The opener is what
+    // distinguishes them, so the opener is what is pinned.
+    assert!(
+        bare.starts_with("that session belongs to"),
+        "the refusal must come from the `mcp.rs` arm (which names the SESSION), \
+         not from `spawn_agent_bound`'s block-shaped one: {bare}"
+    );
 
     // The control for THAT: the same bare-resume shape on a WORKER session is
     // exactly the documented follow-up contract and still works.
@@ -790,8 +800,17 @@ fn the_three_manager_refusals_each_render_as_one_paragraph() {
     )
     .unwrap();
     assert_eq!(out["isError"], json!(true));
-    assert_one_paragraph("the bare-resume sentence", out["content"][0]["text"].as_str().unwrap());
-
+    let sentence = out["content"][0]["text"].as_str().unwrap();
+    // IDENTIFY the arm before checking its shape (#1161 M3 review N8). `call_tool`'s
+    // check runs before `spawn_agent_ex`, so this is the `mcp.rs` sentence today —
+    // but if that arm were removed, `spawn_agent_bound`'s refusal would be returned
+    // instead, case 1 already pins THAT one, and this case would stay green while
+    // the sentence it names went unpinned. The opener is the distinguishing token.
+    assert!(
+        sentence.starts_with("that session belongs to"),
+        "case 3 must be exercising the `mcp.rs` arm, not `spawn_agent_bound`'s: {sentence}"
+    );
+    assert_one_paragraph("the bare-resume sentence", sentence);
     // THE POSITIVE CONTROL for the check itself: it must reject the shape the
     // defect had, or all three assertions above are decoration. Built the way
     // the bug actually was — a newline plus the source indentation that followed
@@ -820,6 +839,12 @@ fn a_manager_opens_even_when_the_spawn_rate_backstop_is_exhausted() {
     // The reason it is the right exemption: the backstop guards against a
     // RUNAWAY ORCHESTRATOR, and the manager is opened once per group by the
     // launch path, which no agent can reach.
+    //
+    // This test pins ONE direction — the manager opens against an exhausted
+    // budget. The other — that opening it does not SPEND a delegate's slot —
+    // cannot be shown on an exhausted fixture, where any assertion holds under
+    // both implementations; it has its own headroom fixture in
+    // `a_manager_open_does_not_consume_an_hour_slot_from_the_delegates`.
     let rails = Guardrails { max_spawns_per_hour: 2, max_agents: 8, ..rails() };
     let (reg, _d) = test_registry();
     let repo = Repo::new(Some(WITH_MANAGER));
@@ -850,17 +875,55 @@ fn a_manager_opens_even_when_the_spawn_rate_backstop_is_exhausted() {
         .expect("a manager is exempt from the spawn-rate backstop");
     assert_eq!(m.role, Role::Manager);
 
-    // It also did not CONSUME a slot in the hour — the exemption is both
-    // directions, or a manager open would silently cost the next delegate its
-    // turn. Proven by the refusal message's own count staying put: still the
-    // same limit, still refusing, with no fourth delegate admitted in between.
-    let after = reg
-        .spawn_agent(&g.id, Role::Worker, "w4", "", false, None)
-        .expect_err("still refused");
-    assert!(after.contains("spawn-rate"), "{after}");
     assert_eq!(
         rows_of(&reg, &g.id, "manager").len(),
         1,
         "and exactly one manager exists — the exempt open really happened"
     );
+}
+
+#[test]
+fn a_manager_open_does_not_consume_an_hour_slot_from_the_delegates() {
+    // The OTHER half of the spawn-rate exemption (#1161 M3 review N9), and it
+    // needs its own fixture because the obvious one cannot fail.
+    //
+    // The tempting version asserts it on the EXHAUSTED group above: open the
+    // manager, then watch another worker still be refused. That passes
+    // identically whether or not the manager consumed a slot — the budget was
+    // already gone two spawns earlier — so it holds under the very
+    // implementation the sentence claims to exclude. Vacuity, stated as proof.
+    //
+    // The fail-able fixture is HEADROOM, not exhaustion: leave exactly one slot,
+    // spend it on the manager, and require a delegate to still get it. That
+    // reddens the moment `check_and_record_spawn` starts running for a manager.
+    let rails = Guardrails { max_spawns_per_hour: 3, max_agents: 8, ..rails() };
+    let (reg, _d) = test_registry();
+    let repo = Repo::new(Some(WITH_MANAGER));
+    let g = reg.create_group(&repo.path(), rails).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // Two of the three slots go to delegates; one is left.
+    for i in 0..2 {
+        reg.spawn_agent(&g.id, Role::Worker, &format!("w{i}"), "", false, None)
+            .unwrap_or_else(|e| panic!("delegate {i} is inside the budget: {e}"));
+    }
+
+    // The manager opens. If it recorded a timestamp, the last slot is now spent.
+    reg.spawn_agent_ex(&g.id, Role::Manager, None, "", "", false, None, None, None, None, None)
+        .expect("the manager opens");
+
+    // THE ASSERTION THAT MOVES: the third delegate must still get the slot the
+    // manager did not take.
+    reg.spawn_agent(&g.id, Role::Worker, "w2", "", false, None).unwrap_or_else(|e| {
+        panic!("the manager consumed a delegate's hour slot — the exemption is one-directional: {e}")
+    });
+
+    // THE CONTROL, so the success above cannot be read as "the limit never
+    // applied here": the FOURTH delegate is refused, by the rate backstop
+    // specifically. Three delegates admitted against a limit of three.
+    let refused = reg
+        .spawn_agent(&g.id, Role::Worker, "w3", "", false, None)
+        .expect_err("the budget really is three");
+    assert!(refused.contains("spawn-rate"), "refused by the rate backstop: {refused}");
+    assert_eq!(rows_of(&reg, &g.id, "manager").len(), 1, "and the manager is live throughout");
 }
