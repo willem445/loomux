@@ -380,21 +380,26 @@ export class TimelineView {
     // fetch is neither dropped nor run concurrently (refreshgate.ts).
     if (!this.gate.begin()) return;
     try {
-      // The pane's shared read (#1317). `forceGh` marks the human's own
-      // gestures — opening the view, the ⟳ button — and those must never be
-      // served a cached answer; a follow tick takes the store's window, which
-      // is what lets the audit viewer's tick at the same cadence be served
-      // this read instead of firing a second `orch_audit` for the same file.
-      // One path is neither, and is deliberately windowed: PollGate's
-      // return-to-a-visible-window refresh passes `false` here because forcing
-      // would also bypass `shouldRefreshGh` and shell out to gh, which that
-      // throttle exists to prevent. Windowed is not stale there — the store
-      // re-reads unless a successful read landed within AUDIT_READ_MAX_AGE_MS,
-      // which is under the follow cadence, so the worst case is the audit
-      // viewer's read from a fraction of a second ago.
+      // The pane's shared read (#1317). `forceGh` doubles as "read fresh",
+      // and in THIS view only the ⟳ button sets it — `show()`, `toggleFollow`
+      // and PollGate's return-to-a-visible-window refresh all pass `false`, so
+      // all three take the store's window (#1317 review N3). The audit viewer
+      // forces on all three of ITS gestures; the two deliberately differ, and
+      // the coupling here is why: forcing would also bypass `shouldRefreshGh`
+      // and shell out to gh, which that throttle exists to prevent, and a gh
+      // shell-out per panel open is a worse trade than a bounded staleness.
+      // What that costs is worth stating rather than leaving implied: with
+      // follow OFF, `show()` is the human's only refresh gesture, so a chart
+      // can open up to AUDIT_READ_MAX_AGE_MS (1200 ms) behind the log.
+      // Sharing the window is also the point — it is what lets the audit
+      // viewer's tick at the same cadence be served this read instead of
+      // firing a second `orch_audit` for the same file.
+      //
       // The store keeps the last good rows on a failed read and never throws,
       // so an unreadable log leaves the chart as it was rather than blanking
-      // it, and an empty chart now means an empty log.
+      // it. On a FIRST read there is nothing to keep, so a rejection there
+      // still renders empty — which is why the empty state reads
+      // `store.loaded` rather than calling an empty chart an empty log.
       this.auditRows = await this.store.read(forceGh ? 0 : undefined);
       const repo = this.opts.getRepo();
       if (!repo) {
@@ -412,10 +417,17 @@ export class TimelineView {
           this.ghError = err;
         }
       }
+      // `end()` moved INSIDE the `finally` (#1317 review N4). It sat on the
+      // line after this block, so any rejection in the region above — today
+      // only `getRepo()`, since the store cannot throw — would skip it, leave
+      // the gate `running`, and make every later `load()` return at
+      // `begin()`: the timeline would never refresh again for the session,
+      // with nothing on screen to say so. One line removes the class rather
+      // than resting on which of the awaits currently cannot reject.
     } finally {
       if (!this.disposed) this.render();
+      if (this.gate.end() && !this.disposed) void this.load(forceGh);
     }
-    if (this.gate.end() && !this.disposed) void this.load(forceGh);
   }
 
   private render(): void {
@@ -484,8 +496,18 @@ export class TimelineView {
       return;
     }
     if (this.extraction!.events.length === 0) {
+      // "Nothing happened" and "I could not look" are different answers, and
+      // the store is what tells them apart (#1317 review N5): after a FIRST
+      // read that rejected it holds no rows and has never loaded, which before
+      // this rendered as a group that had done nothing.
       this.chartEl.append(
-        el("div", "timeline-empty", "No activity recorded for this group yet.")
+        el(
+          "div",
+          "timeline-empty",
+          this.store.loaded
+            ? "No activity recorded for this group yet."
+            : "Could not read this group's audit log."
+        )
       );
       return;
     }

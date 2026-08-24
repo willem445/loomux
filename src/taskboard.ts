@@ -350,9 +350,12 @@ export type ReadinessRow = HasLinks & HasParent;
 /** Derived readiness (#582, extended by #958 slice R): `queued`, every dep
  *  `done`, AND every container above it clear too (`blockingAncestor`). The
  *  board mirrors the backend's `task_ready` rather than reading a `ready` flag
- *  off the wire, because the human's board reads full `Task`s via `orch_tasks`
- *  — `ready` is a `TaskSummary` field, and `TaskSummary` is the MCP
- *  `list_tasks` row the orchestrator gets, not this path. The rules are
+ *  off the wire, because the human's board reads whole board rows via
+ *  `orch_tasks` — `ready` is a `TaskSummary` field, and `TaskSummary` is the
+ *  MCP `list_tasks` row the orchestrator gets, not this path. (Those rows
+ *  were `Task`s flattened whole until #1317 split the note BODIES out of the
+ *  polled read; every field this derivation reads — `status`, `deps`,
+ *  `parent` — is still on every row, which is why nothing here changed.) The rules are
  *  duplicated on purpose and pinned by tests on both sides; the alternative (a
  *  second derived field on the human command) would be a new wire shape for
  *  something the board can compute exactly from data it already has.

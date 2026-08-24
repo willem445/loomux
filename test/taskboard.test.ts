@@ -344,7 +344,10 @@ test("a blank PR ref counts as no PR", () => {
 // Dependency links (#582, slice B — the board's side of the graph).
 // The backend owns the rules (mod.rs `dep_satisfied`/`unmet_deps`/`task_ready`);
 // these pin that the board's chips say the SAME thing, since the human's board
-// reads full Tasks via orch_tasks and derives readiness itself.
+// reads whole board rows via orch_tasks and derives readiness itself. (Those
+// rows carried every Task field until #1317 split the note BODIES out of the
+// polled read; status/deps/parent — everything this derivation reads — are
+// still on every row.)
 // ---------------------------------------------------------------------------
 
 /** A board where t-2 depends on t-1, plus an unrelated row. `deps` is omitted
@@ -1458,7 +1461,9 @@ test("orderSiblings splits one sibling list without mutating the tree's own arra
 // Sprints (#1272) and grounding links (#1273).
 // The backend owns every rule (mod.rs `current_sprint`, `normalize_task_links`);
 // these pin that the board says the SAME thing, since the human's board reads
-// full Tasks via orch_tasks and derives its own view.
+// whole board rows via orch_tasks and derives its own view. (#1317 deferred
+// the note BODIES to the rows the caller names; sprint and link fields ride on
+// every row as before.)
 // ---------------------------------------------------------------------------
 
 /** A board row with a sprint. `sprint` is omitted (not null) on backlog rows,
