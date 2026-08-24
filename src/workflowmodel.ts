@@ -2474,7 +2474,17 @@ function readBlock(raw: YamlValue, index: number, findings: Finding[]): Workflow
   if (r.context !== undefined) block.context = asString(r.context) ?? "";
   // #1457. Read as written — the label is validated, never rewritten, so what the
   // pane shows and what the engine refuses are the same string.
-  if (r.remote !== undefined) block.remote = asString(r.remote) ?? "";
+  //
+  // A NULL is not an empty label, and the two are a real difference here rather
+  // than a pedantic one: a bare `remote:` line is YAML null, which the engine
+  // reads into `Option<String>` as None — a local block, loaded fine — while
+  // `remote: ""` is `Some("")` and is REFUSED (`check_segment` -> Empty). The
+  // `?? ""` idiom the neighbouring fields use would collapse the two, and the
+  // pane would then paint a file red that the engine loads. So a null is treated
+  // as the absent key it means, which is also what the engine's own error would
+  // say if you asked it.
+  const remote = asString(r.remote);
+  if (remote !== null) block.remote = remote;
   return block;
 }
 
