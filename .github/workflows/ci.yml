@@ -50,6 +50,15 @@ jobs:
       - name: Build frontend (typecheck + bundle)
         run: npm run build
 
+      # `npm run build`'s tsc pass only covers `src/` (tsconfig.json's
+      # `include`) — e2e/ has its own tsconfig.json (Node + Playwright types,
+      # deliberately kept off src/'s DOM-only ambient types per constraint 5)
+      # and was never typechecked at all until #1333. A plain `tsc -p` run
+      # over 10 small spec files adds a couple of seconds per platform, not a
+      # new dependency install or a new job.
+      - name: Typecheck e2e specs
+        run: npm run typecheck:e2e
+
       # `npm run build` above is a typecheck, not a test run — the frontend suite
       # (node:test over `test/**/*.test.ts`) was never gated by CI at all, so a
       # regression in a pure module merged green as long as it still typechecked.
