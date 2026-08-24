@@ -2766,7 +2766,7 @@ pub fn live_usage_view(full: &Value) -> Value {
             out.insert(k.clone(), v.clone());
         }
     }
-    out.insert("agent_count".to_string(), json!(agent_count));
+    out.insert("agent_count".to_string(), json!(live.len()));
     out.insert("live_agents".to_string(), Value::Array(live));
     Value::Object(out)
 }
