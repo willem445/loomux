@@ -458,49 +458,6 @@ test("every surface that spells the executable's name agrees with src-tauri/Carg
   );
 });
 
-test("the NSIS pre-install hook guards the PREVIOUS binary, and its file is really there", () => {
-  // Nothing in CI exercises this. ci.yml builds with `--no-bundle`, so NSIS
-  // never runs there and a hooks path that does not resolve would first fail
-  // during a release build — the one place a loud failure is expensive. This
-  // pin is what makes it fail in `npm test` instead.
-  //
-  // The path is resolved by tauri-bundler with `dunce::canonicalize`, against
-  // the process cwd, which tauri-cli's `setup()` has set to the tauri dir
-  // (`set_current_dir(dirs.tauri)`) before the bundler runs — so a relative
-  // installerHooks is relative to `src-tauri/`. Both facts read off
-  // tauri-cli-v2.11.4, the tag package-lock.json pins.
-  const conf = JSON.parse(read("src-tauri/tauri.conf.json"));
-  const hooks: string | undefined = conf?.bundle?.windows?.nsis?.installerHooks;
-  assert.ok(
-    hooks,
-    "bundle.windows.nsis.installerHooks must stay wired up — without it the hook file is dead text"
-  );
-  assert.ok(
-    !hooks.startsWith("/") && !/^[A-Za-z]:/.test(hooks),
-    `installerHooks must be relative to src-tauri/, not absolute: ${hooks}`
-  );
-
-  const src = read(join("src-tauri", hooks)); // throws if the file moved
-  const m = /!insertmacro CheckIfAppIsRunning "([A-Za-z0-9_-]+)\.exe"/.exec(src);
-  assert.ok(
-    m,
-    `${hooks} must insert CheckIfAppIsRunning for an executable name — that is the whole hook`
-  );
-
-  // The bundler's own installer.nsi already inserts this macro for
-  // `${MAINBINARYNAME}.exe`. The hook exists ONLY to cover the name the
-  // bundler cannot know about: the previous one. Pointed at the current name
-  // it is a duplicate of a check that already runs, and the stranding path it
-  // was written for is open again with nothing red to say so.
-  assert.equal(
-    m![1],
-    legacyBinaryName(),
-    `the hook must check the PREVIOUS executable (LEGACY_MAIN_BINARY). The current one is ` +
-      `already covered by installer.nsi's own CheckIfAppIsRunning "\${MAINBINARYNAME}.exe".`
-  );
-  assert.notEqual(m![1], cargoBinaryName(), "...which is not the current one");
-});
-
 test("the guard discriminates — it reports findings when the name does not match", () => {
   // The control for the instrument itself. Every assertion above is
   // absence-shaped, and an absence is what a scan that examined nothing also

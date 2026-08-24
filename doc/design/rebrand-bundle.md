@@ -6,15 +6,19 @@ Two rows of that table are the two roots this note is about, and both were left
 for the same honest reason: each one keys something on a user's machine that the
 rename cannot reach into.
 
-| Root | Before | What it derives |
+| Root | Value before #1562 | What it derives |
 | --- | --- | --- |
 | `src-tauri/Cargo.toml` `[package] name` | `loomux` | the executable (`…\Orrerix\<name>.exe`, `Orrerix.app/Contents/MacOS/<name>`, `/usr/bin/<name>`), `target/release/<name>.pdb`, WER dump names `<name>.exe.<pid>.dmp`, the `--webview-exe-name=<name>.exe` argument WebView2 passes its browser process, and `cargo … -p <name>` |
 | `src-tauri/tauri.conf.json` `identifier` | `dev.loomux.app` | the WebView2 / WebKitGTK profile dir `<data_local_dir>/<identifier>`, macOS `CFBundleIdentifier` (and therefore the TCC microphone grant), the NSIS uninstaller's "delete app data" target |
 
-They are independent, and they moved in two slices: the binary in slice A, the
-identifier in slice B. This note carries both, because the questions a reader
-arrives with — *what is my exe called, what happens when I upgrade, why is that
-thing still called loomux* — do not split along that line.
+They are independent, and they move in two slices. **Slice A — the binary — has
+landed, and is what the "Before" column above describes leaving behind. Slice B
+— the identifier — has NOT: `tauri.conf.json` still reads
+`"identifier": "dev.loomux.app"`, and the section on it near the end of this
+note is a design recorded ahead of its implementation, not a description of
+shipped behaviour.** This note carries both anyway, because the questions a
+reader arrives with — *what is my exe called, what happens when I upgrade, why
+is that thing still called loomux* — do not split along that line.
 
 ## Why the cargo package, and not `mainBinaryName`
 
@@ -101,29 +105,61 @@ on the normal path, and no code was needed for it.**
 **The one path it does not cover** is the old exe still *running*. That `Delete`
 has no `/REBOOTOK`, and the bundler's own guard —
 `!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"` —
-asks about the **new** name only. Install beta4 by hand (`setup.exe`,
-`install.ps1`) while beta3 is open and the delete silently fails, leaving both
-executables in `$INSTDIR` until the next install.
+asks about the **new** name only. Install by hand (`setup.exe`, `install.ps1`)
+while the previous build is open and the delete silently fails, leaving both
+executables in `$INSTDIR` until the next install. That residual is documented in
+`docs/getting-started.md` and left alone. It is cosmetic: the stale exe is not
+launched by anything (every shortcut points at the new one, and the launcher
+probes the current name first), and the next install clears it.
 
-`src-tauri/windows/hooks.nsh` closes that, wired in via
-`bundle.windows.nsis.installerHooks`: the same macro, applied to the previous
-name, at `NSIS_HOOK_PREINSTALL` — which `installer.nsi` inserts at the top of
-`Section Install`, before its own check and before any file is copied. Three
-lines of NSIS under a comment explaining them, and the name it hardcodes is this
-product's own previous binary rather than a toolchain assumption, so it stays
-inside the "no machine-specific special-casing" rule.
-It can be deleted once no supported upgrade path starts from a pre-#1562 build.
+### The NSIS `NSIS_HOOK_PREINSTALL` hook, considered and rejected
 
-Two things about it are worth stating because nothing in CI will tell you:
-`ci.yml` builds with `--no-bundle`, so **NSIS never runs in CI** and a broken
-hooks path would first surface in a release build. `test/bundleidentity.test.ts`
-therefore pins that the file resolves and that it guards the *previous* name —
-pointed at the current one it would be a duplicate of a check that already runs,
-with the stranding path open again and nothing red to say so. (The path is
-resolved by `tauri-bundler` with `dunce::canonicalize` against the process cwd,
-which `tauri-cli`'s `setup()` sets to the tauri dir before the bundler runs, so
-a relative `installerHooks` is relative to `src-tauri/`. Read off
-`tauri-cli-v2.11.4`, the tag `package-lock.json` pins.)
+`bundle.windows.nsis.installerHooks` can insert
+`!insertmacro CheckIfAppIsRunning "loomux.exe" "${PRODUCTNAME}"` before the
+bundler's own check, which looks like a three-line fix for the residual above.
+It was written, reviewed, and removed. **Do not re-add it** without answering
+both of these:
+
+1. **That macro does not refuse — it kills.** In `utils.nsh` at
+   `tauri-cli-v2.11.4`, once `FindProcess{,CurrentUser}` matches,
+   `CheckIfAppIsRunning` runs
+
+   ```nsis
+   IfSilent kill_${UniqueID} 0
+   ${IfThen} $PassiveMode != 1 ${|} MessageBox MB_OKCANCEL $R2 IDOK kill_${UniqueID} IDCANCEL cancel_${UniqueID} ${|}
+   kill_${UniqueID}:
+     nsis_tauri_utils::KillProcess{,CurrentUser} "${executableName}"
+   ```
+
+   (the `CurrentUser` variant under `INSTALLMODE == "currentUser"`, which is
+   Tauri's default and ours), where `$R2` is
+   `"{{product_name}} is running!$\nClick OK to kill it"`. So a silent or
+   passive install terminates the running build with **no prompt at all**, and
+   the interactive one offers killing as the OK action. `install.ps1:28` is
+   `Start-Process -FilePath $dest -ArgumentList "/S" -Wait` — the silent path —
+   so the documented one-line install would have terminated a running build,
+   closing every pane and every agent session in it. That is the exact harm the
+   launcher's own `refuseIfRunning` exists to prevent, and that one really does
+   refuse: it calls `die()`.
+2. **It matches by image name, and `loomux.exe` names two products.** It is the
+   binary of a beta1–beta3 Orrerix install (`%LOCALAPPDATA%\Orrerix\loomux.exe`)
+   *and* of a stable Loomux 1.0/1.1 install (`%LOCALAPPDATA%\Loomux\loomux.exe`)
+   — an install this installer deliberately leaves alone (see the side-by-side
+   argument below and in `rebrand-external.md`). Killing it is collateral damage
+   on a product this installer will not otherwise touch. The bundler's own check
+   is name-based too, but `${MAINBINARYNAME}.exe` names exactly one product;
+   `loomux.exe` does not, and that asymmetry is what stops the macro being the
+   like-for-like reuse it appears to be.
+
+Weighed against a stranded, un-launched, self-clearing file, neither cost is
+worth paying. A future version that genuinely needs this wants a guard scoped to
+`$INSTDIR` (so a side-by-side install is out of reach) *and* a refusal rather
+than a kill — which the bundler's macro does not offer, so it would mean writing
+the NSIS by hand.
+
+Note for whoever revisits it: **`ci.yml` builds with `--no-bundle`, so NSIS
+never runs in CI.** Nothing on a PR compiles a hook file, and a mistake in one
+first surfaces during a release build.
 
 **Taskbar pins dangle.** A user-pinned shortcut points at
 `…\Orrerix\loomux.exe` and the installer only recreates the shortcuts it made
@@ -144,10 +180,16 @@ argument for it — but its only effect is at a stable release, betas cannot
 exercise it, and it is the kind of change whose first real test is a user's
 machine. It is deferred to the stable-release decision, which is the human's.
 
-## The identifier, and the asymmetry in its migration
+## The identifier, and the asymmetry in its migration — PLANNED, NOT SHIPPED
 
-*(Slice B. Recorded here so the two axes stay in one place; see #1562 for the
-implementation.)*
+> **Nothing in this section has landed.** `src-tauri/tauri.conf.json` still reads
+> `"identifier": "dev.loomux.app"`, no `init_webview_profile` exists, and no
+> profile is migrated by any build you can install today. This is #1562's slice
+> B, recorded here ahead of its implementation so the two axes stay in one
+> place — every "moves", "is", and "does" below describes what slice B *will*
+> do, and is a design decision to implement against, not behaviour to rely on.
+> The tracking issue is #1562; if it is closed and this warning is still here,
+> the warning is what is stale.
 
 The identifier keys exactly one directory this app depends on:
 `<data_local_dir>/<identifier>`, holding WebView2's `EBWebView` profile. #1205
@@ -177,7 +219,7 @@ macOS has no Tauri-managed path here at all — WKWebView stores under
 prefs reset plus a fresh microphone (TCC) grant on first voice use, rather than
 a migration.
 
-## What is deliberately still `loomux` after both slices
+## What stays `loomux` on purpose, in both slices
 
 | | Why |
 | --- | --- |

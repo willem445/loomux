@@ -165,10 +165,11 @@ app appears in Add/Remove Programs.
 
 Two things to know:
 
-- **Quit Orrerix before installing.** If the old build is still running, its
-  executable cannot be deleted and both would be left in the install directory.
-  The installer refuses while it is running, so this costs you one retry rather
-  than a broken install; `orrerix update` refuses for the same reason.
+- **Quit Orrerix before installing it by hand.** If the old build is still
+  running, its executable cannot be deleted, so it is left behind next to the
+  new one — harmless, and cleared by the next install, but it stays until then.
+  `orrerix update` refuses outright while the app is running rather than
+  installing over it.
 - **Re-pin your taskbar shortcut.** A shortcut you pinned yourself points at the
   old executable and stops working. The Start-menu and desktop shortcuts the
   installer created are updated for you; pin a fresh one from there.
