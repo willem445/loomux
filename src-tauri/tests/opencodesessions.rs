@@ -343,15 +343,28 @@ fn rails(cli: &str) -> Guardrails {
     }
 }
 
+/// A registry rooted at `root`, with every agent-dir override pointed at a
+/// scratch path under it. THE one raw `OrchRegistry::new` in this file: a
+/// second would leak a generated agent file into the real `~/.claude` /
+/// `~/.copilot` on its first spawn, which
+/// `no_registry_construction_bypasses_the_test_agent_dir_overrides`
+/// (tests/orchestration.rs, #464) refuses by scanning the source. Taking a
+/// `root` rather than minting its own tempdir is what lets a test open a
+/// SECOND registry over the SAME root  an app restart  without bypassing it.
+fn registry_at(root: &Path) -> OrchRegistry {
+    let reg = OrchRegistry::new(root.to_path_buf());
+    reg.set_port(45996);
+    reg.set_claude_projects_dir(root.join("claude-projects"));
+    reg.set_claude_agents_dir_override(root.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(root.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(root.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(root.join("copilot-hooks"));
+    reg
+}
+
 fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
-    reg.set_port(45996);
-    reg.set_claude_projects_dir(dir.path().join("claude-projects"));
-    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
-    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
-    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
-    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
+    let reg = registry_at(dir.path());
     (reg, dir)
 }
 
@@ -675,7 +688,7 @@ fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_th
     // the only state in which any of these rows is resumable at all, since a live
     // group's orchestrator resume is refused outright. The first registry's own
     // view is asserted at the end, where every group IS live.
-    let restarted = OrchRegistry::new(dir.path().to_path_buf());
+    let restarted = registry_at(dir.path());
     let rows = restarted.recorded_orchestrations();
     let live_now = reg.recorded_orchestrations();
     loomux_lib::sessions::set_claude_projects_root_for_test(None);
