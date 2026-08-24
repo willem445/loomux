@@ -4550,6 +4550,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    up green is the one that actually takes the edge.
    `r` is animatable as a CSS property on an SVG circle (the same trick .wf-port-out's hover
    already uses); the fill is what carries the meaning, the size is what makes it findable. */
+/* The GATE's arrival dot is decoration only. Unlike a block's, it is not inside any rect the
+   canvas hit-tests, so a press on it would miss the gate box's own handler and fall through to
+   the edge hit-test — which, since every gate line converges exactly there, would select an
+   arbitrary one of them instead of the gate. */
+.wf-port-gate { pointer-events: none; }
 .wf-port-in.wf-drop-ok { fill: var(--state-ok); stroke: var(--state-ok); r: 6; }
 .wf-port-in.wf-drop-bad { fill: var(--state-danger); stroke: var(--state-danger); r: 6; }
 /* The gate BOX's own arming cue carries no colour token, and that is the channel rule rather

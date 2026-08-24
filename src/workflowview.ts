@@ -2854,12 +2854,20 @@ export class WorkflowView {
     return this.analysis.graph.gates[0]?.reviewers ?? [];
   }
 
+  /** Where the gate box is, or null when the file declares no gate. The ONE construction
+   *  site: the box is drawn from this, hit-tested from this, and the gate lines terminate on
+   *  this, and three copies of the same sums is how a drop target stops matching its picture. */
+  private gateRectOf(rects: ReadonlyMap<string, Rect>): Rect | null {
+    const gate = this.analysis.graph.gates[0];
+    return gate ? gateRect(rects.values(), gate.reviewers.length) : null;
+  }
+
   /** Every DROP target on the canvas, in draw order — the nodes and ghosts, then the gate box,
    *  which is drawn last and therefore wins an overlap under `hitTestDropTarget`'s rule. */
   private dropRects(rects: ReadonlyMap<string, Rect> = this.nodeRects()): Map<string, Rect> {
     const out = new Map(rects);
-    const gate = this.analysis.graph.gates[0];
-    if (gate) out.set(GATE_KEY, gateRect(rects.values(), gate.reviewers.length));
+    const gr = this.gateRectOf(rects);
+    if (gr) out.set(GATE_KEY, gr);
     return out;
   }
 
@@ -2925,7 +2933,7 @@ export class WorkflowView {
     // inlined here, because since #1388 the box is a DROP TARGET as well as a picture: the
     // rect that is drawn and the rect that is hit-tested have to be the same one, and a
     // second copy of the sums is how they stop being.
-    const gr = gate ? gateRect(rects.values(), gate.reviewers.length) : null;
+    const gr = this.gateRectOf(rects);
 
     const bottom = Math.max(...[...pos.values()].map((p) => p.y + NODE_H), gr ? gr.y + gr.h : PAD);
     const width = (gr ? gr.x + gr.w : right) + PAD * 4;
@@ -3056,7 +3064,7 @@ export class WorkflowView {
       inp.setAttribute("cx", String(port.x));
       inp.setAttribute("cy", String(port.y));
       inp.setAttribute("r", "3");
-      inp.setAttribute("class", `wf-port wf-port-in${dropClass(GATE_KEY)}`);
+      inp.setAttribute("class", `wf-port wf-port-in wf-port-gate${dropClass(GATE_KEY)}`);
       root.append(inp);
     }
 
@@ -3125,8 +3133,7 @@ export class WorkflowView {
     // Not a node. An edge, then? THIS is where the pure hit-test earns its keep: an edge is a
     // 1.5px line and nobody can hit that with a mouse — the tolerance is what makes it
     // clickable at all, and it is arithmetic, so it is tested rather than eyeballed.
-    const gate = this.analysis.graph.gates[0];
-    const drawn = this.drawnEdges(rects, gate ? gateRect(rects.values(), gate.reviewers.length) : null);
+    const drawn = this.drawnEdges(rects, this.gateRectOf(rects));
     const hit = hitTestEdges(
       drawn.map((d) => d.geom),
       pt
@@ -3182,10 +3189,13 @@ export class WorkflowView {
         if (err) showToast(err, "info");
         else if (key === GATE_KEY) {
           this.mutate((next) => Object.assign(next, connectToGate(next, from)));
-        } else {
+        } else if (key.startsWith("b:")) {
           const to = this.analysis.workflow.blocks[Number(key.slice(2))]?.id ?? "";
           this.mutate((next) => Object.assign(next, connectBlocks(next, from, to)));
         }
+        // No trailing else: a ghost is the only other key shape, and `dropError` has already
+        // refused it out loud. Spelling the block branch out rather than making it the
+        // fallthrough keeps a future third target from silently being treated as a block.
       }
       this.renderGraph();
     }
