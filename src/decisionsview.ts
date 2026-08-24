@@ -75,7 +75,6 @@ import {
   type SubmitBlock,
 } from "./decisions";
 import { REQUEST_CHANGES_STATUS } from "./taskboard";
-import type { OrchTask } from "./tasksview";
 
 function el(tag: string, cls: string, text?: string): HTMLElement {
   const e = document.createElement(tag);
@@ -105,11 +104,12 @@ export class DecisionsView {
   private toastTimer: number | undefined;
 
   private questions: OrchQuestion[] = [];
-  private tasks: OrchTask[] = [];
-  /** The item registry's rows AND the clear-completed watermark, from ONE
-   *  read — see `NeedsYouView`. Held together because the watermark decides
-   *  which of these rows are hidden, and a stamp from a different read could
-   *  flash back a row the human had just cleared. */
+  /** The item registry's rows, the board rows they name, AND the
+   *  clear-completed watermark, from ONE read — see `NeedsYouView`. Held
+   *  together because the watermark decides which of these rows are hidden,
+   *  and a stamp from a different read could flash back a row the human had
+   *  just cleared; the joined board rows moved onto the same read in #1317,
+   *  which is also what stopped this panel holding a full copy of the board. */
   private view: NeedsYouView = EMPTY_VIEW;
   /** Half-composed answers, keyed by question id, so a re-render (a burst of
    *  board writes, another question arriving) never destroys what the human
@@ -323,19 +323,26 @@ export class DecisionsView {
     // than blanking the panel. One `Promise.all`, so the three land together
     // and the render never mixes this second's items with last second's board.
     try {
-      const [questions, tasks, view] = await Promise.all([
+      // #1317: the whole board used to be a third read here, held in full and
+      // used at ONE site — `linkTask`, a point lookup per open item. The rows
+      // those items name now ride with the items themselves, so this panel
+      // holds what its own queue references rather than a second copy of a
+      // board that is mostly history.
+      const [questions, view] = await Promise.all([
         questionsList(this.groupId),
-        invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId }),
         needsYouList(this.groupId),
       ]);
       this.questions = questions;
-      this.tasks = tasks;
       // The rows come from the read wholesale; the WATERMARK does not. A
       // clear that landed while this read was in flight holds a newer stamp
       // than the file had when it was read, and assigning the view wholesale
       // would bring back the tail the human just dismissed — see
       // `mergeCleared`, where the argument for `max` lives.
-      this.view = { items: view.items, cleared_ms: mergeCleared(view.cleared_ms, this.view.cleared_ms) };
+      this.view = {
+        items: view.items,
+        tasks: view.tasks,
+        cleared_ms: mergeCleared(view.cleared_ms, this.view.cleared_ms),
+      };
     } catch (err) {
       this.toast(String(err));
       return;
@@ -363,7 +370,7 @@ export class DecisionsView {
   // ---------- render ----------
 
   private render(): void {
-    const { open, settled, omitted } = projectPanel(this.view, this.questions, this.tasks);
+    const { open, settled, omitted } = projectPanel(this.view, this.questions);
 
     // `needsYouCount` rather than `open.length` — the same number by
     // construction, and the relation is pinned in test/decisions.test.ts so the

@@ -10701,6 +10701,30 @@ pub struct BoardTask {
     pub link_etag: String,
 }
 
+/// What `orch_needs_you_list` answers (#1317): the needs-you view, plus the
+/// board rows its OPEN items name.
+///
+/// `#[serde(flatten)]` keeps it ADDITIVE — `items` and `cleared_ms` stay
+/// exactly where they were and the read gains one key, so the panel's
+/// one-round-trip property (rows and watermark from the same instant, never
+/// two fetches a moment apart) now covers the joined rows too. That property
+/// is why this is one read rather than the panel asking for the board
+/// separately: it had been rendering this second's items against a board it
+/// fetched in the same `Promise.all` but from a separate parse of a file an
+/// agent can rewrite between them.
+///
+/// A wrapper here rather than a field on `needsyou::View` because `View` lives
+/// in a module that knows nothing about the task board and should keep not
+/// knowing: the join is a property of THIS read, not of the needs-you file.
+#[derive(Serialize, Default)]
+pub struct NeedsYouRead {
+    #[serde(flatten)]
+    pub view: needsyou::View,
+    /// One row per distinct task an OPEN item names, and no others — see
+    /// [`OrchRegistry::needs_you_read`]. Never carries note bodies.
+    pub tasks: Vec<BoardTask>,
+}
+
 /// Project a stored `Task` onto the human board's view — see `BoardTask`.
 ///
 /// `with_notes` decides whether this row carries its note bodies; the count
@@ -26580,6 +26604,50 @@ impl OrchRegistry {
             items: self.needs_you(group)?,
             cleared_ms: self.needs_you_cleared_ms(group),
         })
+    }
+
+    /// [`Self::needs_you_view`] plus the board rows its OPEN items name — the
+    /// whole of what the webview panel reads (#1317).
+    ///
+    /// **Why the join moved here.** The panel used to fetch the WHOLE board
+    /// alongside this, every tick and on every `orch-tasks-changed`, and used
+    /// it at exactly one site: `linkTask` looks up the row an open item names
+    /// and projects six fields off it. So it held a second full copy of a
+    /// board that is mostly history — the other half of #1317's item 2 — to
+    /// answer a handful of point lookups. `items` is bounded by
+    /// [`needsyou::OPEN_MAX`] and each item names at most one row, so this is
+    /// bounded by the human's own open queue rather than by session length.
+    ///
+    /// **OPEN items only, deliberately.** The settled tail never joins the
+    /// board (see the frontend's `projectPanel`): a resolved row renders from
+    /// the item's own record. Sending rows for it would put the board's growth
+    /// back on this read through the retained-resolved cap.
+    ///
+    /// **Still a pure read.** It reads one more file than it did; it writes
+    /// nothing, takes no lock, and stays inside the `viewer` tier's
+    /// definition. See the command's doc.
+    pub fn needs_you_read(&self, group: &GroupId) -> Result<NeedsYouRead, String> {
+        let view = self.needs_you_view(group)?;
+        let wanted: HashSet<&str> = view
+            .items
+            .iter()
+            .filter(|i| !i.status.is_resolved())
+            .filter_map(|i| i.task.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        // No notes: the panel projects six identity/status fields off a joined
+        // row and renders no conversation (#1317).
+        let tasks: Vec<BoardTask> = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            self.tasks(group)
+                .into_iter()
+                .filter(|t| wanted.contains(t.id.as_str()))
+                .map(|t| board_task(t, false))
+                .collect()
+        };
+        Ok(NeedsYouRead { view, tasks })
     }
 
     /// An agent-facing list: open items first, then the newest resolved rows up
@@ -52259,13 +52327,19 @@ pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
 /// throwing, exactly as `orch_questions_list` and `orch_tasks` do. Nothing
 /// WRITES an item through this path, so the loud read that protects the file is
 /// untouched.
+/// **It also carries the board rows its open items name (#1317)**, which is
+/// what lets the panel stop fetching the WHOLE board every tick to answer a
+/// handful of point lookups. That adds one `tasks.json` read to this path and
+/// no lock, no write and no event — the `viewer`-tier property above is about
+/// what a command WRITES, and this still writes nothing. See
+/// [`OrchRegistry::needs_you_read`].
 #[tauri::command]
-pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> needsyou::View {
+pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> NeedsYouRead {
     let reg = reg_of(&app);
     // #904: no error channel; an unvalidated id yields the same empty view a
     // group with no items does. See `command_group`.
-    let Ok(group_id) = command_group(&group_id) else { return needsyou::View::default() };
-    run_blocking(move || reg.needs_you_view(&group_id).unwrap_or_default()).await
+    let Ok(group_id) = command_group(&group_id) else { return NeedsYouRead::default() };
+    run_blocking(move || reg.needs_you_read(&group_id).unwrap_or_default()).await
 }
 
 /// The human closes out a needs-you item, from the app's own webview.
