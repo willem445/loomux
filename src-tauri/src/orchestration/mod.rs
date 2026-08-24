@@ -25259,7 +25259,7 @@ impl InstructionVars {
     /// role templates or a custom block's persona may reference. `g` supplies
     /// the values that are plain fields/lookups on `GroupInfo`; `self` supplies
     /// the ones that need computing (workflow section, conditional notes).
-    /// `BLOCK_NOTE` defaults to empty here — `write_block_instructions`
+    /// `BLOCK_NOTE` defaults to empty here — `render_block_instructions`
     /// overrides it per block — so a class-fallback file (no matching block)
     /// never keeps a literal `{{BLOCK_NOTE}}`.
     fn pairs<'a>(&'a self, g: &'a GroupInfo) -> Vec<(&'a str, &'a str)> {
@@ -25295,8 +25295,8 @@ impl InstructionVars {
             // Beside the other loomux-authored conditional fragment. Both are
             // fixed consts carrying no `{{…}}` of their own, so their position
             // among the earlier vars is inert — unlike the repo-authored
-            // `BLOCK_NAME`, which the caller (`render_block_instructions`)
-            // keeps last on purpose.
+            // `BLOCK_NAME`, which `block_note`'s own `BLOCK_TPL` render keeps
+            // last on purpose (see the comment there).
             ("MERGE_QUEUE", self.merge_queue_note.as_str()),
             ("LOCKS", self.locks_note),
             ("LOCKS_ORCH", self.locks_orch_note),
@@ -38786,11 +38786,11 @@ impl OrchRegistry {
     /// no second list left to drift.
     fn instruction_vars(&self, g: &GroupInfo) -> InstructionVars {
         // The orchestrator's workflow section (#222) — EMPTY for the default
-        // roster, which is what keeps every no-workflow group's instruction files
-        // byte-for-byte what they were. `BLOCK_NOTE` is per-block, so the base
-        // vars carry the empty default and `write_block_instructions` overrides
-        // it; without the default here, a class-fallback file written by the loop
-        // below would keep a literal `{{BLOCK_NOTE}}` in its text.
+        // roster, which is what keeps every no-workflow group's instruction
+        // files byte-for-byte what they were. (`BLOCK_NOTE`'s own empty
+        // default, and who overrides it, is documented on `pairs()` above —
+        // it is a `pairs()` concern, not this function's, since this function
+        // never writes a file or runs the class-fallback loop itself.)
         let workflow_section = self.workflow_section(g);
         // A worker-facing counterpart to `workflow_section`'s ADVISOR_NOTE (which only
         // the orchestrator reads): a worker that gets stuck needs to know it can ask
@@ -38846,6 +38846,18 @@ impl OrchRegistry {
         // workflow file is not in force and its gate is cleared, so the queue is
         // not running either — and prose about a queue that is not running is
         // the exact leak this placeholder exists to prevent.
+        //
+        // #1187 review round 1 N3: this re-reads and re-parses the workflow
+        // file from disk (here and in `locks_declared` below), and now runs on
+        // EVERY spawn — `instruction_vars` being shared put it on the
+        // per-spawn path, not only the group-level render. A transiently
+        // unreadable or, mid-session, edited-into-unparsable file falls back
+        // to `unwrap_or(false)` silently, so a re-render can write an
+        // instruction file with the MERGE_QUEUE/LOCKS sections missing while
+        // `acquire_lock` is still enforced. Named for the record, not fixed:
+        // it is exactly what `write_instruction_files` already did at group
+        // level, and strictly better than this path's pre-#1187 behavior (a
+        // literal `{{LOCKS}}`, which carried no guidance either).
         let merge_queue_note = if g.guardrails.advanced_orchestrator
             && workflow::load_workflow(&g.repo)
                 .ok()

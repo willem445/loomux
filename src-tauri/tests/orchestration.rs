@@ -9608,21 +9608,34 @@ fn instruction_files_rendered_with_group_facts() {
 /// The fix is `OrchRegistry::instruction_vars` — one builder both paths render
 /// from — so this both proves the regression is gone and guards against a
 /// third, independently-drifting list ever being added back.
+///
+/// The roster also declares its OWN orchestrator block (#1187 review round 1
+/// N4), and the test spawns it too: `spawn_agent_ex(role: Orchestrator, block:
+/// None)` is reachable outside the MCP `spawn_agent` tool's `kind:
+/// "orchestrator"` refusal — `resume_agent_session` takes exactly this path
+/// for a persisted `record.role == "orchestrator"` — so `{{WORKFLOW}}`, the
+/// placeholder this issue's own body names as the worst case (it carries the
+/// entire declared-roster section), needs a witness at the *spawn* site, not
+/// only at the group-level render every other test here already covers.
 #[test]
 fn spawn_ex_rerender_carries_the_full_var_list_no_placeholder_survives() {
     let (reg, _d) = test_registry();
     let repo = scratch_dir("spawn-ex-varlist");
     fs::create_dir_all(repo.join(".loomux")).unwrap();
-    // A roster carrying both conditional fragments `worker.md` can hold:
-    // `role_hint: advisor` (ADVISOR_CONSULT_NOTE) and a declared `resources:`
-    // block (LOCKS) — the same two placeholders the live evidence in #1187
-    // named. `advanced_orchestrator` must be on for `load_workflow` to gate
-    // LOCKS in (`locks_declared` in `instruction_vars`).
+    // A roster carrying every conditional fragment `orchestrator.md` and
+    // `worker.md` can hold: an explicit `orchestrator` block (`{{WORKFLOW}}`,
+    // `{{LOCKS_ORCH}}`), `role_hint: advisor` (`{{ADVISOR_CONSULT_NOTE}}`) and
+    // a declared `resources:` block (`{{LOCKS}}`) — the same two placeholders
+    // the live evidence in #1187 named, plus the orchestrator-only one its
+    // body calls out by name. `advanced_orchestrator` must be on for
+    // `load_workflow` to gate LOCKS/LOCKS_ORCH in (`locks_declared` in
+    // `instruction_vars`).
     fs::write(
         repo.join(".loomux").join("workflow.yml"),
         format!(
             "version: {}\n\
              blocks:\n\
+             \x20 - id: orchestrator\n    kind: orchestrator\n\
              \x20 - id: w\n    kind: worker\n\
              \x20 - id: adv\n    kind: planner\n    role_hint: advisor\n\
              resources:\n  build:\n    slots: 1\n    max_hold_minutes: 45\n",
@@ -9686,6 +9699,40 @@ fn spawn_ex_rerender_carries_the_full_var_list_no_placeholder_survives() {
         !after.contains("{{"),
         "spawn_agent_ex's re-render must leave no unrendered {{{{PLACEHOLDER}}}} in the file \
          a spawned agent is told to read (#1187): {after}"
+    );
+
+    // #1187 review round 1 N4: the orchestrator-block case named in the issue
+    // and the body as the worst one — `{{WORKFLOW}}` carries the entire
+    // declared-roster section, not a one-line note. Same shape as the worker
+    // case above: positive control on the group-level render, then the
+    // spawn-time re-render must carry it through.
+    let orch_before = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
+    assert!(
+        orch_before.contains("Spawn by block, not by kind."),
+        "fixture setup: WORKFLOW must be substituted by the group-level render before the \
+         spawn-time re-render is even exercised: {orch_before}"
+    );
+    assert!(!orch_before.contains("{{"), "fixture setup: group-level render must leave no placeholder: {orch_before}");
+
+    // `block: None` — the same shape `resume_agent_session` uses for a
+    // persisted `record.role == "orchestrator"`, and the one the MCP
+    // `spawn_agent` tool's `kind: "orchestrator"` refusal does NOT cover
+    // (that refusal is on the tool surface, not on `spawn_agent_ex` itself).
+    let orch_agent = reg
+        .spawn_agent_ex(&g.id, Role::Orchestrator, None, "orch", "task", false, None, None, None, None, None)
+        .unwrap();
+    assert_eq!(orch_agent.block, "orchestrator");
+
+    let orch_after = fs::read_to_string(dir.join("orchestrator.md")).unwrap();
+    assert!(
+        orch_after.contains("Spawn by block, not by kind."),
+        "spawn_agent_ex's re-render must carry WORKFLOW through for an orchestrator block, not \
+         regress it to a literal placeholder (#1187 N4): {orch_after}"
+    );
+    assert!(
+        !orch_after.contains("{{"),
+        "spawn_agent_ex's re-render of an orchestrator block must leave no unrendered \
+         {{{{PLACEHOLDER}}}} (#1187 N4): {orch_after}"
     );
 }
 
