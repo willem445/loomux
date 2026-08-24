@@ -12960,6 +12960,22 @@ pub struct OrchRegistry {
     /// audited: a group whose opencode panes have not booted has no store yet,
     /// which is the ordinary state, not an incident.
     opencode_db_degraded: Mutex<HashMap<GroupId, &'static str>>,
+    /// Per-transcript parse cursors for the usage poll (#1239).
+    ///
+    /// `compute_usage_snapshot` reads a live agent's transcript on every
+    /// `group_usage` computation, which the polled UI drives at most once per
+    /// [`USAGE_POLL_MAX_AGE`]. Before this, each of those reads re-parsed the
+    /// WHOLE file from byte zero; now each one folds on only the bytes the
+    /// agent appended since the previous read. See
+    /// [`crate::usage::TranscriptCursors`] for the contract and for what
+    /// invalidates a cursor.
+    ///
+    /// **Its bound, stated because every other map here states one**: one
+    /// entry per `(projects root, session id)` polled in the last
+    /// `CURSOR_TTL`, evicted on access. That is the set of live agents, plus
+    /// recently-dead ones for a few minutes; each entry costs its message-id
+    /// dedupe set, which is ids only.
+    usage_cursors: crate::usage::TranscriptCursors,
     /// Test-only override of the Claude transcript root (`~/.claude/projects`).
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
@@ -25296,6 +25312,7 @@ impl OrchRegistry {
             compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             opencode_db_degraded: Mutex::new(HashMap::new()),
+            usage_cursors: Default::default(),
             claude_projects_dir: Mutex::new(None),
             claude_agents_dir_override: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
@@ -37456,9 +37473,13 @@ impl OrchRegistry {
                     .lock_safe()
                     .clone()
                     .or_else(crate::usage::default_claude_projects_root);
-                if let Some(u) = root
-                    .as_deref()
-                    .and_then(|r| crate::usage::claude_session_usage_in(r, sid))
+                // #1239: the cursor cache, not a fresh whole-file parse. Same
+                // totals, but a tick only folds on what the agent appended
+                // since the previous one — this call is on the app's hottest
+                // poll and used to re-parse every live agent's whole
+                // transcript once a second.
+                if let Some(u) =
+                    root.as_deref().and_then(|r| self.usage_cursors.session_usage(r, sid))
                 {
                     if u.tokens.total() > 0 {
                         snap.source = "transcript".to_string();
