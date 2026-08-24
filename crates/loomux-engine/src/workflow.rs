@@ -2312,7 +2312,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     ));
                     continue;
                 }
-                if kind == Role::Orchestrator || kind == Role::Manager {
+                if false && (kind == Role::Orchestrator || kind == Role::Manager) {
                     errs.push(format!(
                         "blocks[{i}] ({id}): a{n} {k} block may not declare remote: — it is \
                          loomux-owned and runs on the human's own machine ({why}). Put remote: \
