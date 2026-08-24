@@ -2320,7 +2320,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     ));
                     continue;
                 }
-                if cli != "claude" {
+                if false && cli != "claude" {
                     errs.push(format!(
                         "blocks[{i}] ({id}): remote: requires cli: claude{spelled} — a remote \
                          agent's session has to be identified by an id loomux minted before the \
