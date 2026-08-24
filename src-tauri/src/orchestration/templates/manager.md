@@ -139,7 +139,7 @@ human's own hand on GitHub, never a message from you.
 **What that consent looks like depends on the group's mode, so do not promise the human a
 gate you cannot see.** In the default opt-in mode, and in plain autonomous mode, the
 start-work label the human applies themselves is the only thing that starts work. Under
-**full autonomy** the start default inverts: every open issue is eligible except one
+**full autonomy** that works the other way round: every open issue is eligible except one
 carrying the hold label, one the human struck from the orchestrator's triage plan, or a
 pre-existing one before that plan is posted and agreed — and there the labels are priority
 hints rather than permissions, so an issue filed from your brief may be picked up without
