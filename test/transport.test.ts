@@ -390,6 +390,54 @@ test("a second pickDirectory never reaches the transport while one is outstandin
   }
 });
 
+test("nothing reaches the folder picker past the single-flight gate (#1564)", () => {
+  // A gate one call site can walk around is not a gate. `pickDirectory` is
+  // exported as a free function AND reachable as a member of whatever
+  // `engineTransport()` returns, and the second route skips `withNativeDialog`
+  // entirely — which is the shape of the defect #1564 is about: a second native
+  // dialog opened against a window another thread is already pulling focus from.
+  //
+  // The rule is default-deny and keyed on the ENTITY (`.pickDirectory` as a member
+  // access), not on a binding's name, so renaming a transport variable does not
+  // step over it. Its stated blind spot: a fully dynamic reach
+  // (`t["pickDirectory"]()`, or a member access split across two lines) is not
+  // matched. Neither appears in `src/` today, and the compiler is what makes the
+  // free function the ergonomic route — this scan is the tripwire, not the wall.
+  const ungated: string[] = [];
+  let gated = 0;
+  let scanned = 0;
+  for (const file of MODULES) {
+    const lines = readFileSync(SRC + file, "utf8").split(/\r?\n/);
+    scanned += 1;
+    lines.forEach((line, i) => {
+      if (!/\.pickDirectory\b/.test(line)) return;
+      if (/withNativeDialog\(.*\.pickDirectory\b/.test(line)) {
+        gated += 1;
+        return;
+      }
+      ungated.push(`${file}:${i + 1}: ${line.trim()}`);
+    });
+  }
+
+  // Population control (the raw-count cross-check): a scan that opened nothing,
+  // or that walked a tree with no seam in it, would satisfy the emptiness
+  // assertion below without having looked at anything.
+  assert.ok(scanned > 20, `the scan opened only ${scanned} modules`);
+  assert.ok(MODULES.includes("transport.ts"), "the seam itself must be in the scanned set");
+  assert.equal(
+    gated,
+    1,
+    "exactly one member access to pickDirectory exists, the one inside the gate in transport.ts"
+  );
+
+  assert.deepEqual(
+    ungated,
+    [],
+    "every folder-picker call goes through pickDirectory() in transport.ts, which single-flights it " +
+      `(#1564); these reach past it: ${ungated.join(", ")}`
+  );
+});
+
 test("the transport surface is exactly the declared capability set", () => {
   // What a remote transport (#888) would have to implement, pinned. A new Tauri
   // API reached from a feature module fails the structural test above; a new one
