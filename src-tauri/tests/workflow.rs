@@ -7271,6 +7271,39 @@ blocks:
 }
 
 #[test]
+fn the_dogfood_reviewer_persona_carries_the_question_set() {
+    // #1292 PR B: `rev-lead.md`'s "Questions every review answers" section is five
+    // fixed headings the review body must carry. This loads the REAL persona through
+    // the REAL profile loader — same as the roster pin above — so a heading dropped
+    // from the file (accidentally, or by a rename that drifts from PR A's product-side
+    // `## Premortem` spelling) reddens here instead of silently thinning the review.
+    let repo = repo_root();
+    let wf = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => wf,
+        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
+    };
+    let block = wf.block("rev-lead").expect("the roster's one reviewer lane is rev-lead");
+    let rel = block.profile.as_deref().expect("rev-lead must point at a persona file");
+    let p = profiles::load_block_profile(&repo, rel, block.kind).unwrap_or_else(|e| panic!("rev-lead: {e}"));
+    let body = flat(&p.instructions);
+
+    for heading in [
+        "## premortem",
+        "## resource envelope",
+        "## design alternative",
+        "## misuse",
+        "## operational futures",
+    ] {
+        pinned(
+            "rev-lead.md",
+            &body,
+            heading,
+            "one of the five fixed headings every review body must carry (#1292 PR B)",
+        );
+    }
+}
+
+#[test]
 fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
     // The end-to-end dogfood pin: the REAL file, through the REAL load + clamp, into
     // the command line loomux would actually run. The teeth: worker-deep and rev-lead
