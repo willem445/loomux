@@ -3707,7 +3707,8 @@ impl SessionSearch {
 ///
 /// This is the extracted, always-on subset of the built-in templates; splitting
 /// every template into `mechanics + body` files is follow-up work.
-pub(crate) fn mechanics_core(kind: Role, role_hint: Option<&str>) -> String {
+#[doc(hidden)] // pub for integration tests
+pub fn mechanics_core(kind: Role, role_hint: Option<&str>) -> String {
     // Shared spine for every delegate; the orchestrator gets its own.
     let common = "\
 These orrerix mechanics are guaranteed by the app and are NOT optional, whatever your \
