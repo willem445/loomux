@@ -2692,6 +2692,85 @@ const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
 /// (the MCP tool, the autonomy anchor, the budget enforcer) passes
 /// `Duration::ZERO` and never sees a stored value at all.
 const USAGE_POLL_MAX_AGE: Duration = Duration::from_millis(1000);
+
+/// Which projection of the memoised group-usage value a reader wants (#1317).
+///
+/// Both come out of ONE computation and one memo cell — see
+/// [`OrchRegistry::group_usage_memoed`].
+#[derive(Clone, Copy)]
+enum UsageView {
+    /// The whole-roster value: every snapshot the group ever captured. What
+    /// the MCP `group_usage` tool, the autonomy anchor and the budget enforcer
+    /// read.
+    Full,
+    /// [`live_usage_view`] of it — what the POLLED GUI command returns.
+    Live,
+}
+
+/// Project [`OrchRegistry::group_usage`]'s value down to what a POLLED reader
+/// needs: the live agents' rows, and no per-agent row for anyone else (#1317).
+///
+/// **What it is fixing.** `agents` is O(agents-EVER), not O(agents-live):
+/// `compute_group_usage` merges each live agent's fresh snapshot with every
+/// snapshot `mark_dead` ever captured, so the array only grows with how long
+/// the human has been running. Nothing accumulates ACROSS ticks — the array is
+/// replaced wholesale each time — but the size of ONE tick grows with session
+/// length, on a fixed 2 s (group view) / 4 s (per group-bound tab) cadence.
+/// That is allocation churn proportional to session length, which is what a
+/// long session feels as GC pressure. The MCP twin was capped for exactly this
+/// (`mcp::summarize_group_usage`: "a 654-agent lifetime roster serialized to
+/// 173,245 chars"); the command the GUI polls was not.
+///
+/// **Why LIVE is the right cut, rather than a top-N cap.** The GUI never
+/// wanted the historical rows: `groupview.ts` indexes this array by agent id
+/// and looks up only the agents `orch_group_summary` reports LIVE, and
+/// `tabbar.ts` reads `live_cost_usd` and no row at all. Live agents are
+/// bounded by the group's `max_agents`; the lifetime roster is bounded by
+/// nothing. A top-N cap would be both looser and — since top-N is by lifetime
+/// tokens — capable of dropping a live agent's row, which is the one row this
+/// caller actually renders.
+///
+/// **Not a silent truncation**, the property `summarize_group_usage`'s `rest`
+/// count holds for the MCP twin:
+/// - every LIFETIME total passes through untouched — `lifetime_tokens`,
+///   `lifetime_cost_usd` and `lifetime_cost_basis` still sum the whole roster,
+///   so no spend disappears from the figure the group view puts on screen;
+/// - `agent_count` names the roster's real size, so `agent_count !=
+///   live_agents.len()` is readable rather than invisible;
+/// - the key is RENAMED (`agents` → `live_agents`) rather than filtered in
+///   place, so a reader written against the whole-roster `agents` fails loudly
+///   instead of quietly seeing a subset. #866 took the same decision for
+///   `top_agents` on the MCP side, for the same reason.
+///
+/// Builds a fresh object rather than cloning and stripping: cloning the full
+/// value to throw the historical rows away would pay the very allocation this
+/// exists to remove.
+#[doc(hidden)] // pub for integration tests
+pub fn live_usage_view(full: &Value) -> Value {
+    let rows = full.get("agents").and_then(|a| a.as_array());
+    let agent_count = rows.map_or(0, |r| r.len());
+    let live: Vec<Value> = rows
+        .map(|r| {
+            r.iter()
+                .filter(|a| a["live"].as_bool().unwrap_or(false))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = full.as_object() {
+        for (k, v) in obj {
+            if k == "agents" {
+                continue;
+            }
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out.insert("agent_count".to_string(), json!(agent_count));
+    out.insert("live_agents".to_string(), Value::Array(live));
+    Value::Object(out)
+}
+
 /// #743 S4a: how long the repo's resolved default-branch NAME may be re-served
 /// before it is re-resolved from `git`.
 ///
@@ -10243,8 +10322,10 @@ pub struct Task {
 /// what `list_tasks` returns — a live board hit **228,577 chars for 70
 /// tasks**, almost entirely from accumulated note text, and blew MCP result
 /// limits so the orchestrator could not read its own board. The human's board
-/// UI is unaffected: it reads `tasks.json` (full `Task`s) via `orch_tasks`,
-/// a separate path from the MCP `list_tasks` tool this feeds.
+/// UI is a separate path — `orch_tasks` and `BoardTask`, not this — and it
+/// took the same cut from the other direction in #1317, for the same reason
+/// measured on the same axis: its rows carry `note_count` and the bodies ride
+/// only for the rows the caller names. See `BoardTask`.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskSummary {
     pub id: String,
@@ -10590,29 +10671,154 @@ pub fn link_etag(task: &Task) -> String {
     format!("{h:016x}")
 }
 
-/// The HUMAN board's read model (#1349): every `Task` field exactly as it was,
-/// flattened, plus the derived `link_etag` the board echoes back on an array
-/// write.
+/// The HUMAN board's read model (#1349; notes split out of it in #1317): the
+/// `Task` fields the board renders, the derived `link_etag` it echoes back on
+/// an array write, and `note_count`.
 ///
-/// A wrapper rather than a field on `Task`, because `Task` is what
+/// A projection rather than a field on `Task`, because `Task` is what
 /// `write_tasks` serializes: a derived key on it would be persisted into a
 /// `tasks.json` humans read and diff, re-read on load, and then immediately
 /// recomputed — `Task::demo_path`'s argument for `skip_serializing_if`, one step
-/// further along. Nothing is stored, so an older loomux reading a newer file
-/// still sees byte-identical rows.
+/// further along. Nothing here is stored, so an older loomux reading a newer
+/// file still sees byte-identical rows.
 ///
-/// `#[serde(flatten)]` keeps this ADDITIVE on the wire: the board's `OrchTask`
-/// gains one key and every existing one is untouched.
+/// **Why the notes are not on every row (#1317).** `orch_tasks` is polled, and
+/// re-fired by every `orch-tasks-changed` event, for the WHOLE board — "a
+/// long-lived group's board is mostly history: 400+ rows, nearly all `done`"
+/// (`Task::cleared_ms`). Text within a row is capped at `MAX_TASK_NOTES`, but
+/// 400 rows × 20 notes of prose is an order of magnitude more wire than every
+/// other field on the board put together, and it is a function of how long the
+/// group has been running rather than of how much work is live. The board
+/// reads the bodies in exactly one place — the notes list under a row the
+/// human has EXPANDED — and reads a count everywhere else, for the `🗨 N`
+/// badge. So the bodies ride only for the rows the caller names, which is the
+/// split MCP's `list_tasks`/`get_task` pair already draws for the agent side.
+///
+/// **Absent notes and no notes are different answers**, which is why this is
+/// `Option` rather than an empty vec: `None` means "you did not ask for this
+/// row's bodies", `Some([])` means "you did, and it has none". Collapsing them
+/// would make an un-fetched row render as a row whose conversation was
+/// deleted. `note_count` is always present and is the ONLY honest source for
+/// the badge — deriving it from `notes` would read 0 for every un-fetched row.
+///
+/// **Default-deny, enforced by the compiler** — `board_task` destructures
+/// `Task` exhaustively (`agent_task_view`'s pattern, and its argument: a
+/// `#[serde(flatten)]` of the storage type hands every future field to this
+/// wire the moment somebody adds one). Adding a field to `Task` stops the
+/// crate compiling until it is classified here.
 #[derive(Serialize)]
 pub struct BoardTask {
-    #[serde(flatten)]
-    pub task: Task,
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub issue: Option<String>,
+    pub pr: Option<String>,
+    pub pr_base: Option<String>,
+    pub assignee: Option<String>,
+    pub session: Option<String>,
+    /// How many notes the row has. Always present; see the type doc.
+    pub note_count: usize,
+    /// The bodies, for the rows the caller asked for. Absent ≠ empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<TaskNote>>,
+    // The remaining keys keep `Task`'s own omitted-when-empty contract
+    // verbatim, so a board that never used a feature is unchanged by its
+    // existence — see each field's doc on `Task`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TaskLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demo_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleared_ms: Option<u64>,
+    pub updated_ms: u64,
     pub link_etag: String,
 }
 
+/// What `orch_needs_you_list` answers (#1317): the needs-you view, plus the
+/// board rows its OPEN items name.
+///
+/// `#[serde(flatten)]` keeps it ADDITIVE — `items` and `cleared_ms` stay
+/// exactly where they were and the read gains one key, so the panel's
+/// one-round-trip property (rows and watermark from the same instant, never
+/// two fetches a moment apart) now covers the joined rows too. That property
+/// is why this is one read rather than the panel asking for the board
+/// separately: it had been rendering this second's items against a board it
+/// fetched in the same `Promise.all` but from a separate parse of a file an
+/// agent can rewrite between them.
+///
+/// A wrapper here rather than a field on `needsyou::View` because `View` lives
+/// in a module that knows nothing about the task board and should keep not
+/// knowing: the join is a property of THIS read, not of the needs-you file.
+#[derive(Serialize, Default)]
+pub struct NeedsYouRead {
+    #[serde(flatten)]
+    pub view: needsyou::View,
+    /// One row per distinct task an OPEN item names, and no others — see
+    /// [`OrchRegistry::needs_you_read`]. Never carries note bodies.
+    pub tasks: Vec<BoardTask>,
+}
+
 /// Project a stored `Task` onto the human board's view — see `BoardTask`.
-pub fn board_task(task: Task) -> BoardTask {
-    BoardTask { link_etag: link_etag(&task), task }
+///
+/// `with_notes` decides whether this row carries its note bodies; the count
+/// rides regardless.
+pub fn board_task(task: Task, with_notes: bool) -> BoardTask {
+    let link_etag = link_etag(&task);
+    // Exhaustive on purpose — see the type doc. A new `Task` field must be
+    // named here (board-visible) or bound to `_` (not), and the compiler is
+    // what asks.
+    let Task {
+        id,
+        title,
+        status,
+        issue,
+        pr,
+        pr_base,
+        assignee,
+        session,
+        notes,
+        deps,
+        related,
+        links,
+        parent,
+        kind,
+        sprint,
+        demo_path,
+        cleared_ms,
+        updated_ms,
+    } = task;
+    BoardTask {
+        id,
+        title,
+        status,
+        issue,
+        pr,
+        pr_base,
+        assignee,
+        session,
+        note_count: notes.len(),
+        notes: with_notes.then_some(notes),
+        deps,
+        related,
+        links,
+        parent,
+        kind,
+        sprint,
+        demo_path,
+        cleared_ms,
+        updated_ms,
+        link_etag,
+    }
 }
 
 /// The only status that satisfies a dependency edge (#582). Merged/accepted is
@@ -12754,7 +12960,16 @@ pub struct OrchRegistry {
     ///
     /// **Bounded by LIVE groups**: `end_group` drops the entry, so the map does
     /// not accumulate one per group this process ever opened.
-    usage_memo: Mutex<HashMap<GroupId, Arc<Mutex<Option<(std::time::Instant, Value)>>>>>,
+    ///
+    /// **Two values per cell, one computation** (#1317): the full whole-roster
+    /// value and [`live_usage_view`] of it, derived together and stamped with
+    /// one `Instant`. Storing the projection beside its source is what keeps
+    /// the polled path from cloning the whole-of-session roster once per call
+    /// just to drop the historical rows — the second value is a subset of the
+    /// first, so the cell costs a fraction more memory and saves an O(roster)
+    /// clone per poll. Two cells would let the two drift onto different
+    /// windows; a projection computed per caller would put the allocation back.
+    usage_memo: Mutex<HashMap<GroupId, Arc<Mutex<Option<(std::time::Instant, Value, Value)>>>>>,
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
     ///
@@ -26434,6 +26649,50 @@ impl OrchRegistry {
         })
     }
 
+    /// [`Self::needs_you_view`] plus the board rows its OPEN items name — the
+    /// whole of what the webview panel reads (#1317).
+    ///
+    /// **Why the join moved here.** The panel used to fetch the WHOLE board
+    /// alongside this, every tick and on every `orch-tasks-changed`, and used
+    /// it at exactly one site: `linkTask` looks up the row an open item names
+    /// and projects six fields off it. So it held a second full copy of a
+    /// board that is mostly history — the other half of #1317's item 2 — to
+    /// answer a handful of point lookups. `items` is bounded by
+    /// [`needsyou::OPEN_MAX`] and each item names at most one row, so this is
+    /// bounded by the human's own open queue rather than by session length.
+    ///
+    /// **OPEN items only, deliberately.** The settled tail never joins the
+    /// board (see the frontend's `projectPanel`): a resolved row renders from
+    /// the item's own record. Sending rows for it would put the board's growth
+    /// back on this read through the retained-resolved cap.
+    ///
+    /// **Still a pure read.** It reads one more file than it did; it writes
+    /// nothing, takes no lock, and stays inside the `viewer` tier's
+    /// definition. See the command's doc.
+    pub fn needs_you_read(&self, group: &GroupId) -> Result<NeedsYouRead, String> {
+        let view = self.needs_you_view(group)?;
+        let wanted: HashSet<&str> = view
+            .items
+            .iter()
+            .filter(|i| !i.status.is_resolved())
+            .filter_map(|i| i.task.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        // No notes: the panel projects six identity/status fields off a joined
+        // row and renders no conversation (#1317).
+        let tasks: Vec<BoardTask> = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            self.tasks(group)
+                .into_iter()
+                .filter(|t| wanted.contains(t.id.as_str()))
+                .map(|t| board_task(t, false))
+                .collect()
+        };
+        Ok(NeedsYouRead { view, tasks })
+    }
+
     /// An agent-facing list: open items first, then the newest resolved rows up
     /// to the cap, with the omitted count alongside so a filtered list is never
     /// mistaken for the whole one. [`Self::question_list`]'s shape, and a pure
@@ -37972,6 +38231,26 @@ impl OrchRegistry {
     /// `Duration::ZERO` disables serving entirely.
     #[doc(hidden)] // pub for integration tests
     pub fn group_usage_within(&self, group: &GroupId, max_age: Duration) -> Value {
+        self.group_usage_memoed(group, max_age, UsageView::Full)
+    }
+
+    /// [`Self::group_usage_within`], projected to the LIVE-agent view the
+    /// polled GUI reads — see [`live_usage_view`] for the shape and the
+    /// argument (#1317).
+    ///
+    /// Shares ONE memo cell, and therefore one computation, with
+    /// [`Self::group_usage_within`]: the projection is derived once per window
+    /// beside the value it is derived from, so a poll never clones the
+    /// whole-of-session roster just to throw the historical rows away.
+    #[doc(hidden)] // pub for integration tests
+    pub fn group_usage_live_within(&self, group: &GroupId, max_age: Duration) -> Value {
+        self.group_usage_memoed(group, max_age, UsageView::Live)
+    }
+
+    /// The memo dance both public readers share. Spelled once: two copies of
+    /// it is how the full value and its projection would come to be computed
+    /// on different windows, or stored under different `Instant`s.
+    fn group_usage_memoed(&self, group: &GroupId, max_age: Duration, view: UsageView) -> Value {
         // Map lock → release → per-group cell (pty.rs's rule): the outer lock is
         // held only to clone the cell's Arc out.
         let cell = {
@@ -37979,9 +38258,12 @@ impl OrchRegistry {
             memo.entry(group.clone()).or_default().clone()
         };
         let mut slot = cell.lock_safe();
-        if let Some((at, value)) = slot.as_ref() {
+        if let Some((at, full, live)) = slot.as_ref() {
             if at.elapsed() < max_age {
-                return value.clone();
+                return match view {
+                    UsageView::Full => full.clone(),
+                    UsageView::Live => live.clone(),
+                };
             }
         }
         // Held across the computation on purpose: a second caller arriving mid
@@ -37989,8 +38271,13 @@ impl OrchRegistry {
         // a groupview + tabbar + orch_autonomy stampede ONE computation rather
         // than three shorter ones.
         let fresh = self.compute_group_usage(group);
-        *slot = Some((std::time::Instant::now(), fresh.clone()));
-        fresh
+        let live = live_usage_view(&fresh);
+        let picked = match view {
+            UsageView::Full => fresh.clone(),
+            UsageView::Live => live.clone(),
+        };
+        *slot = Some((std::time::Instant::now(), fresh, live));
+        picked
     }
 
     /// The uncached usage computation behind [`Self::group_usage_within`].
@@ -49997,6 +50284,16 @@ pub async fn orch_set_max_agents(
 /// body off the webview thread and serves it through the per-group memo, so
 /// those callers share ONE computation per [`USAGE_POLL_MAX_AGE`] window.
 ///
+/// **Payload (#1317).** It answers with [`live_usage_view`], not the whole
+/// value: `live_agents` (one row per LIVE agent) plus `agent_count` (the
+/// lifetime roster's size), where it used to answer `agents` — one row per
+/// agent the group has EVER had. Every lifetime total is unchanged, so nothing
+/// the group view puts on screen moves; what changes is that a tick's size is
+/// now a function of how many agents are running, not of how long the human has
+/// been running. `mcp::summarize_group_usage` is the MCP twin of the same cut,
+/// and the read that still needs the whole roster (`group_usage` with
+/// `detail: true`) goes through [`OrchRegistry::group_usage`] as before.
+///
 /// **Reentrancy.** The read-modify-write is serialized by
 /// [`OrchRegistry::usage_lock`], and concurrent pollers collapse onto one
 /// computation in the memo. The webview's own dispatch was never what made this
@@ -50006,7 +50303,7 @@ pub async fn orch_set_max_agents(
 pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
     let Ok(group_id) = command_group(&group_id) else { return Value::Null };
-    run_blocking(move || reg.group_usage_within(&group_id, USAGE_POLL_MAX_AGE)).await
+    run_blocking(move || reg.group_usage_live_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
 // ---------- autonomous mode (#83): toggles + budget + state read ----------
@@ -52220,13 +52517,19 @@ pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
 /// throwing, exactly as `orch_questions_list` and `orch_tasks` do. Nothing
 /// WRITES an item through this path, so the loud read that protects the file is
 /// untouched.
+/// **It also carries the board rows its open items name (#1317)**, which is
+/// what lets the panel stop fetching the WHOLE board every tick to answer a
+/// handful of point lookups. That adds one `tasks.json` read to this path and
+/// no lock, no write and no event — the `viewer`-tier property above is about
+/// what a command WRITES, and this still writes nothing. See
+/// [`OrchRegistry::needs_you_read`].
 #[tauri::command]
-pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> needsyou::View {
+pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> NeedsYouRead {
     let reg = reg_of(&app);
     // #904: no error channel; an unvalidated id yields the same empty view a
     // group with no items does. See `command_group`.
-    let Ok(group_id) = command_group(&group_id) else { return needsyou::View::default() };
-    run_blocking(move || reg.needs_you_view(&group_id).unwrap_or_default()).await
+    let Ok(group_id) = command_group(&group_id) else { return NeedsYouRead::default() };
+    run_blocking(move || reg.needs_you_read(&group_id).unwrap_or_default()).await
 }
 
 /// The human closes out a needs-you item, from the app's own webview.
@@ -52280,20 +52583,48 @@ pub async fn orch_needs_you_clear(app: AppHandle, group_id: String) -> Result<u6
 /// per call with no cache, re-fired by every `orch-tasks-changed` event — so an
 /// agent's board-write burst multiplied it by the number of open boards.
 ///
+/// **Payload (#1317).** Rows carry `note_count`; only the rows named in
+/// `with_notes` carry their note BODIES, which is where a long-lived board's
+/// weight actually is (`MAX_TASK_NOTES` × 400-odd mostly-`done` rows, every
+/// tick and on every board write). The board names the rows the human has
+/// expanded — normally none, at most a handful — so this is O(open rows)
+/// rather than O(board × notes). An unknown id in `with_notes` is not an
+/// error: it names a row this read did not find, and the answer is the same
+/// board minus that row, exactly as if it had never been asked for.
+/// See `BoardTask` for why absent notes and empty notes are different answers.
+///
 /// **Reentrancy.** A pure read that takes no lock. Board writers rewrite
 /// `tasks.json` through `atomic_write`, so a concurrent reader sees the whole
 /// old file or the whole new one, never a torn one; the main-thread dispatch
 /// this replaces was serializing readers against each other for nothing.
 #[tauri::command]
-pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<BoardTask> {
+pub async fn orch_tasks(
+    app: AppHandle,
+    group_id: String,
+    with_notes: Option<Vec<String>>,
+) -> Vec<BoardTask> {
     let reg = reg_of(&app);
     // #904: no error channel; an unvalidated id yields the same empty list
     // a group with no rows does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
+    // Optional rather than required so a caller that wants no bodies at all
+    // (the NEEDS-YOU panel, the board's own stale-etag re-read) can simply not
+    // pass it, and so an older webview bundle against a newer binary degrades
+    // to "no bodies" instead of failing the whole read.
+    let wanted: HashSet<String> = with_notes.unwrap_or_default().into_iter().collect();
     // #1349: each row carries its derived `link_etag`, which the board sends
     // back as `expect_link_etag` on every write that replaces `deps` or `links`.
     // Derived here rather than stored — see `BoardTask`.
-    run_blocking(move || reg.tasks(&group_id).into_iter().map(board_task).collect()).await
+    run_blocking(move || {
+        reg.tasks(&group_id)
+            .into_iter()
+            .map(|t| {
+                let with_notes = wanted.contains(&t.id);
+                board_task(t, with_notes)
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest

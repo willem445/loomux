@@ -34180,6 +34180,105 @@ fn killed_agent_stays_in_lifetime_total_but_not_live() {
     assert_eq!(after["live_tokens"].as_u64(), Some(0));
 }
 
+// ---------- #1317: the POLLED usage view ----------
+//
+// `orch_group_usage` answered the whole LIFETIME roster — one row per agent
+// the group ever had, rebuilt and re-serialized every 2 s by the group view
+// and every 4 s per group-bound tab. `groupview.ts` indexes that array by id
+// and looks up only the agents `orch_group_summary` reports LIVE, so every
+// historical row was payload with no reader, growing with session length on a
+// fixed cadence. `live_usage_view` is the cut; these two tests pin that it
+// folds the right rows away and that nothing goes missing when it does.
+
+fn usage_ids_where(v: &Value, key: &str, live: bool) -> Vec<String> {
+    const NO_ROWS: &[Value] = &[];
+    let mut ids: Vec<String> = v[key]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(NO_ROWS)
+        .iter()
+        .filter(|a| a["live"].as_bool().unwrap_or(false) == live)
+        .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn the_polled_usage_view_carries_the_live_rows_and_names_the_roster_it_folded() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-usage-live-view", rails()).unwrap();
+
+    let live_w = reg.spawn_agent(&g.id, Role::Worker, "live-w", "t", false, None).unwrap();
+    let live_sid = live_w.session_id.clone().expect("claude worker gets a session id");
+    reg.upsert_usage_snapshot(&g.id, usage_snap(&live_sid, &live_w.id, 1.00, 1000, 0));
+
+    let dead_w = reg.spawn_agent(&g.id, Role::Worker, "dead-w", "t", false, None).unwrap();
+    let dead_sid = dead_w.session_id.clone().unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap(&dead_sid, &dead_w.id, 2.00, 2000, 0));
+    reg.mark_dead(&dead_w.id, Some(0));
+
+    let full = reg.group_usage(&g.id);
+    // POSITIVE CONTROL for every absence assertion below: the roster this is
+    // cut from must really hold BOTH kinds of row, or "the historical rows are
+    // gone" would pass just as well against a roster that never had one.
+    let full_live = usage_ids_where(&full, "agents", true);
+    let full_hist = usage_ids_where(&full, "agents", false);
+    assert_eq!(full_live, vec![live_w.id.clone()], "sanity: one live row in the full roster");
+    assert_eq!(full_hist, vec![dead_w.id.clone()], "sanity: one historical row in the full roster");
+
+    let view = reg.group_usage_live_within(&g.id, Duration::ZERO);
+
+    // The old whole-roster key is GONE rather than filtered in place: a reader
+    // written against `agents` must fail loudly, never quietly render a subset.
+    assert!(view.get("agents").is_none(), "the polled view must not answer the old whole-roster key");
+
+    // Exactly the rows the full value marks live — the set equality, not a
+    // count, so a filter that kept the wrong rows cannot pass.
+    assert_eq!(usage_ids_where(&view, "live_agents", true), full_live);
+    assert!(usage_ids_where(&view, "live_agents", false).is_empty(),
+        "a historical row in the LIVE array would be a row the group view then renders as running");
+
+    // Not a silent truncation: the roster's real size is named, and it does
+    // not equal what was shipped.
+    assert_eq!(view["agent_count"].as_u64(), Some(2));
+    assert_eq!(view["live_agents"].as_array().unwrap().len(), 1);
+
+    // And no spend disappears with the rows. The group view's headline figure
+    // is the LIFETIME total, which still sums the whole roster.
+    assert_eq!(view["lifetime_tokens"], full["lifetime_tokens"]);
+    assert_eq!(view["lifetime_cost_usd"], full["lifetime_cost_usd"]);
+    assert_eq!(view["lifetime_cost_basis"], full["lifetime_cost_basis"]);
+    assert_eq!(view["live_tokens"], full["live_tokens"]);
+    assert_eq!(view["live_cost_usd"], full["live_cost_usd"]);
+    assert_eq!(view["lifetime_tokens"].as_u64(), Some(3000), "1000 live + 2000 historical");
+}
+
+#[test]
+fn a_group_whose_agents_have_all_exited_still_reports_its_lifetime_spend() {
+    // The case where a silent truncation and an honest fold look identical
+    // from the array alone: nothing live, so `live_agents` is empty either
+    // way. `agent_count` and the lifetime totals are what tell them apart —
+    // an empty array beside a $3.00 lifetime figure is a group that HAS
+    // spent, not a group with nothing to report.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-usage-all-exited", rails()).unwrap();
+    for (i, cost) in [1.00f64, 2.00].into_iter().enumerate() {
+        let w = reg.spawn_agent(&g.id, Role::Worker, &format!("w{i}"), "t", false, None).unwrap();
+        let sid = w.session_id.clone().unwrap();
+        reg.upsert_usage_snapshot(&g.id, usage_snap(&sid, &w.id, cost, 1000, 0));
+        reg.mark_dead(&w.id, Some(0));
+    }
+
+    let view = reg.group_usage_live_within(&g.id, Duration::ZERO);
+    assert!(view["live_agents"].as_array().unwrap().is_empty(), "nothing is running");
+    assert_eq!(view["agent_count"].as_u64(), Some(2), "both exited agents are still on the roster");
+    assert_eq!(view["lifetime_tokens"].as_u64(), Some(2000));
+    assert!((view["lifetime_cost_usd"].as_f64().unwrap() - 3.00).abs() < 1e-9,
+        "the lifetime figure must survive the fold that dropped the rows it came from");
+    assert_eq!(view["live_tokens"].as_u64(), Some(0));
+}
+
 #[test]
 fn mark_dead_captures_usage_from_transcript() {
     // Point the usage reader at a fixture transcript tree instead of ~/.claude,
@@ -51716,6 +51815,79 @@ fn write_legacy_board(dir: &tempfile::TempDir, group: &GroupId) {
     let _ = fs::remove_file(dir_g.join("needs-you-migrated"));
 }
 
+// ---------- #1317: the panel's board join rides with its items ----------
+//
+// The NEEDS-YOU panel used to fetch the WHOLE board beside this read, every
+// tick and on every `orch-tasks-changed`, and use it at ONE site — a point
+// lookup per open item. On a long-lived group that board is mostly history, so
+// the panel held a second full copy of it to answer a handful of lookups.
+
+#[test]
+fn the_needs_you_read_joins_the_rows_its_open_items_name_and_no_others() {
+    let (reg, _d, g, _orch) = setup_needs_you();
+    // Four board rows, one of them noisy — the noise is the point: it is what a
+    // whole-board read would have shipped to a panel that renders none of it.
+    let mut ids = Vec::new();
+    for (title, status) in
+        [("Referenced", "queued"), ("Settled", "queued"), ("Also referenced", "queued"), ("Nobody's", "done")]
+    {
+        let t = reg.upsert_task(&g, "orch-1", None, patch(Some(title), Some(status), None)).unwrap();
+        reg.upsert_task(&g, "orch-1", Some(&t.id), patch(None, None, Some("a note nobody reads here")))
+            .unwrap();
+        ids.push(t.id);
+    }
+    assert_eq!(reg.tasks(&g).len(), 4, "premise: the board really has rows this join must leave behind");
+
+    // Two OPEN items naming rows 0 and 2, and one item naming row 1 that the
+    // human has already resolved.
+    for i in [0usize, 1, 2] {
+        reg.raise_needs_you(&g, "orch-1", demo_req("have a look", &ids[i])).unwrap();
+    }
+    let settled = open_items(&reg, &g)
+        .into_iter()
+        .find(|it| it.task.as_deref() == Some(ids[1].as_str()))
+        .expect("the middle row's item");
+    reg.resolve_needs_you(&g, &settled.id, None, needsyou::ResolveSource::Webview).unwrap();
+
+    let read = reg.needs_you_read(&g).unwrap();
+    let mut joined: Vec<&str> = read.tasks.iter().map(|t| t.id.as_str()).collect();
+    joined.sort();
+    let mut want = vec![ids[0].as_str(), ids[2].as_str()];
+    want.sort();
+    assert_eq!(joined, want, "exactly the rows the OPEN items name");
+    // Named individually, because each absence has its own reason: one row is
+    // referenced by a RESOLVED item (the settled tail never joins the board),
+    // the other by nothing at all.
+    assert!(!joined.contains(&ids[1].as_str()), "a resolved item's row is not joined");
+    assert!(!joined.contains(&ids[3].as_str()), "an unreferenced row is not joined");
+
+    // The items and the watermark are exactly what the un-joined read answers:
+    // this is additive, not a re-shaping of what the panel already had.
+    let plain = reg.needs_you_view(&g).unwrap();
+    assert_eq!(read.view.items, plain.items);
+    assert_eq!(read.view.cleared_ms, plain.cleared_ms);
+
+    // And a joined row carries no conversation: the panel projects six
+    // identity/status fields off it and renders no notes.
+    let row = serde_json::to_value(&read.tasks[0]).unwrap();
+    assert_eq!(row["note_count"], json!(1), "positive control: the row really does have a note");
+    assert!(row.get("notes").is_none(), "…and its body is not on this read: {row}");
+}
+
+#[test]
+fn a_needs_you_read_with_nothing_open_joins_no_board_rows_at_all() {
+    // The empty case is worth its own test because it is the common one: a
+    // human with a clear queue must not pay a board read, let alone a board.
+    let (reg, _d, g, _orch) = setup_needs_you();
+    reg.upsert_task(&g, "orch-1", None, patch(Some("Unreferenced"), Some("queued"), None)).unwrap();
+    reg.raise_needs_you(&g, "orch-1", feedback_req("what do you think?")).unwrap();
+
+    let read = reg.needs_you_read(&g).unwrap();
+    assert_eq!(read.view.items.len(), 1, "premise: there IS an open item — it just names no row");
+    assert_eq!(reg.tasks(&g).len(), 1, "premise: and the board is not empty either");
+    assert!(read.tasks.is_empty(), "an item naming no task joins nothing");
+}
+
 /// The open items for `group`, in file order — what the panel's open tier shows.
 fn open_items(reg: &OrchRegistry, group: &GroupId) -> Vec<needsyou::Item> {
     reg.needs_you(group)
@@ -56302,11 +56474,63 @@ fn every_read_surface_carries_the_etag_even_on_a_linkless_row() {
     }
     let view = serde_json::to_value(agent_task_view(&bare)).unwrap();
     assert_eq!(view["link_etag"], json!(link_etag(&bare)), "get_task carries it too: {view}");
-    // The human board's read model: every Task field, flattened, plus the token.
-    let board = serde_json::to_value(board_task(rich.clone())).unwrap();
+    // The human board's read model: the Task's own fields, plus the token.
+    let board = serde_json::to_value(board_task(rich.clone(), false)).unwrap();
     assert_eq!(board["link_etag"], json!(link_etag(&rich)));
     assert_eq!(board["id"], json!("t-2"), "the Task's own fields stay at the top level");
     assert_eq!(board["links"][0]["target"], json!("x.md"));
+}
+
+// ---------- #1317: the board's note bodies ride only for the rows asked for ----------
+//
+// `orch_tasks` is polled AND re-fired by every `orch-tasks-changed` event, for
+// the whole board — which on a long-lived group is mostly history. The bodies
+// are read in exactly one place (the list under an EXPANDED row) and dominate
+// the payload; the badge everywhere else needs only a count.
+
+fn noted(id: &str, texts: &[&str]) -> Task {
+    let mut t = linked(id, "queued", &[], &[]);
+    t.notes = texts.iter().enumerate().map(|(i, s)| note(i as u64 + 1, s)).collect();
+    t
+}
+
+#[test]
+fn a_board_row_carries_its_note_count_always_and_its_bodies_only_when_asked() {
+    let row = noted("t-1", &["first note", "second note"]);
+
+    let compact = serde_json::to_value(board_task(row.clone(), false)).unwrap();
+    assert_eq!(compact["note_count"], json!(2), "the badge's number rides on every row");
+    assert!(compact.get("notes").is_none(),
+        "an unasked-for row must omit the key entirely, not answer an empty list: {compact}");
+    // The prose is the payload this exists to drop — assert on the TEXT, so a
+    // change that kept the bodies under some other key still fails here.
+    assert!(!compact.to_string().contains("second note"),
+        "no note body may appear anywhere on an unasked-for row: {compact}");
+
+    let full = serde_json::to_value(board_task(row.clone(), true)).unwrap();
+    assert_eq!(full["note_count"], json!(2), "the count is unchanged by asking for the bodies");
+    assert_eq!(full["notes"].as_array().unwrap().len(), 2);
+    assert_eq!(full["notes"][1]["text"], json!("second note"));
+
+    // POSITIVE CONTROL for the absence above: the same projection, asked, does
+    // carry it — so `notes` being missing is the flag doing its job and not
+    // the field having quietly stopped existing.
+    assert!(full.to_string().contains("second note"));
+}
+
+#[test]
+fn asked_for_but_empty_is_a_different_answer_from_never_asked() {
+    // The board renders an expanded row's conversation from `notes`. If a row
+    // that was never fetched and a row with no notes looked the same on the
+    // wire, an un-fetched row would render as one whose notes were deleted.
+    let none = noted("t-1", &[]);
+    let asked = serde_json::to_value(board_task(none.clone(), true)).unwrap();
+    let unasked = serde_json::to_value(board_task(none, false)).unwrap();
+
+    assert_eq!(asked["notes"], json!([]), "asked, and there are none");
+    assert!(unasked.get("notes").is_none(), "never asked");
+    assert_eq!(asked["note_count"], json!(0));
+    assert_eq!(unasked["note_count"], json!(0));
 }
 
 /// DERIVED means `tasks.json` gains no key — the additive promise #1272/#1273

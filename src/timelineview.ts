@@ -16,13 +16,13 @@
 // terminal — the chart's width comes from its own container via a
 // ResizeObserver, and the pure layout takes that width as a parameter.
 
-import { invoke } from "./transport.ts";
-// The orch_* reads are called here directly, exactly as AuditView and
-// TasksView call `orch_audit` / `orch_tasks`: an orchestration view is its own
-// bridge for the group-scoped read it renders. The gh half goes through
-// issues.ts's typed wrapper, which is where every gh command already lives.
+// The audit half no longer invokes anything: this view and the audit viewer
+// share ONE `orch_audit` read through `AuditStore`, which the pane owns and
+// injects (#1317). The gh half goes through issues.ts's typed wrapper, which
+// is where every gh command already lives.
 import { ghActivity, type GhActivity } from "./issues";
 import { RefreshGate } from "./refreshgate";
+import { AuditStore } from "./auditstore";
 import {
   CATEGORY_ORDER,
   DEFAULT_CATEGORIES,
@@ -113,9 +113,37 @@ export class TimelineView {
   private notesEl: HTMLElement;
   private detailEl: HTMLElement;
 
-  /** Raw audit rows, as received. Deliberately `unknown[]`: `extractTimeline`
-   *  counts a row it cannot read rather than throwing on it. */
-  private auditRows: unknown[] = [];
+  /** Raw audit rows, as received — a REFERENCE to the pane's shared read
+   *  (#1317), never a copy: the audit viewer renders from the same array, and
+   *  two 5000-row copies of one file's prompt text is the duplication #1317
+   *  names. Deliberately `readonly unknown[]`: `extractTimeline` counts a row
+   *  it cannot read rather than throwing on it, and nothing here may sort or
+   *  splice an array the other view is showing. */
+  private auditRows: readonly unknown[] = [];
+  /** Memo for `extractTimeline` (#1317), keyed by the IDENTITY of the two
+   *  inputs it is derived from.
+   *
+   *  The extraction builds one `TimelineEvent` per audit row, each with a
+   *  freshly-composed label and an alias of the raw `detail` blob — up to
+   *  `AUDIT_VIEW_LIMIT` (5000) of them. It used to run on every RENDER, above
+   *  the no-op signature check below and therefore even on the renders that
+   *  check then discarded: a window-preset click, a category chip, a
+   *  `ResizeObserver` tick, a dot click, expanding a detail row. Now it runs
+   *  once per set of inputs — which is once per successful audit read, since
+   *  the store replaces its array wholesale, plus once per gh refresh.
+   *
+   *  Identity, not a content signature: both arrays are replaced rather than
+   *  mutated (the store hands out `readonly`, and `gh` is reassigned whole),
+   *  so `===` is exactly "the same read". A content signature would also skip
+   *  the re-extraction on a tick where the log did not grow; it is not taken
+   *  here because "same length and same last timestamp" is only sound while
+   *  the log is append-and-drop-front, which the rotation across
+   *  `audit.1.jsonl` makes a claim rather than an obvious fact. */
+  private extractionMemo: {
+    rows: readonly unknown[];
+    gh: GhActivity | null;
+    value: TimelineExtraction;
+  } | null = null;
   private gh: GhActivity | null = null;
   private ghError: unknown = null;
   /** When gh was last ATTEMPTED (not last succeeded) — a failing gh must not
@@ -175,11 +203,18 @@ export class TimelineView {
   private range: TimelineRange | null = null;
   private filtered: TimelineEvent[] = [];
 
+  /** The pane's shared audit read (#1317). Injected rather than constructed
+   *  here, because the whole point is that the audit viewer reads the same
+   *  one — see `AuditStore`. */
+  private store: AuditStore;
+
   constructor(
-    private groupId: string,
+    groupId: string,
     private opts: {
       onClose: () => void;
       onEmbedMenu?: (anchor: HTMLElement) => void;
+      /** The pane's one `orch_audit` read, shared with the audit viewer. */
+      store: AuditStore;
       /** The pane's live repo folder — read on every load rather than
        *  snapshotted, the same way the group panel reads it (#316). Null when
        *  the pane has no folder, which is a real state and renders as a note
@@ -187,6 +222,7 @@ export class TimelineView {
       getRepo: () => string | null;
     }
   ) {
+    this.store = opts.store;
     this.el = el("div", "timeline-view");
 
     const head = el("div", "timeline-head");
@@ -360,13 +396,36 @@ export class TimelineView {
     // failure: `this.gh` is left exactly as a prior successful read set it).
     let readOk = true;
     try {
-      try {
-        this.auditRows = await invoke<unknown[]>("orch_audit", { groupId: this.groupId });
-      } catch {
-        // A missing/unreadable log renders as an empty chart, not a broken one.
-        this.auditRows = [];
-        readOk = false;
-      }
+      // The pane's shared read (#1317). `forceGh` doubles as "read fresh",
+      // and in THIS view only the ⟳ button sets it — `show()`, `toggleFollow`
+      // and PollGate's return-to-a-visible-window refresh all pass `false`, so
+      // all three take the store's window (#1317 review N3). The audit viewer
+      // forces on all three of ITS gestures; the two deliberately differ, and
+      // the coupling here is why: forcing would also bypass `shouldRefreshGh`
+      // and shell out to gh, which that throttle exists to prevent, and a gh
+      // shell-out per panel open is a worse trade than a bounded staleness.
+      // What that costs is worth stating rather than leaving implied: with
+      // follow OFF, `show()` is the human's only refresh gesture, so a chart
+      // can open up to AUDIT_READ_MAX_AGE_MS (1200 ms) behind the log.
+      // Sharing the window is also the point — it is what lets the audit
+      // viewer's tick at the same cadence be served this read instead of
+      // firing a second `orch_audit` for the same file.
+      //
+      // The store keeps the last good rows on a failed read and never throws,
+      // so an unreadable log leaves the chart as it was rather than blanking
+      // it. On a FIRST read there is nothing to keep, so a rejection there
+      // still renders empty — which is why the empty state reads
+      // `store.loaded` rather than calling an empty chart an empty log.
+      //
+      // No `readOk = false` arm for the audit half (#1316 N1 kept it for the
+      // gh half below). That flag exists to stop `render()` pruning
+      // `expanded` against an extraction built from a failure's EMPTY rows;
+      // the store cannot throw and never replaces good rows with an empty
+      // list, so that state is unreachable here. The one empty-without-success
+      // case is a failed FIRST read, which `store.loaded` covers at the prune
+      // site. The gh arm still sets it: a gh throw DOES null `this.gh` and
+      // drop its events.
+      this.auditRows = await this.store.read(forceGh ? 0 : undefined);
       const repo = this.opts.getRepo();
       if (!repo) {
         this.gh = null;
@@ -385,16 +444,32 @@ export class TimelineView {
         }
       }
       this.lastReadOk = readOk;
+      // `end()` moved INSIDE the `finally` (#1317 review N4). It sat on the
+      // line after this block, so any rejection in the region above — today
+      // only `getRepo()`, since the store cannot throw — would skip it, leave
+      // the gate `running`, and make every later `load()` return at
+      // `begin()`: the timeline would never refresh again for the session,
+      // with nothing on screen to say so.
+      //
+      // `end()` runs FIRST inside the `finally`, above `render()`, and its
+      // answer is held for the tail call (#1317 review N4). Being merely
+      // inside the block was not enough: `render()` is the single widest
+      // throwing surface in this view — `extractTimeline` over up to 5000
+      // rows, then SVG construction — so ordering it first would have traded
+      // the `getRepo()` hazard for a larger one and left the sentence above
+      // false. Releasing the gate before anything that can throw is what
+      // actually removes the class.
     } finally {
+      const rerun = this.gate.end();
       if (!this.disposed) this.render();
+      if (rerun && !this.disposed) void this.load(forceGh);
     }
-    if (this.gate.end() && !this.disposed) void this.load(forceGh);
   }
 
   private render(): void {
     if (this.disposed) return;
 
-    const extraction = extractTimeline(this.auditRows, this.gh);
+    const extraction = this.extractionOf();
     const range = resolveWindow(this.windowId, Date.now(), extraction.events);
     const filtered = filterTimeline(extraction.events, range, this.categories);
     const widthPx = Math.round(this.chartEl.clientWidth);
@@ -403,12 +478,19 @@ export class TimelineView {
     // `expanded` was only ever cleared wholesale on a dot click (below), so a
     // row expanded while its cluster stayed selected across a poll could sit
     // stranded once its event aged out of `orch_audit`'s window. Must run
-    // before `sig` is built — it feeds `this.expanded.size` below. Gated on
-    // `lastReadOk` (N1): a failed read already fell back to `auditRows = []`
-    // / `gh = null` in `load()`, and pruning against THAT extraction would
-    // read a transient throw (or a routine gh failure) as "every one of those
-    // events is gone" and collapse every open row for no real reason.
-    if (this.lastReadOk) this.expanded = retainExpandedEvents(this.expanded, extraction.events);
+    // before `sig` is built — it feeds `this.expanded.size` below.
+    //
+    // Two gates, and they cover different failures. `lastReadOk` (#1316 N1)
+    // is now carried by the GH half alone: a gh throw nulls `this.gh` and
+    // drops its events, and pruning against that extraction would read a rate
+    // limit or an offline machine as "every one of those events is gone".
+    // `store.loaded` (#1317) covers the audit half, which the shared store
+    // reshaped: a failed read there keeps the last good rows rather than
+    // emptying them, so the only rows-are-empty-without-a-success state left
+    // is a failed FIRST read — and this is what stops that one pruning.
+    if (this.lastReadOk && this.store.loaded) {
+      this.expanded = retainExpandedEvents(this.expanded, extraction.events);
+    }
 
     // Skip a no-op follow re-render: rebuilding the SVG under the human's
     // pointer (and collapsing an open detail row) for identical data is the
@@ -447,6 +529,16 @@ export class TimelineView {
     this.renderDetail();
   }
 
+  /** `extractTimeline` over the current inputs, memoised — see
+   *  `extractionMemo`. */
+  private extractionOf(): TimelineExtraction {
+    const memo = this.extractionMemo;
+    if (memo && memo.rows === this.auditRows && memo.gh === this.gh) return memo.value;
+    const value = extractTimeline(this.auditRows, this.gh);
+    this.extractionMemo = { rows: this.auditRows, gh: this.gh, value };
+    return value;
+  }
+
   private renderChart(widthPx: number): void {
     const range = this.range!;
     this.chartEl.replaceChildren();
@@ -458,8 +550,22 @@ export class TimelineView {
       return;
     }
     if (this.extraction!.events.length === 0) {
+      // THREE answers, not two (#1317 review N5). "Nothing happened", "I
+      // could not look", and "I have not looked yet" are different things, and
+      // this view reaches the third on every fresh pane: the `ResizeObserver`
+      // wired in the constructor fires a render before the IPC round trip
+      // `show()` starts has landed, so gating on `loaded` alone flashed the
+      // failure text at a healthy group.
       this.chartEl.append(
-        el("div", "timeline-empty", "No activity recorded for this group yet.")
+        el(
+          "div",
+          "timeline-empty",
+          !this.store.attempted
+            ? "Reading this group's audit log…"
+            : this.store.loaded
+              ? "No activity recorded for this group yet."
+              : "Could not read this group's audit log."
+        )
       );
       return;
     }

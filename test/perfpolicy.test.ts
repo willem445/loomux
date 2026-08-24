@@ -60,6 +60,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { AUDIT_READ_MAX_AGE_MS } from "../src/auditstore.ts";
 
 // ---------- the manifests ----------
 
@@ -477,7 +478,9 @@ const TIMERS: TimerRow[] = [
       "cleared on toggle, on close (hide()) and on dispose, suppressed while the window is " +
       "hidden (#743 S6) — the view that had the close half right first. Its gh " +
       "half is separately self-gated to GH_REFRESH_MS (60 s) in timelinechrome.ts, so a tick is " +
-      "one orch_audit refetch, not two shell-outs.",
+      "at most one orch_audit refetch, not two shell-outs — and since #1317 a tick that lands " +
+      "inside AUDIT_READ_MAX_AGE_MS of the audit viewer's is served that read instead of firing " +
+      "its own, because both views read one AuditStore per pane rather than one each.",
     debt: null,
   },
   {
@@ -758,6 +761,25 @@ test("every backend event stream src/ listens to is declared in the stream manif
     [],
     "a STREAMS row names an event no src/ file listens for — delete the row (or fix the " +
       "event name); a stale row makes the manifest fiction"
+  );
+});
+
+test("the shared audit read's window stays under the cadences that share it", () => {
+  // `AUDIT_READ_MAX_AGE_MS`'s own doc requires it be strictly under the follow
+  // cadence: at or above it, a view's own tick would be served its own previous
+  // read and the log would advance at half the rate this manifest advertises
+  // (#1317 review N8). Both operands are already here — the two FOLLOW_MS rows
+  // in TIMERS are asserted against source by the tests around this one — so the
+  // coupling costs three lines and no production change. Without it, a reviewer
+  // lowering a cadence gets a green suite and a silently broken window.
+  const cadences = TIMERS.filter((t) => t.key.endsWith("@FOLLOW_MS")).map((t) => t.cadenceMs);
+  // Positive control: this asserts a MINIMUM over a filtered list, and an empty
+  // list would make `Math.min()` Infinity and the assertion vacuously true.
+  assert.ok(cadences.length >= 2, `expected both follow timers in TIMERS, found ${cadences.length}`);
+  assert.ok(
+    AUDIT_READ_MAX_AGE_MS < Math.min(...cadences),
+    `AUDIT_READ_MAX_AGE_MS (${AUDIT_READ_MAX_AGE_MS}) must be strictly under the smallest ` +
+      `cadence that shares the read (${Math.min(...cadences)}) — see its doc in src/auditstore.ts`
   );
 });
 

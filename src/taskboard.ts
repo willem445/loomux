@@ -350,9 +350,12 @@ export type ReadinessRow = HasLinks & HasParent;
 /** Derived readiness (#582, extended by #958 slice R): `queued`, every dep
  *  `done`, AND every container above it clear too (`blockingAncestor`). The
  *  board mirrors the backend's `task_ready` rather than reading a `ready` flag
- *  off the wire, because the human's board reads full `Task`s via `orch_tasks`
- *  — `ready` is a `TaskSummary` field, and `TaskSummary` is the MCP
- *  `list_tasks` row the orchestrator gets, not this path. The rules are
+ *  off the wire, because the human's board reads whole board rows via
+ *  `orch_tasks` — `ready` is a `TaskSummary` field, and `TaskSummary` is the
+ *  MCP `list_tasks` row the orchestrator gets, not this path. (Those rows
+ *  were `Task`s flattened whole until #1317 split the note BODIES out of the
+ *  polled read; every field this derivation reads — `status`, `deps`,
+ *  `parent` — is still on every row, which is why nothing here changed.) The rules are
  *  duplicated on purpose and pinned by tests on both sides; the alternative (a
  *  second derived field on the human command) would be a new wire shape for
  *  something the board can compute exactly from data it already has.
@@ -1560,9 +1563,11 @@ export function hasMissingParent<T extends HasParent>(task: T, board: readonly T
 // ---------------------------------------------------------------------------
 // Sprints (#1272) and grounding links (#1273) — the board's mirror of the
 // backend model. Every rule here is the backend's (mod.rs `current_sprint`,
-// `normalize_task_links`); these exist because the human's board reads full
-// `Task`s via `orch_tasks` and derives its own view, exactly as it already does
-// for readiness. The two sides are pinned against each other by tests.
+// `normalize_task_links`); these exist because the human's board reads whole
+// board rows via `orch_tasks` and derives its own view, exactly as it already
+// does for readiness. (#1317 split the note BODIES out of that read; sprint and
+// link fields ride on every row as before.) The two sides are pinned against
+// each other by tests.
 // ---------------------------------------------------------------------------
 
 /** A row as far as sprints care. Optional on the wire like every other additive

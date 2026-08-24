@@ -1229,7 +1229,13 @@ export class GroupView {
     if (s.agents.length === 0) {
       this.listEl.append(el("div", "group-empty", "No live agents in this group."));
     } else {
-      const usageOf = new Map(this.usage?.agents.map((a) => [a.id, a] as const));
+      // `live_agents`, not the whole lifetime roster (#1317): every id this
+      // loop looks up comes from `s.agents`, which `orch_group_summary`
+      // already filters to the LIVE panes — so a historical row could never
+      // be hit here, and shipping one per killed agent every 2 s was payload
+      // this view had no reader for. The lifetime figures above are unmoved:
+      // they come from the totals, not from this array.
+      const usageOf = new Map(this.usage?.live_agents.map((a) => [a.id, a] as const));
       for (const a of s.agents) {
         const wrap = el("div", "group-agent");
         const row = el("div", "group-row");

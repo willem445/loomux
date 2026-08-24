@@ -121,7 +121,22 @@ export interface OrchTask {
   pr_base?: string | null;
   assignee?: string | null;
   session?: string | null;
-  notes: OrchTaskNote[];
+  /** How many notes this row has — ALWAYS present, and the only honest source
+   *  for the `🗨 N` badge (#1317). Deriving it from `notes` would read 0 for
+   *  every row whose bodies were not fetched. */
+  note_count: number;
+  /** The note bodies — present ONLY for the rows the last `orch_tasks` read
+   *  named in `withNotes`, i.e. the ones the human has expanded (#1317). A
+   *  long-lived board is mostly history and `MAX_TASK_NOTES` of prose per row
+   *  dominated the polled payload; the bodies are read in exactly one place,
+   *  the list under an expanded row.
+   *
+   *  **Absent is not empty.** `undefined` means "not fetched", `[]` means
+   *  "fetched, and this row has none" — collapsing them would render an
+   *  un-fetched row as one whose conversation had been deleted. Optional on
+   *  the wire, so a reader that assumed the bodies were always there fails to
+   *  compile rather than silently showing none. */
+  notes?: OrchTaskNote[];
   /** Ids of tasks on this board that must be `done` first (#582). Optional
    *  because the backend omits an empty vec entirely
    *  (`skip_serializing_if`) — every pre-#582 board arrives with no key at
@@ -265,15 +280,24 @@ export class TasksView {
    *  `approveWillMerge` treats it as "no gate known" (Approve reads plain)
    *  rather than guessing a warning it can't back up. */
   private workflow: WorkflowStatus | null = null;
-  /** Task ids with their notes section expanded (survives re-renders). */
+  /** Task ids with their notes section expanded (survives re-renders).
+   *
+   *  Load-bearing on the WIRE since #1317, not just in the renderer: this set
+   *  is what the next `orch_tasks` read names in `withNotes`, and it is the
+   *  only thing that decides which rows come back carrying their note bodies.
+   *  That is why it is pruned against the board on every refresh — an id whose
+   *  row has gone would otherwise be asked for on every poll for the rest of
+   *  the session. */
   private expanded = new Set<string>();
   /** Task ids with their GROUNDING section expanded (#1273) — its own set,
    *  not a second meaning for `expanded` above. The two sections answer
    *  different questions ("what was said about this" / "what governs this")
    *  and a human reading one is routinely not done with the other, so folding
-   *  them into one toggle would close the notes to open the links. Like
-   *  `expanded` it is frontend-only and survives re-renders; an id whose row
-   *  has since gone simply never matches. */
+   *  them into one toggle would close the notes to open the links. Survives
+   *  re-renders, and pruned against the board beside `expanded` (#1317) —
+   *  frontend-only, so a stale id here costs nothing on the wire, but two sets
+   *  of the same kind two lines apart with different housekeeping rules is how
+   *  they come to disagree about what a live row is. */
   private expandedLinks = new Set<string>();
   /** The half-typed grounding link per row (#1273 N1), so a re-render never
    *  eats what the human is in the middle of writing.
@@ -767,6 +791,8 @@ export class TasksView {
     return this.mutate(
       attempt(t).catch(async (err) => {
         if (!isStaleLinkEtag(err) || !retriesAfterStale(edit)) throw err;
+        // No `withNotes`: this re-read exists to recover ONE row's fresh
+        // `link_etag`, and the arrays it composes from carry no note bodies.
         const board = await invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId });
         // The row itself can be gone — the concurrent write that moved the
         // arrays may have been a delete. Re-throwing the ORIGINAL refusal is
@@ -888,7 +914,15 @@ export class TasksView {
     }
     this.pendingRefresh = false;
     try {
-      this.tasks = await invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId });
+      // #1317: note BODIES ride only for the rows the human has expanded —
+      // normally none, at most a handful. Every other row answers with
+      // `note_count`, which is all the `🗨 N` badge ever needed. The expanded
+      // set is read HERE rather than remembered anywhere: a row collapsed
+      // between two ticks simply stops being asked for.
+      this.tasks = await invoke<OrchTask[]>("orch_tasks", {
+        groupId: this.groupId,
+        withNotes: [...this.expanded],
+      });
     } catch (err) {
       this.toast(String(err));
       return;
@@ -927,21 +961,23 @@ export class TasksView {
     // (#1273): a draft nobody can ever see again is a leak that grows with the
     // session.
     this.linkDrafts = retainExistingKeys(this.linkDrafts, this.tasks);
-    // NOTE (#1316): `expanded` (notes-expand toggle) belongs on this list too
-    // — it's the same never-pruned shape as its siblings above — but is
-    // deliberately NOT fixed here. PR #1470 (open, `perf/1317-polled-read-payloads`,
-    // commit "fix(tasks): prune the expanded-row sets" — cited by subject, not
-    // SHA, since #1470 rebases and a subject survives that where a hash does
-    // not) already prunes it with this exact call, plus `expandedLinks`
-    // alongside it, because that PR makes `expanded` a wire parameter
-    // (`withNotes`) and needed the prune for correctness, not just hygiene.
-    // Landing this comment costs a trivial textual conflict with
-    // #1470 at this exact insertion point — worth it, since the alternative
-    // is silently duplicating that PR's fix with no pointer explaining why one
-    // of the six #1316 rows is missing from this one. See this PR's body for
-    // the full accounting of all six rows.
-    // RESOLVER: once #1470 merges, delete this whole comment — do not keep it
-    // alongside the two lines it now describes as still-missing.
+    // The two expanded-row sets, pruned on the same rule (#1317).
+    //
+    // This is the sixth of #1316's six module-level collections, and the one
+    // that PR deliberately left here: it landed a NOTE at this exact point
+    // saying so, ending "RESOLVER: once #1470 merges, delete this whole
+    // comment". Deleted on the rebase that brought #1316 in — the two lines
+    // below are what it described as still-missing.
+    //
+    // `expanded` is no longer only a rendering flag: it is what the next read
+    // NAMES in `withNotes`, so an id whose row has gone would be asked for on
+    // every poll for the rest of the session — a request that grows with how
+    // long the human has been running, which is the exact shape this issue is
+    // about. `expandedLinks` carries no wire weight but is the same set of the
+    // same class two lines away, and one of the pair left unpruned is how they
+    // come to disagree about what a live row is.
+    this.expanded = retainExisting(this.expanded, this.tasks);
+    this.expandedLinks = retainExisting(this.expandedLinks, this.tasks);
     this.render();
   }
 
@@ -2915,12 +2951,32 @@ export class TasksView {
     });
     top.appendChild(groundBtn);
 
-    const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
+    // `note_count`, never `notes.length` (#1317): a collapsed row carries no
+    // bodies, so the array is the wrong thing to count and would read 0.
+    const notesBtn = el("button", "task-btn notes", `🗨 ${t.note_count}`) as HTMLButtonElement;
     notesBtn.title = "Notes";
     notesBtn.addEventListener("click", () => {
       if (this.expanded.has(t.id)) this.expanded.delete(t.id);
       else this.expanded.add(t.id);
+      const opening = this.expanded.has(t.id);
+      // Render first so the row opens on the click, then ask for the bodies:
+      // the next read names the newly-expanded row, and the notes fill in when
+      // it lands. Expanding a row the last read did not carry is the ONLY way
+      // the list can be momentarily short, which is why it re-reads here
+      // rather than waiting for the poll.
+      //
+      // Only on the way OPEN (#1317 review N6). A collapse can only SHRINK
+      // `withNotes`, so there is nothing to fetch, and firing a whole-board
+      // read for it would be exactly the polled work this issue is about.
+      //
+      // This view has no `setInterval`, so this is the ONLY thing that ever
+      // fetches an expanded row's bodies. If it rejects, `refreshNow` toasts
+      // and returns, and the row keeps saying "loading notes…" until an agent
+      // writes to the board or the panel is reopened — recoverable, and
+      // visible through the toast, but a failure mode that did not exist when
+      // the bodies were already in hand.
       this.render();
+      if (opening) this.refresh();
     });
     top.appendChild(notesBtn);
 
@@ -2965,7 +3021,15 @@ export class TasksView {
 
     if (this.expanded.has(t.id)) {
       const notes = el("div", "task-notes");
-      for (const n of t.notes) {
+      // ABSENT is not EMPTY (#1317). A row expanded since the last read has no
+      // bodies yet — the re-read the expand kicked off is in flight — and
+      // rendering that as an empty conversation would say this row's notes are
+      // gone. `note_count` is what distinguishes them, so say "loading" only
+      // when there is something to load.
+      if (t.notes === undefined && t.note_count > 0) {
+        notes.appendChild(el("div", "task-note task-note-pending", "loading notes…"));
+      }
+      for (const n of t.notes ?? []) {
         const line = el("div", "task-note");
         line.append(
           el("span", "task-note-meta", `${n.author} · ${fmtTime(n.ts_ms)}`),
