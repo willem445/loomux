@@ -14129,7 +14129,15 @@ pub fn session_cwd_in_store(
     let Some(db) = opencode_db else {
         return Ok(None);
     };
-    match crate::opencodedb::session_directory(db, session_id) {
+    // scratch r2: force open_readonly's immutable=1 fallback for opencode
+    if !db.is_file() {
+        return Ok(None);
+    }
+    let conn = match crate::opencodedb::open_immutable(db) {
+        Ok(c) => c,
+        Err(e) => return Err(e.to_string()),
+    };
+    match crate::opencodedb::session_directory_on(&conn, session_id) {
         Ok(dir) => Ok(dir),
         Err(crate::opencodedb::Unavailable::Absent) => Ok(None),
         Err(e) => Err(e.to_string()),
