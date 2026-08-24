@@ -737,8 +737,11 @@ order of a `cargo test --locked --workspace` run:
       → loomux_lib unit → orrerix bin → every src-tauri/tests/* integration
       binary → doc-tests
 
-(Read off a real green run's log: run 32785686595, job 97617019783, ubuntu leg
-of PR #1571. Re-read it rather than trusting this line.)
+Re-derive it rather than trusting this line: take the newest green `CI` run on
+your branch and grep the ubuntu leg's *Test backend* step for `Running`. No run
+id is pinned here on purpose — a run cannot exist until after the commit that
+would cite it, so any id written on this surface is one commit stale the moment
+it lands, and a stale id is what makes the whole line look untrustworthy.
 
 - To redden a **unit test in `crates/loomux-engine/src/`** (e.g.
   `workflow.rs`) **or in `crates/loomux-server/src/`**, neuter the pure

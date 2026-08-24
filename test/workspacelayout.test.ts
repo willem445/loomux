@@ -101,6 +101,11 @@ function lockVersionOf(lock: string, name: string): string | undefined {
   return undefined;
 }
 
+/** Escape a literal for use inside a RegExp — the package name reaches one. */
+function escapeRe(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** The app package's name, from `src-tauri/Cargo.toml`'s `[package]` section. */
 function appPackageName(): string {
   const toml = repoFile("src-tauri/Cargo.toml");
@@ -246,12 +251,19 @@ test("every build-output path agrees on the workspace-root target/", () => {
   // Scoped to the assignment lines themselves: both files legitimately mention
   // src-tauri in prose nearby, and a whole-file substring check would pass or
   // fail on comment text rather than on the paths that are actually consumed.
+  //
+  // The executable's basename comes from the manifest, not from a literal here.
+  // This test is about the DIRECTORY (workspace-root `target/`, not
+  // `src-tauri/target/`), and hardcoding the name would make the next rename
+  // redden it for a reason it does not police — `test/bundleidentity.test.ts`
+  // owns the name at these same two sites.
+  const exe = escapeRe(`${appPackageName()}.exe`);
   const ci = repoFile(".github/workflows/ci.yml");
   const ciExe = ci.match(/^\s*LOOMUX_E2E_EXE:.*$/m);
   assert.ok(ciExe, "ci.yml's e2e job must set LOOMUX_E2E_EXE");
   assert.match(
     ciExe[0],
-    /workspace\s*}}\\target\\debug\\orrerix\.exe$/,
+    new RegExp(`workspace\\s*}}\\\\target\\\\debug\\\\${exe}$`),
     `LOOMUX_E2E_EXE must point at the workspace-root target/: ${ciExe[0].trim()}`
   );
 
@@ -260,7 +272,7 @@ test("every build-output path agrees on the workspace-root target/", () => {
   assert.ok(defaultExe, "e2e/fixtures.ts must keep a DEFAULT_EXE fallback");
   assert.match(
     defaultExe[0],
-    /"\.\.\/target\/debug\/orrerix\.exe"/,
+    new RegExp(`"\\.\\./target/debug/${exe}"`),
     `DEFAULT_EXE must resolve to the workspace-root target/ — it is what runs when LOOMUX_E2E_EXE is unset: ${defaultExe[0]}`
   );
 
