@@ -29859,11 +29859,6 @@ impl OrchRegistry {
         // line already records it, and a second copy could only ever disagree.
         self.audit(group_id, brand::AUDIT_ACTOR, "session-learned",
             json!({ "agent": agent_id, "session": session_id }));
-        // The frontend's copy of that same fact (#1563), emitted here rather
-        // than at the watcher so every path that binds an id reports it, and
-        // last so that the two early returns above — a claim another pane
-        // holds, and a pane that is gone or already bound — emit nothing.
-        self.emit_session_learned(group_id, agent_id, session_id);
         true
     }
 
