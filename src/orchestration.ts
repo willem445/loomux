@@ -574,9 +574,13 @@ export interface OrchWiring {
   /** Persist the current tab/layout snapshot (#1563). `persistTabs` lives in
    *  main.ts behind the `tabs.onChange` subscription, and an `orch-session-learned`
    *  adoption changes a pane's captured `sessionId` without changing the tab SET —
-   *  so nothing in that subscription fires for it. Same hook the #440 reconciler
-   *  calls after its own `adoptSessionId` pass, for the same reason; a no-op when
-   *  the encoded snapshot is unchanged. */
+   *  so nothing in that subscription fires for it.
+   *
+   *  The #440 reconciler (`reconcileSessionIds`, main.ts) needs the same write
+   *  after its own `adoptSessionId` pass and calls `persistTabs` DIRECTLY — it
+   *  lives in that module, so it never needed a hook. This is the same
+   *  FUNCTION reached from a module that cannot see it, not the same hook; a
+   *  no-op when the encoded snapshot is unchanged. */
   persistLayout(): void;
   /** Force a tab-strip re-render (#271): channel membership is derived live from
    *  each pane's state (tabcounts.ts), not tracked in a maintained per-tab map the

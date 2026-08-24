@@ -29880,9 +29880,14 @@ impl OrchRegistry {
     /// ([`Self::capture_session_baseline`] answers `None` for every other CLI).
     ///
     /// One event per binding, on the same `AppHandle` seam `orch-focus` and
-    /// `orch-spawn-request` use. The payload names the group as well as the
-    /// agent because that is what identifies the record on the frontend side;
-    /// the pane itself is found by agent id (`src/orchestration.ts`).
+    /// `orch-spawn-request` use.
+    ///
+    /// The frontend locates the pane by **agent id alone** and never reads
+    /// `group_id` — sound because agent ids are minted from one registry-global
+    /// counter (see [`Self::seq`]), so an id names at most one pane anywhere.
+    /// `group_id` rides along for audit legibility, for symmetry with every
+    /// other `orch-*` event, and for a future consumer that wants to filter by
+    /// group — not because this event's own listener needs it.
     fn emit_session_learned(&self, group_id: &GroupId, agent_id: &str, session_id: &str) {
         // Built ONCE, above the branch, so the payload a test observes is the
         // same value production emits rather than a second construction of it.
