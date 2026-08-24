@@ -699,7 +699,9 @@ fn fold_appended(cursor: &mut TranscriptCursor) -> std::io::Result<u64> {
         }
         bytes_read += n as u64;
         if buf.last() != Some(&b'\n') {
-            break; // partial trailing line — leave it for a later tick
+            // [scratch] #1239 round 2: fall through instead of breaking, so a
+            // trailing line whose terminator has not arrived yet is folded and
+            // its bytes consumed.
         }
         if let Ok(line) = std::str::from_utf8(&buf) {
             cursor.fold.push(line);
