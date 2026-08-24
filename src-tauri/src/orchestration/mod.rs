@@ -52702,7 +52702,8 @@ pub fn resume_recorded_session(
             // after looking somewhere else entirely — and no opencode group
             // could be reopened at all.
             let db = reg.opencode_db_path(&record.group_id);
-            match session_cwd_in_store(&cli, session_id, Some(&db)) {
+            let _ = &db; // scratch r1: the group's store is deliberately not consulted
+            match session_cwd_in_store(&cli, session_id, None) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Err(format!(
