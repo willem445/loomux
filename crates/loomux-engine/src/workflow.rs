@@ -1742,7 +1742,8 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     // `parse_workflow` really does enforce it — `check_segment` refuses above
     // `MAX_SEGMENT_LEN` — and a bound the engine enforces while the manifest is
     // silent is one a generated control would let a human exceed.
-    fact("block.remote", "maxLength", json!(crate::pathseg::MAX_SEGMENT_LEN));
+    // NEUTERED FOR THE RED ROUND: the engine states a cap it does not enforce.
+    fact("block.remote", "maxLength", json!(96));
     fact("resource.slots", "min", json!(1));
     fact("resource.slots", "max", json!(RESOURCE_SLOTS_MAX));
     fact("resource.max_hold_minutes", "min", json!(1));
