@@ -27,7 +27,9 @@ Three ways loomux could learn an id it didn't mint, in increasing order of
 mechanism cost:
 
 **A — read it off the command line, when it's already there.** A custom line
-carrying `--session-id <id>` or `--resume <id>` *names its own session*. Per
+carrying `--session-id <id>` or `--resume <id>` *names its own session* — and,
+since #1563 A1, so does `--session <id>` on an **opencode** line, which is the
+only spelling opencode has (see *An id the backend learns* below). Per
 the [CLI reference](https://code.claude.com/docs/en/cli-reference):
 
 > `--session-id` — "Use a specific session ID for the conversation (must be a

@@ -7,8 +7,9 @@
 // any of that.
 //
 // WHY THIS EXISTS. Option A (panerestore.ts's adoptableSessionId) only
-// covers a custom command line that already NAMES its session via
-// `--session-id`/`--resume`. A bare `claude` custom line mints its OWN id
+// covers a custom command line that already NAMES its session — via
+// `--session-id`/`--resume`, or `--session` on an opencode line (#1563 A1).
+// A bare `claude` custom line mints its OWN id
 // with nothing on the command line to read — the only way loomux can learn
 // THAT id is to watch what listSessions() turns up for the pane's cwd+CLI
 // after it's had a chance to produce a transcript, and match it back. That's
