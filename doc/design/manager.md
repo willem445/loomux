@@ -1,12 +1,13 @@
 # The manager — the human's own pane, and the channel that reaches it
 
-*#1161. This note covers slice **M2**: the structural no-injection guarantee, the
-`mailbox.json` registry behind it, the two MCP tools, and `Role::Manager`'s
-enumerated tool surface. The capability class itself landed in **M1** (#1169).
-Lifecycle (M3), the elicitation prose (M4), the unread chip (M5) and the
-`role_hint: liaison` migration plus the user docs (M6) extend this note rather
-than replacing it — where a section names a later slice, that slice owns the
-paragraph.*
+*#1161. This note covers slices **M2** — the structural no-injection guarantee,
+the `mailbox.json` registry behind it, the two MCP tools, and `Role::Manager`'s
+enumerated tool surface — and **M3**, the lifecycle: who opens the pane, which
+guardrails skip it, and how both bare-resume routes into it are closed. The
+capability class itself landed in **M1** (#1169). The elicitation prose (M4), the
+unread chip (M5) and the `role_hint: liaison` migration plus the user docs (M6)
+extend this note rather than replacing it — where a section names a later slice,
+that slice owns the paragraph.*
 
 Companion notes: [liaison.md](liaison.md), whose stated promotion trip-wire is
 why this class exists; [human-questions.md](human-questions.md) and
@@ -352,7 +353,207 @@ you would look:
 
 See [acl-manifest.md](acl-manifest.md) for what each of those diffs against.
 
-## What M2 does not ship
+## Lifecycle (M3) — who opens the pane, and what never touches it
+
+### The launch shape
+
+**loomux opens the manager pane at group launch, beside the orchestrator's own
+pane.** `open_manager_pane_at_launch` runs inside `register_orchestrator_pane`,
+off the roster's own declaration — not from anything the orchestrator does, and
+not sequenced behind its bind. That is the whole of the first-class claim: the
+human's interface exists because the repo's `.loomux/workflow.yml` declares it,
+not because an orchestrator was asked to open one and complied.
+
+What it guarantees is that the manager pane is *requested* at launch. It does not
+guarantee an ordering against the orchestrator's kickoff: the two panes bind
+independently, and making one wait on the other would either stall the
+orchestrator behind a `BIND_TIMEOUT` or make the human's pane a dependant of the
+one it exists to relay to.
+
+A group whose roster declares no manager block — which is every default
+(no-workflow) group — opens nothing and says nothing.
+
+If the open fails, the launch still succeeds. A group without a manager pane is a
+degraded group, not a broken one — direct human access to the orchestrator was
+never removed.
+
+**The failure arm has two cases, and they are not the same event.**
+
+- **"One is already open."** The singleton refusal is genuinely reachable here:
+  `resume_recorded_session` documents a double-restore race where two restores of
+  one session can both pass its liveness pre-check (#799). This case is audited
+  (`manager-already-live`) and **nothing is delivered** — the human has their
+  pane, and the degrade notice below is precisely the text that triggers the
+  orchestrator's "manager not live" fallback. Telling it the human is unreachable
+  while they are typing into a live manager is worse than saying nothing. Decided
+  by re-asking the registry (`has_live_manager`), never by matching refusal text.
+- **"It could not open."** Audited as an `error`, and told to the orchestrator,
+  because the orchestrator is the party that can act on it: its fallback is to
+  take the human's input in its own pane, and it cannot take that branch on a
+  fact it was never given. That notice's **delivery outcome is itself audited**
+  rather than discarded: this arm runs on a background thread racing the
+  orchestrator's own bind, so the notice can arrive before that pane has a
+  terminal and be refused. The whole degradation story rests on the orchestrator
+  having been told, so a dropped notice has to be findable in the trail rather
+  than inferred from its absence.
+
+The singleton rule itself is one expression (`is_live_manager_of`), shared by
+`has_live_manager` and by `spawn_agent_bound`'s check under the already-held
+agents guard — two hand-written copies of "same group, `Role::Manager`, not
+dead" would be the same divergence `counts_against_max_agents` exists to prevent
+for the cap.
+
+**The pane opens expanded** (`spawn_opens_minimized` exempts `Role::Manager`,
+M1), in the repo root with no worktree, with `Containment::NoEdits`.
+
+### The resume path
+
+When the launch itself resumes a conversation
+(`SessionOrigin::resumes_session()` — a dormant group brought back, or a promoted
+pane), the manager reopens **its own last recorded session**: the last-touched
+`agents.json` row for the manager block that carries a session id, plus the name
+tier a human rename earned (#95r). A launch that starts fresh, and a group with
+no such row, cold-starts. The continuity matters more here than anywhere else in
+the group: this pane's transcript *is* the record of what the human said.
+
+**A resumed launch reads the PINNED roster, not the file.** `create_group_ex`
+sets `reads_workflow_file = false` for `Launch::Resume`, so a resumed group runs
+the roster persisted in its `group.json` and never re-reads
+`.loomux/workflow.yml` (#255/#459 — the roster is the thing the human consented
+to at launch). The consequence for this feature, stated because it is
+user-visible and easy to read as a bug: **adding a manager block to a repo's
+workflow file does not give a DORMANT group a manager when it is resumed.** It
+gets one on its next fresh launch. The mirror case is the same rule and equally
+deliberate — a manager removed from the file stays with a resumed group that was
+launched with one.
+
+**A resumed manager is typed nothing.** `spawn_agent_bound` delivers a follow-up
+on a resume only when the spawn carries a task, and this one never does — so the
+pane simply reopens with its history. `Delivery::ResumeKickoff` *is* in the
+permitted set (the table above), and this path declines to use it: that carve-out
+is for a pane that has not become a conversation yet, and a resumed manager pane
+is nothing but one. The fresh arm's kickoff is the pane's first line, which is
+the case the carve-out is actually for.
+
+### Both bare-resume routes into `spawn_agent_ex`
+
+M1 refused `spawn_agent(kind: "manager")` and `spawn_agent(block: "<a manager
+block>")`. Both of those test the caller's **arguments**, and block inference in
+`mcp::call_tool` runs after them — so a bare
+`spawn_agent(resume_session: <a manager session>)`, naming neither, reached
+`spawn_agent_ex` holding a manager block having passed every argument check.
+There are two such routes, and M3 closes both:
+
+| route | how the manager block is acquired |
+| --- | --- |
+| post-#222 roster row | the recorded `block` id is inherited verbatim (#254) |
+| pre-#222 roster row (role only, no block id) | `kind_from_str("manager")` resolves the class, and `block_for` takes its default block |
+
+On both, the `role` **argument** reaching `spawn_agent_ex` is `Role::Planner`
+(`kind.unwrap_or(Role::Planner)`), and `block.kind` wins over it — so only a
+check on the resolved block sees them at all.
+
+The enforcement is one line in `spawn_agent_bound`, the twin of the guard the
+orchestrator block has had since #222:
+
+```rust
+if block.kind == Role::Manager && named.is_some() { /* refuse */ }
+```
+
+`named` is the block id the caller supplied. It is `Some` on every
+agent-reachable route, including both resume routes above, and `None` on exactly
+the two openers loomux owns — `open_manager_pane_at_launch` and the session
+browser's manager rejoin — which resolve the block **by class**
+(`block_for(Role::Manager)`). For a manager the two resolutions name the same
+block: `workflow::MANAGER_MAX` is 1, so "the first of that kind" is "the only
+one". That is what lets the refusal stay unconditional on the *shape* instead of
+being softened into a guess about who is calling.
+
+`mcp::call_tool` keeps a third refusal, on the **effective** block after
+inheritance, for the sentence rather than the enforcement (#243's double gate) —
+an orchestrator that reached for a manager session wanted to reach the *human*,
+and the answer to that is `ask_human`, or `message_manager` for status.
+
+### One live manager per group
+
+`MANAGER_MAX` bounds what a workflow file may **declare**, not how many panes one
+declaration opens, and the two openers loomux owns can genuinely race — a human
+clicking Resume on a dead manager session while a relaunch brings the group's own
+one up. `spawn_agent_bound` refuses a second live `Role::Manager` in the same
+group, checked under the agents lock beside the race-safe cap re-check. Two
+manager panes would be two conversations the human has to notice are different,
+and one mailbox drained by whichever read it first.
+
+### The exemptions, keyed on `Role::Manager`
+
+Three guardrails exist to contain **delegate fan-out** — the axis an orchestrator
+controls. A manager is not a delegate it opens, so all three are keyed off the
+class, never off a `role_hint`:
+
+| guardrail | manager | why |
+| --- | --- | --- |
+| idle reaper (`idle_reap_candidates`) | exempt | a manager spawns with no task — the human's first message *is* the task — so `idle_since_ms` stamps at birth. Unguarded it is taken on the first sweep past `idle_kill_minutes`, before the human has typed anything, and the notice goes to the orchestrator's pane rather than to the human sitting in front of the one that vanished. An idle manager is a manager whose human is away: that is its normal state. |
+| stall watchdog (`watchdog_tick`) | exempt | its silence means the human is reading. The notice would be a false report about a pane the human is looking at, delivered to one they are not. |
+| `max_agents` (`counts_against_max_agents`) | exempt (decision **D3**) | the human's interface must not be competable with a worker slot — and on a cap of 1, counting it would leave a group with a manager unable to spawn any worker at all. The spawn-rate backstop rides the same predicate: it guards against a *runaway orchestrator*, and this pane is opened once per group by the launch path. |
+
+The reaper's exemption is keyed on `a.role`, never on the `standing` hint set the
+liaison uses: that set is a property of the group's **roster** (which block ids
+are liaisons) and the class is a property of the **agent**, so a manager stays
+exempt on a pane whose block id no longer resolves — a `workflow.yml` edited
+mid-session, which #459 already treats as a live reality.
+
+The watchdog names `Role::Manager` explicitly even though a manager opened by the
+launch path arrives task-less and is therefore *already* skipped by the
+idle-clock clause. Those are two different rules that agree today: the idle clause
+says "nothing is assigned", which is a fact about which paths exist, while "loomux
+never nags the orchestrator about the human's own pane" is the rule.
+
+`counts_against_max_agents` is one pure predicate, and **every site that decides
+this question calls it** — four functions, five decision points:
+`live_delegate_count` (the value enforcement reads), the cap-refusal roster (the
+names in the message), `spawn_agent_bound` twice (its fast-path check and its
+race-safe re-check), and `group_summary`'s `live_delegates` (the number the
+lifecycle panel shows). A `grep` for the call shows **seven**: the race-safe
+re-check calls it three times — once to gate the block, then inside each of the
+two filters that count the slot-holders and name them.
+
+Four of those sites had independently spelled `role != Role::Orchestrator`.
+`group_summary` had spelled the rule a *third* way again — a hand-sum of
+per-class tallies (`worker + reviewer + planner`) — and was converted in the same
+edit even though that sum already produced the right number. The reason is the
+failure it would otherwise wait for: a sixth `Role` forces a new arm in
+`group_summary`'s exhaustive `match` (the compiler sees to that) but is silently
+missing from the sum, so the panel would under-report the number
+`spawn_agent_bound` enforces, and the cap-below-live warning the panel exists to
+give would go quiet at exactly the cap where spawns start failing. The predicate
+defaults a new class to COUNTED, so routing through it makes that drift
+impossible rather than merely unlikely.
+
+A class therefore cannot be exempt from the count, named in the refusal message,
+and omitted from the panel's total independently of each other.
+
+`recommend_capacity` **inverts** M1's `+1`. `recommended` answers "what must the
+cap be for every declared tier to be live at once", and a class the cap does not
+apply to is live at any cap — the rule the field already stated for the
+orchestrator. `extra_tiers` loses its manager row for the same reason: that list
+is "what a cap below `recommended` can never keep live", and the answer for an
+exempt class is nothing. `minimum` never moved and still does not: it is what one
+review round costs, and a review round does not involve the manager.
+
+### What M3 deliberately does not do
+
+- **No `kill_agent` protection.** An orchestrator can still kill a manager pane.
+  The plan routes "never kill the manager" to M4's `{{MANAGER_NOTE}}` prose, and
+  the degradation position is unchanged: kill or close the pane and the group is
+  byte-for-byte its pre-manager behaviour. Making it mechanically unkillable is a
+  separate decision, and it is not this slice's to take.
+- **No new mid-session delivery.** The permitted set is still exactly the three
+  rows in the table above. M3 adds a producer of `FreshKickoff` into a manager
+  pane (the launch open) and no producer of anything else — and the fresh
+  kickoff is now reachable in production for the first time, where M2 could only
+  reach it through a hand-registered agent.
+
+## What M2 and M3 do not ship
 
 Stated so no surface here reads as advertising a mechanism that does not exist
 (the #1026 line):
@@ -364,8 +565,4 @@ Stated so no surface here reads as advertising a mechanism that does not exist
   descriptions carry the turn-start discipline and the relay rules rather than
   waiting for the templates.
 - **No unread chip.** M5.
-- **No launch-time spawn, and no reaper/watchdog/`max_agents` exemption.** M3.
-  Until it lands, a manager is opened by nothing, so every behaviour here is
-  reachable only through a hand-registered agent — which is how the tests reach
-  it.
 - **No `role_hint: liaison` deprecation and no user-facing docs page.** M6.

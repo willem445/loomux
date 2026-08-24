@@ -1107,18 +1107,21 @@ fn a_declared_manager_makes_the_roster_custom() {
 }
 
 #[test]
-fn a_declared_manager_raises_the_recommended_capacity_and_is_named_in_the_advisory() {
-    // A manager is live for the whole session and, today, occupies a
-    // `max_agents` slot like any non-orchestrator pane (`live_delegate_count`
-    // exempts only the orchestrator) — so the launcher's recommendation must
-    // count it, or every roster with one under-advises by exactly one.
+fn a_declared_manager_does_not_raise_the_recommended_capacity_or_the_advisory() {
+    // #1161 M3 (decision D3): the manager is EXEMPT from `max_agents`
+    // (`counts_against_max_agents`), and `recommended` answers "what must the cap
+    // be for every declared tier to be live at once" — a class the cap does not
+    // apply to is live at any cap, which is the rule
+    // `CapacityRecommendation::recommended` already stated for the orchestrator.
     //
-    // **#1161 M3 INVERTS THIS TEST.** Decision D3 exempts the manager from
-    // `max_agents`; once it does, an exempt class is one `recommended` must not
-    // count (the rule `CapacityRecommendation::recommended` already states for
-    // the orchestrator), and both the `+1` below and the `extra_tiers` row go
-    // the other way. A green here after M3 lands means the exemption was added
-    // without moving this — do not simply delete the test to make it pass.
+    // This is M1's `a_declared_manager_raises_the_recommended_capacity_and_is_
+    // named_in_the_advisory` INVERTED rather than deleted, and the inversion is
+    // the point. M1 landed a `+1` here — correct while `live_delegate_count`
+    // exempted only the orchestrator, since a preview that under-advises is how
+    // #255 happens — and left the standing instruction that M3 must turn it
+    // around rather than tick it off. The `+ 1` becoming `+ 0` below, in the
+    // commit that gave `live_delegate_count` its `Role::Manager` exemption, is
+    // the two moving together.
     let with = workflow::parse_workflow(
         "version: 1\nblocks:\n\
          \x20 - id: worker\n    kind: worker\n\
@@ -1130,24 +1133,50 @@ fn a_declared_manager_raises_the_recommended_capacity_and_is_named_in_the_adviso
     let cap_with = workflow::recommend_capacity(&with.blocks, None);
     let cap_without = workflow::recommend_capacity(&without, None);
     assert_eq!(
-        cap_with.recommended,
-        cap_without.recommended + 1,
-        "a declared manager adds exactly one to the recommendation"
+        cap_with.recommended, cap_without.recommended,
+        "a manager is exempt from max_agents, so it adds nothing to the recommendation"
     );
-    // `minimum` must NOT move: it is what one review round costs, and a review
-    // round does not involve the manager. Counting it there would warn a human
-    // that a cap which genuinely fits their review loop does not.
+    // THE POSITIVE CONTROL for that assertion, which is otherwise the vacuity
+    // shape CLAUDE.md names — it would pass just as well against a `recommended`
+    // that had stopped counting anything at all. The planner is the other "+1 if
+    // declared" tier, the term immediately beside the one M3 removed, and it
+    // still moves the number by exactly one on this same roster.
+    let with_planner = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev\n    kind: reviewer\n\
+         \x20 - id: manager\n    kind: manager\n\
+         \x20 - id: plan\n    kind: planner\n",
+    )
+    .expect("the same roster plus a planner");
+    let cap_planner = workflow::recommend_capacity(&with_planner.blocks, None);
+    assert_eq!(
+        cap_planner.recommended,
+        cap_with.recommended + 1,
+        "control: a declared planner DOES add one — `recommended` still counts the tiers it should"
+    );
+    // `minimum` must NOT move either, and never did: it is what one review round
+    // costs, and a review round does not involve the manager.
     assert_eq!(cap_with.minimum, cap_without.minimum, "a review round does not involve the manager");
-    // ...and the advisory NAMES it, so a human told to raise the cap knows which
-    // tier they would otherwise lose — the one they were going to talk to.
+    // ...and the advisory does not name it. `extra_tiers` lists what a cap sitting
+    // between `minimum` and `recommended` can never keep live alongside a review
+    // round; for an exempt class the answer is nothing, so naming the manager
+    // would tell a human to raise a number that was never going to reach this
+    // pane. Also asserted against a roster where the manager is the ONLY thing
+    // that could have been named, so an empty list here is the manager's absence
+    // rather than the whole mechanism having gone quiet.
     let tiers = workflow::extra_tiers(&with.blocks, cap_with.reviewers_needed);
-    assert!(tiers.iter().any(|t| t == "the manager"), "{tiers:?}");
+    assert!(!tiers.iter().any(|t| t == "the manager"), "{tiers:?}");
+    // Control: the same call still names a tier that genuinely cannot be live —
+    // the planner added above — so `extra_tiers` is demonstrably not simply
+    // returning nothing.
     assert!(
-        !workflow::extra_tiers(&without, cap_without.reviewers_needed).iter().any(|t| t == "the manager"),
-        "and says nothing about a manager that was never declared"
+        workflow::extra_tiers(&with_planner.blocks, cap_planner.reviewers_needed)
+            .iter()
+            .any(|t| t == "the planner"),
+        "control: extra_tiers still names the tiers a cap genuinely cannot keep live"
     );
 }
-
 #[test]
 fn a_manager_block_writes_the_managers_own_instructions_file() {
     // The file-name mapping (`role_instructions_file`) and the template mapping
