@@ -280,15 +280,24 @@ export class TasksView {
    *  `approveWillMerge` treats it as "no gate known" (Approve reads plain)
    *  rather than guessing a warning it can't back up. */
   private workflow: WorkflowStatus | null = null;
-  /** Task ids with their notes section expanded (survives re-renders). */
+  /** Task ids with their notes section expanded (survives re-renders).
+   *
+   *  Load-bearing on the WIRE since #1317, not just in the renderer: this set
+   *  is what the next `orch_tasks` read names in `withNotes`, and it is the
+   *  only thing that decides which rows come back carrying their note bodies.
+   *  That is why it is pruned against the board on every refresh — an id whose
+   *  row has gone would otherwise be asked for on every poll for the rest of
+   *  the session. */
   private expanded = new Set<string>();
   /** Task ids with their GROUNDING section expanded (#1273) — its own set,
    *  not a second meaning for `expanded` above. The two sections answer
    *  different questions ("what was said about this" / "what governs this")
    *  and a human reading one is routinely not done with the other, so folding
-   *  them into one toggle would close the notes to open the links. Like
-   *  `expanded` it is frontend-only and survives re-renders; an id whose row
-   *  has since gone simply never matches. */
+   *  them into one toggle would close the notes to open the links. Survives
+   *  re-renders, and pruned against the board beside `expanded` (#1317) —
+   *  frontend-only, so a stale id here costs nothing on the wire, but two sets
+   *  of the same kind two lines apart with different housekeeping rules is how
+   *  they come to disagree about what a live row is. */
   private expandedLinks = new Set<string>();
   /** The half-typed grounding link per row (#1273 N1), so a re-render never
    *  eats what the human is in the middle of writing.
@@ -952,6 +961,16 @@ export class TasksView {
     // (#1273): a draft nobody can ever see again is a leak that grows with the
     // session.
     this.linkDrafts = retainExistingKeys(this.linkDrafts, this.tasks);
+    // The two expanded-row sets, pruned on the same rule (#1317). `expanded`
+    // is no longer only a rendering flag: it is what the next read NAMES in
+    // `withNotes`, so an id whose row has gone would be asked for on every
+    // poll for the rest of the session — a request that grows with how long
+    // the human has been running, which is the exact shape this issue is
+    // about. `expandedLinks` carries no wire weight but is the same set of
+    // the same class two lines away, and one of the pair left unpruned is how
+    // they come to disagree about what a live row is.
+    this.expanded = retainExisting(this.expanded, this.tasks);
+    this.expandedLinks = retainExisting(this.expandedLinks, this.tasks);
     this.render();
   }
 
