@@ -279,6 +279,15 @@ export class SubmitLatch {
     this.done = false;
   }
 
+  /** Whether a run is in flight RIGHT NOW (begun, not yet released or
+   *  finished). Read by callers that must answer a question about the guarded
+   *  action while it runs — the native-dialog gate (#1564) suppresses the
+   *  window-focus reclaim off this same state, so the refusal and the
+   *  suppression cannot disagree about whether a dialog is outstanding. */
+  get busy(): boolean {
+    return this.inFlight;
+  }
+
   /** Whether a submit has already fired its result (one-shot spent). */
   get settled(): boolean {
     return this.done;

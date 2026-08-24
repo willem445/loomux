@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  pickDirectory,
   setEngineTransport,
   tauriTransport,
   type EngineArgs,
@@ -332,6 +333,61 @@ test("the seam itself does import Tauri — the rule above is a chokepoint, not 
     "@tauri-apps/api/window",
     "@tauri-apps/plugin-dialog",
   ]);
+});
+
+// ---------- behavior: one native dialog at a time (#1564) ----------
+
+/** Holds the FIRST folder pick open until a test releases it, and answers every
+ *  later one immediately. The asymmetry is deliberate: on a build without the
+ *  gate the second call must still SETTLE, so the test below fails on its
+ *  assertion rather than hanging on a promise nobody resolves. */
+class SlowPickerTransport extends RecordingTransport {
+  release: (v: string | null) => void = () => {};
+  picks = 0;
+
+  override pickDirectory(opts: { title?: string; defaultPath?: string }): Promise<string | null> {
+    this.calls.push({ cmd: "@pickDirectory", args: opts as EngineArgs });
+    this.picks += 1;
+    if (this.picks === 1) {
+      return new Promise<string | null>((res) => {
+        this.release = res;
+      });
+    }
+    return Promise.resolve("C:\second-dialog");
+  }
+}
+
+test("a second pickDirectory never reaches the transport while one is outstanding (#1564)", async () => {
+  // The crash this refuses to keep feeding is a Windows focus race: the picker
+  // is shown on a thread the plugin spawns while our main window OWNS it, so its
+  // `SetFocus` re-enters our window procedure and WebView2’s focus machinery
+  // synchronously. A second picker means a second foreign thread pulling at the
+  // same window’s focus — and the gap this test models (a request made, no
+  // dialog on screen yet) is exactly when a human, watching a click do nothing,
+  // clicks Browse again. See src/nativedialog.ts.
+  const slow = new SlowPickerTransport();
+  const previous = setEngineTransport(slow);
+  try {
+    const first = pickDirectory({ title: "Choose repository or folder" });
+    const second = await pickDirectory({ title: "Choose repository or folder" });
+
+    assert.equal(
+      slow.calls.filter((c) => c.cmd === "@pickDirectory").length,
+      1,
+      "the second Browse must not open a second native dialog"
+    );
+    assert.equal(second, null, "a refused pick reads as a cancel, which every call site handles");
+
+    // The dialog that IS up still answers its own caller.
+    slow.release("C:\Projects\loomux");
+    assert.equal(await first, "C:\Projects\loomux");
+
+    // And the gate reopens: a later Browse is admitted normally.
+    slow.release = () => {};
+    assert.equal(await pickDirectory({ title: "again" }), "C:\second-dialog");
+  } finally {
+    setEngineTransport(previous);
+  }
 });
 
 test("the transport surface is exactly the declared capability set", () => {

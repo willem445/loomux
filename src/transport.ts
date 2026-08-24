@@ -40,6 +40,9 @@ import { listen as tauriListen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as tauriOpen } from "@tauri-apps/plugin-dialog";
+// Explicit `.ts`, like every value import a `node --test` module resolves off
+// disk. Pure and Tauri-free, so importing it here keeps the one-seam rule.
+import { withNativeDialog } from "./nativedialog.ts";
 
 /** Cancels an event subscription. Structurally Tauri's `UnlistenFn`; declared
  *  here so consumers don't need the Tauri types either. */
@@ -159,9 +162,15 @@ export function hostVersion(): Promise<string> {
   return active.hostVersion();
 }
 
-/** Native folder picker; null when cancelled. */
+/** Native folder picker; null when cancelled — and null, too, when one is
+ *  already outstanding: at most ONE native dialog may exist at a time (#1564).
+ *  The gate lives on this free function rather than inside `tauriTransport` so
+ *  it holds for every transport, a test fake and a future remote one included —
+ *  the dialog is display-side, and the machine with the screen has one focus to
+ *  lose however the request reached it. See src/nativedialog.ts for the crash
+ *  this refuses to keep feeding. */
 export function pickDirectory(opts: PickDirectoryOptions = {}): Promise<string | null> {
-  return active.pickDirectory(opts);
+  return withNativeDialog(() => active.pickDirectory(opts));
 }
 
 /** Register the app's close gate. */
