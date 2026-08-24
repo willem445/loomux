@@ -405,16 +405,15 @@ compiles.
   assertion's two literals never meet (links `"#7"`, deletes `"t-2"`) while a body and a
   design note call the non-interference pinned and a doc comment leans on it (#1300 B1,
   `doc/design/board-sprints-and-links.md` §3).
-- **A function's doc may only claim what survives its pipeline's LAST writer, and a fixture
-  whose two candidate outputs COINCIDE cannot check it.** A doc block justifying a local
-  choice by a property of the file on disk ("appended, so the order is the human's") is false
-  wherever a downstream canonicaliser rewrites it, and its own test then reads as confirming
-  the upstream claim while measuring the downstream one — green under a sorted insert. Build
-  the fixture so the two orders DIVERGE, label which list each assertion measures, and pin the
-  divergence itself (`assert.notDeepEqual`) so a later fixture edit reddens before the claims
-  do. Signature: a doc block explaining why a list is appended rather than sorted, upstream of
-  a serializer that sorts it — `sortByBlocks` has four call sites and the gate's seat list was
-  only one (#1396 B1; `connectToGate`, `test/workflowmodel.test.ts`).
+- **A function's doc may only claim what survives its pipeline's LAST writer.** A doc block
+  justifying a local choice by a property of the file on disk ("appended, so the order is the
+  human's") is false wherever a downstream canonicaliser rewrites it, and its test then measures
+  the downstream property under the upstream one's label — #1300 B1 / #1182's non-discriminating
+  fixture with the prescription inverted: for an ORDER pin the two candidate outputs must
+  DIVERGE, and that divergence is itself pinned (`assert.notDeepEqual`) so a later fixture edit
+  reddens before the claims do. Signature: a doc block on why a list is appended rather than
+  sorted, upstream of a serializer that sorts it — `sortByBlocks` has four call sites (#1396 B1;
+  `connectToGate`, `test/workflowmodel.test.ts`).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
