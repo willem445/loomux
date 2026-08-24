@@ -23243,20 +23243,6 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
             // claim on the strength of a stripped pointer, for that constant's
             // own reason — `❯ Yes` is byte-identical whether it is a replayed
             // one-word turn of ours or a live dialog's highlighted choice.
-            if let Some(head) = strip_leading_pointer(rows[i]).map(wrap_normalize) {
-                if !head.is_empty() {
-                    let long: Vec<String> = recorded
-                        .iter()
-                        .filter(|l| l.chars().count() >= SELF_ECHO_MIN_POINTER_CHARS)
-                        .cloned()
-                        .collect();
-                    let framed = std::mem::replace(&mut norm[i], head);
-                    claimed = record_claim(&norm, &long, first_row, i);
-                    if claimed.is_none() {
-                        norm[i] = framed;
-                    }
-                }
-            }
         }
         // #903: a record claim is REFUSED when a live dialog's own question row
         // heads the block above the anchor.
