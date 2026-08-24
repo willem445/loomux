@@ -2749,14 +2749,7 @@ enum UsageView {
 pub fn live_usage_view(full: &Value) -> Value {
     let rows = full.get("agents").and_then(|a| a.as_array());
     let agent_count = rows.map_or(0, |r| r.len());
-    let live: Vec<Value> = rows
-        .map(|r| {
-            r.iter()
-                .filter(|a| a["live"].as_bool().unwrap_or(false))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let live: Vec<Value> = rows.map(|r| r.to_vec()).unwrap_or_default();
     let mut out = serde_json::Map::new();
     if let Some(obj) = full.as_object() {
         for (k, v) in obj {
