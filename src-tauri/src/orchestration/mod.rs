@@ -3811,7 +3811,7 @@ channel; keep the human oriented with short summaries."
              at the sizes the code will really see (name the input size that hurts); **docs**. \
              If your persona narrows you to one lane, stay in it and say so — but a lane nobody \
              was assigned is a lane nobody reviewed.\n\
-             - Every review body carries a `## Premortem` section: two ways this change fails in \
+             - Every review body carries a `Premortem` section: two ways this change fails in \
              production that no test in this PR would catch (a wrong answer nobody asserted on, a \
              resource it now holds, a state it can be resumed into), or an argued none — an empty \
              section is a finding against the review. Where the change touches unbounded input (a \
