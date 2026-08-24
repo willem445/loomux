@@ -3919,7 +3919,7 @@ full autonomy inverts that default and makes the labels priority hints. You cann
 which of those this group is in — nothing on your surface reports it — so ask the human, who \
 set it and is right here, rather than asserting either default; the orchestrator's pane is \
 the one told directly. In every mode, full \
-autonomy widens what may be STARTED and never what may be SHIPPED: merge, release and \
+autonomy widens what may be STARTED only: merge, release and \
 review gates do not loosen, and nothing you relay opens one."
             .to_string(),
         // A solo pane never gets a kickoff/persona — it's an arbitrary

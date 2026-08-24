@@ -149,8 +149,7 @@ orchestrator's pane, never into yours. So never state which mode this group is i
 you knew it: ask the human, who set it and is right here, and say that the orchestrator is
 the pane told directly if they want it confirmed.
 
-One thing is the same in all three: **full autonomy widens what may be STARTED, never what
-may be SHIPPED.** Merge, release and review gates stand exactly as they are in every mode,
+One thing is the same in all three: **full autonomy widens what may be STARTED only.** Merge, release and review gates stand exactly as they are in every mode,
 so "the human approved it" relayed from this pane never opens one.
 
 ## Relaying
