@@ -146,12 +146,20 @@ grep -nE '[0-9]+ (file|files) changed' .scratch/body.md
 
 - **PASS** if the second grep prints nothing — the body states no diffstat, so
   there is nothing to disagree with.
-- **PASS** if every line the second grep printed carries the same numbers as the
-  real tail line: files changed, insertions, deletions.
-- **FAIL** if any body line's numbers differ from the real tail line. Quote the two
-  lines one above the other.
-- **ESCALATE** if `.scratch/diffstat.txt` is empty, or the body gives the numbers
-  in prose you cannot line up against the tail line.
+- **PASS** if **at least one** line the second grep printed carries the same three
+  numbers as the real tail line: files changed, insertions, deletions. Quote that
+  line.
+- **FAIL** only if the second grep printed at least one line and **none of them**
+  matches. Quote the real tail line and every line you tried.
+- **ESCALATE** if `.scratch/diffstat.txt` is empty.
+
+**"At least one", not "all" — and this is the same rule as check 2's, for the same
+reason.** A good body in this repo states more than one diffstat: the isolation
+diffstat against a re-derived merge-base, a before/after pair across a rebase, a
+sub-PR's numbers, or a quotation of another PR's figures as evidence about that PR.
+Only one of those can equal this PR's, so requiring all of them to match refuses
+bodies for being thorough. Ask whether this PR's real diffstat is COVERED; never
+whether every number in the body is about this PR.
 
 **Control:** `.scratch/diffstat.txt` must be non-empty and its last line must
 contain the words `changed`. If it does not, your diffstat never got built —
