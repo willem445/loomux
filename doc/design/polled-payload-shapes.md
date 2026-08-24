@@ -93,13 +93,24 @@ a `#[serde(flatten)]` of the storage type hands every future `Task` field to
 this wire the moment somebody adds one. The compiler now asks instead.
 
 **What this does NOT fix.** The row COUNT is untouched and still O(session).
-That is not an oversight and it is not liftable by a payload change: `TasksView`
-has some twenty-five structural reads over rows that are off screen — subtree
-closure for `settledIds`/`clearedIds`, `childCounts`, `depState` on a `done`
-dep, the parent/kind/sprint pickers, `focusMiss`'s "on the board but archived"
-answer — so a server-side row cap breaks the board rather than slimming it.
-Bounding it is a **retention** decision (what may be deleted, and by whom),
-which needs a human. It is #1472.
+That is not an oversight and it is not liftable by a payload change. `TasksView`
+reads the whole board at 54 sites, feeding it to 32 distinct pure helpers, and
+several of those structurally need the rows the renderer HIDES — which a
+server-side row cap would take away rather than merely leave unrendered. The
+code states the requirement itself in two places worth quoting:
+
+- `closedSubtrees`, which both `clearedIds` and `settledIds` are built on,
+  decides a row's fate with `pred(t) && (children.get(t.id) ?? []).every(holds)`,
+  so whether a VISIBLE row is archived depends on every descendant — hidden
+  ones included. `clearedIds`' own doc names the consequence: a cleared
+  container holding a live child stays on the board, because it is the only
+  thing on screen that says where that child lives.
+- `visibleRows` WALKS archived subtrees rather than pruning them, so their rows
+  are marked seen and cannot resurface as stray top-level rows.
+
+Bounding the row count is therefore a **retention** decision — what may leave
+`tasks.json`, on whose authority, and how a human gets it back — not a payload
+one. It is #1472, and it wants a human's answer before it wants code.
 
 ## 3. `orch_needs_you_list` carries the rows its open items name
 
