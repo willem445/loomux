@@ -81,22 +81,34 @@ test("canResume is never true without a session id, whatever the backend said", 
 // ---------------------------------------------------------------------------
 
 test("live groups come first, then most recently active", () => {
+  // The ids are chosen so ALPHABETICAL order CONTRADICTS timestamp order
+  // within each liveness class: sorted by name alone this is
+  // ["alpha", "bravo", "yankee", "zeta"], and by liveness+name it is
+  // ["alpha", "zeta", "bravo", "yankee"]  neither is the expected answer.
+  // A fixture whose names happen to agree with its timestamps cannot fail
+  // when the last_seen key is deleted, and this one did until a mutation
+  // round found the key unpinned.
   const rows = orchRows([
-    rec({ group_id: "old-dormant", last_seen_ms: 10 }),
-    rec({ group_id: "live-oldest", group_live: true, last_seen_ms: 1 }),
-    rec({ group_id: "new-dormant", last_seen_ms: 500 }),
-    rec({ group_id: "live-newest", group_live: true, last_seen_ms: 900 }),
+    rec({ group_id: "bravo", last_seen_ms: 10 }),
+    rec({ group_id: "alpha", group_live: true, last_seen_ms: 1 }),
+    rec({ group_id: "yankee", last_seen_ms: 500 }),
+    rec({ group_id: "zeta", group_live: true, last_seen_ms: 900 }),
   ]);
   assert.deepEqual(
     rows.map((r) => r.groupId),
-    ["live-newest", "live-oldest", "new-dormant", "old-dormant"]
+    ["zeta", "alpha", "yankee", "bravo"]
   );
-  // The two keys must both be load-bearing: a sort on liveness alone would
-  // put live-oldest first, and a sort on last_seen alone would lead with
-  // live-newest but then put new-dormant ABOVE live-oldest.
+  // Both keys are load-bearing, and each control names the order the OTHER
+  // key alone would produce.
   assert.notDeepEqual(
     rows.map((r) => r.groupId),
-    ["live-newest", "new-dormant", "live-oldest", "old-dormant"]
+    ["zeta", "yankee", "alpha", "bravo"],
+    "last_seen alone would lift the newest dormant group above a live one"
+  );
+  assert.notDeepEqual(
+    rows.map((r) => r.groupId),
+    ["alpha", "zeta", "bravo", "yankee"],
+    "liveness plus the name tiebreak alone would ignore last_seen entirely"
   );
 });
 
