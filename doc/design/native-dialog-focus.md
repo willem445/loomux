@@ -67,11 +67,16 @@ read the same `SubmitLatch` rather than two flags that can drift — the repo's
 one-rule-for-every-input convention.
 
 **Bounded by the promise, not a clock.** `withSubmitLatch` releases in a `finally`, so a picker
-that *rejects* reopens the gate exactly as one that resolves does. The only state that holds it
-shut is a picker still running: a dialog genuinely on screen, and the one case where opening a
-second is the wrong answer. A timeout would be strictly worse than no bound — a human browsing
-folders for two minutes is not a fault, and timing out would re-admit the very second dialog this
-refuses.
+that *rejects* reopens the gate exactly as one that resolves does. What holds it shut is one
+thing only: a request that has not settled.
+
+Usually that is a dialog on screen. It also covers the case where the picker **never settles** —
+the host wedged, which is precisely what #1564 reports ("hung, then crashed") — and there the
+gate stays shut for the rest of the session: Browse does nothing until a restart. That is the
+deliberate trade, and it is the honest cost of this fix. A wedged picker is the state in which
+spawning a second dialog thread against the same owner window is *most* dangerous, and it is the
+state the crash was reported from. Releasing on a clock would trade the crash back in for the
+button, and would fire on a human who is merely browsing folders slowly.
 
 **A policy, not a new primitive.** `SubmitLatch` / `withSubmitLatch` (`panesetup.ts`) is the
 single-flight mechanism the repo already has, added for the same class of defect: a second trigger

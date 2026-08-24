@@ -49,11 +49,15 @@
 //
 // The suppression is BOUNDED by the promise, not by a clock: `withSubmitLatch`
 // releases in a `finally`, so a picker that REJECTS reopens the gate just as a
-// picker that resolves does. The only state that holds it shut is a picker still
-// running — which is a native dialog genuinely on screen, and the one case where
-// opening a second one is the wrong answer. A timeout would be worse than no
-// bound at all here: a human browsing folders for two minutes is not a fault,
-// and timing out would re-admit the very second dialog this exists to refuse.
+// picker that resolves does. What holds it shut is one thing only: a request
+// that has not settled. Usually that is a dialog on screen. It ALSO covers the
+// case where the picker never settles at all — the host wedged, which is what
+// #1564 reports — and there the gate stays shut for the session, so Browse does
+// nothing until a restart. That is the deliberate trade: a wedged picker is the
+// state in which spawning a SECOND dialog thread against the same owner window
+// is most dangerous, and it is the state the crash was reported from. A timeout
+// would trade the crash back in for the button — and would fire on a human
+// browsing folders for two minutes, who is not a fault to begin with.
 //
 // One latch, read by both halves. The refusal and the focus suppression are the
 // same question ("is a native dialog outstanding?") and must never be able to
