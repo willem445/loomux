@@ -37,3 +37,7 @@ shell.
 - **[Side dock](side-dock.html)** — git, files and the editor in one collapsible
   panel down the right edge, pointed at whichever pane you are working in
   (`⬔ dock` in the top bar).
+- **[The manager pane](manager.html)** — the optional pane *you* talk to: project
+  discussion, status as a conversation, and turning a half-formed idea into a
+  brief the team can build, with your own label on GitHub still the only thing
+  that starts the work.
