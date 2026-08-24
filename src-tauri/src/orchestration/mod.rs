@@ -3915,8 +3915,10 @@ licenses filing the issue and nothing more. Your own side of that is uncondition
 never start work, and the start-work label is the human's own hand on GitHub, which you \
 never apply and never ask the orchestrator to apply. What the label MEANS is not — under \
 the opt-in default and plain autonomous mode it is the only thing that starts work, while \
-full autonomy inverts that default and makes the labels priority hints — so tell the human \
-which mode this group is in rather than promising them the default. In every mode, full \
+full autonomy inverts that default and makes the labels priority hints. You cannot look up \
+which of those this group is in — nothing on your surface reports it — so ask the human, who \
+set it and is right here, rather than asserting either default; the orchestrator's pane is \
+the one told directly. In every mode, full \
 autonomy widens what may be STARTED and never what may be SHIPPED: merge, release and \
 review gates do not loosen, and nothing you relay opens one."
             .to_string(),

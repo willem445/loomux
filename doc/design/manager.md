@@ -434,6 +434,44 @@ directly rather than leaving it to the golden diff.
   SHIPPED. Stated on both sides on purpose — one could otherwise honour it
   while the other did the thing.
 
+### The mode caveat, what pins it, and what pins cannot reach
+
+D5's seam (above) is the first place the manager's contract describes the
+**orchestrator's** mode machinery, and that has three consequences worth stating
+here rather than leaving in a review thread.
+
+**1. The upgrade unit is now invariant 8 plus the manager's copies of it.** Three
+manager surfaces and a golden assert what `orchestrator.md`'s invariant 8 says:
+`templates/manager.md`, `mechanics_core(Role::Manager)`, `docs/features/manager.md`
+and `tests/fixtures/pre222/manager.md`. If a later slice changes how modes work —
+M3's lifecycle, or any rework of the label funnel — all four go stale together.
+Whoever edits invariant 8 should grep the other four; nothing mechanical will point
+at them.
+
+**2. What the five pins do and do not cover.** `manager_prose.rs` pins each half of
+the seam on both contract surfaces — the manager's unconditional authority, the
+mode-dependent funnel, and the shipping line — so a reword that drops one half goes
+red naming the half it dropped. What they **cannot** detect is invariant 8 changing
+underneath them: they are presence pins on this side of the boundary only, and
+`docs/features/manager.md` is not pinned at all, because no backend test reads
+`docs/`. The alternative that would close it is to pin the RELATIONSHIP rather than
+each side's words — read `ORCHESTRATOR_TPL`'s invariant 8 and assert the manager's
+surfaces carry a caveat whenever it says the default inverts. That is the shape to
+reach for if this drifts again; it was not built here because it is a guard with its
+own design questions, not a line in a prose slice.
+
+**3. The sweep M5 and M6 owe is "can the pane actually DO this", not "is this tool
+granted".** Two guards already stop the prose naming a tool the manager cannot call
+(`the_managers_contract_never_names_a_tool_it_does_not_have`, and its default-deny
+sibling deriving the granted set from `mcp.rs`). Neither catches an **instruction**
+to do something no tool supports, and this slice shipped exactly that and had it
+caught in review: the first cut of the mode caveat told the manager to "find out
+which mode this group is in", which nothing on its fourteen-tool surface reports —
+the mode reaches the orchestrator by a delivery into ITS pane, the one thing that
+never happens to this one. The prose now says it cannot look this up and to ask the
+human, who set it. When adding prose here, read each imperative and ask which
+granted tool performs it; a sentence with no answer is this defect.
+
 ### What the orchestrator is told
 
 `{{MANAGER_NOTE}}` interpolates the declared block's own id, because every rule
