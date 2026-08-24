@@ -2294,7 +2294,8 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         //    later would be a breaking change to every workflow file already
         //    written.
         let remote = match rb.remote.as_deref() {
-            None => None,
+            // NEUTERED FOR THE RED ROUND: the absent key becomes an empty label.
+            None => Some(String::new()),
             Some(raw) => {
                 if let Err(e) = crate::pathseg::check_segment(raw) {
                     errs.push(format!(
