@@ -147,7 +147,7 @@ you might be tempted to hold the pane for.
      an O(n) walk in a hot loop, a file re-read where the value was already in hand. Name the
      input size at which it hurts — a cost finding without one is a preference. For **unbounded
      input** (a file, a transcript, anything off the network or supplied by a user or another
-     agent) answer the whole triple, not the time question alone: the largest realistic input ×
+     agent) answer the whole triple, not the time question alone: the biggest input you will really see ×
      how often this runs × what it allocates or reads per run. Name the size at which **memory or
      IO** hurts, not only where time does — a whole-file read, a buffer nothing trims, a copy per
      event. Time is what gets asked about; what takes a process down is what it holds meanwhile.
