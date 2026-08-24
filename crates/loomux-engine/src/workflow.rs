@@ -1389,7 +1389,7 @@ struct RawIntakeLabels {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+// neutered for the red round: deny_unknown_fields removed from RawBlock
 struct RawBlock {
     id: String,
     #[serde(default)]
