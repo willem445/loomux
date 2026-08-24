@@ -23210,14 +23210,11 @@ fn dialog_header_above(rows: &[&str], norm: &[String], keep: &[bool], from: usiz
         // SCREEN, and consulting the mask to answer it let the mask decide its
         // own bound. A header now vetoes whether or not its row was claimed,
         // which is a term the record cannot buy at any number of claims.
-        if is_dialog_header(&norm[j]) {
-            return true;
-        }
-        // Claimed NON-header rows are still stepped over, unchanged: a loomux
-        // notice interleaved above an option block must not end the scan, which
-        // is what this clause was for before it was asked to do more.
         if !keep[j] {
             continue;
+        }
+        if is_dialog_header(&norm[j]) {
+            return true;
         }
         if option_block_row(rows[j]) {
             continue;
