@@ -51167,6 +51167,56 @@ fn j9_a_granted_override_carries_its_enter_only_on_fresh_proof() {
     );
 }
 
+#[test]
+fn j10_a_collapsed_paste_under_a_dialog_header_is_not_claimed() {
+    // The term the OPERATOR-SET rule found unpinned. `j2`/`j3`/`j5` between them
+    // cover the collapsed-paste claim's shape term and its multi-line term, and
+    // `j3` covers `dialog_header_above` on the RECORD path — but the same guard
+    // on the collapsed-paste claim in `mask_own_paste` was pinned by nothing, so
+    // "this claim is bounded by a dialog header" was a residual derived from
+    // deletion mutations that never touched it.
+    //
+    // It matters in the one direction that costs something: if a dialog really is
+    // up, a placeholder row inside its option block must not be read as "the
+    // composer is holding our paste", because that reading is what releases the
+    // Enter.
+    let brief = "Rebase onto main and re-read the findings.\nThen report when CI is green.";
+    let placeholder = "❯ [Pasted text #1 +6 lines]";
+
+    let read = |screen: &str| {
+        let raw = pty_bytes_903(screen);
+        let with_paste =
+            loomux_lib::orchestration::termgrid::render_visible(&raw, ECHO_COLS, ECHO_ROWS);
+        let masked = mask_own_paste(&with_paste, brief);
+        (with_paste, masked)
+    };
+
+    // CONTROL: the same option block with no question row heading it. The claim
+    // IS made, so the refusal below is the guard and not the screen.
+    let (open_vis, open_masked) =
+        read(&format!("a finished turn's last line\n  $ git push --force\n{placeholder}"));
+    assert!(
+        idle_prompt_row_rendered(Composed {
+            masked: open_masked.as_str(),
+            with_paste: open_vis.as_str()
+        }),
+        "control: with no dialog question above it, the placeholder is claimed as ours"
+    );
+
+    // The case: a dialog's own question row heads the block.
+    let (dlg_vis, dlg_masked) = read(&format!(
+        "? Do you want to proceed with this command\n  $ git push --force\n{placeholder}"
+    ));
+    assert!(
+        !idle_prompt_row_rendered(Composed {
+            masked: dlg_masked.as_str(),
+            with_paste: dlg_vis.as_str()
+        }),
+        "a placeholder inside a live dialog's option block is not evidence of an idle \
+         composer: {dlg_vis:?}"
+    );
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The human-question registry (#946 slice Q1)
