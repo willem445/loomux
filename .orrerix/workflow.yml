@@ -178,7 +178,7 @@ edges:
 #
 # ALL-PASS over four lanes, and what makes that safe is the NARROWNESS of what
 # the three cheap ones are allowed to say — not a claim that they cannot block.
-# Both `fail` and `escalate` refuse a merge (workflow.rs `Verdict::blocks`), so
+# Both `fail` and `escalate` refuse a merge (workflow.rs `Verdict::is_blocking`),
 # a qr-* lane can absolutely stop one. The argument is about what may TRIGGER
 # either: a lane may `fail` a check ONLY on the absence of a named artifact it
 # can quote, may `escalate` a check ONLY when it could not decide that check,

@@ -1975,7 +1975,7 @@ only place it can act on a model that will not infer it.
 
 **Why `all-pass` over four lanes is safe, stated precisely.** Not because the cheap
 lanes cannot block — `escalate` refuses a merge exactly as `fail` does
-(`Verdict::blocks`), and a qr-* lane can absolutely stop one. It is safe because of
+(`Verdict::is_blocking`), and a qr-* lane can absolutely stop one. It is safe because of
 what may *trigger* either: a quotable absence, or a check the lane could not decide.
 Both come with the command and the output that produced them, so a wrong refusal is
 something `rev-lead` or a human settles in one look rather than a round of rework.
@@ -1992,6 +1992,47 @@ these lanes opened by themselves. `rev-lead.md` therefore says both halves: trus
 `PASS` enough not to re-derive it, and re-run any check whose result looks wrong,
 saying in the review that you did. **A row of green qr-* lanes is not a reviewed PR
 — it is a reviewed six inches of it.**
+
+**The alternative this rejected, argued rather than assumed: advisory lanes.** The
+same three blocks in `edges:` but *not* in `gates.merge.reviewers` deliver the entire
+stated benefit — `rev-lead` reads their results instead of re-deriving them — at zero
+merge-availability cost. The reason to gate them anyway is that **a lane nobody must
+answer is a lane whose rot nobody notices**, and rot is this design's real failure mode:
+five of `qr-constraints`' six checks succeed by printing nothing, so a pattern that stops
+matching is indistinguishable from a clean tree. Gating is what makes a lane's silence
+expensive. That is a genuine trade rather than a free win, because gating is also what
+converts a grep bug into a repo-wide merge freeze — three such bugs were found by running
+these checklists against the PR that introduced them.
+
+**So the rollback lever is one line, and it is not "delete the lanes".** If opencode
+proves unreliable, or a lane starts refusing wrongly, remove its id from
+`gates.merge.reviewers` and **leave the block and its edges in place**: the lane still
+runs, still posts its checklist, still saves `rev-lead` the re-derivation, and no longer
+holds the gate. Deleting blocks, edges and persona files is the heavy lever and is almost
+never the one wanted at 2am.
+
+**Availability is the term that does not scale linearly.** `gate_need(gate)` equals the
+number of named reviewers, and the gate blocks on the *absence* of a verdict rather than
+on its value, so merge throughput becomes the **product** of four lanes' availabilities
+rather than the minimum of one. `threshold:` does not help — an abstention is a pass, so
+N-of-4 opens on the fast lanes while the judging lane is still reading, and `threshold: 4`
+is `all-pass` renamed. The only spelling immune to a missing verdict is `threshold: 1`,
+which lets one cheap lane open the gate and is strictly worse. Keep `all-pass`; reach for
+the advisory lever instead.
+
+Two operational notes that follow from four lanes rather than one. **Verdict rows per PR
+quadruple**, so `list_verdicts`' no-arg sweep — already bounded at the 20 newest PRs and a
+30s budget — keeps its PR bound but reaches its practical output-size ceiling about four
+times sooner; the bound is not breached, and it is worth knowing before it is felt. And
+there is **no audit event distinguishing "a gated lane never recorded a verdict" from "a
+gated lane recorded and refused"** — with four lanes on a free-tier model that is exactly
+the difference between an outage and a normal refusal, and today an operator infers it
+from the absence of rows.
+
+Finally, worth stating plainly because it bounds the blast radius: the gh shim intercepts
+`gh pr merge`, so a human merging in the GitHub web UI is **not** gated by any of this. A
+wedged lane stops every agent-driven merge until someone acts; it never permanently bricks
+the repo.
 
 One ordering detail is load-bearing rather than cosmetic: `rev-lead` is declared
 **first** among the reviewer blocks, for the same reason `worker-deep` is declared

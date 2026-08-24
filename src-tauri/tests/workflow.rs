@@ -7553,10 +7553,15 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
     // reviewer, so a roster that flattened either field would emit a claude command
     // line with `--model sonnet`, and there is no fallback anywhere that could produce
     // `opencode/deepseek-v4-flash-free` by accident. This is also the pin behind the
-    // claim that an opencode block carries a persona the way claude and copilot do:
-    // `persona_inject`'s opencode arm writes the contract to a file under the group dir
-    // and puts its handle on `--agent`, so a `--agent` here means the whole contract
-    // (role body + persona) reached the CLI's system-prompt layer, not the kickoff.
+    // DOGFOOD pin, not the general guard — say which, because the distinction is the
+    // difference between evidence and a comfortable assumption. opencode's `--agent`
+    // carriage is ALREADY policed upstream by
+    // `an_opencode_spawn_delivers_its_config_and_containment_by_env` (tests/
+    // orchestration.rs), which asserts the emitted command line directly; a mutation
+    // removing the handle reddens THERE, in an earlier binary, and cargo stops before
+    // this file runs. So what this loop adds is not the property — it is that THIS
+    // REPO'S OWN declared blocks carry their declared model and persona through the
+    // real load + clamp, the opencode analogue of the worker-tier pin above.
     for block in ["qr-evidence", "qr-tests", "qr-constraints"] {
         let (cmd, argv, kickoff) = compile(&reg, &g, block);
         assert!(

@@ -59,11 +59,22 @@ Take `<N>`, the PR number, from your brief. Run these in your own worktree:
 mkdir -p .scratch
 gh pr view <N> --json headRefOid --jq .headRefOid > .scratch/head.txt
 gh pr view <N> --json body --jq .body > .scratch/body.md
-gh pr diff <N> --stat > .scratch/diffstat.txt
+gh pr diff <N> > .scratch/diff.txt
+git apply --stat .scratch/diff.txt > .scratch/diffstat.txt
 cat .scratch/head.txt
+tail -1 .scratch/diffstat.txt
 ```
 
-If any of those four commands errors, stop and record `escalate` for every line,
+**Two things about that diffstat line, both verified on this machine's tools.**
+`gh pr diff` has **no `--stat` flag** (gh 2.95.0: its flags are `--color`,
+`--exclude`, `--name-only`, `--patch`, `--web`) — asking for one exits 1 with
+`unknown flag: --stat`, and under the rule below that would escalate every PR
+forever. And do **not** reach for `--patch` instead: it emits a *commit series*,
+one patch per commit, so `git apply --stat` counts a file once per commit that
+touched it and reports 16 files where the PR changed 10. The plain `gh pr diff`
+above is a single combined diff and is the one that matches the PR page.
+
+If any of those commands errors, stop and record `escalate` for every line,
 quoting the error. Do not guess at a PR you could not read.
 
 ## The checklist
@@ -82,14 +93,16 @@ grep -nEi 'docs.only|comment.only|a revert|pure rename|pure move|re.blessed|gold
   prints at least one line. Quote one line from each.
 - **PASS** if the third grep prints a line naming one of the four exemptions
   (docs/comment-only, a revert, a pure rename/move, a re-blessed golden or
-  snapshot fixture) **and** the body says on that same line why no new test
-  exists. Quote that line.
+  snapshot fixture). Quote that line.
 - **FAIL** if all three greps print nothing. Quote the three commands and write
   `(no output)`.
-- **ESCALATE** in every other case — for example, the first two print lines but
-  you cannot tell whether the failure line belongs to the command beside it.
 
-### 2. Every CI run id the body cites belongs to the PR's current head
+That is the whole rule, and it is deliberately mechanical: you are **not** asked
+to judge whether a failure line belongs to the command beside it, or whether an
+exemption is meant seriously. Those are judgments, and judging is what this lane
+is built on the premise of being bad at. Two greps printing is a PASS.
+
+### 2. The body's CI claims are backed by at least one run at the current head
 
 ```
 cat .scratch/head.txt
@@ -97,23 +110,32 @@ grep -nEo 'runs/[0-9]{6,}|run [0-9]{6,}|[0-9]{10,}' .scratch/body.md
 grep -nEi 'green|CI pass|all checks|checks pass|all three platforms' .scratch/body.md
 ```
 
-For **each** run id `R` the second grep printed:
+For **each** number `R` the second grep printed:
 
 ```
-gh run view R --json headSha,databaseId,conclusion
+gh run view R --json headSha --jq .headSha
+git merge-base --is-ancestor <that headSha> $(cat .scratch/head.txt)
 ```
 
-- **PASS** if the body cites at least one run id and **every** `R`'s `headSha`
-  equals the full 40 characters in `.scratch/head.txt`. Compare all 40 characters,
-  never a prefix.
-- **PASS** if the body cites no run id **and** the third grep prints nothing —
-  nothing was claimed, so nothing is missing.
-- **FAIL** if any cited `R`'s `headSha` differs from the head. Quote `R`, its
-  `headSha`, and the head, on three lines.
-- **FAIL** if the third grep prints a green/CI claim and the second grep prints no
-  run id at all. Quote the claim line.
-- **ESCALATE** if `gh run view` errors on a run id, or a number the second grep
-  matched is plainly not a run id.
+Classify each `R` by what those two commands said:
+
+| `gh run view R` says | then `R` is | and it counts as |
+|---|---|---|
+| a `headSha` equal to `.scratch/head.txt` | a run at the head | **the thing this check looks for** |
+| a `headSha` that is an ancestor of the head (`is-ancestor` exits 0) | an earlier run on this branch's history | fine — **silent** |
+| a `headSha` that is neither | a run on some other branch | fine — **silent** |
+| an error / 404 | not a run id at all (a job id, a byte count, a date) | fine — **silent** |
+
+- **PASS** if at least one `R` is a run at the head. Quote it.
+- **PASS** if the third grep prints nothing — the body claims nothing about CI,
+  so there is nothing to back.
+- **FAIL** only if the third grep prints a CI claim **and not one** cited number
+  resolves to a run at the head. Quote the claim line and the numbers you tried.
+
+**A body citing a run at the BASE as well is correct, not a defect.** This repo
+requires every number to be measured at the base *and* at the head, so base runs,
+superseded runs and job ids all appear in a good body. This check asks only
+whether the head is covered — never whether something else is also cited.
 
 ### 3. The diffstat the body states matches the PR's real diffstat
 
@@ -125,28 +147,48 @@ grep -nE '[0-9]+ (file|files) changed' .scratch/body.md
 - **PASS** if the second grep prints nothing — the body states no diffstat, so
   there is nothing to disagree with.
 - **PASS** if every line the second grep printed carries the same numbers as the
-  real tail line: files changed, insertions, deletions. All three must match.
+  real tail line: files changed, insertions, deletions.
 - **FAIL** if any body line's numbers differ from the real tail line. Quote the two
   lines one above the other.
-- **ESCALATE** if the body gives the numbers in prose you cannot line up against
-  the tail line.
+- **ESCALATE** if `.scratch/diffstat.txt` is empty, or the body gives the numbers
+  in prose you cannot line up against the tail line.
+
+**Control:** `.scratch/diffstat.txt` must be non-empty and its last line must
+contain the words `changed`. If it does not, your diffstat never got built —
+`ESCALATE` rather than reading an empty file as agreement.
 
 ### 4. Every `path:line` cite in the body resolves at the head
 
 ```
 gh pr checkout <N> --detach
-grep -oE '[A-Za-z0-9_./-]+\.(rs|ts|md|yml|yaml|json|toml):[0-9]+' .scratch/body.md | sort -u
+tr '\\\\' '/' < .scratch/body.md > .scratch/body-slashes.md
+grep -oE '[A-Za-z0-9_./-]+\.(rs|ts|md|yml|yaml|json|toml):[0-9]+' .scratch/body-slashes.md | sort -u
 ```
 
-For **each** `PATH:LINE` printed, run `test -f PATH` and count that file's lines
+**The `tr` is not optional.** A body that pastes a Rust panic line — which this
+repo requires as red-before-green evidence — carries a WINDOWS path:
+`panicked at src-tauri\tests\job_object.rs:338:9`. Without the translation the
+pattern matches only the tail, `job_object.rs:338`, which exists nowhere; with it
+the cite is `src-tauri/tests/job_object.rs:338` and resolves. Reading a required
+artifact as a defect is the failure this lane must never produce.
+
+**Then skip, mechanically and silently, any candidate that:**
+
+- contains **no `/`** — a repo-relative cite always has one, so a bare
+  `foo.rs:12` is prose, a log fragment, or a filename mentioned in passing;
+- starts with `/`, or contains `..` — those name somewhere outside the repo, and
+  this lane does not stat paths outside the repo.
+
+Skipping is silent: not an ESCALATE, not a FAIL.
+
+For **each** surviving `PATH:LINE`, run `test -f PATH` and count that file's lines
 with `wc -l < PATH`.
 
 - **PASS** if the grep printed no cite at all, or every `PATH` exists and its
   `LINE` is less than or equal to that file's line count.
 - **FAIL** if any `PATH` does not exist, or any `LINE` is greater than the file's
   line count. Quote the cite and the command output beside it.
-- **ESCALATE** if `gh pr checkout` fails, or a cite names a path that is plainly
-  not in this repo.
+- **ESCALATE** if `gh pr checkout` fails.
 
 ## Posting your result
 
@@ -169,14 +211,20 @@ Exactly this shape, and **nothing else**:
 ```
 **qr-evidence — verdict: pass|fail|escalate** (head `<first 12 chars of the head sha>`)
 
-1. PASS|FAIL|ESCALATE — <at most one line: the command output, or what was absent>
-2. PASS|FAIL|ESCALATE — <at most one line>
-3. PASS|FAIL|ESCALATE — <at most one line>
-4. PASS|FAIL|ESCALATE — <at most one line>
+1. PASS|FAIL|ESCALATE — <the command's output, or what was absent: ONE line>
+2. PASS|FAIL|ESCALATE — <one line>
+3. PASS|FAIL|ESCALATE — <one line>
+4. PASS|FAIL|ESCALATE — <one line>
 
-<omit this block entirely when the verdict is pass>
+<only when the verdict is not pass>
 For each non-PASS line: the command, then its output, in a fenced block.
 ```
+
+**Every line quotes its own output, including a `PASS`.** A bare "PASS" tells
+`rev-lead` nothing it can check, and `rev-lead` is told to re-run any check whose
+result looks wrong — which it cannot judge from a word. One line of real output
+per check: the run id you matched, the diffstat line, the count. That is four
+short lines and it fits the budget comfortably.
 
 **Hard budget: the whole body is at most 40 lines and at most 2500 characters.**
 Count them before you post. If you are over, you are explaining rather than

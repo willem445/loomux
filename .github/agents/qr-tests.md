@@ -156,7 +156,21 @@ gh pr checkout <N> --detach
 grep -oE '`[a-z_][a-z0-9_]{8,}`' .scratch/body.md | tr -d '`' | sort -u
 ```
 
-For **each** name `T` that grep printed which looks like a test name, run:
+**Discard, mechanically, before looking anything up:**
+
+- any candidate matching `^[0-9a-f]{7,40}$` — that is a **commit SHA**, not a test
+  name. This repo's rules require a body to cite SHAs and re-resolve them, so they
+  turn up constantly, and a 40-character SHA that happens to start `a`-`f` matches
+  the pattern above. Roughly a third of them do, which would make this lane refuse
+  intermittently — and an intermittent mechanical refusal reads as a flaky lane
+  rather than as the bug it is.
+- any candidate with **no underscore** in it. Test names in this repo are
+  `snake_case` sentences; a single lowercase word is a function, a crate, a flag or
+  a filename, and none of those is what this check is about.
+
+Discarding is silent: not a FAIL, not an ESCALATE.
+
+For **each** surviving name `T`, run:
 
 ```
 grep -rn "T" src-tauri/tests crates test e2e
@@ -166,8 +180,7 @@ grep -rn "T" src-tauri/tests crates test e2e
   found by at least one of those greps. Quote one hit.
 - **FAIL** if any `T` the body presents as a test name is found nowhere. Quote the
   name and the grep that printed nothing.
-- **ESCALATE** if `gh pr checkout` fails, or if you cannot tell which of the
-  backticked identifiers the body meant as test names.
+- **ESCALATE** if `gh pr checkout` fails.
 
 **A positive control for line 4**: `grep -rn "fn " src-tauri/tests | head -3` must
 print something. If it prints nothing, your grep is broken and you must
@@ -194,14 +207,19 @@ Exactly this shape, and **nothing else**:
 ```
 **qr-tests — verdict: pass|fail|escalate** (head `<first 12 chars of the head sha>`)
 
-1. PASS|FAIL|ESCALATE — <at most one line: the command output, or what was absent>
-2. PASS|FAIL|ESCALATE — <at most one line>
-3. PASS|FAIL|ESCALATE — <at most one line>
-4. PASS|FAIL|ESCALATE — <at most one line>
+1. PASS|FAIL|ESCALATE — <the command's output, or what was absent: ONE line>
+2. PASS|FAIL|ESCALATE — <one line>
+3. PASS|FAIL|ESCALATE — <one line>
+4. PASS|FAIL|ESCALATE — <one line>
 
-<omit this block entirely when the verdict is pass>
+<only when the verdict is not pass>
 For each non-PASS line: the command, then its output, in a fenced block.
 ```
+
+**Every line quotes its own output, including a `PASS`.** A bare "PASS" tells
+`rev-lead` nothing it can check, and `rev-lead` is told to re-run any check whose
+result looks wrong — which it cannot judge from a word. One line of real output
+per check: the counts, the name you found, the delta.
 
 **Hard budget: the whole body is at most 40 lines and at most 2500 characters.**
 Count them before you post. If you are over, you are explaining rather than

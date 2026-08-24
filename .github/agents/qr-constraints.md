@@ -144,11 +144,19 @@ grep -rn 'resizePty(' src/ --include=*.ts | grep -vE '^src/(pane|pty|resizeburst
 ```
 grep -n 'fn the_orchestration_root_is_joined_with_a_group_in_exactly_one_place' src-tauri/tests/groupid.rs
 grep -rnE '^[[:space:]]*impl[[:space:]]+AsRef<Path>[[:space:]]+for[[:space:]]+GroupId' crates/loomux-engine/src src-tauri/src
-grep -rn 'GroupId' crates/loomux-engine/src/groupid.rs
+grep -rnE 'impl[[:space:]]+AsRef<Path>[[:space:]]+for[[:space:]]+GroupId' crates/loomux-engine/src src-tauri/src
 ```
 
-- **ESCALATE** if the third command prints nothing — `GroupId` is defined in that
-  file, so an empty control means the sweep is broken.
+The third command is the control, and it is **the sweep's own pattern minus the
+line-start anchor**. That matters: a control that greps for something unrelated
+(say, the word `GroupId`) proves only that grep can read a file, so a typo in the
+anchored spelling would give you sweep silent, control loud, verdict `PASS` —
+an uncontrolled zero, which the rule above forbids in as many words. This control
+exercises the real pattern, and it has a guaranteed match: the doc comment in
+`groupid.rs` that discusses the absence of such an impl.
+
+- **ESCALATE** if the third command prints nothing — the doc comment it matches is
+  in the tree, so an empty control means the pattern itself is broken.
 - **PASS** if the first command prints a line **and** the second prints nothing.
 - **FAIL** if the first command prints nothing (the guard test was deleted or
   renamed) or the second prints a line (an `AsRef<Path>` impl would let a
@@ -214,16 +222,21 @@ Exactly this shape, and **nothing else**:
 ```
 **qr-constraints — verdict: pass|fail|escalate** (head `<first 12 chars of the head sha>`)
 
-1. PASS|FAIL|ESCALATE — <at most one line: the command output, or what was absent>
-2. PASS|FAIL|ESCALATE — <at most one line>
-3. PASS|FAIL|ESCALATE — <at most one line>
-4. PASS|FAIL|ESCALATE — <at most one line>
-5. PASS|FAIL|ESCALATE — <at most one line>
-6. PASS|FAIL|ESCALATE — <at most one line>
+1. PASS|FAIL|ESCALATE — <the command's output, or what was absent: ONE line>
+2. PASS|FAIL|ESCALATE — <one line>
+3. PASS|FAIL|ESCALATE — <one line>
+4. PASS|FAIL|ESCALATE — <one line>
+5. PASS|FAIL|ESCALATE — <one line>
+6. PASS|FAIL|ESCALATE — <one line>
 
-<omit this block entirely when the verdict is pass>
+<only when the verdict is not pass>
 For each non-PASS line: the command, then its output, in a fenced block.
 ```
+
+**Every line quotes its own output, including a `PASS`.** A bare "PASS" tells
+`rev-lead` nothing it can check, and `rev-lead` is told to re-run any check whose
+result looks wrong — which it cannot judge from a word. One line of real output
+per check: the control's count and the sweep's result.
 
 **Hard budget: the whole body is at most 40 lines and at most 2500 characters.**
 Count them before you post. If you are over, you are explaining rather than
