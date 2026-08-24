@@ -4303,6 +4303,59 @@ mod tests {
         assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some("nullish"));
     }
 
+    /// A user-facing refusal is ONE paragraph, and `.contains(…)` cannot see
+    /// when it stops being one.
+    ///
+    /// This is the house rule (CLAUDE.md, "A user-facing message is ONE
+    /// paragraph"), and this PR is the worked example it names: the three
+    /// refusals below were first authored through a path that collapsed each
+    /// `\` line-continuation into the next line's indentation, shipping 20-30
+    /// consecutive spaces mid-sentence to whoever's workflow file failed to
+    /// load. Every assertion in this module is a `.contains(<substring>)`, and
+    /// not one of them straddled a break — so the defect rode a fully green
+    /// suite until a test happened to assert a phrase that spanned one.
+    ///
+    /// So the SHAPE is pinned beside the content, the same predicate
+    /// `src-tauri/tests/manager_lifecycle.rs::is_one_paragraph` uses: no `\n`
+    /// (a hard break) and no ten-space run (leaked source indentation, which is
+    /// what a collapsed continuation leaves behind). Restated here rather than
+    /// shared because that helper lives in the Tauri crate's test binary, which
+    /// this crate cannot reach.
+    #[test]
+    fn every_remote_refusal_renders_as_one_paragraph() {
+        fn one_paragraph(msg: &str) -> bool {
+            !msg.contains('\n') && !msg.contains("          ")
+        }
+
+        // Every refusal this PR adds, each triggered by the smallest file that
+        // produces it. Collected rather than asserted one at a time so a
+        // refusal added later without a row here is a visible omission.
+        let cases: [(&str, String); 5] = [
+            ("bad label", remote_doc(&[("kind", "worker"), ("cli", "claude"), ("remote", "build box")])),
+            ("orchestrator", remote_doc(&[("kind", "orchestrator"), ("cli", "claude"), ("remote", "buildbox")])),
+            ("manager", remote_doc(&[("kind", "manager"), ("cli", "claude"), ("remote", "buildbox")])),
+            ("wrong cli", remote_doc(&[("kind", "worker"), ("cli", "copilot"), ("remote", "buildbox")])),
+            ("omitted cli", remote_doc(&[("kind", "worker"), ("remote", "buildbox")])),
+        ];
+        let mut checked = 0;
+        for (what, doc) in &cases {
+            let errs = parse_workflow(doc).unwrap_err();
+            for e in &errs {
+                assert!(
+                    one_paragraph(e),
+                    "{what}: a refusal is one paragraph — the house idiom is a `\\` line \
+                     continuation, which strips the newline AND the indentation. This one ships \
+                     a hard break or leaked indentation: {e:?}"
+                );
+                checked += 1;
+            }
+        }
+        // The population control: five refusals were reached, not zero. Without
+        // it a `parse_workflow` that started returning `Ok` for all five would
+        // leave this test green over an empty loop.
+        assert_eq!(checked, 5, "each case must produce exactly one refusal to check");
+    }
+
     #[test]
     fn a_loomux_owned_block_may_not_run_remotely() {
         // The orchestrator holds orchestration state, the gh operations and the
