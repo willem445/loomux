@@ -517,6 +517,73 @@ group has only the second, which is why it cannot be left to the flag. `reviewer
 `mechanics_core(Reviewer)` carry it in lockstep, for the reason every reviewer duty does: a
 `mode: replace` persona never reads `reviewer.md`.
 
+### The premortem and the resource envelope (#1292)
+
+The review lanes above are all **verification** lanes: given a claim, check it. That is the
+half our reviews were already good at, and it is structurally blind to the half that produces
+the claim in the first place. Red-before-green evidences the tests somebody thought to write;
+it says nothing about a property nobody conceived of, so a change whose failure mode was never
+imagined ships behind a green suite and a satisfied evidence rule. The bar this is written
+against is the crash class behind #1218: correctness tests green through four production
+crashes, because the memory behaviour was never framed as something a test could pin.
+
+So two **question-generation** duties join the lanes, chosen as the subset that is cheap on
+every PR rather than as the full set (#1292 lists five; a repo that wants the rest puts them
+in its own reviewer persona, which is where they can be tuned to that codebase):
+
+- **A fixed `## Premortem` section in every review body** — two ways the change fails in
+  production that no test in the PR would catch, or an argued none. A fixed heading is what
+  makes an omission *visible*: a question asked only when the reviewer thinks of it is the
+  question that was not asked on the review that needed it.
+- **The resource envelope**, folded into the cost lane rather than added beside it, and
+  mandatory where the change touches unbounded input: largest realistic input × invocation
+  frequency × allocation/IO per run, naming the size at which memory or IO hurts rather than
+  only where time does. Cost review that asks only about time is exactly what let a whole-file
+  read through.
+
+**Two surfaces, in lockstep** — `reviewer.md` and `mechanics_core(Reviewer)` — for the reason
+every reviewer duty in that function is duplicated: a `mode: replace` persona never reads the
+template, so a duty living only there is one the repo that bothered to write its own reviewer
+never hears. `orchestrator.md`'s disposition step is what makes the section load-bearing: a
+review without it is an *incomplete review, not an approval*, and a premortem entry naming the
+input that triggers it is dispositioned like any other finding. That rule is section-scoped and
+deliberately **not** in the INVARIANTS digest — it is a procedure inside one step, not a rule
+whose loss to a compaction costs a merge.
+
+**The body, not the summary.** The premortem lives in the review posted on the PR, and nothing
+about it reaches `review_verdict`. Three mechanisms that would have made it machine-checkable
+were rejected:
+
+1. A required `premortem:` line in the verdict summary — it fights the ~100-word/400-character
+   notice diet the section above exists to enforce, and it can only ever check *presence*
+   (`premortem: none` satisfies it), which is the property least worth the cost.
+2. A new `premortem` argument on `review_verdict`, persisted in the verdict file — an MCP
+   surface change, a file-shape change, a `gh`-shim parser change and a `list_verdicts` wire
+   change (the whole `add-orch-tool` ladder) to buy a non-empty-string check. Worth revisiting
+   on a live incident where a reviewer actually skipped the section; not before.
+3. The shim grepping the PR review body at merge time — a `gh` call inside the interceptor,
+   textual and fragile, and it moves review *quality* into a gate whose entire design is that
+   it counts verdicts and reads none of them.
+
+Absence is the cheap failure and vacuity is the likely one, so the disposition step addresses
+both: a section answered with an unargued "none" is dispositioned as a *missing* one. That
+asymmetry was in the first draft of this section — the reviewer surfaces both called an empty
+section a finding, while the only surface that acts on a review's SHAPE had been told about
+absence alone, which is a rule with no addressee. The trigger is also the section rather than
+its punctuation: keyed strictly on one spelling, the rule burns a review round on `##
+Pre-mortem`; read loosely with nothing said, it accepts a bolded line and the fixed heading
+stops doing the work claimed for it here.
+
+**Residual, stated rather than closed:** nothing MECHANICAL checks either half. No runtime code
+reads a review body, so "the section is there" and "its contents are not a formula" are both
+enforced by the orchestrator reading the review — which is exactly where the rest of the
+findings policy already lives — and the CI-side guarantee is only that the *instructions* still
+say it (`prompts.rs`, `workflow.rs`'s both-surfaces loop, and the `pre222` goldens). That is the
+same guarantee every prose rule in this section has, and it is the reason they are pinned at
+all. The failure mode to watch is the one that fails UPWARD: a section always present and
+always filled with restatements of what the suite already covers satisfies every surface here,
+and only a human reading premortems against what later broke would ever notice.
+
 ### The verdict notice is a signal; the record is elsewhere (#850)
 
 Text typed into a pane is not a message an agent reads once. It joins that agent's

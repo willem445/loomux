@@ -812,6 +812,18 @@ When a worker reports a PR:
    *for*, and a PR that merges with them dropped is procedurally green and materially worse. So
    an approval opens one more step, not the merge: decide each open finding's disposition, and
    say what you decided.
+   - **A review with no `## Premortem` section is an incomplete review, not an approval.** Read
+     it however the reviewer spelled the heading — what you are looking for is the section, not
+     its punctuation — and send the reviewer back for it rather than dispositioning what it did
+     say. That section is where the ways the change fails in production that no test in the PR
+     would catch get named, and its absence is exactly the silence a review exists to break: a
+     green suite is not evidence about a property nobody stated. **A section whose answer is an
+     unargued "none" is the same as a missing one**, and it is the likelier failure: the heading
+     makes an omission visible only while somebody reads it for content, so "none obvious" buys
+     a complete-looking review at the lowest price on offer. A premortem entry that names an
+     input, or the sequence, that triggers it is dispositioned like any other finding, below;
+     one that names neither is the reviewer's record of what it looked for, not a finding to
+     route.
    - **Default: fix it in this PR.** Route it back to the worker (resume its session) and
      re-review. A non-blocking finding is usually minutes of work, and it is the signal that
      compounds.

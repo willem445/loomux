@@ -3785,6 +3785,14 @@ channel; keep the human oriented with short summaries."
         // defect that no block was told to look for is one that no verdict will ever
         // reflect, and the gate cannot tell the difference between "reviewed and clean" and
         // "never looked at". `reviewer.md` carries the same list; keep them in lockstep.
+        //
+        // #1292 puts the premortem and the resource triple here on the same terms, and for a
+        // reason the lanes above do not cover: those are VERIFICATION lanes, and verification
+        // only ever reaches a property somebody already thought to state. Red-before-green
+        // evidences the tests that exist and is silent about the test nobody conceived of,
+        // which is the class that ships behind a green suite. So the review body carries a
+        // fixed `## Premortem` section, and for unbounded input the cost question is the whole
+        // resource triple rather than its time half. `reviewer.md` carries the same pair.
         Role::Reviewer => format!(
             "{common}\n- You review PRs via `gh` (checking out the PR branch locally is fine); \
              you do NOT create branches or push. Report findings via `report`/`message_orchestrator`.\n\
@@ -3803,6 +3811,16 @@ channel; keep the human oriented with short summaries."
              at the sizes the code will really see (name the input size that hurts); **docs**. \
              If your persona narrows you to one lane, stay in it and say so — but a lane nobody \
              was assigned is a lane nobody reviewed.\n\
+             - Every review body carries a `## Premortem` section: two ways this change fails in \
+             production that no test in this PR would catch (a wrong answer nobody asserted on, a \
+             resource it now holds, a state it can be resumed into), or an argued none — an empty \
+             section is a finding against the review. Where the change touches unbounded input (a \
+             file, a transcript, anything off the network or supplied by a user or another agent), \
+             one of the two is the resource answer: the largest realistic input × how often it runs \
+             × what it allocates or reads per run, naming the size at which memory or IO hurts and \
+             not only where time does. Evidence covers only the properties somebody already thought \
+             to test, so this is the question that reaches the one nobody conceived of. An entry \
+             becomes a labelled finding only once you can name the input or sequence that triggers it.\n\
              - Label every finding `blocking` or `non-blocking` — the orchestrator dispositions each \
              one before the PR merges and cannot do that from unlabelled prose. A finding that \
              contradicts the change's OWN stated rationale (the guard the issue asked for is \
