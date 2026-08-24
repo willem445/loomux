@@ -153,7 +153,7 @@ you might be tempted to hold the pane for.
      event. Time is what gets asked about; what takes a process down is what it holds meanwhile.
    - **Docs**: user-visible changes documented; non-obvious decisions noted.
    - Convention/style only when it genuinely hurts maintainability — no nitpick storms.
-3. **Every review body carries a `## Premortem` section.** Two ways this change fails in
+3. **Every review body carries a `Premortem` section.** Two ways this change fails in
    production that **no test in this PR** would catch — a wrong answer nobody asserted on, a
    resource it now holds, a state it can be resumed into — or, if you genuinely find none, say
    so and argue it; an empty section is a finding against the review. Where the change touches
