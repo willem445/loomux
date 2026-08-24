@@ -86,11 +86,12 @@ finds beta3's key. That key records `MainBinaryName`, and the next install reads
 it back:
 
 ```
-ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
-${If} $OldMainBinaryName != ""
-${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
-  Delete "$INSTDIR\$OldMainBinaryName"
-${EndIf}
+  ; Remove old main binary if it doesn't match new main binary name
+  ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
+  ${If} $OldMainBinaryName != ""
+  ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
+    Delete "$INSTDIR\$OldMainBinaryName"
+  ${EndIf}
 ```
 
 So an in-place upgrade installs `orrerix.exe`, recreates its own shortcuts at
@@ -107,9 +108,10 @@ executables in `$INSTDIR` until the next install.
 `src-tauri/windows/hooks.nsh` closes that, wired in via
 `bundle.windows.nsis.installerHooks`: the same macro, applied to the previous
 name, at `NSIS_HOOK_PREINSTALL` — which `installer.nsi` inserts at the top of
-`Section Install`, before its own check and before any file is copied. Eight
-lines, and it is this product's own previous binary rather than a toolchain
-assumption, so it stays inside the "no machine-specific special-casing" rule.
+`Section Install`, before its own check and before any file is copied. Three
+lines of NSIS under a comment explaining them, and the name it hardcodes is this
+product's own previous binary rather than a toolchain assumption, so it stays
+inside the "no machine-specific special-casing" rule.
 It can be deleted once no supported upgrade path starts from a pre-#1562 build.
 
 Two things about it are worth stating because nothing in CI will tell you:
@@ -127,9 +129,11 @@ a relative `installerHooks` is relative to `src-tauri/`. Read off
 `…\Orrerix\loomux.exe` and the installer only recreates the shortcuts it made
 itself. Unavoidable; it is a release-note line, not a bug to fix.
 
-**MSI (stable releases only — betas ship `--bundles nsis`).** The `UpgradeCode`
-defaults to `uuid5(NAMESPACE_DNS, "<productName>.exe.app.x64")`, so #1153 phase
-5 already changed it. Consequences: an Orrerix MSI over an Orrerix MSI is a
+**MSI (stable releases only — betas ship `--bundles nsis`).** With
+`bundle.windows.wix.upgradeCode` unset, `tauri-bundler` derives it as
+`Uuid::new_v5(&Uuid::NAMESPACE_DNS, format!("{}.exe.app.x64", &settings.product_name()).as_bytes())`
+— off `productName`, so #1153 phase 5 already changed it and the binary rename
+does not touch it at all. Consequences: an Orrerix MSI over an Orrerix MSI is a
 clean major upgrade and the binary rename strands nothing; an Orrerix MSI over a
 **Loomux** MSI installs side by side, exactly as NSIS does.
 
