@@ -425,7 +425,8 @@ interface EmbedEntry {
   overlayEl: HTMLElement;              // the view's own floating-overlay host (unchanged)
   viewEl: HTMLElement;                 // the view's own root element
   show(): void;
-  hide?(): void;                       // extra per-view cleanup beyond hiding the host
+  hide?(): void;                       // stop whatever can wake this view off screen (#1318),
+                                       // plus per-view cleanup beyond hiding the host
   setPanelActive(active: boolean): void;
   floorPx(): number;                   // live floor, for the overlay clamp AND the bottom slot
 }
@@ -661,7 +662,12 @@ survives the move untouched. Verified per view, not assumed:
 
 - **`TasksView`** — an `orch-tasks-changed` subscription, expanded/selected
   row sets, an in-flight edit. Unaffected by reparenting (listeners live on
-  elements inside `tasksView.el`, which moves as a subtree).
+  elements inside `tasksView.el`, which moves as a subtree). `hide()` puts its
+  `WakeGate` to sleep (#1318) — see *What `hide` is actually for*, below.
+- **`DecisionsView`** (#1091) — three subscriptions
+  (`orch-questions-changed`, `orch-tasks-changed`, `orch-needs-you-changed`),
+  open-card and draft-answer state, all of it inside `decisionsView.el`. Same
+  `hide()` as the board's, over three streams instead of two.
 - **`GitView`** — the one with the most internal state (repo root, worktree
   selection, commit log, diff selection) and its own nested resizable
   sub-panes (graph | diff over the changes strip). It was ALREADY
@@ -700,6 +706,48 @@ survives the move untouched. Verified per view, not assumed:
   already had); nothing new needed there for docking. The one addition is
   `setPanelActive`, matching every other view's shape exactly — disables +
   retitles its own ✕ while docked, same as the other seven.
+
+### What `hide` is actually for (#1318)
+
+`EmbedEntry.hide` used to state its rule as *"stops the follow poll on
+close/eviction — which every **polling** view has to answer for."* That names
+the mechanism, not the question, and the two views added after it — the task
+board and the NEEDS-YOU panel — have no timer at all. They are woken by Tauri
+event streams instead, so nobody read that sentence as being about them and
+neither registered a `hide` hook. The cost was not a leaked interval but a
+standing one: every `write_tasks` by every agent drove up to four backend reads
+and a full `replaceChildren` rebuild in **every board and every NEEDS-YOU panel
+that had ever been opened**, on any pane, for the life of the session — and
+`TasksView.render` is super-linear in the board (`unmetDeps`,
+`blockingAncestor`, `siblingPosition`, `childCounts`, `subtreeAllDone`,
+`hasMissingParent` each rescan the whole board once per row).
+
+The rule, restated in terms of what wakes the view:
+
+> **If something outside a view can make that view do work, its `hide` hook is
+> where it says what happens when nobody is looking at it.** Whether the waker
+> is a `setInterval` or a `listen()` is an implementation detail of the waking.
+
+`src/wakegate.ts` is the DOM-free policy behind the two event-driven views, the
+sibling of `src/pollgate.ts` for the timer-driven ones. Three things about it
+are load-bearing:
+
+- **It suppresses; it never catches up.** `openView` calls `show()` on every
+  open in either hosting mode, and both views' `show()` ends in an
+  unconditional `refresh()`. So a wake dropped while hidden is re-earned by the
+  act of looking, and the gate needs no missed-wake bookkeeping.
+- **The accepted cost** of that, stated plainly: a reopened panel shows its last
+  render for one backend round-trip before repainting, where before it was
+  already current. That is the same window a first open has always had, and no
+  staleness survives being looked at.
+- **The release is not the event.** A latch driven only by `show`/`hide` that
+  missed a `show()` would leave a panel frozen while the human stares at it, so
+  the gate also takes the pane's own live `isViewVisible(kind)` read and
+  consults it on exactly the path where being wrong is expensive — a wake the
+  latch would otherwise suppress. That wake runs, and heals the latch. The union
+  errs toward refreshing: a missed `hide()` costs only what the pre-#1318 code
+  cost. `__wakeGateStats()`'s `strays` counter is 0 iff the latch never needed
+  that rescue, which is how the human validates the wiring an agent cannot run.
 
 The overlay host (`.git-overlay`, one per view — unchanged) and each edge's
 slot (`.pane-embed-panel.side-*` / `.pane-embed-divider.side-*`) are all

@@ -333,7 +333,9 @@ const STREAMS: StreamRow[] = [
       "each open view the refetch already in flight plus exactly one more, and the trailing " +
       "run reads the final registry. Each view already shares that same gate with its own " +
       "orch-tasks-changed listener (below), so a simultaneous burst on both streams still " +
-      "coalesces to one refresh per view, not two.",
+      "coalesces to one refresh per view, not two. Both views are ALSO visibility-gated as of " +
+      "#1318 (src/wakegate.ts): a closed board or panel drops the wake outright rather than " +
+      "coalescing it, and show() refreshes unconditionally so nothing is lost by dropping it.",
     debt: null,
   },
   {
@@ -353,7 +355,9 @@ const STREAMS: StreamRow[] = [
       "orch-tasks-changed, and an ungated third listener would have doubled a board burst's " +
       "cost for this panel rather than added to it. Clear-completed is deliberately not on this " +
       "stream at all — it writes only the watermark marker, emits nothing, and the panel applies " +
-      "the stamp the command returns.",
+      "the stamp the command returns. As of #1318 the panel is visibility-gated too " +
+      "(src/wakegate.ts): all three of its streams drop their wake outright while it is off " +
+      "screen, and show() refreshes unconditionally so nothing is lost by dropping them.",
     debt: null,
   },
   {
@@ -362,11 +366,15 @@ const STREAMS: StreamRow[] = [
     bound: "throttled",
     cite: "src/refreshgate.ts",
     reason:
-      "Emitted on EVERY write_tasks, which agents drive in bursts. Each open board now refreshes " +
+      "Emitted on EVERY write_tasks, which agents drive in bursts. Each open board refreshes " +
       "through CoalescingRefresh: single-flight with a trailing-edge merge, so a burst of N " +
       "writes costs the refetch already in flight plus exactly one more, per view, and the " +
       "trailing one reads the final board so nothing is lost (#743 S5). Self-clocking — its " +
-      "window is the duration of a refresh, so a slower backend coalesces harder.",
+      "window is the duration of a refresh, so a slower backend coalesces harder. " +
+      "WHICH boards pay that at all is the second bound (#1318, src/wakegate.ts): 'open' meant " +
+      "'ever opened' until the board and the NEEDS-YOU panel got the hide hook every woken view " +
+      "owes, so an off-screen board now costs one boolean instead of a refetch plus a rebuild " +
+      "that is super-linear in the board. show() refreshes unconditionally, so nothing is lost.",
     debt: null,
   },
 ];

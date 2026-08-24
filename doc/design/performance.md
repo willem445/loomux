@@ -170,7 +170,15 @@ scan pins the shape.
   activity, a walk) is bounded backend-side by P2 or handler-side by P5. Every
   `listen()` appears in E2's stream manifest with `{rate class, bound:
   backend-coalesced | rAF-gated | throttled | argued-none(reason)}`; a new
-  listener with no declared bound is refused. *Enforced: E2 (#743 S3).*
+  listener with no declared bound is refused.
+  **A stream that drives a VIEW's refresh answers INV-4's visibility question
+  too** (#1318): what does it do when nobody is looking at that view? The waker
+  being a `listen()` rather than a `setInterval` changes the mechanism, not the
+  question — stating the rule for polls alone is what left the task board and
+  the NEEDS-YOU panel refetching and rebuilding off screen on every agent write
+  for a whole session. `src/wakegate.ts` is that answer for an event-driven
+  view, as `src/pollgate.ts` is for a timer.
+  *Enforced: E2 (#743 S3).*
 - **INV-4 — Cadenced work declares itself.** Every `setInterval` appears in
   E2's timer manifest with `{cadence, visibility policy: gated |
   component-scoped | argued(reason)}`; a frontend timer that drives IPC or
@@ -292,7 +300,6 @@ Owning issues:
 | xterm scrollback: 13-25 MB per pane, never trimmed for an exited or docked one (INV-8a) | #1315 |
 | six module-level collections with no prune (INV-8a) | #1316 |
 | whole-of-session payloads on a poll: lifetime roster, uncapped board, triple-held audit log (INV-8a) | #1317 |
-| event-driven embed views refetch and re-render off-screen (INV-4's rule, stated for polls only) | #1318 |
 | `tasks_lock` architecture — file IO out from under the board family's lock | #747 |
 | `mq_state_lock` / single gh-poll-thread decoupling (fleet latency; §4 X4) | #748 |
 | `orch_session_roles` unbounded fan-out | #749 |
