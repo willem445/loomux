@@ -34180,6 +34180,105 @@ fn killed_agent_stays_in_lifetime_total_but_not_live() {
     assert_eq!(after["live_tokens"].as_u64(), Some(0));
 }
 
+// ---------- #1317: the POLLED usage view ----------
+//
+// `orch_group_usage` answered the whole LIFETIME roster — one row per agent
+// the group ever had, rebuilt and re-serialized every 2 s by the group view
+// and every 4 s per group-bound tab. `groupview.ts` indexes that array by id
+// and looks up only the agents `orch_group_summary` reports LIVE, so every
+// historical row was payload with no reader, growing with session length on a
+// fixed cadence. `live_usage_view` is the cut; these two tests pin that it
+// folds the right rows away and that nothing goes missing when it does.
+
+fn usage_ids_where(v: &Value, key: &str, live: bool) -> Vec<String> {
+    const NO_ROWS: &[Value] = &[];
+    let mut ids: Vec<String> = v[key]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(NO_ROWS)
+        .iter()
+        .filter(|a| a["live"].as_bool().unwrap_or(false) == live)
+        .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn the_polled_usage_view_carries_the_live_rows_and_names_the_roster_it_folded() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-usage-live-view", rails()).unwrap();
+
+    let live_w = reg.spawn_agent(&g.id, Role::Worker, "live-w", "t", false, None).unwrap();
+    let live_sid = live_w.session_id.clone().expect("claude worker gets a session id");
+    reg.upsert_usage_snapshot(&g.id, usage_snap(&live_sid, &live_w.id, 1.00, 1000, 0));
+
+    let dead_w = reg.spawn_agent(&g.id, Role::Worker, "dead-w", "t", false, None).unwrap();
+    let dead_sid = dead_w.session_id.clone().unwrap();
+    reg.upsert_usage_snapshot(&g.id, usage_snap(&dead_sid, &dead_w.id, 2.00, 2000, 0));
+    reg.mark_dead(&dead_w.id, Some(0));
+
+    let full = reg.group_usage(&g.id);
+    // POSITIVE CONTROL for every absence assertion below: the roster this is
+    // cut from must really hold BOTH kinds of row, or "the historical rows are
+    // gone" would pass just as well against a roster that never had one.
+    let full_live = usage_ids_where(&full, "agents", true);
+    let full_hist = usage_ids_where(&full, "agents", false);
+    assert_eq!(full_live, vec![live_w.id.clone()], "sanity: one live row in the full roster");
+    assert_eq!(full_hist, vec![dead_w.id.clone()], "sanity: one historical row in the full roster");
+
+    let view = reg.group_usage_live_within(&g.id, Duration::ZERO);
+
+    // The old whole-roster key is GONE rather than filtered in place: a reader
+    // written against `agents` must fail loudly, never quietly render a subset.
+    assert!(view.get("agents").is_none(), "the polled view must not answer the old whole-roster key");
+
+    // Exactly the rows the full value marks live — the set equality, not a
+    // count, so a filter that kept the wrong rows cannot pass.
+    assert_eq!(usage_ids_where(&view, "live_agents", true), full_live);
+    assert!(usage_ids_where(&view, "live_agents", false).is_empty(),
+        "a historical row in the LIVE array would be a row the group view then renders as running");
+
+    // Not a silent truncation: the roster's real size is named, and it does
+    // not equal what was shipped.
+    assert_eq!(view["agent_count"].as_u64(), Some(2));
+    assert_eq!(view["live_agents"].as_array().unwrap().len(), 1);
+
+    // And no spend disappears with the rows. The group view's headline figure
+    // is the LIFETIME total, which still sums the whole roster.
+    assert_eq!(view["lifetime_tokens"], full["lifetime_tokens"]);
+    assert_eq!(view["lifetime_cost_usd"], full["lifetime_cost_usd"]);
+    assert_eq!(view["lifetime_cost_basis"], full["lifetime_cost_basis"]);
+    assert_eq!(view["live_tokens"], full["live_tokens"]);
+    assert_eq!(view["live_cost_usd"], full["live_cost_usd"]);
+    assert_eq!(view["lifetime_tokens"].as_u64(), Some(3000), "1000 live + 2000 historical");
+}
+
+#[test]
+fn a_group_whose_agents_have_all_exited_still_reports_its_lifetime_spend() {
+    // The case where a silent truncation and an honest fold look identical
+    // from the array alone: nothing live, so `live_agents` is empty either
+    // way. `agent_count` and the lifetime totals are what tell them apart —
+    // an empty array beside a $3.00 lifetime figure is a group that HAS
+    // spent, not a group with nothing to report.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo-usage-all-exited", rails()).unwrap();
+    for (i, cost) in [1.00f64, 2.00].into_iter().enumerate() {
+        let w = reg.spawn_agent(&g.id, Role::Worker, &format!("w{i}"), "t", false, None).unwrap();
+        let sid = w.session_id.clone().unwrap();
+        reg.upsert_usage_snapshot(&g.id, usage_snap(&sid, &w.id, cost, 1000, 0));
+        reg.mark_dead(&w.id, Some(0));
+    }
+
+    let view = reg.group_usage_live_within(&g.id, Duration::ZERO);
+    assert!(view["live_agents"].as_array().unwrap().is_empty(), "nothing is running");
+    assert_eq!(view["agent_count"].as_u64(), Some(2), "both exited agents are still on the roster");
+    assert_eq!(view["lifetime_tokens"].as_u64(), Some(2000));
+    assert!((view["lifetime_cost_usd"].as_f64().unwrap() - 3.00).abs() < 1e-9,
+        "the lifetime figure must survive the fold that dropped the rows it came from");
+    assert_eq!(view["live_tokens"].as_u64(), Some(0));
+}
+
 #[test]
 fn mark_dead_captures_usage_from_transcript() {
     // Point the usage reader at a fixture transcript tree instead of ~/.claude,

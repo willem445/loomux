@@ -2692,6 +2692,85 @@ const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
 /// (the MCP tool, the autonomy anchor, the budget enforcer) passes
 /// `Duration::ZERO` and never sees a stored value at all.
 const USAGE_POLL_MAX_AGE: Duration = Duration::from_millis(1000);
+
+/// Which projection of the memoised group-usage value a reader wants (#1317).
+///
+/// Both come out of ONE computation and one memo cell — see
+/// [`OrchRegistry::group_usage_memoed`].
+#[derive(Clone, Copy)]
+enum UsageView {
+    /// The whole-roster value: every snapshot the group ever captured. What
+    /// the MCP `group_usage` tool, the autonomy anchor and the budget enforcer
+    /// read.
+    Full,
+    /// [`live_usage_view`] of it — what the POLLED GUI command returns.
+    Live,
+}
+
+/// Project [`OrchRegistry::group_usage`]'s value down to what a POLLED reader
+/// needs: the live agents' rows, and no per-agent row for anyone else (#1317).
+///
+/// **What it is fixing.** `agents` is O(agents-EVER), not O(agents-live):
+/// `compute_group_usage` merges each live agent's fresh snapshot with every
+/// snapshot `mark_dead` ever captured, so the array only grows with how long
+/// the human has been running. Nothing accumulates ACROSS ticks — the array is
+/// replaced wholesale each time — but the size of ONE tick grows with session
+/// length, on a fixed 2 s (group view) / 4 s (per group-bound tab) cadence.
+/// That is allocation churn proportional to session length, which is what a
+/// long session feels as GC pressure. The MCP twin was capped for exactly this
+/// (`mcp::summarize_group_usage`: "a 654-agent lifetime roster serialized to
+/// 173,245 chars"); the command the GUI polls was not.
+///
+/// **Why LIVE is the right cut, rather than a top-N cap.** The GUI never
+/// wanted the historical rows: `groupview.ts` indexes this array by agent id
+/// and looks up only the agents `orch_group_summary` reports LIVE, and
+/// `tabbar.ts` reads `live_cost_usd` and no row at all. Live agents are
+/// bounded by the group's `max_agents`; the lifetime roster is bounded by
+/// nothing. A top-N cap would be both looser and — since top-N is by lifetime
+/// tokens — capable of dropping a live agent's row, which is the one row this
+/// caller actually renders.
+///
+/// **Not a silent truncation**, the property `summarize_group_usage`'s `rest`
+/// count holds for the MCP twin:
+/// - every LIFETIME total passes through untouched — `lifetime_tokens`,
+///   `lifetime_cost_usd` and `lifetime_cost_basis` still sum the whole roster,
+///   so no spend disappears from the figure the group view puts on screen;
+/// - `agent_count` names the roster's real size, so `agent_count !=
+///   live_agents.len()` is readable rather than invisible;
+/// - the key is RENAMED (`agents` → `live_agents`) rather than filtered in
+///   place, so a reader written against the whole-roster `agents` fails loudly
+///   instead of quietly seeing a subset. #866 took the same decision for
+///   `top_agents` on the MCP side, for the same reason.
+///
+/// Builds a fresh object rather than cloning and stripping: cloning the full
+/// value to throw the historical rows away would pay the very allocation this
+/// exists to remove.
+#[doc(hidden)] // pub for integration tests
+pub fn live_usage_view(full: &Value) -> Value {
+    let rows = full.get("agents").and_then(|a| a.as_array());
+    let agent_count = rows.map_or(0, |r| r.len());
+    let live: Vec<Value> = rows
+        .map(|r| {
+            r.iter()
+                .filter(|a| a["live"].as_bool().unwrap_or(false))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = full.as_object() {
+        for (k, v) in obj {
+            if k == "agents" {
+                continue;
+            }
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out.insert("agent_count".to_string(), json!(agent_count));
+    out.insert("live_agents".to_string(), Value::Array(live));
+    Value::Object(out)
+}
+
 /// #743 S4a: how long the repo's resolved default-branch NAME may be re-served
 /// before it is re-resolved from `git`.
 ///
@@ -12754,7 +12833,16 @@ pub struct OrchRegistry {
     ///
     /// **Bounded by LIVE groups**: `end_group` drops the entry, so the map does
     /// not accumulate one per group this process ever opened.
-    usage_memo: Mutex<HashMap<GroupId, Arc<Mutex<Option<(std::time::Instant, Value)>>>>>,
+    ///
+    /// **Two values per cell, one computation** (#1317): the full whole-roster
+    /// value and [`live_usage_view`] of it, derived together and stamped with
+    /// one `Instant`. Storing the projection beside its source is what keeps
+    /// the polled path from cloning the whole-of-session roster once per call
+    /// just to drop the historical rows — the second value is a subset of the
+    /// first, so the cell costs a fraction more memory and saves an O(roster)
+    /// clone per poll. Two cells would let the two drift onto different
+    /// windows; a projection computed per caller would put the allocation back.
+    usage_memo: Mutex<HashMap<GroupId, Arc<Mutex<Option<(std::time::Instant, Value, Value)>>>>>,
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
     ///
@@ -37972,6 +38060,26 @@ impl OrchRegistry {
     /// `Duration::ZERO` disables serving entirely.
     #[doc(hidden)] // pub for integration tests
     pub fn group_usage_within(&self, group: &GroupId, max_age: Duration) -> Value {
+        self.group_usage_memoed(group, max_age, UsageView::Full)
+    }
+
+    /// [`Self::group_usage_within`], projected to the LIVE-agent view the
+    /// polled GUI reads — see [`live_usage_view`] for the shape and the
+    /// argument (#1317).
+    ///
+    /// Shares ONE memo cell, and therefore one computation, with
+    /// [`Self::group_usage_within`]: the projection is derived once per window
+    /// beside the value it is derived from, so a poll never clones the
+    /// whole-of-session roster just to throw the historical rows away.
+    #[doc(hidden)] // pub for integration tests
+    pub fn group_usage_live_within(&self, group: &GroupId, max_age: Duration) -> Value {
+        self.group_usage_memoed(group, max_age, UsageView::Live)
+    }
+
+    /// The memo dance both public readers share. Spelled once: two copies of
+    /// it is how the full value and its projection would come to be computed
+    /// on different windows, or stored under different `Instant`s.
+    fn group_usage_memoed(&self, group: &GroupId, max_age: Duration, view: UsageView) -> Value {
         // Map lock → release → per-group cell (pty.rs's rule): the outer lock is
         // held only to clone the cell's Arc out.
         let cell = {
@@ -37979,9 +38087,12 @@ impl OrchRegistry {
             memo.entry(group.clone()).or_default().clone()
         };
         let mut slot = cell.lock_safe();
-        if let Some((at, value)) = slot.as_ref() {
+        if let Some((at, full, live)) = slot.as_ref() {
             if at.elapsed() < max_age {
-                return value.clone();
+                return match view {
+                    UsageView::Full => full.clone(),
+                    UsageView::Live => live.clone(),
+                };
             }
         }
         // Held across the computation on purpose: a second caller arriving mid
@@ -37989,8 +38100,13 @@ impl OrchRegistry {
         // a groupview + tabbar + orch_autonomy stampede ONE computation rather
         // than three shorter ones.
         let fresh = self.compute_group_usage(group);
-        *slot = Some((std::time::Instant::now(), fresh.clone()));
-        fresh
+        let live = live_usage_view(&fresh);
+        let picked = match view {
+            UsageView::Full => fresh.clone(),
+            UsageView::Live => live.clone(),
+        };
+        *slot = Some((std::time::Instant::now(), fresh, live));
+        picked
     }
 
     /// The uncached usage computation behind [`Self::group_usage_within`].
@@ -49997,6 +50113,16 @@ pub async fn orch_set_max_agents(
 /// body off the webview thread and serves it through the per-group memo, so
 /// those callers share ONE computation per [`USAGE_POLL_MAX_AGE`] window.
 ///
+/// **Payload (#1317).** It answers with [`live_usage_view`], not the whole
+/// value: `live_agents` (one row per LIVE agent) plus `agent_count` (the
+/// lifetime roster's size), where it used to answer `agents` — one row per
+/// agent the group has EVER had. Every lifetime total is unchanged, so nothing
+/// the group view puts on screen moves; what changes is that a tick's size is
+/// now a function of how many agents are running, not of how long the human has
+/// been running. `mcp::summarize_group_usage` is the MCP twin of the same cut,
+/// and the read that still needs the whole roster (`group_usage` with
+/// `detail: true`) goes through [`OrchRegistry::group_usage`] as before.
+///
 /// **Reentrancy.** The read-modify-write is serialized by
 /// [`OrchRegistry::usage_lock`], and concurrent pollers collapse onto one
 /// computation in the memo. The webview's own dispatch was never what made this
@@ -50006,7 +50132,7 @@ pub async fn orch_set_max_agents(
 pub async fn orch_group_usage(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
     let Ok(group_id) = command_group(&group_id) else { return Value::Null };
-    run_blocking(move || reg.group_usage_within(&group_id, USAGE_POLL_MAX_AGE)).await
+    run_blocking(move || reg.group_usage_live_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
 // ---------- autonomous mode (#83): toggles + budget + state read ----------
