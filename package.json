@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "typecheck:e2e": "tsc -p e2e/tsconfig.json --noEmit",
     "test": "node --test \"test/**/*.test.ts\"",
     "test:e2e": "playwright test",
     "check:versions": "node scripts/check-versions.js",
@@ -38,6 +39,7 @@
   "devDependencies": {
     "@playwright/test": "^1.62.0",
     "@tauri-apps/cli": "^2.6.0",
+    "@types/node": "22.20.1",
     "@xterm/headless": "^6.0.0",
     "typescript": "^5.6.0",
     "vite": "^6.0.0"
