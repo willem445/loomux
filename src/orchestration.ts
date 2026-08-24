@@ -1577,6 +1577,13 @@ export interface GroupSummary {
     planner: number;
     manager: number;
   };
+  /** Whether the roster this group is RUNNING declares a manager block at all
+   *  (#1433). Beside `roles.manager`, which counts LIVE ones, because the
+   *  panel's question is the DIFFERENCE between the two: declared and none live
+   *  means the human's own interface to this group is not there. Read off the
+   *  resolved roster, not the repo's file — a group resumes on the roster it
+   *  launched with and never re-reads `.loomux/workflow.yml`. */
+  manager_declared: boolean;
   agents: AgentSummary[];
 }
 

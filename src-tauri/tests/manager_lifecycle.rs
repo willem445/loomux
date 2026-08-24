@@ -1157,3 +1157,170 @@ fn the_counting_pin_is_blind_to_a_class_no_workflow_file_can_name_and_that_is_bo
     .unwrap();
     assert_ne!(ok["isError"], json!(true), "a declarable kind still spawns: {ok}");
 }
+
+// ───────── the manager-lifecycle residuals (#1433, folded into M5) ─────────
+//
+// Two premortem items #1426 filed rather than absorbed. Both come down to one
+// question the app could not answer: **the manager pane is not there — does
+// anyone tell the human?** #1426's arms tell the ORCHESTRATOR (so its `not
+// live` fallback can fire) and write the audit trail; neither reaches the
+// person whose pane it is.
+//
+// The answer is a NOTICE, never a repair, and that is a decided design point
+// rather than a smaller scope — `docs/features/manager.md` already promises the
+// human "if you close the manager pane, the group behaves as it always has", so
+// closing it is a legitimate act, and no code can tell a deliberate close from
+// a crash. Reopening on a guess would contradict a shipped promise. See
+// `doc/design/manager.md`, "Why nothing reopens a dead manager".
+//
+// `group_summary`'s `manager_declared` is the one fact the panel was missing:
+// `roles.manager` counts LIVE managers, and the human's question is the
+// DIFFERENCE between declared and live. `src/group.ts`'s `managerAbsenceNotice`
+// turns the pair into the line, and `test/group.test.ts` pins its wording.
+
+/// Launch a group on a HAND-SUPPLIED roster with no workflow file in the repo.
+///
+/// The launch falls back to the caller's roster when the repo declares nothing
+/// (`promote_orchestrator_cli`'s comment states it: "a broken or absent file
+/// falls back to the caller's roster, exactly as the launch does"), which is the
+/// only way to build the roster `spawn_agent_bound`'s unsupported-CLI branch
+/// exists for — its own comment says so: "an unsupported one here means a
+/// hand-edited group.json", and `parse_workflow` refuses to produce one.
+///
+/// Nothing is executed. The failure this reaches is a guardrail refusal on a
+/// STRING, several steps before any process would be spawned, so constraint 3
+/// (never run a real agent CLI) holds by construction rather than by luck.
+fn launch_on_rails(rails: Guardrails) -> (Arc<OrchRegistry>, tempfile::TempDir, Repo, GroupId) {
+    let (reg, dir) = test_registry();
+    let repo = Repo::new(None);
+    let req =
+        create_orchestration_group(&reg, &repo.path(), rails, SessionOrigin::Fresh, None, None)
+            .expect("the group must launch even when the manager cannot open");
+    let gid = req.group_id.clone();
+    (reg, dir, repo, gid)
+}
+
+/// `WITH_MANAGER`'s roster, parsed, with the manager block's CLI replaced by one
+/// no build supports.
+///
+/// Built by PARSING rather than by constructing `Block`s field by field, so a
+/// new field on `Block` cannot silently give this fixture a different shape from
+/// the one a real workflow file produces.
+fn rails_with_unopenable_manager() -> Guardrails {
+    let mut blocks = workflow::parse_workflow(WITH_MANAGER)
+        .expect("the fixture roster must parse")
+        .blocks;
+    let mut patched = 0;
+    for b in &mut blocks {
+        if b.kind == Role::Manager {
+            b.cli = "notacli".into();
+            patched += 1;
+        }
+    }
+    // The mutation must have LANDED: an anchor that matched nothing leaves the
+    // test green for the wrong reason (CLAUDE.md), and here "nothing patched"
+    // would mean the manager opens perfectly and the arm below is never reached.
+    assert_eq!(patched, 1, "exactly one manager block must have been made unopenable");
+    Guardrails { blocks, ..rails() }
+}
+
+#[test]
+fn a_manager_that_cannot_open_at_launch_is_audited_and_the_group_still_starts() {
+    let (reg, _d, _repo, gid) = launch_on_rails(rails_with_unopenable_manager());
+
+    // The launch DEGRADES rather than failing: a repo file must never be able to
+    // stop a group from starting, and the orchestrator is the pane that can act
+    // on the absence.
+    assert_eq!(
+        rows_of(&reg, &gid, "orchestrator").len(),
+        1,
+        "the orchestrator opens regardless — the manager is not a launch prerequisite"
+    );
+    assert!(
+        rows_of(&reg, &gid, "manager").is_empty(),
+        "no manager pane may exist when its own spawn was refused"
+    );
+
+    // The failure is on the record, with the reason legible — this is the arm
+    // #1426's review noted no test reaches at all.
+    let log = audit_text(&reg, &gid);
+    assert!(
+        log.contains("manager pane open failed"),
+        "the failed open must be audited as an error: {log}"
+    );
+    assert!(
+        log.contains("notacli"),
+        "the audit must carry WHY it failed, not just that it did: {log}"
+    );
+    // …and it is recorded as an `error`, not as the `manager-already-live`
+    // outcome, which is the other arm and means something entirely different.
+    assert!(
+        !log.contains("manager-already-live"),
+        "a manager that never opened is not one that was already live: {log}"
+    );
+}
+
+#[test]
+fn the_panel_can_tell_a_missing_manager_from_a_group_that_declares_none() {
+    // THE PAIR that makes the notice fail-able. `roles.manager` alone cannot
+    // distinguish these two — it is 0 for both — which is exactly why
+    // `manager_declared` had to exist.
+
+    // (1) Declared, and its pane could not open: the human's interface is gone.
+    let (reg, _d, _repo, gid) = launch_on_rails(rails_with_unopenable_manager());
+    let s = reg.group_summary(&gid);
+    assert_eq!(s["manager_declared"], json!(true), "the roster declares one: {s}");
+    assert_eq!(s["roles"]["manager"], json!(0), "and none is live: {s}");
+
+    // (2) The same launch with a manager that DOES open — the control, so (1)
+    // cannot be read as "manager_declared is always true".
+    let (reg2, _d2, _repo2, gid2) = launch(WITH_MANAGER, rails());
+    let s2 = reg2.group_summary(&gid2);
+    assert_eq!(s2["manager_declared"], json!(true), "still declared: {s2}");
+    assert_eq!(s2["roles"]["manager"], json!(1), "and live: {s2}");
+
+    // (3) A roster with no manager block at all — the common case, which must
+    // report `false` rather than "0 live", or the panel would tell every group
+    // in the app that its manager is missing.
+    let (reg3, _d3, _repo3, gid3) = launch(WITHOUT_MANAGER, rails());
+    let s3 = reg3.group_summary(&gid3);
+    assert_eq!(s3["manager_declared"], json!(false), "no manager block is declared: {s3}");
+    assert_eq!(s3["roles"]["manager"], json!(0), "{s3}");
+}
+
+#[test]
+fn a_manager_that_dies_leaves_the_group_declaring_one_it_no_longer_has() {
+    // #1433's SECOND item, on the same surface as the first: the reaper and the
+    // watchdog both skip this class and the launch path is the only automatic
+    // opener, so a manager that dies mid-session leaves a hole nothing fills.
+    // What changes here is not that something fills it — deliberately — but that
+    // the panel can now SEE it.
+    let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    let before = reg.group_summary(&gid);
+    assert_eq!(before["roles"]["manager"], json!(1), "it starts live: {before}");
+
+    let mid = the_manager(&reg, &gid)["id"].as_str().unwrap().to_string();
+    reg.mark_dead(&mid, Some(0));
+
+    let after = reg.group_summary(&gid);
+    assert_eq!(
+        after["manager_declared"],
+        json!(true),
+        "the roster still declares one — a death does not un-declare it: {after}"
+    );
+    assert_eq!(
+        after["roles"]["manager"],
+        json!(0),
+        "and it is no longer live, which is the pair the notice reads: {after}"
+    );
+
+    // And nothing brought it back on its own, which is the decided behaviour
+    // rather than a gap: this assertion is what would fail if a later slice
+    // added an auto-reopen without revisiting the argument in
+    // `doc/design/manager.md` and the promise in `docs/features/manager.md`.
+    assert!(
+        rows_of(&reg, &gid, "manager").iter().all(|m| m["status"] == json!("dead")),
+        "nothing may reopen a manager automatically: {:?}",
+        rows_of(&reg, &gid, "manager")
+    );
+}
