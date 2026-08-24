@@ -9612,13 +9612,19 @@ fn instruction_files_rendered_with_group_facts() {
 /// The roster also declares its OWN orchestrator block (#1187 review round 1
 /// N4), and the test spawns it too: `spawn_agent_ex(role: Orchestrator, block:
 /// None)`. This shape is test-only today, and deliberately so — the MCP
-/// `spawn_agent` tool refuses `kind: "orchestrator"` (`mcp.rs:1893`),
-/// `spawn_agent_bound` itself refuses a *named* orchestrator block
-/// (`mod.rs:42266`), and `resume_recorded_session` short-circuits an
-/// orchestrator record before it ever reaches `spawn_agent_ex`
-/// (`mod.rs:50858`) — so no production caller takes this path (round 1
-/// review B1 corrects a wrong reachability claim made here; see
-/// `mod.rs:42250-42254`'s own comment on the test-only registration use).
+/// `spawn_agent` tool refuses `kind: "orchestrator"` (`mcp.rs`, the `if kind
+/// == Some(Role::Orchestrator)` guard in `call_tool`), `spawn_agent_bound`
+/// itself refuses a *named* orchestrator block (`mod.rs`, the `if
+/// block.kind == Role::Orchestrator && named.is_some()` guard in
+/// `spawn_agent_bound`), and `resume_recorded_session` short-circuits an
+/// orchestrator record (`if record.role == "orchestrator"`) before it ever
+/// reaches `spawn_agent_ex` — so no production caller takes this path (round
+/// 1 review B1 corrects a wrong reachability claim made here; see
+/// `spawn_agent_bound`'s own comment on the test-only registration use, just
+/// above its orchestrator-block-name refusal). Anchored by symbol rather than
+/// line number — round 2's B1 fix already had to re-derive every line cite in
+/// this comment once after an unrelated rebase moved them (#1187 review round
+/// 3 N6).
 /// The test exercises `instruction_vars`/`pairs()` directly through the one
 /// caller that *can* reach it, so `{{WORKFLOW}}` — the placeholder this
 /// issue's own body names as the worst case, since it carries the entire
@@ -9630,8 +9636,9 @@ fn instruction_files_rendered_with_group_facts() {
 /// var list. The pre-fix list demonstrably lacked `WORKFLOW` entirely (it is
 /// not among `REPO, GROUP_ID, MAX_AGENTS, *_MODEL, HOLD_LABEL,
 /// LESSONS_PATH`), so a re-render would have left `{{WORKFLOW}}` literal and
-/// both assertions would have failed the same way the worker-block ones did
-/// at `orchestration.rs:9672` — but that failure was never actually observed.
+/// both assertions would have failed the same way the worker-block
+/// `ADVISOR_CONSULT_NOTE` assertion earlier in this test actually did fail —
+/// but that failure was never actually observed for these two.
 #[test]
 fn spawn_ex_rerender_carries_the_full_var_list_no_placeholder_survives() {
     let (reg, _d) = test_registry();
@@ -9732,7 +9739,8 @@ fn spawn_ex_rerender_carries_the_full_var_list_no_placeholder_survives() {
     // `block: None` — no production caller reaches this shape today (see the
     // doc comment above this test); it is exactly the "register the group's
     // own orchestrator in tests" use `spawn_agent_bound`'s own comment names
-    // (`mod.rs:42250-42254`), exercised directly to reach the shared builder.
+    // (just above its `named.is_some()` orchestrator-block refusal),
+    // exercised directly to reach the shared builder.
     let orch_agent = reg
         .spawn_agent_ex(&g.id, Role::Orchestrator, None, "orch", "task", false, None, None, None, None, None)
         .unwrap();
