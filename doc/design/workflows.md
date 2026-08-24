@@ -1945,6 +1945,13 @@ Two parsers, deliberately (the pane is an editor giving live feedback on text; t
 the engine). A file only one of them accepts is a file the human is being lied to about, and
 these two tests are what stop that drifting apart.
 
+A third pin protects a narrower promise inside the same file:
+`the_dogfood_reviewer_persona_carries_the_question_set` loads `rev-lead.md` through the same
+real profile loader used above and pins its five `## Questions every review answers`
+headings, plus the rule that an empty/"n/a" section is a finding rather than a pass (#1292 PR
+B) — the roster's one reviewer lane and its review-body contract staying in lockstep, not the
+two-parser parity the pair above defends.
+
 "In CI" was not true when this section was first written, and the fix was to make it true
 rather than to soften the sentence: `ci.yml` ran `npm run build` (a **typecheck**, not the
 suite), `cargo check` and `cargo test`, and **no `npm test` at all** — so the entire frontend
