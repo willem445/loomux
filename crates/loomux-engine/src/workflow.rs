@@ -3288,11 +3288,12 @@ pub struct CapacityRecommendation {
     /// slot.
     pub minimum: u32,
     /// What running **every declared tier concurrently** costs: every
-    /// distinct worker block, every distinct reviewer block, one more if the
-    /// workflow declares a planner block, and one more if it declares a manager
-    /// block (#1161 — a manager is live for the whole session and, today,
-    /// occupies a cap slot like any non-orchestrator pane). The orchestrator
-    /// itself is exempt from `max_agents` (mcp.rs) and is never counted here.
+    /// distinct worker block, every distinct reviewer block, and one more if
+    /// the workflow declares a planner block. The orchestrator itself is exempt
+    /// from `max_agents` and is never counted here — and since #1161 M3 (D3)
+    /// **neither is a declared manager**: `live_delegate_count` skips both
+    /// classes, so counting either here would advise a human to raise a cap
+    /// against a pane that never consumes one.
     ///
     /// A workflow with two planner blocks still adds only one slot here — a
     /// repo declares a *second* planner to give it an alternate persona (a
@@ -3331,24 +3332,15 @@ pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityReco
     let workers = blocks.iter().filter(|b| b.kind == Role::Worker).count() as u32;
     let reviewers = blocks.iter().filter(|b| b.kind == Role::Reviewer).count() as u32;
     let has_planner = blocks.iter().any(|b| b.kind == Role::Planner);
-    // #1161. A declared manager is a live pane for the whole session, and
-    // today it occupies a `max_agents` slot exactly like a delegate
-    // (`live_delegate_count` exempts only the orchestrator) — so a preview that
-    // did not count it would under-advise by one on every roster that has one.
-    // `any`, not a count, for the same reason as the planner: a workflow may
-    // declare at most one (`MANAGER_MAX`), so the two spellings agree, and
-    // `any` says which fact is being relied on.
-    //
-    // **M3 MUST INVERT THIS, NOT TICK IT OFF.** Decision D3 exempts the manager
-    // from `max_agents`, and this `+1` is correct only while it does not have
-    // that exemption. The moment `live_delegate_count` stops counting a manager,
-    // the rule stated two lines up — "the orchestrator is exempt from
-    // `max_agents` and is never counted here" — applies to the manager too, and
-    // both this term and
-    // `a_declared_manager_raises_the_recommended_capacity_and_is_named_in_the_advisory`
-    // have to go the other way. Landed in M1 rather than M3 because a preview
-    // that under-advises is wrong TODAY; it is not a head start on M3's work.
-    let has_manager = blocks.iter().any(|b| b.kind == Role::Manager);
+    // #1161 M3 (D3): a declared manager is NOT counted, and the absence is the
+    // decision rather than an omission. M1 landed a `+1` here — correct while
+    // `live_delegate_count` exempted only the orchestrator, since a preview
+    // that under-advises is how #255 happens — and M3 inverted it in the same
+    // commit that gave `live_delegate_count` its `Role::Manager` exemption. The
+    // two move together by construction: `recommended` is "what the cap must be
+    // for every declared tier to be live at once", and a class the cap does not
+    // apply to is live at any cap. Counting it would tell a human to raise a
+    // number that was never going to stop them talking to their manager.
 
     // #1176. A gate that routes by path needs, in the WORST case, its declared
     // list plus every lane any rule can add — a PR that touches all of them. The
@@ -3370,7 +3362,7 @@ pub fn recommend_capacity(blocks: &[Block], gate: Option<&Gate>) -> CapacityReco
         // `minimum` is deliberately untouched: it is what ONE REVIEW ROUND
         // costs, and a review round does not involve the manager.
         minimum: reviewers_needed + worker_slot,
-        recommended: workers + reviewers + u32::from(has_planner) + u32::from(has_manager),
+        recommended: workers + reviewers + u32::from(has_planner),
         reviewers_needed,
     }
 }
@@ -3406,12 +3398,11 @@ pub fn extra_tiers(blocks: &[Block], reviewers_needed: u32) -> Vec<String> {
     if has_planner {
         out.push("the planner".to_string());
     }
-    // #1161: `minimum` budgets a review round, which never includes the
-    // manager, so a declared one is entirely "extra" — and it is the tier a
-    // human would most notice going missing, since it is the pane they talk to.
-    if blocks.iter().any(|b| b.kind == Role::Manager) {
-        out.push("the manager".to_string());
-    }
+    // #1161 M3: no manager row, deliberately. This list answers "what can a cap
+    // between `minimum` and `recommended` never keep live alongside a review
+    // round", and the answer for an exempt class is "nothing" — a manager is
+    // live at every cap (D3). Naming it here would tell a human to raise a
+    // number to protect a pane the number does not reach.
     out
 }
 
