@@ -2298,17 +2298,22 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             Some(raw) => {
                 if let Err(e) = crate::pathseg::check_segment(raw) {
                     errs.push(format!(
-                        "blocks[{i}] ({id}): remote {raw:?} is not a usable label — {e}. A remote                          label is an abstract name the OPERATOR binds to a host outside this                          repo, never an address."
+                        "blocks[{i}] ({id}): remote {raw:?} is not a usable label — {e}. A \
+                         remote label is an abstract name the OPERATOR binds to a host outside \
+                         this repo, never an address."
                     ));
                     continue;
                 }
                 if kind == Role::Orchestrator || kind == Role::Manager {
                     errs.push(format!(
-                        "blocks[{i}] ({id}): a{n} {k} block may not declare remote: — it is                          loomux-owned and runs on the human's own machine ({why}). Put remote: on                          the blocks the orchestrator spawns.",
+                        "blocks[{i}] ({id}): a{n} {k} block may not declare remote: — it is \
+                         loomux-owned and runs on the human's own machine ({why}). Put remote: \
+                         on the blocks the orchestrator spawns.",
                         n = if kind == Role::Orchestrator { "n" } else { "" },
                         k = kind.as_str(),
                         why = if kind == Role::Orchestrator {
-                            "the orchestrator is the trust root, and orchestration state, the gh                              operations and the merge gate stay local"
+                            "the orchestrator is the trust root, and orchestration state, the \
+                             gh operations and the merge gate stay local"
                         } else {
                             "a manager pane is the human's own interface — it is where they type"
                         },
@@ -2317,9 +2322,14 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 }
                 if cli != "claude" {
                     errs.push(format!(
-                        "blocks[{i}] ({id}): remote: requires cli: claude{spelled} — a remote                          agent's session has to be identified by an id loomux minted before the                          spawn, and claude is the only CLI that accepts one (the others recognize                          a session by scanning a local store, which a remote CLI's store is not).",
+                        "blocks[{i}] ({id}): remote: requires cli: claude{spelled} — a remote \
+                         agent's session has to be identified by an id loomux minted before the \
+                         spawn, and claude is the only CLI that accepts one (the others \
+                         recognize a session by scanning a local store, which a remote CLI's \
+                         store is not).",
                         spelled = if cli.is_empty() {
-                            ", spelled out on the block — an omitted cli: inherits the group                              default, which is picked at launch and cannot be checked here"
+                            ", spelled out on the block — an omitted cli: inherits the group \
+                             default, which is picked at launch and cannot be checked here"
                         } else {
                             ""
                         },
