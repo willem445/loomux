@@ -1940,6 +1940,9 @@ The repo's own workflow is validated by **both** halves of the feature, in CI:
 - `test/workflowdogfood.test.ts` (TypeScript) opens the same file in the **pane's** reader
   and validator and asserts zero findings — errors *and* warnings, because a warning here
   means the graph loomux draws of its own workflow has a block nothing points at.
+- `the_dogfood_reviewer_persona_carries_the_question_set` loads `rev-lead.md` through that
+  same real profile loader and pins its five `## Questions every review answers` headings
+  (#1292 PR B) — the roster's reviewer lane and its review-body contract stay in lockstep.
 
 Two parsers, deliberately (the pane is an editor giving live feedback on text; the backend is
 the engine). A file only one of them accepts is a file the human is being lied to about, and

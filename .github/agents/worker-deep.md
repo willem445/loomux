@@ -49,7 +49,7 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    through CI, since local `cargo` is banned. The `ci-validate` skill carries the procedure and
    the trap that costs a round (to redden an *integration* test, neuter the wiring, not the lib
    function). Paste the command and the failure line into the PR body, next to the same
-   command passing on your branch. `rev-tests` is going to
+   command passing on your branch. `rev-lead` is going to
    try to break your pins anyway; a pin you have already seen go red is one you don't lose that
    argument over. If a new test can't be made to fail, it isn't testing your change — find out
    why before you ship it.
@@ -71,9 +71,8 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
 7. **Self-review adversarially before you mark the PR ready.** Re-read your own diff
    as the reviewer who wants to reject it: *what input makes this wrong? what did I
    fail closed on? which of my tests would still pass if I deleted the feature?* Fix
-   what you find and say what you looked for in the PR body. The reviewers are
-   focused (`rev-orch`, `rev-ui`, `rev-tests`) and they reproduce findings rather
-   than reading diffs — the cheapest place to catch a defect is here.
+   what you find and say what you looked for in the PR body. `rev-lead` reproduces
+   findings rather than reading diffs — the cheapest place to catch a defect is here.
 8. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 6 — update
    the description with what changed, why, and how it was validated (the CI run, on
    the platform matrix). Then report.

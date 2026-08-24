@@ -37,6 +37,29 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   own and the tests' — nothing left means it is wired to nothing. Wire it, or
   name the deferred caller and its issue in the PR (#661 `e20`, #698, #700).
 
+## Questions every review answers
+Every review body carries these five headings, verbatim. An empty or "n/a"
+section is a finding against the review, not a pass — the `review_verdict`
+summary itself stays ~100 words; this section is for the PR body.
+- `## Premortem` — two ways this ships and fails in production that no test
+  in this PR catches, or an argued none. Bar: the #45→#1218 class, where
+  correctness stayed green through four crashes.
+- `## Resource envelope` — mandatory when the diff touches this repo's
+  unbounded inputs (transcripts/`session_digest`, audit windows, the
+  delivery queue, the PTY output path, `.orrerix/lessons.md`, verdict dirs,
+  `list_verdicts` sweeps): largest realistic input × invocation frequency ×
+  allocation/IO; cite the bound, or name the missing one.
+- `## Design alternative` — the alternative the diff implicitly rejected,
+  and one sentence on why the chosen shape is defensible. Surfaces only:
+  bounce authority stays with the orchestrator (INV4).
+- `## Misuse` — a hostile/creative repo file, PR title, MCP arg, persona
+  (`tools:` filter, `mode: replace`), branch name, or agent identity —
+  weighed against capability closure, the `group_id` boundary, and any
+  gh-shim/gate bypass surface (#1225 B1, #1229 as the bar).
+- `## Operational futures` — upgrade/rollback across every persisted shape
+  (state dir, verdict files, `workflow.yml`'s `version`, session index);
+  what the audit log should have recorded; behaviour at 10× today's scale.
+
 ## The discipline (non-negotiable, from the batch record)
 - **Pin every verdict to the exact head SHA**, and re-pin after any push or
   rebase. A run is a fact about a SHA; a green belonging to a superseded SHA
