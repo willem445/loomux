@@ -51009,6 +51009,46 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     );
 }
 
+#[test]
+fn j8_a_replayed_notice_row_is_still_a_notice_under_a_chevron() {
+    // The complement of `j2`, and the other half of the resume class. The
+    // session record deliberately excludes marker-led lines (`j6`), so a NOTICE
+    // loomux delivered and the CLI replayed is not covered by it — it is covered
+    // by the marker rule, which stopped recognising its own marker the moment a
+    // resumed CLI painted a `❯` in front of the row. Fifteen of the thirty-nine
+    // `pointer-option` holds in the group's audit log are exactly this shape.
+    let notice = "[orrerix] pr #1408 checks: success — 5 of 6 checks passed (1 skipped)";
+
+    // Precondition: as a plain row the marker rule has always claimed it, so the
+    // assertion below is about the chevron and nothing else.
+    assert!(
+        !mask_loomux_notices(notice).contains("checks: success"),
+        "precondition: the marker rule claims a marker-led row"
+    );
+
+    let replayed = format!("❯ {notice}");
+    assert!(
+        !mask_loomux_notices(&replayed).contains("checks: success"),
+        "and it claims the same row when a resumed CLI replays it under a chevron"
+    );
+
+    // ONE row, still — the widening reads through the glyph, it does not become a
+    // run-mask. A live dialog painted directly beneath a replayed notice must
+    // survive, which is #420's objection to widening this rule at all.
+    let with_dialog = format!("{replayed}\n? Do you want to proceed\n❯ 1. Yes\n  2. No");
+    let masked = mask_loomux_notices(&with_dialog);
+    assert!(
+        masked.contains("1. Yes") && masked.contains("Do you want to proceed"),
+        "the rows below it are untouched: {masked:?}"
+    );
+    let m = prompt_wait_match(&masked).expect("so the dialog is still a question");
+    assert!(
+        question_shown(Some(&m), Some(Composed::plain(&masked))),
+        "…and still holds the Enter"
+    );
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 // The human-question registry (#946 slice Q1)
 //
