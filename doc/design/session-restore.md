@@ -492,7 +492,10 @@ group *ever* had (long-killed workers included) — so a group that closed with 
 orchestrator + 1 worker came back with a swarm of stale worker panes (demo round 4
 over-restore). The fix: each captured orch pane now records **its own session id
 and role** (`Pane.capture()` for kind `orch`, the id parsed from the backend-built
-command by `sessionIdFromCommand` at spawn), so the persisted layout carries one
+command by `sessionIdFromCommand` at spawn, or — for a copilot/opencode pane,
+whose id does not exist until after boot — from the backend's
+`orch-session-learned` event; see
+[session-id-learning.md](session-id-learning.md)), so the persisted layout carries one
 leaf per orch pane that was open at close. On restore those become `dormant-group`
 placeholders each holding that record; `resumeDormantGroup` reads the member set
 straight off the tab's placeholders (`Pane.restoreRecord`). `session_roles()` is

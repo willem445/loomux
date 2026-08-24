@@ -571,6 +571,13 @@ export interface OrchWiring {
    *  without this the routing map would keep the binding for the life of the
    *  window. Only unroutes the group — never closes or touches the tab. */
   forgetGroup(groupId: string): void;
+  /** Persist the current tab/layout snapshot (#1563). `persistTabs` lives in
+   *  main.ts behind the `tabs.onChange` subscription, and an `orch-session-learned`
+   *  adoption changes a pane's captured `sessionId` without changing the tab SET —
+   *  so nothing in that subscription fires for it. Same hook the #440 reconciler
+   *  calls after its own `adoptSessionId` pass, for the same reason; a no-op when
+   *  the encoded snapshot is unchanged. */
+  persistLayout(): void;
   /** Force a tab-strip re-render (#271): channel membership is derived live from
    *  each pane's state (tabcounts.ts), not tracked in a maintained per-tab map the
    *  way attention is, so there is no setter that already triggers one. Called
@@ -620,6 +627,47 @@ export function initOrchestration(wiring: OrchWiring): void {
           if (pane.orchAgentId === payload.agent_id) discardStalePane(grid, pane);
         }
       }
+    }
+  );
+  // A session id the BACKEND learned (#1563). copilot and opencode accept no
+  // pre-minted id, so theirs is discovered after boot by the backend's session
+  // watcher and written to the roster — and until this listener existed, that was
+  // the end of it: the PANE never heard, `Pane.capture()` wrote `sessionId: null`
+  // into tabs.json, and the group's dormant Resume card next boot said there was
+  // no captured orchestrator session for a session that plainly existed.
+  //
+  // Adopted through `adoptSessionId`, the #440 primitive built for exactly "an id
+  // loomux did not mint": null->id only, and a no-op once a pane carries one. So a
+  // second event for an already-bound pane changes nothing here even though the
+  // backend refuses to send one — two independent reasons, neither relied on alone.
+  //
+  // Deliberately NOT gated on `hasForkSession`, unlike the reconciler and the D2
+  // card. That exclusion exists because those two INFER an id — from a transcript
+  // match, or from the command line — and `--fork-session` makes the inferred id
+  // wrong. This id was OBSERVED: the backend watched the process create that
+  // session in the CLI's own store. (It is unreachable for claude besides —
+  // `capture_session_baseline` answers `None` for every CLI but copilot and
+  // opencode, and `--fork-session` is claude's flag.)
+  //
+  // Swept across every tab by agent id, the same shape `orch-spawn-cancelled`
+  // above uses: a group's panes are not confined to one grid.
+  void listen<{ group_id: string; agent_id: string; session_id: string }>(
+    "orch-session-learned",
+    ({ payload }) => {
+      if (!payload.session_id) return;
+      let adopted = false;
+      for (const grid of wiring.allGrids()) {
+        for (const pane of grid.allPanes()) {
+          if (pane.orchAgentId !== payload.agent_id) continue;
+          if (pane.sessionId !== null) continue;
+          pane.adoptSessionId(payload.session_id);
+          adopted = true;
+        }
+      }
+      // Only when something actually moved: `persistLayout` dedups on the encoded
+      // snapshot anyway, but an event for a pane this window does not own (a
+      // delegate in another window, a pane already closed) should not reach it.
+      if (adopted) wiring.persistLayout();
     }
   );
   // Focus: switch to the pane's TAB first, then focus the pane (#63).
