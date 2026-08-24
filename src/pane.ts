@@ -65,6 +65,8 @@ import { TasksView } from "./tasksview";
 import { DecisionsView } from "./decisionsview";
 import { PendingEmbedFocus } from "./embedfocus";
 import { AuditView } from "./auditview";
+import { AuditStore } from "./auditstore";
+import type { AuditEntry } from "./auditsummary";
 import { TimelineView } from "./timelineview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
@@ -597,6 +599,13 @@ export class Pane implements VoiceTargetPane {
    *  delivered: the target view may not be constructed yet, and even once it
    *  is, its rows arrive from an async refresh. */
   private readonly pendingFocus = new PendingEmbedFocus();
+  /** This pane's ONE `orch_audit` read (#1317), shared by the audit viewer
+   *  and the progress timeline — two views on one file that each used to
+   *  fetch it, parse it and hold their own 5000-row copy of it, at the same
+   *  1.5 s follow cadence. Created with the first view that needs it and
+   *  released with this pane; see `AuditStore` for why it is per-pane rather
+   *  than a module-level map keyed by group. */
+  private auditStore: AuditStore | null = null;
   /** Audit-log viewer (any orchestration pane), same overlay mechanics. */
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
@@ -3931,6 +3940,22 @@ export class Pane implements VoiceTargetPane {
     this.toggleView("audit");
   }
 
+  /** This pane's shared `orch_audit` read (#1317), created on first use.
+   *
+   *  Bound to `orchGroup` the same way the two views that read it are — they
+   *  capture it at construction too — so there is one store per pane per
+   *  group's worth of views, and nothing keyed, nothing to prune, and no
+   *  release rule beyond the pane's own teardown (INV-8a). `orchGroup` is
+   *  non-null at every call site: both callers are reached only through a
+   *  `toggle*View` that returns early without one. */
+  private ensureAuditStore(): AuditStore {
+    if (!this.auditStore) {
+      const groupId = this.orchGroup!;
+      this.auditStore = new AuditStore(() => invoke<AuditEntry[]>("orch_audit", { groupId }));
+    }
+    return this.auditStore;
+  }
+
   /** Lazily construct the audit view and register it into `embedRegistry`
    *  (#361). */
   private ensureAuditView(): void {
@@ -3938,6 +3963,7 @@ export class Pane implements VoiceTargetPane {
     this.auditView = new AuditView(this.orchGroup!, {
       onClose: () => this.toggleAuditView(),
       onEmbedMenu: (anchor) => this.showEmbedMenu("audit", anchor),
+      store: this.ensureAuditStore(),
     });
     this.auditOverlay = document.createElement("div");
     this.auditOverlay.className = "git-overlay";
@@ -3974,6 +4000,7 @@ export class Pane implements VoiceTargetPane {
     this.timelineView = new TimelineView(this.orchGroup!, {
       onClose: () => this.toggleTimelineView(),
       onEmbedMenu: (anchor) => this.showEmbedMenu("timeline", anchor),
+      store: this.ensureAuditStore(),
       // Read live, not snapshotted at open time — the same contract the group
       // panel's workflow preview uses (#316). An orchestrator pane's cwd IS
       // the group's repo.

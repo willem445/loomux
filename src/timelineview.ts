@@ -16,13 +16,13 @@
 // terminal — the chart's width comes from its own container via a
 // ResizeObserver, and the pure layout takes that width as a parameter.
 
-import { invoke } from "./transport.ts";
-// The orch_* reads are called here directly, exactly as AuditView and
-// TasksView call `orch_audit` / `orch_tasks`: an orchestration view is its own
-// bridge for the group-scoped read it renders. The gh half goes through
-// issues.ts's typed wrapper, which is where every gh command already lives.
+// The audit half no longer invokes anything: this view and the audit viewer
+// share ONE `orch_audit` read through `AuditStore`, which the pane owns and
+// injects (#1317). The gh half goes through issues.ts's typed wrapper, which
+// is where every gh command already lives.
 import { ghActivity, type GhActivity } from "./issues";
-import { RefreshGate } from "./refreshgate";
+import { RefreshGate } from "./refreshgate";
+import { AuditStore } from "./auditstore";
 import {
   CATEGORY_ORDER,
   DEFAULT_CATEGORIES,
@@ -111,9 +111,37 @@ export class TimelineView {
   private notesEl: HTMLElement;
   private detailEl: HTMLElement;
 
-  /** Raw audit rows, as received. Deliberately `unknown[]`: `extractTimeline`
-   *  counts a row it cannot read rather than throwing on it. */
-  private auditRows: unknown[] = [];
+  /** Raw audit rows, as received — a REFERENCE to the pane's shared read
+   *  (#1317), never a copy: the audit viewer renders from the same array, and
+   *  two 5000-row copies of one file's prompt text is the duplication #1317
+   *  names. Deliberately `readonly unknown[]`: `extractTimeline` counts a row
+   *  it cannot read rather than throwing on it, and nothing here may sort or
+   *  splice an array the other view is showing. */
+  private auditRows: readonly unknown[] = [];
+  /** Memo for `extractTimeline` (#1317), keyed by the IDENTITY of the two
+   *  inputs it is derived from.
+   *
+   *  The extraction builds one `TimelineEvent` per audit row, each with a
+   *  freshly-composed label and an alias of the raw `detail` blob — up to
+   *  `AUDIT_VIEW_LIMIT` (5000) of them. It used to run on every RENDER, above
+   *  the no-op signature check below and therefore even on the renders that
+   *  check then discarded: a window-preset click, a category chip, a
+   *  `ResizeObserver` tick, a dot click, expanding a detail row. Now it runs
+   *  once per set of inputs — which is once per successful audit read, since
+   *  the store replaces its array wholesale, plus once per gh refresh.
+   *
+   *  Identity, not a content signature: both arrays are replaced rather than
+   *  mutated (the store hands out `readonly`, and `gh` is reassigned whole),
+   *  so `===` is exactly "the same read". A content signature would also skip
+   *  the re-extraction on a tick where the log did not grow; it is not taken
+   *  here because "same length and same last timestamp" is only sound while
+   *  the log is append-and-drop-front, which the rotation across
+   *  `audit.1.jsonl` makes a claim rather than an obvious fact. */
+  private extractionMemo: {
+    rows: readonly unknown[];
+    gh: GhActivity | null;
+    value: TimelineExtraction;
+  } | null = null;
   private gh: GhActivity | null = null;
   private ghError: unknown = null;
   /** When gh was last ATTEMPTED (not last succeeded) — a failing gh must not
@@ -163,11 +191,18 @@ export class TimelineView {
   private range: TimelineRange | null = null;
   private filtered: TimelineEvent[] = [];
 
+  /** The pane's shared audit read (#1317). Injected rather than constructed
+   *  here, because the whole point is that the audit viewer reads the same
+   *  one — see `AuditStore`. */
+  private store: AuditStore;
+
   constructor(
-    private groupId: string,
+    groupId: string,
     private opts: {
       onClose: () => void;
       onEmbedMenu?: (anchor: HTMLElement) => void;
+      /** The pane's one `orch_audit` read, shared with the audit viewer. */
+      store: AuditStore;
       /** The pane's live repo folder — read on every load rather than
        *  snapshotted, the same way the group panel reads it (#316). Null when
        *  the pane has no folder, which is a real state and renders as a note
@@ -175,6 +210,7 @@ export class TimelineView {
       getRepo: () => string | null;
     }
   ) {
+    this.store = opts.store;
     this.el = el("div", "timeline-view");
 
     const head = el("div", "timeline-head");
@@ -344,12 +380,15 @@ export class TimelineView {
     // fetch is neither dropped nor run concurrently (refreshgate.ts).
     if (!this.gate.begin()) return;
     try {
-      try {
-        this.auditRows = await invoke<unknown[]>("orch_audit", { groupId: this.groupId });
-      } catch {
-        // A missing/unreadable log renders as an empty chart, not a broken one.
-        this.auditRows = [];
-      }
+      // The pane's shared read (#1317). `forceGh` marks the human's own
+      // gestures — opening the view, the ⟳ button — and those must never be
+      // served a cached answer; a follow tick takes the store's window, which
+      // is what lets the audit viewer's tick at the same cadence be served
+      // this read instead of firing a second `orch_audit` for the same file.
+      // The store keeps the last good rows on a failed read and never throws,
+      // so an unreadable log leaves the chart as it was rather than blanking
+      // it, and an empty chart now means an empty log.
+      this.auditRows = await this.store.read(forceGh ? 0 : undefined);
       const repo = this.opts.getRepo();
       if (!repo) {
         this.gh = null;
@@ -375,7 +414,7 @@ export class TimelineView {
   private render(): void {
     if (this.disposed) return;
 
-    const extraction = extractTimeline(this.auditRows, this.gh);
+    const extraction = this.extractionOf();
     const range = resolveWindow(this.windowId, Date.now(), extraction.events);
     const filtered = filterTimeline(extraction.events, range, this.categories);
     const widthPx = Math.round(this.chartEl.clientWidth);
@@ -415,6 +454,16 @@ export class TimelineView {
     this.renderChart(widthPx);
     this.renderNotes();
     this.renderDetail();
+  }
+
+  /** `extractTimeline` over the current inputs, memoised — see
+   *  `extractionMemo`. */
+  private extractionOf(): TimelineExtraction {
+    const memo = this.extractionMemo;
+    if (memo && memo.rows === this.auditRows && memo.gh === this.gh) return memo.value;
+    const value = extractTimeline(this.auditRows, this.gh);
+    this.extractionMemo = { rows: this.auditRows, gh: this.gh, value };
+    return value;
   }
 
   private renderChart(widthPx: number): void {

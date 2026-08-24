@@ -477,7 +477,9 @@ const TIMERS: TimerRow[] = [
       "cleared on toggle, on close (hide()) and on dispose, suppressed while the window is " +
       "hidden (#743 S6) — the view that had the close half right first. Its gh " +
       "half is separately self-gated to GH_REFRESH_MS (60 s) in timelinechrome.ts, so a tick is " +
-      "one orch_audit refetch, not two shell-outs.",
+      "at most one orch_audit refetch, not two shell-outs — and since #1317 a tick that lands " +
+      "inside AUDIT_READ_MAX_AGE_MS of the audit viewer's is served that read instead of firing " +
+      "its own, because both views read one AuditStore per pane rather than one each.",
     debt: null,
   },
   {
