@@ -1883,7 +1883,12 @@ export class TasksView {
    *  Every write goes through `orch_upsert_task`'s `links` argument, which
    *  REPLACES the whole array — so both edits compose the new list from the one
    *  that was rendered (`withArtifactLink` / `withoutArtifactLinkAt`) and send
-   *  it whole. That is the same replace-or-untouched contract `deps` already
+   *  it whole. Composing from the rendered list is exactly what an agent's
+   *  concurrent write makes unsafe, so since #1349 both go through
+   *  `writeLinkArray`, which pairs the composed array with the `link_etag` that
+   *  came with the same row; a row that moved underneath refuses the write
+   *  rather than silently replacing what it never saw. That is the same
+   *  replace-or-untouched contract `deps` already
    *  has on this view, and it inherits the same error surfacing: the type
    *  vocabulary, the length caps, control characters and the refusal when a
    *  target names a live board task are all validated inside the backend's

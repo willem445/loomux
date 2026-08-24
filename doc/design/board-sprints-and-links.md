@@ -721,9 +721,21 @@ than a transition state:
   against.
 
 So `expect_link_etag: None` keeps the historic last-writer-wins behaviour, `upsert_task`'s tool
-description recommends passing it, and there is no migration and no flag day. Whether to make
-it mandatory for agents later is a separate decision with real evidence behind it by then
-(refusal counts in the audit log); nothing here forecloses it.
+description recommends passing it, and there is no migration and no flag day.
+
+**State the residual precisely, because the obvious reading of it is wrong.** The token is a
+precondition on **the writer alone** — nothing about a landed write is protected by the fact
+that it was itself guarded. So the residual is not "two unguarded writers race each other". It
+is: the human's board edit lands, correctly guarded; an agent holding a `list_tasks` from
+*before* that edit calls `upsert_task(links: […])` with no token; the check is skipped
+entirely, its whole-array replace lands, and the human's edit is gone with no error anywhere.
+One agent, one omitted argument, a destroyed **human** write — #1349's own direction of loss,
+mirrored. What #1349 closes mandatorily is the board's side: the board can never be the writer
+that does this, because it always sends the token.
+
+That residual and the decision it implies — whether to require the token for agent-origin array
+replaces, and what evidence would justify it (a refusal is deliberately not audited today, so
+its rate is not observable yet) — are tracked on **#1386**. Nothing here forecloses any of it.
 
 Passing it on a **create** is refused rather than ignored — a row being created has no prior
 arrays, so a token there can only be a caller mistake, which is the position `claim` already

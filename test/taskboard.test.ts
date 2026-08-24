@@ -2447,8 +2447,11 @@ test("removing a link takes the one that was clicked, not every copy of its targ
   );
   assert.deepEqual(withoutArtifactLinkAt(links, 2).map((l) => l.type), ["requirement", "doc"]);
   assert.equal(links.length, 3, "the input array is not mutated");
-  // A stale render (the row changed underneath between paint and click) must
-  // compose a write that changes nothing, never one that drops a different link.
+  // A stale render whose row got SHORTER must compose a write that changes
+  // nothing, never one that drops a different link. That is a floor and not the
+  // mitigation: a row that changed while staying long enough passes this range
+  // check, which is why every one of these edits carries a `link_etag` (#1349)
+  // and why `retriesAfterStale` never re-applies this one.
   for (const bad of [-1, 3, 99, 1.5, NaN]) {
     assert.deepEqual(
       withoutArtifactLinkAt(links, bad),
@@ -2703,4 +2706,74 @@ test("positional edits are never re-applied; value-named ones always are", () =>
     ["#1349"],
     "index 0 now names the agent's link, not the one the human clicked ✕ on"
   );
+});
+
+test("every argument key the board composes is a declared orch_upsert_task parameter", () => {
+  // The one link in the always-guarded chain that nothing else pins (#1349 N2).
+  // `composeLinkArrayWrite` emits camelCase keys that Tauri maps to the
+  // command's snake_case parameters; a typo THERE — `expectLinkEtag` misspelled,
+  // or the Rust parameter renamed — leaves the board composing an UNGUARDED
+  // write with the whole suite green and `tsc` clean, because neither side can
+  // see the other. That is the silently-inert-guard shape §16.6 cross-pins
+  // `STALE_LINK_ETAG_PREFIX` against, one layer down.
+  //
+  // The keys are DERIVED by running the composer over every edit kind rather
+  // than restated here, so a new edit kind that emits a new argument is covered
+  // the day it is added instead of the day someone remembers this test.
+  const row = {
+    id: "t-1",
+    status: "queued",
+    deps: ["t-2"],
+    links: [{ type: "requirement", target: "#1349" }],
+    link_etag: "0123456789abcdef",
+  };
+  const edits: LinkArrayEdit[] = [
+    { kind: "dep-add", id: "t-3" },
+    { kind: "dep-remove", id: "t-2" },
+    { kind: "link-add", link: { type: "doc", target: "docs/x.md" } },
+    { kind: "link-remove-at", index: 0 },
+  ];
+  const emitted = new Set<string>();
+  for (const edit of edits) {
+    for (const k of Object.keys(composeLinkArrayWrite(edit, row))) emitted.add(k);
+  }
+  assert.ok(
+    emitted.has("expectLinkEtag"),
+    "population control: the composer must emit the guard key at all, or the sweep below " +
+      "is checking an empty set and passes over anything"
+  );
+
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const start = src.indexOf("pub async fn orch_upsert_task(");
+  assert.notEqual(
+    start,
+    -1,
+    "orch_upsert_task is gone or renamed in mod.rs — this guard reads it by name, so update " +
+      "it here rather than deleting the only thing pinning the wire names together"
+  );
+  const end = src.indexOf(") -> Result<Task, String> {", start);
+  assert.notEqual(end, -1, "could not find the end of orch_upsert_task's parameter list");
+  const sig = src.slice(start, end);
+  // `name: Type,` at the head of a line — the declaration shape, not a mention
+  // in the doc comments (which sit ABOVE the fn and are outside this slice
+  // anyway) and not a type name.
+  const declared = new Set([...sig.matchAll(/^\s{4}([a-z_][a-z0-9_]*):\s/gm)].map(([, n]) => n));
+  assert.ok(
+    declared.size > 5,
+    `only ${declared.size} parameters parsed out of orch_upsert_task — the pattern cannot see ` +
+      `its own subjects, so this guard is not comparing what it thinks. Signature was:\n${sig}`
+  );
+  // Tauri's own mapping, and the only transformation in play.
+  const snake = (k: string) => k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  for (const key of emitted) {
+    assert.ok(
+      declared.has(snake(key)),
+      `the board sends \`${key}\` (-> \`${snake(key)}\`), which orch_upsert_task does not ` +
+        `declare. Tauri drops an unknown argument silently, so for \`expectLinkEtag\` that is ` +
+        `an unguarded write the human is told succeeded. Declared: ${[...declared].join(", ")}`
+    );
+  }
+  // Scope, stated rather than implied: this covers the arguments THIS view
+  // composes. The ~20 other parameters on the same command are reached from
+  // other call sites and are not swept here.
 });

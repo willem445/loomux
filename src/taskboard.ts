@@ -1969,8 +1969,16 @@ export function withArtifactLink(
  *  twice under two types (a spec that is also the requirement) or twice with
  *  different labels; removing by value would delete both and the human would
  *  have asked for one. An out-of-range index returns the list unchanged rather
- *  than composing a write that silently drops nothing or everything — a stale
- *  render whose row has already changed underneath is the reachable way in. */
+ *  than composing a write that silently drops nothing or everything.
+ *
+ *  **That unchanged return is a floor, not the mitigation** (#1349, design note
+ *  §16). It only catches the stale render whose row got SHORTER; a row that
+ *  changed while staying long enough passes the range check and this composes a
+ *  write dropping a link nobody pointed at. What makes removal-by-index sound is
+ *  the `link_etag` every one of these edits now carries — an index names what
+ *  the human clicked only while the array it was read from is still the array
+ *  being written, and the backend refuses it otherwise. It is also why this is
+ *  the one edit `retriesAfterStale` never re-applies. */
 export function withoutArtifactLinkAt(
   links: readonly TaskArtifactLink[] | null | undefined,
   index: number
