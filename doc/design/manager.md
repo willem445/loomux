@@ -663,9 +663,9 @@ directly rather than leaving it to the golden diff.
 ### What the manager is told, and why each rule is load-bearing
 
 - **Every turn opens with `check_mail()` and `list_questions()`.** This is not
-  hygiene, it is the channel: the guarantee above means nothing is ever typed
-  into this pane, so there is no notification and nothing arrives while the pane
-  is idle. The human is the scheduler of the manager's attention — a turn that
+  hygiene, it is the channel: the guarantee above means no traffic from the
+  fleet is ever typed into this pane, so there is no notification and nothing
+  arrives while the pane is idle. The human is the scheduler of the manager's attention — a turn that
   does not start with the read is a turn the orchestrator's mail never lands in.
   Reading consumes, so the prose names `include_read: true` beside it as the
   post-compact recovery, and frames every row as the orchestrator's **account**

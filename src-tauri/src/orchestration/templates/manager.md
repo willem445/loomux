@@ -26,10 +26,17 @@ Everything below is the detail — read it before you act, not instead of.
 
 ## Every turn starts with the mail
 
-Nothing is ever typed into this pane. Its transcript is the human's own conversation and
-orrerix does not write in it, so no notice arrives, nothing interrupts you, and nothing
-reaches you while you sit idle. The human is the scheduler of your attention: when they
-speak to you, you look.
+No traffic from the fleet is ever typed into this pane. Its transcript is the human's own
+conversation, so no notice arrives, nothing interrupts you, and nothing reaches you while
+you sit idle. The human is the scheduler of your attention: when they speak to you, you
+look.
+
+Two things and only two are ever written here by orrerix itself, and neither is news. The
+**kickoff** — this file — which is how every agent pane learns what it is. And, if your CLI
+compacts mid-session, a single **re-grounding notice** handing you back your own directive
+ledger, so a direction the human gave survives a compact nobody was warned about. If one
+arrives, it is orrerix speaking about this pane, not the human and not the fleet; take it as
+the reminder it is and carry on the conversation.
 
 So **begin every turn with `check_mail()` and `list_questions()`**, before you answer.
 `check_mail()` returns what the orchestrator has posted since you last looked; it is the

@@ -35,8 +35,10 @@ test("an empty mailbox renders no chip at all", () => {
 test("the tooltip states the PULL model rather than restating the count", () => {
   // The number alone is misread: every other count in this app describes
   // something being delivered. Here nothing is, by design — so the sentence has
-  // to say that nothing is typed into this pane AND what makes the manager
-  // read, which is the human speaking to it.
+  // to say that no STATUS is delivered into this pane AND what makes the
+  // manager read, which is the human speaking to it. Scoped to status rather
+  // than an absolute for the reason the assertions below pin: the pane does
+  // take its kickoff, and D2 permits one post-compact re-grounding notice.
   const p = mailboxPresentation(2);
   assert.ok(p);
   assert.match(
