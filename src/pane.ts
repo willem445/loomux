@@ -496,8 +496,19 @@ interface EmbedEntry {
   show: () => void;
   /** Called every time the view is about to become hidden, in either mode —
    *  extra per-view cleanup beyond hiding its host (e.g. `GitView.hide()`
-   *  dismisses an open context menu). Optional: most views need nothing
-   *  beyond the generic hide. */
+   *  dismisses an open context menu). Optional: a view with nothing to stop
+   *  needs nothing here.
+   *
+   *  **A view that can be WOKEN from outside is not that view (#1318).** The
+   *  rule this hook carries was first written as "stops the follow poll on
+   *  close/eviction — which every polling view has to answer for", and named
+   *  the mechanism rather than the question: the board and the NEEDS-YOU panel
+   *  have no timer at all, so nobody read it as being about them, and both
+   *  refetched and rebuilt off screen on every agent write for the life of the
+   *  session. Whether the waker is a `setInterval` or a Tauri `listen` is an
+   *  implementation detail of the waking. If something outside this view can
+   *  make it do work, this hook is where it says what happens when nobody is
+   *  looking — see doc/design/embedded-panels.md and src/wakegate.ts. */
   hide?: () => void;
   /** Reflect whether this view is currently docked to ANY embed slot —
    *  updates the view's own header toggle button. Side-agnostic on purpose:
@@ -3289,6 +3300,11 @@ export class Pane implements VoiceTargetPane {
       // the NEEDS-YOU panel, routed through this same hook the panel's own
       // onFocusTask below uses the other way.
       onFocusDecision: (id) => this.requestEmbedFocus("decisions", id),
+      // The board's own bounded release (#1318): the pane's authoritative
+      // on-screen read, so a `hide`/`show` pair that never arrives cannot leave
+      // a visible board frozen. Read live, never snapshotted — the same
+      // contract `getRepo`/`isDocked` take on the other views.
+      isVisible: () => this.isViewVisible("tasks"),
     });
     this.tasksOverlay = document.createElement("div");
     this.tasksOverlay.className = "git-overlay";
@@ -3299,6 +3315,12 @@ export class Pane implements VoiceTargetPane {
       overlayEl: this.tasksOverlay,
       viewEl: this.tasksView.el,
       show: () => this.tasksView!.show(),
+      // Stops the board refetching-and-rebuilding off screen on every
+      // `orch-tasks-changed` (#1318). The board has no poll, which is why the
+      // rule as first written — "every polling view has to answer for this" —
+      // read as not applying to it; what it actually asks is what happens when
+      // something WAKES this view and nobody is looking.
+      hide: () => this.tasksView!.hide(),
       setPanelActive: (active) => this.tasksView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
     });
@@ -3324,6 +3346,8 @@ export class Pane implements VoiceTargetPane {
       // The panel never reaches into another view.
       onFocusTask: (taskId) => this.requestEmbedFocus("tasks", taskId),
       takeFocus: () => this.pendingFocus.take("decisions"),
+      // This panel's own bounded release (#1318) — see the board's, above.
+      isVisible: () => this.isViewVisible("decisions"),
     });
     this.decisionsOverlay = document.createElement("div");
     this.decisionsOverlay.className = "git-overlay";
@@ -3337,6 +3361,10 @@ export class Pane implements VoiceTargetPane {
       overlayEl: this.decisionsOverlay,
       viewEl: this.decisionsView.el,
       show: () => this.decisionsView!.show(),
+      // Same as the board's (#1318), over three streams rather than two — and
+      // one board write can fire two of them, since the demo-gate hook raises
+      // or resolves a needs-you item inside `upsert_task`.
+      hide: () => this.decisionsView!.hide(),
       setPanelActive: (active) => this.decisionsView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
     });
