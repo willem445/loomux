@@ -678,11 +678,7 @@ impl TranscriptCursor {
         if len < self.len {
             return StatVerdict::Reset;
         }
-        if let (Some(now), Some(then)) = (modified, self.modified) {
-            if now < then {
-                return StatVerdict::Reset;
-            }
-        }
+        // [scratch] #1239 round 12: the backwards-mtime arm is gone.
         if len == self.len && modified == self.modified {
             return StatVerdict::Serve;
         }
