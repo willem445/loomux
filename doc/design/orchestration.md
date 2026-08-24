@@ -565,12 +565,24 @@ were rejected:
    textual and fragile, and it moves review *quality* into a gate whose entire design is that
    it counts verdicts and reads none of them.
 
-**Residual, stated rather than closed:** nothing at runtime checks that a review body actually
-carries the section or that its contents are non-vacuous. The enforcement is the orchestrator
-reading the review — which is exactly where the rest of the findings policy already lives — and
-the CI-side guarantee is only that the *instructions* still say it (`prompts.rs`,
-`workflow.rs`'s both-surfaces loop, and the `pre222` goldens). That is the same guarantee every
-prose rule in this section has, and it is the reason they are pinned at all.
+Absence is the cheap failure and vacuity is the likely one, so the disposition step addresses
+both: a section answered with an unargued "none" is dispositioned as a *missing* one. That
+asymmetry was in the first draft of this section — the reviewer surfaces both called an empty
+section a finding, while the only surface that acts on a review's SHAPE had been told about
+absence alone, which is a rule with no addressee. The trigger is also the section rather than
+its punctuation: keyed strictly on one spelling, the rule burns a review round on `##
+Pre-mortem`; read loosely with nothing said, it accepts a bolded line and the fixed heading
+stops doing the work claimed for it here.
+
+**Residual, stated rather than closed:** nothing MECHANICAL checks either half. No runtime code
+reads a review body, so "the section is there" and "its contents are not a formula" are both
+enforced by the orchestrator reading the review — which is exactly where the rest of the
+findings policy already lives — and the CI-side guarantee is only that the *instructions* still
+say it (`prompts.rs`, `workflow.rs`'s both-surfaces loop, and the `pre222` goldens). That is the
+same guarantee every prose rule in this section has, and it is the reason they are pinned at
+all. The failure mode to watch is the one that fails UPWARD: a section always present and
+always filled with restatements of what the suite already covers satisfies every surface here,
+and only a human reading premortems against what later broke would ever notice.
 
 ### The verdict notice is a signal; the record is elsewhere (#850)
 
