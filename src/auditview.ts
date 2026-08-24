@@ -5,8 +5,8 @@
 // Rotation is handled backend-side (orch_audit reads audit.1.jsonl before
 // audit.jsonl), so the viewer never has to know about it.
 
-import { invoke } from "./transport.ts";
 import { asObject, entryKey, retainExpanded, str, summarize, type AuditEntry } from "./auditsummary";
+import { AuditStore } from "./auditstore";
 import { nextWindowStart, backfillWindowStart } from "./auditwindow";
 import { PollGate } from "./pollgate";
 
@@ -85,7 +85,12 @@ export class AuditView {
   private embedBtn: HTMLButtonElement;
   private closeBtn: HTMLButtonElement;
 
-  private entries: AuditEntry[] = [];
+  /** The pane's shared audit read (#1317) — see `AuditStore`. A REFERENCE to
+   *  the store's array, never a copy: the progress timeline renders from the
+   *  same one, and two 5000-row arrays of prompt text for one file was the
+   *  duplication #1317 names. Replaced wholesale by each successful read, so a
+   *  render always sees a consistent snapshot. */
+  private entries: readonly AuditEntry[] = [];
   private filters: Filters = { actor: "", action: "", agent: "", search: "" };
   /** Entry keys expanded to show full detail (survives re-renders). */
   private expanded = new Set<string>();
@@ -97,6 +102,7 @@ export class AuditView {
    *  1.5 s — component scope says nothing about whether anyone is looking. */
   private followGate: PollGate = new PollGate({
     arm: () => {
+      // A follow tick, so the shared read's window applies (#1317).
       this.followTimer = window.setInterval(() => void this.load(), FOLLOW_MS);
     },
     disarm: () => {
@@ -105,7 +111,8 @@ export class AuditView {
         this.followTimer = undefined;
       }
     },
-    refresh: () => void this.load(),
+    // Returning to a visible window is a gesture, not a tick: read fresh.
+    refresh: () => void this.load(0),
   });
   private disposed = false;
   /** Signature of the last render's data, to skip no-op follow re-renders
@@ -124,10 +131,16 @@ export class AuditView {
    *  distinguishable from new entries simply having arrived. */
   private lastFilterSig = "";
 
+  /** The pane's shared audit read (#1317). Injected rather than constructed
+   *  here, because the whole point is that the progress timeline reads the
+   *  same one — see `AuditStore`. */
+  private store: AuditStore;
+
   constructor(
-    private groupId: string,
-    opts: { onClose: () => void; onEmbedMenu?: (anchor: HTMLElement) => void }
+    groupId: string,
+    opts: { onClose: () => void; onEmbedMenu?: (anchor: HTMLElement) => void; store: AuditStore }
   ) {
+    this.store = opts.store;
     this.el = el("div", "audit-view");
 
     const head = el("div", "audit-head");
@@ -143,7 +156,7 @@ export class AuditView {
 
     const refresh = el("button", "pane-btn", "⟳") as HTMLButtonElement;
     refresh.title = "Refresh";
-    refresh.addEventListener("click", () => void this.load());
+    refresh.addEventListener("click", () => void this.load(0));
     head.append(refresh);
 
     // Embed side-picker (#361): switch between the floating overlay and any
@@ -195,7 +208,8 @@ export class AuditView {
 
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
-    void this.load();
+    // Opening is a gesture: never serve it a cached read (#1317).
+    void this.load(0);
   }
 
   /** Called by the pane whenever the view is about to be hidden, in either
@@ -251,7 +265,7 @@ export class AuditView {
       // bottom) sticks to the newest line. The gate owns the timer, so the
       // interval exists only while the window is visible.
       this.followGate.enable();
-      void this.load();
+      void this.load(0);
     } else {
       this.stopFollow();
     }
@@ -261,26 +275,35 @@ export class AuditView {
     this.followGate.disable();
   }
 
-  private async load(): Promise<void> {
+  /** Re-read the log and repaint.
+   *
+   *  `maxAgeMs` is 0 for an explicit gesture (opening the panel, the ⟳ button)
+   *  and the store's default window for a follow tick — which is what lets the
+   *  timeline's tick, at the same cadence, be served this one instead of
+   *  firing a second `orch_audit` for the same file. The store keeps the last
+   *  good rows on a failed read and never throws, so an unreadable log leaves
+   *  what is on screen alone rather than blanking it; the empty render is now
+   *  reached only by a log that really is empty. */
+  private async load(maxAgeMs?: number): Promise<void> {
     if (this.disposed) return;
-    try {
-      this.entries = await invoke<AuditEntry[]>("orch_audit", { groupId: this.groupId });
-      // Prune the expand toggle to what's actually loaded (#1316), on the
-      // SUCCESS path only: as new lines push old ones out of `orch_audit`'s
-      // AUDIT_VIEW_LIMIT window on the next poll, an id here that no longer
-      // names a loaded entry can never be seen again — pruning it here keeps
-      // the set from growing for the life of the pane. A failed read must NOT
-      // prune: "could not look" is not "there was nothing there" (CLAUDE.md),
-      // and a transient throw (log mid-rotation, a locked file) would
-      // otherwise collapse every open row on the next repaint even though
-      // none of them actually went away.
-      this.expanded = retainExpanded(this.expanded, this.entries);
-    } catch {
-      // Best-effort: a missing/unreadable log just renders empty — `expanded`
-      // is deliberately left alone above, so a transient failure doesn't
-      // masquerade as every expanded row's entry having vanished.
-      this.entries = [];
-    }
+    this.entries = await this.store.read(maxAgeMs);
+    if (this.disposed) return;
+    // Prune the expand toggle to what's actually loaded (#1316): as new lines
+    // push old ones out of `orch_audit`'s AUDIT_VIEW_LIMIT window, an id here
+    // that no longer names a loaded entry can never be seen again, so pruning
+    // keeps the set from growing for the life of the pane.
+    //
+    // #1316 ran this on the SUCCESS path only, because a failed read there set
+    // `entries = []` and pruning against THAT would read "could not look" as
+    // "there was nothing there" (CLAUDE.md), collapsing every open row on a
+    // transient throw. The shared store (#1317) removes the hazard rather than
+    // the guard: `read()` cannot throw and never replaces good rows with an
+    // empty list, so `entries` here is always the last SUCCESSFUL read's rows.
+    // Pruning against those is exactly what #1316 asked for. The one case
+    // where `entries` is empty without a success is a failed FIRST read, and
+    // `expanded` is necessarily empty there — nothing has ever rendered to
+    // expand. `store.loaded` gates it anyway rather than resting on that.
+    if (this.store.loaded) this.expanded = retainExpanded(this.expanded, this.entries);
     this.render();
   }
 
