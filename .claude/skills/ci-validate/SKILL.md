@@ -368,6 +368,30 @@ outlives the body entirely — no gate re-reads it, so it must be a subject from
 Signature: a cross-PR SHA that still `git cat-file -e`s locally and is an ancestor of
 nothing the sibling still publishes (#1487 N5).
 
+### The re-stamp that fixes those SHAs corrupts the ones naming a BASE
+
+Sweeping the body and re-stamping every SHA to the new head is the obvious cure for the
+**Commit SHAs go stale differently from run ids** section above, and it is a defect generator:
+a base citation (`cut from <sha>`, `whose parent is`) must NOT move, and no sweep can tell it
+from a head citation. `cat-file` and that section's ancestry check both PASS on the corrupted
+line, because it now names this PR's own head; only the subject check can catch it, and only
+if you ask what role that sentence assigns the SHA.
+
+```sh
+# temporal: a scratch round cannot be cut from a commit that did not exist when it ran
+git log -1 --format=%cI <cited-base>       # vs the run's createdAt (gh run view <id> --json createdAt)
+# derive the base rather than naming it, so a reader checks it in one command
+git fetch origin +refs/pull/<scratch-pr>/head:refs/tmp/pr<scratch-pr>   # not local otherwise
+git rev-parse refs/tmp/pr<scratch-pr>^     # "#1432's head e30e92ae, whose parent is ed299ebb"
+```
+
+Best of the three is neither check: **delete the base claim from any line that does not need
+one** — a line naming no base cannot go stale. Then census rather than sample: enumerate every
+SHA-shaped token in the POSTED body and check each against what its own sentence claims it is.
+Signature: two adjacent "cut from" sentences naming different SHAs for one round, the second
+twelve lines from a structurally identical finding a reviewer had already read past (#1429 B2
+round 4, B3 round 5 — three instances in two rounds, plus one the worker self-caught).
+
 ### A range's baseline is a *different* check from a SHA's ancestry
 
 The check above asks *is this SHA still on the branch*. A body that cites a **range** —
