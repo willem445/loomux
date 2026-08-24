@@ -1334,7 +1334,22 @@ export interface GroupUsage {
   lifetime_cost_basis: "estimated" | "reported" | "mixed" | null;
   live_tokens: number;
   lifetime_tokens: number;
-  agents: AgentUsage[];
+  /** One row per **live** agent — NOT one per agent the group has ever had
+   *  (#1317). The backend's own value carries the whole lifetime roster, which
+   *  grows with session length and is what `mcp::summarize_group_usage` caps
+   *  on the MCP side; this polled command projects it to the live rows, which
+   *  are bounded by the group's max-agents setting.
+   *
+   *  Nothing is hidden by the cut: every `lifetime_*` total above still sums
+   *  the whole roster, and `agent_count` names its size. The key is
+   *  deliberately not `agents` — a reader written against the old
+   *  whole-roster array should fail to compile rather than quietly render a
+   *  subset. */
+  live_agents: AgentUsage[];
+  /** How many agents the group has had in total, live and historical — so
+   *  `agent_count > live_agents.length` reads as "there are more rows behind
+   *  the lifetime totals", never as a silent truncation. */
+  agent_count: number;
   note: string;
 }
 
