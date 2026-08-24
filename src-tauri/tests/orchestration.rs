@@ -86,6 +86,7 @@ use loomux_lib::orchestration::{
     // #903 B2: the granted override that carries its own Enter.
     override_enter_admits, QuestionReread, QUESTION_OVERRIDE_CONSECUTIVE_READS,
     prompt_record_admits_kind,
+    record_contributions_for,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
@@ -51358,9 +51359,20 @@ fn j13_excluding_notices_does_not_uncover_their_own_wrapped_rows() {
     // rows, excluding notices from it would trade a leak for a false-positive
     // gap on loomux's own wrapped text.
     //
-    // It was not. A multi-row notice's wrap is masked by the NOTICE record
-    // (#576/#661, `mark_notice_maskable` — opt-in per producer), and that path is
-    // untouched by term 1.
+    // It was not — but the honest scope is narrower than "the notice record
+    // covers it", and the difference matters to anyone reading this as a
+    // guarantee. A multi-row notice's wrap is masked by the NOTICE record
+    // (#576/#661) only for a producer that OPTED IN via `mark_notice_maskable`,
+    // which today is one call site: the orchestrator relay behind `report` /
+    // `message_orchestrator`. The ledger-bearing notices do NOT opt in, so
+    // nothing masks their wrap — they latch until `QuestionStale` badges it at
+    // ten minutes, which is the pre-#903 fail-closed baseline and not a
+    // regression term 1 introduced.
+    //
+    // What term 1 changed for them is the other direction: as first shipped it
+    // ADMITTED their body to the prompt record, which is the hole B1 reported.
+    // So "nothing is traded away" is a claim about coverage that existed BEFORE
+    // this PR, not about coverage the round-1 code had.
     // The token must live on the CONTINUATION, not on the marker-led row: this
     // test is about what covers a notice's wrapped rows, and a fixture whose
     // token sits on row one is cleared by the marker rule alone — the claim below
@@ -51385,15 +51397,17 @@ fn j13_excluding_notices_does_not_uncover_their_own_wrapped_rows() {
     assert_eq!(record.len(), 1, "precondition: the notice is one recordable line");
     assert!(
         prompt_wait_match(&mask_loomux_notices_with_record(wrapped, &record)).is_none(),
-        "the notice record masks the whole wrap run — this is #661's coverage, and term 1 \
-         does not touch it"
+        "for an OPTED-IN producer the notice record masks the whole wrap run — that is \
+         #661's coverage, it is one call site today, and term 1 does not touch it"
     );
 
     // And term 1 confirms the prompt record was never the mechanism: this notice
     // cannot enter it at all.
     assert!(
         delivered_prompt_lines(wrapped).is_empty(),
-        "so nothing is traded away — the prompt record never held these rows to begin with"
+        "so nothing is traded away relative to the pre-#903 baseline. Round 1's code DID \
+         hold these rows — that was B1 — and taking them back out restores the baseline \
+         rather than removing coverage this PR had shipped"
     );
 }
 
@@ -51436,6 +51450,141 @@ fn j14_a_claimed_question_row_still_vetoes_the_row_below_it() {
     assert!(
         !mask_loomux_notices_with_record(&header_only, &chained).contains(header),
         "control: with nothing below it to protect, the recorded header row IS claimed"
+    );
+}
+
+#[test]
+fn j15_a_coalesced_flush_contributes_its_constituents_and_not_its_framing() {
+    // Review round 2, B1'. Term 1 excludes a delivery whose first non-empty line
+    // is marker-led — and a coalesced flush's first line is exactly that, so the
+    // framed whole took its constituent PAYLOADS out of the record with it. Those
+    // payloads are the orchestrator-authored briefs #903 needs masked, so the
+    // exclusion was fail-closed but a real coverage regression.
+    //
+    // The split is not inferred from the text here or in production: #632 already
+    // owns it, the drainer already has the parts separately, and the fix passes
+    // them down as `record_contributions` rather than asking the record to parse
+    // a flush apart. This test builds the REAL flush through
+    // `queue::coalesced_flush_text` — nothing in the suite did before — and pins
+    // all three halves of the rule.
+    let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
+    let ledger_notice = "[orrerix] Context was compacted. Re-grounding you in your role \
+                         instructions.\nYour directive ledger:\n1. Yes, allow once";
+    let items = [
+        queue::FlushConstituent {
+            id: 7,
+            from: "orch-1156",
+            enqueued_ms: 1_000,
+            coalesced: 0,
+            text: brief,
+        },
+        queue::FlushConstituent {
+            id: 8,
+            from: "orrerix",
+            enqueued_ms: 2_000,
+            coalesced: 0,
+            text: ledger_notice,
+        },
+    ];
+    let rendered = queue::coalesced_flush_text(&items, 0, 9_000, queue::FlushCause::PaneBlocked);
+
+    // Precondition 1 — this really is the shape term 1 refuses.
+    assert!(
+        delivered_prompt_lines(&rendered).is_empty(),
+        "the FRAMED whole contributes nothing — which is why the drainer must hand the record \
+         the constituents instead of this string: {rendered:?}"
+    );
+    // Precondition 2 — and the payload rows really are rendered inside it, so
+    // recording them is a statement about rows that are on the pane's screen.
+    assert!(rendered.contains(brief), "precondition: the brief is rendered verbatim in the flush");
+
+    // #632's own invariant, reused rather than restated: everything loomux FRAMED
+    // is maskable and the only survivors are payload rows. The fix rests on that
+    // split, so the test asserts it holds for this fixture instead of trusting it.
+    let payloads: Vec<&str> = items.iter().map(|c| c.text).collect();
+    assert!(
+        unmaskable_framing_rows(&rendered, &payloads).is_empty(),
+        "precondition (#632): every framing row this flush emits is maskable"
+    );
+
+    // The rule, per constituent. The brief is admitted…
+    assert_eq!(
+        delivered_prompt_lines(brief),
+        vec![brief.to_string()],
+        "an orchestrator-authored constituent enters the record on its own merits"
+    );
+    // …and the ledger-bearing notice is NOT, however it is flushed alongside.
+    // This is the half that keeps B1 closed: constituents are admitted
+    // individually, so riding in a batch buys a notice nothing.
+    assert!(
+        delivered_prompt_lines(ledger_notice).is_empty(),
+        "a re-grounding notice riding in the same batch is still refused by its own first line"
+    );
+    // And by kind, independently — either term alone refuses it.
+    assert!(!prompt_record_admits_kind(Delivery::Regrounding));
+}
+
+#[test]
+fn j16_the_record_takes_each_entrys_own_text_never_the_framed_paste() {
+    // B1', at the decision rather than at the rule. `j15` pins what
+    // `delivered_prompt_lines` does with a flush; this pins what the drainer
+    // HANDS it, which is the half that regressed — and the half no test could
+    // reach while the decision was welded into a function needing an `AppHandle`
+    // (the same argument `override_enter_admits` carries).
+    let entry = |id: u64, text: &str, kind| queue::QueuedDelivery {
+        id,
+        agent_id: "rev-1277".into(),
+        from: "orch-1156".into(),
+        payload: queue::QueuedPayload::Text(text.to_string()),
+        reason: queue::EnqueueReason::Question,
+        enqueued_ms: 1_000 + id,
+        coalesced: 0,
+        group: Some("g-1".try_into().unwrap()),
+        to_orchestrator: false,
+        session_id: None,
+        delivery_kind: kind,
+    };
+
+    let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
+    let ledger_notice = "[orrerix] Context was compacted.\nYour directive ledger:\n1. Yes, allow once";
+
+    // A FLUSH: every constituent contributes, under its own kind.
+    let batch = vec![
+        entry(7, brief, Delivery::ResumeKickoff),
+        entry(8, ledger_notice, Delivery::Regrounding),
+    ];
+    let got = record_contributions_for(&batch);
+    assert_eq!(
+        got,
+        vec![
+            (brief.to_string(), Delivery::ResumeKickoff),
+            (ledger_notice.to_string(), Delivery::Regrounding),
+        ],
+        "both constituents are handed over as their OWN texts under their OWN kinds — the \
+         framing is never among them, and the second entry's kind is what refuses it \
+         downstream rather than anything about the batch it rode in"
+    );
+
+    // A LONE delivery is the same rule, not a special case — which matters
+    // because `header_pending` can prepend a flush header to a single delivery,
+    // and recording the framed string would lose it exactly as a flush lost its
+    // constituents.
+    let lone = vec![entry(9, brief, Delivery::MidSession)];
+    assert_eq!(
+        record_contributions_for(&lone),
+        vec![(brief.to_string(), Delivery::MidSession)],
+        "one entry, its own text, its own kind"
+    );
+
+    // A marker entry carries no text and contributes nothing — the `filter_map`
+    // is load-bearing, not defensive.
+    let marker = vec![queue::QueuedDelivery {
+        payload: queue::QueuedPayload::StrandedSubmit,
+        ..entry(10, "", Delivery::MidSession)
+    }];
+    assert!(
+        record_contributions_for(&marker).is_empty(),
+        "a StrandedSubmit marker has no payload text to contribute"
     );
 }
 

@@ -98,8 +98,9 @@ delivery-kind term and by the first-line term respectively. `note_directive(text
 writes the ledger **raw**: no sanitize, no cap, not even the `[ts]` prefix its append branch adds.
 That is what made this a one-party capability rather than a two-party coincidence, and it is the
 reason the rule is about the authorship of the DELIVERY rather than of each line — a notice is one
-marker-led line above a body that is not, so a per-line filter admitted every continuation row. `j6` pins it, with a positive control so the assertion cannot pass by the record
-simply always being empty.
+marker-led line above a body that is not, so a per-line filter admitted every continuation
+row. `j6` pins it, with a positive control so the assertion cannot pass by the record simply
+always being empty.
 
 ## The attack shape that is bounded, not closed
 
@@ -131,10 +132,23 @@ loomux's own and the gate can read clear.
   now runs first, so a header vetoes whether or not its own row was claimed, which is a term
   the record cannot buy at any number of claims. `j14` pins it with the two-line chain, and
   `j3`'s single-line record is exactly why that gap survived the first round.
-- **The trust asymmetry.** `send_prompt` is the orchestrator's tool. The party this residual
-  is available to already holds spawn and prompt powers over the pane in question: it can
-  start the agent, replace it, and dictate what it is told to do. A capability to influence
-  one masking decision in that pane is not a new tier of authority for it — which is
+- **The trust asymmetry, and the one route it does not cover.** `send_prompt` is the
+  orchestrator's tool. For a delivery into somebody ELSE's pane the argument is
+  straightforward: the party this residual is available to already holds spawn and prompt
+  powers over that pane — it can start the agent, replace it, and dictate what it is told to
+  do — so influencing one masking decision there is not a new tier of authority for it.
+
+  That argument does **not** stretch to the orchestrator's OWN pane, and an earlier version of
+  this section implied it did. Neither direct route reaches there — `send_prompt` refuses a
+  caller naming its own id, `spawn_agent` refuses its own block — but the record is keyed by
+  SESSION, so an orchestrator that spawns a worker with `resume_session` set to its own
+  session id has the task text it chose recorded against the session its own pane is running.
+  Reachable only by an adversarial orchestrator, which is the party already granted this
+  residual, so it changes no conclusion; it is written down because the justification as
+  phrased was narrower than the behaviour, and a residual argued from the wrong reason is the
+  kind of thing that gets widened later on the strength of the reason.
+
+  What is NOT reachable this way is the one-party route proper — which is
   precisely what the `notify_when` route WOULD have been, since it is available to any
   agent about itself.
 
@@ -224,8 +238,20 @@ is recorded here as a trade and not as an absence.
   recorded prefix could only be claimed by accident — a run whose rows happen to end exactly
   where the truncation did — so the record would carry entries whose meaning depended on a
   pane's width. Dropping costs a hold.
-- **The record does not survive a coalesced flush's own framing.** Only the constituent
-  payloads are prompt bodies; the flush header is marker-led and stays on the notice rule.
+- **A coalesced flush contributes its constituents, never its framed whole.** The framing —
+  header and per-item banners — is marker-led and stays on the notice rule; the constituent
+  payloads are orchestrator-authored prompt bodies and enter the record on their own merits.
+  The split is not inferred from the flush text: #632 already owns it
+  (`unmaskable_framing_rows`), the drainer still has the parts separately, and it hands them
+  down as `record_contributions` rather than asking this record to parse a flush apart.
+
+  **This was a coverage regression for one review round and is called out because the fix
+  turns on it.** Term 1 as first shipped excluded any delivery whose first non-empty line is
+  marker-led — which a flush's is — so the constituent payloads went out of the record with
+  the header. Fail-closed, and invisible: nothing built a flush-framed delivery, so no test
+  saw it. `j15` now builds one through the real `coalesced_flush_text`, and it asserts the
+  half that keeps B1 closed as well: a re-grounding notice riding in the same batch is still
+  refused, because constituents are admitted INDIVIDUALLY and each one still owes both terms.
 - **Nothing here makes the detector quieter.** Every fix in this note is about recognising
   loomux's own text. A genuinely question-shaped row that loomux did not write still holds a
   delivery, exactly as it did before — which is the direction this guard is always allowed to

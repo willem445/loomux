@@ -20027,10 +20027,25 @@ fn deliver_now(
     // admitted the write, the same reason `wait_for_question_clear` returns its
     // witness rather than letting the abort site re-read.
     question_overridden: bool,
-    // #903 B1: which `Delivery` kind admitted this entry, threaded from the
-    // queue front rather than re-derived, so the record's admission decision and
-    // the queue's own record of what this delivery IS cannot drift.
-    delivery_kind: Delivery,
+    // #903 B1' — what this delivery may contribute to the session prompt
+    // record, decided by the CALLER and paired with the kind each piece was
+    // admitted under.
+    //
+    // Not `(pasted_text, one kind)`, because a paste is not always one
+    // delivery. A coalesced flush is loomux's FRAMING wrapped around N
+    // constituent payloads (#533-A), and a lone delivery can carry a flush
+    // header on its front too — so the bytes pasted are a mixture whose parts
+    // have different authors and, in the flush case, different `Delivery`
+    // kinds. Asking the record to infer that split from the text would be a
+    // second spelling of #632's rule; the caller already knows it exactly,
+    // which is why `unmaskable_framing_rows` takes the payloads rather than
+    // deriving them.
+    //
+    // Each pair is admitted on its OWN merits — both #903 B1 terms run per
+    // contribution — so a re-grounding notice riding in a batch is refused by
+    // its kind and a `resume_kickoff_notice` by its marker-led first line, no
+    // matter what it is flushed alongside.
+    record_contributions: Vec<(String, Delivery)>,
 ) -> DeliverOutcome {
     // ⚠ #561 — READ THIS BEFORE ADDING A STAGE BELOW.
     //
@@ -20465,7 +20480,9 @@ fn deliver_now(
             // same bytes and at the same instant. Separate call rather than a
             // widening of the one above because the two records admit different
             // things for different reasons — see `delivered_prompt_lines`.
-            r.record_delivered_prompt(pty_id, &pasted_text, delivery_kind);
+            for (text, kind) in &record_contributions {
+                r.record_delivered_prompt(pty_id, text, *kind);
+            }
         }
         let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
         while std::time::Instant::now() < echo_deadline {
@@ -22125,6 +22142,9 @@ fn run_queue_drainer(
                 // and came back for the next entry on the following pass,
                 // which cost the receiving agent one full turn per queued
                 // delivery.
+                // #903 B1': what the prompt record may take from this paste —
+                // the entries' own texts, never the framed string built below.
+                let record_contributions = record_contributions_for(&batch);
                 let payload = if batch.len() > 1 {
                     let items: Vec<queue::FlushConstituent> = batch
                         .iter()
@@ -22210,7 +22230,7 @@ fn run_queue_drainer(
                     reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
                     fresh_kickoff.then(|| text.clone()),
                     question_overridden,
-                    front.delivery_kind,
+                    record_contributions,
                 );
                 if matches!(out, DeliverOutcome::Done) {
                     header_pending = false;
@@ -23687,12 +23707,15 @@ pub fn loomux_authored_lines(text: &str) -> Vec<String> {
 ///
 /// What is left is text that reached a pane because loomux was asked to deliver
 /// a PROMPT there — a kickoff brief, or an orchestrator's `send_prompt` body
-/// (and a coalesced flush's constituent payloads, which are themselves prompt
-/// bodies). No agent can address one of those to itself — `send_prompt` refuses
+/// (a coalesced flush's constituent payloads arrive here ONE AT A TIME, as
+/// their own prompt bodies — the drainer splits the framing off before calling,
+/// which is why this function never has to parse a flush apart; see
+/// `record_contributions` on [`deliver_now`], and #632 for the split it reuses).
+/// No agent can address one of those to itself — `send_prompt` refuses
 /// a caller that names its own id, and a kickoff goes to an agent that did not
 /// exist when the caller asked for it. `send_prompt` is the
-/// orchestrator's tool, so the residual this admits is an orchestrator writing
-/// into somebody else's pane — a party that already holds spawn and prompt
+/// orchestrator's tool, so the residual this admits is chiefly an orchestrator
+/// writing into somebody else's pane — a party that already holds spawn and prompt
 /// powers over that pane. The design note argues that asymmetry at length; it is
 /// bounded, not closed.
 ///
@@ -23734,6 +23757,37 @@ pub fn delivered_prompt_lines(text: &str) -> Vec<String> {
         .map(|l| deframe(l).trim())
         .filter(|l| !l.is_empty() && l.chars().count() <= DELIVERED_PROMPT_CHARS)
         .map(str::to_string)
+        .collect()
+}
+
+/// #903 B1': what a paste may contribute to the session prompt record.
+///
+/// One rule for both shapes, which is why it is three lines: the entries' OWN
+/// texts under their OWN kinds, never the string that was pasted. A coalesced
+/// flush pastes loomux's framing wrapped around N constituent payloads (#533-A),
+/// and even a lone delivery can carry a flush header on its front — so the bytes
+/// on the wire are a mixture whose parts have different authors and, in the flush
+/// case, different [`Delivery`] kinds. The queue still has them apart at this
+/// point; #632 already owns the framing/payload split
+/// ([`unmaskable_framing_rows`]), and nothing is gained by making the record
+/// re-derive it from a rendered string.
+///
+/// **Pure, and that is the point of extracting it** — the same argument
+/// [`override_enter_admits`] carries. Welded into the drainer this rule would
+/// need an `AppHandle` to exercise, so nothing in this repo could drive it, and
+/// the round that introduced it shipped a regression no test could see: term 1
+/// excluded the framed whole, which took the constituent payloads #903 needs
+/// masked out of the record with the header.
+///
+/// Each pair is still admitted on its own merits downstream — both #903 B1 terms
+/// run per contribution — so a re-grounding notice riding in a batch is refused
+/// by its kind and a `resume_kickoff_notice` by its marker-led first line,
+/// whatever they are flushed alongside.
+#[doc(hidden)] // pub for integration tests
+pub fn record_contributions_for(batch: &[queue::QueuedDelivery]) -> Vec<(String, Delivery)> {
+    batch
+        .iter()
+        .filter_map(|e| e.payload.text().map(|t| (t.to_string(), e.delivery_kind)))
         .collect()
 }
 
