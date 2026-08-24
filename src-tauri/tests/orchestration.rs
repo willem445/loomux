@@ -9325,6 +9325,55 @@ fn associating_a_copilot_session_records_it_on_roster_and_task_board() {
 }
 
 #[test]
+fn associating_a_session_emits_one_learned_event() {
+    // #1563: copilot and opencode bind their session AFTER boot, so the pane
+    // was never told about an id `agents.json` had recorded all along —
+    // `Pane.capture()` wrote `sessionId: null` into tabs.json and the
+    // dormant-group card then offered no resume for a live session. The event
+    // this pins is the missing consumer of that fact.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "builder", "t", false, None).unwrap();
+    // Absence assertion, and its positive control is the `len() == 1` below:
+    // nothing has been learned yet, and the mechanism demonstrably does fire.
+    assert!(
+        reg.session_learned_events_for_test().is_empty(),
+        "a spawn alone learns nothing — copilot cannot pre-assign an id"
+    );
+
+    let sid = "0f9e8d7c-1234-4abc-8def-0011223344ff";
+    assert!(reg.associate_session(&g.id, &w.id, sid), "the binding must take");
+
+    let events = reg.session_learned_events_for_test();
+    assert_eq!(events.len(), 1, "exactly one event per binding, got {events:?}");
+    assert_eq!(events[0]["group_id"], g.id.as_str(), "names the group");
+    assert_eq!(events[0]["agent_id"], w.id.as_str(), "names the pane's agent");
+    assert_eq!(events[0]["session_id"], sid, "carries the id that was learned");
+
+    // A LATE second discovery for a pane that already carries an id is a no-op
+    // in the roster, and must be one on the wire too: the frontend's own
+    // `adoptSessionId` refuses a second id, but an event that never arrives is
+    // the stronger guarantee and the one this site owes (plan §7).
+    assert!(!reg.associate_session(&g.id, &w.id, "ffffffff-0000-4000-8000-000000000000"));
+    assert_eq!(
+        reg.session_learned_events_for_test().len(),
+        1,
+        "an already-bound pane emits no second event"
+    );
+
+    // The other refusal — a session another pane in the group already claims —
+    // returns from a branch ABOVE `persist_agent_record`, so it exercises a
+    // different placement of the emit than the one above does.
+    let b = reg.spawn_agent(&g.id, Role::Worker, "second", "t", false, None).unwrap();
+    assert!(!reg.associate_session(&g.id, &b.id, sid), "the claim is excluded");
+    assert_eq!(
+        reg.session_learned_events_for_test().len(),
+        1,
+        "a refused claim emits nothing"
+    );
+}
+
+#[test]
 fn copilot_orchestration_session_gets_a_chip_and_restores() {
     use loomux_lib::orchestration::resume_recorded_session;
     use std::sync::Arc;

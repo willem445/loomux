@@ -27,7 +27,9 @@ Three ways loomux could learn an id it didn't mint, in increasing order of
 mechanism cost:
 
 **A — read it off the command line, when it's already there.** A custom line
-carrying `--session-id <id>` or `--resume <id>` *names its own session*. Per
+carrying `--session-id <id>` or `--resume <id>` *names its own session* — and,
+since #1563 A1, so does `--session <id>` on an **opencode** line, which is the
+only spelling opencode has (see *An id the backend learns* below). Per
 the [CLI reference](https://code.claude.com/docs/en/cli-reference):
 
 > `--session-id` — "Use a specific session ID for the conversation (must be a
@@ -331,18 +333,87 @@ the point of an optimistic restore. Nothing in this issue's fix reopens that:
 - The D2 lookup is resolved asynchronously per dormant card, strictly after
   `openActionPane` has already returned the live pane object to the grid.
 
+## An id the backend learns: the `orch-session-learned` event (#1563)
+
+Everything above is the frontend learning an id for itself. There is a fourth
+way an id comes into existence, and it belongs to the backend: **copilot and
+opencode accept no pre-minted session id at all.** Neither has a
+`--session-id` flag, so `build_agent_command` cannot put one on the line, and
+the session does not exist until the CLI has booted and written it to its own
+store. `OrchRegistry::spawn_session_watcher` polls that store for the session
+the pane created and binds it with `associate_session`, which writes it to the
+roster (`agents.json`), mirrors it onto the task board, and audits
+`session-learned`.
+
+**Until #1563 that was the whole list of consumers, and the pane was not on
+it.** `Pane.capture()` reads `Pane.sessionId`, which for such a pane is still
+`null` — nothing had ever told it otherwise — so `tabs.json` recorded
+`sessionId: null` for the orchestrator leaf, and next boot the dormant-group
+card said *"No captured orchestrator session for this group"* about a session
+the roster had been holding all along. Options A and B above cannot reach it:
+A reads the command line, which names no id, and B matches against
+`listSessions()`, which for an opencode group session reads the human's global
+store and never the group's own `opencode.db`.
+
+So the backend emits the fact it already knows, on the same `AppHandle` seam
+`orch-focus` and `orch-spawn-request` use:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `group_id` | `string` | The group the binding belongs to. |
+| `agent_id` | `string` | The pane's agent id — how the frontend finds the pane. |
+| `session_id` | `string` | The id the watcher observed the CLI create. |
+
+Emitted **last** in `associate_session`, after `persist_agent_record` and the
+audit line, so that neither refusal above it — a session another pane in the
+group already claims, and a pane that is gone or already bound — reaches it.
+At most one event per pane, ever.
+
+`src/orchestration.ts` listens, sweeps every tab's grid for the pane with that
+agent id, and adopts through **`Pane.adoptSessionId`** — the same #440
+primitive as option B, refusing null→id twice — then persists through the same
+`persistTabs` the reconciler calls. Two independent reasons a repeat event
+changes nothing, and neither is relied on alone.
+
+**Why the fork exclusion does not apply here.** B3 above bars ever attaching a
+learned id to a `--fork-session` line, and this listener deliberately does not
+check. The exclusion exists because A and B *infer* an id — from the line, or
+from a transcript match — and `--fork-session` makes the inferred id wrong.
+This id was **observed**: the backend watched the process create that session
+in the CLI's own store, so it is the id the process actually has, fork or no.
+It is unreachable for claude besides: `capture_session_baseline` answers
+`None` for every CLI but copilot and opencode, and `--fork-session` is
+claude's flag.
+
+**The command-line half, for a *resumed* opencode pane.** opencode names a
+session with `--session <id>` (#722) — it has no `--resume` and no
+`--session-id` — so a pane the backend relaunched with
+`opencode --session <id>` carried its id in plain sight and
+`sessionIdFromCommand` still returned `null`, because that extractor knew only
+claude's and copilot's two spellings. It now asks which program the line names
+first, exactly as `stripSessionFlagsFromCommand` and `agentResumeCommand`
+already do, and reads `--session` on an opencode line only. Whether `--session`
+means a session to claude or copilot is an unverified vendor fact, and the rule
+for those is to check the reference rather than assume — so their lines read
+exactly as they did before.
+
 ## What's out of scope
 
 - **Minting `--session-id` onto a custom command line.** Explicitly barred by
   the issue: it rewrites a line the human owns, the same objection that ruled
   out option C's `--settings` approach above.
 - **Orchestration (`dormant-group`) restore.** Its session ids are backend-
-  built and already parsed via the unguarded `sessionIdFromCommand`
-  (`orchestration.ts`, #194.5) — a different, already-correct path this issue
-  doesn't touch.
-- **Any backend change.** `list_sessions` already returns every field this
-  fix needs (`id`, `source`, `cwd`, `modified_ms`, `resume_command` —
-  `src-tauri/src/sessions.rs`).
+  built and parsed via the unguarded `sessionIdFromCommand`
+  (`orchestration.ts`, #194.5) — a different path #440 doesn't touch. **This
+  bullet used to call that path already-correct, and it was not**: it is
+  correct only for a CLI whose id is on the command line at spawn, which is
+  claude alone. See **An id the backend learns** above for what #1563 found
+  and what it added.
+- **Any backend change.** For #440: `list_sessions` already returned every
+  field its fix needed (`id`, `source`, `cwd`, `modified_ms`,
+  `resume_command` — `src-tauri/src/sessions.rs`). #1563 did need one — the
+  `orch-session-learned` event above — for the reason that section gives:
+  there is no frontend-observable trace of a post-boot binding at all.
 
 ## Where the pieces live
 
@@ -356,3 +427,6 @@ the point of an optimistic restore. Nothing in this issue's fix reopens that:
 | Reconciler wiring | `src/main.ts` — `reconcileSessionIds`, `reconcileCandidates` | Two triggers (prefetch-chained one-shot + periodic), single-flight, throttled, boot-path-safe; candidacy gated on `firstInputAt` + `!hasForkSession`. |
 | D2 card | `src/main.ts` — the `dormant-agent` case of `openActionPane`, `addDormantCardAction` | Renders synchronously; enriches asynchronously; skips enrichment for a fork-carrying record. |
 | D1c fix | `src/main.ts` — `restoreSession` | One-line: pass the id already in hand. |
+| Backend emit (#1563) | `src-tauri/src/orchestration/mod.rs` — `emit_session_learned`, called last in `associate_session` | One `orch-session-learned` per binding; both refusal branches return above it. Pinned by `associating_a_session_emits_one_learned_event` through the no-app-handle capture seam. |
+| Frontend listener (#1563) | `src/orchestration.ts` — the `orch-session-learned` handler; `OrchWiring.persistLayout` (`src/main.ts`) | Sweeps every tab by agent id, adopts via `adoptSessionId`, persists via `persistTabs`. DOM wiring, hand-validated; its rate/bound row is in `test/perfpolicy.test.ts`'s `STREAMS`. |
+| opencode `--session` capture (#1563) | `src/panerestore.ts` — `sessionIdFromCommand` | Reads opencode's own session flag, gated on the program the line names so claude's and copilot's `--session` are untouched. Unit-tested. |
