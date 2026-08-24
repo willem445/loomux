@@ -506,6 +506,14 @@ narrow their ask back down to the original ticket on your own judgment.
   rung BELOW one that always decides (board order over an array never ties), so the new rung
   is unreachable text (`doc/design/board-sprints-and-links.md` §7,
   `src-tauri/tests/fixtures/pre222/README.md`, #1300).
+- **A routed instruction's factual premise is a claim to verify, not text to transcribe.** A
+  disposition relayed reviewer → orchestrator → worker can carry a reason that was true when
+  someone wrote it and is false in the tree you are editing; transcribing it onto permanent
+  surfaces ships a fresh false claim, and the round that routes one is usually the round FIXING
+  one. Check the premise against the code, decline the clause, and say in the commit message
+  AND the PR which half you dropped and what the surviving reason is — naming the surfaces that
+  really carry it. Signature: a routed reason offers "recapped in `<X>`" and `<X>` names none of
+  the things it is said to recap (#1429 N1, adjudicated for the worker in review round 5).
 
 ## Git & GitHub workflow
 
@@ -593,6 +601,16 @@ narrow their ask back down to the original ticket on your own judgment.
   fails for EVERY branch commit once the PR squashes. Signature: the run ids were re-derived
   after the rebase and the commit SHAs beside them were not — the reproduction SHA the body
   tells a reader to check out included (#1327; recipe in `.claude/skills/ci-validate/SKILL.md`).
+- **The head-SHA SWEEP that fixes that is the other way a body goes false — it rewrites lines
+  naming a BASE.** A body cites two kinds of SHA and a mechanical re-stamp cannot tell them
+  apart: a head citation ("measured at", "applies at") must move, a base one ("cut from") must
+  not, and the re-stamped result passes every check above — it resolves, it is an ancestor of
+  the PR ref, and its subject is this PR's own commit. Prefer a citation the sweep cannot
+  reach: DELETE a base claim from a line that does not need one, derive it (`#1432`'s head's
+  parent), or date the claim to a BLOB hash, which survives the rewrite that invalidates every
+  SHA. Signature: two adjacent "cut from" sentences naming different SHAs for one scratch
+  round, one of them committed hours AFTER the run it supposedly seeded (#1429 B2/B3; census
+  and temporal check in `.claude/skills/ci-validate/SKILL.md`).
 - **A range's BASELINE is re-derived with `git merge-base`, never inferred from an ancestry check.**
   A rebase moves the merge base while leaving the commit you rebased onto LAST time a
   perfectly valid ancestor — resolvable, right subject, passing every check the SHA rule
