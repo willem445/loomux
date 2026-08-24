@@ -444,10 +444,13 @@ however many hits it printed, and however cleanly a positive control matched.
 Worked instance, re-runnable at `b6c1beae`: CLAUDE.md's #1229 doc-splice signature
 (`+///` directly under a context `///`) over #1426's `mod.rs`. `4e5a537e..cd164c72`
 (the tree that CONTAINED the splice) and `4e5a537e..a8ed6604` (the fixed tree) return
-the **same two hits**, neither of them the defect — the whole `has_live_manager` doc
-block is `+` lines, so no context `///` sits above the bad insert. The reviewer who
-quoted that signature as matching "verbatim" was recognising a *file-state* shape by
-reading the file; the diff sweep for it was never going to fire.
+the **same two hits** under `git diff` (the squashed range diff; `git log -p` over the
+same ranges yields four on each side — the identity is form-invariant, but a receipt
+that does not name its form reads as a contradiction to whoever reproduces it in the
+other one), neither of them the defect — the whole `has_live_manager` doc
+block is `+` lines, so no context `///` sits above the bad insert. The signature is
+recognisable in the FILE and not in the diff, so reading the blob finds it and the
+sweep never fires.
 
 **The capable instrument for that class is a name-keyed doc census**, blob-vs-blob
 (never against a worktree copy — CRLF, and the `<ref>:<path>` dot-directory trap):
@@ -458,7 +461,10 @@ reading the file; the diff sweep for it was never going to fire.
 - diff the two maps: which names GAINED a doc block, which LOST one, and the fn count
   at both ends as the population control.
 
-At #1426's own transition (`cd164c72` to `a8ed6604`): 986 fns at both ends, exactly
+At #1426's own transition (`cd164c72` to `a8ed6604`): the fn population is UNCHANGED
+across the two blobs — that invariance is the control, not the number itself, which is
+relative to your fn-matching pattern (two independent censuses of this transition
+counted 986 and 1005 and decided identically). Exactly
 one name gains a block (`live_delegate_count`), zero lose one — the splice is solely
 fixed, which is what the body's sweep claimed and could not show.
 

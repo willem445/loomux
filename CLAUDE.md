@@ -293,12 +293,15 @@ compiles.
   `.claude/skills/ci-validate/SKILL.md`).
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
-- **A user-facing message is ONE paragraph: a `\`-line-continuation, never `\n`
-  plus indentation.** `\n` in a Rust literal ships the source's leading spaces to the
-  reader, and a test pinning that message with `.contains(<substring>)` cannot see a break
-  no asserted substring straddles — so it survives a fully green suite. Pin the SHAPE
-  beside the content (`is_one_paragraph`, `src-tauri/tests/manager_lifecycle.rs`).
-  Signature: `cat -A` on the literal shows `\n` followed by a run of spaces (#1426 B2).
+- **A user-facing message is ONE paragraph, and the leak has TWO shapes.** `\n` plus
+  indentation in a Rust literal ships the source's leading spaces to the reader; a `\`
+  line-continuation avoids that only if it survived the authoring path, and one that
+  collapsed leaves the same run of spaces with no `\n` at all. A test pinning the message
+  with `.contains(<substring>)` sees neither, since no asserted substring straddles the
+  break — it survives a fully green suite. Pin the SHAPE beside the content, as
+  `is_one_paragraph` does (`src-tauri/tests/manager_lifecycle.rs`): no `\n` AND no
+  ten-space run. Signature: `cat -A` shows a >=10-space run mid-literal, with or without
+  a preceding `\n` (#1426 B2; #1457 is the collapse form).
 - Write tests that test intent, not implementation echoes.
 - **A coverage claim is a claim.** When a PR body or comment says a test or mechanism
   polices a property, run the one mutation that removes it and watch WHICH tests
