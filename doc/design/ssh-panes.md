@@ -348,9 +348,12 @@ it, defeating `stampedVersion` (#907 NB2) on exactly the path it was written for
 
 The launcher keeps a `sshKnown` snapshot for the picker and the field editor, and
 it is a **display** copy only — `read()` hands out a deep copy, so an edit to it
-cannot reach disk without going through `write`. The display load is still
-memoized per form, but the memo is now released on failure, so re-picking SSH
-retries instead of leaving the human staring at a list this form has given up on.
+cannot reach disk without going through `write`. The copy is on **both** sides for
+the same reason in mirror: the store outlives the call, so `write` copies the
+profile in as well, or a caller keeping its object could change what a LATER save
+publishes without ever handing anything over. The display load is still memoized
+per form, but the memo is now released on failure, so re-picking SSH retries
+instead of leaving the human staring at a list this form has given up on.
 
 The ordering lives in a class with injected IO rather than a pure function
 because the invariant IS an ordering between two async calls — there is nothing
