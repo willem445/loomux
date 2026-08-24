@@ -54870,7 +54870,24 @@ fn nothing_loomux_sends_mid_session_can_reach_a_manager_pane() {
     let err = reg
         .deliver_prompt(&mgr.id, notice, brand::AUDIT_ACTOR, Delivery::MidSession)
         .expect_err("a mid-session delivery into a manager pane must be refused");
-    assert!(err.contains("never"), "the sender is told synchronously: {err}");
+    // The sender is told SYNCHRONOUSLY, and told enough to act on. Pinned as the
+    // three things that make the refusal actionable rather than on one word: this
+    // assertion used to read `err.contains("never")`, which was pinning the
+    // ABSOLUTE — "the human's own pane, which loomux never types into" — and that
+    // sentence is false. `permitted_into_manager_pane` admits the two kickoffs
+    // and D2's post-compact re-grounding notice, which is why #1161 M6 had to
+    // reword every surface carrying it. A pin on a word the sentence happened to
+    // use is a pin that defends the wording; these three are the property, and
+    // they hold however the sentence is next rephrased.
+    assert!(err.contains(&mgr.id), "the refusal must name the pane it is about: {err}");
+    assert!(
+        err.contains("Nothing was delivered"),
+        "the sender must learn the payload did NOT land, not merely that something was wrong: {err}"
+    );
+    assert!(
+        err.contains("message_manager"),
+        "and the route that DOES work, or the refusal is a dead end: {err}"
+    );
 
     // …and the refusal leaves a record, as a POLICY reason distinct from the
     // resource ones — "loomux will not", not "loomux could not".

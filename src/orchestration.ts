@@ -33,6 +33,7 @@ import {
   type PromoteWorkflow,
 } from "./promote";
 import { readingsByPty, type QueueDepthReading } from "./queuebadge";
+import { mailboxPanes, type MailboxChanged } from "./mailboxbadge";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
@@ -674,6 +675,24 @@ export function initOrchestration(wiring: OrchWiring): void {
       for (const pane of grid.allPanes()) {
         const pty = pane.ptyId;
         pane.setQueueDepth(pty === null ? null : byPty.get(pty) ?? null);
+      }
+    }
+  });
+  // Unread mail on the manager pane (#1161 M5). The backend emits the WHOLE
+  // current count on every mailbox write — a post and a `check_mail` alike — so
+  // there is no paired "cleared" event to miss and a dropped push self-corrects
+  // on the next one, the same shape `orch-queue-depth` above relies on.
+  //
+  // Applied across every tab, for the reason attention routing is: the manager
+  // pane is the human's own interface to the group, and it is exactly the pane
+  // they are NOT looking at while the fleet works. Routed through `mailboxPanes`
+  // rather than `panesInGroup`, because the payload names a group and a group
+  // holds the orchestrator's pane and every delegate's — see that function for
+  // why the role test is the addressing scheme and not tidying.
+  void listen<MailboxChanged>("orch-mailbox-changed", ({ payload }) => {
+    for (const grid of wiring.allGrids()) {
+      for (const pane of mailboxPanes(grid.allPanes(), payload.group_id)) {
+        pane.setMailUnread(payload.unread);
       }
     }
   });
@@ -1558,6 +1577,13 @@ export interface GroupSummary {
     planner: number;
     manager: number;
   };
+  /** Whether the roster this group is RUNNING declares a manager block at all
+   *  (#1433). Beside `roles.manager`, which counts LIVE ones, because the
+   *  panel's question is the DIFFERENCE between the two: declared and none live
+   *  means the human's own interface to this group is not there. Read off the
+   *  resolved roster, not the repo's file — a group resumes on the roster it
+   *  launched with and never re-reads `.loomux/workflow.yml`. */
+  manager_declared: boolean;
   agents: AgentSummary[];
 }
 
@@ -1593,6 +1619,48 @@ export const endGroup = (groupId: string, cleanupWorktrees: boolean): Promise<En
  *  default CLI, which a block with no `cli:` of its own inherits. */
 export const workflowPreview = (repo: string, agentCli: string): Promise<WorkflowPreview> =>
   invoke<WorkflowPreview>("orch_workflow_preview", { repo, agentCli });
+
+// ---------- the manager mailbox, human side (#1161 M5) ----------
+
+/** How many mailbox messages this group's manager has not read.
+ *
+ *  The SEED for the header chip. `orch-mailbox-changed` is a push, so it says
+ *  nothing about state that already existed: a pane opened (or restored) into a
+ *  group whose orchestrator posted status an hour ago would wear no chip until
+ *  the next post. This read is what makes the chip true from the first frame.
+ *
+ *  Never rejects — `0` covers a group with no manager, no mailbox file, and an
+ *  unreadable one alike, because its caller renders a badge and has no error
+ *  channel (see `orch_mailbox_status`). */
+export const mailboxStatus = (groupId: string): Promise<number> =>
+  invoke<number>("orch_mailbox_status", { groupId });
+
+/** Seed a manager pane's unread-mail chip the moment it takes its orchestration
+ *  identity. A no-op for every other role and for a pane with no group, decided
+ *  by the same `mailboxPanes` gate the push uses, so the seed and the push can
+ *  never disagree about which pane owns a group's mailbox.
+ *
+ *  Failure is swallowed on purpose and leaves the chip hidden: this is chrome
+ *  seeded during pane setup, and a rejected read must not surface as an error
+ *  on the human's own conversational pane. The next `orch-mailbox-changed`
+ *  corrects it.
+ */
+export function seedMailUnread(pane: {
+  orchGroupId: string | null;
+  orchRole: string | null;
+  applyMailSeed(unread: number): void;
+}): void {
+  const groupId = pane.orchGroupId;
+  if (!groupId || mailboxPanes([pane], groupId).length === 0) return;
+  // `applyMailSeed`, not `setMailUnread`: this read is in flight for a round
+  // trip, and a push that lands meanwhile is strictly fresher — including a
+  // push of 0, which is how an emptied mailbox is reported. The pane decides,
+  // because only it knows whether a push has already arrived.
+  void mailboxStatus(groupId).then(
+    (unread) => pane.applyMailSeed(unread),
+    () => {}
+  );
+}
 
 // ---------- workflow-mode status (#316): live toggle + armed-gate visibility ----------
 //

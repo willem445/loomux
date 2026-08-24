@@ -537,8 +537,17 @@ test("every enum value the manifest declares is one the PANE accepts too", () =>
     const codes = findingCodesFor(
       `version: 1\nblocks:\n  - id: b\n    kind: ${required}\n    cli: claude\n    role_hint: ${hint}\n`
     );
+    // `role-hint-superseded` is exempt BY NAME, not by prefix: it is an advisory
+    // about where a feature moved (#1161 D4), and the file it is raised on
+    // parses and runs. Every other `role-hint-*` code is a refusal, and a
+    // manifest value that draws one is a real disagreement.
+    //
+    // Scoped to the hint the advisory is ABOUT, not applied to every hint in the
+    // loop (#1502 review N5): a future fourth hint that spuriously drew
+    // `role-hint-superseded` would ride a blanket exemption through unnoticed.
+    const exempt = hint.trim().toLowerCase() === "liaison" ? ["role-hint-superseded"] : [];
     assert.ok(
-      !codes.some((c) => c.startsWith("role-hint")),
+      !codes.some((c) => c.startsWith("role-hint") && !exempt.includes(c)),
       `block.role_hint: ${JSON.stringify(hint)} must pair cleanly with kind ${required}`
     );
   }

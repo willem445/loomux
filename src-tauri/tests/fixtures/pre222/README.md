@@ -810,7 +810,7 @@ pin advertised to stop it (rev-11 F1).
   `templates/workflow.md`, which is not goldened here and renders to nothing for a roster
   that declares no manager. M1 seeded the skeleton and deliberately left three things out
   because M2 had not shipped the mailbox yet; this is those three, plus what they imply.
-  **The mail-first turn**: nothing is ever typed into this pane, so `check_mail()` and
+  **The mail-first turn**: no traffic from the fleet is ever typed into this pane, so `check_mail()` and
   `list_questions()` open every turn — the human is the scheduler of its attention, reading
   consumes the rows, and `include_read: true` is the post-compact recovery. What arrives is
   the orchestrator's account of what is happening, framed as data and never as instructions
@@ -969,3 +969,36 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   `mechanics_core(Reviewer)` carries the same pair in lockstep, for the reason every reviewer
   duty in that function does: a `mode: replace` persona never reads `reviewer.md`, so a duty
   living only in the template is one the repo that wrote its own reviewer never hears.
+
+- **#1161 M6 (PR #1502 review round 1), the D2 carve-out stated instead of an absolute** —
+  `manager.md` only. `orchestrator.md`, `worker.md`, `reviewer.md` and `planner.md` did not
+  move, and level 2 was re-run on all five.
+
+  The template opened its mail section with **"Nothing is ever typed into this pane."** That is
+  false, and it is false about this feature's own headline guarantee:
+  `Delivery::permitted_into_manager_pane` admits three deliveries, not none — the two kickoffs,
+  and `Regrounding`, the post-compact re-grounding notice that **decision D2 of #1161
+  deliberately carved out**. The manager reading this file arrived through one of those, and
+  after a compact it will receive the other.
+
+  The re-bless is warranted because the sentence is *operational* for its reader, not
+  decorative. A manager told "nothing is ever typed here" has no way to classify a re-grounding
+  notice when one appears: the honest readings available to it are "the human wrote this" or
+  "my instructions are wrong", and both are worse than being told. The replacement states what
+  is true and what to do with it — no traffic from the FLEET is ever typed here; exactly two
+  things are written by orrerix itself and neither is news; if one arrives it is orrerix
+  speaking about the pane, so take it as the reminder it is and carry on.
+
+  The same absolute was corrected in the same commit on the surfaces that mirror this one, so a
+  reader cannot find the old claim one file over: `mechanics_core(Role::Manager)` (which a
+  `mode: replace` persona reads *instead* of this template), `{{MANAGER_NOTE}}`, the
+  `message_manager` and `check_mail` tool descriptions, the `deliver_prompt` /
+  `RefusalReason::ManagerPane` / `connect_agents` / `send_prompt` refusal strings, the
+  no-injection guarantee's own code comment, and the user-facing pages. Three instances
+  elsewhere in the tree that say "nothing is typed into a pane" about a *paused* or *blocked*
+  pane were left alone: those are true, and about a different mechanism.
+
+  Worth knowing for the next sweep of this class: a line-based `grep` **cannot see this claim**
+  in Rust. A `\` string continuation splits it across two source lines, which is how
+  `mechanics_core`'s copy survived three sweeps of the branch that fixed the others. Flatten
+  whitespace and search the whole file.

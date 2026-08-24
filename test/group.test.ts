@@ -1,7 +1,7 @@
 // Unit tests for orchestration group-membership selection. Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { panesInGroup, planGroupMinimize } from "../src/group.ts";
+import { managerAbsenceNotice, panesInGroup, planGroupMinimize } from "../src/group.ts";
 
 // A minimal stand-in for a Pane: only the field the selector reads, plus a
 // `minimized` marker used to assert visibility is irrelevant to selection.
@@ -121,4 +121,50 @@ test("only the requested group's members are considered", () => {
   const plan = planGroupMinimize(panes, "g1");
   assert.equal(plan?.action, "restore");
   assert.deepEqual(names(plan!.targets), ["w1"]);
+});
+
+// ── the declared-but-absent manager notice (#1433, #1161 M5) ──
+//
+// What these are FOR: #1433's two premortem items are "the launch-time manager
+// spawn can fail and nobody tells the human" and "nothing reopens a manager
+// that died". The chosen answer to both is one NOTICE, and the properties worth
+// pinning are the ones that make it that answer rather than a decoration — it
+// says nothing for the common case, it fires on a group whose manager is gone
+// however it went, and it names the route back rather than implying something
+// automatic is coming.
+
+test("a group that declares no manager says nothing", () => {
+  // The overwhelmingly common case: every default group and every workflow
+  // without a manager block. A notice here would be a permanent line on almost
+  // every group panel in the app.
+  assert.equal(managerAbsenceNotice(false, 0), null);
+});
+
+test("a declared manager that IS live says nothing either", () => {
+  // The healthy case. Pinned beside the one above so the predicate cannot be
+  // satisfied by "never say anything", which is how an absence-only assertion
+  // passes vacuously.
+  assert.equal(managerAbsenceNotice(true, 1), null);
+});
+
+test("declared and none live is the one case that speaks", () => {
+  const n = managerAbsenceNotice(true, 0);
+  assert.ok(n, "a declared manager with no live pane must be surfaced");
+  assert.match(n.text, /manager/i, n.text);
+  assert.match(n.text, /not open|absent|gone/i, n.text);
+});
+
+test("the notice names the route back, and does not promise a reopen", () => {
+  // The load-bearing half. `docs/features/manager.md` promises the human that
+  // closing this pane is allowed, so nothing reopens it — and a notice that
+  // read like a transient error would leave them waiting for a repair that is
+  // never coming. It has to say where to go instead.
+  const n = managerAbsenceNotice(true, 0);
+  assert.ok(n);
+  assert.match(n.title, /session browser/i, `the way back must be named: ${n.title}`);
+  assert.doesNotMatch(
+    n.title,
+    /reopening|will reopen|retrying|will retry/i,
+    `nothing automatic reopens a manager — the notice must not imply one does: ${n.title}`
+  );
 });

@@ -20,12 +20,13 @@
 //! and asserted; nothing is executed.
 
 use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     create_orchestration_group, counts_against_max_agents, AgentRecord, Caller, Delivery, GroupId,
-    Guardrails, NameSource, OrchRegistry, Role, SessionOrigin,
+    Guardrails, NameSource, OrchRegistry, Role, SessionOrigin, ORCHESTRATOR_TPL,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -928,4 +929,409 @@ fn a_manager_open_does_not_consume_an_hour_slot_from_the_delegates() {
         .expect_err("the budget really is three");
     assert!(refused.contains("spawn-rate"), "refused by the rate backstop: {refused}");
     assert_eq!(rows_of(&reg, &g.id, "manager").len(), 1, "and the manager is live throughout");
+}
+
+// ─────── the orchestrator's own counting claim (#1429 round-5 N3) ───────
+//
+// `templates/orchestrator.md` states the guardrail as "at most {{MAX_AGENTS}}
+// live delegates (workers+reviewers+planners count together)". That
+// parenthetical dates to #76 and was true only by the accident of predating
+// every class that does NOT count: `Role::Orchestrator` was the whole exemption
+// when it was written, and `Role::Manager` joined it with decision D3 (#1161
+// M3). It enumerates the counting classes rather than asserting an exemption,
+// so it is still accurate — and nothing read it for this property, which means
+// the day a class is added that DOES count it becomes a false claim on a
+// GOLDENED template, with a green suite and nothing mechanical pointing at it.
+//
+// The pin below closes that by DERIVING both sides rather than restating
+// either: the enum's variants come from the enum's own source, the population
+// comes from `workflow::kind_from_str`, the counting set comes from
+// `counts_against_max_agents`, and the classes named come from the template.
+// It lives here, beside the exemptions it is a claim about, rather than in
+// `manager_prose.rs` (which pins the MANAGER's own surfaces) or `prompts.rs`
+// (which pins what a DEFAULT group reads, and a default group has no manager).
+
+/// Every `Role` variant, harvested from the enum's own source text.
+///
+/// Harvested rather than listed, because a hand-written population is exactly
+/// the shape a new class slips past (CLAUDE.md's source-scanning-guard
+/// convention): a list would still hold five names on the day a sixth counting
+/// class is added, and the guard would pass while the claim it guards went
+/// false. Doc comments, attributes and blank lines are skipped; a variant is a
+/// bare capitalized identifier followed by a comma, which is every arm of this
+/// enum — none carries a payload.
+fn role_variants_in_source() -> Vec<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/loomux-engine/src/model.rs");
+    let src = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("the Role enum's source must be readable at {path}: {e}"));
+    const OPEN: &str = "pub enum Role {";
+    let start = src
+        .find(OPEN)
+        .unwrap_or_else(|| panic!("`{OPEN}` must exist in {path} — this scan reads it by name"));
+    let body = &src[start + OPEN.len()..];
+    let end = body
+        .find("\n}")
+        .unwrap_or_else(|| panic!("the Role enum's closing brace must be findable in {path}"));
+    body[..end]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+        .filter_map(|l| l.strip_suffix(','))
+        .filter(|name| {
+            name.chars().all(|c| c.is_ascii_alphanumeric())
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `Role` a harvested variant name denotes.
+///
+/// `None` is the ALARM, not a row to skip: a variant this test has never seen
+/// has not been classified, and a guard that counted it as covered would be
+/// certifying coverage it never delivered (CLAUDE.md's population-control rule
+/// — count at the VERIFIED site, never at the MATCH site).
+fn role_named(variant: &str) -> Option<Role> {
+    Some(match variant {
+        "Orchestrator" => Role::Orchestrator,
+        "Worker" => Role::Worker,
+        "Reviewer" => Role::Reviewer,
+        "Planner" => Role::Planner,
+        "Manager" => Role::Manager,
+        "Solo" => Role::Solo,
+        _ => return None,
+    })
+}
+
+/// Whitespace-collapsed, so a rule that is re-wrapped across a line break does
+/// not read as a deleted one — `manager_prose.rs`'s `flat`, for its reason. The
+/// parenthetical this test reads is straddled by a line break in the template
+/// today, so this is load-bearing rather than defensive.
+fn flat(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One trailing plural `s`, removed exactly once — never `trim_end_matches`,
+/// which would eat the last letter of a future class whose own name ends in one.
+fn singular(word: &str) -> String {
+    let w = word.trim().to_ascii_lowercase();
+    w.strip_suffix('s').map(str::to_string).unwrap_or(w)
+}
+
+#[test]
+fn the_orchestrators_counting_parenthetical_names_exactly_the_classes_that_count() {
+    let variants = role_variants_in_source();
+
+    // POSITIVE CONTROL, because this guard's success shape is "the two sets
+    // matched" — byte-identical to a scan that read nothing at all and compared
+    // two empty sets (CLAUDE.md). The population IS the guard here, so it is
+    // checked before anything is concluded from it.
+    assert!(
+        variants.len() >= 6,
+        "the Role harvest found only {variants:?} — a scan that cannot see the enum enforces nothing"
+    );
+    for expected in ["Worker", "Manager", "Solo"] {
+        assert!(
+            variants.iter().any(|v| v == expected),
+            "the Role harvest missed `{expected}`: {variants:?}"
+        );
+    }
+
+    let mut counted: BTreeSet<String> = BTreeSet::new();
+    let mut verified = 0usize;
+    for v in &variants {
+        let role = role_named(v).unwrap_or_else(|| {
+            panic!(
+                "`Role::{v}` is new and unclassified. Add it to `role_named` above, then decide \
+                 two things about it: is it DECLARABLE in a workflow file \
+                 (`workflow::kind_from_str`), and does it spend a `max_agents` slot \
+                 (`counts_against_max_agents`)? If BOTH, `templates/orchestrator.md`'s guardrail \
+                 parenthetical has to name it too — and that is a goldened template, so the \
+                 `pre222` fixtures are re-blessed in the same commit. This is the whole reason \
+                 this test exists (#1429 round-5 N3)."
+            )
+        });
+        // matched == verified: every harvested variant is classified, so one the
+        // scan SAW but could not judge fails above rather than riding through as
+        // covered.
+        verified += 1;
+        // The population is DERIVED, not excluded by hand: a class no workflow
+        // file can name can never occupy a slot in a group, so the claim does
+        // not reach it. `Role::Solo` is the only one today — see the residual
+        // test below, which pins that blind spot and the bound on it.
+        if workflow::kind_from_str(&v.to_ascii_lowercase()) == Some(role)
+            && counts_against_max_agents(role)
+        {
+            counted.insert(role.as_str().to_string());
+        }
+    }
+    assert_eq!(verified, variants.len(), "every harvested variant must be classified");
+    assert!(
+        !counted.is_empty(),
+        "no declarable class counts against `max_agents` — that is the derivation broken, not the claim"
+    );
+
+    // The other side, read off the template rather than restated here.
+    let tpl = flat(ORCHESTRATOR_TPL);
+    const ANCHOR: &str = "live delegates (";
+    let at = tpl.find(ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "`templates/orchestrator.md` no longer states the guardrail as \
+             \"... live delegates (<classes> count together)\". If the sentence moved or was \
+             reworded, MOVE this pin with it rather than deleting it: that parenthetical is a \
+             claim about `counts_against_max_agents`, and this is the only thing that reads it \
+             (#1429 round-5 N3)."
+        )
+    });
+    let rest = &tpl[at + ANCHOR.len()..];
+    let close = rest
+        .find(')')
+        .expect("the guardrail parenthetical must close on the same (flattened) line");
+    let inside = &rest[..close];
+    let listed = inside.split("count together").next().unwrap_or(inside);
+    let named: BTreeSet<String> =
+        listed.split('+').map(singular).filter(|w| !w.is_empty()).collect();
+
+    assert_eq!(
+        named, counted,
+        "`templates/orchestrator.md`'s guardrail parenthetical names {named:?}, but the classes a \
+         workflow file may declare AND that spend a `max_agents` slot are {counted:?}. Whichever \
+         moved, the two have to agree — the orchestrator is being told, in its own instructions, \
+         which of its panes spend the cap it plans against. Editing that template re-blesses \
+         `src-tauri/tests/fixtures/pre222/` in the same commit."
+    );
+}
+
+#[test]
+fn the_counting_pin_is_blind_to_a_class_no_workflow_file_can_name_and_that_is_bounded() {
+    // THE RESIDUAL, pinned rather than merely disclosed (CLAUDE.md): the test
+    // above derives its population from `kind_from_str`, so a class that counts
+    // against the cap but is NOT declarable would be invisible to it.
+    //
+    // `Role::Solo` is exactly that class today — the predicate would count it…
+    assert!(
+        counts_against_max_agents(Role::Solo),
+        "`counts_against_max_agents` defaults a new class to COUNTED; if Solo stopped counting, \
+         this residual changed shape and the note above it went stale"
+    );
+    // …and it is outside the population by DERIVATION, not by a hand-written
+    // exclusion in the test above.
+    assert_eq!(
+        workflow::kind_from_str("solo"),
+        None,
+        "if `solo` became declarable the pin above starts reading it, and the template's \
+         parenthetical has to name it"
+    );
+
+    // THE BOUND on that blindness: a class the workflow file cannot name also
+    // cannot be minted into a group by an agent, because `spawn_agent` resolves
+    // its `kind` through the very same `kind_from_str`. So an undeclarable class
+    // cannot reach a group's cap at all — which is what makes the population the
+    // pin above derives the whole population the claim is about.
+    let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    let caller = orch_caller(&reg, &gid);
+    let before = reg.list_agents(&gid).as_array().unwrap().len();
+    let refusal = |kind: &str| -> String {
+        let out = dispatch(
+            &reg,
+            &caller,
+            "tools/call",
+            &json!({ "name": "spawn_agent", "arguments": { "kind": kind, "task": "t" } }),
+        )
+        .unwrap();
+        out["content"][0]["text"].as_str().unwrap_or_default().to_string()
+    };
+
+    let solo = refusal("solo");
+    assert!(solo.contains("unknown kind"), "`kind: solo` must be refused: {solo}");
+    // …and refused by the KIND PARSE specifically, not by something further in
+    // that would happen to reject it today for an unrelated reason. The refusal
+    // quotes the accepted vocabulary, so this asserts WHICH check said no.
+    assert!(
+        solo.contains(&workflow::kind_names()),
+        "the refusal must come from `kind_from_str`, naming what it does accept: {solo}"
+    );
+    assert_eq!(
+        reg.list_agents(&gid).as_array().unwrap().len(),
+        before,
+        "and nothing may be minted by the attempt"
+    );
+
+    // THE NON-VACUITY CONTROL: the same call shape with a kind the file CAN name
+    // gets PAST that parse. Deliberately not "and then succeeds" — a spawn needs
+    // a git repo and these fixtures have none, so asserting success here would
+    // pin the environment rather than the parse. What must be true is that the
+    // kind check is not refusing everything.
+    let worker = refusal("worker");
+    assert!(
+        !worker.contains("unknown kind"),
+        "a declarable kind must clear the kind parse: {worker}"
+    );
+}
+
+// ───────── the manager-lifecycle residuals (#1433, folded into M5) ─────────
+//
+// Two premortem items #1426 filed rather than absorbed. Both come down to one
+// question the app could not answer: **the manager pane is not there — does
+// anyone tell the human?** #1426's arms tell the ORCHESTRATOR (so its `not
+// live` fallback can fire) and write the audit trail; neither reaches the
+// person whose pane it is.
+//
+// The answer is a NOTICE, never a repair, and that is a decided design point
+// rather than a smaller scope — `docs/features/manager.md` already promises the
+// human "if you close the manager pane, the group behaves as it always has", so
+// closing it is a legitimate act, and no code can tell a deliberate close from
+// a crash. Reopening on a guess would contradict a shipped promise. See
+// `doc/design/manager.md`, "Why nothing reopens a dead manager".
+//
+// `group_summary`'s `manager_declared` is the one fact the panel was missing:
+// `roles.manager` counts LIVE managers, and the human's question is the
+// DIFFERENCE between declared and live. `src/group.ts`'s `managerAbsenceNotice`
+// turns the pair into the line, and `test/group.test.ts` pins its wording.
+
+/// Launch a group on a HAND-SUPPLIED roster with no workflow file in the repo.
+///
+/// The launch falls back to the caller's roster when the repo declares nothing
+/// (`promote_orchestrator_cli`'s comment states it: "a broken or absent file
+/// falls back to the caller's roster, exactly as the launch does"), which is the
+/// only way to build the roster `spawn_agent_bound`'s unsupported-CLI branch
+/// exists for — its own comment says so: "an unsupported one here means a
+/// hand-edited group.json", and `parse_workflow` refuses to produce one.
+///
+/// Nothing is executed. The failure this reaches is a guardrail refusal on a
+/// STRING, several steps before any process would be spawned, so constraint 3
+/// (never run a real agent CLI) holds by construction rather than by luck.
+fn launch_on_rails(rails: Guardrails) -> (Arc<OrchRegistry>, tempfile::TempDir, Repo, GroupId) {
+    let (reg, dir) = test_registry();
+    let repo = Repo::new(None);
+    let req =
+        create_orchestration_group(&reg, &repo.path(), rails, SessionOrigin::Fresh, None, None)
+            .expect("the group must launch even when the manager cannot open");
+    let gid = req.group_id.clone();
+    (reg, dir, repo, gid)
+}
+
+/// `WITH_MANAGER`'s roster, parsed, with the manager block's CLI replaced by one
+/// no build supports.
+///
+/// Built by PARSING rather than by constructing `Block`s field by field, so a
+/// new field on `Block` cannot silently give this fixture a different shape from
+/// the one a real workflow file produces.
+fn rails_with_unopenable_manager() -> Guardrails {
+    let mut blocks = workflow::parse_workflow(WITH_MANAGER)
+        .expect("the fixture roster must parse")
+        .blocks;
+    let mut patched = 0;
+    for b in &mut blocks {
+        if b.kind == Role::Manager {
+            b.cli = "notacli".into();
+            patched += 1;
+        }
+    }
+    // The mutation must have LANDED: an anchor that matched nothing leaves the
+    // test green for the wrong reason (CLAUDE.md), and here "nothing patched"
+    // would mean the manager opens perfectly and the arm below is never reached.
+    assert_eq!(patched, 1, "exactly one manager block must have been made unopenable");
+    Guardrails { blocks, ..rails() }
+}
+
+#[test]
+fn a_manager_that_cannot_open_at_launch_is_audited_and_the_group_still_starts() {
+    let (reg, _d, _repo, gid) = launch_on_rails(rails_with_unopenable_manager());
+
+    // The launch DEGRADES rather than failing: a repo file must never be able to
+    // stop a group from starting, and the orchestrator is the pane that can act
+    // on the absence.
+    assert_eq!(
+        rows_of(&reg, &gid, "orchestrator").len(),
+        1,
+        "the orchestrator opens regardless — the manager is not a launch prerequisite"
+    );
+    assert!(
+        rows_of(&reg, &gid, "manager").is_empty(),
+        "no manager pane may exist when its own spawn was refused"
+    );
+
+    // The failure is on the record, with the reason legible — this is the arm
+    // #1426's review noted no test reaches at all.
+    let log = audit_text(&reg, &gid);
+    assert!(
+        log.contains("manager pane open failed"),
+        "the failed open must be audited as an error: {log}"
+    );
+    assert!(
+        log.contains("notacli"),
+        "the audit must carry WHY it failed, not just that it did: {log}"
+    );
+    // …and it is recorded as an `error`, not as the `manager-already-live`
+    // outcome, which is the other arm and means something entirely different.
+    assert!(
+        !log.contains("manager-already-live"),
+        "a manager that never opened is not one that was already live: {log}"
+    );
+}
+
+#[test]
+fn the_panel_can_tell_a_missing_manager_from_a_group_that_declares_none() {
+    // THE PAIR that makes the notice fail-able. `roles.manager` alone cannot
+    // distinguish these two — it is 0 for both — which is exactly why
+    // `manager_declared` had to exist.
+
+    // (1) Declared, and its pane could not open: the human's interface is gone.
+    let (reg, _d, _repo, gid) = launch_on_rails(rails_with_unopenable_manager());
+    let s = reg.group_summary(&gid);
+    assert_eq!(s["manager_declared"], json!(true), "the roster declares one: {s}");
+    assert_eq!(s["roles"]["manager"], json!(0), "and none is live: {s}");
+
+    // (2) The same launch with a manager that DOES open — the control, so (1)
+    // cannot be read as "manager_declared is always true".
+    let (reg2, _d2, _repo2, gid2) = launch(WITH_MANAGER, rails());
+    let s2 = reg2.group_summary(&gid2);
+    assert_eq!(s2["manager_declared"], json!(true), "still declared: {s2}");
+    assert_eq!(s2["roles"]["manager"], json!(1), "and live: {s2}");
+
+    // (3) A roster with no manager block at all — the common case, which must
+    // report `false` rather than "0 live", or the panel would tell every group
+    // in the app that its manager is missing.
+    let (reg3, _d3, _repo3, gid3) = launch(WITHOUT_MANAGER, rails());
+    let s3 = reg3.group_summary(&gid3);
+    assert_eq!(s3["manager_declared"], json!(false), "no manager block is declared: {s3}");
+    assert_eq!(s3["roles"]["manager"], json!(0), "{s3}");
+}
+
+#[test]
+fn a_manager_that_dies_leaves_the_group_declaring_one_it_no_longer_has() {
+    // #1433's SECOND item, on the same surface as the first: the reaper and the
+    // watchdog both skip this class and the launch path is the only automatic
+    // opener, so a manager that dies mid-session leaves a hole nothing fills.
+    // What changes here is not that something fills it — deliberately — but that
+    // the panel can now SEE it.
+    let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    let before = reg.group_summary(&gid);
+    assert_eq!(before["roles"]["manager"], json!(1), "it starts live: {before}");
+
+    let mid = the_manager(&reg, &gid)["id"].as_str().unwrap().to_string();
+    reg.mark_dead(&mid, Some(0));
+
+    let after = reg.group_summary(&gid);
+    assert_eq!(
+        after["manager_declared"],
+        json!(true),
+        "the roster still declares one — a death does not un-declare it: {after}"
+    );
+    assert_eq!(
+        after["roles"]["manager"],
+        json!(0),
+        "and it is no longer live, which is the pair the notice reads: {after}"
+    );
+
+    // And nothing brought it back on its own, which is the decided behaviour
+    // rather than a gap: this assertion is what would fail if a later slice
+    // added an auto-reopen without revisiting the argument in
+    // `doc/design/manager.md` and the promise in `docs/features/manager.md`.
+    assert!(
+        rows_of(&reg, &gid, "manager").iter().all(|m| m["status"] == json!("dead")),
+        "nothing may reopen a manager automatically: {:?}",
+        rows_of(&reg, &gid, "manager")
+    );
 }

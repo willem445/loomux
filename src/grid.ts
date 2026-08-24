@@ -55,6 +55,7 @@ import type { PersistedPane } from "./tabstore";
 import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./layout";
 import { dockChipAttention } from "./attention";
 import { dockChipQueue, queuePresentation } from "./queuebadge";
+import { dockChipMail, mailboxPresentation } from "./mailboxbadge";
 import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
 import { startDragSession } from "./dragsession";
@@ -1029,6 +1030,28 @@ export class Grid {
         // is a thing going wrong rather than a state of affairs.
         if (!attn.needsAttention && (queue.stalled || !channel)) {
           chip.title = `${pane.name}: ${queuePresentation(reading).title} · click to restore.`;
+        }
+      }
+
+      // Unread mail (#1161 M5): a minimized manager pane's header — and so its
+      // mail chip — is out of the DOM, and the manager pane is the human's own
+      // interface to the group. Minimizing it must not make the fact that the
+      // orchestrator has posted status look like it went away.
+      //
+      // Tooltip precedence, following the two mirrors above: attention still
+      // wins (it is the more urgent ask), and a stalled queue outranks this
+      // because a stalled queue is a thing going WRONG while unread mail is a
+      // state of affairs. Below those, mail outranks a plain channel membership
+      // — it is news, and a membership is not.
+      const mail = dockChipMail(pane.mailUnreadCount);
+      if (mail) {
+        const marker = document.createElement("span");
+        marker.className = "dock-chip-mail";
+        marker.textContent = mail.marker;
+        chip.appendChild(marker);
+        const mailTitle = mailboxPresentation(pane.mailUnreadCount);
+        if (mailTitle && !attn.needsAttention && !queue?.stalled) {
+          chip.title = `${pane.name}: ${mailTitle.title} Click to restore.`;
         }
       }
 

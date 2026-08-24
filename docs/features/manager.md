@@ -24,12 +24,8 @@ turn the last of those into something the team can build correctly the first
 time.
 
 It is optional. A group has a manager only when the repo's workflow file
-declares one, and everything below is silent for a group that does not.
-
-> **Landing in slices (#1161).** This page describes the conversation — what the
-> pane is for and how to talk to it. How the pane opens, the unread-mail chip on
-> its header, and the reference for *authoring* a `kind: manager` block *will*
-> arrive with the remaining slices of that issue.
+declares one, and everything below is silent for a group that does not. To
+declare one, see [Custom agent workflows](../orchestration.html#a-manager-pane--the-humans-own-interface).
 
 ## The mental model
 
@@ -126,9 +122,16 @@ It holds no authority you have not used yourself. Specifically:
 
 ## How it hears from the team
 
-Nothing is ever typed into this pane. Your conversation with the manager is
-yours: orrerix never pastes a notice, a report or a status line into it, which
-is the one hard rule the whole feature is built around.
+No fleet traffic is ever delivered into this pane. Your conversation with the
+manager is yours: orrerix never pastes a notice, a report or a status line from
+the team into it, which is the one hard rule the whole feature is built around.
+
+Exactly two things orrerix itself writes there, and neither is news from the
+team. The **kickoff** that starts the conversation, the way every agent pane
+learns what it is. And, if the CLI compacts mid-session, **one re-grounding
+notice** that hands the manager back its own directive ledger — the running note
+it keeps of what you have told it — so a direction you gave survives a compact
+nobody was warned about. Everything else is refused at the front door.
 
 So news reaches it by **pull**, not push. The orchestrator posts milestones —
 what merged, what is blocked, the issue number your brief became — into a
@@ -136,6 +139,14 @@ durable mailbox, and the manager reads that mailbox at the start of every turn.
 Which means: **it learns what happened when you next speak to it.** You are the
 clock. An idle manager is not one that missed something; it is one whose human
 is away.
+
+So that the pull model does not mean *you* have to guess, the pane's header
+wears an **unread-mail chip** — `✉ 3 unread` — whenever the orchestrator has
+posted something the manager has not read yet. Minimize the pane and the count
+follows it onto the dock chip. The chip is a count and not a notification: it
+never interrupts, nothing is being delivered behind it, and it clears when the
+manager next takes a turn and reads its mail. Which is to say: it clears when
+you say something.
 
 Two consequences worth knowing:
 
@@ -146,6 +157,35 @@ Two consequences worth knowing:
 - After it reads its mail, it has consumed it. If a compact or a restart lands
   between the read and telling you, ask — it can re-read what it already
   consumed.
+
+## When the pane is not there
+
+The group lifecycle panel (`Alt+O`, or the group icon on the orchestrator's
+pane) says **manager declared · not open** when the workflow declares a manager
+and none is live.
+That covers two cases and does not distinguish them, because from where you are
+sitting they are the same fact: the pane could not be opened when the group
+launched, or it has since been closed or has died. The group's audit log records
+which, and why.
+
+**Nothing reopens it automatically**, and that is deliberate rather than a gap.
+Closing that pane is something you are allowed to do — the group behaves as it
+always has without one — and orrerix cannot tell a close you meant from a crash
+you did not. Rather than guess, it says so and leaves the decision with you.
+Bring the pane back from the **session browser** (`Ctrl+Shift+P`), which reopens
+the manager on its own prior conversation. Until then the orchestrator takes
+your input in its own pane, exactly as it does for a group with no manager.
+
+## Adding one to a group that is already running
+
+You cannot, and the reason is worth knowing. A group runs the roster it was
+launched with and never re-reads the workflow file afterwards — that is what
+makes the roster you approved at launch the roster you get, for the life of the
+group. So adding a `kind: manager` block to the file gives a manager to the
+*next* group you launch on that repo. Reattaching a **dormant** group does not
+count as next: a reattach keeps that group's own approved roster too, so a
+group that went dormant without a manager comes back without one. Launch a new
+group to pick up the change.
 
 ## Cost
 

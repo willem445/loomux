@@ -8,8 +8,49 @@ holds no orchestration authority of its own.
 This note covers the `role_hint: liaison` value itself — the public
 `.loomux/workflow.yml` surface it adds — the two capability rules keyed to it,
 the prose that makes a declared liaison do anything (**The prose**), and how the
-pane starts, is skipped and ends (**Lifecycle**). The user-facing documentation
-is a separate slice and is **not** described here as though it shipped.
+pane starts, is skipped and ends (**Lifecycle**).
+
+## Superseded by `kind: manager` (#1161)
+
+**Everything in this note still describes shipped, running behaviour.** The hint
+parses, the rules below still read it, and a repo that declares one keeps working
+unchanged — that is decision D4, and removing the hint is a separate, later,
+human decision.
+
+What changed is that the thing it approximates now has a capability class of its
+own. `doc/design/manager.md` is the note for that class; this section exists so a
+reader who lands here first is not left implementing the superseded shape.
+
+The promotion was not taste. This note's own trip-wire — *a THIRD tool on the
+second root, and the next one that is a write regardless of count* — fired at
+#1151 slice B over `request_attention`, and the fifth kind is the answer it named
+rather than a fourth row on the table below; that passage is *The trip-wire has
+now fired* further down. `check_mail` would have fired it a second time.
+
+The other half is that a manager needs class-level **structural** differences a
+hint cannot express, the load-bearing one being that `deliver_prompt` refuses a
+`Role::Manager` target for every delivery outside a three-element permitted set
+— `Delivery::permitted_into_manager_pane`: the two kickoffs, plus the single
+post-compact re-grounding notice that decision D2 carved out. `MidSession`, which
+is what every other producer in the codebase sends, is refused. So no fleet
+traffic reaches that pane at all, and the set is pinned as a set so a fourth
+carve-out cannot be added quietly (`doc/design/manager.md`'s table). A hint sits
+on a reviewer, and a reviewer is a pane orrerix delivers everything to.
+
+So, concretely: a liaison is a reviewer that behaves differently because of
+instructions plus three enumerated tool-tier exceptions; a manager is not a
+reviewer at all. New files declare `kind: manager`. `validateWorkflow` raises a
+`role-hint-superseded` warning on a liaison block and the launcher preview badges
+it, so an author is told; neither refuses anything.
+
+The hint has no user-facing page of its own and is not getting one. What a human
+reading `docs/` finds instead is the successor: `docs/features/manager.md` for
+using the pane, and `docs/orchestration.md` → *A manager pane* for declaring
+one. The supersession is stated on the second of those and not the first, which
+is deliberate rather than an omission — the hint is a thing you WRITE in a
+workflow file, so a reader with a `liaison` in theirs is on the authoring page,
+and the page for talking to a manager has no reason to mention a spelling its
+reader never types.
 
 ## Why `kind: reviewer`
 

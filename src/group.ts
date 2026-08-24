@@ -56,3 +56,44 @@ export function planGroupMinimize<T extends GroupPaneState>(
   if (visible.length > 0) return { action: "minimize", targets: visible };
   return { action: "restore", targets: members };
 }
+
+/** What the group panel says when the roster declares a manager and none is
+ *  live (#1433, #1161 M5). `null` — say nothing — for every other combination,
+ *  which is nearly every group: most declare no manager at all.
+ *
+ *  **This is the whole human-facing answer to "the manager is not there", and
+ *  it is deliberately a NOTICE rather than a repair.** Nothing in orrerix
+ *  reopens a manager pane automatically, because it cannot tell the two reasons
+ *  apart: `docs/features/manager.md` promises the human "if you close the
+ *  manager pane, the group behaves as it always has", so closing it is a
+ *  legitimate act — and a pane that crashed is indistinguishable from one the
+ *  human deliberately closed. Auto-reopening would contradict a shipped promise
+ *  on a guess. So the app states the fact and names the route back; the human
+ *  decides. See `doc/design/manager.md`, "Why nothing reopens a dead manager".
+ *
+ *  It covers BOTH of #1433's cases with one surface, because from here they are
+ *  the same fact: the launch-time open failed, or the pane died later. What the
+ *  human needs in either case is to know the pane is not there and how to get
+ *  it back — not which of the two happened, which the audit log records anyway.
+ *
+ *  `live` is a count and not a bool on purpose: it is `roles.manager` straight
+ *  off the summary, and a group can never hold two live managers
+ *  (`MANAGER_MAX` is 1, enforced at parse), so anything above zero is "the pane
+ *  is there". */
+export function managerAbsenceNotice(
+  declared: boolean,
+  live: number
+): { text: string; title: string } | null {
+  if (!declared || live > 0) return null;
+  return {
+    text: "manager declared · not open",
+    title:
+      "This group's workflow file declares a manager pane — your own interface to the " +
+      "group — and none is live. Either it could not be opened at launch (the group's " +
+      "audit log says why) or it has since been closed or died. Nothing reopens it " +
+      "automatically, on purpose: closing that pane is something you are allowed to do, " +
+      "and orrerix cannot tell that apart from a crash. Bring it back from the session " +
+      "browser; until then the orchestrator takes your input in its own pane, exactly as " +
+      "it does for a group with no manager.",
+  };
+}
