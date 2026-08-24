@@ -816,7 +816,7 @@ When a worker reports a PR:
      the reviewer back for the section rather than dispositioning what it did say. That section
      is where the ways the change fails in production that no test in the PR would catch get
      named, and its absence is exactly the silence a review exists to break: a green suite is
-     not evidence about a property nobody stated. A premortem entry that names an input, or the
+     not evidence about a property nobody stated. An entry that names an input, or the
      sequence, that triggers it is dispositioned like any other finding, below; one that names
      neither is the reviewer's record of what it looked for, not a finding to route.
    - **Default: fix it in this PR.** Route it back to the worker (resume its session) and
