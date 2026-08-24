@@ -747,6 +747,9 @@ enum Advance {
 /// Streaming, per #1218: one reusable line buffer, never the file. Peak live
 /// bytes are the longest single line plus the fold's message-id set.
 fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io::Result<Advance> {
+    // [scratch] #1239 round 7: the message-id dedupe set does not survive the
+    // tick boundary. Everything else about the cursor still resumes.
+    cursor.fold.seen.clear();
     let mut file = fs::File::open(&cursor.path)?;
     let mut bytes_read = 0u64;
     if verify_anchor && !cursor.anchor.is_empty() {
