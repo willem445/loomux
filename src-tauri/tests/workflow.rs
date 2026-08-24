@@ -2518,12 +2518,15 @@ fn a_broken_workflow_file_is_audited_and_skipped_never_fatal() {
 /// that loses its label is indistinguishable, everywhere downstream, from a
 /// block that never had one.
 ///
-/// So the round trip is pinned in both directions: a legal label survives
-/// `blocks_json` -> `read_blocks` unchanged, and a `group.json` hand-edited
-/// into a state the parser would have refused loses the label rather than
-/// keeping it. Without the first half, a future normalization could start
-/// eating labels with nothing red to say so; without the second, the
-/// defensive re-check could be deleted with nothing red either.
+/// **Both reloads here are `Launch::Resume`, and that is the whole test.**
+/// `create_group` is `Launch::Fresh`, which RE-READS the repo's workflow file —
+/// so a reload through it re-parses the label out of `workflow.yml` and would
+/// pass just as well against a `blocks_json`/`read_blocks` pair that had
+/// dropped the field entirely. Only the resume path answers "did the persisted
+/// roster carry it?", because only there is `group.json` the sole source.
+/// (The first cut of this test used `create_group` for both halves and was
+/// vacuous in exactly that way; CI caught it on the second half, where the
+/// re-read put back a label the hand-edit had just invalidated.)
 #[test]
 fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
     let (reg, dir) = test_registry();
@@ -2550,17 +2553,18 @@ fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
         .clone();
     assert_eq!(on_disk["remote"], "buildbox");
 
-    // A restart reads it back identically. This is the half that would go
-    // quietly wrong: `blocks_json` rewrites the whole roster on every change, so
-    // a field it forgot would vanish on the next resume with nothing to see.
+    // A RESUME reads it back from `group.json` alone. This is the half that
+    // would otherwise go quietly wrong: `blocks_json` rewrites the whole roster
+    // on every change, so a field it forgot would vanish on the next resume
+    // with nothing to see.
     let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
-    let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
-    assert_eq!(g2.id, g.id, "the restart resumes the same group");
+    let g2 = reg2.create_group_ex(&repo.path(), rails(), Launch::Resume).unwrap();
+    assert_eq!(g2.id, g.id, "the resume returns the same group");
     assert_eq!(
         g2.guardrails.block("builder").unwrap().remote.as_deref(),
         Some("buildbox"),
-        "the label must survive the round trip"
+        "the label must survive the persistence round trip"
     );
 
     // …and the fail-closed half, on the one input `parse_workflow` never sees.
@@ -2578,12 +2582,16 @@ fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
 
     let reg3 = relaunch_registry(dir.path());
     reg3.set_port(45999);
-    let g3 = reg3.create_group(&repo.path(), rails()).unwrap();
+    let g3 = reg3.create_group_ex(&repo.path(), rails(), Launch::Resume).unwrap();
     assert_eq!(
         g3.guardrails.block("builder").unwrap().remote,
         None,
         "a group.json the parser would have refused must lose the label, not keep it"
     );
+    // The control that keeps the line above from passing for the wrong reason:
+    // the block is still THERE, still a worker, and only the label went. A
+    // dropped block would satisfy the assertion above just as well.
+    assert_eq!(g3.guardrails.block("builder").unwrap().kind, Role::Worker);
 }
 
 #[test]
