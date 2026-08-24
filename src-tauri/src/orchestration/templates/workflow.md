@@ -96,4 +96,4 @@ declares the roster and the gates; you route.
 
 If a block above looks wrong for the work in hand, say so to the human in one line — the fix
 is an edit to `{{WORKFLOW_PATH}}` (they can open it in an orrerix workflow pane), not a
-workaround in your head.{{ADVISOR_NOTE}}{{PROCESS_NOTE}}{{LIAISON_NOTE}}
+workaround in your head.{{ADVISOR_NOTE}}{{PROCESS_NOTE}}{{LIAISON_NOTE}}{{MANAGER_NOTE}}
