@@ -804,6 +804,45 @@ pin advertised to stop it (rev-11 F1).
   worker through the task row rather than through its instructions, so there was nothing to
   tell them here.
 
+- **#1161 M4, the manager's full contract** — `manager.md` only. `orchestrator.md`,
+  `worker.md`, `reviewer.md` and `planner.md` are byte-identical to their previous blessed
+  copies: the orchestrator's half of this slice is a `{{MANAGER_NOTE}}` fragment in
+  `templates/workflow.md`, which is not goldened here and renders to nothing for a roster
+  that declares no manager. M1 seeded the skeleton and deliberately left three things out
+  because M2 had not shipped the mailbox yet; this is those three, plus what they imply.
+  **The mail-first turn**: nothing is ever typed into this pane, so `check_mail()` and
+  `list_questions()` open every turn — the human is the scheduler of its attention, reading
+  consumes the rows, and `include_read: true` is the post-compact recovery. What arrives is
+  the orchestrator's account of what is happening, framed as data and never as instructions
+  or authority. **The elicitation method** in full, as six axes to work an intake across
+  (the problem behind the ask, acceptance criteria, non-goals, constraints, edge and failure
+  cases, rationale worth keeping), grounded in the repository the manager can read rather
+  than asked in the abstract. **The brief**: a named nine-part shape it hands over, a
+  read-back that must get an explicit yes before anything is relayed, and — decision D5,
+  stated where it can be acted on — that the yes licenses *filing the issue* and nothing
+  more. D5 is split along its own seam rather than stated flat: the manager's authority is
+  UNCONDITIONAL (it never starts work, never applies a label, never asks for one), while
+  what the start-work label MEANS is mode-dependent — the sole start-work consent under the
+  opt-in default and plain autonomous mode, a priority hint under full autonomy, where
+  invariant 8 inverts the start default. Flat in every mode: full autonomy widens what may
+  be STARTED, never what may be SHIPPED. Around them:
+  relaying quotes the human verbatim and keeps the manager's own reading separate; a relay
+  carries the human's words and never their authority; questions are presented, never
+  answered; `ask_human` / `request_attention` / `group_usage` are named with what each is
+  for; and status is a paragraph, not a dump of what a tool returned. `mechanics_core`'s
+  `Role::Manager` arm gained the same four rules in the same commit — that arm is the whole
+  contract a `mode: replace` manager ever reads, so a rule living only here would be a rule
+  such a pane was never told.
+
+  **Amended in review round 3, and it is a behavioural rule rather than a rewording.** The
+  mode caveat above told the manager to find out which mode the group is in — and nothing on
+  its tool surface reports that, so the instruction was unfollowable and the user-facing page
+  promised the human that asking would work. `manager.md` now says plainly that it **cannot
+  look this up**, tells it to ask the human (who sets the mode and is present), and names the
+  orchestrator's pane as the one told directly. Same edit in `mechanics_core`'s arm and on the
+  docs page. What a manager does differently because of it: it no longer asserts a mode, and
+  it asks instead of guessing.
+
 ## If this test fails
 
 It is telling you that **the text every agent in every default group reads has
