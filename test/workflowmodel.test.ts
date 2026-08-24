@@ -1460,6 +1460,27 @@ test("a block that names no remote is a local block, byte for byte (#1457)", () 
   assert.equal(parseWorkflow(serializeWorkflow(withRemote)).workflow.blocks[0]!.remote, "buildbox");
 });
 
+test("a bare remote: is the absent key, an empty one is a refusal (#1457)", () => {
+  // Found in self-review, not by a test: the pane's YAML subset gives `null` for
+  // a bare `remote:` line and `""` for `remote: ""`, and the engine treats those
+  // two DIFFERENTLY — null is `Option<String>` None (a local block, file loads),
+  // `""` is `Some("")` and is refused. The `?? ""` idiom every neighbouring field
+  // uses collapses them, and the pane then paints a file red that the engine
+  // loads. The engine's half of the pair is pinned by
+  // `a_bare_remote_key_is_not_a_remote_block`.
+  const bare = remoteDoc({ kind: "worker", cli: "claude", remote: "" });
+  assert.match(bare, /remote: *\r?\n/, "the fixture must really be a BARE key, not an empty string");
+  const bareParsed = parseWorkflow(bare).workflow;
+  assert.equal(bareParsed.blocks[0]!.remote, undefined, "a null is the absent key, not an empty label");
+  assert.deepEqual(analyzeWorkflow(bare).findings.map((f) => f.code), [], `${codes(analyzeWorkflow(bare).findings)}`);
+  assert.ok(!serializeWorkflow(bareParsed).includes("remote"), "and a save does not invent a value for it");
+
+  // The other half, and the control that keeps the above from reading "an empty
+  // remote is always fine": written OUT as an empty string, it is a refusal.
+  const empty = remoteDoc({ kind: "worker", cli: "claude", remote: '""' });
+  assert.ok(has(analyzeWorkflow(empty).findings, "remote-invalid-label"), `${codes(analyzeWorkflow(empty).findings)}`);
+});
+
 test("a host-shaped key is an unknown key, not a field (#1457)", () => {
   // The repo file SELECTS a label; the operator authors the address. A pane that
   // read `host:` as a field would be offering to author what the engine refuses

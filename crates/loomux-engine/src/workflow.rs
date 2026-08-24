@@ -4232,6 +4232,37 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_remote_key_is_not_a_remote_block() {
+        // The pair the pane's YAML subset would otherwise collapse, and the
+        // reason `readBlock` keeps a null apart from an empty string.
+        //
+        // A bare `remote:` line is YAML null, which serde reads into
+        // `Option<String>` as None — indistinguishable from never writing the
+        // key, so the block is LOCAL and the file loads. An explicit
+        // `remote: ""` is `Some("")`, reaches `check_segment`, and is refused.
+        // Pinned because `src/workflowmodel.ts` mirrors exactly this
+        // difference, and a mirror of an unpinned behaviour is a mirror of an
+        // assumption.
+        let wf = parse_workflow("version: 1\nblocks:\n  - id: b\n    kind: worker\n    remote:\n")
+            .expect("a bare remote: is YAML null, which is the absent key");
+        assert_eq!(wf.block("b").unwrap().remote, None);
+        // …and it really is the ABSENT key, not a remote block that slipped
+        // through: the cli: rule below would have refused it (no cli: is
+        // spelled here), so a parse that reached the remote arm at all could
+        // not have returned Ok.
+        assert!(wf.block("b").unwrap().cli.is_empty());
+
+        let errs = parse_workflow(
+            "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\n    remote: \"\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("remote") && e.contains("empty")),
+            "an explicitly empty label is refused, and says why: {errs:?}"
+        );
+    }
+
+    #[test]
     fn a_loomux_owned_block_may_not_run_remotely() {
         // The orchestrator holds orchestration state, the gh operations and the
         // merge gate; the manager pane is the human's own interface — the thing
