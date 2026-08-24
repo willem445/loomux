@@ -684,6 +684,12 @@ impl TranscriptCursor {
 /// Streaming, per #1218: one reusable line buffer, never the file. Peak live
 /// bytes are the longest single line plus the fold's message-id set.
 fn fold_appended(cursor: &mut TranscriptCursor) -> std::io::Result<u64> {
+    // [scratch] #1239 round 1: start every fold at byte zero, which is the
+    // pre-#1239 whole-file re-parse. The fold restarts with it, so the TOTALS
+    // stay correct and only the WORK changes.
+    cursor.offset = 0;
+    cursor.anchor.clear();
+    cursor.fold = TranscriptFold::default();
     let mut file = fs::File::open(&cursor.path)?;
     if cursor.offset > 0 {
         file.seek(SeekFrom::Start(cursor.offset))?;
