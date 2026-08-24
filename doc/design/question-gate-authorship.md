@@ -66,8 +66,9 @@ a filter on what may enter at all — and that filter is the subject of the next
 it is worth restating because it is the reason #903 was **not** fixed by simply widening
 that record:
 
-> `notify_when(kind, pr, note)` takes an agent-supplied `note`, and `notify_tick` delivers
-> the fired notice **to the registering agent's own pane**. `sanitize_gh_text` maps `[`/`]`
+> `notify_when(kind, pr, note)` takes an agent-supplied `note` (up to `NOTICE_FIELD_CAP`),
+> and `notify_tick` delivers the fired notice **to the registering agent's own pane**.
+> `sanitize_gh_text` maps `[`/`]`
 > to parens and strips control characters — it does not touch ordinary words, `?`, `(`,
 > `)` or `❯`, which is everything a dialog row is made of.
 
