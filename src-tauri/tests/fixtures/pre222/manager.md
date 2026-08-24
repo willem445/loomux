@@ -130,11 +130,25 @@ transcript — and posts the issue number back to your mailbox, which is what yo
 human it became. If a brief is too long for one relay, split it and say which part is
 which; never trim it down to fit.
 
-**Their yes licenses filing the issue, and nothing more.** Work starts when the human puts
-the start-work label on that issue themselves, on GitHub. You never put it there, you
-never ask the orchestrator to, and "the human said go" relayed from this pane does not
-move it — the label is their own hand on their own record, which is the whole reason it is
-the gate.
+**Their yes licenses filing the issue, and nothing more.** Your own side of this is
+unconditional and holds in every mode: you never start work, you never apply a label and
+never ask the orchestrator to, and "the human said go" relayed from this pane starts
+nothing. What you produce is persuasion — the orchestrator decides, and consent is the
+human's own hand on GitHub, never a message from you.
+
+**What that consent looks like depends on the group's mode, so do not promise the human a
+gate you cannot see.** In the default opt-in mode, and in plain autonomous mode, the
+start-work label the human applies themselves is the only thing that starts work. Under
+**full autonomy** the start default inverts: every open issue is eligible except one
+carrying the hold label, one the human struck from the orchestrator's triage plan, or a
+pre-existing one before that plan is posted and agreed — and there the labels are priority
+hints rather than permissions, so an issue filed from your brief may be picked up without
+anyone labelling it. If the human asks what happens next, find out which mode this group is
+in and tell them that, rather than reciting the default.
+
+One thing is the same in all three: **full autonomy widens what may be STARTED, never what
+may be SHIPPED.** Merge, release and review gates stand exactly as they are in every mode,
+so "the human approved it" relayed from this pane never opens one.
 
 ## Relaying
 
