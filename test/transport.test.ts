@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  pickDirectory,
   setEngineTransport,
   tauriTransport,
   type EngineArgs,
@@ -332,6 +333,109 @@ test("the seam itself does import Tauri — the rule above is a chokepoint, not 
     "@tauri-apps/api/window",
     "@tauri-apps/plugin-dialog",
   ]);
+});
+
+// ---------- behavior: one native dialog at a time (#1564) ----------
+
+/** Holds the FIRST folder pick open until a test releases it, and answers every
+ *  later one immediately. The asymmetry is deliberate: on a build without the
+ *  gate the second call must still SETTLE, so the test below fails on its
+ *  assertion rather than hanging on a promise nobody resolves. */
+class SlowPickerTransport extends RecordingTransport {
+  release: (v: string | null) => void = () => {};
+  picks = 0;
+
+  override pickDirectory(opts: { title?: string; defaultPath?: string }): Promise<string | null> {
+    this.calls.push({ cmd: "@pickDirectory", args: opts as EngineArgs });
+    this.picks += 1;
+    if (this.picks === 1) {
+      return new Promise<string | null>((res) => {
+        this.release = res;
+      });
+    }
+    return Promise.resolve("D:/second-dialog");
+  }
+}
+
+test("a second pickDirectory never reaches the transport while one is outstanding (#1564)", async () => {
+  // The crash this refuses to keep feeding is a Windows focus race: the picker
+  // is shown on a thread the plugin spawns while our main window OWNS it, so its
+  // `SetFocus` re-enters our window procedure and WebView2’s focus machinery
+  // synchronously. A second picker means a second foreign thread pulling at the
+  // same window’s focus — and the gap this test models (a request made, no
+  // dialog on screen yet) is exactly when a human, watching a click do nothing,
+  // clicks Browse again. See src/nativedialog.ts.
+  const slow = new SlowPickerTransport();
+  const previous = setEngineTransport(slow);
+  try {
+    const first = pickDirectory({ title: "Choose repository or folder" });
+    const second = await pickDirectory({ title: "Choose repository or folder" });
+
+    assert.equal(
+      slow.calls.filter((c) => c.cmd === "@pickDirectory").length,
+      1,
+      "the second Browse must not open a second native dialog"
+    );
+    assert.equal(second, null, "a refused pick reads as a cancel, which every call site handles");
+
+    // The dialog that IS up still answers its own caller.
+    slow.release("D:/Projects/loomux");
+    assert.equal(await first, "D:/Projects/loomux");
+
+    // And the gate reopens: a later Browse is admitted normally.
+    slow.release = () => {};
+    assert.equal(await pickDirectory({ title: "again" }), "D:/second-dialog");
+  } finally {
+    setEngineTransport(previous);
+  }
+});
+
+test("nothing reaches the folder picker past the single-flight gate (#1564)", () => {
+  // A gate one call site can walk around is not a gate. `pickDirectory` is
+  // exported as a free function AND reachable as a member of whatever
+  // `engineTransport()` returns, and the second route skips `withNativeDialog`
+  // entirely — which is the shape of the defect #1564 is about: a second native
+  // dialog opened against a window another thread is already pulling focus from.
+  //
+  // The rule is default-deny and keyed on the ENTITY (`.pickDirectory` as a member
+  // access), not on a binding's name, so renaming a transport variable does not
+  // step over it. Its stated blind spot: a fully dynamic reach
+  // (`t["pickDirectory"]()`, or a member access split across two lines) is not
+  // matched. Neither appears in `src/` today, and the compiler is what makes the
+  // free function the ergonomic route — this scan is the tripwire, not the wall.
+  const ungated: string[] = [];
+  let gated = 0;
+  let scanned = 0;
+  for (const file of MODULES) {
+    const lines = readFileSync(SRC + file, "utf8").split(/\r?\n/);
+    scanned += 1;
+    lines.forEach((line, i) => {
+      if (!/\.pickDirectory\b/.test(line)) return;
+      if (/withNativeDialog\(.*\.pickDirectory\b/.test(line)) {
+        gated += 1;
+        return;
+      }
+      ungated.push(`${file}:${i + 1}: ${line.trim()}`);
+    });
+  }
+
+  // Population control (the raw-count cross-check): a scan that opened nothing,
+  // or that walked a tree with no seam in it, would satisfy the emptiness
+  // assertion below without having looked at anything.
+  assert.ok(scanned > 20, `the scan opened only ${scanned} modules`);
+  assert.ok(MODULES.includes("transport.ts"), "the seam itself must be in the scanned set");
+  assert.equal(
+    gated,
+    1,
+    "exactly one member access to pickDirectory exists, the one inside the gate in transport.ts"
+  );
+
+  assert.deepEqual(
+    ungated,
+    [],
+    "every folder-picker call goes through pickDirectory() in transport.ts, which single-flights it " +
+      `(#1564); these reach past it: ${ungated.join(", ")}`
+  );
 });
 
 test("the transport surface is exactly the declared capability set", () => {

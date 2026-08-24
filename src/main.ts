@@ -44,6 +44,7 @@ import {
   type KeepOpenReason,
 } from "./dirtystate";
 import { matchShortcut } from "./shortcuts";
+import { reclaimFocusOnWindowFocus } from "./nativedialog.ts";
 import { SideDock } from "./sidedock";
 import { followsPaneChange, isActiveTabChange } from "./sidedockmodel";
 import { admitRoot, ftRootIsDir } from "./fileapi";
@@ -2763,8 +2764,17 @@ window.addEventListener("contextmenu", (e) => {
 });
 
 // WebView2 can come up without keyboard focus; make sure the active
-// terminal reclaims it whenever the window is (re)focused.
-window.addEventListener("focus", () => activeGrid().activePane?.focus());
+// terminal reclaims it whenever the window is (re)focused — EXCEPT while a
+// native dialog is outstanding (#1564). Answering a focus event by grabbing
+// focus back is the app's only code that initiates a focus change from inside
+// one, and a folder picker initializing on a foreign thread is calling
+// `SetFocus` at that same instant; the tug-of-war re-enters WebView2's focus
+// machinery from inside its own focus callback, which is where the #1564
+// minidump faulted. The decision lives in nativedialog.ts so it is testable;
+// this line is the DOM wiring.
+window.addEventListener("focus", () =>
+  reclaimFocusOnWindowFocus(() => activeGrid().activePane?.focus())
+);
 
 // Esc cancels an in-progress connect gesture (#271) from anywhere — deliberately
 // NOT preventDefault/stopPropagation: cancelPendingConnect() is a no-op when
