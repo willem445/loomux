@@ -2526,32 +2526,39 @@ fn a_broken_workflow_file_is_audited_and_skipped_never_fatal() {
 ///
 /// **The fixture makes the operands COLLIDE**, per the non-interference rule: a
 /// pin whose subject `clamped` never touches holds under every implementation,
-/// the one it forbids included. So the remote block here carries exactly the
-/// fields `clamped` DOES rewrite — a model it normalizes and an `effort` its
-/// resolved CLI cannot honor, which `clamped_knob` empties — and the assertion
-/// is that the pass which demonstrably rewrote this block left the label and the
-/// CLI alone.
+/// the one it forbids included.
+///
+/// Finding a field `clamped` really rewrites took a CI round. `model: OPUS` plus
+/// `effort: high` came back byte-identical: `sanitize_model` accepts `OPUS` as
+/// written, `clamped_knob` returns `high` unchanged for a CLI that honors it,
+/// and `parse_workflow` refuses an effort the block's own `cli:` cannot honor —
+/// so an unhonorable one cannot be smuggled past it either. The rewrite that
+/// does happen is the one for an OMITTED `model:`: `clamped` resolves the empty
+/// string to the kind's default for the resolved CLI. So the block below
+/// declares no model, the control asserts `clamped` filled it in, and only then
+/// do the pins claim the label and the CLI survived that same pass.
 #[test]
 fn clamping_a_roster_never_moves_a_remote_block_off_claude() {
     let wf = workflow::parse_workflow(
         "version: 1\nblocks:\n\
-         \x20 - id: builder\n    kind: worker\n    cli: claude\n    model: OPUS\n\
-         \x20   effort: high\n    remote: buildbox\n",
+         \x20 - id: builder\n    kind: worker\n    cli: claude\n    remote: buildbox\n",
     )
     .expect("the fixture must parse");
     let before = wf.block("builder").unwrap().clone();
     assert_eq!(before.remote.as_deref(), Some("buildbox"));
+    assert!(before.model.is_empty(), "the fixture declares no model");
 
     let rails = Guardrails { blocks: wf.blocks.clone(), ..rails() }.clamped();
     let after = rails.block("builder").expect("clamped must keep the block");
 
-    // The collision control FIRST: this pass really did rewrite this block, so
-    // the two assertions below are about a block `clamped` touched rather than
+    // The collision control FIRST: this pass really did write this block's
+    // fields, so the pins below are about a block `clamped` touched rather than
     // one it skipped.
-    assert_ne!(
-        (before.model.as_str(), before.effort.as_str()),
-        (after.model.as_str(), after.effort.as_str()),
-        "the fixture must be one clamped actually rewrites, or the pin below holds vacuously"
+    assert!(
+        !after.model.is_empty(),
+        "the fixture must be one clamped actually rewrites, or the pins below hold vacuously — \
+         it should have resolved the empty model to the kind default, got {:?}",
+        after.model
     );
 
     // …and the invariant survived it.
