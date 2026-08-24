@@ -510,7 +510,9 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
 /// 64 bytes keeps the work bound this whole change exists for intact, and a
 /// transcript line is hundreds of bytes at minimum, so the anchor never spans
 /// more than the tail of one record.
-const ANCHOR_BYTES: usize = 64;
+// [scratch] #1239 round 9: widen the anchor far enough to cover the edited
+// byte, so the guard DOES detect what it structurally cannot detect at 64.
+const ANCHOR_BYTES: usize = 1 << 20;
 
 /// How long a cursor may keep folding incrementally before it is discarded and
 /// the transcript re-parsed from byte zero, whatever the stat and the anchor
