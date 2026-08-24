@@ -445,6 +445,9 @@ const orchWiring: OrchWiring = {
   refreshTabBar(): void {
     tabs.touch();
   },
+  persistLayout(): void {
+    persistTabs();
+  },
 };
 
 // ---------- project tabs: persistence (#63) ----------

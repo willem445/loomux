@@ -235,6 +235,19 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "orch-session-learned",
+    rate: "lifecycle",
+    bound: "argued-none",
+    cite: "src/orchestration.ts",
+    reason:
+      "At most ONE per pane, ever (#1563): `associate_session` binds an id only while the " +
+      "roster record has none, so the second and every later discovery for a pane is refused " +
+      "backend-side and emits nothing. The handler is an O(panes) sweep across tabs plus one " +
+      "`persistLayout()`, which itself dedups on the encoded snapshot — the same shape and the " +
+      "same cost as orch-spawn-cancelled's sweep, and it can run at most once per agent.",
+    debt: null,
+  },
+  {
     event: "orch-rename",
     rate: "lifecycle",
     bound: "argued-none",
