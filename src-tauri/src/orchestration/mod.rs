@@ -3816,7 +3816,7 @@ channel; keep the human oriented with short summaries."
              resource it now holds, a state it can be resumed into), or an argued none — an empty \
              section is a finding against the review. Where the change touches unbounded input (a \
              file, a transcript, anything off the network or supplied by a user or another agent), \
-             one of the two is the resource answer: the largest realistic input × how often it runs \
+             one of the two is the resource answer: the biggest input it will really see × how often it runs \
              × what it allocates or reads per run, naming the size at which memory or IO hurts and \
              not only where time does. Evidence covers only the properties somebody already thought \
              to test, so this is the question that reaches the one nobody conceived of. An entry \
