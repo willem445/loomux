@@ -30,7 +30,7 @@
 //! carries the rule and the owning test goes red, naming the rule it lost.
 
 use loomux_lib::orchestration::workflow::{self, Block};
-use loomux_lib::orchestration::{mechanics_core, GroupId, Guardrails, OrchRegistry, Role};
+use loomux_lib::orchestration::{mailbox, mechanics_core, GroupId, Guardrails, OrchRegistry, Role};
 use std::fs;
 use std::path::PathBuf;
 
@@ -453,6 +453,20 @@ fn a_declared_manager_gives_the_orchestrator_its_note_with_the_block_id() {
     // — which is what keeps this fragment from contradicting the same
     // document two screens up.
     assert!(!orch.contains("**`mgr-desk`** —"), "a manager is not a delegate row: {orch}");
+
+    // The two caps an orchestrator budgets its writes against are INTERPOLATED
+    // from the constants that enforce them, never typed into the prose. Not a
+    // tautology: what this fails on is someone replacing the interpolation with
+    // a literal, which is how a number on a permanent surface goes stale with
+    // no test to redden and no stale grep hit to find.
+    assert!(
+        orch.contains(&format!("Max {} characters", mailbox::MESSAGE_TEXT_MAX)),
+        "the fragment must name the REAL text cap, interpolated from `mailbox::MESSAGE_TEXT_MAX`: {orch}"
+    );
+    assert!(
+        orch.contains(&format!("holds {} unread", mailbox::UNREAD_MAX)),
+        "the fragment must name the REAL unread cap, interpolated from `mailbox::UNREAD_MAX`: {orch}"
+    );
 
     let flat_doc = flat(&orch);
     let note = section(&flat_doc, "**you have a manager.**", "a custom workflow config is your group's roster");

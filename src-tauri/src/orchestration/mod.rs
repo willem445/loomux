@@ -38516,8 +38516,8 @@ impl OrchRegistry {
                  blocked and why, a decision you have registered with `ask_human` (send the \
                  `q-N` so `{id}` can present it), the issue number a brief became. Write it as \
                  prose a human would want to read — `{id}` relays your words — and cite ids \
-                 (`t-7`, `#123`, `q-2`) so it can drill in. Max 2000 characters, refused rather \
-                 than cut, and the mailbox holds 32 unread: a refusal at that cap means nobody \
+                 (`t-7`, `#123`, `q-2`) so it can drill in. Max {cap} characters, refused rather \
+                 than cut, and the mailbox holds {unread} unread: a refusal at that cap means nobody \
                  has read any of it, so raise what matters where the human will actually see \
                  it instead of queueing more.\n\
                  - **Never forward operational traffic to it.** Delegate reports, `[orrerix]` \
@@ -38565,6 +38565,13 @@ impl OrchRegistry {
                  access is the escape hatch and it is always open — a question you could not \
                  get to `{id}` is one you ask here, never a reason to hold the work.",
                 id = b.id,
+                // Interpolated, never hand-copied. Both are facts about a
+                // constant, and a constant a later slice can retune: a number
+                // typed into prose goes stale silently — no test to redden, no
+                // stale grep hit — and it goes stale on the one surface an
+                // orchestrator budgets its writes against.
+                cap = mailbox::MESSAGE_TEXT_MAX,
+                unread = mailbox::UNREAD_MAX,
             ),
             None => String::new(),
         };
