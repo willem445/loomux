@@ -50670,31 +50670,63 @@ fn h13_a_pointerless_dialog_above_our_composer_still_holds() {
 // because `menu_structure_rendered`'s whole-screen pointer clause was reading a
 // row loomux itself had written.
 //
-// **Fixture provenance, stated because half of it is reconstructed.** The
-// twelve message rows come from the 853-character prompt body recorded verbatim
+// **Fixture provenance, and it is measured at both ends rather than asserted.**
+// The twelve message rows are the 853-character prompt body recorded verbatim
 // in the audit (`fp-resumed-prior-delivery-echo.prompt.txt`), word-wrapped at
-// the pane's own width; the wrap is not a guess — at width 78 its first SIX
-// rows reproduce, byte for byte, the six the orchestrator's `get_output`
-// captured off that pane (the capture stops there only because `get_output`
-// caps at 500 characters). The chrome below them — separator, bare `❯`,
-// separator, `⏵⏵ auto mode on …` — is lifted unchanged from
-// `fp-resumed-agent-idle-prompt.txt`, itself a real capture.
+// 78 columns:
+//
+//  - against the SCREEN: those rows' first six reproduce, byte for byte, the six
+//    the orchestrator's own `get_output` captured off that pane (the capture
+//    stops at six only because `get_output` caps at 500 characters);
+//  - against the RING: padded to an 80-column pane and concatenated, they are a
+//    byte-exact prefix of the `matched.line` the audit recorded — which is also
+//    the evidence for how `echo_raw` below encodes the pane, and for why the
+//    detector saw a pointer at all.
+//
+// The chrome below them — separator, bare `❯`, separator, `⏵⏵ auto mode on …` —
+// is lifted unchanged from `fp-resumed-agent-idle-prompt.txt`, itself a real
+// capture.
 const FIX_FP_RESUMED_ECHO: &str =
     include_str!("fixtures/attention/fp-resumed-prior-delivery-echo.txt");
 const FIX_RESUMED_ECHO_PROMPT: &str =
     include_str!("fixtures/attention/fp-resumed-prior-delivery-echo.prompt.txt");
 
-/// The wedge fixture is 16 rows, so it needs a taller reading than
-/// `composed_903`'s twelve — otherwise the replayed prompt's own head scrolls
-/// off and the test would be exercising `R-top` instead of the case it is about.
+/// The incident pane's geometry, both figures measured (see the section header).
+const ECHO_COLS: u16 = 80;
+/// Taller than the sixteen rows the fixture paints, so the replayed prompt's own
+/// head does not scroll off — otherwise this would be exercising `R-top` rather
+/// than the case the section is about.
 const ECHO_ROWS: u16 = 20;
 
+/// The fixture as the PANE emits it, which is not the same thing as the fixture.
+///
+/// A static replayed screen is painted by ADDRESSING rows, not by emitting
+/// newlines, and `strip_ansi` deletes cursor-address sequences — so the byte ring
+/// the detector reads is every row concatenated into ONE line, each padded to the
+/// pane width. That is not a guess about the CLI: the audit's own `matched.line`
+/// for this incident is a byte-exact prefix of exactly that concatenation at 80
+/// columns, gaps and all (`(run` + 12 columns of padding + the next row's 2-space
+/// indent = the 14 spaces the record shows).
+///
+/// Feeding the fixture through `pty_bytes_903` instead would put a newline
+/// between every row, which moves the pointer row out of `prompt_wait_match`'s
+/// last-three-painted window and makes the detector read CLEAR — a fixture that
+/// reproduces the screen and not the bug.
 fn echo_raw() -> Vec<u8> {
-    pty_bytes_903(FIX_FP_RESUMED_ECHO)
+    let mut out = Vec::new();
+    for (i, row) in FIX_FP_RESUMED_ECHO.replace("\r\n", "\n").lines().enumerate() {
+        out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+        out.extend_from_slice(row.as_bytes());
+        let painted = strip_ansi(row.as_bytes()).chars().count();
+        for _ in painted..ECHO_COLS as usize {
+            out.push(b' ');
+        }
+    }
+    out
 }
 
 fn echo_visible(raw: &[u8]) -> String {
-    loomux_lib::orchestration::termgrid::render_visible(raw, 100, ECHO_ROWS)
+    loomux_lib::orchestration::termgrid::render_visible(raw, ECHO_COLS, ECHO_ROWS)
 }
 
 /// The prompt body as the session record holds it.
@@ -50704,9 +50736,9 @@ fn echo_record() -> Vec<String> {
 
 #[test]
 fn j1_a_resumed_panes_replayed_delivery_latches_the_pointer_signal() {
-    // The false positive itself, with no record — i.e. the behaviour every pane
-    // in the incident had. The assertions run in the order the audit recorded
-    // them, so a future reader can line this test up against the log.
+    // The false positive itself, with no record — the behaviour every pane in
+    // the incident had. The assertions run in the order the audit recorded them,
+    // so a future reader can line this test up against the log.
     let raw = echo_raw();
     let m = prompt_wait_match(&strip_ansi(&raw)).expect("the ring matches — it did, for 30 min");
     assert_eq!(
@@ -50739,7 +50771,7 @@ fn j1_a_resumed_panes_replayed_delivery_latches_the_pointer_signal() {
 
     let raw2 = echo_raw();
     let pred = question_hold_predicate_sampled(
-        move || sample_from_raw(&raw2, 100, ECHO_ROWS),
+        move || sample_from_raw(&raw2, ECHO_COLS, ECHO_ROWS),
         None,
         None,
         Vec::new(),
@@ -50751,6 +50783,14 @@ fn j1_a_resumed_panes_replayed_delivery_latches_the_pointer_signal() {
 fn j2_the_session_record_of_our_own_prompt_releases_the_resumed_pane() {
     // The fix, and the whole of it: the ONLY difference from `j1` is that loomux
     // remembers having delivered this text into this session.
+    //
+    // **The ring still matches, and that is the design working rather than the
+    // fix falling short.** The mask cannot claim anything in the ring here — the
+    // ring is the whole screen concatenated into one line, so no row of it is a
+    // wrapped run of a recorded line — and it does not need to: #534's rule is
+    // that the ring TRIGGERS and only the grid may RELEASE. What the record
+    // changes is the grid's answer, from `StillRendered` to `IdlePrompt`, by
+    // removing from the composed screen the rows that were vetoing it.
     let record = echo_record();
     assert_eq!(
         record.len(),
@@ -50778,14 +50818,18 @@ fn j2_the_session_record_of_our_own_prompt_releases_the_resumed_pane() {
         "the whole wrapped run is claimed and only it — the chrome, the composer and the \
          footer all survive:\nBEFORE {visible:?}\nAFTER {masked:?}"
     );
-    assert!(
-        prompt_wait_match(&masked).is_none(),
-        "with our own row gone there is no question on this screen at all: {masked:?}"
+
+    let m = prompt_wait_match(&strip_ansi(&raw)).expect("the ring matches, exactly as in j1");
+    let c = Composed { masked: masked.as_str(), with_paste: masked.as_str() };
+    assert_eq!(
+        grid_evidence_for(&m, Some(c)),
+        GridEvidence::IdlePrompt,
+        "and THAT is the one transition this change makes: still-rendered -> idle-prompt"
     );
 
     let raw2 = echo_raw();
     let pred = question_hold_predicate_sampled(
-        move || sample_from_raw(&raw2, 100, ECHO_ROWS),
+        move || sample_from_raw(&raw2, ECHO_COLS, ECHO_ROWS),
         None,
         None,
         record.clone(),
@@ -50827,6 +50871,20 @@ fn j3_a_recorded_line_that_is_a_dialog_option_is_refused_under_a_question_row() 
     );
 }
 
+/// A finished turn whose prose satisfies the detector, with **no composer row of
+/// its own** (#871's tests).
+///
+/// The captured false-positive fixtures all end in an idle `❯`, which is what
+/// makes them false positives — and which would make every assertion below pass
+/// on the fixture's own composer rather than on the paste reading under test.
+/// This screen is built without one on purpose, so `idle_prompt_row_rendered` can
+/// only ever be true because of the row the test appends.
+fn prose_without_a_composer() -> String {
+    "⏺ Rebased and pushed. The reviewer's round-2 note asks: do you want to proceed\n  \
+     with the merge, or hold for the human? I have not, pending that call."
+        .to_string()
+}
+
 #[test]
 fn j4_a_collapsed_paste_is_still_our_own_text_at_the_pre_enter_checkpoint() {
     // #871's shape, and the one that turns a hold into a STRAND. The pre-paste
@@ -50836,30 +50894,36 @@ fn j4_a_collapsed_paste_is_still_our_own_text_at_the_pre_enter_checkpoint() {
     // otherwise unchanged screen, and the Enter is withheld from a visibly idle
     // pane. The audit recorded exactly that flip: `idle_row:true` at the drainer
     // gate, `idle_row:false` at `stage:"pre-enter"`.
-    //
-    // A TOKEN-signal false positive, deliberately: this test is about the paste
-    // reading, so the screen must not also carry the pointer signal `j1` covers.
     let brief = "Rebase onto main and re-read the findings.\nThen report when CI is green.";
-    let transcript = FIX_FP_RESUMED_VERDICT.replace("\r\n", "\n");
+    let transcript = prose_without_a_composer();
 
-    // Precondition: this screen's ring matches, and NOT on a pointer.
+    // Precondition: this screen's ring matches, and NOT on a pointer — this test
+    // is about the paste reading, so the screen must not also carry `j1`'s signal.
     let m = prompt_wait_match(&strip_ansi(transcript.as_bytes()))
-        .expect("precondition: the resumed-verdict screen is a live false positive");
+        .expect("precondition: question-shaped prose the detector fires on");
     assert_ne!(
         m.needle,
         QuestionNeedle::LeadingPointer,
         "precondition: by a TOKEN signal, so this test isolates the paste reading"
     );
 
-    // Control: the CLI echoed our brief literally. That path has always worked,
+    let compose = |composer: &str, pasted: Option<&str>| {
+        let raw = pty_bytes_903(&format!("{transcript}\n{composer}"));
+        let with_paste =
+            loomux_lib::orchestration::termgrid::render_visible(&raw, ECHO_COLS, ECHO_ROWS);
+        let masked = match pasted {
+            Some(p) => mask_own_paste(&with_paste, p),
+            None => with_paste.clone(),
+        };
+        (with_paste, masked)
+    };
+
+    // Control 1: the CLI echoed our brief literally. That path has always worked,
     // and it fixes what "recognised" means here.
-    let echoed = format!(
-        "{transcript}\n❯ Rebase onto main and re-read the findings.\n❯ Then report when CI is green."
+    let (echoed_vis, echoed_masked) = compose(
+        "❯ Rebase onto main and re-read the findings.\n❯ Then report when CI is green.",
+        Some(brief),
     );
-    let echoed_raw = pty_bytes_903(&echoed);
-    let echoed_vis =
-        loomux_lib::orchestration::termgrid::render_visible(&echoed_raw, 100, ECHO_ROWS);
-    let echoed_masked = mask_own_paste(&echoed_vis, brief);
     assert!(
         idle_prompt_row_rendered(Composed {
             masked: echoed_masked.as_str(),
@@ -50868,11 +50932,20 @@ fn j4_a_collapsed_paste_is_still_our_own_text_at_the_pre_enter_checkpoint() {
         "control: a literally-echoed paste is recognised as ours"
     );
 
-    // The case: the CLI collapsed it instead.
-    let collapsed = format!("{transcript}\n❯ [Pasted text #1 +6 lines]");
-    let raw = pty_bytes_903(&collapsed);
-    let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, ECHO_ROWS);
-    let masked = mask_own_paste(&with_paste, brief);
+    // Control 2: an ORDINARY composer row that is neither empty nor ours reads
+    // false — so the assertion below is about the placeholder and not about the
+    // screen simply having a chevron on it.
+    let (other_vis, other_masked) = compose("❯ something the human typed", Some(brief));
+    assert!(
+        !idle_prompt_row_rendered(Composed {
+            masked: other_masked.as_str(),
+            with_paste: other_vis.as_str()
+        }),
+        "control: a composer holding somebody else's text is not evidence of ours"
+    );
+
+    // The case: the CLI collapsed our paste instead of echoing it.
+    let (with_paste, masked) = compose("❯ [Pasted text #1 +6 lines]", Some(brief));
     let c = Composed { masked: masked.as_str(), with_paste: with_paste.as_str() };
     assert!(
         idle_prompt_row_rendered(c),
@@ -50884,9 +50957,9 @@ fn j4_a_collapsed_paste_is_still_our_own_text_at_the_pre_enter_checkpoint() {
         "…and with no menu structure on this screen that is a release, so the Enter goes"
     );
 
-    let raw2 = pty_bytes_903(&collapsed);
+    let raw2 = pty_bytes_903(&format!("{transcript}\n❯ [Pasted text #1 +6 lines]"));
     let pred = question_hold_predicate_sampled(
-        move || sample_from_raw(&raw2, 100, ECHO_ROWS),
+        move || sample_from_raw(&raw2, ECHO_COLS, ECHO_ROWS),
         Some(brief.to_string()),
         None,
         Vec::new(),
@@ -50900,10 +50973,10 @@ fn j5_a_placeholder_with_no_matching_delivery_is_not_ours() {
     // delivery could have produced it, so a pane that merely has one on screen —
     // a replayed transcript of an older turn, or an agent that printed the string
     // itself — buys nothing.
-    let transcript = FIX_FP_RESUMED_VERDICT.replace("\r\n", "\n");
-    let screen = format!("{transcript}\n❯ [Pasted text #1 +6 lines]");
+    let screen = format!("{}\n❯ [Pasted text #1 +6 lines]", prose_without_a_composer());
     let raw = pty_bytes_903(&screen);
-    let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, ECHO_ROWS);
+    let with_paste =
+        loomux_lib::orchestration::termgrid::render_visible(&raw, ECHO_COLS, ECHO_ROWS);
 
     for (name, pasted) in [
         ("no paste at this checkpoint", None),
@@ -50993,11 +51066,11 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
 
 #[test]
 fn j8_a_replayed_notice_row_is_still_a_notice_under_a_chevron() {
-    // The complement of `j2`, and the other half of the resume class. The
-    // session record deliberately excludes marker-led lines (`j6`), so a NOTICE
-    // loomux delivered and the CLI replayed is not covered by it — it is covered
-    // by the marker rule, which stopped recognising its own marker the moment a
-    // resumed CLI painted a `❯` in front of the row. Fifteen of the thirty-nine
+    // The complement of `j2`, and the other half of the resume class. The session
+    // record deliberately excludes marker-led lines (`j6`), so a NOTICE loomux
+    // delivered and the CLI replayed is not covered by it — it is covered by the
+    // marker rule, which stopped recognising its own marker the moment a resumed
+    // CLI painted a `❯` in front of the row. Fifteen of the thirty-nine
     // `pointer-option` holds in the group's audit log are exactly this shape.
     let notice = "[orrerix] pr #1408 checks: success — 5 of 6 checks passed (1 skipped)";
 
