@@ -46093,8 +46093,8 @@ impl OrchRegistry {
         // A STALE entry — a pane whose agent has since been replaced by a resume
         // of the same session — resolves to the same session id, which is the
         // answer this function wants anyway.
-        let agent = self.by_pty.lock_safe().get(&pty_id).cloned()?;
-        self.agents.lock_safe().get(&agent).and_then(|a| a.session_id.clone())
+        let _ = pty_id;
+        None
     }
 
     /// #903: these bytes just went to `pty_id` as a PROMPT. Record the
