@@ -6536,6 +6536,12 @@ addressed by it.
 
 ## #576 residual: masking on what loomux WROTE, not on what a row claims
 
+> **Continued in `doc/design/question-gate-authorship.md`.** #903 added a SECOND record — the
+> prompt bodies loomux delivered into a CLI **session**, which is what a resumed pane's replayed
+> transcript is made of — and put every record claim behind `dialog_header_above`. That note carries
+> both records side by side, the attack shape each admits or refuses, and why the widening was taken
+> for prompt text and refused for notice text.
+
 **Problem.** The two under-masks above have one shape: the marker rule can only ask *"does this row
 look like a notice"*, and exactly one row of a wrapped notice does. The continuation rows carry the
 detector's tokens (`do you want to run`, `(y/n)` — structured signals, honored across the last
@@ -7229,6 +7235,11 @@ rest of the floor, the latter because `deframe` is now shared across both gates.
 
 ## #903: question-SHAPED text is not a question, and a hold owes a bound it can reach
 
+> **The resumed-pane half of #903 is in `doc/design/question-gate-authorship.md`.** The narrowings
+> below are about text that merely *reads* like a question. They do not reach the case where the
+> question-shaped row is one loomux itself delivered and the CLI replayed — which is what the live
+> beta3 recurrences were, and what `h4` proves cannot be told apart by shape.
+
 **Problem.** Deliveries were parked behind *"an interactive question is on screen"* on panes where
 nobody was being asked anything. Three resumed reviewer panes — all resumes of one session, and it
 reproduced on demand — then the **orchestrator's own** pane: 30+ minutes, four deliveries, ending
@@ -7451,12 +7462,27 @@ directions are not remotely equal in cost, and (rev-427 B2) that the *order* of 
 matters, because the earlier version of this section led with dedup and dedup does not cover the
 expensive failure.
 
+> **Superseded in part by #903 (B2).** The paragraph below describes the pre-Enter gate as one the
+> override does **not** skip. That was true when it was written and is no longer: an attempt the
+> drainer granted an override to now carries that grant to its Enter, re-proved on a fresh sample at
+> the override's own weak-idleness standard (`preenter_override_admits`). The reason, and the
+> residual it leaves, are in `doc/design/question-gate-authorship.md`; the short version is that the
+> grant's own precondition guarantees this checkpoint reaches the same false positive, so leaving it
+> unoverridden did not withhold an Enter from a dialog — it stranded a paste on a pane that had no
+> dialog, which every later delivery then queued behind. What is written below still describes the
+> ORDER of the defences correctly for every delivery that was not granted an override, which is all
+> of them but the fifteen-minute case.
+
 **The expensive failure is not a stray paste — it is a stray Enter.** A delivery into a live dialog
 does not merge text; the Enter *selects* whatever is highlighted, and no dedup rule can undo a
-selected option. What stops that is `deliver_now`'s **pre-Enter** `wait_for_question_clear`, which
-the override does **not** skip: it runs against the screen masked with this delivery's own paste,
-and on a genuinely live dialog it holds, caps, and returns `AbortedPreEnter` with the Enter
-withheld. The human then finds the brief sitting in the box — untidy, and recoverable.
+selected option. What stops that is `deliver_now`'s **pre-Enter** `wait_for_question_clear`. For every
+delivery that was NOT granted an override it runs unskipped: against the screen masked with this
+delivery's own paste, and on a genuinely live dialog it holds, caps, and returns `AbortedPreEnter`
+with the Enter withheld. The human then finds the brief sitting in the box — untidy, and
+recoverable. **For a delivery that WAS granted one, #903 lets the grant carry to the Enter**
+(`override_enter_admits`), re-proved on fresh re-reads at the override's own weak-idleness
+standard — see `doc/design/question-gate-authorship.md` for why leaving it unoverridden withheld
+no Enter from any dialog and instead stranded a paste on a pane that had none.
 
 That defence is only real because of rev-427 B1's fix. Before it, the pre-Enter reading could not
 see a composer holding our own paste (the mask deletes the row), so it answered `StillRendered` for
@@ -7489,13 +7515,17 @@ absolute is untouched — a human's own typed line is never overridden, at any a
   it so it is a known limit rather than a surprise. The badge (#532) is still the channel for it.
 - **A CLI whose empty box is a *placeholder* (`❯ Try "fix the build"`)** does not read as idle —
   #727's residual, unchanged, and the same answer applies: a narrower signal, not a wider mask.
-- **The override can paste into a live menu; it cannot press Enter into one.** Layer 3's term has no
+- **The override can paste into a live menu, and since #903 (B2) it can press Enter into one.**
+  Layer 3's term has no
   menu-absent conjunct (see the section above for why the strong reading would make it dead code),
   so a CLI that paints a dialog *above* a live composer would satisfy it. What that costs is bounded
-  by the pre-Enter checkpoint, which is not overridden and which `h8` pins in both directions — not
-  by the idleness reading. Stated as a limit rather than left in the safety argument's shadow,
-  because a reader deciding whether to widen the override needs to know which gate is actually
-  holding the line.
+  by the pre-Enter checkpoint — which `h8` pins in both directions, and which #903 lets a GRANTED
+  override carry through on the same weak-idleness standard rather than abort against. So for an
+  overridden delivery the bound is that standard, re-proved on fresh reads, and not a second
+  unconditional gate; the residual that leaves is named in
+  `doc/design/question-gate-authorship.md`. Stated as a limit rather than left in the safety
+  argument's shadow, because a reader deciding whether to widen the override needs to know which
+  gate is actually holding the line.
 - **The idleness reading is inferred from authorship, not observed.** "The composer is on screen
   holding only our own text" is inferred from the paste mask having claimed a row in the tail window.
   A CLI that echoed our text somewhere *other* than its composer — a transcript echo low on the

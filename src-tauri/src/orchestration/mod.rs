@@ -12597,6 +12597,15 @@ pub struct OrchRegistry {
     /// (`record_delivered_text`) is called from inside `deliver_now`'s paste
     /// loop, which already holds the per-pane delivery lock.
     delivered_notices: Arc<Mutex<HashMap<u32, DeliveredNotices>>>,
+    /// #903: prompt bodies loomux has delivered, keyed by the agent's CLI
+    /// SESSION rather than by pane — see [`DeliveredPrompts`] for why the
+    /// keying is the fix and not an optimisation.
+    ///
+    /// **Lock order: `agents` is taken and RELEASED before this one.** Resolving
+    /// a pty to its session reads `agents`; nothing here holds this map while
+    /// reaching for that one, which is the same order
+    /// [`OrchRegistry::mark_notice_maskable`] already uses.
+    delivered_prompts: Arc<Mutex<HashMap<String, DeliveredPrompts>>>,
     /// Per-pane FIFO delivery queue (#445): a hold-cap expiry in
     /// `deliver_now` enqueues here instead of destroying the payload. `Arc`
     /// for the same reason `last_delivery` is — the drainer thread
@@ -20019,6 +20028,25 @@ fn deliver_now(
     // admitted the write, the same reason `wait_for_question_clear` returns its
     // witness rather than letting the abort site re-read.
     question_overridden: bool,
+    // #903 B1' — what this delivery may contribute to the session prompt
+    // record, decided by the CALLER and paired with the kind each piece was
+    // admitted under.
+    //
+    // Not `(pasted_text, one kind)`, because a paste is not always one
+    // delivery. A coalesced flush is loomux's FRAMING wrapped around N
+    // constituent payloads (#533-A), and a lone delivery can carry a flush
+    // header on its front too — so the bytes pasted are a mixture whose parts
+    // have different authors and, in the flush case, different `Delivery`
+    // kinds. Asking the record to infer that split from the text would be a
+    // second spelling of #632's rule; the caller already knows it exactly,
+    // which is why `unmaskable_framing_rows` takes the payloads rather than
+    // deriving them.
+    //
+    // Each pair is admitted on its OWN merits — both #903 B1 terms run per
+    // contribution — so a re-grounding notice riding in a batch is refused by
+    // its kind and a `resume_kickoff_notice` by its marker-led first line, no
+    // matter what it is flushed alongside.
+    record_contributions: Vec<(String, Delivery)>,
 ) -> DeliverOutcome {
     // ⚠ #561 — READ THIS BEFORE ADDING A STAGE BELOW.
     //
@@ -20449,6 +20477,13 @@ fn deliver_now(
         // de-duplicates a repeated line so a retype costs it nothing.
         if let Some(r) = &reg {
             r.record_delivered_text(pty_id, &pasted_text);
+            // #903: and the SESSION-scoped prompt record beside it, from the
+            // same bytes and at the same instant. Separate call rather than a
+            // widening of the one above because the two records admit different
+            // things for different reasons — see `delivered_prompt_lines`.
+            for (text, kind) in &record_contributions {
+                r.record_delivered_prompt(pty_id, text, *kind);
+            }
         }
         let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
         while std::time::Instant::now() < echo_deadline {
@@ -20556,23 +20591,65 @@ fn deliver_now(
         }
         PasteDecision::Paste { .. } => {}
         PasteDecision::Abort { held_ms } => {
-            append_audit(&root, &group, brand::AUDIT_ACTOR, "delivery-aborted-question", json!({
-                "to": agent, "stage": "pre-enter", "held_ms": held_ms,
-                "matched": witness_audit(question_seen_preenter.as_ref()),
-            }));
-            // #420 rev-15 B3: unlike the pre-paste abort, the text IS
-            // already pasted at this point — only the Enter was
-            // withheld. It's sitting unsubmitted in the box, exactly
-            // the shape the stranded-text flush (#81/#84) exists to
-            // clear on the NEXT delivery — but only if that delivery
-            // can see it. Recording nothing here would leave
-            // `last_delivery` holding whatever outcome (or none) an
-            // EARLIER delivery left, so the next delivery's flush
-            // could wrongly conclude nothing needs clearing and
-            // append its own paste onto this one's abandoned text.
-            record_aborted_preenter_outcome(
-                &last_delivery, pty_id, delivery_from, Some(pasted_text.clone()));
-            return DeliverOutcome::AbortedPreEnter(queue::EnqueueReason::Question);
+            // #903 B2: an attempt the drainer GRANTED an override to carries
+            // that grant to its Enter, re-proved here on a FRESH read.
+            //
+            // **Why this arm existed as a dead end.** The grant's own
+            // precondition is that the question gate has been reading a false
+            // positive for fifteen minutes on a pane whose screen never changes.
+            // Nothing about pasting into it changes that, so this checkpoint
+            // re-reads the same screen, gets the same false positive by
+            // construction, and aborts with the text already in the box. The
+            // override therefore converted a bounded hold into an unrecoverable
+            // wedge — a stranded paste every later delivery queues behind, which
+            // is strictly worse than never having overridden at all. That is what
+            // the live incident did, twice, before the pane was killed by hand.
+            //
+            // **What it is re-proved on, and what it is NOT.** The override's own
+            // standard: the WEAK idleness reading
+            // ([`idle_prompt_row_rendered`]), on a fresh sample, twice —
+            // never a flag the drainer set minutes ago. The strong reading is not
+            // used here for the reason [`QUESTION_HOLD_OVERRIDE_AFTER`] gives for
+            // the grant itself: on the pane this exists for, the strong reading is
+            // exactly the thing that is wrong, so requiring it would make this
+            // code unreachable. The residual that leaves — a dialog painted above
+            // a composer holding our paste, showing no token evidence, inside the
+            // override window — is argued in
+            // `doc/design/question-gate-authorship.md`; `h13`'s dialog is caught
+            // by the menu-structure TOKEN clause and is not in it.
+            if question_overridden
+                && preenter_override_admits(
+                    &ptys,
+                    pty_id,
+                    &pasted_text,
+                    delivered_lines(&reg, pty_id),
+                )
+            {
+                append_audit(&root, &group, brand::AUDIT_ACTOR, "delivery-question-override-enter", json!({
+                    "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                    "matched": witness_audit(question_seen_preenter.as_ref()),
+                    "reads": QUESTION_OVERRIDE_CONSECUTIVE_READS,
+                    "reason": "granted a question override; the composer still holds this paste",
+                }));
+            } else {
+                append_audit(&root, &group, brand::AUDIT_ACTOR, "delivery-aborted-question", json!({
+                    "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                    "matched": witness_audit(question_seen_preenter.as_ref()),
+                }));
+                // #420 rev-15 B3: unlike the pre-paste abort, the text IS
+                // already pasted at this point — only the Enter was
+                // withheld. It's sitting unsubmitted in the box, exactly
+                // the shape the stranded-text flush (#81/#84) exists to
+                // clear on the NEXT delivery — but only if that delivery
+                // can see it. Recording nothing here would leave
+                // `last_delivery` holding whatever outcome (or none) an
+                // EARLIER delivery left, so the next delivery's flush
+                // could wrongly conclude nothing needs clearing and
+                // append its own paste onto this one's abandoned text.
+                record_aborted_preenter_outcome(
+                    &last_delivery, pty_id, delivery_from, Some(pasted_text.clone()));
+                return DeliverOutcome::AbortedPreEnter(queue::EnqueueReason::Question);
+            }
         }
     }
     // #532: the LAST gate before the Enter, and the one that was missing.
@@ -21885,7 +21962,7 @@ fn run_queue_drainer(
             // audit has to say what it keyed on — see
             // `question_active_witnessed`.
             let reading =
-                question_active_witnessed(&ptys, pty_id, None, reg.delivered_notice_lines(pty_id));
+                question_active_witnessed(&ptys, pty_id, None, reg.delivered_mask_lines(pty_id));
             let question_seen = reading.witnessed;
             let admission = write_admission(box_pending, reading.active);
             // #903: the streak the last-resort override keys on. Counted here,
@@ -21964,9 +22041,14 @@ fn run_queue_drainer(
             // keeps showing an empty input prompt is not a question — it is the
             // detector being wrong about a pane nobody is being asked anything
             // by, and the human has already been badged about it for five
-            // minutes (`QUESTION_HOLD_STALE_AFTER`). Paste — and only paste: the
-            // pre-Enter checkpoint below is not overridden, so a genuinely live
-            // dialog still gets the Enter withheld.
+            // minutes (`QUESTION_HOLD_STALE_AFTER`). Paste — and, since this
+            // grant now CARRIES to the Enter, deliver: the pre-Enter checkpoint
+            // re-proves the pane on fresh reads at this same weak-idleness
+            // standard (`override_enter_admits`) rather than aborting against a
+            // reading the grant exists because loomux has stopped believing. It
+            // was the abort that stranded the paste and wedged the queue behind
+            // it; the residual that carrying leaves is named in
+            // `doc/design/question-gate-authorship.md`.
             //
             // The chip is NOT lowered here: the pane is still held as far as
             // every gate is concerned, and a successful delivery lowers it below
@@ -22061,6 +22143,9 @@ fn run_queue_drainer(
                 // and came back for the next entry on the following pass,
                 // which cost the receiving agent one full turn per queued
                 // delivery.
+                // #903 B1': what the prompt record may take from this paste —
+                // the entries' own texts, never the framed string built below.
+                let record_contributions = record_contributions_for(&batch);
                 let payload = if batch.len() > 1 {
                     let items: Vec<queue::FlushConstituent> = batch
                         .iter()
@@ -22146,6 +22231,7 @@ fn run_queue_drainer(
                     reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
                     fresh_kickoff.then(|| text.clone()),
                     question_overridden,
+                    record_contributions,
                 );
                 if matches!(out, DeliverOutcome::Done) {
                     header_pending = false;
@@ -22157,7 +22243,7 @@ fn run_queue_drainer(
                 let submit = submit_sequence(&cli);
                 match drain_stranded_submit(
                     &ptys, &reg.last_delivery, front.from.clone(), pty_id, submit,
-                    reg.delivered_notice_lines(pty_id),
+                    reg.delivered_mask_lines(pty_id),
                 ) {
                     StrandedMarkerAction::Press => DeliverOutcome::Done,
                     StrandedMarkerAction::Retire(why) => DeliverOutcome::Retired(why),
@@ -22932,6 +23018,43 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
                 }
             }
         }
+        // #871/#903: the CLI COLLAPSED this paste rather than echoing it, so
+        // there is no row here that IS our text and every reading above has
+        // nothing to match. Claude Code replaces a multi-line paste with a
+        // placeholder of its own (`[Pasted text #1 +6 lines]` on the live
+        // incident), and this file already knows that happens — the Tier 1
+        // precondition declines to govern for exactly this reason. The composer
+        // reading never learned it, which is why `idle_row` flips true to FALSE
+        // between the pre-paste checkpoint and the pre-Enter one on an unchanged
+        // screen, and the Enter is then withheld from a pane that is visibly
+        // idle: the delivery aborts with the paste stranded in the box, and every
+        // later delivery queues behind it.
+        //
+        // **The evidence this claims on is the CLI's, not a shape we invented.**
+        // A pane that echoed our bytes into a free-text composer is a pane that
+        // was not showing a modal — a dialog does not take a paste and render a
+        // placeholder for it. What the row proves is authorship, which is all
+        // this mask ever claims.
+        //
+        // **Two terms, both narrowing.** The paste must be MULTI-LINE, because a
+        // single line is not one a CLI collapses, so a placeholder beside one is
+        // not ours (a long single-line paste that some CLI collapses anyway is a
+        // stated residual: it fails to match and the gate holds). And no dialog
+        // question row may head the block above, the same term every record
+        // claim now carries.
+        //
+        // Deliberately NOT keyed on the placeholder's `+N lines` count: the
+        // exact text is the CLI's to change and this repo has no citable
+        // specification of its arithmetic, so pinning one would be a guess
+        // dressed as a check. The shape plus the multi-line term is what is
+        // actually known.
+        if claimed.is_none()
+            && pasted.len() > 1
+            && collapsed_paste_row(rows[i])
+            && !dialog_header_above(&rows, &norm, &keep, i)
+        {
+            claimed = Some(i + 1);
+        }
         match claimed {
             Some(end) => {
                 keep[i..end].fill(false);
@@ -22956,6 +23079,28 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
 fn strip_leading_pointer(line: &str) -> Option<&str> {
     let d = deframe(line);
     POINTER_GLYPHS.iter().find_map(|g| d.strip_prefix(*g))
+}
+/// Is this rendered row a CLI's own placeholder for a paste it COLLAPSED
+/// instead of echoing (#871/#903)?
+///
+/// Shape only, and loosely: a bracketed row that names a pasted text. The
+/// bracket pair is what keeps it from matching prose — a CLI's placeholder is a
+/// self-contained token on the composer's line, not a clause inside a sentence
+/// — and the wording is matched case-insensitively and without reading the
+/// `#N`/`+M lines` parts, because those are the CLI's to change and there is no
+/// citable specification of them to pin. See the call site in
+/// [`mask_own_paste`] for the terms that do the narrowing; this predicate is
+/// deliberately not one of them.
+///
+/// A leading pointer glyph is stripped first: Claude Code's composer paints
+/// `❯ [Pasted text #1 +6 lines]`, and it is that whole row — chevron included —
+/// that must stop being read as a pointer at a menu option.
+fn collapsed_paste_row(row: &str) -> bool {
+    let inner = strip_leading_pointer(row).unwrap_or_else(|| deframe(row));
+    let inner = inner.trim().trim_end_matches(is_frame_char);
+    inner.starts_with('[')
+        && inner.ends_with(']')
+        && inner.to_lowercase().contains("pasted text")
 }
 
 /// How long a pasted line must be before [`mask_own_paste`] will claim a row
@@ -23075,11 +23220,25 @@ fn dialog_header_above(rows: &[&str], norm: &[String], keep: &[bool], from: usiz
     let mut j = from;
     while j > 0 {
         j -= 1;
-        if !keep[j] {
-            continue;
-        }
+        // #903 B2: the header test runs BEFORE the `keep` check, and the order is
+        // the whole finding. Testing `keep` first let a claimed row be stepped
+        // over — so two recorded lines were enough to walk this scan past the
+        // very question row it vetoes on: claim the dialog's question row with
+        // the first, and the second's option row then reads as having no header
+        // above it, masks, and the gate releases an Enter into a live dialog.
+        //
+        // "Is a dialog's question row above this one" is a fact about the
+        // SCREEN, and consulting the mask to answer it let the mask decide its
+        // own bound. A header now vetoes whether or not its row was claimed,
+        // which is a term the record cannot buy at any number of claims.
         if is_dialog_header(&norm[j]) {
             return true;
+        }
+        // Claimed NON-header rows are still stepped over, unchanged: a loomux
+        // notice interleaved above an option block must not end the scan, which
+        // is what this clause was for before it was asked to do more.
+        if !keep[j] {
+            continue;
         }
         if option_block_row(rows[j]) {
             continue;
@@ -23252,6 +23411,38 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 /// pane. See the residual note at the bottom for the review finding that
 /// established this.
 ///
+/// **#903 widened what `delivered` may contain, and narrowed what a claim
+/// costs.** It now also carries the PROMPT bodies loomux delivered into this
+/// pane's CLI **session** ([`DeliveredPrompts`], unioned in by
+/// [`OrchRegistry::delivered_mask_lines`]), because the rows this mask could
+/// not claim on a resumed pane were loomux's own previous deliveries replayed
+/// by the CLI — not notices at all. Two things keep the widening from being a
+/// weakening:
+///
+/// - **Admission is by provenance and excludes notice text.**
+///   [`delivered_prompt_lines`] drops every marker-led line, so the one-party
+///   route [`OrchRegistry::mark_notice_maskable`] documents — an agent putting a
+///   line of its own choosing into its own pane's record via
+///   `notify_when(note:)` — stays exactly as closed as it is today. What is
+///   admitted is a kickoff brief or an orchestrator's `send_prompt` body, and no
+///   agent can address one of those to itself — and that is now ENFORCED rather
+///   than observed: `send_prompt` refuses `a.id == caller.agent_id` outright
+///   ("cannot send a prompt to yourself"), and a kickoff's target is an agent
+///   `spawn_agent` has just created, which the caller cannot be. The two routes
+///   that DID let an agent reach its own pane — the post-compact re-grounding
+///   notice and `resume_kickoff_notice`, both of which paste the agent's own
+///   directive ledger — are refused by [`prompt_record_admits_kind`] and by
+///   [`delivered_prompt_lines`]'s first-line rule respectively.
+/// - **Every record claim now owes `dialog_header_above`**, not only the
+///   pointer-stripped ones. That is a strictly smaller set of claims than the
+///   pre-#903 rule made, so the widening cannot reach a row the old rule would
+///   have refused.
+///
+/// The residual that remains — an orchestrator delivering rows that coincide
+/// with a real dialog's, a dialog with no question row of its own, a header
+/// whose text the same party controls — is argued in
+/// `doc/design/question-gate-authorship.md` and is bounded, not closed.
+///
 /// **Two rules, both anchored in the record:**
 ///
 /// - *A wrapped notice (`R-wrap`).* A run of rows starting at a row that is the
@@ -23327,7 +23518,7 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 /// mismatch, any missing tail, any unmarked line, any lost record ends the run.
 pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> String {
     let rows: Vec<&str> = tail.lines().collect();
-    let norm: Vec<String> = rows.iter().map(|r| wrap_normalize(deframe(r))).collect();
+    let mut norm: Vec<String> = rows.iter().map(|r| wrap_normalize(deframe(r))).collect();
     let recorded: Vec<String> = delivered.iter().map(|d| wrap_normalize(d)).collect();
     let first_row = norm.iter().position(|n| !n.is_empty());
     let mut keep = vec![true; rows.len()];
@@ -23337,28 +23528,91 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
             i += 1;
             continue;
         }
-        // The marker rule, unchanged and unconditional: one row, no record
-        // needed. Everything below only ever claims MORE rows, never this one
-        // differently.
-        if leads_with_notice_marker(rows[i]) {
+        // The marker rule: one row, no record needed. Everything below only ever
+        // claims MORE rows, never this one differently.
+        //
+        // #903 reads it through a leading POINTER glyph as well, and the reason is
+        // the same replay that made the session record necessary. A resumed CLI
+        // renders a replayed user turn with a `❯` in front of it, and `deframe`
+        // does not treat a pointer as framing — so a notice loomux delivered and
+        // the CLI replayed comes back as `❯ [orrerix] …` and the marker rule
+        // stops seeing its own marker. Fifteen of the thirty-nine
+        // `pointer-option` holds in the group's audit log were marker-led notices
+        // wearing exactly that chevron.
+        //
+        // It claims no more than the marker rule already claims: ONE row, the one
+        // the marker leads. The #420 objection to widening this — that an agent
+        // can print a marker row itself, so a RUN-mask hands a pane the power to
+        // delete the rows beneath an attacker-chosen row — is untouched, because
+        // a pane that can print `[orrerix] …` can already print it and get that
+        // single row claimed. Adding a chevron in front of it buys the pane
+        // nothing it did not have.
+        if leads_with_notice_marker(rows[i])
+            || strip_leading_pointer(rows[i]).is_some_and(leads_with_notice_marker)
+        {
             keep[i] = false;
         }
-        let claimed = recorded.iter().find_map(|line| {
-            reconstructs_to_end(&norm, i, line, 0).or_else(|| {
-                // `R-top`: a mid-line anchor, allowed at the first non-empty
-                // row of the reading and nowhere else. `at > 0` because offset
-                // zero is `R-wrap` above — a headless run is by definition
-                // missing something.
-                (first_row == Some(i) && norm[i].chars().count() >= R_TOP_MIN_ANCHOR_CHARS)
-                    .then(|| {
-                        line.match_indices(norm[i].as_str())
-                            .find_map(|(at, _)| {
-                                (at > 0).then(|| reconstructs_to_end(&norm, i, line, at)).flatten()
-                            })
-                    })
-                    .flatten()
-            })
-        });
+        let mut claimed = record_claim(&norm, &recorded, first_row, i);
+        if claimed.is_none() {
+            // #903: the same POINTER-stripped second reading `mask_own_paste`
+            // has, and here for a reason that is not symmetry. A resumed CLI
+            // renders a replayed USER turn with a leading `❯`, so the row that
+            // starts a recorded prompt on a resumed pane's screen is the
+            // recorded line with a chevron in front of it and matches nothing.
+            // That row is the one this whole record exists to claim.
+            //
+            // Only the anchor row is re-read: a wrap run's continuations carry
+            // no chevron, so stripping one off them would be inventing evidence.
+            // And only lines that clear [`SELF_ECHO_MIN_POINTER_CHARS`] may
+            // claim on the strength of a stripped pointer, for that constant's
+            // own reason — `❯ Yes` is byte-identical whether it is a replayed
+            // one-word turn of ours or a live dialog's highlighted choice.
+            if let Some(head) = strip_leading_pointer(rows[i]).map(wrap_normalize) {
+                if !head.is_empty() {
+                    let long: Vec<String> = recorded
+                        .iter()
+                        .filter(|l| l.chars().count() >= SELF_ECHO_MIN_POINTER_CHARS)
+                        .cloned()
+                        .collect();
+                    let framed = std::mem::replace(&mut norm[i], head);
+                    claimed = record_claim(&norm, &long, first_row, i);
+                    if claimed.is_none() {
+                        norm[i] = framed;
+                    }
+                }
+            }
+        }
+        // #903: a record claim is REFUSED when a live dialog's own question row
+        // heads the block above the anchor.
+        //
+        // This narrows every record claim, not only the pointer-stripped ones,
+        // and the uniformity is deliberate: one rule for the whole record path
+        // means "which record did this line come from" is never something the
+        // mask has to get right per row. It can only ever refuse a claim the
+        // pre-#903 rule would have made — the fail-CLOSED direction, which costs
+        // a hold the ten-minute `QuestionStale` badge already reports.
+        //
+        // It is also the term the widened record is bounded by. A recorded line
+        // that happens to coincide with a dialog's rows cannot delete them out
+        // from under the detector while the dialog's own question row is still
+        // above them; `dialog_header_above` is the same shape-tracking scan
+        // `mask_own_paste` uses for its short-pointer case. What it does NOT
+        // bound is stated in `doc/design/question-gate-authorship.md`: a dialog
+        // with no question row of its own, and a header whose text the same
+        // party controls.
+        if claimed.is_some() && dialog_header_above(&rows, &norm, &keep, i) {
+            claimed = None;
+            // N3: put the row back the way the pointer-stripped attempt found
+            // it. That attempt rewrites `norm[i]` in place and only restores it
+            // on ITS own miss, so a claim it made and this veto then nulled left
+            // the stripped form behind for every later reader of `norm` — the
+            // upward scans above included. It was inert only by coincidence
+            // before B2; now that those scans test `is_dialog_header(&norm[j])`
+            // on rows regardless of `keep`, a row left stripped of its leading
+            // glyph is a row this function reads differently than the screen
+            // shows it.
+            norm[i] = wrap_normalize(deframe(rows[i]));
+        }
         match claimed {
             Some(end) => {
                 keep[i..end].fill(false);
@@ -23372,6 +23626,36 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
         .filter_map(|(r, k)| k.then_some(*r))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// One record-anchored claim attempt at row `i`: `R-wrap` first, then `R-top`.
+///
+/// Extracted from [`mask_loomux_notices_with_record`] (#903) so the row can be
+/// re-read with its leading pointer glyph stripped without the two rules being
+/// written out twice — a second spelling of `R-top`'s floor or of
+/// reconstruct-to-end is exactly the drift this file's guards keep finding.
+fn record_claim(
+    norm: &[String],
+    recorded: &[String],
+    first_row: Option<usize>,
+    i: usize,
+) -> Option<usize> {
+    recorded.iter().find_map(|line| {
+        reconstructs_to_end(norm, i, line, 0).or_else(|| {
+            // `R-top`: a mid-line anchor, allowed at the first non-empty
+            // row of the reading and nowhere else. `at > 0` because offset
+            // zero is `R-wrap` above — a headless run is by definition
+            // missing something.
+            (first_row == Some(i) && norm[i].chars().count() >= R_TOP_MIN_ANCHOR_CHARS)
+                .then(|| {
+                    line.match_indices(norm[i].as_str())
+                        .find_map(|(at, _)| {
+                            (at > 0).then(|| reconstructs_to_end(norm, i, line, at)).flatten()
+                        })
+                })
+                .flatten()
+        })
+    })
 }
 
 /// The lines of a delivery that [`mask_loomux_notices`] would claim — i.e. the
@@ -23407,6 +23691,137 @@ pub fn loomux_authored_lines(text: &str) -> Vec<String> {
         .map(|l| deframe(l).trim().chars().take(DELIVERED_NOTICE_CHARS).collect())
         .collect()
 }
+/// The lines of a delivery that are loomux-ORIGINATED **prompt** text — a
+/// kickoff brief or a `send_prompt` body — as opposed to a notice (#903).
+///
+/// The complement of [`loomux_authored_lines`], and the complement is the whole
+/// safety argument rather than a tidy split. A notice is text loomux *writes*,
+/// and the record of one is deliberately opt-in per producer, because
+/// `notify_when(kind, pr, note)` takes an agent-supplied `note` and delivers the
+/// fired notice into the **registering agent's own pane** — so admitting notice
+/// text by provenance alone would let one agent, with one tool call it makes
+/// itself, put a line of its choosing into its own pane's record, print that
+/// line's head, and have its CLI paint a dialog whose rows are that line's
+/// remainder. That is [`OrchRegistry::mark_notice_maskable`]'s documented
+/// one-party attack, and this filter is what keeps it closed: marker-led lines
+/// are excluded here and stay on the opt-in rule, unchanged.
+///
+/// What is left is text that reached a pane because loomux was asked to deliver
+/// a PROMPT there — a kickoff brief, or an orchestrator's `send_prompt` body
+/// (a coalesced flush's constituent payloads arrive here ONE AT A TIME, as
+/// their own prompt bodies — the drainer splits the framing off before calling,
+/// which is why this function never has to parse a flush apart; see
+/// `record_contributions` on [`deliver_now`], and #632 for the split it reuses).
+/// No agent can address one of those to itself — `send_prompt` refuses
+/// a caller that names its own id, and a kickoff goes to an agent that did not
+/// exist when the caller asked for it. `send_prompt` is the
+/// orchestrator's tool, so the residual this admits is chiefly an orchestrator
+/// writing into somebody else's pane — a party that already holds spawn and prompt
+/// powers over that pane. The design note argues that asymmetry at length; it is
+/// bounded, not closed.
+///
+/// Lines longer than [`DELIVERED_PROMPT_CHARS`] are DROPPED, never truncated —
+/// see that constant for why a prefix would be a claim whose meaning depends on
+/// the pane's width.
+pub fn delivered_prompt_lines(text: &str) -> Vec<String> {
+    // #903 B1 — TERM 1, and the finding that forced it. Filtering marker-led
+    // lines ONE AT A TIME is not the same rule as excluding notices: a loomux
+    // notice is one marker-led first line followed by a body that is not, so
+    // every continuation row of a multi-line notice was entering this record.
+    //
+    // That is a one-party hole, not a cosmetic one. `note_directive(text,
+    // replace: true)` writes the ledger RAW — no sanitize, no cap, no `[ts]`
+    // prefix, and it is self-scoped by construction — and both
+    // `compact_reinjection_notice` (via the self-callable `request_compact`) and
+    // `resume_kickoff_notice` paste that ledger VERBATIM into the SAME agent's
+    // pane, below their marker-led first line. So one agent, with two tool calls
+    // it makes itself, could put a line of its own choosing into its own
+    // session's record — exactly the capability
+    // [`OrchRegistry::mark_notice_maskable`] is default-closed to withhold.
+    //
+    // The rule is therefore about the authorship of the DELIVERY, not of each
+    // line: if loomux wrote the first non-empty line as a notice, loomux is
+    // relaying whatever follows rather than originating it. That generalises to
+    // every future embed, because a loomux notice is marker-led by producer
+    // convention (#624/#632 enforce it at the producer), where a content
+    // blocklist would need editing for each new one.
+    //
+    // Unforgeable in the direction that matters: this text is what loomux
+    // pasted, and an agent controls only the block BELOW that first line. An
+    // orchestrator prefixing its own `send_prompt` with the marker only
+    // downgrades its own masking, which is the safe direction.
+    if text.lines().find(|l| !l.trim().is_empty()).is_some_and(leads_with_notice_marker) {
+        return Vec::new();
+    }
+    text.lines()
+        .filter(|l| !leads_with_notice_marker(l))
+        .map(|l| deframe(l).trim())
+        .filter(|l| !l.is_empty() && l.chars().count() <= DELIVERED_PROMPT_CHARS)
+        .map(str::to_string)
+        .collect()
+}
+
+/// #903 B1': what a paste may contribute to the session prompt record.
+///
+/// One rule for both shapes, which is why it is three lines: the entries' OWN
+/// texts under their OWN kinds, never the string that was pasted. A coalesced
+/// flush pastes loomux's framing wrapped around N constituent payloads (#533-A),
+/// and even a lone delivery can carry a flush header on its front — so the bytes
+/// on the wire are a mixture whose parts have different authors and, in the flush
+/// case, different [`Delivery`] kinds. The queue still has them apart at this
+/// point; #632 already owns the framing/payload split
+/// ([`unmaskable_framing_rows`]), and nothing is gained by making the record
+/// re-derive it from a rendered string.
+///
+/// **Pure, and that is the point of extracting it** — the same argument
+/// [`override_enter_admits`] carries. Welded into the drainer this rule would
+/// need an `AppHandle` to exercise, so nothing in this repo could drive it, and
+/// the round that introduced it shipped a regression no test could see: term 1
+/// excluded the framed whole, which took the constituent payloads #903 needs
+/// masked out of the record with the header.
+///
+/// Each pair is still admitted on its own merits downstream — both #903 B1 terms
+/// run per contribution — so a re-grounding notice riding in a batch is refused
+/// by its kind and a `resume_kickoff_notice` by its marker-led first line,
+/// whatever they are flushed alongside.
+#[doc(hidden)] // pub for integration tests
+pub fn record_contributions_for(batch: &[queue::QueuedDelivery]) -> Vec<(String, Delivery)> {
+    batch
+        .iter()
+        .filter_map(|e| e.payload.text().map(|t| (t.to_string(), e.delivery_kind)))
+        .collect()
+}
+
+/// #903 B1 — TERM 2: may a delivery of this KIND contribute to the session
+/// prompt record at all?
+///
+/// Spelled as an exhaustive match with **no wildcard arm**, for the reason
+/// [`question_shown`] spells its `GridEvidence` reading the same way: a fifth
+/// [`Delivery`] variant added later must decide which side it is on at the
+/// compiler's insistence, instead of inheriting admission from a `_ => true`
+/// nobody re-reads.
+///
+/// - `FreshKickoff` / `ResumeKickoff` — the brief an orchestrator wrote for a
+///   spawn. `ResumeKickoff` in particular is the incident's OWN payload: the
+///   `[orch] Round 3 (cap) re-record…` that wedged `rev-1277` reached `rev-1262`
+///   on this kind, so refusing it would close the door by regressing #903.
+/// - `MidSession` — a `send_prompt` body, orchestrator-authored. The accepted
+///   two-party residual, argued in `doc/design/question-gate-authorship.md`.
+/// - `Regrounding` — REFUSED. Its entire payload is the post-compact notice
+///   whose body is the agent's own directive ledger.
+///
+/// This is the SECOND of two independent terms, and neither is redundant:
+/// `ResumeKickoff` carries both an orchestrator brief (admitted here) and, at
+/// the promoted-orchestrator call site, `resume_kickoff_notice`'s ledger embed —
+/// which only TERM 1 refuses. Kind alone would let that through; content alone
+/// would let a future non-marker-led embed through.
+#[doc(hidden)] // pub for integration tests
+pub fn prompt_record_admits_kind(kind: Delivery) -> bool {
+    match kind {
+        Delivery::FreshKickoff | Delivery::ResumeKickoff | Delivery::MidSession => true,
+        Delivery::Regrounding => false,
+    }
+}
 
 /// One pane's delivery record, or empty when there is no registry to ask.
 ///
@@ -23414,7 +23829,7 @@ pub fn loomux_authored_lines(text: &str) -> Vec<String> {
 /// registry at all; an absent record is the same legitimate "nothing known"
 /// an untouched pane has, and means the marker rule (#576).
 fn delivered_lines(reg: &Option<Arc<OrchRegistry>>, pty_id: u32) -> Vec<String> {
-    reg.as_ref().map(|r| r.delivered_notice_lines(pty_id)).unwrap_or_default()
+    reg.as_ref().map(|r| r.delivered_mask_lines(pty_id)).unwrap_or_default()
 }
 
 /// The evidence floor a MID-LINE anchor must clear (rev-163 N1).
@@ -23446,6 +23861,40 @@ pub const DELIVERED_NOTICE_CHARS: usize = 512;
 /// have already pushed past is long out of every reading that consults this.
 /// Drop-oldest, the `PendingIntake`/`OrchNoticeInbox::park` shape.
 pub const DELIVERED_NOTICES_PER_PANE: usize = 24;
+/// #903: how many characters of one delivered PROMPT line the session record
+/// below keeps.
+///
+/// Four times [`DELIVERED_NOTICE_CHARS`], and the figure is measured rather
+/// than picked: the live wedge this record exists for replayed an
+/// **853-character** orchestrator prompt as ONE logical line, and
+/// [`reconstructs_to_end`] can only claim a run that accounts for a recorded
+/// line *to its end*. A cap sized for a notice's one sentence would therefore
+/// record a prefix that reconstructs against nothing, and the gate would keep
+/// holding with the record looking populated.
+///
+/// A line LONGER than this is dropped rather than truncated. Recording a prefix
+/// would leave a line that can only ever be claimed by accident — a run whose
+/// rows happen to end exactly where the truncation did — so the record would
+/// carry entries whose meaning depends on a pane's width. Dropping degrades to
+/// the same cheap error every other loss here does: the gate holds.
+pub const DELIVERED_PROMPT_CHARS: usize = 2048;
+
+/// #903: prompt lines remembered per SESSION, drop-oldest.
+///
+/// A resumed CLI replays its transcript's tail, so what can be on a resumed
+/// pane's screen is the last few user turns — not the session's whole history.
+/// Sixteen covers that with room to spare while keeping the record small enough
+/// that its worst case is arithmetic rather than a hope.
+pub const DELIVERED_PROMPT_LINES_PER_SESSION: usize = 16;
+
+/// #903: sessions tracked at once, evicting the least-recently-written.
+///
+/// The ceiling this and the two constants above fix is
+/// 2048 x 16 x 32 = 1 MiB, argued the same way [`DELIVERED_NOTICE_PANES`]
+/// argues its own: a group is a handful of agents and a long session resumes
+/// some of them, so this is generous for the live fleet while bounding a map
+/// that would otherwise grow with every session id a run ever saw.
+pub const DELIVERED_PROMPT_SESSIONS: usize = 32;
 
 /// Panes tracked at once, evicting the least-recently-written. A group is a
 /// handful of panes and a long session respawns some, so this is generous for
@@ -23527,6 +23976,56 @@ impl DeliveredNotices {
     /// The claimable lines: marked by a producer AND delivered.
     fn claimable(&self) -> Vec<String> {
         self.lines.iter().filter(|l| l.written).map(|l| l.text.clone()).collect()
+    }
+}
+
+/// #903: the prompt bodies loomux has delivered into one CLI **session**.
+///
+/// Keyed by session and not by pane, which is the entire point. A resumed pane
+/// is a NEW pty replaying an OLD transcript, so a per-pane record is empty
+/// exactly when the screen is fullest — and the rows on it are loomux's own
+/// previous deliveries, rendered by the CLI with a leading pointer glyph, which
+/// is what latched `prompt_wait_match`'s `pointer-option` signal for the whole
+/// life of the pane. The record has to outlive the pane because the text does.
+///
+/// **One phase, not two** — unlike [`DeliveredNotices`], which parks a line
+/// until a producer promises it. There is no producer to ask here: admission is
+/// by PROVENANCE, and [`delivered_prompt_lines`] is the promise, made once,
+/// structurally, about what may enter at all. Every line in here is text loomux
+/// put on the wire as a prompt, recorded after the write succeeded.
+///
+/// **Not verbatim, and the difference is load-bearing rather than sloppy**: each
+/// line is stored [`deframe`]d and trimmed, because that is the form the mask
+/// compares against. A rendered row reaches `record_claim` as
+/// `wrap_normalize(deframe(row))`, so a record holding the raw line would fail to
+/// match any row whose leading glyph the CLI painted — and a brief line beginning
+/// `* ` or `● ` is exactly such a row. Storing the compared form is what keeps the
+/// two sides of that comparison from drifting.
+#[derive(Debug, Default)]
+pub struct DeliveredPrompts {
+    lines: VecDeque<String>,
+    /// Monotonic write stamp for evicting the least-recently-written SESSION —
+    /// an order, not a clock, for [`DeliveredNotices`]'s reason.
+    seq: u64,
+}
+
+impl DeliveredPrompts {
+    /// These bytes just went to a pane bound to this session.
+    fn note_written(&mut self, text: &str, seq: u64) {
+        self.seq = seq;
+        for line in delivered_prompt_lines(text) {
+            if self.lines.iter().any(|l| *l == line) {
+                continue;
+            }
+            self.lines.push_back(line);
+            while self.lines.len() > DELIVERED_PROMPT_LINES_PER_SESSION {
+                self.lines.pop_front();
+            }
+        }
+    }
+
+    fn claimable(&self) -> Vec<String> {
+        self.lines.iter().cloned().collect()
     }
 }
 
@@ -23858,7 +24357,8 @@ pub fn question_hold_predicate_sampled<T>(
     pasted_text: Option<String>,
     witness: Option<QuestionWitness>,
     // #576: what loomux knows it wrote to this pane
-    // (`OrchRegistry::delivered_notice_lines`). A REQUIRED argument rather than
+    // (`OrchRegistry::delivered_mask_lines` — the per-pane notice record plus
+    // the per-session prompt record, #576/#903). A REQUIRED argument rather than
     // a defaulted one: every production caller has it, and a call site that
     // silently got an empty record would be a gate quietly running on the
     // pre-#576 rule with nothing to say so (the #544 "never acquired by
@@ -24327,10 +24827,15 @@ pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> boo
 /// #903: how long a pane's delivery may be held by the QUESTION gate alone
 /// before loomux stops believing its own detector and **pastes** anyway.
 ///
-/// Pastes, not delivers, and the distinction is the override's whole safety
-/// argument rather than a nicety: the pre-Enter checkpoint is not overridden, so
-/// on a genuinely live dialog the Enter is still withheld and the brief is left
-/// in the box for a human. See [`question_override_admits`].
+/// Pasted, and — since #903 B2 — delivered: a granted override carries to the
+/// Enter rather than stopping at the paste. The earlier version of this doc said
+/// the pre-Enter checkpoint is not overridden and rested the safety argument on
+/// that; it is no longer true and the argument now rests elsewhere. What
+/// withholds the Enter from a live dialog is [`override_enter_admits`]: fresh
+/// re-reads, every one of which must show this pane's own composer holding this
+/// delivery's paste. What that does NOT bound is written up in
+/// `doc/design/question-gate-authorship.md` rather than left implicit here. See
+/// [`question_override_admits`] for the grant itself.
 ///
 /// **Sized between the two clocks that already exist**, which is the whole of
 /// the choice: longer than [`QUESTION_HOLD_STALE_AFTER`] (10 min), so the human
@@ -24374,7 +24879,8 @@ pub const QUESTION_HOLD_OVERRIDE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// same number: one reading of a composed screen can catch a mid-redraw
 /// instant, and this reading licenses a WRITE. Two polls is four seconds
 /// against a bound measured in quarter-hours, so it costs nothing that matters.
-const QUESTION_OVERRIDE_CONSECUTIVE_READS: u32 = 2;
+#[doc(hidden)] // pub for integration tests
+pub const QUESTION_OVERRIDE_CONSECUTIVE_READS: u32 = 2;
 
 /// #903: may this poll deliver despite the question gate saying no?
 ///
@@ -24415,6 +24921,94 @@ pub fn question_override_admits(
         return false;
     }
     held_since_ms.is_some_and(|since| hold_bound_elapsed(since, now_ms, bound_ms))
+}
+
+/// One fresh pre-Enter re-read, reduced to the two bits the decision uses (#903
+/// B2).
+///
+/// A named pair rather than a tuple because both bits are booleans and swapping
+/// them silently inverts the safety argument — `active` says the gate is still
+/// holding, `idle_prompt` says the pane's own screen shows its composer holding
+/// this paste.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuestionReread {
+    /// Did the question gate still read as holding on this poll?
+    pub active: bool,
+    /// Did that same screen show the CLI's composer holding this delivery's
+    /// paste — [`idle_prompt_row_rendered`], the WEAK reading, which is the
+    /// override's own standard?
+    pub idle_prompt: bool,
+}
+
+impl QuestionReread {
+    /// Does THIS one read permit the Enter?
+    ///
+    /// `!active` counts, and it is not a widening: a poll where the gate has
+    /// simply gone clear is a poll the ordinary checkpoint would have released
+    /// on. Without it a screen that repainted between the abort and this re-read
+    /// would strand the paste for having got BETTER.
+    pub fn admits(&self) -> bool {
+        !self.active || self.idle_prompt
+    }
+}
+
+/// #903 B2: do these fresh pre-Enter re-reads carry a granted override's Enter?
+///
+/// [`question_override_admits`] decides the PASTE, minutes earlier, on the
+/// drainer's poll. This decides the ENTER, here, now — and the split is the whole
+/// of what makes the grant worth anything. Skipping only the pre-paste gate left
+/// the pre-Enter checkpoint to re-read an unchanged screen, reach the same false
+/// positive the grant was issued because of, and abort with the text already in
+/// the box.
+///
+/// Pure, and separated from the pane reading for the reason
+/// [`question_hold_predicate_sampled`]'s own doc gives about rev-15 B4: a
+/// decision welded to a live `PtyManager` is one no test in this repo can drive,
+/// so the rule ends up pinned by nothing. The GRANT itself is not a term here —
+/// it is the caller's `question_overridden`, decided by the drainer poll that
+/// observed the pane, and re-deriving it at this site would describe a different
+/// instant than the one that admitted the write.
+///
+/// Two terms, both narrowing:
+///
+/// - **Enough reads.** [`QUESTION_OVERRIDE_CONSECUTIVE_READS`], for its own
+///   reason: one reading of a composed screen can catch a mid-redraw instant,
+///   and this one licenses an Enter. An empty slice is never enough, so a caller
+///   that took no reads at all cannot pass by omission.
+/// - **EVERY read admits.** Not a majority and not the last one — a pane that
+///   painted a dialog on any of these polls is ineligible, with no memory of
+///   having been eligible on the others.
+#[doc(hidden)] // pub for integration tests
+pub fn override_enter_admits(reads: &[QuestionReread]) -> bool {
+    reads.len() as u32 >= QUESTION_OVERRIDE_CONSECUTIVE_READS
+        && reads.iter().all(QuestionReread::admits)
+}
+
+/// The production half of [`override_enter_admits`]: take the fresh reads this
+/// pane owes, then let that function decide.
+///
+/// Stops early on the first read that does not admit — there is nothing for a
+/// second poll to rescue, and the delivery is aborting anyway, so the sleep
+/// would be latency spent on a decision already made.
+fn preenter_override_admits(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    pasted_text: &str,
+    delivered: Vec<String>,
+) -> bool {
+    let mut reads: Vec<QuestionReread> = Vec::new();
+    for round in 0..QUESTION_OVERRIDE_CONSECUTIVE_READS {
+        if round > 0 {
+            std::thread::sleep(QUESTION_HOLD_POLL);
+        }
+        let r = question_active_witnessed(ptys, pty_id, Some(pasted_text), delivered.clone());
+        let read = QuestionReread { active: r.active, idle_prompt: r.idle_prompt };
+        reads.push(read);
+        if !read.admits() {
+            break;
+        }
+    }
+    override_enter_admits(&reads)
 }
 
 /// What the drainer should do about a pane it is not yet allowed to write to
@@ -25675,6 +26269,7 @@ impl OrchRegistry {
             delivery: Mutex::new(HashMap::new()),
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             delivered_notices: Arc::new(Mutex::new(HashMap::new())),
+            delivered_prompts: Arc::new(Mutex::new(HashMap::new())),
             queues: Arc::new(queuestate::QueueMap::new()),
             queue_seq: Arc::new(AtomicU64::new(0)),
             queue_persist: Arc::new(Mutex::new(())),
@@ -37426,7 +38021,7 @@ impl OrchRegistry {
                     .map(|t| {
                         let delivered = a
                             .pty_id
-                            .map(|p| self.delivered_notice_lines(p))
+                            .map(|p| self.delivered_mask_lines(p))
                             .unwrap_or_default();
                         prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
                     })
@@ -37531,7 +38126,7 @@ impl OrchRegistry {
                     .map(|t| {
                         // #576 residual: the record is keyed by pty id, which
                         // is exactly what this path has.
-                        let delivered = self.delivered_notice_lines(pty);
+                        let delivered = self.delivered_mask_lines(pty);
                         prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
                     })
                     .unwrap_or(false);
@@ -45511,6 +46106,93 @@ impl OrchRegistry {
         self.delivered_notices.lock_safe().get(&pty_id).map(|d| d.claimable()).unwrap_or_default()
     }
 
+    /// #903: the CLI session id of whichever agent currently holds `pty_id`.
+    ///
+    /// Through `by_pty`, the reverse index this registry already maintains
+    /// beside every `pty_id` write — not a fresh scan of `agents`, because a
+    /// second way of answering "who holds this pane" is a second thing that can
+    /// drift from the first.
+    ///
+    /// **Lock order**: `by_pty` is taken and RELEASED before `agents`, and
+    /// neither is held while reaching for [`OrchRegistry::delivered_prompts`] —
+    /// see that field for the order that matters.
+    fn session_for_pty(&self, pty_id: u32) -> Option<String> {
+        // Through the EXISTING reverse index, never a fresh scan of `agents`:
+        // `by_pty` is already maintained beside every `pty_id` write, and a
+        // second way of answering "who holds this pane" is a second thing that
+        // can drift from the first.
+        //
+        // A STALE entry — a pane whose agent has since been replaced by a resume
+        // of the same session — resolves to the same session id, which is the
+        // answer this function wants anyway.
+        let agent = self.by_pty.lock_safe().get(&pty_id).cloned()?;
+        self.agents.lock_safe().get(&agent).and_then(|a| a.session_id.clone())
+    }
+
+    /// #903: these bytes just went to `pty_id` as a PROMPT. Record the
+    /// loomux-originated lines against the pane's SESSION, so a later resume of
+    /// that session can recognise them replayed on its own screen.
+    ///
+    /// **Called after the write, never before it**, for
+    /// [`OrchRegistry::record_delivered_text`]'s reason: a record of text that
+    /// never reached a pane would let the mask claim rows nobody wrote, which is
+    /// the fail-OPEN direction.
+    ///
+    /// A pane with no session — one loomux never assigned or resolved an id for
+    /// — records nothing. That is the same "nothing known" an untouched pane
+    /// has, and it costs a hold, never a release.
+    #[doc(hidden)] // pub for integration tests
+    pub fn record_delivered_prompt(&self, pty_id: u32, text: &str, kind: Delivery) {
+        // #903 B1: both terms, and the kind is checked FIRST so a refused kind
+        // never pays for the line scan.
+        if !prompt_record_admits_kind(kind) {
+            return;
+        }
+        if delivered_prompt_lines(text).is_empty() {
+            return;
+        }
+        let Some(session) = self.session_for_pty(pty_id) else {
+            return;
+        };
+        let mut map = self.delivered_prompts.lock_safe();
+        let seq = map.values().map(|d| d.seq).max().unwrap_or(0) + 1;
+        map.entry(session).or_default().note_written(text, seq);
+        while map.len() > DELIVERED_PROMPT_SESSIONS {
+            let Some(stalest) = map.iter().min_by_key(|(_, d)| d.seq).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            map.remove(&stalest);
+        }
+    }
+
+    /// #903: the prompt lines loomux has delivered into `pty_id`'s SESSION —
+    /// including ones delivered to a DIFFERENT pane of the same session, which
+    /// is the whole reason this exists.
+    #[doc(hidden)] // pub for integration tests
+    pub fn delivered_prompt_record(&self, pty_id: u32) -> Vec<String> {
+        let Some(session) = self.session_for_pty(pty_id) else {
+            return Vec::new();
+        };
+        self.delivered_prompts.lock_safe().get(&session).map(|d| d.claimable()).unwrap_or_default()
+    }
+
+    /// #903: everything the question gate's mask may claim in `pty_id` — the
+    /// per-pane notice record (#576/#661, opt-in per producer) plus the
+    /// per-session prompt record (#903, admitted by provenance).
+    ///
+    /// The two classes are unioned here and NOT distinguished downstream,
+    /// because [`mask_loomux_notices_with_record`] applies one rule to both and
+    /// that rule is the stricter of the two it replaces: reconstruct-to-end AND
+    /// no dialog question row heading the block above the anchor. A single rule
+    /// is what stops "which record did this line come from" becoming a thing the
+    /// mask has to get right on every row.
+    #[doc(hidden)] // pub for integration tests
+    pub fn delivered_mask_lines(&self, pty_id: u32) -> Vec<String> {
+        let mut lines = self.delivered_notice_lines(pty_id);
+        lines.extend(self.delivered_prompt_record(pty_id));
+        lines
+    }
+
     /// #560: when `pty_id`'s open hold episode began, if one is open.
     ///
     /// Read-only itself. It does NOT imply that every mutation goes through
@@ -46686,6 +47368,15 @@ impl OrchRegistry {
             a.pty_id = Some(pty_id);
         }
         self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
+    }
+    /// Test-only companion to [`OrchRegistry::set_pty_for_test`]: give an agent
+    /// the CLI session id a real spawn would have assigned it, so the
+    /// session-keyed prompt record (#903) is reachable from a headless test.
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_session_for_test(&self, agent_id: &str, session_id: &str) {
+        if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
+            a.session_id = Some(session_id.to_string());
+        }
     }
 
     /// Path of `group`'s durable queue snapshot (#468). Sits beside

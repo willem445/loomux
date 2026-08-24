@@ -81,6 +81,12 @@ use loomux_lib::orchestration::{
     // #903: the idle-composer reading, and the bounded last-resort override.
     idle_prompt_rendered, idle_prompt_row_rendered, question_override_admits, Composed,
     QUESTION_HOLD_OVERRIDE_AFTER,
+    // #903: the session-keyed record of loomux's own delivered PROMPT text.
+    delivered_prompt_lines, DELIVERED_PROMPT_CHARS, DELIVERED_NOTICE_CHARS,
+    // #903 B2: the granted override that carries its own Enter.
+    override_enter_admits, QuestionReread, QUESTION_OVERRIDE_CONSECUTIVE_READS,
+    prompt_record_admits_kind,
+    record_contributions_for,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
@@ -50671,6 +50677,917 @@ fn h13_a_pointerless_dialog_above_our_composer_still_holds() {
     );
     assert!(pred(), "…and the pre-Enter gate withholds the Enter (#420/#532)");
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// J. #903 / #871: loomux's OWN delivered text, replayed onto a resumed pane
+//
+// The live wedge, reconstructed from group `loomux-68435179`'s own
+// `audit.jsonl` rather than imagined. Pane `rev-1277` resumed session
+// `39b611be`; the transcript `claude --resume` replayed ended with loomux's own
+// kickoff prompt to `rev-1262` — the SAME session, the same app run, delivered
+// 1.5 h earlier — which the CLI renders with a leading `❯`. Every poll for the
+// next thirty minutes audited `signal:"pointer-option"`, `grid:"still-rendered"`
+// and `idle_row:true`: loomux saw the empty composer and refused to act on it,
+// because `menu_structure_rendered`'s whole-screen pointer clause was reading a
+// row loomux itself had written.
+//
+// **Fixture provenance, and it is measured at both ends rather than asserted.**
+// The twelve message rows are the 853-character prompt body recorded verbatim
+// in the audit (`fp-resumed-prior-delivery-echo.prompt.txt`), word-wrapped at
+// 78 columns:
+//
+//  - against the SCREEN: those rows' first six reproduce, byte for byte, the six
+//    the orchestrator's own `get_output` captured off that pane (the capture
+//    stops at six only because `get_output` caps at 500 characters);
+//  - against the RING: padded to an 80-column pane and concatenated, they are a
+//    byte-exact prefix of the `matched.line` the audit recorded — which is also
+//    the evidence for how `echo_raw` below encodes the pane, and for why the
+//    detector saw a pointer at all.
+//
+// The chrome below them — separator, bare `❯`, separator, `⏵⏵ auto mode on …` —
+// is lifted unchanged from `fp-resumed-agent-idle-prompt.txt`, itself a real
+// capture.
+const FIX_FP_RESUMED_ECHO: &str =
+    include_str!("fixtures/attention/fp-resumed-prior-delivery-echo.txt");
+const FIX_RESUMED_ECHO_PROMPT: &str =
+    include_str!("fixtures/attention/fp-resumed-prior-delivery-echo.prompt.txt");
+
+/// The incident pane's geometry, both figures measured (see the section header).
+const ECHO_COLS: u16 = 80;
+/// Taller than the sixteen rows the fixture paints, so the replayed prompt's own
+/// head does not scroll off — otherwise this would be exercising `R-top` rather
+/// than the case the section is about.
+const ECHO_ROWS: u16 = 20;
+
+/// The fixture as the PANE emits it, which is not the same thing as the fixture.
+///
+/// A static replayed screen is painted by ADDRESSING rows, not by emitting
+/// newlines, and `strip_ansi` deletes cursor-address sequences — so the byte ring
+/// the detector reads is every row concatenated into ONE line, each padded to the
+/// pane width. That is not a guess about the CLI: the audit's own `matched.line`
+/// for this incident is a byte-exact prefix of exactly that concatenation at 80
+/// columns, gaps and all (`(run` + 12 columns of padding + the next row's 2-space
+/// indent = the 14 spaces the record shows).
+///
+/// Feeding the fixture through `pty_bytes_903` instead would put a newline
+/// between every row, which moves the pointer row out of `prompt_wait_match`'s
+/// last-three-painted window and makes the detector read CLEAR — a fixture that
+/// reproduces the screen and not the bug.
+fn echo_raw() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, row) in FIX_FP_RESUMED_ECHO.replace("\r\n", "\n").lines().enumerate() {
+        out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+        out.extend_from_slice(row.as_bytes());
+        let painted = strip_ansi(row.as_bytes()).chars().count();
+        for _ in painted..ECHO_COLS as usize {
+            out.push(b' ');
+        }
+    }
+    out
+}
+
+fn echo_visible(raw: &[u8]) -> String {
+    loomux_lib::orchestration::termgrid::render_visible(raw, ECHO_COLS, ECHO_ROWS)
+}
+
+/// The prompt body as the session record holds it.
+fn echo_record() -> Vec<String> {
+    delivered_prompt_lines(FIX_RESUMED_ECHO_PROMPT.trim_end_matches(['\r', '\n']))
+}
+
+#[test]
+fn j1_a_resumed_panes_replayed_delivery_latches_the_pointer_signal() {
+    // The false positive itself, with no record — the behaviour every pane in
+    // the incident had. The assertions run in the order the audit recorded them,
+    // so a future reader can line this test up against the log.
+    let raw = echo_raw();
+    let m = prompt_wait_match(&strip_ansi(&raw)).expect("the ring matches — it did, for 30 min");
+    assert_eq!(
+        m.signal, "pointer-option",
+        "and by the signal the audit named: the replayed row leads with a chevron"
+    );
+    assert!(
+        m.line.contains("[orch] round 3"),
+        "the row it matched is loomux's OWN delivery, replayed: {:?}",
+        m.line
+    );
+
+    let visible = echo_visible(&raw);
+    let c = Composed::plain(&visible);
+    assert!(
+        idle_prompt_row_rendered(c),
+        "precondition — the composer IS on screen and empty. loomux saw this every poll \
+         (`idle_row:true`) and it is what makes the hold indefensible: {visible:?}"
+    );
+    assert!(
+        !idle_prompt_rendered(c),
+        "…and the release is vetoed anyway, by the menu-structure conjunct reading a \
+         pointer row loomux itself wrote — THE bug"
+    );
+    assert_eq!(
+        grid_evidence_for(&m, Some(c)),
+        GridEvidence::StillRendered,
+        "which the grid reports exactly as the audit did"
+    );
+
+    let raw2 = echo_raw();
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw2, ECHO_COLS, ECHO_ROWS),
+        None,
+        None,
+        Vec::new(),
+    );
+    assert!(pred(), "so with no record of our own delivery, the gate holds — the wedge");
+}
+
+#[test]
+fn j2_the_session_record_of_our_own_prompt_releases_the_resumed_pane() {
+    // The fix, and the whole of it: the ONLY difference from `j1` is that loomux
+    // remembers having delivered this text into this session.
+    //
+    // **The ring still matches, and that is the design working rather than the
+    // fix falling short.** The mask cannot claim anything in the ring here — the
+    // ring is the whole screen concatenated into one line, so no row of it is a
+    // wrapped run of a recorded line — and it does not need to: #534's rule is
+    // that the ring TRIGGERS and only the grid may RELEASE. What the record
+    // changes is the grid's answer, from `StillRendered` to `IdlePrompt`, by
+    // removing from the composed screen the rows that were vetoing it.
+    let record = echo_record();
+    assert_eq!(
+        record.len(),
+        1,
+        "the incident's prompt is ONE logical line — 853 chars the CLI wrapped over twelve \
+         rows, which is why `DELIVERED_PROMPT_CHARS` is not `DELIVERED_NOTICE_CHARS`"
+    );
+    assert!(
+        record[0].chars().count() > DELIVERED_NOTICE_CHARS,
+        "and it is longer than the notice cap, so a record sized for notices would hold a \
+         PREFIX and reconstruct against nothing"
+    );
+    assert!(record[0].chars().count() <= DELIVERED_PROMPT_CHARS);
+
+    let raw = echo_raw();
+    let visible = echo_visible(&raw);
+    let masked = mask_loomux_notices_with_record(&visible, &record);
+
+    // The MECHANISM, not just the outcome: exactly the twelve rows of the
+    // replayed prompt are claimed, and nothing else on the screen is.
+    let rows_of = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        rows_of(&visible) - rows_of(&masked),
+        12,
+        "the whole wrapped run is claimed and only it — the chrome, the composer and the \
+         footer all survive:\nBEFORE {visible:?}\nAFTER {masked:?}"
+    );
+
+    let m = prompt_wait_match(&strip_ansi(&raw)).expect("the ring matches, exactly as in j1");
+    let c = Composed { masked: masked.as_str(), with_paste: masked.as_str() };
+    assert_eq!(
+        grid_evidence_for(&m, Some(c)),
+        GridEvidence::IdlePrompt,
+        "and THAT is the one transition this change makes: still-rendered -> idle-prompt"
+    );
+
+    let raw2 = echo_raw();
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw2, ECHO_COLS, ECHO_ROWS),
+        None,
+        None,
+        record.clone(),
+    );
+    assert!(!pred(), "so the delivery flushes, in seconds, at the FIRST poll");
+}
+
+#[test]
+fn j3_a_recorded_line_that_is_a_dialog_option_is_refused_under_a_question_row() {
+    // `h4`'s authorship twin, and the term that bounds what a widened record can
+    // reach. `h4` pins that a live menu above an empty composer holds; this pins
+    // that it still holds when the menu's highlighted option is byte-identical to
+    // a line loomux really did deliver — the shape an orchestrator choosing its
+    // own `send_prompt` text could construct.
+    let option = "1. Yes, and do not ask again for git commit commands in this project";
+    let record = vec![option.to_string()];
+
+    // CONTROL first, so the assertion below cannot pass because the claim failed
+    // for some unrelated reason (the length floor, the wrap rule, a typo).
+    // Same rows, no question heading them: the claim IS made.
+    let headless = format!("some ordinary transcript line\n❯ {option}\n  2. No\n─────────\n❯");
+    assert!(
+        !mask_loomux_notices_with_record(&headless, &record).contains(option),
+        "control: with no dialog question above it, a recorded line IS claimed — so the \
+         refusal below is `dialog_header_above` and not an accident"
+    );
+
+    let dialog =
+        format!("? Do you want to proceed with this command\n❯ {option}\n  2. No\n─────────\n❯");
+    let masked = mask_loomux_notices_with_record(&dialog, &record);
+    assert!(
+        masked.contains(option),
+        "the dialog's highlighted choice survives the mask: {masked:?}"
+    );
+    let m = prompt_wait_match(&masked).expect("and the detector still sees the dialog");
+    assert!(
+        question_shown(Some(&m), Some(Composed::plain(&masked))),
+        "…so the Enter is still withheld from a live question (#420)"
+    );
+}
+
+/// A finished turn whose prose satisfies the detector, with **no composer row of
+/// its own** (#871's tests).
+///
+/// The captured false-positive fixtures all end in an idle `❯`, which is what
+/// makes them false positives — and which would make every assertion below pass
+/// on the fixture's own composer rather than on the paste reading under test.
+/// This screen is built without one on purpose, so `idle_prompt_row_rendered` can
+/// only ever be true because of the row the test appends.
+fn prose_without_a_composer() -> String {
+    "⏺ Rebased and pushed. The reviewer's round-2 note asks: do you want to proceed\n  \
+     with the merge, or hold for the human? I have not, pending that call."
+        .to_string()
+}
+
+#[test]
+fn j4_a_collapsed_paste_is_still_our_own_text_at_the_pre_enter_checkpoint() {
+    // #871's shape, and the one that turns a hold into a STRAND. The pre-paste
+    // checkpoint releases (the composer is empty, so `idle_row` is true), the
+    // paste lands, and the CLI collapses it to a placeholder — at which point
+    // `mask_own_paste` has nothing to match, `idle_row` flips to false on an
+    // otherwise unchanged screen, and the Enter is withheld from a visibly idle
+    // pane. The audit recorded exactly that flip: `idle_row:true` at the drainer
+    // gate, `idle_row:false` at `stage:"pre-enter"`.
+    let brief = "Rebase onto main and re-read the findings.\nThen report when CI is green.";
+    let transcript = prose_without_a_composer();
+
+    // Precondition: this screen's ring matches, and NOT on a pointer — this test
+    // is about the paste reading, so the screen must not also carry `j1`'s signal.
+    let m = prompt_wait_match(&strip_ansi(transcript.as_bytes()))
+        .expect("precondition: question-shaped prose the detector fires on");
+    assert_ne!(
+        m.needle,
+        QuestionNeedle::LeadingPointer,
+        "precondition: by a TOKEN signal, so this test isolates the paste reading"
+    );
+
+    let compose = |composer: &str, pasted: Option<&str>| {
+        let raw = pty_bytes_903(&format!("{transcript}\n{composer}"));
+        let with_paste =
+            loomux_lib::orchestration::termgrid::render_visible(&raw, ECHO_COLS, ECHO_ROWS);
+        let masked = match pasted {
+            Some(p) => mask_own_paste(&with_paste, p),
+            None => with_paste.clone(),
+        };
+        (with_paste, masked)
+    };
+
+    // Control 1: the CLI echoed our brief literally. That path has always worked,
+    // and it fixes what "recognised" means here.
+    let (echoed_vis, echoed_masked) = compose(
+        "❯ Rebase onto main and re-read the findings.\n❯ Then report when CI is green.",
+        Some(brief),
+    );
+    assert!(
+        idle_prompt_row_rendered(Composed {
+            masked: echoed_masked.as_str(),
+            with_paste: echoed_vis.as_str()
+        }),
+        "control: a literally-echoed paste is recognised as ours"
+    );
+
+    // Control 2: an ORDINARY composer row that is neither empty nor ours reads
+    // false — so the assertion below is about the placeholder and not about the
+    // screen simply having a chevron on it.
+    let (other_vis, other_masked) = compose("❯ something the human typed", Some(brief));
+    assert!(
+        !idle_prompt_row_rendered(Composed {
+            masked: other_masked.as_str(),
+            with_paste: other_vis.as_str()
+        }),
+        "control: a composer holding somebody else's text is not evidence of ours"
+    );
+
+    // The case: the CLI collapsed our paste instead of echoing it.
+    let (with_paste, masked) = compose("❯ [Pasted text #1 +6 lines]", Some(brief));
+    let c = Composed { masked: masked.as_str(), with_paste: with_paste.as_str() };
+    assert!(
+        idle_prompt_row_rendered(c),
+        "the placeholder row is OUR paste — the CLI took our bytes into its composer, which \
+         is the evidence, not a shape we invented: {with_paste:?}"
+    );
+    assert!(
+        idle_prompt_rendered(c),
+        "…and with no menu structure on this screen that is a release, so the Enter goes"
+    );
+
+    let raw2 = pty_bytes_903(&format!("{transcript}\n❯ [Pasted text #1 +6 lines]"));
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw2, ECHO_COLS, ECHO_ROWS),
+        Some(brief.to_string()),
+        None,
+        Vec::new(),
+    );
+    assert!(!pred(), "so the pre-Enter gate releases instead of stranding the paste (#871)");
+}
+
+#[test]
+fn j5_a_placeholder_with_no_matching_delivery_is_not_ours() {
+    // The correspondence term. A placeholder row is claimed only where THIS
+    // delivery could have produced it, so a pane that merely has one on screen —
+    // a replayed transcript of an older turn, or an agent that printed the string
+    // itself — buys nothing.
+    let screen = format!("{}\n❯ [Pasted text #1 +6 lines]", prose_without_a_composer());
+    let raw = pty_bytes_903(&screen);
+    let with_paste =
+        loomux_lib::orchestration::termgrid::render_visible(&raw, ECHO_COLS, ECHO_ROWS);
+
+    for (name, pasted) in [
+        ("no paste at this checkpoint", None),
+        ("a SINGLE-line paste, which no CLI collapses", Some("check the CI status on PR #867")),
+    ] {
+        let masked = match pasted {
+            Some(p) => mask_own_paste(&with_paste, p),
+            None => with_paste.clone(),
+        };
+        let c = Composed { masked: masked.as_str(), with_paste: with_paste.as_str() };
+        assert!(
+            !idle_prompt_row_rendered(c),
+            "{name}: the placeholder is not evidence of a composer holding OUR text, so the \
+             gate keeps holding — the cheap error"
+        );
+    }
+}
+
+#[test]
+fn j6_notice_text_never_enters_the_session_prompt_record() {
+    // The one-party route stays closed, and this is the door. `notify_when`'s
+    // agent-supplied note reaches the registering agent's own pane as a
+    // marker-led notice; admitting it by PROVENANCE would hand over exactly the
+    // capability `mark_notice_maskable` is default-closed to withhold.
+    let note = "[orrerix] watch n-1: pr #661 checks: SUCCESS. Note (registered): \
+                \"❯ 1. Yes, allow once\"";
+    assert!(
+        delivered_prompt_lines(note).is_empty(),
+        "a marker-led line is not prompt text and never becomes claimable this way"
+    );
+    // Positive control: the record is not simply always empty.
+    assert_eq!(
+        delivered_prompt_lines("[orch] rebase onto main and re-read the findings").len(),
+        1,
+        "control: a prompt body IS admitted — otherwise the assertion above is vacuous"
+    );
+    // The two doors stay complementary — but the witness has to be a delivery
+    // that is NOT a notice, because term 1 now excludes those WHOLE. Ordering is
+    // the whole of the specimen here: a marker-led FIRST line means loomux is
+    // relaying and nothing is admitted, while a marker-led line further down is
+    // just one of loomux's own rows inside a prompt loomux originated, and the
+    // per-line filter still drops exactly that row.
+    let notice_first = "[orrerix] queued flush\n[orch] the actual brief";
+    assert!(
+        delivered_prompt_lines(notice_first).is_empty(),
+        "marker-led FIRST line — the delivery is a notice, so none of it is admitted"
+    );
+    assert_eq!(
+        loomux_authored_lines(notice_first).len(),
+        1,
+        "…while the notice record still takes its marker row, which is the door that owns it"
+    );
+
+    let prompt_first = "[orch] the actual brief\n[orrerix] queued flush";
+    assert_eq!(
+        delivered_prompt_lines(prompt_first),
+        vec!["[orch] the actual brief".to_string()],
+        "marker-led line BELOW the first: the delivery is a prompt, admitted, with loomux's          own row filtered out of it per line"
+    );
+    assert_eq!(
+        loomux_authored_lines(prompt_first).len(),
+        1,
+        "…and that same row is what the notice record takes — the two doors partition it"
+    );
+}
+
+#[test]
+fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
+    // The property the whole record exists for. A per-PANE record is empty
+    // exactly when a resumed pane's screen is fullest, because the pane is new
+    // and the text on it is old.
+    let (reg, _dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    let session = "39b611be-f2af-4316-8efd-2917faf8f790";
+    let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
+
+    let first = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review", false, None).unwrap();
+    reg.set_session_for_test(&first.id, session);
+    reg.set_pty_for_test(&first.id, 101);
+    reg.record_delivered_prompt(101, brief, Delivery::MidSession);
+    assert!(
+        reg.delivered_mask_lines(101).iter().any(|l| l == brief),
+        "the pane it was delivered into can see it"
+    );
+
+    // The resume: a NEW agent in a NEW pane, replaying the SAME session.
+    let resumed = reg.spawn_agent(&g.id, Role::Reviewer, "rev2", "review", false, None).unwrap();
+    reg.set_session_for_test(&resumed.id, session);
+    reg.set_pty_for_test(&resumed.id, 102);
+    assert!(
+        reg.delivered_mask_lines(102).iter().any(|l| l == brief),
+        "and so can the pane that replays it — which the per-pane notice record cannot do"
+    );
+    assert!(
+        reg.delivered_notice_lines(102).is_empty(),
+        "control: the per-PANE record is empty here, so the line above came from the session \
+         record and not from the one #661 already had"
+    );
+
+    // #903 review B1, at the registry door rather than only in the predicate:
+    // a refused KIND writes nothing, so the two terms are wired and not merely
+    // written. Without this, changing the recorder's signature is the only thing
+    // that would have caught a caller passing the wrong kind — which is exactly
+    // what the compiler had to tell me on the round that added it.
+    reg.record_delivered_prompt(101, "[orch] a regrounding-borne line", Delivery::Regrounding);
+    assert!(
+        !reg.delivered_mask_lines(101).iter().any(|l| l.contains("regrounding-borne")),
+        "a Regrounding delivery contributes nothing, however ordinary its text looks"
+    );
+
+    // A different session sees nothing: the key is doing work.
+    let other = reg.spawn_agent(&g.id, Role::Reviewer, "rev3", "review", false, None).unwrap();
+    reg.set_session_for_test(&other.id, "9038509b-0000-0000-0000-000000000000");
+    reg.set_pty_for_test(&other.id, 103);
+    assert!(
+        reg.delivered_mask_lines(103).is_empty(),
+        "a pane resuming some OTHER session inherits nothing"
+    );
+}
+
+#[test]
+fn j8_a_replayed_notice_row_is_still_a_notice_under_a_chevron() {
+    // The complement of `j2`, and the other half of the resume class. The session
+    // record deliberately excludes marker-led lines (`j6`), so a NOTICE loomux
+    // delivered and the CLI replayed is not covered by it — it is covered by the
+    // marker rule, which stopped recognising its own marker the moment a resumed
+    // CLI painted a `❯` in front of the row. Fifteen of the thirty-nine
+    // `pointer-option` holds in the group's audit log are exactly this shape.
+    let notice = "[orrerix] pr #1408 checks: success — 5 of 6 checks passed (1 skipped)";
+
+    // Precondition: as a plain row the marker rule has always claimed it, so the
+    // assertion below is about the chevron and nothing else.
+    assert!(
+        !mask_loomux_notices(notice).contains("checks: success"),
+        "precondition: the marker rule claims a marker-led row"
+    );
+
+    let replayed = format!("❯ {notice}");
+    assert!(
+        !mask_loomux_notices(&replayed).contains("checks: success"),
+        "and it claims the same row when a resumed CLI replays it under a chevron"
+    );
+
+    // ONE row, still — the widening reads through the glyph, it does not become a
+    // run-mask. A live dialog painted directly beneath a replayed notice must
+    // survive, which is #420's objection to widening this rule at all.
+    let with_dialog = format!("{replayed}\n? Do you want to proceed\n❯ 1. Yes\n  2. No");
+    let masked = mask_loomux_notices(&with_dialog);
+    assert!(
+        masked.contains("1. Yes") && masked.contains("Do you want to proceed"),
+        "the rows below it are untouched: {masked:?}"
+    );
+    let m = prompt_wait_match(&masked).expect("so the dialog is still a question");
+    assert!(
+        question_shown(Some(&m), Some(Composed::plain(&masked))),
+        "…and still holds the Enter"
+    );
+}
+
+#[test]
+fn j9_a_granted_override_carries_its_enter_only_on_fresh_proof() {
+    // B2's decision, which is the one term standing between "the override moves
+    // the queue" and "the override strands a paste on a pane with a live dialog
+    // on it". `question_override_admits` decides the PASTE minutes earlier; this
+    // decides the ENTER at the moment it is pressed.
+    //
+    // Written in terms of `QUESTION_OVERRIDE_CONSECUTIVE_READS` throughout, so a
+    // future edit to that constant cannot leave this test asserting a rule the
+    // code no longer has.
+    let n = QUESTION_OVERRIDE_CONSECUTIVE_READS as usize;
+    let idle = QuestionReread { active: true, idle_prompt: true };
+    let dialog = QuestionReread { active: true, idle_prompt: false };
+    let cleared = QuestionReread { active: false, idle_prompt: false };
+
+    // The one shape that does NOT admit, and the three that do.
+    assert!(!dialog.admits(), "a gate still holding with no composer on screen is a dialog");
+    assert!(idle.admits(), "…and one whose screen shows our own paste in the composer is not");
+    assert!(cleared.admits(), "…nor is a gate that has simply gone clear since the abort");
+
+    // Enough reads, and never fewer.
+    assert!(
+        !override_enter_admits(&[]),
+        "no reads at all must not pass by omission — the caller that took none is the \
+         one this term exists to catch"
+    );
+    assert!(
+        !override_enter_admits(&vec![idle; n - 1]),
+        "one short of the bar is short of the bar: a single reading of a composed screen \
+         can catch a mid-redraw instant, and this one licenses an Enter"
+    );
+    assert!(override_enter_admits(&vec![idle; n]), "and at the bar, with every read idle, it carries");
+    assert!(
+        override_enter_admits(&vec![cleared; n]),
+        "a pane that repainted itself clear between the abort and this re-read must not be \
+         stranded for having got BETTER"
+    );
+
+    // EVERY read, not the last one and not a majority — pinned in both orders, so
+    // an implementation that looked at either end would fail here.
+    let mut first_bad = vec![idle; n];
+    first_bad[0] = dialog;
+    let mut last_bad = vec![idle; n];
+    last_bad[n - 1] = dialog;
+    assert!(
+        !override_enter_admits(&first_bad),
+        "a dialog on the FIRST read is disqualifying, however the rest read"
+    );
+    assert!(
+        !override_enter_admits(&last_bad),
+        "and so is one on the LAST — there is no memory of having been eligible"
+    );
+
+    // A longer run does not dilute it either: the rule is universal, not a count.
+    let mut long_run = vec![idle; n + 3];
+    long_run[2] = dialog;
+    assert!(
+        !override_enter_admits(&long_run),
+        "one dialog read anywhere in a longer run still refuses the Enter"
+    );
+}
+
+#[test]
+fn j10_a_collapsed_paste_under_a_dialog_header_is_not_claimed() {
+    // The term the OPERATOR-SET rule found unpinned. `j2`/`j3`/`j5` between them
+    // cover the collapsed-paste claim's shape term and its multi-line term, and
+    // `j3` covers `dialog_header_above` on the RECORD path — but the same guard
+    // on the collapsed-paste claim in `mask_own_paste` was pinned by nothing, so
+    // "this claim is bounded by a dialog header" was a residual derived from
+    // deletion mutations that never touched it.
+    //
+    // It matters in the one direction that costs something: if a dialog really is
+    // up, a placeholder row inside its option block must not be read as "the
+    // composer is holding our paste", because that reading is what releases the
+    // Enter.
+    let brief = "Rebase onto main and re-read the findings.\nThen report when CI is green.";
+    let placeholder = "❯ [Pasted text #1 +6 lines]";
+
+    let read = |screen: &str| {
+        let raw = pty_bytes_903(screen);
+        let with_paste =
+            loomux_lib::orchestration::termgrid::render_visible(&raw, ECHO_COLS, ECHO_ROWS);
+        let masked = mask_own_paste(&with_paste, brief);
+        (with_paste, masked)
+    };
+
+    // CONTROL: the same option block with no question row heading it. The claim
+    // IS made, so the refusal below is the guard and not the screen.
+    let (open_vis, open_masked) =
+        read(&format!("a finished turn's last line\n  $ git push --force\n{placeholder}"));
+    assert!(
+        idle_prompt_row_rendered(Composed {
+            masked: open_masked.as_str(),
+            with_paste: open_vis.as_str()
+        }),
+        "control: with no dialog question above it, the placeholder is claimed as ours"
+    );
+
+    // The case: a dialog's own question row heads the block.
+    let (dlg_vis, dlg_masked) = read(&format!(
+        "? Do you want to proceed with this command\n  $ git push --force\n{placeholder}"
+    ));
+    assert!(
+        !idle_prompt_row_rendered(Composed {
+            masked: dlg_masked.as_str(),
+            with_paste: dlg_vis.as_str()
+        }),
+        "a placeholder inside a live dialog's option block is not evidence of an idle \
+         composer: {dlg_vis:?}"
+    );
+}
+
+#[test]
+fn j11_a_loomux_notice_contributes_nothing_to_the_prompt_record() {
+    // B1 TERM 1, and the hole it closes. Filtering marker-led lines one at a
+    // time is not the same rule as excluding notices: a notice is one marker-led
+    // first line followed by a body that is not, so every continuation row was
+    // entering the prompt record — and the body of the two re-grounding notices
+    // is the agent's OWN directive ledger, written raw by
+    // `note_directive(replace: true)` and pasted back into that same agent's
+    // pane on a self-callable `request_compact`. One party, on demand.
+    let ledger_notice = "[orrerix] Context was compacted. Re-grounding you in your role \
+                         instructions before you continue.\n\
+                         Your directive ledger:\n\
+                         ? Do you want to proceed with this command\n\
+                         1. Yes, and do not ask again for git commit commands in this project";
+
+    // Precondition — this text really is multi-line and really does carry rows a
+    // per-line filter would have admitted, or the assertion below is vacuous.
+    assert!(
+        ledger_notice.lines().skip(1).any(|l| !l.trim().is_empty()),
+        "precondition: the notice has a body below its marker-led first line"
+    );
+    let body_only = ledger_notice.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        delivered_prompt_lines(&body_only).len(),
+        3,
+        "precondition: those body lines are EXACTLY what the per-line filter admitted, so the \
+         assertion below is about the notice's first line excluding them"
+    );
+
+    assert!(
+        delivered_prompt_lines(ledger_notice).is_empty(),
+        "a delivery whose FIRST non-empty line is a loomux notice contributes NOTHING — \
+         not its marker row, and not one line of the body it is relaying"
+    );
+
+    // The same body, delivered as an ordinary prompt, IS admitted — so the
+    // exclusion is keyed on the delivery being a notice, not on the body's
+    // content, and this test cannot pass by the record being empty for everyone.
+    let as_a_prompt = "[orch] please re-read the findings\nthen report when CI is green";
+    assert_eq!(
+        delivered_prompt_lines(as_a_prompt).len(),
+        2,
+        "control: an orchestrator's own multi-line prompt still enters the record whole"
+    );
+}
+
+#[test]
+fn j12_the_delivery_kind_gate_is_default_closed() {
+    // B1 TERM 2. Independent of term 1, and neither is redundant: `ResumeKickoff`
+    // carries BOTH an orchestrator brief (admitted here) and, at the
+    // promoted-orchestrator call site, `resume_kickoff_notice`'s ledger embed —
+    // which only term 1 refuses.
+    assert!(
+        !prompt_record_admits_kind(Delivery::Regrounding),
+        "the post-compact re-grounding delivery exists to paste the agent's own ledger"
+    );
+    for kind in [Delivery::FreshKickoff, Delivery::ResumeKickoff, Delivery::MidSession] {
+        assert!(
+            prompt_record_admits_kind(kind),
+            "{kind:?} carries a brief the orchestrator wrote, and ResumeKickoff in particular \
+             is the incident's OWN payload — refusing it would close the door by regressing #903"
+        );
+    }
+
+    // The set, not the list: exactly one variant is refused. A fifth variant
+    // added later fails the `match` at compile time AND this count, so it cannot
+    // acquire admission by being forgotten in either place.
+    let all = [
+        Delivery::FreshKickoff,
+        Delivery::ResumeKickoff,
+        Delivery::MidSession,
+        Delivery::Regrounding,
+    ];
+    assert_eq!(
+        all.iter().filter(|k| !prompt_record_admits_kind(**k)).count(),
+        1,
+        "exactly one delivery kind is refused; if that changed, the design note's argument did too"
+    );
+}
+
+#[test]
+fn j13_excluding_notices_does_not_uncover_their_own_wrapped_rows() {
+    // The mirror risk of term 1, closed here rather than asserted in prose: if
+    // the prompt record had been the only thing masking a notice's continuation
+    // rows, excluding notices from it would trade a leak for a false-positive
+    // gap on loomux's own wrapped text.
+    //
+    // It was not — but the honest scope is narrower than "the notice record
+    // covers it", and the difference matters to anyone reading this as a
+    // guarantee. A multi-row notice's wrap is masked by the NOTICE record
+    // (#576/#661) only for a producer that OPTED IN via `mark_notice_maskable`,
+    // which today is one call site: the orchestrator relay behind `report` /
+    // `message_orchestrator`. The ledger-bearing notices do NOT opt in, so
+    // nothing masks their wrap — they latch until `QuestionStale` badges it at
+    // ten minutes, which is the pre-#903 fail-closed baseline and not a
+    // regression term 1 introduced.
+    //
+    // What term 1 changed for them is the other direction: as first shipped it
+    // ADMITTED their body to the prompt record, which is the hole B1 reported.
+    // So "nothing is traded away" is a claim about coverage that existed BEFORE
+    // this PR, not about coverage the round-1 code had.
+    // The token must live on the CONTINUATION, not on the marker-led row: this
+    // test is about what covers a notice's wrapped rows, and a fixture whose
+    // token sits on row one is cleared by the marker rule alone — the claim below
+    // would then hold for a reason that has nothing to do with the record. The
+    // first version of this test had exactly that shape and its precondition
+    // caught it.
+    let notice = "[orrerix] w-7 reports blocked: the CLI is waiting on do you want to \
+                  proceed (y/n) before it will run the suite";
+    let wrapped = "[orrerix] w-7 reports blocked: the CLI is waiting on\n\
+                   do you want to proceed (y/n) before it will run the suite";
+
+    // Precondition — the continuation alone is what the detector fires on, so
+    // masking only the first row would leave the pane latched.
+    assert!(
+        prompt_wait_match(&mask_loomux_notices(wrapped)).is_some(),
+        "precondition: the marker rule alone leaves this notice's continuation matching"
+    );
+
+    // With the NOTICE record — the mechanism that actually covers this — the run
+    // masks whole and the gate reads clear.
+    let record = loomux_authored_lines(notice);
+    assert_eq!(record.len(), 1, "precondition: the notice is one recordable line");
+    assert!(
+        prompt_wait_match(&mask_loomux_notices_with_record(wrapped, &record)).is_none(),
+        "for an OPTED-IN producer the notice record masks the whole wrap run — that is \
+         #661's coverage, it is one call site today, and term 1 does not touch it"
+    );
+
+    // And term 1 confirms the prompt record was never the mechanism: this notice
+    // cannot enter it at all.
+    assert!(
+        delivered_prompt_lines(wrapped).is_empty(),
+        "so nothing is traded away relative to the pre-#903 baseline. Round 1's code DID \
+         hold these rows — that was B1 — and taking them back out restores the baseline \
+         rather than removing coverage this PR had shipped"
+    );
+}
+
+#[test]
+fn j14_a_claimed_question_row_still_vetoes_the_row_below_it() {
+    // B2. The upward scan used to consult `keep` BEFORE testing for a header, so
+    // a row that had already been claimed was stepped over — and two recorded
+    // lines were therefore enough to walk the scan past the very question row it
+    // vetoes on. `j3` could not see it: its record holds ONE line, so nothing
+    // above the option row was ever claimed.
+    let header = "? Do you want to proceed with this command";
+    let option = "1. Yes, and do not ask again for git commit commands in this project";
+    let screen = format!("{header}\n❯ {option}\n  2. No\n─────────\n❯");
+
+    // ONE recorded line — `j3`'s shape. The header is not claimed, so it vetoes.
+    let single = vec![option.to_string()];
+    assert!(
+        mask_loomux_notices_with_record(&screen, &single).contains(option),
+        "precondition (j3's case): with the header unclaimed, the option survives"
+    );
+
+    // TWO recorded lines, chained: the first claims the header row itself.
+    let chained = vec![header.to_string(), option.to_string()];
+    let masked = mask_loomux_notices_with_record(&screen, &chained);
+    assert!(
+        masked.contains(option),
+        "a claimed question row still vetoes the claim below it — the mask must not be \
+         allowed to decide its own bound: {masked:?}"
+    );
+    let m = prompt_wait_match(&masked).expect("and the dialog is still a question");
+    assert!(
+        question_shown(Some(&m), Some(Composed::plain(&masked))),
+        "…so the Enter is still withheld (#420)"
+    );
+
+    // The control that keeps this honest: the chain's FIRST line really is
+    // claimable, so the assertion above is the veto working and not the header
+    // simply failing to match.
+    let header_only = format!("{header}\nsome ordinary transcript row");
+    assert!(
+        !mask_loomux_notices_with_record(&header_only, &chained).contains(header),
+        "control: with nothing below it to protect, the recorded header row IS claimed"
+    );
+}
+
+#[test]
+fn j15_a_coalesced_flush_contributes_its_constituents_and_not_its_framing() {
+    // Review round 2, B1'. Term 1 excludes a delivery whose first non-empty line
+    // is marker-led — and a coalesced flush's first line is exactly that, so the
+    // framed whole took its constituent PAYLOADS out of the record with it. Those
+    // payloads are the orchestrator-authored briefs #903 needs masked, so the
+    // exclusion was fail-closed but a real coverage regression.
+    //
+    // The split is not inferred from the text here or in production: #632 already
+    // owns it, the drainer already has the parts separately, and the fix passes
+    // them down as `record_contributions` rather than asking the record to parse
+    // a flush apart. This test builds the REAL flush through
+    // `queue::coalesced_flush_text` — nothing in the suite did before — and pins
+    // all three halves of the rule.
+    let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
+    let ledger_notice = "[orrerix] Context was compacted. Re-grounding you in your role \
+                         instructions.\nYour directive ledger:\n1. Yes, allow once";
+    let items = [
+        queue::FlushConstituent {
+            id: 7,
+            from: "orch-1156",
+            enqueued_ms: 1_000,
+            coalesced: 0,
+            text: brief,
+        },
+        queue::FlushConstituent {
+            id: 8,
+            from: "orrerix",
+            enqueued_ms: 2_000,
+            coalesced: 0,
+            text: ledger_notice,
+        },
+    ];
+    let rendered = queue::coalesced_flush_text(&items, 0, 9_000, queue::FlushCause::PaneBlocked);
+
+    // Precondition 1 — this really is the shape term 1 refuses.
+    assert!(
+        delivered_prompt_lines(&rendered).is_empty(),
+        "the FRAMED whole contributes nothing — which is why the drainer must hand the record \
+         the constituents instead of this string: {rendered:?}"
+    );
+    // Precondition 2 — and the payload rows really are rendered inside it, so
+    // recording them is a statement about rows that are on the pane's screen.
+    assert!(rendered.contains(brief), "precondition: the brief is rendered verbatim in the flush");
+
+    // #632's own invariant, reused rather than restated: everything loomux FRAMED
+    // is maskable and the only survivors are payload rows. The fix rests on that
+    // split, so the test asserts it holds for this fixture instead of trusting it.
+    let payloads: Vec<&str> = items.iter().map(|c| c.text).collect();
+    assert!(
+        unmaskable_framing_rows(&rendered, &payloads).is_empty(),
+        "precondition (#632): every framing row this flush emits is maskable"
+    );
+
+    // The rule, per constituent. The brief is admitted…
+    assert_eq!(
+        delivered_prompt_lines(brief),
+        vec![brief.to_string()],
+        "an orchestrator-authored constituent enters the record on its own merits"
+    );
+    // …and the ledger-bearing notice is NOT, however it is flushed alongside.
+    // This is the half that keeps B1 closed: constituents are admitted
+    // individually, so riding in a batch buys a notice nothing.
+    assert!(
+        delivered_prompt_lines(ledger_notice).is_empty(),
+        "a re-grounding notice riding in the same batch is still refused by its own first line"
+    );
+    // And by kind, independently — either term alone refuses it.
+    assert!(!prompt_record_admits_kind(Delivery::Regrounding));
+}
+
+#[test]
+fn j16_the_record_takes_each_entrys_own_text_never_the_framed_paste() {
+    // B1', at the decision rather than at the rule. `j15` pins what
+    // `delivered_prompt_lines` does with a flush; this pins what the drainer
+    // HANDS it, which is the half that regressed — and the half no test could
+    // reach while the decision was welded into a function needing an `AppHandle`
+    // (the same argument `override_enter_admits` carries).
+    let entry = |id: u64, text: &str, kind| queue::QueuedDelivery {
+        id,
+        agent_id: "rev-1277".into(),
+        from: "orch-1156".into(),
+        payload: queue::QueuedPayload::Text(text.to_string()),
+        reason: queue::EnqueueReason::Question,
+        enqueued_ms: 1_000 + id,
+        coalesced: 0,
+        group: Some("g-1".try_into().unwrap()),
+        to_orchestrator: false,
+        session_id: None,
+        delivery_kind: kind,
+    };
+
+    let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
+    let ledger_notice = "[orrerix] Context was compacted.\nYour directive ledger:\n1. Yes, allow once";
+
+    // A FLUSH: every constituent contributes, under its own kind.
+    let batch = vec![
+        entry(7, brief, Delivery::ResumeKickoff),
+        entry(8, ledger_notice, Delivery::Regrounding),
+    ];
+    let got = record_contributions_for(&batch);
+    assert_eq!(
+        got,
+        vec![
+            (brief.to_string(), Delivery::ResumeKickoff),
+            (ledger_notice.to_string(), Delivery::Regrounding),
+        ],
+        "both constituents are handed over as their OWN texts under their OWN kinds — the \
+         framing is never among them, and the second entry's kind is what refuses it \
+         downstream rather than anything about the batch it rode in"
+    );
+
+    // A LONE delivery is the same rule, not a special case — which matters
+    // because `header_pending` can prepend a flush header to a single delivery,
+    // and recording the framed string would lose it exactly as a flush lost its
+    // constituents.
+    let lone = vec![entry(9, brief, Delivery::MidSession)];
+    assert_eq!(
+        record_contributions_for(&lone),
+        vec![(brief.to_string(), Delivery::MidSession)],
+        "one entry, its own text, its own kind"
+    );
+
+    // A marker entry carries no text and contributes nothing — the `filter_map`
+    // is load-bearing, not defensive.
+    let marker = vec![queue::QueuedDelivery {
+        payload: queue::QueuedPayload::StrandedSubmit,
+        ..entry(10, "", Delivery::MidSession)
+    }];
+    assert!(
+        record_contributions_for(&marker).is_empty(),
+        "a StrandedSubmit marker has no payload text to contribute"
+    );
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The human-question registry (#946 slice Q1)
