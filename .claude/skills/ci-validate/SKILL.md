@@ -551,8 +551,10 @@ PR's own review fixes).
 
 **A re-cut wave needs its own OPEN PRs — a pushed scratch branch builds nothing.**
 `ci.yml` is `on: push: branches: [main]` plus `pull_request`, so a branch is built only
-while a PR is open on it: measured over the last 400 runs, every `push` run is on `main`
-or a `v*` tag and all 356 others are `pull_request`. Step 4 above closes the scratch PR
+while a PR is open on it: over the last 400 runs NOT ONE `push` run is on a branch other
+than `main` or a `v*` tag. Measure that zero, not the pass/fail split beside it — the
+window slides with every run in the repo, so a total quoted here is stale on arrival.
+Step 4 above closes the scratch PR
 and deletes its branch once cited, which is what makes the second wave the dangerous one
 — re-pushing those branches and reusing their PR numbers builds nothing at all, and
 `gh pr checks` keeps answering for the round you already quoted. Assert `state == OPEN`
@@ -580,13 +582,15 @@ where one was expected (#1236 — eight rounds, each reconciling to 376).
 **A round that reddens NOTHING is a finding; a round that reddens EVERYTHING is not
 evidence.** Publish the zero-red row rather than dropping it — a dropped row leaves the
 reader believing every arm has its own counterfactual — then diagnose it, because the
-remedies diverge. The property is defended TWICE, so removing one arm changes nothing —
-cut the follow-up round that removes *both* (#1361 rounds 4→5, #1299 M10→M10b, and #889,
-where the surviving half of a compound guard caught it and dropping the whole line reddened
-three). Or the mutation landed textually somewhere it can never fire — re-place it, and
-assert non-inertness structurally rather than trusting the edit (#1426 round 2). Or the
-production code is genuinely dead behind a comment claiming otherwise, and the answer is to
-delete it (#664, corrected in #686). At the other end, one mutation
+remedies diverge — and a case can PRESENT as one and RESOLVE as another, which is why the
+row is diagnosed rather than handed to the first fit. The property is defended TWICE, so
+removing one arm changes nothing: cut the follow-up round that removes *both* (#1361 rounds
+4→5, #1299 M10→M10b). Or the mutation landed textually somewhere it can never fire: re-place
+it, and assert non-inertness structurally rather than trusting the edit (#1426 round 2, open
+when this was written). Or the code is unwitnessable and the answer is to DELETE it rather
+than widen the round — #889 read as defence-in-depth and resolved this way, because the
+honest wider row "would have left an unwitnessable branch in the code", the same discharge
+as #664/#686's dead production code behind a comment claiming otherwise. At the other end, one mutation
 reddening many tests attributes to none of them — narrow it to a single red where you can
 (#1300, 9→1), and where you cannot, say so and name the per-property witness each broad
 red already has (#1361 round 11, #1358). Signature: a wave table with an empty "test
