@@ -52,8 +52,17 @@ export type OrchRowState = "resumable" | "live" | "unidentified" | "lost" | "dam
  *  so the caller cannot build a Resume button with nothing to resume. */
 export interface OrchRow {
   groupId: string;
-  /** The CLI's name for display, or "unknown CLI" when the record is damaged. */
+  /** The CLI's name for display, or "unknown CLI" when the record is damaged.
+   *  DISPLAY ONLY — it can contain a space, so it must never be interpolated
+   *  into a class name or any other token position (#1568 review N4). */
   cli: string;
+  /** The raw `cli` off the wire, for keying a CSS class or any other token
+   *  the renderer needs: a known CLI (`claude` | `copilot` | `opencode` | …)
+   *  or `""` when `group.json` could not be read. Deliberately NOT the
+   *  display label above — `cliLabel`'s "unknown CLI" would splice two junk
+   *  classes onto the element, and a label is free to gain a space or a
+   *  capital at any time without that being a wire change. */
+  cliKey: string;
   /** Repo basename when known, else the group id — never a blank line. */
   title: string;
   sessionId: string | null;
@@ -148,6 +157,8 @@ export function orchRows(
       return {
         groupId: r.group_id,
         cli: cliLabel(r.cli),
+        // Trimmed, never labelled: this one is a token, not prose.
+        cliKey: r.cli.trim(),
         title: r.repo ? repoName(r.repo) : r.group_id,
         sessionId: r.session_id,
         state,

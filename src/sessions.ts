@@ -245,7 +245,13 @@ export class SessionBrowser {
     // Same `.session-badge <cli>` shape the session rows use, so the CLI
     // colour table answers one question app-wide (styles.css, #1020 wave 2).
     // A CLI with no rule renders uncoloured, never unlabelled.
-    badge.className = `session-badge ${row.cli}`;
+    //
+    // The CLASS keys off `cliKey` (the raw wire value) and the TEXT off `cli`
+    // (the display label): the label is "unknown CLI" for a damaged group, and
+    // interpolating that would put two junk classes — `unknown` and `CLI` — on
+    // the element (#1568 review N4). An empty key contributes no class at all,
+    // which is the same uncoloured-but-labelled result as an unknown CLI.
+    badge.className = row.cliKey ? `session-badge ${row.cliKey}` : "session-badge";
     badge.textContent = row.cli;
     const title = document.createElement("span");
     title.className = "orch-title";

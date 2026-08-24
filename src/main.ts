@@ -2262,7 +2262,20 @@ const sessions = new SessionBrowser(
     // brought back by its orchestrator session — the same route (and the
     // same tab binding and start-fresh affordance) as clicking its ORCH row
     // in the session list.
-    void restoreRecordedSession(groupId, "orchestrator", sessionId);
+    //
+    // Re-read the list once the attempt SETTLES, either way (#1568 review
+    // N5). On success the group is now live, and a row still offering Resume
+    // is a button whose second click reaches `resume_recorded_session`'s
+    // live-group refusal — which carries no `resume-` tag, so
+    // `resumeFailureKind` returns null, `offersStartFresh` is false, and the
+    // human gets a fatal banner instead of the graceful copy this section
+    // exists for. It also stops the button being clickable repeatedly into
+    // the #799 liveness race the resume path documents. On FAILURE the
+    // refresh is equally right: whatever made the resume fail (a store that
+    // lost the session) is exactly what `resumable` should now report.
+    void restoreRecordedSession(groupId, "orchestrator", sessionId).finally(() => {
+      void sessions.refresh();
+    });
   }
 );
 

@@ -62,9 +62,25 @@ test("a damaged group record is listed, with no CLI guessed and no button", () =
   assert.equal(row.state, "damaged");
   assert.equal(row.canResume, false);
   assert.equal(row.cli, "unknown CLI");
+  // The DISPLAY label carries a space, which is why the renderer must not key
+  // a class off it (#1568 review N4): `session-badge unknown CLI` is two junk
+  // classes. `cliKey` is the token, and an unreadable record has none.
+  assert.equal(row.cliKey, "");
   // Falls back to the group id rather than rendering a blank title.
   assert.equal(row.title, "loomux-aaaa1111");
   assert.doesNotMatch(row.detail, /claude|copilot|opencode/i);
+});
+
+test("cliKey is the raw wire value, never the display label", () => {
+  // Trimmed but not relabelled — a class name is a token, not prose. The two
+  // fields must not be the same string in the damaged case (asserted above),
+  // and must agree in the ordinary one.
+  const [ok] = orchRows([rec({ cli: "opencode" })]);
+  assert.equal(ok.cliKey, "opencode");
+  assert.equal(ok.cli, "opencode");
+  const [padded] = orchRows([rec({ cli: "  claude  " })]);
+  assert.equal(padded.cliKey, "claude", "a token never carries surrounding whitespace");
+  assert.doesNotMatch(padded.cliKey, /s/, "a cliKey must never contain whitespace");
 });
 
 test("canResume is never true without a session id, whatever the backend said", () => {
