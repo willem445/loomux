@@ -926,7 +926,9 @@ impl TranscriptCursors {
         // every other signal is content.
         let mut verdict = match slot.as_ref() {
             None => StatVerdict::Reset,
-            Some(c) if c.built.elapsed() >= self.revalidate_after => {
+            // [scratch] #1239 round 11: the timer fires on EVERY tick, not only
+            // on an expired cursor.
+            Some(c) if c.built.elapsed() >= Duration::ZERO => {
                 work.revalidated = true;
                 StatVerdict::Reset
             }
