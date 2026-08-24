@@ -1450,9 +1450,18 @@ test("role_hint: liaison requires kind: reviewer (#891)", () => {
     role_hint: "liaison",
   });
   ok.edges.push({ from: "worker", to: "human" });
+  // Exactly the deprecation advisory and nothing else (#1161 D4): the pairing is
+  // legal, the block runs, and the ONE thing the author is told is where the
+  // feature moved. Spelled as the full expected list rather than as "no errors",
+  // so a spurious second finding on a valid liaison still fails here.
   assert.deepEqual(
     codes(validateWorkflow(ok)).filter((c) => c.startsWith("role-hint") || c.startsWith("gate-")),
-    []
+    ["role-hint-superseded"]
+  );
+  assert.deepEqual(
+    validateWorkflow(ok).filter((f) => f.code === "role-hint-superseded").map((f) => f.severity),
+    ["warning"],
+    "superseded is an ADVISORY — a `liaison` file must still load and run"
   );
 
   // On every other kind it is the same named finding — "requires reviewer" is a
@@ -2565,7 +2574,21 @@ test("the role_hint offer is DERIVED from the pairing rule, for every kind (#102
       ).workflow;
       const roleFindings = validateWorkflow(w).filter((f) => f.code.startsWith("role-hint-"));
       if (offered.includes(hint)) {
-        assert.deepEqual(roleFindings, [], `${kind} is offered ${hint} — it must validate`);
+        // An offered pairing raises no ERROR. It may still raise the one advisory
+        // this validator emits for a LEGAL hint — `liaison` is superseded by
+        // `kind: manager` (#1161 D4) — so the expectation is exact rather than
+        // "no role-hint findings at all": a spurious warning on any other hint
+        // still fails here, and so does an advisory that hardens into an error.
+        assert.deepEqual(
+          codes(roleFindings),
+          hint === "liaison" ? ["role-hint-superseded"] : [],
+          `${kind} is offered ${hint} — it must validate`
+        );
+        assert.deepEqual(
+          roleFindings.filter((f) => f.severity === "error"),
+          [],
+          `${kind} is offered ${hint} — an offered pairing is never an error`
+        );
       } else {
         assert.deepEqual(
           codes(roleFindings),
@@ -3217,4 +3240,66 @@ test("the pane refuses every routing rule the engine refuses (#1176)", () => {
     ).findings.some((x) => x.code === "gate-bad-routing"),
     "an unknown key inside a rule is a refusal — the engine refuses the whole file over one"
   );
+});
+
+// ── `role_hint: liaison` is superseded by `kind: manager` (#1161 M6, D4) ──
+//
+// What these are FOR: decision D4 is "the hint keeps parsing, with a superseded
+// warning; removal is a later, separate, human decision". Both halves are
+// load-bearing and each fails differently. If the warning stops firing, a file
+// written before the manager class existed never learns a better shape exists.
+// If it hardens into an ERROR, every repo that shipped a liaison stops loading
+// on an upgrade — which is precisely what D4 refused to do.
+
+test("a valid liaison block is warned, not refused (#1161 D4)", () => {
+  const w = parseWorkflow(
+    "version: 1\nblocks:\n  - id: human\n    kind: reviewer\n    cli: claude\n    role_hint: liaison\n"
+  ).workflow;
+  const f = validateWorkflow(w).filter((x) => x.code === "role-hint-superseded");
+  assert.equal(f.length, 1, "exactly one supersession advisory per liaison block");
+  assert.equal(f[0]!.severity, "warning", "an ERROR here would stop a shipped repo from loading");
+  assert.equal(f[0]!.blockId, "human", "the finding must land on the block that carries the hint");
+  // It has to name the replacement. A deprecation notice that does not say what
+  // to write instead is a nag, and the author's next move is a search.
+  assert.match(f[0]!.message, /kind: manager/, f[0]!.message);
+  // …and it must not read as a refusal, because it is not one.
+  assert.equal(
+    validateWorkflow(w).some((x) => x.severity === "error"),
+    false,
+    "a liaison file still validates — D4 keeps it running"
+  );
+});
+
+test("the supersession advisory fires for `liaison` alone", () => {
+  // THE CONTROL. Without it, "the liaison is warned" is satisfied by a
+  // validator that warns on every hint, or on every block.
+  for (const [kind, hint] of [
+    ["planner", "advisor"],
+    ["worker", "process"],
+  ] as const) {
+    const w = parseWorkflow(
+      `version: 1\nblocks:\n  - id: b\n    kind: ${kind}\n    cli: claude\n    role_hint: ${hint}\n`
+    ).workflow;
+    assert.deepEqual(
+      codes(validateWorkflow(w)).filter((c) => c === "role-hint-superseded"),
+      [],
+      `${hint} is not superseded by anything — it must draw no advisory`
+    );
+  }
+  // A block with no hint at all is the commonest case of all.
+  const plain = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\n"
+  ).workflow;
+  assert.deepEqual(codes(validateWorkflow(plain)).filter((c) => c.startsWith("role-hint")), []);
+});
+
+test("a liaison on the WRONG kind is still refused, and draws no advisory", () => {
+  // The ladder's order matters: an author who wrote `role_hint: liaison` on a
+  // worker has a file that will not load, and telling them about `kind: manager`
+  // instead of about the refusal would bury the thing that actually stops them.
+  const w = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\n    role_hint: liaison\n"
+  ).workflow;
+  const role = codes(validateWorkflow(w)).filter((c) => c.startsWith("role-hint"));
+  assert.deepEqual(role, ["role-hint-wrong-kind"]);
 });

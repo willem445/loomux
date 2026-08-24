@@ -80,8 +80,16 @@ export function isWorkflowCli(v: string): v is WorkflowCli {
  *  template/badge marker. `kind` alone decides the deny-flags and the cwd rule;
  *  the MCP tool scope has a short enumerated list of hint-keyed exceptions
  *  (`doc/design/liaison.md`): two narrowing — `session_digest` to `process`,
- *  `review_verdict` away from `liaison` — and one widening, `group_usage`
- *  (otherwise orchestrator-only) toward that same `liaison`.
+ *  `review_verdict` away from `liaison` — and TWO widening toward that same
+ *  `liaison`, both otherwise orchestrator-only: `group_usage`, and `ask_human`
+ *  (the pose only — nothing answers on the human's behalf, and
+ *  `withdraw_question` is deliberately not widened with it).
+ *
+ *  `liaison` is SUPERSEDED by `kind: manager`, the first-class human-interface
+ *  class. It still parses and still runs, unchanged, and the exceptions above
+ *  are still exactly what it gets; a manager is a capability class of its own
+ *  with its own tools and its own structural rules. `validateWorkflow` warns on
+ *  one so a file's author is told where the feature moved.
  *  Mirrors the backend's `role_hint_requires` (workflow.rs) so this pane's
  *  pre-run pass agrees with what the real parser would say. Each hint REQUIRES a
  *  specific `kind` — `advisor` needs `planner`, `process` needs `worker`,
@@ -723,6 +731,7 @@ export type FindingCode =
   | "prompt-and-profile"
   | "role-hint-unknown"
   | "role-hint-wrong-kind"
+  | "role-hint-superseded"
   | "manager-not-unique"
   | "knob-unavailable"
   | "edge-not-a-mapping"
@@ -2849,6 +2858,18 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
           severity: "error",
           code: "role-hint-wrong-kind",
           message: `Block "${where}" has role_hint "${b.role_hint}", which requires kind: ${required} (this block is kind: "${b.kind}").`,
+          blockId: b.id,
+        });
+      } else if (b.role_hint.trim().toLowerCase() === "liaison") {
+        // A WARNING, never an error: the hint parses on the real engine and the
+        // group runs exactly as it did (#1161 decision D4). What the author is
+        // owed is where the feature went — a hint on a reviewer cannot express
+        // what the manager class is, and someone reading a file written before
+        // that class existed has no way to know a better shape is available.
+        findings.push({
+          severity: "warning",
+          code: "role-hint-superseded",
+          message: `Block "${where}" has role_hint: liaison, which is superseded by kind: manager — the first-class human-interface class. The hint still parses and this block still runs exactly as it does today; a manager instead gets its own capability class, a durable mailbox from the orchestrator, and a pane orrerix never types into. See docs/orchestration.md.`,
           blockId: b.id,
         });
       }
