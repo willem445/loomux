@@ -670,11 +670,7 @@ impl TranscriptCursor {
         modified: Option<SystemTime>,
         created: Option<SystemTime>,
     ) -> StatVerdict {
-        if let (Some(now), Some(then)) = (created, self.created) {
-            if now != then {
-                return StatVerdict::Reset;
-            }
-        }
+        // [scratch] #1239 round 13: the creation-time arm is gone.
         if len < self.len {
             return StatVerdict::Reset;
         }
