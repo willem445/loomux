@@ -9618,13 +9618,11 @@ fn instruction_files_rendered_with_group_facts() {
 /// block.kind == Role::Orchestrator && named.is_some()` guard in
 /// `spawn_agent_bound`), and `resume_recorded_session` short-circuits an
 /// orchestrator record (`if record.role == "orchestrator"`) before it ever
-/// reaches `spawn_agent_ex` — so no production caller takes this path (round
-/// 1 review B1 corrects a wrong reachability claim made here; see
+/// reaches `spawn_agent_ex` — so no production caller takes this path (see
 /// `spawn_agent_bound`'s own comment on the test-only registration use, just
 /// above its orchestrator-block-name refusal). Anchored by symbol rather than
-/// line number — round 2's B1 fix already had to re-derive every line cite in
-/// this comment once after an unrelated rebase moved them (#1187 review round
-/// 3 N6).
+/// line number, since a symbol survives a rebase that moves the file and a
+/// bare line number does not.
 /// The test exercises `instruction_vars`/`pairs()` directly through the one
 /// caller that *can* reach it, so `{{WORKFLOW}}` — the placeholder this
 /// issue's own body names as the worst case, since it carries the entire
