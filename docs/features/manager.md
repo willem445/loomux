@@ -97,9 +97,10 @@ label, and cannot ask the orchestrator to treat your yes as one — nothing it s
 to another agent carries your authority, only your words. What varies between the
 modes is the *funnel* the issue then goes through, not what the manager is allowed
 to do to it. One thing the manager cannot tell you is which of those modes you are
-in — nothing it can read reports that, and it will say so rather than guess. You set
-the mode when you launched the group, and the orchestrator's pane is the one told
-directly, so that is where a definitive answer lives.
+in — nothing it can read reports that, and it will say so rather than guess. You control
+it: both autonomous mode and full autonomy are checkboxes in the group view, and either
+can be flipped mid-session rather than only at launch. The orchestrator's pane is the one
+told directly when they change, so that is where a definitive answer lives.
 
 Shipping does not vary at all. Full autonomy widens what may be **started**, never
 what may be **shipped**: merging is still gated on your own approval in every mode,

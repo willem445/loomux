@@ -834,6 +834,15 @@ pin advertised to stop it (rev-11 F1).
   contract a `mode: replace` manager ever reads, so a rule living only here would be a rule
   such a pane was never told.
 
+  **Amended in review round 3, and it is a behavioural rule rather than a rewording.** The
+  mode caveat above told the manager to find out which mode the group is in — and nothing on
+  its tool surface reports that, so the instruction was unfollowable and the user-facing page
+  promised the human that asking would work. `manager.md` now says plainly that it **cannot
+  look this up**, tells it to ask the human (who sets the mode and is present), and names the
+  orchestrator's pane as the one told directly. Same edit in `mechanics_core`'s arm and on the
+  docs page. What a manager does differently because of it: it no longer asserts a mode, and
+  it asks instead of guessing.
+
 ## If this test fails
 
 It is telling you that **the text every agent in every default group reads has
