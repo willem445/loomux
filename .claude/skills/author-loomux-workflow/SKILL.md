@@ -56,6 +56,16 @@ Read the human's description and extract, explicitly, before writing YAML:
   warning — and `allow:` patterns apply to neither: those are Claude/Copilot
   tool-matcher strings, and a gemini or opencode block runs with its class's
   baseline.
+- **A pane the HUMAN talks to.** "I want to chat about the project rather than
+  drive the orchestrator", "somebody to take my half-formed feature ideas and
+  turn them into a proper ticket", "status without reading agent traffic" → a
+  `kind: manager` block. It is a capability class of its own, not a persona on a
+  reviewer: orrerix never types into that pane (no kickoff after the first, no
+  notices, no relays), the orchestrator reaches it only by posting to a durable
+  mailbox it pulls, and it holds no authority the human has not used themselves —
+  no repo writes, no spawns, no verdicts. **At most one per file**, and a second
+  is a parse error. Declare one only if the human asked for that shape; a group
+  without one behaves exactly as it does today. See `docs/features/manager.md`.
 - **Review rigor.** One reviewer that must pass, or several focused lanes
   that must *all* pass (`all-pass`), or "any N of these M" (`threshold: N`)?
   This becomes the `gates.merge` clause (Step 4).
@@ -95,10 +105,11 @@ Read the human's description and extract, explicitly, before writing YAML:
 | Human language | orrerix concept |
 |---|---|
 | "a role" / "an agent that does X" | a **block**: `id` (immutable identity), `name` (display only), `kind` (capability class), `cli`, `model`, and a persona (`prompt:` or `profile:`) |
-| "what kind of work can it do" | `kind` — one of exactly four: `orchestrator`, `worker`, `reviewer`, `planner`. This is the **only** thing that grants capability. See Invariant 1. |
+| "what kind of work can it do" | `kind` — one of exactly five: `orchestrator`, `worker`, `reviewer`, `planner`, `manager`. This is the **only** thing that grants capability. See Invariant 1. |
 | "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner, `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
 | "a domain expert, consulted on demand" | `kind: planner` + `role_hint: advisor` — read-only, spawned only when stuck on a specific question, exits the moment it reports. |
 | "a design-review or premortem second opinion, not on every PR" | Same `kind: planner` + `role_hint: advisor` shape — never `kind: reviewer`, which the merge gate would need to pass on every PR or run on every PR to avoid holding it shut. See `docs/orchestration.md` → "Adding a second lens". |
+| "a pane I talk to" / "turn my idea into a ticket" / "status as a conversation" | `kind: manager` — the human's own interface. At most one per file (a second is a parse error); never spawned by an agent and never typed into; reaches the orchestrator through a durable mailbox and `message_orchestrator`. Not `kind: reviewer` + `role_hint: liaison`, which is the superseded shape. |
 | "someone who writes up lessons after a PR merges" | `kind: worker` + `role_hint: process` — opens a normal PR and never merges it. Its PRs are a standing-authorized merge class the orchestrator dispositions itself rather than deferring to the human (#1021); the bar (review, green CI, findings settled) is unchanged. |
 | "must all pass" / "any 2 of these 3" | `gates.merge.require: all-pass` (the default) or `require: threshold` + `threshold: N` |
 | "also needs CI green" | `gates.merge.also: [ci-green]` — the only condition the shim can check today (see Step 5) |
@@ -111,8 +122,8 @@ file that tries to spell any of them out is a **hard parse error**, not a
 soft warning:
 
 1. **A workflow file can never grant a capability.** `kind` selects one of
-   four closed enum values; there is no `read_only: false`, no `allow_write`,
-   no fifth class. `deny_unknown_fields` is on every wire struct, so a made-up
+   five closed enum values; there is no `read_only: false`, no `allow_write`,
+   no sixth class. `deny_unknown_fields` is on every wire struct, so a made-up
    key is a validation error, not a silent no-op. `allow:` can only
    *pre-approve tool patterns within what the kind already permits* — and is
    flatly **banned** on a read-only kind (`planner`), because a pre-approved
@@ -181,15 +192,15 @@ One block (`RawBlock`, `deny_unknown_fields`):
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `id` | string | yes | immutable identity; `[A-Za-z0-9_-]` only, ≤48 chars, unique; the four kind names (`orchestrator`/`worker`/`reviewer`/`planner`) are **reserved** — usable only by a block of that same `kind` |
+| `id` | string | yes | immutable identity; `[A-Za-z0-9_-]` only, ≤48 chars, unique; the five kind names (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) are **reserved** — usable only by a block of that same `kind` |
 | `name` | string | no (default `""`) | display only; falls back to `id` if empty; renaming never breaks a reference |
-| `kind` | string | yes | one of `orchestrator`, `worker`, `reviewer`, `planner` (case-insensitive); anything else is a named error, never coerced |
+| `kind` | string | yes | one of `orchestrator`, `worker`, `reviewer`, `planner`, `manager` (case-insensitive); anything else is a named error, never coerced. `manager` is capped at **one per file** and may not be named as a gate reviewer (it records no verdict); `prompt:`/`profile:`/`allow:` on a manager block are parse errors, as they are on an orchestrator block |
 | `cli` | string | no (default `""`) | `""` = inherit the group default; else must be one of `SUPPORTED_CLIS` (`claude`, `copilot`, `gemini`) |
 | `model` | string | no (default `""`) | `""` = inherit the kind's default for the resolved `cli`; allowlist-filtered (alnum, `.`, `-`, `_`) |
 | `prompt` | string | no | inline persona text; mutually exclusive with `profile` |
 | `profile` | string | no | repo-relative path to a persona file; mutually exclusive with `prompt`; no `..`, no absolute path, no drive letter |
 | `allow` | list of string | no (default `[]`) | extra pre-approved tool patterns; **rejected outright** if the block's `kind` is read-only (`planner`) |
-| `role_hint` | string | no | `advisor` (requires `kind: planner`), `process` (requires `kind: worker`), or `liaison` (requires `kind: reviewer`); any other value, or a value paired with the wrong `kind`, is a parse error |
+| `role_hint` | string | no | `advisor` (requires `kind: planner`), `process` (requires `kind: worker`), or `liaison` (requires `kind: reviewer`); any other value, or a value paired with the wrong `kind`, is a parse error. **`liaison` is superseded by `kind: manager`** — it still parses and still runs, and the workflow pane warns on it; write `kind: manager` in a new file |
 | `effort` | string | no (default `""`) | thinking level; `""` = the CLI's own default. One of `low`, `medium`, `high`, `xhigh`, `max` — see the caps-gating rule below |
 | `context` | string | no (default `""`) | context-window variant; `""` = the model's own window. One of `1m` today — same caps-gating rule. Composed into the model alias at emit (`sonnet[1m]`), never written into `model:` itself |
 
@@ -324,6 +335,70 @@ gates:
     reviewers: [rev-lead]
     also: [ci-green]
 ```
+
+### Worked example — a manager between the human and the fleet
+
+Declare a `kind: manager` block when the human wants to talk to a *person*
+rather than drive an orchestrator: project discussion, status as a
+conversation, and turning a half-formed idea into a brief the team can build.
+
+```yaml
+version: 1
+name: with-a-manager
+
+blocks:
+  - id: orchestrator
+    kind: orchestrator
+    cli: claude
+    model: opus
+
+  # The human's own interface. At most one per file; a second is a parse error.
+  # No prompt:/profile:/allow: here — a manager block takes none, exactly as an
+  # orchestrator block takes none (Invariant 5). Only cli: and model:.
+  - id: manager
+    name: Manager
+    kind: manager
+    cli: claude
+    model: opus
+
+  - id: worker
+    kind: worker
+    cli: claude
+    model: sonnet
+
+  - id: rev-lead
+    kind: reviewer
+    cli: claude
+    model: opus
+
+edges:
+  - { from: orchestrator, to: [worker] }
+  - { from: worker, to: [rev-lead] }
+
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-lead]      # never the manager: it records no verdict
+```
+
+What changes for the human, and what does not:
+
+- The manager pane opens with the group and is **never typed into** by orrerix.
+  It learns what happened by reading a durable mailbox the orchestrator posts
+  to, at the start of each of its turns — which is the next time its human
+  speaks to it.
+- It holds **no authority the human has not used themselves**: no repo writes,
+  no spawns, no kills, no verdicts. It relays; the orchestrator decides.
+- It does **not** start work. A brief it grooms becomes a GitHub issue, and the
+  human's own label is still the only thing that hands that issue to the fleet.
+- The manager is exempt from `max_agents` and from the idle reaper, so it does
+  not compete with delegates for a slot and does not get closed for being quiet.
+- The `edges:` list deliberately does not mention it. Edges describe the work
+  handoff; the manager is not in that path.
+
+Do not declare one the human did not ask for. A group without a manager behaves
+exactly as it does today, and adding one changes where the human stands.
+
 
 ### Persona-file template (`.github/agents/<name>.md`)
 

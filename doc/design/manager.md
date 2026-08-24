@@ -7,9 +7,11 @@ pane, which guardrails skip it, and how both bare-resume routes into it are
 closed. **M4**: the prose that teaches both ends to use them — the manager's own
 contract, the `mode: replace` mechanics core it stays in lockstep with, and the
 orchestrator's `{{MANAGER_NOTE}}` fragment. The capability class itself landed in
-**M1** (#1169). The unread chip (M5) and the `role_hint: liaison` migration plus
-the workflow-author docs (M6) extend this note rather than replacing it — where a
-section names a later slice, that slice owns the paragraph.*
+**M1** (#1169). **M5** added the unread chip and the declared-but-absent notice;
+**M6**, the last slice, added the `role_hint: liaison` supersession and the
+pages. Each extended this note rather than replacing it, so its sections read
+chronologically — what is still OPEN is one list, at the end: *What the manager
+feature does not ship*.*
 
 Companion notes: [liaison.md](liaison.md), whose stated promotion trip-wire is
 why this class exists; [human-questions.md](human-questions.md) and
@@ -335,8 +337,9 @@ One new `#[tauri::command]`: `orch_mailbox_status(group_id) -> usize`, the
 manager's unread count, parsed through `command_group` (constraint 6). It reads
 0 for every group that declares no manager, and 0 on a read failure — chrome has
 no error channel, and the registry's loud read is untouched. M5's unread chip is
-its consumer; until then it is a read nothing calls, which is cheaper than a
-second visit to the ACL surfaces later.
+its consumer: `seedMailUnread` calls it once, at the moment a pane learns it is
+the manager, because the `orch-mailbox-changed` push says nothing about mail
+that was already waiting when that pane opened.
 
 **Registering it is a five-place change**, and the count is worth recording
 because two of the five are easy to miss and neither fails loudly at the place
@@ -720,8 +723,8 @@ surfaces carry a caveat whenever it says the default inverts. That is the shape 
 reach for if this drifts again; it was not built here because it is a guard with its
 own design questions, not a line in a prose slice.
 
-**3. The sweep M5 and M6 owe is "can the pane actually DO this", not "is this tool
-granted".** Two guards already stop the prose naming a tool the manager cannot call
+**3. The sweep every prose slice owes is "can the pane actually DO this", not "is
+this tool granted".** Two guards already stop the prose naming a tool the manager cannot call
 (`the_managers_contract_never_names_a_tool_it_does_not_have`, and its default-deny
 sibling deriving the granted set from `mcp.rs`). Neither catches an **instruction**
 to do something no tool supports, and this slice shipped exactly that and had it
@@ -782,29 +785,161 @@ human has not exercised themselves. It is never empty, so it sits mid-line like
 `{{BLOCK_KIND}}` — the line-final placeholders in that template keep the
 property that lets them render to nothing.
 
-## What M2 and M3 do not ship
+## M5 — the chrome, and the one thing it must not become
 
-Stated so no surface here reads as advertising a mechanism that does not exist
-(the #1026 line):
+M2 shipped the whole channel and left the human with no signal at all. The
+manager reads its mail at the start of a turn, and its turns are caused by its
+human speaking to it — so before M5 the only way to learn that anything had
+happened was to start a conversation and be told, which is one conversation too
+late to decide whether to have it.
 
-- **The prose that teaches the two tools is M4's, and it has landed** — see
-  *M4 — the prose* above. The tool DESCRIPTIONS still carry the turn-start
-  discipline and the relay rules in their own words, which was M2's answer to
-  shipping a channel before the templates named it, and stays the floor for a
-  manager whose instructions file it never read.
-- **No unread chip.** M5.
-- **No `role_hint: liaison` deprecation warning, and no page for the workflow
-  AUTHOR.** M6. The user-facing page for the human who *talks* to the manager
-  (`docs/features/manager.md`) ships in M4; what M6 still owes is the
-  `author-loomux-workflow` skill row, the worked `kind: manager` example and
-  the supersession note.
+`.pane-mail` is the answer: a header chip on the manager pane reading
+`✉ 3 unread`, mirrored onto the dock chip when the pane is minimized. Header
+chrome and a dock marker, so constraint 1 (never resize the PTY for a UI
+feature) holds trivially rather than by care.
 
-## What M4 does not ship
+### It has no click action, and that is the design
 
-- **No unread chip.** M5 — until it lands, the human's only signal that mail is
-  waiting is the manager telling them after it reads.
-- **No `role_hint: liaison` deprecation warning.** M6.
-- **No user-facing page for the workflow author.** `docs/features/manager.md`
-  ships here and is written for the **human who talks to the manager**; the
-  `author-loomux-workflow` skill table, the worked `kind: manager` example and
-  the supersession note are M6's.
+Every other header chip in this app either acts (`.pane-attn` focuses and
+acknowledges; `.pane-channel` disconnects) or is inert because there is nothing
+truthful a click could do (`.pane-queue`: the queue drains when the pane is
+free). This one is the second kind for a sharper reason than that. A click that
+"marked it read" would be the app consuming the human's status stream on their
+behalf — on the one pane whose entire contract is that orrerix does not act
+inside it. What makes the manager read is the human speaking to it. The chip
+says so in its tooltip and offers no shortcut past it.
+
+### Why it does not render the cap
+
+`.pane-queue` renders `3/8`, and the cap is what makes that number legible:
+a full queue DROPS arrivals, so "how close to full" is the fact. The mailbox is
+the opposite. At `mailbox::UNREAD_MAX` the WRITER is refused — loudly, with the
+alternatives named in the refusal text — and no unread row is ever evicted. The
+consequence of a full mailbox therefore reaches an agent that can act on it,
+rather than needing to be inferred from a badge by a human who is, by
+construction, not there.
+
+The rejected alternative was to widen the event payload and
+`orch_mailbox_status`'s return with the cap. Both are shipped contracts, and the
+only thing they would buy is a cue for a state that means "you have been away a
+very long time" — one the human learns about from the manager, in the
+conversation whose absence caused it. Hardcoding `32` in TypeScript instead was
+rejected outright: nothing could pin it against the Rust constant, and a
+cross-language number with no guard is a drift waiting to happen.
+
+### One gate decides which pane wears it
+
+`orch-mailbox-changed` carries a group id and an unread count, and a group holds
+the orchestrator's pane and every delegate's. A same-group filter alone would put
+the manager's mail on all of them. `mailboxPanes` (in `src/mailboxbadge.ts`) is
+the single place that adds the role test, and the SEED goes through it too — a
+push says nothing about mail that was already waiting when a pane opened, so
+`seedMailUnread` reads `orch_mailbox_status` once at the moment a pane learns it
+is the manager. Seed and push resolving the target the same way is what stops
+them disagreeing about which pane owns a group's mailbox.
+
+### The INV-3 row is declared owned rather than claimed closed
+
+`orch-mailbox-changed` is producer-rate — an agent writes the file, not a clock —
+and it has no coalescer and no throttle. What actually bounds it is a REFUSAL,
+and `performance.md` §3's vocabulary (`backend-coalesced | rAF-gated | throttled
+| argued-none`) has no term for one, so the manifest row says `argued-none` with
+an owner rather than borrowing a label that would be false. The real bound is
+worth stating here because the row is where it will be re-read: past
+`UNREAD_MAX` the writer is refused, so an orchestrator cannot drive this stream
+past 32 emits without the manager consuming, and the manager consumes only when
+its human speaks. The budget is ~32 emits per human turn per group, and zero for
+every group that declares no manager. If a writer ever arrives that is not
+turn-bound, that argument fails and the row needs a real mechanism.
+
+## M6 — the supersession and the pages
+
+### `role_hint: liaison`, warned on two surfaces and refused on none
+
+Decision D4: the hint keeps parsing, with a superseded warning; removal is a
+later, separate, human decision. Both halves are load-bearing and they fail
+differently. A hint that never warns leaves a file written before this class
+existed with no way to learn a better shape is available. A hint that ERRORS
+stops every repo that shipped a liaison from loading on an upgrade — which is
+the thing D4 exists to refuse.
+
+Two surfaces, because they reach different people. `validateWorkflow` raises
+`role-hint-superseded` (severity `warning`) — that reaches whoever EDITS the
+file, in the pane where they edit it. The launcher preview's roster chip reads
+`LIAISON (SUPERSEDED)` — that reaches whoever LAUNCHES a repo they did not
+write, at the moment they consent to its roster. Neither refuses anything.
+
+**The engine raises nothing, deliberately.** `parse_workflow` returns
+`Result<Workflow, Vec<String>>` — errors only, no warning channel — and adding
+one would be a public-contract change to a core function with many callers, for
+an advisory whose two audiences are both already served. The file loads and the
+group runs byte for byte as before, which is exactly what D4 says it should.
+
+### What each page is for, and why there are three
+
+- `docs/features/manager.md` — the human who TALKS to the pane. What it is good
+  at, how a request becomes work, what it will not do, the unread chip, what the
+  group panel says when the pane is not there, and why adding a block to the
+  file does not give a running group a manager.
+- `docs/orchestration.md` → *A manager pane* — the human who DECLARES one. The
+  worked `kind: manager` block, the constraints that bite at parse (one per
+  file, no persona keys, never a gate reviewer), and the supersession.
+- `.claude/skills/author-loomux-workflow/SKILL.md` — the AGENT that authors a
+  workflow file from a human's description. A mapping row so "a pane I talk to"
+  resolves to `kind: manager` rather than to a liaison, the schema rows, and a
+  worked example.
+
+The split is not filing: each answers a different question, and the third is
+read by something that never reads the other two.
+
+### Two corrections that rode along
+
+`src/workflowmodel.ts`'s `ROLE_HINTS` comment claimed ONE widening toward the
+liaison (`group_usage`). There have been two since #1091 slice E added
+`ask_human` (the pose only — `withdraw_question` is deliberately not widened
+with it). The engine's own copy of that sentence was already current, so this
+was the frontend mirror drifting, and it is the reason the mirror is now stated
+as a mirror.
+
+`doc/design/architecture.md` called `kind` a "closed 4-variant enum". It is five
+declarable variants, and the module map had no `mailbox.rs` row at all.
+
+### `orchestrator.md`'s counting parenthetical is pinned, not reworded
+
+`templates/orchestrator.md` tells the orchestrator "at most `{{MAX_AGENTS}}` live
+delegates (workers+reviewers+planners count together)". That sentence dates to
+#76 and is true only by the accident of predating every class that does not
+count — `Role::Orchestrator` when it was written, and `Role::Manager` since D3.
+It enumerates the counting classes rather than asserting an exemption, so it is
+accurate today, and nothing read it for this property: the day a class is added
+that DOES count, it becomes a false claim on a goldened template with a green
+suite over it.
+
+The two options were to reword it defensively or to pin it. Pinning is strictly
+stronger — a reworded sentence is still a sentence nobody checks — and it costs
+no `pre222` re-bless, because the template is untouched. Both sides of the pin
+are DERIVED rather than restated: the `Role` variants are harvested from the
+enum's own source (a hand-written list is what a new class walks past), the
+population is whatever `workflow::kind_from_str` accepts, the counting set comes
+from `counts_against_max_agents`, and the named classes are read out of the
+template. The residual — a class that counts but is not declarable — is pinned
+too, along with the bound that makes it harmless: `spawn_agent` resolves its
+`kind` through that same `kind_from_str`, so an undeclarable class cannot reach
+a group's cap at all.
+
+## What the manager feature does not ship
+
+Current as of M6, which is the last slice of #1161. Everything the earlier
+slices deferred has landed except the items below, and each of these is a
+decision rather than a gap.
+
+- **No `kill_agent` protection.** An orchestrator can still kill a manager pane;
+  "never kill the manager" is instruction-backed, in `{{MANAGER_NOTE}}`. Making
+  it mechanically unkillable is a separate decision.
+- **Nothing reopens a manager that is closed or dies.** Decided, not deferred —
+  see *Why nothing reopens a dead manager* above.
+- **`role_hint: liaison` is not removed.** D4: superseded and warned, never
+  refused. Removal is a separate, later, human decision.
+- **No engine-side warning channel.** See *warned on two surfaces* above.
+- **No brief registry.** A groomed brief becomes a GitHub issue the orchestrator
+  files; the issue is the durable artifact and nothing else is planned.

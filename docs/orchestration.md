@@ -1417,7 +1417,8 @@ By default a group runs the built-in four-role roster — one orchestrator,
 worker, reviewer, and planner, each on the CLI/model you picked at launch. A
 repo can commit `<repo>/.orrerix/workflow.yml` and declare its own instead: any
 number of named blocks, each with its own capability class (orchestrator,
-worker, reviewer, or planner), CLI, model, and persona, plus a **merge gate**
+worker, reviewer, planner, or manager — the last being the pane *you* talk to,
+see below), CLI, model, and persona, plus a **merge gate**
 naming which reviewer blocks must record a `pass` verdict — enforced
 mechanically by the `gh` shim — before `gh pr merge` can succeed. See
 [`doc/design/workflows.md`](https://github.com/willem445/orrerix/blob/main/doc/design/workflows.md)
@@ -1666,6 +1667,86 @@ lens** below. The question that separates them is not how valuable the opinion i
 it is **does this run on every PR?** A checklist does, and belongs in the gate; a
 lens does not, and a reviewer block would both run it every time and hold every
 merge shut waiting for it.
+
+### A manager pane — the human's own interface
+
+Every block above is an agent doing work. A `kind: manager` block is not: it is
+the pane **you** talk to. Project discussion, "how is it going", and the
+half-formed feature idea you have not written down yet all belong there, and its
+job is to turn the last of those into something the team can build correctly the
+first time. [The manager pane](features/manager.html) is the page for using one;
+this section is how to declare one.
+
+```yaml
+version: 1
+blocks:
+  - id: orchestrator
+    kind: orchestrator
+    cli: claude
+    model: opus
+
+  - id: manager           # at most one per file; a second is a parse error
+    name: Manager
+    kind: manager
+    cli: claude
+    model: opus
+
+  - id: worker
+    kind: worker
+    cli: claude
+    model: sonnet
+
+  - id: rev-lead
+    kind: reviewer
+    cli: claude
+    model: opus
+
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-lead]  # never the manager — it records no verdict
+```
+
+What that block gets you, and what it deliberately does not:
+
+- **Orrerix never types into that pane.** No notices, no relays, no status
+  lines — your conversation with the manager is yours. News reaches it by
+  **pull**: the orchestrator posts milestones into a durable mailbox, and the
+  manager reads that mailbox at the start of each of its turns, which is the
+  next time you speak to it. An **unread-mail chip** on the pane header tells
+  you when something is waiting.
+- **It holds no authority you have not used yourself.** No repo writes, no
+  branches, no PRs, no spawning or killing panes, no review verdicts. It relays;
+  the orchestrator decides.
+- **It does not start work.** A brief it grooms with you becomes a GitHub issue,
+  and your own label on that issue is still the only thing that hands it to the
+  fleet.
+- **It costs no delegate slot.** A manager is exempt from `max_agents`, from the
+  idle reaper and from the stall watchdog — it is idle whenever you are not
+  talking to it, which is most of the time, and that is not a fault.
+- **It may not be a gate reviewer**, and `prompt:`, `profile:` and `allow:` are
+  parse errors on a manager block — the same rule an `orchestrator` block
+  follows. Its instructions are orrerix's, not the repo's.
+- **The group works without it.** Close the pane and everything behaves exactly
+  as it does for a group that declares none: the orchestrator takes your input
+  in its own pane, as it always has. Nothing reopens the pane automatically, on
+  purpose — closing it is something you are allowed to do, and orrerix cannot
+  tell that apart from a crash. The group panel says *manager declared · not
+  open* while it is gone, and the session browser brings it back.
+
+**A manager is only ever declared, never inherited.** Adding a `kind: manager`
+block to the file gives a manager to *fresh* launches of that repo. A group that
+already exists — including a dormant one you reattach — keeps the roster its own
+launch approved and never re-reads the file, so it will not gain one on resume.
+Launch a new group to pick up the change.
+
+**`role_hint: liaison` is superseded by this.** The hint still parses and a repo
+that uses it keeps working unchanged; the workflow pane now marks it as
+superseded and the launcher preview badges it `LIAISON (SUPERSEDED)`. Write
+`kind: manager` in a new file: a hint on a reviewer block cannot express what
+this class is — a pane orrerix never types into, with a mailbox of its own and a
+capability set that is not a reviewer's.
+
 
 ### Turning on the merge queue
 
