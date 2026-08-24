@@ -35517,7 +35517,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("prompts.rs", 1),       // test_registry
         ("perf_leaflocks.rs", 1), // test_registry
         ("opencodeusage.rs", 1), // test_registry
-        ("opencodesessions.rs", 1), // test_registry
+        ("opencodesessions.rs", 1), // registry_at
         ("opencodedigest.rs", 1), // test_registry
         ("rootreg.rs", 1),        // registry_at
         ("manager_lifecycle.rs", 1), // relaunch_registry
