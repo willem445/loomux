@@ -142,6 +142,19 @@ fn audit_text(reg: &OrchRegistry, g: &GroupId) -> String {
     fs::read_to_string(reg.state_root().join(g.as_str()).join("audit.jsonl")).unwrap_or_default()
 }
 
+/// RED RUN ONLY (round 2). Base has no launch-time open, so in round 1 seven of
+/// these tests died at `the_manager`'s "expected exactly one manager row"
+/// BEFORE reaching the assertion they exist for — a red that evidences only the
+/// missing launch, not each guard. This hand-registers the pane exactly the way
+/// loomux's own opener does (`block: None`, resolved by class) so every
+/// assertion below the launch one runs and reddens on its own logic.
+fn ensure_manager(reg: &OrchRegistry, g: &GroupId) {
+    if rows_of(reg, g, "manager").is_empty() {
+        reg.spawn_agent_ex(g, Role::Manager, None, "", "", false, None, None, None, None, None)
+            .expect("hand-registered manager stand-in for the launch open");
+    }
+}
+
 fn orch_caller(reg: &OrchRegistry, g: &GroupId) -> Caller {
     let id = rows_of(reg, g, "orchestrator")
         .first()
@@ -295,6 +308,7 @@ fn nothing_may_be_typed_into_the_manager_pane_the_launch_opened() {
     // made about was hand-registered, so the guarantee had never been exercised
     // on the path that now creates one.
     let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    ensure_manager(&reg, &gid); // RED RUN ONLY
     let m = the_manager(&reg, &gid);
     let mid = m["id"].as_str().unwrap();
 
@@ -348,6 +362,7 @@ fn the_idle_reaper_takes_a_worker_beside_the_manager_and_never_the_manager() {
     // the notice goes to the orchestrator's pane, not to the human sitting in
     // front of the one that just vanished.
     let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    ensure_manager(&reg, &gid); // RED RUN ONLY
     let m = the_manager(&reg, &gid);
     let mid = m["id"].as_str().unwrap().to_string();
 
@@ -443,6 +458,7 @@ fn a_manager_does_not_spend_a_max_agents_slot() {
 
     let rails = Guardrails { max_agents: 1, ..rails() };
     let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails);
+    ensure_manager(&reg, &gid); // RED RUN ONLY
     let _ = the_manager(&reg, &gid); // it is live
 
     // With the manager counted, this spawn is refused. It must not be.
@@ -482,6 +498,7 @@ fn a_manager_does_not_spend_a_max_agents_slot() {
 #[test]
 fn no_agent_reachable_route_can_open_a_manager_pane() {
     let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    ensure_manager(&reg, &gid); // RED RUN ONLY
     let caller = orch_caller(&reg, &gid);
     let manager_session = the_manager(&reg, &gid)["session"].as_str().unwrap().to_string();
 
@@ -636,6 +653,7 @@ fn a_group_may_not_hold_two_live_managers() {
     // has to notice are different, and one mailbox drained by whichever read it
     // first.
     let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    ensure_manager(&reg, &gid); // RED RUN ONLY
     let m = the_manager(&reg, &gid);
     let mid = m["id"].as_str().unwrap().to_string();
 
