@@ -29,7 +29,7 @@ thread it spawns (`desktop.rs`: `run_on_main_thread(...)` → `std::thread::spaw
 attaches the input queues of an owner/owned pair, so the dialog thread's `SetFocus` is delivered
 **synchronously** into the owner thread's window procedure — ours.
 
-From there the path is entirely dependency code compiled into `loomux.exe`:
+From there the path is entirely dependency code compiled into `orrerix.exe`:
 
 - `wry`'s parent subclass answers `WM_SETFOCUS` by forcing
   `ICoreWebView2Controller::MoveFocus` back into the webview.
