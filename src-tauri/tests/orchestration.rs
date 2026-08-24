@@ -83,6 +83,8 @@ use loomux_lib::orchestration::{
     QUESTION_HOLD_OVERRIDE_AFTER,
     // #903: the session-keyed record of loomux's own delivered PROMPT text.
     delivered_prompt_lines, DELIVERED_PROMPT_CHARS, DELIVERED_NOTICE_CHARS,
+    // #903 B2: the granted override that carries its own Enter.
+    override_enter_admits, QuestionReread, QUESTION_OVERRIDE_CONSECUTIVE_READS,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
@@ -51000,6 +51002,68 @@ fn j8_a_replayed_notice_row_is_still_a_notice_under_a_chevron() {
     assert!(
         question_shown(Some(&m), Some(Composed::plain(&masked))),
         "…and still holds the Enter"
+    );
+}
+
+#[test]
+fn j9_a_granted_override_carries_its_enter_only_on_fresh_proof() {
+    // B2's decision, which is the one term standing between "the override moves
+    // the queue" and "the override strands a paste on a pane with a live dialog
+    // on it". `question_override_admits` decides the PASTE minutes earlier; this
+    // decides the ENTER at the moment it is pressed.
+    //
+    // Written in terms of `QUESTION_OVERRIDE_CONSECUTIVE_READS` throughout, so a
+    // future edit to that constant cannot leave this test asserting a rule the
+    // code no longer has.
+    let n = QUESTION_OVERRIDE_CONSECUTIVE_READS as usize;
+    let idle = QuestionReread { active: true, idle_prompt: true };
+    let dialog = QuestionReread { active: true, idle_prompt: false };
+    let cleared = QuestionReread { active: false, idle_prompt: false };
+
+    // The one shape that does NOT admit, and the three that do.
+    assert!(!dialog.admits(), "a gate still holding with no composer on screen is a dialog");
+    assert!(idle.admits(), "…and one whose screen shows our own paste in the composer is not");
+    assert!(cleared.admits(), "…nor is a gate that has simply gone clear since the abort");
+
+    // Enough reads, and never fewer.
+    assert!(
+        !override_enter_admits(&[]),
+        "no reads at all must not pass by omission — the caller that took none is the \
+         one this term exists to catch"
+    );
+    assert!(
+        !override_enter_admits(&vec![idle; n - 1]),
+        "one short of the bar is short of the bar: a single reading of a composed screen \
+         can catch a mid-redraw instant, and this one licenses an Enter"
+    );
+    assert!(override_enter_admits(&vec![idle; n]), "and at the bar, with every read idle, it carries");
+    assert!(
+        override_enter_admits(&vec![cleared; n]),
+        "a pane that repainted itself clear between the abort and this re-read must not be \
+         stranded for having got BETTER"
+    );
+
+    // EVERY read, not the last one and not a majority — pinned in both orders, so
+    // an implementation that looked at either end would fail here.
+    let mut first_bad = vec![idle; n];
+    first_bad[0] = dialog;
+    let mut last_bad = vec![idle; n];
+    last_bad[n - 1] = dialog;
+    assert!(
+        !override_enter_admits(&first_bad),
+        "a dialog on the FIRST read is disqualifying, however the rest read"
+    );
+    assert!(
+        !override_enter_admits(&last_bad),
+        "and so is one on the LAST — there is no memory of having been eligible"
+    );
+
+    // A longer run does not dilute it either: the rule is universal, not a count.
+    let mut long_run = vec![idle; n + 3];
+    long_run[2] = dialog;
+    assert!(
+        !override_enter_admits(&long_run),
+        "one dialog read anywhere in a longer run still refuses the Enter"
     );
 }
 
