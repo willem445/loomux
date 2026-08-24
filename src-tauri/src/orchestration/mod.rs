@@ -12545,6 +12545,19 @@ pub struct OrchRegistry {
     /// is not by itself a bound — the insert site prunes ids that are no longer
     /// live agents instead.
     spawn_notices: Mutex<HashMap<String, Vec<String>>>,
+    /// The `orch-session-learned` payloads produced while there was no
+    /// `AppHandle` to emit them to. Empty in production, where every payload
+    /// goes to the webview instead — the same seam, and the same reason, as
+    /// [`Self::test_spawn_requests`]: with no frontend, this is the only place
+    /// what the emit SITE built stays observable.
+    ///
+    /// Its residual, stated rather than left to be discovered: this records
+    /// that `associate_session` reached the emit exactly once per binding and
+    /// with which payload — not that `app.emit` itself fired, which no test
+    /// without a Tauri app handle can reach. The uncovered branch is one line
+    /// long and takes the SAME payload value as the covered one, built above
+    /// the branch precisely so the two cannot disagree.
+    test_session_learned: Mutex<Vec<serde_json::Value>>,
     port: AtomicU16,
     /// Agent-id counter: `w-3`, `rev-8`, `solo-2`, `orch-1` all mint their
     /// numeric suffix here. **Registry-global, not per-group** — one counter
@@ -26261,6 +26274,7 @@ impl OrchRegistry {
             pending_binds: Mutex::new(HashMap::new()),
             test_spawn_requests: Mutex::new(HashMap::new()),
             spawn_notices: Mutex::new(HashMap::new()),
+            test_session_learned: Mutex::new(Vec::new()),
             port: AtomicU16::new(0),
             // Seeded from disk on the first mint, not here — see `seq`'s doc.
             seq: AtomicU32::new(0),
@@ -29840,7 +29854,44 @@ impl OrchRegistry {
         // line already records it, and a second copy could only ever disagree.
         self.audit(group_id, brand::AUDIT_ACTOR, "session-learned",
             json!({ "agent": agent_id, "session": session_id }));
+        // The frontend's copy of that same fact (#1563), emitted here rather
+        // than at the watcher so every path that binds an id reports it, and
+        // last so that the two early returns above — a claim another pane
+        // holds, and a pane that is gone or already bound — emit nothing.
+        self.emit_session_learned(group_id, agent_id, session_id);
         true
+    }
+
+    /// Tell the frontend an id the BACKEND learned (#1563).
+    ///
+    /// copilot and opencode accept no pre-minted session id, so their session
+    /// is bound after boot by [`Self::spawn_session_watcher`] →
+    /// `associate_session`, and until this event existed the pane was never
+    /// told: `Pane.capture()` wrote `sessionId: null` into `tabs.json` and the
+    /// dormant-group card then offered no resume for a session `agents.json`
+    /// had recorded all along. The roster knew; the webview had no way to be
+    /// told. claude is unaffected — its id is minted onto the command line at
+    /// spawn, so it never reaches this path at all
+    /// ([`Self::capture_session_baseline`] answers `None` for every other CLI).
+    ///
+    /// One event per binding, on the same `AppHandle` seam `orch-focus` and
+    /// `orch-spawn-request` use. The payload names the group as well as the
+    /// agent because that is what identifies the record on the frontend side;
+    /// the pane itself is found by agent id (`src/orchestration.ts`).
+    fn emit_session_learned(&self, group_id: &GroupId, agent_id: &str, session_id: &str) {
+        // Built ONCE, above the branch, so the payload a test observes is the
+        // same value production emits rather than a second construction of it.
+        let payload = json!({
+            "group_id": group_id,
+            "agent_id": agent_id,
+            "session_id": session_id,
+        });
+        match self.app.lock_safe().clone() {
+            // Best-effort: a webview that has gone away must not fail the
+            // binding, which is already durable in `agents.json` by now.
+            Some(app) => { let _ = app.emit("orch-session-learned", &payload); }
+            None => self.test_session_learned.lock_safe().push(payload),
+        }
     }
 
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
@@ -49724,6 +49775,13 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn spawn_request_for_test(&self, agent_id: &str) -> Option<SpawnRequest> {
         self.test_spawn_requests.lock_safe().get(agent_id).cloned()
+    }
+    /// Every `orch-session-learned` payload this registry produced with no
+    /// frontend to emit to, oldest first. Empty in production; see
+    /// [`Self::test_session_learned`] for what it does and does not pin.
+    #[doc(hidden)] // pub for integration tests
+    pub fn session_learned_events_for_test(&self) -> Vec<serde_json::Value> {
+        self.test_session_learned.lock_safe().clone()
     }
 
     pub fn bind(&self, agent_id: &str, pty_id: u32) -> Result<(), String> {
