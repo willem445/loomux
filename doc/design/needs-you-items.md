@@ -153,7 +153,7 @@ the watermark fails toward showing *more*, never toward hiding.
 
 | command | set | notes |
 | --- | --- | --- |
-| `orch_needs_you_list(group_id)` | orch-read | items + `cleared_ms`, in one round trip |
+| `orch_needs_you_list(group_id)` | orch-read | items + `cleared_ms` + the board rows the open items name, in one round trip |
 | `orch_needs_you_resolve(group_id, id, note?)` | orch-control | the human's close-out |
 | `orch_needs_you_clear(group_id)` | orch-control | stamps the watermark, returns it |
 
@@ -169,6 +169,14 @@ second's stamp and flash back a row the human had just cleared. It returns the
 whole file, uncapped, for `orch_questions_list`'s reason — retention already
 bounds it, and a cap whose size the caller cannot see is the silent truncation
 the rest of this feature refuses.
+
+Since #1317 it carries the **board rows its open items name** on the same read,
+for the same argument one step further: the panel used to fetch the whole board
+separately to answer `linkTask`'s point lookups, which both held a second copy
+of a mostly-historical board and let a row and the item naming it come from two
+parses a moment apart. One row per distinct task an OPEN item names, and no
+others — the settled tail never joins the board. See
+doc/design/polled-payload-shapes.md §3.
 
 **It is a pure read.** It writes nothing, takes no lock, and must stay that way:
 §5.4 of `remote-engine-protocol.md` classifies it `viewer`, and that tier is

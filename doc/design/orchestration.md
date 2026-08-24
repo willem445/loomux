@@ -11681,7 +11681,7 @@ sitting in `queued`") is a rendering claim, and only this slice can make it true
 
 **The board derives readiness itself, and that duplication is the design.** `ready` is a
 `TaskSummary` field, and `TaskSummary` is the MCP `list_tasks` row — the *orchestrator's* path.
-The human's board reads full `Task`s over `orch_tasks`, a separate command, so it computes
+The human's board reads whole board rows over `orch_tasks`, a separate command, so it computes
 readiness from `deps` + the statuses already in that payload (`taskboard.ts`: `depState`,
 `unmetDeps`, `isReady`, mirroring `dep_satisfied`/`unmet_deps`/`task_ready`). The alternative —
 adding a derived flag to the human command's wire shape — would be a new contract for something
