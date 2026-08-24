@@ -20,12 +20,13 @@
 //! and asserted; nothing is executed.
 
 use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     create_orchestration_group, counts_against_max_agents, AgentRecord, Caller, Delivery, GroupId,
-    Guardrails, NameSource, OrchRegistry, Role, SessionOrigin,
+    Guardrails, NameSource, OrchRegistry, Role, SessionOrigin, ORCHESTRATOR_TPL,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -928,4 +929,231 @@ fn a_manager_open_does_not_consume_an_hour_slot_from_the_delegates() {
         .expect_err("the budget really is three");
     assert!(refused.contains("spawn-rate"), "refused by the rate backstop: {refused}");
     assert_eq!(rows_of(&reg, &g.id, "manager").len(), 1, "and the manager is live throughout");
+}
+
+// ─────── the orchestrator's own counting claim (#1429 round-5 N3) ───────
+//
+// `templates/orchestrator.md` states the guardrail as "at most {{MAX_AGENTS}}
+// live delegates (workers+reviewers+planners count together)". That
+// parenthetical dates to #76 and was true only by the accident of predating
+// every class that does NOT count: `Role::Orchestrator` was the whole exemption
+// when it was written, and `Role::Manager` joined it with decision D3 (#1161
+// M3). It enumerates the counting classes rather than asserting an exemption,
+// so it is still accurate — and nothing read it for this property, which means
+// the day a class is added that DOES count it becomes a false claim on a
+// GOLDENED template, with a green suite and nothing mechanical pointing at it.
+//
+// The pin below closes that by DERIVING both sides rather than restating
+// either: the enum's variants come from the enum's own source, the population
+// comes from `workflow::kind_from_str`, the counting set comes from
+// `counts_against_max_agents`, and the classes named come from the template.
+// It lives here, beside the exemptions it is a claim about, rather than in
+// `manager_prose.rs` (which pins the MANAGER's own surfaces) or `prompts.rs`
+// (which pins what a DEFAULT group reads, and a default group has no manager).
+
+/// Every `Role` variant, harvested from the enum's own source text.
+///
+/// Harvested rather than listed, because a hand-written population is exactly
+/// the shape a new class slips past (CLAUDE.md's source-scanning-guard
+/// convention): a list would still hold five names on the day a sixth counting
+/// class is added, and the guard would pass while the claim it guards went
+/// false. Doc comments, attributes and blank lines are skipped; a variant is a
+/// bare capitalized identifier followed by a comma, which is every arm of this
+/// enum — none carries a payload.
+fn role_variants_in_source() -> Vec<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/loomux-engine/src/model.rs");
+    let src = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("the Role enum's source must be readable at {path}: {e}"));
+    const OPEN: &str = "pub enum Role {";
+    let start = src
+        .find(OPEN)
+        .unwrap_or_else(|| panic!("`{OPEN}` must exist in {path} — this scan reads it by name"));
+    let body = &src[start + OPEN.len()..];
+    let end = body
+        .find("\n}")
+        .unwrap_or_else(|| panic!("the Role enum's closing brace must be findable in {path}"));
+    body[..end]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#["))
+        .filter_map(|l| l.strip_suffix(','))
+        .filter(|name| {
+            name.chars().all(|c| c.is_ascii_alphanumeric())
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `Role` a harvested variant name denotes.
+///
+/// `None` is the ALARM, not a row to skip: a variant this test has never seen
+/// has not been classified, and a guard that counted it as covered would be
+/// certifying coverage it never delivered (CLAUDE.md's population-control rule
+/// — count at the VERIFIED site, never at the MATCH site).
+fn role_named(variant: &str) -> Option<Role> {
+    Some(match variant {
+        "Orchestrator" => Role::Orchestrator,
+        "Worker" => Role::Worker,
+        "Reviewer" => Role::Reviewer,
+        "Planner" => Role::Planner,
+        "Manager" => Role::Manager,
+        "Solo" => Role::Solo,
+        _ => return None,
+    })
+}
+
+/// Whitespace-collapsed, so a rule that is re-wrapped across a line break does
+/// not read as a deleted one — `manager_prose.rs`'s `flat`, for its reason. The
+/// parenthetical this test reads is straddled by a line break in the template
+/// today, so this is load-bearing rather than defensive.
+fn flat(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One trailing plural `s`, removed exactly once — never `trim_end_matches`,
+/// which would eat the last letter of a future class whose own name ends in one.
+fn singular(word: &str) -> String {
+    let w = word.trim().to_ascii_lowercase();
+    w.strip_suffix('s').map(str::to_string).unwrap_or(w)
+}
+
+#[test]
+fn the_orchestrators_counting_parenthetical_names_exactly_the_classes_that_count() {
+    let variants = role_variants_in_source();
+
+    // POSITIVE CONTROL, because this guard's success shape is "the two sets
+    // matched" — byte-identical to a scan that read nothing at all and compared
+    // two empty sets (CLAUDE.md). The population IS the guard here, so it is
+    // checked before anything is concluded from it.
+    assert!(
+        variants.len() >= 6,
+        "the Role harvest found only {variants:?} — a scan that cannot see the enum enforces nothing"
+    );
+    for expected in ["Worker", "Manager", "Solo"] {
+        assert!(
+            variants.iter().any(|v| v == expected),
+            "the Role harvest missed `{expected}`: {variants:?}"
+        );
+    }
+
+    let mut counted: BTreeSet<String> = BTreeSet::new();
+    let mut verified = 0usize;
+    for v in &variants {
+        let role = role_named(v).unwrap_or_else(|| {
+            panic!(
+                "`Role::{v}` is new and unclassified. Add it to `role_named` above, then decide \
+                 two things about it: is it DECLARABLE in a workflow file \
+                 (`workflow::kind_from_str`), and does it spend a `max_agents` slot \
+                 (`counts_against_max_agents`)? If BOTH, `templates/orchestrator.md`'s guardrail \
+                 parenthetical has to name it too — and that is a goldened template, so the \
+                 `pre222` fixtures are re-blessed in the same commit. This is the whole reason \
+                 this test exists (#1429 round-5 N3)."
+            )
+        });
+        // matched == verified: every harvested variant is classified, so one the
+        // scan SAW but could not judge fails above rather than riding through as
+        // covered.
+        verified += 1;
+        // The population is DERIVED, not excluded by hand: a class no workflow
+        // file can name can never occupy a slot in a group, so the claim does
+        // not reach it. `Role::Solo` is the only one today — see the residual
+        // test below, which pins that blind spot and the bound on it.
+        if workflow::kind_from_str(&v.to_ascii_lowercase()) == Some(role)
+            && counts_against_max_agents(role)
+        {
+            counted.insert(role.as_str().to_string());
+        }
+    }
+    assert_eq!(verified, variants.len(), "every harvested variant must be classified");
+    assert!(
+        !counted.is_empty(),
+        "no declarable class counts against `max_agents` — that is the derivation broken, not the claim"
+    );
+
+    // The other side, read off the template rather than restated here.
+    let tpl = flat(ORCHESTRATOR_TPL);
+    const ANCHOR: &str = "live delegates (";
+    let at = tpl.find(ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "`templates/orchestrator.md` no longer states the guardrail as \
+             \"... live delegates (<classes> count together)\". If the sentence moved or was \
+             reworded, MOVE this pin with it rather than deleting it: that parenthetical is a \
+             claim about `counts_against_max_agents`, and this is the only thing that reads it \
+             (#1429 round-5 N3)."
+        )
+    });
+    let rest = &tpl[at + ANCHOR.len()..];
+    let close = rest
+        .find(')')
+        .expect("the guardrail parenthetical must close on the same (flattened) line");
+    let inside = &rest[..close];
+    let listed = inside.split("count together").next().unwrap_or(inside);
+    let named: BTreeSet<String> =
+        listed.split('+').map(singular).filter(|w| !w.is_empty()).collect();
+
+    assert_eq!(
+        named, counted,
+        "`templates/orchestrator.md`'s guardrail parenthetical names {named:?}, but the classes a \
+         workflow file may declare AND that spend a `max_agents` slot are {counted:?}. Whichever \
+         moved, the two have to agree — the orchestrator is being told, in its own instructions, \
+         which of its panes spend the cap it plans against. Editing that template re-blesses \
+         `src-tauri/tests/fixtures/pre222/` in the same commit."
+    );
+}
+
+#[test]
+fn the_counting_pin_is_blind_to_a_class_no_workflow_file_can_name_and_that_is_bounded() {
+    // THE RESIDUAL, pinned rather than merely disclosed (CLAUDE.md): the test
+    // above derives its population from `kind_from_str`, so a class that counts
+    // against the cap but is NOT declarable would be invisible to it.
+    //
+    // `Role::Solo` is exactly that class today — the predicate would count it…
+    assert!(
+        counts_against_max_agents(Role::Solo),
+        "`counts_against_max_agents` defaults a new class to COUNTED; if Solo stopped counting, \
+         this residual changed shape and the note above it went stale"
+    );
+    // …and it is outside the population by DERIVATION, not by a hand-written
+    // exclusion in the test above.
+    assert_eq!(
+        workflow::kind_from_str("solo"),
+        None,
+        "if `solo` became declarable the pin above starts reading it, and the template's \
+         parenthetical has to name it"
+    );
+
+    // THE BOUND on that blindness: a class the workflow file cannot name also
+    // cannot be minted into a group by an agent, because `spawn_agent` resolves
+    // its `kind` through the very same `kind_from_str`. So an undeclarable class
+    // cannot reach a group's cap at all — which is what makes the population the
+    // pin above derives the whole population the claim is about.
+    let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
+    let caller = orch_caller(&reg, &gid);
+    let before = reg.list_agents(&gid).as_array().unwrap().len();
+    let out = dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "solo", "task": "t" } }),
+    )
+    .unwrap();
+    assert_eq!(out["isError"], json!(true), "`kind: solo` must be refused: {out}");
+    assert_eq!(
+        reg.list_agents(&gid).as_array().unwrap().len(),
+        before,
+        "and nothing may be minted by the attempt"
+    );
+
+    // The non-vacuity control for that refusal: the same call shape with a kind
+    // the file CAN name is admitted, so the assertion above is about `solo` and
+    // not about a `spawn_agent` that refuses everything.
+    let ok = dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "t" } }),
+    )
+    .unwrap();
+    assert_ne!(ok["isError"], json!(true), "a declarable kind still spawns: {ok}");
 }
