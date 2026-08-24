@@ -801,9 +801,10 @@ async function runMac(getRelease, command) {
 // them at once. `Programs\` is kept as a root because older Tauri installers
 // used it and those installs are still out there.
 //
-// Product-major, then exe-major within it: a machine carrying several installs
-// must launch the CURRENT one wherever it sits, rather than whichever happens
-// to live under the root that got listed first.
+// Ordered product, then root, then exe — most likely first at every level. A
+// machine carrying several installs must launch the CURRENT one wherever it
+// sits, rather than whichever happens to live under the root, or carry
+// the exe name, that got listed first.
 //
 // `env` is a parameter so the ordering rule is testable without a real machine.
 function windowsExeCandidates(env = process.env) {
@@ -996,8 +997,6 @@ if (require.main === module) {
 module.exports = {
   PRODUCT_NAMES,
   CLI_NAMES,
-  MAIN_BINARY,
-  LEGACY_MAIN_BINARY,
   EXE_NAMES,
   parseArgs,
   planAction,
