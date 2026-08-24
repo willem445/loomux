@@ -1425,6 +1425,25 @@ struct RawBlock {
     /// (the reasoning [`RawMergeQueue::max_batch`] states).
     #[serde(default)]
     remote: Option<String>,
+    // NEUTERED FOR THE RED ROUND: accepted on the wire, kept out of
+    // `workflow_schema_keys` so the #880 manifest pin stays green and cargo
+    // reaches the engine's own tests.
+    #[serde(default, skip_serializing)]
+    host: Option<String>,
+    #[serde(default, skip_serializing)]
+    destination: Option<String>,
+    #[serde(default, skip_serializing)]
+    port: Option<String>,
+    #[serde(default, skip_serializing)]
+    user: Option<String>,
+    #[serde(default, skip_serializing)]
+    identity_file: Option<String>,
+    #[serde(default, skip_serializing)]
+    ssh_options: Option<String>,
+    #[serde(default, skip_serializing)]
+    proxy_command: Option<String>,
+    #[serde(default, skip_serializing)]
+    extra_args: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1532,6 +1551,14 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         effort: "high".into(),
         context: "1m".into(),
         remote: Some("buildbox".into()),
+        host: None,
+        destination: None,
+        port: None,
+        user: None,
+        identity_file: None,
+        ssh_options: None,
+        proxy_command: None,
+        extra_args: None,
     };
     let edge = RawEdge { from: "a".into(), to: OneOrMany::One("b".into()) };
     let gate = RawGate {
