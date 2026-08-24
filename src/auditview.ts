@@ -392,17 +392,22 @@ export class AuditView {
 
     this.listEl.replaceChildren();
     if (this.entries.length === 0) {
-      // `loaded` distinguishes an empty log from a read that never succeeded
-      // (#1317 review N5) — before this, a rejected first read was shown as a
-      // group that had done nothing. It is also what keeps
-      // `AuditStore.loaded` from being a getter only the tests read.
+      // Three answers, not two (#1317 review N5): an empty log, a read that
+      // failed, and a read that has not happened yet. This view never renders
+      // before its first `load()` resolves — unlike the timeline, which the
+      // third state was found on — so `!attempted` is not reachable here
+      // today. It is spelled out anyway: the pair of views must not answer the
+      // same question two different ways, and "unreachable in this view" is a
+      // property of the current wiring rather than of the store.
       this.listEl.appendChild(
         el(
           "div",
           "audit-empty",
-          this.store.loaded
-            ? "No audit entries yet for this group."
-            : "Could not read this group's audit log."
+          !this.store.attempted
+            ? "Reading this group's audit log…"
+            : this.store.loaded
+              ? "No audit entries yet for this group."
+              : "Could not read this group's audit log."
         )
       );
       return;

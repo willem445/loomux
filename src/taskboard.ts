@@ -1563,9 +1563,11 @@ export function hasMissingParent<T extends HasParent>(task: T, board: readonly T
 // ---------------------------------------------------------------------------
 // Sprints (#1272) and grounding links (#1273) — the board's mirror of the
 // backend model. Every rule here is the backend's (mod.rs `current_sprint`,
-// `normalize_task_links`); these exist because the human's board reads full
-// `Task`s via `orch_tasks` and derives its own view, exactly as it already does
-// for readiness. The two sides are pinned against each other by tests.
+// `normalize_task_links`); these exist because the human's board reads whole
+// board rows via `orch_tasks` and derives its own view, exactly as it already
+// does for readiness. (#1317 split the note BODIES out of that read; sprint and
+// link fields ride on every row as before.) The two sides are pinned against
+// each other by tests.
 // ---------------------------------------------------------------------------
 
 /** A row as far as sprints care. Optional on the wire like every other additive

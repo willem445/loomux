@@ -449,11 +449,20 @@ export class TimelineView {
       // only `getRepo()`, since the store cannot throw — would skip it, leave
       // the gate `running`, and make every later `load()` return at
       // `begin()`: the timeline would never refresh again for the session,
-      // with nothing on screen to say so. One line removes the class rather
-      // than resting on which of the awaits currently cannot reject.
+      // with nothing on screen to say so.
+      //
+      // `end()` runs FIRST inside the `finally`, above `render()`, and its
+      // answer is held for the tail call (#1317 review N4). Being merely
+      // inside the block was not enough: `render()` is the single widest
+      // throwing surface in this view — `extractTimeline` over up to 5000
+      // rows, then SVG construction — so ordering it first would have traded
+      // the `getRepo()` hazard for a larger one and left the sentence above
+      // false. Releasing the gate before anything that can throw is what
+      // actually removes the class.
     } finally {
+      const rerun = this.gate.end();
       if (!this.disposed) this.render();
-      if (this.gate.end() && !this.disposed) void this.load(forceGh);
+      if (rerun && !this.disposed) void this.load(forceGh);
     }
   }
 
@@ -541,17 +550,21 @@ export class TimelineView {
       return;
     }
     if (this.extraction!.events.length === 0) {
-      // "Nothing happened" and "I could not look" are different answers, and
-      // the store is what tells them apart (#1317 review N5): after a FIRST
-      // read that rejected it holds no rows and has never loaded, which before
-      // this rendered as a group that had done nothing.
+      // THREE answers, not two (#1317 review N5). "Nothing happened", "I
+      // could not look", and "I have not looked yet" are different things, and
+      // this view reaches the third on every fresh pane: the `ResizeObserver`
+      // wired in the constructor fires a render before the IPC round trip
+      // `show()` starts has landed, so gating on `loaded` alone flashed the
+      // failure text at a healthy group.
       this.chartEl.append(
         el(
           "div",
           "timeline-empty",
-          this.store.loaded
-            ? "No activity recorded for this group yet."
-            : "Could not read this group's audit log."
+          !this.store.attempted
+            ? "Reading this group's audit log…"
+            : this.store.loaded
+              ? "No activity recorded for this group yet."
+              : "Could not read this group's audit log."
         )
       );
       return;

@@ -49,6 +49,10 @@ export class AuditStore {
   /** When `rows` was last successfully replaced. Never advanced by a failed
    *  read: "I could not look" is not "there is nothing new". */
   private stampMs = 0;
+  /** Whether a read has ever COMPLETED — see `attempted`. Unlike
+   *  `loadedOnce`, a failure sets it: the question it answers is "has anyone
+   *  looked yet", not "did anyone succeed". */
+  private attemptedOnce = false;
   /** The run every concurrent caller joins instead of starting its own. */
   private inflight: Promise<void> | null = null;
   private fetchRows: () => Promise<AuditEntry[]>;
@@ -80,6 +84,23 @@ export class AuditStore {
     return this.loadedOnce;
   }
 
+  /** Whether any read has ever COMPLETED here, successfully or not.
+   *
+   *  `loaded` alone is a two-way answer to a three-way question (#1317 review
+   *  N5). It is false both before the first read has landed and after one that
+   *  failed, so a view rendering on `!loaded` says "could not read the log"
+   *  during the perfectly healthy window before the first answer arrives —
+   *  which `TimelineView` really does hit, because its `ResizeObserver` fires
+   *  a render ahead of the IPC round trip `show()` starts.
+   *
+   *  Together the two give three states: `!attempted` is "not yet read",
+   *  `attempted && !loaded` is "read failed", and `loaded` is a real answer.
+   *  Set on BOTH paths of the read, which is what distinguishes it from
+   *  `loaded`. */
+  get attempted(): boolean {
+    return this.attemptedOnce;
+  }
+
   /** The rows, re-reading unless a recent-enough read can answer.
    *
    *  Three cases, in order:
@@ -108,10 +129,14 @@ export class AuditStore {
       (rows) => {
         this.rows = rows;
         this.loadedOnce = true;
+        this.attemptedOnce = true;
         this.stampMs = this.now();
       },
       () => {
-        /* keep the last good rows — see the doc above */
+        // Keep the last good rows — see the doc above — but DO record that a
+        // read happened, so a view can tell a failure from a first read still
+        // in flight (#1317 review N5).
+        this.attemptedOnce = true;
       }
     );
     this.inflight = run;

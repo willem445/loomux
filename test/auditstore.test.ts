@@ -144,6 +144,38 @@ test("a failed read keeps the last good rows, does not throw, and does not latch
   assert.deepEqual((await settles(retry, "retry")).map((e) => e.ts_ms), [1, 2]);
 });
 
+test("the three states are distinguishable: not yet read, read failed, read landed", async () => {
+  // `loaded` alone is a two-way answer to a three-way question (#1317 review
+  // N5), and the timeline reaches the third on every fresh pane: its
+  // ResizeObserver renders before the first read lands, so gating the failure
+  // message on `!loaded` flashed it at a healthy group.
+  const f = deferredFetch();
+  const store = new AuditStore(f.fetchRows, clock().now);
+
+  // 1. nothing has been read yet — neither flag is set.
+  assert.equal(store.attempted, false, "no read has completed");
+  assert.equal(store.loaded, false);
+
+  // 2. a read is IN FLIGHT — still "not yet", because nothing has landed.
+  const first = store.read(0);
+  assert.equal(store.attempted, false, "an in-flight read has not completed");
+  assert.equal(store.loaded, false);
+
+  // 3. it failed — attempted, but not loaded. This is the state that must
+  //    render "could not read", and the only one that may.
+  f.pending[0].reject(new Error("nope"));
+  await settles(first, "first");
+  assert.equal(store.attempted, true, "a failure is still an attempt");
+  assert.equal(store.loaded, false);
+
+  // 4. a later read succeeds — both true.
+  const next = store.read(0);
+  f.pending[1].resolve([entry(1)]);
+  await settles(next, "next");
+  assert.equal(store.attempted, true);
+  assert.equal(store.loaded, true);
+});
+
 test("a failed FIRST read leaves the store unloaded rather than empty-and-loaded", async () => {
   const f = deferredFetch();
   const store = new AuditStore(f.fetchRows, clock().now);
