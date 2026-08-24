@@ -56,6 +56,11 @@ that MUST print something. Run the control first.
   line. **Never record `PASS` off an uncontrolled zero.**
 - Do not pipe a sweep through `| wc -l`. That throws away the exit code and the
   error, and turns a broken command into a confident `0`.
+- **Never combine `-i` with `-F`.** On this machine's GNU grep, `-iF` under the
+  C/POSIX locale aborts with exit 134 and prints *nothing at all* — not to
+  stdout, not to stderr — so a sweep over a tree that DOES contain the term
+  looks exactly like a clean one. Every command below uses `-E`; keep it that
+  way. If you ever need a literal case-insensitive match, use `-rni`.
 
 ## Rolling the lines up into ONE verdict
 
