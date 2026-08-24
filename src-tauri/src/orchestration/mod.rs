@@ -23579,19 +23579,6 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
         // bound is stated in `doc/design/question-gate-authorship.md`: a dialog
         // with no question row of its own, and a header whose text the same
         // party controls.
-        if claimed.is_some() && dialog_header_above(&rows, &norm, &keep, i) {
-            claimed = None;
-            // N3: put the row back the way the pointer-stripped attempt found
-            // it. That attempt rewrites `norm[i]` in place and only restores it
-            // on ITS own miss, so a claim it made and this veto then nulled left
-            // the stripped form behind for every later reader of `norm` — the
-            // upward scans above included. It was inert only by coincidence
-            // before B2; now that those scans test `is_dialog_header(&norm[j])`
-            // on rows regardless of `keep`, a row left stripped of its leading
-            // glyph is a row this function reads differently than the screen
-            // shows it.
-            norm[i] = wrap_normalize(deframe(rows[i]));
-        }
         match claimed {
             Some(end) => {
                 keep[i..end].fill(false);
