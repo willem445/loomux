@@ -23726,9 +23726,6 @@ pub fn delivered_prompt_lines(text: &str) -> Vec<String> {
     // pasted, and an agent controls only the block BELOW that first line. An
     // orchestrator prefixing its own `send_prompt` with the marker only
     // downgrades its own masking, which is the safe direction.
-    if text.lines().find(|l| !l.trim().is_empty()).is_some_and(leads_with_notice_marker) {
-        return Vec::new();
-    }
     text.lines()
         .filter(|l| !leads_with_notice_marker(l))
         .map(|l| deframe(l).trim())
