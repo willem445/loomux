@@ -51,7 +51,7 @@
 //   than terminates (never closes someone else's browser). A `/json/version`
 //   identity cross-check before handing back the page would close this
 //   properly; not implemented here.
-import { test as base, chromium, type Page } from "@playwright/test";
+import { test as base, chromium, type BrowserContext, type Page } from "@playwright/test";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -346,7 +346,9 @@ export const test = base.extend<{ appPage: Page }>({
     try {
       const browser = await connectWithRetry(`http://127.0.0.1:${CDP_PORT}`, proc, output);
       try {
-        const context = browser.contexts()[0] ?? (await browser.waitForEvent("context"));
+        const context =
+          browser.contexts()[0] ??
+          (await new Promise<BrowserContext>((resolve) => browser.once("context", resolve)));
         const page = context.pages()[0] ?? (await context.waitForEvent("page"));
         await page.waitForSelector("#tab-bar", { state: "attached", timeout: 30_000 });
         await page.waitForSelector("#workspace-stack .pane, #workspace-stack .welcome-form", {
