@@ -35,13 +35,16 @@
 //! (`parse_claude_transcript`) takes text and is exercised by fixture tests,
 //! never a live CLI.
 
+use loomux_engine::obs::LockExt;
 use loomux_engine::pathseg::PathSegment;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Exact token counts for a session, split by kind so the UI can show tokens
 /// even when no dollar figure is available.
@@ -155,39 +158,70 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
 /// reads a transcript off disk must never hold the whole file: see
 /// [`claude_session_usage_in`] and #1218.
 ///
-/// The fold was ALREADY per-line; nothing but the source of the lines
-/// changed. Memory is bounded by the longest single line plus the dedupe set
-/// of message ids — not by the file.
+/// The fold is per-line and lives in [`TranscriptFold`]; nothing but the
+/// source of the lines changes between callers. Memory is bounded by the
+/// longest single line plus the dedupe set of message ids — not by the file.
 pub fn parse_claude_transcript_lines<I, S>(lines: I) -> SessionUsage
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut totals = TokenUsage::default();
-    let mut cost = 0.0f64;
-    let mut any_priced = false;
-    let mut seen: HashSet<String> = HashSet::new();
-    // Track the priced model with the most output tokens, for display.
-    let mut best_model: Option<(String, u64)> = None;
-
+    let mut fold = TranscriptFold::default();
     for line in lines {
-        let line = line.as_ref().trim();
+        fold.push(line.as_ref());
+    }
+    fold.usage()
+}
+
+/// The running state of a transcript fold: the four token totals, the accrued
+/// dollar cost, the message-id dedupe set, and the best-priced model so far.
+///
+/// **Why it is a struct (#1239).** The fold was already per-line, but it lived
+/// inside `parse_claude_transcript_lines` as six locals, which meant it could
+/// only ever run to completion in one call. The incremental reader
+/// ([`TranscriptCursors`]) keeps one of these alive ACROSS polls and pushes
+/// only the newly-appended lines into it, so a tick's work is proportional to
+/// what the agent just wrote rather than to the whole session.
+///
+/// Extracting it is also what keeps the whole-file parse and the incremental
+/// one from drifting: there is exactly one implementation of the rules
+/// documented on [`parse_claude_transcript`], and both paths are that
+/// implementation fed different lines. Two folds could not have been kept in
+/// step by review.
+#[derive(Default)]
+struct TranscriptFold {
+    totals: TokenUsage,
+    cost: f64,
+    any_priced: bool,
+    seen: HashSet<String>,
+    /// The priced model with the most output tokens, for display.
+    best_model: Option<(String, u64)>,
+}
+
+impl TranscriptFold {
+    /// Fold ONE transcript line in, per the rules on
+    /// [`parse_claude_transcript`]. A line that is blank, unparseable, not an
+    /// assistant turn, carries no `usage`, or repeats an already-seen message
+    /// id contributes nothing — which is what makes the fold safe to feed the
+    /// same line twice.
+    fn push(&mut self, line: &str) {
+        let line = line.trim();
         if line.is_empty() {
-            continue;
+            return;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
+            return;
         };
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
+            return;
         }
-        let Some(msg) = v.get("message") else { continue };
-        let Some(usage) = msg.get("usage") else { continue };
+        let Some(msg) = v.get("message") else { return };
+        let Some(usage) = msg.get("usage") else { return };
 
         // Dedupe by message id when present.
         if let Some(id) = msg.get("id").and_then(Value::as_str) {
-            if !seen.insert(id.to_string()) {
-                continue;
+            if !self.seen.insert(id.to_string()) {
+                return;
             }
         }
 
@@ -197,30 +231,34 @@ where
             cache_creation_tokens: u64_field(usage, "cache_creation_input_tokens"),
             cache_read_tokens: u64_field(usage, "cache_read_input_tokens"),
         };
-        totals.input_tokens += t.input_tokens;
-        totals.output_tokens += t.output_tokens;
-        totals.cache_creation_tokens += t.cache_creation_tokens;
-        totals.cache_read_tokens += t.cache_read_tokens;
+        self.totals.input_tokens += t.input_tokens;
+        self.totals.output_tokens += t.output_tokens;
+        self.totals.cache_creation_tokens += t.cache_creation_tokens;
+        self.totals.cache_read_tokens += t.cache_read_tokens;
 
         let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
         if model.is_empty() || model == "<synthetic>" {
-            continue;
+            return;
         }
         if let Some(p) = price_for(model) {
-            cost += cost_of(&t, &p);
-            any_priced = true;
+            self.cost += cost_of(&t, &p);
+            self.any_priced = true;
             let out = t.output_tokens;
-            match &mut best_model {
+            match &mut self.best_model {
                 Some((_, best_out)) if *best_out >= out => {}
-                _ => best_model = Some((model.to_string(), out)),
+                _ => self.best_model = Some((model.to_string(), out)),
             }
         }
     }
 
-    SessionUsage {
-        tokens: totals,
-        cost_usd: any_priced.then_some(cost),
-        model: best_model.map(|(m, _)| m),
+    /// The session usage as of everything folded in so far. Cheap enough to
+    /// call on every poll — it clones one model id and copies four counters.
+    fn usage(&self) -> SessionUsage {
+        SessionUsage {
+            tokens: self.totals,
+            cost_usd: self.any_priced.then_some(self.cost),
+            model: self.best_model.as_ref().map(|(m, _)| m.clone()),
+        }
     }
 }
 
@@ -414,9 +452,9 @@ pub fn claude_session_usage(session_id: &str) -> Option<SessionUsage> {
 }
 
 /// Read and sum a Claude session's usage from a transcript under an explicit
-/// projects `root`. Lets the orchestration layer (and its tests) point at any
-/// tree. `None` when the transcript can't be found or opened — or when
-/// `session_id` is not a usable path component (#925).
+/// projects `root`, parsing the file from byte zero. `None` when the
+/// transcript can't be found or opened — or when `session_id` is not a usable
+/// path component (#925).
 ///
 /// The refusal shares the existing `None` channel deliberately. This is a
 /// polled usage meter reading an id off a persisted index entry; an entry
@@ -424,35 +462,377 @@ pub fn claude_session_usage(session_id: &str) -> Option<SessionUsage> {
 /// that id" is the same answer it already gives for a transcript that has not
 /// been written yet. Same fail-closed-into-an-existing-degrade shape #904 used
 /// for `promptsubmit_marker_path`.
+///
+/// **This is no longer what the poll calls.** Since #1239 the polled path is
+/// [`TranscriptCursors::session_usage`], which reaches the same totals by
+/// folding only the bytes appended since the previous tick. This function
+/// remains the whole-file read: `claude_session_usage`'s implementation, the
+/// answer a fresh cursor computes on its first tick, and the thing the
+/// incremental result is checked against. Both go through [`fold_appended`],
+/// so #1218's streaming property is shared by construction rather than by two
+/// readers being kept in step.
 pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionUsage> {
     let session = PathSegment::parse(session_id).ok()?;
     let path = claude_transcript_path(root, &session)?;
-    let file = fs::File::open(&path).ok()?;
-    // STREAM it — never materialize the transcript (#1218).
-    //
-    // This used to build one `String` holding the whole file, under a comment
-    // claiming it did the opposite of what it did. That was `read_to_string`
-    // with extra steps, and it is what killed the app three times: a
-    // multi-day agent transcript passes 32 MiB, `String`'s backing `Vec<u8>`
-    // grows by DOUBLING, and an infallible `Vec` grow whose allocation fails
-    // calls `handle_alloc_error`, which aborts the process immediately. That
-    // abort never enters `std::panicking`, so the panic hook does not run and
-    // NOTHING is written — no crash log, no breadcrumb. Both 1.2.0-beta1
-    // dumps are that exact abort, one asking for 64 MiB and one for 128 MiB,
-    // on a machine whose commit charge was pinned at its limit.
-    //
-    // It is on the app's hottest poll: `compute_group_usage` runs this for
-    // every live agent, at most once per `USAGE_POLL_MAX_AGE` (1 s). So the
-    // old code allocated, filled and freed every agent's entire transcript
-    // about once a second.
-    //
-    // `lines()` yields one `String` at a time and drops it before the next,
-    // so peak live bytes are one line rather than the whole file. What still
-    // scales with the session is the parser's message-id dedupe set, which is
-    // ids only — kilobytes where this was tens of megabytes.
-    Some(parse_claude_transcript_lines(
-        BufReader::new(file).lines().map_while(Result::ok),
-    ))
+    let mut cursor = TranscriptCursor::new(path);
+    fold_appended(&mut cursor).ok()?;
+    Some(cursor.fold.usage())
+}
+
+// ---------------------------------------------------------------------------
+// Incremental transcript reading (#1239)
+// ---------------------------------------------------------------------------
+
+/// Bytes of ALREADY-FOLDED content a cursor re-reads and compares before it
+/// folds anything new on top — its proof that the region it consumed is still
+/// there, byte-for-byte, at the same offset.
+///
+/// `len`+`mtime` alone cannot see an in-place rewrite that happens to land on
+/// the same length, and on a coarse-`mtime` filesystem it cannot see one
+/// inside the same timestamp tick either. The anchor can: any edit to the last
+/// 64 bytes before the offset — or a wholesale replacement that shifts the
+/// content — changes what sits there, and the cursor throws itself away. 64
+/// bytes is small enough that the work bound this whole change exists for is
+/// unaffected, and a transcript line is hundreds of bytes at minimum, so an
+/// anchor never spans more than the tail of one record.
+const ANCHOR_BYTES: usize = 64;
+
+/// A cursor untouched for this long is dropped, so the map is bounded by
+/// transcripts being POLLED rather than by every transcript this process ever
+/// read. There is no lifecycle event to hang eviction on — a cursor outlives
+/// its agent's pane on purpose (`mark_dead` reads usage after teardown) — so a
+/// TTL is the honest bound. Ten minutes is far longer than the 1 s poll, so a
+/// live agent never loses its cursor and a gone one costs at most one more
+/// full re-parse than it had to.
+const CURSOR_TTL: Duration = Duration::from_secs(600);
+
+/// What one cursor read actually cost and what it decided.
+///
+/// The whole point of #1239 is a WORK bound, and a work bound is not
+/// observable from the totals — the old whole-file re-parse produced exactly
+/// the same numbers. So the reader reports its own cost, incremented at the
+/// single place bytes leave the disk, and the tests assert on that. Production
+/// ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CursorWork {
+    /// Bytes pulled off the disk by this read: the appended region, plus the
+    /// anchor re-read, plus (on a reset or a first read) the whole file.
+    pub bytes_read: u64,
+    /// An existing cursor was discarded and the transcript re-folded from byte
+    /// zero. False on a first read, which has no cursor to discard.
+    pub reset: bool,
+    /// The file's `len` and `mtime` were unchanged, so the cached totals were
+    /// served without opening it at all.
+    pub served_cached: bool,
+    /// The projects root was scanned for the transcript file. True on a first
+    /// read and whenever the remembered path stops being a file.
+    pub scanned_root: bool,
+}
+
+/// One transcript's parse position and everything needed to resume from it.
+struct TranscriptCursor {
+    /// The transcript file this cursor is bound to.
+    ///
+    /// Remembered rather than re-resolved: `claude_transcript_path` scans
+    /// every project folder under the root, and doing that once a second per
+    /// live agent is the same class of waste as the re-parse. It is
+    /// re-validated with one `is_file()` per tick and re-scanned when that
+    /// fails. The scan picks whichever project folder yields a match first,
+    /// which is directory order and was already arbitrary when it ran every
+    /// tick; pinning it makes that choice stable instead of stable-by-luck.
+    path: PathBuf,
+    /// The fold this cursor resumes.
+    fold: TranscriptFold,
+    /// Bytes CONSUMED. Always sits immediately after a `\n`, so resuming from
+    /// it can never land mid-record.
+    offset: u64,
+    /// File length as of the stat this cursor last acted on. May exceed
+    /// `offset` when the tail is a line whose newline has not arrived yet.
+    len: u64,
+    modified: Option<SystemTime>,
+    /// Creation time where the platform reports one (`Err` on filesystems
+    /// without a birth time — Linux ext4 without statx, for instance — and
+    /// then simply not a signal).
+    created: Option<SystemTime>,
+    /// The last [`ANCHOR_BYTES`] of the consumed region.
+    anchor: Vec<u8>,
+}
+
+/// The stat-level decision for a cursor, before any bytes are read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatVerdict {
+    /// Nothing changed: serve the cached totals, open nothing.
+    Serve,
+    /// The file grew (or its mtime moved): fold the appended region on.
+    Extend,
+    /// The file was replaced, truncated or rewritten: throw the cursor away.
+    Reset,
+}
+
+impl TranscriptCursor {
+    fn new(path: PathBuf) -> Self {
+        TranscriptCursor {
+            path,
+            fold: TranscriptFold::default(),
+            offset: 0,
+            len: 0,
+            modified: None,
+            created: None,
+            anchor: Vec::new(),
+        }
+    }
+
+    /// Classify what the file's current stat means for this cursor.
+    ///
+    /// The three reset arms, and why each is a reset rather than an extend:
+    ///
+    /// - **A different creation time** is a different FILE at the same path —
+    ///   a rotation, or a delete-and-rewrite. Nothing about the old offset
+    ///   refers to anything in it.
+    /// - **A shorter file** cannot be the one we consumed: a transcript only
+    ///   ever grows, so a shrink means it was truncated or rewritten. This is
+    ///   the arm the issue calls out as the one to get right, and it is
+    ///   deliberately `len < self.len` (shrank AT ALL) rather than
+    ///   `len < self.offset` (shrank past what we consumed): a truncation that
+    ///   still leaves our offset addressable tells us just as loudly that the
+    ///   file is not the one we were reading.
+    /// - **An mtime that moved BACKWARDS** is a file restored from elsewhere —
+    ///   a copy, a sync, a checkout — over the one we were reading.
+    ///
+    /// `Serve` demands BOTH an unchanged length and an unchanged mtime, so a
+    /// same-length rewrite reaches [`StatVerdict::Extend`] and then has to get
+    /// past the anchor, which it cannot. The residual blind spot is a rewrite
+    /// that lands on the same length AND the same mtime AND leaves the 64
+    /// bytes before the offset identical; the file would have to be edited in
+    /// place inside one filesystem timestamp tick to produce it, and the
+    /// consequence is one poll window of stale totals, not a wrong number
+    /// forever — the next append moves the mtime and the anchor decides again.
+    fn stat_verdict(
+        &self,
+        len: u64,
+        modified: Option<SystemTime>,
+        created: Option<SystemTime>,
+    ) -> StatVerdict {
+        if let (Some(now), Some(then)) = (created, self.created) {
+            if now != then {
+                return StatVerdict::Reset;
+            }
+        }
+        if len < self.len {
+            return StatVerdict::Reset;
+        }
+        if let (Some(now), Some(then)) = (modified, self.modified) {
+            if now < then {
+                return StatVerdict::Reset;
+            }
+        }
+        if len == self.len && modified == self.modified {
+            return StatVerdict::Serve;
+        }
+        StatVerdict::Extend
+    }
+
+    /// Re-read the [`ANCHOR_BYTES`] immediately before `offset` and report
+    /// whether they are still what this cursor folded. An I/O failure is a
+    /// mismatch: a cursor that cannot prove its position is not one to resume
+    /// from.
+    fn anchor_holds(&self) -> bool {
+        if self.anchor.is_empty() {
+            return true; // nothing consumed yet — nothing to disagree with
+        }
+        let start = self.offset.saturating_sub(self.anchor.len() as u64);
+        let read = || -> std::io::Result<Vec<u8>> {
+            let mut file = fs::File::open(&self.path)?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; self.anchor.len()];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        };
+        matches!(read(), Ok(buf) if buf == self.anchor)
+    }
+
+    /// Extend the anchor with bytes just consumed, keeping only the last
+    /// [`ANCHOR_BYTES`].
+    fn push_anchor(&mut self, bytes: &[u8]) {
+        self.anchor.extend_from_slice(bytes);
+        let excess = self.anchor.len().saturating_sub(ANCHOR_BYTES);
+        if excess > 0 {
+            self.anchor.drain(..excess);
+        }
+    }
+}
+
+/// Fold every COMPLETE line from `cursor.offset` to end-of-file into the
+/// cursor, advancing its offset and anchor. Returns the bytes read off disk.
+///
+/// **A partial trailing line is read but NOT consumed.** A JSONL writer
+/// appends a record and its newline as separate bytes, so a poll can land
+/// between them; the offset therefore only ever advances past a `\n`. The
+/// alternative — folding a torn record — is not "one tick early", it is
+/// permanently wrong: a truncated line either fails to parse (and is then
+/// skipped forever, losing that message's tokens) or, worse, parses with
+/// truncated numbers. Holding back costs at most one poll window of freshness
+/// on the newest message, and the bytes are re-read next tick.
+///
+/// **A line that is not valid UTF-8 is skipped, not fatal.** The reader this
+/// replaced used `.lines().map_while(Result::ok)`, which STOPS at the first
+/// such line — one bad byte silently truncated a whole session's usage to
+/// whatever preceded it. Skipping is both the strictly better answer and the
+/// only one a cursor can hold: stalling at a line forever would freeze the
+/// offset there.
+///
+/// Streaming, per #1218: one reusable line buffer, never the file. Peak live
+/// bytes are the longest single line plus the fold's message-id set.
+fn fold_appended(cursor: &mut TranscriptCursor) -> std::io::Result<u64> {
+    let mut file = fs::File::open(&cursor.path)?;
+    if cursor.offset > 0 {
+        file.seek(SeekFrom::Start(cursor.offset))?;
+    }
+    let mut reader = BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut bytes_read = 0u64;
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break; // end of file
+        }
+        bytes_read += n as u64;
+        if buf.last() != Some(&b'\n') {
+            break; // partial trailing line — leave it for a later tick
+        }
+        if let Ok(line) = std::str::from_utf8(&buf) {
+            cursor.fold.push(line);
+        }
+        cursor.offset += n as u64;
+        cursor.push_anchor(&buf);
+    }
+    Ok(bytes_read)
+}
+
+/// Per-transcript parse cursors, so a usage poll parses only what an agent
+/// has WRITTEN since the previous poll (#1239).
+///
+/// **The problem.** `compute_group_usage` runs on the app's hottest poll, at
+/// most once per `USAGE_POLL_MAX_AGE` (1 s), and re-read and re-parsed every
+/// live agent's ENTIRE transcript on each tick — tens of MiB per agent on a
+/// multi-day session, `serde_json` over every line of it, the message-id
+/// dedupe set rebuilt from scratch — to advance four totals by a few lines.
+/// #1218/#1237 bounded the MEMORY of that read (it streams); they did not
+/// remove the work. The minidump behind #1239 records 1,701,161,634 page
+/// faults on the process, and this loop is that churn.
+///
+/// **The contract.** A cursor holds the byte offset it has consumed up to, the
+/// fold resumed from there (totals, cost, best model, and the dedupe set —
+/// which is what makes resuming safe against a `--resume` re-emit), and the
+/// stat it last acted on. Per tick:
+///
+/// - unchanged `len` and `mtime` → the cached totals, with the file not
+///   opened at all;
+/// - grown → seek to the offset, verify the anchor, fold the appended
+///   complete lines on;
+/// - replaced, truncated or rewritten → discard the cursor and re-parse from
+///   zero, which is exactly the pre-#1239 cost. The failure mode of every
+///   guard here is "as slow as it used to be", never a wrong total.
+///
+/// **`Arc<Mutex<..>>` per transcript, not one map lock** — the same map-lock →
+/// release → leaf-lock rule the usage memo follows. The outer lock is held
+/// only long enough to clone one cell out, so a full re-parse for one agent
+/// never blocks another agent's tick.
+#[derive(Default)]
+pub struct TranscriptCursors {
+    cursors: Mutex<HashMap<(PathBuf, String), CursorEntry>>,
+}
+
+struct CursorEntry {
+    /// Last time this cursor was asked for — drives [`CURSOR_TTL`] eviction.
+    used: Instant,
+    cursor: Arc<Mutex<Option<TranscriptCursor>>>,
+}
+
+impl TranscriptCursors {
+    /// A Claude session's usage, parsing only what was appended since this
+    /// cache last read the same transcript. Same totals as
+    /// [`claude_session_usage_in`], same `None` cases.
+    pub fn session_usage(&self, root: &Path, session_id: &str) -> Option<SessionUsage> {
+        self.session_usage_measured(root, session_id).map(|(u, _)| u)
+    }
+
+    /// [`Self::session_usage`], also reporting what the read cost and what it
+    /// decided ([`CursorWork`]).
+    ///
+    /// `#[doc(hidden)] pub` for the integration tests: the work bound is the
+    /// property this whole type exists for, and it is invisible in the totals.
+    #[doc(hidden)] // pub for integration tests
+    pub fn session_usage_measured(
+        &self,
+        root: &Path,
+        session_id: &str,
+    ) -> Option<(SessionUsage, CursorWork)> {
+        // Same refusal-into-the-existing-`None` channel as
+        // `claude_session_usage_in` (#925): an id that is not a usable path
+        // component never reaches the join.
+        let session = PathSegment::parse(session_id).ok()?;
+
+        let cell = {
+            let mut map = self.cursors.lock_safe();
+            map.retain(|_, e| e.used.elapsed() < CURSOR_TTL);
+            let entry = map
+                .entry((root.to_path_buf(), session_id.to_string()))
+                .or_insert_with(|| CursorEntry {
+                    used: Instant::now(),
+                    cursor: Arc::new(Mutex::new(None)),
+                });
+            entry.used = Instant::now();
+            entry.cursor.clone()
+        };
+        let mut slot = cell.lock_safe();
+        let mut work = CursorWork::default();
+
+        // Resolve the transcript path once and keep it; one `is_file()` per
+        // tick replaces a scan of every project folder under the root.
+        let remembered = slot.as_ref().map(|c| c.path.clone());
+        let path = match remembered {
+            Some(p) if p.is_file() => p,
+            _ => {
+                work.scanned_root = true;
+                *slot = None;
+                claude_transcript_path(root, &session)?
+            }
+        };
+
+        let meta = fs::metadata(&path).ok()?;
+        let (len, modified, created) = (meta.len(), meta.modified().ok(), meta.created().ok());
+
+        // Decide from the stat, then let the anchor overrule an `Extend`.
+        let verdict = match slot.as_ref() {
+            None => StatVerdict::Reset,
+            Some(c) => match c.stat_verdict(len, modified, created) {
+                StatVerdict::Serve => {
+                    work.served_cached = true;
+                    return Some((c.fold.usage(), work));
+                }
+                StatVerdict::Extend if c.anchor_holds() => {
+                    work.bytes_read += c.anchor.len() as u64;
+                    StatVerdict::Extend
+                }
+                _ => StatVerdict::Reset,
+            },
+        };
+
+        if verdict == StatVerdict::Reset {
+            // `reset` is "a cursor was thrown away", so a first-ever read —
+            // which also parses from zero — is not one.
+            work.reset = slot.is_some();
+            *slot = Some(TranscriptCursor::new(path));
+        }
+        let cursor = slot.as_mut()?;
+        work.bytes_read += fold_appended(cursor).ok()?;
+        cursor.len = len;
+        cursor.modified = modified;
+        cursor.created = created;
+        Some((cursor.fold.usage(), work))
+    }
 }
 
 // ---------------------------------------------------------------------------

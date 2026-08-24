@@ -48558,6 +48558,53 @@ fn group_usage_serves_one_snapshot_per_window_and_recomputes_past_it() {
     );
 }
 
+/// #1239: the polled usage path now resumes a per-transcript cursor instead of
+/// re-parsing the file, so the regression it could introduce is STALENESS — an
+/// agent whose spend stops moving because the cursor never advances past what
+/// it read first. `tests/usage_cursor.rs` pins the reader's own contract (work
+/// bound, resets, partial lines); this pins the freshness of the answer
+/// `group_usage` actually serves, which is what a human reads off the group
+/// view.
+#[test]
+fn group_usage_stays_fresh_across_a_transcript_append() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg
+        .spawn_agent(&g.id, Role::Worker, "w", "task", false, None)
+        .unwrap();
+    let sid = w.session_id.clone().expect("a claude worker gets a session id");
+    let encoded = proj.path().join("C--tmp-repo");
+    write_usage_transcript(&encoded, &sid, 1000, 500);
+
+    assert_eq!(
+        reg.group_usage(&g.id)["lifetime_tokens"].as_u64(),
+        Some(1500),
+        "positive control: the first read finds and folds the transcript"
+    );
+
+    // The agent keeps working: one more assistant line APPENDED, exactly the
+    // way Claude Code writes one — no rewrite of anything already there.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(encoded.join(format!("{sid}.jsonl")))
+        .unwrap();
+    let next = json!({"type":"assistant","message":{"id":"m2","model":"claude-opus-4-8",
+        "usage":{"input_tokens":30,"output_tokens":20,
+                 "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}});
+    std::io::Write::write_all(&mut f, format!("{next}\n").as_bytes()).unwrap();
+    drop(f);
+
+    assert_eq!(
+        reg.group_usage(&g.id)["lifetime_tokens"].as_u64(),
+        Some(1550),
+        "#1239: the appended line is folded onto the cursor. A cursor that never \
+         advanced would still report 1500 here, and `upsert_usage_snapshot`'s \
+         never-downgrade merge would then keep reporting it forever"
+    );
+}
+
 /// #743 S4b: `mark_dead` captures an exiting agent's spend by writing
 /// `usage.json` from OUTSIDE the usage computation, so it must drop the memo.
 /// Without that, a killed agent keeps rendering as live in the group view until

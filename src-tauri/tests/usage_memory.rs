@@ -20,6 +20,11 @@
 //! unit-test binary linking the full lib misses the comctl32-v6 manifest
 //! `build.rs` embeds only for integration-test targets.
 //!
+//! Since #1239 the POLLED path is `usage::TranscriptCursors`, not this
+//! function — but both fold through `fold_appended`, the one streaming reader,
+//! so the property below is shared by construction rather than by two readers
+//! being kept in step by review.
+//!
 //! **This file deliberately holds exactly one `#[test]`.** The allocator
 //! counter below is process-global, and `cargo test` runs a binary's tests on
 //! parallel threads — a second test in this file would allocate concurrently
