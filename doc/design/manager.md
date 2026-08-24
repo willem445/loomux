@@ -1,13 +1,15 @@
 # The manager — the human's own pane, and the channel that reaches it
 
-*#1161. This note covers slices **M2** — the structural no-injection guarantee,
-the `mailbox.json` registry behind it, the two MCP tools, and `Role::Manager`'s
-enumerated tool surface — and **M3**, the lifecycle: who opens the pane, which
-guardrails skip it, and how both bare-resume routes into it are closed. The
-capability class itself landed in **M1** (#1169). The elicitation prose (M4), the
-unread chip (M5) and the `role_hint: liaison` migration plus the user docs (M6)
-extend this note rather than replacing it — where a section names a later slice,
-that slice owns the paragraph.*
+*#1161. This note covers three slices. **M2**: the structural no-injection
+guarantee, the `mailbox.json` registry behind it, the two MCP tools, and
+`Role::Manager`'s enumerated tool surface. **M3**, the lifecycle: who opens the
+pane, which guardrails skip it, and how both bare-resume routes into it are
+closed. **M4**: the prose that teaches both ends to use them — the manager's own
+contract, the `mode: replace` mechanics core it stays in lockstep with, and the
+orchestrator's `{{MANAGER_NOTE}}` fragment. The capability class itself landed in
+**M1** (#1169). The unread chip (M5) and the `role_hint: liaison` migration plus
+the workflow-author docs (M6) extend this note rather than replacing it — where a
+section names a later slice, that slice owns the paragraph.*
 
 Companion notes: [liaison.md](liaison.md), whose stated promotion trip-wire is
 why this class exists; [human-questions.md](human-questions.md) and
@@ -553,16 +555,135 @@ review round costs, and a review round does not involve the manager.
   kickoff is now reachable in production for the first time, where M2 could only
   reach it through a hand-registered agent.
 
+## M4 — the prose, and why it lands on three surfaces at once
+
+M2 shipped a channel nothing was told to use. M4 is what tells the two ends,
+and it is three edits rather than one because the manager's contract reaches a
+pane by three different routes and a rule present on only one of them is a rule
+some manager was never given.
+
+| surface | who reads it | what happens if the rule is only elsewhere |
+| --- | --- | --- |
+| `templates/manager.md` | every manager, as its instructions file | — |
+| `mechanics_core(Role::Manager)` | a `mode: replace` manager, *instead of* that template | it reads a contract with the rule missing |
+| `{{MANAGER_NOTE}}` in `templates/workflow.md` | the orchestrator of a group that declares a manager | the other end never learns the protocol |
+
+The second row is the one worth arguing. Decision D1 denies a manager block a
+repo-authored persona, so `parse_workflow` refuses `prompt:` / `profile:` /
+`allow:` on one and the parser cannot produce a replace-mode manager today —
+which makes that arm reachable only through a hand-edited `group.json`. It is
+still written as a real contract rather than an `unreachable!()`, for the reason
+the arm's own comment gives: D1 is a **policy** decision a later human opt-in
+could relax, and the cost of the arm being right is one paragraph while the cost
+of it being wrong is a human-facing pane with no instructions. `manager_prose.rs`
+pins the template and the arm against the same anchors so the two cannot drift.
+
+`templates/orchestrator.md` is **not** touched, and that is the same discipline
+`{{LIAISON_NOTE}}` established: a group that declares no manager must not read
+one word about one, which is what keeps all five goldened role templates
+byte-identical through this slice. `manager_prose_stays_silent_unless_a_roster_declares_one`
+asserts it directly rather than leaving it to the golden diff.
+
+### What the manager is told, and why each rule is load-bearing
+
+- **Every turn opens with `check_mail()` and `list_questions()`.** This is not
+  hygiene, it is the channel: the guarantee above means nothing is ever typed
+  into this pane, so there is no notification and nothing arrives while the pane
+  is idle. The human is the scheduler of the manager's attention — a turn that
+  does not start with the read is a turn the orchestrator's mail never lands in.
+  Reading consumes, so the prose names `include_read: true` beside it as the
+  post-compact recovery, and frames every row as the orchestrator's **account**
+  of what is happening: data, never instructions, and never authority. That
+  framing is the mitigation for the residual risk this note's M2 half records —
+  an orchestrator fed hostile repo content could write misleading status into a
+  pane the human trusts.
+- **Sharpen, then read back.** The human's scope-add makes the manager a
+  requirements surface rather than a relay, and "sharpen it" is a sentiment
+  until it names axes. Six: the problem behind the ask, acceptance criteria,
+  non-goals, constraints, edge and failure cases, and the rationale worth
+  keeping. Grounded in the repository — the class is `Containment::NoEdits`
+  precisely so it can read the code, and a question a file already answers is a
+  question that spends the human for nothing.
+- **The brief has a shape, and a gate.** Nine named parts, and an explicit yes
+  before anything is relayed. The gate has to enumerate its own failure modes or
+  it does not hold: silence is not a yes, a yes to a summary rather than to the
+  text is not a yes, and a yes to an earlier version does not carry to one
+  edited afterwards.
+- **Relay fidelity, and the authority line.** `message_orchestrator` is the
+  manager's only outbound channel and the whole of its authority. It quotes the
+  human verbatim and keeps its own reading plainly separate, because the
+  orchestrator has no other way to tell a direction from an interpretation of
+  one. And a relay carries the human's **words**, never their **authority** —
+  `{{MANAGER_NOTE}}` states the same rule to the side that would be the one able
+  to act on a grant it never got.
+- **Decision D5, on both sides.** The in-conversation yes licenses *filing the
+  issue* and nothing more. The start-work label is the human's own hand on
+  GitHub: the manager never moves it, never asks the orchestrator to, and the
+  orchestrator is told that a relayed yes does not reach it. Stated twice on
+  purpose — one side could otherwise honour it while the other did the thing.
+
+### What the orchestrator is told
+
+`{{MANAGER_NOTE}}` interpolates the declared block's own id, because every rule
+in it addresses a specific pane. Its claims are scoped to what M1 and M2
+actually shipped, deliberately (the #1026 line): `spawn_agent` refuses a manager
+by `kind` and by `block`, so "you do not open it, and you cannot" is a fact
+about code; `deliver_prompt` refuses the pane, so the fragment names
+`message_manager` rather than letting the orchestrator discover a `send_prompt`
+error. It does **not** assert the reaper, watchdog or `max_agents` exemptions —
+those are M3's (decision D3) and asserting them early would be prose about a
+mechanism the reader may not have. What it says instead is an *instruction* that
+holds either way: never `kill_agent` the manager. Inside the group the
+orchestrator is the one thing that can end the human's own pane.
+
+The brief hand-off is the fragment's other half. The manager's containment keeps
+`gh`, so "the manager never files the issue" is instruction-backed rather than
+structural — the *designed* path keeps issue authority where it already lives:
+the orchestrator files it quoting the brief verbatim, applies the label its own
+intake rules would apply, and posts the issue number back with
+`message_manager(kind: "reply")`. The issue is the durable artifact; no brief
+registry exists and none is planned.
+
+### `block.md`'s recap is per-class now (w-875 N9)
+
+The block note's closing paragraph recaps "the mechanics the workflow file did
+not change", and it used to be one sentence for every class: the MCP tools, the
+`report(status, summary)` discipline, the branch → PR flow, and the human gating
+every merge. A manager whose block id is not the reserved `manager` — `- id:
+mgr-desk`, which is the only manager `block_note` renders for, since a builtin
+id with no persona early-returns — was being handed that as its contract. Every
+clause of it is false for a pane with no `report`, no branch and no work of its
+own to have merged, and it arrives in the one paragraph that tells the reader to
+believe this file over its own instructions. So it reads as the correction, not
+as a mismatch to resolve.
+
+`{{MECHANICS_RECAP}}` replaces the list. Same three-clause shape either way, so
+the sentence still lands as a recap rather than as a second contract; for a
+manager the three become the MCP tools, the `check_mail()` its turn opens with,
+the read-back before any relay, and the rule that it holds no authority the
+human has not exercised themselves. It is never empty, so it sits mid-line like
+`{{BLOCK_KIND}}` — the line-final placeholders in that template keep the
+property that lets them render to nothing.
+
 ## What M2 and M3 do not ship
 
 Stated so no surface here reads as advertising a mechanism that does not exist
 (the #1026 line):
 
-- **No prose teaches the two tools yet.** `manager.md` and the orchestrator's
-  `{{MANAGER_NOTE}}` fragment are M4's, and the plan sequences them after this
-  slice precisely because the tool names have to exist first. Until then the
-  tools are discoverable through their own descriptions — which is why those
-  descriptions carry the turn-start discipline and the relay rules rather than
-  waiting for the templates.
+- **The prose that teaches the two tools is M4's, and it has landed** — see
+  *M4 — the prose* above. The tool DESCRIPTIONS still carry the turn-start
+  discipline and the relay rules in their own words, which was M2's answer to
+  shipping a channel before the templates named it, and stays the floor for a
+  manager whose instructions file it never read.
 - **No unread chip.** M5.
 - **No `role_hint: liaison` deprecation and no user-facing docs page.** M6.
+
+## What M4 does not ship
+
+- **No unread chip.** M5 — until it lands, the human's only signal that mail is
+  waiting is the manager telling them after it reads.
+- **No `role_hint: liaison` deprecation warning.** M6.
+- **No user-facing page for the workflow author.** `docs/features/manager.md`
+  ships here and is written for the **human who talks to the manager**; the
+  `author-loomux-workflow` skill table, the worked `kind: manager` example and
+  the supersession note are M6's.
