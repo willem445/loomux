@@ -158,18 +158,18 @@ One `stat` — the same call that validates the remembered path — then:
 | shorter than the last stat | reset: discard the cursor, re-parse from byte zero |
 | creation time differs | reset — a different file at the same path |
 | mtime moved **backwards** | reset — restored over from a copy, a sync, a checkout |
-
-Those last two are **defence-in-depth over the anchor and the length**, and
-which of them actually fires is platform-dependent — measured, not assumed.
-Removing the backwards-mtime arm reddens its test on Linux and Windows but not
-on macOS, where APFS drags the birth time back with the mtime so the
-creation-time arm covers the case instead; removing the creation-time arm
-reddens its test on Linux and macOS but not on Windows, where NTFS **file
-tunneling** restores the original birth time for a same-name recreate inside a
-~15 s window, leaving that arm inert. Neither arm is evidenced on all three
-platforms, and the realistic rotation — to *different* content — is caught by
-the anchor or the length regardless.
 | anchor no longer matches | reset — the **last 64 bytes** of the consumed region were rewritten |
+
+The **creation-time** and **backwards-mtime** rows are defence-in-depth over
+the anchor and the length, and which of them actually fires is
+platform-dependent — measured, not assumed. Removing the backwards-mtime arm
+reddens its test on Linux and Windows but not on macOS, where APFS drags the
+birth time back with the mtime so the creation-time arm covers the case
+instead; removing the creation-time arm reddens its test on Linux and macOS but
+not on Windows, where NTFS **file tunneling** restores the original birth time
+for a same-name recreate inside a ~15 s window, leaving that arm inert. Neither
+arm is evidenced on all three platforms, and the realistic rotation — to
+*different* content — is caught by the anchor or the length regardless.
 
 Every reset costs exactly what the old code cost on every tick. That is the
 shape of the whole design: **each guard fails toward slow, never toward
@@ -227,6 +227,17 @@ permanent. Against a 1 s poll the timer still leaves the incremental path
 doing roughly 1/300th of the old work, so the guarantee costs almost none of
 the win, and it is deliberately shorter than `CURSOR_TTL` so a cursor that
 survives eviction has revalidated at least once in between.
+
+**That 1/300th is an average, not a distribution.** Cursors are built when an
+agent is first polled, so a group's cursors tend to expire in the same tick,
+and `compute_group_usage` walks its live agents serially. One tick in every
+~300 therefore costs what a pre-#1239 tick cost — for every live agent at once
+— rather than spreading one agent's re-parse per tick. The mean is what the
+amortized figure says; the worst tick is the old worst tick. That is acceptable
+because the old cost was paid on *every* tick and the poll is already coalesced
+behind the usage memo, but it is the first thing to look at if a periodic hitch
+on the group view is ever reported, and a per-cursor phase offset is the fix if
+it is.
 
 Both halves are pinned, deliberately: `an_edit_below_the_anchor_window_is_not_detected_by_any_guard`
 asserts the cursor really does disagree with a full re-parse by exactly the

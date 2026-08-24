@@ -516,23 +516,42 @@ fn a_replaced_file_with_identical_content_resets_on_its_creation_time() {
     assert_eq!(t.len(), was_len, "the replacement must be byte-identical to test this arm");
     t.bump_mtime();
 
-    match (before, after_created) {
-        (Some(a), Some(b)) if a != b => {}
-        _ => {
-            eprintln!(
-                "skipped: this host reports no distinct creation time for a recreated \n                 file (no birth time, or NTFS file tunneling), so the creation-time \n                 reset arm is inert here by design — see TranscriptCursor::created"
-            );
-            return;
-        }
-    }
-
+    let distinct = matches!((before, after_created), (Some(a), Some(b)) if a != b);
     let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
-    assert!(
-        w.reset,
-        "a different file at the same path must throw the cursor away even when its \n         bytes are identical — nothing about the old offset refers into it"
-    );
-    assert!(!w.revalidated, "and it is a GUARD firing, not the timer");
-    assert_eq!(after.tokens, first.tokens, "identical content, so identical totals");
+
+    // EVERY path below asserts something. An early `return` here would report
+    // `ok` while evidencing nothing, and cargo hides a passing test's output,
+    // so the reader could not tell coverage from a silent no-op (#1361 review
+    // N11).
+    if distinct {
+        assert!(
+            w.reset,
+            "a different file at the same path must throw the cursor away even when \
+             its bytes are identical — nothing about the old offset refers into it"
+        );
+        assert!(!w.revalidated, "and it is a GUARD firing, not the timer");
+        assert_eq!(after.tokens, first.tokens, "identical content, so identical totals");
+    } else if cfg!(windows) {
+        // NTFS file tunneling: the recreated name keeps its original birth
+        // time, so this arm CANNOT fire here. Pin that documented consequence
+        // rather than skipping — if tunneling is ever off on the host, the
+        // branch above runs instead and asserts the real thing.
+        assert!(
+            !w.reset,
+            "tunneling gave the replacement the original creation time, so the \
+             creation-time arm is inert on this host and nothing else can catch a \
+             byte-identical replacement — if this now resets, tunneling is off and \
+             the `distinct` branch should have run"
+        );
+        assert_eq!(after.tokens, first.tokens, "and the totals are unchanged either way");
+    } else {
+        panic!(
+            "could not produce a distinguishable creation time after 10 attempts on a \
+             non-Windows host, where nothing should coalesce them: before={before:?} \
+             after={after_created:?}. This is the test harness failing to set up its \
+             precondition, not the code under test — do not turn it back into a skip"
+        );
+    }
 }
 
 
