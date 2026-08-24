@@ -1489,13 +1489,14 @@ export interface GroupSummary {
    *  unknown to the registry. Drives the GroupView stepper. */
   max_agents: number | null;
   /** What counts against `max_agents` — every live pane the cap applies to,
-   *  which today is workers + reviewers + planners + a declared manager (#1161).
-   *  The ORCHESTRATOR is the only exemption, on both sides: the backend sums
-   *  exactly this set in `group_summary`, mirroring `live_delegate_count`, which
-   *  is the value enforcement actually reads. Lowering the cap below this blocks
-   *  new spawns. (#1161 M3 may exempt the manager per decision D3; when it does,
-   *  the backend's sum and this sentence move together or the panel starts
-   *  disagreeing with the guardrail it is describing.) */
+   *  which is workers + reviewers + planners. TWO classes are exempt on both
+   *  sides: the orchestrator, and a declared manager (#1161 M3, decision D3 —
+   *  the human's interface is not a delegate slot the orchestrator competes
+   *  for). The backend sums exactly this set in `group_summary`, mirroring
+   *  `counts_against_max_agents`, which is the predicate enforcement actually
+   *  reads. Lowering the cap below this blocks new spawns; a live manager still
+   *  appears in `roles.manager` below, so the panel shows the pane and shows
+   *  that it is not spending a slot. */
   live_delegates: number;
   paused: boolean;
   /** Group uptime (from the earliest live agent), or null if none are live. */

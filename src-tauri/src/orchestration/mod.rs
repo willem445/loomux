@@ -6372,6 +6372,33 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
     !matches!(role, Role::Orchestrator | Role::Manager) && !group_opted_expanded
 }
 
+/// **Whether a live pane of this class consumes a `max_agents` slot** — the
+/// cap's exemption rule, as one pure predicate (#1161 M3, decision D3).
+///
+/// `false` for [`Role::Orchestrator`] (as it always was) and for
+/// [`Role::Manager`]. The cap contains DELEGATE fan-out, which is the one axis
+/// an orchestrator controls; neither exempt class is a delegate it opens. A
+/// manager is declared in the repo's `.loomux/workflow.yml` and opened by
+/// loomux at launch for the human, so making it competable with a worker slot
+/// would let a cap the orchestrator itself can lower
+/// (`set_max_agents`) decide whether the human has an interface.
+///
+/// [`Role::Solo`] counts: a solo pane is not in an orchestration group at all
+/// (`__solo__`), so no group's cap is ever evaluated against one — reading
+/// `true` here keeps the predicate a statement about the two EXEMPT classes
+/// rather than a hand-list of the counted ones that a sixth class would join
+/// silently.
+///
+/// Pure, and the one expression: `live_delegate_count`, `live_delegate_roster`,
+/// `spawn_agent_bound`'s fast-path cap check and its race-safe re-check under
+/// the agents lock, and `group_status`'s `live_delegates` sum all read THIS —
+/// so a class cannot be exempt from the count and named in the refusal
+/// message, which is the asymmetry four independently-written `role !=
+/// Role::Orchestrator` filters were one edit away from producing.
+pub fn counts_against_max_agents(role: Role) -> bool {
+    !matches!(role, Role::Orchestrator | Role::Manager)
+}
+
 /// Whether the spawn-rate guardrail should reject the next spawn: true when
 /// at least `limit` spawns already fall inside the trailing `window_ms`.
 /// Pure so the sliding-window arithmetic is testable; `limit` 0 = unlimited.
@@ -30058,6 +30085,22 @@ impl OrchRegistry {
     /// `idle_kill_minutes`. Pure selection (no killing) so the reaper policy
     /// is testable at a chosen `now`.
     ///
+    /// **A `Role::Manager` pane is exempt (#1161 M3), by CLASS rather than by
+    /// hint** — the reaper's premise is false for it in the strongest form the
+    /// premise can be false. A manager spawns with no task (the human's first
+    /// message is the task), so `idle_since_ms` stamps at BIRTH: unguarded, it
+    /// is taken on the first sweep past `idle_kill_minutes`, before the human
+    /// has typed anything, and the notice that it happened goes to the
+    /// orchestrator's pane rather than to the human sitting in front of the one
+    /// that vanished. An idle manager is a manager whose human is away — that
+    /// is its normal state, not an abandoned slot.
+    ///
+    /// Keyed on `a.role`, never on the `standing` hint set below: the hint set
+    /// is a property of the group's ROSTER (which block ids are liaisons) and
+    /// the class is a property of the AGENT, so a manager is exempt even on a
+    /// pane whose block id no longer resolves in the roster (a workflow file
+    /// edited mid-session — #459 treats that as a live reality).
+    ///
     /// **A liaison block is exempt (#891 S4)**, and it is the only hint that is.
     /// The reaper's premise — audited as "a slot the orchestrator wasn't using
     /// was reclaimed" — is false for the one pane the orchestrator is not the
@@ -30095,7 +30138,10 @@ impl OrchRegistry {
         self.agents
             .lock_safe()
             .values()
-            .filter(|a| a.role != Role::Orchestrator && a.status == AgentStatus::Running)
+            .filter(|a| {
+                !matches!(a.role, Role::Orchestrator | Role::Manager)
+                    && a.status == AgentStatus::Running
+            })
             .filter(|a| {
                 let Some((t, standing)) = policy.get(&a.group) else { return false };
                 !standing.contains(&a.block) && idle_should_kill(a.idle_since_ms, now, *t)
@@ -30319,9 +30365,22 @@ impl OrchRegistry {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
                 // Only agents actively working: running, not the orchestrator,
-                // and currently assigned (idle_since_ms clear). This excludes
-                // idle, done/blocked, dead, and reaped agents by construction.
-                if a.role == Role::Orchestrator
+                // not the manager, and currently assigned (idle_since_ms
+                // clear). This excludes idle, done/blocked, dead, and reaped
+                // agents by construction.
+                //
+                // #1161 M3: `Role::Manager` is named EXPLICITLY rather than
+                // left to the idle-clock clause, even though a manager opened
+                // by the launch path arrives task-less and is therefore already
+                // skipped by it. The two are different rules that happen to
+                // agree today: the idle clause says "nothing is assigned", and
+                // whether a manager's clock is clear is a fact about paths that
+                // may change, while "loomux never nags the orchestrator about
+                // the human's own pane" is the rule. A stall notice about a
+                // manager is a false report either way — its silence means the
+                // human is reading, and the notice lands in a pane the human is
+                // not looking at, naming a pane they are.
+                if matches!(a.role, Role::Orchestrator | Role::Manager)
                     || a.status != AgentStatus::Running
                     || a.idle_since_ms.is_some()
                 {
@@ -37966,14 +38025,14 @@ impl OrchRegistry {
             // cap would (harmlessly) block spawns until attrition. Must match
             // `live_delegate_count` (the value enforcement actually reads):
             // planners count too (#47), so a cap-below-live warning stays honest.
-            // A manager counts here for exactly that reason and no other —
-            // `live_delegate_count` exempts only the orchestrator, so today a
-            // live manager DOES occupy a cap slot, and a summary that left it
-            // out would under-report the number enforcement uses. #1161 M3
-            // decides whether to exempt it; when it does, this sum moves with
-            // `live_delegate_count`, not before it.
+            // A manager is NOT summed (#1161 M3, decision D3) — the same edit
+            // that gave `live_delegate_count` its `Role::Manager` exemption, so
+            // the panel keeps describing the number the guardrail enforces
+            // rather than one it computed independently. The per-class
+            // breakdown below still reports `manager`: the human is told the
+            // pane is live, and told it is not spending a slot.
             "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
-            "live_delegates": worker + reviewer + planner + manager,
+            "live_delegates": worker + reviewer + planner,
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
             "roles": { "orchestrator": orch, "worker": worker, "reviewer": reviewer, "planner": planner, "manager": manager },
@@ -40250,25 +40309,43 @@ impl OrchRegistry {
             .unwrap_or_else(|| "claude".to_string())
     }
 
+    /// How many live panes count against this group's `max_agents`.
+    ///
+    /// **Two classes are exempt, and they are the two panes the orchestrator
+    /// does not own**: itself, and the group's manager (#1161 M3, decision
+    /// D3). The cap exists to contain DELEGATE fan-out — the orchestrator
+    /// deciding to open five more workers — and a manager is not something it
+    /// decides at all: the repo's workflow file declares it and loomux opens it
+    /// at launch for the human. Counting it would make the human's own
+    /// interface competable with a worker slot, and (on a cap of 1) would make
+    /// a group with a manager unable to spawn any worker at all.
+    ///
+    /// [`counts_against_max_agents`] is the one expression; every reader of
+    /// this rule calls it rather than re-spelling the pair.
     fn live_delegate_count(&self, group: &GroupId) -> u32 {
         self.agents
             .lock_safe()
             .values()
-            .filter(|a| a.group == group && a.role != Role::Orchestrator && a.status != AgentStatus::Dead)
+            .filter(|a| a.group == group && counts_against_max_agents(a.role) && a.status != AgentStatus::Dead)
             .count() as u32
     }
 
     /// Human-readable roster of the group's live delegates (workers, reviewers,
-    /// planners — the orchestrator is exempt from the cap) for the cap-rejection
-    /// guardrail message (#203). Locks `agents`; the race-safe cap check in
-    /// `spawn_agent` already holds that lock, so it calls
+    /// planners — the orchestrator and the manager are exempt from the cap) for
+    /// the cap-rejection guardrail message (#203). Locks `agents`; the race-safe
+    /// cap check in `spawn_agent` already holds that lock, so it calls
     /// [`format_delegate_roster`] directly against its guard instead of this.
+    ///
+    /// Filtered by the SAME predicate as [`Self::live_delegate_count`] (#1161
+    /// M3): this message answers "which panes are holding the slots", and a
+    /// pane the cap does not count is not holding one — naming it here would
+    /// point a refused orchestrator at a pane it must not reuse or kill.
     fn live_delegate_roster(&self, group: &GroupId) -> String {
         let rows = self
             .agents
             .lock_safe()
             .values()
-            .filter(|a| a.group == group && a.role != Role::Orchestrator && a.status != AgentStatus::Dead)
+            .filter(|a| a.group == group && counts_against_max_agents(a.role) && a.status != AgentStatus::Dead)
             .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
             .collect();
         format_delegate_roster(rows)
@@ -42402,18 +42479,36 @@ impl OrchRegistry {
         // catches `block: "<an orchestrator block>"`, which arrives with
         // `kind: worker` and would otherwise be promoted by `role = block.kind`.
         //
-        // #1161: a MANAGER block deliberately has NO twin of this guard here,
-        // and the asymmetry is chosen rather than missed. `mcp::call_tool` is
-        // the only agent-reachable entry point and refuses it there (by `kind`
-        // and by `block`); this function is also the path loomux's own
-        // launch-time open will take in M3, so a blanket refusal keyed on
-        // `Role::Manager` here would refuse the one caller that is supposed to
-        // succeed. The orchestrator-block guard can be unconditional because
-        // loomux registers the group's own orchestrator through the un-named
-        // path; M3 decides which shape the manager's launch path takes.
         if block.kind == Role::Orchestrator && named.is_some() {
             return Err(format!(
                 "block {:?} is an orchestrator block — a group has exactly one orchestrator, opened at launch",
+                block.id
+            ));
+        }
+        // #1161 M3: the manager's twin of the guard above, in the SAME shape
+        // for the same reason. A NAMED block is a caller choosing this class by
+        // id, and no caller that may choose it exists; loomux's own two openers
+        // — `open_manager_pane_at_launch` and the session browser's manager
+        // rejoin (`resume_recorded_session`) — resolve it by CLASS instead
+        // (`block: None` → `block_for(Role::Manager)`, which for a manager is
+        // "the only one": `workflow::MANAGER_MAX` is 1 and a second is a parse
+        // error). So `named` is `None` on exactly the paths that must succeed.
+        //
+        // **THIS IS WHAT CLOSES THE TWO BARE-RESUME ROUTES.** `mcp::call_tool`
+        // refuses `kind: "manager"` and `block: "<a manager block>"` by testing
+        // the ARGUMENTS, and block inference runs after both — so
+        // `spawn_agent(resume_session: <a manager session>)`, naming neither,
+        // inherits the recorded block id (a post-#222 roster row) or resolves
+        // `kind_from_str("manager")` and takes that class's default block (a
+        // pre-#222 row that recorded only a role), and reaches this function
+        // with `named` Some. Its `role` ARGUMENT is `Role::Planner` on both
+        // routes (`kind.unwrap_or(Role::Planner)`), so only a check on
+        // `block.kind` — the value that actually wins here — can see them at
+        // all. `mcp.rs` keeps its own refusal on the resolved block for the
+        // SENTENCE (#243's double gate); this one is the enforcement.
+        if block.kind == Role::Manager && named.is_some() {
+            return Err(format!(
+                "block {:?} is this group's manager — the human's own interface, declared in the \n                 repo's workflow file and opened for them at launch, never spawned by an agent. \n                 That includes resuming its session: a manager pane comes back through the \n                 session browser, not through spawn_agent. To put something to the human, use \n                 ask_human; to send them status, use message_manager.",
                 block.id
             ));
         }
@@ -42440,8 +42535,14 @@ impl OrchRegistry {
             }
         }
 
-        // Guardrail: live delegate cap (the orchestrator itself is exempt).
-        if role != Role::Orchestrator {
+        // Guardrail: live delegate cap. Two classes are exempt — the
+        // orchestrator and, since #1161 M3 (D3), the manager; both are loomux's
+        // own panes rather than delegates this cap exists to contain. The
+        // spawn-rate backstop below rides the same predicate for the same
+        // reason: it is a backstop against a RUNAWAY ORCHESTRATOR, and a
+        // manager is opened once per group by the launch path, never in a loop
+        // by anything an agent can reach (`counts_against_max_agents`).
+        if counts_against_max_agents(role) {
             let live = self.live_delegate_count(group_id);
             if live >= group.guardrails.max_agents {
                 // #203: name who holds the slots so a rejected orchestrator can
@@ -42807,12 +42908,34 @@ impl OrchRegistry {
             // check above fast-fails before worktree creation, but only this
             // one is race-free against concurrent spawns.
             let mut agents = self.agents.lock_safe();
-            if role != Role::Orchestrator {
+            // #1161 M3: at most ONE live manager per group. The cap below
+            // cannot cover it — a manager is exempt from `max_agents` — and
+            // `MANAGER_MAX` bounds what a workflow file may DECLARE, not how
+            // many panes one declaration opens. Checked here, under the same
+            // guard as the race-safe cap re-check, because loomux's two openers
+            // can genuinely race: a human clicking Resume on a dead manager
+            // session while a relaunch is bringing the group's own one up.
+            // Two manager panes would be two conversations the human has to
+            // notice are different, and one mailbox drained by whichever read
+            // it first.
+            if role == Role::Manager
+                && agents.values().any(|a| {
+                    a.group == group_id
+                        && a.role == Role::Manager
+                        && a.status != AgentStatus::Dead
+                })
+            {
+                let _ = fs::remove_file(&cfg.path);
+                return Err(format!(
+                    "group {group_id} already has a live manager — the human's interface is a \n                     singleton, and a second pane would split the conversation and the mailbox \n                     between two of them. Kill the live one first if it needs replacing."
+                ));
+            }
+            if counts_against_max_agents(role) {
                 let live = agents
                     .values()
                     .filter(|a| {
                         a.group == group_id
-                            && a.role != Role::Orchestrator
+                            && counts_against_max_agents(a.role)
                             && a.status != AgentStatus::Dead
                     })
                     .count() as u32;
@@ -42826,7 +42949,7 @@ impl OrchRegistry {
                             .values()
                             .filter(|a| {
                                 a.group == group_id
-                                    && a.role != Role::Orchestrator
+                                    && counts_against_max_agents(a.role)
                                     && a.status != AgentStatus::Dead
                             })
                             .map(|a| (a.id.clone(), a.role.as_str(), a.idle_since_ms.is_some()))
@@ -50404,6 +50527,111 @@ pub fn create_orchestration_group(
     register_orchestrator_pane(reg, &group, &origin, initial_workers)
 }
 
+/// Open this group's MANAGER pane, when its roster declares one (#1161 M3).
+///
+/// **Beside the orchestrator's own launch path, never through the
+/// orchestrator.** That is the whole of the first-class claim: the human's
+/// interface exists because the repo's `.loomux/workflow.yml` declares it and
+/// loomux opened it, not because an orchestrator was asked to and complied.
+/// `spawn_agent(kind: "manager")` is refused (`mcp::call_tool`), so this
+/// function and the session browser's manager rejoin are the only two openers
+/// there are.
+///
+/// **`block: None`, deliberately.** `spawn_agent_bound` refuses a NAMED manager
+/// block outright — that refusal is what closes the agent-reachable spawn and
+/// bare-resume routes — so loomux's own openers must resolve the block by
+/// class. For a manager the two resolutions are the same block:
+/// `workflow::MANAGER_MAX` is 1, so `block_for(Role::Manager)`'s "the first of
+/// that kind" is "the only one".
+///
+/// **The resume path.** When the group's own launch resumes a conversation
+/// (`SessionOrigin::resumes_session` — a dormant group being brought back, or a
+/// promoted pane), the manager reopens ITS last recorded session too. A human's
+/// conversation with their manager surviving an app restart is the same
+/// continuity the orchestrator already gets, and it matters more here: this
+/// pane's transcript *is* the record of what the human said. A launch that
+/// starts fresh, or a group with no recorded manager session, cold-starts.
+///
+/// **A resumed manager is typed NOTHING.** `spawn_agent_bound` delivers a
+/// follow-up on a resume only when the spawn carries a task, and this one never
+/// does — so the pane simply reopens with its history. `Delivery::ResumeKickoff`
+/// *is* in the permitted set (`Delivery::permitted_into_manager_pane`), and this
+/// path declines to use it: that carve-out exists for a pane that has not become
+/// a conversation yet, and a resumed manager pane is nothing but one. The fresh
+/// arm's kickoff is the pane's first line, which is the case the carve-out is
+/// actually for.
+///
+/// Errors are audited and told to the orchestrator rather than failing the
+/// launch: a group whose manager could not open is degraded (the human talks to
+/// the orchestrator directly, exactly as they did before this feature), while a
+/// launch that refused to happen is a group the human does not have at all.
+fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origin: &SessionOrigin) {
+    let Some(block) = group.guardrails.block_for(Role::Manager).cloned() else {
+        // No manager declared — the overwhelmingly common case, including every
+        // default (no-workflow) group. Nothing is opened and nothing is said.
+        return;
+    };
+    // The manager's own last-touched roster row, for its session id and for the
+    // name tier a human rename earned (#95r). Read only when the launch itself
+    // resumes; a fresh launch cold-starts even if rows from an earlier life of
+    // this group id are still on disk.
+    let prior = origin.resumes_session().then(|| {
+        reg.merged_records(&group.id)
+            .into_iter()
+            .filter(|r| r.block == block.id && r.session.is_some())
+            .max_by_key(|r| r.updated_ms)
+    }).flatten();
+    let reg2 = reg.clone();
+    let group_id = group.id.clone();
+    let open = move || {
+        let (name, name_source, session) = match &prior {
+            Some(r) => (r.name.clone(), Some(r.name_source), r.session.clone()),
+            // Empty name → derived from the minted id, like every other spawn.
+            None => (String::new(), None, None),
+        };
+        match reg2.spawn_agent_ex(
+            &group_id, Role::Manager, None, &name, "", false, None, None, session, None, name_source,
+        ) {
+            Ok(a) => {
+                reg2.audit(&group_id, brand::AUDIT_ACTOR, "manager-opened", json!({
+                    "agent": a.id, "block": a.block, "resumed": a.session_id.is_some() && prior.is_some(),
+                }));
+            }
+            Err(e) => {
+                reg2.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
+                    "what": "manager pane open failed", "block": block.id, "err": e.clone(),
+                }));
+                // The orchestrator is told because it is the pane that can act
+                // on it: its own `{{MANAGER_NOTE}}` fallback prose (M4) is
+                // "manager not live — take the human's input in your own pane",
+                // and it cannot take that branch on a fact it was never given.
+                let _ = reg2.deliver_to_orchestrator(
+                    &group_id,
+                    &format!(
+                        "[orrerix] this group's workflow declares a manager block ({}), but its \
+                         pane could not be opened: {e}. The human has no manager pane this \
+                         session — take their input in your own pane, exactly as your base rules \
+                         say.",
+                        block.id
+                    ),
+                    brand::AUDIT_ACTOR,
+                );
+            }
+        }
+    };
+    // `spawn_agent_ex` BLOCKS until the pane binds when a frontend is attached
+    // (it emits `orch-spawn-request` and waits on `pending_binds`), and the
+    // caller of this function is on the IPC thread that also serves that bind —
+    // so running it inline there would deadlock until `BIND_TIMEOUT`. With no
+    // frontend (tests) it returns synchronously, and running it inline is what
+    // makes a launch fully observable from one call instead of racing a thread.
+    if reg.app.lock_safe().is_none() {
+        open();
+    } else {
+        std::thread::spawn(open);
+    }
+}
+
 /// Register a group's orchestrator and hand back the pane spec the frontend
 /// opens. `origin` decides whether the pane reopens a prior conversation (with
 /// fresh MCP wiring either way) or starts cold, and which kickoff it is typed —
@@ -50703,6 +50931,17 @@ fn register_orchestrator_pane(
         ),
     );
 
+    // #1161 M3: the manager pane opens HERE — at launch, beside the
+    // orchestrator's own pane and off its own declaration, not from anything
+    // the orchestrator does. Placed above the test-mode return (rather than in
+    // the bind thread below, where the initial workers go) for two reasons: it
+    // must not be sequenced behind the orchestrator's bind, since it is not the
+    // orchestrator's delegate and does not wait on it; and a group launched
+    // with no frontend must still open it, so a test can observe a whole launch
+    // from one synchronous call. Neither pane waits on the other — what this
+    // guarantees is that the manager is REQUESTED at launch, not that it binds
+    // before the orchestrator's kickoff lands.
+    open_manager_pane_at_launch(reg, group, origin);
     if reg.app.lock_safe().is_none() {
         // Test mode: no frontend; mark running without a pane. Tolerate a
         // vanished entry rather than unwrapping under the agents lock.
@@ -51151,8 +51390,21 @@ pub fn resume_recorded_session(
     // for `spawn_agent(block:)` a typo should be an error — so the fallback has to
     // happen here, where "stale" and "wrong" are distinguishable. (`kickoff_prompt`
     // already falls back the same way for the instructions path.)
+    // #1161 M3: a MANAGER rejoins by CLASS, never by block id — the one
+    // deliberate exception to the rejoin-as-the-same-block rule above, and it
+    // costs nothing, because a group has at most one manager block
+    // (`workflow::MANAGER_MAX`) so its class default IS its recorded block.
+    // `spawn_agent_bound` refuses a NAMED manager block, which is what closes
+    // the agent-reachable spawn and bare-resume routes; loomux's two own
+    // openers (this one and `open_manager_pane_at_launch`) pass `None` so the
+    // refusal can stay unconditional on the shape rather than being softened
+    // into a guess about who is calling. This entry point is a Tauri command
+    // driven by a human clicking a row in the session browser — the trusted
+    // webview, not an agent — and the singleton re-check inside
+    // `spawn_agent_bound` is what stops it opening a second live one.
     let block = matched
         .as_ref()
+        .filter(|_| role != Role::Manager)
         .map(|r| r.block.clone())
         .filter(|b| !b.trim().is_empty())
         .filter(|b| {

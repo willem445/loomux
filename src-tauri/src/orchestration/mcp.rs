@@ -2156,6 +2156,32 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             } else {
                 block
             };
+            // #1161 M3 — the manager refusal on the EFFECTIVE block, which is
+            // the only spelling the two above cannot see. Both of those test
+            // the caller's ARGUMENTS (`kind`, `block`), and the inheritance
+            // immediately above runs after them: a bare
+            // `spawn_agent(resume_session: <a manager session>)` names neither,
+            // and then either inherits the recorded block id (a post-#222
+            // roster row) or resolves `kind_from_str("manager")` and takes that
+            // class's default block (a pre-#222 row that recorded only a role).
+            // Both routes arrive here holding a manager block having passed
+            // every argument check.
+            //
+            // This is the SENTENCE, not the enforcement — `spawn_agent_bound`
+            // refuses a named manager block outright and would refuse both
+            // routes anyway (#243's double gate). It is worth its own arm for
+            // the same reason `send_prompt`'s is: an orchestrator that reached
+            // for a manager session wanted to reach the HUMAN, and the answer
+            // to that is a tool it already holds.
+            if let Some(id) = block.as_deref() {
+                let effective_kind =
+                    reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind));
+                if effective_kind == Some(Role::Manager) {
+                    return Err(format!(
+                        "that session belongs to this group's manager (block {id:?}) — the \n                         human's own interface, opened for them at launch and never spawned or \n                         resumed by you, however it is spelled. A manager pane comes back \n                         through the session browser, which is the human's own surface. To put \n                         something to the human, use ask_human; to send them status, use \n                         message_manager."
+                    ));
+                }
+            }
             // rev-13 finding on #345 (extended for #359 to cover reviewers too):
             // a worker/reviewer RESUME that omits `cwd` fell through silently to
             // `spawn_agent_ex`'s per-role default — the main clone for anything
