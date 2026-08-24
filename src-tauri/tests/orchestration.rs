@@ -8486,6 +8486,17 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
         ("resource.slots-above-max", format!("version: 1\n{block}resources:\n  build:\n    slots: 65\n")),
         ("resource.max_hold_minutes", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 0\n")),
         ("resource.max_hold_minutes-above-max", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 481\n")),
+        // #1457 N10. Declared with an explicit `cli: claude`, and for the same
+        // reason the `gate.max_diff_lines` row above declares a reviewer: a
+        // remote block with no `cli:` is refused for THAT, and both refusals
+        // mention "remote", so a row that could fail for two reasons pins
+        // neither. With the cli spelled out the only rule left to break is the
+        // length, which is what this row is about — 65 characters against a
+        // cap of 64.
+        ("block.remote-above-max", format!(
+            "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    remote: {}\n",
+            "b".repeat(65)
+        )),
     ] {
         let err = workflow::parse_workflow(&text)
             .err()

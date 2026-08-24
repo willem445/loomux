@@ -2657,10 +2657,28 @@ fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
     // `as_str()` returning `None` on a missing key, which is true today and is
     // exactly the kind of true-by-reading that this PR keeps finding is not
     // true-by-test.
-    let mut pre_1457: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    // Built from the ORIGINAL `gj` — read at the top, before the fail-closed
+    // stanza wrote `"cli": "claude "` into the file. Re-reading `path` here
+    // instead would leave that edit in place, and `remote == None` would then
+    // hold for three independent reasons — the missing key (the property under
+    // test), `check_segment` on a hypothetical `Some("")`, and the cli no
+    // longer being claude — with the assertion unable to tell them apart
+    // (#1457 review N12). Same class as the collision control that fired on its
+    // own fixture: an assertion that holds for a reason other than its own.
+    let mut pre_1457: Value = gj.clone();
     for b in pre_1457["guardrails"]["blocks"].as_array_mut().unwrap() {
         b.as_object_mut().unwrap().remove("remote");
     }
+    assert_eq!(
+        pre_1457["guardrails"]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "builder")
+            .unwrap()["cli"],
+        "claude",
+        "the migration fixture must carry a CLEAN cli, or the assertion below is confounded"
+    );
     assert!(
         !serde_json::to_string(&pre_1457).unwrap().contains("remote"),
         "the fixture must really carry no remote key, or it is not a pre-#1457 file"
