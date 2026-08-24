@@ -401,6 +401,13 @@ export class TimelineView {
       // served a cached answer; a follow tick takes the store's window, which
       // is what lets the audit viewer's tick at the same cadence be served
       // this read instead of firing a second `orch_audit` for the same file.
+      // One path is neither, and is deliberately windowed: PollGate's
+      // return-to-a-visible-window refresh passes `false` here because forcing
+      // would also bypass `shouldRefreshGh` and shell out to gh, which that
+      // throttle exists to prevent. Windowed is not stale there — the store
+      // re-reads unless a successful read landed within AUDIT_READ_MAX_AGE_MS,
+      // which is under the follow cadence, so the worst case is the audit
+      // viewer's read from a fraction of a second ago.
       // The store keeps the last good rows on a failed read and never throws,
       // so an unreadable log leaves the chart as it was rather than blanking
       // it, and an empty chart now means an empty log.
