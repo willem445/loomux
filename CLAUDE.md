@@ -322,7 +322,11 @@ compiles.
   exactly like coverage. Assert the mutation is present — anchor count, or a diff
   against the pre-mutation blob — and abort rather than record a run you did not
   produce; the CRLF trap under *Running these in an agent worktree* is one way the
-  anchor silently misses. Signature: the pre- and post-mutation runs report identical
+  anchor silently misses, and decoding the file in one encoding while the anchor is source
+  text in another is a second — a `latin1` read (the byte-faithful choice) leaves a UTF-8 em
+  dash as three characters, and nearly every source file here carries a non-ASCII character,
+  so an anchor cut from a real message usually does too. Decode and anchor in ONE encoding
+  (#1396 round 2). Signature: the pre- and post-mutation runs report identical
   pass counts (#1297). An anchor can also match and the edit still land wrong: JS
   `String.replace` with a *string* replacement expands `` $& ``, `` $` `` and `` $' ``,
   so an anchor or payload containing one splices the file into itself — pass a function
@@ -401,6 +405,15 @@ compiles.
   assertion's two literals never meet (links `"#7"`, deletes `"t-2"`) while a body and a
   design note call the non-interference pinned and a doc comment leans on it (#1300 B1,
   `doc/design/board-sprints-and-links.md` §3).
+- **A function's doc may only claim what survives its pipeline's LAST writer.** A doc block
+  justifying a local choice by a property of the file on disk ("appended, so the order is the
+  human's") is false wherever a downstream canonicaliser rewrites it, and its test then measures
+  the downstream property under the upstream one's label — #1300 B1 / #1182's non-discriminating
+  fixture with the prescription inverted: for an ORDER pin the two candidate outputs must
+  DIVERGE, and that divergence is itself pinned (`assert.notDeepEqual`) so a later fixture edit
+  reddens before the claims do. Signature: a doc block on why a list is appended rather than
+  sorted, upstream of a serializer that sorts it — `sortByBlocks` has four call sites (#1396 B1;
+  `connectToGate`, `test/workflowmodel.test.ts`).
 - **A test's specimen must stay a member of the class it witnesses.** When a directive
   moves a real specimen out of that class (a declared value converging with the
   default, a file gaining its "absent" block, a concrete list going stale), relocate
