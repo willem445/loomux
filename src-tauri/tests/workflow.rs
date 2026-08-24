@@ -7149,9 +7149,11 @@ fn gate_missing_blocks_reports_a_block_named_by_id_but_not_kind_reviewer() {
 
 // ────────── loomux's own workflow, and what a block's model: is worth ─────────
 //
-// The repo dogfoods the feature (#222): `.loomux/workflow.yml` at the root declares
-// loomux's own roster — two worker tiers and three focused reviewers, each with a
-// persona in `.github/agents/` — and the tests below are what keep that file honest.
+// The repo dogfoods the feature (#222): `.orrerix/workflow.yml` at the root declares
+// loomux's own roster — two worker tiers, one JUDGING reviewer lane (`rev-lead`) and
+// three cheap mechanical quick-review lanes ahead of it on `cli: opencode` (#1388),
+// each with a persona in `.github/agents/` — and the tests below are what keep that
+// file honest.
 // The pane's half of the same pin lives in `test/workflowdogfood.test.ts`.
 
 /// The loomux repo root (the crate's manifest dir is `src-tauri/`).
@@ -7177,9 +7179,66 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
 
     assert_eq!(
         wf.blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-        ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-lead", "process"],
+        [
+            "orchestrator",
+            "planner",
+            "worker-deep",
+            "worker-quick",
+            "rev-lead",
+            "qr-evidence",
+            "qr-tests",
+            "qr-constraints",
+            "process"
+        ],
         "ids are what edges, gates and spawn_agent(block:) reference — a rename here breaks the gate"
     );
+
+    // THE THREE CHEAP LANES (#1388), and the one ordering property this roster leans
+    // on. `Guardrails::block_for(Role::Reviewer)` resolves a bare
+    // `spawn_agent(kind: "reviewer")` to the FIRST reviewing block in roster order, so
+    // rev-lead must be declared ahead of the qr-* lanes: a checklist lane sitting first
+    // would answer an unrouted review request with a grep report instead of a review.
+    // Stated as an ordered list rather than as a set, so a reordering edit fails HERE
+    // rather than silently changing what a bare spawn does.
+    let reviewers: Vec<(&str, &str, &str, &str)> = wf
+        .blocks
+        .iter()
+        .filter(|b| b.kind == Role::Reviewer)
+        .map(|b| {
+            (b.id.as_str(), b.cli.as_str(), b.model.as_str(), b.profile.as_deref().unwrap_or(""))
+        })
+        .collect();
+    assert_eq!(
+        reviewers,
+        [
+            ("rev-lead", "claude", "opus", ".github/agents/rev-lead.md"),
+            ("qr-evidence", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-evidence.md"),
+            ("qr-tests", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-tests.md"),
+            ("qr-constraints", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-constraints.md")
+        ],
+        "the judging lane is declared first; the three cheap lanes run opencode on the free Zen model"
+    );
+
+    // The model id is pinned in FULL on purpose. `default_model("opencode", …)` is
+    // deliberately EMPTY — opencode has no vendor-neutral alias, its ids are
+    // `provider_id/model_id` against a catalog of dozens of providers — so a block that
+    // dropped the provider half would name a model that does not exist, handed over with
+    // no error (doc/design/opencode.md, the pre-#722 `sanitize_model` bug). This asserts
+    // the `/` survives the parser, which is the character #722 had to widen it to admit.
+    for (id, cli, model, _) in reviewers.iter().filter(|r| r.1 == "opencode") {
+        assert!(
+            model.starts_with("opencode/") && model.len() > "opencode/".len(),
+            "{id} on {cli} must name its provider in the model id, got {model:?}"
+        );
+    }
+
+    // And every one of them is a class this CLI may actually host — the containment
+    // gate the parser itself consults, re-asserted here against the real file so a
+    // future roster cannot pair a class with a CLI that cannot contain it.
+    for b in wf.blocks.iter().filter(|b| !b.cli.is_empty()) {
+        loomux_lib::orchestration::cli_can_host(&b.cli, b.kind)
+            .unwrap_or_else(|e| panic!("{}: {e}", b.id));
+    }
 
     // process (#324): role_hint pairs with the kind it requires — the worker-side half
     // of the rule, exercised against the real parser by the real file. (The planner-side
@@ -7239,7 +7298,11 @@ blocks:
     let declared: Vec<&str> =
         wf.blocks.iter().filter(|b| b.kind == Role::Reviewer).map(|b| b.id.as_str()).collect();
     assert_eq!(gate.reviewers, declared, "every declared reviewer lane is in the gate");
-    assert_eq!(gate.reviewers, ["rev-lead"], "…and today that is the single lead lane");
+    assert_eq!(
+        gate.reviewers,
+        ["rev-lead", "qr-evidence", "qr-tests", "qr-constraints"],
+        "…and today that is the lead lane plus the three cheap pre-lead lanes"
+    );
     assert_eq!(
         workflow::gate_need(gate),
         gate.reviewers.len() as u32,
@@ -7282,7 +7345,7 @@ fn the_dogfood_reviewer_persona_carries_the_question_set() {
         Ok(Some(wf)) => wf,
         other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
     };
-    let block = wf.block("rev-lead").expect("the roster's one reviewer lane is rev-lead");
+    let block = wf.block("rev-lead").expect("rev-lead is the roster's JUDGING reviewer lane");
     let rel = block.profile.as_deref().expect("rev-lead must point at a persona file");
     let p = profiles::load_block_profile(&repo, rel, block.kind).unwrap_or_else(|e| panic!("rev-lead: {e}"));
     let body = flat(&p.instructions);
@@ -7313,6 +7376,119 @@ fn the_dogfood_reviewer_persona_carries_the_question_set() {
         "an empty or \"n/a\" section is a finding against the review, not a pass",
         "the enforcement rule that makes the five headings load-bearing rather than \
          decorative (#1292 PR B, review round 2 N2)",
+    );
+}
+
+#[test]
+fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
+    // #1388's sibling of the question-set pin above, and for the same reason: these
+    // three personas are INSTRUMENTS, and every safety property the gate argument
+    // rests on lives as a sentence in a markdown file. A rule deleted from one of
+    // them costs nothing at compile time and silently converts a lane from "fails
+    // only on a quotable absence" into "fails on whatever a small model felt".
+    //
+    // The four defects #1388 found by running these checklists against its own PR
+    // were all FALSE BLOCKS — a lane refusing a healthy change — which is the one
+    // direction `all-pass` over four lanes is not safe in. Hence a pin, not a
+    // comment.
+    let repo = repo_root();
+    let wf = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => wf,
+        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
+    };
+
+    // Derived from the ROSTER by capability + CLI, never from a hardcoded id list:
+    // a fourth cheap lane added later is covered the day it is declared, and a
+    // renamed one does not quietly stop being checked.
+    let lanes: Vec<&workflow::Block> = wf
+        .blocks
+        .iter()
+        .filter(|b| b.kind == Role::Reviewer && b.cli == "opencode")
+        .collect();
+
+    // POPULATION CONTROL, counted at the VERIFIED site below rather than here: an
+    // empty or shrunken list would sail through the loop and certify nothing.
+    assert_eq!(
+        lanes.len(),
+        3,
+        "expected the three cheap lanes; got {:?} — if a lane was added or removed, move this \
+         number in the same commit",
+        lanes.iter().map(|b| b.id.as_str()).collect::<Vec<_>>()
+    );
+
+    let mut verified = 0usize;
+    for b in &lanes {
+        let rel = b.profile.as_deref().unwrap_or_else(|| panic!("{}: a lane must carry a persona file", b.id));
+        let p = profiles::load_block_profile(&repo, rel, b.kind)
+            .unwrap_or_else(|e| panic!("{}: {e}", b.id));
+        let body = flat(&p.instructions);
+        let label = format!("{rel}");
+
+        // The three rules EVERY lane owes, whatever it checks.
+        pinned(
+            &label,
+            &body,
+            "anything not on your checklist is silent",
+            "the rule that stops a small model volunteering judgment it was never asked for — \
+             without it a lane starts reporting opinions rev-lead already owns (#1388)",
+        );
+        pinned(
+            &label,
+            &body,
+            "never review design, architecture, naming, wording, style, or formatting",
+            "the explicit scope floor: these lanes are instruments, and design review is \
+             rev-lead's alone (#1388)",
+        );
+        pinned(
+            &label,
+            &body,
+            "when in doubt, `escalate`",
+            "the tiebreak that keeps an undecidable check off the FAIL path, where it would \
+             read as a defect the author has to answer for (#1388)",
+        );
+
+        // The FAIL rule itself — the load-bearing half of the all-pass safety argument.
+        // Two spellings, because qr-constraints' checks are sweeps whose failure is a
+        // line PRESENT rather than an artifact absent; both say the same thing, that a
+        // FAIL must be quotable.
+        let fail_rule = if b.id == "qr-constraints" {
+            "fail means a line you can quote"
+        } else {
+            "fail means absence of a named artifact you can quote"
+        };
+        pinned(
+            &label,
+            &body,
+            fail_rule,
+            "the whole reason all-pass over four lanes is safe: a lane may only refuse on \
+             something it can paste, never on judgment (#1388)",
+        );
+
+        verified += 1;
+    }
+    assert_eq!(verified, lanes.len(), "every lane found must also have been checked");
+
+    // qr-constraints alone owes the zero-shaped-sweep rules: five of its six checks
+    // succeed by printing NOTHING, and an uncontrolled zero is byte-identical to a
+    // grep that never worked. CLAUDE.md states this for the repo; a small model will
+    // not infer it, so it has to be in the prompt — and therefore pinned.
+    let qc = wf.block("qr-constraints").expect("the constraints lane");
+    let qcp = profiles::load_block_profile(&repo, qc.profile.as_deref().unwrap(), qc.kind)
+        .expect("qr-constraints persona");
+    let qcbody = flat(&qcp.instructions);
+    pinned(
+        ".github/agents/qr-constraints.md",
+        &qcbody,
+        "never record `pass` off an uncontrolled zero",
+        "the positive-control rule: without it a broken grep reads as a clean sweep, which \
+         is the one way this lane can silently certify nothing (#1388)",
+    );
+    pinned(
+        ".github/agents/qr-constraints.md",
+        &qcbody,
+        "do not pipe a sweep through `| wc -l`",
+        "the specific form that discards grep's exit code and turns a broken command into a \
+         confident 0 (CLAUDE.md's zero-shaped-sweep rule, #1388)",
     );
 }
 
@@ -7369,6 +7545,51 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
         assert!(
             cmd.contains(&format!("--agent loomux-{}-worker-quick", g.id)),
             "worker-quick: persona must reach the CLI: {cmd}"
+        );
+    }
+
+    // THE OPENCODE LANES, end to end (#1388). These are the strongest anti-flattening
+    // witnesses in this file: the launcher's picks say `claude`/`sonnet` for every
+    // reviewer, so a roster that flattened either field would emit a claude command
+    // line with `--model sonnet`, and there is no fallback anywhere that could produce
+    // `opencode/deepseek-v4-flash-free` by accident. This is also the pin behind the
+    // DOGFOOD pin, not the general guard — say which, because the distinction is the
+    // difference between evidence and a comfortable assumption. opencode's `--agent`
+    // carriage is ALREADY policed upstream by
+    // `an_opencode_spawn_delivers_its_config_and_containment_by_env` (tests/
+    // orchestration.rs), which asserts the emitted command line directly; a mutation
+    // removing the handle reddens THERE, in an earlier binary, and cargo stops before
+    // this file runs. So what this loop adds is not the property — it is that THIS
+    // REPO'S OWN declared blocks carry their declared model and persona through the
+    // real load + clamp, the opencode analogue of the worker-tier pin above.
+    for block in ["qr-evidence", "qr-tests", "qr-constraints"] {
+        let (cmd, argv, kickoff) = compile(&reg, &g, block);
+        assert!(
+            cmd.starts_with("opencode "),
+            "{block}: the declared cli must reach the launch line, not the launcher pick: {cmd}"
+        );
+        assert!(
+            cmd.contains("--model opencode/deepseek-v4-flash-free"),
+            "{block}: the full provider/model id must survive sanitize_model: {cmd}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--model", "opencode/deepseek-v4-flash-free"]),
+            "{block}: the argv path must agree with the command line: {argv:?}"
+        );
+        assert!(
+            !cmd.contains("--model sonnet") && !cmd.contains("--model opus"),
+            "{block}: a launcher per-role pick must never flatten a declared block model: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("--agent loomux-{}-{block}", g.id)),
+            "{block}: the persona must reach opencode natively, by handle: {cmd}"
+        );
+        // …and NOT through the kickoff, which is the fallback `persona_inject` takes
+        // only when the group dir is unwritable. A kickoff here would mean the durable
+        // contract never reached the system-prompt layer at all.
+        assert!(
+            kickoff.is_none(),
+            "{block}: the contract must ride the system-prompt layer, not the kickoff: {kickoff:?}"
         );
     }
 }
