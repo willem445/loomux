@@ -10,8 +10,8 @@ import { invoke, listen } from "./transport.ts";
 import type { Grid } from "./grid";
 import type { Pane, PaneEvents } from "./pane";
 import { panesInGroup } from "./group";
-import { badgeFor, type OrchRole } from "./orchbadge";
-import { isSpawnRequestExpired } from "./spawnexpiry";
+import { badgeFor, forgetGroupMeta, type OrchRole } from "./orchbadge";
+import { isSpawnRequestExpired, spawnsForGroup } from "./spawnexpiry";
 import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
 import type { NeedsYouView, OrchQuestion } from "./decisions";
@@ -421,10 +421,16 @@ export const grantRelease = (
 ): Promise<void> => invoke("orch_grant_release", { groupId, tag, comment });
 
 /** Agent ids the backend cancelled via `orch-spawn-cancelled` (its bind wait
- *  timed out) whose pane may still be mid-open (#106). Consulted in
- *  `openAgentPane` right before binding so a live-but-slow frontend drops a
- *  request the bind-timeout already tore down, instead of leaving a zombie. */
-const cancelledSpawns = new Set<string>();
+ *  timed out) whose pane may still be mid-open (#106), mapped to the group the
+ *  cancel named. Consulted in `openAgentPane` right before binding so a
+ *  live-but-slow frontend drops a request the bind-timeout already tore down,
+ *  instead of leaving a zombie. The value (group id) exists only so
+ *  `orch-group-ended` can sweep a group's stranded entries — see
+ *  `spawnsForGroup` (#1316): a cancel for a request already dropped as expired
+ *  never reaches `openAgentPane`'s `finally`, which is this map's only other
+ *  delete, so without the sweep such an id is stranded for the life of the
+ *  window. */
+const cancelledSpawns = new Map<string, string>();
 
 /** Close a pane we opened for a spawn that turned out to be stale, killing the
  *  CLI it booted against a now-deleted config, and tell the human briefly.
@@ -559,6 +565,11 @@ export interface OrchWiring {
    *  orchestrator that asked for the worker. The launched-group paths do the same
    *  thing at the tab they create (`launchOrchestratorTab`). */
   bindGroupForPane(pane: Pane, groupId: string): void;
+  /** Forget `groupId`'s tab route once its group has ended (#1316): the tab
+   *  itself commonly stays open (the human keeps it after a group ends), so
+   *  without this the routing map would keep the binding for the life of the
+   *  window. Only unroutes the group — never closes or touches the tab. */
+  forgetGroup(groupId: string): void;
   /** Force a tab-strip re-render (#271): channel membership is derived live from
    *  each pane's state (tabcounts.ts), not tracked in a maintained per-tab map the
    *  way attention is, so there is no setter that already triggers one. Called
@@ -602,7 +613,7 @@ export function initOrchestration(wiring: OrchWiring): void {
   void listen<{ group_id: string; agent_id: string }>(
     "orch-spawn-cancelled",
     ({ payload }) => {
-      cancelledSpawns.add(payload.agent_id);
+      cancelledSpawns.set(payload.agent_id, payload.group_id);
       for (const grid of wiring.allGrids()) {
         for (const pane of grid.allPanes()) {
           if (pane.orchAgentId === payload.agent_id) discardStalePane(grid, pane);
@@ -697,6 +708,23 @@ export function initOrchestration(wiring: OrchWiring): void {
           : `Group ended. ${kept} panes stayed open — they have unsaved edits in their file editors.`,
         "info"
       );
+    }
+    // Prune the three module-level maps this ended group can no longer add to
+    // (#1316): its color assignment, its tab route (the tab itself commonly
+    // stays open — only the group is gone), and any spawn cancel stranded by
+    // the race spawnsForGroup's doc comment describes. This narrows the #106
+    // guard in `openAgentPane` (`cancelledSpawns.has(req.agent_id)`, below two
+    // awaits): an entry this sweep removes while that pane-open is still
+    // in-flight now falls through to `bind_agent` instead of being dropped
+    // there — safe, because the backend's bind wait has already timed out to
+    // produce the cancel that got it into this map, so `bind_agent` rejects
+    // and the existing `discardStalePane` catch (plus this same handler's own
+    // `panesInGroup` close, a few lines up) still tears the pane down; the
+    // only observable delta is a silent discard becoming a discard-with-toast.
+    forgetGroupMeta(payload.group_id);
+    wiring.forgetGroup(payload.group_id);
+    for (const agentId of spawnsForGroup(cancelledSpawns, payload.group_id)) {
+      cancelledSpawns.delete(agentId);
     }
   });
   // Cross-workspace channel membership (#271): the backend pushes the current

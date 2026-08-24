@@ -30,9 +30,11 @@ import {
   WINDOW_PRESETS,
   categoryOf,
   coverageNotes,
+  eventKey,
   extractTimeline,
   filterTimeline,
   resolveWindow,
+  retainExpandedEvents,
   type TimelineCategory,
   type TimelineEvent,
   type TimelineExtraction,
@@ -129,6 +131,16 @@ export class TimelineView {
    *  time span still identify the same cluster in the next payload. */
   private selected: { lane: string; tsMinMs: number; tsMaxMs: number } | null = null;
   private expanded = new Set<string>();
+  /** Whether the MOST RECENT `load()` cycle's reads all succeeded — audit and
+   *  (when attempted) gh (#1316 N1). Starts true so the very first render, with
+   *  no load yet, is free to prune (there is nothing to protect against on an
+   *  empty set). `render()` only prunes `expanded` while this is true: a
+   *  failed read already falls back to `auditRows = []` / `gh = null` above,
+   *  and pruning `expanded` against THAT would read "could not look" as "there
+   *  was nothing there" (CLAUDE.md) — collapsing every open detail row on a
+   *  transient throw, or on a routine gh failure (rate limit, no auth,
+   *  offline) that the surrounding code otherwise treats as additive. */
+  private lastReadOk = true;
 
   private follow = false;
   private followTimer: number | undefined;
@@ -343,12 +355,17 @@ export class TimelineView {
     // Single-flight with a trailing re-run, so a click during an in-flight
     // fetch is neither dropped nor run concurrently (refreshgate.ts).
     if (!this.gate.begin()) return;
+    // Tracks whether EVERY read this cycle succeeded (#1316 N1) — audit, and
+    // gh when it was actually attempted (a throttled-skip below is not a
+    // failure: `this.gh` is left exactly as a prior successful read set it).
+    let readOk = true;
     try {
       try {
         this.auditRows = await invoke<unknown[]>("orch_audit", { groupId: this.groupId });
       } catch {
         // A missing/unreadable log renders as an empty chart, not a broken one.
         this.auditRows = [];
+        readOk = false;
       }
       const repo = this.opts.getRepo();
       if (!repo) {
@@ -364,8 +381,10 @@ export class TimelineView {
           // missing (timelinechrome's note), rather than blanking the view.
           this.gh = null;
           this.ghError = err;
+          readOk = false;
         }
       }
+      this.lastReadOk = readOk;
     } finally {
       if (!this.disposed) this.render();
     }
@@ -379,6 +398,17 @@ export class TimelineView {
     const range = resolveWindow(this.windowId, Date.now(), extraction.events);
     const filtered = filterTimeline(extraction.events, range, this.categories);
     const widthPx = Math.round(this.chartEl.clientWidth);
+
+    // Prune the expand toggle to what's actually loaded (#1316): before this,
+    // `expanded` was only ever cleared wholesale on a dot click (below), so a
+    // row expanded while its cluster stayed selected across a poll could sit
+    // stranded once its event aged out of `orch_audit`'s window. Must run
+    // before `sig` is built — it feeds `this.expanded.size` below. Gated on
+    // `lastReadOk` (N1): a failed read already fell back to `auditRows = []`
+    // / `gh = null` in `load()`, and pruning against THAT extraction would
+    // read a transient throw (or a routine gh failure) as "every one of those
+    // events is gone" and collapse every open row for no real reason.
+    if (this.lastReadOk) this.expanded = retainExpandedEvents(this.expanded, extraction.events);
 
     // Skip a no-op follow re-render: rebuilding the SVG under the human's
     // pointer (and collapsing an open detail row) for identical data is the
@@ -647,7 +677,7 @@ export class TimelineView {
   private renderDetailRow(ev: TimelineEvent): HTMLElement {
     // Keyed by the EVENT, never by its index: a follow poll shifts every index
     // in `filtered`, which would silently collapse (or worse, move) an open row.
-    const key = `${ev.ts_ms}|${ev.kind}|${ev.label}`;
+    const key = eventKey(ev);
     const row = el("div", "timeline-detail-row");
     const top = el("div", "timeline-detail-top expandable");
     top.append(el("span", "timeline-detail-caret", this.expanded.has(key) ? "▾" : "▸"));

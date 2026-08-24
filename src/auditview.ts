@@ -6,7 +6,7 @@
 // audit.jsonl), so the viewer never has to know about it.
 
 import { invoke } from "./transport.ts";
-import { asObject, str, summarize, type AuditEntry } from "./auditsummary";
+import { asObject, entryKey, retainExpanded, str, summarize, type AuditEntry } from "./auditsummary";
 import { nextWindowStart, backfillWindowStart } from "./auditwindow";
 import { PollGate } from "./pollgate";
 
@@ -265,8 +265,20 @@ export class AuditView {
     if (this.disposed) return;
     try {
       this.entries = await invoke<AuditEntry[]>("orch_audit", { groupId: this.groupId });
+      // Prune the expand toggle to what's actually loaded (#1316), on the
+      // SUCCESS path only: as new lines push old ones out of `orch_audit`'s
+      // AUDIT_VIEW_LIMIT window on the next poll, an id here that no longer
+      // names a loaded entry can never be seen again — pruning it here keeps
+      // the set from growing for the life of the pane. A failed read must NOT
+      // prune: "could not look" is not "there was nothing there" (CLAUDE.md),
+      // and a transient throw (log mid-rotation, a locked file) would
+      // otherwise collapse every open row on the next repaint even though
+      // none of them actually went away.
+      this.expanded = retainExpanded(this.expanded, this.entries);
     } catch {
-      // Best-effort: a missing/unreadable log just renders empty.
+      // Best-effort: a missing/unreadable log just renders empty — `expanded`
+      // is deliberately left alone above, so a transient failure doesn't
+      // masquerade as every expanded row's entry having vanished.
       this.entries = [];
     }
     this.render();
@@ -306,16 +318,6 @@ export class AuditView {
       if (!hay.includes(f.search)) return false;
     }
     return true;
-  }
-
-  private entryKey(e: AuditEntry): string {
-    // ts_ms|actor|action alone collides when the same actor logs the same
-    // action within one millisecond (e.g. two prompt deliveries) — expanding
-    // one row would toggle both. Mix in a hash of the detail to disambiguate.
-    let h = 5381;
-    const detail = JSON.stringify(e.detail ?? "");
-    for (let i = 0; i < detail.length; i++) h = ((h << 5) + h + detail.charCodeAt(i)) | 0;
-    return `${e.ts_ms}|${e.actor}|${e.action}|${h >>> 0}`;
   }
 
   private render(): void {
@@ -402,7 +404,7 @@ export class AuditView {
   }
 
   private renderRow(e: AuditEntry): HTMLElement {
-    const key = this.entryKey(e);
+    const key = entryKey(e);
     const row = el("div", "audit-row");
 
     const top = el("div", "audit-top");

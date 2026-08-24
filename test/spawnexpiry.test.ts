@@ -7,7 +7,7 @@
 // `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isSpawnRequestExpired } from "../src/spawnexpiry.ts";
+import { isSpawnRequestExpired, spawnsForGroup } from "../src/spawnexpiry.ts";
 
 test("a request whose deadline is in the future is NOT expired", () => {
   const now = 1_000_000;
@@ -31,4 +31,27 @@ test("deadline 0 means unstamped (legacy backend) and never expires", () => {
   // An older backend that doesn't stamp the field must degrade to the previous
   // always-service behaviour rather than dropping every spawn.
   assert.equal(isSpawnRequestExpired(0, 5_000_000), false);
+});
+
+// --- spawnsForGroup: the orch-group-ended backstop for cancelledSpawns (#1316) ---
+//
+// The bug: a cancel for a spawn already dropped by isSpawnRequestExpired above
+// never has a matching openAgentPane, so cancelledSpawns.delete() (its only
+// production caller) never runs for that id — it's stranded for the life of
+// the window. orch-group-ended sweeps every entry for its group as a backstop.
+
+test("spawnsForGroup picks out only the entries for that group", () => {
+  const entries: [string, string][] = [
+    ["a-1", "g1"],
+    ["a-2", "g2"],
+    ["a-3", "g1"],
+  ];
+  assert.deepEqual(spawnsForGroup(entries, "g1").sort(), ["a-1", "a-3"]);
+  assert.deepEqual(spawnsForGroup(entries, "g2"), ["a-2"]);
+});
+
+test("spawnsForGroup on a group with no stranded entries returns nothing", () => {
+  const entries: [string, string][] = [["a-1", "g1"]];
+  assert.deepEqual(spawnsForGroup(entries, "g-never-seen"), []);
+  assert.deepEqual(spawnsForGroup([], "g1"), []);
 });

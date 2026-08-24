@@ -262,6 +262,30 @@ test("routing: closing a tab forgets its group binding", () => {
   assert.equal(tabs.workspaceForGroup("grp-1"), undefined, "stale group route dropped");
 });
 
+test("routing: forgetGroup drops a group's route without closing its tab (#1316)", () => {
+  // A tab commonly outlives the group it once routed — the human keeps it open
+  // after `orch-group-ended`. Before this, only closeTab ever pruned groupToWs,
+  // so an ended group's binding survived for the life of the window.
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  tabs.bindGroup("grp-1", a.id);
+  tabs.forgetGroup("grp-1");
+  assert.equal(tabs.workspaceForGroup("grp-1"), undefined, "ended group's route is gone");
+  assert.equal(tabs.count, 1, "the tab itself is untouched");
+  assert.equal(tabs.get(a.id)?.id, a.id, "tab is still there, just unrouted");
+});
+
+test("routing: forgetGroup on an unbound group, or a group bound to another tab, is a no-op", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab();
+  tabs.bindGroup("grp-1", a.id);
+  tabs.forgetGroup("nope"); // never bound
+  assert.equal(tabs.workspaceForGroup("grp-1")?.id, a.id, "unrelated forget leaves grp-1 alone");
+  tabs.forgetGroup("grp-2"); // bound to nothing
+  assert.equal(tabs.groupForWorkspace(b.id), null);
+});
+
 // ---------- P4: the counter re-render contract (HIGH-1) ----------
 //
 // The demo bug was that the tab strip's agent counter didn't update on the

@@ -15,9 +15,11 @@ import {
   MIN_WINDOW_MS,
   categoryOf,
   coverageNotes,
+  eventKey,
   extractTimeline,
   filterTimeline,
   resolveWindow,
+  retainExpandedEvents,
   windowPreset,
   type AuditEntryLike,
   type GhActivityLike,
@@ -530,4 +532,42 @@ test("every kind the extractor can emit has a category", () => {
     assert.ok(CATEGORY_ORDER.includes(categoryOf(k)), `${k} has no lane`);
   }
   assert.equal(DEFAULT_CATEGORIES.includes("ops"), false, "ops is off by default");
+});
+
+// --- eventKey / retainExpandedEvents: the detail-panel expand prune (#1316) ---
+//
+// Before this, TimelineView.expanded was cleared only on a dot click, never
+// pruned against what the latest poll actually loaded — a row expanded while
+// its cluster stayed selected could sit stranded once its event aged out of
+// orch_audit's AUDIT_VIEW_LIMIT window.
+
+function ev(over: Partial<TimelineEvent> = {}): TimelineEvent {
+  return { ts_ms: T0, kind: "ops", label: "x", source: "audit", detail: {}, ...over };
+}
+
+test("eventKey is keyed by the event, not by array position", () => {
+  const a = ev({ label: "one" });
+  const b = ev({ label: "two" });
+  assert.notEqual(eventKey(a), eventKey(b));
+  assert.equal(eventKey(a), eventKey(ev({ label: "one" })), "same event content -> same key");
+});
+
+test("retainExpandedEvents keeps only keys that still name a loaded event", () => {
+  const a = ev({ label: "aged-out" });
+  const b = ev({ label: "still-loaded" });
+  const live = retainExpandedEvents([eventKey(a), eventKey(b)], [b]);
+  assert.deepEqual([...live], [eventKey(b)]);
+});
+
+test("retainExpandedEvents on an empty event list (or empty expand set) keeps nothing", () => {
+  const a = ev();
+  assert.equal(retainExpandedEvents([eventKey(a)], []).size, 0);
+  assert.equal(retainExpandedEvents([], [a]).size, 0);
+});
+
+test("retainExpandedEvents returns a fresh set, not the input", () => {
+  const a = ev();
+  const expanded = new Set([eventKey(a)]);
+  const live = retainExpandedEvents(expanded, [a]);
+  assert.notEqual(live, expanded);
 });

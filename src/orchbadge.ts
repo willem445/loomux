@@ -53,6 +53,16 @@ export function resetGroupMeta(): void {
   groupMeta.clear();
 }
 
+/** Forget one group's color assignment once it has ended (#1316) — `groupMeta`
+ *  otherwise has no production caller that ever shrinks it (only the test-only
+ *  `resetGroupMeta` above does), so it grew for the life of the window. Called
+ *  by the `orch-group-ended` handler. A no-op if the group was never assigned
+ *  one (or was already forgotten): the next `metaForGroup` for that id just
+ *  mints a fresh tag/color, same as any other never-before-seen group. */
+export function forgetGroupMeta(groupId: string): void {
+  groupMeta.delete(groupId);
+}
+
 const ROLE_LABELS: Record<OrchRole, string> = {
   orchestrator: "ORCH",
   worker: "W",
