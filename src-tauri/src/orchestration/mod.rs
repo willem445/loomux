@@ -26576,7 +26576,6 @@ impl OrchRegistry {
         let wanted: HashSet<&str> = view
             .items
             .iter()
-            .filter(|i| !i.status.is_resolved())
             .filter_map(|i| i.task.as_deref())
             .map(str::trim)
             .filter(|t| !t.is_empty())
