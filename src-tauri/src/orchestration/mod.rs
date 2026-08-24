@@ -41175,7 +41175,7 @@ impl OrchRegistry {
         if cli == "opencode" {
             match self.write_opencode_agent_file(group, block, contract) {
                 Some((handle, path)) => {
-                    out.opencode_agent = Some(handle);
+                    out.opencode_agent = None; // MUTATION (#1388 evidence)
                     out.opencode_prompt_file = Some(path);
                     out.contract_carrier = ContractCarrier::SystemLayerFull;
                 }
