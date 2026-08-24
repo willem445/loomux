@@ -350,11 +350,13 @@ compiles.
   polarity, by placement, and by a per-branch side effect going missing — so invert the gate,
   move the guarded statement out of the block that gates it, and drop each assignment that
   sets the flag, one at a time. Re-derive the residual on the round that ADDS a guard: the
-  earlier round's operator set no longer spans the code. Signature: a round-1 residual scoped
-  to "one call, if deleted" still standing after a later round's fix, whose inverted gate
-  reverts that very fix with `tsc --noEmit` at exit 0 and the suite green throughout (#1487
-  N2/N4 — four such mutations, the inverted `lastReadOk` gate and `auditview.ts`'s prune
-  moved back outside its `try` among them).
+  earlier round's operator set no longer spans the code. On a hand-validated module (DOM glue
+  with no test file of its own) the residual rests on `tsc --noEmit`/`noUnusedLocals` ALONE —
+  which sees a deletion and not an inversion — so a green suite there is the module having no
+  tests, never evidence about the mutation. Signature: a round-1 residual scoped to "one call,
+  if deleted" still standing after a later round's fix, whose inverted gate reverts that very
+  fix with `tsc --noEmit` at exit 0 and the suite green throughout (#1487 N2/N4 — four such
+  mutations, two of them polarity or placement rather than deletion).
 - **An absence-only assertion needs a positive control, and the vacuity is a SHAPE.**
   `is_empty()`, `!contains(…)`, "renders nothing" — each passes just as well when the
   mechanism never ran at all. Pin first that it DID (`fired.len() == 1`, `scanned > 0`
@@ -591,12 +593,6 @@ narrow their ask back down to the original ticket on your own judgment.
   fails for EVERY branch commit once the PR squashes. Signature: the run ids were re-derived
   after the rebase and the commit SHAs beside them were not — the reproduction SHA the body
   tells a reader to check out included (#1327; recipe in `.claude/skills/ci-validate/SKILL.md`).
-  A SHA naming a commit on ANOTHER open PR's branch is worse on both axes: it rots on that
-  PR's force-push schedule rather than your own, and a shipped code comment carrying one
-  outlives every gate that could re-check it. Cite such a commit by **subject** — a subject
-  survives a rebase where a hash does not — and check it against that PR's own
-  `refs/pull/<n>/head`, not yours. Signature: a cross-PR citation whose SHA still
-  `cat-file -e`s locally and is an ancestor of nothing the sibling still publishes (#1487 N5).
 - **A range's BASELINE is re-derived with `git merge-base`, never inferred from an ancestry check.**
   A rebase moves the merge base while leaving the commit you rebased onto LAST time a
   perfectly valid ancestor — resolvable, right subject, passing every check the SHA rule

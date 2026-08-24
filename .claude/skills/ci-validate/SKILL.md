@@ -367,6 +367,7 @@ round rather than only after your own rebase; and a SHA that ships in a **code c
 outlives the body entirely — no gate re-reads it, so it must be a subject from the start.
 Signature: a cross-PR SHA that still `git cat-file -e`s locally and is an ancestor of
 nothing the sibling still publishes (#1487 N5).
+
 ### A range's baseline is a *different* check from a SHA's ancestry
 
 The check above asks *is this SHA still on the branch*. A body that cites a **range** —
