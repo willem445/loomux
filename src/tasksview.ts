@@ -121,7 +121,22 @@ export interface OrchTask {
   pr_base?: string | null;
   assignee?: string | null;
   session?: string | null;
-  notes: OrchTaskNote[];
+  /** How many notes this row has — ALWAYS present, and the only honest source
+   *  for the `🗨 N` badge (#1317). Deriving it from `notes` would read 0 for
+   *  every row whose bodies were not fetched. */
+  note_count: number;
+  /** The note bodies — present ONLY for the rows the last `orch_tasks` read
+   *  named in `withNotes`, i.e. the ones the human has expanded (#1317). A
+   *  long-lived board is mostly history and `MAX_TASK_NOTES` of prose per row
+   *  dominated the polled payload; the bodies are read in exactly one place,
+   *  the list under an expanded row.
+   *
+   *  **Absent is not empty.** `undefined` means "not fetched", `[]` means
+   *  "fetched, and this row has none" — collapsing them would render an
+   *  un-fetched row as one whose conversation had been deleted. Optional on
+   *  the wire, so a reader that assumed the bodies were always there fails to
+   *  compile rather than silently showing none. */
+  notes?: OrchTaskNote[];
   /** Ids of tasks on this board that must be `done` first (#582). Optional
    *  because the backend omits an empty vec entirely
    *  (`skip_serializing_if`) — every pre-#582 board arrives with no key at
@@ -767,6 +782,8 @@ export class TasksView {
     return this.mutate(
       attempt(t).catch(async (err) => {
         if (!isStaleLinkEtag(err) || !retriesAfterStale(edit)) throw err;
+        // No `withNotes`: this re-read exists to recover ONE row's fresh
+        // `link_etag`, and the arrays it composes from carry no note bodies.
         const board = await invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId });
         // The row itself can be gone — the concurrent write that moved the
         // arrays may have been a delete. Re-throwing the ORIGINAL refusal is
@@ -888,7 +905,15 @@ export class TasksView {
     }
     this.pendingRefresh = false;
     try {
-      this.tasks = await invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId });
+      // #1317: note BODIES ride only for the rows the human has expanded —
+      // normally none, at most a handful. Every other row answers with
+      // `note_count`, which is all the `🗨 N` badge ever needed. The expanded
+      // set is read HERE rather than remembered anywhere: a row collapsed
+      // between two ticks simply stops being asked for.
+      this.tasks = await invoke<OrchTask[]>("orch_tasks", {
+        groupId: this.groupId,
+        withNotes: [...this.expanded],
+      });
     } catch (err) {
       this.toast(String(err));
       return;
@@ -2900,12 +2925,20 @@ export class TasksView {
     });
     top.appendChild(groundBtn);
 
-    const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
+    // `note_count`, never `notes.length` (#1317): a collapsed row carries no
+    // bodies, so the array is the wrong thing to count and would read 0.
+    const notesBtn = el("button", "task-btn notes", `🗨 ${t.note_count}`) as HTMLButtonElement;
     notesBtn.title = "Notes";
     notesBtn.addEventListener("click", () => {
       if (this.expanded.has(t.id)) this.expanded.delete(t.id);
       else this.expanded.add(t.id);
+      // Render first so the row opens on the click, then ask for the bodies:
+      // the next read names the newly-expanded row, and the notes fill in when
+      // it lands. Expanding a row the last read did not carry is the ONLY way
+      // the list can be momentarily short, which is why it re-reads here
+      // rather than waiting for the poll.
       this.render();
+      this.refresh();
     });
     top.appendChild(notesBtn);
 
@@ -2950,7 +2983,15 @@ export class TasksView {
 
     if (this.expanded.has(t.id)) {
       const notes = el("div", "task-notes");
-      for (const n of t.notes) {
+      // ABSENT is not EMPTY (#1317). A row expanded since the last read has no
+      // bodies yet — the re-read the expand kicked off is in flight — and
+      // rendering that as an empty conversation would say this row's notes are
+      // gone. `note_count` is what distinguishes them, so say "loading" only
+      // when there is something to load.
+      if (t.notes === undefined && t.note_count > 0) {
+        notes.appendChild(el("div", "task-note task-note-pending", "loading notes…"));
+      }
+      for (const n of t.notes ?? []) {
         const line = el("div", "task-note");
         line.append(
           el("span", "task-note-meta", `${n.author} · ${fmtTime(n.ts_ms)}`),

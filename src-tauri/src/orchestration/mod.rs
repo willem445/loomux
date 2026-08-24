@@ -10628,29 +10628,130 @@ pub fn link_etag(task: &Task) -> String {
     format!("{h:016x}")
 }
 
-/// The HUMAN board's read model (#1349): every `Task` field exactly as it was,
-/// flattened, plus the derived `link_etag` the board echoes back on an array
-/// write.
+/// The HUMAN board's read model (#1349; notes split out of it in #1317): the
+/// `Task` fields the board renders, the derived `link_etag` it echoes back on
+/// an array write, and `note_count`.
 ///
-/// A wrapper rather than a field on `Task`, because `Task` is what
+/// A projection rather than a field on `Task`, because `Task` is what
 /// `write_tasks` serializes: a derived key on it would be persisted into a
 /// `tasks.json` humans read and diff, re-read on load, and then immediately
 /// recomputed — `Task::demo_path`'s argument for `skip_serializing_if`, one step
-/// further along. Nothing is stored, so an older loomux reading a newer file
-/// still sees byte-identical rows.
+/// further along. Nothing here is stored, so an older loomux reading a newer
+/// file still sees byte-identical rows.
 ///
-/// `#[serde(flatten)]` keeps this ADDITIVE on the wire: the board's `OrchTask`
-/// gains one key and every existing one is untouched.
+/// **Why the notes are not on every row (#1317).** `orch_tasks` is polled, and
+/// re-fired by every `orch-tasks-changed` event, for the WHOLE board — "a
+/// long-lived group's board is mostly history: 400+ rows, nearly all `done`"
+/// (`Task::cleared_ms`). Text within a row is capped at `MAX_TASK_NOTES`, but
+/// 400 rows × 20 notes of prose is an order of magnitude more wire than every
+/// other field on the board put together, and it is a function of how long the
+/// group has been running rather than of how much work is live. The board
+/// reads the bodies in exactly one place — the notes list under a row the
+/// human has EXPANDED — and reads a count everywhere else, for the `🗨 N`
+/// badge. So the bodies ride only for the rows the caller names, which is the
+/// split MCP's `list_tasks`/`get_task` pair already draws for the agent side.
+///
+/// **Absent notes and no notes are different answers**, which is why this is
+/// `Option` rather than an empty vec: `None` means "you did not ask for this
+/// row's bodies", `Some([])` means "you did, and it has none". Collapsing them
+/// would make an un-fetched row render as a row whose conversation was
+/// deleted. `note_count` is always present and is the ONLY honest source for
+/// the badge — deriving it from `notes` would read 0 for every un-fetched row.
+///
+/// **Default-deny, enforced by the compiler** — `board_task` destructures
+/// `Task` exhaustively (`agent_task_view`'s pattern, and its argument: a
+/// `#[serde(flatten)]` of the storage type hands every future field to this
+/// wire the moment somebody adds one). Adding a field to `Task` stops the
+/// crate compiling until it is classified here.
 #[derive(Serialize)]
 pub struct BoardTask {
-    #[serde(flatten)]
-    pub task: Task,
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub issue: Option<String>,
+    pub pr: Option<String>,
+    pub pr_base: Option<String>,
+    pub assignee: Option<String>,
+    pub session: Option<String>,
+    /// How many notes the row has. Always present; see the type doc.
+    pub note_count: usize,
+    /// The bodies, for the rows the caller asked for. Absent ≠ empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<TaskNote>>,
+    // The remaining keys keep `Task`'s own omitted-when-empty contract
+    // verbatim, so a board that never used a feature is unchanged by its
+    // existence — see each field's doc on `Task`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TaskLink>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprint: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demo_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleared_ms: Option<u64>,
+    pub updated_ms: u64,
     pub link_etag: String,
 }
 
 /// Project a stored `Task` onto the human board's view — see `BoardTask`.
-pub fn board_task(task: Task) -> BoardTask {
-    BoardTask { link_etag: link_etag(&task), task }
+///
+/// `with_notes` decides whether this row carries its note bodies; the count
+/// rides regardless.
+pub fn board_task(task: Task, with_notes: bool) -> BoardTask {
+    let link_etag = link_etag(&task);
+    // Exhaustive on purpose — see the type doc. A new `Task` field must be
+    // named here (board-visible) or bound to `_` (not), and the compiler is
+    // what asks.
+    let Task {
+        id,
+        title,
+        status,
+        issue,
+        pr,
+        pr_base,
+        assignee,
+        session,
+        notes,
+        deps,
+        related,
+        links,
+        parent,
+        kind,
+        sprint,
+        demo_path,
+        cleared_ms,
+        updated_ms,
+    } = task;
+    BoardTask {
+        id,
+        title,
+        status,
+        issue,
+        pr,
+        pr_base,
+        assignee,
+        session,
+        note_count: notes.len(),
+        notes: with_notes.then_some(notes),
+        deps,
+        related,
+        links,
+        parent,
+        kind,
+        sprint,
+        demo_path,
+        cleared_ms,
+        updated_ms,
+        link_etag,
+    }
 }
 
 /// The only status that satisfies a dependency edge (#582). Merged/accepted is
@@ -52218,20 +52319,48 @@ pub async fn orch_needs_you_clear(app: AppHandle, group_id: String) -> Result<u6
 /// per call with no cache, re-fired by every `orch-tasks-changed` event — so an
 /// agent's board-write burst multiplied it by the number of open boards.
 ///
+/// **Payload (#1317).** Rows carry `note_count`; only the rows named in
+/// `with_notes` carry their note BODIES, which is where a long-lived board's
+/// weight actually is (`MAX_TASK_NOTES` × 400-odd mostly-`done` rows, every
+/// tick and on every board write). The board names the rows the human has
+/// expanded — normally none, at most a handful — so this is O(open rows)
+/// rather than O(board × notes). An unknown id in `with_notes` is not an
+/// error: it names a row this read did not find, and the answer is the same
+/// board minus that row, exactly as if it had never been asked for.
+/// See `BoardTask` for why absent notes and empty notes are different answers.
+///
 /// **Reentrancy.** A pure read that takes no lock. Board writers rewrite
 /// `tasks.json` through `atomic_write`, so a concurrent reader sees the whole
 /// old file or the whole new one, never a torn one; the main-thread dispatch
 /// this replaces was serializing readers against each other for nothing.
 #[tauri::command]
-pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<BoardTask> {
+pub async fn orch_tasks(
+    app: AppHandle,
+    group_id: String,
+    with_notes: Option<Vec<String>>,
+) -> Vec<BoardTask> {
     let reg = reg_of(&app);
     // #904: no error channel; an unvalidated id yields the same empty list
     // a group with no rows does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
+    // Optional rather than required so a caller that wants no bodies at all
+    // (the NEEDS-YOU panel, the board's own stale-etag re-read) can simply not
+    // pass it, and so an older webview bundle against a newer binary degrades
+    // to "no bodies" instead of failing the whole read.
+    let wanted: HashSet<String> = with_notes.unwrap_or_default().into_iter().collect();
     // #1349: each row carries its derived `link_etag`, which the board sends
     // back as `expect_link_etag` on every write that replaces `deps` or `links`.
     // Derived here rather than stored — see `BoardTask`.
-    run_blocking(move || reg.tasks(&group_id).into_iter().map(board_task).collect()).await
+    run_blocking(move || {
+        reg.tasks(&group_id)
+            .into_iter()
+            .map(|t| {
+                let with_notes = wanted.contains(&t.id);
+                board_task(t, with_notes)
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest

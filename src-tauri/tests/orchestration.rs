@@ -56400,11 +56400,63 @@ fn every_read_surface_carries_the_etag_even_on_a_linkless_row() {
     }
     let view = serde_json::to_value(agent_task_view(&bare)).unwrap();
     assert_eq!(view["link_etag"], json!(link_etag(&bare)), "get_task carries it too: {view}");
-    // The human board's read model: every Task field, flattened, plus the token.
-    let board = serde_json::to_value(board_task(rich.clone())).unwrap();
+    // The human board's read model: the Task's own fields, plus the token.
+    let board = serde_json::to_value(board_task(rich.clone(), false)).unwrap();
     assert_eq!(board["link_etag"], json!(link_etag(&rich)));
     assert_eq!(board["id"], json!("t-2"), "the Task's own fields stay at the top level");
     assert_eq!(board["links"][0]["target"], json!("x.md"));
+}
+
+// ---------- #1317: the board's note bodies ride only for the rows asked for ----------
+//
+// `orch_tasks` is polled AND re-fired by every `orch-tasks-changed` event, for
+// the whole board — which on a long-lived group is mostly history. The bodies
+// are read in exactly one place (the list under an EXPANDED row) and dominate
+// the payload; the badge everywhere else needs only a count.
+
+fn noted(id: &str, texts: &[&str]) -> Task {
+    let mut t = linked(id, "queued", &[], &[]);
+    t.notes = texts.iter().enumerate().map(|(i, s)| note(i as u64 + 1, s)).collect();
+    t
+}
+
+#[test]
+fn a_board_row_carries_its_note_count_always_and_its_bodies_only_when_asked() {
+    let row = noted("t-1", &["first note", "second note"]);
+
+    let compact = serde_json::to_value(board_task(row.clone(), false)).unwrap();
+    assert_eq!(compact["note_count"], json!(2), "the badge's number rides on every row");
+    assert!(compact.get("notes").is_none(),
+        "an unasked-for row must omit the key entirely, not answer an empty list: {compact}");
+    // The prose is the payload this exists to drop — assert on the TEXT, so a
+    // change that kept the bodies under some other key still fails here.
+    assert!(!compact.to_string().contains("second note"),
+        "no note body may appear anywhere on an unasked-for row: {compact}");
+
+    let full = serde_json::to_value(board_task(row.clone(), true)).unwrap();
+    assert_eq!(full["note_count"], json!(2), "the count is unchanged by asking for the bodies");
+    assert_eq!(full["notes"].as_array().unwrap().len(), 2);
+    assert_eq!(full["notes"][1]["text"], json!("second note"));
+
+    // POSITIVE CONTROL for the absence above: the same projection, asked, does
+    // carry it — so `notes` being missing is the flag doing its job and not
+    // the field having quietly stopped existing.
+    assert!(full.to_string().contains("second note"));
+}
+
+#[test]
+fn asked_for_but_empty_is_a_different_answer_from_never_asked() {
+    // The board renders an expanded row's conversation from `notes`. If a row
+    // that was never fetched and a row with no notes looked the same on the
+    // wire, an un-fetched row would render as one whose notes were deleted.
+    let none = noted("t-1", &[]);
+    let asked = serde_json::to_value(board_task(none.clone(), true)).unwrap();
+    let unasked = serde_json::to_value(board_task(none, false)).unwrap();
+
+    assert_eq!(asked["notes"], json!([]), "asked, and there are none");
+    assert!(unasked.get("notes").is_none(), "never asked");
+    assert_eq!(asked["note_count"], json!(0));
+    assert_eq!(unasked["note_count"], json!(0));
 }
 
 /// DERIVED means `tasks.json` gains no key — the additive promise #1272/#1273
