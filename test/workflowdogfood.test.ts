@@ -53,7 +53,17 @@ test("the roster is the one the repo means to run", () => {
   // renamed *id* must, because it breaks the gate.
   assert.deepEqual(
     workflow.blocks.map((b) => b.id),
-    ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-lead", "process"]
+    [
+      "orchestrator",
+      "planner",
+      "worker-deep",
+      "worker-quick",
+      "rev-lead",
+      "qr-evidence",
+      "qr-tests",
+      "qr-constraints",
+      "process",
+    ]
   );
   // Two worker tiers, and the deep one FIRST: the first block of a class is what a
   // bare `spawn_agent(kind: "worker")` resolves to, and the safe default for an
@@ -72,6 +82,35 @@ test("the roster is the one the repo means to run", () => {
   // half of that rule is exercised end to end by this real file. (The
   // planner-side half — role_hint: advisor — moved to the synthetic fixture
   // below when the advisor block left the roster; the rule outlives the block.)
+  // THE REVIEWER LANES, and the one ordering property the roster now leans on.
+  // `block_for(Role::Reviewer)` resolves a bare `spawn_agent(kind: "reviewer")` to
+  // the FIRST reviewing block in roster order, so rev-lead must be declared ahead
+  // of the three cheap qr-* lanes: a checklist lane sitting first would answer an
+  // unrouted review request with a grep report instead of a review. Same shape as
+  // the worker-tier pin above, and stated as an index rather than as a set so a
+  // reordering edit fails here rather than silently changing what a bare spawn does.
+  const reviewers = workflow.blocks.filter((b) => b.kind === "reviewer");
+  assert.deepEqual(
+    reviewers.map((b) => [b.id, b.cli, b.model]),
+    [
+      ["rev-lead", "claude", "opus"],
+      ["qr-evidence", "opencode", "opencode/deepseek-v4-flash-free"],
+      ["qr-tests", "opencode", "opencode/deepseek-v4-flash-free"],
+      ["qr-constraints", "opencode", "opencode/deepseek-v4-flash-free"],
+    ],
+    "the judging lane is declared first; the three cheap lanes run opencode on the free Zen model"
+  );
+  assert.equal(reviewers[0].id, "rev-lead", "a bare spawn_agent(kind: \"reviewer\") must reach the lane that judges");
+  // The model id is pinned in FULL on purpose. `default_model("opencode", …)` is
+  // deliberately empty — opencode has no vendor-neutral alias, its ids are
+  // `provider_id/model_id` — so the bare `deepseek-v4-flash-free` half is not a
+  // model that exists, and a block that dropped the provider would spawn against
+  // nothing. This asserts the `/` specifically, which is the character #722 had to
+  // widen `sanitize_model` to admit.
+  for (const b of reviewers.filter((r) => r.cli === "opencode")) {
+    assert.match(b.model ?? "", /^opencode\/[a-z0-9.-]+$/, `${b.id}: an opencode model id names its provider`);
+  }
+
   const processPro = workflow.blocks.find((b) => b.id === "process");
   assert.deepEqual([processPro?.kind, processPro?.role_hint], ["worker", "process"]);
   // Every delegate carries a repo-authored persona, and it is a FILE in
@@ -100,7 +139,11 @@ test("the merge gate names EVERY declared reviewer lane, because an abstention i
   // catches a future second lane someone forgets to wire in.
   const declaredReviewers = workflow.blocks.filter((b) => b.kind === "reviewer").map((b) => b.id);
   assert.deepEqual(gate.reviewers, declaredReviewers, "every declared reviewer lane is in the gate");
-  assert.deepEqual(gate.reviewers, ["rev-lead"], "…and today that is the single lead lane");
+  assert.deepEqual(
+    gate.reviewers,
+    ["rev-lead", "qr-evidence", "qr-tests", "qr-constraints"],
+    "…and today that is the lead lane plus the three cheap pre-lead lanes"
+  );
   assert.equal(gate.require, "all-pass");
   assert.equal(gate.threshold, undefined, "an all-pass gate takes no threshold");
   // ci-green: the PR's own checks. body-unchanged (#565/#634): the squash record
@@ -221,7 +264,8 @@ test("editing one block's model keeps every other block's comments — and the s
   assert.match(out, /orrerix's own agent workflow/, "the file preamble survives");
   assert.match(out, /The orchestrator is orrerix's trust root/, "an untouched block's comment survives");
   assert.match(out, /two worker tiers, routed by difficulty/, "the comment on the untouched sibling worker survives");
-  assert.match(out, /one reviewer lane/, "the reviewer's comment survives");
+  assert.match(out, /the lead reviewer: the one lane that JUDGES/, "the reviewer's comment survives");
+  assert.match(out, /three cheap quick-review lanes/, "…and so does the qr-* section's own header");
   assert.match(out, /the bisecting merge queue/, "the merge_queue block's comment survives");
   assert.match(out, /^edges:/m, "the edges section is untouched");
   assert.match(out, /^# ADVISORY/m, "…and keeps its own header comment");

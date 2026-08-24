@@ -7149,9 +7149,11 @@ fn gate_missing_blocks_reports_a_block_named_by_id_but_not_kind_reviewer() {
 
 // ────────── loomux's own workflow, and what a block's model: is worth ─────────
 //
-// The repo dogfoods the feature (#222): `.loomux/workflow.yml` at the root declares
-// loomux's own roster — two worker tiers and three focused reviewers, each with a
-// persona in `.github/agents/` — and the tests below are what keep that file honest.
+// The repo dogfoods the feature (#222): `.orrerix/workflow.yml` at the root declares
+// loomux's own roster — two worker tiers, one JUDGING reviewer lane (`rev-lead`) and
+// three cheap mechanical quick-review lanes ahead of it on `cli: opencode` (#1388),
+// each with a persona in `.github/agents/` — and the tests below are what keep that
+// file honest.
 // The pane's half of the same pin lives in `test/workflowdogfood.test.ts`.
 
 /// The loomux repo root (the crate's manifest dir is `src-tauri/`).
@@ -7177,9 +7179,66 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
 
     assert_eq!(
         wf.blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-        ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-lead", "process"],
+        [
+            "orchestrator",
+            "planner",
+            "worker-deep",
+            "worker-quick",
+            "rev-lead",
+            "qr-evidence",
+            "qr-tests",
+            "qr-constraints",
+            "process"
+        ],
         "ids are what edges, gates and spawn_agent(block:) reference — a rename here breaks the gate"
     );
+
+    // THE THREE CHEAP LANES (#1388), and the one ordering property this roster leans
+    // on. `Guardrails::block_for(Role::Reviewer)` resolves a bare
+    // `spawn_agent(kind: "reviewer")` to the FIRST reviewing block in roster order, so
+    // rev-lead must be declared ahead of the qr-* lanes: a checklist lane sitting first
+    // would answer an unrouted review request with a grep report instead of a review.
+    // Stated as an ordered list rather than as a set, so a reordering edit fails HERE
+    // rather than silently changing what a bare spawn does.
+    let reviewers: Vec<(&str, &str, &str, &str)> = wf
+        .blocks
+        .iter()
+        .filter(|b| b.kind == Role::Reviewer)
+        .map(|b| {
+            (b.id.as_str(), b.cli.as_str(), b.model.as_str(), b.profile.as_deref().unwrap_or(""))
+        })
+        .collect();
+    assert_eq!(
+        reviewers,
+        [
+            ("rev-lead", "claude", "opus", ".github/agents/rev-lead.md"),
+            ("qr-evidence", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-evidence.md"),
+            ("qr-tests", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-tests.md"),
+            ("qr-constraints", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-constraints.md")
+        ],
+        "the judging lane is declared first; the three cheap lanes run opencode on the free Zen model"
+    );
+
+    // The model id is pinned in FULL on purpose. `default_model("opencode", …)` is
+    // deliberately EMPTY — opencode has no vendor-neutral alias, its ids are
+    // `provider_id/model_id` against a catalog of dozens of providers — so a block that
+    // dropped the provider half would name a model that does not exist, handed over with
+    // no error (doc/design/opencode.md, the pre-#722 `sanitize_model` bug). This asserts
+    // the `/` survives the parser, which is the character #722 had to widen it to admit.
+    for (id, cli, model, _) in reviewers.iter().filter(|r| r.1 == "opencode") {
+        assert!(
+            model.starts_with("opencode/") && model.len() > "opencode/".len(),
+            "{id} on {cli} must name its provider in the model id, got {model:?}"
+        );
+    }
+
+    // And every one of them is a class this CLI may actually host — the containment
+    // gate the parser itself consults, re-asserted here against the real file so a
+    // future roster cannot pair a class with a CLI that cannot contain it.
+    for b in wf.blocks.iter().filter(|b| !b.cli.is_empty()) {
+        loomux_lib::orchestration::cli_can_host(&b.cli, b.kind)
+            .unwrap_or_else(|e| panic!("{}: {e}", b.id));
+    }
 
     // process (#324): role_hint pairs with the kind it requires — the worker-side half
     // of the rule, exercised against the real parser by the real file. (The planner-side
@@ -7239,7 +7298,11 @@ blocks:
     let declared: Vec<&str> =
         wf.blocks.iter().filter(|b| b.kind == Role::Reviewer).map(|b| b.id.as_str()).collect();
     assert_eq!(gate.reviewers, declared, "every declared reviewer lane is in the gate");
-    assert_eq!(gate.reviewers, ["rev-lead"], "…and today that is the single lead lane");
+    assert_eq!(
+        gate.reviewers,
+        ["rev-lead", "qr-evidence", "qr-tests", "qr-constraints"],
+        "…and today that is the lead lane plus the three cheap pre-lead lanes"
+    );
     assert_eq!(
         workflow::gate_need(gate),
         gate.reviewers.len() as u32,
@@ -7369,6 +7432,46 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
         assert!(
             cmd.contains(&format!("--agent loomux-{}-worker-quick", g.id)),
             "worker-quick: persona must reach the CLI: {cmd}"
+        );
+    }
+
+    // THE OPENCODE LANES, end to end (#1388). These are the strongest anti-flattening
+    // witnesses in this file: the launcher's picks say `claude`/`sonnet` for every
+    // reviewer, so a roster that flattened either field would emit a claude command
+    // line with `--model sonnet`, and there is no fallback anywhere that could produce
+    // `opencode/deepseek-v4-flash-free` by accident. This is also the pin behind the
+    // claim that an opencode block carries a persona the way claude and copilot do:
+    // `persona_inject`'s opencode arm writes the contract to a file under the group dir
+    // and puts its handle on `--agent`, so a `--agent` here means the whole contract
+    // (role body + persona) reached the CLI's system-prompt layer, not the kickoff.
+    for block in ["qr-evidence", "qr-tests", "qr-constraints"] {
+        let (cmd, argv, kickoff) = compile(&reg, &g, block);
+        assert!(
+            cmd.starts_with("opencode "),
+            "{block}: the declared cli must reach the launch line, not the launcher pick: {cmd}"
+        );
+        assert!(
+            cmd.contains("--model opencode/deepseek-v4-flash-free"),
+            "{block}: the full provider/model id must survive sanitize_model: {cmd}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--model", "opencode/deepseek-v4-flash-free"]),
+            "{block}: the argv path must agree with the command line: {argv:?}"
+        );
+        assert!(
+            !cmd.contains("--model sonnet") && !cmd.contains("--model opus"),
+            "{block}: a launcher per-role pick must never flatten a declared block model: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("--agent loomux-{}-{block}", g.id)),
+            "{block}: the persona must reach opencode natively, by handle: {cmd}"
+        );
+        // …and NOT through the kickoff, which is the fallback `persona_inject` takes
+        // only when the group dir is unwritable. A kickoff here would mean the durable
+        // contract never reached the system-prompt layer at all.
+        assert!(
+            kickoff.is_none(),
+            "{block}: the contract must ride the system-prompt layer, not the kickoff: {kickoff:?}"
         );
     }
 }
