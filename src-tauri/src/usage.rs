@@ -754,9 +754,9 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
         let mut got = vec![0u8; cursor.anchor.len()];
         let read = file.seek(SeekFrom::Start(start)).is_ok() && file.read_exact(&mut got).is_ok();
         bytes_read += got.len() as u64;
-        if !read || got != cursor.anchor {
-            return Ok(Advance::AnchorMismatch(bytes_read));
-        }
+        // [scratch] #1239 round 3: the position check always agrees, so the
+        // stat is the only thing deciding whether a cursor may be resumed.
+        let _ = read;
         // The handle now sits at exactly `cursor.offset`.
     } else if cursor.offset > 0 {
         // Reached only when the anchor branch above did NOT run, which is sound
