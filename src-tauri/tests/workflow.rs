@@ -3912,18 +3912,23 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
     let g2 = reg2.create_group(&plain.path(), plain_rails()).unwrap();
     let builtin = instructions_lf(&reg2, &g2.id, "reviewer.md");
 
-    // These five strings are pinned AS STRINGS, deliberately (rev-19 F8). `non-blocking`
+    // These six strings are pinned AS STRINGS, deliberately (rev-19 F8). `non-blocking`
     // is no longer prose — it is the label `orchestrator.md` tells the orchestrator to READ,
     // so the literal token IS the contract; the next two are the phrasings that carry the
     // duty. A meaning-preserving reword therefore turns this red on purpose: reword the
     // templates and this test together, as one decision, rather than reading the red as noise.
     //
-    // The last two are #1292's, and they ride this loop for exactly the reason the duty
-    // above does: the review body's `## Premortem` section and the resource triple are
-    // question GENERATION, the half of review that red-before-green cannot reach — the
-    // property nobody thought to test is the one no evidence discipline will ever demand.
-    // A `mode: replace` reviewer never reads `reviewer.md`, so a premortem duty living only
-    // there is one the repo that wrote its own reviewer persona never hears.
+    // The last three are #1292's, and they ride this loop for exactly the reason the duty
+    // above does: the review body's `## Premortem` section, the bar it is filled against, and
+    // the resource triple are question GENERATION, the half of review that red-before-green
+    // cannot reach — the property nobody thought to test is the one no evidence discipline will
+    // ever demand. A `mode: replace` reviewer never reads `reviewer.md`, so a premortem duty
+    // living only there is one the repo that wrote its own reviewer persona never hears.
+    //
+    // The BAR is pinned separately from the heading because they fail separately (review round
+    // 1, N1): a compression of this bullet that keeps `## Premortem` and drops "no test in this
+    // PR" leaves the section named and unstandardised, and `reviewer.md`'s own copy — pinned in
+    // `prompts.rs` — would have kept the suite green over it.
     for (surface, doc) in [("mechanics_core(Reviewer)", &core), ("reviewer.md", &builtin)] {
         assert!(
             doc.contains("non-blocking"),
@@ -3952,6 +3957,14 @@ fn every_reviewer_hears_the_findings_duty_however_its_persona_was_written() {
             "{surface} must ask the RESOURCE question for unbounded input — largest realistic \
              input × how often it runs × what it allocates or reads per run. Cost review that \
              asks only about TIME is how a whole-file read ships behind a green suite: {doc}"
+        );
+        assert!(
+            doc.contains("no test in this PR"),
+            "{surface} must keep the premortem's BAR and not just its heading — the two failures \
+             it asks for are the ones no test in the PR would catch. This function is edited \
+             every time a reviewer duty is added, and a bullet compressed to 'two ways this \
+             change fails in production' leaves a heading with no standard for filling it, on \
+             the one surface a `mode: replace` reviewer actually reads: {doc}"
         );
     }
 

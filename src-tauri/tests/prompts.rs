@@ -779,4 +779,22 @@ fn every_review_carries_a_premortem() {
         "…and an entry that names the input which triggers it is dispositioned like any other \
          finding (fixed here, or deferred at the three costs), or the premortem becomes a place \
          to park a real defect where no disposition rule reaches it");
+
+    // Absence is the cheap failure to catch; VACUITY is the likely one, and until the review
+    // round that found this the orchestrator had been told about absence alone. A reviewer that
+    // writes the heading and "none obvious" under it satisfies every other surface — the section
+    // is present, the suite is green — so the rule that reaches it has to live on the one surface
+    // that reads a review's SHAPE, or the heading degrades to a checkbox by the cheapest route.
+    pinned("the disposition step", disposition, "unargued \"none\" is the same as a missing one",
+        "…and a section answered with an unargued \"none\" is dispositioned as a MISSING one: the \
+         reviewer surfaces both say an empty section is a finding, but the orchestrator is the only \
+         surface that acts on a review's shape, so an unaddressed vacuity rule is not a rule");
+
+    // And the trigger is the SECTION, not its punctuation. Keyed strictly on one spelling, the
+    // rule bounces a complete review over `## Pre-mortem` and costs a round on the group's most
+    // expensive agents; read loosely with nothing said, it accepts a bolded line and the
+    // "a fixed heading makes an omission visible" argument quietly does less work than claimed.
+    pinned("the disposition step", disposition, "however the reviewer spelled the heading",
+        "…and the orchestrator reads the section however it is spelled — the strict reading burns \
+         a review round on punctuation, and neither reading is safe while the template says neither");
 }

@@ -292,8 +292,9 @@ allocates or reads per run, naming the size at which memory or IO hurts rather t
 time does. Those are *question-generation* duties, and they exist because the rest of the
 process is verification: red-before-green evidence proves the tests somebody already thought to
 write and is silent about the property nobody conceived of. The orchestrator treats a review
-that arrives without the section as an incomplete review rather than an approval, and
-dispositions a premortem entry that names its trigger like any other finding. A repo that
+that arrives without the section — or with an unargued "none" under it — as an incomplete
+review rather than an approval, and dispositions a premortem entry that names its trigger like
+any other finding. A repo that
 wants more of the question set than that — design alternatives, misuse, operational futures —
 puts it in its own reviewer persona (see **Custom agent workflows**).
 
