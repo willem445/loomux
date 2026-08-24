@@ -229,6 +229,20 @@ compiles.
   (`layout.ts`, `steer.ts`, `spawnexpiry.ts`, …) and tested in
   `test/*.test.ts` with `node:test` + `node:assert/strict`. DOM wiring is
   validated by hand — don't simulate a DOM in tests.
+- **An in-list editor's un-submitted state lives in the view, never in its DOM
+  elements.** The board re-renders on every agent write (`orch-tasks-changed`
+  fires on EVERY `write_tasks`) and `refreshNow` defers only while
+  `isEditing()` — `document.activeElement` being an `INPUT`/`TEXTAREA` inside
+  the list. A `<select>`, a checkbox, and the click on the form's own commit
+  button all sit outside that, so the render proceeds and rebuilds the controls
+  from their seeds. Hold the draft in a `Map<rowId, …>` the elements are a view
+  of, prune it beside `selected`/`collapsed`, and put "is this draft untouched"
+  in ONE pure predicate reading EVERY field the form has — the renderer's seed
+  and the predicate's default are one question asked twice. Clearing on success
+  alone discharges it on the Enter route and leaves it on the button route,
+  which is the one most people use. Signature: a control whose value is read at
+  submit rather than written on `change`, seeded from a literal instead of from
+  view state (#1348 N1/N4; `TasksView.linkDrafts`, `linkDraftIsPristine`).
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
@@ -488,6 +502,19 @@ narrow their ask back down to the original ticket on your own judgment.
   of its own subjects is not a census (#1209). Build the pattern from what a token may
   CONTAIN (a fact), never from what may FOLLOW it (unbounded prose): the second instance
   was a follow-class omitting `#`, blinding a guard to `…/loomux#readme` (#1297).
+- **A body revised across review rounds is DATED per section, never certified
+  by a sentence.** "Everything above is measured at `<sha>` and stands as
+  written" is itself a hand-maintained claim over text: it goes stale with the
+  numbers it covers, and is then the second false claim rather than the fix for
+  the first. Name the SHA in each section that carries a number, so a reader can
+  check it instead of trusting the certificate; when one number is found stale,
+  re-date the sections rather than widening the sentence. Audit by sweeping
+  EVERY section for an undated number — the ones the sentence names are the ones
+  already thought about. Signature: a section whose only SHA is the BASE, with
+  its head written as `HEAD` (which moves), sitting under tables headed by a
+  literal SHA (which don't) and a sentence saying only one section needed the
+  edit (#1348 B1: a Diffstat 109 insertions light, certified as not needing the
+  touch).
 - **A commit SHA in a PR body is re-resolved against the PR's own ref, never your worktree.**
   A rebase rewrites every SHA the body cites while the prose survives untouched; the orphans
   still `git cat-file -e` locally, so existence proves nothing, and ancestry against `main`
