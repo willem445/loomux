@@ -282,8 +282,10 @@ export class AuditView {
    *  timeline's tick, at the same cadence, be served this one instead of
    *  firing a second `orch_audit` for the same file. The store keeps the last
    *  good rows on a failed read and never throws, so an unreadable log leaves
-   *  what is on screen alone rather than blanking it; the empty render is now
-   *  reached only by a log that really is empty. */
+   *  what is on screen alone rather than blanking it. On a FIRST read there is
+   *  nothing to keep, so a rejection there still renders empty — which is why
+   *  the empty state reads `store.loaded` rather than claiming that an empty
+   *  render means an empty log (#1317 review N5). */
   private async load(maxAgeMs?: number): Promise<void> {
     if (this.disposed) return;
     this.entries = await this.store.read(maxAgeMs);
@@ -390,7 +392,19 @@ export class AuditView {
 
     this.listEl.replaceChildren();
     if (this.entries.length === 0) {
-      this.listEl.appendChild(el("div", "audit-empty", "No audit entries yet for this group."));
+      // `loaded` distinguishes an empty log from a read that never succeeded
+      // (#1317 review N5) — before this, a rejected first read was shown as a
+      // group that had done nothing. It is also what keeps
+      // `AuditStore.loaded` from being a getter only the tests read.
+      this.listEl.appendChild(
+        el(
+          "div",
+          "audit-empty",
+          this.store.loaded
+            ? "No audit entries yet for this group."
+            : "Could not read this group's audit log."
+        )
+      );
       return;
     }
     if (filtered.length === 0) {

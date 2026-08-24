@@ -431,8 +431,10 @@ Deliberately **not** added to `TaskSummary` — the compact row `list_tasks`
 returns (#245's size constraint: that row stays minimal by construction, and
 slice B's plan never asked to widen it). A caller that needs
 `demo_path` reads the full record: `get_task` (MCP) or `orch_tasks` (the human
-board's own Tauri read, already full `Task`s) — so the panel this field exists
-for (slice C) needed no new read surface either.
+board's own Tauri read, which carries `demo_path` on every row) — so the panel
+this field exists for (slice C) needed no new read surface either. That read
+stopped being whole `Task`s in #1317, which split the note BODIES out of it;
+`demo_path` was never one of the fields deferred, so this is unaffected.
 
 **What slice B did not build, at the time it landed.** No UI rendered
 `demo_path` — a recorded path was visible only in `tasks.json`, in the audit

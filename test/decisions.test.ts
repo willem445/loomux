@@ -567,7 +567,16 @@ test("a row leaves the panel when its ITEM resolves, not when its task moves", (
   // hook, and until that lands the human still sees the ask they were given.
   const moved = [task({ id: "t-9", status: "done" })];
   const parked = view([item({ id: "n-1", task: "t-9" })], 0, moved);
-  assert.equal(projectPanel(parked, []).open.length, 1, "the ask outlives the status");
+  const open = projectPanel(parked, []).open;
+  assert.equal(open.length, 1, "the ask outlives the status");
+  // The POSITIVE half of the join (#1317 review N1): every other assertion
+  // about `task` in this file is a negative one — a miss yields null — and
+  // `linkTask`'s own tests call it directly rather than through here. So
+  // nothing witnessed that `projectPanel` reads the rows off `view.tasks` at
+  // all: handing it an empty array left the whole suite green while every open
+  // card silently lost its title, status, demo path, PR and Proceed.
+  assert.equal(open[0].source === "item" && open[0].task?.id, "t-9",
+    "the card must carry the row the item names, joined off the SAME read as the item");
   const resolved = view(
     [item({ id: "n-1", task: "t-9", status: "resolved", resolved_ms: 7, resolved_by: "board:done" })],
     0,

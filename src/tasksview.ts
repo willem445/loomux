@@ -2958,13 +2958,25 @@ export class TasksView {
     notesBtn.addEventListener("click", () => {
       if (this.expanded.has(t.id)) this.expanded.delete(t.id);
       else this.expanded.add(t.id);
+      const opening = this.expanded.has(t.id);
       // Render first so the row opens on the click, then ask for the bodies:
       // the next read names the newly-expanded row, and the notes fill in when
       // it lands. Expanding a row the last read did not carry is the ONLY way
       // the list can be momentarily short, which is why it re-reads here
       // rather than waiting for the poll.
+      //
+      // Only on the way OPEN (#1317 review N6). A collapse can only SHRINK
+      // `withNotes`, so there is nothing to fetch, and firing a whole-board
+      // read for it would be exactly the polled work this issue is about.
+      //
+      // This view has no `setInterval`, so this is the ONLY thing that ever
+      // fetches an expanded row's bodies. If it rejects, `refreshNow` toasts
+      // and returns, and the row keeps saying "loading notes…" until an agent
+      // writes to the board or the panel is reopened — recoverable, and
+      // visible through the toast, but a failure mode that did not exist when
+      // the bodies were already in hand.
       this.render();
-      this.refresh();
+      if (opening) this.refresh();
     });
     top.appendChild(notesBtn);
 
