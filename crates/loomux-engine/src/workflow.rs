@@ -281,6 +281,14 @@ pub struct Block {
     /// is why this keeps a `String` and borrows only the checks; it does reach
     /// an operator-side lookup key and, at #1459, a command line.
     ///
+    /// **The alphabet is case-SENSITIVE, and #1458 has to keep it that way**
+    /// (#1457 review N3). `check_segment` accepts upper and lower case, so
+    /// `buildbox` and `BuildBox` are two different labels here — which is the
+    /// only thing that makes "refused, never rewritten" mean anything. A
+    /// case-INSENSITIVE lookup on the operator side would put the two spellings
+    /// back onto one binding and reintroduce exactly the hazard this refuses,
+    /// one layer down where no test in this crate can see it.
+    ///
     /// Two pairings are parse errors rather than fields anyone downstream has
     /// to re-check: `remote:` on an orchestrator or manager block, and
     /// `remote:` without `cli: claude`. See `parse_workflow` for both
@@ -4251,6 +4259,43 @@ mod tests {
             errs.iter().any(|e| e.contains("remote") && e.contains("empty")),
             "an explicitly empty label is refused, and says why: {errs:?}"
         );
+    }
+
+    #[test]
+    fn every_yaml_null_spelling_is_the_absent_key() {
+        // The engine half of the pair `test/workflowmodel.test.ts` pins from the
+        // other side (#1457 review N2). The pane's YAML subset resolves only
+        // `null` and `~`; this asserts what the ENGINE's reader does with the
+        // rest of the core schema's null set, so the divergence is a measured
+        // fact rather than an assumption about a library.
+        //
+        // Every spelling here must be the ABSENT key — a local block — because
+        // that is what `Option<String>` means and what the refusals below are
+        // written against. If a future YAML reader narrowed this set, a file
+        // that reads as local today would start carrying an empty label into
+        // `check_segment` and be refused, which is a silent break for anyone
+        // who wrote one.
+        for spelling in ["null", "Null", "NULL", "~"] {
+            let doc = format!(
+                "version: 1\nblocks:\n  - id: b\n    kind: worker\n    remote: {spelling}\n"
+            );
+            let wf = parse_workflow(&doc)
+                .unwrap_or_else(|e| panic!("remote: {spelling} must read as the absent key: {e:?}"));
+            assert_eq!(
+                wf.block("b").unwrap().remote,
+                None,
+                "remote: {spelling} must be the absent key, not a label"
+            );
+        }
+        // The non-vacuity control, and it is the one that makes the loop mean
+        // something: a spelling OUTSIDE the null set really does arrive as a
+        // label, so the loop above is not passing because everything is None.
+        // (`nul` is not YAML's null — one letter short — and is a legal label.)
+        let wf = parse_workflow(
+            "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\n    remote: nul\n",
+        )
+        .expect("a label that merely looks like a null must parse");
+        assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some("nul"));
     }
 
     #[test]

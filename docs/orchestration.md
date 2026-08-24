@@ -1710,15 +1710,26 @@ Two rules the parser enforces, both of which fail the file rather than warn:
   the local disk, which a remote CLI's disk is not. Leaving `cli:` off is refused
   too: an omitted CLI inherits the group default, which is picked at launch, so
   orrerix cannot tell at load time whether the block would end up on Claude.
-  Both rules are deliberately strict in the direction that is cheap to change
-  later: relaxing a refusal costs nobody anything, while adding one to a key
-  people have already written into committed files breaks their workflows.
+
+Both rules are deliberately strict in the direction that is cheap to change
+later: relaxing a refusal costs nobody anything, while adding one to a key
+people have already written into committed files breaks their workflows.
 
 The label itself is letters, digits, `-` and `_`, at most 64 characters, and not
 starting with `-`. It is refused rather than cleaned up, so two spellings can
-never end up meaning one machine. A block with no `remote:` key is a local block
-and is completely unaffected — which is every block in every workflow file
-written so far.
+never end up meaning one machine — and it is **case-sensitive**, so `buildbox`
+and `BuildBox` are two different labels, not one written two ways. A block with
+no `remote:` key is a local block and is completely unaffected — which is every
+block in every workflow file written so far.
+
+One thing to know before you write a label into a committed file: **a label
+nobody has bound yet is not an error today.** It parses, saves and round-trips,
+and the block runs locally. That is deliberate for now — the key ships before
+the binding does — but it means a name written today is a name an operator may
+bind differently later. Whether an unbound label should say so at launch is a
+decision for the binding step ([#1458](https://github.com/willem445/orrerix/issues/1458));
+until it lands, treat a label as a note to your operator rather than as a
+setting that is in force.
 
 The full design note for remote roles lands with the rest of the feature
 ([#1462](https://github.com/willem445/orrerix/issues/1462)); the plan it is being

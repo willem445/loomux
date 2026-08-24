@@ -2154,7 +2154,19 @@ const KNOWN_TOP = new Set([
   "resources",
   "board",
 ]);
-const KNOWN_BLOCK = new Set([
+/** The block keys this build knows — the pane's half of the #880 schema
+ *  lockstep, EXPORTED so a test can read it as a set.
+ *
+ *  Exported for one reason, and it is not convenience: the manifest -> pane
+ *  direction was already pinned (every declared field is read), but pane ->
+ *  manifest was not, so a key added HERE reddened nothing. That asymmetry is
+ *  load-bearing for `remote:` (#1457): the whole argument for the key is that a
+ *  repo file may not author a destination, and the pane's half of that is that
+ *  no destination-shaped key is a field. An 8-name test enumerating
+ *  `host`/`port`/… catches only the names it lists; a set equality against the
+ *  manifest catches every name nobody thought of.
+ *  `test/workflowschema.test.ts` holds both directions. */
+export const KNOWN_BLOCK = new Set([
   "id",
   "name",
   "kind",

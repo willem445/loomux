@@ -1723,6 +1723,51 @@ test("a bare remote: is the absent key, an empty one is a refusal (#1457)", () =
   assert.ok(has(analyzeWorkflow(empty).findings, "remote-invalid-label"), `${codes(analyzeWorkflow(empty).findings)}`);
 });
 
+test("the pane's YAML subset knows two of YAML's null spellings, and that gap is pinned (#1457 review N2)", () => {
+  // A DISCLOSED RESIDUAL, pinned rather than described. `plainScalar`
+  // (src/workflowmodel.ts) resolves `null` and `~` and nothing else, so
+  // `remote: Null` reads back as the LABEL "Null" while the engine — whose YAML
+  // reader follows the full core schema — sees a null and therefore no remote at
+  // all. The fix commit's rationale says "a null is treated as the absent key it
+  // means", which is true for the two spellings below and not for the others;
+  // this test is what stops that sentence going false in silence.
+  //
+  // NOT fixed here, deliberately. The gap belongs to the pane's shared YAML
+  // subset, not to this key: `plainScalar` and `emitScalar` are symmetric about
+  // exactly these two spellings, and widening the reader alone would break the
+  // round-trip for every field (a string "Null" would emit unquoted and re-read
+  // as null). Widening both is a change to every key in the file, which is not
+  // R1's to make.
+  //
+  // THE BOUND, which is what keeps this a display gap rather than a spawn one:
+  // the pane's model never reaches a spawn. `parse_workflow` is the only reader
+  // that decides what runs, and `Block.remote` is written there and read by
+  // nobody else in this build. So the worst this can do today is show a remote
+  // block where the engine sees a local one — in the editor, to the human
+  // holding the file. `a_remote_label_survives_a_group_json_round_trip` and the
+  // engine's own null-spelling pin are the other half of this pair.
+  const at = (spelling: string) =>
+    parseWorkflow(remoteDoc({ kind: "worker", cli: "claude", remote: spelling })).workflow.blocks[0]!.remote;
+
+  // Recognised: the pane agrees with the engine.
+  assert.equal(at("null"), undefined, "lowercase null is the absent key");
+  assert.equal(at("~"), undefined, "~ is the absent key");
+
+  // NOT recognised: the pane reads a label where the engine reads a null. This
+  // is the blind spot itself, asserted so that closing it reddens here and the
+  // disclosure above gets revisited rather than quietly becoming wrong.
+  assert.equal(at("Null"), "Null", "the known gap: capitalised Null is read as a LABEL");
+  assert.equal(at("NULL"), "NULL", "the known gap: NULL is read as a LABEL");
+
+  // …and while it is read as a label it is a VALID one, so the pane reports the
+  // file clean. That is the whole shape of the divergence in one assertion.
+  assert.deepEqual(
+    analyzeWorkflow(remoteDoc({ kind: "worker", cli: "claude", remote: "Null" })).findings.map((f) => f.code),
+    [],
+    "the pane reports it clean, as a remote block"
+  );
+});
+
 test("a host-shaped key is an unknown key, not a field (#1457)", () => {
   // The repo file SELECTS a label; the operator authors the address. A pane that
   // read `host:` as a field would be offering to author what the engine refuses

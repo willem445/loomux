@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   analyzeWorkflow,
+  KNOWN_BLOCK,
   parseWorkflow,
   roleHintRequires,
   serializeWorkflow,
@@ -391,6 +392,38 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "board.wip.human-testing",
   "board.wip.blocked",
 ]);
+
+test("the pane's block-key set IS the manifest's, in both directions (#1457 review N1)", () => {
+  // The other half of "(a) the parser knows every field". That test walks the
+  // MANIFEST and checks the pane reads each one, so it catches a field the pane
+  // forgot. It cannot catch the opposite — a key the PANE knows and the manifest
+  // (and therefore the engine) does not — because it never reads the pane's set.
+  //
+  // That direction is the one `remote:` makes load-bearing (#1457). The engine
+  // refuses a destination-shaped key by `deny_unknown_fields`, which is
+  // default-deny; the pane's `KNOWN_BLOCK` is an allowlist, so a later PR adding
+  // `hostname`, `addr`, `ssh_host`, `via` or `jump` to it would make the pane
+  // report a file clean that the engine fails WHOLE — the launch then falls back
+  // to the built-in roster with no finding to explain where the roster went.
+  // A set equality needs no enumeration and cannot go stale.
+  const manifestBlockKeys = new Set(manifest.sections.block!.fields.map((f) => f.name));
+  const paneKeys = new Set(KNOWN_BLOCK);
+  assert.deepEqual(
+    [...paneKeys].filter((k) => !manifestBlockKeys.has(k)).sort(),
+    [],
+    "the pane reads a block key the schema does not declare — the engine will refuse the whole file over it"
+  );
+  assert.deepEqual(
+    [...manifestBlockKeys].filter((k) => !paneKeys.has(k)).sort(),
+    [],
+    "the schema declares a block key the pane does not read — it would land in the unknown-key bag"
+  );
+  // The non-vacuity control: both sets are non-empty and really do contain the
+  // key this test was written for, so a future refactor that empties either one
+  // fails here rather than passing as two empty sets.
+  assert.ok(paneKeys.size >= 12, `the pane's block-key set looks empty: ${paneKeys.size}`);
+  assert.ok(paneKeys.has("remote") && manifestBlockKeys.has("remote"));
+});
 
 test("every schema field is either editable in the pane or listed as not yet editable", () => {
   const ids = leafFields().map((f) => f.id);
