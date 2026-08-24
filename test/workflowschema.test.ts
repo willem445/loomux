@@ -21,7 +21,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   analyzeWorkflow,
+  isRemoteLabel,
   KNOWN_BLOCK,
+  REMOTE_LABEL_MAX,
   parseWorkflow,
   roleHintRequires,
   serializeWorkflow,
@@ -46,6 +48,8 @@ interface SchemaField {
   required?: boolean;
   min?: number;
   max?: number;
+  /** Longest accepted STRING (#1457). Distinct from `max`, which bounds a number. */
+  maxLength?: number;
   /** How many entries a `section-map` may hold (`workflow.resources`). */
   max_entries?: number;
   /** What the ENGINE does with a value outside `min`/`max` — refuse the whole file, or
@@ -642,6 +646,43 @@ test("every bound the pane clamps to is the bound the manifest declares (#1020)"
   // The one cardinality cap: an "add a resource" button that writes a 33rd entry produces a
   // file the engine refuses whole, so the form disables itself at exactly this number.
   assert.equal(bound("workflow", "resources").max_entries, RESOURCES_MAX);
+});
+
+test("the pane's remote-label cap IS the manifest's, which IS the engine's (#1457 review B3)", () => {
+  // The third link of the engine -> manifest -> pane chain, for the one bound
+  // that was outside it. `REMOTE_LABEL_MAX` carried a comment claiming this
+  // mechanism while being enrolled in nothing: the engine stated no fact for
+  // `block.remote`, so the manifest declared none, so the bidirectional Rust pin
+  // had nothing to compare, so this constant was pinned to nothing at all.
+  //
+  // Both sides tested their cap against their OWN constant — the engine builds
+  // its over-cap fixture from `MAX_SEGMENT_LEN + 1`, the pane from
+  // `REMOTE_LABEL_MAX + 1` — so both stayed green while free to disagree.
+  // `MAX_SEGMENT_LEN` is shared by four identifier families (#925), so a change
+  // to it is a live possibility: raise it to 96 and the engine would accept a
+  // 70-character label while the pane reported `remote-invalid-label` on a file
+  // the engine loads clean.
+  //
+  // The Rust half (`the_workflow_schema_manifest_matches_the_engines_values_
+  // defaults_and_bounds`, now pinning `maxLength` too) holds engine == manifest;
+  // this holds manifest == pane. Neither operand here is this test's own.
+  const declared = bound("block", "remote").maxLength;
+  assert.equal(
+    typeof declared,
+    "number",
+    "block.remote must declare a maxLength — without it the Rust pin has nothing to compare and this constant is pinned to nothing"
+  );
+  assert.equal(
+    REMOTE_LABEL_MAX,
+    declared,
+    "the pane's cap and the manifest's disagree — the pane would paint a legal file red, or accept one the engine refuses"
+  );
+
+  // …and the pane's PREDICATE really uses that constant, rather than a literal
+  // that happens to match it today. Without this the equality above could hold
+  // while `isRemoteLabel` enforced something else entirely.
+  assert.equal(isRemoteLabel("b".repeat(declared)), true, "a label exactly at the cap is legal");
+  assert.equal(isRemoteLabel("b".repeat(declared + 1)), false, "one character over is not");
 });
 
 test("refuse-vs-clamp is the difference between an error and a warning in the pane (#1020)", () => {

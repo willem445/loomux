@@ -8400,7 +8400,10 @@ fn the_workflow_schema_manifest_matches_the_engines_raw_types() {
 #[test]
 fn the_workflow_schema_manifest_matches_the_engines_values_defaults_and_bounds() {
     const MANIFEST: &str = include_str!("../../src/workflow-schema.json");
-    const PINNED: [&str; 5] = ["values", "default", "min", "max", "max_entries"];
+    // `maxLength` (#1457) is a LENGTH bound on a string field, distinct from
+    // `max` — which this manifest documents as "highest accepted number".
+    const PINNED: [&str; 6] =
+        ["values", "default", "min", "max", "max_entries", "maxLength"];
 
     let manifest: Value = serde_json::from_str(MANIFEST).expect("the manifest must be valid JSON");
     let sections = manifest["sections"].as_object().expect("manifest.sections must be a mapping");

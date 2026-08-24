@@ -2511,6 +2511,55 @@ fn a_broken_workflow_file_is_audited_and_skipped_never_fatal() {
 
 // ─────────────────────────── persistence round-trip ─────────────────────────
 
+/// #1457 review, premortem 1. The invariant `remote: Some(_) => cli == "claude"
+/// and the kind is one the orchestrator spawns` is established twice —
+/// `parse_workflow` and `read_blocks` each derive it — and asserted nowhere.
+///
+/// `Guardrails::clamped` runs after both and is free to rewrite blocks: it
+/// already writes `id`, `name`, `model`, `effort` and `context`, drops blocks on
+/// two rules, and prepends a synthesized orchestrator. It happens not to touch
+/// `cli`, which is true by reading and enforced by nothing. Add a `cli`
+/// normalization there — a lowercase, or a fallback when `cli_caps` returns
+/// `None`, both plausible as CLIs are added — and a block carrying `remote:`
+/// comes out on a CLI whose session identity cannot survive the trip, with
+/// nothing red to say so.
+///
+/// **The fixture makes the operands COLLIDE**, per the non-interference rule: a
+/// pin whose subject `clamped` never touches holds under every implementation,
+/// the one it forbids included. So the remote block here carries exactly the
+/// fields `clamped` DOES rewrite — a model it normalizes and an `effort` its
+/// resolved CLI cannot honor, which `clamped_knob` empties — and the assertion
+/// is that the pass which demonstrably rewrote this block left the label and the
+/// CLI alone.
+#[test]
+fn clamping_a_roster_never_moves_a_remote_block_off_claude() {
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: builder\n    kind: worker\n    cli: claude\n    model: OPUS\n\
+         \x20   effort: high\n    remote: buildbox\n",
+    )
+    .expect("the fixture must parse");
+    let before = wf.block("builder").unwrap().clone();
+    assert_eq!(before.remote.as_deref(), Some("buildbox"));
+
+    let rails = Guardrails { blocks: wf.blocks.clone(), ..rails() }.clamped();
+    let after = rails.block("builder").expect("clamped must keep the block");
+
+    // The collision control FIRST: this pass really did rewrite this block, so
+    // the two assertions below are about a block `clamped` touched rather than
+    // one it skipped.
+    assert_ne!(
+        (before.model.as_str(), before.effort.as_str()),
+        (after.model.as_str(), after.effort.as_str()),
+        "the fixture must be one clamped actually rewrites, or the pin below holds vacuously"
+    );
+
+    // …and the invariant survived it.
+    assert_eq!(after.remote.as_deref(), Some("buildbox"), "clamping must not drop a remote label");
+    assert_eq!(after.cli, "claude", "clamping must not move a remote block off claude");
+    assert_eq!(after.kind, Role::Worker, "…nor change the kind the refusals were checked against");
+}
+
 /// #1457 review, premortem 2. `read_blocks` re-derives all three `remote:`
 /// rules defensively and DROPS a label that fails any of them, silently —
 /// there is no human at that layer to show a parse error to. That is the right
@@ -2592,6 +2641,36 @@ fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
     // the block is still THERE, still a worker, and only the label went. A
     // dropped block would satisfy that assertion just as well.
     assert_eq!(edited_back.block("builder").unwrap().kind, Role::Worker);
+
+    // #1457 review, premortem 2: the MIGRATION case, which is every group on
+    // every existing install and the one case that had no witness. A group.json
+    // written before this field existed has no `remote` key at all — not a
+    // null, simply absent — and `read_blocks` must read that as a local block
+    // rather than tripping over it. Asserted with a fixture rather than left to
+    // `as_str()` returning `None` on a missing key, which is true today and is
+    // exactly the kind of true-by-reading that this PR keeps finding is not
+    // true-by-test.
+    let mut pre_1457: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for b in pre_1457["guardrails"]["blocks"].as_array_mut().unwrap() {
+        b.as_object_mut().unwrap().remove("remote");
+    }
+    assert!(
+        !serde_json::to_string(&pre_1457).unwrap().contains("remote"),
+        "the fixture must really carry no remote key, or it is not a pre-#1457 file"
+    );
+    fs::write(&path, serde_json::to_string_pretty(&pre_1457).unwrap()).unwrap();
+
+    let (_, migrated) = reg.load_group_file(&g.id).expect("a pre-#1457 group.json must still load");
+    assert_eq!(
+        migrated.block("builder").unwrap().remote,
+        None,
+        "a group.json predating the key is a LOCAL block"
+    );
+    assert_eq!(
+        migrated.block("builder").unwrap().kind,
+        Role::Worker,
+        "…and the block survives the read, rather than being dropped for lacking a key"
+    );
 }
 
 #[test]
