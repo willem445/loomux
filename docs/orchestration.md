@@ -1652,6 +1652,63 @@ it is **does this run on every PR?** A checklist does, and belongs in the gate; 
 lens does not, and a reviewer block would both run it every time and hold every
 merge shut waiting for it.
 
+### Running a block on another machine: `remote:` (not usable yet)
+
+A block can name an abstract **label** for the machine its agent should run on
+over SSH:
+
+```yaml
+blocks:
+  - id: builder-remote
+    kind: worker
+    cli: claude             # required, and spelled out — see below
+    remote: buildbox        # a label, not an address
+```
+
+**Right now this key does nothing.** Orrerix parses it, validates it, and keeps
+it across a save — and then spawns the block locally, exactly as if you had not
+written it. It becomes real in two later steps: binding the label to an actual
+host (the operator side, [#1458](https://github.com/willem445/orrerix/issues/1458))
+and the remote spawn path itself
+([#1459](https://github.com/willem445/orrerix/issues/1459)). The key ships first,
+on its own, because it is the part everything else has to agree with.
+
+**The label is a name you choose, never an address.** There is deliberately no
+`host:`, `port:`, `user:`, `identity_file:` or ssh-options key — writing one does
+not "not work", it fails the whole file at load. `workflow.yml` is committed to
+your repository, so anyone who can open a pull request can edit it; a
+repo-authored hostname would let that person point execution at any machine you
+can reach. So the repo file only ever *selects* a name, and you — the operator,
+outside the repo — decide which host, which account and which clone path that
+name means. Same seam as personas: a repo picks from what you defined, and can
+never mint something new.
+
+Two rules the parser enforces, both of which fail the file rather than warn:
+
+- **Not on an `orchestrator` or `manager` block.** Those two run where you are,
+  and that is load-bearing: the orchestrator holds your orchestration state, its
+  `gh` operations and the merge gate, and a manager pane is the thing you type
+  into. Put `remote:` on the blocks the orchestrator spawns.
+- **`cli: claude`, written on the block.** A remote agent's session has to be
+  identified by an id orrerix minted before the spawn, and Claude is the only CLI
+  today that accepts one — the others recognise a session by scanning a store on
+  the local disk, which a remote CLI's disk is not. Leaving `cli:` off is refused
+  too: an omitted CLI inherits the group default, which is picked at launch, so
+  orrerix cannot tell at load time whether the block would end up on Claude.
+  Both rules are deliberately strict in the direction that is cheap to change
+  later: relaxing a refusal costs nobody anything, while adding one to a key
+  people have already written into committed files breaks their workflows.
+
+The label itself is letters, digits, `-` and `_`, at most 64 characters, and not
+starting with `-`. It is refused rather than cleaned up, so two spellings can
+never end up meaning one machine. A block with no `remote:` key is a local block
+and is completely unaffected — which is every block in every workflow file
+written so far.
+
+The full design note for remote roles lands with the rest of the feature
+([#1462](https://github.com/willem445/orrerix/issues/1462)); the plan it is being
+built from is on [#1436](https://github.com/willem445/orrerix/issues/1436).
+
 ### Turning on the merge queue
 
 A `merge_queue:` block, beside `gates:`, opts the repo in:

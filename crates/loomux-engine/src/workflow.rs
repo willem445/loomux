@@ -4140,6 +4140,208 @@ mod tests {
     /// human gate, then update this inventory (name the field in the
     /// matching destructure below and re-run this test to prove it still
     /// compiles).
+
+    // ── `remote:` (#1457) ────────────────────────────────────────────────
+    //
+    // Engine UNIT tests rather than `src-tauri/tests/workflow.rs` integration
+    // ones: `parse_workflow` is pure and lives here, and nothing below links
+    // the Tauri lib, so CLAUDE.md constraint 4 (test executables that link the
+    // lib need the comctl32-v6 manifest, which only integration targets get)
+    // does not apply. The three refusals are the whole of what R1 ships, so
+    // they are tested against the parser directly.
+
+    /// One block, with whatever keys the case under test needs.
+    fn remote_doc(keys: &[(&str, &str)]) -> String {
+        let mut s = String::from("version: 1\nblocks:\n  - id: b\n");
+        for (k, v) in keys {
+            s.push_str(&format!("    {k}: {v}\n"));
+        }
+        s
+    }
+
+    /// Labels the engine must REFUSE, and why. The pane mirrors this predicate
+    /// (`isRemoteLabel`, src/workflowmodel.ts) and its twin test walks the same
+    /// list — a mirror nobody compares is a mirror that has drifted.
+    const BAD_LABELS: &[(&str, &str)] = &[
+        ("\"\"", "empty"),
+        ("\"build box\"", "a space"),
+        ("build.box", "a dot — which is what makes '..' unspellable"),
+        ("\"../buildbox\"", "a traversal, which sanitize_id would REWRITE to buildbox"),
+        ("build/box", "a separator"),
+        ("\"C:\"", "a Windows drive prefix — Path::join REPLACES the receiver on one"),
+        ("\"-buildbox\"", "a leading dash — an OPTION to any command line"),
+        ("CON", "a Windows reserved device name"),
+    ];
+
+    #[test]
+    fn a_remote_label_is_refused_rather_than_rewritten() {
+        // The label is validated with `pathseg::check_segment` — #925's shared
+        // checks — and NOT with `sanitize_id`, which rewrites. That difference
+        // is the whole test: a rewrite would let `../buildbox` and `buildbox`
+        // name one operator binding, which is exactly the hazard the identifier
+        // consolidation exists to prevent.
+        for &(label, why) in BAD_LABELS {
+            let errs = parse_workflow(&remote_doc(&[
+                ("kind", "worker"),
+                ("cli", "claude"),
+                ("remote", label),
+            ]))
+            .unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("remote")),
+                "{label} ({why}) must be refused by name: {errs:?}"
+            );
+        }
+        // One character over the shared cap, built rather than listed so the
+        // constant and the fixture cannot drift apart.
+        let over = "b".repeat(crate::pathseg::MAX_SEGMENT_LEN + 1);
+        let errs =
+            parse_workflow(&remote_doc(&[("kind", "worker"), ("cli", "claude"), ("remote", over.as_str())]))
+                .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("remote")), "one over the cap: {errs:?}");
+
+        // The positive controls — without which every assertion above would
+        // pass just as well against a parser that refused every label there is.
+        let at_cap = "b".repeat(crate::pathseg::MAX_SEGMENT_LEN);
+        for label in ["buildbox", "build-box_2", at_cap.as_str()] {
+            let wf = parse_workflow(&remote_doc(&[
+                ("kind", "worker"),
+                ("cli", "claude"),
+                ("remote", label),
+            ]))
+            .unwrap_or_else(|e| panic!("{label:?} must parse: {e:?}"));
+            // Read back BYTE FOR BYTE: nothing trims, lowercases or normalizes
+            // it on the way in.
+            assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some(label));
+        }
+
+        // Absent is None — today's behavior, byte for byte, which is every
+        // block in every workflow file written before this key existed.
+        let wf = parse_workflow("version: 1\nblocks:\n  - id: w\n    kind: worker\n").unwrap();
+        assert_eq!(wf.block("w").unwrap().remote, None);
+    }
+
+    #[test]
+    fn a_loomux_owned_block_may_not_run_remotely() {
+        // The orchestrator holds orchestration state, the gh operations and the
+        // merge gate; the manager pane is the human's own interface — the thing
+        // they type into. Both are load-bearing LOCALLY, so this is not a
+        // feature with a missing implementation, it is the one this design
+        // refuses. The pair is the same one `persona_allowed` answers for.
+        for kind in ["orchestrator", "manager"] {
+            let errs = parse_workflow(&remote_doc(&[
+                ("kind", kind),
+                ("cli", "claude"),
+                ("remote", "buildbox"),
+            ]))
+            .unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("remote:") && e.contains(kind)),
+                "a {kind} block must be refused by name: {errs:?}"
+            );
+        }
+        // The controls, and they are what keep this from being "no block may
+        // run remotely": every class the orchestrator SPAWNS may.
+        for kind in ["worker", "reviewer", "planner"] {
+            let wf = parse_workflow(&remote_doc(&[
+                ("kind", kind),
+                ("cli", "claude"),
+                ("remote", "buildbox"),
+            ]))
+            .unwrap_or_else(|e| panic!("a remote {kind} must parse: {e:?}"));
+            assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some("buildbox"));
+        }
+    }
+
+    #[test]
+    fn a_remote_block_must_spell_out_cli_claude() {
+        // Session identity is what decides this (plan #1436 part 5): loomux
+        // pre-mints the session id and claude accepts it (`--session-id` /
+        // `--resume`), while copilot/opencode/gemini recognize a session by
+        // scanning a LOCAL store — which a remote CLI's store is not.
+        for cli in ["copilot", "gemini", "opencode"] {
+            let errs = parse_workflow(&remote_doc(&[
+                ("kind", "worker"),
+                ("cli", cli),
+                ("remote", "buildbox"),
+            ]))
+            .unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains("remote:") && e.contains("claude")),
+                "a remote block on {cli} must be refused and name claude: {errs:?}"
+            );
+        }
+        // An OMITTED cli: is refused too, and this is the fail-closed half: it
+        // inherits the group default, which the launcher picks and this parser
+        // cannot see. Refusing it makes the contract total — a remote block is
+        // verifiable from the file alone.
+        let errs =
+            parse_workflow(&remote_doc(&[("kind", "worker"), ("remote", "buildbox")])).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("remote:") && e.contains("claude")),
+            "an omitted cli: must be refused: {errs:?}"
+        );
+        // …and it must say WHICH of the two mistakes it is, because the fix
+        // differs: change the CLI, or write the line you left out.
+        assert!(
+            errs.iter().any(|e| e.contains("inherits the group default")),
+            "the omitted-cli refusal must not read like the wrong-cli one: {errs:?}"
+        );
+
+        // The control.
+        let wf = parse_workflow(&remote_doc(&[
+            ("kind", "worker"),
+            ("cli", "claude"),
+            ("remote", "buildbox"),
+        ]))
+        .expect("cli: claude with a remote label must parse");
+        assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some("buildbox"));
+    }
+
+    #[test]
+    fn a_host_shaped_key_fails_the_whole_file() {
+        // The repo file SELECTS a label; the OPERATOR authors the address. A
+        // repo-authored host/port/identity_file would let whoever opens a PR
+        // direct execution onto any machine the operator can reach — so none of
+        // these is an unsupported field, each is an UNKNOWN one, and
+        // `deny_unknown_fields` on `RawBlock` fails the file over it.
+        //
+        // The whole-file part is the safe-downgrade property (#1436 part 4) and
+        // is why the legal sibling block is here: nothing partial comes back, so
+        // a build that does not understand a key can never run a roster the file
+        // did not describe. A build predating `remote:` refuses a file that
+        // declares it for exactly the same reason.
+        for key in [
+            "host",
+            "destination",
+            "port",
+            "user",
+            "identity_file",
+            "ssh_options",
+            "proxy_command",
+            "extra_args",
+        ] {
+            let doc = format!(
+                "version: 1\nblocks:\n  - id: legal\n    kind: worker\n    cli: claude\n\
+                 \x20 - id: b\n    kind: worker\n    cli: claude\n    {key}: example.com\n"
+            );
+            let errs = parse_workflow(&doc).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.contains(key)),
+                "{key}: the refusal must name the key the author wrote: {errs:?}"
+            );
+        }
+        // The control: the same two-block file with no stray key loads BOTH
+        // blocks, so the refusals above are about the key and not about the
+        // fixture.
+        let ok = parse_workflow(
+            "version: 1\nblocks:\n  - id: legal\n    kind: worker\n    cli: claude\n\
+             \x20 - id: b\n    kind: worker\n    cli: claude\n",
+        )
+        .expect("the control file must load");
+        assert_eq!(ok.blocks.len(), 2);
+    }
+
     #[test]
     fn intake_schema_field_inventory_is_exhaustively_named() {
         fn raw_workflow_fields(v: RawWorkflow) {
