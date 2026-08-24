@@ -763,6 +763,13 @@ export class Pane implements VoiceTargetPane {
    *  The thing that makes it read is the human speaking to it. */
   private mailChip: HTMLElement;
   private mailUnread = 0;
+  /** Whether an `orch-mailbox-changed` PUSH has ever been applied to this pane.
+   *  The seed read (`applyMailSeed`) is asynchronous and a push can land while
+   *  it is in flight, so without this the seed's older number would overwrite a
+   *  newer one — including a push of 0, which is how an emptied mailbox is
+   *  reported. A push is always the fresher of the two, so once one has arrived
+   *  the seed has nothing left to contribute. */
+  private mailPushed = false;
   /** Cross-workspace channel chip (#271): shown when this pane is a live channel
    *  member. Clicking it disconnects — the "easy close from the indicator itself"
    *  requirement — separate from the pane-menu Disconnect item, same destination. */
@@ -2785,6 +2792,20 @@ export class Pane implements VoiceTargetPane {
    *  would churn the DOM for nothing. Header chrome only — never touches the
    *  pane's size. */
   setMailUnread(unread: number): void {
+    // Every caller of THIS method is the push (`orch-mailbox-changed`); the
+    // seed goes through `applyMailSeed` below, which defers to it.
+    this.mailPushed = true;
+    this.renderMailUnread(unread);
+  }
+
+  /** Apply the one-shot seed read taken when this pane learned it is the
+   *  manager — but only while no push has arrived. See `mailPushed`. */
+  applyMailSeed(unread: number): void {
+    if (this.mailPushed) return;
+    this.renderMailUnread(unread);
+  }
+
+  private renderMailUnread(unread: number): void {
     const p = mailboxPresentation(unread);
     const next = p ? unread : 0;
     if (next === this.mailUnread) return;

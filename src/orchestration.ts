@@ -1648,12 +1648,16 @@ export const mailboxStatus = (groupId: string): Promise<number> =>
 export function seedMailUnread(pane: {
   orchGroupId: string | null;
   orchRole: string | null;
-  setMailUnread(unread: number): void;
+  applyMailSeed(unread: number): void;
 }): void {
   const groupId = pane.orchGroupId;
   if (!groupId || mailboxPanes([pane], groupId).length === 0) return;
+  // `applyMailSeed`, not `setMailUnread`: this read is in flight for a round
+  // trip, and a push that lands meanwhile is strictly fresher — including a
+  // push of 0, which is how an emptied mailbox is reported. The pane decides,
+  // because only it knows whether a push has already arrived.
   void mailboxStatus(groupId).then(
-    (unread) => pane.setMailUnread(unread),
+    (unread) => pane.applyMailSeed(unread),
     () => {}
   );
 }

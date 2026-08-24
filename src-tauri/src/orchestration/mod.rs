@@ -38497,6 +38497,12 @@ impl OrchRegistry {
             })
             .collect();
         list.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        // ONE read of the group record for the two fields below that need it.
+        // This is a POLL path — the group panel refreshes on a timer — so a
+        // second `self.group()` for `manager_declared` would be a second lock
+        // acquisition per tick for a value read out of the same record
+        // (INV-5's "latency-sensitive means cadenced").
+        let g = self.group(group);
         json!({
             "group": group,
             "live_agents": live.len(),
@@ -38521,7 +38527,7 @@ impl OrchRegistry {
             //
             // The per-class breakdown below still reports `manager`: the human
             // is told the pane is live, and told it is not spending a slot.
-            "max_agents": self.group(group).map(|g| g.guardrails.max_agents),
+            "max_agents": g.as_ref().map(|g| g.guardrails.max_agents),
             "live_delegates": live.iter().filter(|a| counts_against_max_agents(a.role)).count(),
             "paused": self.is_paused(group),
             "uptime_ms": earliest.map(|e| now.saturating_sub(e)),
@@ -38540,8 +38546,8 @@ impl OrchRegistry {
             // resumes on the roster it launched with and never re-reads
             // `.loomux/workflow.yml`, so the file is not what this group is
             // running.
-            "manager_declared": self
-                .group(group)
+            "manager_declared": g
+                .as_ref()
                 .map(|g| g.guardrails.block_for(Role::Manager).is_some())
                 .unwrap_or(false),
             "agents": list,
