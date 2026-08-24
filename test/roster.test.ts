@@ -475,9 +475,12 @@ test("a role_hint block gets an ADVISOR/PROCESS chip (#250/#324)", () => {
 test("a liaison block is badged LIAISON, and stays a reviewer first (#891)", () => {
   // The chip is the one glance that tells a human which reviewer-class pane is
   // the one THEY will be talking to — at the moment they consent to it existing.
+  // It also says the hint is SUPERSEDED by `kind: manager` (#1161 D4), because
+  // this row is where somebody launching a repo they did not write finds out.
+  // The chip is a note, never a refusal: the block still runs.
   assert.equal(
     describeBlock(block({ id: "human", kind: "reviewer", role_hint: "liaison" })),
-    "reviewer · claude · sonnet · LIAISON"
+    "reviewer · claude · sonnet · LIAISON (SUPERSEDED)"
   );
   // A value the backend would never resolve renders NO chip, rather than a
   // guessed label — the hint is not free text the roster will echo back.

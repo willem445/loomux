@@ -319,9 +319,13 @@ export function describeRoster(blocks: readonly RosterBlock[]): string {
  *  the backend wouldn't itself resolve renders no chip at all, rather than
  *  guessing at a label for a value that could never legitimately reach here. */
 function roleHintChip(hint: string | null | undefined): string | null {
-  return hint === "advisor" || hint === "process" || hint === "liaison"
-    ? hint.toUpperCase()
-    : null;
+  // `liaison` is superseded by `kind: manager` (#1161 D4) and says so HERE,
+  // because this row is the moment the human consents to the roster — the
+  // workflow pane's `role-hint-superseded` warning reaches whoever edits the
+  // file, and this reaches whoever launches it, who need not be the same
+  // person. It is a note, not a refusal: the hint parses and the block runs.
+  if (hint === "liaison") return "LIAISON (SUPERSEDED)";
+  return hint === "advisor" || hint === "process" ? hint.toUpperCase() : null;
 }
 
 /** The one-line description of a block for the roster table: what it is and what
