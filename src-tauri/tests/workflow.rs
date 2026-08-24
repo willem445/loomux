@@ -994,6 +994,7 @@ fn a_manager_block_never_carries_a_persona_even_from_a_hand_edited_group_json() 
         role_hint: None,
         effort: String::new(),
         context: String::new(),
+        remote: None,
     };
     assert!(!workflow::persona_allowed(&manager), "a manager block may never carry a persona");
     // The control, on an otherwise identical block: the predicate is about the
@@ -2720,6 +2721,7 @@ fn the_four_class_names_are_reserved_ids_for_their_own_class() {
                 role_hint: None,
                 effort: String::new(),
                 context: String::new(),
+                remote: None,
             },
             workflow::Block {
                 id: "worker".into(),
@@ -2733,6 +2735,7 @@ fn the_four_class_names_are_reserved_ids_for_their_own_class() {
                 role_hint: None,
                 effort: String::new(),
                 context: String::new(),
+                remote: None,
             },
             workflow::Block {
                 id: "worker".into(), // duplicate
@@ -2746,6 +2749,7 @@ fn the_four_class_names_are_reserved_ids_for_their_own_class() {
                 role_hint: None,
                 effort: String::new(),
                 context: String::new(),
+                remote: None,
             },
         ],
         ..Guardrails::default()
@@ -4850,6 +4854,7 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
                     role_hint: None,
                     effort: String::new(),
                     context: String::new(),
+                    remote: None,
                 }],
                 ..rails()
             },
@@ -6754,6 +6759,7 @@ fn block(id: &str, kind: Role) -> workflow::Block {
         role_hint: None,
         effort: String::new(),
         context: String::new(),
+        remote: None,
     }
 }
 
