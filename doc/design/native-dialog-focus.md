@@ -116,3 +116,13 @@ What is *not* on trust is the app-side rule the fix rests on. `test/nativedialog
 dialog still answering its own caller, the gate reopening on **both** settle paths, the gate shut
 from the moment of the request (the gap the report was lost in), and the focus reclaim suppressed
 while a dialog is outstanding — with the positive control that it runs otherwise.
+
+**Both halves are pinned at the source too, symmetrically.** A decision being correct says nothing
+about the app still routing through it, and both routes are one-line edits the compiler cannot see:
+`noUnusedLocals` catches deleting a call, never an honest revert that drops the import with it. So
+two source scans stand beside the behavioural tests — one refusing any `.pickDirectory` member
+access that is not the one inside the gate, one requiring every window-level `focus` listener in
+`src/` to route through `reclaimFocusOnWindowFocus`. Both are default-deny, keyed on the entity
+rather than on a binding's name, carry population controls, and state their blind spots where they
+are implemented. A suppression one line can walk around is no more a suppression than a gate one
+call site can walk around is a gate.

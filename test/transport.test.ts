@@ -353,7 +353,7 @@ class SlowPickerTransport extends RecordingTransport {
         this.release = res;
       });
     }
-    return Promise.resolve("C:\second-dialog");
+    return Promise.resolve("D:/second-dialog");
   }
 }
 
@@ -379,12 +379,12 @@ test("a second pickDirectory never reaches the transport while one is outstandin
     assert.equal(second, null, "a refused pick reads as a cancel, which every call site handles");
 
     // The dialog that IS up still answers its own caller.
-    slow.release("C:\Projects\loomux");
-    assert.equal(await first, "C:\Projects\loomux");
+    slow.release("D:/Projects/loomux");
+    assert.equal(await first, "D:/Projects/loomux");
 
     // And the gate reopens: a later Browse is admitted normally.
     slow.release = () => {};
-    assert.equal(await pickDirectory({ title: "again" }), "C:\second-dialog");
+    assert.equal(await pickDirectory({ title: "again" }), "D:/second-dialog");
   } finally {
     setEngineTransport(previous);
   }
