@@ -300,6 +300,29 @@ const STREAMS: StreamRow[] = [
     debt: null,
   },
   {
+    event: "orch-mailbox-changed",
+    rate: "producer",
+    bound: "argued-none",
+    cite: "src-tauri/src/orchestration/mod.rs",
+    reason:
+      "The manager pane's unread-mail chip (#1161 M5). Emitted from write_mailbox — the single " +
+      "mutation point — so its rate is set by an agent, not by a clock: the orchestrator's " +
+      "message_manager posts and the manager's own check_mail read. There is NO coalescer and no " +
+      "throttle, which is why this row is declared owned rather than claimed closed. What actually " +
+      "bounds it is a REFUSAL, and the vocabulary above has no term for one: past " +
+      "mailbox::UNREAD_MAX (32) unread rows the WRITER is refused, so an orchestrator cannot drive " +
+      "this stream past 32 emits without the manager consuming — and the manager consumes only when " +
+      "its human speaks to it. The budget is therefore ~32 emits per human turn, per group, and it " +
+      "is zero for the overwhelming majority of groups, which declare no manager and so never write " +
+      "the file at all. The webview cost of one emit is a filter over live panes plus one " +
+      "idempotent text write on at most one of them (MANAGER_MAX is 1): setMailUnread returns early " +
+      "on an unchanged count, so a re-push costs the scan and nothing else. No view refresh and no " +
+      "refetch hang off this stream, so INV-4's visibility question does not arise for it — a chip " +
+      "on a pane nobody is looking at is a DOM write already paid for.",
+    debt: "#1161 owns it: if the mailbox ever gains a writer that is not turn-bound, the refusal cap " +
+      "stops being the bound and this row needs a real one.",
+  },
+  {
     event: "orch-group-ended",
     rate: "lifecycle",
     bound: "argued-none",

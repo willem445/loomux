@@ -892,6 +892,29 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   color: var(--state-attention); background: color-mix(in srgb, var(--state-attention) 22%, transparent);
 }
 
+/* The manager pane's unread-mail chip (#1161 M5). Same header-chrome geometry
+   and the same shrink factor as `.pane-queue` above — one chip is allowed to
+   give up its room before the title (the pane's drag handle) does, and a manager
+   pane can wear both — but in the manager's own identity color rather than the
+   neutral one, so the chip reads as belonging to the pane it is on. Not the
+   attention palette: unread mail is a state of affairs, not something going
+   wrong, and the pane it sits on is the human's own. */
+.pane-mail {
+  flex: 0 100 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 9px; font-weight: 600; letter-spacing: 0.3px;
+  border: 1px solid color-mix(in srgb, var(--id-orchid) 35%, transparent); border-radius: 4px; padding: 1.5px 6px;
+  color: var(--id-orchid); background: color-mix(in srgb, var(--id-orchid) 16%, transparent);
+}
+/* The dock-chip mirror for a minimized manager pane (#1161 M5) — see
+   grid.ts's renderDock, and `.dock-chip-queue` above for the shape. */
+.dock-chip-mail {
+  flex: none;
+  font-size: 8.5px; font-weight: 700;
+  border-radius: 3px; padding: 0 3px;
+  color: var(--id-orchid); background: color-mix(in srgb, var(--id-orchid) 22%, transparent);
+}
+
 /* ---------- cross-workspace channels (#271) ---------- */
 /* The connect gesture's three visual states, each independent (so they never fight
    the grouped/attention box-shadow stripes above): an ARMED pane (right-clicked,
