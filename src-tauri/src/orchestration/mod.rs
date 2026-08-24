@@ -26583,15 +26583,9 @@ impl OrchRegistry {
             .collect();
         // No notes: the panel projects six identity/status fields off a joined
         // row and renders no conversation (#1317).
-        let tasks: Vec<BoardTask> = if wanted.is_empty() {
-            Vec::new()
-        } else {
-            self.tasks(group)
-                .into_iter()
-                .filter(|t| wanted.contains(t.id.as_str()))
-                .map(|t| board_task(t, false))
-                .collect()
-        };
+        let _ = &wanted;
+        let tasks: Vec<BoardTask> =
+            self.tasks(group).into_iter().map(|t| board_task(t, false)).collect();
         Ok(NeedsYouRead { view, tasks })
     }
 
