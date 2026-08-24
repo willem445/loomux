@@ -918,6 +918,15 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   it always reads this file, which is why one surface here and two for the reviewer is principled
   rather than an omission.
 
+  **The reviewer's steps renumber**, because the premortem is the new step 3: *label every
+  finding* is now 4, *post the review* 5, and *report* 6. Every reference to a step number
+  OUTSIDE the file names step 1 (`doc/design/orchestration.md`, and this file's own #338/#359
+  worktree entry), which does not move — with one exception, and it is an entry above rather
+  than a live pointer: **#850's entry says "Step 5 already said the findings stay on the PR"**,
+  and that step is now 6. It is left as written, per *Reading the entries above this one*: an
+  entry records what its own round changed, and rewriting it to today's numbering would falsify
+  the record instead of correcting it. Read every step number in an entry as dated to that entry.
+
   `mechanics_core(Reviewer)` carries the same pair in lockstep, for the reason every reviewer
   duty in that function does: a `mode: replace` persona never reads `reviewer.md`, so a duty
   living only in the template is one the repo that wrote its own reviewer never hears.
