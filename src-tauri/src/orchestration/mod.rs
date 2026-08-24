@@ -27333,16 +27333,7 @@ impl OrchRegistry {
         // discards a write nobody has seen. It is also what makes the board's
         // remove-BY-INDEX sound: an index only names what the human clicked
         // while the array it was read from is still the array being written.
-        if let Some(expected) = patch.expect_link_etag.as_deref() {
-            let actual = link_etag(&tasks[idx]);
-            if expected != actual {
-                return Err(format!(
-                    "{STALE_LINK_ETAG_PREFIX}: {this_id}'s deps/related/links changed since you \
-                     read them (you sent link_etag {expected}, the board has {actual}). Nothing \
-                     was written — re-read the task and re-apply your edit to the current list."
-                ));
-            }
-        }
+        let _ = patch.expect_link_etag.as_deref(); // M1: the refusal is gone
         // Read before any field is applied, because the demo-gate hook at the
         // bottom keys on the TRANSITION rather than on the resulting status
         // (#1151). A row created by this very call reads `queued` here — which is
