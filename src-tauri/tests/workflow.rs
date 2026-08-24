@@ -7345,7 +7345,7 @@ fn the_dogfood_reviewer_persona_carries_the_question_set() {
         Ok(Some(wf)) => wf,
         other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
     };
-    let block = wf.block("rev-lead").expect("the roster's one reviewer lane is rev-lead");
+    let block = wf.block("rev-lead").expect("rev-lead is the roster's JUDGING reviewer lane");
     let rel = block.profile.as_deref().expect("rev-lead must point at a persona file");
     let p = profiles::load_block_profile(&repo, rel, block.kind).unwrap_or_else(|e| panic!("rev-lead: {e}"));
     let body = flat(&p.instructions);
@@ -7376,6 +7376,119 @@ fn the_dogfood_reviewer_persona_carries_the_question_set() {
         "an empty or \"n/a\" section is a finding against the review, not a pass",
         "the enforcement rule that makes the five headings load-bearing rather than \
          decorative (#1292 PR B, review round 2 N2)",
+    );
+}
+
+#[test]
+fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
+    // #1388's sibling of the question-set pin above, and for the same reason: these
+    // three personas are INSTRUMENTS, and every safety property the gate argument
+    // rests on lives as a sentence in a markdown file. A rule deleted from one of
+    // them costs nothing at compile time and silently converts a lane from "fails
+    // only on a quotable absence" into "fails on whatever a small model felt".
+    //
+    // The four defects #1388 found by running these checklists against its own PR
+    // were all FALSE BLOCKS — a lane refusing a healthy change — which is the one
+    // direction `all-pass` over four lanes is not safe in. Hence a pin, not a
+    // comment.
+    let repo = repo_root();
+    let wf = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => wf,
+        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
+    };
+
+    // Derived from the ROSTER by capability + CLI, never from a hardcoded id list:
+    // a fourth cheap lane added later is covered the day it is declared, and a
+    // renamed one does not quietly stop being checked.
+    let lanes: Vec<&workflow::Block> = wf
+        .blocks
+        .iter()
+        .filter(|b| b.kind == Role::Reviewer && b.cli == "opencode")
+        .collect();
+
+    // POPULATION CONTROL, counted at the VERIFIED site below rather than here: an
+    // empty or shrunken list would sail through the loop and certify nothing.
+    assert_eq!(
+        lanes.len(),
+        3,
+        "expected the three cheap lanes; got {:?} — if a lane was added or removed, move this \
+         number in the same commit",
+        lanes.iter().map(|b| b.id.as_str()).collect::<Vec<_>>()
+    );
+
+    let mut verified = 0usize;
+    for b in &lanes {
+        let rel = b.profile.as_deref().unwrap_or_else(|| panic!("{}: a lane must carry a persona file", b.id));
+        let p = profiles::load_block_profile(&repo, rel, b.kind)
+            .unwrap_or_else(|e| panic!("{}: {e}", b.id));
+        let body = flat(&p.instructions);
+        let label = format!("{rel}");
+
+        // The three rules EVERY lane owes, whatever it checks.
+        pinned(
+            &label,
+            &body,
+            "anything not on your checklist is silent",
+            "the rule that stops a small model volunteering judgment it was never asked for — \
+             without it a lane starts reporting opinions rev-lead already owns (#1388)",
+        );
+        pinned(
+            &label,
+            &body,
+            "never review design, architecture, naming, wording, style, or formatting",
+            "the explicit scope floor: these lanes are instruments, and design review is \
+             rev-lead's alone (#1388)",
+        );
+        pinned(
+            &label,
+            &body,
+            "when in doubt, `escalate`",
+            "the tiebreak that keeps an undecidable check off the FAIL path, where it would \
+             read as a defect the author has to answer for (#1388)",
+        );
+
+        // The FAIL rule itself — the load-bearing half of the all-pass safety argument.
+        // Two spellings, because qr-constraints' checks are sweeps whose failure is a
+        // line PRESENT rather than an artifact absent; both say the same thing, that a
+        // FAIL must be quotable.
+        let fail_rule = if b.id == "qr-constraints" {
+            "fail means a line you can quote"
+        } else {
+            "fail means absence of a named artifact you can quote"
+        };
+        pinned(
+            &label,
+            &body,
+            fail_rule,
+            "the whole reason all-pass over four lanes is safe: a lane may only refuse on \
+             something it can paste, never on judgment (#1388)",
+        );
+
+        verified += 1;
+    }
+    assert_eq!(verified, lanes.len(), "every lane found must also have been checked");
+
+    // qr-constraints alone owes the zero-shaped-sweep rules: five of its six checks
+    // succeed by printing NOTHING, and an uncontrolled zero is byte-identical to a
+    // grep that never worked. CLAUDE.md states this for the repo; a small model will
+    // not infer it, so it has to be in the prompt — and therefore pinned.
+    let qc = wf.block("qr-constraints").expect("the constraints lane");
+    let qcp = profiles::load_block_profile(&repo, qc.profile.as_deref().unwrap(), qc.kind)
+        .expect("qr-constraints persona");
+    let qcbody = flat(&qcp.instructions);
+    pinned(
+        ".github/agents/qr-constraints.md",
+        &qcbody,
+        "never record `pass` off an uncontrolled zero",
+        "the positive-control rule: without it a broken grep reads as a clean sweep, which \
+         is the one way this lane can silently certify nothing (#1388)",
+    );
+    pinned(
+        ".github/agents/qr-constraints.md",
+        &qcbody,
+        "do not pipe a sweep through `| wc -l`",
+        "the specific form that discards grep's exit code and turns a broken command into a \
+         confident 0 (CLAUDE.md's zero-shaped-sweep rule, #1388)",
     );
 }
 

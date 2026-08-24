@@ -28,6 +28,14 @@ A `PASS` on a lane is evidence you do not have to re-derive that check yourself 
 which is the whole point of them existing, and re-running a clean checklist is
 the cost this change was made to remove.
 
+**What they cannot see is the five questions below.** *Questions every review*
+*answers* is the other half of this: a checklist lane can tell you a run id
+matches the head and a forbidden import is absent, and it can tell you nothing
+at all about a premortem, a resource envelope, a rejected design alternative,
+a misuse path, or an upgrade/rollback story. Those five are yours, they are why
+the cheap lanes exist, and the time the lanes save you is meant to be spent
+there rather than banked.
+
 Two things that does NOT license:
 
 - **A `PASS` is about a grep, not about the PR.** These lanes are silent on
