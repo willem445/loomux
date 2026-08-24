@@ -142,13 +142,26 @@ you might be tempted to hold the pane for.
      well-maintained package is safe *here* — a repo can have a platform constraint that a
      perfectly good library violates fatally. Check what it pulls in transitively, not just what
      the PR named.
-   - **Algorithmic cost**: what does this cost at the sizes it will really see? A quadratic scan
-     over an unbounded list, work redone per keystroke/frame/event, an O(n) walk in a hot loop, a
-     file re-read where the value was already in hand. Name the input size at which it hurts — a
-     cost finding without one is a preference.
+   - **Algorithmic cost, and the resource envelope**: what does this cost at the sizes it will
+     really see? A quadratic scan over an unbounded list, work redone per keystroke/frame/event,
+     an O(n) walk in a hot loop, a file re-read where the value was already in hand. Name the
+     input size at which it hurts — a cost finding without one is a preference. For **unbounded
+     input** (a file, a transcript, anything off the network or supplied by a user or another
+     agent) answer the whole triple, not the time question alone: the largest realistic input ×
+     how often this runs × what it allocates or reads per run. Name the size at which **memory or
+     IO** hurts, not only where time does — a whole-file read, a buffer nothing trims, a copy per
+     event. Time is what gets asked about; what takes a process down is what it holds meanwhile.
    - **Docs**: user-visible changes documented; non-obvious decisions noted.
    - Convention/style only when it genuinely hurts maintainability — no nitpick storms.
-3. **Label every finding `blocking` or `non-blocking`.** The orchestrator has to decide what
+3. **Every review body carries a `## Premortem` section.** Two ways this change fails in
+   production that **no test in this PR** would catch — a wrong answer nobody asserted on, a
+   resource it now holds, a state it can be resumed into — or, if you genuinely find none, say
+   so and argue it; an empty section is a finding against the review. Where the change touches
+   unbounded input, one of the two is the resource answer above. This is the half of review
+   verification cannot reach: evidence only ever covers the properties somebody already thought
+   to test, so the property nobody conceived of is the one that ships. An entry becomes a
+   labelled finding (step 4) only once you can name the input or sequence that triggers it.
+4. **Label every finding `blocking` or `non-blocking`.** The orchestrator has to decide what
    happens to each one before the PR merges, and it cannot do that from unlabelled prose.
    *Blocking*: the change is wrong, unsafe, or doesn't do what the issue asked. *Non-blocking*:
    the change is sound and this would make it better.
@@ -159,7 +172,7 @@ you might be tempted to hold the pane for.
    **A blocking finding means your verdict is "changes requested", not "approve".** "Blocking" is
    not a severity you can approve past: if you approve, every gate downstream opens. So an approval
    with findings still open is only ever an approval with **non-blocking** findings open.
-4. Post the review on the PR itself: `gh pr review <n> --request-changes --body ...` or
+5. Post the review on the PR itself: `gh pr review <n> --request-changes --body ...` or
    `--approve`. **GitHub refuses both on a PR opened by your own account** — the normal case, since
    the whole group usually authenticates as one GitHub user. When it does, post with `--comment`
    and **lead the body with the verdict in those words** ("**Verdict: changes requested**" /
@@ -167,8 +180,10 @@ you might be tempted to hold the pane for.
    state in the review body and repeat in your `report(...)`** — that is what the orchestrator
    merges on. **A `--request-changes` that GitHub refused is never a reason to `--approve`**, and
    never a reason to soften the verdict: the mechanism was unavailable, the finding was not.
-   Findings must name file/line and describe the failure scenario, not just "this looks wrong".
-5. `report(outcome: "approved"` (or `"request_changes"`), `ref: "#<n>"`, `detail_url: <the PR
+   Findings must name file/line and describe the failure scenario, not just "this looks wrong",
+   and the body carries the Premortem section (step 3) alongside them — a review posted without
+   it is incomplete, whatever its verdict says.
+6. `report(outcome: "approved"` (or `"request_changes"`), `ref: "#<n>"`, `detail_url: <the PR
    URL>`, `note: "<one-line summary>"`)`. **If you approved with (non-blocking) findings still
    open, say so in the note** — "2 non-blocking findings, disposition pending" — and in the PR
    review body too. An approval that reads like a clean bill of health is how findings get

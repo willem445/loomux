@@ -877,3 +877,30 @@ for (const [f,ks] of Object.entries(keys)) {
 
 Both files come out of the same working tree, so both carry that tree's line endings and the
 comparison is honest either way. If it still says MISMATCH, that is a real one.
+
+- **#1292, the review premortem and the resource envelope** — `reviewer.md` and
+  `orchestrator.md`; `worker.md`, `planner.md` and `manager.md` did not move.
+
+  Every review body now carries a fixed **`## Premortem`** section: two ways the change fails in
+  production that no test in the PR would catch, or an argued none. That is question
+  *generation*, and it is the half of review that the evidence discipline structurally cannot
+  reach — red-before-green proves the tests somebody already thought to write, and says nothing
+  about the property nobody conceived of, which is the class that ships behind a green suite. The
+  **Algorithmic cost** lane gains the other half in the same argument: for unbounded input (a
+  file, a transcript, anything off the network or supplied by a user or another agent) the
+  question is the whole triple — largest realistic input × how often it runs × what it allocates
+  or reads per run — and it must name the size at which *memory or IO* hurts, not only where time
+  does. The reviewer's steps renumber (the premortem is the new step 3), and the posting step
+  states that the body carries the section.
+
+  `orchestrator.md`'s **disposition step** gains the rule that makes the section load-bearing
+  rather than advisory: a review that arrives without it is an *incomplete review, not an
+  approval* — the reviewer goes back for it — and a premortem entry that names the input or
+  sequence triggering it is dispositioned like any other finding, while one that names neither is
+  the reviewer's record of what it looked for. The rule is section-scoped deliberately and is
+  **not** in the INVARIANTS digest: it is a procedure inside one step, not a rule whose loss to a
+  compaction costs a merge.
+
+  `mechanics_core(Reviewer)` carries the same pair in lockstep, for the reason every reviewer
+  duty in that function does: a `mode: replace` persona never reads `reviewer.md`, so a duty
+  living only in the template is one the repo that wrote its own reviewer never hears.
