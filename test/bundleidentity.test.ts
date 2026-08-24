@@ -28,7 +28,19 @@
 //   - The SHAPE scan is the exhaustive half, and it is default-deny: every
 //     `<token>.exe` / `<token>.pdb` in those files must BE the binary name or
 //     be on ALLOW with a reason. It decides on the shape of the token, never on
-//     the name of the binding around it, so a rename cannot step over it.
+//     the name of the binding around it, so a rename cannot step over it. Its
+//     regex is cross-checked against a raw count of `.exe`/`.pdb` in the same
+//     file, so a pattern that cannot see one of its own subjects fails as a
+//     blind instrument rather than passing as "no offenders".
+//
+// What the SHAPE half does NOT see, stated rather than left to be discovered:
+// the binary's name where it appears WITHOUT its extension — `Contents/MacOS/
+// <name>`, `/usr/bin/<name>`, `-p <name>`, `cargo … -p <name>`. There is no
+// shape to key on there; a bare word is just a word. Those sites are covered by
+// SITES rows instead, which means they are covered only where someone listed
+// them: a NEW file that names the binary bare is invisible to this test. The
+// same is true of a name assembled at runtime (`"orrer" + "ix.exe"`). Neither
+// exists today.
 //
 // See doc/design/rebrand-bundle.md.
 import { test } from "node:test";
@@ -160,6 +172,33 @@ const SHAPE_FILES = [
 const SHAPE = /([A-Za-z0-9_.${}-]+)\.(?:exe|pdb)(?![A-Za-z0-9_])/g;
 
 /**
+ * The same subjects counted WITHOUT the name pattern — the instrument's own
+ * cross-check. `SHAPE`'s character class is a guess about the alphabet an
+ * executable name may be spelled with, and a guess that stops one character
+ * short silently drops a subject and reports a clean scan.
+ */
+const RAW_SHAPE = /\.(?:exe|pdb)(?![A-Za-z0-9_])/g;
+
+/**
+ * ...and the reconciliation: a raw hit SHAPE did not match is only acceptable
+ * when the character in front of the dot means there is no name in front of it.
+ * Default-deny on that character, so an alphabet gap fails loudly instead of
+ * being absorbed as "just prose".
+ */
+const NAMELESS_BEFORE: Array<{ ch: string; why: string }> = [
+  { ch: " ", why: "prose naming a bare extension: `the Windows .pdb.zip`" },
+  { ch: "`", why: "a backticked bare extension in a comment: `` `.exe`-suffixed ``" },
+  {
+    ch: "\\",
+    why:
+      "a JS regex literal escaping the dot (`/-setup\\.exe$/`). NOTE the residual this " +
+      "names: SHAPE cannot see a name behind an escaped dot, so a regex spelled " +
+      "`/orrerix\\.exe$/` would be invisible to the shape half. No such regex exists today; " +
+      "if one is added it needs a SITES row.",
+  },
+];
+
+/**
  * Tokens the shape scan sees that are NOT this binary, each with the reason.
  * Default-deny: anything not listed is a finding. A row nothing matches any
  * more is asserted stale below, so the list cannot rot into a blanket
@@ -225,6 +264,10 @@ type Scan = {
   offenders: string[];
   siteHits: Map<string, number>; // "file: what" -> matches the pattern made
   shapeHits: Map<string, number>; // file -> tokens that ARE the expected name
+  seenShapes: Map<string, number>; // file -> tokens the SHAPE pattern matched at all
+  rawShapes: Map<string, number>; // file -> raw `.exe`/`.pdb` occurrences
+  unexplained: string[]; // raw hits SHAPE missed whose preceding char is not on NAMELESS_BEFORE
+  namelessHit: Set<string>;
   allowedHit: Set<string>;
   rows: AllowRow[]; // ALLOW plus the derived legacy-name row
 };
@@ -237,6 +280,10 @@ function scan(expected: string): Scan {
   const offenders: string[] = [];
   const siteHits = new Map<string, number>();
   const shapeHits = new Map<string, number>();
+  const seenShapes = new Map<string, number>();
+  const rawShapes = new Map<string, number>();
+  const unexplained: string[] = [];
+  const namelessHit = new Set<string>();
   const allowedHit = new Set<string>();
 
   // The legacy-name exemption is derived, not typed: it is exactly the string
@@ -262,11 +309,31 @@ function scan(expected: string): Scan {
   }
 
   for (const file of SHAPE_FILES) {
-    const lines = read(file).split(/\r?\n/);
+    const src = read(file);
+    const lines = src.split(/\r?\n/);
+    let raw = 0;
+    for (const m of src.matchAll(new RegExp(RAW_SHAPE.source, "g"))) {
+      raw += 1;
+      const before = m.index! > 0 ? src[m.index! - 1] : "";
+      if (/[A-Za-z0-9_.${}-]/.test(before)) continue; // SHAPE will have matched it
+      const row = NAMELESS_BEFORE.find((r) => r.ch === before);
+      if (row) {
+        namelessHit.add(row.ch);
+        raw -= 1; // deliberately nameless: nothing here for SHAPE to check
+        continue;
+      }
+      unexplained.push(
+        `${file}: a ".exe"/".pdb" preceded by ${JSON.stringify(before)}, which is neither a ` +
+          `character SHAPE can read as part of a name nor an argued NAMELESS_BEFORE row`
+      );
+    }
+    rawShapes.set(file, raw);
     let mine = 0;
+    let seen = 0;
     lines.forEach((line, i) => {
       for (const m of line.matchAll(new RegExp(SHAPE.source, "g"))) {
         const token = m[1];
+        seen += 1;
         if (token === expected) {
           mine += 1;
           continue;
@@ -282,14 +349,25 @@ function scan(expected: string): Scan {
       }
     });
     shapeHits.set(file, mine);
+    seenShapes.set(file, seen);
   }
 
-  return { offenders, siteHits, shapeHits, allowedHit, rows };
+  return { offenders, siteHits, shapeHits, seenShapes, rawShapes, unexplained, namelessHit, allowedHit, rows };
 }
 
 test("every surface that spells the executable's name agrees with src-tauri/Cargo.toml", () => {
   const expected = cargoBinaryName();
-  const { offenders, siteHits, shapeHits, allowedHit, rows } = scan(expected);
+  const {
+    offenders,
+    siteHits,
+    shapeHits,
+    seenShapes,
+    rawShapes,
+    unexplained,
+    namelessHit,
+    allowedHit,
+    rows,
+  } = scan(expected);
 
   // The finding first, the controls after. A half-rename trips several of
   // these at once — every stale site AND "this file no longer mentions the new
@@ -324,6 +402,37 @@ test("every surface that spells the executable's name agrees with src-tauri/Carg
       n > 0,
       `${file} carries no "${expected}.exe"/"${expected}.pdb" occurrence at all — either the ` +
         `binary reference moved out of it (drop the row) or the scan has gone blind to it`
+    );
+  }
+
+  // The instrument, checked against a raw count of its own container. Every
+  // literal `.exe`/`.pdb` in a scanned file must have produced a SHAPE match,
+  // or be one the reconciliation below explains away; the ones the pattern
+  // cannot see are unguarded — they could be renamed alone and this test would
+  // still report a clean scan.
+  assert.deepEqual(
+    unexplained,
+    [],
+    `a ".exe"/".pdb" occurrence sits behind a character SHAPE's class does not cover, and ` +
+      `nothing on NAMELESS_BEFORE explains it. Either widen the class (if a name can really ` +
+      `be spelled that way) or add an argued NAMELESS_BEFORE row.\n` + unexplained.join("\n")
+  );
+  for (const { ch, why } of NAMELESS_BEFORE) {
+    assert.ok(
+      namelessHit.has(ch),
+      `NAMELESS_BEFORE carries ${JSON.stringify(ch)} (${why}) but nothing in the scanned ` +
+        `files sits behind it any more — drop the row rather than leaving an unexamined ` +
+        `exemption behind`
+    );
+  }
+  for (const file of SHAPE_FILES) {
+    assert.equal(
+      seenShapes.get(file) ?? 0,
+      rawShapes.get(file) ?? 0,
+      `in ${file} the SHAPE pattern matched ${seenShapes.get(file) ?? 0} of the ` +
+        `${rawShapes.get(file) ?? 0} literal ".exe"/".pdb" occurrences. Its character class ` +
+        `is a guess about the alphabet an executable name may be spelled with, and it just ` +
+        `came up short on one of its own subjects.`
     );
   }
 
