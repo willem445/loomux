@@ -21,7 +21,7 @@
 // injects (#1317). The gh half goes through issues.ts's typed wrapper, which
 // is where every gh command already lives.
 import { ghActivity, type GhActivity } from "./issues";
-import { RefreshGate } from "./refreshgate";
+import { RefreshGate } from "./refreshgate";
 import { AuditStore } from "./auditstore";
 import {
   CATEGORY_ORDER,
