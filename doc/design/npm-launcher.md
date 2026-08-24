@@ -210,9 +210,11 @@ Two things a reader of this file needs and cannot infer from the code alone:
   are indifferent to the product-name prefix in both directions. They are now one
   pure `assetPattern(platform, arch)`, pinned against both spellings.
 - **The product name and the binary name are different strings** — the bundle is
-  `Orrerix.app` and the executable inside it is `loomux`, because `mainBinaryName`
-  is unset and Tauri then takes cargo's output. The install and running-app probes
-  read one of each (#1294).
+  `Orrerix.app` and the executable inside it is `orrerix` — the same word, but from a
+  different config field: `mainBinaryName` is unset, so Tauri takes cargo's output,
+  which #1562 renamed on its own axis. The install and running-app probes read one of
+  each, and both accept the pre-#1562 `loomux` spelling too (#1294, #1562).
 
 Full argument, including why an Orrerix install lands *beside* a Loomux one
-rather than replacing it: `doc/design/rebrand-external.md`.
+rather than replacing it: `doc/design/rebrand-external.md`. The binary axis and its
+upgrade behaviour: `doc/design/rebrand-bundle.md`.

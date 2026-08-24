@@ -79,7 +79,7 @@ Each pane is a ConPTY (`OpenConsole.exe` host) plus its child process tree. The 
 CLI (`claude`/`copilot`) **is** the child — spawned directly, no wrapper shell:
 
 ```
-loomux.exe
+orrerix.exe
 ├─ OpenConsole.exe … (ConPTY host, 1 per pane — inherent)
 └─ claude.exe --session-id … --mcp-config … (the agent — inherent)
 ```

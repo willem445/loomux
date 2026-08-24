@@ -186,6 +186,9 @@ that *does* exist is Windows':
 - `%LOCALAPPDATA%\CrashDumps` — a dump, if local dump collection is enabled
   (it is off by default; see Microsoft's [Collecting user-mode
   dumps](https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps)).
+  Windows names these after the executable, so look for `orrerix.exe.<pid>.dmp`.
+  A dump from a build before the executable was renamed is `loomux.exe.<pid>.dmp`
+  and is just as useful — attach whichever you find.
 - **Event Viewer → Windows Logs → Application**, source `Application Error` —
   always written, and it carries the exception code. `0xc0000409` is what a Rust
   binary's own `abort()` looks like from outside.

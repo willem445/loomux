@@ -421,7 +421,7 @@ not a bug Microsoft will fix:
   `ReleaseChannel{Preference,s}`) stores itself as a **key**, not a value,
   containing one Value-Name/Value pair per app (name = exe name/AUMID, or
   `*` for all apps). Restructuring the write to match that convention
-  (`...\WebView2\AdditionalBrowserArguments` as the key, `loomux.exe` as the
+  (`...\WebView2\AdditionalBrowserArguments` as the key, the app's own exe name (`orrerix.exe`) as the
   value name) fixed it: the CDP port opened, and 2 of 3 specs passed in CI on
   the very next run (the third had an unrelated drag-timing flake, since
   fixed — see `pane-reorder.spec.ts`).
