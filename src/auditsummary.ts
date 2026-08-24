@@ -24,6 +24,29 @@ export function str(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
+/** Row identity for the audit viewer's expand/collapse toggle. `ts_ms` alone
+ *  collides when the same actor logs the same action within one millisecond
+ *  (e.g. two prompt deliveries), so the detail is hashed in to disambiguate. */
+export function entryKey(e: AuditEntry): string {
+  let h = 5381;
+  const detail = JSON.stringify(e.detail ?? "");
+  for (let i = 0; i < detail.length; i++) h = ((h << 5) + h + detail.charCodeAt(i)) | 0;
+  return `${e.ts_ms}|${e.actor}|${e.action}|${h >>> 0}`;
+}
+
+/** Prune an expand/collapse set down to keys that still name a loaded entry,
+ *  returning a fresh set (#1316). The audit log itself is append-only, but
+ *  `orch_audit` returns only its most recent `AUDIT_VIEW_LIMIT` window
+ *  (mod.rs) — as new lines push old ones out of that window on the next poll,
+ *  their expand state becomes unreachable and would otherwise accumulate for
+ *  the life of the pane. */
+export function retainExpanded(expanded: Iterable<string>, entries: readonly AuditEntry[]): Set<string> {
+  const present = new Set(entries.map(entryKey));
+  const live = new Set<string>();
+  for (const key of expanded) if (present.has(key)) live.add(key);
+  return live;
+}
+
 /** A `*_ms` duration as whole minutes, for the lock lifecycle lines (#858).
  *  Rounds UP so a 40-second hold reads "1 min" rather than "0 min", which
  *  would read as a bug in the mechanism rather than a short hold. Non-numeric

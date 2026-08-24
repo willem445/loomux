@@ -30,9 +30,11 @@ import {
   WINDOW_PRESETS,
   categoryOf,
   coverageNotes,
+  eventKey,
   extractTimeline,
   filterTimeline,
   resolveWindow,
+  retainExpandedEvents,
   type TimelineCategory,
   type TimelineEvent,
   type TimelineExtraction,
@@ -380,6 +382,13 @@ export class TimelineView {
     const filtered = filterTimeline(extraction.events, range, this.categories);
     const widthPx = Math.round(this.chartEl.clientWidth);
 
+    // Prune the expand toggle to what's actually loaded (#1316): before this,
+    // `expanded` was only ever cleared wholesale on a dot click (below), so a
+    // row expanded while its cluster stayed selected across a poll could sit
+    // stranded once its event aged out of `orch_audit`'s window. Must run
+    // before `sig` is built — it feeds `this.expanded.size` below.
+    this.expanded = retainExpandedEvents(this.expanded, extraction.events);
+
     // Skip a no-op follow re-render: rebuilding the SVG under the human's
     // pointer (and collapsing an open detail row) for identical data is the
     // same fight with the human the audit view's own signature avoids. The
@@ -647,7 +656,7 @@ export class TimelineView {
   private renderDetailRow(ev: TimelineEvent): HTMLElement {
     // Keyed by the EVENT, never by its index: a follow poll shifts every index
     // in `filtered`, which would silently collapse (or worse, move) an open row.
-    const key = `${ev.ts_ms}|${ev.kind}|${ev.label}`;
+    const key = eventKey(ev);
     const row = el("div", "timeline-detail-row");
     const top = el("div", "timeline-detail-top expandable");
     top.append(el("span", "timeline-detail-caret", this.expanded.has(key) ? "▾" : "▸"));

@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { badgeFor, agentSeq, metaForGroup, resetGroupMeta, roleLabel } from "../src/orchbadge.ts";
+import { badgeFor, agentSeq, forgetGroupMeta, metaForGroup, resetGroupMeta, roleLabel } from "../src/orchbadge.ts";
 
 type Role = "orchestrator" | "worker" | "reviewer" | "planner" | "manager";
 const req = (group_id: string, agent_id: string, role: Role) => ({ group_id, agent_id, role });
@@ -133,6 +133,33 @@ test("distinct groups get distinct colors in first-seen order", () => {
   assert.notEqual(a.color, b.color);
   // Re-deriving gA keeps its original color (order is remembered, not re-minted).
   assert.equal(badgeFor(req("gA", "w-9", "worker")).color, a.color);
+});
+
+test("forgetGroupMeta actually shrinks the map, and leaves other groups alone (#1316)", () => {
+  // groupMeta had no production caller that ever shrank it — it grew for the
+  // life of the window as groups came and went (only test-only resetGroupMeta
+  // cleared the whole thing). orch-group-ended now forgets one group's entry.
+  //
+  // `tag` is `groupMeta.size + 1` at mint time, so it's a direct witness of the
+  // map's size: forgetting gA must free its slot, or gC below mints the tag gD
+  // would have gotten instead — an assertion a no-op forgetGroupMeta would fail.
+  metaForGroup("gA"); // tag 1
+  const b = metaForGroup("gB"); // tag 2
+  forgetGroupMeta("gA");
+  const c = metaForGroup("gC"); // gA's slot freed → tag 2, not 3
+  assert.equal(c.tag, 2, "gA's entry was actually removed, not just shadowed");
+  // gB's own assignment is untouched by forgetting a DIFFERENT group.
+  assert.equal(metaForGroup("gB").tag, b.tag);
+  assert.equal(metaForGroup("gB").color, b.color);
+  // gA is genuinely forgotten, not merely re-served stale state: re-deriving it
+  // mints a fresh entry (tag 3) rather than handing back its old tag (1).
+  assert.equal(metaForGroup("gA").tag, 3);
+});
+
+test("forgetGroupMeta on an unknown group is a no-op", () => {
+  const a = badgeFor(req("gA", "w-1", "worker"));
+  forgetGroupMeta("never-seen");
+  assert.equal(badgeFor(req("gA", "w-2", "worker")).color, a.color);
 });
 
 test("the color palette wraps after it is exhausted rather than going undefined", () => {

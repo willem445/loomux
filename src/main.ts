@@ -438,6 +438,10 @@ const orchWiring: OrchWiring = {
     tabs.bindGroup(groupId, ws.id);
     persistTabs();
   },
+  forgetGroup(groupId): void {
+    tabs.forgetGroup(groupId);
+    persistTabs();
+  },
   refreshTabBar(): void {
     tabs.touch();
   },

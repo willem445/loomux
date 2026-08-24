@@ -9,7 +9,7 @@
 // test runner can't parse — see that file's header. Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { summarize, type AuditEntry } from "../src/auditsummary.ts";
+import { entryKey, retainExpanded, summarize, type AuditEntry } from "../src/auditsummary.ts";
 
 function entry(action: string, detail: unknown, actor = "w-1"): AuditEntry {
   return { ts_ms: 0, actor, action, detail };
@@ -313,4 +313,48 @@ test("every lock action has its own case — none falls through to raw JSON", ()
     assert.ok(s.length > 0, `${action} rendered nothing`);
     assert.ok(!s.startsWith("{"), `${action} fell through to the raw-JSON default: ${s}`);
   }
+});
+
+// --- entryKey / retainExpanded: the audit viewer's expand-toggle prune (#1316) ---
+//
+// AuditView.expanded had no production caller that ever pruned it. The log
+// itself is append-only, but `orch_audit` returns only the most recent
+// AUDIT_VIEW_LIMIT window — as new lines push old ones out on the next poll,
+// an id in `expanded` for a row no longer in that window is unreachable and
+// would otherwise accumulate for the life of the pane.
+
+test("entryKey disambiguates same-actor same-action entries within one ms", () => {
+  // ts_ms|actor|action alone would collide here — expanding one row would
+  // silently also expand the other.
+  const a = entry("prompt", { to: "w-1", text: "one" });
+  const b = entry("prompt", { to: "w-1", text: "two" });
+  assert.notEqual(entryKey(a), entryKey(b));
+});
+
+test("entryKey is stable for the same entry (idempotent, order-independent of calls)", () => {
+  const e = entry("task-upsert", { id: "t-1", title: "x", status: "queued" });
+  assert.equal(entryKey(e), entryKey(e));
+});
+
+test("retainExpanded keeps only keys that still name a loaded entry", () => {
+  const e1 = entry("task-upsert", { id: "t-1" });
+  const e2 = entry("task-upsert", { id: "t-2" });
+  const k1 = entryKey(e1);
+  const k2 = entryKey(e2);
+  // e1 aged out of the window on the latest fetch; only e2 is loaded now.
+  const live = retainExpanded([k1, k2], [e2]);
+  assert.deepEqual([...live], [k2]);
+});
+
+test("retainExpanded on an empty window (or an empty expand set) keeps nothing", () => {
+  const e = entry("task-upsert", { id: "t-1" });
+  assert.equal(retainExpanded([entryKey(e)], []).size, 0);
+  assert.equal(retainExpanded([], [e]).size, 0);
+});
+
+test("retainExpanded returns a fresh set, not the input", () => {
+  const e = entry("task-upsert", { id: "t-1" });
+  const expanded = new Set([entryKey(e)]);
+  const live = retainExpanded(expanded, [e]);
+  assert.notEqual(live, expanded);
 });

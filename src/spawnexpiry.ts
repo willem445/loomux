@@ -18,3 +18,16 @@
 export function isSpawnRequestExpired(deadlineMs: number, nowMs: number): boolean {
   return deadlineMs !== 0 && nowMs > deadlineMs;
 }
+
+/** Agent ids from a `cancelledSpawns` map (agentId -> groupId, orchestration.ts)
+ *  that belong to `groupId` (#1316). `cancelledSpawns`' only delete is in
+ *  `openAgentPane`'s `finally` — a cancel for a request already dropped as
+ *  expired (`isSpawnRequestExpired` above) never reaches `openAgentPane`, so
+ *  the id is stranded there forever. `orch-group-ended` sweeps every entry for
+ *  its group as a backstop: by the time a group has ended, any spawn it was
+ *  still waiting to bind is moot regardless of which race stranded it. */
+export function spawnsForGroup(entries: Iterable<readonly [string, string]>, groupId: string): string[] {
+  const out: string[] = [];
+  for (const [agentId, gid] of entries) if (gid === groupId) out.push(agentId);
+  return out;
+}

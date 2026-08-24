@@ -291,6 +291,15 @@ export class TabManager<T extends ManagedWorkspace> {
     for (const [g, wid] of this.groupToWs) if (wid === workspaceId) out.push(g);
     return out;
   }
+  /** Forget one group's route without touching its tab (#1316). `forgetRoutes`
+   *  below only runs on tab CLOSE — a tab commonly outlives the group it once
+   *  routed (the human keeps it open after the group ends), so that binding
+   *  would otherwise survive for the life of the window. Called by the
+   *  `orch-group-ended` handler alongside the pane close that event already
+   *  drives. A no-op if the group was never bound. */
+  forgetGroup(groupId: string): void {
+    this.groupToWs.delete(groupId);
+  }
 
   // ---------- per-tab attention ----------
 

@@ -176,6 +176,30 @@ export interface TimelineEvent {
   detail: unknown;
 }
 
+/** Row identity for the detail-panel expand/collapse toggle. Keyed by the
+ *  EVENT, never by its index in `events`/`filtered` — a follow poll re-derives
+ *  both arrays from scratch, which would silently collapse (or worse, move) an
+ *  open row keyed by position. */
+export function eventKey(ev: TimelineEvent): string {
+  return `${ev.ts_ms}|${ev.kind}|${ev.label}`;
+}
+
+/** Prune an expand/collapse set down to keys that still name a plotted event,
+ *  returning a fresh set (#1316). Before this, `TimelineView.expanded` was
+ *  only ever cleared wholesale on a dot click — never pruned against what the
+ *  next poll actually loaded, so a row expanded while its selected cluster
+ *  stayed selected (no dot click in between) could sit stranded once its
+ *  event aged out of `orch_audit`'s AUDIT_VIEW_LIMIT window. */
+export function retainExpandedEvents(
+  expanded: Iterable<string>,
+  events: readonly TimelineEvent[]
+): Set<string> {
+  const present = new Set(events.map(eventKey));
+  const live = new Set<string>();
+  for (const key of expanded) if (present.has(key)) live.add(key);
+  return live;
+}
+
 /** The `orch_audit` cap, mirrored from `AUDIT_VIEW_LIMIT` in
  *  src-tauri/src/orchestration/mod.rs. Duplicated rather than plumbed: the
  *  command sends no truncation flag (`audit_log_windowed` keeps that for

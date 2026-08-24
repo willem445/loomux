@@ -927,6 +927,15 @@ export class TasksView {
     // (#1273): a draft nobody can ever see again is a leak that grows with the
     // session.
     this.linkDrafts = retainExistingKeys(this.linkDrafts, this.tasks);
+    // NOTE (#1316): `expanded` (notes-expand toggle) belongs on this list too
+    // — it's the same never-pruned shape as its siblings above — but is
+    // deliberately NOT fixed here. PR #1470 (open, `perf/1317-polled-read-payloads`,
+    // commit 4c831f34) already prunes it with this exact call, plus
+    // `expandedLinks` alongside it, because that PR makes `expanded` a wire
+    // parameter (`withNotes`) and needed the prune for correctness, not just
+    // hygiene. Duplicating it here would just be a guaranteed rebase conflict
+    // for no benefit — see this PR's body for the full accounting of all six
+    // rows named in #1316.
     this.render();
   }
 
