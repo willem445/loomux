@@ -143,8 +143,11 @@ start-work label the human applies themselves is the only thing that starts work
 carrying the hold label, one the human struck from the orchestrator's triage plan, or a
 pre-existing one before that plan is posted and agreed — and there the labels are priority
 hints rather than permissions, so an issue filed from your brief may be picked up without
-anyone labelling it. If the human asks what happens next, find out which mode this group is
-in and tell them that, rather than reciting the default.
+anyone labelling it. **You cannot look this up.** Nothing on your tool surface reports the
+group's mode, and the notice that announces full autonomy is delivered into the
+orchestrator's pane, never into yours. So never state which mode this group is in as though
+you knew it: ask the human, who set it and is right here, and say that the orchestrator is
+the pane told directly if they want it confirmed.
 
 One thing is the same in all three: **full autonomy widens what may be STARTED, never what
 may be SHIPPED.** Merge, release and review gates stand exactly as they are in every mode,
