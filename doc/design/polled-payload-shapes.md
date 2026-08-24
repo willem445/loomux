@@ -94,10 +94,21 @@ this wire the moment somebody adds one. The compiler now asks instead.
 
 **What this does NOT fix.** The row COUNT is untouched and still O(session).
 That is not an oversight and it is not liftable by a payload change. `TasksView`
-reads the whole board at 54 sites, feeding it to 32 distinct pure helpers, and
-several of those structurally need the rows the renderer HIDES — which a
-server-side row cap would take away rather than merely leave unrendered. The
-code states the requirement itself in two places worth quoting:
+reads the whole board at **56 sites**, feeding it to **32 distinct pure
+helpers**, and several of those structurally need the rows the renderer HIDES —
+which a server-side row cap would take away rather than merely leave
+unrendered.
+
+That count is dated to `src/tasksview.ts` **blob `a2a32d7b`**, not to a
+commit, and deliberately so: a hand-derived count is valid only for the file it
+was derived from, and dating it to a tree makes any later commit — including a
+sibling that never touches this file — silently invalidate it. This figure was
+54 when first written and this PR's own next commit made it 56, which is the
+drift a blob hash removes: it stays checkable until the only thing that can
+move the count actually moves. `git rev-parse HEAD:src/tasksview.ts` is the
+whole check.
+
+The code states the requirement itself in two places worth quoting:
 
 - `closedSubtrees`, which both `clearedIds` and `settledIds` are built on,
   decides a row's fate with `pred(t) && (children.get(t.id) ?? []).every(holds)`,
@@ -156,8 +167,19 @@ rarely land inside one another. `AUDIT_READ_MAX_AGE_MS` (1200 ms, strictly
 under the 1500 ms follow cadence so a view's own tick is never served its own
 previous read) is what makes the second view's tick free. It is
 `USAGE_POLL_MAX_AGE`'s shape, applied on the frontend because this read has no
-backend memo. An explicit gesture — opening the panel, the ⟳ button, returning
-to a visible window — passes 0 and is never served a cached answer.
+backend memo.
+
+**The two views answer "is this gesture worth a fresh read?" differently, and
+that is deliberate.** The audit viewer forces (passes 0) on all three of its
+gestures — opening the panel, the ⟳ button, returning to a visible window. The
+timeline forces on the ⟳ button only: `show()`, `toggleFollow` and PollGate's
+refresh all take the window instead, because in that view the force flag is the
+same flag that bypasses `shouldRefreshGh`, so forcing would shell out to gh on
+every panel open. A gh subprocess per open is a worse trade than a bounded
+staleness — and the staleness is worth naming rather than leaving implied: with
+follow OFF, `show()` is the human's only refresh gesture, so a chart can open
+up to `AUDIT_READ_MAX_AGE_MS` behind the log. Decoupling the two flags would
+remove that, and is the obvious next move if the gap is ever felt.
 
 **The third copy was derived, and it was rebuilt on the wrong event.**
 `extractTimeline` builds one `TimelineEvent` per audit row — a freshly-composed
