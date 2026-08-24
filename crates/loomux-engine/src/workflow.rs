@@ -2304,7 +2304,10 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         let remote = match rb.remote.as_deref() {
             None => None,
             Some(raw) => {
-                if let Err(e) = crate::pathseg::check_segment(raw) {
+                // NEUTERED FOR THE RED ROUND: an empty label stops being refused.
+                let checked =
+                    if raw.is_empty() { Ok(()) } else { crate::pathseg::check_segment(raw) };
+                if let Err(e) = checked {
                     errs.push(format!(
                         "blocks[{i}] ({id}): remote {raw:?} is not a usable label — {e}. A \
                          remote label is an abstract name the OPERATOR binds to a host outside \
