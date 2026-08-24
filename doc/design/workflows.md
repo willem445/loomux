@@ -39,9 +39,11 @@ prose in `templates/orchestrator.md`, not code). What you could not do was
 - A **`BlockId`** (a string — `rev-security`) is the agent's identity. Edges,
   gates, `spawn_agent(block:)` and the roster all reference it.
 - **`Role` survives as the block's `kind`** — its *capability class*. It is
-  still a closed enum with exactly four values, and every structural guarantee
-  keys off it: the CLI-level deny flags in `build_agent_command`, the
-  cwd/worktree rule in `spawn_agent_ex`, the MCP tool scope in `mcp::tool_defs`.
+  still a closed enum — `orchestrator` / `worker` / `reviewer` / `planner`,
+  plus the workflow-only `manager` added later (#1161) — and every structural
+  guarantee keys off it: the CLI-level deny flags in `build_agent_command`,
+  the cwd/worktree rule in `spawn_agent_ex`, the MCP tool scope in
+  `mcp::tool_defs`.
 - Persona, CLI and model are unbounded data on the block.
 
 `prefix()`, `template()` and `instructions_file()` moved off `Role` onto
@@ -82,7 +84,7 @@ inert text or a choice from a value set loomux already ships:
 
 | Block field | What it can do | Why it's safe |
 |---|---|---|
-| `kind` | select one of 4 classes | closed enum; unknown values are **rejected**, not coerced (see below) |
+| `kind` | select a class from the closed set (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) | closed enum; unknown values are **rejected**, not coerced (see below) |
 | `cli` | select `claude` \| `copilot` \| `gemini` | validated against `SUPPORTED_CLIS` at parse *and* at spawn — and, since #267, against `CLI_CAPS`: a CLI that cannot enforce the class's containment tier is refused at both ends too |
 | `model` | name a model | `sanitize_model` — the pre-existing allowlist filter |
 | `effort` | select a thinking level | closed enum (`low`/`medium`/`high`/`xhigh`/`max`); rejected outright if it isn't in the vocabulary, **and** if the block's `cli:` has no `effort_levels` in `CLI_CAPS` |
@@ -90,9 +92,9 @@ inert text or a choice from a value set loomux already ships:
 | `prompt` | free text | inert; sanitized, then delivered as a persona **addendum**, never as a replacement for the loomux contract |
 | `profile` | name a repo file | confined to the repo (no `..`, no absolute path, no drive prefix) |
 | `allow` | add tool patterns | **banned outright on a read-only class** (see below); inert for the rest — deny beats allow on both CLIs, so it can never re-grant what a class's tier denies |
-| `id` | name the block | reserved: the four class names may only be used by their own class, so no block can hijack another's contract file |
+| `id` | name the block | reserved: the class names (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) may only be used by their own class, so no block can hijack another's contract file |
 | *(on a `kind: orchestrator` block)* | pin `cli` / `model` / `effort` / `context` only | `prompt:`/`profile:`/`allow:` are a **parse error** — the trust root is not a repo-writable surface (see below) |
-| — | grant write access | **no spelling exists.** No `read_only:`, no fifth class, no capability key of any kind |
+| — | grant write access | **no spelling exists.** No `read_only:`, no capability key of any kind, and no way for a workflow file to invent a class of its own |
 
 `deny_unknown_fields` on the wire types is what makes that last row true: a
 `read_only: false` in a block isn't ignored, it's a validation error.
@@ -104,7 +106,7 @@ Pre-#222, *two* places parsed a kind string as `_ => Role::Worker` —
 typo'd, hallucinated or corrupt kind therefore produced **a worker**: a
 dedicated git worktree, write access, and PR authority, handed out on a guess.
 
-Both are gone. An unrecognized kind is now a named error that lists the four
+Both are gone. An unrecognized kind is now a named error that lists the
 classes that *are* allowed.
 
 That fix has a sharp edge, and a review caught it: the old catch-all was also,
@@ -183,6 +185,40 @@ allow pattern names nothing it could not already run) while the editing tools
 #462 denies it cannot be re-granted anyway — deny beats allow on both CLIs. The
 ban stays keyed to the *fully* read-only class, where the argument above actually
 bites.
+
+### Why a second lens (design-review, premortem) didn't get a new mechanism
+
+An on-demand design-review or premortem lens — consulted on a plan before it's
+built, or on a PR the orchestrator judges unusually risky — could have been built
+three other ways, and none of them shipped. **A new `kind`** was rejected against
+the one precedent for actually widening this enum, `manager` (#1161): `Role::Manager`'s
+own doc comment (`crates/loomux-engine/src/model.rs`) argues a class is warranted only
+when what distinguishes it is *structural* and no `role_hint` can express it — a
+manager needed a capability tool no existing hint granted. A design-review or
+premortem lens is the opposite case: `role_hint: advisor` already expresses
+everything that sets it apart — read-only, spawned on demand, no verdict — so a
+dedicated kind would not clear the bar that got `manager` in; it would just be a
+second class doing what one hint already does, on an enum loomux has shown itself
+willing to widen only when a hint genuinely can't cover the distinction. A
+**`when:`/`optional:` block field** — something naming a condition under which a
+block is required in a gate — was rejected too: it would need its own row in the
+schema manifest (below, "The schema manifest"), its own pane control, its own
+docs, and its own orchestrator rule — new surface for a need `role_hint: advisor`
+personas already meet, since an advisor is already read-only, already spawned only
+when the orchestrator decides to, and already exits and reports rather than
+lingering. And letting the merge gate's **`threshold`** count an advisor block
+toward the required N was rejected because a threshold assumes every named
+reviewer runs on every PR it gates — exactly the property an on-demand lens is
+defined by not having — so counting one in would let the standing reviewer be
+outvoted (or the gate held open) on a PR the lens was never spawned for at all.
+`role_hint: advisor` — already shipped for the single "domain expert on call"
+case — needed no new code to cover a design-review/premortem lens too, though
+it supplies the *shape* (read-only, reports and exits, no verdict) and not
+the *trigger*: orrerix's own generated advisor prose is keyed to "only when
+the team is stuck," not to plan intake or PR risk, and a workflow file cannot
+widen that (no field lets it re-author the orchestrator's persona); see
+`docs/orchestration.md` → "Adding a second
+lens".
 
 ### Sanitization
 
@@ -484,7 +520,8 @@ first draft rather than by design:
   launcher asks for no starters at all, so the only caller that can still reach
   this is the promote modal — the notice is unchanged and still earns its place,
   because the count that reaches it is a human's either way.)
-- **The four class names are reserved ids.** `- id: planner, kind: reviewer` is a
+- **The class names are reserved ids — five today, `orchestrator`/`worker`/
+  `reviewer`/`planner`/`manager`.** `- id: planner, kind: reviewer` is a
   validation error, because a block's contract file is `<id>.md` and that block
   would write `reviewer.md` — the real reviewer's file. (It also breaks the
   orchestrator synthesis above, by letting a non-orchestrator hold the id

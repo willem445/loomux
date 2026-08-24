@@ -59,6 +59,17 @@ Read the human's description and extract, explicitly, before writing YAML:
   that runs after a merge (→ `kind: worker` with `role_hint: process`). Both
   hints are optional; neither is purely cosmetic — a hint can change which MCP
   tools its block is offered, within the enumerated list. See Invariant 4.
+- **A design-review or premortem "second lens".** Same shape as the
+  domain-expert advisor above (`kind: planner` + `role_hint: advisor`) —
+  never `kind: reviewer`: orrerix's own built-in orchestrator template runs
+  every reviewing block (every `kind: reviewer` block except one hinted
+  `role_hint: liaison`) on every PR, so an on-demand lens declared as a
+  reviewer runs on every PR regardless (defeating "on demand"), and naming it
+  in a merge gate on top of that holds every merge shut until someone spawns
+  it and it passes. See `docs/orchestration.md` → "Adding a second lens" for
+  two ready-made personas (`design-review.md`, `premortem.md`) — including
+  the caveat that `role_hint: advisor` gives you the shape, not an automatic
+  trigger for *when* to spawn one.
 - **What stays default.** If the human didn't ask for something (a planner,
   a second worker tier, a merge gate at all), don't invent it. A workflow
   file that declares only what it's for is easier to read and easier for the
@@ -73,6 +84,7 @@ Read the human's description and extract, explicitly, before writing YAML:
 | "what kind of work can it do" | `kind` — one of exactly four: `orchestrator`, `worker`, `reviewer`, `planner`. This is the **only** thing that grants capability. See Invariant 1. |
 | "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner, `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
 | "a domain expert, consulted on demand" | `kind: planner` + `role_hint: advisor` — read-only, spawned only when stuck on a specific question, exits the moment it reports. |
+| "a design-review or premortem second opinion, not on every PR" | Same `kind: planner` + `role_hint: advisor` shape — never `kind: reviewer`, which the merge gate would need to pass on every PR or run on every PR to avoid holding it shut. See `docs/orchestration.md` → "Adding a second lens". |
 | "someone who writes up lessons after a PR merges" | `kind: worker` + `role_hint: process` — opens a normal PR and never merges it. Its PRs are a standing-authorized merge class the orchestrator dispositions itself rather than deferring to the human (#1021); the bar (review, green CI, findings settled) is unchanged. |
 | "must all pass" / "any 2 of these 3" | `gates.merge.require: all-pass` (the default) or `require: threshold` + `threshold: N` |
 | "also needs CI green" | `gates.merge.also: [ci-green]` — the only condition the shim can check today (see Step 5) |

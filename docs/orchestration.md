@@ -1729,6 +1729,161 @@ CLI (per-role CLI overrides picked at launch aren't separately retained, so an
 off→on→off round trip rebuilds the roster from your default CLI rather than
 restoring them).
 
+### Adding a second lens
+
+A repo that wants a design-review opinion before code is written, or a
+premortem pass on an unusually risky PR, doesn't need new capability to get
+there — `kind: planner` + `role_hint: advisor` already gives a block the
+right *shape*: read-only, reports with `report("done", ...)` and exits
+rather than holding a pane open, and never records a verdict. What it does
+**not** already give you is the trigger. Every sentence orrerix itself
+generates about an advisor block — the orchestrator's own kickoff note, the
+worker's counterpart, and the non-overridable addendum the advisor block
+receives regardless of its persona — is keyed to *the team being stuck*, not
+to plan intake, PR size, or risk. A workflow file cannot widen that:
+`prompt:`/`profile:`/`allow:` on the `orchestrator` block are a parse error
+(see "The orchestrator block is loomux-owned" in
+[`doc/design/workflows.md`](https://github.com/willem445/orrerix/blob/main/doc/design/workflows.md)),
+so there is no way to tell your orchestrator "consult `design-review` at
+plan intake" or "spawn `premortem` when the diff looks risky" from the file
+itself. In practice, what fires a plan-intake or high-risk consult today is
+a human asking for one, or the orchestrator's own judgment reading the
+roster — not anything this pattern wires up mechanically. Declare as many
+advisor blocks as you want, each with its own persona; just don't expect the
+trigger to come for free.
+
+**Why not `kind: reviewer`.** orrerix's own built-in orchestrator template
+makes the orchestrator run **every** reviewing block — every `kind: reviewer`
+block except one hinted `role_hint: liaison` — on **every** PR,
+unconditionally, whether or not that block is named in a merge gate.
+Declaring the lens as a reviewer costs a pane on every PR it was never meant
+to see; naming it in a gate on top of that adds a second, separate cost — it
+can then hold every merge shut until someone spawns it and it passes. An
+advisor block avoids the first cost outright (nothing spawns it
+automatically) and the second is structural, not just a discipline you have
+to keep: `gate_reviewer_error` refuses, at parse time, any gate naming a
+non-reviewer block — an advisor cannot even be *named* in one, the file
+would not load. The orchestrator only spawns it when it judges the moment
+warrants the extra look (see the trigger caveat above).
+
+Two ready-made personas, modeled on this repo's own
+[`.github/agents/advisor.md`](https://github.com/willem445/orrerix/blob/main/.github/agents/advisor.md):
+
+```markdown
+---
+name: design-review
+description: >
+  A read-only advisor consulted on a plan before it's built, or a PR whose
+  diff crosses this repo's size threshold — a second opinion on the shape of
+  the change, not a correctness review. Investigates and reports; never
+  merges, spawns, or records a verdict.
+kind: planner
+mode: replace
+---
+You are consulted on a design question: a plan under intake, or a PR the
+orchestrator judges large or consequential enough to warrant a second look at
+its shape, not just its correctness.
+
+## What you do
+
+1. **Investigate READ-ONLY.** Read the plan or diff, the issue thread, and
+   any design notes. You cannot write a file, branch, or push — the planner
+   capability class denies those at the CLI level regardless.
+2. **Answer one question: what alternative did this implicitly reject, and is
+   the choice defensible?** Name the alternative, not just "this looks fine"
+   — a design review that agrees with everything isn't a second opinion.
+3. **Report and exit.** `report("done", "<your assessment>")` is your one
+   deliverable — lead with the alternative and your verdict on it. Skip
+   anything that didn't change your answer.
+
+## What you never do
+
+No authority beyond the assessment: never merge, never spawn another agent,
+never record a review verdict, never edit or push. The orchestrator decides
+what to do with your advice, including ignoring it.
+```
+
+```markdown
+---
+name: premortem
+description: >
+  A read-only advisor consulted on a PR the orchestrator judges high-risk —
+  a migration, a security-sensitive surface, a persisted-shape change.
+  Investigates and reports; never merges, spawns, or records a verdict.
+kind: planner
+mode: replace
+---
+You are consulted on a PR the orchestrator has flagged as high-risk. Your job
+is to imagine it has already shipped and failed, and work backward.
+
+## What you do
+
+1. **Investigate READ-ONLY.** Read the diff, the issue thread, and the tests
+   it added. You cannot write a file, branch, or push — the planner
+   capability class denies those at the CLI level regardless.
+2. **Answer three questions:**
+   - **Premortem** — two concrete ways this fails in production that no test
+     in the PR catches, or an argued "none".
+   - **Resource envelope** — if the diff touches an unbounded input, the
+     largest realistic size × invocation frequency × allocation/IO, and
+     whether anything bounds it.
+   - **Operational futures** — what happens at 10× load, and on an
+     upgrade/rollback across whatever persisted shape the diff touches.
+3. **Report and exit.** `report("done", "<your findings>")`. An empty answer
+   to one of the three questions is a finding in itself — say so rather than
+   skipping it.
+
+## What you never do
+
+No authority beyond the findings: never merge, never spawn another agent,
+never record a review verdict, never edit or push. The orchestrator decides
+what to do with your findings, including ignoring them.
+```
+
+`workflow.yml` declares both the same way as any other advisor block:
+
+```yaml
+blocks:
+  - id: design-review
+    name: Design review
+    kind: planner
+    role_hint: advisor
+    profile: .github/agents/design-review.md
+
+  - id: premortem
+    name: Premortem
+    kind: planner
+    role_hint: advisor
+    profile: .github/agents/premortem.md
+
+edges:
+  - { from: orchestrator, to: [design-review, premortem] }
+```
+
+`spawn_agent` is orchestrator-only for every block, advisor or not — a worker
+that gets stuck is told to `message_orchestrator` and ask for a consult rather
+than spawn one itself — so both lenses hang off the orchestrator in `edges:`,
+never off a worker or reviewer. (One implementation detail worth knowing: the
+orchestrator's auto-generated "consult the advisor" kickoff sentence is built
+by `role_hint_block`, which the engine's own doc comment says picks the
+*first* block carrying a given hint on purpose — so with two advisor blocks
+declared, that sentence names only the first. The second is still listed
+under "Your delegates" with its own persona, and is spawnable by
+`block: "premortem"` exactly the same way — it just isn't individually
+called out by that one sentence.)
+
+**The residual.** An advisor's report can never satisfy or block a merge gate
+— not just because it never calls `review_verdict`, but because a gate
+cannot even name it (see the structural point above), so the orchestrator
+reads its advice and dispositions it like any other input, the same as a
+human's. A repo that wants these questions to actually gate a merge, not just
+advise on one, puts them in its **standing reviewer persona** instead, as
+fixed headings its review body must carry (this repo's own
+`.github/agents/rev-lead.md` does exactly that for its own question set):
+that shape buys enforcement, at the cost of running on every PR rather than
+only the ones that need it — and it needs no trigger caveat, either, since a
+reviewer that's named in the gate is spawned every time by construction.
+
 ### Proposed lessons come with their evidence
 
 A workflow can declare a **process-pro** block — a worker that runs after a
