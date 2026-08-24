@@ -712,7 +712,15 @@ export function initOrchestration(wiring: OrchWiring): void {
     // Prune the three module-level maps this ended group can no longer add to
     // (#1316): its color assignment, its tab route (the tab itself commonly
     // stays open — only the group is gone), and any spawn cancel stranded by
-    // the race spawnsForGroup's doc comment describes.
+    // the race spawnsForGroup's doc comment describes. This narrows the #106
+    // guard in `openAgentPane` (`cancelledSpawns.has(req.agent_id)`, below two
+    // awaits): an entry this sweep removes while that pane-open is still
+    // in-flight now falls through to `bind_agent` instead of being dropped
+    // there — safe, because the backend's bind wait has already timed out to
+    // produce the cancel that got it into this map, so `bind_agent` rejects
+    // and the existing `discardStalePane` catch (plus this same handler's own
+    // `panesInGroup` close, a few lines up) still tears the pane down; the
+    // only observable delta is a silent discard becoming a discard-with-toast.
     forgetGroupMeta(payload.group_id);
     wiring.forgetGroup(payload.group_id);
     for (const agentId of spawnsForGroup(cancelledSpawns, payload.group_id)) {

@@ -265,16 +265,22 @@ export class AuditView {
     if (this.disposed) return;
     try {
       this.entries = await invoke<AuditEntry[]>("orch_audit", { groupId: this.groupId });
+      // Prune the expand toggle to what's actually loaded (#1316), on the
+      // SUCCESS path only: as new lines push old ones out of `orch_audit`'s
+      // AUDIT_VIEW_LIMIT window on the next poll, an id here that no longer
+      // names a loaded entry can never be seen again — pruning it here keeps
+      // the set from growing for the life of the pane. A failed read must NOT
+      // prune: "could not look" is not "there was nothing there" (CLAUDE.md),
+      // and a transient throw (log mid-rotation, a locked file) would
+      // otherwise collapse every open row on the next repaint even though
+      // none of them actually went away.
+      this.expanded = retainExpanded(this.expanded, this.entries);
     } catch {
-      // Best-effort: a missing/unreadable log just renders empty.
+      // Best-effort: a missing/unreadable log just renders empty — `expanded`
+      // is deliberately left alone above, so a transient failure doesn't
+      // masquerade as every expanded row's entry having vanished.
       this.entries = [];
     }
-    // Prune the expand toggle to what's actually loaded (#1316): as new lines
-    // push old ones out of `orch_audit`'s AUDIT_VIEW_LIMIT window on the next
-    // poll, an id here that no longer names a loaded entry can never be seen
-    // again — pruning it here keeps the set from growing for the life of the
-    // pane.
-    this.expanded = retainExpanded(this.expanded, this.entries);
     this.render();
   }
 
