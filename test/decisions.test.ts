@@ -88,7 +88,8 @@ const item = (over: Partial<NeedsYouItem> = {}): NeedsYouItem => ({
   ...over,
 });
 
-const view = (items: NeedsYouItem[], cleared_ms = 0): NeedsYouView => ({ items, cleared_ms });
+const view = (items: NeedsYouItem[], cleared_ms = 0, tasks: DemoTask[] = []): NeedsYouView =>
+  ({ items, cleared_ms, tasks });
 
 // ---------- the unified projection ----------
 
@@ -98,7 +99,7 @@ test("the open list holds exactly what is still waiting, from BOTH registries", 
   const withdrawn = q({ id: "q-3", status: "withdrawn" });
   const open = item({ id: "n-1" });
   const resolved = item({ id: "n-2", status: "resolved", resolved_ms: 9, resolved_by: "webview" });
-  const p = projectPanel(view([open, resolved]), [answered, pend, withdrawn], []);
+  const p = projectPanel(view([open, resolved]), [answered, pend, withdrawn]);
   assert.deepEqual(p.open.map((r) => (r.source === "item" ? r.item.id : r.question.id)), [
     "n-1",
     "q-1",
@@ -127,8 +128,7 @@ test("the open list is urgency-pinned, then newest-first (#1151 D1)", () => {
       item({ id: "n-urgent-old", created_ms: 200, urgency: "high" }),
       item({ id: "n-new", created_ms: 900 }),
     ]),
-    [q({ id: "q-newest", created_ms: 950 }), q({ id: "q-urgent", created_ms: 300, urgency: "high" })],
-    []
+    [q({ id: "q-newest", created_ms: 950 }), q({ id: "q-urgent", created_ms: 300, urgency: "high" })]
   ).open;
   assert.deepEqual(
     rows.map((r) => (r.source === "item" ? r.item.id : r.question.id)),
@@ -144,14 +144,14 @@ test("rows tied on urgency and timestamp keep a FIXED order rather than shufflin
   const items = [item({ id: "n-a", created_ms: 500 }), item({ id: "n-b", created_ms: 500 })];
   const qs = [q({ id: "q-a", created_ms: 500 }), q({ id: "q-b", created_ms: 500 })];
   const order = () =>
-    projectPanel(view(items), qs, []).open.map((r) =>
+    projectPanel(view(items), qs).open.map((r) =>
       r.source === "item" ? r.item.id : r.question.id
     );
   assert.deepEqual(order(), ["n-a", "n-b", "q-a", "q-b"]);
   assert.deepEqual(order(), order(), "the same input renders the same order every time");
   // A row with no `created_ms` at all (a file written by an older build) sorts
   // last rather than randomly, and stays there.
-  const withNulls = projectPanel(view([item({ id: "n-x", created_ms: undefined })]), qs, []).open;
+  const withNulls = projectPanel(view([item({ id: "n-x", created_ms: undefined })]), qs).open;
   const last = withNulls[withNulls.length - 1];
   assert.equal(last.source === "item" && last.item.id, "n-x");
 });
@@ -163,14 +163,14 @@ test("the settled tail is newest-settled-first and reports only what the CAP dro
   const rows = Array.from({ length: 13 }, (_, i) =>
     q({ id: `s-${i}`, status: "answered", settled_ms: 100 + i })
   );
-  const p = projectPanel(EMPTY_VIEW, rows, [], 3);
+  const p = projectPanel(EMPTY_VIEW, rows, 3);
   assert.deepEqual(
     p.settled.map((r) => (r.source === "question" ? r.question.id : r.item.id)),
     ["s-12", "s-11", "s-10"]
   );
   assert.equal(p.omitted, 10);
   // Under the cap nothing is dropped, and the count says so.
-  assert.equal(projectPanel(EMPTY_VIEW, rows.slice(0, 2), [], 3).omitted, 0);
+  assert.equal(projectPanel(EMPTY_VIEW, rows.slice(0, 2), 3).omitted, 0);
 });
 
 test("the tail interleaves both registries by WHEN they settled, not by which file", () => {
@@ -179,8 +179,7 @@ test("the tail interleaves both registries by WHEN they settled, not by which fi
       item({ id: "n-mid", status: "resolved", resolved_ms: 200, resolved_by: "webview" }),
       item({ id: "n-old", status: "resolved", resolved_ms: 50, resolved_by: "board:done" }),
     ]),
-    [q({ id: "q-new", status: "answered", settled_ms: 300 })],
-    []
+    [q({ id: "q-new", status: "answered", settled_ms: 300 })]
   );
   assert.deepEqual(
     p.settled.map((r) => (r.source === "item" ? r.item.id : r.question.id)),
@@ -216,8 +215,7 @@ test("the watermark hides settled rows only — an OPEN row is untouchable by it
   const newQuestion = q({ id: "q-kept", status: "answered", settled_ms: 1400 });
   const p = projectPanel(
     view([stale, settledBefore, settledAfter], 1000),
-    [oldQuestion, newQuestion],
-    []
+    [oldQuestion, newQuestion]
   );
   assert.deepEqual(p.open.map((r) => r.anchor), ["t-1"], "the open row survived its own clear");
   assert.deepEqual(
@@ -241,9 +239,9 @@ test("`omitted` counts what the CAP dropped, never what the human cleared", () =
   );
   // Clear the first five: three visible rows against a cap of 3 → nothing is
   // dropped by the cap, so `omitted` is 0 even though five rows are hidden.
-  const cleared = projectPanel(EMPTY_VIEW, rows, [], 3);
+  const cleared = projectPanel(EMPTY_VIEW, rows, 3);
   assert.equal(cleared.omitted, 5, "precondition: with no clear, the cap drops five");
-  const afterClear = projectPanel({ items: [], cleared_ms: 104 }, rows, [], 3);
+  const afterClear = projectPanel({ items: [], cleared_ms: 104, tasks: [] }, rows, 3);
   assert.deepEqual(
     afterClear.settled.map((r) => (r.source === "question" ? r.question.id : r.item.id)),
     ["s-7", "s-6", "s-5"]
@@ -256,7 +254,7 @@ test("a watermark of 0 hides NOTHING, because 0 is the never-cleared sentinel", 
   // cleared", and a settled row with no timestamp also reads as `0`, so the
   // whole tail of a group nobody has ever cleared would blank on first render.
   const rows = [q({ id: "q-1", status: "answered", settled_ms: 0 })];
-  assert.equal(projectPanel(EMPTY_VIEW, rows, []).settled.length, 1);
+  assert.equal(projectPanel(EMPTY_VIEW, rows).settled.length, 1);
   assert.equal(isCleared(0, 0), false);
   // Once something IS cleared, a timestamp-less settled row goes with it — it
   // is by definition older than anything stamped, and the alternative is a row
@@ -303,7 +301,7 @@ test("the header count and the rendered list cannot disagree", () => {
   const qs = [q({ id: "q-1" }), q({ id: "q-2", status: "withdrawn", settled_ms: 5 })];
   for (const cleared of [0, 3, 9999]) {
     const v = view(items, cleared);
-    assert.equal(needsYouCount(v, qs), projectPanel(v, qs, []).open.length, `cleared=${cleared}`);
+    assert.equal(needsYouCount(v, qs), projectPanel(v, qs).open.length, `cleared=${cleared}`);
   }
   assert.equal(needsYouCount(EMPTY_VIEW, []), 0);
 });
@@ -314,7 +312,7 @@ test("an open demo card anchors on its TASK id, which is what the board marker e
   // #1091 slice G's board chip emits `{kind:"demo", target: task.id}` — it has
   // no idea an `n-N` exists. An item card that anchored on its own id would
   // leave that chip landing on nothing, silently.
-  const p = projectPanel(view([item({ id: "n-4", task: "t-12" })]), [q({ id: "q-9" })], []);
+  const p = projectPanel(view([item({ id: "n-4", task: "t-12" })]), [q({ id: "q-9" })]);
   assert.deepEqual(p.open.map((r) => r.anchor).sort(), ["q-9", "t-12"]);
   assert.equal(anchorOf(item({ id: "n-4", task: "t-12" }), true), "t-12");
 });
@@ -403,7 +401,7 @@ test("a missing task DEGRADES the join to null — it never throws and never gue
   assert.equal(linkTask("  ", [task({ id: "t-1" })]), null);
   assert.equal(linkTask("t-1", []), null, "an empty board is not an exception");
   // …and the projection carries that null through rather than dropping the row.
-  const p = projectPanel(view([item({ id: "n-1", task: "t-404" })]), [], [task({ id: "t-1" })]);
+  const p = projectPanel(view([item({ id: "n-1", task: "t-404" })], 0, [task({ id: "t-1" })]), []);
   assert.equal(p.open.length, 1, "the item is still waiting on the human");
   assert.equal(p.open[0].source === "item" && p.open[0].task, null);
   assert.equal(p.open[0].anchor, "t-404", "and still deep-linkable by the id it names");
@@ -567,14 +565,16 @@ test("a row leaves the panel when its ITEM resolves, not when its task moves", (
   // left the demo gate, because the card WAS the task. Now the item is the
   // record — a task that moves on has its item auto-resolved by the backend
   // hook, and until that lands the human still sees the ask they were given.
-  const parked = view([item({ id: "n-1", task: "t-9" })]);
   const moved = [task({ id: "t-9", status: "done" })];
-  assert.equal(projectPanel(parked, [], moved).open.length, 1, "the ask outlives the status");
-  const resolved = view([
-    item({ id: "n-1", task: "t-9", status: "resolved", resolved_ms: 7, resolved_by: "board:done" }),
-  ]);
-  assert.equal(projectPanel(resolved, [], moved).open.length, 0);
-  assert.equal(projectPanel(resolved, [], moved).settled.length, 1, "it recedes, it does not vanish");
+  const parked = view([item({ id: "n-1", task: "t-9" })], 0, moved);
+  assert.equal(projectPanel(parked, []).open.length, 1, "the ask outlives the status");
+  const resolved = view(
+    [item({ id: "n-1", task: "t-9", status: "resolved", resolved_ms: 7, resolved_by: "board:done" })],
+    0,
+    moved
+  );
+  assert.equal(projectPanel(resolved, []).open.length, 0);
+  assert.equal(projectPanel(resolved, []).settled.length, 1, "it recedes, it does not vanish");
 });
 
 // ---------- the count ----------
@@ -803,7 +803,7 @@ test("an item-driven refresh cannot drop a half-typed answer", () => {
   // The projection is where items and questions meet, and it reads no draft at
   // all — the two halves of a refresh cannot reach each other.
   assert.equal(
-    projectPanel(view([item({ id: "n-1" })]), [live], []).open.length,
+    projectPanel(view([item({ id: "n-1" })]), [live]).open.length,
     2,
     "the item and the question both render; neither consumed the other's state"
   );

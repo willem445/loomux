@@ -244,11 +244,27 @@ export interface NeedsYouView {
    *  ever been cleared — and `0` is NOT a watermark that hides a row stamped
    *  `0`, see `isCleared`. */
   cleared_ms: number;
+  /** The board rows this view's OPEN items name — one per distinct task id,
+   *  and no others (#1317).
+   *
+   *  The panel used to fetch the WHOLE board beside this read and use it at a
+   *  single site: `linkTask` looks up the row an open item names and projects
+   *  six fields off it. On a long-lived group that board is mostly history, so
+   *  the panel was holding a second full copy of it to answer a handful of
+   *  point lookups. These arrive from the same backend read as `items`, so a
+   *  row and the item naming it can no longer come from two parses a moment
+   *  apart.
+   *
+   *  Deliberately open-only: the settled tail renders from the item's own
+   *  record and never joins the board. A miss is already first-class —
+   *  `linkTask` answers `null` and the card degrades but stays resolvable —
+   *  so a join that finds nothing is a display outcome, not a failure. */
+  tasks: DemoTask[];
 }
 
 /** What the panel renders before its first read resolves, and what a failed
  *  read leaves behind. */
-export const EMPTY_VIEW: NeedsYouView = { items: [], cleared_ms: 0 };
+export const EMPTY_VIEW: NeedsYouView = { items: [], cleared_ms: 0, tasks: [] };
 
 /** Mirror of `needsyou::RESOLUTION_TEXT_MAX`. The backend REJECTS an over-cap
  *  note rather than truncating it (`validate_resolution`), so the panel stops
@@ -580,15 +596,19 @@ export function compareOpen(a: OpenRow, b: OpenRow): number {
 
 /** Everything waiting on the human, in one list, plus the settled tail.
  *
- *  Takes the whole `NeedsYouView` rather than rows and a watermark separately,
- *  so the two cannot come from different reads — the reason the backend returns
- *  them together in the first place. */
+ *  Takes the whole `NeedsYouView` rather than rows, a watermark and a board
+ *  separately, so none of the three can come from a different read — the
+ *  reason the backend returns them together in the first place. The joined
+ *  board rows arrived as a fourth argument until #1317, when the backend
+ *  started sending exactly the rows this projection looks up; taking them off
+ *  the view rather than from a parameter is what makes "same read" structural
+ *  instead of a convention every call site has to keep. */
 export function projectPanel(
   view: NeedsYouView,
   questions: readonly OrchQuestion[],
-  tasks: readonly DemoTask[],
   cap: number = SETTLED_SHOWN
 ): PanelProjection {
+  const tasks: readonly DemoTask[] = view.tasks;
   const open: OpenRow[] = [];
   for (const item of view.items) {
     if (!isOpenItem(item)) continue;
