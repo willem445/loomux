@@ -8,7 +8,7 @@
     "  src-tauri/tests/orchestration.rs",
     "    - every section's FIELD NAMES against the engine's `Raw*` serde types, both",
     "      directions, with no exclusion list;",
-    "    - each field's `values`, `default`, `min`, `max` and `max_entries` against the",
+    "    - each field's `values`, `default`, `min`, `max`, `maxLength` and `max_entries` against the",
     "      engine's own accessors and constants (SUPPORTED_CLIS, kind_names,",
     "      role_hint_names, intake_source_names, builtin_intake_profile, the",
     "      MergeQueuePolicy/ResourcePolicy Default impls, RESOURCE_*, NOTIFY_EXPIRES_*,",
@@ -66,6 +66,7 @@
     "default": "what the engine BEHAVES as when the key is omitted (the placeholder a form shows), which is not always the wire default — `merge_queue.max_batch` is absent on the wire and 3 in effect",
     "min": "lowest accepted number",
     "max": "highest accepted number",
+    "maxLength": "longest accepted STRING, in BYTES as the engine counts it (`check_segment` compares `s.len()`) — distinct from `max`, which bounds a number. A generated text control sets its maxlength from this, and an HTML maxlength counts UTF-16 code units: the two agree only while the field's alphabet is ASCII, which `block.remote`'s is and a future field's may not be. DECLARING THIS COMMITS THE ENGINE: the manifest pin panics on any field that declares a bound the engine states no fact for, so a limit documented here without a matching `workflow_schema_field_facts()` entry reddens CI rather than informing a control",
     "on_out_of_range": "`refuse` = the engine rejects the whole file; `clamp` = it silently pulls the value into range. A generated control must refuse the submit in the first case and may accept-and-coerce in the second",
     "max_entries": "for `section-map`: how many entries the engine will load before refusing the file",
     "required": "the engine has no default for this — a file without it does not load",
@@ -210,6 +211,13 @@
           "type": "string",
           "default": "",
           "help": "Context-window variant, e.g. \"1m\". Same ownership as `effort`: the backend states what is deliverable. Empty = the model's own window."
+        },
+        {
+          "name": "remote",
+          "type": "string",
+          "maxLength": 64,
+          "on_out_of_range": "refuse",
+          "help": "An abstract LABEL for a machine this block's agent runs on over SSH. The repo file only ever SELECTS a name; the OPERATOR binds it to a host, an account and a remote clone path outside the repo — so there is no host/port/identity_file key here, and writing one fails the whole file. Requires kind: worker, reviewer or planner and an explicitly spelled cli: claude. Letters, digits, '-' and '_', at most 64 characters, not starting with '-'. Absent = a local block, which is every block today: the key does nothing until the operator binds it."
         }
       ]
     },

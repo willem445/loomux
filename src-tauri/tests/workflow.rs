@@ -994,6 +994,7 @@ fn a_manager_block_never_carries_a_persona_even_from_a_hand_edited_group_json() 
         role_hint: None,
         effort: String::new(),
         context: String::new(),
+        remote: None,
     };
     assert!(!workflow::persona_allowed(&manager), "a manager block may never carry a persona");
     // The control, on an otherwise identical block: the predicate is about the
@@ -2510,6 +2511,193 @@ fn a_broken_workflow_file_is_audited_and_skipped_never_fatal() {
 
 // ─────────────────────────── persistence round-trip ─────────────────────────
 
+/// #1457 review, premortem 1. The invariant `remote: Some(_) => cli == "claude"
+/// and the kind is one the orchestrator spawns` is established twice —
+/// `parse_workflow` and `read_blocks` each derive it — and asserted nowhere.
+///
+/// `Guardrails::clamped` runs after both and is free to rewrite blocks: it
+/// already writes `id`, `name`, `model`, `effort` and `context`, drops blocks on
+/// two rules, and prepends a synthesized orchestrator. It happens not to touch
+/// `cli`, which is true by reading and enforced by nothing. Add a `cli`
+/// normalization there — a lowercase, or a fallback when `cli_caps` returns
+/// `None`, both plausible as CLIs are added — and a block carrying `remote:`
+/// comes out on a CLI whose session identity cannot survive the trip, with
+/// nothing red to say so.
+///
+/// **The fixture makes the operands COLLIDE**, per the non-interference rule: a
+/// pin whose subject `clamped` never touches holds under every implementation,
+/// the one it forbids included.
+///
+/// Finding a field `clamped` really rewrites took a CI round. `model: OPUS` plus
+/// `effort: high` came back byte-identical: `sanitize_model` accepts `OPUS` as
+/// written, `clamped_knob` returns `high` unchanged for a CLI that honors it,
+/// and `parse_workflow` refuses an effort the block's own `cli:` cannot honor —
+/// so an unhonorable one cannot be smuggled past it either. The rewrite that
+/// does happen is the one for an OMITTED `model:`: `clamped` resolves the empty
+/// string to the kind's default for the resolved CLI. So the block below
+/// declares no model, the control asserts `clamped` filled it in, and only then
+/// do the pins claim the label and the CLI survived that same pass.
+#[test]
+fn clamping_a_roster_never_moves_a_remote_block_off_claude() {
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: builder\n    kind: worker\n    cli: claude\n    remote: buildbox\n",
+    )
+    .expect("the fixture must parse");
+    let before = wf.block("builder").unwrap().clone();
+    assert_eq!(before.remote.as_deref(), Some("buildbox"));
+    assert!(before.model.is_empty(), "the fixture declares no model");
+
+    let rails = Guardrails { blocks: wf.blocks.clone(), ..rails() }.clamped();
+    let after = rails.block("builder").expect("clamped must keep the block");
+
+    // The collision control FIRST: this pass really did write this block's
+    // fields, so the pins below are about a block `clamped` touched rather than
+    // one it skipped.
+    assert!(
+        !after.model.is_empty(),
+        "the fixture must be one clamped actually rewrites, or the pins below hold vacuously — \
+         it should have resolved the empty model to the kind default, got {:?}",
+        after.model
+    );
+
+    // …and the invariant survived it.
+    assert_eq!(after.remote.as_deref(), Some("buildbox"), "clamping must not drop a remote label");
+    assert_eq!(after.cli, "claude", "clamping must not move a remote block off claude");
+    assert_eq!(after.kind, Role::Worker, "…nor change the kind the refusals were checked against");
+}
+
+/// #1457 review, premortem 2. `read_blocks` re-derives all three `remote:`
+/// rules defensively and DROPS a label that fails any of them, silently —
+/// there is no human at that layer to show a parse error to. That is the right
+/// posture and it has one consequence worth a test of its own: a remote block
+/// that loses its label is indistinguishable, everywhere downstream, from a
+/// block that never had one.
+///
+/// **Tested through `load_group_file`, which is the one public caller of
+/// `read_blocks`** — and getting there took two wrong turns worth recording,
+/// because both were green-looking:
+///
+/// - `create_group` is `Launch::Fresh`, which RE-READS the repo's
+///   `workflow.yml`. A reload through it re-parses the label out of the file,
+///   so it would pass against a `blocks_json`/`read_blocks` pair that had
+///   dropped the field entirely.
+/// - `create_group_ex(.., Launch::Resume)` does not read `group.json` either:
+///   per its own doc, "its caller loads `group.json` itself and hands the
+///   persisted guardrails straight back in", so passing `rails()` hands it a
+///   default roster and the block is not there at all.
+///
+/// `load_group_file` is that caller's loader, so it is where the persisted
+/// roster actually comes from.
+#[test]
+fn a_remote_label_survives_a_group_json_round_trip_and_drops_when_it_should() {
+    let (reg, _dir) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: builder\n    kind: worker\n    cli: claude\n    remote: buildbox\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(
+        g.guardrails.block("builder").unwrap().remote.as_deref(),
+        Some("buildbox"),
+        "the parsed roster carries the label"
+    );
+
+    // It is on disk as a plain JSON string — no path, no interpolation.
+    let path = reg.state_root().join(g.id.as_str()).join("group.json");
+    let gj: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let on_disk = gj["guardrails"]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == "builder")
+        .unwrap()
+        .clone();
+    assert_eq!(on_disk["remote"], "buildbox");
+
+    // …and it comes back out. This is the half that would otherwise go quietly
+    // wrong: `blocks_json` rewrites the whole roster on every change, so a field
+    // it forgot would vanish on the next resume with nothing to see.
+    let (_, rails_back) = reg.load_group_file(&g.id).expect("the group file must load");
+    assert_eq!(
+        rails_back.block("builder").unwrap().remote.as_deref(),
+        Some("buildbox"),
+        "the label must survive the persistence round trip"
+    );
+
+    // The fail-closed half, on the one input `parse_workflow` never sees.
+    // `read_blocks` compares the block's cli UNTRIMMED, so `"claude "` is not
+    // claude: the label is dropped and the block comes back local. Anything
+    // else would let a hand-edited group.json hold a remote label the parser
+    // would have refused.
+    let mut edited: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for b in edited["guardrails"]["blocks"].as_array_mut().unwrap() {
+        if b["id"] == "builder" {
+            b["cli"] = Value::String("claude ".into());
+        }
+    }
+    fs::write(&path, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+
+    let (_, edited_back) = reg.load_group_file(&g.id).expect("the edited group file must still load");
+    assert_eq!(
+        edited_back.block("builder").unwrap().remote,
+        None,
+        "a group.json the parser would have refused must lose the label, not keep it"
+    );
+    // The control that keeps the line above from passing for the wrong reason:
+    // the block is still THERE, still a worker, and only the label went. A
+    // dropped block would satisfy that assertion just as well.
+    assert_eq!(edited_back.block("builder").unwrap().kind, Role::Worker);
+
+    // #1457 review, premortem 2: the MIGRATION case, which is every group on
+    // every existing install and the one case that had no witness. A group.json
+    // written before this field existed has no `remote` key at all — not a
+    // null, simply absent — and `read_blocks` must read that as a local block
+    // rather than tripping over it. Asserted with a fixture rather than left to
+    // `as_str()` returning `None` on a missing key, which is true today and is
+    // exactly the kind of true-by-reading that this PR keeps finding is not
+    // true-by-test.
+    // Built from the ORIGINAL `gj` — read at the top, before the fail-closed
+    // stanza wrote `"cli": "claude "` into the file. Re-reading `path` here
+    // instead would leave that edit in place, and `remote == None` would then
+    // hold for three independent reasons — the missing key (the property under
+    // test), `check_segment` on a hypothetical `Some("")`, and the cli no
+    // longer being claude — with the assertion unable to tell them apart
+    // (#1457 review N12). Same class as the collision control that fired on its
+    // own fixture: an assertion that holds for a reason other than its own.
+    let mut pre_1457: Value = gj.clone();
+    for b in pre_1457["guardrails"]["blocks"].as_array_mut().unwrap() {
+        b.as_object_mut().unwrap().remove("remote");
+    }
+    assert_eq!(
+        pre_1457["guardrails"]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "builder")
+            .unwrap()["cli"],
+        "claude",
+        "the migration fixture must carry a CLEAN cli, or the assertion below is confounded"
+    );
+    assert!(
+        !serde_json::to_string(&pre_1457).unwrap().contains("remote"),
+        "the fixture must really carry no remote key, or it is not a pre-#1457 file"
+    );
+    fs::write(&path, serde_json::to_string_pretty(&pre_1457).unwrap()).unwrap();
+
+    let (_, migrated) = reg.load_group_file(&g.id).expect("a pre-#1457 group.json must still load");
+    assert_eq!(
+        migrated.block("builder").unwrap().remote,
+        None,
+        "a group.json predating the key is a LOCAL block"
+    );
+    assert_eq!(
+        migrated.block("builder").unwrap().kind,
+        Role::Worker,
+        "…and the block survives the read, rather than being dropped for lacking a key"
+    );
+}
+
 #[test]
 fn block_map_round_trips_through_group_json() {
     let (reg, dir) = test_registry();
@@ -2720,6 +2908,7 @@ fn the_four_class_names_are_reserved_ids_for_their_own_class() {
                 role_hint: None,
                 effort: String::new(),
                 context: String::new(),
+                remote: None,
             },
             workflow::Block {
                 id: "worker".into(),
@@ -2733,6 +2922,7 @@ fn the_four_class_names_are_reserved_ids_for_their_own_class() {
                 role_hint: None,
                 effort: String::new(),
                 context: String::new(),
+                remote: None,
             },
             workflow::Block {
                 id: "worker".into(), // duplicate
@@ -2746,6 +2936,7 @@ fn the_four_class_names_are_reserved_ids_for_their_own_class() {
                 role_hint: None,
                 effort: String::new(),
                 context: String::new(),
+                remote: None,
             },
         ],
         ..Guardrails::default()
@@ -4850,6 +5041,7 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
                     role_hint: None,
                     effort: String::new(),
                     context: String::new(),
+                    remote: None,
                 }],
                 ..rails()
             },
@@ -6754,6 +6946,7 @@ fn block(id: &str, kind: Role) -> workflow::Block {
         role_hint: None,
         effort: String::new(),
         context: String::new(),
+        remote: None,
     }
 }
 

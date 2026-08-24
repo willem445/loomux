@@ -8983,6 +8983,21 @@ fn read_blocks(g: &Value) -> Vec<workflow::Block> {
                     // today's spawn byte for byte.
                     effort: s(b, "effort"),
                     context: s(b, "context"),
+                    // #1457, defense in depth exactly like `role_hint` above: a
+                    // hand-edited group.json never meets `parse_workflow`, so
+                    // every rule that function enforces on a remote label is
+                    // re-applied here and a value failing any of them is
+                    // DROPPED rather than resurrected — there is no human to
+                    // show a parse error to at this layer. An absent key is a
+                    // local block, which is every group.json written before
+                    // this field existed.
+                    remote: b["remote"].as_str().and_then(|raw| {
+                        let local_only = kind == Role::Orchestrator || kind == Role::Manager;
+                        (PathSegment::parse(raw).is_ok()
+                            && !local_only
+                            && s(b, "cli") == "claude")
+                            .then(|| raw.to_string())
+                    }),
                 })
             })
             .collect();
@@ -9021,6 +9036,7 @@ fn blocks_json(blocks: &[workflow::Block]) -> Value {
                     "role_hint": b.role_hint,
                     "effort": b.effort,
                     "context": b.context,
+                    "remote": b.remote,
                 })
             })
             .collect(),

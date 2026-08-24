@@ -8400,7 +8400,10 @@ fn the_workflow_schema_manifest_matches_the_engines_raw_types() {
 #[test]
 fn the_workflow_schema_manifest_matches_the_engines_values_defaults_and_bounds() {
     const MANIFEST: &str = include_str!("../../src/workflow-schema.json");
-    const PINNED: [&str; 5] = ["values", "default", "min", "max", "max_entries"];
+    // `maxLength` (#1457) is a LENGTH bound on a string field, distinct from
+    // `max` — which this manifest documents as "highest accepted number".
+    const PINNED: [&str; 6] =
+        ["values", "default", "min", "max", "max_entries", "maxLength"];
 
     let manifest: Value = serde_json::from_str(MANIFEST).expect("the manifest must be valid JSON");
     let sections = manifest["sections"].as_object().expect("manifest.sections must be a mapping");
@@ -8483,6 +8486,17 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
         ("resource.slots-above-max", format!("version: 1\n{block}resources:\n  build:\n    slots: 65\n")),
         ("resource.max_hold_minutes", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 0\n")),
         ("resource.max_hold_minutes-above-max", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 481\n")),
+        // #1457 N10. Declared with an explicit `cli: claude`, and for the same
+        // reason the `gate.max_diff_lines` row above declares a reviewer: a
+        // remote block with no `cli:` is refused for THAT, and both refusals
+        // mention "remote", so a row that could fail for two reasons pins
+        // neither. With the cli spelled out the only rule left to break is the
+        // length, which is what this row is about — 65 characters against a
+        // cap of 64.
+        ("block.remote-above-max", format!(
+            "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    remote: {}\n",
+            "b".repeat(65)
+        )),
     ] {
         let err = workflow::parse_workflow(&text)
             .err()
@@ -15593,6 +15607,7 @@ fn advisor_hinted_planner_auto_closes_on_report_done() {
         role_hint: Some("advisor".into()),
         effort: String::new(),
         context: String::new(),
+        remote: None,
     });
     let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -16066,6 +16081,7 @@ fn a_liaison_is_never_taken_by_the_idle_reaper() {
         role_hint: Some("liaison".into()),
         effort: String::new(),
         context: String::new(),
+        remote: None,
     });
     let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -34344,6 +34360,7 @@ fn rails_with_process_block() -> Guardrails {
         role_hint: Some("process".into()),
         effort: String::new(),
         context: String::new(),
+        remote: None,
     });
     g
 }
@@ -48401,6 +48418,7 @@ fn clamped_drops_a_knob_the_resolved_cli_cannot_honor() {
         role_hint: None,
         effort: effort.into(),
         context: context.into(),
+        remote: None,
     };
     let resolve = |agent_cli: &str, b: workflow::Block| -> workflow::Block {
         let g = Guardrails {
