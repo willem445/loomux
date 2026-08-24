@@ -93,11 +93,61 @@ goes down together. The Job Object code is entirely behind
 ## Tests (`src-tauri/tests/job_object.rs`, Windows-gated)
 
 - **`kill_on_close_job_reaps_the_whole_descendant_tree`** — opens a real ConPTY
-  the way `spawn_pty` does, runs a shell that spawns a long-lived **grandchild**
-  (recording its PID), enrolls the shell via the production
-  `assign_kill_on_close_job`, then drops **only** the job handle while keeping
-  the ConPTY master + child alive — so a pass can only be explained by
-  kill-on-close, not ConPTY teardown — and asserts via `Get-Process` that the
-  grandchild is gone.
+  the way `spawn_pty` does, enrolls the pane's shell via the production
+  `assign_kill_on_close_job`, and only *then* types
+  `cmd.exe /d /c ping -n 300 127.0.0.1 > nul` into the pane, so the wrapper
+  shell and the long-lived process under it are born strictly after enrollment.
+  It finds them by walking the OS process table (`sysinfo`) down from the
+  shell, asserts what hangs off the shell really is a **tree** — the wrapper at
+  depth 1, the grandchild at depth 2 — then drops **only** the job handle while
+  keeping the ConPTY master + child alive, so a pass can only be explained by
+  kill-on-close and not by ConPTY teardown, and waits on a `SYNCHRONIZE` handle
+  per member for the kernel to signal each of them dead.
 - **`assign_job_is_fail_soft_on_a_bad_pid`** — enrolling a nonexistent PID
   returns `None` (the fail-soft contract), never panics or leaks.
+
+### Why the test starts no PowerShell (#1345)
+
+The first cut of the descendant-tree test drove the pane with PowerShell, had
+that shell spawn a *second* PowerShell as the grandchild, and waited up to 15 s
+for the grandchild's PID to land in a temp file. Every item that window had to
+cover was a process start: a cold `pwsh` booting far enough to execute a
+`-Command` script, an 800 ms sleep so the test could win the enrollment race,
+and then a second `pwsh` image load. Afterwards the test answered "is this PID
+alive?" by starting yet another PowerShell per answer (`Get-Process`) — four of
+them on a healthy run, and one more per 100 ms for as long as either teardown
+wait went unsatisfied.
+
+On `windows-latest` it failed four times in a single day with "grandchild never
+reported its PID", always green on re-run, once on a tree whose exact contents
+had already passed the same job on `main`.
+
+The window was the symptom. Every process start inside it was an artifact of
+how the test was written rather than anything the guarantee requires, so the fix
+removed them instead of widening the window:
+
+- **A native tree.** `cmd.exe` and `ping.exe` are small, always-resident
+  System32 binaries; PowerShell is a CLR host that has to boot before it can run
+  a script, which is what made the old critical path long enough to lose. The
+  guarantee does not care what the descendants run, only that they are
+  descendants born after enrollment.
+- **Causal ordering instead of a sleep.** The old script slept 800 ms so the
+  test could win the race to enroll the shell before it forked — the assignment
+  race described under *What is deliberately not covered*, met with a timer.
+  Typing the spawn command into the pane *after* `assign_kill_on_close_job`
+  returns removes the race rather than out-waiting it: the descendants cannot
+  exist before the bytes that create them are sent. It is also what orrerix does
+  to a pane in production.
+- **Handle waits instead of shell-outs.** A process handle is signaled the
+  instant the kernel terminates the process, so the pre-kill liveness check and
+  the teardown assertion are both `WaitForSingleObject` calls that return as it
+  happens — no polling, no process start per poll, and no PID-reuse hazard,
+  since a handle names one process for as long as it is held.
+
+What remains is slack rather than schedule. The test's three budgets — 60 s for
+the shell to say something, 60 s for the typed tree to appear in the process
+table, 30 s for the kernel to tear the job down — are each a wait that ends when
+its event happens, on a local read or a kernel handle rather than on a process
+start. Measured on the CI leg the old test flaked on, everything before teardown
+costs ~3 s and teardown itself ~0 s, so a passing run spends effectively none of
+them, and a broken one spends only the time it takes to report.
