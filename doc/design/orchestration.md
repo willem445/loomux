@@ -3204,7 +3204,8 @@ survives it even when nothing warned anyone first.
 
 - **Directive ledger: a diary kept at receipt time, not a deathbed dump.** `note_directive
   (text, replace?)` is a new MCP tool, in the identical shared tier as `request_compact` —
-  every non-solo role (orchestrator, worker, reviewer, planner), self-scoped to the CALLING
+  every non-solo role (orchestrator, worker, reviewer, planner, and — since #1161 — manager,
+  whose `MANAGER_SHARED` allow-list keeps both), self-scoped to the CALLING
   agent's own entry with no `group_id`-style path segment and no cross-pane power, the same
   discipline held everywhere else in this file. The whole point is timing: an emergency
   auto-compact gives no warning turn, so "offload what matters before it lands" (#328's
