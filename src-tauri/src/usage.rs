@@ -952,7 +952,10 @@ impl TranscriptCursors {
         if verdict == StatVerdict::Reset {
             // `reset` is "a cursor was thrown away", so a first-ever read —
             // which also parses from zero — is not one.
-            work.reset = had_cursor;
+            // [scratch] #1239 round 14: read the flag off the slot AFTER the
+            // path re-resolution has already cleared it, which is the bug
+            // commit 0a79a32a fixed.
+            work.reset = slot.is_some();
             *slot = Some(TranscriptCursor::new(path));
             // A fresh cursor has no anchor, so this call cannot report a
             // mismatch; both arms mean the same thing here.
