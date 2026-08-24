@@ -11,7 +11,9 @@ import {
   SSH_PROFILES_SCHEMA_VERSION,
   DEFAULT_REMOTE_SHELL,
   MAX_KEEPALIVE_SECONDS,
+  SshProfilesStore,
   type SshProfile,
+  type SshProfileIo,
   type SshProfileStore,
 } from "../src/sshprofile.ts";
 
@@ -509,4 +511,317 @@ test("string fields are trimmed, so a stray-space hand-edit doesn't become the v
   assert.equal(p.name, "build box");
   assert.equal(p.destination, "dev@host");
   assert.equal(p.remoteCwd, "/srv");
+});
+
+// ---------------------------------------------------------------------------
+// SshProfilesStore — the read-before-publish ordering (#1332).
+//
+// A save republishes the WHOLE file, so a save built from a list that was never
+// read publishes the one new connection as the entire truth and destroys every
+// saved connection the human had. These are the tests that fail on the racy
+// order the launcher used to run: a fire-and-forget load, an in-memory list
+// seeded empty, and a rejected read collapsed into "you have none".
+// ---------------------------------------------------------------------------
+
+/** A blob holding one OTHER connection — the thing a premature save destroys. */
+const OTHERS = JSON.stringify(
+  store(fullProfile({ id: "p-other", name: "prod", destination: "root@prod.example.net" }))
+);
+
+/** The connection a launch is trying to save. */
+const MINE = fullProfile({ id: "p-mine", name: "laptop", destination: "me@laptop.local" });
+
+/** Records what reached the backend, and lets the test decide when the read
+ *  resolves. */
+function fakeIo(load: () => Promise<string | null>): SshProfileIo & { saved: string[] } {
+  const saved: string[] = [];
+  return {
+    saved,
+    load,
+    save: async (contents: string) => {
+      saved.push(contents);
+    },
+  };
+}
+
+/** The ids in a published blob, read back through the real decoder. */
+const publishedIds = (raw: string) => (decodeSshProfiles(raw)?.profiles ?? []).map((p) => p.id);
+
+/** Let every already-scheduled microtask/timer run. */
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+test("a write that beats the read does not publish a list nobody has read", async () => {
+  // THE #1332 PIN. The human picks SSH, types a destination and hits Create
+  // before the load has come back. A store that writes straight from its empty
+  // in-memory list publishes a file containing only this connection — silently
+  // deleting every other saved one, with no error anywhere because every
+  // individual step succeeded.
+  let release: (v: string | null) => void = () => {};
+  let reads = 0;
+  const io = fakeIo(() => {
+    reads += 1;
+    return new Promise<string | null>((res) => (release = res));
+  });
+  const profiles = new SshProfilesStore(io);
+
+  const writing = profiles.write(MINE);
+  await settle();
+  // Positive control before the absence (CLAUDE.md, #1209): the write really is
+  // in flight and really did ask for the file. Without this, "nothing reached
+  // disk" is also what a write that threw on entry, or a broken fake, looks
+  // like — and the interesting assertion below would be vacuous.
+  assert.equal(reads, 1, "the write asked for the file");
+  assert.deepEqual(io.saved, [], "…and published nothing while that read was outstanding");
+
+  release(OTHERS); // the file finally arrives, holding the human's other connection
+  assert.equal(await writing, "saved");
+  assert.equal(io.saved.length, 1);
+  assert.deepEqual(
+    publishedIds(io.saved[0]),
+    ["p-other", "p-mine"],
+    "the saved connection survived the launch that raced it, beside the new one"
+  );
+});
+
+test("a write is declined outright when the file could not be read", async () => {
+  // "I could not look" is not "you have no saved connections". Publishing here
+  // would turn one transient IPC rejection into permanent data loss — and
+  // `persistSshProfile` is best-effort, so nothing downstream would ever say so.
+  let reads = 0;
+  const io = fakeIo(() => {
+    reads += 1;
+    return Promise.reject(new Error("ipc rejected"));
+  });
+  const profiles = new SshProfilesStore(io);
+  assert.equal(await profiles.write(MINE), "declined-unread");
+  assert.equal(reads, 1, "the write asked for the file");
+  assert.deepEqual(io.saved, [], "a list that was never read is never published");
+});
+
+test("a failed read is retried by the next launch, not latched for the session", async () => {
+  // The other direction, so the guard cannot pass by refusing everything: one
+  // rejection must not disable persistence for as long as the form is open.
+  let attempt = 0;
+  const io = fakeIo(() => {
+    attempt += 1;
+    return attempt === 1 ? Promise.reject(new Error("transient")) : Promise.resolve(OTHERS);
+  });
+  const profiles = new SshProfilesStore(io);
+
+  assert.equal(await profiles.write(MINE), "declined-unread");
+  assert.equal(await profiles.write(MINE), "saved", "the retry lands");
+  assert.equal(attempt, 2);
+  assert.deepEqual(publishedIds(io.saved[0]), ["p-other", "p-mine"]);
+});
+
+test("an unreadable file reads as null, never as a form with no saved connections", async () => {
+  // The caller must be able to tell "there is nothing saved" (open on New
+  // connection) from "I cannot see the file" (open the same way, but never let
+  // that reading reach a save). This pins the DISTINCTION only; what protects
+  // the file once the human launches anyway is the write-side behaviour above.
+  const bad = new SshProfilesStore(fakeIo(() => Promise.reject(new Error("nope"))));
+  assert.equal(await bad.read(), null);
+
+  const absent = new SshProfilesStore(fakeIo(() => Promise.resolve(null)));
+  const first = await absent.read();
+  assert.notEqual(first, null, "an ABSENT file is a complete answer, not a failure");
+  assert.deepEqual(first?.profiles, []);
+
+  // …and so is a blob that is not this schema at all: uistate.rs has already
+  // renamed a corrupt file aside by the time one could get here, so seeding
+  // empty (and letting a launch publish over it) is the designed first-run
+  // path, not the accident this section is about.
+  const mangled = new SshProfilesStore(fakeIo(() => Promise.resolve("{ not json")));
+  assert.deepEqual((await mangled.read())?.profiles, []);
+});
+
+test("a write carries the file's own schemaVersion, never this build's", async () => {
+  // The caller cannot supply a schemaVersion — it has no way to reach one — so a
+  // form whose list came back empty cannot re-stamp a v2 file as v1 on the
+  // strength of its own constructed default (`stampedVersion`, #907 NB2).
+  const future = JSON.stringify({ schemaVersion: 2, profiles: [fullProfile({ id: "p-other" })] });
+  const io = fakeIo(() => Promise.resolve(future));
+  const profiles = new SshProfilesStore(io);
+  assert.equal(await profiles.write(MINE), "saved");
+  assert.equal(decodeSshProfiles(io.saved[0])?.schemaVersion, 2);
+});
+
+test("the file is read once however many launches arrive", async () => {
+  let reads = 0;
+  const io = fakeIo(() => {
+    reads += 1;
+    return Promise.resolve(OTHERS);
+  });
+  const profiles = new SshProfilesStore(io);
+  // Concurrent, then sequential — one shared in-flight read, then the memo.
+  await Promise.all([profiles.read(), profiles.read(), profiles.write(MINE)]);
+  await profiles.write(fullProfile({ id: "p-third" }));
+  assert.equal(reads, 1, "a burst of launches must not each re-read the blob");
+});
+
+test("read hands out a copy, so an edit to it cannot reach disk without a write", async () => {
+  const io = fakeIo(() => Promise.resolve(OTHERS));
+  const profiles = new SshProfilesStore(io);
+  const snapshot = await profiles.read();
+  assert.equal(snapshot?.profiles.length, 1, "the read really returned the stored connection");
+  snapshot!.profiles[0].destination = "attacker@elsewhere";
+  snapshot!.profiles[0].extraArgs.push("-o", "ProxyCommand=evil");
+  snapshot!.profiles.push(MINE);
+
+  assert.equal(await profiles.write(fullProfile({ id: "p-third" })), "saved");
+  const back = decodeSshProfiles(io.saved[0])?.profiles ?? [];
+  assert.deepEqual(
+    back.map((p) => p.id),
+    ["p-other", "p-third"],
+    "the pushed entry never reached the file"
+  );
+  assert.equal(back[0].destination, "root@prod.example.net", "…nor the edited destination");
+  assert.deepEqual(back[0].extraArgs, ["-J", "jump.example.net"], "…nor the appended argv words");
+});
+
+test("write copies the profile in, so an edit made afterwards cannot ride the next save", async () => {
+  // The mirror of the test above, and the reason the copy is on BOTH sides: the
+  // store outlives the call, so a caller that keeps its object could otherwise
+  // change what a later write publishes without ever handing anything over.
+  const io = fakeIo(() => Promise.resolve(OTHERS));
+  const profiles = new SshProfilesStore(io);
+  const handed = fullProfile({ id: "p-mine", destination: "me@laptop.local", extraArgs: ["-J", "gate"] });
+  assert.equal(await profiles.write(handed), "saved");
+  assert.equal(
+    decodeSshProfiles(io.saved[0])?.profiles.find((p) => p.id === "p-mine")?.destination,
+    "me@laptop.local",
+    "the first save really carried the handed-over connection"
+  );
+
+  handed.destination = "attacker@elsewhere";
+  handed.extraArgs.push("-o", "ProxyCommand=evil");
+  assert.equal(await profiles.write(fullProfile({ id: "p-third" })), "saved");
+
+  const mine = decodeSshProfiles(io.saved[1])?.profiles.find((p) => p.id === "p-mine");
+  assert.equal(mine?.destination, "me@laptop.local", "the later edit never reached the file");
+  assert.deepEqual(mine?.extraArgs, ["-J", "gate"], "…nor the appended argv words");
+});
+
+test("a save that fails says so, and leaves the newer value in memory", async () => {
+  const io: SshProfileIo = {
+    load: () => Promise.resolve(OTHERS),
+    save: () => Promise.reject(new Error("disk full")),
+  };
+  const profiles = new SshProfilesStore(io);
+  assert.equal(await profiles.write(MINE), "failed");
+  // Not "declined-unread": the read succeeded, so the failure is the write's.
+  // The store keeps the value, which is what makes the next launch re-offer it.
+  assert.deepEqual(
+    (await profiles.read())?.profiles.map((p) => p.id),
+    ["p-other", "p-mine"]
+  );
+});
+
+test("an edit updates the connection in place; only a create appends", async () => {
+  // A picker that reorders itself under the human every time they launch is its
+  // own small bug, and a second row carrying the same id would make the
+  // persisted-pane lookup ambiguous (`dedupeById` would then pick one for them).
+  const io = fakeIo(() =>
+    Promise.resolve(JSON.stringify(store(fullProfile({ id: "p-a" }), fullProfile({ id: "p-b" }))))
+  );
+  const profiles = new SshProfilesStore(io);
+  assert.equal(await profiles.write(fullProfile({ id: "p-a", name: "renamed" })), "saved");
+  const back = decodeSshProfiles(io.saved[0])?.profiles ?? [];
+  assert.deepEqual(
+    back.map((p) => p.id),
+    ["p-a", "p-b"],
+    "the edited connection kept its position"
+  );
+  assert.equal(back[0].name, "renamed", "…and took the edit");
+});
+
+test("two overlapping writes serialize, so neither publishes over the other", async () => {
+  // #1358 review N2. Two writes each publish a WHOLE blob, and the backend
+  // applies them in COMPLETION order, not call order — so unserialized, the
+  // blob computed first can land second and drop what the other one added.
+  // Same lost update this class exists to prevent, one level up.
+  //
+  // `applied` records at RESOLVE time, not at call time, because that is the
+  // order the file actually ends up in.
+  const applied: string[] = [];
+  const inFlight: Array<() => void> = [];
+  const io: SshProfileIo = {
+    load: () => Promise.resolve(OTHERS),
+    save: (contents: string) =>
+      new Promise<void>((res) =>
+        inFlight.push(() => {
+          applied.push(contents);
+          res();
+        })
+      ),
+  };
+  const profiles = new SshProfilesStore(io);
+
+  const first = profiles.write(fullProfile({ id: "p-a", name: "alpha" }));
+  const second = profiles.write(fullProfile({ id: "p-b", name: "beta" }));
+  await settle();
+
+  // Positive control, then the pin. The control is that a write really did
+  // reach the backend — without it, "only one is in flight" is also what two
+  // writes that both threw on entry would look like.
+  assert.equal(inFlight.length, 1, "the first write really reached the backend");
+  assert.deepEqual(applied, [], "…and nothing has landed yet");
+  // THE PIN: the second write has NOT published. Unserialized, both blobs are in
+  // flight at once and the backend may apply them in either order.
+
+  inFlight[0]();
+  assert.equal(await first, "saved");
+  await settle();
+  assert.equal(inFlight.length, 2, "the second write starts only once the first has landed");
+
+  inFlight[1]();
+  assert.equal(await second, "saved");
+  assert.deepEqual(
+    publishedIds(applied[applied.length - 1]),
+    ["p-other", "p-a", "p-b"],
+    "the file the backend ends up with holds every connection, in call order"
+  );
+});
+
+test("a write queued behind a FAILING one still waits for it, then still runs", async () => {
+  // The other direction, so serializing cannot pass by never draining: a save
+  // that rejects must neither release the next write early nor wedge the queue
+  // behind it. Both halves are asserted, because each fails a different way —
+  // early release is the lost update again, and a wedge is the latching this
+  // class refuses on the read side.
+  const outcomes: string[] = [];
+  const inFlight: Array<(ok: boolean) => void> = [];
+  const io: SshProfileIo = {
+    load: () => Promise.resolve(OTHERS),
+    save: () =>
+      new Promise<void>((res, rej) =>
+        inFlight.push((ok) => {
+          outcomes.push(ok ? "ok" : "threw");
+          ok ? res() : rej(new Error("disk full"));
+        })
+      ),
+  };
+  const profiles = new SshProfilesStore(io);
+  const first = profiles.write(fullProfile({ id: "p-a" }));
+  const second = profiles.write(fullProfile({ id: "p-b" }));
+  await settle();
+
+  assert.equal(inFlight.length, 1, "the first write really reached the backend");
+  // The serialization pin, on the failure path specifically.
+  assert.deepEqual(outcomes, [], "…and the second has not published behind its back");
+
+  inFlight[0](false); // the first save rejects
+  assert.equal(await first, "failed");
+  await settle();
+  assert.equal(inFlight.length, 2, "the queue drained past the failure rather than wedging");
+
+  inFlight[1](true);
+  assert.equal(await second, "saved");
+  assert.deepEqual(outcomes, ["threw", "ok"], "in that order, never overlapping");
+  // The failed write's value is still in memory, so the one behind it carries
+  // both — the `persistTabs` best-effort contract, held across the queue.
+  assert.deepEqual(
+    (await profiles.read())?.profiles.map((p) => p.id),
+    ["p-other", "p-a", "p-b"]
+  );
 });

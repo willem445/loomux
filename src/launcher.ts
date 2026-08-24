@@ -61,18 +61,15 @@ import {
   SSH_NO_CLIENT,
 } from "./panesetup";
 import {
-  decodeSshProfiles,
-  encodeSshProfiles,
-  emptySshProfileStore,
   REMOTE_SHELLS,
   DEFAULT_REMOTE_SHELL,
   MAX_KEEPALIVE_SECONDS,
   MAX_SSH_PORT,
   MIN_KEEPALIVE_SECONDS,
   MIN_SSH_PORT,
+  SshProfilesStore,
   type RemoteShell,
   type SshProfile,
-  type SshProfileStore,
 } from "./sshprofile";
 import {
   agentCliKnobs,
@@ -309,9 +306,16 @@ export class WelcomeForm {
    *  naming a remote CLI this build doesn't know. Never a blocker on its own —
    *  the missing-client case is refused at submit, where it can say so once. */
   private sshWarn: HTMLElement;
-  /** The saved connections, as last loaded/saved. The store's `schemaVersion` is
-   *  carried in this object rather than re-stamped on save (sshprofile.ts). */
-  private sshStore: SshProfileStore = emptySshProfileStore();
+  /** Owns `sshprofiles.json`: the read-once lifecycle, and the rule that a save
+   *  never publishes a list nobody has read (#1332). The form hands it ONE
+   *  profile and gets back what happened — it cannot reach the list or the
+   *  `schemaVersion`, which is what makes the save-before-load defect
+   *  unrepresentable here rather than merely absent. */
+  private readonly sshProfiles = new SshProfilesStore({ load: loadSshProfiles, save: saveSshProfiles });
+  /** The saved connections as last read, for the picker and the field editor.
+   *  A DISPLAY snapshot and never the source of a save — `sshProfiles` owns
+   *  what reaches disk. */
+  private sshKnown: SshProfile[] = [];
   /** The id a NEW connection will be saved under. Minted once when the human
    *  switches the picker to "new" rather than per submit, so a validation bounce
    *  and its retry save one profile, not two. */
@@ -1578,15 +1582,24 @@ export class WelcomeForm {
 
   // ---------- SSH connections (#887 S3) ----------
 
-  /** Load the saved connections once per form, and paint the picker. Failures
-   *  (or a first run) leave an empty store: a connection list we couldn't read is
-   *  a form with no saved entries, never a form that won't open. */
+  /** Load the saved connections once per form, and paint the picker. A first run
+   *  (or a file `uistate.rs` quarantined) is an empty picker; a read that FAILED
+   *  is an empty picker too, because a connection list we couldn't read is a form
+   *  with no saved entries, never a form that won't open.
+   *
+   *  The two are not the same to the STORE, and that is the whole of #1332: this
+   *  is a display load, it never decides what gets written, and the memo is
+   *  released on a failure so re-picking SSH retries rather than leaving the
+   *  human staring at a list that this form has given up on. */
   private loadSshProfilesOnce(): Promise<void> {
-    this.sshLoad ??= loadSshProfiles()
-      .then((raw) => decodeSshProfiles(raw) ?? emptySshProfileStore())
-      .catch(() => emptySshProfileStore())
+    this.sshLoad ??= this.sshProfiles
+      .read()
       .then((store) => {
-        this.sshStore = store;
+        if (!store) {
+          this.sshLoad = null;
+          return;
+        }
+        this.sshKnown = store.profiles;
         this.paintSshProfiles();
         // Seed the fields from the first saved connection — the overwhelmingly
         // common case is reconnecting to a host you already use, and a form that
@@ -1605,7 +1618,7 @@ export class WelcomeForm {
   private paintSshProfiles(): void {
     const current = this.sshProfileSel.value;
     this.sshProfileSel.replaceChildren(
-      ...this.sshStore.profiles.map((p) => {
+      ...this.sshKnown.map((p) => {
         const o = document.createElement("option");
         o.value = p.id;
         o.textContent = `${p.name} — ${p.destination}`;
@@ -1616,13 +1629,13 @@ export class WelcomeForm {
     fresh.value = SSH_NEW;
     fresh.textContent = "New connection…";
     this.sshProfileSel.appendChild(fresh);
-    this.sshProfileSel.value = this.sshStore.profiles.some((p) => p.id === current) ? current : SSH_NEW;
+    this.sshProfileSel.value = this.sshKnown.some((p) => p.id === current) ? current : SSH_NEW;
   }
 
   /** Fill the editor fields from the picked connection — or clear them for a new
    *  one. The fields ARE the profile, so this is the whole of "selecting" it. */
   private applySshProfile(): void {
-    const picked = this.sshStore.profiles.find((p) => p.id === this.sshProfileSel.value) ?? null;
+    const picked = this.sshKnown.find((p) => p.id === this.sshProfileSel.value) ?? null;
     // A fresh id per switch INTO "new", not per submit: a validation bounce and
     // the retry that follows it must save one connection, not two.
     if (!picked) this.sshNewId = crypto.randomUUID();
@@ -1712,7 +1725,7 @@ export class WelcomeForm {
     const name = this.sshNameInput.value.trim();
     const destination = this.sshDestInput.value.trim();
     if (!name || !destination) return null;
-    const picked = this.sshStore.profiles.find((p) => p.id === this.sshProfileSel.value);
+    const picked = this.sshKnown.find((p) => p.id === this.sshProfileSel.value);
     return {
       id: picked?.id ?? this.sshNewId ?? crypto.randomUUID(),
       name,
@@ -1738,23 +1751,37 @@ export class WelcomeForm {
    *  Best-effort by design (the same contract `saveUiTabs` has): a connection
    *  that started is worth more than the record of it, and failing the launch
    *  because the store couldn't be written would be trading the thing the human
-   *  asked for against a convenience. */
+   *  asked for against a convenience.
+   *
+   *  Best-effort is NOT best-guess, which is what #1332 was: the whole file is
+   *  republished here, so `SshProfilesStore` awaits its own read before it will
+   *  publish anything and declines outright when that read failed. This method
+   *  can no longer reach the profile LIST, so it can no longer publish an empty
+   *  one over the human's saved connections. */
   private async persistSshProfile(profile: SshProfile): Promise<void> {
-    const others = this.sshStore.profiles.filter((p) => p.id !== profile.id);
-    const existing = this.sshStore.profiles.some((p) => p.id === profile.id);
-    // Keeps position on an edit, appends on a create — a picker that reorders
-    // itself under the human every time they launch is its own small bug.
-    this.sshStore = {
-      ...this.sshStore,
-      profiles: existing
-        ? this.sshStore.profiles.map((p) => (p.id === profile.id ? profile : p))
-        : [...others, profile],
-    };
-    try {
-      await saveSshProfiles(encodeSshProfiles(this.sshStore));
-    } catch {
-      /* best-effort — the pane still launches; the connection just isn't saved */
-    }
+    const outcome = await this.sshProfiles.write(profile);
+    if (outcome !== "saved") return;
+    // Keep the display snapshot in step, so a form left open after a launch
+    // offers the connection it just saved. `reopenAfterLaunchFailure` is the
+    // path that reaches this: the human saves a connection, the downstream
+    // launch throws, and the still-mounted form comes back — with the new
+    // connection in the picker, which is what makes this sentence true rather
+    // than merely intended (#1358 review N1). The repaint is required for that:
+    // the `sshLoad` memo has long since resolved, so nothing else rebuilds the
+    // element.
+    //
+    // Copied in, like the store does — `sshKnown` is display-only and provably
+    // cannot reach disk, but keeping one side holding the caller's object is
+    // how the two drift apart.
+    const taken: SshProfile = { ...profile, extraArgs: [...profile.extraArgs] };
+    const existing = this.sshKnown.some((p) => p.id === taken.id);
+    this.sshKnown = existing
+      ? this.sshKnown.map((p) => (p.id === taken.id ? taken : p))
+      : [...this.sshKnown, taken];
+    // Keeps whatever the human had selected: `paintSshProfiles` re-selects
+    // `current` when it survives, and falls back to "New connection…" — which
+    // is where a just-created connection leaves the picker anyway.
+    this.paintSshProfiles();
   }
 
   private async pickRepo(): Promise<void> {
