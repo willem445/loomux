@@ -23818,7 +23818,15 @@ impl DeliveredNotices {
 /// until a producer promises it. There is no producer to ask here: admission is
 /// by PROVENANCE, and [`delivered_prompt_lines`] is the promise, made once,
 /// structurally, about what may enter at all. Every line in here is text loomux
-/// put on the wire as a prompt, recorded verbatim after the write succeeded.
+/// put on the wire as a prompt, recorded after the write succeeded.
+///
+/// **Not verbatim, and the difference is load-bearing rather than sloppy**: each
+/// line is stored [`deframe`]d and trimmed, because that is the form the mask
+/// compares against. A rendered row reaches `record_claim` as
+/// `wrap_normalize(deframe(row))`, so a record holding the raw line would fail to
+/// match any row whose leading glyph the CLI painted — and a brief line beginning
+/// `* ` or `● ` is exactly such a row. Storing the compared form is what keeps the
+/// two sides of that comparison from drifting.
 #[derive(Debug, Default)]
 pub struct DeliveredPrompts {
     lines: VecDeque<String>,

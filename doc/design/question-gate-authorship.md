@@ -137,7 +137,9 @@ exactly the checkpoint that decides the Enter — on an otherwise unchanged scre
 incident shows the flip in two consecutive audit records. `mask_own_paste` now claims such a
 row, on two narrowing terms: the paste must be **multi-line** (a single line is not one a
 CLI collapses, so a placeholder beside one is not ours — `j5`), and no dialog header may sit
-above it. The evidence being claimed on is the CLI's, not a shape invented here: a pane that
+above it (`j10`, with a control that the same placeholder IS claimed once the question row
+is gone — that term went unpinned in the first cut of this work, and a residual claiming it
+bounded the claim was therefore a claim rather than evidence). The evidence being claimed on is the CLI's, not a shape invented here: a pane that
 took our bytes into a free-text composer is a pane that was not showing a modal. The
 placeholder's `#N`/`+M lines` parts are deliberately not parsed — that text is the CLI's to
 change and this repo has no citable specification of it.
