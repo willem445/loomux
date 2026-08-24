@@ -23818,7 +23818,7 @@ pub fn record_contributions_for(batch: &[queue::QueuedDelivery]) -> Vec<(String,
 pub fn prompt_record_admits_kind(kind: Delivery) -> bool {
     match kind {
         Delivery::FreshKickoff | Delivery::ResumeKickoff | Delivery::MidSession => true,
-        Delivery::Regrounding => false,
+        Delivery::Regrounding => true,
     }
 }
 
