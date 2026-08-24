@@ -3,12 +3,14 @@
 //! opened one.
 //!
 //! Its own integration-test binary rather than more of `orchestration.rs` for
-//! two reasons. The mechanical one: three PRs touching that file were ahead of
-//! this slice in the merge queue, and an end-of-file append conflicts on its
-//! shared trailing tokens rather than on its content (CLAUDE.md's git section).
+//! two reasons. The mechanical one: that file is a permanent contention point —
+//! an end-of-file append there conflicts on its shared trailing tokens rather
+//! than on its content (CLAUDE.md's git section), so concurrent slices splice
+//! into each other's final assertion. This file adds exactly one line to it (the
+//! `sanctioned` row the #464 guard requires) and keeps everything else here.
 //! The real one: these tests are one subject — the lifecycle of a single
-//! capability class — and the class is new enough that a reader should be able
-//! to find all of it in one place.
+//! capability class — and belong together for a reader regardless of what the
+//! merge queue happens to hold.
 //!
 //! An integration test (not a unit test) because a test executable linking the
 //! full lib needs the common-controls-v6 manifest `build.rs` embeds via
