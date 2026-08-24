@@ -492,11 +492,29 @@ fn a_replaced_file_with_identical_content_resets_on_its_creation_time() {
     let before = fs::metadata(&t.path).expect("stat").created().ok();
     let same = t.text();
     let was_len = t.len();
-    fs::remove_file(&t.path).expect("remove");
-    fs::write(&t.path, &same).expect("recreate with identical content");
+
+    // Produce a creation time that is genuinely DISTINGUISHABLE, and only then
+    // let the probe below decide.
+    //
+    // A bare remove-and-recreate can land inside a single clock tick, and the
+    // probe then cannot tell "this host coalesces creation times" from "we were
+    // simply too quick" — so the test skips, reports ok, and evidences nothing.
+    // That is not hypothetical: scratch rounds 13 and 16 removed the SAME arm
+    // and this test came back red on one ubuntu run and green on the other. A
+    // test that silently degrades to a no-op is worse than no test, because the
+    // suite stays green either way.
+    let mut after_created = None;
+    for _ in 0..10 {
+        fs::remove_file(&t.path).expect("remove");
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&t.path, &same).expect("recreate with identical content");
+        after_created = fs::metadata(&t.path).expect("stat").created().ok();
+        if before.is_none() || after_created != before {
+            break;
+        }
+    }
     assert_eq!(t.len(), was_len, "the replacement must be byte-identical to test this arm");
     t.bump_mtime();
-    let after_created = fs::metadata(&t.path).expect("stat").created().ok();
 
     match (before, after_created) {
         (Some(a), Some(b)) if a != b => {}

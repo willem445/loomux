@@ -158,6 +158,17 @@ One `stat` — the same call that validates the remembered path — then:
 | shorter than the last stat | reset: discard the cursor, re-parse from byte zero |
 | creation time differs | reset — a different file at the same path |
 | mtime moved **backwards** | reset — restored over from a copy, a sync, a checkout |
+
+Those last two are **defence-in-depth over the anchor and the length**, and
+which of them actually fires is platform-dependent — measured, not assumed.
+Removing the backwards-mtime arm reddens its test on Linux and Windows but not
+on macOS, where APFS drags the birth time back with the mtime so the
+creation-time arm covers the case instead; removing the creation-time arm
+reddens its test on Linux and macOS but not on Windows, where NTFS **file
+tunneling** restores the original birth time for a same-name recreate inside a
+~15 s window, leaving that arm inert. Neither arm is evidenced on all three
+platforms, and the realistic rotation — to *different* content — is caught by
+the anchor or the length regardless.
 | anchor no longer matches | reset — the **last 64 bytes** of the consumed region were rewritten |
 
 Every reset costs exactly what the old code cost on every tick. That is the
