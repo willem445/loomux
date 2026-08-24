@@ -35,6 +35,9 @@ import {
   isBlockKind,
   allowDenialReason,
   personaDenialReason,
+  isRemoteLabel,
+  remoteDenialReason,
+  REMOTE_LABEL_MAX,
   isReviewingBlock,
   isWorkflowCli,
   isValidIntakeLabel,
@@ -1582,6 +1585,134 @@ test("a loomux-owned block may not declare a persona (#1161 D1, review N5)", () 
   const ok = withManager();
   ok.blocks[2]! = { ...ok.blocks[2]!, prompt: "Review for security." }; // the reviewer
   assert.ok(!has(validateWorkflow(ok), "persona-not-permitted"));
+});
+
+// ---------- remote blocks (#1457) ----------
+
+/** One block, with whatever keys the case under test needs. The refusals are all
+ *  per-block, so a one-block roster is the whole fixture. */
+const remoteDoc = (keys: Record<string, string>): string =>
+  `version: 1
+blocks:
+  - id: b
+` +
+  Object.entries(keys)
+    .map(([k, v]) => `    ${k}: ${v}
+`)
+    .join("");
+
+/** Labels the ENGINE refuses, and why — the pane's `isRemoteLabel` mirrors
+ *  `pathseg::check_segment`, and its Rust twin
+ *  (`a_remote_label_is_refused_rather_than_rewritten`) walks this same list. Keep
+ *  the two in step: a mirror nobody compares is a mirror that has drifted. */
+const BAD_LABELS: [string, string][] = [
+  ["", "empty"],
+  ["build box", "a space"],
+  ["build.box", "a dot — so '..' is unspellable"],
+  ['"../buildbox"', "a traversal, which sanitize_id would REWRITE to buildbox"],
+  ["build/box", "a separator"],
+  ['"C:"', "a Windows drive prefix"],
+  ["-buildbox", "a leading dash — an OPTION to any command line"],
+  ["CON", "a Windows reserved device name"],
+  ["b".repeat(REMOTE_LABEL_MAX + 1), "one character over the cap"],
+];
+
+test("a remote label is refused, never rewritten (#1457)", () => {
+  // The pane's mirror of `pathseg::check_segment`. What makes this the right
+  // predicate rather than the id one: `sanitize_id` REWRITES, so "../buildbox"
+  // would become "buildbox" — two strings naming one operator binding, which is
+  // the hazard #925 consolidated the identifier families to prevent.
+  for (const [label, why] of BAD_LABELS) {
+    assert.equal(isRemoteLabel(label.replace(/^"|"$/g, "")), false, `${JSON.stringify(label)} (${why}) must be refused`);
+    const f = analyzeWorkflow(remoteDoc({ kind: "worker", cli: "claude", remote: label || '""' })).findings;
+    assert.ok(has(f, "remote-invalid-label"), `${why}: ${codes(f)}`);
+  }
+  // The positive control, without which every assertion above would pass just as
+  // well against a predicate that refused everything.
+  assert.equal(isRemoteLabel("buildbox"), true);
+  assert.equal(isRemoteLabel("build-box_2"), true);
+  assert.equal(isRemoteLabel("b".repeat(REMOTE_LABEL_MAX)), true, "the cap itself is legal");
+  assert.ok(
+    !has(analyzeWorkflow(remoteDoc({ kind: "worker", cli: "claude", remote: "buildbox" })).findings, "remote-invalid-label")
+  );
+});
+
+test("a loomux-owned block may not run remotely (#1457)", () => {
+  // The mirror of `parse_workflow`'s refusal, and the same two classes
+  // `personaDenialReason` answers for — for a related but distinct reason:
+  // these two are load-bearing LOCALLY. The orchestrator holds orchestration
+  // state, the gh operations and the merge gate; the manager pane is what the
+  // human types into.
+  for (const kind of ["orchestrator", "manager"] as const) {
+    assert.ok(remoteDenialReason(kind), `${kind} must state a reason`);
+    const f = analyzeWorkflow(remoteDoc({ kind, cli: "claude", remote: "buildbox" })).findings;
+    assert.ok(has(f, "remote-not-permitted"), `${kind}: ${codes(f)}`);
+    assert.equal(f.find((x) => x.code === "remote-not-permitted")!.blockId, "b");
+  }
+  // The controls — and they are what keep this from being "no block may run
+  // remotely". Every class the orchestrator SPAWNS may.
+  for (const kind of ["worker", "reviewer", "planner"] as const) {
+    assert.equal(remoteDenialReason(kind), null);
+    const f = analyzeWorkflow(remoteDoc({ kind, cli: "claude", remote: "buildbox" })).findings;
+    assert.ok(!has(f, "remote-not-permitted"), `${kind}: ${codes(f)}`);
+  }
+});
+
+test("a remote block must SPELL OUT cli: claude (#1457)", () => {
+  // Only Claude's session identity survives the trip: orrerix pre-mints the id
+  // and the CLI accepts it, while the others recognize a session by scanning a
+  // LOCAL store. An OMITTED cli: inherits the group default — picked at launch,
+  // unknowable to a parser — so it is refused rather than parsed into a promise
+  // the spawn would have to break.
+  for (const cli of ["copilot", "gemini", "opencode"]) {
+    const f = analyzeWorkflow(remoteDoc({ kind: "worker", cli, remote: "buildbox" })).findings;
+    assert.ok(has(f, "remote-requires-claude"), `${cli}: ${codes(f)}`);
+  }
+  const omitted = analyzeWorkflow(remoteDoc({ kind: "worker", remote: "buildbox" })).findings;
+  assert.ok(has(omitted, "remote-requires-claude"), `an omitted cli: ${codes(omitted)}`);
+  // …and the message has to say WHICH of the two mistakes it is, because the fix
+  // differs: change the CLI, or write the line you left out.
+  assert.match(omitted.find((x) => x.code === "remote-requires-claude")!.message, /inherits the group default/);
+
+  // The control.
+  assert.ok(
+    !has(analyzeWorkflow(remoteDoc({ kind: "worker", cli: "claude", remote: "buildbox" })).findings, "remote-requires-claude")
+  );
+});
+
+test("a block that names no remote is a local block, byte for byte (#1457)", () => {
+  // The migration guarantee: absent is `undefined`, not "", and a file that
+  // never mentioned the key serializes exactly as it did before it existed.
+  const before =
+    "version: 1" + "\n" + "blocks:" + "\n" + "  - id: b" + "\n" +
+    "    name: b" + "\n" + "    kind: worker" + "\n" + "    cli: claude" + "\n";
+  const w = parseWorkflow(before).workflow;
+  assert.equal(w.blocks[0]!.remote, undefined);
+  assert.ok(!serializeWorkflow(w).includes("remote"));
+
+  // …and a declared one survives a round-trip as WRITTEN — the label is never
+  // normalized, so what the pane shows and what the engine reads are one string.
+  const withRemote = parseWorkflow(
+    before.replace(
+      "    cli: claude" + "\n",
+      "    cli: claude" + "\n" + "    remote: buildbox" + "\n"
+    )
+  ).workflow;
+  assert.equal(withRemote.blocks[0]!.remote, "buildbox");
+  assert.equal(parseWorkflow(serializeWorkflow(withRemote)).workflow.blocks[0]!.remote, "buildbox");
+});
+
+test("a host-shaped key is an unknown key, not a field (#1457)", () => {
+  // The repo file SELECTS a label; the operator authors the address. A pane that
+  // read `host:` as a field would be offering to author what the engine refuses
+  // — and the engine's refusal is whole-file, so this is not a cosmetic split.
+  for (const key of ["host", "destination", "port", "user", "identity_file", "ssh_options", "proxy_command", "extra_args"]) {
+    const doc = remoteDoc({ kind: "worker", cli: "claude", [key]: "example.com" });
+    const workflow = parseWorkflow(doc).workflow;
+    const findings = analyzeWorkflow(doc).findings;
+    assert.ok(has(findings, "unknown-key"), `${key}: ${codes(findings)}`);
+    assert.deepEqual(Object.keys(workflow.blocks[0]!.extra ?? {}), [key], `${key} must land in the unknown-key bag`);
+  }
 });
 
 test("the manager never reviews, so it can never satisfy a gate (#1161)", () => {

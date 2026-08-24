@@ -195,6 +195,60 @@ export function allowDenialReason(kind: string): string | null {
   return null;
 }
 
+/** Longest `remote:` label the engine accepts — `pathseg::MAX_SEGMENT_LEN`
+ *  (crates/loomux-engine/src/pathseg.rs), the shared #925 identifier cap the
+ *  engine validates a remote label with. A hand-written mirror, like
+ *  {@link WORKFLOW_CLIS}, and safe for the same reason: the Rust side pins the
+ *  manifest against the engine's own constant, and `test/workflowschema.test.ts`
+ *  pins this against the manifest. */
+export const REMOTE_LABEL_MAX = 64;
+
+/** Whether a `remote:` label is one the engine will accept — the pane's mirror of
+ *  `pathseg::check_segment`, which `parse_workflow` validates the key with (#1457).
+ *
+ *  `[A-Za-z0-9_-]`, non-empty, at most {@link REMOTE_LABEL_MAX}, no leading `-`
+ *  (a bare `-foo` is an OPTION to any command line the label is interpolated
+ *  into), and no Windows reserved device name. REFUSED, never rewritten: two
+ *  spellings must not be able to name one operator binding.
+ *
+ *  Not the same predicate as an id's: `sanitize_id` REWRITES, which is exactly
+ *  what a label may not do. */
+export function isRemoteLabel(label: string): boolean {
+  if (!label || label.length > REMOTE_LABEL_MAX) return false;
+  if (!/^[A-Za-z0-9_-]+$/.test(label)) return false;
+  if (label.startsWith("-")) return false;
+  const stem = (label.split(".")[0] ?? "").toUpperCase();
+  return !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem);
+}
+
+/** Why a block of this kind may NOT declare `remote:`, or `null` when it may
+ *  (#1457) — the mirror of `parse_workflow`'s refusal.
+ *
+ *  The same two loomux-owned classes {@link personaDenialReason} answers for, and
+ *  for a related but distinct reason: those two blocks are load-bearing LOCALLY.
+ *  The orchestrator is the trust root and holds orchestration state, the `gh`
+ *  operations and the merge gate; the manager pane is the human's own interface —
+ *  the thing they type into. Neither is a remote-execution feature with a missing
+ *  implementation.
+ *
+ *  An UNRECOGNIZED kind answers `null`, exactly like {@link allowDenialReason}:
+ *  `unknown-kind` already says what is wrong with that block. */
+export function remoteDenialReason(kind: string): string | null {
+  if (kind === "orchestrator") {
+    return (
+      "the orchestrator is orrerix's trust root — orchestration state, the gh operations and " +
+      "the merge gate stay on this machine — so put remote: on the blocks it spawns"
+    );
+  }
+  if (kind === "manager") {
+    return (
+      "a manager pane is the human's own interface, the thing they type into, so it runs where " +
+      "they are — put remote: on the blocks the orchestrator spawns"
+    );
+  }
+  return null;
+}
+
 /** What the engine will actually apply for one `allow:` entry, or `null` when it
  *  drops the entry entirely. Mirrors `sanitize_allow` (profiles.rs): everything
  *  outside its alphabet is FILTERED OUT — silently, on the way to the CLI's
@@ -489,6 +543,16 @@ export interface WorkflowBlock {
   /** Context-window variant (#687) — `1m`, or "" for the model's own window.
    *  Same ownership rule as {@link effort}. */
   context?: string;
+  /** OPTIONAL remote LABEL (#1457) — the abstract name of a machine this block's
+   *  agent runs on over SSH. A repo file SELECTS a label; the operator binds it
+   *  to a host, an account and a remote clone path outside the repo, so a
+   *  `host:`/`port:`/`identity_file:` key is not a field here — it is an unknown
+   *  key, and an unknown key fails the whole file on the engine.
+   *
+   *  Absent is a local block, byte for byte. Declared, it is inert in this build:
+   *  the operator binding (#1458) and the spawn path (#1459) are what make it do
+   *  anything. */
+  remote?: string;
   /** Keys this build doesn't know, preserved verbatim across a round-trip. */
   extra?: Record<string, YamlValue>;
 }
@@ -670,6 +734,9 @@ export type FindingCode =
   | "resource-name-invalid"
   | "allow-not-permitted"
   | "persona-not-permitted"
+  | "remote-invalid-label"
+  | "remote-not-permitted"
+  | "remote-requires-claude"
   | "allow-sanitized";
 
 /** The policy sections a finding can be ABOUT — the routing key for the three that are
@@ -1367,6 +1434,9 @@ function emitBlockLines(b: WorkflowBlock, markerIndent = 2): string[] {
   // `emitScalar`, which quotes for flow context, so `Bash(gh pr view --json
   // title,body)` survives instead of re-reading as two entries (rev-5 F1).
   if (b.allow !== undefined) out.push(`${field}allow: [${b.allow.map(emitScalar).join(", ")}]`);
+  // #1457: only when declared — a block that named no remote serializes byte for
+  // byte as it did before the key existed.
+  if (b.remote !== undefined) out.push(`${field}remote: ${emitScalar(b.remote)}`);
   out.push(...extraLines(b.extra, field));
   if (b.prompt !== undefined) out.push(...emitBlockScalar("prompt", b.prompt, field));
   return out;
@@ -2096,6 +2166,7 @@ const KNOWN_BLOCK = new Set([
   "role_hint",
   "effort",
   "context",
+  "remote",
 ]);
 /** `gates:` is a MAP keyed by gate name, not a fixed struct: the engine reads it as
  *  `BTreeMap<String, RawGate>`, so a `release:` gate parses fine — loomux simply
@@ -2401,6 +2472,9 @@ function readBlock(raw: YamlValue, index: number, findings: Finding[]): Workflow
   // the way role_hint keeps them, so a save can't turn one into the other.
   if (r.effort !== undefined) block.effort = asString(r.effort) ?? "";
   if (r.context !== undefined) block.context = asString(r.context) ?? "";
+  // #1457. Read as written — the label is validated, never rewritten, so what the
+  // pane shows and what the engine refuses are the same string.
+  if (r.remote !== undefined) block.remote = asString(r.remote) ?? "";
   return block;
 }
 
@@ -2740,6 +2814,37 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
           severity: "error",
           code: "role-hint-wrong-kind",
           message: `Block "${where}" has role_hint "${b.role_hint}", which requires kind: ${required} (this block is kind: "${b.kind}").`,
+          blockId: b.id,
+        });
+      }
+    }
+    // #1457. Mirrors `parse_workflow`'s three refusals, in its order, for the
+    // reason `personaDenialReason` states: each of them fails the WHOLE file on
+    // the engine, so a pane that reported one clean would let an author save a
+    // workflow whose launch silently falls back to the built-in roster.
+    if (b.remote !== undefined) {
+      const denial = remoteDenialReason(b.kind);
+      if (!isRemoteLabel(b.remote)) {
+        findings.push({
+          severity: "error",
+          code: "remote-invalid-label",
+          message: `Block "${where}" has remote "${b.remote}", which is not a usable label — letters, digits, '-' and '_' only, at most ${REMOTE_LABEL_MAX} characters, and not starting with '-'. A remote label is an abstract name the OPERATOR binds to a host outside this repo, never an address.`,
+          blockId: b.id,
+        });
+      } else if (denial) {
+        findings.push({
+          severity: "error",
+          code: "remote-not-permitted",
+          message: `Block "${where}" declares remote:, which a ${b.kind} block may not — ${denial}.`,
+          blockId: b.id,
+        });
+      } else if (b.cli !== "claude") {
+        findings.push({
+          severity: "error",
+          code: "remote-requires-claude",
+          message: b.cli
+            ? `Block "${where}" declares remote: with cli "${b.cli}" — a remote block must run cli: claude, the only CLI that accepts a session id orrerix minted before the spawn.`
+            : `Block "${where}" declares remote: with no cli — a remote block must spell out cli: claude. An omitted cli inherits the group default, which is picked at launch, so orrerix cannot check it here.`,
           blockId: b.id,
         });
       }

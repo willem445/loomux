@@ -350,6 +350,12 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "block.role_hint",
   "block.effort",
   "block.context",
+  // #1457. The pane READS, EMITS and VALIDATES `remote:` — the three tests above
+  // and `workflowmodel.test.ts`'s refusal tests are what check that — but the
+  // designer has no control for it yet, and deliberately not: R1 is the schema
+  // and its refusals. An affordance for it waits on the operator binding
+  // (#1458), which is what turns a label into a list of names worth offering.
+  "block.remote",
   "edge.from",
   "edge.to",
   "gate.require",
