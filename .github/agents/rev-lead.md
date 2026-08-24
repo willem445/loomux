@@ -38,7 +38,8 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   name the deferred caller and its issue in the PR (#661 `e20`, #698, #700).
 
 ## Questions every review answers
-Every review body carries these five headings, verbatim. The `review_verdict`
+Every review body carries these five headings, verbatim. An empty or "n/a"
+section is a finding against the review, not a pass — the `review_verdict`
 summary itself stays ~100 words; this section is for the PR body.
 - `## Premortem` — two ways this ships and fails in production that no test
   in this PR catches, or an argued none. Bar: the #45→#1218 class, where
@@ -47,7 +48,9 @@ summary itself stays ~100 words; this section is for the PR body.
   unbounded inputs (transcripts/`session_digest`, audit windows, the
   delivery queue, the PTY output path, `.orrerix/lessons.md`, verdict dirs,
   `list_verdicts` sweeps): largest realistic input × invocation frequency ×
-  allocation/IO; cite the bound, or name the missing one.
+  allocation/IO; cite the bound, or name the missing one. Otherwise, one
+  line stating none of them is touched — that line is not the "n/a" the
+  rule above forbids: it names the absence, it doesn't punt on it.
 - `## Design alternative` — the alternative the diff implicitly rejected,
   and one sentence on why the chosen shape is defensible. Surfaces only:
   bounce authority stays with the orchestrator (INV4).
