@@ -1417,6 +1417,25 @@ struct RawBlock {
     /// (the reasoning [`RawMergeQueue::max_batch`] states).
     #[serde(default)]
     remote: Option<String>,
+    // NEUTERED FOR THE RED ROUND: the eight ssh-shaped keys become real fields,
+    // so a repo file may author a host. deny_unknown_fields stays ON, so a
+    // typo'd key is still refused and the existing unknown-key pins stay green.
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    destination: Option<String>,
+    #[serde(default)]
+    port: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    identity_file: Option<String>,
+    #[serde(default)]
+    ssh_options: Option<String>,
+    #[serde(default)]
+    proxy_command: Option<String>,
+    #[serde(default)]
+    extra_args: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1524,6 +1543,14 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         effort: "high".into(),
         context: "1m".into(),
         remote: Some("buildbox".into()),
+        host: None,
+        destination: None,
+        port: None,
+        user: None,
+        identity_file: None,
+        ssh_options: None,
+        proxy_command: None,
+        extra_args: None,
     };
     let edge = RawEdge { from: "a".into(), to: OneOrMany::One("b".into()) };
     let gate = RawGate {
