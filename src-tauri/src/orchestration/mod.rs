@@ -23787,6 +23787,7 @@ pub fn delivered_prompt_lines(text: &str) -> Vec<String> {
 pub fn record_contributions_for(batch: &[queue::QueuedDelivery]) -> Vec<(String, Delivery)> {
     batch
         .iter()
+        .take(1)
         .filter_map(|e| e.payload.text().map(|t| (t.to_string(), e.delivery_kind)))
         .collect()
 }
