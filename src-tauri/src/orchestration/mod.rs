@@ -6390,13 +6390,17 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
 /// silently.
 ///
 /// Pure, and the one expression. **Every site that decides this question calls
-/// it rather than re-spelling the rule** — five reading sites in four
-/// functions: [`OrchRegistry::live_delegate_count`] (the value enforcement
-/// reads), [`OrchRegistry::live_delegate_roster`] (the names in the refusal
-/// message), `spawn_agent_bound` twice (its fast-path cap check and its
-/// race-safe re-check under the agents lock), and
-/// [`OrchRegistry::group_summary`]'s `live_delegates` (the number the lifecycle
-/// panel shows).
+/// it rather than re-spelling the rule** — four functions, five decision
+/// points: [`OrchRegistry::live_delegate_count`] (the value enforcement reads),
+/// [`OrchRegistry::live_delegate_roster`] (the names in the refusal message),
+/// `spawn_agent_bound` twice (its fast-path cap check and its race-safe
+/// re-check under the agents lock), and [`OrchRegistry::group_summary`]'s
+/// `live_delegates` (the number the lifecycle panel shows).
+///
+/// A `grep` for the call shows **seven**, not five, and the difference is not a
+/// miscount: the race-safe re-check calls it three times — once to gate the
+/// block, then inside each of the two filters that count the slot-holders and
+/// name them — which is one decision made in three places that must agree.
 ///
 /// Four of those sites had independently spelled `role != Role::Orchestrator`.
 /// `group_summary` had spelled the rule a THIRD way again — a hand-sum of

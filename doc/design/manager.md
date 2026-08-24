@@ -509,11 +509,13 @@ says "nothing is assigned", which is a fact about which paths exist, while "loom
 never nags the orchestrator about the human's own pane" is the rule.
 
 `counts_against_max_agents` is one pure predicate, and **every site that decides
-this question calls it** — five reading sites in four functions:
+this question calls it** — four functions, five decision points:
 `live_delegate_count` (the value enforcement reads), the cap-refusal roster (the
 names in the message), `spawn_agent_bound` twice (its fast-path check and its
 race-safe re-check), and `group_summary`'s `live_delegates` (the number the
-lifecycle panel shows).
+lifecycle panel shows). A `grep` for the call shows **seven**: the race-safe
+re-check calls it three times — once to gate the block, then inside each of the
+two filters that count the slot-holders and name them.
 
 Four of those sites had independently spelled `role != Role::Orchestrator`.
 `group_summary` had spelled the rule a *third* way again — a hand-sum of
