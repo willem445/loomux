@@ -345,6 +345,18 @@ compiles.
   exactly ONE test" beside that file's own `130→129` row, where the whole suite reddens two
   (#1337: `test/decisions.test.ts` also goes red, pinning the set difference instead of
   iterating the list).
+  And only as wide as its OPERATOR SET: a residual claim ("this line is pinned by nothing")
+  derived from DELETION mutations alone says nothing about a STATEFUL guard, which fails by
+  polarity, by placement, and by a per-branch side effect going missing — so invert the gate,
+  move the guarded statement out of the block that gates it, and drop each assignment that
+  sets the flag, one at a time. Re-derive the residual on the round that ADDS a guard: the
+  earlier round's operator set no longer spans the code. On a hand-validated module (DOM glue
+  with no test file of its own) the residual rests on `tsc --noEmit`/`noUnusedLocals` ALONE —
+  which sees a deletion and not an inversion — so a green suite there is the module having no
+  tests, never evidence about the mutation. Signature: a round-1 residual scoped to "one call,
+  if deleted" still standing after a later round's fix, whose inverted gate reverts that very
+  fix with `tsc --noEmit` at exit 0 and the suite green throughout (#1487 N2/N4 — four such
+  mutations, two of them polarity or placement rather than deletion).
 - **An absence-only assertion needs a positive control, and the vacuity is a SHAPE.**
   `is_empty()`, `!contains(…)`, "renders nothing" — each passes just as well when the
   mechanism never ran at all. Pin first that it DID (`fired.len() == 1`, `scanned > 0`
@@ -529,6 +541,17 @@ narrow their ask back down to the original ticket on your own judgment.
   #1299's own resolution: 102 test names at the base, 116 at the head, 0 lost. A splice
   is silently GREEN — one side's block nested inside the other's final assertion still
   parses and still runs — so parsing the result proves nothing (#1299).
+- **A conflict hunk whose other side is EMPTY is not add-vs-add, and a union silently
+  reinstates what that side deleted.** Where a sibling branch REPLACES the block your change
+  lives inside, `git merge-tree` prints that side of the hunk empty, and "keep both sides"
+  restores a guard that no longer guards, a second read beside the replacement, or a `catch`
+  that is now dead code — parsing, passing, and reverting your own earlier fix. #1299's
+  "deletes nothing of the other side's blob" census is the wrong instrument here: a correct
+  resolution of a replace-vs-augment hunk deletes YOUR lines. Classify per HUNK, and treat the
+  prose that tells a future resolver what to do — a body's overlap section, a shipped comment —
+  as load-bearing text reviewable as code, never one blanket sentence over a multi-file
+  conflict. Signature: a body licensing "resolve by keeping both sides" across a file list
+  `git merge-tree` shows an empty other side for (#1487 B3).
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,

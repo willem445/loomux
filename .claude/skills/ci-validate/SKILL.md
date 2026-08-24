@@ -346,6 +346,28 @@ mechanism working, and the fix is to ping the reviewer to re-record, not to leav
 SHAs wrong. Signature: run ids re-derived after a rebase, commit SHAs beside them not
 — including the one the body tells a reader to check out (#1327).
 
+### A SHA on ANOTHER open PR's branch: cite the subject, check their ref
+
+The check above frames a SHA against *your* PR's ref. A body or comment that cites a
+**sibling PR's** commit — "#1470 already carries `829ea8a4`, which prunes this set" — has
+no such frame: that branch force-pushes on its own schedule, between your rounds, with
+nothing on your side changing. Both traps above still apply and neither check fires,
+because the orphan is in someone else's history:
+
+```sh
+# the SIBLING's number, not yours; leading + for the same non-fast-forward reason
+git fetch origin +refs/pull/<sibling>/head:refs/tmp/pr<sibling>
+git merge-base --is-ancestor <sha> refs/tmp/pr<sibling>   # non-zero = orphaned
+git log refs/tmp/pr<sibling> --oneline --grep '<subject>'  # what to cite instead
+```
+
+Cite the **commit subject**, which survives their rebase. Two extras this direction adds:
+the citation can rot with your PR already merged, so re-check it at the body gate of every
+round rather than only after your own rebase; and a SHA that ships in a **code comment**
+outlives the body entirely — no gate re-reads it, so it must be a subject from the start.
+Signature: a cross-PR SHA that still `git cat-file -e`s locally and is an ancestor of
+nothing the sibling still publishes (#1487 N5).
+
 ### A range's baseline is a *different* check from a SHA's ancestry
 
 The check above asks *is this SHA still on the branch*. A body that cites a **range** —
