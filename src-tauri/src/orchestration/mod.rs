@@ -23001,13 +23001,6 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
         // specification of its arithmetic, so pinning one would be a guess
         // dressed as a check. The shape plus the multi-line term is what is
         // actually known.
-        if claimed.is_none()
-            && pasted.len() > 1
-            && collapsed_paste_row(rows[i])
-            && !dialog_header_above(&rows, &norm, &keep, i)
-        {
-            claimed = Some(i + 1);
-        }
         match claimed {
             Some(end) => {
                 keep[i..end].fill(false);
