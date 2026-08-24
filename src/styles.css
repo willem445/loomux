@@ -2918,6 +2918,9 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .task-note { display: flex; gap: 8px; padding: 2px 0; font-size: 11px; }
 .task-note-meta { flex: none; color: var(--ink-dim); font-size: 10px; padding-top: 1px; }
 .task-note-text { min-width: 0; color: var(--ink); user-select: text; }
+/* #1317: a row expanded since the last read has its bodies in flight. Muted,
+   because it is a state of the READ, not a note anyone wrote. */
+.task-note-pending { color: var(--ink-dim); font-style: italic; }
 .task-note-add { display: flex; gap: 6px; margin-top: 5px; }
 .task-note-add input { flex: 1; min-width: 0; padding: 3px 8px; font-size: 11px; }
 
