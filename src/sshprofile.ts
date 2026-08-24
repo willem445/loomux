@@ -479,6 +479,9 @@ export class SshProfilesStore {
   /** The read in flight, shared by every concurrent caller so a burst of
    *  gestures cannot start several. Cleared on failure so a later call retries. */
   private reading: Promise<boolean> | null = null;
+  /** The tail of the write queue — see `write`. Starts resolved, so the first
+   *  write costs one microtask and nothing else. */
+  private writing: Promise<unknown> = Promise.resolve();
   /** An explicit field, not a constructor parameter property: node's
    *  strip-only TypeScript (what `npm test` runs) rejects those outright, so
    *  the terser form would make this module untestable in this repo. */
@@ -525,10 +528,49 @@ export class SshProfilesStore {
     };
   }
 
-  /** Create or update one connection and publish the whole file. Keeps position
-   *  on an edit and appends on a create — a picker that reorders itself under
-   *  the human every time they launch is its own small bug. */
-  async write(profile: SshProfile): Promise<SshProfileWrite> {
+  /** Create or update one connection and publish the whole file.
+   *
+   *  **Writes serialize.** Each one waits for the previous to have LANDED before
+   *  it publishes, because two overlapping writes each publish a whole blob and
+   *  the backend applies them in completion order, not call order — so a blob
+   *  computed first but landing second silently drops whatever the other one
+   *  added. That is the same lost-update this class exists to prevent, one level
+   *  up: the read-before-publish rule stops a save built from a list nobody
+   *  read, and this stops a save built from a list that was correct when it was
+   *  computed and stale by the time it landed.
+   *
+   *  Serialized HERE rather than left to the caller (#1358 review N2). Today the
+   *  only caller is `persistSshProfile`, behind `SubmitLatch` — `submit` takes
+   *  `latch.begin()` before any await, so a second concurrent submit cannot
+   *  start and the interleaving is unreachable. But this class's whole argument
+   *  is that an ordering nobody enforces is not an ordering, and a doc-comment
+   *  asking the next caller to be single-flight is exactly that. The invariant
+   *  is cheaper to keep than to document.
+   *
+   *  `BoardPrefsStore` (`boardprefs.ts`), the precedent this class is modelled
+   *  on, does NOT serialize. That divergence is deliberate and is *not* a claim
+   *  about whether its own caller is safe — it is a different feature's module
+   *  and widening this diff into it would make the review worse. Flagged, not
+   *  changed.
+   *
+   *  Keeps position on an edit and appends on a create — a picker that reorders
+   *  itself under the human every time they launch is its own small bug. */
+  write(profile: SshProfile): Promise<SshProfileWrite> {
+    // The chain's tail never rejects: `publish` resolves a `SshProfileWrite` on
+    // every path, and the handlers below discharge anything a future edit might
+    // throw, so one failure cannot wedge every later write behind a rejected
+    // promise.
+    const mine = this.writing.then(() => this.publish(profile));
+    this.writing = mine.then(
+      () => undefined,
+      () => undefined
+    );
+    return mine;
+  }
+
+  /** One write's read-modify-publish. Never called directly — `write` owns the
+   *  queueing, so there is no way to reach this and skip it. */
+  private async publish(profile: SshProfile): Promise<SshProfileWrite> {
     if (!(await this.ensureLoaded())) return "declined-unread";
     // Copied on the way IN, the mirror of `read`'s copy on the way out: the
     // store outlives the call, so keeping the caller's object would let an edit

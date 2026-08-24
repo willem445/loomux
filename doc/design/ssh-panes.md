@@ -355,6 +355,37 @@ publishes without ever handing anything over. The display load is still memoized
 per form, but the memo is now released on failure, so re-picking SSH retries
 instead of leaving the human staring at a list this form has given up on.
 
+**The second ordering, one level up: writes serialize** (#1358 review N2). A save
+publishes the whole file, so two overlapping writes each publish a whole blob —
+and the backend applies them in COMPLETION order, not call order. The blob
+computed first can land second and silently drop whatever the other one added.
+That is the same lost update as the defect above, with a different cause: the
+read-before-publish rule stops a save built from a list nobody read, and this
+stops a save built from a list that was correct when computed and stale by the
+time it landed.
+
+It is enforced in the store rather than left to the caller, and the reason is the
+one this whole note argues. Today the interleaving is unreachable — `write`'s only
+caller is `persistSshProfile`, behind `SubmitLatch`, and `submit` takes
+`latch.begin()` before any await, so a second concurrent submit cannot start. A
+class whose thesis is "an ordering nobody enforces is not an ordering" cannot then
+ship a doc-comment asking its next caller to be single-flight; the invariant is
+cheaper to keep than to document. `write` chains onto a shared tail and `publish`
+holds the read-modify-save, which is private, so there is no way to reach the
+publish and skip the queue.
+
+`BoardPrefsStore`, the precedent this class is modelled on, does **not** serialize.
+That divergence is deliberate and is not a claim either way about whether its own
+caller is safe — it is a different feature's module, and widening this change into
+it would make the review worse than the finding. Flagged here so whoever picks it
+up has the argument already written.
+
+One piece of this is deliberately unpinned and is called out rather than implied:
+the queue's tail discharges a rejection (`.then(() => undefined, () => undefined)`)
+so one throw cannot wedge every later write. `publish` resolves an outcome on
+every path and never rejects, so no test can redden that handler — it guards a
+future edit, not a reachable state today.
+
 The ordering lives in a class with injected IO rather than a pure function
 because the invariant IS an ordering between two async calls — there is nothing
 to assert about a single value. `test/sshprofile.test.ts`'s last section is the

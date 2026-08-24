@@ -734,3 +734,94 @@ test("an edit updates the connection in place; only a create appends", async () 
   );
   assert.equal(back[0].name, "renamed", "…and took the edit");
 });
+
+test("two overlapping writes serialize, so neither publishes over the other", async () => {
+  // #1358 review N2. Two writes each publish a WHOLE blob, and the backend
+  // applies them in COMPLETION order, not call order — so unserialized, the
+  // blob computed first can land second and drop what the other one added.
+  // Same lost update this class exists to prevent, one level up.
+  //
+  // `applied` records at RESOLVE time, not at call time, because that is the
+  // order the file actually ends up in.
+  const applied: string[] = [];
+  const inFlight: Array<() => void> = [];
+  const io: SshProfileIo = {
+    load: () => Promise.resolve(OTHERS),
+    save: (contents: string) =>
+      new Promise<void>((res) =>
+        inFlight.push(() => {
+          applied.push(contents);
+          res();
+        })
+      ),
+  };
+  const profiles = new SshProfilesStore(io);
+
+  const first = profiles.write(fullProfile({ id: "p-a", name: "alpha" }));
+  const second = profiles.write(fullProfile({ id: "p-b", name: "beta" }));
+  await settle();
+
+  // Positive control, then the pin. The control is that a write really did
+  // reach the backend — without it, "only one is in flight" is also what two
+  // writes that both threw on entry would look like.
+  assert.equal(inFlight.length, 1, "the first write really reached the backend");
+  assert.deepEqual(applied, [], "…and nothing has landed yet");
+  // THE PIN: the second write has NOT published. Unserialized, both blobs are in
+  // flight at once and the backend may apply them in either order.
+
+  inFlight[0]();
+  assert.equal(await first, "saved");
+  await settle();
+  assert.equal(inFlight.length, 2, "the second write starts only once the first has landed");
+
+  inFlight[1]();
+  assert.equal(await second, "saved");
+  assert.deepEqual(
+    publishedIds(applied[applied.length - 1]),
+    ["p-other", "p-a", "p-b"],
+    "the file the backend ends up with holds every connection, in call order"
+  );
+});
+
+test("a write queued behind a FAILING one still waits for it, then still runs", async () => {
+  // The other direction, so serializing cannot pass by never draining: a save
+  // that rejects must neither release the next write early nor wedge the queue
+  // behind it. Both halves are asserted, because each fails a different way —
+  // early release is the lost update again, and a wedge is the latching this
+  // class refuses on the read side.
+  const outcomes: string[] = [];
+  const inFlight: Array<(ok: boolean) => void> = [];
+  const io: SshProfileIo = {
+    load: () => Promise.resolve(OTHERS),
+    save: () =>
+      new Promise<void>((res, rej) =>
+        inFlight.push((ok) => {
+          outcomes.push(ok ? "ok" : "threw");
+          ok ? res() : rej(new Error("disk full"));
+        })
+      ),
+  };
+  const profiles = new SshProfilesStore(io);
+  const first = profiles.write(fullProfile({ id: "p-a" }));
+  const second = profiles.write(fullProfile({ id: "p-b" }));
+  await settle();
+
+  assert.equal(inFlight.length, 1, "the first write really reached the backend");
+  // The serialization pin, on the failure path specifically.
+  assert.deepEqual(outcomes, [], "…and the second has not published behind its back");
+
+  inFlight[0](false); // the first save rejects
+  assert.equal(await first, "failed");
+  await settle();
+  assert.equal(inFlight.length, 2, "the queue drained past the failure rather than wedging");
+
+  inFlight[1](true);
+  assert.equal(await second, "saved");
+  assert.deepEqual(outcomes, ["threw", "ok"], "in that order, never overlapping");
+  // The failed write's value is still in memory, so the one behind it carries
+  // both — the `persistTabs` best-effort contract, held across the queue.
+  assert.deepEqual(
+    (await profiles.read())?.profiles.map((p) => p.id),
+    ["p-other", "p-a", "p-b"]
+  );
+});

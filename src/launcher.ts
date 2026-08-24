@@ -1762,11 +1762,26 @@ export class WelcomeForm {
     const outcome = await this.sshProfiles.write(profile);
     if (outcome !== "saved") return;
     // Keep the display snapshot in step, so a form left open after a launch
-    // offers the connection it just saved.
-    const existing = this.sshKnown.some((p) => p.id === profile.id);
+    // offers the connection it just saved. `reopenAfterLaunchFailure` is the
+    // path that reaches this: the human saves a connection, the downstream
+    // launch throws, and the still-mounted form comes back — with the new
+    // connection in the picker, which is what makes this sentence true rather
+    // than merely intended (#1358 review N1). The repaint is required for that:
+    // the `sshLoad` memo has long since resolved, so nothing else rebuilds the
+    // element.
+    //
+    // Copied in, like the store does — `sshKnown` is display-only and provably
+    // cannot reach disk, but keeping one side holding the caller's object is
+    // how the two drift apart.
+    const taken: SshProfile = { ...profile, extraArgs: [...profile.extraArgs] };
+    const existing = this.sshKnown.some((p) => p.id === taken.id);
     this.sshKnown = existing
-      ? this.sshKnown.map((p) => (p.id === profile.id ? profile : p))
-      : [...this.sshKnown, profile];
+      ? this.sshKnown.map((p) => (p.id === taken.id ? taken : p))
+      : [...this.sshKnown, taken];
+    // Keeps whatever the human had selected: `paintSshProfiles` re-selects
+    // `current` when it survives, and falls back to "New connection…" — which
+    // is where a just-created connection leaves the picker anyway.
+    this.paintSshProfiles();
   }
 
   private async pickRepo(): Promise<void> {
