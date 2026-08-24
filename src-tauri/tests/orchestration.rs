@@ -51034,10 +51034,34 @@ fn j6_notice_text_never_enters_the_session_prompt_record() {
         1,
         "control: a prompt body IS admitted — otherwise the assertion above is vacuous"
     );
-    // And the two doors stay complementary: what one admits the other refuses.
-    let mixed = "[orrerix] queued flush\n[orch] the actual brief";
-    assert_eq!(loomux_authored_lines(mixed).len(), 1);
-    assert_eq!(delivered_prompt_lines(mixed), vec!["[orch] the actual brief".to_string()]);
+    // The two doors stay complementary — but the witness has to be a delivery
+    // that is NOT a notice, because term 1 now excludes those WHOLE. Ordering is
+    // the whole of the specimen here: a marker-led FIRST line means loomux is
+    // relaying and nothing is admitted, while a marker-led line further down is
+    // just one of loomux's own rows inside a prompt loomux originated, and the
+    // per-line filter still drops exactly that row.
+    let notice_first = "[orrerix] queued flush\n[orch] the actual brief";
+    assert!(
+        delivered_prompt_lines(notice_first).is_empty(),
+        "marker-led FIRST line — the delivery is a notice, so none of it is admitted"
+    );
+    assert_eq!(
+        loomux_authored_lines(notice_first).len(),
+        1,
+        "…while the notice record still takes its marker row, which is the door that owns it"
+    );
+
+    let prompt_first = "[orch] the actual brief\n[orrerix] queued flush";
+    assert_eq!(
+        delivered_prompt_lines(prompt_first),
+        vec!["[orch] the actual brief".to_string()],
+        "marker-led line BELOW the first: the delivery is a prompt, admitted, with loomux's          own row filtered out of it per line"
+    );
+    assert_eq!(
+        loomux_authored_lines(prompt_first).len(),
+        1,
+        "…and that same row is what the notice record takes — the two doors partition it"
+    );
 }
 
 #[test]
@@ -51337,11 +51361,16 @@ fn j13_excluding_notices_does_not_uncover_their_own_wrapped_rows() {
     // It was not. A multi-row notice's wrap is masked by the NOTICE record
     // (#576/#661, `mark_notice_maskable` — opt-in per producer), and that path is
     // untouched by term 1.
-    let notice = "[orrerix] w-7 reports blocked: the CLI asked do you want to proceed with \
-                  this command before it would run the suite";
-    // As the CLI wraps it: marker-led first row, continuation carrying the tokens.
-    let wrapped = "[orrerix] w-7 reports blocked: the CLI asked do you want to proceed\n\
-                   with this command before it would run the suite";
+    // The token must live on the CONTINUATION, not on the marker-led row: this
+    // test is about what covers a notice's wrapped rows, and a fixture whose
+    // token sits on row one is cleared by the marker rule alone — the claim below
+    // would then hold for a reason that has nothing to do with the record. The
+    // first version of this test had exactly that shape and its precondition
+    // caught it.
+    let notice = "[orrerix] w-7 reports blocked: the CLI is waiting on do you want to \
+                  proceed (y/n) before it will run the suite";
+    let wrapped = "[orrerix] w-7 reports blocked: the CLI is waiting on\n\
+                   do you want to proceed (y/n) before it will run the suite";
 
     // Precondition — the continuation alone is what the detector fires on, so
     // masking only the first row would leave the pane latched.
