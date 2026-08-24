@@ -38,8 +38,7 @@ Review every PR across all three surfaces, weighted by what the diff touches:
   name the deferred caller and its issue in the PR (#661 `e20`, #698, #700).
 
 ## Questions every review answers
-Every review body carries these five headings, verbatim. An empty or "n/a"
-section is a finding against the review, not a pass — the `review_verdict`
+Every review body carries these five headings, verbatim. The `review_verdict`
 summary itself stays ~100 words; this section is for the PR body.
 - `## Premortem` — two ways this ships and fails in production that no test
   in this PR catches, or an argued none. Bar: the #45→#1218 class, where

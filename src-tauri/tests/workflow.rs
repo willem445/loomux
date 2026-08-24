@@ -7301,6 +7301,19 @@ fn the_dogfood_reviewer_persona_carries_the_question_set() {
             "one of the five fixed headings every review body must carry (#1292 PR B)",
         );
     }
+
+    // The headings alone are decorative without the rule that makes them load-bearing:
+    // an empty/"n/a" section under one of the five must be a finding, not a pass. Round-2
+    // review (N2) named this clause unpinned — deleting it would drop CI to green while
+    // silently permitting a rubber-stamped review. Pinned separately from the headings
+    // above because it is a distinct sentence, not a sixth heading.
+    pinned(
+        "rev-lead.md",
+        &body,
+        "an empty or \"n/a\" section is a finding against the review, not a pass",
+        "the enforcement rule that makes the five headings load-bearing rather than \
+         decorative (#1292 PR B, review round 2 N2)",
+    );
 }
 
 #[test]
