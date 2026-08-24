@@ -69,10 +69,13 @@ import {
   UNLABELLED_KIND,
   unmetDeps,
   visibleRows,
-  withArtifactLink,
-  withDep,
-  withoutArtifactLinkAt,
-  withoutDep,
+  // #1349: the stale-snapshot guard. `composeLinkArrayWrite` is what pairs a
+  // row's arrays with the fingerprint they were read under, which is why this
+  // view no longer calls `withDep`/`withArtifactLink` and friends directly.
+  composeLinkArrayWrite,
+  isStaleLinkEtag,
+  retriesAfterStale,
+  type LinkArrayEdit,
   type BoardFilter,
   type BoardMarker,
   type BoardRow,
@@ -170,6 +173,13 @@ export interface OrchTask {
    *  the stamp while the row is still `done`. */
   cleared_ms?: number | null;
   updated_ms: number;
+  /** Fingerprint of this row's `deps`/`related`/`links` as of the read that
+   *  produced it (#1349) — DERIVED per read by the backend, never stored on the
+   *  board. Every write this view composes from one of those arrays sends it
+   *  back as `expect_link_etag`, so an agent's concurrent edit refuses the write
+   *  instead of being silently replaced by a list painted before it existed.
+   *  Optional only because the wire type is; see `HasLinkArrays`. */
+  link_etag?: string | null;
 }
 
 /** The nest picker's "take it back to the top level" option (#958). A sentinel
@@ -685,6 +695,54 @@ export class TasksView {
       this.toast(String(err));
       this.refresh(); // resync UI with reality after a failed edit
     }
+  }
+
+  /** Write one edit to a row's replace-wholesale arrays (#1349).
+   *
+   *  **Every board edit to `deps` or `links` goes through here**, because each
+   *  one composes a whole new array from the row as it was PAINTED — and the
+   *  orchestrator writes the same three arrays through MCP while that paint sits
+   *  on screen. `composeLinkArrayWrite` pairs the array with the `link_etag`
+   *  that came with the very same row, so the backend can refuse a write built
+   *  on a list that has since moved instead of silently replacing an edit
+   *  nobody here ever saw.
+   *
+   *  **On a refusal: re-read, then re-apply the INTENT — once.** The retry sends
+   *  the human's edit against the row as it is now, not the array they had, and
+   *  the second attempt is guarded exactly like the first (its token comes from
+   *  the re-read), so a third writer arriving in between refuses it rather than
+   *  landing it blind. One retry and no loop: a second failure means the board
+   *  is moving faster than the human can be shown anything useful, and the
+   *  honest answer is the toast plus the repaint. `retriesAfterStale` decides
+   *  which edits are eligible at all — a link removal names an index and is
+   *  never re-applied.
+   *
+   *  Anything that is NOT a stale-token refusal (an unknown dep, a cycle, the
+   *  link cap, a target naming a board task) falls straight through to
+   *  `mutate`'s toast: those are the human's own edit being wrong, and the
+   *  errors that teach are the ones this view has always shown them. */
+  private writeLinkArray(t: OrchTask, edit: LinkArrayEdit, onLanded?: () => void): Promise<void> {
+    const attempt = (row: OrchTask): Promise<void> =>
+      invoke("orch_upsert_task", {
+        groupId: this.groupId,
+        id: row.id,
+        ...composeLinkArrayWrite(edit, row),
+      }).then(() => {
+        onLanded?.();
+      });
+    return this.mutate(
+      attempt(t).catch(async (err) => {
+        if (!isStaleLinkEtag(err) || !retriesAfterStale(edit)) throw err;
+        const board = await invoke<OrchTask[]>("orch_tasks", { groupId: this.groupId });
+        // The row itself can be gone — the concurrent write that moved the
+        // arrays may have been a delete. Re-throwing the ORIGINAL refusal is
+        // right: `mutate` toasts it and refreshes, and the repaint is what tells
+        // the human the row is no longer there.
+        const fresh = board.find((x) => x.id === t.id);
+        if (!fresh) throw err;
+        return attempt(fresh);
+      })
+    );
   }
 
   /** True while the human is typing in an inline editor inside the list
@@ -1754,13 +1812,7 @@ export class TasksView {
         const rm = el("button", "task-dep-remove", "✕") as HTMLButtonElement;
         rm.title = `Remove the dependency on ${id}`;
         rm.addEventListener("click", () =>
-          void this.mutate(
-            invoke("orch_upsert_task", {
-              groupId: this.groupId,
-              id: t.id,
-              deps: withoutDep(t.deps, id),
-            })
-          )
+          void this.writeLinkArray(t, { kind: "dep-remove", id })
         );
         chip.appendChild(rm);
         line.appendChild(chip);
@@ -1883,15 +1935,14 @@ export class TasksView {
       const rm = el("button", "task-dep-remove", "✕") as HTMLButtonElement;
       rm.title = `Remove this ${link.type} link`;
       rm.addEventListener("click", () =>
-        void this.mutate(
-          invoke("orch_upsert_task", {
-            groupId: this.groupId,
-            id: t.id,
-            // BY INDEX — a row may carry one target twice (nothing dedupes
-            // this array), and the human clicked exactly one ✕.
-            links: withoutArtifactLinkAt(t.links, i),
-          })
-        )
+        // BY INDEX — a row may carry one target twice (nothing dedupes this
+        // array), and the human clicked exactly one ✕. That is sound only
+        // because the write carries this row's `link_etag` (#1349): an index
+        // names what was clicked exactly while the list it was read from is
+        // still the list being written, and the backend refuses it otherwise.
+        // It is also why this one edit is never auto-re-applied — see
+        // `retriesAfterStale`.
+        void this.writeLinkArray(t, { kind: "link-remove-at", index: i })
       );
       row.appendChild(rm);
       box.appendChild(row);
@@ -1983,20 +2034,14 @@ export class TasksView {
       // a board task is the sentence that teaches `deps`/`related` — and
       // resyncs; the draft survives that render, so the human can act on what
       // they were just told instead of retyping it first.
-      void this.mutate(
-        invoke("orch_upsert_task", {
-          groupId: this.groupId,
-          id: t.id,
-          links: withArtifactLink(t.links, draft),
-        }).then(() => {
-          this.linkDrafts.delete(t.id);
-          // Render rather than clearing these two elements: the success event
-          // may have rebuilt the form already, and blanking the detached copy
-          // would leave the live one still holding the text. One authority.
-          this.linkFocus = t.id;
-          this.render();
-        })
-      );
+      void this.writeLinkArray(t, { kind: "link-add", link: draft }, () => {
+        this.linkDrafts.delete(t.id);
+        // Render rather than clearing these two elements: the success event
+        // may have rebuilt the form already, and blanking the detached copy
+        // would leave the live one still holding the text. One authority.
+        this.linkFocus = t.id;
+        this.render();
+      });
     };
     const btn = el("button", "dlg-btn", "Add link") as HTMLButtonElement;
     btn.addEventListener("click", submit);
@@ -2281,15 +2326,12 @@ export class TasksView {
     sel.addEventListener("change", () => {
       const pick = sel.value;
       if (!pick) return;
-      const deps = withDep(t.deps, pick);
       this.picking = null;
       // Close the picker on our own rather than waiting for the board-change
       // event the write will raise: if the write is refused, mutate() toasts
       // and resyncs, and either way the picker has done its job.
       this.render();
-      void this.mutate(
-        invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, deps })
-      );
+      void this.writeLinkArray(t, { kind: "dep-add", id: pick });
     });
     // Keep keystrokes off the terminal underneath (every inline editor in this
     // view does this); Esc backs out without writing anything.

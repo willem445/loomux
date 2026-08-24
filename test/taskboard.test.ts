@@ -87,6 +87,12 @@ import {
   MAX_ARTIFACT_LINKS,
   withArtifactLink,
   withoutArtifactLinkAt,
+  // #1349: the stale-snapshot guard's board half.
+  composeLinkArrayWrite,
+  isStaleLinkEtag,
+  retriesAfterStale,
+  STALE_LINK_ETAG_PREFIX,
+  type LinkArrayEdit,
   type TaskArtifactLink,
 } from "../src/taskboard.ts";
 
@@ -2531,4 +2537,170 @@ test("a link draft counts as touched when the TYPE alone was chosen", () => {
   // "keep it" — so the two are not in conflict.
   assert.equal(linkDraftIsPristine({ ...pristine, target: " " }), false);
   assert.equal(artifactLinkDraft(DEFAULT_LINK_TYPE, " ", ""), null, "and it still cannot be submitted");
+});
+
+// ---------------------------------------------------------------------------
+// The stale-snapshot guard (#1349) — the board half.
+//
+// The board composes a WHOLE new array from the row it painted, so an agent's
+// concurrent write to `deps`/`related`/`links` is silently discarded. These pin
+// the three things the board contributes: it always sends the token that came
+// with the very row it composed from; it recognises the backend's refusal (and
+// nothing else); and it re-applies only the edits that name a VALUE.
+// ---------------------------------------------------------------------------
+
+test("the stale-refusal prefix the board matches on is the backend's, read out of the Rust source", () => {
+  // Same guard shape as the status and link-type vocabularies above, for the
+  // same reason and with a sharper failure mode: this string is not a display
+  // label, it is the only thing that tells a "the row moved under you" refusal
+  // from a cycle or a cap. Drift and the board stops recovering from the one
+  // error it was built to recover from — silently, with no test red anywhere
+  // else, because every OTHER refusal keeps behaving exactly as before.
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const decl = src.match(/pub const STALE_LINK_ETAG_PREFIX: &str = "([^"]*)";/);
+  assert.ok(
+    decl,
+    "STALE_LINK_ETAG_PREFIX is gone or renamed in mod.rs — this guard reads it by name, so " +
+      "update it here rather than deleting the only thing pinning the two spellings together"
+  );
+  assert.equal(
+    STALE_LINK_ETAG_PREFIX,
+    decl[1],
+    "the board's prefix must BE the backend's, byte for byte"
+  );
+  // Mutation control for the matcher itself: it has to say yes to a real
+  // refusal built from that const and no to every other one the same command
+  // can return. A matcher that answered yes to everything would pass the line
+  // above and turn every refused edit into a silent retry.
+  assert.equal(isStaleLinkEtag(`${decl[1]}: t-5's deps/related/links changed`), true);
+  assert.equal(isStaleLinkEtag("deps: dependency cycle t-1 → t-2 → t-1"), false);
+  assert.equal(isStaleLinkEtag("unknown task: t-9"), false);
+  assert.equal(isStaleLinkEtag(undefined), false, "and a non-error is not a stale refusal");
+});
+
+test("every array write carries the etag that came with the row it was composed from", () => {
+  const row = {
+    id: "t-1",
+    status: "queued",
+    deps: ["t-2"],
+    links: [{ type: "requirement", target: "#1349" }],
+    link_etag: "0123456789abcdef",
+  };
+  const edits: LinkArrayEdit[] = [
+    { kind: "dep-add", id: "t-3" },
+    { kind: "dep-remove", id: "t-2" },
+    { kind: "link-add", link: { type: "doc", target: "docs/x.md" } },
+    { kind: "link-remove-at", index: 0 },
+  ];
+  for (const edit of edits) {
+    const write = composeLinkArrayWrite(edit, row);
+    assert.equal(
+      write.expectLinkEtag,
+      row.link_etag,
+      `${edit.kind} must guard on the row's own token — the array and the token coming from ` +
+        `two different reads is the whole defect`
+    );
+    // Exactly one array per write: the other two are left untouched, which is
+    // what omitting the argument means to `orch_upsert_task`.
+    const named = [write.deps, write.links].filter((a) => a !== undefined);
+    assert.equal(named.length, 1, `${edit.kind} names exactly one array`);
+  }
+  // The unguarded shape is reachable only from a row that arrived without a
+  // token, and it is the PRE-#1349 write rather than a new failure.
+  assert.equal(
+    composeLinkArrayWrite({ kind: "dep-add", id: "t-3" }, { ...row, link_etag: undefined })
+      .expectLinkEtag,
+    undefined
+  );
+});
+
+test("a re-applied add composes against the CURRENT row, so a concurrent link survives", () => {
+  // The issue's interleaving, from the board's side. The human's click was
+  // composed from a two-link row; by the time the retry runs, the row the
+  // backend holds has three.
+  const painted = {
+    id: "t-1",
+    status: "queued",
+    links: [
+      { type: "requirement", target: "#1349" },
+      { type: "design-note", target: "doc/design/board-sprints-and-links.md" },
+    ],
+    link_etag: "aaaaaaaaaaaaaaaa",
+  };
+  const fresh = {
+    ...painted,
+    links: [...painted.links, { type: "test-case", target: "tests/t.rs" }],
+    link_etag: "bbbbbbbbbbbbbbbb",
+  };
+  const add: LinkArrayEdit = { kind: "link-add", link: { type: "doc", target: "docs/x.md" } };
+
+  const first = composeLinkArrayWrite(add, painted);
+  assert.deepEqual(
+    first.links?.map((l) => l.target),
+    ["#1349", "doc/design/board-sprints-and-links.md", "docs/x.md"],
+    "the first attempt is composed from what the human saw — and would drop tests/t.rs"
+  );
+  const retry = composeLinkArrayWrite(add, fresh);
+  assert.deepEqual(
+    retry.links?.map((l) => l.target),
+    ["#1349", "doc/design/board-sprints-and-links.md", "tests/t.rs", "docs/x.md"],
+    "re-applied against the current row, the human's link lands AND the agent's survives"
+  );
+  assert.equal(
+    retry.expectLinkEtag,
+    fresh.link_etag,
+    "and the retry is guarded on the re-read's token, not the stale one — a third writer " +
+      "arriving in between refuses it rather than landing it blind"
+  );
+});
+
+test("a re-applied dep removal names an id, so it still removes what the human clicked", () => {
+  const painted = { id: "t-1", status: "queued", deps: ["t-2", "t-3"], link_etag: "a" };
+  const fresh = { ...painted, deps: ["t-2", "t-3", "t-4"], link_etag: "b" };
+  const edit: LinkArrayEdit = { kind: "dep-remove", id: "t-2" };
+  assert.deepEqual(
+    composeLinkArrayWrite(edit, fresh).deps,
+    ["t-3", "t-4"],
+    "the dep the agent added is untouched and the one the human clicked is gone"
+  );
+});
+
+test("positional edits are never re-applied; value-named ones always are", () => {
+  // A link removal is the ONLY positional edit: `links` is not deduped, so the
+  // index is the only thing that can tell two identical targets apart, and an
+  // index means nothing against a list it was not read from. Re-applying one
+  // would delete whatever slid into the slot — a sharper version of the defect
+  // #1349 closes.
+  assert.equal(retriesAfterStale({ kind: "link-remove-at", index: 0 }), false);
+  for (const edit of [
+    { kind: "dep-add", id: "t-3" },
+    { kind: "dep-remove", id: "t-2" },
+    { kind: "link-add", link: { type: "doc", target: "x" } },
+  ] as LinkArrayEdit[]) {
+    assert.equal(
+      retriesAfterStale(edit),
+      true,
+      `${edit.kind} names what it acts on, so the row moving underneath does not change what ` +
+        `the human asked for`
+    );
+  }
+  // Concretely: re-applying a removal by index against a row that gained a link
+  // at the front takes the WRONG entry — which is why the predicate above says
+  // no rather than the call site being careful.
+  const shifted = {
+    id: "t-1",
+    status: "queued",
+    links: [
+      { type: "test-case", target: "tests/t.rs" },
+      { type: "requirement", target: "#1349" },
+    ],
+    link_etag: "b",
+  };
+  assert.deepEqual(
+    composeLinkArrayWrite({ kind: "link-remove-at", index: 0 }, shifted).links?.map(
+      (l) => l.target
+    ),
+    ["#1349"],
+    "index 0 now names the agent's link, not the one the human clicked ✕ on"
+  );
 });
