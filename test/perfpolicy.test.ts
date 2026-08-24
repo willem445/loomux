@@ -333,9 +333,10 @@ const STREAMS: StreamRow[] = [
       "each open view the refetch already in flight plus exactly one more, and the trailing " +
       "run reads the final registry. Each view already shares that same gate with its own " +
       "orch-tasks-changed listener (below), so a simultaneous burst on both streams still " +
-      "coalesces to one refresh per view, not two. Both views are ALSO visibility-gated as of " +
-      "#1318 (src/wakegate.ts): a closed board or panel drops the wake outright rather than " +
-      "coalescing it, and show() refreshes unconditionally so nothing is lost by dropping it.",
+      "coalesces to one refresh per view, not two. Both views are ALSO panel-gated as of " +
+      "#1318 (src/wakegate.ts): a board or panel whose PANEL IS CLOSED drops the wake outright " +
+      "rather than coalescing it, and show() refreshes unconditionally so nothing is lost by " +
+      "dropping it. One left OPEN behind a background tab or a minimized pane still pays — #1465.",
     debt: null,
   },
   {
@@ -355,9 +356,10 @@ const STREAMS: StreamRow[] = [
       "orch-tasks-changed, and an ungated third listener would have doubled a board burst's " +
       "cost for this panel rather than added to it. Clear-completed is deliberately not on this " +
       "stream at all — it writes only the watermark marker, emits nothing, and the panel applies " +
-      "the stamp the command returns. As of #1318 the panel is visibility-gated too " +
-      "(src/wakegate.ts): all three of its streams drop their wake outright while it is off " +
-      "screen, and show() refreshes unconditionally so nothing is lost by dropping them.",
+      "the stamp the command returns. As of #1318 the panel is panel-gated too " +
+      "(src/wakegate.ts): all three of its streams drop their wake outright while the panel is " +
+      "CLOSED, and show() refreshes unconditionally so nothing is lost by dropping them. A panel " +
+      "left OPEN behind a background tab or a minimized pane still pays in full — #1465.",
     debt: null,
   },
   {
@@ -373,8 +375,14 @@ const STREAMS: StreamRow[] = [
       "window is the duration of a refresh, so a slower backend coalesces harder. " +
       "WHICH boards pay that at all is the second bound (#1318, src/wakegate.ts): 'open' meant " +
       "'ever opened' until the board and the NEEDS-YOU panel got the hide hook every woken view " +
-      "owes, so an off-screen board now costs one boolean instead of a refetch plus a rebuild " +
-      "that is super-linear in the board. show() refreshes unconditionally, so nothing is lost.",
+      "owes, so a board whose PANEL IS CLOSED now costs one boolean instead of a refetch plus a " +
+      "rebuild that is super-linear in the board. show() refreshes unconditionally, so nothing " +
+      "is lost — except that the coalescer's trailing run re-enters itself rather than the view's " +
+      "gated refresh(), so a run in flight at the moment of a close lands one more refetch after " +
+      "it: one per close, not one per event. CLOSED is the exact word: the gate's probe reads the " +
+      "view host's own hidden attribute, so a board left OPEN in a background tab (display:none " +
+      "on an ancestor) or in a minimized pane (element detached) still pays in full. That " +
+      "residual is #1465's, not this row's.",
     debt: null,
   },
 ];

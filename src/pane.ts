@@ -499,16 +499,23 @@ interface EmbedEntry {
    *  dismisses an open context menu). Optional: a view with nothing to stop
    *  needs nothing here.
    *
-   *  **A view that can be WOKEN from outside is not that view (#1318).** The
-   *  rule this hook carries was first written as "stops the follow poll on
-   *  close/eviction — which every polling view has to answer for", and named
-   *  the mechanism rather than the question: the board and the NEEDS-YOU panel
-   *  have no timer at all, so nobody read it as being about them, and both
-   *  refetched and rebuilt off screen on every agent write for the life of the
-   *  session. Whether the waker is a `setInterval` or a Tauri `listen` is an
-   *  implementation detail of the waking. If something outside this view can
-   *  make it do work, this hook is where it says what happens when nobody is
-   *  looking — see doc/design/embedded-panels.md and src/wakegate.ts. */
+   *  **A view that can be WOKEN from outside is not that view (#1318).** Until
+   *  #1318 this doc said only the sentence above it — "most views need nothing
+   *  beyond the generic hide" — while the rule that actually mattered lived
+   *  three thousand lines below, as a call-site comment on the `timeline`
+   *  entry: "stops the follow poll on close/eviction … which every polling view
+   *  has to answer for". Neither half reached whoever added the next view. They
+   *  read an invitation to skip the hook, and the rule that would have stopped
+   *  them was on another view's registration, where nobody adding a NEW view
+   *  has any reason to look — so the board and the NEEDS-YOU panel refetched
+   *  and rebuilt off screen on every agent write for the life of the session,
+   *  and the audit log kept a live-follow poll running behind a closed panel.
+   *  The rule belongs here, and it is about the QUESTION rather than the
+   *  mechanism: whether the waker is a `setInterval` or a Tauri `listen`
+   *  changes nothing. If something outside this view can make it do work, this
+   *  hook is where it says what happens when nobody is looking — enforced by
+   *  test/embedwake.test.ts; see doc/design/embedded-panels.md and
+   *  src/wakegate.ts. */
   hide?: () => void;
   /** Reflect whether this view is currently docked to ANY embed slot —
    *  updates the view's own header toggle button. Side-agnostic on purpose:
@@ -3315,11 +3322,9 @@ export class Pane implements VoiceTargetPane {
       overlayEl: this.tasksOverlay,
       viewEl: this.tasksView.el,
       show: () => this.tasksView!.show(),
-      // Stops the board refetching-and-rebuilding off screen on every
-      // `orch-tasks-changed` (#1318). The board has no poll, which is why the
-      // rule as first written — "every polling view has to answer for this" —
-      // read as not applying to it; what it actually asks is what happens when
-      // something WAKES this view and nobody is looking.
+      // Stops the board refetching-and-rebuilding while its panel is closed,
+      // on every `orch-tasks-changed` (#1318). See `EmbedEntry.hide` for the
+      // rule and for why this entry was written without one.
       hide: () => this.tasksView!.hide(),
       setPanelActive: (active) => this.tasksView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
@@ -3987,7 +3992,9 @@ export class Pane implements VoiceTargetPane {
       viewEl: this.timelineView.el,
       show: () => this.timelineView!.show(),
       // Stops the follow poll on close/eviction — the leak #361 rev-38 found
-      // on the group panel, which every polling view has to answer for.
+      // on the group panel. The general rule this is one instance of lives on
+      // `EmbedEntry.hide` as of #1318; it sat here, on one view's registration,
+      // from #648 until then, which is most of why three later views missed it.
       hide: () => this.timelineView!.hide(),
       setPanelActive: (active) => this.timelineView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,

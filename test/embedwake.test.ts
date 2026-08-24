@@ -1,15 +1,18 @@
 // Every embed view that can be WOKEN from outside registers a `hide` hook (#1318).
 //
-// THE DEFECT THIS EXISTS FOR. `EmbedEntry.hide` carried its rule as prose — "stops the
-// follow poll on close/eviction, which every POLLING view has to answer for" — and prose
-// that names a MECHANISM does not cover a view that reaches the same cost by another one.
-// Three views proved it in the same session: the task board and the NEEDS-YOU panel are
-// woken by Tauri event streams and registered no `hide` at all, so both refetched and
-// rebuilt off screen on every agent write for the life of the session; the audit log DOES
-// poll, and was still missed, because its `setInterval` is armed by a follow toggle rather
-// than by `show()` and nobody re-read the sentence against a close. The rule restated —
-// *if something outside a view can make it do work, `hide` is where it says what happens
-// when nobody is looking* — is now enforced here rather than only asserted in a doc.
+// THE DEFECT THIS EXISTS FOR. `EmbedEntry.hide`'s own doc never carried a rule at all: it
+// described the hook as "extra per-view cleanup beyond hiding its host" and closed with
+// "Optional: most views need nothing beyond the generic hide". The rule existed, but as a
+// comment on ONE view's registration three thousand lines below ("stops the follow poll on
+// close/eviction ... which every POLLING view has to answer for", on the `timeline` entry
+// since #648) — where nobody adding a NEW view has any reason to look, and scoped to a
+// mechanism besides. Three views then proved both halves of that: the task board and the
+// NEEDS-YOU panel are woken by Tauri event streams and registered no `hide` at all, so both
+// refetched and rebuilt off screen on every agent write for the life of the session; the
+// audit log DOES poll, and was missed anyway, because its `setInterval` is armed by a follow
+// toggle rather than by `show()`. The rule now sits on the interface — *if something outside
+// a view can make it do work, `hide` is where it says what happens when nobody is looking* —
+// and is enforced here rather than asserted in a doc a third time.
 //
 // WHY A MANIFEST AND NOT A PURE SCAN, and what each half is allowed to decide. The
 // manifest DECLARES which kinds are woken, with the reason in the row; the scan is the
@@ -20,12 +23,20 @@
 // subscription is made through `fileapi.ts`'s `onSearchBatch` wrapper, so no `listen(`
 // appears in its own source — and it is why the scan is not the authority here.
 //
-// STATED BLIND SPOTS. The scan reads each view's own file only: a waker reached through a
-// helper module is invisible to it (hence `indirectWaker`), and so is one registered from a
-// dynamic event name. It also reads `pane.ts` textually — an `embedRegistry.set` call
-// assembled any way other than a literal object at a literal kind is not something it can
-// name, so it refuses to pass over one instead, by requiring the set of parsed entries to
-// be exactly `EMBED_KINDS`.
+// STATED BLIND SPOTS. The scan reads each view's own file only, so it is blind to every
+// waker that lives somewhere else, and two of the eight are exactly that: `FileEditView`'s
+// `ft-search` subscription goes through `fileapi.ts`'s `onSearchBatch`, and `GitView` is
+// woken from `pane.ts` itself (`Pane.onExternalGitChange` and every shell prompt call
+// `notifyPrompt`). Both carry `indirectWaker` and are declared woken by hand. A scan over
+// `pane.ts` for calls into a view could catch the second class, but only by allow-listing
+// the method names that are PULLS rather than wakes (`groupView.minChromeHeight`), and this
+// repo's convention is that a guard deciding from a name enforces nothing a rename cannot
+// step over — so that residue is carried by the manifest and by review, deliberately, and
+// the `why` on each row is where the reading was done. A listener registered under a
+// dynamic event name is invisible to it too. It also reads `pane.ts` textually — an
+// `embedRegistry.set` call assembled any way other than a literal object at a literal kind
+// is not something it can name, so it refuses to pass over one instead, by requiring the
+// set of parsed entries to be exactly `EMBED_KINDS`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -86,14 +97,15 @@ const VIEWS: ViewRow[] = [
   {
     kind: "git",
     source: "src/gitview.ts",
-    woken: false,
-    why: "nothing outside it wakes it: git-changed is handled in pane.ts, which calls the view's own refresh through refreshthrottle.ts. Its hide() exists for a different reason — dismissing an open context menu.",
+    woken: true,
+    indirectWaker: true,
+    why: "woken from pane.ts, not from its own file: every shell prompt and every backend git-changed calls GitView.notifyPrompt (Pane.onExternalGitChange). It answers the rule a second way as well as through hide() — notifyPrompt early-returns on !this.visible, and its scheduled trailing run re-tests that — but the waker is real and a per-file scan cannot see it.",
   },
   {
     kind: "issues",
     source: "src/issuesview.ts",
     woken: false,
-    why: "a plain list refreshed by a mode switch and a manual reload button. No stream, no timer.",
+    why: "a plain list refreshed by a mode switch and a manual reload button. No stream, no timer, and pane.ts calls nothing on it beyond show/hide/setPanelActive/dispose — checked, because the git row above was misclassified on exactly that question.",
   },
 ];
 

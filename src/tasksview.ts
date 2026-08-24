@@ -661,11 +661,13 @@ export class TasksView {
   /** Called by the pane whenever the view is about to be hidden, in either
    *  mode — a close, a slot eviction, an un-dock (#1318).
    *
-   *  The board has no timer, which is exactly why it had no `hide` hook: the
-   *  rule this answers used to be written as "every POLLING view", and the
-   *  board is woken by an event stream instead. Nothing is lost by stopping:
-   *  `show()` above refreshes unconditionally, so no staleness survives the
-   *  panel being looked at. */
+   *  The board had no `hide` hook because nothing on `EmbedEntry.hide` asked
+   *  for one — see its doc for what was actually written there, and where the
+   *  rule really lived. Nothing is lost by stopping: `show()` above refreshes
+   *  unconditionally, so no staleness survives the panel being looked at.
+   *
+   *  Scope: this is the panel being CLOSED. A board left open in a background
+   *  tab or a minimized pane never reaches here — #1465. */
   hide(): void {
     this.wakeGate.sleep();
   }

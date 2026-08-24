@@ -3,17 +3,23 @@
 // §3: pollgate.ts answers "this view has a TIMER — should it tick?", and this
 // answers "this view has an EVENT STREAM — should a wake run a refresh?".
 //
-// WHY THE TWO NEEDED SEPARATING. `pane.ts`'s `EmbedEntry.hide` already carried
-// a rule, and it was written in terms of the mechanism rather than the
-// question: "stops the follow poll on close/eviction ... which every POLLING
-// view has to answer for". `TasksView` and `DecisionsView` have no timer at
-// all, so nobody read that sentence as being about them — and they registered
-// no `hide` hook. The result was that every `write_tasks` by every agent (plus
-// every questions/needs-you write) drove a full refetch-and-rebuild in every
-// board and every NEEDS-YOU panel that had EVER been opened on any pane in the
-// session, on screen or not. The rule restated so it covers both: **a view that
-// can be woken from outside must say what happens when nobody is looking at
-// it** — the waker being a `setInterval` or a Tauri `listen` is an
+// WHY THE TWO NEEDED SEPARATING. Nothing on `EmbedEntry.hide` ever asked a new
+// view this question. Its doc comment said the hook was for "extra per-view
+// cleanup beyond hiding its host", and closed with "Optional: most views need
+// nothing beyond the generic hide" — an invitation to skip it. The rule that
+// would have caught this was real but misplaced: it sat three thousand lines
+// below, as a comment on ONE view's registration ("stops the follow poll on
+// close/eviction ... which every POLLING view has to answer for", on the
+// `timeline` entry since #648), where nobody adding a NEW view has any reason
+// to look. `TasksView` and `DecisionsView` were then registered with no `hide`
+// hook at all, so every `write_tasks` by every agent (plus every
+// questions/needs-you write) drove a full refetch-and-rebuild in every board
+// and every NEEDS-YOU panel that had EVER been opened on any pane in the
+// session. `AuditView` missed it a third time from the other direction: it DOES
+// poll, and its poll was still left running behind a closed panel. The rule now
+// lives on the interface, and is about the question rather than the mechanism:
+// **a view that can be woken from outside must say what happens when nobody is
+// looking at it** — the waker being a `setInterval` or a Tauri `listen` is an
 // implementation detail of the waking, not of the rule.
 //
 // SUPPRESS, DON'T CATCH UP. Unlike `PollGate`, this gate owes no catch-up run:
@@ -49,10 +55,26 @@
 // layout, no IPC, and it is only ever reached on a wake the gate is about to
 // suppress anyway.
 
-/** The pane's live read of whether this view is on screen, in EITHER hosting
+/** The pane's live read of whether this view's PANEL is open, in EITHER hosting
  *  mode. Injected rather than read off the DOM here so the policy stays
  *  DOM-free and the tests drive all four crossings directly. Must be cheap and
- *  must not force layout — it is called once per suppressed wake. */
+ *  must not force layout — it is called once per suppressed wake.
+ *
+ *  **What it can and cannot see, because everything below turns on this.** The
+ *  shipped probe is `Pane.isViewVisible`, which reads one element's own
+ *  `hidden` attribute. That is exactly "is this panel open"; it is NOT "can a
+ *  human see it". Two states put a view genuinely off screen with that
+ *  attribute untouched, and the gate keeps working in both: a background
+ *  project tab (`Workspace.setVisible(false)` sets `display:none` on an
+ *  ancestor) and a minimized pane (`pane.el` is detached, not hidden). Neither
+ *  calls any pane method that could move the latch. So the bound this module
+ *  delivers is **"a closed panel costs one boolean"**, not "an off-screen one":
+ *  a board left open in a background tab still pays the full refetch and
+ *  rebuild on every agent write. That residual is #1465, and it is a real
+ *  visibility signal pushed down from the tab/grid layer, not a clause — the
+ *  cheap probes are all barred, since `offsetParent`/`getBoundingClientRect`
+ *  force layout (the contract above) and `isConnected` catches the detached
+ *  case but not `display:none`. */
 export type VisibleProbe = () => boolean;
 
 /** Counters behind `wakeGateStats()`. Module-level rather than a live-gate
@@ -65,12 +87,16 @@ let strayCount = 0;
 export interface WakeGateStats {
   /** Wakes that ran a refresh. */
   delivered: number;
-  /** Wakes dropped because the view was off screen — the whole point. */
+  /** Wakes dropped because the view's panel was closed — the whole point. */
   suppressed: number;
   /** Wakes that ran because `confirm` contradicted the latch. **Expected to
-   *  stay 0.** Anything else means a path makes a view visible without going
-   *  through `Pane.openView` — i.e. the latch has a hole, and this is the
-   *  instrument that says so rather than the panel quietly going stale. */
+   *  stay 0**, and worth being precise about what that proves: since `confirm`
+   *  is `Pane.isViewVisible`, a stray can only be raised by a path that OPENS a
+   *  panel without going through `Pane.openView`. A clean `strays` therefore
+   *  says `openView`/`closeView` pairs balance — which `test/embedwake.test.ts`
+   *  already argues structurally — and says NOTHING about the two states
+   *  `VisibleProbe` is blind to (a background tab, a minimized pane; #1465).
+   *  It is a latch-integrity counter, not a visibility one. */
   strays: number;
 }
 
@@ -79,7 +105,14 @@ export interface WakeGateStats {
  *  timer half, and for the same reason: agents cannot run the GUI, so this is
  *  how the human sees whether the DOM wiring does what these unit tests say the
  *  policy does. Open a board, let agents write, close it: `suppressed` must
- *  climb while `delivered` stops, and `strays` must stay 0. */
+ *  climb while `delivered` stops, and `strays` must stay 0.
+ *
+ *  These counters are MODULE-GLOBAL — every gate in every view in every pane in
+ *  every tab adds to the same three numbers. So "close the board and `delivered`
+ *  must stop" means close every board and every NEEDS-YOU panel in EVERY tab,
+ *  including background ones; one left open elsewhere keeps `delivered`
+ *  climbing and reads exactly like the fix not working. A per-pane breakdown is
+ *  part of #1465. */
 export function wakeGateStats(): WakeGateStats {
   return { delivered: deliveredCount, suppressed: suppressedCount, strays: strayCount };
 }
@@ -96,12 +129,15 @@ export function resetWakeGateStats(): void {
 
 /** Runs an event-driven view's refresh only while that view is on screen.
  *
- *  Born asleep: every embed view in `pane.ts` is constructed lazily and the
- *  construction is always followed by the `openView` that shows it, so the
- *  first `wake()` arrives before anything can ask. Starting awake would instead
- *  leave a view that is built-but-never-shown refreshing forever — which is
- *  reachable today, since `Pane.requestEmbedFocus` constructs a view before
- *  deciding whether it can open one. */
+ *  Born asleep, because a latch starts in the state the pane has not yet
+ *  asserted, and "not shown yet" is not "showing". No path reaches it today: I
+ *  checked every construction site in `pane.ts` (`ensureEmbedView` and
+ *  `restoreEmbeds` both construct only on branches that fall through to
+ *  `openView`, and every `toggleXView` calls its `ensureXView` immediately
+ *  before `toggleView`), so the first `wake()` always arrives before anything
+ *  can ask. That is a property of today's call sites, not of this class — the
+ *  default is what keeps a future construct-then-decide path from leaving a
+ *  view refreshing forever, and `M5` pins it against being flipped. */
 export class WakeGate {
   private latch = false;
   private readonly confirm: VisibleProbe;
@@ -126,9 +162,9 @@ export class WakeGate {
     this.latch = false;
   }
 
-  /** Whether the gate currently believes the view is off screen. For the stats
-   *  instrument and the tests; never a substitute for `accepts()`, which is the
-   *  only thing that consults `confirm`. */
+  /** Whether the gate currently believes the view's panel is closed. For the
+   *  stats instrument and the tests; never a substitute for `accepts()`, which
+   *  is the only thing that consults `confirm`. */
   get asleep(): boolean {
     return !this.latch;
   }

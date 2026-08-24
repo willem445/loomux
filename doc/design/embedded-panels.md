@@ -425,8 +425,8 @@ interface EmbedEntry {
   overlayEl: HTMLElement;              // the view's own floating-overlay host (unchanged)
   viewEl: HTMLElement;                 // the view's own root element
   show(): void;
-  hide?(): void;                       // stop whatever can wake this view off screen (#1318),
-                                       // plus per-view cleanup beyond hiding the host
+  hide?(): void;                       // stop whatever can wake this view while its panel
+                                       // is closed (#1318), plus per-view cleanup
   setPanelActive(active: boolean): void;
   floorPx(): number;                   // live floor, for the overlay clamp AND the bottom slot
 }
@@ -716,18 +716,39 @@ survives the move untouched. Verified per view, not assumed:
 
 ### What `hide` is actually for (#1318)
 
-`EmbedEntry.hide` used to state its rule as *"stops the follow poll on
-close/eviction — which every **polling** view has to answer for."* That names
-the mechanism, not the question, and the two views added after it — the task
-board and the NEEDS-YOU panel — have no timer at all. They are woken by Tauri
-event streams instead, so nobody read that sentence as being about them and
-neither registered a `hide` hook. The cost was not a leaked interval but a
-standing one: every `write_tasks` by every agent drove up to four backend reads
-and a full `replaceChildren` rebuild in **every board and every NEEDS-YOU panel
-that had ever been opened**, on any pane, for the life of the session — and
-`TasksView.render` is super-linear in the board (`unmetDeps`,
-`blockingAncestor`, `siblingPosition`, `childCounts`, `subtreeAllDone`,
-`hasMissingParent` each rescan the whole board once per row).
+Two things were wrong, and the second is the one worth remembering.
+
+`EmbedEntry.hide`'s own doc comment carried **no rule**. In full, at every
+commit before #1318:
+
+> Called every time the view is about to become hidden, in either mode — extra
+> per-view cleanup beyond hiding its host (e.g. `GitView.hide()` dismisses an
+> open context menu). Optional: most views need nothing beyond the generic hide.
+
+That last sentence is an invitation to skip the hook, and it is what an author
+adding a new view actually read.
+
+The rule did exist — but as a comment on **one view's registration**, three
+thousand lines below the interface, introduced with the progress timeline in
+#648:
+
+> Stops the follow poll on close/eviction — the leak #361 rev-38 found on the
+> group panel, which every **polling** view has to answer for.
+
+Nobody adding a *new* view has any reason to read another view's
+`embedRegistry.set` call, so that sentence never reached the two views added
+after it; and had it reached them it would have read as not applying, since it
+names a mechanism (a poll) rather than the question. Both failure modes fired.
+The task board and the NEEDS-YOU panel are woken by Tauri event streams and
+registered no `hide` at all; the audit log, which *does* poll, was missed anyway
+because its `setInterval` is armed by a follow toggle rather than by `show()`.
+
+The cost was not a leaked interval but a standing one: every `write_tasks` by
+every agent drove up to four backend reads and a full `replaceChildren` rebuild
+in **every board and every NEEDS-YOU panel that had ever been opened**, on any
+pane, for the life of the session — and `TasksView.render` is super-linear in
+the board (`unmetDeps`, `blockingAncestor`, `siblingPosition`, `childCounts`,
+`subtreeAllDone`, `hasMissingParent` each rescan the whole board once per row).
 
 The rule, restated in terms of what wakes the view:
 
@@ -747,8 +768,8 @@ subscription goes through `fileapi.ts`'s `onSearchBatch` wrapper, so no
 requires every uncorroborated woken row to.
 
 `src/wakegate.ts` is the DOM-free policy behind the two event-driven views, the
-sibling of `src/pollgate.ts` for the timer-driven ones. Three things about it
-are load-bearing:
+sibling of `src/pollgate.ts` for the timer-driven ones. Four things about it are
+load-bearing:
 
 - **It suppresses; it never catches up.** `openView` calls `show()` on every
   open in either hosting mode, and both views' `show()` ends in an
@@ -765,7 +786,34 @@ are load-bearing:
   latch would otherwise suppress. That wake runs, and heals the latch. The union
   errs toward refreshing: a missed `hide()` costs only what the pre-#1318 code
   cost. `__wakeGateStats()`'s `strays` counter is 0 iff the latch never needed
-  that rescue, which is how the human validates the wiring an agent cannot run.
+  that rescue. Be precise about what that proves, since the counter is the
+  instrument a human is pointed at: `isViewVisible` reads one element's own
+  `hidden` attribute, so a stray can only be raised by a path that OPENS a panel
+  without going through `openView`. Clean `strays` says the open/close pairs
+  balance — which `test/embedwake.test.ts` argues structurally anyway — and says
+  nothing about the two states in the next bullet.
+- **What it does NOT gate, and why that is a separate problem (#1465).** The
+  bound delivered is *"a panel that is CLOSED costs one boolean"*, not *"an
+  off-screen one"*. `Workspace.setVisible(false)` puts a whole project tab
+  behind `display: none` on an ancestor, and a minimized pane is *detached*
+  rather than hidden; neither touches the view host's own `hidden` attribute and
+  neither calls any pane method that could move the latch, so a board left OPEN
+  in a background tab still pays the full refetch and rebuild on every agent
+  write. Closing that needs a real visibility signal pushed down from the
+  tab/grid layer — the cheap probes are barred, since `offsetParent` /
+  `getBoundingClientRect` force layout (which `VisibleProbe`'s contract
+  forbids to keep the suppress path free) and `isConnected` catches the detached
+  case but not `display: none`.
+
+**What is pinned, and what is not.** The policy is a pure module and its whole
+state machine is unit-tested; `test/embedwake.test.ts` pins that every woken kind
+*registers* a `hide`; the `isVisible` option is required, so the compiler pins
+that the pane supplies it. Not pinned by anything: the bodies of the three
+`hide()` methods themselves, and the two `accepts()` call sites inside the views.
+Neutering `AuditView.hide()` — the whole substance of that view's fix — leaves
+the suite green. Those are DOM, this repo validates DOM wiring by hand rather
+than by simulating a document, and this paragraph is where that residue is
+recorded rather than left to be rediscovered.
 
 The overlay host (`.git-overlay`, one per view — unchanged) and each edge's
 slot (`.pane-embed-panel.side-*` / `.pane-embed-divider.side-*`) are all

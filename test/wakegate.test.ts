@@ -2,9 +2,11 @@
 //
 // The defect this pins: `TasksView`/`DecisionsView` refetched and rebuilt on every
 // `orch-tasks-changed` / `orch-questions-changed` / `orch-needs-you-changed` event in
-// every pane that had ever opened one, on screen or not. The policy is one predicate,
-// so it is tested as one — the DOM wiring (`EmbedEntry.hide`, the views' `show()`/
-// `hide()`) is validated by hand through `__wakeGateStats()`, per the module header.
+// every pane that had ever opened one, on screen or not. What the gate below actually
+// closes is the CLOSED-PANEL half of that — see `VisibleProbe`'s doc for the two states
+// it is blind to, and #1465, which owns them. The policy is one predicate, so it is
+// tested as one — the DOM wiring (`EmbedEntry.hide`, the views' `show()`/`hide()`) is
+// validated by hand through `__wakeGateStats()`, per the module header.
 //
 // WHY THE FOUR CROSSINGS. The gate reads TWO inputs — the `wake()`/`sleep()` latch and
 // the pane's live `confirm` probe — and the repo's standing rule is that a guard reading
@@ -80,10 +82,11 @@ test("negative control: a visible view refreshes on EVERY wake, not just the fir
 
 // ---------- the state machine around them ----------
 
-test("born asleep: a view constructed but never shown suppresses its stream", () => {
-  // `Pane.requestEmbedFocus` constructs a view before deciding whether it can open one,
-  // and `restoreEmbeds` can build one whose slot never opens. Starting awake would leave
-  // exactly those refreshing forever, which is the bug in a different disguise.
+test("born asleep: the latch starts in the state the pane has not yet asserted", () => {
+  // Deliberately NOT justified by a live path: every construction site in pane.ts today
+  // falls through to `openView`, so no view is ever built-but-never-shown. This pins the
+  // DEFAULT — flip it and a future construct-then-decide path leaves a view refreshing
+  // forever, which is the bug in a different disguise, with nothing else to catch it.
   const gate = new WakeGate(() => false);
   assert.equal(gate.asleep, true);
   assert.equal(gate.accepts(), false);
