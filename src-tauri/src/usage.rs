@@ -618,9 +618,7 @@ impl TranscriptCursor {
                 return StatVerdict::Reset;
             }
         }
-        if len < self.len {
-            return StatVerdict::Reset;
-        }
+        // [scratch] #1239 round 4: the shorter-than-last-stat arm is gone.
         if let (Some(now), Some(then)) = (modified, self.modified) {
             if now < then {
                 return StatVerdict::Reset;
