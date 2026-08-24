@@ -926,10 +926,8 @@ impl TranscriptCursors {
         // every other signal is content.
         let mut verdict = match slot.as_ref() {
             None => StatVerdict::Reset,
-            Some(c) if c.built.elapsed() >= self.revalidate_after => {
-                work.revalidated = true;
-                StatVerdict::Reset
-            }
+            // [scratch] #1239 round 10: no revalidation timer at all, so only
+            // the stat arms and the anchor decide.
             Some(c) => match c.stat_verdict(len, modified, created) {
                 StatVerdict::Serve => {
                     work.served_cached = true;
