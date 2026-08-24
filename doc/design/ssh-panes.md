@@ -303,6 +303,60 @@ the exact class of guess `remoteShell` exists to refuse. Refusing to *save* it
 would throw away a setting that becomes correct the moment a CLI is picked. So it
 is kept, and the human is told. Not silent, not lost, not guessed at.
 
+### The other silent loss: a save that publishes a list it never read (#1332)
+
+The section above is about one field going quietly missing. This one is about the
+whole file, and it is the same defect class `BoardPrefsStore` was built for on
+`boardprefs.json` (#1270 review B1) — surfaced here by the #1299 process review,
+then confirmed on the code.
+
+`sshprofiles.json` is republished **whole** on every launch: there is no
+per-profile write. The launcher used to hold the list in a field seeded
+`emptySshProfileStore()`, fill it when a fire-and-forget `loadSshProfilesOnce()`
+resolved, and serialize that field at submit. Two orderings reach the save with a
+list nobody read, and both delete every saved connection:
+
+- **The read had not come back.** `applyKind` starts the load when the human picks
+  SSH; nothing awaits it. `submit` awaits `discoverSsh` — an independent `invoke`
+  started in the same tick, so nothing orders the two — and then saves.
+- **The read had FAILED.** `.catch(() => emptySshProfileStore())` read a rejected
+  IPC call as "you have no saved connections", and the `??=` memo latched that for
+  the life of the form. No race needed; the next launch publishes it.
+
+Both are silent, because every individual step succeeds — and `persistSshProfile`
+is best-effort by design, so even a thrown save is swallowed. The read side of
+this feature already refused the same conflation: `restoreSshCard` says *"A store
+we could not READ is not a store that says the connection is gone"*. The write
+side is what #1332 brings into line.
+
+`SshProfilesStore` (in `sshprofile.ts`, beside the schema it publishes) owns the
+lifecycle: read once, share the in-flight read, and **await it before publishing
+anything**. A read that rejected returns `declined-unread` and writes nothing; the
+failure is not latched, so the next launch retries. A read that *resolves* is a
+complete answer even when there is nothing usable in it — an absent file is first
+run, and a blob the decoder refuses has already been renamed aside to
+`sshprofiles.corrupt.json` by `uistate.rs` — so both seed empty and both may be
+published over. That is the designed first-run path, not the accident.
+
+**Why it is unrepresentable rather than merely fixed.** `write` takes ONE
+`SshProfile` and nothing else, the `GroupBoardEdit` argument applied here. The
+caller cannot hand over a profile list, so it cannot hand over an empty one; and
+it cannot hand over a `schemaVersion` either, which closes a third, quieter leak
+in the old shape — `{ ...this.sshStore, profiles }` carried the version from the
+same unread store, so a v2 file could be re-stamped v1 by a form that never saw
+it, defeating `stampedVersion` (#907 NB2) on exactly the path it was written for.
+
+The launcher keeps a `sshKnown` snapshot for the picker and the field editor, and
+it is a **display** copy only — `read()` hands out a deep copy, so an edit to it
+cannot reach disk without going through `write`. The display load is still
+memoized per form, but the memo is now released on failure, so re-picking SSH
+retries instead of leaving the human staring at a list this form has given up on.
+
+The ordering lives in a class with injected IO rather than a pure function
+because the invariant IS an ordering between two async calls — there is nothing
+to assert about a single value. `test/sshprofile.test.ts`'s last section is the
+pin; each of its assertions is witnessed by a mutation recorded on the PR.
+
 ## Restore: the leaf records a connection, not a command line
 
 The full argument lives in `doc/design/session-restore.md`'s #887 S4 section; the

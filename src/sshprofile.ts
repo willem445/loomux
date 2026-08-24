@@ -412,3 +412,140 @@ export function decodeSshProfiles(raw: string | null): SshProfileStore | null {
       : SSH_PROFILES_SCHEMA_VERSION;
   return { schemaVersion, profiles };
 }
+
+// ---------------------------------------------------------------------------
+// The one ordering rule the schema cannot express (#1332)
+// ---------------------------------------------------------------------------
+
+/** The two IPC calls the store needs, injected so the ordering below is
+ *  exercisable without a backend (`src/pty.ts` supplies the real pair). */
+export interface SshProfileIo {
+  load: () => Promise<string | null>;
+  save: (contents: string) => Promise<void>;
+}
+
+/** What a `write` did. `declined-unread` is the interesting one: the store
+ *  refused to publish because it has never successfully read the file, so it
+ *  does not know what it would be overwriting. */
+export type SshProfileWrite = "saved" | "declined-unread" | "failed";
+
+/** Reads and writes the whole `sshprofiles.json` blob, holding the invariant
+ *  that makes one shared file safe for a form that edits one connection.
+ *
+ *  **A save publishes the WHOLE file, so it must never run against a store
+ *  nobody has read.** The launcher starts with an empty profile list and fills
+ *  it when the load resolves; a save that beats that — the human picking SSH,
+ *  typing a destination and hitting Create while the read is still in flight,
+ *  or any launch at all after a read that REJECTED — would serialize the empty
+ *  list plus the one new connection as the entire file and silently destroy
+ *  every saved connection. No error anywhere, because every individual step
+ *  succeeded, and `persistSshProfile` is best-effort so even a thrown save is
+ *  swallowed by design.
+ *
+ *  So every `write` awaits the read first, and a read that FAILED declines the
+ *  write outright rather than treating "I could not look" as "there was nothing
+ *  there" — the same distinction `restoreSshCard` (`src/main.ts`) already makes
+ *  on the read side, where an unreadable store names itself instead of
+ *  reporting the connection gone. The failure is not latched: the next write
+ *  retries the read, so one transient IPC rejection does not disable
+ *  persistence for the life of the form.
+ *
+ *  A load that RESOLVES is a complete answer even when there is nothing usable
+ *  in it. An absent file is first run; a blob `decodeSshProfiles` refuses is a
+ *  file that is not this file, which `uistate.rs` has already renamed aside to
+ *  `sshprofiles.corrupt.json` before it could get here (docs/features/ssh-panes.md).
+ *  Both seed an empty store and both may be published over — that is the
+ *  designed first-run path, not the accident above.
+ *
+ *  `write` takes ONE profile and nothing else, which is what makes the defect
+ *  unrepresentable rather than merely fixed (the `GroupBoardEdit` argument in
+ *  `boardprefs.ts`): the caller cannot hand over a profile LIST at all, so it
+ *  cannot hand over an empty one, and it cannot hand over a `schemaVersion`
+ *  either — the store carries that off the record it just re-read, so a future
+ *  v2 file cannot be re-stamped v1 by a form that never saw it (`stampedVersion`,
+ *  #907 NB2).
+ *
+ *  This is a class with injected IO rather than a pure function because the
+ *  invariant IS an ordering between two async calls — there is nothing to
+ *  assert about a single value. Precedent: `BoardPrefsStore` (`boardprefs.ts`),
+ *  which fixed this same defect class on `boardprefs.json` (#1270 review B1).
+ *  Keeping it out of `launcher.ts` is what makes it testable at all: DOM wiring
+ *  is validated by hand here, and this is the part with a race in it. */
+export class SshProfilesStore {
+  private store: SshProfileStore = emptySshProfileStore();
+  /** The blob has been read back at least once — including "the file is not
+   *  there", which is a complete answer (an empty store), not a gap. */
+  private loaded = false;
+  /** The read in flight, shared by every concurrent caller so a burst of
+   *  gestures cannot start several. Cleared on failure so a later call retries. */
+  private reading: Promise<boolean> | null = null;
+  /** An explicit field, not a constructor parameter property: node's
+   *  strip-only TypeScript (what `npm test` runs) rejects those outright, so
+   *  the terser form would make this module untestable in this repo. */
+  private readonly io: SshProfileIo;
+
+  constructor(io: SshProfileIo) {
+    this.io = io;
+  }
+
+  /** Whether the store now reflects the file. Never throws. */
+  private ensureLoaded(): Promise<boolean> {
+    if (this.loaded) return Promise.resolve(true);
+    if (!this.reading) {
+      this.reading = this.io.load().then(
+        (raw) => {
+          this.store = decodeSshProfiles(raw) ?? emptySshProfileStore();
+          this.loaded = true;
+          this.reading = null;
+          return true;
+        },
+        () => {
+          this.reading = null;
+          return false;
+        }
+      );
+    }
+    return this.reading;
+  }
+
+  /** Every saved connection, or `null` if the file could not be read — which a
+   *  caller must NOT collapse into `emptySshProfileStore()`. "I could not look"
+   *  is not "you have no saved connections", and a picker that says the second
+   *  when the first is true invites the human to recreate a connection that
+   *  already exists.
+   *
+   *  Returns a DEEP copy: the store is long-lived and handing out its interior
+   *  would let a caller's edit to a profile land in the file at the next write
+   *  without ever going through `write`. */
+  async read(): Promise<SshProfileStore | null> {
+    if (!(await this.ensureLoaded())) return null;
+    return {
+      schemaVersion: this.store.schemaVersion,
+      profiles: this.store.profiles.map((p) => ({ ...p, extraArgs: [...p.extraArgs] })),
+    };
+  }
+
+  /** Create or update one connection and publish the whole file. Keeps position
+   *  on an edit and appends on a create — a picker that reorders itself under
+   *  the human every time they launch is its own small bug. */
+  async write(profile: SshProfile): Promise<SshProfileWrite> {
+    if (!(await this.ensureLoaded())) return "declined-unread";
+    const existing = this.store.profiles.some((p) => p.id === profile.id);
+    this.store = {
+      // The FILE's version, off the record just re-read — never the caller's.
+      schemaVersion: this.store.schemaVersion,
+      profiles: existing
+        ? this.store.profiles.map((p) => (p.id === profile.id ? profile : p))
+        : [...this.store.profiles, profile],
+    };
+    try {
+      await this.io.save(encodeSshProfiles(this.store));
+      return "saved";
+    } catch {
+      // Best-effort, the `persistTabs` contract: a connection that started is
+      // worth more than the record of it. The in-memory store keeps the newer
+      // value, so the next launch re-offers it.
+      return "failed";
+    }
+  }
+}

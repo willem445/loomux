@@ -135,6 +135,13 @@ than taking the whole list with it; a file that won't parse as JSON at all is
 renamed aside to `sshprofiles.corrupt.json` and orrerix starts from an empty
 list — the same treatment `tabs.json` gets.
 
+Launching a connection rewrites that whole file, so orrerix will not write it
+until it has read it back. If your saved list has not loaded yet, the save waits
+for it; if orrerix could not read the file at all — not corrupt, just unreadable
+— the connection you just launched is **not saved**, rather than becoming the
+only line in the file. The pane still opens either way. Re-picking **SSH** in the
+launcher retries the read.
+
 > **The trust boundary, stated plainly.** Anyone who can write
 > `sshprofiles.json` can make your `ssh` do anything your `ssh` can do — the
 > **Extra ssh flags** field reaches `ssh` as raw argv, exactly like a line in your
