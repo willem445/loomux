@@ -283,6 +283,20 @@ allow, but what it merely leaves out of its allow-list — general `Bash`, and s
 `cargo check` — a repo-level `permissions.allow` can grant. Absent that, a plan
 will say when it could not confirm something by running it.
 
+Every review answers two standing questions as well as reporting what it found. Its body
+carries a **`## Premortem`** section — two ways this change fails in production that no test in
+the PR would catch, or an argued none — and where the change touches unbounded input (a file, a
+transcript, anything off the network or supplied by a user or another agent) one of those two
+is the **resource** answer: largest realistic input × how often the code runs × what it
+allocates or reads per run, naming the size at which memory or IO hurts rather than only where
+time does. Those are *question-generation* duties, and they exist because the rest of the
+process is verification: red-before-green evidence proves the tests somebody already thought to
+write and is silent about the property nobody conceived of. The orchestrator treats a review
+that arrives without the section as an incomplete review rather than an approval, and
+dispositions a premortem entry that names its trigger like any other finding. A repo that
+wants more of the question set than that — design alternatives, misuse, operational futures —
+puts it in its own reviewer persona (see **Custom agent workflows**).
+
 **No agent ever merges.** Agents open PRs; you merge, after your own review.
 
 Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`
