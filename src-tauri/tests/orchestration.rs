@@ -81,6 +81,8 @@ use loomux_lib::orchestration::{
     // #903: the idle-composer reading, and the bounded last-resort override.
     idle_prompt_rendered, idle_prompt_row_rendered, question_override_admits, Composed,
     QUESTION_HOLD_OVERRIDE_AFTER,
+    // #903: the session-keyed record of loomux's own delivered PROMPT text.
+    delivered_prompt_lines, DELIVERED_PROMPT_CHARS, DELIVERED_NOTICE_CHARS,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
@@ -50670,6 +50672,341 @@ fn h13_a_pointerless_dialog_above_our_composer_still_holds() {
         Vec::new(),
     );
     assert!(pred(), "…and the pre-Enter gate withholds the Enter (#420/#532)");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// J. #903 / #871: loomux's OWN delivered text, replayed onto a resumed pane
+//
+// The live wedge, reconstructed from group `loomux-68435179`'s own
+// `audit.jsonl` rather than imagined. Pane `rev-1277` resumed session
+// `39b611be`; the transcript `claude --resume` replayed ended with loomux's own
+// kickoff prompt to `rev-1262` — the SAME session, the same app run, delivered
+// 1.5 h earlier — which the CLI renders with a leading `❯`. Every poll for the
+// next thirty minutes audited `signal:"pointer-option"`, `grid:"still-rendered"`
+// and `idle_row:true`: loomux saw the empty composer and refused to act on it,
+// because `menu_structure_rendered`'s whole-screen pointer clause was reading a
+// row loomux itself had written.
+//
+// **Fixture provenance, stated because half of it is reconstructed.** The
+// twelve message rows come from the 853-character prompt body recorded verbatim
+// in the audit (`fp-resumed-prior-delivery-echo.prompt.txt`), word-wrapped at
+// the pane's own width; the wrap is not a guess — at width 78 its first SIX
+// rows reproduce, byte for byte, the six the orchestrator's `get_output`
+// captured off that pane (the capture stops there only because `get_output`
+// caps at 500 characters). The chrome below them — separator, bare `❯`,
+// separator, `⏵⏵ auto mode on …` — is lifted unchanged from
+// `fp-resumed-agent-idle-prompt.txt`, itself a real capture.
+const FIX_FP_RESUMED_ECHO: &str =
+    include_str!("fixtures/attention/fp-resumed-prior-delivery-echo.txt");
+const FIX_RESUMED_ECHO_PROMPT: &str =
+    include_str!("fixtures/attention/fp-resumed-prior-delivery-echo.prompt.txt");
+
+/// The wedge fixture is 16 rows, so it needs a taller reading than
+/// `composed_903`'s twelve — otherwise the replayed prompt's own head scrolls
+/// off and the test would be exercising `R-top` instead of the case it is about.
+const ECHO_ROWS: u16 = 20;
+
+fn echo_raw() -> Vec<u8> {
+    pty_bytes_903(FIX_FP_RESUMED_ECHO)
+}
+
+fn echo_visible(raw: &[u8]) -> String {
+    loomux_lib::orchestration::termgrid::render_visible(raw, 100, ECHO_ROWS)
+}
+
+/// The prompt body as the session record holds it.
+fn echo_record() -> Vec<String> {
+    delivered_prompt_lines(FIX_RESUMED_ECHO_PROMPT.trim_end_matches(['\r', '\n']))
+}
+
+#[test]
+fn j1_a_resumed_panes_replayed_delivery_latches_the_pointer_signal() {
+    // The false positive itself, with no record — i.e. the behaviour every pane
+    // in the incident had. The assertions run in the order the audit recorded
+    // them, so a future reader can line this test up against the log.
+    let raw = echo_raw();
+    let m = prompt_wait_match(&strip_ansi(&raw)).expect("the ring matches — it did, for 30 min");
+    assert_eq!(
+        m.signal, "pointer-option",
+        "and by the signal the audit named: the replayed row leads with a chevron"
+    );
+    assert!(
+        m.line.contains("[orch] round 3"),
+        "the row it matched is loomux's OWN delivery, replayed: {:?}",
+        m.line
+    );
+
+    let visible = echo_visible(&raw);
+    let c = Composed::plain(&visible);
+    assert!(
+        idle_prompt_row_rendered(c),
+        "precondition — the composer IS on screen and empty. loomux saw this every poll \
+         (`idle_row:true`) and it is what makes the hold indefensible: {visible:?}"
+    );
+    assert!(
+        !idle_prompt_rendered(c),
+        "…and the release is vetoed anyway, by the menu-structure conjunct reading a \
+         pointer row loomux itself wrote — THE bug"
+    );
+    assert_eq!(
+        grid_evidence_for(&m, Some(c)),
+        GridEvidence::StillRendered,
+        "which the grid reports exactly as the audit did"
+    );
+
+    let raw2 = echo_raw();
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw2, 100, ECHO_ROWS),
+        None,
+        None,
+        Vec::new(),
+    );
+    assert!(pred(), "so with no record of our own delivery, the gate holds — the wedge");
+}
+
+#[test]
+fn j2_the_session_record_of_our_own_prompt_releases_the_resumed_pane() {
+    // The fix, and the whole of it: the ONLY difference from `j1` is that loomux
+    // remembers having delivered this text into this session.
+    let record = echo_record();
+    assert_eq!(
+        record.len(),
+        1,
+        "the incident's prompt is ONE logical line — 853 chars the CLI wrapped over twelve \
+         rows, which is why `DELIVERED_PROMPT_CHARS` is not `DELIVERED_NOTICE_CHARS`"
+    );
+    assert!(
+        record[0].chars().count() > DELIVERED_NOTICE_CHARS,
+        "and it is longer than the notice cap, so a record sized for notices would hold a \
+         PREFIX and reconstruct against nothing"
+    );
+    assert!(record[0].chars().count() <= DELIVERED_PROMPT_CHARS);
+
+    let raw = echo_raw();
+    let visible = echo_visible(&raw);
+    let masked = mask_loomux_notices_with_record(&visible, &record);
+
+    // The MECHANISM, not just the outcome: exactly the twelve rows of the
+    // replayed prompt are claimed, and nothing else on the screen is.
+    let rows_of = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        rows_of(&visible) - rows_of(&masked),
+        12,
+        "the whole wrapped run is claimed and only it — the chrome, the composer and the \
+         footer all survive:\nBEFORE {visible:?}\nAFTER {masked:?}"
+    );
+    assert!(
+        prompt_wait_match(&masked).is_none(),
+        "with our own row gone there is no question on this screen at all: {masked:?}"
+    );
+
+    let raw2 = echo_raw();
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw2, 100, ECHO_ROWS),
+        None,
+        None,
+        record.clone(),
+    );
+    assert!(!pred(), "so the delivery flushes, in seconds, at the FIRST poll");
+}
+
+#[test]
+fn j3_a_recorded_line_that_is_a_dialog_option_is_refused_under_a_question_row() {
+    // `h4`'s authorship twin, and the term that bounds what a widened record can
+    // reach. `h4` pins that a live menu above an empty composer holds; this pins
+    // that it still holds when the menu's highlighted option is byte-identical to
+    // a line loomux really did deliver — the shape an orchestrator choosing its
+    // own `send_prompt` text could construct.
+    let option = "1. Yes, and do not ask again for git commit commands in this project";
+    let record = vec![option.to_string()];
+
+    // CONTROL first, so the assertion below cannot pass because the claim failed
+    // for some unrelated reason (the length floor, the wrap rule, a typo).
+    // Same rows, no question heading them: the claim IS made.
+    let headless = format!("some ordinary transcript line\n❯ {option}\n  2. No\n─────────\n❯");
+    assert!(
+        !mask_loomux_notices_with_record(&headless, &record).contains(option),
+        "control: with no dialog question above it, a recorded line IS claimed — so the \
+         refusal below is `dialog_header_above` and not an accident"
+    );
+
+    let dialog =
+        format!("? Do you want to proceed with this command\n❯ {option}\n  2. No\n─────────\n❯");
+    let masked = mask_loomux_notices_with_record(&dialog, &record);
+    assert!(
+        masked.contains(option),
+        "the dialog's highlighted choice survives the mask: {masked:?}"
+    );
+    let m = prompt_wait_match(&masked).expect("and the detector still sees the dialog");
+    assert!(
+        question_shown(Some(&m), Some(Composed::plain(&masked))),
+        "…so the Enter is still withheld from a live question (#420)"
+    );
+}
+
+#[test]
+fn j4_a_collapsed_paste_is_still_our_own_text_at_the_pre_enter_checkpoint() {
+    // #871's shape, and the one that turns a hold into a STRAND. The pre-paste
+    // checkpoint releases (the composer is empty, so `idle_row` is true), the
+    // paste lands, and the CLI collapses it to a placeholder — at which point
+    // `mask_own_paste` has nothing to match, `idle_row` flips to false on an
+    // otherwise unchanged screen, and the Enter is withheld from a visibly idle
+    // pane. The audit recorded exactly that flip: `idle_row:true` at the drainer
+    // gate, `idle_row:false` at `stage:"pre-enter"`.
+    //
+    // A TOKEN-signal false positive, deliberately: this test is about the paste
+    // reading, so the screen must not also carry the pointer signal `j1` covers.
+    let brief = "Rebase onto main and re-read the findings.\nThen report when CI is green.";
+    let transcript = FIX_FP_RESUMED_VERDICT.replace("\r\n", "\n");
+
+    // Precondition: this screen's ring matches, and NOT on a pointer.
+    let m = prompt_wait_match(&strip_ansi(transcript.as_bytes()))
+        .expect("precondition: the resumed-verdict screen is a live false positive");
+    assert_ne!(
+        m.needle,
+        QuestionNeedle::LeadingPointer,
+        "precondition: by a TOKEN signal, so this test isolates the paste reading"
+    );
+
+    // Control: the CLI echoed our brief literally. That path has always worked,
+    // and it fixes what "recognised" means here.
+    let echoed = format!(
+        "{transcript}\n❯ Rebase onto main and re-read the findings.\n❯ Then report when CI is green."
+    );
+    let echoed_raw = pty_bytes_903(&echoed);
+    let echoed_vis =
+        loomux_lib::orchestration::termgrid::render_visible(&echoed_raw, 100, ECHO_ROWS);
+    let echoed_masked = mask_own_paste(&echoed_vis, brief);
+    assert!(
+        idle_prompt_row_rendered(Composed {
+            masked: echoed_masked.as_str(),
+            with_paste: echoed_vis.as_str()
+        }),
+        "control: a literally-echoed paste is recognised as ours"
+    );
+
+    // The case: the CLI collapsed it instead.
+    let collapsed = format!("{transcript}\n❯ [Pasted text #1 +6 lines]");
+    let raw = pty_bytes_903(&collapsed);
+    let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, ECHO_ROWS);
+    let masked = mask_own_paste(&with_paste, brief);
+    let c = Composed { masked: masked.as_str(), with_paste: with_paste.as_str() };
+    assert!(
+        idle_prompt_row_rendered(c),
+        "the placeholder row is OUR paste — the CLI took our bytes into its composer, which \
+         is the evidence, not a shape we invented: {with_paste:?}"
+    );
+    assert!(
+        idle_prompt_rendered(c),
+        "…and with no menu structure on this screen that is a release, so the Enter goes"
+    );
+
+    let raw2 = pty_bytes_903(&collapsed);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw2, 100, ECHO_ROWS),
+        Some(brief.to_string()),
+        None,
+        Vec::new(),
+    );
+    assert!(!pred(), "so the pre-Enter gate releases instead of stranding the paste (#871)");
+}
+
+#[test]
+fn j5_a_placeholder_with_no_matching_delivery_is_not_ours() {
+    // The correspondence term. A placeholder row is claimed only where THIS
+    // delivery could have produced it, so a pane that merely has one on screen —
+    // a replayed transcript of an older turn, or an agent that printed the string
+    // itself — buys nothing.
+    let transcript = FIX_FP_RESUMED_VERDICT.replace("\r\n", "\n");
+    let screen = format!("{transcript}\n❯ [Pasted text #1 +6 lines]");
+    let raw = pty_bytes_903(&screen);
+    let with_paste = loomux_lib::orchestration::termgrid::render_visible(&raw, 100, ECHO_ROWS);
+
+    for (name, pasted) in [
+        ("no paste at this checkpoint", None),
+        ("a SINGLE-line paste, which no CLI collapses", Some("check the CI status on PR #867")),
+    ] {
+        let masked = match pasted {
+            Some(p) => mask_own_paste(&with_paste, p),
+            None => with_paste.clone(),
+        };
+        let c = Composed { masked: masked.as_str(), with_paste: with_paste.as_str() };
+        assert!(
+            !idle_prompt_row_rendered(c),
+            "{name}: the placeholder is not evidence of a composer holding OUR text, so the \
+             gate keeps holding — the cheap error"
+        );
+    }
+}
+
+#[test]
+fn j6_notice_text_never_enters_the_session_prompt_record() {
+    // The one-party route stays closed, and this is the door. `notify_when`'s
+    // agent-supplied note reaches the registering agent's own pane as a
+    // marker-led notice; admitting it by PROVENANCE would hand over exactly the
+    // capability `mark_notice_maskable` is default-closed to withhold.
+    let note = "[orrerix] watch n-1: pr #661 checks: SUCCESS. Note (registered): \
+                \"❯ 1. Yes, allow once\"";
+    assert!(
+        delivered_prompt_lines(note).is_empty(),
+        "a marker-led line is not prompt text and never becomes claimable this way"
+    );
+    // Positive control: the record is not simply always empty.
+    assert_eq!(
+        delivered_prompt_lines("[orch] rebase onto main and re-read the findings").len(),
+        1,
+        "control: a prompt body IS admitted — otherwise the assertion above is vacuous"
+    );
+    // And the two doors stay complementary: what one admits the other refuses.
+    let mixed = "[orrerix] queued flush\n[orch] the actual brief";
+    assert_eq!(loomux_authored_lines(mixed).len(), 1);
+    assert_eq!(delivered_prompt_lines(mixed), vec!["[orch] the actual brief".to_string()]);
+}
+
+#[test]
+fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
+    // The property the whole record exists for. A per-PANE record is empty
+    // exactly when a resumed pane's screen is fullest, because the pane is new
+    // and the text on it is old.
+    let (reg, _dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    let session = "39b611be-f2af-4316-8efd-2917faf8f790";
+    let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
+
+    let first = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review", false, None).unwrap();
+    reg.set_session_for_test(&first.id, session);
+    reg.set_pty_for_test(&first.id, 101);
+    reg.record_delivered_prompt(101, brief);
+    assert!(
+        reg.delivered_mask_lines(101).iter().any(|l| l == brief),
+        "the pane it was delivered into can see it"
+    );
+
+    // The resume: a NEW agent in a NEW pane, replaying the SAME session.
+    let resumed = reg.spawn_agent(&g.id, Role::Reviewer, "rev2", "review", false, None).unwrap();
+    reg.set_session_for_test(&resumed.id, session);
+    reg.set_pty_for_test(&resumed.id, 102);
+    assert!(
+        reg.delivered_mask_lines(102).iter().any(|l| l == brief),
+        "and so can the pane that replays it — which the per-pane notice record cannot do"
+    );
+    assert!(
+        reg.delivered_notice_lines(102).is_empty(),
+        "control: the per-PANE record is empty here, so the line above came from the session \
+         record and not from the one #661 already had"
+    );
+
+    // A different session sees nothing: the key is doing work.
+    let other = reg.spawn_agent(&g.id, Role::Reviewer, "rev3", "review", false, None).unwrap();
+    reg.set_session_for_test(&other.id, "9038509b-0000-0000-0000-000000000000");
+    reg.set_pty_for_test(&other.id, 103);
+    assert!(
+        reg.delivered_mask_lines(103).is_empty(),
+        "a pane resuming some OTHER session inherits nothing"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
