@@ -78,6 +78,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "bind_agent",
     "orch_agent_renamed",
     "orch_session_roles",
+    "orch_list_recorded",
     "resume_orch_session",
     "orch_tasks",
     "orch_audit",

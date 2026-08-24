@@ -611,3 +611,135 @@ fn an_opencode_resume_reads_its_own_store_and_not_claudes() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------
+// 3. The Orchestrations list (#1563 slice B)
+// ---------------------------------------------------------------------------
+
+/// The list the session browser's "Orchestrations" section reads
+/// (`orch_list_recorded` → `OrchRegistry::recorded_orchestrations`).
+///
+/// WHY THIS TEST IS THE POINT OF THE SLICE. The sidebar's session scan reads
+/// the human's GLOBAL opencode store on purpose (`doc/design/opencode.md`), so
+/// a group-store session — the only kind an orchestrator ever has, since every
+/// opencode pane in a group is pointed at `<group>/opencode/opencode.db` via
+/// `OPENCODE_DB` — is invisible to it. That left a fresh opencode orchestrator
+/// with no UI route to `resume_recorded_session` at all. This list is that
+/// route, and the property that makes it worth having is the one asserted
+/// below: a session that exists ONLY in the group's own store is reported
+/// `resumable`, because the lookup asks the same question, of the same store,
+/// as the resume path it is offering to call (#722).
+///
+/// THE DISCRIMINATING PAIR. `resumable: true` alone would pass just as well
+/// against a stub that returned `true` for every recorded session, so the
+/// second group is identical in every respect EXCEPT that its store does not
+/// hold its session — and it must come back `false`. The third and fourth
+/// groups pin the two honest "no button" cases: an orchestrator whose id was
+/// never learned, and a group whose CLI is not opencode at all (listed, one
+/// shape, so the section is the primary restart surface for every CLI rather
+/// than an opencode workaround).
+#[test]
+fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_the_group_store() {
+    let (reg, _d) = test_registry();
+
+    // A claude session id resolves against `~/.claude/projects`; point that at
+    // an empty directory for this thread so the claude row below is decided by
+    // the fixture and not by whatever happens to be in the runner's home.
+    let claude_root = tempfile::tempdir().unwrap();
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(claude_root.path().to_path_buf()));
+
+    // (1) opencode, session present in THIS GROUP's store.
+    let found = reg.create_group("C:/tmp/opencode-found", rails("opencode")).unwrap();
+    let o1 = reg.spawn_agent(&found.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    assert!(o1.session_id.is_none(), "opencode mints no id up front — the watcher learns it");
+    reg.associate_session(&found.id, &o1.id, NEW);
+    store(&reg.opencode_db_path(&found.id), &[Row::new(NEW)]);
+
+    // (2) opencode, same shape, but its store never held that session.
+    let missing = reg.create_group("C:/tmp/opencode-missing", rails("opencode")).unwrap();
+    let o2 = reg.spawn_agent(&missing.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.associate_session(&missing.id, &o2.id, NEW);
+    store(&reg.opencode_db_path(&missing.id), &[Row::new(OTHER)]);
+
+    // (3) opencode, watcher never bound an id (a `session-untracked` group).
+    let unknown = reg.create_group("C:/tmp/opencode-unknown", rails("opencode")).unwrap();
+    reg.spawn_agent(&unknown.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // (4) claude — listed in the SAME shape, which is what makes this section
+    // the restart surface for every CLI instead of an opencode special case.
+    let claude = reg.create_group("C:/tmp/claude-repo", rails("claude")).unwrap();
+    let o4 = reg.spawn_agent(&claude.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    let rows = reg.recorded_orchestrations();
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+
+    let by = |g: &loomux_lib::orchestration::GroupId| {
+        rows.iter().find(|r| &r.group_id == g).unwrap_or_else(|| panic!("no row for {g}"))
+    };
+    assert_eq!(rows.len(), 4, "every group with a group.json is listed, got {}", rows.len());
+
+    let r1 = by(&found.id);
+    assert_eq!(r1.cli, "opencode");
+    assert_eq!(r1.session_id.as_deref(), Some(NEW));
+    assert!(
+        r1.resumable,
+        "a session held ONLY by the group's own store must be resumable — this is the case the \
+         sidebar's global-store scan cannot see, and the whole reason this list exists (#1563)"
+    );
+    assert_eq!(r1.repo.as_deref(), Some("C:/tmp/opencode-found"));
+    assert!(!r1.group_live, "no agent is bound to a pty in this test, so nothing is live");
+    assert!(r1.last_seen_ms > 0, "the ordering key comes off the roster, never fabricated");
+
+    let r2 = by(&missing.id);
+    assert_eq!(r2.session_id.as_deref(), Some(NEW), "the id is recorded either way");
+    assert!(
+        !r2.resumable,
+        "the same recorded id in a store that does not hold it is NOT resumable — the list must \
+         not offer a button `resume_recorded_session` will refuse"
+    );
+
+    let r3 = by(&unknown.id);
+    assert_eq!(r3.session_id, None, "no id was ever learned for this orchestrator");
+    assert!(!r3.resumable, "nothing to resume is not the same as a resume that would work");
+    assert_eq!(r3.cli, "opencode", "the CLI is known from group.json even with no session");
+
+    let r4 = by(&claude.id);
+    assert_eq!(r4.cli, "claude", "every CLI is listed in one shape, claude included");
+    assert_eq!(r4.session_id.as_deref(), o4.session_id.as_deref(), "claude is handed its id at spawn");
+    assert!(
+        !r4.resumable,
+        "an empty claude projects root holds no transcript for this id, so it is honestly \
+         unresumable — the router asked claude's store, not opencode's"
+    );
+}
+
+/// A group directory whose `group.json` will not parse is LISTED, with the
+/// fields it could not read left honestly empty — never skipped. The human
+/// whose group record got torn is exactly the one who needs to see that the
+/// group is still on disk, and hiding it is how "my orchestration vanished"
+/// (#1563's own report) happens a second time.
+#[test]
+fn a_group_whose_record_is_damaged_still_appears_in_the_orchestrations_list() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/opencode-torn", rails("opencode")).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.associate_session(&g.id, &o.id, NEW);
+    store(&reg.opencode_db_path(&g.id), &[Row::new(NEW)]);
+
+    // Torn write: the file is there (so this is a group), and unparseable.
+    // The group dir, derived through the registry's own path function rather
+    // than reassembled from the root (CLAUDE.md constraint 6): opencode_db_path
+    // is <group dir>/opencode/opencode.db.
+    let group_dir = reg.opencode_db_path(&g.id).parent().unwrap().parent().unwrap().to_path_buf();
+    std::fs::write(group_dir.join("group.json"), b"{\"repo\":").unwrap();
+
+    let rows = reg.recorded_orchestrations();
+    assert_eq!(rows.len(), 1, "the group is still listed");
+    assert_eq!(rows[0].repo, None, "an unreadable repo is None, never a guess");
+    assert_eq!(rows[0].cli, "", "and the CLI is empty rather than defaulted to the wrong one");
+    assert_eq!(rows[0].session_id.as_deref(), Some(NEW), "agents.json is a separate file and still read");
+    assert!(
+        !rows[0].resumable,
+        "with no CLI there is no store to ask, so the row cannot promise a resume"
+    );
+}
