@@ -2049,12 +2049,19 @@ Two parsers, deliberately (the pane is an editor giving live feedback on text; t
 the engine). A file only one of them accepts is a file the human is being lied to about, and
 these two tests are what stop that drifting apart.
 
-A third pin protects a narrower promise inside the same file:
+Two further pins protect narrower promises inside the same file.
 `the_dogfood_reviewer_persona_carries_the_question_set` loads `rev-lead.md` through the same
 real profile loader used above and pins its five `## Questions every review answers`
 headings, plus the rule that an empty/"n/a" section is a finding rather than a pass (#1292 PR
-B) — the roster's one reviewer lane and its review-body contract staying in lockstep, not the
+B) — the JUDGING reviewer lane and its review-body contract staying in lockstep, not the
 two-parser parity the pair above defends.
+`the_cheap_review_lanes_carry_the_rules_that_make_them_safe` does the same job for the three
+`qr-*` lanes (#1388), pinning per lane the silent-off-checklist rule, the never-review-design
+scope floor, the when-in-doubt-escalate tiebreak and the FAIL rule itself — plus, on
+`qr-constraints` alone, the two zero-shaped-sweep rules. Those sentences ARE the safety
+argument for `all-pass` over four lanes, and they live in a markdown file where nothing but a
+pin can notice one going missing. Its lane list is derived from the roster by kind + CLI, so a
+fourth cheap lane is covered the day it is declared.
 
 "In CI" was not true when this section was first written, and the fix was to make it true
 rather than to soften the sentence: `ci.yml` ran `npm run build` (a **typecheck**, not the
