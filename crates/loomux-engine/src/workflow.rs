@@ -87,6 +87,17 @@
 //!                             # kind: reviewer — anything else is a parse
 //!                             # error.
 //!
+//!   - id: builder-remote     # remote: OPTIONAL (#1457) — an abstract LABEL
+//!     kind: worker            # the OPERATOR binds to an SSH profile + a
+//!     cli: claude             # remote clone path outside the repo. The repo
+//!     remote: buildbox        # file SELECTS; it can never author a host, a
+//!                             # port or an ssh option — those are unknown
+//!                             # keys, and an unknown key fails the file.
+//!                             # claude-only, never on an orchestrator or a
+//!                             # manager block. Inert until the operator
+//!                             # binds it (#1458) and the spawn path lands
+//!                             # (#1459).
+//!
 //!   - id: manager           # OPTIONAL, at most one (#1161). The human's own
 //!     kind: manager         # interface pane: it converses, grooms feature
 //!     model: opus           # requests into briefs, and relays. cli:/model:/
@@ -244,6 +255,41 @@ pub struct Block {
     /// would put a POSIX-shell glob pattern on the command line. The suffix is
     /// composed at emit time instead — see `claude_model_token`.
     pub context: String,
+    /// An abstract REMOTE LABEL (the `remote:` key, #1457/#1436) — the name of
+    /// a machine this block's agent CLI should run on, over SSH. `None` (the
+    /// key absent) is today's behavior byte for byte: a local block.
+    ///
+    /// **The label is a selection, not an address**, and that is the whole
+    /// security argument. A repo file is untrusted input (see the
+    /// capability-closure rule at the top of this module), so it may pick a
+    /// name; the operator — outside the repo, in loomux's own state — decides
+    /// which host, which account and which remote clone path that name resolves
+    /// to (#1458). A repo-authored `host:`/`port:`/`identity_file:` would let
+    /// whoever opens a PR direct execution onto any machine the operator can
+    /// reach, so those keys are not "unsupported": they are unknown fields, and
+    /// [`RawBlock`] is `deny_unknown_fields`, so one of them fails the WHOLE
+    /// file. That failure mode is deliberate in the other direction too: a
+    /// build that predates `remote:` refuses a file that declares it, rather
+    /// than silently spawning a remote-intended block on the human's own
+    /// machine.
+    ///
+    /// Validated with [`crate::pathseg::check_segment`] — the same checks
+    /// [`crate::groupid::GroupId`] delegates to (#925), and for the same
+    /// reasons: `[A-Za-z0-9_-]`, length-capped, no leading `-`, no Windows
+    /// device name, and **refused rather than rewritten**, so two spellings can
+    /// never name one binding. The label is not a path component today, which
+    /// is why this keeps a `String` and borrows only the checks; it does reach
+    /// an operator-side lookup key and, at #1459, a command line.
+    ///
+    /// Two pairings are parse errors rather than fields anyone downstream has
+    /// to re-check: `remote:` on an orchestrator or manager block, and
+    /// `remote:` without `cli: claude`. See `parse_workflow` for both
+    /// arguments.
+    ///
+    /// **Inert in this build.** Nothing reads this field on the spawn path yet:
+    /// the operator binding is #1458 and the spawn path #1459, so a block that
+    /// declares it spawns exactly as it does today — locally.
+    pub remote: Option<String>,
 }
 
 /// The per-block model knobs that reach a spawn alongside the model itself
@@ -892,6 +938,10 @@ pub fn default_roster_ex(pins: &[(Role, &str, &str, ModelKnobs<'_>)]) -> Vec<Blo
             // resolved CLI cannot honor (the same treatment `model` gets).
             effort: knobs.effort.trim().to_string(),
             context: knobs.context.trim().to_string(),
+            // #1457: every roster loomux synthesizes on a group's behalf is
+            // LOCAL. A remote block can only come from a repo's workflow file,
+            // which is the only surface the operator opted a label into.
+            remote: None,
         })
         .collect()
 }
@@ -1361,6 +1411,12 @@ struct RawBlock {
     effort: String,
     #[serde(default)]
     context: String,
+    /// #1457. `Option` rather than a defaulted `String` so "omitted" and
+    /// "written empty" stay distinguishable: an empty label is refused, and
+    /// refusing one the author never wrote would be an error about nothing
+    /// (the reasoning [`RawMergeQueue::max_batch`] states).
+    #[serde(default)]
+    remote: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1467,6 +1523,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         role_hint: Some("process".into()),
         effort: "high".into(),
         context: "1m".into(),
+        remote: Some("buildbox".into()),
     };
     let edge = RawEdge { from: "a".into(), to: OneOrMany::One("b".into()) };
     let gate = RawGate {
@@ -2203,6 +2260,75 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 continue;
             }
         };
+        // `remote:` (#1457) — the label that says this block's agent CLI runs
+        // on another machine over SSH. THREE refusals, all parse errors, all
+        // fail-closed on purpose: this is the one block key whose eventual
+        // effect is "run code somewhere else", so every question it raises is
+        // answered in the file or the file does not load.
+        //
+        // 1. THE LABEL ITSELF is checked with `pathseg::check_segment` — the
+        //    #925 shared validator `GroupId` delegates to — rather than a
+        //    fourth private "is this a safe id" predicate. Refused, never
+        //    rewritten: `sanitize_id` would turn `../buildbox` into
+        //    `buildbox`, and two strings naming one binding is exactly the
+        //    hazard that consolidation exists to prevent.
+        //
+        // 2. NOT ON AN ORCHESTRATOR OR A MANAGER BLOCK. Both are loomux-owned
+        //    (the same pair the persona check above refuses `prompt:`/
+        //    `profile:`/`allow:` on) and both are load-bearing LOCALLY: the
+        //    orchestrator is the trust root that holds orchestration state,
+        //    the `gh` operations and the merge gate, and the manager is the
+        //    human's own interface pane — the thing they type into. Moving
+        //    either onto a machine the repo file named is not a feature with a
+        //    missing implementation; it is the feature this design refuses.
+        //
+        // 3. `cli: claude` MUST BE SPELLED OUT. Only Claude's session identity
+        //    survives the trip: loomux pre-mints the session id and the CLI
+        //    accepts it (`--session-id`/`--resume`), while copilot/opencode/
+        //    gemini identify a session by scanning a LOCAL store, which a
+        //    remote CLI's store is not. An `cli:` omitted inherits the group
+        //    default — picked in the launcher, unknowable here — so a block
+        //    that leaves it blank is refused rather than parsed into a promise
+        //    the spawn would have to break. The asymmetry decides it: relaxing
+        //    this later (accepting an inherited claude) is cheap, tightening it
+        //    later would be a breaking change to every workflow file already
+        //    written.
+        let remote = match rb.remote.as_deref() {
+            None => None,
+            Some(raw) => {
+                if let Err(e) = crate::pathseg::check_segment(raw) {
+                    errs.push(format!(
+                        "blocks[{i}] ({id}): remote {raw:?} is not a usable label — {e}. A remote                          label is an abstract name the OPERATOR binds to a host outside this                          repo, never an address."
+                    ));
+                    continue;
+                }
+                if kind == Role::Orchestrator || kind == Role::Manager {
+                    errs.push(format!(
+                        "blocks[{i}] ({id}): a{n} {k} block may not declare remote: — it is                          loomux-owned and runs on the human's own machine ({why}). Put remote: on                          the blocks the orchestrator spawns.",
+                        n = if kind == Role::Orchestrator { "n" } else { "" },
+                        k = kind.as_str(),
+                        why = if kind == Role::Orchestrator {
+                            "the orchestrator is the trust root, and orchestration state, the gh                              operations and the merge gate stay local"
+                        } else {
+                            "a manager pane is the human's own interface — it is where they type"
+                        },
+                    ));
+                    continue;
+                }
+                if cli != "claude" {
+                    errs.push(format!(
+                        "blocks[{i}] ({id}): remote: requires cli: claude{spelled} — a remote                          agent's session has to be identified by an id loomux minted before the                          spawn, and claude is the only CLI that accepts one (the others recognize                          a session by scanning a local store, which a remote CLI's store is not).",
+                        spelled = if cli.is_empty() {
+                            ", spelled out on the block — an omitted cli: inherits the group                              default, which is picked at launch and cannot be checked here"
+                        } else {
+                            ""
+                        },
+                    ));
+                    continue;
+                }
+                Some(raw.to_string())
+            }
+        };
         let name = sanitize_display(&rb.name);
         blocks.push(Block {
             name: if name.is_empty() { id.clone() } else { name },
@@ -2216,6 +2342,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             role_hint,
             effort,
             context,
+            remote,
         });
     }
 

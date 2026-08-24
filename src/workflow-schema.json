@@ -210,6 +210,11 @@
           "type": "string",
           "default": "",
           "help": "Context-window variant, e.g. \"1m\". Same ownership as `effort`: the backend states what is deliverable. Empty = the model's own window."
+        },
+        {
+          "name": "remote",
+          "type": "string",
+          "help": "An abstract LABEL for a machine this block's agent runs on over SSH. The repo file only ever SELECTS a name; the OPERATOR binds it to a host, an account and a remote clone path outside the repo — so there is no host/port/identity_file key here, and writing one fails the whole file. Requires kind: worker, reviewer or planner and an explicitly spelled cli: claude. Letters, digits, '-' and '_', at most 64 characters, not starting with '-'. Absent = a local block, which is every block today: the key does nothing until the operator binds it."
         }
       ]
     },
