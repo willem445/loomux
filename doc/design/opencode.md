@@ -648,6 +648,64 @@ Both are identity, both were found building this slice.
   store — which is where its panes write, `OPENCODE_DB` pointing every one of
   them at `opencode_db_path(group)`.
 
+### Resuming an orchestrator, and what a killed store does to it (#1563)
+
+The backend resume is CLI-aware, and `opencode_orchestration_restores_from_recorded_session`
+(`src-tauri/tests/orchestration.rs`) is the pin that says so.
+`resume_recorded_session`'s orchestrator branch resolves the CLI from the
+group's own block, asks `session_cwd_in_store` — which routes opencode to
+`opencode_db_path(group)` — and relaunches through
+`create_orchestration_group`, which emits `opencode --session <id>`. Its
+copilot twin has existed since #412; nothing drove an opencode orchestrator
+through that path until #1563. The three things the pin holds down are the
+three that are opencode-specific: the store consulted is the **group's**, the
+flag is `--session` (opencode's *continue* flag — not claude's `--session-id`,
+not copilot's `--resume`), and the MCP wiring rides the pane environment rather
+than argv, so a resumed orchestrator that came back without
+`OPENCODE_CONFIG_CONTENT` would have its conversation and no loomux server at
+all.
+
+What that pin is **not** is a claim that an opencode orchestrator is resumable
+from the UI. The reason it was not sits above this layer — the learned id never
+reached `tabs.json`, and the sessions browser reads the human's *global* store
+by design (see *The Sessions browser* below). Those are #1563 A and B.
+
+**A store a killed process left behind.** The crash the report started from
+raises a specific question about this path: `opencodedb::open_readonly` is a
+plain read-only open with an `immutable=1` **fallback**, and an immutable
+connection reads the main database file alone — it never consults the WAL. A
+hard kill is exactly the state where that distinction bites, because the main
+file holds what was last checkpointed and the `-wal` holds everything committed
+since, which usually includes the orchestrator's own session row.
+
+Measured on the artifacts a kill actually leaves, rather than assumed
+(`an_opencode_store_left_by_a_killed_process_still_resolves_the_session`):
+
+- With the whole set on disk — main file, dirty `-wal`, `-shm` — the session
+  resolves. A read-only connection consults the WAL, which is the entire reason
+  the primary open is not `immutable=1`.
+- With the `-shm` swept (a reboot, a cleaner, a hand-copy that took the two
+  files a human thinks of), it still resolves: SQLite rebuilds the wal-index
+  given write access to the directory, and `SQLITE_OPEN_READ_ONLY` constrains
+  the *database*, not its sidecars.
+- The fallback's blindness is real all the same, and the test proves it on that
+  same store instead of describing it: an `immutable=1` connection returns
+  `Ok(None)` for the row living in the `-wal` while reading the checkpointed
+  row beside it perfectly.
+
+So the fallback loses crash-committed sessions **if** it engages, and nothing
+on the resume path engages it on either artifact set. That is recorded rather
+than fixed. The fix would be a `-wal`/`-shm` presence check before falling
+back, and it belongs to whoever finds a reachable case: widening
+`open_readonly` on a hypothetical trades a working degrade — a number for a
+store that cannot be opened any other way — for a refusal, on no evidence.
+
+One limit the test states about itself: the `-shm` it copies out from under a
+live connection is coherent, where a real kill can leave a torn one. A torn
+index forces SQLite's recovery path, which needs directory write access — the
+case where the read-only open really could fail, and the one no test can
+produce deterministically.
+
 ## Transcript and digest readback (#722 slice B2)
 
 `session_digest` reduces a finished worker's transcript to friction windows, and

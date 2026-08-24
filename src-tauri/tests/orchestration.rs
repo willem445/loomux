@@ -415,6 +415,103 @@ fn fixture_copilot_session(root: &std::path::Path, id: &str, cwd: &str) {
     fs::write(dir.join("workspace.yaml"), format!("id: {id}\nname: fixture\ncwd: {cwd}\n")).unwrap();
 }
 
+/// The `session` DDL an opencode store is built from in this file, verbatim
+/// from the one `opencodedb`'s module docs quote — read off
+/// `anomalyco/opencode@f67e80c2` (tag `v1.18.11`), recorded in full on #722.
+///
+/// Kept as a literal here rather than shared with `tests/opencodesessions.rs`
+/// and `tests/opencodeusage.rs`, which each carry their own copy for the same
+/// reason: Rust compiles every integration test as its own crate, so there is
+/// no cheaper place to put it than beside the tests that use it.
+///
+/// No opencode is ever run to produce one (constraint 3).
+const OPENCODE_SESSION_DDL: &str = "CREATE TABLE session (
+    id text PRIMARY KEY, project_id text NOT NULL, parent_id text,
+    slug text NOT NULL, directory text NOT NULL, title text NOT NULL,
+    version text NOT NULL, share_url text, permission text,
+    time_created integer NOT NULL, time_updated integer NOT NULL,
+    time_compacting integer, time_archived integer, workspace_id text,
+    path text, agent text, model text,
+    cost real DEFAULT 0 NOT NULL,
+    tokens_input integer DEFAULT 0 NOT NULL,
+    tokens_output integer DEFAULT 0 NOT NULL,
+    tokens_reasoning integer DEFAULT 0 NOT NULL,
+    tokens_cache_read integer DEFAULT 0 NOT NULL,
+    tokens_cache_write integer DEFAULT 0 NOT NULL,
+    metadata text)";
+
+/// Open (creating) an opencode store at `db` in **WAL** — the journal mode
+/// opencode opens its own database in (`SOURCE`, `database/database.ts`).
+///
+/// WAL is not a detail of the fixture: it is what makes
+/// [`an_opencode_store_left_by_a_killed_process_still_resolves_the_session`]
+/// able to leave a dirty `-wal` behind at all, and what
+/// `opencodedb::open_readonly`'s "not `immutable=1`" decision is about.
+fn open_opencode_store(db: &Path) -> rusqlite::Connection {
+    fs::create_dir_all(db.parent().expect("an opencode db path always has a parent")).unwrap();
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mode: String =
+        conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0)).unwrap();
+    assert_eq!(mode, "wal", "the fixture store must really be in WAL, got {mode:?}");
+    conn
+}
+
+/// One root `session` row: the columns these tests vary, and realistic
+/// constants for the rest.
+///
+/// `directory` is spelled with forward slashes because that is how opencode
+/// writes the column (`LOCAL-OBSERVED`), and `project_id` is the real sha1 for
+/// this repo — every worktree of one repo shares it, which is exactly why
+/// identification cannot key on the project (see `doc/design/opencode.md`).
+fn insert_opencode_session(conn: &rusqlite::Connection, id: &str, directory: &str) {
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version,
+                              time_created, time_updated)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?7)",
+        rusqlite::params![
+            id,
+            "f9dd9fcdf18a51fa9de041f787210d1ce5e0d1e7",
+            "loomux",
+            directory,
+            "a title",
+            "1.18.11",
+            1_785_703_307_950i64,
+        ],
+    )
+    .unwrap();
+}
+
+/// A group's opencode store at `db` holding one root session per
+/// `(id, directory)`, closed cleanly — the ordinary case.
+fn fixture_opencode_store(db: &Path, rows: &[(&str, &str)]) {
+    let conn = open_opencode_store(db);
+    conn.execute_batch(OPENCODE_SESSION_DDL).unwrap();
+    for (id, directory) in rows {
+        insert_opencode_session(&conn, id, directory);
+    }
+}
+
+/// `db` with a SQLite sidecar suffix appended (`-wal`, `-shm`) — appended to
+/// the whole path, extension included, which is how SQLite names them.
+fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut s = db.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Copy one SQLite file through `read`+`write` rather than [`fs::copy`].
+///
+/// Deliberate on Windows: `fs::copy` is `CopyFileExW`, which opens the source
+/// with a sharing mode that a live SQLite `-shm` mapping can refuse, while
+/// `File::open` (what `fs::read` uses) asks for share-read/write/delete and
+/// gets the bytes. The fixture below copies files out from under an OPEN
+/// connection on purpose, so this is the difference between a fixture and a
+/// sharing violation.
+fn copy_sqlite_file(from: &Path, to: &Path) {
+    fs::create_dir_all(to.parent().unwrap()).unwrap();
+    fs::write(to, fs::read(from).unwrap()).unwrap();
+}
+
 // ---------- the merge queue's registry seam (#581 slice D2) ----------
 
 /// A canned `MqRunner` for the reconcile seam. Minimal on purpose — the queue's
@@ -9269,6 +9366,239 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
     assert!(req.command.starts_with("copilot "), "must relaunch copilot, got: {}", req.command);
     assert!(req.command.contains(&format!("--resume={sid}")), "must resume the recorded session");
     assert!(!req.command.contains("--resume "), "#458/#781: never the space form on copilot");
+}
+
+/// #1563 slice C1: the **opencode** half of the orchestrator restore, mirroring
+/// `copilot_orchestration_session_gets_a_chip_and_restores` one store down.
+///
+/// **A regression pin, not a behaviour change — GREEN on the base commit.** The
+/// backend resume path has been CLI-aware since #722 and this half already
+/// works; what #1563 found broken is everything ABOVE it (an opencode
+/// orchestrator's learned id never reaches `tabs.json`, and the session browser
+/// reads the human's global store by design, never a group's), and that is
+/// slices A and B. This pins the half those two must not silently break while
+/// they land, and it is the half nothing covered: `copilot_orchestration_…`
+/// pinned copilot, and no test drove an opencode orchestrator through
+/// `resume_recorded_session` at all.
+///
+/// Three things it holds down that a command-line-only assertion would miss:
+///
+/// - the store the resume pre-check consults is **this group's**
+///   (`opencode_db_path`), not the human's global one — the #722 bug that made
+///   an opencode group unreopenable was reading somewhere else entirely;
+/// - the relaunch is `--session`, opencode's *continue* flag, and neither
+///   claude's `--session-id` nor copilot's `--resume`;
+/// - the MCP wiring rides the pane **environment**, because opencode names no
+///   config file on argv (`CliCaps::mcp_argv_seam` is false for it). A resumed
+///   orchestrator that came back without it would be a pane with its
+///   conversation intact and no loomux MCP server at all — resumed and mute.
+#[test]
+fn opencode_orchestration_restores_from_recorded_session() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap(); // must exist for restore
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    // opencode's own id shape: `ses_` + 12 hex + 14 base62 (a real id from the
+    // #722 slice-V memo). A claude-shaped UUID would not exercise the widening
+    // `sanitize_session` needed for opencode at all.
+    let sid = "ses_1508a391dffext5Xb0UUF2UDjk";
+    let gid;
+    let db;
+    {
+        let reg = relaunch_registry(dir.path());
+        let g = reg.create_group(&repo_path, opencode_rails()).unwrap();
+        gid = g.id.clone();
+        db = reg.opencode_db_path(&g.id);
+        // No flag pre-assigns an opencode session id, so the orchestrator pane
+        // spawns untracked and the watcher binds its id once the `session` row
+        // appears. Driven directly here — constraint 3, no opencode is run.
+        let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        assert!(orch.session_id.is_none(), "opencode cannot pre-assign a session id");
+        reg.associate_session(&g.id, &orch.id, sid);
+        let roles: Vec<_> =
+            reg.session_roles().into_iter().filter(|r| r.session_id == sid).collect();
+        assert_eq!(roles.len(), 1, "one roster row for the orchestrator pane");
+        assert_eq!(roles[0].role, "orchestrator");
+        assert_eq!(roles[0].group_id, gid);
+    }
+    // The store the resume pre-check reads is THIS GROUP's — `OPENCODE_DB`
+    // points every pane in the group at it (#722) — so that is where the
+    // orchestrator's session has to be for the resume to find it.
+    fixture_opencode_store(&db, &[(sid, repo_path.as_str())]);
+
+    // "App restart": a new registry restores the whole orchestration from the
+    // recorded session.
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    let req =
+        resume_recorded_session(&reg, sid, None, false).unwrap().expect("orchestrator pane spec");
+    assert_eq!(req.group_id, gid);
+    assert_eq!(req.role, Role::Orchestrator);
+    assert_eq!(
+        Path::new(&req.cwd),
+        repo.path(),
+        "an orchestrator's launch cwd is the group's repo, never a worktree"
+    );
+    assert!(req.command.starts_with("opencode"), "must relaunch opencode, got: {}", req.command);
+    assert!(
+        req.command.contains(&format!("--session {sid}")),
+        "must continue the recorded session, got: {}",
+        req.command
+    );
+    assert!(
+        !req.command.contains("--session-id"),
+        "`--session-id` is claude's spelling and opencode has no such flag: {}",
+        req.command
+    );
+    assert!(
+        !req.command.contains("--resume"),
+        "`--resume` is copilot's/claude's spelling: {}",
+        req.command
+    );
+
+    // The MCP wiring, which for opencode is NOT on the command line.
+    let env: HashMap<&str, &str> = req.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let cfg: Value = serde_json::from_str(
+        env.get("OPENCODE_CONFIG_CONTENT")
+            .expect("the generated config must ride the RESUMED pane's env, not only a fresh one"),
+    )
+    .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+    assert_eq!(
+        cfg["mcp"][brand::MCP_SERVER]["type"].as_str(),
+        Some("remote"),
+        "the loomux MCP server is the only channel a resumed orchestrator has: {cfg}"
+    );
+    assert!(
+        cfg["mcp"][brand::MCP_SERVER]["headers"]["X-Orrerix-Agent"].is_string(),
+        "the per-agent token is what makes every MCP call attributable: {cfg}"
+    );
+    assert_eq!(
+        env.get("OPENCODE_DB").map(|p| p.replace('\\', "/")),
+        Some(db.display().to_string().replace('\\', "/")),
+        "the resumed pane must be pointed back at the SAME store its session lives in, or its \
+         next turn writes a session nothing can find again: {env:?}"
+    );
+}
+
+/// #1563 slice C2: an opencode store left mid-flight by a **killed** process —
+/// the crash the human was actually recovering from — must still resolve its
+/// orchestrator's session.
+///
+/// **The fixture is the artifacts, not a flag.** A hard kill leaves three
+/// files: the main database holding whatever was last checkpointed, a `-wal`
+/// holding everything committed since, and a `-shm` wal-index nobody got to
+/// remove. They are built here by copying a live store's three files out from
+/// under an OPEN connection and then letting that connection close the
+/// *original* — so the copy has a dirty WAL and no living handle anywhere,
+/// which is what `TerminateProcess` leaves and what a clean quit never does.
+/// (One honest limit: the `-shm` copied this way is coherent, where a real
+/// kill can leave a torn one. That is the easier case, and it is the one whose
+/// success is claimed below — a torn index forces SQLite's recovery path, which
+/// no test can produce deterministically.)
+///
+/// **The finding this test records rather than fixes.**
+/// `opencodedb::open_readonly` falls back to an `immutable=1` open when the
+/// plain read-only open fails, and an immutable connection reads the main
+/// database file ALONE — it never consults the WAL. The last two assertions
+/// prove that is not theoretical on this very store: the fallback returns
+/// `Ok(None)` for a session plainly in it, with a positive control (the
+/// checkpointed row it CAN see) so the miss cannot be mistaken for a store it
+/// simply failed to open. Nothing in the two live arms engages that fallback,
+/// because a read-only open succeeds against both artifact sets — so the
+/// blindness is real and not reachable *from these fixtures*, which is why it
+/// is recorded rather than papered over by rigging the fixture around it. The
+/// fix, if a reachable case is ever found, is a `-shm`/`-wal` presence check
+/// before falling back; see `doc/design/opencode.md`, Session identification.
+#[test]
+fn an_opencode_store_left_by_a_killed_process_still_resolves_the_session() {
+    use loomux_lib::opencodedb;
+    use loomux_lib::orchestration::session_cwd_in_store;
+    let scratch = scratch_dir("opencode-killed-store");
+    let live = scratch.join("live").join("opencode.db");
+    let killed = scratch.join("killed").join("opencode.db");
+    let swept = scratch.join("swept").join("opencode.db");
+    // Written before the crash and checkpointed into the main file.
+    let checkpointed = "ses_03bd2d53dffeiBvu9PvuCPjxT7";
+    // Committed after it and never checkpointed — the orchestrator's own.
+    let in_wal = "ses_1508a391dffext5Xb0UUF2UDjk";
+
+    {
+        let conn = open_opencode_store(&live);
+        conn.execute_batch(OPENCODE_SESSION_DDL).unwrap();
+        insert_opencode_session(&conn, checkpointed, "C:/Projects/loomux");
+        // Everything so far lands in the main database file...
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)).unwrap();
+        // ...and everything after it stays in the -wal, which is the state a
+        // kill freezes. (Autocheckpoint would not have fired on one row at its
+        // 1000-page default either; off is the claim, not the coincidence.)
+        conn.execute_batch("PRAGMA wal_autocheckpoint=0").unwrap();
+        insert_opencode_session(&conn, in_wal, "C:/Projects/loomux-worktrees/test/x");
+        for suffix in ["", "-wal", "-shm"] {
+            let from = sqlite_sidecar(&live, suffix);
+            if from.is_file() {
+                copy_sqlite_file(&from, &sqlite_sidecar(&killed, suffix));
+            }
+        }
+        // The same store as a reboot or a sweeper leaves it: the -shm is
+        // regenerable and routinely goes missing, the -wal is not.
+        for suffix in ["", "-wal"] {
+            copy_sqlite_file(&sqlite_sidecar(&live, suffix), &sqlite_sidecar(&swept, suffix));
+        }
+    } // the LIVE store closes cleanly here — the two copies never did
+
+    // The fixture really did leave a dirty WAL behind. Without this, every
+    // assertion below would pass just as well against a store that quietly
+    // checkpointed, i.e. against no crash at all.
+    let wal = sqlite_sidecar(&killed, "-wal");
+    assert!(wal.is_file(), "a killed store keeps its -wal: {}", wal.display());
+    assert!(
+        wal.metadata().unwrap().len() > 0,
+        "an empty -wal holds no uncheckpointed row and would make this test vacuous"
+    );
+    assert!(
+        sqlite_sidecar(&killed, "-shm").is_file(),
+        "and the -shm index the dead process never got to remove"
+    );
+
+    // ARM 1 — the whole kill artifact set, which is what a resume actually
+    // meets. `open_readonly` is deliberately NOT immutable precisely so this
+    // works: a read-only connection consults the WAL and sees the last
+    // committed state.
+    assert_eq!(
+        session_cwd_in_store("opencode", in_wal, Some(&killed)).unwrap().as_deref(),
+        Some("C:/Projects/loomux-worktrees/test/x"),
+        "a session committed but never checkpointed must still resolve, or every orchestrator \
+         whose app was killed comes back unresumable"
+    );
+
+    // ARM 2 — the same store after the -shm was swept. SQLite recreates the
+    // wal-index from the -wal given write access to the directory, so the row
+    // survives this too: the read-only flag is about the DATABASE, not the
+    // sidecars.
+    assert_eq!(
+        session_cwd_in_store("opencode", in_wal, Some(&swept)).unwrap().as_deref(),
+        Some("C:/Projects/loomux-worktrees/test/x"),
+        "a missing -shm is regenerated, not a lost session"
+    );
+
+    // ARM 3 — what the immutable fallback would cost if it ever engaged here.
+    let conn = opencodedb::open_immutable(&killed).expect("an immutable open of a real store");
+    assert_eq!(
+        opencodedb::session_directory_on(&conn, checkpointed).unwrap().as_deref(),
+        Some("C:/Projects/loomux"),
+        "positive control: this connection DID open the store and can read what was \
+         checkpointed — the miss below is not a failed open"
+    );
+    assert_eq!(
+        opencodedb::session_directory_on(&conn, in_wal).unwrap(),
+        None,
+        "and it silently loses everything the dead process committed but never checkpointed. \
+         `open_readonly`'s immutable fallback is blind to exactly the rows a crash leaves in \
+         the -wal — recorded here (#1563 C2), not fixed, because nothing on these fixtures \
+         reaches it: see doc/design/opencode.md, Session identification"
+    );
+    drop(conn);
+    let _ = fs::remove_dir_all(&scratch);
 }
 
 #[test]
