@@ -38596,11 +38596,6 @@ impl OrchRegistry {
                  going\" for itself out of `list_tasks` / `get_task` / `list_agents` / \
                  `get_state` / `list_verdicts`, without spending a turn of yours. That is the \
                  point of it, so don't push status at it and don't keep a second board there.\n\
-                 - **Never `kill_agent` `{id}`.** It is a standing conversation, not a delegate \
-                 between tasks, so \"never hold an idle one\" in **Planning & scheduling** is \
-                 not about it — an idle manager is a manager whose human is away, which is its \
-                 normal state. Killing it ends the human's own interface mid-conversation, and \
-                 inside this group you are the only thing that can.\n\
                  - **Nothing here depends on it being alive.** Never opened, closed, wedged: \
                  ask the human in this pane exactly as the base rules say, and carry on. Direct \
                  access is the escape hatch and it is always open — a question you could not \
@@ -38849,9 +38844,8 @@ impl OrchRegistry {
         // placeholders keep the property that makes them able to render to nothing.
         let mechanics_recap = match b.kind {
             Role::Manager => {
-                "the MCP tools, the `check_mail()` your every turn opens with, the read-back \
-                 that has to come before any relay, and the rule that you hold no authority \
-                 the human has not exercised themselves"
+                "the MCP tools, the `report(status, summary)` discipline, the branch → PR \
+                 flow, and the rule that the human gates every merge"
             }
             _ => {
                 "the MCP tools, the `report(status, summary)` discipline, the branch → PR \
