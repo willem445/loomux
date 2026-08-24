@@ -30054,7 +30054,7 @@ impl OrchRegistry {
             if !e.path().join("group.json").is_file() {
                 continue;
             }
-            let loaded = self.load_group_file(&group_id);
+            let Some(loaded) = self.load_group_file(&group_id).map(Some) else { continue };
             let repo = loaded.as_ref().map(|(repo, _)| repo.clone());
             // Resolved exactly as `resume_recorded_session`'s orchestrator
             // branch resolves it (the orchestrator BLOCK's cli, falling back
