@@ -4290,12 +4290,17 @@ mod tests {
         // The non-vacuity control, and it is the one that makes the loop mean
         // something: a spelling OUTSIDE the null set really does arrive as a
         // label, so the loop above is not passing because everything is None.
-        // (`nul` is not YAML's null — one letter short — and is a legal label.)
+        //
+        // `nul` was the obvious pick and is the wrong one: `NUL` is a Windows
+        // reserved device name, so `check_segment` refuses it whatever its case and
+        // the control failed for a reason that has nothing to do with null
+        // spellings. That refusal is the device-name rule working as intended;
+        // `nullish` is a control that isolates the property under test.
         let wf = parse_workflow(
-            "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\n    remote: nul\n",
+            "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\n    remote: nullish\n",
         )
         .expect("a label that merely looks like a null must parse");
-        assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some("nul"));
+        assert_eq!(wf.block("b").unwrap().remote.as_deref(), Some("nullish"));
     }
 
     #[test]
