@@ -1131,31 +1131,42 @@ fn the_counting_pin_is_blind_to_a_class_no_workflow_file_can_name_and_that_is_bo
     let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
     let caller = orch_caller(&reg, &gid);
     let before = reg.list_agents(&gid).as_array().unwrap().len();
-    let out = dispatch(
-        &reg,
-        &caller,
-        "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "kind": "solo", "task": "t" } }),
-    )
-    .unwrap();
-    assert_eq!(out["isError"], json!(true), "`kind: solo` must be refused: {out}");
+    let refusal = |kind: &str| -> String {
+        let out = dispatch(
+            &reg,
+            &caller,
+            "tools/call",
+            &json!({ "name": "spawn_agent", "arguments": { "kind": kind, "task": "t" } }),
+        )
+        .unwrap();
+        out["content"][0]["text"].as_str().unwrap_or_default().to_string()
+    };
+
+    let solo = refusal("solo");
+    assert!(solo.contains("unknown kind"), "`kind: solo` must be refused: {solo}");
+    // …and refused by the KIND PARSE specifically, not by something further in
+    // that would happen to reject it today for an unrelated reason. The refusal
+    // quotes the accepted vocabulary, so this asserts WHICH check said no.
+    assert!(
+        solo.contains(&workflow::kind_names()),
+        "the refusal must come from `kind_from_str`, naming what it does accept: {solo}"
+    );
     assert_eq!(
         reg.list_agents(&gid).as_array().unwrap().len(),
         before,
         "and nothing may be minted by the attempt"
     );
 
-    // The non-vacuity control for that refusal: the same call shape with a kind
-    // the file CAN name is admitted, so the assertion above is about `solo` and
-    // not about a `spawn_agent` that refuses everything.
-    let ok = dispatch(
-        &reg,
-        &caller,
-        "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "t" } }),
-    )
-    .unwrap();
-    assert_ne!(ok["isError"], json!(true), "a declarable kind still spawns: {ok}");
+    // THE NON-VACUITY CONTROL: the same call shape with a kind the file CAN name
+    // gets PAST that parse. Deliberately not "and then succeeds" — a spawn needs
+    // a git repo and these fixtures have none, so asserting success here would
+    // pin the environment rather than the parse. What must be true is that the
+    // kind check is not refusing everything.
+    let worker = refusal("worker");
+    assert!(
+        !worker.contains("unknown kind"),
+        "a declarable kind must clear the kind parse: {worker}"
+    );
 }
 
 // ───────── the manager-lifecycle residuals (#1433, folded into M5) ─────────
