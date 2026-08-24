@@ -129,6 +129,10 @@ impl Drop for Scratch {
 const OLD: &str = "ses_03bd2d53dffeiBvu9PvuCPjxT7";
 const NEW: &str = "ses_1508a391dffext5Xb0UUF2UDjk";
 const OTHER: &str = "ses_15089ff54ffeQ2mSoRBFxdH2mS";
+
+/// One claude transcript line, enough for `find_claude_session_cwd`'s
+/// `scan_claude_jsonl` to report a cwd (#1568 review N1).
+const CLAUDE_LINE: &[u8] = br#"{"cwd":"C:/tmp/opencode-torn","type":"user"}"#;
 const SUB: &str = "ses_1508b00120ffZZmSoRBFxdH2mS";
 
 /// The pane's cwd as loomux holds it: Windows-native separators, which is NOT
@@ -750,10 +754,27 @@ fn orch_list_recorded_flags_an_opencode_orchestrator_whose_session_is_only_in_th
 /// (#1563's own report) happens a second time.
 #[test]
 fn a_group_whose_record_is_damaged_still_appears_in_the_orchestrations_list() {
-    let (reg, _d) = test_registry();
+    let (reg, dir) = test_registry();
     let g = reg.create_group("C:/tmp/opencode-torn", rails("opencode")).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.associate_session(&g.id, &o.id, NEW);
+
+    // A CLAUDE-shaped session id, with a real transcript fixtured where
+    // claude's store lookup would find it. Both halves are load-bearing
+    // (#1568 review N1): `session_cwd_in_store`'s non-opencode branch routes
+    // to `find_session_cwd`, whose DEFAULT arm is claude's, so an empty `cli`
+    // would ask claude's projects directory and this fixture would answer
+    // YES. Without the `!cli.is_empty()` short-circuit in
+    // `recorded_orchestrations` the final assertion below fails — which is the
+    // point: with an opencode-shaped id and no fixture, it passed for a reason
+    // its own message did not state.
+    let claude_sid = "11111111-2222-4333-8444-555555555555";
+    let claude_root = dir.path().join("claude-projects-fixture");
+    let project = claude_root.join("C--tmp-opencode-torn");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(format!("{claude_sid}.jsonl")), CLAUDE_LINE).unwrap();
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(claude_root));
+
+    reg.associate_session(&g.id, &o.id, claude_sid);
     store(&reg.opencode_db_path(&g.id), &[Row::new(NEW)]);
 
     // Torn write: the file is there (so this is a group), and unparseable.
@@ -764,12 +785,27 @@ fn a_group_whose_record_is_damaged_still_appears_in_the_orchestrations_list() {
     std::fs::write(group_dir.join("group.json"), b"{\"repo\":").unwrap();
 
     let rows = reg.recorded_orchestrations();
+
+    // Non-vacuity control: the fixture IS reachable through the same router,
+    // asked as claude. Without this, the assertion below passes just as well
+    // against a store that holds nothing at all.
+    assert_eq!(
+        orchestration::session_cwd_in_store("claude", claude_sid, None).unwrap().as_deref(),
+        Some("C:/tmp/opencode-torn"),
+        "the claude fixture must be findable, or the short-circuit below is untested"
+    );
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+
     assert_eq!(rows.len(), 1, "the group is still listed");
     assert_eq!(rows[0].repo, None, "an unreadable repo is None, never a guess");
     assert_eq!(rows[0].cli, "", "and the CLI is empty rather than defaulted to the wrong one");
-    assert_eq!(rows[0].session_id.as_deref(), Some(NEW), "agents.json is a separate file and still read");
+    assert_eq!(
+        rows[0].session_id.as_deref(),
+        Some(claude_sid),
+        "agents.json is a separate file and still read"
+    );
     assert!(
         !rows[0].resumable,
-        "with no CLI there is no store to ask, so the row cannot promise a resume"
+        "an unknown CLI must ask NO store: the default arm is claude's, and this group's recorded session IS in the claude fixture, so a row promising a resume here would promise one that resume_recorded_session refuses at load_group_file"
     );
 }

@@ -11748,6 +11748,13 @@ pub struct RecordedOrchestration {
     /// label beside a Resume button names the CLI the resume will launch.
     /// Empty string when `group.json` could not be read (see `repo`); never
     /// a guessed default, which would name the wrong CLI on a damaged group.
+    ///
+    /// That absolute is about an UNPARSEABLE file, and only that. A
+    /// `group.json` that parses but carries no `guardrails.agent_cli` gets
+    /// `"claude"` from `load_group_file`'s own `s("agent_cli", "claude")`
+    /// fallback — a default this type inherits rather than introduces, and
+    /// named here so the sentence above is not read wider than it holds
+    /// (#1568 review N1).
     pub cli: String,
     /// The orchestrator's recorded CLI session id, or `None` when no
     /// orchestrator session has been identified for this group yet — a fresh
@@ -30105,6 +30112,31 @@ impl OrchRegistry {
     /// forbids. The cost here is two small JSON reads per group, plus one
     /// store lookup for each group that has a recorded orchestrator session.
     ///
+    /// **That per-group lookup is not uniformly cheap, and the miss is the
+    /// expensive case** (#1568 review N3). Claude's is a filename probe per
+    /// project dir (`<id>.jsonl`); opencode's is one indexed `SELECT`. But
+    /// `find_copilot_session_cwd` has no filename-is-the-id shortcut — a
+    /// copilot session's directory name is not guaranteed to equal its id, so
+    /// only `workspace.yaml`'s own `id:` field is authoritative — and a MISS
+    /// therefore parses every session directory in the store, for each group
+    /// that misses. A stale copilot group is precisely the one that misses. It
+    /// is off the webview thread and coalesced by the sidebar's `RefreshGate`,
+    /// so it cannot block the UI or stack up; it is stated here because "one
+    /// store lookup" reads cheaper than the case a stale group actually hits.
+    ///
+    /// **What that exclusion COSTS, not only what it saves.** Reading
+    /// `agents.json` alone means this list can resolve strictly LESS than
+    /// `session_roles` can (#1568 review N2): a group whose orchestrator
+    /// session survives only in `audit.jsonl` — a roster write lost to a
+    /// crash, or a build predating the roster — reports `session_id: None`
+    /// here ("session not yet identified") while the session list still
+    /// offers its `ORCH` row and restores it fine. `last_seen_ms` is `0` for
+    /// the same group, sorting it last within its liveness class. That is a
+    /// deliberate trade and not merely a cost decision: the audit fallback is
+    /// what the fan-out above buys, and it is bounded — the roster is written
+    /// on every spawn and every `associate_session`, so an audit-only
+    /// orchestrator means a lost write, not an ordinary state.
+    ///
     /// **A damaged group is listed, not hidden.** A directory with a
     /// `group.json` that will not parse yields a row with `repo: None` and an
     /// empty `cli` rather than being skipped — the human whose group.json got
@@ -30154,12 +30186,25 @@ impl OrchRegistry {
             // resumed says so instead of showing a button that fails on click.
             // An unreadable store degrades to `false`, never to an error: this
             // is a listing, and one broken group must not blank the whole list.
-            let resumable = session_id.as_deref().is_some_and(|sid| {
-                matches!(
-                    session_cwd_in_store(&cli, sid, Some(&self.opencode_db_path(&group_id))),
-                    Ok(Some(_))
-                )
-            });
+            //
+            // An EMPTY `cli` (unreadable group.json) short-circuits to `false`
+            // rather than asking a store, and that is load-bearing rather than
+            // tidy (#1568 review N1). `session_cwd_in_store`'s non-opencode
+            // branch routes to `find_session_cwd`, whose default arm is
+            // CLAUDE's — so `""` would ask claude's projects directory, and a
+            // torn group.json over a roster still naming a real claude session
+            // would report `resumable: true` while `resume_recorded_session`
+            // refuses at `load_group_file` ("group.json is missing for this
+            // orchestration") without reaching any store at all. Asking a
+            // DIFFERENT store's question is exactly what the parity claim above
+            // forbids, so the answer is to ask none.
+            let resumable = !cli.is_empty()
+                && session_id.as_deref().is_some_and(|sid| {
+                    matches!(
+                        session_cwd_in_store(&cli, sid, Some(&self.opencode_db_path(&group_id))),
+                        Ok(Some(_))
+                    )
+                });
             out.push(RecordedOrchestration {
                 group_live: self.group_is_live(&group_id),
                 group_id,

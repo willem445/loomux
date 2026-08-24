@@ -41,7 +41,8 @@ A row without a **Resume** button says why it has none:
 | What the row says | What happened | What to do |
 | --- | --- | --- |
 | *Running now* | The group has live agents in this window | Focus its orchestrator pane |
-| *Session not yet identified* | Copilot and OpenCode mint their session ids after boot, and orrerix has not learned this one yet (or its watcher timed out) | Wait for it, or resume that orchestrator once by hand from the session list |
+| *Session not yet identified*, on **Copilot** | Copilot mints its session id after boot, and orrerix has not learned this one yet (or its watcher timed out) | Wait for it — or, if it timed out, resume that orchestrator once by hand from the session list below, after which its id is recorded |
+| *Session not yet identified*, on **OpenCode** | The same, but an OpenCode group's sessions are in the group's own store, so they are never in the session list below | Wait for it. If the watcher timed out there is nothing to resume by hand: start a fresh orchestrator, which reattaches to this group's existing board and roster |
 | *Recorded session is no longer in the … store* | The CLI's own history no longer holds that conversation | Start a fresh orchestrator — it reattaches to this group's existing board and roster |
 | *This group's record could not be read* | The group's `group.json` is missing or damaged | Repair or remove that file; until then orrerix cannot tell which CLI ran the group |
 
