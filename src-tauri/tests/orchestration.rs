@@ -85,6 +85,7 @@ use loomux_lib::orchestration::{
     delivered_prompt_lines, DELIVERED_PROMPT_CHARS, DELIVERED_NOTICE_CHARS,
     // #903 B2: the granted override that carries its own Enter.
     override_enter_admits, QuestionReread, QUESTION_OVERRIDE_CONSECUTIVE_READS,
+    prompt_record_admits_kind,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
@@ -51054,7 +51055,7 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     let first = reg.spawn_agent(&g.id, Role::Reviewer, "rev", "review", false, None).unwrap();
     reg.set_session_for_test(&first.id, session);
     reg.set_pty_for_test(&first.id, 101);
-    reg.record_delivered_prompt(101, brief);
+    reg.record_delivered_prompt(101, brief, Delivery::MidSession);
     assert!(
         reg.delivered_mask_lines(101).iter().any(|l| l == brief),
         "the pane it was delivered into can see it"
@@ -51072,6 +51073,17 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
         reg.delivered_notice_lines(102).is_empty(),
         "control: the per-PANE record is empty here, so the line above came from the session \
          record and not from the one #661 already had"
+    );
+
+    // #903 review B1, at the registry door rather than only in the predicate:
+    // a refused KIND writes nothing, so the two terms are wired and not merely
+    // written. Without this, changing the recorder's signature is the only thing
+    // that would have caught a caller passing the wrong kind — which is exactly
+    // what the compiler had to tell me on the round that added it.
+    reg.record_delivered_prompt(101, "[orch] a regrounding-borne line", Delivery::Regrounding);
+    assert!(
+        !reg.delivered_mask_lines(101).iter().any(|l| l.contains("regrounding-borne")),
+        "a Regrounding delivery contributes nothing, however ordinary its text looks"
     );
 
     // A different session sees nothing: the key is doing work.
