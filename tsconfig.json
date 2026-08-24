@@ -11,7 +11,15 @@
     "useDefineForClassFields": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    // TypeScript auto-includes every package under node_modules/@types with
+    // no "types" field set, so @types/node (added for e2e/, see
+    // e2e/tsconfig.json) would otherwise leak Node's ambient globals
+    // (process, Buffer, __dirname, ...) into this DOM-only program —
+    // typechecking green code that throws at runtime in the browser, the
+    // opposite of constraint 5's frontend/backend seam (#1428 review B1).
+    // e2e/tsconfig.json's own "types" override is unaffected by this.
+    "types": []
   },
   "include": ["src"]
 }

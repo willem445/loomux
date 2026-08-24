@@ -51,11 +51,14 @@ jobs:
         run: npm run build
 
       # `npm run build`'s tsc pass only covers `src/` (tsconfig.json's
-      # `include`) — e2e/ has its own tsconfig.json (Node + Playwright types,
-      # deliberately kept off src/'s DOM-only ambient types per constraint 5)
-      # and was never typechecked at all until #1333. A plain `tsc -p` run
-      # over 10 small spec files adds a couple of seconds per platform, not a
-      # new dependency install or a new job.
+      # `include`) — e2e/ has its own tsconfig.json (Node + Playwright types)
+      # and was never typechecked at all until #1333. Root tsconfig.json pins
+      # `"types": []` so installing @types/node for e2e/ can't auto-widen
+      # src/'s DOM-only program with Node's ambient globals (constraint 5;
+      # #1428 review B1) — the seam is enforced there, not by this being a
+      # separate tsconfig. A plain `tsc -p` run over 10 small spec files adds
+      # a couple of seconds per platform, not a new dependency install or a
+      # new job.
       - name: Typecheck e2e specs
         run: npm run typecheck:e2e
 
