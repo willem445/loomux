@@ -1729,6 +1729,141 @@ CLI (per-role CLI overrides picked at launch aren't separately retained, so an
 off→on→off round trip rebuilds the roster from your default CLI rather than
 restoring them).
 
+### Adding a second lens
+
+A repo that wants a design-review opinion before code is written, or a
+premortem pass on an unusually risky PR, doesn't need a new mechanism —
+`kind: planner` + `role_hint: advisor` (see **Almost every setting in the
+file is editable in the pane**, above) is already built for exactly this:
+read-only, spawned only when the orchestrator decides the situation calls for
+it, and it reports and exits rather than holding a pane open. Declare as many
+of these as you want, each with its own persona.
+
+**Why not `kind: reviewer`.** The workflow-aware instructions make the
+orchestrator run **every** declared reviewer block on **every** PR, and a
+merge gate names which reviewers must record a `pass`. An on-demand lens
+declared as a reviewer is stuck between two bad options: run it on every PR
+(which defeats "on demand" and burns a pane on PRs that never needed a second
+opinion), or name it in the gate and have it hold every merge shut until
+someone remembers to spawn it and it passes. An advisor block sidesteps both
+— it never records a verdict at all, so it can neither satisfy nor block a
+gate, and the orchestrator only spawns it when it judges the PR or plan
+actually warrants the extra look.
+
+Two ready-made personas, modeled on this repo's own
+[`.github/agents/advisor.md`](https://github.com/willem445/orrerix/blob/main/.github/agents/advisor.md):
+
+```markdown
+---
+name: design-review
+description: >
+  A read-only advisor consulted on a plan before it's built, or a PR whose
+  diff crosses this repo's size threshold — a second opinion on the shape of
+  the change, not a correctness review. Investigates and reports; never
+  merges, spawns, or records a verdict.
+kind: planner
+mode: replace
+---
+You are consulted on a design question: a plan under intake, or a PR the
+orchestrator judges large or consequential enough to warrant a second look at
+its shape, not just its correctness.
+
+## What you do
+
+1. **Investigate READ-ONLY.** Read the plan or diff, the issue thread, and
+   any design notes. You cannot write a file, branch, or push — the planner
+   capability class denies those at the CLI level regardless.
+2. **Answer one question: what alternative did this implicitly reject, and is
+   the choice defensible?** Name the alternative, not just "this looks fine"
+   — a design review that agrees with everything isn't a second opinion.
+3. **Report and exit.** `report("done", "<your assessment>")` is your one
+   deliverable — lead with the alternative and your verdict on it. Skip
+   anything that didn't change your answer.
+
+## What you never do
+
+No authority beyond the assessment: never merge, never spawn another agent,
+never record a review verdict, never edit or push. The orchestrator decides
+what to do with your advice, including ignoring it.
+```
+
+```markdown
+---
+name: premortem
+description: >
+  A read-only advisor consulted on a PR the orchestrator judges high-risk —
+  a migration, a security-sensitive surface, a persisted-shape change.
+  Investigates and reports; never merges, spawns, or records a verdict.
+kind: planner
+mode: replace
+---
+You are consulted on a PR the orchestrator has flagged as high-risk. Your job
+is to imagine it has already shipped and failed, and work backward.
+
+## What you do
+
+1. **Investigate READ-ONLY.** Read the diff, the issue thread, and the tests
+   it added. You cannot write a file, branch, or push — the planner
+   capability class denies those at the CLI level regardless.
+2. **Answer three questions:**
+   - **Premortem** — two concrete ways this fails in production that no test
+     in the PR catches, or an argued "none".
+   - **Resource envelope** — if the diff touches an unbounded input, the
+     largest realistic size × invocation frequency × allocation/IO, and
+     whether anything bounds it.
+   - **Operational futures** — what happens at 10× load, and on an
+     upgrade/rollback across whatever persisted shape the diff touches.
+3. **Report and exit.** `report("done", "<your findings>")`. An empty answer
+   to one of the three questions is a finding in itself — say so rather than
+   skipping it.
+
+## What you never do
+
+No authority beyond the findings: never merge, never spawn another agent,
+never record a review verdict, never edit or push. The orchestrator decides
+what to do with your findings, including ignoring them.
+```
+
+`workflow.yml` declares both the same way as any other advisor block:
+
+```yaml
+blocks:
+  - id: design-review
+    name: Design review
+    kind: planner
+    role_hint: advisor
+    profile: .github/agents/design-review.md
+
+  - id: premortem
+    name: Premortem
+    kind: planner
+    role_hint: advisor
+    profile: .github/agents/premortem.md
+
+edges:
+  - { from: orchestrator, to: [design-review, premortem] }
+```
+
+`spawn_agent` is orchestrator-only for every block, advisor or not — a worker
+that gets stuck is told to `message_orchestrator` and ask for a consult rather
+than spawn one itself — so both lenses hang off the orchestrator in `edges:`,
+never off a worker or reviewer. (One implementation detail worth knowing: the
+orchestrator's auto-generated "consult the advisor" kickoff sentence names
+only the *first* `role_hint: advisor` block declared in the file. A second
+one is still listed under "Your delegates" with its own persona, and is
+spawnable by `block: "premortem"` exactly the same way — it just isn't
+individually called out by that one sentence.)
+
+**The residual.** An advisor never calls `review_verdict`, so `design-review`'s
+or `premortem`'s report can never satisfy or block a merge gate — the
+orchestrator reads the advice and dispositions it like any other input, the
+same as a human's. A repo that wants these questions to actually gate a merge,
+not just advise on one, puts them in its **standing reviewer persona**
+instead, as fixed headings its review body must carry (this repo's own
+`.github/agents/rev-lead.md` does exactly that for its own question set):
+that shape buys enforcement, at the cost of running on every PR rather than
+only the ones that need it.
+
 ### Proposed lessons come with their evidence
 
 A workflow can declare a **process-pro** block — a worker that runs after a

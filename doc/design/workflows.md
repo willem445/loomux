@@ -184,6 +184,30 @@ allow pattern names nothing it could not already run) while the editing tools
 ban stays keyed to the *fully* read-only class, where the argument above actually
 bites.
 
+### Why a second lens (design-review, premortem) didn't get a new mechanism
+
+An on-demand design-review or premortem lens — consulted on a plan before it's
+built, or on a PR the orchestrator judges unusually risky — could have been built
+three other ways, and none of them shipped. A **fifth `kind`** was rejected for
+the reason this whole section argues: `kind` is the *only* thing that grants
+capability, and it is a closed four-value enum for exactly that reason — widening
+it for one feature reopens, forever, the question of what capability class the
+fifth kind gets. A **`when:`/`optional:` block field** — something naming a
+condition under which a block is required in a gate — was rejected too: it would
+need its own row in the schema manifest (below, "The schema manifest"), its own
+pane control, its own docs, and its own orchestrator rule — new surface for a
+need `role_hint: advisor` personas already meet, since an advisor is already
+read-only, already spawned only when the orchestrator decides to, and already
+exits and reports rather than lingering. And letting the merge gate's
+**`threshold`** count an advisor block toward the required N was rejected
+because a threshold assumes every named reviewer runs on every PR it gates —
+exactly the property an on-demand lens is defined by not having — so counting
+one in would let the standing reviewer be outvoted (or the gate held open) on a
+PR the lens was never spawned for at all. `role_hint: advisor` — already shipped
+for the single "domain expert on call" case — needed no new code to cover a
+design-review/premortem lens too; see `docs/orchestration.md` → "Adding a second
+lens".
+
 ### Sanitization
 
 Block ids reach a `--agent` flag and a file name; display names reach a pane
