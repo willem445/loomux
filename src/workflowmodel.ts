@@ -197,10 +197,23 @@ export function allowDenialReason(kind: string): string | null {
 
 /** Longest `remote:` label the engine accepts — `pathseg::MAX_SEGMENT_LEN`
  *  (crates/loomux-engine/src/pathseg.rs), the shared #925 identifier cap the
- *  engine validates a remote label with. A hand-written mirror, like
- *  {@link WORKFLOW_CLIS}, and safe for the same reason: the Rust side pins the
- *  manifest against the engine's own constant, and `test/workflowschema.test.ts`
- *  pins this against the manifest. */
+ *  engine validates a remote label with.
+ *
+ *  A hand-written mirror, like {@link WORKFLOW_CLIS}, and safe for the same
+ *  reason — **engine -> manifest -> pane, with no step left to assumption**:
+ *  `workflow_schema_field_facts()` states `block.remote.maxLength` from
+ *  `MAX_SEGMENT_LEN` itself,
+ *  `the_workflow_schema_manifest_matches_the_engines_values_defaults_and_bounds`
+ *  pins `src/workflow-schema.json` against that fact in both directions, and
+ *  `test/workflowschema.test.ts` pins THIS constant against the manifest row.
+ *  Raise `MAX_SEGMENT_LEN` and the Rust test reddens; change this number alone
+ *  and the pane test does.
+ *
+ *  It was NOT in that chain when the key shipped (#1457 review B3): the engine
+ *  stated no fact for `block.remote`, so the manifest declared none, so the
+ *  bidirectional pin had nothing to compare and this constant was pinned to
+ *  nothing while a comment here said otherwise. Both sides tested their cap
+ *  against their own constant, which is green and tautological at once. */
 export const REMOTE_LABEL_MAX = 64;
 
 /** Whether a `remote:` label is one the engine will accept — the pane's mirror of

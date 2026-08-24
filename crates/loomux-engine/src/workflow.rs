@@ -1736,6 +1736,13 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("merge_queue.max_batch", "min", json!(1));
     fact("merge_queue.checks_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("merge_queue.checks_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
+    // #1457. A LENGTH bound on a string, so it is `maxLength` rather than `max`:
+    // this manifest documents `max` as "highest accepted number", and a generated
+    // text control needs a maxlength, not a numeric ceiling. Stated here because
+    // `parse_workflow` really does enforce it — `check_segment` refuses above
+    // `MAX_SEGMENT_LEN` — and a bound the engine enforces while the manifest is
+    // silent is one a generated control would let a human exceed.
+    fact("block.remote", "maxLength", json!(crate::pathseg::MAX_SEGMENT_LEN));
     fact("resource.slots", "min", json!(1));
     fact("resource.slots", "max", json!(RESOURCE_SLOTS_MAX));
     fact("resource.max_hold_minutes", "min", json!(1));
@@ -4350,9 +4357,19 @@ mod tests {
                 checked += 1;
             }
         }
-        // The population control: five refusals were reached, not zero. Without
-        // it a `parse_workflow` that started returning `Ok` for all five would
-        // leave this test green over an empty loop.
+        // The population control, and it guards a narrower vacuity than the
+        // obvious one (#1457 review N6). An `Ok` return is NOT the case:
+        // `unwrap_err()` panics on it, so that is red with or without this
+        // assert. What it guards is `Err(vec![])` — `unwrap_err()` succeeds,
+        // the inner loop never runs, and `checked` stays 0 while every
+        // assertion above is vacuously satisfied. That route is closed today by
+        // `parse_workflow` returning `Err` only under `if !errs.is_empty()`,
+        // which is exactly why this stays: a future editor who notices
+        // `unwrap_err` already panics on `Ok` would otherwise read this as
+        // redundant and delete it.
+        //
+        // It also pins more than a floor: `== 5` is one refusal PER CASE, so a
+        // case that starts producing two reddens here rather than passing.
         assert_eq!(checked, 5, "each case must produce exactly one refusal to check");
     }
 
