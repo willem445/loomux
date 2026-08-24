@@ -731,3 +731,52 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
     pinned("planner.md's first-turn primer", planner_primer, "gh issue view",
         "a planner's first move is reading the work item in full");
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1292: every review body carries a premortem, and the resource question that goes with it
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn every_review_carries_a_premortem() {
+    // Our reviewers VERIFY well (attack-surface enumeration, re-measurement, mutation re-runs)
+    // and the half they were never told to do is QUESTION GENERATION: naming the property that
+    // nobody thought to write a test for. That gap is not hypothetical — the crash class behind
+    // #1218 merged with a green correctness suite through four production crashes, because the
+    // memory behaviour was never conceived of as something a test could pin, so red-before-green
+    // (which only ever evidences the properties somebody DID think of) could not have caught it.
+    //
+    // The fix is structural rather than per-review prose: every review body carries a fixed
+    // `## Premortem` section, and for unbounded input the resource triple is one of its two
+    // answers. Prose with no pin under it is prose the next compression deletes, so each of the
+    // three load-bearing clauses is anchored on its own words.
+    let reviewer = instructions("reviewer.md");
+    let r = flat(&reviewer);
+
+    pinned("reviewer.md", &r, "## premortem",
+        "the SECTION itself — a fixed heading in every review body, which is what makes its \
+         absence visible to the orchestrator; a question asked only when a reviewer thinks of it \
+         is the question that was not asked on the review that needed it");
+    pinned("reviewer.md", &r, "no test in this pr",
+        "…and the BAR that makes the section worth writing: two ways this fails in production \
+         that the PR's own tests would not catch. A premortem satisfied by restating what the \
+         suite already covers is a section with nothing in it");
+    pinned("reviewer.md", &r, "largest realistic input",
+        "the RESOURCE question, mandatory for unbounded input: largest realistic input × how \
+         often it runs × what it allocates or reads per run. Cost review that asks only about \
+         TIME is how a whole-file read at 200 MB ships behind a green suite");
+
+    // And the orchestrator has to act on the absence, or the section is advisory. This is the
+    // disposition step's own rule, pinned inside that step: a review missing the section is an
+    // incomplete review, not an approval to disposition.
+    let orch = instructions("orchestrator.md");
+    let o = flat(&orch);
+    let disposition = section(&o, "3. **disposition every finding**", "4. do your own **high-level**");
+    pinned("the disposition step", disposition, "review with no `## premortem` section",
+        "a review that skipped the section is INCOMPLETE — the orchestrator sends the reviewer \
+         back for it rather than dispositioning what it did say; without this the section is a \
+         request, and a request a busy reviewer may drop is not a structural change");
+    pinned("the disposition step", disposition, "premortem entry that names an input",
+        "…and an entry that names the input which triggers it is dispositioned like any other \
+         finding (fixed here, or deferred at the three costs), or the premortem becomes a place \
+         to park a real defect where no disposition rule reaches it");
+}
