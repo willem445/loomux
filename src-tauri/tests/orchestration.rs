@@ -51815,6 +51815,79 @@ fn write_legacy_board(dir: &tempfile::TempDir, group: &GroupId) {
     let _ = fs::remove_file(dir_g.join("needs-you-migrated"));
 }
 
+// ---------- #1317: the panel's board join rides with its items ----------
+//
+// The NEEDS-YOU panel used to fetch the WHOLE board beside this read, every
+// tick and on every `orch-tasks-changed`, and use it at ONE site — a point
+// lookup per open item. On a long-lived group that board is mostly history, so
+// the panel held a second full copy of it to answer a handful of lookups.
+
+#[test]
+fn the_needs_you_read_joins_the_rows_its_open_items_name_and_no_others() {
+    let (reg, _d, g, _orch) = setup_needs_you();
+    // Four board rows, one of them noisy — the noise is the point: it is what a
+    // whole-board read would have shipped to a panel that renders none of it.
+    let mut ids = Vec::new();
+    for (title, status) in
+        [("Referenced", "queued"), ("Settled", "queued"), ("Also referenced", "queued"), ("Nobody's", "done")]
+    {
+        let t = reg.upsert_task(&g, "orch-1", None, patch(Some(title), Some(status), None)).unwrap();
+        reg.upsert_task(&g, "orch-1", Some(&t.id), patch(None, None, Some("a note nobody reads here")))
+            .unwrap();
+        ids.push(t.id);
+    }
+    assert_eq!(reg.tasks(&g).len(), 4, "premise: the board really has rows this join must leave behind");
+
+    // Two OPEN items naming rows 0 and 2, and one item naming row 1 that the
+    // human has already resolved.
+    for i in [0usize, 1, 2] {
+        reg.raise_needs_you(&g, "orch-1", demo_req("have a look", &ids[i])).unwrap();
+    }
+    let settled = open_items(&reg, &g)
+        .into_iter()
+        .find(|it| it.task.as_deref() == Some(ids[1].as_str()))
+        .expect("the middle row's item");
+    reg.resolve_needs_you(&g, &settled.id, None, needsyou::ResolveSource::Webview).unwrap();
+
+    let read = reg.needs_you_read(&g).unwrap();
+    let mut joined: Vec<&str> = read.tasks.iter().map(|t| t.id.as_str()).collect();
+    joined.sort();
+    let mut want = vec![ids[0].as_str(), ids[2].as_str()];
+    want.sort();
+    assert_eq!(joined, want, "exactly the rows the OPEN items name");
+    // Named individually, because each absence has its own reason: one row is
+    // referenced by a RESOLVED item (the settled tail never joins the board),
+    // the other by nothing at all.
+    assert!(!joined.contains(&ids[1].as_str()), "a resolved item's row is not joined");
+    assert!(!joined.contains(&ids[3].as_str()), "an unreferenced row is not joined");
+
+    // The items and the watermark are exactly what the un-joined read answers:
+    // this is additive, not a re-shaping of what the panel already had.
+    let plain = reg.needs_you_view(&g).unwrap();
+    assert_eq!(read.view.items, plain.items);
+    assert_eq!(read.view.cleared_ms, plain.cleared_ms);
+
+    // And a joined row carries no conversation: the panel projects six
+    // identity/status fields off it and renders no notes.
+    let row = serde_json::to_value(&read.tasks[0]).unwrap();
+    assert_eq!(row["note_count"], json!(1), "positive control: the row really does have a note");
+    assert!(row.get("notes").is_none(), "…and its body is not on this read: {row}");
+}
+
+#[test]
+fn a_needs_you_read_with_nothing_open_joins_no_board_rows_at_all() {
+    // The empty case is worth its own test because it is the common one: a
+    // human with a clear queue must not pay a board read, let alone a board.
+    let (reg, _d, g, _orch) = setup_needs_you();
+    reg.upsert_task(&g, "orch-1", None, patch(Some("Unreferenced"), Some("queued"), None)).unwrap();
+    reg.raise_needs_you(&g, "orch-1", feedback_req("what do you think?")).unwrap();
+
+    let read = reg.needs_you_read(&g).unwrap();
+    assert_eq!(read.view.items.len(), 1, "premise: there IS an open item — it just names no row");
+    assert_eq!(reg.tasks(&g).len(), 1, "premise: and the board is not empty either");
+    assert!(read.tasks.is_empty(), "an item naming no task joins nothing");
+}
+
 /// The open items for `group`, in file order — what the panel's open tier shows.
 fn open_items(reg: &OrchRegistry, group: &GroupId) -> Vec<needsyou::Item> {
     reg.needs_you(group)
