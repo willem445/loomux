@@ -34,8 +34,14 @@ test("dragging a tab past another one reorders the tab strip", async ({ appPage:
   const tabNames = () => tabBar.locator(".tab .tab-name").allTextContents();
   await expect.poll(tabNames).toEqual(["Tab 1", "Tab 2", "Tab 3"]);
 
+  // `exact` isn't a `LocatorOptions` field (it belongs to `getByText`, not
+  // `.locator(selector, { hasText })`) — an anchored regex gets the same
+  // exact-match semantics the author wanted without changing the `.tab-name`
+  // scoping the substring form relied on.
   const tabByName = (name: string) =>
-    tabBar.locator(".tab", { has: page.locator(".tab-name", { hasText: name, exact: true }) });
+    tabBar.locator(".tab", {
+      has: page.locator(".tab-name", { hasText: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) }),
+    });
 
   // Drop on the target's right 15% rather than its exact center: `dropsBefore`
   // (tabbar.ts) is a strict `<` comparison against the target's midpoint, so a

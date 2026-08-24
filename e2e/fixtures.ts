@@ -51,7 +51,7 @@
 //   than terminates (never closes someone else's browser). A `/json/version`
 //   identity cross-check before handing back the page would close this
 //   properly; not implemented here.
-import { test as base, chromium, type Page } from "@playwright/test";
+import { test as base, chromium, type BrowserContext, type Page } from "@playwright/test";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -346,7 +346,24 @@ export const test = base.extend<{ appPage: Page }>({
     try {
       const browser = await connectWithRetry(`http://127.0.0.1:${CDP_PORT}`, proc, output);
       try {
-        const context = browser.contexts()[0] ?? (await browser.waitForEvent("context"));
+        // `Browser` has no `waitForEvent` (only `BrowserContext`/`Page` do —
+        // #1428 review), so this waits on the 'context' event directly. That
+        // loses `waitForEvent`'s default timeout, so give it the same 30s
+        // budget the selector waits below use, named, rather than letting a
+        // browser that never opens a context hang the fixture to Playwright's
+        // whole-test timeout with no clue why (#1428 review N2).
+        const context =
+          browser.contexts()[0] ??
+          (await new Promise<BrowserContext>((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error("timed out after 30s waiting for the browser to open its first context")),
+              30_000
+            );
+            browser.once("context", (ctx) => {
+              clearTimeout(timer);
+              resolve(ctx);
+            });
+          }));
         const page = context.pages()[0] ?? (await context.waitForEvent("page"));
         await page.waitForSelector("#tab-bar", { state: "attached", timeout: 30_000 });
         await page.waitForSelector("#workspace-stack .pane, #workspace-stack .welcome-form", {

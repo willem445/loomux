@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "@playwright/test"]
+  },
+  // `playwright.config.ts` sits at the repo root, outside both this
+  // program's "." and the root tsconfig's "src" — without naming it here it
+  // would sit in no program at all and never be typechecked (#1428 review
+  // N4). `vite.config.ts` has the same gap but is out of scope for #1333
+  // (it's not part of the e2e harness).
+  "include": [".", "../playwright.config.ts"]
+}
