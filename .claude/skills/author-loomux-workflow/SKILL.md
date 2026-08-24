@@ -45,11 +45,17 @@ Read the human's description and extract, explicitly, before writing YAML:
   model+CLI combos for high-volume or mechanical work (e.g. `copilot` /
   `auto`, or `claude` / `haiku`); stronger ones for judgment-heavy work or
   the security-critical review lane (e.g. `claude` / `opus`). Only `claude`,
-  `copilot` and `gemini` exist as CLIs today (`SUPPORTED_CLIS`) — don't invent
-  a fourth. `gemini` is the cross-model option (#267): a different model family
-  for a reviewer lane, defaulting to its `pro` tier. It cannot host a block
-  whose class it can't contain — that pairing is a parse error, not a warning —
-  and `allow:` patterns don't apply to it.
+  `copilot`, `gemini` and `opencode` exist as CLIs today (`SUPPORTED_CLIS`) —
+  don't invent a fifth. `gemini` and `opencode` are the cross-model options
+  (#267, #722): a different model family for a reviewer lane. `gemini` defaults
+  to its `pro` tier; `opencode` has NO default at all (its ids are
+  `provider_id/model_id` against dozens of providers, so orrerix picks none and
+  the pane inherits the human's own config) — an opencode block that wants a
+  specific model must pin the FULL id, provider half included. Neither can host a
+  block whose class it can't contain — that pairing is a parse error, not a
+  warning — and `allow:` patterns apply to neither: those are Claude/Copilot
+  tool-matcher strings, and a gemini or opencode block runs with its class's
+  baseline.
 - **Review rigor.** One reviewer that must pass, or several focused lanes
   that must *all* pass (`all-pass`), or "any N of these M" (`threshold: N`)?
   This becomes the `gates.merge` clause (Step 4).
@@ -200,6 +206,7 @@ hand there is no such rail, so this is it:
 | `claude` | `low`, `medium`, `high`, `xhigh`, `max` | `1m` | `--effort <level>` is a session flag; `[1m]` is a model-alias suffix |
 | `copilot` | **none** | **none** | effort is `~/.copilot/settings.json`-only (no flag, no env, and orrerix never writes a user's global settings); the context window is the interactive `/context` control |
 | `gemini` | **none** | **none** | its thinking level is a settings-file key whose schema is unverified, so orrerix does not write it; its window is model-determined |
+| `opencode` | **none** | **none** | its reasoning effort is a model *variant* — a flag on `opencode run`, absent from the TUI orrerix spawns — and its context window is model-determined |
 
 **This table is a snapshot; `CliCaps` is the truth.** The rows come from
 `CLI_CAPS` in `crates/loomux-engine/src/model.rs`, which the `agent_cli_knobs`

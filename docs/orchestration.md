@@ -1626,6 +1626,24 @@ different class of defect than the one already primed on its own output.
 Worth considering for any reviewer-heavy workflow; orrerix's own dogfood
 `.orrerix/workflow.yml` notes the same above its reviewer blocks.
 
+**Cheap lanes ahead of the expensive one.** A reviewer lane does not have to be a
+reviewer. Because `cli` and `model` are per-block, you can put a small, fast model
+on a lane whose whole job is running a fixed checklist of shell commands — is the
+evidence the PR body claims actually in it, does a cited CI run belong to the
+current head, does the diffstat match, is a forbidden import present — and name it
+in `gates.merge.reviewers` alongside your real reviewer. The strong lane then reads
+those results instead of re-deriving them, and spends its attention on the things
+no command can settle. Two rules make it work: write the cheap lane's persona as a
+numbered checklist with the exact command on each line rather than as a description
+of what to look for, and tell it to fail **only** on the absence of something it can
+quote, escalating anything it cannot decide. A small model asked for judgment gives
+you unreliable judgment; asked what a command printed, it is accurate. Be clear-eyed
+about the trade: a cheap lane can pass a check it should have failed, so the strong
+lane stays in the gate and stays the bar — the cheap lanes buy its time, they do not
+carry its verdict. orrerix's own `.orrerix/workflow.yml` runs three of them
+(`qr-evidence`, `qr-tests`, `qr-constraints`) ahead of its lead reviewer, and their
+persona files in `.github/agents/` are worth reading as worked examples.
+
 ### Turning on the merge queue
 
 A `merge_queue:` block, beside `gates:`, opts the repo in:

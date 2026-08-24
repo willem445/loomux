@@ -8,11 +8,14 @@
 # wrong, which is why it is said here.
 #
 # Shape (2026-08, distilled from two autonomous hardening batches):
-# one reviewer lane instead of three (a fixed three-lane fan-out proved
-# token-heavy; one strong adversarial reviewer caught every defect class the
-# lanes did), two worker tiers routed by task difficulty, a planner for
-# design-first features, a post-merge process-pro, and the #581 merge queue
-# armed for integration branches.
+# one JUDGING reviewer lane instead of three (a fixed three-lane fan-out of
+# full reviewers proved token-heavy; one strong adversarial reviewer caught
+# every defect class the lanes did), fronted by three CHEAP mechanical
+# quick-review lanes on a small model that settle the checkable claims
+# before the lead lane spends attention on them (#1388), two worker tiers
+# routed by task difficulty, a planner for design-first features, a
+# post-merge process-pro, and the #581 merge queue armed for integration
+# branches.
 #
 # Each block's persona is a file in `.github/agents/`, which is Copilot's own
 # custom-agent convention — a `cli: copilot` block loads it natively and a
@@ -73,7 +76,7 @@ blocks:
     model: sonnet
     profile: .github/agents/worker-quick.md
 
-  # ── one reviewer lane ─────────────────────────────────────────────────────
+  # ── the lead reviewer: the one lane that JUDGES ───────────────────────────
   # A single strong adversarial reviewer replaces the previous three
   # lane-scoped ones: the fixed three-lane fan-out cost three panes per PR
   # (two of which usually abstained "outside my lane") and re-staled three
@@ -88,6 +91,51 @@ blocks:
     cli: claude
     model: opus
     profile: .github/agents/rev-lead.md
+
+  # ── three cheap quick-review lanes, ahead of the lead lane (#1388) ────────
+  # Each runs a FIXED numbered checklist of shell commands and reports what
+  # they printed: qr-evidence on the body's own evidence (red-before-green,
+  # run ids that name the head SHA, the diffstat, file:line cites), qr-tests
+  # on the tests (added at all, mutation receipts, count delta, named tests
+  # exist), qr-constraints on CLAUDE.md's hard constraints as greps with
+  # positive controls. They are instruments, not reviewers: each line is PASS
+  # (artifact present), FAIL (artifact ABSENT and quotable) or ESCALATE (could
+  # not decide), and anything off the checklist is SILENT — design, naming and
+  # style are rev-lead's, and only rev-lead's.
+  #
+  # `opencode` + a free Zen model is the point: the work these lanes do is
+  # running greps and comparing strings, which does not need opus, and a lane
+  # that can only fail on a quotable absence cannot spend a strong model's
+  # judgment badly. Model ids on this CLI are `provider_id/model_id` and
+  # `default_model("opencode", …)` is deliberately EMPTY, so the id is pinned
+  # in full here — the bare half is not a model that exists.
+  #
+  # ORDER IS LOAD-BEARING: rev-lead is declared FIRST among reviewer blocks
+  # because `block_for(Role::Reviewer)` resolves a bare
+  # `spawn_agent(kind: "reviewer")` to the first reviewing block in roster
+  # order. A qr-* lane sitting first would answer an unrouted review request
+  # with a checklist instead of a review. Same argument as worker-deep's.
+
+  - id: qr-evidence
+    name: Quick review — evidence
+    kind: reviewer
+    cli: opencode
+    model: opencode/deepseek-v4-flash-free
+    profile: .github/agents/qr-evidence.md
+
+  - id: qr-tests
+    name: Quick review — tests
+    kind: reviewer
+    cli: opencode
+    model: opencode/deepseek-v4-flash-free
+    profile: .github/agents/qr-tests.md
+
+  - id: qr-constraints
+    name: Quick review — constraints
+    kind: reviewer
+    cli: opencode
+    model: opencode/deepseek-v4-flash-free
+    profile: .github/agents/qr-constraints.md
 
   # ── process-pro: spawned after a merge, not on the per-PR path ────────────
   # `role_hint` is not cosmetic: a hint can change which MCP tools its block is
@@ -117,14 +165,39 @@ blocks:
 edges:
   - { from: orchestrator, to: [planner, worker-deep, worker-quick, process] }
   - { from: planner, to: [worker-deep, worker-quick] }
-  - { from: worker-deep, to: [rev-lead] }
-  - { from: worker-quick, to: [rev-lead] }
+  - { from: worker-deep, to: [qr-evidence, qr-tests, qr-constraints] }
+  - { from: worker-quick, to: [qr-evidence, qr-tests, qr-constraints] }
+  # The quick lanes run FIRST and chain into the lead lane: their whole value
+  # is that rev-lead reads their PASS results instead of re-deriving them.
+  - { from: qr-evidence, to: [rev-lead] }
+  - { from: qr-tests, to: [rev-lead] }
+  - { from: qr-constraints, to: [rev-lead] }
 
 # ENFORCED — the gh shim refuses `gh pr merge` until this is satisfied,
 # whatever an agent believes about its own approval.
 #
-# Single lane, so all-pass and threshold are equivalent; all-pass is the
-# honest spelling. `ci-green` requires the PR's own checks green at merge.
+# ALL-PASS over four lanes, and what makes that safe is the NARROWNESS of what
+# the three cheap ones are allowed to say — not a claim that they cannot block.
+# Both `fail` and `escalate` refuse a merge (workflow.rs `Verdict::blocks`), so
+# a qr-* lane can absolutely stop one. The argument is about what may TRIGGER
+# either: a lane may `fail` a check ONLY on the absence of a named artifact it
+# can quote, may `escalate` a check ONLY when it could not decide that check,
+# and is SILENT on everything off its checklist. It is never asked for a
+# judgment, so it can never block on one — every refusal it can produce comes
+# with the command and the output that produced it, which is a thing a human or
+# rev-lead can settle in one look.
+#
+# The residual, stated rather than argued away: a small model can PASS a lane it
+# should have failed. That costs a missed mechanical check, and rev-lead is
+# still in this gate and still reviews the whole PR — so the failure mode is a
+# check that silently did not happen, never a wrong merge these lanes waved
+# through on their own. Read a qr-* pass as "the grep printed what it should",
+# never as "this PR is fine".
+#
+# `threshold:` would be the unsafe spelling here — an abstention is a pass, so
+# N-of-4 could open on the three cheap lanes while the one lane that judges is
+# still reading.
+# `ci-green` requires the PR's own checks green at merge.
 # `body-unchanged` (#565/#634) pins the PR body — the squash commit message —
 # to what the reviewer approved: a body edited after the pass refuses the
 # merge until the reviewer re-records. Batches saw repeated post-approval
@@ -132,5 +205,5 @@ edges:
 gates:
   merge:
     require: all-pass
-    reviewers: [rev-lead]
+    reviewers: [rev-lead, qr-evidence, qr-tests, qr-constraints]
     also: [ci-green, body-unchanged]
