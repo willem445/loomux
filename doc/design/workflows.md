@@ -92,9 +92,9 @@ inert text or a choice from a value set loomux already ships:
 | `prompt` | free text | inert; sanitized, then delivered as a persona **addendum**, never as a replacement for the loomux contract |
 | `profile` | name a repo file | confined to the repo (no `..`, no absolute path, no drive prefix) |
 | `allow` | add tool patterns | **banned outright on a read-only class** (see below); inert for the rest — deny beats allow on both CLIs, so it can never re-grant what a class's tier denies |
-| `id` | name the block | reserved: the four class names may only be used by their own class, so no block can hijack another's contract file |
+| `id` | name the block | reserved: the class names (`orchestrator`/`worker`/`reviewer`/`planner`/`manager`) may only be used by their own class, so no block can hijack another's contract file |
 | *(on a `kind: orchestrator` block)* | pin `cli` / `model` / `effort` / `context` only | `prompt:`/`profile:`/`allow:` are a **parse error** — the trust root is not a repo-writable surface (see below) |
-| — | grant write access | **no spelling exists.** No `read_only:`, no fifth class, no capability key of any kind |
+| — | grant write access | **no spelling exists.** No `read_only:`, no capability key of any kind, and no way for a workflow file to invent a class of its own |
 
 `deny_unknown_fields` on the wire types is what makes that last row true: a
 `read_only: false` in a block isn't ignored, it's a validation error.
@@ -106,7 +106,7 @@ Pre-#222, *two* places parsed a kind string as `_ => Role::Worker` —
 typo'd, hallucinated or corrupt kind therefore produced **a worker**: a
 dedicated git worktree, write access, and PR authority, handed out on a guess.
 
-Both are gone. An unrecognized kind is now a named error that lists the four
+Both are gone. An unrecognized kind is now a named error that lists the
 classes that *are* allowed.
 
 That fix has a sharp edge, and a review caught it: the old catch-all was also,
@@ -212,7 +212,11 @@ reviewer runs on every PR it gates — exactly the property an on-demand lens is
 defined by not having — so counting one in would let the standing reviewer be
 outvoted (or the gate held open) on a PR the lens was never spawned for at all.
 `role_hint: advisor` — already shipped for the single "domain expert on call"
-case — needed no new code to cover a design-review/premortem lens too; see
+case — needed no new code to cover a design-review/premortem lens too, though
+it supplies the *shape* (read-only, reports and exits, no verdict) and not
+the *trigger*: orrerix's own generated advisor prose is keyed to "only when
+the team is stuck," not to plan intake or PR risk, and a workflow file cannot
+widen that (no field lets it re-author the orchestrator's persona); see
 `docs/orchestration.md` → "Adding a second
 lens".
 
@@ -516,7 +520,8 @@ first draft rather than by design:
   launcher asks for no starters at all, so the only caller that can still reach
   this is the promote modal — the notice is unchanged and still earns its place,
   because the count that reaches it is a human's either way.)
-- **The four class names are reserved ids.** `- id: planner, kind: reviewer` is a
+- **The class names are reserved ids — five today, `orchestrator`/`worker`/
+  `reviewer`/`planner`/`manager`.** `- id: planner, kind: reviewer` is a
   validation error, because a block's contract file is `<id>.md` and that block
   would write `reviewer.md` — the real reviewer's file. (It also breaks the
   orchestrator synthesis above, by letting a non-orchestrator hold the id
