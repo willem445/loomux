@@ -307,20 +307,34 @@ const STREAMS: StreamRow[] = [
     reason:
       "The manager pane's unread-mail chip (#1161 M5). Emitted from write_mailbox — the single " +
       "mutation point — so its rate is set by an agent, not by a clock: the orchestrator's " +
-      "message_manager posts and the manager's own check_mail read. There is NO coalescer and no " +
-      "throttle, which is why this row is declared owned rather than claimed closed. What actually " +
-      "bounds it is a REFUSAL, and the vocabulary above has no term for one: past " +
-      "mailbox::UNREAD_MAX (32) unread rows the WRITER is refused, so an orchestrator cannot drive " +
-      "this stream past 32 emits without the manager consuming — and the manager consumes only when " +
-      "its human speaks to it. The budget is therefore ~32 emits per human turn, per group, and it " +
-      "is zero for the overwhelming majority of groups, which declare no manager and so never write " +
-      "the file at all. The webview cost of one emit is a filter over live panes plus one " +
-      "idempotent text write on at most one of them (MANAGER_MAX is 1): setMailUnread returns early " +
-      "on an unchanged count, so a re-push costs the scan and nothing else. No view refresh and no " +
-      "refetch hang off this stream, so INV-4's visibility question does not arise for it — a chip " +
-      "on a pane nobody is looking at is a DOM write already paid for.",
-    debt: "#1161 owns it: if the mailbox ever gains a writer that is not turn-bound, the refusal cap " +
-      "stops being the bound and this row needs a real one.",
+      "message_manager posts and the manager's own check_mail read.\n\n" +
+      "WHAT ACTUALLY BOUNDS IT, since it is not one of the four names above: a REFUSAL CAP, " +
+      "enforced by the WRITER's own entry point. `OrchRegistry::post_to_manager` reads the " +
+      "mailbox under its lock and returns an Err — audited `mail-reject`, reason `unread-cap` — " +
+      "once mailbox::UNREAD_MAX (32) rows are unread, and it never evicts a row to make space. So " +
+      "an orchestrator cannot drive this stream past 32 emits without the manager CONSUMING, and " +
+      "the manager consumes only when its human speaks to it. The budget is ~32 emits per human " +
+      "turn, per group, and it is zero for the overwhelming majority of groups, which declare no " +
+      "manager and so never write the file at all.\n\n" +
+      "WHY `argued-none` RATHER THAN ONE OF THE OTHER THREE — this is the nearest existing term, " +
+      "not the right one, and each alternative is rejected for a reason rather than by " +
+      "elimination. `backend-coalesced` would be a FALSE claim: there is no coalescer, and every " +
+      "write genuinely changes the count, so a skip-if-unchanged would never fire. `throttled` is " +
+      "false the same way and this test would catch it (the cite carries no throttle). " +
+      "`rAF-gated` is not the shape at all — the handler is a chip update, not a render loop. " +
+      "That leaves `argued-none`, whose own doc reads as \"no gate today, owned as debt\", which " +
+      "undersells a hard cap. The row is therefore an ARGUED POSITION, not a shrug: the honest " +
+      "label would be a fifth term, and inventing one HERE would widen a closed vocabulary " +
+      "mid-PR, which this test's own BOUNDS refusal says is a design-note change first. The gap " +
+      "is filed as #1511 to be decided on its own.\n\n" +
+      "COST OF ONE EMIT: a filter over live panes plus one idempotent text write on at most one " +
+      "of them (MANAGER_MAX is 1) — the shared render path returns early on an unchanged count, " +
+      "so a re-push costs the scan and nothing else. No view refresh and no refetch hangs off " +
+      "this stream, so INV-4's visibility question does not arise for it: a chip on a pane nobody " +
+      "is looking at is a DOM write already paid for.",
+    debt: "#1511 owns the VOCABULARY gap (INV-3 has no term for a refusal cap). #1161 owns the " +
+      "BOUND: if the mailbox ever gains a writer that is not turn-bound, the cap stops being the " +
+      "bound and this row needs a real mechanism rather than a better word.",
   },
   {
     event: "orch-group-ended",
