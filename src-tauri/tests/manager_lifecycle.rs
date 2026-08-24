@@ -132,7 +132,20 @@ fn rows_of(reg: &OrchRegistry, g: &GroupId, role: &str) -> Vec<Value> {
 
 fn the_manager(reg: &OrchRegistry, g: &GroupId) -> Value {
     let rows = rows_of(reg, g, "manager");
-    assert_eq!(rows.len(), 1, "expected exactly one manager row, got {rows:?}");
+    // The audit log rides the failure message: `open_manager_pane_at_launch`
+    // DEGRADES rather than failing the launch, so "no manager row" is the
+    // symptom of a refusal recorded over there, and a bare count would send a
+    // reader hunting for it.
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one manager row, got {rows:?}
+roster: {}
+audit:
+{}",
+        reg.list_agents(g),
+        audit_text(reg, g)
+    );
     rows[0].clone()
 }
 
@@ -429,10 +442,21 @@ fn the_stall_watchdog_never_notifies_about_a_manager() {
     );
     let log = audit_text(&reg2, &g2.id);
     assert!(log.contains("watchdog-stall"), "the control's stall must be audited: {log}");
-    assert!(
-        !log.contains(&tasked_manager.id),
-        "...and nothing may be audited against the manager: {log}"
-    );
+    // Scoped to the WATCHDOG's own records rather than the whole file: every
+    // agent has an `agent-spawn` line naming it, so a file-wide substring search
+    // for the manager's id can never be false — which would make this assertion
+    // unfailable in the wrong direction (it would fire on a correct build).
+    // `watchdog-suppressed` is included because it is the watchdog's OTHER
+    // record, and a manager reaching it would be just as wrong.
+    let watchdog_lines: Vec<&str> =
+        log.lines().filter(|l| l.contains("watchdog-stall") || l.contains("watchdog-suppressed")).collect();
+    assert!(!watchdog_lines.is_empty(), "control: the watchdog wrote something");
+    for line in &watchdog_lines {
+        assert!(
+            !line.contains(&tasked_manager.id),
+            "no watchdog record may name the manager: {line}"
+        );
+    }
 
     // The launch-opened manager (idle, the ordinary shape) is not flagged either.
     assert!(reg.watchdog_tick(FAR, &HashMap::new(), &HashMap::new()).is_empty());
