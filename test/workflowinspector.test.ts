@@ -107,6 +107,48 @@ test("unparseable YAML blocks the inspector outright — it does not fall back t
   }
 });
 
+test("#1388: a gate SEAT is a selection of its own, and it outlives nothing", () => {
+  // The amber line from a reviewer to the gate box was drawn and unclickable — the one
+  // ENFORCED thing on the canvas was the one thing you could not point at. It is a selection
+  // now, held by the reviewer's id, because that is the whole of what a seat is: there is one
+  // merge gate, and a seat on it is an entry in `gates.merge.reviewers`.
+  const w = fixture();
+  assert.deepEqual(pane.inspectorTarget({ kind: "gate-edge", reviewer: "rev-lead" }, w, false), {
+    kind: "gate-edge",
+    reviewer: "rev-lead",
+  });
+  // The same fallback an erased edge gets, and it has three ways to happen: erased here,
+  // unticked in the gate form, or edited out of the YAML.
+  assert.deepEqual(pane.inspectorTarget({ kind: "gate-edge", reviewer: "worker" }, w, false), {
+    kind: "workflow",
+  });
+  assert.deepEqual(pane.inspectorTarget({ kind: "gate-edge", reviewer: "gone" }, w, false), {
+    kind: "workflow",
+  });
+  // A file with no gate at all cannot be showing a seat on one.
+  const ungated: Workflow = { ...w, gates: {} };
+  assert.deepEqual(pane.inspectorTarget({ kind: "gate-edge", reviewer: "rev-lead" }, ungated, false), {
+    kind: "workflow",
+  });
+  // And the blocked rule covers it like every other selection: an inspector edit serializes
+  // the model back over text the human is mid-repair on.
+  assert.deepEqual(pane.inspectorTarget({ kind: "gate-edge", reviewer: "rev-lead" }, w, true), {
+    kind: "blocked",
+  });
+});
+
+test("#1388: the heading says which line you clicked — advisory, or the one that stops a merge", () => {
+  // The sub-line is the one place the canvas's two kinds of line are named side by side, and
+  // which of them can actually block a merge is the thing worth learning from a click.
+  const w = fixture();
+  const seat = pane.inspectorHeading({ kind: "gate-edge", reviewer: "rev-lead" }, w);
+  assert.equal(seat.title, "rev-lead → merge gate");
+  assert.match(seat.sub, /enforced/);
+  const edge = pane.inspectorHeading({ kind: "edge", from: "worker", to: "rev-lead" }, w);
+  assert.match(edge.sub, /advisory/);
+  assert.notEqual(seat.sub, edge.sub, "the two lines do not get the same label");
+});
+
 // ---------- what the inspector calls it ----------
 
 test("the inspector names the selected block by its ID, not only its name", () => {

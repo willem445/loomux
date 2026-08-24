@@ -503,7 +503,9 @@ is answered rather than abandoned:
 ```
   drag a node        → .loomux/workflow.layout.json          (never the workflow)
   drag port → node   → connectBlocks()   → canonical YAML    (the pure model, same as a form edit)
+  drag port → gate   → connectToGate()   → gates.merge.reviewers      (#1388)
   click edge, ✕      → disconnectBlocks() → canonical YAML
+  click gate line, ✕ → disconnectFromGate() → canonical YAML          (#1388)
   + Block            → asks for the ID   → addBlock()
   Delete             → removeBlockAt()   → takes its edges and its gate seat with it
 ```
@@ -533,9 +535,48 @@ Three commitments the canvas keeps, each because someone else broke it:
   get wrong but the wiring. (The edge hit-tolerance is why an edge is clickable at all: it is a
   1.5px line, and nobody hits that.)
 
-And the gate is still not a node you can drag or wire. It is not a block — it is a *rule about*
-blocks — and making it draggable would imply it can be rewired, which is the single most
-important thing about it that isn't true.
+**Where a drop may land** (#1387). The drop target used to be a node's BODY rect and nothing
+else — while the in-port the arrowhead visibly points at is drawn on that body's left EDGE, so
+half of it sits outside the only thing that accepted a release. Aiming at the target the picture
+offers therefore connected nothing, and the release that did work (the far side of the box, or
+its out-port) is the one nothing on screen suggests. `hitTestDropTarget` adds a tolerance around
+each in-port, and it is *additive by construction*: wherever the body rule had an answer it gives
+the same one, so #1387 buys drops that used to fail and moves none that used to work
+(`test/workflowlayout.test.ts` sweeps a grid over two overlapping nodes to say so). The
+affordance is the other half — the in-port lights up while a band is over it, green or red from
+the same `connectionError` the release itself will ask, because a canvas that lights a target up
+and then refuses the drop has made a promise.
+
+**The gate is not draggable, and since #1388 it is wireable — one way.** Those are two different
+claims and only the first was ever the point. It is not a block: it is a *rule about* blocks, so
+it has no position of its own, no roster row, and no place in the layout file, and dragging it
+around like a node would imply it can be *moved* in a graph it is not part of. What a human can
+now do is drop a reviewer's out-port on it, which adds that block's id to
+`gates.merge.reviewers` — the same list the gate form's checkboxes write and the same one
+`parse_workflow` already reads. Before that, the one ENFORCED thing on the canvas was the one
+thing you could not point at: the amber lines were drawn, un-clickable and un-erasable, and the
+only route to gating a second reviewer was the form or the YAML.
+
+Three rules keep that from becoming "the gate is a block after all":
+
+- **It only accepts what could ever open it.** The refusal is `gateReviewerFinding` — the same
+  function the findings strip uses and the same question the engine's `gate_reviewer_error`
+  asks — so a drop the canvas turns away is turned away in the validator's own words. A worker,
+  a manager, a liaison and a name no block answers to are all refused with the reason, on
+  release, rather than silently.
+- **A seat is erased like an edge, because it is the same gesture on the same kind of line** —
+  select it, ✕ or Delete, `disconnectFromGate`. What differs is what it MEANS, and that is
+  carried by the colour, the dashes and the inspector panel ("gate seat · enforced" against the
+  advisory edge's "edge · advisory"), not by making one of them unclickable.
+- **A `threshold` follows its list down.** `threshold: 2` over two reviewers is valid; erase one
+  seat and "2 passes from 1 reviewer" is a file `parse_workflow` refuses *whole*, so the group
+  falls back to the built-in roster over a single click on a ✕. `withGateReviewers` lowers the
+  number instead — to `GATE_THRESHOLD_MIN` and no further, so emptying the gate leaves the
+  human's own gate recoverable by re-seating a reviewer rather than a zero to retype — and the
+  view says so in a toast, because a policy number that changes itself silently is one the human
+  finds in `git diff` later and cannot account for. `removeBlockAt` goes through the same
+  helper: there is no reading on which deleting a block may leave the file unloadable while
+  deleting its gate edge doesn't.
 
 ### Comments, and the save that used to eat them (#233)
 

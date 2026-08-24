@@ -51,6 +51,9 @@ import {
   connectBlocks,
   disconnectBlocks,
   connectionError,
+  connectToGate,
+  disconnectFromGate,
+  gateConnectionError,
   isValidBlockId,
   isBlockKind,
   isReviewingBlock,
@@ -109,6 +112,9 @@ import {
   edgeMidpoint,
   hitTestNodes,
   hitTestEdges,
+  hitTestDropTarget,
+  gateRect,
+  GATE_KEY,
   blockKey,
   ghostKey,
   NODE_W,
@@ -1392,6 +1398,10 @@ export class WorkflowView {
       this.formPane.replaceChildren(this.edgeForm(target.from, target.to));
       return;
     }
+    if (target.kind === "gate-edge") {
+      this.formPane.replaceChildren(this.gateEdgeForm(target.reviewer));
+      return;
+    }
     if (target.kind === "intake") {
       this.formPane.replaceChildren(this.intakeForm(w));
       return;
@@ -2039,6 +2049,41 @@ export class WorkflowView {
     del.className = "wf-btn wf-btn-danger";
     del.textContent = "Delete edge";
     del.addEventListener("click", () => this.eraseEdge(from, to));
+    box.append(del);
+    return box;
+  }
+
+  /** The panel for one reviewer's SEAT on the merge gate. The mirror of `edgeForm`, and it
+   *  earns its own text for the same reason that one does: this is the one place a human
+   *  clicks on an amber line, and it is where they should learn that this line — unlike the
+   *  solid one — is the half that actually stops a merge. */
+  private gateEdgeForm(reviewer: string): HTMLElement {
+    const box = el("div", "wf-fields");
+    const gate = this.analysis.workflow.gates.merge;
+    box.append(
+      el(
+        "p",
+        "wf-note",
+        `An ENFORCED seat on the merge gate: orrerix's \`gh\` shim refuses \`gh pr merge\` until ` +
+          `"${reviewer}" has recorded a PASS on the commit being merged. Unlike an advisory edge, ` +
+          `this one is not a hint to the orchestrator — it is a rule about the merge itself.`
+      )
+    );
+    if (gate?.require === "threshold") {
+      box.append(
+        el(
+          "p",
+          "wf-hint",
+          `This gate needs ${gate.threshold ?? "?"} of its ${gate.reviewers.length} reviewer(s) to ` +
+            `pass. Removing a seat lowers the threshold if it would otherwise ask for more passes ` +
+            `than the gate names reviewers — which is a file the engine refuses outright.`
+        )
+      );
+    }
+    const del = document.createElement("button");
+    del.className = "wf-btn wf-btn-danger";
+    del.textContent = "Remove from gate";
+    del.addEventListener("click", () => this.eraseGateEdge(reviewer));
     box.append(del);
     return box;
   }
@@ -2771,20 +2816,68 @@ export class WorkflowView {
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   }
 
-  /** The drawn edges as GEOMETRY, in render order — the list the pure hit-test is asked about. */
+  /** Every line on the canvas as GEOMETRY, in render order, each carrying the SELECTION a
+   *  click on it makes — the list the pure hit-test is asked about.
+   *
+   *  Gate lines are in it since #1388. They were drawn and not clickable, which made the one
+   *  enforced thing on the canvas the one thing you could not point at: the amber line said a
+   *  reviewer gates the merge and offered no way to ask about it or take it back, so the only
+   *  route to un-gating a reviewer was the form's checkbox or the YAML. */
   private drawnEdges(
-    rects: ReadonlyMap<string, Rect>
-  ): { edge: { from: string; to: string }; geom: { from: Point; to: Point } }[] {
-    const out: { edge: { from: string; to: string }; geom: { from: Point; to: Point } }[] = [];
+    rects: ReadonlyMap<string, Rect>,
+    gr: Rect | null
+  ): { sel: Selection; geom: { from: Point; to: Point } }[] {
+    const out: { sel: Selection; geom: { from: Point; to: Point } }[] = [];
     for (const e of this.analysis.graph.edges) {
       const a = this.keyOf(e.from);
       const b = this.keyOf(e.to);
       const ra = a ? rects.get(a) : undefined;
       const rb = b ? rects.get(b) : undefined;
       if (!ra || !rb) continue;
-      out.push({ edge: { from: e.from, to: e.to }, geom: { from: outPort(ra), to: inPort(rb) } });
+      out.push({
+        sel: { kind: "edge", from: e.from, to: e.to },
+        geom: { from: outPort(ra), to: inPort(rb) },
+      });
+    }
+    for (const rid of this.gateReviewers()) {
+      const rKey = this.keyOf(rid);
+      const ra = rKey ? rects.get(rKey) : undefined;
+      if (!ra || !gr) continue;
+      out.push({ sel: { kind: "gate-edge", reviewer: rid }, geom: { from: outPort(ra), to: inPort(gr) } });
     }
     return out;
+  }
+
+  /** The reviewers the merge gate names, or none. One reader, so "is there a gate at all" is
+   *  asked in one place rather than at each of the four sites that draw or hit-test its lines. */
+  private gateReviewers(): readonly string[] {
+    return this.analysis.graph.gates[0]?.reviewers ?? [];
+  }
+
+  /** Every DROP target on the canvas, in draw order — the nodes and ghosts, then the gate box,
+   *  which is drawn last and therefore wins an overlap under `hitTestDropTarget`'s rule. */
+  private dropRects(rects: ReadonlyMap<string, Rect> = this.nodeRects()): Map<string, Rect> {
+    const out = new Map(rects);
+    const gate = this.analysis.graph.gates[0];
+    if (gate) out.set(GATE_KEY, gateRect(rects.values(), gate.reviewers.length));
+    return out;
+  }
+
+  /** Why releasing the rubber band on `key` would NOT connect, or null when it would.
+   *
+   *  ONE definition, asked twice: while the band is in flight, to colour the affordance, and
+   *  again on release, to say the reason out loud. A canvas that lights a target up and then
+   *  refuses the drop is worse than one that never lit it — it made a promise. Both answers
+   *  come from the pure model (`connectionError` / `gateConnectionError`), so neither can
+   *  drift from what the findings strip says about the same pair. */
+  private dropError(key: string, from: string): string | null {
+    const w = this.analysis.workflow;
+    if (key === GATE_KEY) return gateConnectionError(w, from);
+    // A ghost is the ABSENCE of a block, so `connectionError` answers for it too — "that
+    // block doesn't exist" is exactly right, and inventing a second sentence here is how the
+    // canvas ends up refusing in words the validator never uses.
+    if (key.startsWith("g:")) return connectionError(w, from, key.slice(2));
+    return connectionError(w, from, this.analysis.workflow.blocks[Number(key.slice(2))]?.id ?? "");
   }
 
   private renderGraph(): void {
@@ -2801,7 +2894,7 @@ export class WorkflowView {
       el(
         "span",
         "wf-graph-hint",
-        "Drag a node to move it · drag from its ● to another node to connect · click an edge to select it · double-click the canvas to add a block"
+        "Drag a node to move it · drag from its ● to another node's ● (or onto the merge gate, from a reviewer) to connect · click an edge to select it · double-click the canvas to add a block"
       )
     );
     const legend = el("div", "wf-legend");
@@ -2820,19 +2913,33 @@ export class WorkflowView {
     const rects = this.nodeRects();
     const ghosts = this.ghosts();
 
-    // The gate hangs off the reviewers it names, to the right of everything else. It is NOT a
-    // draggable, wireable node: it is not a block, it is a rule ABOUT blocks, and letting it be
-    // dragged around like one would imply it can be rewired like one — which is the single most
-    // important thing about it that isn't true.
+    // The gate hangs off the reviewers it names, to the right of everything else. It is not a
+    // DRAGGABLE node — it is not a block, it is a rule ABOUT blocks, so it has no position of
+    // its own, no roster row and no entry in the layout file, and dragging it would imply it
+    // can be moved in a graph it is not part of. It IS a drop target (#1388): a reviewer's
+    // out-port may be released on it, which adds that id to `gates.merge.reviewers` and
+    // nothing else. Wireable one way, still not a block — see doc/design/content-panes.md.
     const gate = g.gates[0];
     const right = Math.max(...[...pos.values()].map((p) => p.x + NODE_W), PAD);
-    const gateX = right + 96;
-    const gateH = gate ? Math.max(NODE_H, Math.max(1, gate.reviewers.length) * 22 + 30) : 0;
-    const gateY = PAD;
+    // The box's rect comes from `gateRect` (workflowlayout.ts) rather than being arithmetic
+    // inlined here, because since #1388 the box is a DROP TARGET as well as a picture: the
+    // rect that is drawn and the rect that is hit-tested have to be the same one, and a
+    // second copy of the sums is how they stop being.
+    const gr = gate ? gateRect(rects.values(), gate.reviewers.length) : null;
 
-    const bottom = Math.max(...[...pos.values()].map((p) => p.y + NODE_H), gateY + gateH);
-    const width = (gate ? gateX + NODE_W : right) + PAD * 4;
+    const bottom = Math.max(...[...pos.values()].map((p) => p.y + NODE_H), gr ? gr.y + gr.h : PAD);
+    const width = (gr ? gr.x + gr.w : right) + PAD * 4;
     const height = bottom + PAD * 4;
+
+    // What the rubber band in flight is over, and whether releasing there would connect. The
+    // affordance half of "refuse before the gesture completes": the target the drop will land
+    // on says so while the human is still holding it, and says which way it will go.
+    const hover = this.connecting
+      ? hitTestDropTarget(this.dropRects(rects), this.connecting.at)
+      : null;
+    const hoverOk = hover ? !this.dropError(hover, this.connecting!.from) : false;
+    const dropClass = (key: string): string =>
+      hover === key ? (hoverOk ? " wf-drop-ok" : " wf-drop-bad") : "";
 
     const root = svg("svg");
     root.setAttribute("class", "wf-graph-svg");
@@ -2870,24 +2977,7 @@ export class WorkflowView {
       path.setAttribute("marker-end", "url(#wf-arrow)");
       group.append(path);
 
-      // The ✕ hangs off the CURVE's midpoint — on an edge that doubles back (the reviewer →
-      // worker rework loop, a real workflow) the straight-line middle is nowhere near the line
-      // you can see, and a ✕ floating in empty space is a ✕ nobody trusts.
-      const mid = edgeMidpoint(from, to);
-      const del = svg("g");
-      del.setAttribute("class", "wf-edge-del");
-      const disc = svg("circle");
-      disc.setAttribute("cx", String(mid.x));
-      disc.setAttribute("cy", String(mid.y));
-      disc.setAttribute("r", "9");
-      const glyph = text(mid.x, mid.y + 4, "✕", "wf-edge-del-x");
-      glyph.setAttribute("text-anchor", "middle");
-      del.append(disc, glyph);
-      del.addEventListener("pointerdown", (ev) => {
-        ev.stopPropagation(); // this is a click on the ✕, not a canvas gesture
-        this.eraseEdge(e.from, e.to);
-      });
-      group.append(del);
+      group.append(eraseButton(from, to, () => this.eraseEdge(e.from, e.to)));
       root.append(group);
     }
 
@@ -2907,45 +2997,67 @@ export class WorkflowView {
     // ---- nodes ----
     for (const n of g.nodes) {
       const selected = this.selection.kind === "block" && this.selection.index === n.index;
-      root.append(nodeGroup(rects.get(blockKey(n.index))!, n, selected));
+      root.append(
+        nodeGroup(rects.get(blockKey(n.index))!, n, selected, dropClass(blockKey(n.index)))
+      );
     }
     for (const id of ghosts) root.append(ghostGroup(rects.get(ghostKey(id))!, id));
 
     // ---- the ENFORCED gate ----
-    if (gate) {
+    if (gate && gr) {
+      const port = inPort(gr);
       for (const rid of gate.reviewers) {
         const rKey = this.keyOf(rid);
         const a = rKey ? rects.get(rKey) : undefined;
         if (!a) continue;
+        const from = outPort(a);
+        const selected = this.selection.kind === "gate-edge" && this.selection.reviewer === rid;
+        // Wrapped in the SAME `.wf-edge-g` group an advisory edge gets, so hover, selection
+        // and the ✕ behave identically on both. A seat on the gate is erased the way an edge
+        // is because it is the same gesture on the same kind of line — what differs is what it
+        // MEANS, which is what the colour, the dashes and the inspector panel are for.
+        const group = svg("g");
+        group.setAttribute("class", `wf-edge-g${selected ? " selected" : ""}`);
         const line = svg("path");
-        line.setAttribute("d", edgePath(outPort(a), { x: gateX, y: gateY + gateH / 2 }));
+        line.setAttribute("d", edgePath(from, port));
         line.setAttribute("class", "wf-edge wf-edge-gate");
         line.setAttribute("marker-end", "url(#wf-arrow-gate)");
-        root.append(line);
+        group.append(line);
+        group.append(eraseButton(from, port, () => this.eraseGateEdge(rid)));
+        root.append(group);
       }
       const box = svg("rect");
-      box.setAttribute("x", String(gateX));
-      box.setAttribute("y", String(gateY));
-      box.setAttribute("width", String(NODE_W));
-      box.setAttribute("height", String(gateH));
+      box.setAttribute("x", String(gr.x));
+      box.setAttribute("y", String(gr.y));
+      box.setAttribute("width", String(gr.w));
+      box.setAttribute("height", String(gr.h));
       box.setAttribute("rx", "8");
-      box.setAttribute("class", "wf-gate-box");
+      box.setAttribute("class", `wf-gate-box${dropClass(GATE_KEY)}`);
       box.addEventListener("pointerdown", (ev) => {
         ev.stopPropagation();
         this.selectItem({ kind: "gate" });
       });
       root.append(box);
-      root.append(text(gateX + 12, gateY + 22, "⛔ merge gate", "wf-gate-title"));
+      root.append(text(gr.x + 12, gr.y + 22, "⛔ merge gate", "wf-gate-title"));
       root.append(
         text(
-          gateX + 12,
-          gateY + 40,
+          gr.x + 12,
+          gr.y + 40,
           gate.require === "threshold"
             ? `${gate.threshold ?? "?"} of ${gate.reviewers.length} must PASS`
             : `all ${gate.reviewers.length} must PASS`,
           "wf-gate-sub"
         )
       );
+      // The IN-port, drawn on the gate exactly as it is on a block — because since #1388 it
+      // means the same thing on both: this is where a line arrives, and where one may be let
+      // go. Drawn AFTER the box so the box's fill cannot cover it.
+      const inp = svg("circle");
+      inp.setAttribute("cx", String(port.x));
+      inp.setAttribute("cy", String(port.y));
+      inp.setAttribute("r", "3");
+      inp.setAttribute("class", `wf-port wf-port-in${dropClass(GATE_KEY)}`);
+      root.append(inp);
     }
 
     // Double-click on empty canvas → a block, THERE. (rev-15 minor: `createBlock(at)` took a
@@ -3013,16 +3125,13 @@ export class WorkflowView {
     // Not a node. An edge, then? THIS is where the pure hit-test earns its keep: an edge is a
     // 1.5px line and nobody can hit that with a mouse — the tolerance is what makes it
     // clickable at all, and it is arithmetic, so it is tested rather than eyeballed.
-    const drawn = this.drawnEdges(rects);
+    const gate = this.analysis.graph.gates[0];
+    const drawn = this.drawnEdges(rects, gate ? gateRect(rects.values(), gate.reviewers.length) : null);
     const hit = hitTestEdges(
       drawn.map((d) => d.geom),
       pt
     );
-    this.selectItem(
-      hit !== null
-        ? { kind: "edge", from: drawn[hit]!.edge.from, to: drawn[hit]!.edge.to }
-        : { kind: "workflow" }
-    );
+    this.selectItem(hit !== null ? drawn[hit]!.sel : { kind: "workflow" });
   }
 
   private onCanvasMove(e: PointerEvent, root: SVGElement): void {
@@ -3059,15 +3168,24 @@ export class WorkflowView {
     if (this.connecting) {
       const from = this.connecting.from;
       this.connecting = null;
-      const key = hitTestNodes(this.nodeRects(), pt);
-      if (key?.startsWith("b:")) {
-        const to = this.analysis.workflow.blocks[Number(key.slice(2))]?.id ?? "";
+      // `hitTestDropTarget`, not `hitTestNodes` (#1387): the drop used to be the node's BODY,
+      // and the in-port the arrowhead points at is drawn on the body's left EDGE — so a
+      // release aimed at the target the picture offers landed on nothing at all. It also
+      // carries the gate box (#1388), which is why this is one hit-test and not two.
+      const key = hitTestDropTarget(this.dropRects(), pt);
+      if (key) {
         // Refused BEFORE the edge exists, with the reason. A canvas that lets you complete the
         // gesture and only then tells you the edge was invalid has wasted the gesture and left
-        // you to undo it.
-        const err = connectionError(this.analysis.workflow, from, to);
+        // you to undo it — and a canvas that says nothing at all, which is what a release on
+        // the gate used to do, is worse still: nothing happened and nothing said why.
+        const err = this.dropError(key, from);
         if (err) showToast(err, "info");
-        else this.mutate((next) => Object.assign(next, connectBlocks(next, from, to)));
+        else if (key === GATE_KEY) {
+          this.mutate((next) => Object.assign(next, connectToGate(next, from)));
+        } else {
+          const to = this.analysis.workflow.blocks[Number(key.slice(2))]?.id ?? "";
+          this.mutate((next) => Object.assign(next, connectBlocks(next, from, to)));
+        }
       }
       this.renderGraph();
     }
@@ -3084,11 +3202,34 @@ export class WorkflowView {
     this.mutate((next) => Object.assign(next, disconnectBlocks(next, from, to)));
   }
 
+  /** Take a reviewer's seat off the merge gate — `eraseEdge`'s gate mirror, and no confirm
+   *  for the same reason: it is one gesture to redraw.
+   *
+   *  The toast is the one thing this has that `eraseEdge` doesn't. `disconnectFromGate` may
+   *  lower a `threshold` to keep the gate satisfiable (the engine refuses the WHOLE file over
+   *  "3 passes from 2 reviewers"), and a policy number that changes itself without saying so
+   *  is a number the human finds in `git diff` later and cannot account for. */
+  private eraseGateEdge(reviewer: string): void {
+    const before = this.analysis.workflow.gates.merge?.threshold;
+    this.mutate((next) => Object.assign(next, disconnectFromGate(next, reviewer)));
+    const after = this.analysis.workflow.gates.merge?.threshold;
+    if (after !== undefined && after !== before) {
+      showToast(
+        `Threshold lowered to ${after} — the gate can only require passes from the reviewers it names.`,
+        "info"
+      );
+    }
+  }
+
   /** Delete whatever is selected — the keyboard half of the canvas. A canvas you can only
    *  operate with a mouse is a canvas that is tiring to use. */
   private deleteSelection(): void {
     if (this.selection.kind === "edge") {
       this.eraseEdge(this.selection.from, this.selection.to);
+      return;
+    }
+    if (this.selection.kind === "gate-edge") {
+      this.eraseGateEdge(this.selection.reviewer);
       return;
     }
     if (this.selection.kind === "block") {
@@ -3150,8 +3291,34 @@ function text(x: number, y: number, s: string, cls: string): SVGElement {
  *  width, so a fixed budget is the honest bound. */
 const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max - 1) + "…" : s);
 
-/** One block, as a draggable, connectable node. */
-function nodeGroup(r: Rect, n: GraphNode, selected: boolean): SVGElement {
+/** The ✕ that erases a line, hung off the CURVE's midpoint — on a line that doubles back
+ *  (the reviewer → worker rework loop, a real workflow) the straight-line middle is nowhere
+ *  near the line you can see, and a ✕ floating in empty space is a ✕ nobody trusts.
+ *
+ *  One builder for both kinds of line since #1388: an advisory edge and a gate seat are
+ *  erased by the same gesture on the same-shaped control, and two copies of it is how one of
+ *  them ends up with a delete button that hangs somewhere else. */
+function eraseButton(from: Point, to: Point, erase: () => void): SVGElement {
+  const mid = edgeMidpoint(from, to);
+  const del = svg("g");
+  del.setAttribute("class", "wf-edge-del");
+  const disc = svg("circle");
+  disc.setAttribute("cx", String(mid.x));
+  disc.setAttribute("cy", String(mid.y));
+  disc.setAttribute("r", "9");
+  const glyph = text(mid.x, mid.y + 4, "✕", "wf-edge-del-x");
+  glyph.setAttribute("text-anchor", "middle");
+  del.append(disc, glyph);
+  del.addEventListener("pointerdown", (ev) => {
+    ev.stopPropagation(); // this is a click on the ✕, not a canvas gesture
+    erase();
+  });
+  return del;
+}
+
+/** One block, as a draggable, connectable node. `drop` is the affordance for a rubber band
+ *  currently over this node: empty, or the class that says whether releasing here connects. */
+function nodeGroup(r: Rect, n: GraphNode, selected: boolean, drop = ""): SVGElement {
   const bad = !n.known || !isWorkflowCli(n.block.cli);
   const g = svg("g");
   g.setAttribute("class", `wf-node-g${selected ? " selected" : ""}`);
@@ -3193,7 +3360,10 @@ function nodeGroup(r: Rect, n: GraphNode, selected: boolean): SVGElement {
   inp.setAttribute("cx", String(ip.x));
   inp.setAttribute("cy", String(ip.y));
   inp.setAttribute("r", "3");
-  inp.setAttribute("class", "wf-port wf-port-in");
+  // #1387: the in-port is also the DROP target now, and it says so while a band is over it.
+  // The affordance and the hit-test are the same answer (`dropError`), so the dot that lights
+  // up green is the one that will actually take the edge.
+  inp.setAttribute("class", `wf-port wf-port-in${drop}`);
   g.append(inp);
   return g;
 }

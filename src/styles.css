@@ -4543,6 +4543,25 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .wf-port-out { cursor: crosshair; }
 .wf-node-g:hover .wf-port-out { fill: var(--accent); stroke: var(--accent); r: 6; }
 .wf-port-in { fill: var(--ink-faint); stroke: none; }
+/* The DROP affordance (#1387/#1388). A rubber band in flight lights up the target it would
+   land on — green when the release connects, danger when it would only earn a toast — so the
+   answer arrives while the human can still act on it rather than after they let go. Both
+   classes are set from the same `dropError` the release itself asks, so the dot that lights
+   up green is the one that actually takes the edge.
+   `r` is animatable as a CSS property on an SVG circle (the same trick .wf-port-out's hover
+   already uses); the fill is what carries the meaning, the size is what makes it findable. */
+.wf-port-in.wf-drop-ok { fill: var(--state-ok); stroke: var(--state-ok); r: 6; }
+.wf-port-in.wf-drop-bad { fill: var(--state-danger); stroke: var(--state-danger); r: 6; }
+/* The gate BOX's own arming cue carries no colour token, and that is the channel rule rather
+   than an omission: its fill and stroke are --id-amber, which answers "which thing is this",
+   and painting the same two properties with a --state-* token in a variant would make one
+   position answer two questions (test/theme.test.ts, "no position mixes the state and identity
+   channels across its own variants"). So the box thickens and stops dashing — it is a wider
+   target and it is what the pointer is over — while the ok/bad ANSWER is on its in-port dot,
+   in exactly the same green/red a block's dot uses. One visual language for every drop
+   target, which is the point: the gate accepts a line the way a block does. */
+.wf-gate-box.wf-drop-ok { stroke-width: 2.5; stroke-dasharray: none; }
+.wf-gate-box.wf-drop-bad { stroke-width: 2.5; }
 .wf-node { fill: var(--surface-2); stroke: var(--line); stroke-width: 1; }
 /* Identity, not interaction: a node's stroke says WHICH role it is. It was --accent, which
    is token-identical to the selected-node stroke above, so the graph could not draw a

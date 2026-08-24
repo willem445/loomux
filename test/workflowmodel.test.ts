@@ -25,6 +25,9 @@ import {
   scaffoldWorkflowText,
   connectBlocks,
   disconnectBlocks,
+  connectToGate,
+  disconnectFromGate,
+  gateConnectionError,
   connectionError,
   addBlock,
   newBlock,
@@ -524,6 +527,131 @@ test("erasing an edge takes the edge and nothing else", () => {
   const f = validateWorkflow(cut);
   assert.equal(hasErrors(f), false);
   assert.ok(f.some((x) => x.code === "isolated-block" && x.blockId === "reviewer"));
+});
+
+// ---------- the merge gate as a drop target (#1388) ----------
+
+/** The starter roster plus a second reviewer and a non-reviewer, which is the shape every
+ *  gate question below needs: someone to add, someone to refuse, someone already seated. */
+const gateFixture = (): Workflow => {
+  let w = addBlock(starterWorkflow(), newBlock("quick-review", "Quick review"));
+  w = addBlock(w, newBlock("scout", "Scout", "worker"));
+  w = connectBlocks(w, "worker", "quick-review");
+  // Wired, so the roster has no isolated block muddying a `codes(...)` assertion below.
+  return connectBlocks(w, "planner", "scout");
+};
+
+test("#1388: dropping a reviewer on the gate gives it a seat, and the file reads back the same", () => {
+  // The gesture the issue is about: a cheap scoped reviewer placed before the lead one, and
+  // BOTH counted by the gate. Before this, the only route to that was the form or the YAML —
+  // a release on the gate node did nothing at all and said nothing about why.
+  const w = gateFixture();
+  assert.equal(gateConnectionError(w, "quick-review"), null, "a reviewer block may gate the merge");
+
+  const gated = connectToGate(w, "quick-review");
+  assert.deepEqual(gated.gates.merge?.reviewers, ["reviewer", "quick-review"], "appended, in the human's order");
+  assert.deepEqual(gated.blocks, w.blocks, "wiring a gate seat edits no block");
+  assert.deepEqual(gated.edges, w.edges, "and draws no advisory edge");
+
+  // The round-trip the canvas rests on: gesture → model → canonical file → model, unchanged.
+  // This is also what makes "no new backend surface" checkable — the text below is the shape
+  // `parse_workflow` already reads, a list of block ids under `gates.merge.reviewers`.
+  const text = serializeWorkflow(gated);
+  assert.match(text, /reviewers: \[reviewer, quick-review\]/);
+  const reread = parseWorkflow(text).workflow;
+  assert.deepEqual(reread.gates.merge?.reviewers, ["reviewer", "quick-review"]);
+  assert.deepEqual(codes(validateWorkflow(reread)), [], "and the gate it wrote is a valid one");
+});
+
+test("#1388: the gate refuses what it cannot read a verdict from, in the validator's own words", () => {
+  // The refusal is `gateReviewerFinding` — the SAME function the findings strip and the
+  // engine's `gate_reviewer_error` use. A canvas that refused a drop in words the validator
+  // never uses would be a second definition of the rule, which is what #1176 collapsed.
+  const w = gateFixture();
+  assert.match(gateConnectionError(w, "scout") ?? "", /only a reviewer records a verdict/);
+  assert.match(gateConnectionError(w, "nobody") ?? "", /no block has that id/);
+  assert.match(gateConnectionError(w, "") ?? "", /needs an id/);
+  assert.match(gateConnectionError(w, "reviewer") ?? "", /already gates the merge/);
+
+  // Word-for-word the finding, not merely the same shape of complaint.
+  const finding = validateWorkflow({
+    ...w,
+    gates: { merge: { ...w.gates.merge!, reviewers: ["scout"] } },
+  }).find((f) => f.code === "gate-not-a-reviewer");
+  assert.equal(gateConnectionError(w, "scout"), finding?.message);
+
+  // And every refusal is enforced by the operation too, not only by the pre-check: the canvas
+  // is the first line of defence, not the only one.
+  for (const id of ["scout", "nobody", "", "reviewer"]) {
+    assert.deepEqual(connectToGate(w, id).gates.merge?.reviewers, ["reviewer"], `refused: "${id}"`);
+  }
+});
+
+test("#1388: with no merge gate declared there is nothing to drop onto, and it says so", () => {
+  const w: Workflow = { ...gateFixture(), gates: {} };
+  assert.match(gateConnectionError(w, "quick-review") ?? "", /no merge gate/);
+  assert.deepEqual(connectToGate(w, "quick-review").gates, {}, "a gate is never invented by a drop");
+});
+
+test("#1388: erasing a gate edge takes the seat and nothing else", () => {
+  const w = connectToGate(gateFixture(), "quick-review");
+  const cut = disconnectFromGate(w, "quick-review");
+  assert.deepEqual(cut.gates.merge?.reviewers, ["reviewer"]);
+  assert.deepEqual(cut.blocks, w.blocks, "the reviewer block itself is untouched");
+  assert.deepEqual(cut.edges, w.edges, "and so is every advisory edge");
+  assert.equal(cut.gates.merge?.require, "all-pass", "and the rest of the gate's policy");
+  assert.deepEqual(disconnectFromGate(w, "scout"), w, "removing a seat nobody holds changes nothing");
+});
+
+test("#1388: a threshold follows its reviewer list DOWN, so a one-click erase cannot break the file", () => {
+  // `parse_workflow` refuses the WHOLE workflow.yml over "3 passes from 2 reviewers" — not
+  // the gate, the file — and the group then silently falls back to the built-in roster. A
+  // gesture that cheap must not be able to do that.
+  const base = connectToGate(gateFixture(), "quick-review");
+  const w: Workflow = {
+    ...base,
+    gates: { merge: { ...base.gates.merge!, require: "threshold", threshold: 2 } },
+  };
+  assert.deepEqual(codes(validateWorkflow(w)), [], "2 of 2 is a valid gate to start from");
+
+  const cut = disconnectFromGate(w, "quick-review");
+  assert.deepEqual(cut.gates.merge?.reviewers, ["reviewer"]);
+  assert.equal(cut.gates.merge?.threshold, 1, "the number follows the list down");
+  assert.deepEqual(codes(validateWorkflow(cut)), [], "so the file the engine reads still loads");
+
+  // DOWN only: adding a reviewer leaves the number alone, because "2 of 3 must pass" is a
+  // policy, not a proportion.
+  const grown = connectToGate(cut, "quick-review");
+  assert.equal(grown.gates.merge?.threshold, 1, "adding a seat does not raise the bar");
+
+  // And it clamps to the MINIMUM rather than to zero: emptying the gate is already
+  // `gate-no-reviewers`, loudly, and destroying the human's number would buy nothing.
+  const empty = disconnectFromGate(cut, "reviewer");
+  assert.deepEqual(empty.gates.merge?.reviewers, []);
+  assert.equal(empty.gates.merge?.threshold, 1, "a threshold of 0 is not a thing the schema has");
+  assert.ok(codes(validateWorkflow(empty)).includes("gate-no-reviewers"));
+  // Re-seat a reviewer and the human's own gate is back, valid, with nothing to retype.
+  assert.deepEqual(codes(validateWorkflow(connectToGate(empty, "reviewer"))), []);
+});
+
+test("#1388: deleting the BLOCK clamps the threshold the same way deleting its gate edge does", () => {
+  // Two paths to one empty seat, and there is no reading on which one of them may leave the
+  // file unloadable while the other doesn't.
+  const base = connectToGate(gateFixture(), "quick-review");
+  const w: Workflow = {
+    ...base,
+    gates: { merge: { ...base.gates.merge!, require: "threshold", threshold: 2 } },
+  };
+  const deleted = removeBlockAt(w, w.blocks.findIndex((b) => b.id === "quick-review"));
+  assert.deepEqual(deleted.gates.merge?.reviewers, ["reviewer"], "the seat goes with the block");
+  assert.equal(deleted.gates.merge?.threshold, 1, "and so does the number that counted it");
+  assert.deepEqual(codes(validateWorkflow(deleted)), []);
+
+  // A block that is NOT on the gate leaves the gate entirely alone — the clamp is a
+  // consequence of the list getting shorter, not something a delete does on its own.
+  const other = removeBlockAt(w, w.blocks.findIndex((b) => b.id === "scout"));
+  assert.equal(other.gates.merge?.threshold, 2);
+  assert.deepEqual(other.gates.merge?.reviewers, ["reviewer", "quick-review"]);
 });
 
 test("a block created on the canvas keeps the id the human gave it", () => {
