@@ -725,6 +725,14 @@ narrow their ask back down to the original ticket on your own judgment.
   on the same branch removed, and the squash republishes it on the one surface
   nobody can edit afterwards (#1271). Recipe, and the blind spots it is scoped
   to: `.claude/skills/ci-validate/SKILL.md`.
+  **A TEST is one of those surfaces, and it fails LOUD rather than silent.** An
+  assertion quoting the wording (`err.contains("never")`) does not merely carry
+  the false claim, it ENFORCES it: the correction reddens a test and reads as a
+  regression, so the pressure is to revert the fix rather than the pin. Repin per
+  *tests test intent, not implementation echoes* above, and add a `doesNotMatch`
+  on the retracted claim so it cannot come back. Signature: correcting a claim
+  reddens a test whose assertion quotes it (#1502 — `test/mailboxbadge.test.ts`
+  and `nothing_loomux_sends_mid_session_can_reach_a_manager_pane`).
 - **A doc naming a file or test that hasn't landed must say so in its tense
   and name the slice** — `` `tests/perf_dispatch.rs` *will* enforce … (#743
   S2/S3) `` — or the pointer waits for that slice. Present tense beside a
