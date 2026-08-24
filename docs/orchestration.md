@@ -554,6 +554,15 @@ loop (`t-1 → t-3 → t-2 → t-1`) — you'll see it in the board's toast, and
 is written. Deleting a task strips it from every remaining task's links in the
 same write, so a delete never leaves a dangling dependency behind.
 
+**If an agent edited the same row while you were looking at it**, your click is
+refused rather than quietly overwriting what it wrote — the board is telling you
+it moved under you. For an edit that names a *thing* (removing a dependency,
+adding a grounding link) orrerix simply re-applies what you asked against the
+row as it now stands, so you usually see the result and never the message. For
+removing a grounding link it stops and repaints instead: that click names a
+*position* in the list, and the list you were shown is no longer the list on the
+board. Look at the refreshed row and click the **✕** you can now see.
+
 ### Parent tasks and subtasks
 
 A task can sit *inside* another task — an Epic or Feature the orchestrator created to hang
@@ -745,7 +754,8 @@ of it.
 - Unfolding it lists the links, each with its type and its label (or its target when it has
   no label, with the raw target beside a labelled one — a gloss shouldn't hide what it points
   at). **✕** on an entry removes that one entry, even if another link on the row points at
-  the same thing.
+  the same thing. If an agent changed the row's links since it was drawn, the ✕ is refused and
+  the row repaints — see *If an agent edited the same row* above.
 - **Clicking a link acts on it.** An issue or PR ref and an `http(s)` URL open in your
   browser; everything else — a repo path, anything the board can't recognise — is **copied to
   the clipboard** instead. That's deliberate: a target is free text that an agent may have

@@ -87,6 +87,12 @@ import {
   MAX_ARTIFACT_LINKS,
   withArtifactLink,
   withoutArtifactLinkAt,
+  // #1349: the stale-snapshot guard's board half.
+  composeLinkArrayWrite,
+  isStaleLinkEtag,
+  retriesAfterStale,
+  STALE_LINK_ETAG_PREFIX,
+  type LinkArrayEdit,
   type TaskArtifactLink,
 } from "../src/taskboard.ts";
 
@@ -2441,8 +2447,11 @@ test("removing a link takes the one that was clicked, not every copy of its targ
   );
   assert.deepEqual(withoutArtifactLinkAt(links, 2).map((l) => l.type), ["requirement", "doc"]);
   assert.equal(links.length, 3, "the input array is not mutated");
-  // A stale render (the row changed underneath between paint and click) must
-  // compose a write that changes nothing, never one that drops a different link.
+  // A stale render whose row got SHORTER must compose a write that changes
+  // nothing, never one that drops a different link. That is a floor and not the
+  // mitigation: a row that changed while staying long enough passes this range
+  // check, which is why every one of these edits carries a `link_etag` (#1349)
+  // and why `retriesAfterStale` never re-applies this one.
   for (const bad of [-1, 3, 99, 1.5, NaN]) {
     assert.deepEqual(
       withoutArtifactLinkAt(links, bad),
@@ -2531,4 +2540,240 @@ test("a link draft counts as touched when the TYPE alone was chosen", () => {
   // "keep it" — so the two are not in conflict.
   assert.equal(linkDraftIsPristine({ ...pristine, target: " " }), false);
   assert.equal(artifactLinkDraft(DEFAULT_LINK_TYPE, " ", ""), null, "and it still cannot be submitted");
+});
+
+// ---------------------------------------------------------------------------
+// The stale-snapshot guard (#1349) — the board half.
+//
+// The board composes a WHOLE new array from the row it painted, so an agent's
+// concurrent write to `deps`/`related`/`links` is silently discarded. These pin
+// the three things the board contributes: it always sends the token that came
+// with the very row it composed from; it recognises the backend's refusal (and
+// nothing else); and it re-applies only the edits that name a VALUE.
+// ---------------------------------------------------------------------------
+
+test("the stale-refusal prefix the board matches on is the backend's, read out of the Rust source", () => {
+  // Same guard shape as the status and link-type vocabularies above, for the
+  // same reason and with a sharper failure mode: this string is not a display
+  // label, it is the only thing that tells a "the row moved under you" refusal
+  // from a cycle or a cap. Drift and the board stops recovering from the one
+  // error it was built to recover from — silently, with no test red anywhere
+  // else, because every OTHER refusal keeps behaving exactly as before.
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const decl = src.match(/pub const STALE_LINK_ETAG_PREFIX: &str = "([^"]*)";/);
+  assert.ok(
+    decl,
+    "STALE_LINK_ETAG_PREFIX is gone or renamed in mod.rs — this guard reads it by name, so " +
+      "update it here rather than deleting the only thing pinning the two spellings together"
+  );
+  assert.equal(
+    STALE_LINK_ETAG_PREFIX,
+    decl[1],
+    "the board's prefix must BE the backend's, byte for byte"
+  );
+  // Mutation control for the matcher itself: it has to say yes to a real
+  // refusal built from that const and no to every other one the same command
+  // can return. A matcher that answered yes to everything would pass the line
+  // above and turn every refused edit into a silent retry.
+  assert.equal(isStaleLinkEtag(`${decl[1]}: t-5's deps/related/links changed`), true);
+  assert.equal(isStaleLinkEtag("deps: dependency cycle t-1 → t-2 → t-1"), false);
+  assert.equal(isStaleLinkEtag("unknown task: t-9"), false);
+  assert.equal(isStaleLinkEtag(undefined), false, "and a non-error is not a stale refusal");
+});
+
+test("every array write carries the etag that came with the row it was composed from", () => {
+  const row = {
+    id: "t-1",
+    status: "queued",
+    deps: ["t-2"],
+    links: [{ type: "requirement", target: "#1349" }],
+    link_etag: "0123456789abcdef",
+  };
+  const edits: LinkArrayEdit[] = [
+    { kind: "dep-add", id: "t-3" },
+    { kind: "dep-remove", id: "t-2" },
+    { kind: "link-add", link: { type: "doc", target: "docs/x.md" } },
+    { kind: "link-remove-at", index: 0 },
+  ];
+  for (const edit of edits) {
+    const write = composeLinkArrayWrite(edit, row);
+    assert.equal(
+      write.expectLinkEtag,
+      row.link_etag,
+      `${edit.kind} must guard on the row's own token — the array and the token coming from ` +
+        `two different reads is the whole defect`
+    );
+    // Exactly one array per write: the other two are left untouched, which is
+    // what omitting the argument means to `orch_upsert_task`.
+    const named = [write.deps, write.links].filter((a) => a !== undefined);
+    assert.equal(named.length, 1, `${edit.kind} names exactly one array`);
+  }
+  // The unguarded shape is reachable only from a row that arrived without a
+  // token, and it is the PRE-#1349 write rather than a new failure.
+  assert.equal(
+    composeLinkArrayWrite({ kind: "dep-add", id: "t-3" }, { ...row, link_etag: undefined })
+      .expectLinkEtag,
+    undefined
+  );
+});
+
+test("a re-applied add composes against the CURRENT row, so a concurrent link survives", () => {
+  // The issue's interleaving, from the board's side. The human's click was
+  // composed from a two-link row; by the time the retry runs, the row the
+  // backend holds has three.
+  const painted = {
+    id: "t-1",
+    status: "queued",
+    links: [
+      { type: "requirement", target: "#1349" },
+      { type: "design-note", target: "doc/design/board-sprints-and-links.md" },
+    ],
+    link_etag: "aaaaaaaaaaaaaaaa",
+  };
+  const fresh = {
+    ...painted,
+    links: [...painted.links, { type: "test-case", target: "tests/t.rs" }],
+    link_etag: "bbbbbbbbbbbbbbbb",
+  };
+  const add: LinkArrayEdit = { kind: "link-add", link: { type: "doc", target: "docs/x.md" } };
+
+  const first = composeLinkArrayWrite(add, painted);
+  assert.deepEqual(
+    first.links?.map((l) => l.target),
+    ["#1349", "doc/design/board-sprints-and-links.md", "docs/x.md"],
+    "the first attempt is composed from what the human saw — and would drop tests/t.rs"
+  );
+  const retry = composeLinkArrayWrite(add, fresh);
+  assert.deepEqual(
+    retry.links?.map((l) => l.target),
+    ["#1349", "doc/design/board-sprints-and-links.md", "tests/t.rs", "docs/x.md"],
+    "re-applied against the current row, the human's link lands AND the agent's survives"
+  );
+  assert.equal(
+    retry.expectLinkEtag,
+    fresh.link_etag,
+    "and the retry is guarded on the re-read's token, not the stale one — a third writer " +
+      "arriving in between refuses it rather than landing it blind"
+  );
+});
+
+test("a re-applied dep removal names an id, so it still removes what the human clicked", () => {
+  const painted = { id: "t-1", status: "queued", deps: ["t-2", "t-3"], link_etag: "a" };
+  const fresh = { ...painted, deps: ["t-2", "t-3", "t-4"], link_etag: "b" };
+  const edit: LinkArrayEdit = { kind: "dep-remove", id: "t-2" };
+  assert.deepEqual(
+    composeLinkArrayWrite(edit, fresh).deps,
+    ["t-3", "t-4"],
+    "the dep the agent added is untouched and the one the human clicked is gone"
+  );
+});
+
+test("positional edits are never re-applied; value-named ones always are", () => {
+  // A link removal is the ONLY positional edit: `links` is not deduped, so the
+  // index is the only thing that can tell two identical targets apart, and an
+  // index means nothing against a list it was not read from. Re-applying one
+  // would delete whatever slid into the slot — a sharper version of the defect
+  // #1349 closes.
+  assert.equal(retriesAfterStale({ kind: "link-remove-at", index: 0 }), false);
+  for (const edit of [
+    { kind: "dep-add", id: "t-3" },
+    { kind: "dep-remove", id: "t-2" },
+    { kind: "link-add", link: { type: "doc", target: "x" } },
+  ] as LinkArrayEdit[]) {
+    assert.equal(
+      retriesAfterStale(edit),
+      true,
+      `${edit.kind} names what it acts on, so the row moving underneath does not change what ` +
+        `the human asked for`
+    );
+  }
+  // Concretely: re-applying a removal by index against a row that gained a link
+  // at the front takes the WRONG entry — which is why the predicate above says
+  // no rather than the call site being careful.
+  const shifted = {
+    id: "t-1",
+    status: "queued",
+    links: [
+      { type: "test-case", target: "tests/t.rs" },
+      { type: "requirement", target: "#1349" },
+    ],
+    link_etag: "b",
+  };
+  assert.deepEqual(
+    composeLinkArrayWrite({ kind: "link-remove-at", index: 0 }, shifted).links?.map(
+      (l) => l.target
+    ),
+    ["#1349"],
+    "index 0 now names the agent's link, not the one the human clicked ✕ on"
+  );
+});
+
+test("every argument key the board composes is a declared orch_upsert_task parameter", () => {
+  // The one link in the always-guarded chain that nothing else pins (#1349 N2).
+  // `composeLinkArrayWrite` emits camelCase keys that Tauri maps to the
+  // command's snake_case parameters; a typo THERE — `expectLinkEtag` misspelled,
+  // or the Rust parameter renamed — leaves the board composing an UNGUARDED
+  // write with the whole suite green and `tsc` clean, because neither side can
+  // see the other. That is the silently-inert-guard shape §16.6 cross-pins
+  // `STALE_LINK_ETAG_PREFIX` against, one layer down.
+  //
+  // The keys are DERIVED by running the composer over every edit kind rather
+  // than restated here, so a new edit kind that emits a new argument is covered
+  // the day it is added instead of the day someone remembers this test.
+  const row = {
+    id: "t-1",
+    status: "queued",
+    deps: ["t-2"],
+    links: [{ type: "requirement", target: "#1349" }],
+    link_etag: "0123456789abcdef",
+  };
+  const edits: LinkArrayEdit[] = [
+    { kind: "dep-add", id: "t-3" },
+    { kind: "dep-remove", id: "t-2" },
+    { kind: "link-add", link: { type: "doc", target: "docs/x.md" } },
+    { kind: "link-remove-at", index: 0 },
+  ];
+  const emitted = new Set<string>();
+  for (const edit of edits) {
+    for (const k of Object.keys(composeLinkArrayWrite(edit, row))) emitted.add(k);
+  }
+  assert.ok(
+    emitted.has("expectLinkEtag"),
+    "population control: the composer must emit the guard key at all, or the sweep below " +
+      "is checking an empty set and passes over anything"
+  );
+
+  const src = readFileSync(RUST_LADDER, "utf8");
+  const start = src.indexOf("pub async fn orch_upsert_task(");
+  assert.notEqual(
+    start,
+    -1,
+    "orch_upsert_task is gone or renamed in mod.rs — this guard reads it by name, so update " +
+      "it here rather than deleting the only thing pinning the wire names together"
+  );
+  const end = src.indexOf(") -> Result<Task, String> {", start);
+  assert.notEqual(end, -1, "could not find the end of orch_upsert_task's parameter list");
+  const sig = src.slice(start, end);
+  // `name: Type,` at the head of a line — the declaration shape, not a mention
+  // in the doc comments (which sit ABOVE the fn and are outside this slice
+  // anyway) and not a type name.
+  const declared = new Set([...sig.matchAll(/^\s{4}([a-z_][a-z0-9_]*):\s/gm)].map(([, n]) => n));
+  assert.ok(
+    declared.size > 5,
+    `only ${declared.size} parameters parsed out of orch_upsert_task — the pattern cannot see ` +
+      `its own subjects, so this guard is not comparing what it thinks. Signature was:\n${sig}`
+  );
+  // Tauri's own mapping, and the only transformation in play.
+  const snake = (k: string) => k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  for (const key of emitted) {
+    assert.ok(
+      declared.has(snake(key)),
+      `the board sends \`${key}\` (-> \`${snake(key)}\`), which orch_upsert_task does not ` +
+        `declare. Tauri drops an unknown argument silently, so for \`expectLinkEtag\` that is ` +
+        `an unguarded write the human is told succeeded. Declared: ${[...declared].join(", ")}`
+    );
+  }
+  // Scope, stated rather than implied: this covers the arguments THIS view
+  // composes. The ~20 other parameters on the same command are reached from
+  // other call sites and are not swept here.
 });

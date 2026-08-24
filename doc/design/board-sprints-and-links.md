@@ -1,7 +1,8 @@
 # Design: board sprints and typed grounding links (#1272, #1273)
 
 Status: **backend implemented** (PR A); **grounding injected at spawn** (PR B, §12); **the
-board's sprint UI implemented** (PR C, §13); **the board's links UI implemented** (PR D, §14).
+board's sprint UI implemented** (PR C, §13); **the board's links UI implemented** (PR D, §14);
+**whole-array writes guarded against a stale snapshot** (#1349, §16).
 Two human-requested features that touch the same
 persisted structure, landed as ONE additive board-model revision rather than two: the schema
 change, its validation, the derived projections, the MCP surface, and the one role-template
@@ -464,7 +465,9 @@ Three surfaces, all of them chrome inside the existing board overlay — nothing
 layout sibling of `#grid-area` and nothing resizes a PTY (hard constraint 1). **No new
 backend surface either**: both edits ride `orch_upsert_task`'s existing `links` argument
 from PR A, which replaces the whole array, so each one composes the new list from the one
-that was rendered and sends it whole.
+that was rendered and sends it whole. (#1349 added exactly one argument to that call — the
+`expect_link_etag` guard in §16 — and no new command. Composing from the rendered list is still
+what the board does; what it can no longer do is land a list composed from one that has moved.)
 
 **One entry point per row, carrying the count.** 📎 sits in the same slot as 🔗/⤵/🏷/🎯 and
 is present on every row, for the reason the sprint picker is: a row with no links has no
@@ -512,6 +515,13 @@ same target twice under two types — the spec that is also the requirement. Rem
 would take both, and the human clicked exactly one ✕. `withoutArtifactLinkAt` also returns the
 list unchanged for an out-of-range index, because a stale render whose row has already changed
 underneath is the reachable way one arrives.
+
+That unchanged-list return is a *floor*, not the answer, and §16 is what makes removal-by-index
+sound: an index names what the human clicked only while the array it was read from is still the
+array being written, and a shorter concurrent list makes the range check pass on an entry nobody
+pointed at. Since #1349 every one of these edits carries the row's `link_etag`, so a stale
+render is REFUSED rather than silently composing something else — and this one edit is the one
+the board never re-applies automatically, for the same reason.
 
 **The editor re-spells none of the backend's rules.** Its only refusal is an empty target,
 and that is "the form is not filled in yet", not validation. The type vocabulary, the length
@@ -584,3 +594,212 @@ PR D (the links UI, §14) — `src/taskboard.ts`: `MAX_ARTIFACT_LINKS`, `artifac
 
 Tests: `src-tauri/tests/orchestration.rs` (the `#1272`/`#1273` block),
 `test/taskboard.test.ts`, `test/boardprefs.test.ts`.
+
+#1349 (the stale-snapshot guard) has its own symbol list in §16.8 — it is a later revision of
+this contract rather than one of the four PRs above, and keeping it separate is what stops this
+section reading as though it shipped with them.
+
+## 16. The stale-snapshot guard on whole-array writes — `link_etag` (#1349)
+
+**A public-contract change**, and the third one this note carries: an MCP tool argument, a
+`#[tauri::command]` parameter, and one new key on every agent-facing task read.
+
+### 16.1 The failure
+
+`deps`, `related` and `links` all REPLACE (§8) — there is no add or remove verb anywhere on
+the surface. The human's board therefore composes each edit as a whole new array from the row
+it **painted**, which is what §14 says outright, and what `withoutDep`, `withArtifactLink` and
+`withoutArtifactLinkAt` are for.
+
+That is safe only while nothing else writes those arrays. #1273's entire premise is that
+something does: planners and orchestrators record grounding on rows the human is looking at.
+So:
+
+1. the board paints `t-5` with two links;
+2. the orchestrator adds a third through `upsert_task`;
+3. the human clicks ✕ on entry 0 of the two they can see.
+
+The write sends the *old* two-element list minus index 0. The orchestrator's link is gone, no
+error is raised anywhere, and nobody involved can tell. Index drift is the same defect one
+level down: `withoutArtifactLinkAt`'s range check passes against a list that no longer has the
+entry at the position the human clicked, so the removal takes a different link than the one
+they pointed at.
+
+This is a **family property, not a links defect**. `withoutDep` has had the identical
+replace-from-snapshot shape since #582; PR D inherited the contract rather than introducing it.
+Whatever closes it has to close all three arrays, which is why there is one mechanism here and
+not one per field.
+
+### 16.2 The mechanism
+
+Every read of a task now carries **`link_etag`** — a 16-hex fingerprint of exactly `deps`,
+`related` and `links`. `upsert_task` and `orch_upsert_task` gain an optional
+**`expect_link_etag`**: pass the token the row carried in the read you composed your array
+from, and the write is refused — nothing written, both tokens named in the error — if any of
+those three arrays has moved since. Omit it and the write lands unguarded, exactly as before.
+
+The HTTP `ETag`/`If-Match` shape, deliberately: optimistic concurrency, refuse-and-refresh, no
+locks, no server-side merge.
+
+Three properties are load-bearing.
+
+**Derived, never stored.** `link_etag` is a function of the row's content, computed at read
+time. `tasks.json` gains no key, so #1272/#1273's additive promise holds unchanged and an older
+loomux reading a newer board still sees byte-identical rows. More importantly there is **no
+bump site to forget**: every path that changes one of those arrays moves the token by
+construction — an agent's `upsert_task`, the human's board, `strip_deleted_links` when a linked
+task is deleted, `promote_orphans`, even a hand edit of the file. A stored counter would need
+an increment at each of those, and the one nobody remembers is the one that leaves the guard
+silently inert. `a_delete_that_strips_a_dep_moves_the_survivors_etag` is that property under
+test, against a path that has never heard of #1349.
+
+**Scoped to the three arrays, and nothing else.** The token covers what a whole-array replace
+DESTROYS. A note append, a status flip, an assignee write and a sprint change all leave a
+pending array edit valid — which matters because the rows a human is part-way through editing
+are exactly the rows a worker is posting progress notes to. Over-refusal is not free: a guard
+that fires on unrelated activity is one people route around.
+
+**Not an authorization, and nothing may ever read it as one.** FNV-1a is trivially collidable.
+That is acceptable because forging a token buys a caller nothing it could not already do by
+writing the array with no token at all — an unguarded replace is still the default. The guard
+turns a silent loss into a refusal; it is not, and must never become, a check on who may write.
+
+The hash is written out rather than taken from `DefaultHasher`, whose output Rust explicitly
+does not guarantee across versions — "reproducible from the row alone" is the whole contract.
+Fields are mixed in **length-prefixed** and under their own name, so `["ab"]` and `["a","b"]`
+differ, moving an id from `deps` to `related` differs, an absent label and an empty one differ
+(they are different rows on the wire), and a reorder differs (order IS the reading order, §3).
+
+`link_etag`'s body destructures `Task` **exhaustively**, for `agent_task_view`'s reason one
+field over: a fourth replace-wholesale array added later must not silently fall outside the
+guard. Adding a field to `Task` stops the crate compiling until somebody classifies it.
+
+### 16.3 Rejected: server-side patch ops (`add_link` / `remove_link`)
+
+The issue's other candidate — give the surface add/remove verbs so the server composes against
+current state. Rejected on three counts, the first of which is fatal on its own:
+
+1. **It does not fix removal.** `links` is not deduped (§3), so there is no value that
+   identifies one entry: `remove_link(target)` takes both copies of a target the row carries
+   twice, and `remove_link(index)` is the index-drift half of §16.1 with the drift moved
+   server-side, where the human cannot even see it. Making it work needs per-link identity —
+   a stored id on every entry, a migration for every existing board, and a new thing for agents
+   to carry. That is a much larger contract change to solve half the problem.
+2. **It multiplies the surface.** Three arrays × add/remove is six new arguments (or a verb
+   field, which is a second dispatcher inside one tool) beside the three that already exist and
+   must keep existing for agents that legitimately set a whole array at once. `expect_link_etag`
+   is one argument covering all three, and the replace semantics stay exactly as documented.
+3. **It closes only the operations it enumerates.** The hazard is the *class* — a whole-array
+   replace composed from a stale read — and a token guards every such write, including ones
+   nobody has written yet.
+
+### 16.4 Rejected: `updated_ms` as the token
+
+Tempting because it needs no new key anywhere: it is already on `Task`, `TaskSummary` and
+`AgentTaskView`, and the board already receives it. Rejected on two independent grounds.
+
+- **It is too broad.** It moves on *every* write to the row, so a worker's progress note
+  refuses the human's link removal. That is a spurious failure on the most active rows, and
+  spurious failures are how a guard gets called noisy and worked around.
+- **It is not sound.** `now_ms()` has millisecond granularity, so two writes to the same row
+  inside one millisecond produce the same stamp and a changed row can present an unchanged
+  token — an ABA a content fingerprint cannot have.
+
+Hashing the whole row instead of the three arrays fixes the second and keeps the first.
+
+### 16.5 Backward compatibility, and why the two callers differ
+
+**Agents are opt-in; the human's board always sends it.** The asymmetry is the point rather
+than a transition state:
+
+- An agent composes an array from a `list_tasks` it made inside the same turn, and it *can* be
+  told to re-read and retry, in an error message it will actually act on. Requiring the token
+  would break every existing orchestrator prompt and every third-party CLI driving this tool,
+  for a materially smaller exposure.
+- The human's board composes from a **render** that can be minutes old, edited by hand, and
+  the human cannot be scripted into a retry. It is also the surface the issue was filed
+  against.
+
+So `expect_link_etag: None` keeps the historic last-writer-wins behaviour, `upsert_task`'s tool
+description recommends passing it, and there is no migration and no flag day.
+
+**State the residual precisely, because the obvious reading of it is wrong.** The token is a
+precondition on **the writer alone** — nothing about a landed write is protected by the fact
+that it was itself guarded. So the residual is not "two unguarded writers race each other". It
+is: the human's board edit lands, correctly guarded; an agent holding a `list_tasks` from
+*before* that edit calls `upsert_task(links: […])` with no token; the check is skipped
+entirely, its whole-array replace lands, and the human's edit is gone with no error anywhere.
+One agent, one omitted argument, a destroyed **human** write — #1349's own direction of loss,
+mirrored. What #1349 closes mandatorily is the board's side: the board can never be the writer
+that does this, because it always sends the token.
+
+That residual and the decision it implies — whether to require the token for agent-origin array
+replaces, and what evidence would justify it (a refusal is deliberately not audited today, so
+its rate is not observable yet) — are tracked on **#1386**. Nothing here forecloses any of it.
+
+Passing it on a **create** is refused rather than ignored — a row being created has no prior
+arrays, so a token there can only be a caller mistake, which is the position `claim` already
+takes for the same reason.
+
+### 16.6 The board's recovery: refuse, re-read, re-apply the INTENT — once
+
+`TasksView.writeLinkArray` is the single path for all four array edits. It sends
+`composeLinkArrayWrite(edit, row)`, which pairs the array with the token from **the same row**
+— the pairing is the reason this is one function and not a convention at four call sites.
+
+On a stale refusal it re-reads the board and re-applies the human's **intent** to the row as it
+is now, guarded again by the re-read's own token, so a third writer arriving in between refuses
+the retry rather than landing it blind. One retry, no loop: a second failure means the board is
+moving faster than anything useful can be shown, and the honest answer is the toast plus the
+repaint.
+
+**Which edits are eligible is decided by shape, not by taste.** `retriesAfterStale` says yes to
+every edit that names a VALUE — "remove the dep on t-3", "add this requirement link" — because
+re-applying those to the current row is exactly what the human asked for whatever else changed.
+It says no to the one edit that names a POSITION: a link removal carries an index, an index
+means nothing against a list it was not read from, and re-applying one would delete whatever
+slid into that slot. That one refuses, the board repaints, and the human clicks the ✕ they can
+now see.
+
+Everything that is *not* a stale-token refusal — an unknown dep, a cycle, the link cap, a
+target naming a board task — falls straight through to the toast, unchanged. Those are the
+human's own edit being wrong, and §14's "the editor re-spells none of the backend's rules"
+still holds: the errors that teach are the ones the human keeps seeing.
+
+`STALE_LINK_ETAG_PREFIX` is the one string both sides spell, so it is pinned the way the status
+and link-type vocabularies are — a test reads the Rust const out of `mod.rs` and compares. Drift
+there is invisible otherwise: every other refusal keeps behaving exactly as before, and the
+board simply stops recovering from the one error it was built to recover from.
+
+### 16.7 Surface
+
+- **`upsert_task`** gains `expect_link_etag` (string, optional, **strict** — a wrong-typed
+  value is refused, never dropped, because a silently-dropped guard tells the caller their
+  guarded write landed when it did not).
+- **`list_tasks`** rows and **`get_task`** carry `link_etag`, **always present** — unlike every
+  other optional key on a row. A row with no links is exactly the row a first link is added to,
+  so omitting the token on the empty case would leave the one caller that needs a value with
+  none. Sixteen characters; §8's pay-for-what-you-use rule is about unbounded payload (#245),
+  and this is not that.
+- **`orch_upsert_task`** gains the same optional parameter. Validation lives in the registry
+  for both callers: the rule does not depend on who wrote it.
+- **`orch_tasks`** returns `BoardTask` — every `Task` field flattened, plus `link_etag`. A
+  wrapper rather than a field on `Task`, because `Task` is what `write_tasks` persists.
+- No ACL or manifest change: `command_manifest.rs` and `tests/acl_manifest.rs` pin command
+  *names*, never signatures.
+- The refusal is not audited. Nothing is written, and an audit entry for a write that did not
+  happen would be the log claiming something the board never did — the position `upsert_task`
+  already takes for every other refusal.
+### 16.8 Symbols
+
+Backend (`src-tauri/src/orchestration/mod.rs`): `link_etag`, `STALE_LINK_ETAG_PREFIX`,
+`BoardTask`, `board_task`, `TaskPatch::expect_link_etag`, `TaskSummary::link_etag`,
+`AgentTaskView::link_etag`; the `expect_link_etag` argument on `upsert_task` (`mcp.rs`) and on
+`orch_upsert_task`.
+
+Frontend (`src/taskboard.ts`): `STALE_LINK_ETAG_PREFIX`, `isStaleLinkEtag`, `LinkArrayEdit`,
+`LinkArrayWrite`, `HasLinkArrays`, `composeLinkArrayWrite`, `retriesAfterStale`.
+`src/tasksview.ts`: `TasksView.writeLinkArray`, `OrchTask.link_etag`.
+
+Tests: the `#1349` block in `src-tauri/tests/orchestration.rs` and the `#1349` block at the end
+of `test/taskboard.test.ts`.

@@ -10180,6 +10180,17 @@ pub struct TaskSummary {
     /// trip per candidate row to learn what a task is even about.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<TaskLink>,
+    /// This row's link-array fingerprint (#1349) — see `link_etag`. Echo it back
+    /// as `upsert_task`'s `expect_link_etag` when you replace `deps`, `related`
+    /// or `links` with a list you composed from THIS read, and the write is
+    /// refused rather than silently dropping whatever changed in between.
+    ///
+    /// Always present, unlike every other optional key on this row: `list_tasks`
+    /// is the read an agent composes an array replace from, and a row with no
+    /// links is exactly the row a first link gets added to. Sixteen hex
+    /// characters — the pay-for-what-you-use rule the fields above follow is
+    /// about unbounded payload (#245), and this is not that.
+    pub link_etag: String,
     /// DIRECT children of this row, and how many of them are `done` (#958) —
     /// derived at read time in `board_summaries`, never stored. Counts ONLY,
     /// and only one level: a nested child list is exactly the expansion #245
@@ -10282,6 +10293,17 @@ pub struct AgentTaskView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demo_path: Option<&'a str>,
     pub updated_ms: u64,
+    /// AGENT-VISIBLE (#1349), and DERIVED rather than projected off a `Task`
+    /// field — which is why it is an owned `String` among borrows. It is what an
+    /// agent echoes back as `expect_link_etag` when it replaces `deps`,
+    /// `related` or `links` from what this read told it, so withholding it would
+    /// leave the guard reachable only from the human board. See `link_etag`.
+    ///
+    /// Always present, never skipped: a row with no links at all is exactly the
+    /// row an agent adds a FIRST link to, and that write needs a token as much
+    /// as any other — omitting it on the empty case would leave the one caller
+    /// that needs a value with none.
+    pub link_etag: String,
 }
 
 /// Project a stored `Task` onto the agent-facing view — see `AgentTaskView`.
@@ -10334,7 +10356,147 @@ pub fn agent_task_view(task: &Task) -> AgentTaskView<'_> {
         sprint: *sprint,
         links,
         updated_ms: *updated_ms,
+        link_etag: link_etag(task),
     }
+}
+
+/// The prefix every stale-`link_etag` refusal opens with (#1349). Load-bearing
+/// TEXT, not decoration: the human board matches on it to tell "the row moved
+/// under you, re-read and re-apply" from every other refusal `upsert_task` can
+/// return (a cycle, a cap, an unknown id), which are the human's own mistake and
+/// must not be silently retried. `test/taskboard.test.ts` reads this const out
+/// of this source so the two spellings cannot drift.
+pub const STALE_LINK_ETAG_PREFIX: &str = "the board changed under you";
+
+/// FNV-1a's 64-bit offset basis and prime, written out rather than reached for
+/// through `DefaultHasher` (#1349).
+///
+/// `DefaultHasher`'s output is explicitly NOT guaranteed stable across Rust
+/// versions, and while an etag never outlives a process today, "this token is
+/// reproducible from the row alone" is the whole contract — a hash whose
+/// documentation reserves the right to change is the wrong thing to build it on.
+/// Ten lines of fully-specified arithmetic cost nothing and are testable.
+const LINK_ETAG_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const LINK_ETAG_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn etag_byte(h: &mut u64, b: u8) {
+    *h ^= b as u64;
+    *h = h.wrapping_mul(LINK_ETAG_PRIME);
+}
+
+/// Mix one field in LENGTH-PREFIXED, never as bare bytes. Without the prefix
+/// `["a","b"]` and `["ab"]` hash identically, and a concurrent write that split
+/// one dep id into two would then be invisible to the guard — the exact class of
+/// silent loss #1349 exists to close.
+fn etag_field(h: &mut u64, bytes: &[u8]) {
+    for b in (bytes.len() as u64).to_le_bytes() {
+        etag_byte(h, b);
+    }
+    for &b in bytes {
+        etag_byte(h, b);
+    }
+}
+
+/// A fingerprint of the three arrays on a task that `upsert_task` REPLACES
+/// wholesale — `deps`, `related` and `links` (#1349).
+///
+/// **Derived, never stored.** `tasks.json` gains no key and there is no bump
+/// site to forget: every path that changes one of those arrays — an agent's
+/// `upsert_task`, the human board, `strip_deleted_links` on a delete,
+/// `promote_orphans`, a hand edit of the file — changes the token by
+/// construction, because the token is a function of the row's content and
+/// nothing else. A stored counter would have to be incremented at each of those
+/// sites, and the one nobody remembers is the one that silently disables the
+/// guard.
+///
+/// **Scoped to those three arrays and nothing else, and that is the design.**
+/// The hazard is a whole-array replace composed from a stale snapshot, so the
+/// token covers exactly what such a write destroys. Hashing the whole row
+/// instead (or reusing `updated_ms`, which is the same thing with worse
+/// granularity — see `doc/design/board-sprints-and-links.md` §16) would refuse a
+/// human's half-finished link edit because a worker appended a progress note to
+/// the same row, which is a spurious refusal on the board's most active rows.
+///
+/// **NOT AN AUTHORIZATION, and nothing may ever treat it as one.** FNV-1a is
+/// trivially collidable, deliberately: forging a token buys a caller nothing it
+/// cannot already do by writing the array directly, since an unguarded replace
+/// is still the default. This is optimistic concurrency — the HTTP `ETag` /
+/// `If-Match` shape — and its only job is to turn a silent loss into a refusal.
+pub fn link_etag(task: &Task) -> String {
+    // EXHAUSTIVE ON PURPOSE, for `agent_task_view`'s reason one field over: a
+    // fourth replace-wholesale array added to `Task` must not silently fall
+    // outside the guard. Adding a field breaks this line, and whoever adds it
+    // has to say whether the token covers it (name it below) or not (bind it to
+    // `_` here). Do not replace it with `..`.
+    let Task {
+        deps,
+        related,
+        links,
+        // Not covered — none of these is replaced wholesale from a rendered
+        // snapshot, and folding them in would make every note append and every
+        // status flip invalidate a pending array edit.
+        id: _,
+        title: _,
+        status: _,
+        issue: _,
+        pr: _,
+        pr_base: _,
+        assignee: _,
+        session: _,
+        notes: _,
+        parent: _,
+        kind: _,
+        sprint: _,
+        demo_path: _,
+        cleared_ms: _,
+        updated_ms: _,
+    } = task;
+    let mut h = LINK_ETAG_OFFSET;
+    for (name, ids) in [("deps", deps), ("related", related)] {
+        // The field NAME is mixed in too, so moving an id from `deps` to
+        // `related` changes the token even though the multiset did not.
+        etag_field(&mut h, name.as_bytes());
+        etag_field(&mut h, &(ids.len() as u64).to_le_bytes());
+        for id in ids {
+            etag_field(&mut h, id.as_bytes());
+        }
+    }
+    etag_field(&mut h, b"links");
+    etag_field(&mut h, &(links.len() as u64).to_le_bytes());
+    for l in links {
+        etag_field(&mut h, l.link_type.as_bytes());
+        etag_field(&mut h, l.target.as_bytes());
+        etag_field(&mut h, l.label.as_deref().unwrap_or("").as_bytes());
+        // A missing label and an empty one are different rows on the wire
+        // (`skip_serializing_if`), so they must be different tokens.
+        etag_byte(&mut h, u8::from(l.label.is_some()));
+    }
+    format!("{h:016x}")
+}
+
+/// The HUMAN board's read model (#1349): every `Task` field exactly as it was,
+/// flattened, plus the derived `link_etag` the board echoes back on an array
+/// write.
+///
+/// A wrapper rather than a field on `Task`, because `Task` is what
+/// `write_tasks` serializes: a derived key on it would be persisted into a
+/// `tasks.json` humans read and diff, re-read on load, and then immediately
+/// recomputed — `Task::demo_path`'s argument for `skip_serializing_if`, one step
+/// further along. Nothing is stored, so an older loomux reading a newer file
+/// still sees byte-identical rows.
+///
+/// `#[serde(flatten)]` keeps this ADDITIVE on the wire: the board's `OrchTask`
+/// gains one key and every existing one is untouched.
+#[derive(Serialize)]
+pub struct BoardTask {
+    #[serde(flatten)]
+    pub task: Task,
+    pub link_etag: String,
+}
+
+/// Project a stored `Task` onto the human board's view — see `BoardTask`.
+pub fn board_task(task: Task) -> BoardTask {
+    BoardTask { link_etag: link_etag(&task), task }
 }
 
 /// The only status that satisfies a dependency edge (#582). Merged/accepted is
@@ -10466,6 +10628,7 @@ pub fn task_summary(t: &Task, ready: bool, children: usize, children_done: usize
         kind: t.kind.clone(),
         sprint: t.sprint,
         links: t.links.clone(),
+        link_etag: link_etag(t),
         children,
         children_done,
         ready,
@@ -11089,6 +11252,19 @@ pub struct TaskPatch {
     /// spells this field out as `None` rather than defaulting it, so an agent
     /// cannot reach it and a future field cannot leak there by omission.
     pub cleared: Option<bool>,
+    /// Optimistic-concurrency guard on the three replace-wholesale arrays
+    /// (#1349): the `link_etag` the caller read, echoed back. `None` skips the
+    /// check entirely, which is what keeps every pre-#1349 caller working —
+    /// including every agent that replaces `links` from a `list_tasks` it made
+    /// inside the same turn.
+    ///
+    /// Checked before ANY field is applied, so a mismatch leaves the board
+    /// exactly as it was, like every other refusal in `upsert_task_from`. It
+    /// guards the whole write rather than only the array arguments: a caller
+    /// that passes it is saying "apply this against the row I read", and
+    /// splitting the write into a guarded and an unguarded half would be a
+    /// second rule for the same call.
+    pub expect_link_etag: Option<String>,
     /// Atomic claim (#582): guard this write on the task still being
     /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
     /// the same locked write. A plain (non-claim) upsert keeps its historic
@@ -27031,6 +27207,18 @@ impl OrchRegistry {
         // sit in a sprint far ahead of every other. `current_sprint` derives
         // from whatever the rows say, so there is no board-level invariant to
         // keep and no ordering the board could be wrong about.
+        // Same shape as the claim check below, and for the same reason: a row
+        // this call is CREATING has no prior arrays to have changed under
+        // anybody, so a token can only ever be a caller mistake. Refuse it where
+        // the caller can see it rather than ignoring an argument they passed on
+        // purpose (#1349).
+        if patch.expect_link_etag.is_some() && id.is_none() {
+            return Err(
+                "expect_link_etag guards an EXISTING task's links against a concurrent edit — \
+                 a task being created has none. Drop it, or pass the id you meant to edit."
+                    .into(),
+            );
+        }
         if patch.claim {
             // A claim is a guarded transition on an EXISTING row: the guards
             // (queued, unclaimed-or-mine, deps met) are the whole point, and a
@@ -27132,6 +27320,29 @@ impl OrchRegistry {
             }
         };
         let this_id = tasks[idx].id.clone();
+        // ---- the stale-snapshot guard (#1349), FIRST among the checks that
+        // read this row, and before any of them can waste work on a write that
+        // is about to be refused. The board this write is judged against is the
+        // one under `tasks_lock`, so a token that matches here cannot go stale
+        // before `write_tasks` at the bottom.
+        //
+        // The failure it closes: the human board paints a row's links, an agent
+        // adds one through MCP, and the human clicks ✕ on entry 0. Composed from
+        // the RENDERED array, that click sends a two-element list with no trace
+        // of the agent's third link — a whole-array replace that silently
+        // discards a write nobody has seen. It is also what makes the board's
+        // remove-BY-INDEX sound: an index only names what the human clicked
+        // while the array it was read from is still the array being written.
+        if let Some(expected) = patch.expect_link_etag.as_deref() {
+            let actual = link_etag(&tasks[idx]);
+            if expected != actual {
+                return Err(format!(
+                    "{STALE_LINK_ETAG_PREFIX}: {this_id}'s deps/related/links changed since you \
+                     read them (you sent link_etag {expected}, the board has {actual}). Nothing \
+                     was written — re-read the task and re-apply your edit to the current list."
+                ));
+            }
+        }
         // Read before any field is applied, because the demo-gate hook at the
         // bottom keys on the TRANSITION rather than on the resulting status
         // (#1151). A row created by this very call reads `queued` here — which is
@@ -51455,12 +51666,15 @@ pub async fn orch_needs_you_clear(app: AppHandle, group_id: String) -> Result<u6
 /// old file or the whole new one, never a torn one; the main-thread dispatch
 /// this replaces was serializing readers against each other for nothing.
 #[tauri::command]
-pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<Task> {
+pub async fn orch_tasks(app: AppHandle, group_id: String) -> Vec<BoardTask> {
     let reg = reg_of(&app);
     // #904: no error channel; an unvalidated id yields the same empty list
     // a group with no rows does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
-    run_blocking(move || reg.tasks(&group_id)).await
+    // #1349: each row carries its derived `link_etag`, which the board sends
+    // back as `expect_link_etag` on every write that replaces `deps` or `links`.
+    // Derived here rather than stored — see `BoardTask`.
+    run_blocking(move || reg.tasks(&group_id).into_iter().map(board_task).collect()).await
 }
 
 /// Audit-log timeline for the pane's audit-viewer overlay (read-only). Oldest
@@ -51660,6 +51874,12 @@ pub async fn orch_upsert_task(
     // #1152: the human's archive stamp. Same additive contract; absent means
     // "leave it alone". Human-only by construction — no MCP tool takes it.
     cleared: Option<bool>,
+    // #1349: the `link_etag` the board read this row at. Additive like the
+    // rest — but the board sends it on EVERY write that replaces `deps` or
+    // `links`, because the board's arrays are composed from a painted row that
+    // an agent may already have edited underneath. Validated in the registry,
+    // identically to the MCP path: the rule does not depend on who wrote it.
+    expect_link_etag: Option<String>,
 ) -> Result<Task, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
@@ -51679,6 +51899,7 @@ pub async fn orch_upsert_task(
                 cleared,
                 sprint,
                 links,
+                expect_link_etag,
                 ..Default::default()
             },
         )?;

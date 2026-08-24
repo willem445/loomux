@@ -148,6 +148,9 @@ use loomux_lib::orchestration::{
     // so the placement pin can rebuild the expected kickoff rather than
     // re-spelling the section as a literal that could drift from it.
     grounding_section,
+    // #1349: the derived fingerprint of the three replace-wholesale arrays,
+    // and the prefix its refusal opens with (which the board matches on).
+    board_task, link_etag, STALE_LINK_ETAG_PREFIX,
     MAX_TASK_LINKS, MAX_TASK_LINK_TARGET, MAX_TASK_LINK_LABEL,
     TASK_STATUSES,
     // #1156: the strict Agile ladder, pinned against Rust literals here
@@ -9966,6 +9969,9 @@ fn done_row(id: &str, status: &str, updated_ms: u64) -> TaskSummary {
         kind: None,
         sprint: None,
         links: vec![],
+        // #1349: derived per read, so the literal that stands in for one carries
+        // the token an empty row produces. `filter_done_rows` never reads it.
+        link_etag: link_etag(&linked(id, status, &[], &[])),
         children: 0,
         children_done: 0,
         ready: false,
@@ -55747,5 +55753,428 @@ fn the_agent_spawn_audit_records_which_board_row_grounded_it() {
         json!(null),
         "an unbound spawn records the absence rather than omitting the key — the two are \
          different facts and the log has to be able to say which"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The stale-snapshot guard on whole-array board writes (#1349).
+//
+// `deps`, `related` and `links` all REPLACE, and the human's board composes each
+// new array from the row it PAINTED — so an agent's concurrent write to the same
+// arrays is discarded with no error anywhere. `link_etag` fingerprints exactly
+// those three arrays; `expect_link_etag` refuses a write built on a stale one.
+// See doc/design/board-sprints-and-links.md §16.
+// ---------------------------------------------------------------------------
+
+/// The issue's own interleaving, end to end: the board paints a row with two
+/// links, the orchestrator adds a third through MCP, and the human clicks ✕ on
+/// entry 0 of the two they can see.
+///
+/// The human's write is composed from the SNAPSHOT — a two-element list minus
+/// index 0 — which is exactly what the board sends. Guarded, it is refused and
+/// the agent's link survives; the sibling test below is the same interleaving
+/// unguarded, and is what makes this one's assertions non-vacuous.
+#[test]
+fn a_stale_link_etag_refuses_the_write_and_the_agents_link_survives() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg
+        .upsert_task(&g.id, "orch", None, patch(Some("Ship the parser"), None, None))
+        .unwrap();
+    let painted = vec![
+        link("requirement", "#1349", Some("the ask")),
+        link("design-note", "doc/design/board-sprints-and-links.md", None),
+    ];
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(painted.clone())).unwrap();
+
+    // What the human's board read, and rendered its two ✕ buttons from.
+    let snapshot = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    let etag = link_etag(&snapshot);
+
+    // ...and then the orchestrator adds a third link the human never saw.
+    let mut agent_links = painted.clone();
+    agent_links.push(link("test-case", "src-tauri/tests/orchestration.rs", None));
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(agent_links)).unwrap();
+
+    // The click: the whole array as painted, minus index 0.
+    let err = reg
+        .upsert_task_by_human(
+            &g.id,
+            "human",
+            Some(&t.id),
+            TaskPatch {
+                links: Some(painted[1..].to_vec()),
+                expect_link_etag: Some(etag.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        err.starts_with(STALE_LINK_ETAG_PREFIX),
+        "the refusal must open with the prefix the board matches on, so it can tell this \
+         from a cycle or a cap and re-read instead of just toasting: {err}"
+    );
+    assert!(err.contains(&etag), "the error names the token the caller sent: {err}");
+
+    let after = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    assert_eq!(
+        after.links.len(),
+        3,
+        "NOTHING was written: the agent's third link is still there, and so is the entry the \
+         human meant to remove — a refusal leaves the board exactly as it was"
+    );
+    assert_eq!(after.links[2].target, "src-tauri/tests/orchestration.rs");
+}
+
+/// The same interleaving with NO token — today's behaviour, kept working on
+/// purpose (every agent that replaces an array from a read it just made is
+/// unaffected by #1349), and the positive control for the test above: it proves
+/// the interleaving really does destroy the agent's link, so the refusal is
+/// preventing a loss rather than passing over an already-safe write.
+#[test]
+fn an_unguarded_replace_still_lands_and_still_drops_the_concurrent_write() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch", None, patch(Some("Ship it"), None, None)).unwrap();
+    let painted = vec![link("requirement", "#1349", None), link("doc", "docs/x.md", None)];
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(painted.clone())).unwrap();
+
+    let mut agent_links = painted.clone();
+    agent_links.push(link("test-case", "tests/t.rs", None));
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(agent_links)).unwrap();
+
+    // No `expect_link_etag` — the pre-#1349 call, byte for byte.
+    reg.upsert_task_by_human(&g.id, "human", Some(&t.id), links_patch(painted[1..].to_vec()))
+        .unwrap();
+
+    let after = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    assert_eq!(
+        after.links.len(),
+        1,
+        "unguarded, the stale replace lands whole — the agent's third link is GONE, which is \
+         the loss #1349 exists to close and the reason the guard is worth having"
+    );
+    assert_eq!(after.links[0].target, "docs/x.md");
+}
+
+/// The other half of the control: a token that still MATCHES must let the write
+/// through untouched. Without this the refusal could be refusing everything.
+#[test]
+fn a_matching_link_etag_lets_the_write_through() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch", None, patch(Some("Ship it"), None, None)).unwrap();
+    let painted = vec![link("requirement", "#1349", None), link("doc", "docs/x.md", None)];
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(painted.clone())).unwrap();
+
+    let etag = link_etag(&reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap());
+    reg.upsert_task_by_human(
+        &g.id,
+        "human",
+        Some(&t.id),
+        TaskPatch {
+            links: Some(painted[1..].to_vec()),
+            expect_link_etag: Some(etag),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let after = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    assert_eq!(after.links.len(), 1, "nothing moved under it, so the removal lands");
+    assert_eq!(after.links[0].target, "docs/x.md");
+}
+
+/// ONE mechanism for all three arrays, not one per array. A `deps` edit and a
+/// `related` edit each invalidate a pending `links` write, because all three are
+/// replaced wholesale from the same painted row and a separate token per array
+/// would be three guards to keep in step.
+#[test]
+fn the_etag_covers_deps_and_related_and_not_only_links() {
+    for field in ["deps", "related"] {
+        let (reg, _d) = test_registry();
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let a = reg.upsert_task(&g.id, "orch", None, patch(Some("A"), None, None)).unwrap();
+        let b = reg.upsert_task(&g.id, "orch", None, patch(Some("B"), None, None)).unwrap();
+        reg.upsert_task(&g.id, "orch", Some(&a.id), links_patch(vec![link("doc", "x.md", None)]))
+            .unwrap();
+
+        let etag = link_etag(&reg.tasks(&g.id).into_iter().find(|x| x.id == a.id).unwrap());
+        // The concurrent write touches a DIFFERENT array from the one the human
+        // is editing.
+        let moved = if field == "deps" {
+            TaskPatch { deps: Some(vec![b.id.clone()]), ..Default::default() }
+        } else {
+            TaskPatch { related: Some(vec![b.id.clone()]), ..Default::default() }
+        };
+        reg.upsert_task(&g.id, "orch", Some(&a.id), moved).unwrap();
+
+        let err = reg
+            .upsert_task_by_human(
+                &g.id,
+                "human",
+                Some(&a.id),
+                TaskPatch {
+                    links: Some(vec![]),
+                    expect_link_etag: Some(etag),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.starts_with(STALE_LINK_ETAG_PREFIX),
+            "a concurrent {field} write must invalidate a pending links write — one token \
+             covers all three arrays: {err}"
+        );
+        let after = reg.tasks(&g.id).into_iter().find(|x| x.id == a.id).unwrap();
+        assert_eq!(after.links.len(), 1, "and nothing was written");
+    }
+}
+
+/// The BOUND on over-refusal, and the reason the token is not `updated_ms` and
+/// not a hash of the whole row (§16).
+///
+/// A worker appending a progress note to the row the human is part-way through
+/// editing is routine — it is the most active rows that get both — and refusing
+/// the human's click for it would be a spurious failure on exactly the boards
+/// this feature is for. The token covers what a replace DESTROYS and nothing
+/// else, so a note, a status flip and an assignee write all leave it valid.
+#[test]
+fn a_note_or_status_write_leaves_a_pending_array_edit_valid() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch", None, patch(Some("Ship it"), None, None)).unwrap();
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(vec![link("doc", "x.md", None)]))
+        .unwrap();
+    let etag = link_etag(&reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap());
+
+    reg.upsert_task(&g.id, "orch", Some(&t.id), patch(None, Some("in-progress"), Some("on it")))
+        .unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch",
+        Some(&t.id),
+        TaskPatch { assignee: Some("w-9".into()), sprint: Some(3), ..Default::default() },
+    )
+    .unwrap();
+
+    let fresh = reg.tasks(&g.id).into_iter().find(|x| x.id == t.id).unwrap();
+    assert_eq!(
+        link_etag(&fresh),
+        etag,
+        "the row moved — status, note, assignee and sprint all changed — but none of the three \
+         replace-wholesale arrays did, so the human's pending link edit is still valid"
+    );
+    reg.upsert_task_by_human(
+        &g.id,
+        "human",
+        Some(&t.id),
+        TaskPatch { links: Some(vec![]), expect_link_etag: Some(etag), ..Default::default() },
+    )
+    .expect("...and the write lands");
+}
+
+/// DERIVED, not stored — so there is no bump site anyone can forget. Deleting a
+/// linked task strips its id out of every survivor's `deps` in the same write
+/// (`strip_deleted_links`), a path that has never heard of #1349, and the
+/// survivor's token moves anyway because it is a function of the row's content.
+///
+/// A stored counter is what this test would fail against: `delete_task` would
+/// have to remember to increment it on the rows it edited, and the guard would
+/// be silently inert exactly there.
+#[test]
+fn a_delete_that_strips_a_dep_moves_the_survivors_etag() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let a = reg.upsert_task(&g.id, "orch", None, patch(Some("A"), None, None)).unwrap();
+    let b = reg.upsert_task(&g.id, "orch", None, patch(Some("B"), None, None)).unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch",
+        Some(&b.id),
+        TaskPatch { deps: Some(vec![a.id.clone()]), ..Default::default() },
+    )
+    .unwrap();
+
+    let before = link_etag(&reg.tasks(&g.id).into_iter().find(|x| x.id == b.id).unwrap());
+    reg.delete_task(&g.id, "human", &a.id).unwrap();
+    let after_row = reg.tasks(&g.id).into_iter().find(|x| x.id == b.id).unwrap();
+    assert!(after_row.deps.is_empty(), "the delete stripped the dep, as it always did");
+    assert_ne!(
+        link_etag(&after_row),
+        before,
+        "a path that never heard of the guard still moved the token, because the token is \
+         derived from the arrays rather than incremented by whoever remembers to"
+    );
+}
+
+/// The token is FRAMED, not a concatenation. Four ways two different rows could
+/// otherwise hash alike — and the second is the one a real board produces, since
+/// moving an id between `deps` and `related` is an ordinary orchestrator edit.
+#[test]
+fn the_etag_frames_its_fields_so_different_arrays_cannot_collide() {
+    let one = |deps: &[&str], related: &[&str], links: Vec<TaskLink>| {
+        let mut t = linked("t-1", "queued", deps, related);
+        t.links = links;
+        link_etag(&t)
+    };
+    assert_ne!(
+        one(&["ab"], &[], vec![]),
+        one(&["a", "b"], &[], vec![]),
+        "length-prefixing is what keeps one id and two concatenated ones apart"
+    );
+    assert_ne!(
+        one(&["t-2"], &[], vec![]),
+        one(&[], &["t-2"], vec![]),
+        "the field NAME is mixed in, so moving an id from deps to related moves the token"
+    );
+    assert_ne!(
+        one(&[], &[], vec![link("doc", "x.md", None)]),
+        one(&[], &[], vec![link("doc", "x.md", Some(""))]),
+        "an absent label and an empty one are different rows on the wire, so different tokens"
+    );
+    assert_ne!(
+        one(&[], &[], vec![link("doc", "a.md", None), link("doc", "b.md", None)]),
+        one(&[], &[], vec![link("doc", "b.md", None), link("doc", "a.md", None)]),
+        "order IS the reading order, so a reorder is a change"
+    );
+    assert_eq!(
+        one(&["t-2"], &["t-3"], vec![link("doc", "x.md", Some("g"))]),
+        one(&["t-2"], &["t-3"], vec![link("doc", "x.md", Some("g"))]),
+        "and the same arrays hash the same, or nothing above means anything"
+    );
+}
+
+/// A row this call is CREATING has no prior arrays, so a token can only be a
+/// caller mistake — refused where they can see it rather than ignored, the
+/// position `claim` already takes for the same reason.
+#[test]
+fn expect_link_etag_on_a_create_is_refused() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let err = reg
+        .upsert_task(
+            &g.id,
+            "orch",
+            None,
+            TaskPatch {
+                title: Some("New".into()),
+                expect_link_etag: Some("0000000000000000".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(err.contains("expect_link_etag"), "the error names the argument: {err}");
+    assert!(reg.tasks(&g.id).is_empty(), "and no row was created");
+}
+
+/// Every read surface carries the token, ALWAYS — including on a row with no
+/// links at all, which is exactly the row a first link gets added to. An
+/// omitted-when-empty key would leave the one caller that needs a value with
+/// none.
+#[test]
+fn every_read_surface_carries_the_etag_even_on_a_linkless_row() {
+    let bare = linked("t-1", "queued", &[], &[]);
+    let mut rich = linked("t-2", "queued", &["t-1"], &[]);
+    rich.links = vec![link("doc", "x.md", None)];
+
+    let rows = board_summaries(&[bare.clone(), rich.clone()]);
+    for (i, expect) in [(0usize, link_etag(&bare)), (1, link_etag(&rich))] {
+        let row = serde_json::to_value(&rows[i]).unwrap();
+        assert_eq!(
+            row["link_etag"],
+            json!(expect),
+            "list_tasks row {i} must carry the token its own arrays produce: {row}"
+        );
+    }
+    let view = serde_json::to_value(agent_task_view(&bare)).unwrap();
+    assert_eq!(view["link_etag"], json!(link_etag(&bare)), "get_task carries it too: {view}");
+    // The human board's read model: every Task field, flattened, plus the token.
+    let board = serde_json::to_value(board_task(rich.clone())).unwrap();
+    assert_eq!(board["link_etag"], json!(link_etag(&rich)));
+    assert_eq!(board["id"], json!("t-2"), "the Task's own fields stay at the top level");
+    assert_eq!(board["links"][0]["target"], json!("x.md"));
+}
+
+/// DERIVED means `tasks.json` gains no key — the additive promise #1272/#1273
+/// made, kept here too. A stored token would appear on every row of a file
+/// humans read and diff, and an older loomux would carry it forward stale.
+#[test]
+fn the_etag_is_never_written_to_the_board_file() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch", None, patch(Some("Ship it"), None, None)).unwrap();
+    reg.upsert_task(&g.id, "orch", Some(&t.id), links_patch(vec![link("doc", "x.md", None)]))
+        .unwrap();
+    let text =
+        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("tasks.json")).unwrap();
+    assert!(text.contains("\"links\""), "positive control: the row really did gain its links");
+    assert!(
+        !text.contains("link_etag"),
+        "the token is derived per read and must never be persisted:\n{text}"
+    );
+}
+
+/// The MCP arm carries it, and carries it STRICTLY: a wrong-typed guard silently
+/// dropped would tell the caller their guarded write landed when it was in fact
+/// unguarded — the worst failure this particular argument has.
+#[test]
+fn the_mcp_upsert_task_arm_honours_and_type_checks_the_guard() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let g = co.group.clone();
+    let made = dispatch(
+        &reg,
+        &co,
+        "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "title": "Ship it" } }),
+    )
+    .unwrap();
+    let id =
+        made["content"][0]["text"].as_str().unwrap().split_whitespace().next().unwrap().to_string();
+    reg.upsert_task(&g, "orch", Some(&id), links_patch(vec![link("doc", "x.md", None)]))
+        .unwrap();
+    let etag = link_etag(&reg.tasks(&g).into_iter().find(|x| x.id == id).unwrap());
+
+    // A number where a string belongs is refused, not ignored.
+    let typed = dispatch(
+        &reg,
+        &co,
+        "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "links": [], "expect_link_etag": 7 } }),
+    )
+    .unwrap();
+    let typed_text = typed["content"][0]["text"].as_str().unwrap();
+    assert_eq!(typed["isError"], true, "a mistyped guard is an error, never a silent drop");
+    assert!(typed_text.contains("expect_link_etag"), "...and names itself: {typed_text}");
+    assert_eq!(
+        reg.tasks(&g).into_iter().find(|x| x.id == id).unwrap().links.len(),
+        1,
+        "and wrote nothing"
+    );
+
+    // A stale one refuses; the matching one lands. Both through the tool, not
+    // the registry: the argument has to be wired, not merely to exist.
+    let stale = dispatch(
+        &reg,
+        &co,
+        "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "links": [], "expect_link_etag": "0000000000000000" } }),
+    )
+    .unwrap();
+    assert_eq!(stale["isError"], true);
+    assert!(
+        stale["content"][0]["text"].as_str().unwrap().starts_with(STALE_LINK_ETAG_PREFIX),
+        "{stale}"
+    );
+    dispatch(
+        &reg,
+        &co,
+        "tools/call",
+        &json!({ "name": "upsert_task", "arguments": { "id": id, "links": [], "expect_link_etag": etag } }),
+    )
+    .unwrap();
+    assert!(
+        reg.tasks(&g).into_iter().find(|x| x.id == id).unwrap().links.is_empty(),
+        "the matching token let the clear through"
     );
 }

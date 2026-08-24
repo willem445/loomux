@@ -1969,8 +1969,16 @@ export function withArtifactLink(
  *  twice under two types (a spec that is also the requirement) or twice with
  *  different labels; removing by value would delete both and the human would
  *  have asked for one. An out-of-range index returns the list unchanged rather
- *  than composing a write that silently drops nothing or everything — a stale
- *  render whose row has already changed underneath is the reachable way in. */
+ *  than composing a write that silently drops nothing or everything.
+ *
+ *  **That unchanged return is a floor, not the mitigation** (#1349, design note
+ *  §16). It only catches the stale render whose row got SHORTER; a row that
+ *  changed while staying long enough passes the range check and this composes a
+ *  write dropping a link nobody pointed at. What makes removal-by-index sound is
+ *  the `link_etag` every one of these edits now carries — an index names what
+ *  the human clicked only while the array it was read from is still the array
+ *  being written, and the backend refuses it otherwise. It is also why this is
+ *  the one edit `retriesAfterStale` never re-applies. */
 export function withoutArtifactLinkAt(
   links: readonly TaskArtifactLink[] | null | undefined,
   index: number
@@ -1979,4 +1987,114 @@ export function withoutArtifactLinkAt(
   if (!Number.isInteger(index) || index < 0 || index >= all.length) return all;
   all.splice(index, 1);
   return all;
+}
+
+// ---------------------------------------------------------------------------
+// The stale-snapshot guard (#1349) — the board half.
+//
+// Every helper above composes a WHOLE new array from the row the board painted,
+// because `orch_upsert_task`'s array arguments replace rather than append. That
+// is what makes a click on a row an agent has edited underneath destructive: the
+// human removes entry 0 of the two links they can see, and the third one the
+// orchestrator added a second ago is gone with it, silently. The backend now
+// fingerprints exactly those three arrays as `link_etag` and refuses a write
+// whose `expect_link_etag` no longer matches; this section is what sends it and
+// what decides whether the human's intent can simply be re-applied.
+//
+// See `doc/design/board-sprints-and-links.md` §16.
+
+/** The opening words of the backend's stale-`link_etag` refusal.
+ *
+ *  A duplicated string literal, and pinned as one: `test/taskboard.test.ts`
+ *  reads `STALE_LINK_ETAG_PREFIX` out of the Rust source and compares, the same
+ *  guard shape the status and link-type vocabularies carry. Drifting apart is
+ *  invisible otherwise — the board would stop recognising the one refusal it is
+ *  meant to recover from and would toast it at the human as a plain error. */
+export const STALE_LINK_ETAG_PREFIX = "the board changed under you";
+
+/** Is this rejection the backend saying the row's arrays moved under us?
+ *
+ *  Matched on the PREFIX rather than on the whole sentence, because the tail
+ *  names the row and both tokens. Every other refusal `orch_upsert_task` can
+ *  return — an unknown dep, a cycle, the link cap, a target naming a board task
+ *  — is the human's own edit being wrong, and must reach them as a toast rather
+ *  than being quietly retried into landing. */
+export function isStaleLinkEtag(err: unknown): boolean {
+  return String(err ?? "").includes(STALE_LINK_ETAG_PREFIX);
+}
+
+/** One human edit to a row's replace-wholesale arrays, as an INTENT rather than
+ *  as the array it produces (#1349).
+ *
+ *  The distinction is the whole point: an array is only meaningful against the
+ *  list it was composed from, while "remove the dep on t-3" or "add this
+ *  requirement link" survives the board moving underneath and can be re-applied
+ *  to whatever the row says now. */
+export type LinkArrayEdit =
+  | { readonly kind: "dep-add"; readonly id: string }
+  | { readonly kind: "dep-remove"; readonly id: string }
+  | { readonly kind: "link-add"; readonly link: TaskArtifactLink }
+  | { readonly kind: "link-remove-at"; readonly index: number };
+
+/** The `orch_upsert_task` arguments one `LinkArrayEdit` becomes. Exactly one
+ *  array field is ever present — the write touches the array the human edited
+ *  and leaves the other two untouched, which is what an omitted argument means
+ *  on that command. */
+export interface LinkArrayWrite {
+  readonly deps?: readonly string[];
+  readonly links?: readonly TaskArtifactLink[];
+  readonly expectLinkEtag?: string;
+}
+
+/** A board row as far as an array write cares: the three arrays, plus the
+ *  fingerprint the backend derived for them on the read this row came from. */
+export interface HasLinkArrays extends HasArtifactLinks {
+  deps?: readonly string[] | null;
+  /** Derived per read by the backend and never stored — see `link_etag` in
+   *  `mod.rs`. Optional only because the wire type is: the backend that serves
+   *  this board always sends it, and a row that somehow arrives without one
+   *  composes an UNGUARDED write, which is precisely the pre-#1349 behaviour
+   *  rather than a new failure. */
+  link_etag?: string | null;
+}
+
+/** Turn one edit into the write that applies it TO THIS ROW — always guarded on
+ *  the fingerprint that came with this same row, so the array and the token can
+ *  never come from two different reads. That pairing is the reason this is one
+ *  function and not a convention at four call sites. */
+export function composeLinkArrayWrite(edit: LinkArrayEdit, task: HasLinkArrays): LinkArrayWrite {
+  const guard = task.link_etag ? { expectLinkEtag: task.link_etag } : {};
+  switch (edit.kind) {
+    case "dep-add":
+      return { ...guard, deps: withDep(task.deps, edit.id) };
+    case "dep-remove":
+      return { ...guard, deps: withoutDep(task.deps, edit.id) };
+    case "link-add":
+      return { ...guard, links: withArtifactLink(task.links, edit.link) };
+    case "link-remove-at":
+      return { ...guard, links: withoutArtifactLinkAt(task.links, edit.index) };
+    default: {
+      // Exhaustiveness, checked by `tsc --noEmit`: a new edit kind must be
+      // given a composition here rather than falling through to a write that
+      // names no array at all — which the backend would accept as a no-op and
+      // the human would read as their click having worked.
+      const never: never = edit;
+      throw new Error(`unhandled link-array edit ${JSON.stringify(never)}`);
+    }
+  }
+}
+
+/** May this edit be re-applied automatically once the board has been re-read?
+ *
+ *  **Value-named edits yes, POSITIONAL edits never.** `remove the dep on t-3`
+ *  and `add this link` name what they act on, so re-applying them to the row as
+ *  it is now is exactly what the human asked for, whatever else changed. A
+ *  link removal names an INDEX — `links` is not deduped, so index is the only
+ *  thing that can distinguish two identical targets (§14) — and an index means
+ *  nothing against a list it was not read from. Re-applying one would delete
+ *  whatever slid into that slot, which is a sharper version of the very defect
+ *  #1349 closes. That one refuses, the board repaints, and the human clicks the
+ *  ✕ they can now see. */
+export function retriesAfterStale(edit: LinkArrayEdit): boolean {
+  return edit.kind !== "link-remove-at";
 }
