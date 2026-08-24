@@ -683,9 +683,8 @@ impl TranscriptCursor {
                 return StatVerdict::Reset;
             }
         }
-        if len == self.len && modified == self.modified {
-            return StatVerdict::Serve;
-        }
+        // [scratch] #1239 round 6: the stat gate is gone, so an unchanged
+        // transcript is opened and re-examined like a grown one.
         StatVerdict::Extend
     }
 
