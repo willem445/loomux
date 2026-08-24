@@ -607,6 +607,18 @@ resumes on the roster it launched with and never re-reads
 the same rule that makes "adding a manager block does not give a dormant group
 one on resume" true (see *The resume path* above).
 
+**It FAILS QUIET, and that is the right direction for exactly one reason —
+which also bounds it.** `g.as_ref().map(…).unwrap_or(false)` collapses "this
+group declares no manager" and "I could not read the group record" into one
+value, so the panel cannot tell them apart. For a NOTICE that is correct: the
+failure mode of guessing wrong is a false alarm on every group in the app, and
+the silent branch costs one missing line on a group whose record is unreadable —
+which is a bigger problem than a missing chrome line anyway. But it is the shape
+CLAUDE.md warns about ("I could not look" is not "there was nothing there"),
+landing on a READ rather than a write, which is the whole of why it is benign
+here. **If a later slice ever drives an ACTION off `manager_declared` rather
+than a line of text, that arm has to become a third state before it does.**
+
 **The failed-open arm is reachable in tests now.** `spawn_agent_bound` refuses a
 block whose `cli` no build supports, and its own comment says where such a block
 comes from: "an unsupported one here means a hand-edited group.json". A launch
@@ -805,8 +817,11 @@ acknowledges; `.pane-channel` disconnects) or is inert because there is nothing
 truthful a click could do (`.pane-queue`: the queue drains when the pane is
 free). This one is the second kind for a sharper reason than that. A click that
 "marked it read" would be the app consuming the human's status stream on their
-behalf — on the one pane whose entire contract is that orrerix does not act
-inside it. What makes the manager read is the human speaking to it. The chip
+behalf — on the one pane whose entire contract is that orrerix never acts FOR
+the human inside it. (Not "never types into it": the pane takes its kickoff, and
+decision D2 permits one post-compact re-grounding notice. What it never takes is
+a decision made on the human's behalf.) What makes the manager read is the human
+speaking to it. The chip
 says so in its tooltip and offers no shortcut past it.
 
 ### Why it does not render the cap
@@ -898,8 +913,9 @@ read by something that never reads the other two.
 liaison (`group_usage`). There have been two since #1091 slice E added
 `ask_human` (the pose only — `withdraw_question` is deliberately not widened
 with it). The engine's own copy of that sentence was already current, so this
-was the frontend mirror drifting, and it is the reason the mirror is now stated
-as a mirror.
+was the frontend mirror drifting away from it — which is the failure mode that
+comment's own "Mirrors the backend's `role_hint_requires`" line already named,
+and did not prevent.
 
 `doc/design/architecture.md` called `kind` a "closed 4-variant enum". It is five
 declarable variants, and the module map had no `mailbox.rs` row at all.

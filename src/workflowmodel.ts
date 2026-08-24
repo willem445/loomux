@@ -2869,7 +2869,7 @@ export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
         findings.push({
           severity: "warning",
           code: "role-hint-superseded",
-          message: `Block "${where}" has role_hint: liaison, which is superseded by kind: manager — the first-class human-interface class. The hint still parses and this block still runs exactly as it does today; a manager instead gets its own capability class, a durable mailbox from the orchestrator, and a pane orrerix never types into. See docs/orchestration.md.`,
+          message: `Block "${where}" has role_hint: liaison, which is superseded by kind: manager — the first-class human-interface class. The hint still parses and this block still runs exactly as it does today; a manager instead gets its own capability class, a durable mailbox from the orchestrator, and a pane no fleet traffic is delivered into. See docs/orchestration.md.`,
           blockId: b.id,
         });
       }

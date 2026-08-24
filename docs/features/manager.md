@@ -122,9 +122,16 @@ It holds no authority you have not used yourself. Specifically:
 
 ## How it hears from the team
 
-Nothing is ever typed into this pane. Your conversation with the manager is
-yours: orrerix never pastes a notice, a report or a status line into it, which
-is the one hard rule the whole feature is built around.
+No fleet traffic is ever delivered into this pane. Your conversation with the
+manager is yours: orrerix never pastes a notice, a report or a status line from
+the team into it, which is the one hard rule the whole feature is built around.
+
+Exactly two things orrerix itself writes there, and neither is news from the
+team. The **kickoff** that starts the conversation, the way every agent pane
+learns what it is. And, if the CLI compacts mid-session, **one re-grounding
+notice** that hands the manager back its own directive ledger — the running note
+it keeps of what you have told it — so a direction you gave survives a compact
+nobody was warned about. Everything else is refused at the front door.
 
 So news reaches it by **pull**, not push. The orchestrator posts milestones —
 what merged, what is blocked, the issue number your brief became — into a
@@ -153,8 +160,9 @@ Two consequences worth knowing:
 
 ## When the pane is not there
 
-The group panel (the ☰ button on the orchestrator's pane) says **manager
-declared · not open** when the workflow declares a manager and none is live.
+The group lifecycle panel (`Alt+O`, or the group icon on the orchestrator's
+pane) says **manager declared · not open** when the workflow declares a manager
+and none is live.
 That covers two cases and does not distinguish them, because from where you are
 sitting they are the same fact: the pane could not be opened when the group
 launched, or it has since been closed or has died. The group's audit log records

@@ -4,9 +4,13 @@
 // pane's dock chip. DOM-free, like `queuebadge.ts` and `heldbadge.ts`, so the
 // wording and the count rules are unit-testable without a webview.
 //
-// **What the chip is for.** The manager pane is the one pane loomux never types
-// into (`doc/design/manager.md` — `deliver_prompt` refuses a `Role::Manager`
-// target). News from the orchestrator reaches it by PULL: `message_manager`
+// **What the chip is for.** The manager pane is the one pane no fleet traffic is
+// delivered into: `deliver_prompt` refuses a `Role::Manager` target for every
+// delivery outside `permitted_into_manager_pane`'s three-element set — the two
+// kickoffs, plus the post-compact re-grounding notice decision D2 carved out
+// (`doc/design/manager.md`'s table). `MidSession`, which is what every other
+// producer sends, is refused. News from the orchestrator reaches it by PULL:
+// `message_manager`
 // writes a durable row, the manager runs `check_mail()` at the start of its next
 // turn, and its next turn is the next time its human speaks to it. So without a
 // chip the human's only signal that anything happened is the manager telling
@@ -14,8 +18,9 @@
 // late to decide whether to have it.
 //
 // **Why the chip does NOT render the unread cap**, unlike `.pane-queue`'s
-// `3/32`. There, the cap is the fact that makes the number legible, because a
-// full queue DROPS arrivals. Here nothing is ever dropped: at
+// `3/8` (`QUEUE_MAX_PER_PANE` is 8, not 32 — the two caps are easy to cross).
+// There, the cap is the fact that makes the number legible, because a full queue
+// DROPS arrivals. Here nothing is ever dropped: at
 // `mailbox::UNREAD_MAX` the WRITER is refused, loudly, with the alternatives
 // spelled out in the refusal text (say it in your own pane, `ask_human`,
 // `request_attention`) — so the consequence of a full mailbox reaches the human
@@ -55,8 +60,10 @@ function safeCount(unread: number): number {
  *  The tooltip states the pull model rather than restating the number, because
  *  the number alone is misread: a human who sees "3 unread" on any other pane
  *  in this app assumes something is being delivered. Here nothing is, by
- *  design, and the human is the clock — so the sentence says both that nothing
- *  is typed into this pane and what will make the manager read. */
+ *  design, and the human is the clock — so the sentence says both that no status
+ *  is delivered into this pane and what will make the manager read. Scoped to
+ *  STATUS rather than an absolute "nothing is ever typed here": the pane does
+ *  take its kickoff, and D2 permits one post-compact re-grounding notice. */
 export function mailboxPresentation(unread: number): MailboxPresentation | null {
   const n = safeCount(unread);
   if (n === 0) return null;
@@ -64,9 +71,9 @@ export function mailboxPresentation(unread: number): MailboxPresentation | null 
   return {
     label: `✉ ${n} unread`,
     title:
-      `${n} ${noun} waiting in this manager's mailbox. Nothing is ever typed into this ` +
-      `pane — the manager reads its mail at the start of its next turn, which is the next ` +
-      `time you speak to it.`,
+      `${n} ${noun} waiting in this manager's mailbox. No status is ever delivered into ` +
+      `this pane — the manager reads its mail at the start of its next turn, which is the ` +
+      `next time you speak to it.`,
   };
 }
 

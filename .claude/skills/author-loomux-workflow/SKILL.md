@@ -60,10 +60,14 @@ Read the human's description and extract, explicitly, before writing YAML:
   drive the orchestrator", "somebody to take my half-formed feature ideas and
   turn them into a proper ticket", "status without reading agent traffic" → a
   `kind: manager` block. It is a capability class of its own, not a persona on a
-  reviewer: orrerix never types into that pane (no kickoff after the first, no
-  notices, no relays), the orchestrator reaches it only by posting to a durable
-  mailbox it pulls, and it holds no authority the human has not used themselves —
-  no repo writes, no spawns, no verdicts. **At most one per file**, and a second
+  reviewer: no fleet traffic is ever delivered into that pane (no notices, no
+  relays, no status lines), and the only two things orrerix itself writes there
+  are the kickoff and — after a mid-session compact — one re-grounding notice.
+  The orchestrator reaches it only by posting to a durable mailbox it pulls, and
+  it holds no authority the human has not used themselves — no spawns and no
+  verdicts (structural), and no branches or PRs (its containment denies the
+  editing tools; the designed path has the orchestrator file the issue).
+  **At most one per file**, and a second
   is a parse error. Declare one only if the human asked for that shape; a group
   without one behaves exactly as it does today. See `docs/features/manager.md`.
 - **Review rigor.** One reviewer that must pass, or several focused lanes
@@ -106,7 +110,7 @@ Read the human's description and extract, explicitly, before writing YAML:
 |---|---|
 | "a role" / "an agent that does X" | a **block**: `id` (immutable identity), `name` (display only), `kind` (capability class), `cli`, `model`, and a persona (`prompt:` or `profile:`) |
 | "what kind of work can it do" | `kind` — one of exactly five: `orchestrator`, `worker`, `reviewer`, `planner`, `manager`. This is the **only** thing that grants capability. See Invariant 1. |
-| "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner, `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
+| "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner/**manager** — the reasoning-heavy classes — and `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
 | "a domain expert, consulted on demand" | `kind: planner` + `role_hint: advisor` — read-only, spawned only when stuck on a specific question, exits the moment it reports. |
 | "a design-review or premortem second opinion, not on every PR" | Same `kind: planner` + `role_hint: advisor` shape — never `kind: reviewer`, which the merge gate would need to pass on every PR or run on every PR to avoid holding it shut. See `docs/orchestration.md` → "Adding a second lens". |
 | "a pane I talk to" / "turn my idea into a ticket" / "status as a conversation" | `kind: manager` — the human's own interface. At most one per file (a second is a parse error); never spawned by an agent and never typed into; reaches the orchestrator through a durable mailbox and `message_orchestrator`. Not `kind: reviewer` + `role_hint: liaison`, which is the superseded shape. |

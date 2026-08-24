@@ -1778,15 +1778,23 @@ gates:
 
 What that block gets you, and what it deliberately does not:
 
-- **Orrerix never types into that pane.** No notices, no relays, no status
-  lines — your conversation with the manager is yours. News reaches it by
-  **pull**: the orchestrator posts milestones into a durable mailbox, and the
-  manager reads that mailbox at the start of each of its turns, which is the
-  next time you speak to it. An **unread-mail chip** on the pane header tells
-  you when something is waiting.
-- **It holds no authority you have not used yourself.** No repo writes, no
-  branches, no PRs, no spawning or killing panes, no review verdicts. It relays;
-  the orchestrator decides.
+- **No fleet traffic is ever delivered into that pane.** No notices, no relays,
+  no status lines, no reports — your conversation with the manager is yours.
+  Exactly two things orrerix itself writes there, and both are about the pane
+  rather than about the work: the kickoff that starts the conversation, and — if
+  the CLI compacts mid-session — one re-grounding notice that hands the manager
+  back its own directive ledger, so a direction you gave survives a compact
+  nobody was warned about. Everything else is refused at the front door. News
+  reaches it by **pull**: the orchestrator posts milestones into a durable
+  mailbox, and the manager reads that mailbox at the start of each of its turns,
+  which is the next time you speak to it. An **unread-mail chip** on the pane
+  header tells you when something is waiting.
+- **It holds no authority you have not used yourself.** No spawning or killing
+  panes and no review verdicts — those are structural, denied at the tool level.
+  No branches, commits or PRs either: orrerix runs the pane under a containment
+  tier that denies its editing tools, and the rest is its instructions, which is
+  why the designed path has the *orchestrator* file the issue your brief becomes.
+  It relays; the orchestrator decides.
 - **It does not start work.** A brief it grooms with you becomes a GitHub issue,
   and your own label on that issue is still the only thing that hands it to the
   fleet.
@@ -1813,8 +1821,8 @@ Launch a new group to pick up the change.
 that uses it keeps working unchanged; the workflow pane now marks it as
 superseded and the launcher preview badges it `LIAISON (SUPERSEDED)`. Write
 `kind: manager` in a new file: a hint on a reviewer block cannot express what
-this class is — a pane orrerix never types into, with a mailbox of its own and a
-capability set that is not a reviewer's.
+this class is — a pane no fleet traffic is delivered into, with a mailbox of its
+own and a capability set that is not a reviewer's.
 
 
 ### Turning on the merge queue

@@ -27175,8 +27175,9 @@ impl OrchRegistry {
             .map_err(|e| e.to_string())?;
         // The single mutation point, so the single notification point — the
         // `emit_tasks_changed` / `orch-questions-changed` shape. M5's unread
-        // chip is the listener; until then the event is inert, which is cheaper
-        // than a second visit to this function later.
+        // chip is the listener, and it has landed: `orchestration.ts` subscribes
+        // and routes each push through `mailboxPanes` to the one manager pane in
+        // the group.
         if let Some(app) = self.app.lock_safe().clone() {
             let _ = app.emit(
                 "orch-mailbox-changed",

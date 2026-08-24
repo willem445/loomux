@@ -29,8 +29,13 @@ now fired* further down. `check_mail` would have fired it a second time.
 
 The other half is that a manager needs class-level **structural** differences a
 hint cannot express, the load-bearing one being that `deliver_prompt` refuses a
-`Role::Manager` target outright, so orrerix never types into that pane at all. A
-hint sits on a reviewer, and a reviewer is a pane orrerix delivers to.
+`Role::Manager` target for every delivery outside a three-element permitted set
+— `Delivery::permitted_into_manager_pane`: the two kickoffs, plus the single
+post-compact re-grounding notice that decision D2 carved out. `MidSession`, which
+is what every other producer in the codebase sends, is refused. So no fleet
+traffic reaches that pane at all, and the set is pinned as a set so a fourth
+carve-out cannot be added quietly (`doc/design/manager.md`'s table). A hint sits
+on a reviewer, and a reviewer is a pane orrerix delivers everything to.
 
 So, concretely: a liaison is a reviewer that behaves differently because of
 instructions plus three enumerated tool-tier exceptions; a manager is not a
@@ -39,10 +44,13 @@ reviewer at all. New files declare `kind: manager`. `validateWorkflow` raises a
 it, so an author is told; neither refuses anything.
 
 The hint has no user-facing page of its own and is not getting one. What a human
-reading `docs/` finds instead is the successor — `docs/features/manager.md` for
-using the pane, `docs/orchestration.md` → *A manager pane* for declaring one —
-each carrying the supersession, which is the answer a reader with a `liaison` in
-their file actually needs.
+reading `docs/` finds instead is the successor: `docs/features/manager.md` for
+using the pane, and `docs/orchestration.md` → *A manager pane* for declaring
+one. The supersession is stated on the second of those and not the first, which
+is deliberate rather than an omission — the hint is a thing you WRITE in a
+workflow file, so a reader with a `liaison` in theirs is on the authoring page,
+and the page for talking to a manager has no reason to mention a spelling its
+reader never types.
 
 ## Why `kind: reviewer`
 

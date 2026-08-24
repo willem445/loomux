@@ -3273,10 +3273,16 @@ test("a valid liaison block is warned, not refused (#1161 D4)", () => {
 test("the supersession advisory fires for `liaison` alone", () => {
   // THE CONTROL. Without it, "the liaison is warned" is satisfied by a
   // validator that warns on every hint, or on every block.
-  for (const [kind, hint] of [
-    ["planner", "advisor"],
-    ["worker", "process"],
-  ] as const) {
+  //
+  // The population is DERIVED from `ROLE_HINTS` rather than listed, so a fourth
+  // hint is covered on the day it is added instead of on the day someone
+  // remembers this test. A hardcoded pair would still read as a control while
+  // silently covering two of three (#1502 review N5).
+  const others = ROLE_HINTS.filter((h) => h !== "liaison");
+  assert.ok(others.length > 0, "the control must have something to control WITH");
+  for (const hint of others) {
+    const kind = roleHintRequires(hint);
+    assert.ok(kind, `${hint} must resolve to a kind, or this row tests nothing`);
     const w = parseWorkflow(
       `version: 1\nblocks:\n  - id: b\n    kind: ${kind}\n    cli: claude\n    role_hint: ${hint}\n`
     ).workflow;
