@@ -333,7 +333,10 @@ const STREAMS: StreamRow[] = [
       "each open view the refetch already in flight plus exactly one more, and the trailing " +
       "run reads the final registry. Each view already shares that same gate with its own " +
       "orch-tasks-changed listener (below), so a simultaneous burst on both streams still " +
-      "coalesces to one refresh per view, not two.",
+      "coalesces to one refresh per view, not two. Both views are ALSO panel-gated as of " +
+      "#1318 (src/wakegate.ts): a board or panel whose PANEL IS CLOSED drops the wake outright " +
+      "rather than coalescing it, and show() refreshes unconditionally so nothing is lost by " +
+      "dropping it. One left OPEN behind a background tab or a minimized pane still pays — #1465.",
     debt: null,
   },
   {
@@ -353,7 +356,10 @@ const STREAMS: StreamRow[] = [
       "orch-tasks-changed, and an ungated third listener would have doubled a board burst's " +
       "cost for this panel rather than added to it. Clear-completed is deliberately not on this " +
       "stream at all — it writes only the watermark marker, emits nothing, and the panel applies " +
-      "the stamp the command returns.",
+      "the stamp the command returns. As of #1318 the panel is panel-gated too " +
+      "(src/wakegate.ts): all three of its streams drop their wake outright while the panel is " +
+      "CLOSED, and show() refreshes unconditionally so nothing is lost by dropping them. A panel " +
+      "left OPEN behind a background tab or a minimized pane still pays in full — #1465.",
     debt: null,
   },
   {
@@ -362,11 +368,21 @@ const STREAMS: StreamRow[] = [
     bound: "throttled",
     cite: "src/refreshgate.ts",
     reason:
-      "Emitted on EVERY write_tasks, which agents drive in bursts. Each open board now refreshes " +
+      "Emitted on EVERY write_tasks, which agents drive in bursts. Each open board refreshes " +
       "through CoalescingRefresh: single-flight with a trailing-edge merge, so a burst of N " +
       "writes costs the refetch already in flight plus exactly one more, per view, and the " +
       "trailing one reads the final board so nothing is lost (#743 S5). Self-clocking — its " +
-      "window is the duration of a refresh, so a slower backend coalesces harder.",
+      "window is the duration of a refresh, so a slower backend coalesces harder. " +
+      "WHICH boards pay that at all is the second bound (#1318, src/wakegate.ts): 'open' meant " +
+      "'ever opened' until the board and the NEEDS-YOU panel got the hide hook every woken view " +
+      "owes, so a board whose PANEL IS CLOSED now costs one boolean instead of a refetch plus a " +
+      "rebuild that is super-linear in the board. show() refreshes unconditionally, so nothing " +
+      "is lost — except that the coalescer's trailing run re-enters itself rather than the view's " +
+      "gated refresh(), so a run in flight at the moment of a close lands one more refetch after " +
+      "it: one per close, not one per event. CLOSED is the exact word: the gate's probe reads the " +
+      "view host's own hidden attribute, so a board left OPEN in a background tab (display:none " +
+      "on an ancestor) or in a minimized pane (element detached) still pays in full. That " +
+      "residual is #1465's, not this row's.",
     debt: null,
   },
 ];
@@ -444,10 +460,12 @@ const TIMERS: TimerRow[] = [
     cadenceMs: 1500,
     policy: "gated",
     reason:
-      "Opt-in: armed only by the follow toggle, cleared by the toggle and by dispose(), so it " +
-      "cannot outlive the view — and gated within that, so an armed follow behind a hidden window " +
+      "Opt-in: armed only by the follow toggle, cleared by the toggle, by a close/eviction " +
+      "(AuditView.hide, #1318) and by dispose(), so it outlives neither the view nor the panel " +
+      "being on screen — and gated within that, so an armed follow behind a hidden window " +
       "refetches nothing and re-renders nothing until the window is back, then catches up once " +
-      "(#743 S6).",
+      "(#743 S6). Until #1318 the close was the missing one: PollGate pauses this behind a hidden " +
+      "WINDOW, and nothing stopped it behind a closed PANEL.",
     debt: null,
   },
   {
@@ -456,7 +474,8 @@ const TIMERS: TimerRow[] = [
     policy: "gated",
     reason:
       "The timeline's follow toggle, same shape and same gate as auditview's: armed on toggle, " +
-      "cleared on toggle and dispose, suppressed while the window is hidden (#743 S6). Its gh " +
+      "cleared on toggle, on close (hide()) and on dispose, suppressed while the window is " +
+      "hidden (#743 S6) — the view that had the close half right first. Its gh " +
       "half is separately self-gated to GH_REFRESH_MS (60 s) in timelinechrome.ts, so a tick is " +
       "one orch_audit refetch, not two shell-outs.",
     debt: null,

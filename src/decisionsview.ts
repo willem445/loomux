@@ -41,6 +41,7 @@ import {
   resolveNeedsYou,
 } from "./orchestration";
 import { CoalescingRefresh } from "./refreshgate";
+import { WakeGate } from "./wakegate";
 import {
   answerFor,
   citedTask,
@@ -127,6 +128,14 @@ export class DecisionsView {
    *  costs the run in flight plus exactly one trailing run, which reads the
    *  final state, so nothing is lost by coalescing. */
   private readonly refresher = new CoalescingRefresh(() => this.refreshNow());
+  /** Whether this panel is on screen (#1318). THREE agent-driven streams land
+   *  here and each refresh is three backend reads plus a re-render, so a closed
+   *  panel that keeps refetching costs every pane in the session on every
+   *  question, item and board write. `show()` refreshes unconditionally, so a
+   *  wake dropped here is re-earned the moment anyone looks — see
+   *  `wakegate.ts` for why the pane's live `isVisible` read, not the latch
+   *  alone, is what releases it. */
+  private readonly wakeGate = new WakeGate(() => this.opts.isVisible());
   private unlistenQuestions: UnlistenFn | null = null;
   private unlistenTasks: UnlistenFn | null = null;
   private unlistenItems: UnlistenFn | null = null;
@@ -152,6 +161,11 @@ export class DecisionsView {
        *  the panel was closed or unbuilt — #1091 slice G's board marker is the
        *  first caller. `undefined` when the host wires no focus at all. */
       takeFocus?: () => string | null;
+      /** The pane's live read of whether this panel is on screen, in either
+       *  hosting mode (#1318) — `wakeGate`'s bounded release. Required, not
+       *  optional: an event-driven view that forgets it is the defect #1318
+       *  fixed, and a default would let the next one forget it silently. */
+      isVisible: () => boolean;
     }
   ) {
     this.el = el("div", "tasks-view decisions-view");
@@ -231,7 +245,24 @@ export class DecisionsView {
 
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
+    // Before the refresh, so that refresh is the one this open owes rather than
+    // the first thing the gate suppresses (#1318).
+    this.wakeGate.wake();
     this.refresh();
+  }
+
+  /** Called by the pane whenever the view is about to be hidden, in either
+   *  mode — a close, a slot eviction, an un-dock (#1318).
+   *
+   *  This panel had no `hide` hook because nothing on `EmbedEntry.hide` asked
+   *  for one — see its doc for what was actually written there, and where the
+   *  rule really lived. Nothing is lost by stopping: `show()` above refreshes
+   *  unconditionally, so no staleness survives the panel being looked at.
+   *
+   *  Scope: this is the panel being CLOSED. One left open in a background tab
+   *  or a minimized pane never reaches here — #1465. */
+  hide(): void {
+    this.wakeGate.sleep();
   }
 
   /** Reflect which mode the pane currently has this view mounted in — the
@@ -270,7 +301,12 @@ export class DecisionsView {
     return !!a && this.listEl.contains(a) && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
   }
 
+  /** Ask for a refresh — through the visibility gate first (#1318), then the
+   *  coalescer. One funnel, one rule, so no call site can forget either; ahead
+   *  of the coalescer rather than inside `refreshNow` so a suppressed wake
+   *  never touches the single-flight state at all. */
   private refresh(): void {
+    if (!this.wakeGate.accepts()) return;
     this.refresher.request();
   }
 

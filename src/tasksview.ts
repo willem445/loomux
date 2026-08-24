@@ -96,6 +96,7 @@ import { writeClipboard } from "./clipboard";
 import { isPending, type OrchQuestion } from "./decisions";
 import { normalizeComment } from "./autonomy";
 import { CoalescingRefresh } from "./refreshgate";
+import { WakeGate } from "./wakegate";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
 import { wipChips } from "./wipchips";
 import { BoardPrefsStore } from "./boardprefs.ts";
@@ -361,10 +362,21 @@ export class TasksView {
    *  `orch-tasks-changed` fires on EVERY `write_tasks`, and agents write in
    *  bursts (a plan posting ten tasks, a batch status sweep), so an ungated
    *  handler cost one full refetch — three backend commands and a whole-board
-   *  re-render — per write, per open board. A burst of N now costs the run
+   *  re-render — per write, per board. A burst of N now costs the run
    *  already in flight plus exactly one trailing run, which reads the final
-   *  state, so nothing is lost by coalescing. */
+   *  state, so nothing is lost by coalescing.
+   *
+   *  "Per board" meant per board that had EVER been opened until #1318 — the
+   *  coalescer bounds a burst's cost, `wakeGate` below is what decides whether
+   *  this board pays it at all. */
   private readonly refresher = new CoalescingRefresh(() => this.refreshNow());
+  /** Whether this board is on screen (#1318). Its stream is agent-driven and
+   *  its render is super-linear in the board, so a closed board that keeps
+   *  refetching costs every pane in the session on every `write_tasks` by every
+   *  agent. `show()` refreshes unconditionally, so a wake dropped here is
+   *  re-earned the moment anyone looks — see `wakegate.ts` for why the pane's
+   *  live `isVisible` read, not the latch alone, is what releases it. */
+  private readonly wakeGate = new WakeGate(() => this.opts.isVisible());
   /** The open request-changes modal, if any (kept to one at a time). */
   private dialogEl: HTMLElement | null = null;
   private unlistenTasks: UnlistenFn | null = null;
@@ -393,6 +405,11 @@ export class TasksView {
        *  `boardMarker` in `taskboard.ts`). Returns whether the pane could
        *  route it, mirroring `decisionsview.ts`'s `onFocusTask` the other way. */
       onFocusDecision: (id: string) => boolean;
+      /** The pane's live read of whether this view is on screen, in either
+       *  hosting mode (#1318) — `wakeGate`'s bounded release. Required, not
+       *  optional: an event-driven view that forgets it is the defect #1318
+       *  fixed, and a default would let the next one forget it silently. */
+      isVisible: () => boolean;
     }
   ) {
     this.el = el("div", "tasks-view");
@@ -630,12 +647,29 @@ export class TasksView {
 
   /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
+    // Before the refresh below, so that refresh is the one this open owes
+    // rather than the first thing the gate suppresses (#1318).
+    this.wakeGate.wake();
     // Re-attempt a boot read that failed (#1270 review N5), but only while the
     // human has changed nothing — once they have, their gesture is newer than
     // the file and adopting over it would look like the click was ignored. The
     // store memoises a SUCCESSFUL read, so this is a no-op in the normal case.
     if (!this.prefsAdopted && !this.prefsTouched) void this.loadPrefs();
     this.refresh();
+  }
+
+  /** Called by the pane whenever the view is about to be hidden, in either
+   *  mode — a close, a slot eviction, an un-dock (#1318).
+   *
+   *  The board had no `hide` hook because nothing on `EmbedEntry.hide` asked
+   *  for one — see its doc for what was actually written there, and where the
+   *  rule really lived. Nothing is lost by stopping: `show()` above refreshes
+   *  unconditionally, so no staleness survives the panel being looked at.
+   *
+   *  Scope: this is the panel being CLOSED. A board left open in a background
+   *  tab or a minimized pane never reaches here — #1465. */
+  hide(): void {
+    this.wakeGate.sleep();
   }
 
   /** Reflect which mode the pane currently has this view mounted in —
@@ -754,8 +788,14 @@ export class TasksView {
 
   /** Ask for a refresh. Coalesced — see `refresher`. The gate lives here rather
    *  than at each call site so a future caller cannot forget it, and so the
-   *  event handler and the human's own actions share one in-flight run. */
+   *  event handler and the human's own actions share one in-flight run.
+   *
+   *  The visibility gate lives here too, ahead of the coalescer, and for the
+   *  same reason (#1318): one funnel, one rule, no call site that can forget
+   *  it. Ahead of it rather than inside `refreshNow` so a suppressed wake never
+   *  touches the single-flight state at all. */
   private refresh(): void {
+    if (!this.wakeGate.accepts()) return;
     this.refresher.request();
   }
 
