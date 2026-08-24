@@ -1732,23 +1732,39 @@ restoring them).
 ### Adding a second lens
 
 A repo that wants a design-review opinion before code is written, or a
-premortem pass on an unusually risky PR, doesn't need a new mechanism —
-`kind: planner` + `role_hint: advisor` (see **Almost every setting in the
-file is editable in the pane**, above) is already built for exactly this:
-read-only, spawned only when the orchestrator decides the situation calls for
-it, and it reports and exits rather than holding a pane open. Declare as many
-of these as you want, each with its own persona.
+premortem pass on an unusually risky PR, doesn't need new capability to get
+there — `kind: planner` + `role_hint: advisor` already gives a block the
+right *shape*: read-only, reports with `report("done", ...)` and exits
+rather than holding a pane open, and never records a verdict. What it does
+**not** already give you is the trigger. Every sentence orrerix itself
+generates about an advisor block — the orchestrator's own kickoff note, the
+worker's counterpart, and the non-overridable addendum the advisor block
+receives regardless of its persona — is keyed to *the team being stuck*, not
+to plan intake, PR size, or risk. A workflow file cannot widen that:
+`prompt:`/`profile:`/`allow:` on the `orchestrator` block are a parse error
+(see "The orchestrator block is loomux-owned" in
+[`doc/design/workflows.md`](https://github.com/willem445/orrerix/blob/main/doc/design/workflows.md)),
+so there is no way to tell your orchestrator "consult `design-review` at
+plan intake" or "spawn `premortem` when the diff looks risky" from the file
+itself. In practice, what fires a plan-intake or high-risk consult today is
+a human asking for one, or the orchestrator's own judgment reading the
+roster — not anything this pattern wires up mechanically. Declare as many
+advisor blocks as you want, each with its own persona; just don't expect the
+trigger to come for free.
 
-**Why not `kind: reviewer`.** The workflow-aware instructions make the
-orchestrator run **every** declared reviewer block on **every** PR, and a
-merge gate names which reviewers must record a `pass`. An on-demand lens
-declared as a reviewer is stuck between two bad options: run it on every PR
-(which defeats "on demand" and burns a pane on PRs that never needed a second
-opinion), or name it in the gate and have it hold every merge shut until
-someone remembers to spawn it and it passes. An advisor block sidesteps both
-— it never records a verdict at all, so it can neither satisfy nor block a
-gate, and the orchestrator only spawns it when it judges the PR or plan
-actually warrants the extra look.
+**Why not `kind: reviewer`.** orrerix's own built-in orchestrator template
+makes the orchestrator run **every** reviewing block — every `kind: reviewer`
+block except one hinted `role_hint: liaison` — on **every** PR,
+unconditionally, whether or not that block is named in a merge gate.
+Declaring the lens as a reviewer costs a pane on every PR it was never meant
+to see; naming it in a gate on top of that adds a second, separate cost — it
+can then hold every merge shut until someone spawns it and it passes. An
+advisor block avoids the first cost outright (nothing spawns it
+automatically) and the second is structural, not just a discipline you have
+to keep: `gate_reviewer_error` refuses, at parse time, any gate naming a
+non-reviewer block — an advisor cannot even be *named* in one, the file
+would not load. The orchestrator only spawns it when it judges the moment
+warrants the extra look (see the trigger caveat above).
 
 Two ready-made personas, modeled on this repo's own
 [`.github/agents/advisor.md`](https://github.com/willem445/orrerix/blob/main/.github/agents/advisor.md):
@@ -1848,21 +1864,25 @@ edges:
 that gets stuck is told to `message_orchestrator` and ask for a consult rather
 than spawn one itself — so both lenses hang off the orchestrator in `edges:`,
 never off a worker or reviewer. (One implementation detail worth knowing: the
-orchestrator's auto-generated "consult the advisor" kickoff sentence names
-only the *first* `role_hint: advisor` block declared in the file. A second
-one is still listed under "Your delegates" with its own persona, and is
-spawnable by `block: "premortem"` exactly the same way — it just isn't
-individually called out by that one sentence.)
+orchestrator's auto-generated "consult the advisor" kickoff sentence is built
+by `role_hint_block`, which the engine's own doc comment says picks the
+*first* block carrying a given hint on purpose — so with two advisor blocks
+declared, that sentence names only the first. The second is still listed
+under "Your delegates" with its own persona, and is spawnable by
+`block: "premortem"` exactly the same way — it just isn't individually
+called out by that one sentence.)
 
-**The residual.** An advisor never calls `review_verdict`, so `design-review`'s
-or `premortem`'s report can never satisfy or block a merge gate — the
-orchestrator reads the advice and dispositions it like any other input, the
-same as a human's. A repo that wants these questions to actually gate a merge,
-not just advise on one, puts them in its **standing reviewer persona**
-instead, as fixed headings its review body must carry (this repo's own
+**The residual.** An advisor's report can never satisfy or block a merge gate
+— not just because it never calls `review_verdict`, but because a gate
+cannot even name it (see the structural point above), so the orchestrator
+reads its advice and dispositions it like any other input, the same as a
+human's. A repo that wants these questions to actually gate a merge, not just
+advise on one, puts them in its **standing reviewer persona** instead, as
+fixed headings its review body must carry (this repo's own
 `.github/agents/rev-lead.md` does exactly that for its own question set):
 that shape buys enforcement, at the cost of running on every PR rather than
-only the ones that need it.
+only the ones that need it — and it needs no trigger caveat, either, since a
+reviewer that's named in the gate is spawned every time by construction.
 
 ### Proposed lessons come with their evidence
 

@@ -61,12 +61,15 @@ Read the human's description and extract, explicitly, before writing YAML:
   tools its block is offered, within the enumerated list. See Invariant 4.
 - **A design-review or premortem "second lens".** Same shape as the
   domain-expert advisor above (`kind: planner` + `role_hint: advisor`) —
-  never `kind: reviewer`: this repo's workflow-aware instructions run every
-  reviewer block on every PR, so an on-demand lens declared as a reviewer
-  either runs on every PR (defeating "on demand") or, once named in a merge
-  gate, holds every merge shut until someone remembers to spawn it and it
-  passes. See `docs/orchestration.md` → "Adding a second lens" for two
-  ready-made personas (`design-review.md`, `premortem.md`).
+  never `kind: reviewer`: orrerix's own built-in orchestrator template runs
+  every reviewing block (every `kind: reviewer` block except one hinted
+  `role_hint: liaison`) on every PR, so an on-demand lens declared as a
+  reviewer runs on every PR regardless (defeating "on demand"), and naming it
+  in a merge gate on top of that holds every merge shut until someone spawns
+  it and it passes. See `docs/orchestration.md` → "Adding a second lens" for
+  two ready-made personas (`design-review.md`, `premortem.md`) — including
+  the caveat that `role_hint: advisor` gives you the shape, not an automatic
+  trigger for *when* to spawn one.
 - **What stays default.** If the human didn't ask for something (a planner,
   a second worker tier, a merge gate at all), don't invent it. A workflow
   file that declares only what it's for is easier to read and easier for the
