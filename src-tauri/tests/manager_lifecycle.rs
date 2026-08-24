@@ -160,15 +160,24 @@ fn a_declared_manager_pane_opens_at_group_launch() {
     // and nothing else, so a declared manager was a block nothing ever
     // instantiated — every M2 behaviour was reachable only through a
     // hand-registered agent.
-    let (reg, _d, repo, gid) = launch(WITH_MANAGER, rails());
+    let (reg, _d, _repo, gid) = launch(WITH_MANAGER, rails());
 
     let m = the_manager(&reg, &gid);
     assert_eq!(m["block"], json!("manager"), "it must be the DECLARED block, not a class default");
     assert_eq!(m["status"], json!("running"));
+    // The group's OWN repo, read back from the registry rather than compared
+    // against the string this test passed in: what is pinned is "the manager
+    // sits in the repo, not in a cut worktree", and re-deriving the left side
+    // from the launch input would pass under any normalisation the group
+    // applied to both sides equally.
     assert_eq!(
-        m["cwd"].as_str().unwrap().replace('\\', "/"),
-        repo.path(),
+        m["cwd"].as_str().unwrap(),
+        reg.group(&gid).expect("the launched group").repo,
         "a manager works in the repo the human is talking about — no worktree"
+    );
+    assert!(
+        !m["cwd"].as_str().unwrap().contains("-worktrees"),
+        "...and specifically not the sibling worktree dir a delegate would get: {m}"
     );
     assert!(
         m["session"].as_str().is_some(),

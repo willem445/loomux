@@ -50689,7 +50689,7 @@ fn open_manager_pane_at_launch(reg: &Arc<OrchRegistry>, group: &GroupInfo, origi
             }
             Err(e) => {
                 reg2.audit(&group_id, brand::AUDIT_ACTOR, "error", json!({
-                    "what": "manager pane open failed", "block": block.id, "err": e.clone(),
+                    "what": "manager pane open failed", "block": block.id.clone(), "err": e.clone(),
                 }));
                 // The orchestrator is told because it is the pane that can act
                 // on it: its own `{{MANAGER_NOTE}}` fallback prose (M4) is
