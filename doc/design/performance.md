@@ -266,6 +266,29 @@ scan pins the shape.
   states for self-rescheduling timers. The standing debt this invariant names
   but does not close is in §5.
 
+- **INV-9 — What one TICK carries is bounded by LIVE work, not by session
+  length.** INV-3 and INV-4 bound how *often* the webview pays; INV-8 bounds
+  what a handler retains once it has it. Neither says how big one tick may be,
+  and #1317 is the gap between them: three polled reads whose per-tick size was
+  a direct function of how long the human had been running. None was a leak —
+  each is replaced wholesale every tick, so nothing accumulates — which is
+  precisely why INV-8 does not reach them: it is allocation churn proportional
+  to session length, on a fixed cadence.
+  **A polled read is sized by the population its READER indexes**, which is
+  something to go and measure rather than a cap to guess: in all three cases
+  the consuming view provably never looked at the rows that made the payload
+  grow. **Where such a read folds a population away it stays legible** — it
+  keeps that population's totals, names its size, and RENAMES the key it
+  narrowed, so a reader written against the old shape fails loudly instead of
+  quietly rendering a subset (`mcp::summarize_group_usage`'s `rest` count,
+  #866, is the precedent). See doc/design/polled-payload-shapes.md for the four
+  worked cases, including the one this deliberately does not close (#1472,
+  §5) — a bound that would cost the reader data it structurally needs is a
+  retention question, not a payload one.
+  *Enforced: review* + each read's own wire-shape tests
+  (`tests/orchestration.rs`: the live-usage view, the board's note split, the
+  needs-you join; `test/auditstore.test.ts` for the shared read).
+
 ## 4. Argued exceptions
 
 These are deliberate and stay. Each is argued **in code** at the cite; an E1/E2
@@ -303,7 +326,7 @@ Owning issues:
 | 16 sync git-shelling commands | #726 |
 | xterm scrollback: 13-25 MB per pane, never trimmed for an exited or docked one (INV-8a) | #1315 |
 | six module-level collections with no prune (INV-8a) | #1316 |
-| whole-of-session payloads on a poll: lifetime roster, uncapped board, triple-held audit log (INV-8a) | #1317 |
+| the human board's ROW COUNT on a poll — a retention decision, not a payload one (INV-9; #1317 lifted the payloads and argued this half out of scope) | #1472 |
 | embed views left OPEN in a background tab or a minimized pane still refetch and re-render (#1318 closed the closed-panel half only) | #1465 |
 | `tasks_lock` architecture — file IO out from under the board family's lock | #747 |
 | `mq_state_lock` / single gh-poll-thread decoupling (fleet latency; §4 X4) | #748 |

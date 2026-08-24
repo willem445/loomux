@@ -10281,8 +10281,10 @@ pub struct Task {
 /// what `list_tasks` returns — a live board hit **228,577 chars for 70
 /// tasks**, almost entirely from accumulated note text, and blew MCP result
 /// limits so the orchestrator could not read its own board. The human's board
-/// UI is unaffected: it reads `tasks.json` (full `Task`s) via `orch_tasks`,
-/// a separate path from the MCP `list_tasks` tool this feeds.
+/// UI is a separate path — `orch_tasks` and `BoardTask`, not this — and it
+/// took the same cut from the other direction in #1317, for the same reason
+/// measured on the same axis: its rows carry `note_count` and the bodies ride
+/// only for the rows the caller names. See `BoardTask`.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskSummary {
     pub id: String,
