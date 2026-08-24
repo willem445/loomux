@@ -42621,7 +42621,9 @@ impl OrchRegistry {
             // before any pane/worktree work so a burst fast-fails. A refused
             // spawn is not counted; one admitted here but later aborted
             // (worktree/bind failure) still counts toward the hour.
-            if role != Role::Orchestrator { self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?; }
+        }
+        if role != Role::Orchestrator {
+            self.check_and_record_spawn(group_id, group.guardrails.max_spawns_per_hour)?;
         }
 
         // Guardrail: the CLI and model are pinned per block (#4, now #222).

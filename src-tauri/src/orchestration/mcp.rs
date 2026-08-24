@@ -2173,7 +2173,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // the same reason `send_prompt`'s is: an orchestrator that reached
             // for a manager session wanted to reach the HUMAN, and the answer
             // to that is a tool it already holds.
-            // MUTATION 3: mcp.rs manager sentence arm deleted.
+            if let Some(id) = block.as_deref() {
+                let effective_kind =
+                    reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind));
+                if effective_kind == Some(Role::Manager) {
+                    return Err(format!(
+                        "that session belongs to this group's manager (block {id:?}) — the \
+                         human's own interface, opened for them at launch and never spawned or \
+                         resumed by you, however it is spelled. A manager pane comes back \
+                         through the session browser, which is the human's own surface. To put \
+                         something to the human, use ask_human; to send them status, use \
+                         message_manager."
+                    ));
+                }
+            }
             // rev-13 finding on #345 (extended for #359 to cover reviewers too):
             // a worker/reviewer RESUME that omits `cwd` fell through silently to
             // `spawn_agent_ex`'s per-role default — the main clone for anything
