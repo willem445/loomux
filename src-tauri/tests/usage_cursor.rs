@@ -342,3 +342,235 @@ fn a_half_written_line_is_not_consumed_until_its_newline_arrives() {
     );
     assert_eq!(after.tokens, parse_claude_transcript(&t.text()).tokens);
 }
+
+// ---------------------------------------------------------------------------
+// The blind spot, and the timer that bounds it (#1361 review B1)
+// ---------------------------------------------------------------------------
+
+/// Edit one byte of an ALREADY-CONSUMED line, far enough back that the anchor
+/// window cannot see it, and keep appending normally.
+///
+/// This is the shape no stat arm and no anchor detects: the file grew, the
+/// mtime moved forward, the creation time is unchanged, and the last
+/// `ANCHOR_BYTES` of the consumed region are untouched. The two tests below
+/// pin BOTH halves of the honest claim — that the guards miss it, and that the
+/// revalidation timer is what bounds it — because a design note that says so
+/// and a suite that pins only the happy half is the mismatch this repo keeps
+/// catching.
+fn edit_an_early_consumed_line(t: &Transcript) -> u64 {
+    let text = t.text();
+    // `body()` writes `"input_tokens":10` on every line; rewrite the FIRST
+    // occurrence to 90. Same length, so nothing shifts, and the first line is
+    // thousands of bytes before the end of the consumed region.
+    let at = text.find("\"input_tokens\":10").expect("fixture shape");
+    let mut bytes = text.into_bytes();
+    let needle = b"\"input_tokens\":10";
+    bytes[at + needle.len() - 2] = b'9'; // 10 -> 90
+    let edited = String::from_utf8(bytes).expect("still utf-8");
+    fs::write(&t.path, &edited).expect("rewrite in place");
+    80 // how much the input-token total moves once the edit is actually read
+}
+
+#[test]
+fn an_edit_below_the_anchor_window_is_not_detected_by_any_guard() {
+    // A long revalidation interval, so this test is purely about the guards.
+    let t = Transcript::new("sess-blind", &body("b", 40));
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+
+    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    assert_eq!(first.tokens.input_tokens, 400, "positive control: 40 lines folded");
+
+    let delta = edit_an_early_consumed_line(&t);
+    t.bump_mtime();
+    t.append(&line("b-new", "claude-opus-4-8", 1, 1));
+
+    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    assert!(!w.reset, "no guard fires: len grew, mtime moved forward, anchor intact");
+
+    let full = parse_claude_transcript(&t.text());
+    assert_eq!(full.tokens.input_tokens, 400 + delta + 1, "the file really did change");
+    assert_eq!(
+        after.tokens.input_tokens,
+        400 + 1,
+        "#1361 B1, pinned rather than papered over: the cursor folds the append on \
+         and never re-reads the edited bytes, so it disagrees with a full re-parse \
+         by exactly the edit. This is the documented residual — if this assertion \
+         ever starts failing because a guard caught it, the docs on ANCHOR_BYTES \
+         and stat_verdict are now understating what the code does and must be \
+         re-widened"
+    );
+}
+
+#[test]
+fn the_revalidation_timer_bounds_that_blind_spot() {
+    // The same fixture and the same edit, with the timer expired instead.
+    let t = Transcript::new("sess-reval", &body("r", 40));
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::ZERO);
+
+    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    assert_eq!(first.tokens.input_tokens, 400);
+
+    let delta = edit_an_early_consumed_line(&t);
+    t.bump_mtime();
+    t.append(&line("r-new", "claude-opus-4-8", 1, 1));
+
+    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    assert!(w.revalidated, "the age check, not a guard, is what discarded the cursor");
+    assert!(w.reset, "and a revalidation IS a reset — `revalidated` only says why");
+    assert_eq!(
+        after.tokens,
+        parse_claude_transcript(&t.text()).tokens,
+        "so the totals come back to the full re-parse answer — this is the whole \
+         reason the timer exists"
+    );
+    assert_eq!(after.tokens.input_tokens, 400 + delta + 1, "and by the edit's own size");
+}
+
+#[test]
+fn an_unexpired_cursor_is_not_revalidated() {
+    // Non-vacuity for the two tests above: `revalidated` must not simply be
+    // true on every tick, or the bound they pin would be measuring nothing.
+    let t = Transcript::new("sess-noreval", &body("n", 4));
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+
+    cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    t.append(&line("n-new", "claude-opus-4-8", 1, 1));
+
+    let (_, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    assert!(!w.revalidated, "well inside the interval, the cursor keeps folding");
+    assert!(!w.reset);
+}
+
+// ---------------------------------------------------------------------------
+// The reset arms the first round left unpinned (#1361 review N1, N2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_mtime_that_moved_backwards_resets_the_cursor() {
+    // A file restored over from a copy, a sync or a checkout. Content and
+    // length are identical, so neither `len` nor the anchor can object — this
+    // arm is the only thing that fires, which is what makes it worth pinning.
+    let t = Transcript::new("sess-backwards", &body("m", 6));
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+
+    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    assert_eq!(first.tokens.input_tokens, 60, "positive control: 6 lines folded");
+
+    let was = fs::metadata(&t.path).expect("stat").modified().expect("mtime");
+    let f = fs::OpenOptions::new().write(true).open(&t.path).expect("open");
+    f.set_times(fs::FileTimes::new().set_modified(was - Duration::from_secs(60)))
+        .expect("set mtime backwards");
+    drop(f);
+
+    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    assert!(w.reset, "an mtime that moved backwards must throw the cursor away");
+    assert!(!w.revalidated, "and it is a GUARD firing, not the timer");
+    assert_eq!(after.tokens, first.tokens, "the content did not change, so the answer does not");
+}
+
+#[test]
+fn a_replaced_file_with_identical_content_resets_on_its_creation_time() {
+    // A rotation: same path, same bytes, different file. Length matches, the
+    // anchor matches, and the mtime is moved forward — so the creation-time arm
+    // is the only one that can fire.
+    //
+    // Whether it CAN fire is a property of the host, and the test measures that
+    // rather than assuming it. Two ways it comes back inert: a filesystem with
+    // no birth time at all (`created()` is `Err`), and — the one that would
+    // otherwise make this flaky on the repo's own platform — NTFS **file
+    // tunneling**, which deliberately restores the ORIGINAL creation timestamp
+    // when a name is deleted and recreated in the same directory inside a ~15 s
+    // window. Sleeping past that window in a unit test is not an option, so the
+    // test compares the real before/after creation times and only asserts where
+    // the platform actually presents a different one.
+    let t = Transcript::new("sess-rotate", &body("c", 6));
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+
+    let (first, _) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    assert_eq!(first.tokens.input_tokens, 60, "positive control: 6 lines folded");
+
+    let before = fs::metadata(&t.path).expect("stat").created().ok();
+    let same = t.text();
+    let was_len = t.len();
+    fs::remove_file(&t.path).expect("remove");
+    fs::write(&t.path, &same).expect("recreate with identical content");
+    assert_eq!(t.len(), was_len, "the replacement must be byte-identical to test this arm");
+    t.bump_mtime();
+    let after_created = fs::metadata(&t.path).expect("stat").created().ok();
+
+    match (before, after_created) {
+        (Some(a), Some(b)) if a != b => {}
+        _ => {
+            eprintln!(
+                "skipped: this host reports no distinct creation time for a recreated \n                 file (no birth time, or NTFS file tunneling), so the creation-time \n                 reset arm is inert here by design — see TranscriptCursor::created"
+            );
+            return;
+        }
+    }
+
+    let (after, w) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    assert!(
+        w.reset,
+        "a different file at the same path must throw the cursor away even when its \n         bytes are identical — nothing about the old offset refers into it"
+    );
+    assert!(!w.revalidated, "and it is a GUARD firing, not the timer");
+    assert_eq!(after.tokens, first.tokens, "identical content, so identical totals");
+}
+
+
+#[test]
+fn a_transcript_that_moves_project_folder_is_rescanned_and_reset() {
+    // The cursor pins its resolved path. When Claude re-encodes a project
+    // folder the old path stops being a file, and the tick must rescan the
+    // root rather than give up — and must report the cursor it dropped on the
+    // way as a reset, which is the `had_cursor` ordering commit `0a79a32a`
+    // exists for (#1361 review N2).
+    let t = Transcript::new("sess-moved", &body("v", 5));
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+
+    let (first, w1) = cursors.session_usage_measured(t.root(), &t.session).expect("first");
+    assert_eq!(first.tokens.input_tokens, 50, "positive control: 5 lines folded");
+    assert!(w1.scanned_root, "the first tick resolves the path by scanning");
+
+    let moved = t.root().join("C--tmp-repo-renamed");
+    fs::create_dir_all(&moved).expect("create the new project folder");
+    fs::rename(&t.path, moved.join(format!("{}.jsonl", t.session))).expect("move it");
+
+    let (after, w2) = cursors.session_usage_measured(t.root(), &t.session).expect("second");
+    assert!(w2.scanned_root, "the remembered path stopped being a file, so rescan");
+    assert!(
+        w2.reset,
+        "and the cursor it discarded must be reported as a reset — read off `slot` \
+         AFTER the rescan cleared it, this would say `false`"
+    );
+    assert!(!w2.revalidated, "a vanished path is a guard firing, not the timer");
+    assert_eq!(after.tokens, first.tokens, "same transcript, same totals, new path");
+}
+
+// ---------------------------------------------------------------------------
+// The reader's own degrade (#1361 review N3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_line_that_is_not_utf8_is_skipped_rather_than_ending_the_parse() {
+    // The behaviour change this PR makes to `claude_session_usage_in`'s
+    // answer, and the only one that alters what a pre-existing caller gets:
+    // the old reader used `.lines().map_while(Result::ok)`, which STOPS at the
+    // first undecodable line, so one bad byte truncated a whole session's
+    // usage to whatever preceded it.
+    let t = Transcript::new("sess-badutf8", &body("u", 2));
+    let mut raw = fs::read(&t.path).expect("read");
+    raw.extend_from_slice(&[0x7b, 0xff, 0xfe, 0x22, 0x0a]); // `{`, two invalid bytes, `"`, newline
+    raw.extend_from_slice(line("u-after", "claude-opus-4-8", 500, 3).as_bytes());
+    fs::write(&t.path, &raw).expect("write");
+
+    let cursors = TranscriptCursors::with_revalidate_after(Duration::from_secs(3600));
+    let (usage, _) = cursors.session_usage_measured(t.root(), &t.session).expect("read");
+
+    assert_eq!(
+        usage.tokens.input_tokens,
+        20 + 500,
+        "the undecodable line contributes nothing AND does not end the fold — a \
+         reader that stopped there would report 20"
+    );
+}

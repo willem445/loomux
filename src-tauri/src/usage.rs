@@ -484,18 +484,53 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
 // ---------------------------------------------------------------------------
 
 /// Bytes of ALREADY-FOLDED content a cursor re-reads and compares before it
-/// folds anything new on top — its proof that the region it consumed is still
-/// there, byte-for-byte, at the same offset.
+/// folds anything new on top.
 ///
-/// `len`+`mtime` alone cannot see an in-place rewrite that happens to land on
-/// the same length, and on a coarse-`mtime` filesystem it cannot see one
-/// inside the same timestamp tick either. The anchor can: any edit to the last
-/// 64 bytes before the offset — or a wholesale replacement that shifts the
-/// content — changes what sits there, and the cursor throws itself away. 64
-/// bytes is small enough that the work bound this whole change exists for is
-/// unaffected, and a transcript line is hundreds of bytes at minimum, so an
-/// anchor never spans more than the tail of one record.
+/// **What it proves, exactly: that the LAST `ANCHOR_BYTES` of the consumed
+/// region are still what was folded there.** Not that the consumed region is
+/// intact — that is a strictly stronger statement this check does not make,
+/// and reading it as the stronger one is the mistake #1361's review caught.
+///
+/// It buys the cases `len`+`mtime` cannot see: an in-place rewrite landing on
+/// the same length, or one inside a single coarse-`mtime` tick. A wholesale
+/// replacement shifts the content, and a rewrite of the most recent record
+/// lands inside the window, so both change what sits there and the cursor
+/// throws itself away.
+///
+/// **What it does NOT see**, stated here because three other passages used to
+/// imply otherwise: an in-place edit to a consumed byte at an offset BELOW
+/// `offset - ANCHOR_BYTES`, on a file that goes on being appended to normally.
+/// `len` grew, mtime moved forward, the creation time is unchanged and the
+/// anchor window is untouched, so every guard agrees and the edited bytes are
+/// never re-read. Nothing in the stat or the anchor will ever notice; what
+/// bounds it is [`CURSOR_REVALIDATE_AFTER`], which throws the whole cursor
+/// away on a timer so the error is corrected within one interval instead of
+/// persisting for the life of the session.
+///
+/// 64 bytes keeps the work bound this whole change exists for intact, and a
+/// transcript line is hundreds of bytes at minimum, so the anchor never spans
+/// more than the tail of one record.
 const ANCHOR_BYTES: usize = 64;
+
+/// How long a cursor may keep folding incrementally before it is discarded and
+/// the transcript re-parsed from byte zero, whatever the stat and the anchor
+/// say.
+///
+/// **This is what makes "fails toward slow, never toward wrong" true rather
+/// than nearly true** (#1361 review B1). The stat arms and the anchor between
+/// them catch replacement, truncation, rotation, a backwards mtime, and any
+/// rewrite touching the last [`ANCHOR_BYTES`] of the consumed region. They do
+/// NOT catch an in-place edit further back on a still-appending file — see the
+/// note on `ANCHOR_BYTES`. Without a timer that case is wrong forever, which
+/// is a different kind of claim from "one poll window of staleness"; with one
+/// it is wrong for at most this long.
+///
+/// Five minutes against a 1 s poll means the incremental path still does
+/// roughly 1/300th of the work the whole-file re-parse did, so the guarantee
+/// costs almost none of the win. It is deliberately shorter than
+/// [`CURSOR_TTL`], so a cursor that survives eviction has revalidated at least
+/// once in between.
+const CURSOR_REVALIDATE_AFTER: Duration = Duration::from_secs(300);
 
 /// A cursor untouched for this long is dropped, so the map is bounded by
 /// transcripts being POLLED rather than by every transcript this process ever
@@ -527,6 +562,10 @@ pub struct CursorWork {
     /// The projects root was scanned for the transcript file. True on a first
     /// read and whenever the remembered path stops being a file.
     pub scanned_root: bool,
+    /// The cursor was discarded because it had been folding incrementally for
+    /// [`CURSOR_REVALIDATE_AFTER`], not because any guard objected. Always
+    /// accompanied by `reset`; this only says WHY.
+    pub revalidated: bool,
 }
 
 /// One transcript's parse position and everything needed to resume from it.
@@ -553,9 +592,20 @@ struct TranscriptCursor {
     /// Creation time where the platform reports one (`Err` on filesystems
     /// without a birth time — Linux ext4 without statx, for instance — and
     /// then simply not a signal).
+    ///
+    /// It is a weaker signal on Windows than it looks: NTFS **file tunneling**
+    /// deliberately restores the ORIGINAL creation timestamp when a name is
+    /// deleted and recreated in the same directory inside a ~15 s window, so a
+    /// quick rotation through the same path can present as the same file. That
+    /// is why this arm is defence-in-depth over the anchor and the length
+    /// rather than the thing relied on, and why the test for it probes the
+    /// real before/after times instead of assuming they differ.
     created: Option<SystemTime>,
     /// The last [`ANCHOR_BYTES`] of the consumed region.
     anchor: Vec<u8>,
+    /// When this cursor last started folding from byte zero — the clock
+    /// [`CURSOR_REVALIDATE_AFTER`] runs against.
+    built: Instant,
 }
 
 /// The stat-level decision for a cursor, before any bytes are read.
@@ -579,6 +629,7 @@ impl TranscriptCursor {
             modified: None,
             created: None,
             anchor: Vec::new(),
+            built: Instant::now(),
         }
     }
 
@@ -601,12 +652,18 @@ impl TranscriptCursor {
     ///
     /// `Serve` demands BOTH an unchanged length and an unchanged mtime, so a
     /// same-length rewrite reaches [`StatVerdict::Extend`] and then has to get
-    /// past the anchor, which it cannot. The residual blind spot is a rewrite
-    /// that lands on the same length AND the same mtime AND leaves the 64
-    /// bytes before the offset identical; the file would have to be edited in
-    /// place inside one filesystem timestamp tick to produce it, and the
-    /// consequence is one poll window of stale totals, not a wrong number
-    /// forever — the next append moves the mtime and the anchor decides again.
+    /// past the anchor.
+    ///
+    /// **What no arm here detects** (#1361 review B1, corrected from a much
+    /// narrower claim): an in-place edit to a consumed byte earlier than
+    /// `offset - ANCHOR_BYTES`, on a file that keeps being appended to. It
+    /// does not shrink the file, does not move the mtime backwards, does not
+    /// change the creation time, and does not touch the anchor window — so
+    /// every arm below agrees, the edited bytes are never re-read, and no
+    /// later append re-decides anything. It is NOT "one poll window of stale
+    /// totals": nothing in this function or the anchor will ever notice it.
+    /// [`CURSOR_REVALIDATE_AFTER`] is what bounds it, by discarding the cursor
+    /// on a timer regardless of what these arms say.
     fn stat_verdict(
         &self,
         len: u64,
@@ -702,6 +759,13 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
         }
         // The handle now sits at exactly `cursor.offset`.
     } else if cursor.offset > 0 {
+        // Reached only when the anchor branch above did NOT run, which is sound
+        // because a non-zero offset always carries a non-empty anchor:
+        // `push_anchor` runs on every consumed line, so `anchor.len()` is
+        // `min(offset, ANCHOR_BYTES)` by construction. If that ever stopped
+        // holding, a verify_anchor tick with a non-empty offset would skip the
+        // seek and re-fold the whole file from byte zero onto a cursor that
+        // already holds it (#1361 review, latent-coupling note).
         file.seek(SeekFrom::Start(cursor.offset))?;
     }
     let mut reader = BufReader::new(file);
@@ -754,9 +818,19 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
 /// release → leaf-lock rule the usage memo follows. The outer lock is held
 /// only long enough to clone one cell out, so a full re-parse for one agent
 /// never blocks another agent's tick.
-#[derive(Default)]
 pub struct TranscriptCursors {
     cursors: Mutex<HashMap<(PathBuf, String), CursorEntry>>,
+    /// How long any one cursor may fold incrementally before it is discarded
+    /// and re-parsed from zero. [`CURSOR_REVALIDATE_AFTER`] in production;
+    /// a parameter only so the tests can exercise the timer without waiting
+    /// on a real clock.
+    revalidate_after: Duration,
+}
+
+impl Default for TranscriptCursors {
+    fn default() -> Self {
+        TranscriptCursors::with_revalidate_after(CURSOR_REVALIDATE_AFTER)
+    }
 }
 
 struct CursorEntry {
@@ -766,6 +840,19 @@ struct CursorEntry {
 }
 
 impl TranscriptCursors {
+    /// A cache whose cursors revalidate on the given interval instead of the
+    /// production [`CURSOR_REVALIDATE_AFTER`].
+    ///
+    /// `#[doc(hidden)] pub` for the integration tests. The timer is the whole
+    /// of what bounds the blind spot documented on [`ANCHOR_BYTES`], so it has
+    /// to be testable; waiting five real minutes in a test is not a test.
+    /// `Duration::ZERO` revalidates on every tick. Production constructs this
+    /// type through `Default` and therefore never takes another value.
+    #[doc(hidden)] // pub for integration tests
+    pub fn with_revalidate_after(revalidate_after: Duration) -> Self {
+        TranscriptCursors { cursors: Mutex::new(HashMap::new()), revalidate_after }
+    }
+
     /// A Claude session's usage, parsing only what was appended since this
     /// cache last read the same transcript. Same totals as
     /// [`claude_session_usage_in`], same `None` cases.
@@ -808,25 +895,41 @@ impl TranscriptCursors {
         // discarded", and reading it off `slot` afterwards would miss that one.
         let had_cursor = slot.is_some();
 
-        // Resolve the transcript path once and keep it; one `is_file()` per
-        // tick replaces a scan of every project folder under the root.
+        // ONE stat per tick, and it does double duty: the same `metadata` call
+        // that answers `len`/mtime/creation is what validates the remembered
+        // path. Asking `is_file()` first would be a second stat on the app's
+        // hottest poll and would falsify the "one stat, then" claim this
+        // design is documented with (#1361 review N4).
         let remembered = slot.as_ref().map(|c| c.path.clone());
-        let path = match remembered {
-            Some(p) if p.is_file() => p,
-            _ => {
+        let (path, meta) = match remembered.and_then(|p| {
+            let m = fs::metadata(&p).ok()?;
+            m.is_file().then_some((p, m))
+        }) {
+            Some(found) => found,
+            None => {
                 work.scanned_root = true;
                 *slot = None;
-                claude_transcript_path(root, &session)?
+                let p = claude_transcript_path(root, &session)?;
+                let m = fs::metadata(&p).ok()?;
+                (p, m)
             }
         };
-
-        let meta = fs::metadata(&path).ok()?;
         let (len, modified, created) = (meta.len(), meta.modified().ok(), meta.created().ok());
 
         // Decide from the stat; the anchor then gets to overrule an `Extend`,
         // from inside the same read that would have folded onto it.
+        //
+        // The age check comes FIRST and overrules both. It is not a guard that
+        // detected anything — it is the timer that bounds what the guards
+        // structurally cannot detect (see `ANCHOR_BYTES` and
+        // `CURSOR_REVALIDATE_AFTER`), so it has to fire even on a tick where
+        // every other signal is content.
         let mut verdict = match slot.as_ref() {
             None => StatVerdict::Reset,
+            Some(c) if c.built.elapsed() >= self.revalidate_after => {
+                work.revalidated = true;
+                StatVerdict::Reset
+            }
             Some(c) => match c.stat_verdict(len, modified, created) {
                 StatVerdict::Serve => {
                     work.served_cached = true;

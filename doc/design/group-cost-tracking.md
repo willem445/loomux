@@ -148,22 +148,31 @@ fold continue instead of restarting.
 
 ### The per-tick decision
 
-One `stat`, then:
+One `stat` — the same call that validates the remembered path — then:
 
 | Observation | Action |
 | --- | --- |
+| the cursor has been folding for `CURSOR_REVALIDATE_AFTER` | reset, whatever everything below says |
 | `len` and mtime both unchanged | serve the cursor's totals; the file is not opened |
 | grew, or mtime moved forward | re-read the anchor and, if it matches, fold the appended **complete** lines on — through one handle |
 | shorter than the last stat | reset: discard the cursor, re-parse from byte zero |
 | creation time differs | reset — a different file at the same path |
 | mtime moved **backwards** | reset — restored over from a copy, a sync, a checkout |
-| anchor no longer matches | reset — the consumed region was rewritten under us |
+| anchor no longer matches | reset — the **last 64 bytes** of the consumed region were rewritten |
 
 Every reset costs exactly what the old code cost on every tick. That is the
 shape of the whole design: **each guard fails toward slow, never toward
-wrong.** It rests on Claude Code appending to a session's `.jsonl` and never
-rewriting earlier lines; if that ever stops holding, these guards are what
-notice, and the fallback is the pre-#1239 full re-parse.
+wrong** — with the top row doing more work in that sentence than it looks,
+for the reason the next section gives.
+
+The design rests on Claude Code appending to a session's `.jsonl` and never
+rewriting earlier lines. Be precise about what happens if that stops holding,
+because an earlier draft of this note was not: the guards notice a
+**replacement**, a **truncation**, a **rotation**, an mtime restored
+**backwards**, and any rewrite that touches the last 64 bytes of the consumed
+region. They do **not** notice an in-place edit further back on a file that
+keeps being appended to. The revalidation timer, not the guards, is what
+covers that case.
 
 ### Why an anchor as well as `len` and mtime
 
@@ -183,11 +192,52 @@ into another, which is the one way this design could produce a *wrong* total
 rather than a slow tick. Reading the anchor also leaves the handle at exactly
 the offset, so the check costs one seek and 64 bytes.
 
-The residual blind spot, stated rather than hidden: a rewrite landing on the
-same length **and** the same mtime **and** leaving those 64 bytes identical.
-The file would have to be edited in place inside one filesystem timestamp
-tick to produce it, and the consequence is one poll window of stale totals —
-the next append moves the mtime and the anchor decides again.
+### What the anchor does not prove, and the timer that covers it
+
+The anchor proves that the **last `ANCHOR_BYTES` of the consumed region** are
+still what was folded there. It does not prove the consumed region is intact,
+and the difference is not academic:
+
+> Let the consumed region be `[0, O)`. Edit any byte below `O − 64` in place —
+> one `input_tokens` value in an earlier line — while the agent goes on
+> appending normally. `len` grew, the mtime moved forward, the creation time
+> is unchanged, and the anchor window is untouched. Every guard agrees, the
+> edited bytes are never re-read, and no later append re-decides anything.
+
+No stat arm and no anchor will ever catch that. Left alone it is not "one poll
+window of stale totals" — it is wrong for the life of the cursor.
+
+So the cursor is discarded on a timer: `CURSOR_REVALIDATE_AFTER` (5 minutes)
+puts a ceiling on how long any incremental fold may run before the transcript
+is re-parsed from byte zero regardless of what every other signal says. That
+is what makes "fails toward slow, never toward wrong" a true statement rather
+than a nearly-true one — the error becomes bounded by the interval instead of
+permanent. Against a 1 s poll the timer still leaves the incremental path
+doing roughly 1/300th of the old work, so the guarantee costs almost none of
+the win, and it is deliberately shorter than `CURSOR_TTL` so a cursor that
+survives eviction has revalidated at least once in between.
+
+Both halves are pinned, deliberately: `an_edit_below_the_anchor_window_is_not_detected_by_any_guard`
+asserts the cursor really does disagree with a full re-parse by exactly the
+edit, and `the_revalidation_timer_bounds_that_blind_spot` asserts the timer
+brings it back. A note that discloses a residual while the suite pins only the
+happy half is the mismatch this repo keeps catching.
+
+### Why not just poll less often
+
+The cheaper fix for a 1 Hz whole-file re-parse is to stop doing it at 1 Hz:
+raise `USAGE_POLL_MAX_AGE`, or throttle the transcript read specifically. That
+cuts the same churn by the throttle factor, adds no cross-tick state, and has
+no blind spot to disclose at all.
+
+It was not chosen because it trades the thing the poll exists for. Freshness on
+the group view is a real product property — a human watching an agent burn
+tokens is watching *this* number — and throttling degrades it linearly with the
+saving: a 60× cut in work is a 60× cut in freshness. The cursor decouples the
+two, buying the same reduction while keeping a 1 s answer, at the cost of the
+state and the residual described above. If that residual ever proves
+troublesome in practice, throttling is the fallback that needs no new
+invariants — and shortening `CURSOR_REVALIDATE_AFTER` is the dial in between.
 
 ### A partial trailing line is never consumed
 
@@ -222,6 +272,24 @@ ones for a few minutes. There is no lifecycle event to hang eviction on: a
 cursor deliberately outlives its agent's pane, because `mark_dead` reads usage
 after teardown.
 
+**The per-entry cost is the genuinely new fact, and it is a residency change
+rather than a size one.** Each cursor holds its fold's message-id dedupe set,
+roughly `n_assistant_messages × ~60 B`: a 32 MiB multi-day transcript at ~3 KB
+a line is a few thousand ids (~300 KB), a very long-lived one tens of
+thousands (~3 MB). That set is not new — the old code built and freed an
+identical one on *every tick*. What changed is that it is now **held** per
+polled transcript for up to `CURSOR_TTL` instead of churned once a second, so
+single-digit MB is resident across a busy group where before it was
+single-digit MB allocated and freed every second. That churn is precisely what
+the page-fault count in #1239 was measuring, so the trade is the point of the
+change rather than a cost of it — but the resident figure is the one to look
+at first if memory, not CPU, is ever the complaint.
+
+`tests/usage_memory.rs` (#1218) pins peak live heap on the whole-file reader,
+whose fold is dropped when it returns. The cursor's fold is not dropped, by
+design, so that test does not bound it and no test does; the arithmetic above
+is the bound.
+
 The map holds `Arc<Mutex<..>>` per transcript, following the same map-lock →
 release → leaf-lock rule as the usage memo: the outer lock is held only long
 enough to clone one cell out, so one agent's full re-parse never blocks
@@ -229,8 +297,9 @@ another agent's tick.
 
 The resolved transcript path lives in the cursor too. `claude_transcript_path`
 scans every project folder under the root, and doing that once a second per
-live agent is the same class of waste as the re-parse; it is re-validated with
-one `is_file()` per tick and re-scanned when that fails. The scan returns
+live agent is the same class of waste as the re-parse; it is re-validated by
+the tick's single `stat` — the same `metadata` call that answers `len`, mtime
+and creation time — and re-scanned when that comes back missing or not a file. The scan returns
 whichever project folder matches first — directory order, already arbitrary
 when it ran every tick — so pinning it makes that choice stable rather than
 stable-by-luck.
@@ -255,7 +324,9 @@ tooltip giving the source, model, and full token breakdown.
   leaves no temp file; a corrupt `usage.json` is preserved as `.bad` rather than
   wiped; and a total blending estimated and reported dollars is labelled
   `mixed`. No test ever spawns a real agent CLI.
-- `tests/usage_cursor.rs` pins the cursor contract (#1239): appended lines fold
+- `tests/usage_cursor.rs` pins the cursor contract (#1239), including every row
+  of the decision table above and BOTH halves of the residual — the guards
+  missing an edit below the anchor window, and the timer bounding it. Appended lines fold
   onto the cursor and reach the full-re-parse answer (including a re-emitted
   message id, which must not count twice, and a model switch, which must
   re-decide the priced model); a tick reads only the appended bytes plus the
