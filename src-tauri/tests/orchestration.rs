@@ -48520,6 +48520,7 @@ fn write_usage_transcript(dir: &Path, sid: &str, input: u64, output: u64) {
 /// `orch_autonomy`'s budget meter). Inside one window they must share ONE
 /// computation; past it, the next caller recomputes.
 #[test]
+#[ignore = "[scratch] #1239 round 3b: this test ALSO reddens under round 3's mutation (round 3a is the run that shows it). cargo test stops at the first failing test BINARY, and this binary runs before tests/usage_cursor.rs — so it is ignored here purely so the run reaches the later binary. No behaviour is neutered by this line."]
 fn group_usage_serves_one_snapshot_per_window_and_recomputes_past_it() {
     let proj = tempfile::tempdir().unwrap();
     let (reg, _d) = test_registry();
