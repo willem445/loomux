@@ -23204,10 +23204,28 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
             i += 1;
             continue;
         }
-        // The marker rule, unchanged and unconditional: one row, no record
-        // needed. Everything below only ever claims MORE rows, never this one
-        // differently.
-        if leads_with_notice_marker(rows[i]) {
+        // The marker rule: one row, no record needed. Everything below only ever
+        // claims MORE rows, never this one differently.
+        //
+        // #903 reads it through a leading POINTER glyph as well, and the reason is
+        // the same replay that made the session record necessary. A resumed CLI
+        // renders a replayed user turn with a `❯` in front of it, and `deframe`
+        // does not treat a pointer as framing — so a notice loomux delivered and
+        // the CLI replayed comes back as `❯ [orrerix] …` and the marker rule
+        // stops seeing its own marker. Fifteen of the thirty-nine
+        // `pointer-option` holds in the group's audit log were marker-led notices
+        // wearing exactly that chevron.
+        //
+        // It claims no more than the marker rule already claims: ONE row, the one
+        // the marker leads. The #420 objection to widening this — that an agent
+        // can print a marker row itself, so a RUN-mask hands a pane the power to
+        // delete the rows beneath an attacker-chosen row — is untouched, because
+        // a pane that can print `[orrerix] …` can already print it and get that
+        // single row claimed. Adding a chevron in front of it buys the pane
+        // nothing it did not have.
+        if leads_with_notice_marker(rows[i])
+            || strip_leading_pointer(rows[i]).is_some_and(leads_with_notice_marker)
+        {
             keep[i] = false;
         }
         let mut claimed = record_claim(&norm, &recorded, first_row, i);
