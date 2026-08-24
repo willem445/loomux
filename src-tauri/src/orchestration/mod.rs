@@ -24692,7 +24692,8 @@ pub const QUESTION_HOLD_OVERRIDE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// same number: one reading of a composed screen can catch a mid-redraw
 /// instant, and this reading licenses a WRITE. Two polls is four seconds
 /// against a bound measured in quarter-hours, so it costs nothing that matters.
-const QUESTION_OVERRIDE_CONSECUTIVE_READS: u32 = 2;
+#[doc(hidden)] // pub for integration tests
+pub const QUESTION_OVERRIDE_CONSECUTIVE_READS: u32 = 2;
 
 /// #903: may this poll deliver despite the question gate saying no?
 ///
@@ -24735,47 +24736,92 @@ pub fn question_override_admits(
     held_since_ms.is_some_and(|since| hold_bound_elapsed(since, now_ms, bound_ms))
 }
 
-/// #903 B2: may an attempt the drainer already granted a question override to
-/// press its ENTER?
+/// One fresh pre-Enter re-read, reduced to the two bits the decision uses (#903
+/// B2).
+///
+/// A named pair rather than a tuple because both bits are booleans and swapping
+/// them silently inverts the safety argument — `active` says the gate is still
+/// holding, `idle_prompt` says the pane's own screen shows its composer holding
+/// this paste.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuestionReread {
+    /// Did the question gate still read as holding on this poll?
+    pub active: bool,
+    /// Did that same screen show the CLI's composer holding this delivery's
+    /// paste — [`idle_prompt_row_rendered`], the WEAK reading, which is the
+    /// override's own standard?
+    pub idle_prompt: bool,
+}
+
+impl QuestionReread {
+    /// Does THIS one read permit the Enter?
+    ///
+    /// `!active` counts, and it is not a widening: a poll where the gate has
+    /// simply gone clear is a poll the ordinary checkpoint would have released
+    /// on. Without it a screen that repainted between the abort and this re-read
+    /// would strand the paste for having got BETTER.
+    pub fn admits(&self) -> bool {
+        !self.active || self.idle_prompt
+    }
+}
+
+/// #903 B2: do these fresh pre-Enter re-reads carry a granted override's Enter?
 ///
 /// [`question_override_admits`] decides the PASTE, minutes earlier, on the
-/// drainer's poll. This decides the Enter, here, now — and the split is the whole
+/// drainer's poll. This decides the ENTER, here, now — and the split is the whole
 /// of what makes the grant worth anything. Skipping only the pre-paste gate left
-/// this checkpoint to re-read an unchanged screen, reach the same false positive
-/// the grant was issued because of, and abort with the text already in the box.
+/// the pre-Enter checkpoint to re-read an unchanged screen, reach the same false
+/// positive the grant was issued because of, and abort with the text already in
+/// the box.
 ///
-/// **Three terms, and each is the narrow one available:**
+/// Pure, and separated from the pane reading for the reason
+/// [`question_hold_predicate_sampled`]'s own doc gives about rev-15 B4: a
+/// decision welded to a live `PtyManager` is one no test in this repo can drive,
+/// so the rule ends up pinned by nothing. The GRANT itself is not a term here —
+/// it is the caller's `question_overridden`, decided by the drainer poll that
+/// observed the pane, and re-deriving it at this site would describe a different
+/// instant than the one that admitted the write.
 ///
-/// - **The grant is the caller's**, passed in as `question_overridden` rather
-///   than re-derived, for the reason `deliver_now`'s own parameter doc gives: the
-///   decision belongs to the poll that observed the pane.
-/// - **The evidence is FRESH and re-proved, never latched.** Each round takes a
-///   new sample; a pane that painted a dialog since the grant fails on the very
-///   next read with no memory of having been eligible. Two rounds, spaced by the
-///   guard's own poll interval, matching [`QUESTION_OVERRIDE_CONSECUTIVE_READS`]
-///   and for its reason: one reading of a composed screen can catch a mid-redraw
-///   instant, and this one licenses an Enter.
-/// - **The bar is the WEAK idleness reading**, the same one the grant was
-///   decided on. The strong reading would make this unreachable on exactly the
-///   pane class it exists for — see [`QUESTION_HOLD_OVERRIDE_AFTER`].
+/// Two terms, both narrowing:
 ///
-/// `!r.active` admits too, and it is not a widening: a round where the gate has
-/// simply gone clear is a round the ordinary checkpoint would have released on.
-/// Without it a screen that repainted between the abort and this re-read would
-/// strand the paste for having got BETTER.
+/// - **Enough reads.** [`QUESTION_OVERRIDE_CONSECUTIVE_READS`], for its own
+///   reason: one reading of a composed screen can catch a mid-redraw instant,
+///   and this one licenses an Enter. An empty slice is never enough, so a caller
+///   that took no reads at all cannot pass by omission.
+/// - **EVERY read admits.** Not a majority and not the last one — a pane that
+///   painted a dialog on any of these polls is ineligible, with no memory of
+///   having been eligible on the others.
+#[doc(hidden)] // pub for integration tests
+pub fn override_enter_admits(reads: &[QuestionReread]) -> bool {
+    reads.len() as u32 >= QUESTION_OVERRIDE_CONSECUTIVE_READS
+        && reads.iter().all(QuestionReread::admits)
+}
+
+/// The production half of [`override_enter_admits`]: take the fresh reads this
+/// pane owes, then let that function decide.
+///
+/// Stops early on the first read that does not admit — there is nothing for a
+/// second poll to rescue, and the delivery is aborting anyway, so the sleep
+/// would be latency spent on a decision already made.
 fn preenter_override_admits(
     ptys: &crate::pty::PtyManager,
     pty_id: u32,
     pasted_text: &str,
     delivered: Vec<String>,
 ) -> bool {
-    (0..QUESTION_OVERRIDE_CONSECUTIVE_READS).all(|round| {
+    let mut reads: Vec<QuestionReread> = Vec::new();
+    for round in 0..QUESTION_OVERRIDE_CONSECUTIVE_READS {
         if round > 0 {
             std::thread::sleep(QUESTION_HOLD_POLL);
         }
         let r = question_active_witnessed(ptys, pty_id, Some(pasted_text), delivered.clone());
-        !r.active || r.idle_prompt
-    })
+        let read = QuestionReread { active: r.active, idle_prompt: r.idle_prompt };
+        reads.push(read);
+        if !read.admits() {
+            break;
+        }
+    }
+    override_enter_admits(&reads)
 }
 
 /// What the drainer should do about a pane it is not yet allowed to write to
