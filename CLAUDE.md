@@ -266,6 +266,17 @@ compiles.
   scan is implemented. Precedents: `tests/groupid.rs`, `tests/perf_dispatch.rs`,
   `test/perfpolicy.test.ts`. Signature: the guard's own doc quotes the line it
   was written for, and that line still passes (#922).
+- **A guard that REFUSES ships only after it has run clean over known-good subjects.**
+  Reading a check never finds a false block; running it against real PRs — merged ones,
+  and the one in hand — does, and the refusals cluster on the artifacts this repo
+  MANDATES: a base-measured run id, a cited commit SHA, a pasted Windows panic path.
+  The harness that runs the corpus is itself an instrument — prove its extraction against
+  a subject known to FAIL before reading its clean report, or the report is about the
+  harness rather than the corpus (the #1209 census bullet, one level up). Signature: ALL
+  FIVE false blocks found by RUNNING checklists that had survived every read of them, and
+  one of the five invisible to a harness that examined only the FIRST of the body's
+  stated diffstats (#1395 B1/B2/B3/B5/B6; the false-NEGATIVE direction is the
+  positive-control bullets below).
 - `src-tauri/src/orchestration/mod.rs` is tens of thousands of lines — grep for
   the function/struct, don't read it top to bottom. Anchor an INSERT above the
   item's `///` block, never above its `#[tauri::command]`/`fn` — those sit BELOW
@@ -296,7 +307,11 @@ compiles.
   against the pre-mutation blob — and abort rather than record a run you did not
   produce; the CRLF trap under *Running these in an agent worktree* is one way the
   anchor silently misses. Signature: the pre- and post-mutation runs report identical
-  pass counts (#1297).
+  pass counts (#1297). An anchor can also match and the edit still land wrong: JS
+  `String.replace` with a *string* replacement expands `` $& ``, `` $` `` and `` $' ``,
+  so an anchor or payload containing one splices the file into itself — pass a function
+  replacer, and diff against the pre-mutation blob rather than trusting an anchor count
+  (#1395).
   A mutation table is only as wide as its INSTRUMENT: `npm test` is `node --test` over `.ts`,
   which strips types without checking them, so a row reading "no test reddened" has not asked
   whether the compiler had an opinion — run `tsc --noEmit` on every row, and never state which
@@ -494,7 +509,9 @@ narrow their ask back down to the original ticket on your own judgment.
   derived by arithmetic, remembered, or carried from a mid-branch run. Counts,
   deltas, diffstats and run ids all go stale on the next commit. Read both
   totals out of the two runs' own logs, and check that the per-file deltas sum
-  to the total you are claiming (#859, #862, #889, #907, #914, #921).
+  to the total you are claiming (#859, #862, #889, #907, #914, #921); which
+  `gh pr diff` form a diffstat may be measured from at all is a recipe in
+  `.claude/skills/ci-validate/SKILL.md`.
   A number is also only as good as the instrument that produced it: a regex character
   class is a GUESS about the alphabet of its own subjects, so census by walking the real
   delimiters and cross-check the total against a raw count of the container. Signature:
