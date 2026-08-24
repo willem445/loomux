@@ -477,7 +477,7 @@ never nags the orchestrator about the human's own pane" is the rule.
 `counts_against_max_agents` is one pure predicate read by all five sites that had
 independently spelled `role != Role::Orchestrator`: `live_delegate_count`, the
 cap-refusal roster, `spawn_agent_bound`'s fast-path check and its race-safe
-re-check, and `group_status`'s `live_delegates` sum. A class cannot now be exempt
+re-check, and `group_summary`'s `live_delegates` sum. A class cannot now be exempt
 from the count and named in the refusal message.
 
 `recommend_capacity` **inverts** M1's `+1`. `recommended` answers "what must the

@@ -6391,7 +6391,7 @@ pub fn spawn_opens_minimized(role: Role, group_opted_expanded: bool) -> bool {
 ///
 /// Pure, and the one expression: `live_delegate_count`, `live_delegate_roster`,
 /// `spawn_agent_bound`'s fast-path cap check and its race-safe re-check under
-/// the agents lock, and `group_status`'s `live_delegates` sum all read THIS —
+/// the agents lock, and `group_summary`'s `live_delegates` sum all read THIS —
 /// so a class cannot be exempt from the count and named in the refusal
 /// message, which is the asymmetry four independently-written `role !=
 /// Role::Orchestrator` filters were one edit away from producing.
