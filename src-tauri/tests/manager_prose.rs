@@ -317,6 +317,84 @@ fn the_managers_contract_never_names_a_tool_it_does_not_have() {
 }
 
 #[test]
+fn every_tool_the_managers_prose_names_is_one_the_manager_holds() {
+    // The DEFAULT-DENY half, and the repo's source-scanning-guard convention
+    // prefers it to the enumerated list above: `WITHHELD_TOOLS` catches the
+    // tools someone thought to list, and cannot catch a tool nobody did — a
+    // name invented by a later edit, or one a future slice adds to the shared
+    // tier without adding it here. This derives the GRANTED set from `mcp.rs`'s
+    // manager arm itself, so the prose is checked against what the code
+    // actually enumerates rather than against a second copy of it.
+    //
+    // Stated blind spots, per the convention: it is a textual scan, so it sees
+    // `MANAGER_SHARED`'s string literals and the `*_tool()` calls in the
+    // `tools.extend([...])` beside them, and would not see a tool added by some
+    // other shape (a helper that pushes conditionally, a name built at
+    // runtime). None exists today. It also only inspects prose written as a
+    // CALL — `` `check_mail(` `` — which is how this template teaches every
+    // tool; a bare backticked name with no paren is invisible to it, and the
+    // `WITHHELD_TOOLS` sweep above is what covers that shape.
+    let mcp = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestration/mcp.rs"))
+        .expect("read mcp.rs");
+    let shared_at = mcp.find("const MANAGER_SHARED").expect(
+        "mcp.rs no longer declares MANAGER_SHARED — the manager's tool surface moved, and this \
+         guard is reading nothing. Re-point it at wherever the surface is enumerated now.",
+    );
+    let shared_end = mcp[shared_at..].find("];").expect("MANAGER_SHARED is unterminated") + shared_at;
+    let shared: Vec<&str> = mcp[shared_at..shared_end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        .collect();
+    let ext_at = mcp[shared_at..].find("tools.extend([").expect("the manager's extension list") + shared_at;
+    let ext_end = mcp[ext_at..].find("]);").expect("the extension list is unterminated") + ext_at;
+    let ext: Vec<&str> = mcp[ext_at..ext_end]
+        .match_indices("_tool()")
+        .map(|(i, _)| {
+            let head = &mcp[ext_at..ext_at + i];
+            let start = head.rfind(|c: char| !(c.is_ascii_lowercase() || c == '_')).map_or(0, |x| x + 1);
+            &head[start..]
+        })
+        .collect();
+
+    // Per-part controls. The first cut of this scan sliced the extension block
+    // to a marker that does not follow it, so `ext` came back EMPTY and five
+    // GRANTED tools read as ungranted. A single "the surface looks big enough"
+    // check passed on `shared` alone while the half that mattered had silently
+    // extracted nothing — so each half is floored on its own.
+    assert!(shared.len() >= 5, "control: MANAGER_SHARED extracted {} names: {shared:?}", shared.len());
+    assert!(ext.len() >= 3, "control: the extension list extracted {} names: {ext:?}", ext.len());
+
+    let (reg, _d) = test_registry();
+    let repo = Repo::with_workflow(WITH_MANAGER);
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let doc = instructions_lf(&reg, &g.id, "manager.md");
+
+    let named: Vec<String> = doc
+        .match_indices('(')
+        .filter_map(|(i, _)| {
+            let head = &doc[..i];
+            let start = head.rfind(|c: char| !(c.is_ascii_lowercase() || c == '_'))? + 1;
+            let name = &head[start..];
+            // Only a backticked call — ``foo(`` — is the template teaching a tool.
+            (!name.is_empty() && head[..start].ends_with('`')).then(|| name.to_string())
+        })
+        .collect();
+    assert!(named.len() >= 4, "control: found only {} tool calls in manager.md: {named:?}", named.len());
+
+    for name in &named {
+        assert!(
+            shared.contains(&name.as_str()) || ext.contains(&name.as_str()),
+            "manager.md teaches `{name}(...)`, which is NOT on `Role::Manager`'s enumerated \
+             surface in mcp.rs (granted: shared {shared:?} + extension {ext:?}). A manager that \
+             calls it gets a permission-denied in front of the human, and reads the same line \
+             again next turn. Grant it deliberately or say what the manager does in words."
+        );
+    }
+}
+
+#[test]
 fn a_replace_mode_manager_still_gets_the_rules_the_template_carries() {
     // The lockstep half, and the reason `mechanics_core` is reachable from a
     // test at all: a `mode: replace` persona's block never reads its class
