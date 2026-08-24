@@ -1716,7 +1716,9 @@ later: relaxing a refusal costs nobody anything, while adding one to a key
 people have already written into committed files breaks their workflows.
 
 The label itself is letters, digits, `-` and `_`, at most 64 characters, and not
-starting with `-`. It is refused rather than cleaned up, so two spellings can
+starting with `-`. A handful of names Windows reserves for devices (`CON`,
+`NUL`, `COM1`…) are refused too, in any capitalisation — on Windows those are
+not file names at all. It is refused rather than cleaned up, so two spellings can
 never end up meaning one machine — and it is **case-sensitive**, so `buildbox`
 and `BuildBox` are two different labels, not one written two ways. A block with
 no `remote:` key is a local block and is completely unaffected — which is every
