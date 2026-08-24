@@ -679,6 +679,29 @@ test("read hands out a copy, so an edit to it cannot reach disk without a write"
   assert.deepEqual(back[0].extraArgs, ["-J", "jump.example.net"], "…nor the appended argv words");
 });
 
+test("write copies the profile in, so an edit made afterwards cannot ride the next save", async () => {
+  // The mirror of the test above, and the reason the copy is on BOTH sides: the
+  // store outlives the call, so a caller that keeps its object could otherwise
+  // change what a later write publishes without ever handing anything over.
+  const io = fakeIo(() => Promise.resolve(OTHERS));
+  const profiles = new SshProfilesStore(io);
+  const handed = fullProfile({ id: "p-mine", destination: "me@laptop.local", extraArgs: ["-J", "gate"] });
+  assert.equal(await profiles.write(handed), "saved");
+  assert.equal(
+    decodeSshProfiles(io.saved[0])?.profiles.find((p) => p.id === "p-mine")?.destination,
+    "me@laptop.local",
+    "the first save really carried the handed-over connection"
+  );
+
+  handed.destination = "attacker@elsewhere";
+  handed.extraArgs.push("-o", "ProxyCommand=evil");
+  assert.equal(await profiles.write(fullProfile({ id: "p-third" })), "saved");
+
+  const mine = decodeSshProfiles(io.saved[1])?.profiles.find((p) => p.id === "p-mine");
+  assert.equal(mine?.destination, "me@laptop.local", "the later edit never reached the file");
+  assert.deepEqual(mine?.extraArgs, ["-J", "gate"], "…nor the appended argv words");
+});
+
 test("a save that fails says so, and leaves the newer value in memory", async () => {
   const io: SshProfileIo = {
     load: () => Promise.resolve(OTHERS),

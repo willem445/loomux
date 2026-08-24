@@ -530,13 +530,18 @@ export class SshProfilesStore {
    *  the human every time they launch is its own small bug. */
   async write(profile: SshProfile): Promise<SshProfileWrite> {
     if (!(await this.ensureLoaded())) return "declined-unread";
-    const existing = this.store.profiles.some((p) => p.id === profile.id);
+    // Copied on the way IN, the mirror of `read`'s copy on the way out: the
+    // store outlives the call, so keeping the caller's object would let an edit
+    // made after this returns ride into the NEXT write's blob without ever
+    // being handed over. Symmetric, so neither direction is the weak one.
+    const taken: SshProfile = { ...profile, extraArgs: [...profile.extraArgs] };
+    const existing = this.store.profiles.some((p) => p.id === taken.id);
     this.store = {
       // The FILE's version, off the record just re-read — never the caller's.
       schemaVersion: this.store.schemaVersion,
       profiles: existing
-        ? this.store.profiles.map((p) => (p.id === profile.id ? profile : p))
-        : [...this.store.profiles, profile],
+        ? this.store.profiles.map((p) => (p.id === taken.id ? taken : p))
+        : [...this.store.profiles, taken],
     };
     try {
       await this.io.save(encodeSshProfiles(this.store));
