@@ -34,11 +34,13 @@ import {
 } from "./promote";
 import { readingsByPty, type QueueDepthReading } from "./queuebadge";
 import { mailboxPanes, type MailboxChanged } from "./mailboxbadge";
+import type { RecordedOrchestration } from "./orchlist";
 
 export type { AutonomyState };
 export type { WorkflowPreview };
 
 export type { OrchRole };
+export type { RecordedOrchestration };
 export { badgeFor, metaForGroup } from "./orchbadge";
 
 /** Backend request to open (or spec to open) an agent pane. */
@@ -1238,6 +1240,19 @@ export interface SessionRoleInfo {
 
 export const orchSessionRoles = (): Promise<SessionRoleInfo[]> =>
   invoke<SessionRoleInfo[]>("orch_session_roles");
+
+/** The recorded-orchestration list behind the session browser's
+ *  "Orchestrations" section (#1563). Reads loomux's OWN record of every
+ *  group  `group.json` + the orchestrator row of `agents.json`  never a
+ *  CLI's session store, which is why it can surface an opencode orchestrator
+ *  whose session lives only in `<group>/opencode/opencode.db` and is
+ *  therefore invisible to the sidebar's global-store scan.
+ *
+ *  See `RecordedOrchestration` in `src/orchlist.ts` for the row shape and
+ *  `OrchRegistry::recorded_orchestrations` for what it does and does not
+ *  read. Typed wrapper over the transport seam per CLAUDE.md constraint 5. */
+export const orchListRecorded = (): Promise<RecordedOrchestration[]> =>
+  invoke<RecordedOrchestration[]>("orch_list_recorded");
 
 /** Restore a recorded orchestration session from the session browser.
  *  Orchestrator sessions relaunch the whole group (MCP identity, task

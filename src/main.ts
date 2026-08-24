@@ -57,6 +57,7 @@ import { WelcomeForm, type WelcomeResult, type AgentLaunchSpec } from "./launche
 import {
   initOrchestration,
   launchOrchestrator,
+  orchListRecorded,
   orchSessionRoles,
   resumeOrchSession,
   showPaneConnectMenu,
@@ -2247,7 +2248,19 @@ const sessions = new SessionBrowser(
   (s: SessionInfo) => {
     void restoreSession(s);
   },
-  orchSessionRoles
+  orchSessionRoles,
+  // #1563: loomux's own record of every orchestration group. The section it
+  // feeds is the ONLY route into an opencode group's orchestrator, whose
+  // session lives in <group>/opencode/opencode.db and is deliberately absent
+  // from the session scan above (doc/design/opencode.md).
+  orchListRecorded,
+  (groupId: string, sessionId: string) => {
+    // Always "orchestrator": the section lists groups, and a group is
+    // brought back by its orchestrator session — the same route (and the
+    // same tab binding and start-fresh affordance) as clicking its ORCH row
+    // in the session list.
+    void restoreRecordedSession(groupId, "orchestrator", sessionId);
+  }
 );
 
 // Prefetch the session list in the background at boot (live-test feedback:
@@ -2405,6 +2418,81 @@ void sessionsPrefetch.then(() => reconcileSessionIds());
 // waiting a full extra minute.
 setInterval(() => void reconcileSessionIds(), 20_000);
 
+/** Bring a recorded orchestration session back into its group — MCP identity,
+ *  badges and task board included — instead of a powerless plain `--resume`.
+ *
+ *  Extracted from `restoreSession` for #1563: the Orchestrations section
+ *  (`sessions.ts`) resumes a group through exactly this route, and the
+ *  tab-binding rule and the start-fresh affordance below must not exist in two
+ *  places. `role` is the RECORDED role of `sessionId` — always "orchestrator"
+ *  for an Orchestrations row, any role for a session-list click. */
+async function restoreRecordedSession(
+  groupId: string,
+  role: string,
+  sessionId: string
+): Promise<void> {
+  // Route a restored group into the tab that OWNS it, if one exists — a
+  // persisted tab (its shell restored on boot) whose group binding survived,
+  // or a tab already hosting that group this session. This is the real
+  // persistence↔restore integration (#63): the group re-inhabits its own tab
+  // through the resume machinery, not whatever tab happens to be active. Only
+  // when no tab owns the group does it land in the active tab.
+  const owning = tabs.workspaceForGroup(groupId);
+  const ws = owning ?? tabs.activeWorkspace;
+  if (owning && owning.id !== tabs.activeTabId) tabs.switchTo(owning.id);
+  const hint = { group: groupId, role };
+  // #412: the resume/rejoin machinery never opens a pane speculatively — a
+  // failure throws BEFORE anything is spawned (see `resolve_worker_resume_cwd`
+  // in the backend), so there is never a degraded plain pane to clean up
+  // here; there is only "opened" or "didn't, with a reason". A tagged
+  // not-found/workspace-missing failure gets an actionable choice instead of
+  // just a fatal banner: retry as a FRESH session, reusing the same
+  // recorded group/role/block/task brief the resume would have rejoined.
+  const attempt = (startFresh: boolean) =>
+    resumeOrchSession(ws.grid, eventsFor(ws), sessionId, hint, startFresh);
+  try {
+    const restored = await attempt(false);
+    // Bind the restored group to this tab so its rejoined workers spawn here
+    // and focus/attention resolve here (#63); idempotent when the tab already
+    // owned it. Pane lookups scan live panes, so there's no per-pty binding.
+    if (restored) {
+      tabs.bindGroup(restored.groupId, ws.id);
+      persistTabs();
+    }
+  } catch (err) {
+    const message = String(err);
+    const kind = resumeFailureKind(message);
+    if (!offersStartFresh(kind)) {
+      showFatal(message);
+      return;
+    }
+    // #412 rev-17 NB4: an orchestrator has no task brief to "keep the same" —
+    // start-fresh re-boots its control plane on the group's EXISTING board/
+    // roster/gate (never a re-read of the repo's workflow file — see
+    // create_orchestration_group's Launch::Resume contract), a worker/
+    // reviewer's start-fresh reuses its recorded task in a NEW worktree.
+    const whatItDoes =
+      role === "orchestrator"
+        ? "Start a fresh orchestrator session instead? It reattaches to this group's existing board and roster."
+        : "Start a fresh session instead, with the same task, in a new worktree?";
+    const startFresh = await confirmModal(
+      "Session not resumable",
+      `${resumeFailureReason(kind)} ${whatItDoes}`,
+      "Start fresh"
+    );
+    if (!startFresh) return;
+    try {
+      const restored = await attempt(true);
+      if (restored) {
+        tabs.bindGroup(restored.groupId, ws.id);
+        persistTabs();
+      }
+    } catch (err2) {
+      showFatal(String(err2));
+    }
+  }
+}
+
 async function restoreSession(s: SessionInfo): Promise<void> {
   // Recorded orchestration sessions restore into their group — MCP identity,
   // badges, and task board included — instead of a powerless plain `--resume`.
@@ -2414,66 +2502,7 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   // promised it would not be.
   const route = sessionRestoreRoute(s, sessions.roleFor(s));
   if (route.kind === "orchestration") {
-    // Route a restored group into the tab that OWNS it, if one exists — a
-    // persisted tab (its shell restored on boot) whose group binding survived,
-    // or a tab already hosting that group this session. This is the real
-    // persistence↔restore integration (#63): the group re-inhabits its own tab
-    // through the resume machinery, not whatever tab happens to be active. Only
-    // when no tab owns the group does it land in the active tab.
-    const owning = tabs.workspaceForGroup(route.groupId);
-    const ws = owning ?? tabs.activeWorkspace;
-    if (owning && owning.id !== tabs.activeTabId) tabs.switchTo(owning.id);
-    const hint = { group: route.groupId, role: route.role };
-    // #412: the resume/rejoin machinery never opens a pane speculatively — a
-    // failure throws BEFORE anything is spawned (see `resolve_worker_resume_cwd`
-    // in the backend), so there is never a degraded plain pane to clean up
-    // here; there is only "opened" or "didn't, with a reason". A tagged
-    // not-found/workspace-missing failure gets an actionable choice instead of
-    // just a fatal banner: retry as a FRESH session, reusing the same
-    // recorded group/role/block/task brief the resume would have rejoined.
-    const attempt = (startFresh: boolean) =>
-      resumeOrchSession(ws.grid, eventsFor(ws), s.id, hint, startFresh);
-    try {
-      const restored = await attempt(false);
-      // Bind the restored group to this tab so its rejoined workers spawn here
-      // and focus/attention resolve here (#63); idempotent when the tab already
-      // owned it. Pane lookups scan live panes, so there's no per-pty binding.
-      if (restored) {
-        tabs.bindGroup(restored.groupId, ws.id);
-        persistTabs();
-      }
-    } catch (err) {
-      const message = String(err);
-      const kind = resumeFailureKind(message);
-      if (!offersStartFresh(kind)) {
-        showFatal(message);
-        return;
-      }
-      // #412 rev-17 NB4: an orchestrator has no task brief to "keep the same" —
-      // start-fresh re-boots its control plane on the group's EXISTING board/
-      // roster/gate (never a re-read of the repo's workflow file — see
-      // create_orchestration_group's Launch::Resume contract), a worker/
-      // reviewer's start-fresh reuses its recorded task in a NEW worktree.
-      const whatItDoes =
-        route.role === "orchestrator"
-          ? "Start a fresh orchestrator session instead? It reattaches to this group's existing board and roster."
-          : "Start a fresh session instead, with the same task, in a new worktree?";
-      const startFresh = await confirmModal(
-        "Session not resumable",
-        `${resumeFailureReason(kind)} ${whatItDoes}`,
-        "Start fresh"
-      );
-      if (!startFresh) return;
-      try {
-        const restored = await attempt(true);
-        if (restored) {
-          tabs.bindGroup(restored.groupId, ws.id);
-          persistTabs();
-        }
-      } catch (err2) {
-        showFatal(String(err2));
-      }
-    }
+    await restoreRecordedSession(route.groupId, route.role, s.id);
     return;
   }
   // Plain (non-orchestration) sessions restore into the active tab. A row with
