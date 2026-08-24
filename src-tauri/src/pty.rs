@@ -87,7 +87,8 @@ pub fn assign_kill_on_close_job(pid: u32) -> Option<JobHandle> {
         let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // [scratch #1345] the limit flag that makes closing the handle reap the set,
+        // deliberately not set here.
         if SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
