@@ -11729,6 +11729,49 @@ pub struct SessionRole {
     pub pr: Option<String>,
 }
 
+/// One recorded orchestration GROUP, for the session browser's
+/// "Orchestrations" section (#1563). Built from loomux's own records —
+/// `group.json` plus the orchestrator row of `agents.json` — never from a
+/// CLI's session store, which is what lets it list a group whose CLI store
+/// loomux does not enumerate.
+#[derive(Clone, Serialize)]
+pub struct RecordedOrchestration {
+    pub group_id: GroupId,
+    /// The group's repo path from `group.json`. `None` when that file is
+    /// missing or unparseable — the group dir is still listed (a group whose
+    /// record is damaged is exactly the one the human needs to see), with
+    /// `cli` empty for the same reason.
+    pub repo: Option<String>,
+    /// The CLI this group's ORCHESTRATOR block runs — resolved exactly as
+    /// `resume_recorded_session`'s orchestrator branch resolves it, so the
+    /// label beside a Resume button names the CLI the resume will launch.
+    /// Empty string when `group.json` could not be read (see `repo`); never
+    /// a guessed default, which would name the wrong CLI on a damaged group.
+    pub cli: String,
+    /// The orchestrator's recorded CLI session id, or `None` when no
+    /// orchestrator session has been identified for this group yet — a fresh
+    /// copilot/opencode orchestrator whose watcher has not bound its id, or
+    /// one whose watcher timed out (`session-untracked`). The frontend says
+    /// so rather than offering a button that has nothing to resume.
+    pub session_id: Option<String>,
+    /// Whether this group currently has live agents in this app instance.
+    /// A live group is NOT resumable — `resume_recorded_session` refuses
+    /// ("already has a live orchestrator — focus its pane instead") — so this
+    /// is what stops the list offering a click the backend will reject.
+    pub group_live: bool,
+    /// Whether `session_id` actually resolves in the CLI store the resume
+    /// path will look in. See [`OrchRegistry::recorded_orchestrations`] —
+    /// this asks that path's own question, so the button never promises what
+    /// the backend will refuse. `false` whenever `session_id` is `None`.
+    pub resumable: bool,
+    /// The most recent `updated_ms` on ANY of this group's roster rows — the
+    /// group's last recorded activity, deliberately not the orchestrator
+    /// row's alone (an orchestrator that died early is not evidence the group
+    /// went quiet). `0` for a group with no readable roster, which sorts it
+    /// last within its liveness class rather than inventing a timestamp.
+    pub last_seen_ms: u64,
+}
+
 /// Identity resolved from an MCP request's token header.
 #[derive(Clone, Debug)]
 pub struct Caller {
@@ -29968,6 +30011,96 @@ impl OrchRegistry {
                     });
                 }
             }
+        }
+        out
+    }
+
+    /// Every orchestration group loomux has a record of on disk, for the
+    /// session browser's "Orchestrations" section (#1563).
+    ///
+    /// **Why loomux's own record and not a CLI's.** The sidebar's session
+    /// scan reads each CLI's own store, and for opencode that is deliberately
+    /// the human's GLOBAL store only (`doc/design/opencode.md`): a group's
+    /// opencode sessions live in `<group>/opencode/opencode.db`, which is
+    /// excluded on purpose because a bare `--session` pane spawned from such a
+    /// row would be powerless. The consequence was that a fresh opencode
+    /// orchestrator had no UI route to `resume_recorded_session` AT ALL. This
+    /// reads `group.json` + `agents.json` instead, so every recorded group has
+    /// a route regardless of which CLI ran it — and one shape for every CLI,
+    /// so claude groups reach it the same way.
+    ///
+    /// **What it deliberately does NOT read.** No transcript scan and no
+    /// CLI-store enumeration, and in particular NOT [`Self::merged_records`],
+    /// which parses both audit generations (bounded at ~16 MB per group).
+    /// `orch_session_roles` already pays that fan-out per group and #743's F4
+    /// row owns it; a second one on the same surface is what the #1563 plan
+    /// forbids. The cost here is two small JSON reads per group, plus one
+    /// store lookup for each group that has a recorded orchestrator session.
+    ///
+    /// **A damaged group is listed, not hidden.** A directory with a
+    /// `group.json` that will not parse yields a row with `repo: None` and an
+    /// empty `cli` rather than being skipped — the human whose group.json got
+    /// torn is precisely the one who needs to see that the group is still
+    /// there. The gate is the same one [`Self::session_roles`] uses (a
+    /// `group.json` FILE must exist), so the two agree on what a group is.
+    pub fn recorded_orchestrations(&self) -> Vec<RecordedOrchestration> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            // #904: a directory name is an id from outside this process — parse it.
+            let Ok(group_id) = GroupId::parse(&e.file_name().to_string_lossy()) else { continue };
+            if !e.path().join("group.json").is_file() {
+                continue;
+            }
+            let loaded = self.load_group_file(&group_id);
+            let repo = loaded.as_ref().map(|(repo, _)| repo.clone());
+            // Resolved exactly as `resume_recorded_session`'s orchestrator
+            // branch resolves it (the orchestrator BLOCK's cli, falling back
+            // to the group's default), because `resumable` below has to ask
+            // that path's question, not a similar one.
+            let cli = loaded
+                .as_ref()
+                .map(|(_, g)| {
+                    g.block_for(Role::Orchestrator)
+                        .map(|b| workflow::cli_of(b, &g.agent_cli).to_string())
+                        .unwrap_or_else(|| g.agent_cli.clone())
+                })
+                .unwrap_or_default();
+            let records = self.group_records(&group_id);
+            let last_seen_ms = records.iter().map(|r| r.updated_ms).max().unwrap_or(0);
+            // A group can hold several orchestrator rows — every resume mints
+            // a new agent id and upserts a new one. Prefer a row that actually
+            // carries a session id (a later row with none is not evidence the
+            // earlier session is gone), then the most recently updated.
+            let session_id = records
+                .iter()
+                .filter(|r| r.role == "orchestrator")
+                .max_by_key(|r| (r.session.is_some(), r.updated_ms))
+                .and_then(|r| r.session.clone())
+                .filter(|s| !s.trim().is_empty());
+            // The SAME question the resume path asks, with the SAME per-group
+            // opencode store (#722) — so a row that offers Resume is one
+            // `resume_recorded_session` will accept, and one that cannot be
+            // resumed says so instead of showing a button that fails on click.
+            // An unreadable store degrades to `false`, never to an error: this
+            // is a listing, and one broken group must not blank the whole list.
+            let resumable = session_id.as_deref().is_some_and(|sid| {
+                matches!(
+                    session_cwd_in_store(&cli, sid, Some(&self.opencode_db_path(&group_id))),
+                    Ok(Some(_))
+                )
+            });
+            out.push(RecordedOrchestration {
+                group_live: self.group_is_live(&group_id),
+                group_id,
+                repo,
+                cli,
+                session_id,
+                resumable,
+                last_seen_ms,
+            });
         }
         out
     }
@@ -52918,6 +53051,31 @@ pub async fn orch_agent_renamed(
 #[tauri::command]
 pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRole> {
     reg.session_roles()
+}
+
+/// Every orchestration group loomux has a record of, for the session
+/// browser's "Orchestrations" section (see
+/// [`OrchRegistry::recorded_orchestrations`], which carries the argument for
+/// what this reads and what it refuses to read).
+///
+/// Off-thread (#762 — see [`run_blocking`]): this walks the group root and
+/// reads two small JSON files per group, plus one CLI-store lookup per group
+/// that has a recorded orchestrator session — an opencode lookup opens that
+/// group's SQLite store. `orch_session_roles` above is the sync command that
+/// already fans out over every group (#743 F4 owns converting it); putting a
+/// SECOND such fan-out on the webview thread is exactly what the #1563 plan
+/// forbids, so this one is async from the start.
+///
+/// **Reentrancy.** Read-only and idempotent: no registry state is mutated, and
+/// every file it touches is read whole with the "unreadable degrades, never
+/// fails" rule the listing paths already use. Two concurrent calls (the boot
+/// prefetch racing a human opening the sidebar) can disagree only about a
+/// group whose files changed between them, which is the same freshness
+/// question a single call already answers as of when it ran.
+#[tauri::command]
+pub async fn orch_list_recorded(app: AppHandle) -> Vec<RecordedOrchestration> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.recorded_orchestrations()).await
 }
 
 /// Restore a recorded orchestration session (see `resume_recorded_session`).
