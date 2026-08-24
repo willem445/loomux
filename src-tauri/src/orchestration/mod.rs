@@ -23004,7 +23004,6 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
         if claimed.is_none()
             && pasted.len() > 1
             && collapsed_paste_row(rows[i])
-            && !dialog_header_above(&rows, &norm, &keep, i)
         {
             claimed = Some(i + 1);
         }
