@@ -26,6 +26,24 @@ function deferredFetch() {
   return { fetchRows, pending, calls: () => calls };
 }
 
+/** Await a store read, but FAIL rather than hang if it never settles.
+ *
+ *  Every read here is fed by `deferredFetch`, so a mutation that makes the
+ *  store start a fetch it should not have started leaves the await pending
+ *  forever — and a hung suite is a timeout with no assertion in it, which is
+ *  not evidence about anything (`.claude/skills/ci-validate`: "a mutation that
+ *  hangs the suite is a timeout, not a red"). This turns that into a named
+ *  failure. The timer is real, unlike the store's own clock, and 250 ms is
+ *  orders of magnitude above what a resolved promise needs. */
+function settles<T>(p: Promise<T>, what: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${what}: never settled — the store started a read nobody resolved`)), 250).unref()
+    ),
+  ]);
+}
+
 /** A clock the test moves by hand — the window is measured, never slept. */
 function clock(start = 1000) {
   let t = start;
@@ -42,8 +60,9 @@ test("a second reader inside an in-flight read JOINS it — one fetch, not two",
   assert.equal(f.calls(), 1, "the second caller must not start its own read");
 
   f.pending[0].resolve([entry(1), entry(2)]);
-  assert.deepEqual((await a).map((e) => e.ts_ms), [1, 2]);
-  assert.deepEqual((await b).map((e) => e.ts_ms), [1, 2], "and it gets the joined run's answer");
+  assert.deepEqual((await settles(a, "first")).map((e) => e.ts_ms), [1, 2]);
+  assert.deepEqual((await settles(b, "joiner")).map((e) => e.ts_ms), [1, 2],
+    "and it gets the joined run's answer");
   assert.equal(f.calls(), 1);
 });
 
@@ -54,7 +73,7 @@ test("both readers get the SAME array — the de-duplication, not two copies", a
   const b = store.read(0);
   const rows = [entry(1)];
   f.pending[0].resolve(rows);
-  const [ra, rb] = [await a, await b];
+  const [ra, rb] = [await settles(a, "first"), await settles(b, "joiner")];
   assert.equal(ra, rb, "one array, handed to both");
   assert.equal(ra, store.cached);
 });
@@ -66,12 +85,16 @@ test("a read younger than the window is served without touching IPC", async () =
 
   const first = store.read(0);
   f.pending[0].resolve([entry(1)]);
-  await first;
+  await settles(first, "first");
   assert.equal(f.calls(), 1);
 
   c.advance(AUDIT_READ_MAX_AGE_MS - 1);
-  assert.deepEqual((await store.read()).map((e) => e.ts_ms), [1]);
+  const served = store.read();
+  // Asserted BEFORE the await: this is the whole property, and a store that
+  // wrongly starts a read would otherwise leave the await hanging instead of
+  // failing here.
   assert.equal(f.calls(), 1, "inside the window: the other view's tick is free");
+  assert.deepEqual((await settles(served, "windowed")).map((e) => e.ts_ms), [1]);
 
   // POSITIVE CONTROL: the window is a bound, not a cache-forever switch — one
   // more millisecond and it reads again.
@@ -79,7 +102,7 @@ test("a read younger than the window is served without touching IPC", async () =
   const again = store.read();
   assert.equal(f.calls(), 2, "past the window it re-reads");
   f.pending[1].resolve([entry(1), entry(2)]);
-  assert.deepEqual((await again).map((e) => e.ts_ms), [1, 2]);
+  assert.deepEqual((await settles(again, "past the window")).map((e) => e.ts_ms), [1, 2]);
 });
 
 test("an explicit gesture passes 0 and is never served a cached answer", async () => {
@@ -88,12 +111,12 @@ test("an explicit gesture passes 0 and is never served a cached answer", async (
   const store = new AuditStore(f.fetchRows, c.now);
   const first = store.read(0);
   f.pending[0].resolve([entry(1)]);
-  await first;
+  await settles(first, "first");
 
   const forced = store.read(0);
   assert.equal(f.calls(), 2, "the ⟳ button asked for a read, so it gets one");
   f.pending[1].resolve([entry(1), entry(2)]);
-  await forced;
+  await settles(forced, "forced");
 });
 
 test("a failed read keeps the last good rows, does not throw, and does not latch", async () => {
@@ -103,12 +126,13 @@ test("a failed read keeps the last good rows, does not throw, and does not latch
 
   const first = store.read(0);
   f.pending[0].resolve([entry(1)]);
-  await first;
+  await settles(first, "first");
   assert.equal(store.loaded, true);
 
   const failed = store.read(0);
   f.pending[1].reject(new Error("group id refused"));
-  assert.deepEqual((await failed).map((e) => e.ts_ms), [1], "the log a view is showing survives");
+  assert.deepEqual((await settles(failed, "failed")).map((e) => e.ts_ms), [1],
+    "the log a view is showing survives");
   assert.equal(store.loaded, true);
 
   // Not latched: "I could not look" must not become "there is nothing new"
@@ -117,7 +141,7 @@ test("a failed read keeps the last good rows, does not throw, and does not latch
   const retry = store.read(0);
   assert.equal(f.calls(), 3, "the next request retries");
   f.pending[2].resolve([entry(1), entry(2)]);
-  assert.deepEqual((await retry).map((e) => e.ts_ms), [1, 2]);
+  assert.deepEqual((await settles(retry, "retry")).map((e) => e.ts_ms), [1, 2]);
 });
 
 test("a failed FIRST read leaves the store unloaded rather than empty-and-loaded", async () => {
@@ -125,12 +149,12 @@ test("a failed FIRST read leaves the store unloaded rather than empty-and-loaded
   const store = new AuditStore(f.fetchRows, clock().now);
   const first = store.read(0);
   f.pending[0].reject(new Error("nope"));
-  assert.deepEqual(await first, []);
+  assert.deepEqual(await settles(first, "first"), []);
   assert.equal(store.loaded, false, "a rejected read is not 'we have the log'");
 
   // …so the window cannot serve it either: an unloaded store always reads.
   const next = store.read();
-  assert.equal(f.calls(), 2);
+  assert.equal(f.calls(), 2, "an unloaded store reads even inside the window");
   f.pending[1].resolve([entry(7)]);
-  assert.deepEqual((await next).map((e) => e.ts_ms), [7]);
+  assert.deepEqual((await settles(next, "next")).map((e) => e.ts_ms), [7]);
 });
