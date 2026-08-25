@@ -116,11 +116,11 @@ function detailFor(r: RecordedOrchestration, state: OrchRowState): string {
   const cli = cliLabel(r.cli);
   switch (state) {
     case "damaged":
-      return "This group's record could not be read — loomux can't tell which CLI ran it, so there is nothing safe to resume.";
+      return "This group's record could not be read — orrerix can't tell which CLI ran it, so there is nothing safe to resume.";
     case "live":
       return "Running now — focus its orchestrator pane instead of resuming it.";
     case "unidentified":
-      return `Session not yet identified — loomux has not learned this ${cli} orchestrator's session id, so there is nothing to resume yet.`;
+      return `Session not yet identified — orrerix has not learned this ${cli} orchestrator's session id, so there is nothing to resume yet.`;
     case "lost":
       return `Recorded session is no longer in the ${cli} session store on this machine — start a fresh orchestrator on this group's board instead.`;
     case "resumable":
