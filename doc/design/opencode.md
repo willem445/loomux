@@ -796,8 +796,11 @@ are deliberately absent — they are reopened *through the group*, with its
 roster, board and MCP identity, never as a bare `--session` pane. The
 affordance that actually reopens one is the session browser's
 **Orchestrations** section (`orch_list_recorded`, #1563): it reads loomux's own
-record of each group rather than any CLI's store, which is the only way a
-group-store session can be surfaced at all.
+record of each group rather than any CLI's store, which is what lets a
+group-store session be surfaced at all. A dormant-group Resume card can carry
+one too, since #1563 slice A persists a learned id to `tabs.json` — but only
+for a pane that was open when the watcher bound it, in a tab set that survived;
+the Orchestrations list is the route that holds regardless.
 
 **No index entry, and that is not an oversight.** `session-index.json` (#493)
 exists to avoid re-reading the head of a transcript that has not changed. There

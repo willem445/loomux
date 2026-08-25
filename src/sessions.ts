@@ -190,11 +190,14 @@ export class SessionBrowser {
 
   /** The "Orchestrations" section (#1563), above the session list.
    *
-   *  WHY IT IS ABOVE, AND WHY IT LISTS EVERY CLI. This is the only route into
-   *  a recorded orchestration that does not go through a CLI's own session
-   *  store, and for an opencode group there IS no other route: its sessions
-   *  live in `<group>/opencode/opencode.db`, which the sidebar's scan
-   *  deliberately excludes (`doc/design/opencode.md`). Listing claude and
+   *  WHY IT IS ABOVE, AND WHY IT LISTS EVERY CLI. It is the only route into a
+   *  recorded orchestration that reads neither a CLI's session store nor
+   *  `tabs.json`: an opencode group's sessions live in
+   *  `<group>/opencode/opencode.db`, which the sidebar's scan deliberately
+   *  excludes (`doc/design/opencode.md`), and the dormant-group card that
+   *  #1563 slice A taught to carry a learned id needs the pane to have been
+   *  open when the watcher bound it AND that tab set to survive. This reads
+   *  the group's own `agents.json`, so it needs neither. Listing claude and
    *  copilot groups here too — same shape, same button — makes this the
    *  primary restart surface rather than an opencode special case, so the
    *  docs have one thing to point at.

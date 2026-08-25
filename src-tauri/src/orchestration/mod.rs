@@ -30097,11 +30097,19 @@ impl OrchRegistry {
     /// the human's GLOBAL store only (`doc/design/opencode.md`): a group's
     /// opencode sessions live in `<group>/opencode/opencode.db`, which is
     /// excluded on purpose because a bare `--session` pane spawned from such a
-    /// row would be powerless. The consequence was that a fresh opencode
-    /// orchestrator had no UI route to `resume_recorded_session` AT ALL. This
+    /// row would be powerless. Before #1563 that left a fresh opencode
+    /// orchestrator with no UI route to `resume_recorded_session` AT ALL. This
     /// reads `group.json` + `agents.json` instead, so every recorded group has
     /// a route regardless of which CLI ran it — and one shape for every CLI,
     /// so claude groups reach it the same way.
+    ///
+    /// **Not the only route now, and the distinction is the point.** #1563
+    /// slice A persists a learned id to `tabs.json`, so a dormant-group card
+    /// can carry an opencode id too. That route needs the pane to have been
+    /// open when the watcher bound the id, and that tab set to survive; this
+    /// one reads the group's own roster and needs neither, so it still reaches
+    /// a group whose card was never captured or whose tab set this window does
+    /// not have.
     ///
     /// **What it deliberately does NOT read.** No transcript scan and no
     /// CLI-store enumeration, and in particular NOT [`Self::merged_records`],

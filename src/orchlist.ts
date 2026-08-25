@@ -6,11 +6,20 @@
 // opencode store. A group's opencode sessions are NOT in that global store —
 // they live in `<group>/opencode/opencode.db`, deliberately excluded because a
 // bare `--session` pane restored from one would be powerless (see
-// `doc/design/opencode.md`). So a fresh opencode orchestrator had no clickable
-// route to the backend resume at all. This section reads loomux's own record
-// (`orch_list_recorded`) instead, which is the only source that can see one —
-// and it lists every CLI in one shape, so it is the primary restart surface
-// rather than an opencode workaround.
+// `doc/design/opencode.md`). Before #1563 that left a fresh opencode
+// orchestrator with no clickable route to the backend resume at all. This
+// section reads loomux's own record (`orch_list_recorded`) instead, and it
+// lists every CLI in one shape, so it is the primary restart surface rather
+// than an opencode workaround.
+//
+// NOT THE ONLY ROUTE ANY MORE, AND THE DIFFERENCE MATTERS. Slice A (#1563)
+// landed the other half: a learned session id now reaches its pane via
+// `orch-session-learned` and is persisted to `tabs.json`, so a DORMANT GROUP
+// CARD can carry an opencode id too. That route depends on the pane having
+// been open when the watcher bound the id, and on that tab set surviving.
+// This one depends on neither — it reads the group's own `agents.json`, so it
+// still reaches a group whose card was never captured, whose tab was closed,
+// or that belongs to a tab set this window does not have.
 //
 // EVERY "NO BUTTON" CASE HAS ITS OWN SENTENCE. The three ways a row cannot be
 // resumed are genuinely different problems with genuinely different answers,
