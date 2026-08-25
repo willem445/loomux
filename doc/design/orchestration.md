@@ -481,19 +481,35 @@ reads loomux's OWN record of each group — `group.json` for the repo and the
 orchestrator block's CLI, the orchestrator row of `agents.json` for the session
 id — and nothing else. No transcript scan, no CLI-store enumeration, and
 explicitly **not** `merged_records`, which parses both audit generations (up to
-~16 MB per group): `orch_session_roles` already pays that fan-out per group and
-#743's F4 row owns converting it, so a second such read on the same surface
-would double the cost of opening the sidebar. This command is `async` over
-`run_blocking` from the start for the same reason.
+~16 MB per group): `orch_session_roles` already pays that fan-out per group, so
+a second such read on the same surface would double the cost of opening the
+sidebar. This command is `async` over `run_blocking` from the start for the same
+reason.
 
-**`resumable` asks the resume path's own question.** It calls the same
-`session_cwd_in_store(cli, sid, Some(opencode_db_path(group)))` that
-`resume_recorded_session`'s orchestrator branch calls, with the same per-group
-store, resolving the CLI the same way (the orchestrator BLOCK's cli, falling
-back to the group default). So a row offering Resume is one the backend will
+When this section was written, `orch_session_roles` was additionally **sync**,
+and #743's F4 row owned converting it. #1592 did that — it is `async` over
+`run_blocking` now and the debt row is gone — so the argument above stands on
+the fan-out alone, which is what it always rested on. What #749 still owns is
+narrower: an index or live-groups filter, so `session_roles` stops scaling with
+groups *ever created* (`performance.md` §5).
+
+**`resumable` asks the resume path's own question.** It resolves the CLI the
+same way `resume_recorded_session`'s orchestrator branch does (the orchestrator
+BLOCK's cli, falling back to the group default), and asks that path's own
+question of the same store. So a row offering Resume is one the backend will
 accept; a row that would be refused says so instead. An unreadable store
 degrades to `false` rather than erroring — this is a listing, and one broken
 group must not blank it.
+
+*How* it asks changed in #1592; the question did not. opencode still goes
+through `session_cwd_in_store(cli, sid, Some(opencode_db_path(group)))` — a
+per-group db, with nothing to share across groups. The file-backed stores go
+through `StoreIndex`, which enumerates each store at most once per listing
+rather than once per group: a listing only needs to know the store HOLDS the id
+(`Ok(Some(_))`), never the recorded cwd, so membership is the whole question
+there. A resume still needs the cwd and still calls `session_cwd_in_store`
+itself. `the_listing_and_the_per_group_store_lookup_agree_about_resumability`
+pins the two against each other with that function as the oracle.
 
 **Why every CLI, not just OpenCode.** The section lists Claude groups too, in
 one shape. That makes it the primary restart surface the user docs can point at,

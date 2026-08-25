@@ -57997,6 +57997,6 @@ fn the_audit_marker_prefilter_is_a_superset_test_and_never_the_decision() {
     );
     assert!(
         !seen.iter().any(|s| s == decoy),
-        "a line that merely CONTAINS the marker is not an agent-spawn — the prefilter is a          superset test, and `action` is what decides"
+        "a line that merely CONTAINS the marker is not an agent-spawn — the prefilter is a superset test, and `action` is what decides"
     );
 }

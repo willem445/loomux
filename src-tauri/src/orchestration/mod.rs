@@ -30040,9 +30040,6 @@ impl OrchRegistry {
         }
     }
 
-    /// Roster entries derived from `agent-spawn` audit lines. Backfill for
-    /// groups created before agents.json existed — their session-to-role
-    /// mapping lives only in the audit log.
     /// The substring a line must contain before it is worth handing to
     /// `serde_json` at all (#1592). Conservative by construction: `action` is
     /// compared against this exact literal below, so a line that does not carry
@@ -30055,7 +30052,12 @@ impl OrchRegistry {
     /// parse-everything loop would have matched it.
     const AUDIT_SPAWN_MARKER: &'static str = "agent-spawn";
 
-    /// Every `agent-spawn` row in a group's audit log, oldest first.
+    /// Roster entries derived from `agent-spawn` audit lines, oldest first.
+    /// Backfill for groups created before agents.json existed — their
+    /// session-to-role mapping lives only in the audit log. That is WHY the
+    /// audit is read at all, and it is the half of this comment that is
+    /// load-bearing: without it the streaming note below reads as an
+    /// optimisation of something with no stated purpose.
     ///
     /// **Streamed, not slurped** (#1592). This used to `read_to_string` BOTH
     /// generations into one `String` and then build a full `serde_json::Value`
@@ -30064,8 +30066,19 @@ impl OrchRegistry {
     /// per group — so peak memory was the whole corpus at once, and every line
     /// of it was parsed whether or not it was a spawn. Reading line by line
     /// bounds the buffer at one line, and the marker prefilter above keeps the
-    /// `Value` allocation for the rows that can actually match. The rows
-    /// returned, and their order, are unchanged.
+    /// `Value` allocation for the rows that can actually match.
+    ///
+    /// **The rows returned, and their order, are unchanged on every well-formed
+    /// line** — and the two degrade paths are strictly WIDER, never narrower,
+    /// which is a behaviour change rather than a pure refactor (#1592 review
+    /// N2). No record is lost either way:
+    ///
+    ///  1. A per-line IO or UTF-8 error stops THAT generation and moves on,
+    ///     where `read_to_string` failed the whole file and contributed
+    ///     nothing.
+    ///  2. An `audit.1.jsonl` with no trailing newline no longer has its last
+    ///     line concatenated onto `audit.jsonl`'s first. Both used to be lost
+    ///     to the one parse failure that splice caused; both now parse.
     fn records_from_audit(&self, group: &GroupId) -> Vec<AgentRecord> {
         let mut out: Vec<AgentRecord> = Vec::new();
         // Oldest first so newer spawns win the (id, session) upsert; the
@@ -30235,22 +30248,33 @@ impl OrchRegistry {
     /// **What it deliberately does NOT read.** No transcript scan and no
     /// CLI-store enumeration, and in particular NOT [`Self::merged_records`],
     /// which parses both audit generations (bounded at ~16 MB per group).
-    /// `orch_session_roles` already pays that fan-out per group and #743's F4
-    /// row owns it; a second one on the same surface is what the #1563 plan
-    /// forbids. The cost here is two small JSON reads per group, plus one
-    /// store lookup for each group that has a recorded orchestrator session.
+    /// `orch_session_roles` already pays that fan-out per group; a second one
+    /// on the same surface is what the #1563 plan forbids. (Until #1592 that
+    /// command was also SYNC and #743's F4 row owned converting it. Both are
+    /// now false — it is `async` over `run_blocking`, and that debt row is
+    /// deleted — so the cost argument above stands on the fan-out alone, which
+    /// is what it always rested on. What #749 still owns is narrower: an index
+    /// or live-groups filter, so `session_roles` stops scaling with groups
+    /// EVER created. See `doc/design/performance.md` §5.) The cost here is two
+    /// small JSON reads per group, plus a store membership test per group with
+    /// a recorded orchestrator session.
     ///
-    /// **That per-group lookup is not uniformly cheap, and the miss is the
-    /// expensive case** (#1568 review N3). Claude's is a filename probe per
-    /// project dir (`<id>.jsonl`); opencode's is one indexed `SELECT`. But
+    /// **That membership test used to be a per-group store enumeration, and
+    /// that is what #1592 fixed** (the paragraph this replaces described the
+    /// pre-#1592 shape, and is preserved as history rather than deleted
+    /// because the hazard it names is real and returns the moment anyone puts
+    /// a per-group lookup back). Claude's was a filename probe per project
+    /// dir (`<id>.jsonl`); opencode's is one indexed `SELECT`. But
     /// `find_copilot_session_cwd` has no filename-is-the-id shortcut — a
     /// copilot session's directory name is not guaranteed to equal its id, so
     /// only `workspace.yaml`'s own `id:` field is authoritative — and a MISS
-    /// therefore parses every session directory in the store, for each group
-    /// that misses. A stale copilot group is precisely the one that misses. It
-    /// is off the webview thread and coalesced by the sidebar's `RefreshGate`,
-    /// so it cannot block the UI or stack up; it is stated here because "one
-    /// store lookup" reads cheaper than the case a stale group actually hits.
+    /// therefore parsed every session directory in the store, FOR EACH GROUP
+    /// that missed. A stale group is precisely the one that misses, so the
+    /// listing cost grew as groups × store. [`StoreIndex`] now enumerates each
+    /// file-backed store at most once per listing; opencode keeps its own
+    /// per-group `SELECT`, which has nothing to share across groups. Being off
+    /// the webview thread and coalesced by the sidebar's `RefreshGate` bounds
+    /// how often this runs — it never bounded how much it did.
     ///
     /// **What that exclusion COSTS, not only what it saves.** Reading
     /// `agents.json` alone means this list can resolve strictly LESS than
@@ -53343,10 +53367,12 @@ pub async fn orch_session_roles(app: AppHandle) -> Vec<SessionRole> {
 /// Off-thread (#762 — see [`run_blocking`]): this walks the group root and
 /// reads two small JSON files per group, plus one CLI-store lookup per group
 /// that has a recorded orchestrator session — an opencode lookup opens that
-/// group's SQLite store. `orch_session_roles` above is the sync command that
-/// already fans out over every group (#743 F4 owns converting it); putting a
-/// SECOND such fan-out on the webview thread is exactly what the #1563 plan
-/// forbids, so this one is async from the start.
+/// group's SQLite store. `orch_session_roles` above fans out over every group
+/// too, and when this command landed it was still SYNC — putting a second such
+/// fan-out on the webview thread is exactly what the #1563 plan forbade, so
+/// this one was async from the start. #1592 converted that one as well, so the
+/// contrast is gone and the reason is not: two full per-group fan-outs share
+/// this surface, and neither may be on the thread that paints.
 ///
 /// **Reentrancy.** Read-only and idempotent: no registry state is mutated, and
 /// every file it touches is read whole with the "unreadable degrades, never

@@ -343,6 +343,18 @@ pub fn claude_session_ids(root: &Path) -> HashSet<String> {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
+            // `is_file()`, not merely "has the extension" (#1592 review N4).
+            // The per-group probe this replaces admits a candidate on
+            // `candidate.is_file()`, so a DIRECTORY named `<id>.jsonl` under a
+            // project dir would otherwise be a member of this index and a miss
+            // for that probe — a false `resumable: true` on a row whose Resume
+            // the backend then refuses. Contrived, and that is the point: the
+            // claim below is that the two halves cannot disagree about which
+            // files name a session, and one `file_type` check is what makes
+            // that true rather than nearly true.
+            if !f.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 ids.insert(stem.to_string());
             }
