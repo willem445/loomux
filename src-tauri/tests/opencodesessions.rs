@@ -809,3 +809,67 @@ fn a_group_whose_record_is_damaged_still_appears_in_the_orchestrations_list() {
         "an unknown CLI must ask NO store: the default arm is claude's, and this group's recorded session IS in the claude fixture, so a row promising a resume here would promise one that resume_recorded_session refuses at load_group_file"
     );
 }
+
+/// #1592: the listing's `resumable` for a file-backed store now comes from
+/// `StoreIndex` — one enumeration of the store for the WHOLE listing — instead
+/// of `session_cwd_in_store` once per group. The refactor is only sound if the
+/// two answer the same question, so this pins the equivalence directly, in both
+/// directions, with the per-group function itself as the oracle.
+///
+/// The two groups are the point: a single group cannot tell an index that
+/// answers correctly from one that answers a constant, and the yes-group is
+/// listed FIRST-or-second by `recorded_orchestrations`'s own ordering, so the
+/// rows are matched by group id rather than by position.
+#[test]
+fn the_listing_and_the_per_group_store_lookup_agree_about_resumability() {
+    let (reg, dir) = test_registry();
+
+    // Two claude groups. One's recorded orchestrator session is fixtured in the
+    // store; the other's is a well-formed id the store has never held.
+    let found_sid = "aaaaaaaa-1111-4111-8111-111111111111";
+    let missing_sid = "bbbbbbbb-2222-4222-8222-222222222222";
+
+    let claude_root = dir.path().join("claude-projects-index");
+    let project = claude_root.join("C--tmp-index-yes");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(format!("{found_sid}.jsonl")), CLAUDE_LINE).unwrap();
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(claude_root));
+
+    let yes = reg.create_group("C:/tmp/index-yes", rails("claude")).unwrap();
+    let yo = reg.spawn_agent(&yes.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.associate_session(&yes.id, &yo.id, found_sid);
+
+    let no = reg.create_group("C:/tmp/index-no", rails("claude")).unwrap();
+    let no_o = reg.spawn_agent(&no.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.associate_session(&no.id, &no_o.id, missing_sid);
+
+    // The oracle: what the per-group lookup the listing REPLACED would say.
+    // Read before the seam is cleared, and asserted rather than merely read, so
+    // a fixture that never became reachable fails here instead of quietly
+    // making both halves below agree on "no".
+    let oracle_yes =
+        orchestration::session_cwd_in_store("claude", found_sid, None).unwrap().is_some();
+    let oracle_no =
+        orchestration::session_cwd_in_store("claude", missing_sid, None).unwrap().is_some();
+    assert!(oracle_yes, "the fixture must be reachable, or this test proves nothing");
+    assert!(!oracle_no, "the missing id must really be missing, or neither half discriminates");
+
+    let rows = reg.recorded_orchestrations();
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+
+    let row_of = |gid: &str| {
+        rows.iter()
+            .find(|r| r.group_id.as_str() == gid)
+            .unwrap_or_else(|| panic!("group {gid} must be listed"))
+    };
+    assert_eq!(
+        row_of(yes.id.as_str()).resumable,
+        oracle_yes,
+        "the shared index must answer YES exactly where the per-group lookup does"
+    );
+    assert_eq!(
+        row_of(no.id.as_str()).resumable,
+        oracle_no,
+        "and NO exactly where it does — an index that answers a constant passes only one of these"
+    );
+}

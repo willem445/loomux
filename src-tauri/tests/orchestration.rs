@@ -57946,3 +57946,57 @@ fn the_mcp_upsert_task_arm_honours_and_type_checks_the_guard() {
         "the matching token let the clear through"
     );
 }
+
+#[test]
+fn the_audit_marker_prefilter_is_a_superset_test_and_never_the_decision() {
+    // #1592 streams the audit log instead of slurping both generations into one
+    // String, and skips any line that does not carry the `agent-spawn` marker
+    // before handing it to serde_json. That prefilter is only sound as a
+    // SUPERSET test: the `action` comparison must still be what decides.
+    //
+    // Both halves are asserted because they fail in opposite directions. If the
+    // prefilter is too narrow, the spawn row vanishes and a real session stops
+    // resolving; if it becomes the decision, any line mentioning the marker
+    // mints a phantom agent record.
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let sid = w.session_id.unwrap();
+
+    // A non-spawn row whose DETAIL carries the marker verbatim, and which names
+    // a session and an agent nothing ever spawned. Nothing but the `action`
+    // comparison can tell it from the real spawn row.
+    let decoy = "99999999-9999-4999-8999-999999999999";
+    reg.audit(
+        &g.id,
+        "orrerix",
+        "note",
+        json!({
+            "text": "the agent-spawn path was taken",
+            "session": decoy,
+            "role": "worker",
+            "agent": "w-99",
+        }),
+    );
+
+    // Force the answer to come from the AUDIT rather than the roster: with
+    // `agents.json` gone, `merged_records` has only the backfill left, so the
+    // positive half below is evidence the streamed parse ran at all rather than
+    // evidence the roster survived. Without this the spawn row resolves from
+    // the roster and the assertion passes over an untouched audit path.
+    let gdir = reg.state_root().join(g.id.as_str());
+    std::fs::remove_file(gdir.join("agents.json")).unwrap();
+
+    let seen: Vec<String> =
+        reg.session_roles().into_iter().map(|r| r.session_id).collect();
+    assert!(
+        seen.contains(&sid),
+        "the real spawn row must survive the prefilter, read back from the audit alone"
+    );
+    assert!(
+        !seen.iter().any(|s| s == decoy),
+        "a line that merely CONTAINS the marker is not an agent-spawn — the prefilter is a          superset test, and `action` is what decides"
+    );
+}

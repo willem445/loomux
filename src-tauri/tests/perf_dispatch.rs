@@ -19,9 +19,17 @@
 //! are meant to read as one idea.
 //!
 //! WHY A MANIFEST AND NOT A LINT. The property is not "no blocking sync
-//! commands exist": 1 does today (66 when this file landed), enumerated in
+//! commands exist": 0 do today (66 when this file landed, 1 until #1592
+//! converted the last one), enumerated in
 //! #743's census (planning comments parts 1-2, which `performance.md` §5 names
-//! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
+//! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. An
+//! EMPTY debt tier is the manifest working, not the manifest expiring: the
+//! forwards half of the equality is what refuses the next unargued sync
+//! command, and it bites exactly as hard against zero rows as against one.
+//! Nor does an empty tier mean every owning issue is finished — #749's scope
+//! was "an index or a live-groups filter, not just a thread hop", and #1592
+//! delivered the thread hop and the audit-slurp half; `performance.md` §5
+//! keeps the remainder. The property is that **one cannot be
 //! added silently**. A new sync command fails this test until somebody writes
 //! down what it does on the webview thread and who owns moving it off, and that
 //! sentence is a review-visible diff. The debt tier is the census made
@@ -91,26 +99,27 @@ struct Row {
 /// set on purpose: "who owns this" is then a declaration a reviewer can check
 /// against the issue, not free text that quietly names anything.
 const DEBT_OWNERS: &[(&str, &str)] = &[
-    (
-        "#749",
-        "F4 of #743: orch_session_roles fans out over every group ever created — an index or a \
-         live-groups filter, not just a thread hop.",
-    ),
+    // EMPTY as of #1592, which converted the last debt row
+    // (`orch_session_roles`). `every_declared_owner_actually_owns_something`
+    // is what forces this to empty with it: an owner nobody names any more is
+    // a pointer to finished work. The table and its checks stay — they are
+    // what the NEXT debt row has to satisfy, and an empty closed set still
+    // refuses a row that names an owner nobody declared.
 ];
 
-/// The 26 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 25 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
 /// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
 /// orchestration conversions, #762's 40 orchestration mutation and lifecycle
-/// conversions and #746's 25 gesture conversions already removed. This is
-/// today's truth, not the target state.
+/// conversions, #746's 25 gesture conversions and #1592's 1 already removed.
+/// This is today's truth, not the target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 109 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25;
+/// 110 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25 + #1592's 1;
 /// 20 `cheap` = the 20 C; 5 `exception` = the 4 T plus `resize_pty` (census B,
-/// but §4 X1 argues it stays sync); 1 `debt` = 91 B − 16 (#726) − 8 (#752)
-/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`), owned by #749.
+/// but §4 X1 argues it stays sync); 0 `debt` = 91 B − 16 (#726) − 8 (#752)
+/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`) − 1 (#1592).
 ///
 /// CITE CONVENTION. A `reason` that points at code names the **symbol** and
 /// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
@@ -330,18 +339,12 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: None,
     },
     // ---------------------------------------------------------------------
-    // debt — #749, the last row in this tier. #746 (F1) drained the other 25;
-    // #726, #752 and #762 the 64 before them.
+    // debt — EMPTY. #1592 converted the last row (`orch_session_roles`, owned
+    // by #749) after #746 (F1) drained 25 and #726/#752/#762 the 64 before
+    // them. The tier stays in the type: the next sync command that lands has
+    // to argue itself into one of these three classes, and `debt` is where an
+    // honest "yes, and here is who owns moving it" goes.
     // ---------------------------------------------------------------------
-    Row {
-        name: "orch_session_roles",
-        class: Class::Debt,
-        reason: "read_dir over the whole orchestration root, then group.json plus tasks.json plus \
-                 merged records PER GROUP — so it scales with groups EVER CREATED, not with live \
-                 ones, and it runs at app boot and on every sidebar open. Unbounded fan-out on \
-                 the webview thread; a thread hop alone would not fix it.",
-        issue: Some("#749"),
-    },
 ];
 
 // ---------- the scanner ----------

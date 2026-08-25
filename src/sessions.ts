@@ -11,6 +11,7 @@ import { orchRows, type OrchRow } from "./orchlist";
 import { taskSummary, repoBranchLine, prLabel, sessionBadgeLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
+import { delegateToggleLabel, partitionSessions } from "./sessionfilter";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -56,6 +57,20 @@ export class SessionBrowser {
    *  on every render. */
   private orchEl: HTMLElement;
   private orchestrations: RecordedOrchestration[] = [];
+  /** The "show hidden agent sessions" toggle (#1592). Its own element rather
+   *  than part of the list, because the list is emptied and rebuilt on every
+   *  render and the toggle must survive that with its state intact. */
+  private toggleEl: HTMLButtonElement;
+  /** Whether delegate (worker/reviewer/...) rows are shown. Default OFF: a
+   *  machine that has run a few fleets accumulates hundreds of them against a
+   *  handful the human would ever click, and each is respawned by its own
+   *  orchestrator rather than restarted by hand (`sessionfilter.ts`).
+   *
+   *  In-memory and per-window on purpose: this is a reading preference, not a
+   *  setting, and every session is still scanned and still one click away.
+   *  Nothing here bounds the SCAN — #1592's hang was a backend scaling defect
+   *  and is fixed there; this changes only what a human has to read. */
+  private showDelegates = false;
 
   constructor(
     private el: HTMLElement,
@@ -91,11 +106,18 @@ export class SessionBrowser {
     this.listEl = document.createElement("div");
     this.listEl.className = "sessions-list";
 
+    this.toggleEl = document.createElement("button");
+    this.toggleEl.className = "sessions-delegate-toggle";
+    this.toggleEl.addEventListener("click", () => {
+      this.showDelegates = !this.showDelegates;
+      this.render();
+    });
+
     // Fixed-width inner column so content doesn't squash while the
     // sidebar's width animates open/closed.
     const inner = document.createElement("div");
     inner.className = "sessions-inner";
-    inner.append(head, this.searchEl, this.orchEl, this.listEl);
+    inner.append(head, this.searchEl, this.orchEl, this.listEl, this.toggleEl);
     this.el.appendChild(inner);
   }
 
@@ -283,21 +305,41 @@ export class SessionBrowser {
   private render(): void {
     const q = this.searchEl.value.trim().toLowerCase();
     this.renderOrchestrations(q);
-    const shown = this.store.cached.filter(
+    const matching = this.store.cached.filter(
       (s) =>
         !q ||
         s.title.toLowerCase().includes(q) ||
         s.cwd.toLowerCase().includes(q) ||
         s.source.includes(q)
     );
+    // Role filter AFTER the text filter, so the toggle's count is "how many of
+    // the rows you searched for are hidden" rather than a machine-wide total
+    // that would not change as you type (#1592).
+    const { shown, hidden } = partitionSessions(
+      matching,
+      (s) => this.roleFor(s),
+      this.showDelegates
+    );
+
+    const toggleLabel = delegateToggleLabel(hidden, this.showDelegates);
+    this.toggleEl.textContent = toggleLabel ?? "";
+    this.toggleEl.classList.toggle("hidden", toggleLabel === null);
 
     this.listEl.replaceChildren();
     if (shown.length === 0) {
       const empty = document.createElement("div");
       empty.className = "sessions-empty";
-      empty.textContent = q
-        ? "No sessions match."
-        : "No agent sessions found on this machine.";
+      // Three genuinely different situations, so three sentences: nothing
+      // matched, everything that matched is hidden, or there is nothing here
+      // at all. Collapsing the middle one into "no sessions match" would tell
+      // a human their search failed while the rows sit behind the toggle
+      // right below it.
+      empty.textContent =
+        hidden > 0
+          ? "Only agent sessions here — use the button below to show them."
+          : q
+            ? "No sessions match."
+            : "No agent sessions found on this machine.";
       this.listEl.appendChild(empty);
       return;
     }
