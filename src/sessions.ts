@@ -6,7 +6,8 @@
 // here without a matching edit.
 
 import { listSessions, type SessionInfo } from "./pty";
-import type { SessionRoleInfo } from "./orchestration";
+import type { RecordedOrchestration, SessionRoleInfo } from "./orchestration";
+import { orchRows, type OrchRow } from "./orchlist";
 import { taskSummary, repoBranchLine, prLabel, sessionBadgeLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
@@ -49,11 +50,24 @@ export class SessionBrowser {
    *  once", while this gate also covers the `loadRoles()` half of a refresh and
    *  the render, and owes a dropped caller its one trailing re-run. */
   private refreshGate = new RefreshGate();
+  /** The Orchestrations section's own DOM and data (#1563). Kept beside the
+   *  session list rather than inside it: a group is not a session row, and
+   *  the sessions list is emptied and rebuilt (including its empty state)
+   *  on every render. */
+  private orchEl: HTMLElement;
+  private orchestrations: RecordedOrchestration[] = [];
 
   constructor(
     private el: HTMLElement,
     private onRestore: (session: SessionInfo) => void,
-    private loadRoles?: () => Promise<SessionRoleInfo[]>
+    private loadRoles?: () => Promise<SessionRoleInfo[]>,
+    /** Recorded orchestration groups (#1563). Optional so a caller that only
+     *  wants the session list  and the tests  need not supply one. */
+    private loadOrchestrations?: () => Promise<RecordedOrchestration[]>,
+    /** Resume a recorded orchestration: the whole group comes back, exactly
+     *  as clicking its ORCH session row does. Only ever called with a row
+     *  `orchlist.ts` marked resumable. */
+    private onResumeOrchestration?: (groupId: string, sessionId: string) => void
   ) {
     const head = document.createElement("div");
     head.className = "sessions-head";
@@ -71,6 +85,9 @@ export class SessionBrowser {
     this.searchEl.placeholder = "Filter sessions…";
     this.searchEl.addEventListener("input", () => this.render());
 
+    this.orchEl = document.createElement("div");
+    this.orchEl.className = "orch-list";
+
     this.listEl = document.createElement("div");
     this.listEl.className = "sessions-list";
 
@@ -78,7 +95,7 @@ export class SessionBrowser {
     // sidebar's width animates open/closed.
     const inner = document.createElement("div");
     inner.className = "sessions-inner";
-    inner.append(head, this.searchEl, this.listEl);
+    inner.append(head, this.searchEl, this.orchEl, this.listEl);
     this.el.appendChild(inner);
   }
 
@@ -155,19 +172,117 @@ export class SessionBrowser {
     // any number of dropped calls still end in exactly one fresh fetch.
     if (!this.refreshGate.begin()) return;
     try {
-      const [, roles] = await Promise.all([
+      const [, roles, orchestrations] = await Promise.all([
         this.store.refresh(),
         this.loadRoles?.().catch(() => []) ?? Promise.resolve([]),
+        // Best-effort, same rule as the roles above: a backend that cannot
+        // answer must not take the session list down with it. An empty
+        // result renders the section's own empty line, never a stale list.
+        this.loadOrchestrations?.().catch(() => []) ?? Promise.resolve([]),
       ]);
       this.roles = new Map(roles.map((r) => [r.session_id, r]));
+      this.orchestrations = orchestrations;
       this.render();
     } finally {
       if (this.refreshGate.end()) void this.refresh();
     }
   }
 
+  /** The "Orchestrations" section (#1563), above the session list.
+   *
+   *  WHY IT IS ABOVE, AND WHY IT LISTS EVERY CLI. It is the only route into a
+   *  recorded orchestration that reads neither a CLI's session store nor
+   *  `tabs.json`: an opencode group's sessions live in
+   *  `<group>/opencode/opencode.db`, which the sidebar's scan deliberately
+   *  excludes (`doc/design/opencode.md`), and the dormant-group card that
+   *  #1563 slice A taught to carry a learned id needs the pane to have been
+   *  open when the watcher bound it AND that tab set to survive. This reads
+   *  the group's own `agents.json`, so it needs neither. Listing claude and
+   *  copilot groups here too — same shape, same button — makes this the
+   *  primary restart surface rather than an opencode special case, so the
+   *  docs have one thing to point at.
+   *
+   *  A ROW WITHOUT A RESUME STILL SAYS WHY. `orchlist.ts` decides that; this
+   *  method only renders it. The button exists exactly when `canResume` is
+   *  true, and `sessionId` is non-null whenever it is, so there is no path
+   *  here that can call the resume with nothing to resume.
+   *
+   *  Rendered whenever the section is drawn, including with an empty list —
+   *  a human whose orchestration "vanished" needs to see the section exist
+   *  and say it found nothing, not an absence they have to interpret. */
+  private renderOrchestrations(q: string): void {
+    this.orchEl.replaceChildren();
+    if (!this.loadOrchestrations) return;
+    const rows = orchRows(this.orchestrations, q);
+
+    const head = document.createElement("div");
+    head.className = "orch-list-head";
+    head.textContent = "Orchestrations";
+    this.orchEl.appendChild(head);
+
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "orch-empty";
+      empty.textContent = q
+        ? "No orchestrations match."
+        : "No orchestration groups recorded yet.";
+      this.orchEl.appendChild(empty);
+      return;
+    }
+
+    for (const row of rows) {
+      this.orchEl.appendChild(this.orchRowEl(row));
+    }
+  }
+
+  /** One Orchestrations row. A resumable row is a button (the whole row is
+   *  the target, matching `.session-item`); every other row is a plain div,
+   *  so there is nothing clickable that cannot act. */
+  private orchRowEl(row: OrchRow): HTMLElement {
+    const item = document.createElement(row.canResume ? "button" : "div");
+    item.className = `orch-item ${row.state}`;
+
+    const top = document.createElement("div");
+    top.className = "orch-top";
+    const badge = document.createElement("span");
+    // Same `.session-badge <cli>` shape the session rows use, so the CLI
+    // colour table answers one question app-wide (styles.css, #1020 wave 2).
+    // A CLI with no rule renders uncoloured, never unlabelled.
+    //
+    // The CLASS keys off `cliKey` (the raw wire value) and the TEXT off `cli`
+    // (the display label): the label is "unknown CLI" for a damaged group, and
+    // interpolating that would put two junk classes — `unknown` and `CLI` — on
+    // the element (#1568 review N4). An empty key contributes no class at all,
+    // which is the same uncoloured-but-labelled result as an unknown CLI.
+    badge.className = row.cliKey ? `session-badge ${row.cliKey}` : "session-badge";
+    badge.textContent = row.cli;
+    const title = document.createElement("span");
+    title.className = "orch-title";
+    title.textContent = row.title;
+    title.title = row.groupId;
+    top.append(badge, title);
+
+    const detail = document.createElement("div");
+    detail.className = "orch-detail";
+    detail.textContent = row.detail;
+
+    item.append(top, detail);
+
+    if (row.canResume && row.sessionId) {
+      item.title = `Resume orchestration group ${row.groupId}`;
+      const sessionId = row.sessionId;
+      item.addEventListener("click", () =>
+        this.onResumeOrchestration?.(row.groupId, sessionId)
+      );
+    } else {
+      item.title = row.groupId;
+    }
+    return item;
+  }
+
   private render(): void {
     const q = this.searchEl.value.trim().toLowerCase();
+    this.renderOrchestrations(q);
     const shown = this.store.cached.filter(
       (s) =>
         !q ||

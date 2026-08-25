@@ -198,6 +198,7 @@ pub fn run() {
             orchestration::bind_agent,
             orchestration::orch_agent_renamed,
             orchestration::orch_session_roles,
+            orchestration::orch_list_recorded,
             orchestration::resume_orch_session,
             orchestration::orch_tasks,
             orchestration::orch_audit,
