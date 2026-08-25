@@ -1,0 +1,489 @@
+// One binary name, everywhere (#1562 slice A).
+//
+// The executable's basename is not configured anywhere: `mainBinaryName` is
+// unset in `tauri.conf.json`, so Tauri ships "the output binary from cargo" —
+// which means `src-tauri/Cargo.toml`'s `[package] name` IS the name of the
+// installed exe, of `target/release/<name>.pdb`, of the WER dump files, of the
+// `--webview-exe-name=` argument WebView2 passes its browser process, and of
+// `cargo … -p <name>`. Several files spell that name out by hand.
+//
+// Renaming the package is therefore a many-site edit with nothing mechanical
+// holding the sites together, and a HALF-rename is worse than none: CI's E2E
+// job would launch a path that does not exist, `symbolicate.yml` would build a
+// package cargo no longer has, `release.yml` would zip a missing PDB, and
+// `scripts/check-versions.js` would stop finding the lockfile entry it reads
+// the release version out of — each failing in a different workflow, at a
+// different time, with nothing saying "you renamed one thing".
+//
+// So: one name, taken from the manifest, asserted at every site that spells it.
+// This test is deliberately green in BOTH consistent states (all `loomux`, all
+// `orrerix`) — it polices agreement, not a particular spelling, which is what
+// makes it survive the rename it was written for.
+//
+// Two instruments, because named sites and exhaustive shapes fail differently:
+//
+//   - SITES is the specific half. Each row names the one construct that must
+//     carry the binary name, so a stale one fails with a message a reader can
+//     act on. It cannot see a site nobody thought to list.
+//   - The SHAPE scan is the exhaustive half, and it is default-deny: every
+//     `<token>.exe` / `<token>.pdb` in those files must BE the binary name or
+//     be on ALLOW with a reason. It decides on the shape of the token, never on
+//     the name of the binding around it, so a rename cannot step over it. Its
+//     regex is cross-checked against a raw count of `.exe`/`.pdb` in the same
+//     file, so a pattern that cannot see one of its own subjects fails as a
+//     blind instrument rather than passing as "no offenders".
+//
+// What the SHAPE half does NOT see, stated rather than left to be discovered:
+// the binary's name where it appears WITHOUT its extension — `Contents/MacOS/
+// <name>`, `/usr/bin/<name>`, `-p <name>`, `cargo … -p <name>`. There is no
+// shape to key on there; a bare word is just a word. Those sites are covered by
+// SITES rows instead, which means they are covered only where someone listed
+// them: a NEW file that names the binary bare is invisible to this test. The
+// same is true of a name assembled at runtime (`"orrer" + "ix.exe"`). Neither
+// exists today.
+//
+// See doc/design/rebrand-bundle.md.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
+
+/**
+ * The source of truth: `[package] name` in `src-tauri/Cargo.toml`.
+ *
+ * Scoped to the `[package]` section rather than matched file-wide, because
+ * `[lib] name = "loomux_lib"` is the very next `name =` line in the file and
+ * is deliberately NOT renamed — a file-wide match would read the lib name and
+ * this whole test would police the wrong string.
+ */
+function cargoBinaryName(): string {
+  const toml = read("src-tauri/Cargo.toml");
+  const start = toml.indexOf("[package]");
+  assert.ok(start >= 0, "src-tauri/Cargo.toml must declare a [package] section");
+  const rest = toml.slice(start + "[package]".length);
+  const end = rest.search(/^\[/m);
+  const section = end === -1 ? rest : rest.slice(0, end);
+  const m = /^name = "([A-Za-z0-9_-]+)"/m.exec(section);
+  assert.ok(m, "src-tauri/Cargo.toml's [package] section must declare a name");
+  return m![1];
+}
+
+/**
+ * The launcher's `LEGACY_MAIN_BINARY` — the ONE place the pre-rename
+ * executable name is still spelled on purpose.
+ *
+ * The launcher has to recognise an install it did not create (#1225's
+ * accept-every-spelling rule, and #816's downgrade guard, which is disarmed by
+ * an install it cannot see). So `npm/bin/orrerix.js` is the one file where a
+ * literal `loomux.exe` is correct after the rename — and rather than hardcode
+ * that exemption, the scan reads it from the constant, so the exemption is only
+ * ever as wide as what the launcher actually probes.
+ */
+function legacyBinaryName(): string {
+  const m = /^const LEGACY_MAIN_BINARY = "([A-Za-z0-9_-]+)";/m.exec(read("npm/bin/orrerix.js"));
+  assert.ok(
+    m,
+    "npm/bin/orrerix.js must declare LEGACY_MAIN_BINARY — it is what lets `orrerix update` " +
+      "still see a pre-rename install, which is what keeps #816's downgrade guard armed"
+  );
+  return m![1];
+}
+
+/**
+ * Every construct that spells the binary name out by hand. `re` must capture
+ * the basename in group 1, and must be global: several rows legitimately match
+ * more than once and ALL of them have to agree.
+ */
+const SITES: Array<{ file: string; what: string; re: RegExp }> = [
+  {
+    file: ".github/workflows/ci.yml",
+    what: "the E2E job's LOOMUX_E2E_EXE path",
+    re: /^\s*LOOMUX_E2E_EXE:.*\\target\\debug\\([A-Za-z0-9_-]+)\.exe\s*$/gm,
+  },
+  {
+    file: ".github/workflows/ci.yml",
+    what: "the WebView2 AdditionalBrowserArguments HKLM policy value name (a per-app key, named after the exe)",
+    re: /-Name "([A-Za-z0-9_-]+)\.exe"/g,
+  },
+  {
+    file: "e2e/fixtures.ts",
+    what: "DEFAULT_EXE, which is what runs when LOOMUX_E2E_EXE is unset",
+    re: /^const DEFAULT_EXE = .*"\.\.\/target\/debug\/([A-Za-z0-9_-]+)\.exe"/gm,
+  },
+  {
+    file: "e2e/fixtures.ts",
+    what: "the --webview-exe-name= filter that identifies our own WebView2 browser processes",
+    re: /--webview-exe-name=([A-Za-z0-9_-]+)\.exe/g,
+  },
+  {
+    file: ".github/workflows/symbolicate.yml",
+    what: "the cargo build package selector",
+    re: /cargo build[^\n]*\s-p\s+([A-Za-z0-9_-]+)/g,
+  },
+  {
+    file: ".github/workflows/symbolicate.yml",
+    what: "the target/release exe and pdb paths",
+    re: /target\/release\/([A-Za-z0-9_-]+)\.(?:exe|pdb)/g,
+  },
+  {
+    file: ".github/workflows/symbolicate.yml",
+    what: "the symbols artifact name",
+    re: /artifact=([A-Za-z0-9_-]+)-symbols-/g,
+  },
+  {
+    file: ".github/workflows/release.yml",
+    what: "the PDB source path the release asset is zipped from",
+    re: /Compress-Archive -Path target\/release\/([A-Za-z0-9_-]+)\.pdb/g,
+  },
+  {
+    file: "scripts/check-versions.js",
+    what: "the exact-match string that finds the package's Cargo.lock entry",
+    re: /=== 'name = "([A-Za-z0-9_-]+)"'/g,
+  },
+  {
+    file: "npm/bin/orrerix.js",
+    what: "the launcher's MAIN_BINARY",
+    re: /^const MAIN_BINARY = "([A-Za-z0-9_-]+)";/gm,
+  },
+  {
+    file: "CLAUDE.md",
+    what: "the Commands table's one-backend-test invocation",
+    re: /cargo test --locked -p ([A-Za-z0-9_-]+)/g,
+  },
+];
+
+/** The files the exhaustive shape scan reads. */
+const SHAPE_FILES = [
+  ".github/workflows/ci.yml",
+  ".github/workflows/symbolicate.yml",
+  ".github/workflows/release.yml",
+  "e2e/fixtures.ts",
+  "npm/bin/orrerix.js",
+];
+
+/**
+ * A `<token>.exe` / `<token>.pdb` occurrence. The trailing guard keeps
+ * `re.exec(` from reading as an `re.exe` file.
+ */
+const SHAPE = /([A-Za-z0-9_.${}-]+)\.(?:exe|pdb)(?![A-Za-z0-9_])/g;
+
+/**
+ * The same subjects counted WITHOUT the name pattern — the instrument's own
+ * cross-check. `SHAPE`'s character class is a guess about the alphabet an
+ * executable name may be spelled with, and a guess that stops one character
+ * short silently drops a subject and reports a clean scan.
+ */
+const RAW_SHAPE = /\.(?:exe|pdb)(?![A-Za-z0-9_])/g;
+
+/**
+ * ...and the reconciliation: a raw hit SHAPE did not match is only acceptable
+ * when the character in front of the dot means there is no name in front of it.
+ * Default-deny on that character, so an alphabet gap fails loudly instead of
+ * being absorbed as "just prose".
+ */
+const NAMELESS_BEFORE: Array<{ ch: string; why: string }> = [
+  { ch: " ", why: "prose naming a bare extension: `the Windows .pdb.zip`" },
+  { ch: "`", why: "a backticked bare extension in a comment: `` `.exe`-suffixed ``" },
+  {
+    ch: "\\",
+    why:
+      "a JS regex literal escaping the dot (`/-setup\\.exe$/`). NOTE the residual this " +
+      "names: SHAPE cannot see a name behind an escaped dot, so a regex spelled " +
+      "`/orrerix\\.exe$/` would be invisible to the shape half. No such regex exists today; " +
+      "if one is added it needs a SITES row.",
+  },
+];
+
+/**
+ * Tokens the shape scan sees that are NOT this binary, each with the reason.
+ * Default-deny: anything not listed is a finding. A row nothing matches any
+ * more is asserted stale below, so the list cannot rot into a blanket
+ * exemption. `file`, where present, scopes the row to one file — an exemption
+ * that is correct in the launcher is not correct in a workflow.
+ */
+type AllowRow = { token: string | RegExp; why: string; file?: string };
+
+const ALLOW: AllowRow[] = [
+  {
+    token: "msedgewebview2",
+    why: "WebView2's own browser process — Microsoft's binary, which e2e/fixtures.ts asks the OS about by name",
+  },
+  {
+    token: "setup",
+    why: "the NSIS installer asset's `-setup.exe` suffix: tauri-bundler names it off productName, not off the cargo binary",
+  },
+  {
+    token: "-setup",
+    why: "the same suffix quoted as a glob (`*-setup.exe`) in prose and in the release-notes template",
+  },
+  {
+    token: /^Orrerix_/,
+    why: "release-asset filenames (`Orrerix_<version>_x64-setup.exe`, `..._x64.pdb.zip`) — the productName axis, flipped by #1153 phase 5",
+  },
+  {
+    token: "_x64",
+    why: "the tail of that same asset name where the version is interpolated (`Orrerix_$(...)_x64.pdb.zip`), so the prefix is not literal text here",
+  },
+  {
+    token: "steps",
+    why: "`steps.pdb.outputs.name` — a GitHub Actions step id, not a filename",
+  },
+  {
+    token: "${MAINBINARYNAME}",
+    why: "an NSIS template variable quoted in a comment about installer.nsi's own source",
+  },
+  {
+    token: "${exe}",
+    why: "interpolated from the launcher's EXE_NAMES array, which is the single place those names are written",
+  },
+  {
+    token: "${n}",
+    why: "the same array, interpolated in processNames()",
+  },
+];
+
+const allowKey = (row: AllowRow) =>
+  `${row.file ?? "*"}|${typeof row.token === "string" ? row.token : String(row.token)}`;
+
+const allowed = (rows: AllowRow[], file: string, token: string) =>
+  rows.find(
+    (r) =>
+      (r.file === undefined || r.file === file) &&
+      (typeof r.token === "string" ? r.token === token : r.token.test(token))
+  );
+
+function capturesOf(src: string, re: RegExp): string[] {
+  return [...src.matchAll(new RegExp(re.source, re.flags))].map((m) => m[1]);
+}
+
+type Scan = {
+  offenders: string[];
+  siteHits: Map<string, number>; // "file: what" -> matches the pattern made
+  shapeHits: Map<string, number>; // file -> tokens that ARE the expected name
+  seenShapes: Map<string, number>; // file -> tokens the SHAPE pattern matched at all
+  rawShapes: Map<string, number>; // file -> raw `.exe`/`.pdb` occurrences
+  unexplained: string[]; // raw hits SHAPE missed whose preceding char is not on NAMELESS_BEFORE
+  namelessHit: Set<string>;
+  allowedHit: Set<string>;
+  rows: AllowRow[]; // ALLOW plus the derived legacy-name row
+};
+
+/**
+ * The whole guard as a pure function of the name it expects, so the test can
+ * run it against a name the tree does NOT use and check that it goes red.
+ */
+function scan(expected: string): Scan {
+  const offenders: string[] = [];
+  const siteHits = new Map<string, number>();
+  const shapeHits = new Map<string, number>();
+  const seenShapes = new Map<string, number>();
+  const rawShapes = new Map<string, number>();
+  const unexplained: string[] = [];
+  const namelessHit = new Set<string>();
+  const allowedHit = new Set<string>();
+
+  // The legacy-name exemption is derived, not typed: it is exactly the string
+  // the launcher's own LEGACY_MAIN_BINARY carries, and only in the launcher.
+  const rows: AllowRow[] = [
+    ...ALLOW,
+    {
+      token: legacyBinaryName(),
+      file: "npm/bin/orrerix.js",
+      why: "LEGACY_MAIN_BINARY — the launcher must keep recognising a pre-rename install, so this file spells the old exe name on purpose (doc/design/rebrand-protocol.md: emit one spelling, accept every spelling)",
+    },
+  ];
+
+  for (const { file, what, re } of SITES) {
+    const key = `${file}: ${what}`;
+    const found = capturesOf(read(file), re);
+    siteHits.set(key, (siteHits.get(key) ?? 0) + found.length);
+    for (const name of found) {
+      if (name !== expected) {
+        offenders.push(`${file}: ${what} names "${name}", not "${expected}"`);
+      }
+    }
+  }
+
+  for (const file of SHAPE_FILES) {
+    const src = read(file);
+    const lines = src.split(/\r?\n/);
+    let raw = 0;
+    for (const m of src.matchAll(new RegExp(RAW_SHAPE.source, "g"))) {
+      raw += 1;
+      const before = m.index! > 0 ? src[m.index! - 1] : "";
+      if (/[A-Za-z0-9_.${}-]/.test(before)) continue; // SHAPE will have matched it
+      const row = NAMELESS_BEFORE.find((r) => r.ch === before);
+      if (row) {
+        namelessHit.add(row.ch);
+        raw -= 1; // deliberately nameless: nothing here for SHAPE to check
+        continue;
+      }
+      unexplained.push(
+        `${file}: a ".exe"/".pdb" preceded by ${JSON.stringify(before)}, which is neither a ` +
+          `character SHAPE can read as part of a name nor an argued NAMELESS_BEFORE row`
+      );
+    }
+    rawShapes.set(file, raw);
+    let mine = 0;
+    let seen = 0;
+    lines.forEach((line, i) => {
+      for (const m of line.matchAll(new RegExp(SHAPE.source, "g"))) {
+        const token = m[1];
+        seen += 1;
+        if (token === expected) {
+          mine += 1;
+          continue;
+        }
+        const row = allowed(rows, file, token);
+        if (row) {
+          allowedHit.add(allowKey(row));
+          continue;
+        }
+        offenders.push(
+          `${file}:${i + 1}: "${token}" is neither the binary name ("${expected}") nor an argued ALLOW row — ${line.trim()}`
+        );
+      }
+    });
+    shapeHits.set(file, mine);
+    seenShapes.set(file, seen);
+  }
+
+  return { offenders, siteHits, shapeHits, seenShapes, rawShapes, unexplained, namelessHit, allowedHit, rows };
+}
+
+test("every surface that spells the executable's name agrees with src-tauri/Cargo.toml", () => {
+  const expected = cargoBinaryName();
+  const {
+    offenders,
+    siteHits,
+    shapeHits,
+    seenShapes,
+    rawShapes,
+    unexplained,
+    namelessHit,
+    allowedHit,
+    rows,
+  } = scan(expected);
+
+  // The finding first, the controls after. A half-rename trips several of
+  // these at once — every stale site AND "this file no longer mentions the new
+  // name" — and the list of stale sites is the one a reader can act on. The
+  // controls below still run on every green round, which is when they are what
+  // makes the green mean anything.
+  assert.deepEqual(
+    offenders,
+    [],
+    `the executable's name must be spelled the same everywhere. It comes from cargo (` +
+      `mainBinaryName is unset), so src-tauri/Cargo.toml's [package] name decides it and ` +
+      `every site below has to follow.\n` +
+      offenders.join("\n")
+  );
+
+  // Non-vacuity, per site. An absence-only assertion ("no offenders") passes
+  // just as well when a pattern matched nothing at all, and a reworded YAML
+  // key or a moved constant is exactly how that happens.
+  for (const [key, n] of siteHits) {
+    assert.ok(
+      n > 0,
+      `the pattern for ${key} matched nothing — that site is no longer policed, so it ` +
+        `could be renamed alone and this test would still pass`
+    );
+  }
+
+  // Non-vacuity, per scanned file, counted at the VERIFIED site: every file in
+  // SHAPE_FILES must actually contain the binary name. A file that stopped
+  // mentioning it is a file this scan is watching for nothing.
+  for (const [file, n] of shapeHits) {
+    assert.ok(
+      n > 0,
+      `${file} carries no "${expected}.exe"/"${expected}.pdb" occurrence at all — either the ` +
+        `binary reference moved out of it (drop the row) or the scan has gone blind to it`
+    );
+  }
+
+  // The instrument, checked against a raw count of its own container. Every
+  // literal `.exe`/`.pdb` in a scanned file must have produced a SHAPE match,
+  // or be one the reconciliation below explains away; the ones the pattern
+  // cannot see are unguarded — they could be renamed alone and this test would
+  // still report a clean scan.
+  assert.deepEqual(
+    unexplained,
+    [],
+    `a ".exe"/".pdb" occurrence sits behind a character SHAPE's class does not cover, and ` +
+      `nothing on NAMELESS_BEFORE explains it. Either widen the class (if a name can really ` +
+      `be spelled that way) or add an argued NAMELESS_BEFORE row.\n` + unexplained.join("\n")
+  );
+  for (const { ch, why } of NAMELESS_BEFORE) {
+    assert.ok(
+      namelessHit.has(ch),
+      `NAMELESS_BEFORE carries ${JSON.stringify(ch)} (${why}) but nothing in the scanned ` +
+        `files sits behind it any more — drop the row rather than leaving an unexamined ` +
+        `exemption behind`
+    );
+  }
+  for (const file of SHAPE_FILES) {
+    assert.equal(
+      seenShapes.get(file) ?? 0,
+      rawShapes.get(file) ?? 0,
+      `in ${file} the SHAPE pattern matched ${seenShapes.get(file) ?? 0} of the ` +
+        `${rawShapes.get(file) ?? 0} literal ".exe"/".pdb" occurrences. Its character class ` +
+        `is a guess about the alphabet an executable name may be spelled with, and it just ` +
+        `came up short on one of its own subjects.`
+    );
+  }
+
+  // A stale ALLOW row is an exemption nobody re-checked.
+  for (const row of rows) {
+    assert.ok(
+      allowedHit.has(allowKey(row)),
+      `ALLOW exempts ${row.token}${row.file ? ` in ${row.file}` : ""} (${row.why}) but nothing ` +
+        `in the scanned files matches it any more — drop the row rather than leaving an ` +
+        `unexamined exemption behind`
+    );
+  }
+
+  // The legacy name has to BE a different name. If someone "simplified"
+  // LEGACY_MAIN_BINARY to the current one, the launcher would probe a single
+  // name twice, `orrerix update` would stop seeing a pre-rename install, and
+  // #816's downgrade guard would go quietly unarmed — with every test that
+  // merely checks "both names are probed" still green.
+  assert.notEqual(
+    legacyBinaryName(),
+    expected,
+    "LEGACY_MAIN_BINARY must name the PREVIOUS executable, not the current one"
+  );
+});
+
+test("the guard discriminates — it reports findings when the name does not match", () => {
+  // The control for the instrument itself. Every assertion above is
+  // absence-shaped, and an absence is what a scan that examined nothing also
+  // produces. Running the identical scan against a name the tree does not use
+  // must produce findings from BOTH halves, or "no offenders" was never
+  // evidence of anything.
+  const bogus = scan("definitely-not-the-binary-name");
+
+  assert.ok(
+    bogus.offenders.length > 0,
+    "scanning for a name nothing uses produced no findings — the scan is inert"
+  );
+
+  // `<file>:<line>:` prefixes come from the shape half; the site half has no
+  // line number. Both must fire, or one instrument is dead while the other
+  // carries the test.
+  const fromShape = bogus.offenders.filter((o) => /^\S+:\d+: /.test(o));
+  const fromSites = bogus.offenders.filter((o) => !/^\S+:\d+: /.test(o));
+  assert.ok(fromSites.length > 0, "the named-site half produced nothing — SITES is inert");
+  assert.ok(fromShape.length > 0, "the shape half produced nothing — the SHAPE scan is inert");
+
+  // And it is not a scan that flags everything: the real name is the one that
+  // comes back clean, which is what the first test asserts in detail.
+  assert.equal(
+    scan(cargoBinaryName()).offenders.length,
+    0,
+    "the real binary name must scan clean — see the first test for the offender list"
+  );
+});

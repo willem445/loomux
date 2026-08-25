@@ -1,5 +1,5 @@
 // E2E harness (spike, see doc/design/e2e-testing.md): launches the built
-// loomux.exe against an isolated profile and hands back a connected Playwright
+// orrerix.exe against an isolated profile and hands back a connected Playwright
 // Page talking to its main WebView2 webview over CDP.
 //
 // Isolation (issue #394 overlap — deliberately generic, not test-only):
@@ -69,7 +69,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // thing for the CI run; test/workspacelayout.test.ts pins that the two agree,
 // because a drift here fails as "exe not found" long after the edit that
 // caused it.
-const DEFAULT_EXE = path.resolve(__dirname, "../target/debug/loomux.exe");
+const DEFAULT_EXE = path.resolve(__dirname, "../target/debug/orrerix.exe");
 const EXE_FROM_ENV = process.env.LOOMUX_E2E_EXE;
 const EXE = EXE_FROM_ENV ?? DEFAULT_EXE;
 
@@ -112,8 +112,8 @@ async function webview2ChildOf(pid: number): Promise<Webview2Process | null> {
   }
 }
 
-/** Any `msedgewebview2.exe` hosting `loomux.exe` that is NOT a child of
- *  `excludePid` — i.e. a browser process some OTHER loomux.exe instance
+/** Any `msedgewebview2.exe` hosting `orrerix.exe` that is NOT a child of
+ *  `excludePid` — i.e. a browser process some OTHER orrerix.exe instance
  *  already owns, which a same-identifier launch can join instead of
  *  spawning its own child (the #394 sharing mechanism, pointed at either a
  *  real production instance or a not-yet-exited previous E2E run). */
@@ -124,7 +124,7 @@ async function foreignLoomuxWebview2(excludePid: number): Promise<Webview2Proces
       "-NonInteractive",
       "-Command",
       `Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" ` +
-        `| Where-Object { $_.CommandLine -like '*--webview-exe-name=loomux.exe*' -and $_.ParentProcessId -ne ${excludePid} } ` +
+        `| Where-Object { $_.CommandLine -like '*--webview-exe-name=orrerix.exe*' -and $_.ParentProcessId -ne ${excludePid} } ` +
         `| Select-Object -First 1 ProcessId,CommandLine | ConvertTo-Json -Compress`,
     ]);
     const trimmed = stdout.trim();
@@ -160,7 +160,7 @@ async function verifyIsolatedBuild(
   while (Date.now() < deadline) {
     if (proc.exitCode !== null || proc.signalCode !== null) {
       throw new Error(
-        `loomux.exe exited early (code=${proc.exitCode} signal=${proc.signalCode}) before its ` +
+        `orrerix.exe exited early (code=${proc.exitCode} signal=${proc.signalCode}) before its ` +
           `WebView2 child could be verified.\n--- stdout ---\n${output.stdout}\n--- stderr ---\n${output.stderr}`
       );
     }
@@ -203,7 +203,7 @@ async function verifyIsolatedBuild(
   }
   throw new Error(
     `no WebView2 child process appeared under pid ${pid} within ${timeoutMs}ms, and no other ` +
-      `loomux.exe WebView2 process was found either — cannot verify it's the E2E build. Refusing ` +
+      `orrerix.exe WebView2 process was found either — cannot verify it's the E2E build. Refusing ` +
       `to proceed.\n--- stdout ---\n${output.stdout}\n--- stderr ---\n${output.stderr}`
   );
 }
@@ -221,7 +221,7 @@ async function connectWithRetry(
     // printed instead of burning the rest of the timeout on retries.
     if (proc.exitCode !== null || proc.signalCode !== null) {
       throw new Error(
-        `loomux.exe exited early (code=${proc.exitCode} signal=${proc.signalCode}) before opening ` +
+        `orrerix.exe exited early (code=${proc.exitCode} signal=${proc.signalCode}) before opening ` +
           `the CDP port.\n--- stdout ---\n${output.stdout}\n--- stderr ---\n${output.stderr}`
       );
     }
@@ -289,7 +289,7 @@ export const test = base.extend<{ appPage: Page }>({
 
     if (!fs.existsSync(EXE)) {
       throw new Error(
-        `loomux exe not found at ${EXE} — build it first with:\n` +
+        `orrerix exe not found at ${EXE} — build it first with:\n` +
           `  npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json`
       );
     }

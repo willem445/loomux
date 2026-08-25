@@ -554,10 +554,22 @@ test("the Windows install probe takes the directory from the product and the exe
   // installer.nsi installs `$INSTDIR\${MAINBINARYNAME}.exe` into
   // `$LOCALAPPDATA\${PRODUCTNAME}`, and `mainBinaryName` is unset in
   // tauri.conf.json — the schema says it then "uses the output binary from
-  // cargo", which is `loomux`. Deriving the exe from the PRODUCT found the
-  // pre-rename install only because Windows is case-insensitive; after the flip
-  // `Orrerix\Orrerix.exe` exists nowhere and plain launch stops finding its own
-  // install.
+  // cargo". Deriving the exe from the PRODUCT found the pre-rename install only
+  // because Windows is case-insensitive; `Orrerix\Orrerix.exe` exists nowhere
+  // and plain launch would stop finding its own install.
+  //
+  // The two axes moved at DIFFERENT times, which is why three real combinations
+  // exist on users' machines and all three are pinned here (#1562):
+  //
+  //   Orrerix\orrerix.exe   current
+  //   Orrerix\loomux.exe    beta1–beta3: product renamed, binary not yet
+  //   Loomux\loomux.exe     stable 1.0/1.1: neither renamed
+  //
+  // The middle row is the specimen a mechanical rename would have deleted — it
+  // was the "current" case when this test was written, and rewriting its string
+  // literal to the new spelling would have removed the only witness that a
+  // beta3 install is still findable, in the same commit that made it legacy
+  // (#1225: pin the pre-rename specimen BESIDE the current one).
   const local = join("C:", "Users", "u", "AppData", "Local");
   const progfiles = join("C:", "Program Files");
   const candidates = windowsExeCandidates({
@@ -566,12 +578,16 @@ test("the Windows install probe takes the directory from the product and the exe
   });
 
   assert.ok(
-    candidates.includes(join(local, "Orrerix", "loomux.exe")),
+    candidates.includes(join(local, "Orrerix", "orrerix.exe")),
     "the real post-rename per-user path must be probed"
   );
   assert.ok(
-    candidates.includes(join(progfiles, "Orrerix", "loomux.exe")),
+    candidates.includes(join(progfiles, "Orrerix", "orrerix.exe")),
     "...and the per-machine one"
+  );
+  assert.ok(
+    candidates.includes(join(local, "Orrerix", "loomux.exe")),
+    "a beta1–beta3 install — renamed product, pre-rename binary — must still be findable"
   );
   assert.ok(
     candidates.includes(join(local, "Loomux", "loomux.exe")),
@@ -589,6 +605,18 @@ test("the Windows install probe takes the directory from the product and the exe
   assert.ok(firstLegacy > 0, "the legacy product must appear at all");
   assert.ok(lastCurrent < firstLegacy, "product-major ordering, not root-major");
 
+  // ...and exe-major within one product+root: the current binary before the
+  // legacy one, so a machine that upgraded by hand (leaving both exes in
+  // `Orrerix\`) launches the new build rather than the one it just replaced.
+  const inOrrerixLocal = candidates.filter(
+    (p: string) => dirname(p) === join(local, "Orrerix")
+  );
+  assert.ok(
+    inOrrerixLocal.indexOf(join(local, "Orrerix", "orrerix.exe")) <
+      inOrrerixLocal.indexOf(join(local, "Orrerix", "loomux.exe")),
+    "within one install directory the current binary must be probed before the legacy one"
+  );
+
   // An unset environment contributes no relative candidates: `Programs\...`
   // resolved against the process CWD is a path that could match anything.
   assert.deepEqual(windowsExeCandidates({}), []);
@@ -601,18 +629,31 @@ const fakeProc =
     running.includes(name);
 
 test("the running-app guard probes the executable's name, not the product's", () => {
-  // #1294. The bundle is `Orrerix.app` but the process inside it is `loomux`,
-  // because tauri-bundler takes CFBundleExecutable from `mainBinaryName`.
-  // macOS `pgrep -x` is case-sensitive, so a product-named probe matched
-  // nothing there and `update` was free to `rm -rf` a running bundle — the
-  // #815 class, on the one platform with no other backstop.
-  assert.ok(processNames("darwin").includes("loomux"), "macOS reports CFBundleExecutable");
-  assert.ok(processNames("win32").includes("loomux.exe"), "Windows reports the installed exe");
+  // #1294. The bundle is `Orrerix.app` but the process inside it is the cargo
+  // binary, because tauri-bundler takes CFBundleExecutable from
+  // `mainBinaryName`. macOS `pgrep -x` is case-sensitive, so a product-named
+  // probe matched nothing there and `update` was free to `rm -rf` a running
+  // bundle — the #815 class, on the one platform with no other backstop.
+  assert.ok(processNames("darwin").includes("orrerix"), "macOS reports CFBundleExecutable");
+  assert.ok(processNames("win32").includes("orrerix.exe"), "Windows reports the installed exe");
   assert.equal(
-    appIsRunning("darwin", fakeProc("loomux")),
+    appIsRunning("darwin", fakeProc("orrerix")),
     true,
     "a running app must be SEEN — refusing is this guard's only job"
   );
+  assert.equal(appIsRunning("win32", fakeProc("orrerix.exe")), true);
+});
+
+test("...and still sees a running PRE-RENAME binary (#1562)", () => {
+  // The specimen this rename would otherwise have swept out of the test above.
+  // A beta3 build is a running app like any other: the installer would close it
+  // to replace its files, and this guard's whole job is to refuse first. A
+  // rename that leaves `loomux` unprobed is `update` free to kill a live
+  // session again, with the test above still green because it pins the NEW
+  // name and nothing pins the old one.
+  assert.ok(processNames("darwin").includes("loomux"), "macOS: the previous CFBundleExecutable");
+  assert.ok(processNames("win32").includes("loomux.exe"), "Windows: the previous exe");
+  assert.equal(appIsRunning("darwin", fakeProc("loomux")), true);
   assert.equal(appIsRunning("win32", fakeProc("loomux.exe")), true);
 });
 
@@ -636,7 +677,7 @@ test("nothing running is not a refusal", () => {
     "an unrelated process is not this app"
   );
   assert.equal(
-    appIsRunning("linux", fakeProc("loomux")),
+    appIsRunning("linux", fakeProc("orrerix")),
     false,
     "Linux has no probe at all; download()'s ETXTBSY is the backstop there"
   );

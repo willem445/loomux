@@ -16,19 +16,25 @@ for different files **inside the same path**.
 | | Config field | Value here | What it names |
 | --- | --- | --- | --- |
 | **Product** | `productName` | `Loomux` → **`Orrerix`** | the macOS bundle `Orrerix.app`; the Windows install dir `%LOCALAPPDATA%\Orrerix`; the Add/Remove key `…\Uninstall\Orrerix`; every asset filename `Orrerix_<version>_<arch>.<ext>` |
-| **Main binary** | `mainBinaryName` | *unset* → `loomux` | the executable itself: `…\Orrerix\loomux.exe`, `Orrerix.app/Contents/MacOS/loomux` |
+| **Main binary** | `mainBinaryName` | *unset* → `loomux` (→ `orrerix` in #1562, see below) | the executable itself: `…\Orrerix\loomux.exe`, `Orrerix.app/Contents/MacOS/loomux` |
 
 `mainBinaryName` is unset, and the Tauri v2 config schema says what that means:
 
 > Overrides app's main binary filename. By default, Tauri uses the output binary from
 > `cargo` […]
 
-Cargo's output is the `loomux` crate in `src-tauri/Cargo.toml`, which this phase does
-**not** rename — the crate name is internal, it is what `-p loomux`,
-`target/release/loomux.pdb` and `symbolicate.yml` all refer to, and nothing outside the
-repo ever sees it.
+Cargo's output was the `loomux` crate in `src-tauri/Cargo.toml`, which this phase did
+**not** rename — the crate name was treated as internal, being what `-p loomux`,
+`target/release/loomux.pdb` and `symbolicate.yml` all referred to.
 
-So `Orrerix.app` contains an executable called `loomux`, and that is correct rather
+> **Superseded by #1562**, which is the argued reversal: the cargo package name *is*
+> the executable's name, which makes it externally visible after all. It is now
+> `orrerix`, and the bundle carries `orrerix.exe` / `Contents/MacOS/orrerix`. Nothing
+> below changes — this section describes the state phase 5 shipped, and #1294's
+> lessons are about the two axes being separate, which they still are. See
+> [rebrand-bundle.md](rebrand-bundle.md).
+
+So `Orrerix.app` contained an executable called `loomux`, and that was correct rather
 than an oversight. Two consequences fall straight out of it, and #1294 is what happens
 when they are missed:
 
@@ -36,7 +42,7 @@ when they are missed:
   directory, the binary for the file. `%LOCALAPPDATA%\Orrerix\Orrerix.exe` exists
   nowhere.
 - **The macOS running-app probe needs the binary name.** `pgrep -x` matches the process
-  name case-sensitively, and the process is `loomux`. A probe spelled `Loomux` matched
+  name case-sensitively, and the process was `loomux`. A probe spelled `Loomux` matched
   nothing there for as long as it existed, which meant `update` was free to delete a
   running `/Applications` bundle. Windows had been getting away with the same confusion
   only because `tasklist`'s `IMAGENAME` filter and NTFS are case-insensitive — and
@@ -73,7 +79,9 @@ the symbols zip resolves to nothing on all three platforms.
 
 One asset name is written by hand and does have to be kept in step: that same
 `.pdb.zip`, built by a `release.yml` step rather than by the bundler. Its **source** path
-stays `target/release/loomux.pdb` — that is the cargo axis, not the product one.
+is on the cargo axis, not the product one — `target/release/loomux.pdb` when this phase
+shipped, `target/release/orrerix.pdb` since #1562 renamed that axis. The **asset** name
+is unchanged either way.
 
 `install.sh` is the one script that could not stay name-free. It always resolves
 `/releases/latest`, so it straddles the rename: it now installs whichever `.app` the
@@ -130,8 +138,8 @@ phase 4 and is not keyed on the product name.
 | --- | --- |
 | The GitHub repo slug | A human button, coordinated separately from *this* phase's product/binary rename — #1153 called the repo rename "a human-only action" and this phase's edits did not speculate about its target ahead of time. The human has since renamed the repo and #1334 swept every in-tree occurrence; see "The human runbook" below for the classification that guided that sweep. `test/reposlug.test.ts` is what stopped a partial rename from shipping. |
 | npm trusted-publishing config | A human button on npmjs.com, and a security-relevant one. `release.yml` already reads `PKG` out of `package.json` rather than hardcoding it, so the workflow needed no edit for the package rename. It does need the runbook's step 2 to have happened first. |
-| The bundle identifier `dev.loomux.app` | It keys the WebView2 user-data folder and the macOS bundle ID. Moving it orphans every user's webview profile, and no one outside the repo ever sees it. |
-| Cargo crate names (`loomux`, `loomux_lib`, `loomux-engine`, `loomux-server`) | Internal. `symbolicate.yml`, `ci.yml`'s E2E exe path, and the `.pdb` filename all name the cargo axis, and none of them is an external identity. |
+| The bundle identifier `dev.loomux.app` | It keys the WebView2 user-data folder and the macOS bundle ID. Moving it orphans every user's webview profile, and no one outside the repo ever sees it. **Still `dev.loomux.app` today.** #1562 argues for reversing this and *will* flip it, moving the profile once, in its slice B — not yet landed; [rebrand-bundle.md](rebrand-bundle.md) carries the design. |
+| Cargo crate names (`loomux`, `loomux_lib`, `loomux-engine`, `loomux-server`) | Internal. `symbolicate.yml`, `ci.yml`'s E2E exe path, and the `.pdb` filename all name the cargo axis, and none of them is an external identity. **Partly reversed in #1562**: the `[package]` name IS the executable, so it became `orrerix` — the lib and the two `loomux-*` crates stay. See [rebrand-bundle.md](rebrand-bundle.md). |
 | Internal prose still saying "Loomux" in `src/` comments | Phase 2's surface, not this one. |
 
 ## Where `loomux-desktop` actually went

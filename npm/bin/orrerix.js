@@ -43,9 +43,11 @@ const { spawn, spawnSync } = require("child_process");
 const REPO = "willem445/orrerix";
 const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
 
-// ---------- brand identity (#1153 phase 5) ----------
+// ---------- brand identity (#1153 phase 5, #1562) ----------
 //
-// Two axes, and conflating them is the trap this block exists to stop.
+// Two axes, and conflating them is the trap this block exists to stop. They
+// moved at different times, which is what makes them separate axes rather than
+// one rename told twice.
 //
 //   PRODUCT_NAMES  Tauri's `productName`. It names everything the BUNDLER
 //                  creates, which is everything this launcher has to
@@ -57,11 +59,14 @@ const { version: PKG_VERSION, name: PKG_NAME } = require("../package.json");
 //
 //   MAIN_BINARY    Tauri's `mainBinaryName`, which this app does not set. The
 //                  config schema is explicit that it then "uses the output
-//                  binary from cargo" — the `loomux` crate — so the executable
-//                  INSIDE the bundle is `loomux.exe` / `Contents/MacOS/loomux`
-//                  and the rebrand did NOT move it. Reading it as though it
-//                  followed the product name is how a probe ends up matching
-//                  nothing at all (#1294).
+//                  binary from cargo", so the executable INSIDE the bundle is
+//                  whatever `src-tauri/Cargo.toml`'s `[package] name` says —
+//                  `orrerix.exe` / `Contents/MacOS/orrerix` since #1562, and
+//                  `loomux.exe` / `Contents/MacOS/loomux` before it. Reading
+//                  this axis as though it followed the product name is how a
+//                  probe ends up matching nothing at all (#1294); reading it as
+//                  though it never changes is how a probe stops finding the
+//                  install it is supposed to protect.
 //
 // The rule from doc/design/rebrand-protocol.md applies here verbatim: emit
 // exactly one spelling, accept every spelling on every reading surface, and
@@ -85,15 +90,25 @@ const PRODUCT = PRODUCT_NAMES[0];
 const NAME_ALT = PRODUCT_NAMES.map(escapeRe).join("|");
 
 // The cargo crate name, which is what Tauri ships as the bundle's executable.
-// Not part of the external rebrand, and unchanged by it.
-const MAIN_BINARY = "loomux";
+// This is a SECOND axis with its own history: #1153 phase 5 renamed the product
+// and deliberately left the binary alone; #1562 renamed the binary too.
+const MAIN_BINARY = "orrerix";
 
-// Executable basenames an install can carry, most likely first. MAIN_BINARY is
-// what today's bundler writes; the product names follow because a bundle built
-// under a config that renamed the binary to the product would carry one of
-// those instead, and an install this launcher cannot find is an install it
-// cannot protect.
-const EXE_NAMES = [MAIN_BINARY, ...PRODUCT_NAMES];
+// The binary's previous spelling. Same accept-every-spelling rule as
+// PRODUCT_NAMES, and for a sharper reason: an NSIS in-place upgrade deletes the
+// old exe, but a machine that installed beta4 BESIDE an older build — or by
+// hand while the old app was running — still carries it, and an install this
+// launcher cannot see is an install it cannot protect. `updateBaseline` treats
+// "nothing installed" as safe to order against this launcher's own version, so
+// a blind probe is #816's downgrade guard disarmed by a rename, silently.
+const LEGACY_MAIN_BINARY = "loomux";
+
+// Executable basenames an install can carry, most likely first: the current
+// cargo binary, then the previous one, then the product names — because a
+// bundle built under a config that renamed the binary to the product would
+// carry one of those instead. Every reader iterates the whole array, so the
+// order is what decides which install a machine carrying several resolves to.
+const EXE_NAMES = [MAIN_BINARY, LEGACY_MAIN_BINARY, ...PRODUCT_NAMES];
 
 // The command this package installs, and the launcher's own cache directory
 // name. That cache is ours alone — nothing but this launcher writes it — so by
@@ -584,13 +599,18 @@ function escapeRe(literal) {
 // This is the EXE axis, not the product axis (#1294), and the difference is the
 // whole bug this function exists to close. tauri-bundler writes the bundle's
 // binary under `mainBinaryName`, which this app leaves unset, so it is cargo's
-// output (MAIN_BINARY) — the process is `loomux` while the bundle around it is
-// `Orrerix.app`. Windows never noticed, because `tasklist`'s IMAGENAME filter
-// is case-insensitive and the old product spelling differed only in case;
-// macOS's `pgrep -x` is not, so the guard matched nothing there and `update`
-// was free to `rm -rf` a running /Applications bundle. Post-rename the product
-// spelling stops matching on BOTH platforms, since `Orrerix` and `loomux` do
-// not differ by case.
+// output — and for every build before #1562 that was `loomux` while the bundle
+// around it was `Orrerix.app`. Windows never noticed, because `tasklist`'s
+// IMAGENAME filter is case-insensitive and the old product spelling differed
+// only in case; macOS's `pgrep -x` is not, so the guard matched nothing there
+// and `update` was free to `rm -rf` a running /Applications bundle. Neither
+// `Orrerix` nor `orrerix` vs `loomux` differs merely by case, so nothing
+// case-insensitivity gives us covers this — the array does, or nothing does.
+//
+// Both binary spellings are asked about, not just the current one: an older
+// build that is still installed is still a running process this must refuse
+// over, and refusing is this guard's only action, so a name too many costs one
+// avoidable "quit the app" message while a name too few costs a killed session.
 //
 // Pure and parameterised on the platform so the derivation is pinned by a test
 // rather than by this comment.
@@ -773,13 +793,18 @@ async function runMac(getRelease, command) {
 // Two different names, one path (#1294): the DIRECTORY is the product
 // (`installer.nsi` sets `$INSTDIR` to `$LOCALAPPDATA\${PRODUCTNAME}` per-user,
 // `$PROGRAMFILES\${PRODUCTNAME}` per-machine) and the EXECUTABLE inside it is
-// `${MAINBINARYNAME}.exe`, which is cargo's output and did not move with the
-// rebrand. `Programs\` is kept as a root because older Tauri installers used
-// it and those installs are still out there.
+// `${MAINBINARYNAME}.exe`, which is cargo's output. The two axes moved at
+// different times — the product at #1153 phase 5, the binary at #1562 — so the
+// four live combinations are `Orrerix\orrerix.exe` (current),
+// `Orrerix\loomux.exe` (a beta1–beta3 install), `Loomux\loomux.exe` (a stable
+// 1.0/1.1 install), and, on a machine that has had several, more than one of
+// them at once. `Programs\` is kept as a root because older Tauri installers
+// used it and those installs are still out there.
 //
-// Product-major, not root-major: a machine carrying both a pre-rename and a
-// post-rename install must launch the CURRENT one wherever it sits, rather than
-// whichever happens to live under the root that got listed first.
+// Ordered product, then root, then exe — most likely first at every level. A
+// machine carrying several installs must launch the CURRENT one wherever it
+// sits, rather than whichever happens to live under the root, or carry
+// the exe name, that got listed first.
 //
 // `env` is a parameter so the ordering rule is testable without a real machine.
 function windowsExeCandidates(env = process.env) {

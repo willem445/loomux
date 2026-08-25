@@ -22,7 +22,7 @@ root. See `doc/design/engine-extraction.md` and
 | One frontend test file | `node --test test/layout.test.ts` |
 | Backend check (what CI gates on) | `cargo check --locked --workspace` at the repo root |
 | Backend tests | `cargo test --locked --workspace` at the repo root |
-| One backend test | `cargo test --locked -p loomux --test orchestration <name_filter>` at the repo root |
+| One backend test | `cargo test --locked -p orrerix --test orchestration <name_filter>` at the repo root |
 | Run the app | `npm run tauri dev` — opens a GUI window and never exits; don't run it unattended |
 
 There is no lint/format gate (no eslint/prettier; rustfmt is not enforced in

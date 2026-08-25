@@ -729,26 +729,35 @@ Neutering a lib function reddens the **lib** suite, and cargo then never runs
 the integration binary at all — so every integration-level assertion you meant
 to evidence produces no output, and the round is wasted. Split by target:
 
-- To redden a **unit test in `src-tauri`'s own lib** (e.g.
-  `src/orchestration/digest.rs`), neuter the pure function. That lib suite is
-  the first binary, so it is reached. Check where the file lives before
-  picking it: #888 is moving `orchestration/` modules into the engine crate
-  one batch at a time, and a file that moved is governed by the next bullet,
-  not this one.
+**The order is alphabetical by PACKAGE name**, so a rename or a new workspace
+member moves it — never infer it, and never carry a remembered one. Observed
+order of a `cargo test --locked --workspace` run:
+
+    loomux_engine unit → loomux_server lib unit → loomux_server bin unit
+      → loomux_lib unit → orrerix bin → every src-tauri/tests/* integration
+      binary → doc-tests
+
+Re-derive it rather than trusting this line: take the newest green `CI` run on
+your branch and grep the ubuntu leg's *Test backend* step for `Running`. No run
+id is pinned here on purpose — a run cannot exist until after the commit that
+would cite it, so any id written on this surface is one commit stale the moment
+it lands, and a stale id is what makes the whole line look untrustworthy.
+
 - To redden a **unit test in `crates/loomux-engine/src/`** (e.g.
-  `workflow.rs`) **or in `crates/loomux-server/src/`**, the same move works but
-  the ordering is against you. The observed order of a `cargo test --locked
-  --workspace` run is: `loomux_lib` unit tests → `loomux` bin → **every**
-  `src-tauri/tests/*` integration binary → `loomux_engine` unit tests →
-  `loomux_server` lib unit tests → `loomux_server` bin unit tests → doc-tests.
-  So the two `crates/` members run **last**, with `loomux-server` last of all,
-  and a plant that reddens anything earlier — `src-tauri` lib, any integration
-  binary, or the engine — stops the run before they execute, which means the
-  red says nothing about them. Pick a plant the rest of the suite does not
-  catch, and read the earlier targets passing in the same run as part of the
-  evidence. (Order read off a real green run's log, not inferred: run
-  31888299216 on PR #1023. Re-read it rather than trusting this line if cargo's
-  scheduling ever looks different.)
+  `workflow.rs`) **or in `crates/loomux-server/src/`**, neuter the pure
+  function. Both `crates/` members run **first**, so the plant is reached
+  before anything in `src-tauri` can stop the run. The cost is at the other
+  end: everything in `src-tauri` runs after them, so a plant here stops the run
+  before the `src-tauri` lib and every integration binary — those are exactly
+  the targets you would otherwise quote as "the rest of the suite passed in the
+  same run", and they did not execute. Read which targets actually ran.
+- To redden a **unit test in `src-tauri`'s own lib** (e.g.
+  `src/orchestration/digest.rs`), neuter the pure function. `loomux_lib` runs
+  after both `crates/` members and before every integration binary, so a plant
+  there is reached, and the two `crates/` members passing in the same run are
+  readable evidence. Check where the file lives before picking it: #888 is
+  moving `orchestration/` modules into the engine crate one batch at a time,
+  and a file that moved is governed by the bullet above, not this one.
 - To redden an **integration test in `src-tauri/tests/`**, neuter the
   **wiring** instead — the call site, or the gate's consumption of the value —
   and leave the lib function intact, so the lib suite stays green and the

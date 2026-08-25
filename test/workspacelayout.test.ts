@@ -101,20 +101,45 @@ function lockVersionOf(lock: string, name: string): string | undefined {
   return undefined;
 }
 
-test("the lockfile's loomux entry is not shadowed by its loomux-* siblings", () => {
+/** Escape a literal for use inside a RegExp — the package name reaches one. */
+function escapeRe(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The app package's name, from `src-tauri/Cargo.toml`'s `[package]` section. */
+function appPackageName(): string {
+  const toml = repoFile("src-tauri/Cargo.toml");
+  const start = toml.indexOf("[package]");
+  const rest = toml.slice(start + "[package]".length);
+  const end = rest.search(/^\[/m);
+  const m = /^name = "([A-Za-z0-9_-]+)"/m.exec(end === -1 ? rest : rest.slice(0, end));
+  assert.ok(m, "src-tauri/Cargo.toml's [package] section must declare a name");
+  return m![1];
+}
+
+test("the lockfile's app entry is not shadowed by its sibling members", () => {
   const lock = repoFile("Cargo.lock");
   const appVersion = JSON.parse(repoFile("package.json")).version;
+  const app = appPackageName();
 
+  // Read from the manifest, not typed in: the package was renamed `loomux` →
+  // `orrerix` in #1562, and a hardcoded name here would have gone on asserting
+  // something true about a lock entry that no longer exists.
   assert.equal(
-    lockVersionOf(lock, "loomux"),
+    lockVersionOf(lock, app),
     appVersion,
-    "the `loomux` entry in the root Cargo.lock must carry the release version — this is the field scripts/check-versions.js reads"
+    `the \`${app}\` entry in the root Cargo.lock must carry the release version — this is the field scripts/check-versions.js reads`
   );
-  // `loomux` is a strict prefix of BOTH `loomux-engine` and `loomux-server`, so
-  // any prefix/substring match in the version checker would read the wrong
-  // entry. Pinning that the versions genuinely differ keeps that hazard
-  // testable rather than theoretical — and it grows with each sibling, which is
-  // the point: every new `loomux-*` member is another chance for a loose match.
+  // The siblings stay at a version the app's can never be, so a loose name
+  // match in the checker fails loudly instead of silently agreeing.
+  //
+  // Note what this pair does NOT witness any more. It was written when the app
+  // package was `loomux`, a strict prefix of both siblings — the collision that
+  // made exact-equality load-bearing. `orrerix` is a prefix of neither, so the
+  // real lockfile no longer contains the shape this was guarding. Rather than
+  // relax the claim to fit today's names, the prefix case moves to its own test
+  // below, on a fixture that still has it (#689: relocate the property onto a
+  // witness that still distinguishes).
   for (const sibling of ["loomux-engine", "loomux-server"]) {
     assert.equal(
       lockVersionOf(lock, sibling),
@@ -127,6 +152,45 @@ test("the lockfile's loomux entry is not shadowed by its loomux-* siblings", () 
       "the lock entries must stay distinguishable, so a loose name match in check-versions.js fails loudly instead of silently agreeing"
     );
   }
+});
+
+test("the lockfile lookup resolves by exact name, not by prefix", () => {
+  // The property the test above used to carry, on a fixture that still
+  // exhibits it. Cargo.lock is alphabetical, so a prefix sibling can sit either
+  // side of the entry being looked for — both orders are here, because a
+  // first-match-wins bug is invisible from whichever side happens to come
+  // second today.
+  //
+  // This is what `scripts/check-versions.js`'s `=== 'name = "<app>"'` buys, and
+  // it is the assertion that fails if anyone ever relaxes it to `startsWith` or
+  // `includes` on the grounds that "nothing collides anymore".
+  const synthetic = [
+    "[[package]]",
+    'name = "app-core"',
+    'version = "0.0.0"',
+    "",
+    "[[package]]",
+    'name = "app"',
+    'version = "9.9.9"',
+    "",
+    "[[package]]",
+    'name = "app-server"',
+    'version = "0.0.0"',
+    "",
+  ].join("\n");
+
+  assert.equal(
+    lockVersionOf(synthetic, "app"),
+    "9.9.9",
+    "a lookup for `app` must not resolve to `app-core` (which sorts before it) or `app-server` (after)"
+  );
+  assert.equal(lockVersionOf(synthetic, "app-core"), "0.0.0");
+  assert.equal(lockVersionOf(synthetic, "app-server"), "0.0.0");
+  assert.equal(
+    lockVersionOf(synthetic, "ap"),
+    undefined,
+    "a name that is merely a prefix of a real entry must resolve to nothing at all"
+  );
 });
 
 test("check-versions.js reads the workspace-root lockfile", () => {
@@ -187,12 +251,19 @@ test("every build-output path agrees on the workspace-root target/", () => {
   // Scoped to the assignment lines themselves: both files legitimately mention
   // src-tauri in prose nearby, and a whole-file substring check would pass or
   // fail on comment text rather than on the paths that are actually consumed.
+  //
+  // The executable's basename comes from the manifest, not from a literal here.
+  // This test is about the DIRECTORY (workspace-root `target/`, not
+  // `src-tauri/target/`), and hardcoding the name would make the next rename
+  // redden it for a reason it does not police — `test/bundleidentity.test.ts`
+  // owns the name at these same two sites.
+  const exe = escapeRe(`${appPackageName()}.exe`);
   const ci = repoFile(".github/workflows/ci.yml");
   const ciExe = ci.match(/^\s*LOOMUX_E2E_EXE:.*$/m);
   assert.ok(ciExe, "ci.yml's e2e job must set LOOMUX_E2E_EXE");
   assert.match(
     ciExe[0],
-    /workspace\s*}}\\target\\debug\\loomux\.exe$/,
+    new RegExp(`workspace\\s*}}\\\\target\\\\debug\\\\${exe}$`),
     `LOOMUX_E2E_EXE must point at the workspace-root target/: ${ciExe[0].trim()}`
   );
 
@@ -201,7 +272,7 @@ test("every build-output path agrees on the workspace-root target/", () => {
   assert.ok(defaultExe, "e2e/fixtures.ts must keep a DEFAULT_EXE fallback");
   assert.match(
     defaultExe[0],
-    /"\.\.\/target\/debug\/loomux\.exe"/,
+    new RegExp(`"\\.\\./target/debug/${exe}"`),
     `DEFAULT_EXE must resolve to the workspace-root target/ — it is what runs when LOOMUX_E2E_EXE is unset: ${defaultExe[0]}`
   );
 

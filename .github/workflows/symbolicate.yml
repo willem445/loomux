@@ -1,15 +1,15 @@
 # Manual-only: rebuild a shipped release's binary WITH its PDB, so a minidump
 # from that build can be symbolicated.
 #
-# Why this exists at all: a release build DOES emit `target/release/loomux.pdb`
+# Why this exists at all: a release build DOES emit `target/release/orrerix.pdb`
 # — the shipped exe carries an `RSDS` CodeView record, so the linker produced
 # one — but nothing ever uploads it. The release workflow ships bundles via
 # tauri-action, and the PDB stays on the runner and dies with it. (`strip =
 # "debuginfo"` keeps the *exe* slim; it does not suppress the PDB.) A crash dump
 # from an installed build therefore resolves to
-# `loomux.exe+0x<rva>` and nothing else. This job checks out the ORIGINAL tag,
+# `orrerix.exe+0x<rva>` and nothing else. This job checks out the ORIGINAL tag,
 # rebuilds it on the same runner image the release used, and uploads
-# `loomux.pdb` alongside `loomux.exe` so the two can be compared byte-for-byte
+# `orrerix.pdb` alongside `orrerix.exe` so the two can be compared byte-for-byte
 # against the installed binary before any symbol is trusted.
 #
 # A rebuild is NOT the same binary. The PDB's GUID will differ, and any drift
@@ -86,7 +86,7 @@ jobs:
           # upload-artifact@v4 rejects a name containing any of / \ " : < > | * ?
           # free-form — a branch name or a refs/tags/... spelling would fail the
           # LAST step, discarding a build that already ran for tens of minutes.
-          echo "artifact=loomux-symbols-${REF//[^A-Za-z0-9._-]/-}" >> "$GITHUB_OUTPUT"
+          echo "artifact=orrerix-symbols-${REF//[^A-Za-z0-9._-]/-}" >> "$GITHUB_OUTPUT"
 
       - name: Install frontend dependencies
         if: ${{ !inputs.probe_only }}
@@ -102,14 +102,14 @@ jobs:
       # `--locked` so the rebuild resolves the exact dependency versions the
       # tag's Cargo.lock pinned; anything else changes the linked graph and
       # with it the code layout.
-      - name: Build loomux (release profile, with PDB)
+      - name: Build orrerix (release profile, with PDB)
         if: ${{ !inputs.probe_only }}
-        run: cargo build --release --locked -p loomux
+        run: cargo build --release --locked -p orrerix
 
       - name: Report build outputs
         if: ${{ !inputs.probe_only }}
         shell: bash
-        run: ls -l target/release/loomux.exe target/release/loomux.pdb
+        run: ls -l target/release/orrerix.exe target/release/orrerix.pdb
 
       - name: Upload symbols
         if: ${{ !inputs.probe_only }}
@@ -117,8 +117,8 @@ jobs:
         with:
           name: ${{ steps.toolchain.outputs.artifact }}
           path: |
-            target/release/loomux.exe
-            target/release/loomux.pdb
+            target/release/orrerix.exe
+            target/release/orrerix.pdb
             rustc-version.txt
           retention-days: 14
           if-no-files-found: error

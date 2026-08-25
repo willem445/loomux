@@ -17,7 +17,7 @@
 // `run_on_main_thread` -> `std::thread::spawn` -> rfd). Windows attaches the two
 // threads' input queues for an owner/owned pair, so the dialog thread's
 // `SetFocus` is delivered SYNCHRONOUSLY into our main thread's window procedure.
-// From there it is all dependency code compiled into loomux.exe: wry's parent
+// From there it is all dependency code compiled into orrerix.exe: wry's parent
 // subclass answers `WM_SETFOCUS` by forcing `ICoreWebView2Controller::MoveFocus`
 // back into the webview, and tauri-runtime-wry's `add_GotFocus`/`add_LostFocus`
 // handlers run inside WebView2's own focus machinery, each taking two mutexes

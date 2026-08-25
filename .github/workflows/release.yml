@@ -194,7 +194,7 @@ jobs:
 
       # #1218: ship the Windows debug symbols alongside the installers.
       #
-      # The release build already EMITS `target/release/loomux.pdb` — the
+      # The release build already EMITS `target/release/orrerix.pdb` — the
       # workspace-root `[profile.release]` sets `debug = "line-tables-only"`
       # for #53, and `strip = "debuginfo"` only keeps the *exe* slim — but
       # nothing ever uploaded it, so it died with the runner. That is why
@@ -228,10 +228,12 @@ jobs:
           # construction, which is why the rename needed no fallback list in
           # any of them.)
           #
-          # The SOURCE path stays `loomux.pdb`: that name comes from the cargo
-          # crate, not from productName, and the rebrand did not move it.
+          # The SOURCE path is `orrerix.pdb`: that name comes from the cargo
+          # crate, not from productName, so #1562 moved it when it renamed the
+          # binary — while the ASSET name above, which is productName-derived,
+          # did not change at all.
           $name = "Orrerix_$($env:TAG -replace '^v', '')_x64.pdb.zip"
-          Compress-Archive -Path target/release/loomux.pdb -DestinationPath $name -CompressionLevel Optimal -Force
+          Compress-Archive -Path target/release/orrerix.pdb -DestinationPath $name -CompressionLevel Optimal -Force
           "name=$name" >> $env:GITHUB_OUTPUT
 
       # Uploaded BY RELEASE ID, never by a tag lookup — the draft this run

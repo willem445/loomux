@@ -192,7 +192,7 @@ jobs:
         run: |
           New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments" -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments" `
-            -Name "loomux.exe" -Value "--remote-debugging-port=9333 --disable-gpu" -Type String
+            -Name "orrerix.exe" -Value "--remote-debugging-port=9333 --disable-gpu" -Type String
 
       - name: Run Playwright E2E suite
         run: npx playwright test
@@ -202,7 +202,7 @@ jobs:
           # longer under src-tauri/. Must stay in step with e2e/fixtures.ts's
           # DEFAULT_EXE, which is what runs when this env var is unset;
           # test/workspacelayout.test.ts pins that the two agree.
-          LOOMUX_E2E_EXE: ${{ github.workspace }}\target\debug\loomux.exe
+          LOOMUX_E2E_EXE: ${{ github.workspace }}\target\debug\orrerix.exe
 
       # If the suite above failed, surface a pointer to the debugging docs in
       # the job output itself — not just in a comment nobody reading the

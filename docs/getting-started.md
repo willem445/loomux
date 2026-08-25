@@ -156,6 +156,31 @@ there.
 Your data is not duplicated and nothing needs migrating — both builds read the
 same profile directory, which moved separately and earlier.
 
+### Upgrading from an earlier Orrerix build
+
+The executable inside the install is now `orrerix.exe`; earlier Orrerix builds
+carried `loomux.exe`. Installing over one of those — **with the old build closed**
+— replaces it in place and removes the old executable for you, and no second app
+appears in Add/Remove Programs. Closed is the part that matters: see the first
+bullet below.
+
+Two things to know:
+
+- **Quit Orrerix before installing it by hand.** If the old build is still
+  running its executable cannot be deleted, so it is left behind next to the new
+  one — and it stays there for good: later installs will not remove it, and
+  neither will uninstalling. It is inert, and Orrerix never runs it, but if you
+  want the space back you have to delete it yourself from the install folder
+  (`%LOCALAPPDATA%\Orrerix`). Quitting first avoids the whole thing.
+  `orrerix update` refuses outright while the app is running rather than
+  installing over it.
+- **Re-pin your taskbar shortcut.** A shortcut you pinned yourself points at the
+  old executable and stops working. The Start-menu and desktop shortcuts the
+  installer created are updated for you; pin a fresh one from there.
+
+Crash dumps written by Windows are named after the executable, so they are now
+`orrerix.exe.<pid>.dmp` — see [Troubleshooting](troubleshooting.html).
+
 ## First launch
 
 Open orrerix and you get a single terminal pane running your default shell — it

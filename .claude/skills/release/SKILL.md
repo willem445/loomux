@@ -24,7 +24,7 @@ The version lives in **five** places that must stay in lockstep:
 | `package-lock.json` | `version` (both top-level and `packages[""].version`) |
 | `src-tauri/tauri.conf.json` | `version` |
 | `src-tauri/Cargo.toml` | `[package] version` |
-| `Cargo.lock` | the `loomux` package entry (workspace root — **not** `src-tauri/`) |
+| `Cargo.lock` | the `orrerix` package entry (workspace root — **not** `src-tauri/`) |
 
 **The lockfiles are what get missed** (#90, #224). After editing Cargo.toml,
 run `cargo update --workspace` at the **repo root** (the Cargo workspace root)

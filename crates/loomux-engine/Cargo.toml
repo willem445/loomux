@@ -126,7 +126,7 @@ winreg = "0.55"
 # The crate's first dev-dependency, and the boundary it sits on is worth stating
 # once: dev-dependencies are never built for a downstream crate, so nothing here
 # can reach the shipped binary — the ban above is about load-time imports of
-# loomux.exe, and this graph is not in it. `default-features = false` anyway,
+# orrerix.exe, and this graph is not in it. `default-features = false` anyway,
 # mirroring src-tauri's identical entry: tempfile's defaults switch on
 # `getrandom` for its random file names, and belt-and-braces is cheap when the
 # alternative is a future reader having to re-derive why the exemption applies.

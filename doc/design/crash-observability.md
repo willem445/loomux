@@ -119,7 +119,7 @@ actually matters for naming loomux's own frames is **`debug`, not `strip`**:
 - `debug = "line-tables-only"` makes rustc emit debug info covering loomux's
   own functions (names + line numbers). **This is the setting that symbolicates
   our frames.** Without it — a `[profile.release]` with no `debug` key defaults
-  to `debug = false` — the emitted MSVC `loomux.pdb` carries only public/linker
+  to `debug = false` — the emitted MSVC `orrerix.pdb` carries only public/linker
   symbols, so dbghelp resolves our internal functions as `__ImageBase` **even
   with the PDB sitting right next to the exe**. (Only *std* frames get named in
   that case, because the Rust toolchain ships std's debuginfo separately — which
@@ -139,10 +139,10 @@ numbers**. So the profile now sets **both** `debug = "line-tables-only"` and
 `strip = "debuginfo"`.
 
 With that, **build-tree and CI** backtraces are genuinely symbolicated (own
-frames + line numbers) because `loomux.pdb` sits beside the exe in
+frames + line numbers) because `orrerix.pdb` sits beside the exe in
 `target/release/`. The remaining gap is the shipped **bundle**:
-`tauri.conf.json` → `bundle.targets: "all"` (NSIS/MSI) copies only `loomux.exe`,
-the conhost resources, and icons into the installer — **not** `loomux.pdb`. So an
+`tauri.conf.json` → `bundle.targets: "all"` (NSIS/MSI) copies only `orrerix.exe`,
+the conhost resources, and icons into the installer — **not** `orrerix.pdb`. So an
 **end-user's installed** loomux still produces **address-only** backtraces. Even
 there the panic *message*, *location* (`file:line:col`, from panic metadata —
 independent of the PDB), and *thread name* are always captured and usually
@@ -162,11 +162,11 @@ We deliberately do **not** ship the PDB **in the installer**: it exposes symbols
 and would add ~23 MB to every download. That is still true.
 
 **The release itself now carries it** (#1218). `release.yml`'s Windows leg zips
-`target/release/loomux.pdb` to `Orrerix_X.Y.Z_x64.pdb.zip` and attaches it to the
+`target/release/orrerix.pdb` to `Orrerix_X.Y.Z_x64.pdb.zip` and attaches it to the
 GitHub release beside the installers, so the PDB is no longer discarded with the
 runner. This costs the installer payload nothing — it is a separate asset nobody
-has to download — and it turns the "drop the matching `loomux.pdb` beside the
-installed `loomux.exe`" workaround from hypothetical into a two-step recipe:
+has to download — and it turns the "drop the matching `orrerix.pdb` beside the
+installed `orrerix.exe`" workaround from hypothetical into a two-step recipe:
 download the `.pdb.zip` **for the exact version that crashed**, unzip it next to
 the installed exe. With `debug = "line-tables-only"` in place that genuinely
 symbolicates loomux frames (it would not have with the old `debug=false` PDB).
@@ -280,7 +280,7 @@ high-water mark. Declared in the lib, this one is inherited by every
 error: the `#[global_allocator]` in this crate conflicts with global allocator in: loomux_lib
 ```
 
-In `main.rs` it covers exactly what it should — the shipped `loomux.exe` and
+In `main.rs` it covers exactly what it should — the shipped `orrerix.exe` and
 the E2E build made from the same entry point — and nothing at runtime is lost,
 because the choice is made at link time for the whole process: allocations made
 by code inside `loomux_lib`, which is all of them, go through the wrapper just
