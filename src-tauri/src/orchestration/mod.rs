@@ -14222,6 +14222,18 @@ pub fn session_cwd_in_store(
 /// This makes it O(store + groups): each store is enumerated the first time a
 /// group asks for it and never again within the same listing.
 ///
+/// **Where the trade actually turns, stated rather than glossed.** The
+/// per-group lookup stops at the first HIT, so for ONE group whose session sits
+/// early in claude's projects root it can finish in a handful of `stat` calls,
+/// where this always walks the whole store once. The index is therefore MORE
+/// work in exactly one case — a single group that hits early — and less from
+/// two groups, or from any single MISS, which already costs the full
+/// enumeration. That is the right side to be wrong on for a LISTING: its
+/// premise is many groups, a stale group is precisely the one that misses, and
+/// #1592 was reported from an install with hundreds of them. It is also off the
+/// webview thread and coalesced by the sidebar's `RefreshGate`, so the walk it
+/// does pay cannot block the UI or stack up.
+///
 /// **Lazy per store, on purpose.** A root holding only claude groups must not
 /// pay for copilot's enumeration, and vice versa — which is also why the two
 /// halves are separate fields rather than one merged set. `None` is "not asked
@@ -30061,6 +30073,14 @@ impl OrchRegistry {
         for name in ["audit.1.jsonl", "audit.jsonl"] {
             let Ok(file) = fs::File::open(self.group_dir(group).join(name)) else { continue };
             for line in BufReader::new(file).lines() {
+                // A read error (I/O, or invalid UTF-8 in one line) stops THIS
+                // generation and moves to the next, where the pre-streaming
+                // `read_to_string` failed the whole file and contributed
+                // nothing. The degrade is therefore strictly WIDER, not
+                // narrower — partial rows where there used to be none — which
+                // is the direction a best-effort listing wants, and it is
+                // stated because it IS a behaviour change rather than a pure
+                // refactor.
                 let Ok(line) = line else { break };
                 Self::push_audit_spawn(&line, &mut out);
             }
