@@ -14205,6 +14205,73 @@ pub fn session_cwd_in_store(
     }
 }
 
+/// Store membership for a WHOLE listing, enumerated at most once per store
+/// (#1592).
+///
+/// [`session_cwd_in_store`] above answers "is this one id in this one store?",
+/// which is the right shape for a resume — one click, one id. A LISTING asks it
+/// once per group, and the file-backed stores answer it by enumerating
+/// themselves: claude probes `<id>.jsonl` in every project directory, and
+/// copilot, which has no filename-is-the-id shortcut, parses every session
+/// directory's `workspace.yaml`. Both stop early on a HIT and pay the full
+/// enumeration on a MISS — and a stale group, the one that misses, is exactly
+/// what accumulates in a long history. So the listing's cost was
+/// O(groups × store), and on the install #1592 was reported from that is
+/// hundreds of groups against a store of ~1000 sessions.
+///
+/// This makes it O(store + groups): each store is enumerated the first time a
+/// group asks for it and never again within the same listing.
+///
+/// **Lazy per store, on purpose.** A root holding only claude groups must not
+/// pay for copilot's enumeration, and vice versa — which is also why the two
+/// halves are separate fields rather than one merged set. `None` is "not asked
+/// yet"; an empty set is "asked, and the store held nothing".
+///
+/// **Membership is the whole question here.** `resumable` is
+/// `matches!(…, Ok(Some(_)))` — it never reads the cwd, only whether the store
+/// has the id — so the three ways `session_cwd_in_store` can answer "no"
+/// (`Ok(None)`, an unreadable root's `Err`, and a root that does not exist)
+/// all collapse to `false` here exactly as they did through `matches!`.
+///
+/// **Not for a resume.** A resume needs the recorded cwd to launch in, and this
+/// deliberately does not read one; `resume_recorded_session` still goes through
+/// `session_cwd_in_store`, so the listing and the resume keep asking one
+/// question each rather than sharing a weakened one.
+#[derive(Default)]
+struct StoreIndex {
+    claude: Option<HashSet<String>>,
+    copilot: Option<HashSet<String>>,
+}
+
+impl StoreIndex {
+    /// Whether `cli`'s store holds `session_id` — the same answer
+    /// `matches!(session_cwd_in_store(cli, session_id, _), Ok(Some(_)))` gives
+    /// for every non-opencode `cli`, including the default-arm CLIs
+    /// `find_session_cwd` routes to claude.
+    fn contains(&mut self, cli: &str, session_id: &str) -> bool {
+        // The same admission `find_session_cwd` applies before it will touch a
+        // store at all (#925): an id that is not a single path component is
+        // `Ok(None)` there, so it is `false` here. Kept rather than left to the
+        // set lookup, so the two agree by construction and not by the accident
+        // that no real file is named `../x`.
+        let Ok(seg) = PathSegment::parse(session_id) else { return false };
+        let set = if cli == "copilot" {
+            self.copilot.get_or_insert_with(|| {
+                crate::sessions::copilot_session_state_root()
+                    .map(|root| crate::sessions::copilot_session_ids(&root))
+                    .unwrap_or_default()
+            })
+        } else {
+            self.claude.get_or_insert_with(|| {
+                crate::sessions::claude_projects_root()
+                    .map(|root| crate::sessions::claude_session_ids(&root))
+                    .unwrap_or_default()
+            })
+        };
+        set.contains(seg.as_str())
+    }
+}
+
 /// Resolve a worker/reviewer resume's launch cwd: prefer a still-valid
 /// caller/roster-supplied cwd when there is one (the common case — nothing
 /// moved since the session ran, so this is a cheap no-op), falling back to
@@ -29964,23 +30031,57 @@ impl OrchRegistry {
     /// Roster entries derived from `agent-spawn` audit lines. Backfill for
     /// groups created before agents.json existed — their session-to-role
     /// mapping lives only in the audit log.
+    /// The substring a line must contain before it is worth handing to
+    /// `serde_json` at all (#1592). Conservative by construction: `action` is
+    /// compared against this exact literal below, so a line that does not carry
+    /// these bytes anywhere cannot possibly match. Every writer of this file is
+    /// `serde_json::to_string` in this process (see `audit`), and serde_json's
+    /// serializer never escapes an ASCII letter or a hyphen — so the raw bytes
+    /// of an `agent-spawn` action are always literally present. The residual is
+    /// stated rather than assumed away: a hand-edited audit line spelling the
+    /// action with `\u` escapes would be skipped here where the old
+    /// parse-everything loop would have matched it.
+    const AUDIT_SPAWN_MARKER: &'static str = "agent-spawn";
+
+    /// Every `agent-spawn` row in a group's audit log, oldest first.
+    ///
+    /// **Streamed, not slurped** (#1592). This used to `read_to_string` BOTH
+    /// generations into one `String` and then build a full `serde_json::Value`
+    /// for every line of it. An install with a long orchestration history keeps
+    /// tens of megabytes per group there, and `session_roles` calls this once
+    /// per group — so peak memory was the whole corpus at once, and every line
+    /// of it was parsed whether or not it was a spawn. Reading line by line
+    /// bounds the buffer at one line, and the marker prefilter above keeps the
+    /// `Value` allocation for the rows that can actually match. The rows
+    /// returned, and their order, are unchanged.
     fn records_from_audit(&self, group: &GroupId) -> Vec<AgentRecord> {
+        let mut out: Vec<AgentRecord> = Vec::new();
         // Oldest first so newer spawns win the (id, session) upsert; the
         // rotated generation holds the older entries.
-        let mut text = String::new();
         for name in ["audit.1.jsonl", "audit.jsonl"] {
-            if let Ok(t) = fs::read_to_string(self.group_dir(group).join(name)) {
-                text.push_str(&t);
+            let Ok(file) = fs::File::open(self.group_dir(group).join(name)) else { continue };
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else { break };
+                Self::push_audit_spawn(&line, &mut out);
             }
         }
-        let mut out: Vec<AgentRecord> = Vec::new();
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        out
+    }
+
+    /// One audit line's contribution to [`Self::records_from_audit`]. Split out
+    /// so the streaming loop above stays a loop and this stays the parse (#1592);
+    /// the body is byte-for-byte the pre-streaming one.
+    fn push_audit_spawn(line: &str, out: &mut Vec<AgentRecord>) {
+        if !line.contains(Self::AUDIT_SPAWN_MARKER) {
+            return;
+        }
+        {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { return };
             if v["action"] != "agent-spawn" {
-                continue;
+                return;
             }
             let d = &v["detail"];
-            let Some(session) = d["session"].as_str() else { continue };
+            let Some(session) = d["session"].as_str() else { return };
             let role = d["role"].as_str().unwrap_or("worker").to_string();
             // Mirror `spawn_agent_ex`'s persisted_branch rule (#1): the spawn
             // audit always records a `branch` value (even a fallback name for
@@ -30020,7 +30121,6 @@ impl OrchRegistry {
                 None => out.push(record),
             }
         }
-        out
     }
 
     /// Roster + audit backfill, deduped by session (roster wins). Sessions
@@ -30153,6 +30253,10 @@ impl OrchRegistry {
     /// `group.json` FILE must exist), so the two agree on what a group is.
     pub fn recorded_orchestrations(&self) -> Vec<RecordedOrchestration> {
         let mut out = Vec::new();
+        // One enumeration per STORE for the whole listing, not one per group
+        // (#1592) — see [`StoreIndex`]. Built lazily, so a root with no claude
+        // group never lists claude's projects at all.
+        let mut store = StoreIndex::default();
         let Ok(entries) = fs::read_dir(&self.root) else {
             return out;
         };
@@ -30208,10 +30312,23 @@ impl OrchRegistry {
             // forbids, so the answer is to ask none.
             let resumable = !cli.is_empty()
                 && session_id.as_deref().is_some_and(|sid| {
-                    matches!(
-                        session_cwd_in_store(&cli, sid, Some(&self.opencode_db_path(&group_id))),
-                        Ok(Some(_))
-                    )
+                    // opencode's answer is already O(1) — one indexed SELECT
+                    // against THIS GROUP's own db — and there is nothing to
+                    // share across groups, so it keeps asking the resume path's
+                    // own function. The file-backed stores are the shared ones,
+                    // and those go through the index (#1592).
+                    if cli == "opencode" {
+                        matches!(
+                            session_cwd_in_store(
+                                &cli,
+                                sid,
+                                Some(&self.opencode_db_path(&group_id))
+                            ),
+                            Ok(Some(_))
+                        )
+                    } else {
+                        store.contains(&cli, sid)
+                    }
                 });
             out.push(RecordedOrchestration {
                 group_live: self.group_is_live(&group_id),
@@ -53177,9 +53294,25 @@ pub async fn orch_agent_renamed(
 }
 
 /// Session ↔ orchestration-role mapping for the session browser badges.
+///
+/// Off-thread (#1592). This was the last full per-group fan-out still
+/// dispatched SYNCHRONOUSLY: Tauri calls a sync `#[tauri::command]` directly on
+/// the webview main thread (the same note `git.rs` and `sessions::list_sessions`
+/// carry, issues #207/#399), so [`OrchRegistry::session_roles`] — which reads and
+/// parses every group's roster AND both audit generations — blocked the UI for
+/// as long as that took. On an install with a long orchestration history that is
+/// tens of megabytes of JSONL parsed on the thread that has to paint, which is
+/// the `AppHangB1` half of #1592. #1568's own doc comment named this as the
+/// unconverted debt (#743 F4); this is the conversion.
+///
+/// **Reentrancy.** Read-only and idempotent, the same rule
+/// [`orch_list_recorded`] documents: no registry state is mutated, and two
+/// concurrent calls (the sidebar's boot prefetch racing a human's refresh) can
+/// disagree only about a group whose files changed between them.
 #[tauri::command]
-pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRole> {
-    reg.session_roles()
+pub async fn orch_session_roles(app: AppHandle) -> Vec<SessionRole> {
+    let reg = reg_of(&app);
+    run_blocking(move || reg.session_roles()).await
 }
 
 /// Every orchestration group loomux has a record of, for the session

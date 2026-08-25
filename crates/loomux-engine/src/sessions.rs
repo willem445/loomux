@@ -311,6 +311,46 @@ pub fn copilot_session_ids(root: &Path) -> HashSet<String> {
     ids
 }
 
+/// Every session id claude's store holds, in ONE pass over the projects root
+/// (#1592).
+///
+/// [`find_claude_session_cwd`] answers "is THIS id here?" with a filename probe
+/// per project directory, which is cheap once and quadratic when a caller asks
+/// it per group: a listing over N groups re-enumerated the same P project
+/// directories N times, and a MISS — the stale group, which is exactly the
+/// common case in a long history — pays all P probes. This pays P directory
+/// listings once, so the same listing is O(store + groups) instead of
+/// O(store × groups).
+///
+/// **Membership only, deliberately.** The per-id lookup returns the session's
+/// recorded `cwd` because a RESUME needs somewhere to launch; a LISTING only
+/// needs to know the store has the id at all (`Ok(Some(_))`), and reading each
+/// session's head to recover a cwd nobody asked for would put back the cost
+/// this removes. A caller that needs the cwd still calls `find_session_cwd`.
+///
+/// The id is the file STEM, matching the layout `find_claude_session_cwd`
+/// joins (`<project>/<id>.jsonl`), so the two halves cannot disagree about
+/// which files name a session.
+pub fn claude_session_ids(root: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(projects) = fs::read_dir(root) else {
+        return ids;
+    };
+    for project in projects.flatten() {
+        let Ok(files) = fs::read_dir(project.path()) else { continue };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                ids.insert(stem.to_string());
+            }
+        }
+    }
+    ids
+}
+
 /// The copilot session most likely created by a just-spawned pane: one absent
 /// from `baseline`, preferring a session whose recorded cwd matches `cwd`
 /// (disambiguating agents spawned concurrently in different worktrees),

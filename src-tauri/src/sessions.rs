@@ -60,14 +60,14 @@ pub use loomux_engine::sessions::{
 // `yaml_field` read, and the four `orchestration/mod.rs` spawn-path calls all
 // stayed in this crate.
 pub(crate) use loomux_engine::sessions::{
-    copilot_session_dir_at, copilot_session_ids, copilot_session_state_root,
-    newest_new_copilot_session, norm_path, yaml_field,
+    claude_projects_root, claude_session_ids, copilot_session_dir_at, copilot_session_ids,
+    copilot_session_state_root, newest_new_copilot_session, norm_path, yaml_field,
 };
 
 // Was module-private: only the scan machinery below calls these, so a bare
 // `use` keeps them reachable from nowhere else, exactly as before.
 use loomux_engine::sessions::{
-    claude_projects_root, read_copilot_session, scan_claude_jsonl, tidy_title,
+    read_copilot_session, scan_claude_jsonl, tidy_title,
 };
 
 #[derive(Serialize)]
