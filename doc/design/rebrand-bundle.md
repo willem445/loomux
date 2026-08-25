@@ -96,6 +96,9 @@ it back:
   ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
     Delete "$INSTDIR\$OldMainBinaryName"
   ${EndIf}
+
+  ; Save current MAINBINARYNAME for future updates
+  WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
 ```
 
 So an in-place upgrade installs `orrerix.exe`, recreates its own shortcuts at
@@ -107,10 +110,30 @@ has no `/REBOOTOK`, and the bundler's own guard —
 `!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"` —
 asks about the **new** name only. Install by hand (`setup.exe`, `install.ps1`)
 while the previous build is open and the delete silently fails, leaving both
-executables in `$INSTDIR` until the next install. That residual is documented in
-`docs/getting-started.md` and left alone. It is cosmetic: the stale exe is not
-launched by anything (every shortcut points at the new one, and the launcher
-probes the current name first), and the next install clears it.
+executables in `$INSTDIR`.
+
+**That stranding is permanent.** Read the second statement in the block above:
+the `WriteRegStr` that records `MainBinaryName` sits **outside** the `${If}`,
+and is not conditioned on the `Delete` having succeeded. So the very install
+that failed to remove `loomux.exe` still records `MainBinaryName = orrerix.exe`.
+Every later install reads that back, finds `$OldMainBinaryName` equal to
+`${MAINBINARYNAME}.exe`, and never runs the `Delete` again — and that `Delete`
+is the only thing in `Section Install` that removes pre-existing `$INSTDIR`
+content. Once missed, it is missed for good: nothing on this axis will ever
+retry it, because the name it would now be looking for is the one already
+installed.
+
+It outlives an uninstall, too. The uninstaller deletes
+`"$INSTDIR\${MAINBINARYNAME}.exe"` — the *current* name — and then calls
+`RMDir "$INSTDIR"` **without `/r`**, so a directory still holding `loomux.exe`
+is not empty and is not removed. An uninstall leaves both
+`%LOCALAPPDATA%\Orrerix\` and the stale exe behind.
+
+The residual is therefore small but **not** self-healing: one un-launched file
+(every shortcut points at the new exe, and the launcher probes the current name
+first) that stays until the user deletes it. The mitigation is prevention, not
+cleanup — quit the old build before a hand-install — and that is what
+`docs/getting-started.md` tells the user.
 
 ### The NSIS `NSIS_HOOK_PREINSTALL` hook, considered and rejected
 
@@ -125,14 +148,19 @@ both of these:
    `CheckIfAppIsRunning` runs
 
    ```nsis
-   IfSilent kill_${UniqueID} 0
-   ${IfThen} $PassiveMode != 1 ${|} MessageBox MB_OKCANCEL $R2 IDOK kill_${UniqueID} IDCANCEL cancel_${UniqueID} ${|}
-   kill_${UniqueID}:
-     nsis_tauri_utils::KillProcess{,CurrentUser} "${executableName}"
+   ${If} $R0 = 0
+       IfSilent kill_${UniqueID} 0
+       ${IfThen} $PassiveMode != 1 ${|} MessageBox MB_OKCANCEL $R2 IDOK kill_${UniqueID} IDCANCEL cancel_${UniqueID} ${|}
+       kill_${UniqueID}:
+         !if "${INSTALLMODE}" == "currentUser"
+           nsis_tauri_utils::KillProcessCurrentUser "${executableName}"
+         !else
+           nsis_tauri_utils::KillProcess "${executableName}"
+         !endif
    ```
 
-   (the `CurrentUser` variant under `INSTALLMODE == "currentUser"`, which is
-   Tauri's default and ours), where `$R2` is
+   (`$R0` is `FindProcess`'s result; `INSTALLMODE` is `currentUser` by default,
+   which is ours), where `$R2` is
    `"{{product_name}} is running!$\nClick OK to kill it"`. So a silent or
    passive install terminates the running build with **no prompt at all**, and
    the interactive one offers killing as the OK action. `install.ps1:28` is
@@ -151,11 +179,14 @@ both of these:
    `loomux.exe` does not, and that asymmetry is what stops the macro being the
    like-for-like reuse it appears to be.
 
-Weighed against a stranded, un-launched, self-clearing file, neither cost is
-worth paying. A future version that genuinely needs this wants a guard scoped to
-`$INSTDIR` (so a side-by-side install is out of reach) *and* a refusal rather
-than a kill — which the bundler's macro does not offer, so it would mean writing
-the NSIS by hand.
+Weighed against one un-launched file that a user can delete — permanent, as the
+section above establishes, but inert and visible only in `$INSTDIR` — neither
+cost is worth paying. Killing a running app, possibly a *different product*,
+with no prompt, is a far larger harm than a stale file on a path the user
+already opened an installer against. A future version that genuinely needs this
+wants a guard scoped to `$INSTDIR` (so a side-by-side install is out of reach)
+*and* a refusal rather than a kill — which the bundler's macro does not offer,
+so it would mean writing the NSIS by hand.
 
 Note for whoever revisits it: **`ci.yml` builds with `--no-bundle`, so NSIS
 never runs in CI.** Nothing on a PR compiles a hook file, and a mistake in one
