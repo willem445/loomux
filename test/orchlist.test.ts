@@ -80,7 +80,16 @@ test("cliKey is the raw wire value, never the display label", () => {
   assert.equal(ok.cli, "opencode");
   const [padded] = orchRows([rec({ cli: "  claude  " })]);
   assert.equal(padded.cliKey, "claude", "a token never carries surrounding whitespace");
-  assert.doesNotMatch(padded.cliKey, /s/, "a cliKey must never contain whitespace");
+  assert.doesNotMatch(padded.cliKey, /\s/, "a cliKey must never contain whitespace");
+
+  // The INTERIOR case, which `trim()` alone does not close and which the
+  // surrounding-whitespace assertion above can never catch: one space inside
+  // the value would splice the class attribute into two class names, which is
+  // the whole hazard `cliKey` exists to avoid. No key at all is the honest
+  // answer — the badge renders uncoloured but still labelled.
+  const [spaced] = orchRows([rec({ cli: "my cli" })]);
+  assert.equal(spaced.cliKey, "", "a value that cannot be one token yields no key");
+  assert.equal(spaced.cli, "my cli", "the DISPLAY label still shows it verbatim");
 });
 
 test("canResume is never true without a session id, whatever the backend said", () => {

@@ -96,6 +96,14 @@ function cliLabel(cli: string): string {
   return cli.trim() || "unknown CLI";
 }
 
+/** The CLI as a class-name TOKEN, or `""` when it cannot be one. A token may
+ *  not contain whitespace at all: the renderer interpolates this into a
+ *  `class` attribute, where one space silently becomes two class names. */
+function cliToken(cli: string): string {
+  const t = cli.trim();
+  return /\s/.test(t) ? "" : t;
+}
+
 /** Which of the five states a record is in. Order matters and is argued:
  *
  *  - `damaged` first, because with no readable `group.json` nothing else about
@@ -166,8 +174,14 @@ export function orchRows(
       return {
         groupId: r.group_id,
         cli: cliLabel(r.cli),
-        // Trimmed, never labelled: this one is a token, not prose.
-        cliKey: r.cli.trim(),
+        // A token, not prose — so it is trimmed, and any value that still
+        // carries whitespace yields NO key at all rather than a string the
+        // renderer would splice into two classes. `trim()` alone closes only
+        // the surrounding case; an INTERIOR space survives it, and
+        // `agent_cli` comes from `group.json`, which is operator-authored
+        // (#1568 review round 2). No key renders as a bare `session-badge`:
+        // uncoloured, still labelled, never two junk classes.
+        cliKey: cliToken(r.cli),
         title: r.repo ? repoName(r.repo) : r.group_id,
         sessionId: r.session_id,
         state,
