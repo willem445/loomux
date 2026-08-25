@@ -30206,7 +30206,7 @@ impl OrchRegistry {
             // orchestration") without reaching any store at all. Asking a
             // DIFFERENT store's question is exactly what the parity claim above
             // forbids, so the answer is to ask none.
-            let resumable = !cli.is_empty()
+            let resumable = true
                 && session_id.as_deref().is_some_and(|sid| {
                     matches!(
                         session_cwd_in_store(&cli, sid, Some(&self.opencode_db_path(&group_id))),
