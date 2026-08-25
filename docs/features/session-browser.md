@@ -75,6 +75,23 @@ decided by the recorded membership the chip reflects, never by which CLI wrote
 the session. See
 [Restart after orrerix closes](../orchestration.html#persistence--restart).
 
+#### Agent sessions are hidden by default
+
+A group mints a session per delegate and a fresh one on every rejoin, so a
+machine that has run a few fleets accumulates hundreds of worker and reviewer
+rows against the handful you would ever click. By default the list shows only
+**your own sessions and orchestrator sessions**; everything else sits behind a
+**Show N hidden agent sessions** button under the list, which toggles them all
+back on.
+
+Nothing is filtered out of the *scan* — every session is still found, still
+badged, and one click away. Restoring a group still brings its workers and
+reviewers back: the orchestrator respawns them from the group's own roster,
+which is why their individual rows are not a route you need.
+
+The button counts what your current search left hidden, so it changes as you
+type. It disappears entirely when nothing is hidden.
+
 ## Open in editor
 
 Orrerix is a terminal, not an editor — so when you need to open files in a real

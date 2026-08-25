@@ -311,6 +311,70 @@ pub fn copilot_session_ids(root: &Path) -> HashSet<String> {
     ids
 }
 
+/// Every session id claude's store holds, in ONE pass over the projects root
+/// (#1592).
+///
+/// [`find_claude_session_cwd`] answers "is THIS id here?" with a filename probe
+/// per project directory, which is cheap once and quadratic when a caller asks
+/// it per group: a listing over N groups re-enumerated the same P project
+/// directories N times, and a MISS — the stale group, which is exactly the
+/// common case in a long history — pays all P probes. This pays P directory
+/// listings once, so the same listing is O(store + groups) instead of
+/// O(store × groups).
+///
+/// **Membership only, deliberately.** The per-id lookup returns the session's
+/// recorded `cwd` because a RESUME needs somewhere to launch; a LISTING only
+/// needs to know the store has the id at all (`Ok(Some(_))`), and reading each
+/// session's head to recover a cwd nobody asked for would put back the cost
+/// this removes. A caller that needs the cwd still calls `find_session_cwd`.
+///
+/// The id is the file STEM, matching the layout `find_claude_session_cwd`
+/// joins (`<project>/<id>.jsonl`), so the two halves cannot disagree about
+/// which files name a session.
+pub fn claude_session_ids(root: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(projects) = fs::read_dir(root) else {
+        return ids;
+    };
+    for project in projects.flatten() {
+        let Ok(files) = fs::read_dir(project.path()) else { continue };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // `Path::is_file()`, not merely "has the extension", and not
+            // `DirEntry::file_type()` either (#1592 review N4 and its round-2
+            // correction). The per-group probe this replaces admits a candidate
+            // on `candidate.is_file()`, so this has to ask the IDENTICAL
+            // question or the two halves disagree — which they can do in both
+            // directions:
+            //
+            //  - extension alone: a DIRECTORY named `<id>.jsonl` is a member
+            //    here and a miss there, a false `resumable: true` on a row
+            //    whose Resume the backend then refuses;
+            //  - `DirEntry::file_type()`: it reports the entry WITHOUT
+            //    following symlinks, so a symlinked session file is a miss
+            //    here and a hit there — a false `resumable: false`, which is
+            //    worse, because Resume just silently is not offered and
+            //    nothing says why.
+            //
+            // `Path::is_file()` follows symlinks, so it is the one spelling
+            // that matches. This costs a `stat` per candidate file rather than
+            // reusing the directory entry's cached type; that is the price of
+            // the claim below being true rather than nearly true, and it is
+            // paid once per store per listing rather than once per group.
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                ids.insert(stem.to_string());
+            }
+        }
+    }
+    ids
+}
+
 /// The copilot session most likely created by a just-spawned pane: one absent
 /// from `baseline`, preferring a session whose recorded cwd matches `cwd`
 /// (disambiguating agents spawned concurrently in different worktrees),

@@ -19,9 +19,17 @@
 //! are meant to read as one idea.
 //!
 //! WHY A MANIFEST AND NOT A LINT. The property is not "no blocking sync
-//! commands exist": 1 does today (66 when this file landed), enumerated in
+//! commands exist": 0 do today (66 when this file landed, 1 until #1592
+//! converted the last one), enumerated in
 //! #743's census (planning comments parts 1-2, which `performance.md` §5 names
-//! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. The property is that **one cannot be
+//! as the one source of truth) and owned by the issues in `DEBT_OWNERS`. An
+//! EMPTY debt tier is the manifest working, not the manifest expiring: the
+//! forwards half of the equality is what refuses the next unargued sync
+//! command, and it bites exactly as hard against zero rows as against one.
+//! Nor does an empty tier mean every owning issue is finished — #749's scope
+//! was "an index or a live-groups filter, not just a thread hop", and #1592
+//! delivered the thread hop and the audit-slurp half; `performance.md` §5
+//! keeps the remainder. The property is that **one cannot be
 //! added silently**. A new sync command fails this test until somebody writes
 //! down what it does on the webview thread and who owns moving it off, and that
 //! sentence is a review-visible diff. The debt tier is the census made
@@ -91,26 +99,27 @@ struct Row {
 /// set on purpose: "who owns this" is then a declaration a reviewer can check
 /// against the issue, not free text that quietly names anything.
 const DEBT_OWNERS: &[(&str, &str)] = &[
-    (
-        "#749",
-        "F4 of #743: orch_session_roles fans out over every group ever created — an index or a \
-         live-groups filter, not just a thread hop.",
-    ),
+    // EMPTY as of #1592, which converted the last debt row
+    // (`orch_session_roles`). `every_declared_owner_actually_owns_something`
+    // is what forces this to empty with it: an owner nobody names any more is
+    // a pointer to finished work. The table and its checks stay — they are
+    // what the NEXT debt row has to satisfy, and an empty closed set still
+    // refuses a row that names an owner nobody declared.
 ];
 
-/// The 26 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 25 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
 /// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
 /// orchestration conversions, #762's 40 orchestration mutation and lifecycle
-/// conversions and #746's 25 gesture conversions already removed. This is
-/// today's truth, not the target state.
+/// conversions, #746's 25 gesture conversions and #1592's 1 already removed.
+/// This is today's truth, not the target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 109 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25;
+/// 110 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25 + #1592's 1;
 /// 20 `cheap` = the 20 C; 5 `exception` = the 4 T plus `resize_pty` (census B,
-/// but §4 X1 argues it stays sync); 1 `debt` = 91 B − 16 (#726) − 8 (#752)
-/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`), owned by #749.
+/// but §4 X1 argues it stays sync); 0 `debt` = 91 B − 16 (#726) − 8 (#752)
+/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`) − 1 (#1592).
 ///
 /// CITE CONVENTION. A `reason` that points at code names the **symbol** and
 /// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
@@ -330,18 +339,12 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: None,
     },
     // ---------------------------------------------------------------------
-    // debt — #749, the last row in this tier. #746 (F1) drained the other 25;
-    // #726, #752 and #762 the 64 before them.
+    // debt — EMPTY. #1592 converted the last row (`orch_session_roles`, owned
+    // by #749) after #746 (F1) drained 25 and #726/#752/#762 the 64 before
+    // them. The tier stays in the type: the next sync command that lands has
+    // to argue itself into one of these three classes, and `debt` is where an
+    // honest "yes, and here is who owns moving it" goes.
     // ---------------------------------------------------------------------
-    Row {
-        name: "orch_session_roles",
-        class: Class::Debt,
-        reason: "read_dir over the whole orchestration root, then group.json plus tasks.json plus \
-                 merged records PER GROUP — so it scales with groups EVER CREATED, not with live \
-                 ones, and it runs at app boot and on every sidebar open. Unbounded fan-out on \
-                 the webview thread; a thread hop alone would not fix it.",
-        issue: Some("#749"),
-    },
 ];
 
 // ---------- the scanner ----------
@@ -1077,7 +1080,6 @@ fn cheap_commands_carry_no_spawn_shell_out_or_filesystem_marker() {
 fn every_manifest_row_carries_an_argument_that_still_points_somewhere() {
     let design = std::fs::read_to_string(crate_root().join("../doc/design/performance.md"))
         .expect("doc/design/performance.md is the citable ground for every exception row");
-    let owners: BTreeSet<&str> = DEBT_OWNERS.iter().map(|(id, _)| *id).collect();
     let mut problems: Vec<String> = Vec::new();
 
     for row in SYNC_COMMANDS {
@@ -1090,25 +1092,15 @@ fn every_manifest_row_carries_an_argument_that_still_points_somewhere() {
                  sentence"
             ));
         }
-        if let Some(issue) = row.issue {
-            if !owners.contains(issue) {
-                problems.push(format!(
-                    "{at}: names owner `{issue}`, which is not in DEBT_OWNERS — add it there with \
-                     the scope that issue actually accepted, so `who owns this` stays a \
-                     declaration a reviewer can check"
-                ));
-            }
-        }
+        // The owner-membership and debt-needs-an-issue rules used to live here
+        // too. They moved to `debt_tier_problems` (#1592 review N1) so that
+        // `the_debt_tier_rules_still_bite_while_the_tier_is_empty` can run them
+        // over a synthetic manifest: with the real debt tier at ZERO rows they
+        // are otherwise assertions over an empty set, which passes whether or
+        // not they still work. They are asserted, once, by
+        // `every_declared_owner_actually_owns_something` below.
         match row.class {
-            Class::Debt => {
-                if row.issue.is_none() {
-                    problems.push(format!(
-                        "{at}: a debt row must name the issue that owns converting it \
-                         (performance.md §3 INV-1/INV-2) — debt with no owner is just a command \
-                         nobody is going to fix"
-                    ));
-                }
-            }
+            Class::Debt => {}
             Class::Exception => {
                 // An exception is only an exception because §4 argues it. The
                 // citation has to resolve, or the row is asserting an argument
@@ -1157,46 +1149,153 @@ fn every_manifest_row_carries_an_argument_that_still_points_somewhere() {
     assert!(problems.is_empty(), "{problems:#?}");
 }
 
-#[test]
-fn every_declared_owner_actually_owns_something() {
-    // The other direction of DEBT_OWNERS. An owner whose rows have all been
-    // converted is a closed issue still listed as pending work — the same
-    // staleness the manifest equality refuses for rows, applied to the table
-    // that gives them their meaning.
+/// Every debt-tier rule, over an ARBITRARY manifest and owner table (#1592
+/// review N1).
+///
+/// These rules used to be inlined against the two real constants. That was fine
+/// while the debt tier had rows in it; #1592 converted the last one, so every
+/// one of them now iterates an empty set and passes whether or not it still
+/// works — CLAUDE.md's "an absence-only assertion needs a positive control",
+/// applied to a whole tier rather than one assertion. Taking `rows` and
+/// `owners` as parameters is what lets
+/// `the_debt_tier_rules_still_bite_while_the_tier_is_empty` feed them a
+/// synthetic manifest that MUST fail, so the tier stays fail-able while it is
+/// empty and the next debt row lands on checks somebody has seen bite.
+///
+/// Returns every problem rather than asserting, so one call reports all of them
+/// and the synthetic test can assert on WHICH fired rather than merely that
+/// something did.
+fn debt_tier_problems(rows: &[Row], owners: &[(&str, &str)]) -> Vec<String> {
+    let declared: BTreeSet<&str> = owners.iter().map(|(id, _)| *id).collect();
+    let mut problems: Vec<String> = Vec::new();
+
+    for row in rows {
+        let at = format!("SYNC_COMMANDS[{}]", row.name);
+        if let Some(issue) = row.issue {
+            if !declared.contains(issue) {
+                problems.push(format!(
+                    "{at}: names owner `{issue}`, which is not in DEBT_OWNERS — add it there with \
+                     the scope that issue actually accepted, so `who owns this` stays a \
+                     declaration a reviewer can check"
+                ));
+            }
+        }
+        if row.class == Class::Debt && row.issue.is_none() {
+            problems.push(format!(
+                "{at}: a debt row must name the issue that owns converting it (performance.md §3 \
+                 INV-1/INV-2) — debt with no owner is just a command nobody is going to fix"
+            ));
+        }
+    }
+
+    // The other direction. An owner whose rows have all been converted is a
+    // closed issue still listed as pending work — the same staleness the
+    // manifest equality refuses for rows, applied to the table that gives them
+    // their meaning.
     //
     // **Debt rows only.** A non-debt row may name an issue as a pointer (a
     // `cheap` row noting who owns its lock scope, say), and counting those
     // would let one keep an owner alive after its last real debt converted —
-    // exactly the staleness this test exists to catch, hidden by a row that
-    // was never the issue's work in the first place.
-    let used: BTreeSet<&str> = SYNC_COMMANDS
-        .iter()
-        .filter(|r| r.class == Class::Debt)
-        .filter_map(|r| r.issue)
-        .collect();
-    let unused: Vec<&str> = DEBT_OWNERS
-        .iter()
-        .map(|(id, _)| *id)
-        .filter(|id| !used.contains(id))
-        .collect();
-    assert!(
-        unused.is_empty(),
-        "DEBT_OWNERS lists {unused:?}, which no row names any more — every row that issue owned \
-         has been converted, so close it out and delete the entry rather than leaving a pointer \
-         to finished work"
-    );
-    for (id, scope) in DEBT_OWNERS {
-        assert!(
-            matches!(
-                id.strip_prefix('#').and_then(|rest| rest.chars().next()),
-                Some(c) if c.is_ascii_digit()
-            ),
-            "DEBT_OWNERS entry `{id}` does not start with an issue number"
-        );
-        assert!(
-            scope.len() >= 60,
-            "DEBT_OWNERS[{id}]: say what scope that issue accepted, in a sentence — otherwise the \
-             owner is a number and not a commitment"
-        );
+    // exactly the staleness this exists to catch, hidden by a row that was
+    // never the issue's work in the first place.
+    let used: BTreeSet<&str> =
+        rows.iter().filter(|r| r.class == Class::Debt).filter_map(|r| r.issue).collect();
+    for (id, scope) in owners {
+        if !used.contains(id) {
+            problems.push(format!(
+                "DEBT_OWNERS lists `{id}`, which no row names any more — every row that issue \
+                 owned has been converted, so close it out and delete the entry rather than \
+                 leaving a pointer to finished work"
+            ));
+        }
+        if !matches!(
+            id.strip_prefix('#').and_then(|rest| rest.chars().next()),
+            Some(c) if c.is_ascii_digit()
+        ) {
+            problems.push(format!("DEBT_OWNERS entry `{id}` does not start with an issue number"));
+        }
+        if scope.len() < 60 {
+            problems.push(format!(
+                "DEBT_OWNERS[{id}]: say what scope that issue accepted, in a sentence — otherwise \
+                 the owner is a number and not a commitment"
+            ));
+        }
     }
+    problems
+}
+
+#[test]
+fn every_declared_owner_actually_owns_something() {
+    assert!(debt_tier_problems(SYNC_COMMANDS, DEBT_OWNERS).is_empty(), "{:#?}", debt_tier_problems(SYNC_COMMANDS, DEBT_OWNERS));
+}
+
+#[test]
+fn the_debt_tier_rules_still_bite_while_the_tier_is_empty() {
+    // The positive control for the test above (#1592 review N1). With the real
+    // tier at zero rows and `DEBT_OWNERS` empty, that assertion is true of an
+    // empty set and would stay green if every rule below were deleted. These
+    // fixtures MUST fail, and each is asserted by WHICH rule it trips — a bare
+    // "something failed" would pass if one rule fired for all four.
+    const GOOD_SCOPE: &str = "A sentence long enough to be a commitment rather than a number, \
+                              which is exactly what the length floor is checking for.";
+
+    let debt_without_owner = [Row {
+        name: "orphan_command",
+        class: Class::Debt,
+        reason: "A debt row with no owning issue at all — the manifest says somebody should move \
+                 this off the webview thread and names nobody.",
+        issue: None,
+    }];
+    let p = debt_tier_problems(&debt_without_owner, &[]);
+    assert!(
+        p.iter().any(|m| m.contains("a debt row must name the issue")),
+        "a debt row with no issue must be refused, got {p:#?}"
+    );
+
+    let undeclared_owner = [Row {
+        name: "misfiled_command",
+        class: Class::Debt,
+        reason: "A debt row naming an issue that no DEBT_OWNERS entry declares, so `who owns \
+                 this` is free text rather than a checkable declaration.",
+        issue: Some("#99999"),
+    }];
+    let p = debt_tier_problems(&undeclared_owner, &[]);
+    assert!(
+        p.iter().any(|m| m.contains("is not in DEBT_OWNERS")),
+        "an undeclared owner must be refused, got {p:#?}"
+    );
+
+    // An owner nobody names — the staleness that FORCED `DEBT_OWNERS` to empty
+    // in this PR. Without this, deleting that rule would go unnoticed.
+    let p = debt_tier_problems(&[], &[("#123", GOOD_SCOPE)]);
+    assert!(
+        p.iter().any(|m| m.contains("which no row names any more")),
+        "an owner with no rows must be refused, got {p:#?}"
+    );
+
+    // The owner-table shape rules.
+    let p = debt_tier_problems(&[], &[("749", GOOD_SCOPE)]);
+    assert!(
+        p.iter().any(|m| m.contains("does not start with an issue number")),
+        "an id with no `#<digit>` must be refused, got {p:#?}"
+    );
+    let p = debt_tier_problems(&[], &[("#123", "too short")]);
+    assert!(
+        p.iter().any(|m| m.contains("say what scope that issue accepted")),
+        "a scope that is not a sentence must be refused, got {p:#?}"
+    );
+
+    // Non-vacuity: a WELL-FORMED pairing must produce NO problems, or every
+    // assertion above would pass against a function that refuses everything.
+    let ok_rows = [Row {
+        name: "well_formed_command",
+        class: Class::Debt,
+        reason: "A debt row that names a declared owner, which is what the four refusals above \
+                 are being told apart from.",
+        issue: Some("#123"),
+    }];
+    assert!(
+        debt_tier_problems(&ok_rows, &[("#123", GOOD_SCOPE)]).is_empty(),
+        "a well-formed debt row and its declared owner must pass, or the refusals prove nothing"
+    );
 }

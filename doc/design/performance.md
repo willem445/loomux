@@ -317,7 +317,10 @@ should not be duplicated anywhere: a second copy goes stale silently.
 
 E1's `debt` tier is seeded verbatim from that census, so the register is
 executable — deleting a row is the roadmap, adding one is a review-visible diff
-that must argue itself.
+that must argue itself. **That tier is empty as of #1592**, which converted the
+last row (`orch_session_roles`). An empty tier is not an empty register: the
+table below still owns work, and E1's forwards half still refuses the next
+unargued sync command.
 
 Owning issues:
 
@@ -330,4 +333,4 @@ Owning issues:
 | embed views left OPEN in a background tab or a minimized pane still refetch and re-render (#1318 closed the closed-panel half only) | #1465 |
 | `tasks_lock` architecture — file IO out from under the board family's lock | #747 |
 | `mq_state_lock` / single gh-poll-thread decoupling (fleet latency; §4 X4) | #748 |
-| `orch_session_roles` unbounded fan-out | #749 |
+| `orch_session_roles` fan-out still scales with groups EVER created — #1592 took it off the webview thread and stopped it slurping both audit generations per group, so what remains is the index or live-groups filter #749's scope actually named | #749 |
