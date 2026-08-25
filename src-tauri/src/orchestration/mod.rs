@@ -53202,9 +53202,8 @@ pub fn orch_session_roles(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<SessionRo
 /// group whose files changed between them, which is the same freshness
 /// question a single call already answers as of when it ran.
 #[tauri::command]
-pub async fn orch_list_recorded(app: AppHandle) -> Vec<RecordedOrchestration> {
-    let reg = reg_of(&app);
-    run_blocking(move || reg.recorded_orchestrations()).await
+pub fn orch_list_recorded(reg: tauri::State<Arc<OrchRegistry>>) -> Vec<RecordedOrchestration> {
+    reg.recorded_orchestrations()
 }
 
 /// Restore a recorded orchestration session (see `resume_recorded_session`).
