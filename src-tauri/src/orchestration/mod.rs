@@ -30208,7 +30208,7 @@ impl OrchRegistry {
             let resumable = !cli.is_empty()
                 && session_id.as_deref().is_some_and(|sid| {
                     matches!(
-                        session_cwd_in_store(&cli, sid, Some(&self.opencode_db_path(&group_id))),
+                        session_cwd_in_store(&cli, sid, None),
                         Ok(Some(_))
                     )
                 });
