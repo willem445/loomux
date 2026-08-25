@@ -464,6 +464,18 @@ had **no UI route to `resume_recorded_session` at all**, on any path. Copilot's
 was reachable only once its watcher bound an id inside `COPILOT_SESSION_TIMEOUT`.
 The backend resume itself was already CLI-correct (#722); nothing could call it.
 
+**What slice A changed about that, since both landed on #1563.** A1-A3 made a
+learned session id reach its pane (`orch-session-learned` → `adoptSessionId`)
+and persist to `tabs.json`, so a dormant-group Resume card can now carry an
+opencode id as well. That is a second route, and this section is no longer "the
+only one" — the claim it still holds is narrower and is the reason both shipped:
+the card route needs the pane to have been open when the watcher bound the id,
+and needs that tab set to survive, whereas this list reads the group's own
+`agents.json` and so still reaches a group whose card was never captured, whose
+tab was closed, or that belongs to a tab set this window does not have. The two
+are complementary, not redundant; wording anywhere that calls either one the
+sole route is stale (#715/#721).
+
 **The shape.** `orch_list_recorded` → `OrchRegistry::recorded_orchestrations`
 reads loomux's OWN record of each group — `group.json` for the repo and the
 orchestrator block's CLI, the orchestrator row of `agents.json` for the session
