@@ -51979,12 +51979,19 @@ pub async fn orch_group_watches(app: AppHandle, group_id: String) -> Value {
 /// other group-taking command, so this no longer rests on the webview being the
 /// only caller. It adds no agent-reachable input either way.
 ///
-/// **Off-thread** (performance.md §2 P1), unlike its neighbours
-/// `orch_group_summary`/`orch_group_watches`: those are pure in-memory registry
-/// reads, but this one reconciles against the repo's declared `resources:`,
-/// which reads and parses `.loomux/workflow.yml` — on the group view's 2s
-/// batch. That is the same read `orch_workflow_status` already makes on that
-/// batch, and the same reason `orch_merge_queue` is async.
+/// **Off-thread** (performance.md §2 P1): this reconciles against the repo's
+/// declared `resources:`, which reads and parses `.loomux/workflow.yml` — on
+/// the group view's 2 s batch. That is the same read `orch_workflow_status`
+/// already makes on that batch, and the same reason `orch_merge_queue` is
+/// async.
+///
+/// This used to add "unlike its neighbours `orch_group_summary`/
+/// `orch_group_watches`: those are pure in-memory registry reads". #1595
+/// deleted the contrast by converting both of them — being in-memory turned
+/// out not to make a POLLED sync command safe, because what it bounds is the
+/// critical section and not the acquisition. The file IO named above is still
+/// why THIS one could never have been sync; it is no longer what tells it
+/// apart from its neighbours.
 #[tauri::command]
 pub async fn orch_lock_state(app: AppHandle, group_id: String) -> Value {
     let reg = reg_of(&app);
@@ -52030,9 +52037,12 @@ pub async fn orch_set_advanced_orchestrator(
 /// satisfiability guarantee) — `{ advanced, name, default_branch: string|null,
 /// blocks: [{id,kind,cli,model,persona}],
 /// gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
-/// Part of the group view's 2 s poll batch — `GroupView.load()`'s nine-invoke
-/// `Promise.all` (groupview.ts:649-672), alongside `orch_group_summary` — not
-/// a once-per-open read.
+/// Part of the group view's 2 s poll batch — `GroupView.load()`'s ten-invoke
+/// `Promise.all` (`groupview.ts`, `Promise.all` in `load()`), alongside
+/// `orch_group_summary` — not a once-per-open read. (Was "nine-invoke
+/// (groupview.ts:649-672)"; corrected in #1595 after counting the batch, which
+/// is ten and no longer at those lines. Raw line numbers rot silently — the
+/// same lesson `perf_dispatch.rs`'s CITE CONVENTION states.)
 ///
 /// Off-thread (#743 S4c), and its `default_branch` is memoised per repo (#743
 /// S4a) — resolving that name costs 2-4 blocking `git` spawns, which this was

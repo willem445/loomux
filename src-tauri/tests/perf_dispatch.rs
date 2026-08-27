@@ -74,6 +74,23 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
     /// In-memory only, under briefly-held locks. No IO, no spawn.
+    ///
+    /// **"Briefly held" is a fact about the HOLDER, and what a sync command
+    /// pays is the ACQUISITION** (#1595). If any other thread can hold the same
+    /// lock, this class says nothing about how long the webview thread waits —
+    /// `lock_safe` is `Mutex::lock` with poison recovery: no timeout, no
+    /// try-lock, no bound. #1595's five rows were all correctly classified by
+    /// the rule above (genuinely in-memory, no INV-2 marker to find) and all
+    /// five froze the app, because they were on a fixed-cadence poll and the
+    /// registry mutex they take is shared with the idle reaper, the watchdog,
+    /// the gh poller and `note_agent_activity` on the pty output path.
+    ///
+    /// So the question this class does NOT answer, and a classifier has to ask
+    /// separately: **can a background thread hold this lock, and is this
+    /// command polled?** Both yes is not `cheap` — it is async, whatever the
+    /// body costs. The scan cannot see either property (one is a call-chain
+    /// fact, the other lives in the frontend), so it is review's, and it is
+    /// written here because this is where the next classifier looks.
     Cheap,
     /// Deliberate and staying — argued in code at the cite and in
     /// `performance.md` §4, which the `reason` must cite by id.
@@ -1265,5 +1282,175 @@ fn the_debt_tier_rules_still_bite_while_the_tier_is_empty() {
     assert!(
         debt_tier_problems(&ok_rows, &[("#123", GOOD_SCOPE)]).is_empty(),
         "a well-formed debt row and its declared owner must pass, or the refusals prove nothing"
+    );
+}
+
+// ---------- the poll path (#1595) ----------
+
+/// Where a polled command is polled FROM, as a source location this test reads
+/// rather than a fact a reviewer has to remember. `needle` is a substring that
+/// appears once, ending at the `[` whose entries are the batch.
+const POLL_SITES: &[(&str, &str, &str)] = &[
+    (
+        "src/groupview.ts",
+        "] = await Promise.all([",
+        "GroupView.load() -- the group view's 2 s batch",
+    ),
+    (
+        "src/tabbar.ts",
+        "const [summary, usage] = await Promise.all([",
+        "TabBar.pollStatus() -- the 4 s tab-strip loop, once per group-bound tab",
+    ),
+];
+
+/// The frontend's `wrapperName -> "backend_command"` map, read out of
+/// `src/orchestration.ts`'s `invoke<...>("...")` calls: walk BACK from each
+/// `invoke` to the nearest preceding `export const NAME`, which is the shape
+/// every wrapper there uses. A wrapper this cannot resolve is simply absent,
+/// and the non-vacuity assertions below are what stop an absent mapping from
+/// reading as a pass.
+fn frontend_command_map() -> BTreeMap<String, String> {
+    let src = std::fs::read_to_string(crate_root().join("../src/orchestration.ts"))
+        .expect("src/orchestration.ts is the one place a wrapper names its command");
+    let mut map = BTreeMap::new();
+    let mut at = 0usize;
+    while let Some(i) = src[at..].find("invoke<") {
+        let abs = at + i;
+        at = abs + "invoke<".len();
+        let Some(q1) = src[abs..].find('"') else { continue };
+        let start = abs + q1 + 1;
+        let Some(q2) = src[start..].find('"') else { continue };
+        let cmd = &src[start..start + q2];
+        if cmd.is_empty() || !cmd.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            continue;
+        }
+        let Some(e) = src[..abs].rfind("export const ") else { continue };
+        let rest = &src[e + "export const ".len()..];
+        let name: String =
+            rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() {
+            map.insert(name, cmd.to_string());
+        }
+    }
+    map
+}
+
+/// The identifiers called inside one `Promise.all([ ... ])` batch.
+fn poll_batch_calls(file: &str, needle: &str) -> Vec<String> {
+    let src = std::fs::read_to_string(crate_root().join("..").join(file))
+        .unwrap_or_else(|e| panic!("{file}: {e}"));
+    let at = src.find(needle).unwrap_or_else(|| {
+        panic!(
+            "{file}: `{needle}` not found -- the poll site moved, and this test is now watching \
+             nothing. Re-point it rather than deleting it."
+        )
+    });
+    let body_start = at + needle.len();
+    let bytes = src.as_bytes();
+    let mut depth = 1i32;
+    let mut i = body_start;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    assert!(depth == 0, "{file}: unbalanced Promise.all([ ... ]) -- refusing to guess its extent");
+    let body = &src[body_start..i - 1];
+    let mut out: Vec<String> = Vec::new();
+    for (idx, _) in body.match_indices('(') {
+        let head: String = body[..idx]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if head.is_empty() {
+            continue;
+        }
+        if body[..idx - head.len()].chars().last() == Some('.') {
+            continue;
+        }
+        if !out.contains(&head) {
+            out.push(head);
+        }
+    }
+    out
+}
+
+/// **No command on a fixed-cadence poll path may be synchronous** (#1595).
+///
+/// The guard that would have caught #1595 before it shipped, and deliberately
+/// NOT a timing test: "the UI stayed responsive" measured with a clock is flaky
+/// on CI and passes for the wrong reason on a fast machine. The property that
+/// matters is structural -- Tauri dispatches a sync command on the webview/GTK
+/// main-loop thread, so a POLLED sync command parks that thread every tick for
+/// as long as whoever holds the registry mutex takes, and `lock_safe` is
+/// `Mutex::lock` with poison recovery: no timeout, no try-lock, no bound.
+///
+/// **Why this reads the FRONTEND.** `SYNC_COMMANDS` can say what a command
+/// costs but not how often it is called, and that fact lives in `groupview.ts`
+/// and `tabbar.ts`. Which is precisely how these five passed two rounds of
+/// classification (#752's conversions and #743's census) as correctly `cheap`
+/// and still froze the app. Making the poll SITE an input is what stops the
+/// next batch from quietly acquiring a sync member.
+#[test]
+fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
+    let sites = commands();
+    let sync: BTreeSet<String> =
+        sites.iter().filter(|s| !s.is_async).map(|s| s.name.clone()).collect();
+    let map = frontend_command_map();
+
+    // Non-vacuity FIRST, so nothing below can pass over an empty set.
+    assert!(
+        map.len() >= 20,
+        "the wrapper map resolved only {} entries -- the invoke shape changed and this test is \
+         now checking almost nothing",
+        map.len()
+    );
+    assert_eq!(
+        map.get("groupSummary").map(String::as_str),
+        Some("orch_group_summary"),
+        "the wrapper map must resolve the command #1595 was about, or it proves nothing"
+    );
+    assert!(
+        !sync.is_empty(),
+        "the sync set is empty -- the scanner stopped telling async from sync, so `no polled \
+         command is sync` would hold vacuously"
+    );
+
+    let mut checked = 0usize;
+    let mut offenders: Vec<String> = Vec::new();
+    for (file, needle, what) in POLL_SITES {
+        let calls = poll_batch_calls(file, needle);
+        assert!(
+            !calls.is_empty(),
+            "{file}: parsed an EMPTY poll batch -- the extractor broke, not the code"
+        );
+        for call in calls {
+            let Some(cmd) = map.get(&call) else { continue };
+            checked += 1;
+            if sync.contains(cmd) {
+                offenders.push(format!("{cmd} (via `{call}`) polled by {what}"));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 10,
+        "only {checked} poll-batch entries resolved to backend commands -- expected the group \
+         view's ten-invoke batch plus the tab strip's two, so the extractor is under-matching"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these commands are POLLED and SYNCHRONOUS, so every tick parks the webview/GTK main \
+         loop on an unbounded registry-mutex acquisition (#1595, and #1592 before it): \
+         {offenders:#?}. Make each async over run_blocking and delete its SYNC_COMMANDS row. \
+         `cheap` does not save a polled command: it bounds the critical section, and what the UI \
+         thread pays is the acquisition."
     );
 }

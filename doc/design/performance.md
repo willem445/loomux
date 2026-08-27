@@ -158,7 +158,18 @@ scan pins the shape.
   offender, owning issue named). A new unargued sync command is refused by a
   test, not by a reviewer's memory. Sync commands that hand work to a raw
   `std::thread::spawn` and return are `exception` entries.
-  *Enforced: E1 (#743 S2).*
+
+  **`cheap` bounds the critical section, not the acquisition** (#1595). A
+  command may be in-memory only and still park the webview thread for an
+  unbounded time, because `lock_safe` is `Mutex::lock` with poison recovery —
+  no timeout, no try-lock — and the registry mutexes are shared with background
+  threads. So `cheap` requires a second, non-mechanical answer: **no lock a
+  background thread can hold, OR not on a poll path.** Both fail it. #1592 and
+  #1595 were the same defect with opposite work profiles — one expensive, one
+  genuinely trivial — which is the evidence that the work was never the
+  property that mattered. E1's scan cannot see either half (one is a call-chain
+  fact, the other lives in the frontend); review owns it.
+  *Enforced: E1 (#743 S2) + review.*
 - **INV-2 — No process spawn and no network round trip on the webview thread,
   ever.** No class permits it: `cheap` bodies additionally must carry no
   `Command::new` / `ShellExecuteW` / `.output(` / `fs::` marker, and only a
