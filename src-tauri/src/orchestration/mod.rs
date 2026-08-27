@@ -51284,15 +51284,29 @@ pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), S
 }
 
 /// Whether a group is currently paused (drives the pause/resume button state).
+/// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
+/// the webview/GTK main-loop thread, and `is_paused` takes a registry mutex shared
+/// with the background threads (idle reaper, watchdog, gh poller, and the pty
+/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
+/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
+/// not a slow one. That is #1595's freeze, and it is the same class as #1593's
+/// `orch_session_roles`: cheap work, fatal thread.
+///
+/// "Cheap" was never the property that made this safe to be sync. A cheap
+/// CRITICAL SECTION is not a cheap ACQUISITION when someone else holds the
+/// lock, and this command is on a fixed-cadence poll, so it re-asks that
+/// question every tick forever.
 #[tauri::command]
-pub fn orch_group_paused(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+pub async fn orch_group_paused(app: AppHandle, group_id: String) -> bool {
     // #904 / rev-440 N4: `false` is indistinguishable from the honest answer
     // for an unknown group — deliberately, since a caller that cannot name a
     // valid group has no business learning whether one exists. Every MUTATING
     // twin of these three returns `Err` instead; only the read-only pair-state
     // queries degrade silently. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return false };
-    reg.is_paused(&group_id)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.is_paused(&group_id)).await
 }
 
 // ---------- attention routing (human side) ----------
@@ -51338,15 +51352,29 @@ pub async fn orch_dismiss_stranded(app: AppHandle, agent_id: String) -> bool {
 }
 
 /// Whether desktop notifications are enabled for a group (toggle button state).
+/// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
+/// the webview/GTK main-loop thread, and `notify_enabled` takes a registry mutex shared
+/// with the background threads (idle reaper, watchdog, gh poller, and the pty
+/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
+/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
+/// not a slow one. That is #1595's freeze, and it is the same class as #1593's
+/// `orch_session_roles`: cheap work, fatal thread.
+///
+/// "Cheap" was never the property that made this safe to be sync. A cheap
+/// CRITICAL SECTION is not a cheap ACQUISITION when someone else holds the
+/// lock, and this command is on a fixed-cadence poll, so it re-asks that
+/// question every tick forever.
 #[tauri::command]
-pub fn orch_notify_enabled(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+pub async fn orch_notify_enabled(app: AppHandle, group_id: String) -> bool {
     // #904 / rev-440 N4: `false` is indistinguishable from the honest answer
     // for an unknown group — deliberately, since a caller that cannot name a
     // valid group has no business learning whether one exists. Every MUTATING
     // twin of these three returns `Err` instead; only the read-only pair-state
     // queries degrade silently. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return false };
-    reg.notify_enabled(&group_id)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.notify_enabled(&group_id)).await
 }
 
 /// Enable/disable desktop notifications for a group (durable, per-group).
@@ -51376,15 +51404,29 @@ pub async fn orch_set_notify(
 /// Whether this group has opted OUT of the #260 minimize-on-spawn default
 /// (toggle button state — the panel shows the OPT-IN sense, "auto-dock", so
 /// the frontend negates this: see `spawnExpanded` in orchestration.ts).
+/// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
+/// the webview/GTK main-loop thread, and `spawn_expanded` takes a registry mutex shared
+/// with the background threads (idle reaper, watchdog, gh poller, and the pty
+/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
+/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
+/// not a slow one. That is #1595's freeze, and it is the same class as #1593's
+/// `orch_session_roles`: cheap work, fatal thread.
+///
+/// "Cheap" was never the property that made this safe to be sync. A cheap
+/// CRITICAL SECTION is not a cheap ACQUISITION when someone else holds the
+/// lock, and this command is on a fixed-cadence poll, so it re-asks that
+/// question every tick forever.
 #[tauri::command]
-pub fn orch_spawn_expanded(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> bool {
+pub async fn orch_spawn_expanded(app: AppHandle, group_id: String) -> bool {
     // #904 / rev-440 N4: `false` is indistinguishable from the honest answer
     // for an unknown group — deliberately, since a caller that cannot name a
     // valid group has no business learning whether one exists. Every MUTATING
     // twin of these three returns `Err` instead; only the read-only pair-state
     // queries degrade silently. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return false };
-    reg.spawn_expanded(&group_id)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.spawn_expanded(&group_id)).await
 }
 
 /// Opt a group in/out of the #260 minimize-on-spawn default (durable, per-group).
@@ -51880,17 +51922,43 @@ pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
 }
 
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.
+///
+/// **Off the UI thread** (#1595) — the command whose sync dispatch froze
+/// v1.2.0-beta5. `group_summary` takes the `agents` mutex (and then, in a
+/// separate statement, `groups`), both shared with the background threads:
+/// the idle reaper, the watchdog, the gh poller, and `note_agent_activity` on
+/// the pty output path. `lock_safe` is `Mutex::lock` with poison recovery —
+/// no timeout, no try-lock — so the acquisition is UNBOUNDED. On the GTK main
+/// loop an unbounded acquisition is a frozen window that never repaints and
+/// never processes input, which is a force-quit rather than a slow panel.
+///
+/// **It is polled from TWO loops, not one**, which is why the freeze arrives a
+/// minute or two in rather than at startup: `GroupView.load()`'s 2 s batch
+/// (`groupview.ts`), and `TabBar.pollStatus()`'s 4 s loop (`tabbar.ts`),
+/// which iterates EVERY group-bound tab and awaits each in turn. So the number
+/// of unbounded main-thread acquisitions per tick scales with open group tabs.
+///
+/// **The "cheap in-memory" classification was not wrong about the work — it was
+/// wrong about what makes a sync command safe.** A cheap CRITICAL SECTION is
+/// not a cheap ACQUISITION while another thread holds the lock, and being on a
+/// fixed cadence means the question is re-asked every tick forever. #1593's
+/// `orch_session_roles` was the same class with expensive work; this one shows
+/// the work never had to be expensive.
 #[tauri::command]
-pub fn orch_group_summary(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+pub async fn orch_group_summary(app: AppHandle, group_id: String) -> Value {
     let Ok(group_id) = command_group(&group_id) else { return Value::Null };
-    reg.group_summary(&group_id)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.group_summary(&group_id)).await
 }
 
 /// Live watches for a group's agents — the group view's "⏳ waiting on …"
 /// per-agent indicator (#248), fed from the same registry state the
 /// `notify_when`/`list_notifications` MCP tools use.
+/// **Off the UI thread** (#1595), for the reason spelled out on
+/// [`orch_group_summary`] above: it reads the same registry state under the
+/// same unbounded `lock_safe` acquisition, on the same 2 s poll batch.
 #[tauri::command]
-pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+pub async fn orch_group_watches(app: AppHandle, group_id: String) -> Value {
     // #904 / rev-440 B4: an ARRAY, because that is what success returns here and
     // the panel calls `.filter` on it (`groupview.ts` `this.watches.filter`).
     // The rule for these no-error-channel degrades is written out once, above
@@ -51898,7 +51966,8 @@ pub fn orch_group_watches(reg: tauri::State<Arc<OrchRegistry>>, group_id: String
     // absent-case handling already copes with, verified per site, never a
     // uniform `{}`.
     let Ok(group_id) = command_group(&group_id) else { return json!([]) };
-    reg.group_watches(&group_id)
+    let reg = reg_of(&app);
+    run_blocking(move || reg.group_watches(&group_id)).await
 }
 
 /// Live lock-resource state for a group's chrome (#858) — who holds what, and

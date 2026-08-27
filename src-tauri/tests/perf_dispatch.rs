@@ -107,19 +107,25 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
     // refuses a row that names an owner nobody declared.
 ];
 
-/// The 25 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 20 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
 /// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
 /// orchestration conversions, #762's 40 orchestration mutation and lifecycle
-/// conversions, #746's 25 gesture conversions and #1592's 1 already removed.
-/// This is today's truth, not the target state.
+/// conversions, #746's 25 gesture conversions, #1592's 1 and #1595's 5 already
+/// removed. This is today's truth, not the target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
-/// 110 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25 + #1592's 1;
-/// 20 `cheap` = the 20 C; 5 `exception` = the 4 T plus `resize_pty` (census B,
-/// but §4 X1 argues it stays sync); 0 `debt` = 91 B − 16 (#726) − 8 (#752)
-/// − 40 (#762) − 25 (#746) − 1 (`resize_pty`) − 1 (#1592).
+/// 115 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25 + #1592's 1
+/// + #1595's 5; 15 `cheap` = the 20 C − #1595's 5; 5 `exception` = the 4 T plus
+/// `resize_pty` (census B, but §4 X1 argues it stays sync); 0 `debt` = 91 B
+/// − 16 (#726) − 8 (#752) − 40 (#762) − 25 (#746) − 1 (`resize_pty`) − 1 (#1592).
+///
+/// **#1595 moved five `cheap` rows, and the reason matters more than the
+/// count.** They were correctly classified — genuinely in-memory, no marker
+/// INV-2 would catch — and they still froze the app, because `cheap` describes
+/// the CRITICAL SECTION and what a poll-path sync command actually risks is the
+/// ACQUISITION. See the note above `Class::Cheap`.
 ///
 /// CITE CONVENTION. A `reason` that points at code names the **symbol** and
 /// carries the line only as a parenthetical hint (`… in `PtyManager::kill`
@@ -249,14 +255,6 @@ const SYNC_COMMANDS: &[Row] = &[
         issue: None,
     },
     Row {
-        name: "orch_group_paused",
-        class: Class::Cheap,
-        reason: "A HashSet contains() against the paused-group set. It is in the group view's 2 s \
-                 poll batch, which is exactly why it must stay in-memory: a thread-pool hop would \
-                 add latency to a lookup that costs nothing.",
-        issue: None,
-    },
-    Row {
         name: "orch_ack_attention",
         class: Class::Cheap,
         reason: "Clears the attention flag for one agent in the in-memory registry. A gesture-rate \
@@ -268,36 +266,6 @@ const SYNC_COMMANDS: &[Row] = &[
         class: Class::Cheap,
         reason: "The pane-keyed twin of orch_ack_attention: resolves a pty id to its agent and \
                  clears the same in-memory flag. No IO on either path.",
-        issue: None,
-    },
-    Row {
-        name: "orch_notify_enabled",
-        class: Class::Cheap,
-        reason: "Reads the in-memory notify flag for a group. Another member of the 2 s poll \
-                 batch that is deliberately left sync because it touches no file.",
-        issue: None,
-    },
-    Row {
-        name: "orch_spawn_expanded",
-        class: Class::Cheap,
-        reason: "Reads the in-memory spawn-strip expansion flag for a group. In the 2 s poll \
-                 batch; its writer (orch_set_spawn_expanded) is the row that does the IO.",
-        issue: None,
-    },
-    Row {
-        name: "orch_group_summary",
-        class: Class::Cheap,
-        reason: "An in-memory filter over the registry's agent records. Its own doc contrasts it \
-                 with orch_group_usage explicitly: same poll batch, same 4 s tab-strip loop, but \
-                 no transcript reads — which is what keeps it in this class.",
-        issue: None,
-    },
-    Row {
-        name: "orch_group_watches",
-        class: Class::Cheap,
-        reason: "Returns the live notify_when watches for a group from the in-memory table. In \
-                 the 2 s poll batch; the watches themselves are serviced by the poll thread, not \
-                 by this read.",
         issue: None,
     },
     Row {
