@@ -1,6 +1,6 @@
 [package]
 name = "orrerix"
-version = "1.2.0-beta5"
+version = "1.2.0-beta6"
 description = "A sleek terminal multiplexer for AI agent management"
 edition = "2021"
 
