@@ -70,7 +70,11 @@
 //! A lock-ORDER finding (#1610) writes no file from the acquiring thread
 //! either: it stamps one slot in atomics and the watchdog composes it, which
 //! is the same split, for the same reason. See [`stamp_order_report`]. The
-//! one exception is the DEBUG panic, which is a build that is stopping.
+//! exceptions are the PANICS — the debug panic on an inversion, and (#1702) a
+//! re-entrant acquisition's refusal in any build — because a panic runs `obs`'s
+//! hook, and that writes a crash log while the outer lock is still held. Both
+//! are threads that are leaving rather than continuing; see
+//! [`TrackedMutex::refuse_reentrant`], which states the cost.
 //!
 //! It was not always so, and the reasoning that got it wrong is worth keeping.
 //! The release path used to write its own report, excused by "a hold that has
@@ -926,14 +930,22 @@ const UNRANKED_EVENT: &str = "lock-rank-unranked";
 /// Ordering violations and re-entrant acquisitions seen this process.
 static LOCK_ORDER_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a violation PANICS.
+/// Whether an INVERSION panics.
 ///
 /// Debug and test builds: yes — a violation is a defect, and the plan asks for
 /// a panic naming both locks and both sites. Release: no, and the fail-open is
-/// deliberate rather than timid. The deadlock risk exists in the shipped build
-/// today; refusing the acquisition would convert a *possible* hang into a
-/// *certain* crash on a path nobody has proven wrong, and the crash trail is
-/// what this whole epic is for.
+/// deliberate rather than timid. An inversion is a *possible* deadlock: it
+/// needs a second thread taking the same two locks the other way round, at the
+/// same moment. Refusing it would convert that possibility into a certain crash
+/// on a path nobody has proven wrong, and the crash trail is what this whole
+/// epic is for.
+///
+/// **It does not decide what a RE-ENTRANT acquisition does** (#1702). That one
+/// is refused on every path, in every build, because it is a certain deadlock
+/// rather than a possible one — see [`TrackedMutex::refuse_reentrant`]. What
+/// this flag still chooses for it is the SHAPE of the refusal: armed, a panic
+/// that fails the build; disarmed, an unwind to a `read_budget` frame where one
+/// exists.
 static LOCK_ORDER_PANICS: AtomicBool = AtomicBool::new(cfg!(debug_assertions));
 
 /// Unranked locks that have nested under another lock for the first time.
@@ -950,7 +962,8 @@ pub fn unranked_nestings() -> u64 {
     UNRANKED_NESTINGS.load(Ordering::Relaxed)
 }
 
-/// Whether a violation currently panics.
+/// Whether an inversion currently panics. See [`LOCK_ORDER_PANICS`] for what
+/// it does and does not decide.
 pub fn lock_order_panics() -> bool {
     LOCK_ORDER_PANICS.load(Ordering::Relaxed)
 }
@@ -959,9 +972,11 @@ pub fn lock_order_panics() -> bool {
 ///
 /// Process-wide, so a test that flips it flips it for every test running
 /// concurrently in the same binary — take a serial guard around it, the way
-/// `obs`'s `SERIAL` does. It exists because the RELEASE behaviour (breadcrumb,
-/// fail open) is otherwise unreachable from a test, and a fail-open path nobody
-/// has executed is a fail-open path nobody has checked.
+/// `obs`'s `SERIAL` does. It exists because the RELEASE behaviour is otherwise
+/// unreachable from a test, and a path nobody has executed is a path nobody has
+/// checked: an inversion's breadcrumb-and-carry-on, and — since #1702 — a
+/// re-entrant acquisition's unwind-or-panic, which is the half that must never
+/// park whichever way this flag is set.
 #[doc(hidden)]
 pub fn set_lock_order_panics(on: bool) -> bool {
     LOCK_ORDER_PANICS.swap(on, Ordering::Relaxed)
@@ -1111,8 +1126,35 @@ pub fn record_order_reports(reports: Vec<OrderReport>) {
     }
 }
 
-/// Report an inversion or a re-entrant acquisition: panic in debug, stamp for
-/// the watchdog in release.
+/// The panic a re-entrant acquisition raises, composed once so the debug panic
+/// and the shipped-build refusal ([`TrackedMutex::refuse_reentrant`]) are the
+/// SAME sentence rather than two that drift (#1702).
+///
+/// Names both locks and both sites for [`report_order_violation`]'s reason: a
+/// report naming only the lock being taken sends the next reader back into a
+/// 54,000-line module to guess what was already held.
+fn reentrant_panic_message(
+    inner_name: &str,
+    inner_site: &'static Location<'static>,
+    outer_file: &str,
+    outer_line: u32,
+) -> String {
+    format!(
+        "{REENTRANT_EVENT}: `{inner_name}` at {}:{} is ALREADY held by this thread, taken \
+         at {outer_file}:{outer_line} — this mutex is not re-entrant, so the acquisition \
+         would self-deadlock",
+        inner_site.file(),
+        inner_site.line(),
+    )
+}
+
+/// Report an INVERSION: panic in debug, stamp for the watchdog in release.
+///
+/// Inversions only, since #1702. A re-entrant acquisition is refused on every
+/// path instead — [`TrackedMutex::check_order`] and `doc/design/lock-order.md`
+/// §6 — because the two verdicts are different facts: an inversion is a
+/// *possible* deadlock that needs the other thread to show up, and a re-entrant
+/// acquire on a non-reentrant mutex is a certain one, on this thread, now.
 ///
 /// **Both locks and both sites, in both surfaces.** A report naming only the
 /// lock being taken is the report that sends the next reader back into a
@@ -1125,27 +1167,17 @@ pub fn record_order_reports(reports: Vec<OrderReport>) {
 /// nowhere else: a debug build that reaches this is stopping.
 #[cold]
 fn report_order_violation(
-    kind: u8,
     st: &LockState,
     inner_site: &'static Location<'static>,
     outer: &HeldEntry,
 ) {
     LOCK_ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
     if !LOCK_ORDER_PANICS.load(Ordering::Relaxed) {
-        stamp_order_report(st, kind, inner_site, outer);
+        stamp_order_report(st, REPORT_ORDER, inner_site, outer);
         return;
     }
     let inner_name = st.name;
     let (outer_file, outer_line) = site_of(outer.site as *mut _);
-    if kind == REPORT_REENTRANT {
-        panic!(
-            "{REENTRANT_EVENT}: `{inner_name}` at {}:{} is ALREADY held by this thread, taken \
-             at {outer_file}:{outer_line} — this mutex is not re-entrant, so the acquisition \
-             would self-deadlock",
-            inner_site.file(),
-            inner_site.line(),
-        );
-    }
     panic!(
         "{ORDER_EVENT}: `{inner_name}` (rank {}) at {}:{} acquired while `{}` (rank {}) is \
          held by this thread, taken at {outer_file}:{outer_line} — the declared order is \
@@ -1251,9 +1283,18 @@ impl<T> TrackedMutex<T> {
 
     /// Acquire, honouring whatever budget this THREAD is running under.
     ///
+    /// **Before any of that**, and whatever the budget says: if this thread
+    /// ALREADY holds this lock, nothing is acquired at all. The inner primitive
+    /// is not re-entrant, so the acquisition below would park this thread
+    /// permanently; #1702 refuses it instead, and the refusal leaves by an
+    /// unwind because this signature has nowhere else to put one. See
+    /// [`refuse_reentrant`](Self::refuse_reentrant) for the three shapes that
+    /// takes and why it is not the fail-open an inversion gets.
+    ///
     /// With no [`crate::budget::read_budget`] frame installed — which is every
     /// call site that existed before #1609, and every mutating one after it —
-    /// this is an unbounded acquire and behaves exactly as Phase 0 left it.
+    /// this is otherwise an unbounded acquire and behaves exactly as Phase 0
+    /// left it.
     ///
     /// Under a budget, three outcomes:
     ///
@@ -1311,10 +1352,12 @@ impl<T> TrackedMutex<T> {
         // parks forever, so a checker that ran after the acquire would be a
         // checker that never runs on the case it exists for.
         //
-        // `lock_safe` returns a guard, so it has nowhere to put a refusal:
-        // its answers are a debug panic naming both locks, or — in release —
-        // the breadcrumb and then exactly what it would have done anyway.
-        let _ = self.check_order(site, false);
+        // And it REFUSES rather than reporting-and-carrying-on (#1702). An
+        // inversion is still fail-open below; this one is not, because the two
+        // are different facts — see `refuse_reentrant`.
+        if let Err(busy) = self.check_order(site) {
+            self.refuse_reentrant(site, busy);
+        }
         let Some((left, frame)) = budget::remaining() else {
             return self.acquire_blocking(site);
         };
@@ -1354,12 +1397,16 @@ impl<T> TrackedMutex<T> {
     /// (#1610). This entry point has an `Err` to put it in, and the answer it
     /// gives — [`BusyKind::Reentrant`], naming the frame that already holds
     /// the lock — is strictly more useful than a hang and strictly less
-    /// destructive than a crash. That is the plan's 3a rule: `Busy::Reentrant`
-    /// from `lock_within`, a debug panic from `lock_safe`.
+    /// destructive than a crash.
+    ///
+    /// Since #1702 the refusal itself is not this entry point's privilege:
+    /// [`lock_safe`](Self::lock_safe) refuses too, and the only difference left
+    /// is where the refusal GOES — here it is returned, there it is unwound
+    /// (see [`refuse_reentrant`](Self::refuse_reentrant)).
     #[track_caller]
     pub fn lock_within(&self, budget: Duration) -> Result<TrackedGuard<'_, T>, Busy> {
         let site = Location::caller();
-        self.check_order(site, true)?;
+        self.check_order(site)?;
         self.acquire_within(site, budget, "lock-busy")
     }
 
@@ -1387,7 +1434,14 @@ impl<T> TrackedMutex<T> {
     pub fn try_lock_safe(&self) -> Option<TrackedGuard<'_, T>> {
         let site = Location::caller();
         let guard = self.inner.try_lock()?;
-        let _ = self.check_order(site, false);
+        // The discarded `Err` is the re-entrant verdict, and it is unreachable
+        // here by construction rather than by policy: `parking_lot::try_lock`
+        // on a mutex this thread already holds returns `None`, so the `?` above
+        // has already returned. Discarding it rather than unwinding is what
+        // keeps this correct if the inner primitive ever changes — a `try` that
+        // was GRANTED holds a real guard, and unwinding out of a caller that
+        // has one in hand would drop it on a path with no refusal to deliver.
+        let _ = self.check_order(site);
         Some(self.record_acquired(guard, site))
     }
 
@@ -1450,30 +1504,30 @@ impl<T> TrackedMutex<T> {
     /// The lock-order check (#1610). Runs before any acquisition that can
     /// block, and after one that cannot ([`try_lock_safe`](Self::try_lock_safe)).
     ///
-    /// Returns `Err` only when `refuse_reentrant` is set — [`lock_within`]'s
-    /// contract. It is a parameter rather than a mode because the two entry
-    /// points genuinely differ in what they can say: `lock_within` returns a
-    /// `Result` and can refuse; `lock_safe` returns a guard and cannot.
+    /// **A re-entrant verdict is always an `Err`** (#1702). It used to depend
+    /// on a `refuse_reentrant` parameter, on the reasoning that `lock_safe`
+    /// returns a guard and so "cannot refuse". It can: a refusal it has nowhere
+    /// to PUT is still a refusal, delivered as an unwind
+    /// ([`refuse_reentrant`](Self::refuse_reentrant)). What the parameter
+    /// actually bought was the one behaviour a shipped build may not have —
+    /// falling through to `inner.lock()` on a lock this thread already holds,
+    /// which is a permanent park rather than a risk of one.
+    ///
+    /// So the two entry points differ in what they DO with the `Err`, not in
+    /// whether they get one: [`lock_within`] hands it to its caller;
+    /// [`lock_safe`] unwinds. An inversion is still fail-open — see
+    /// [`report_order_violation`] and `doc/design/lock-order.md` §2.1 for why the
+    /// two verdicts get different answers.
     ///
     /// [`lock_within`]: Self::lock_within
-    fn check_order(
-        &self,
-        site: &'static Location<'static>,
-        refuse_reentrant: bool,
-    ) -> Result<(), Busy> {
+    /// [`lock_safe`]: Self::lock_safe
+    fn check_order(&self, site: &'static Location<'static>) -> Result<(), Busy> {
         let st = &self.state;
         match inspect_held(st.id, st.rank) {
             Verdict::Clear => Ok(()),
-            Verdict::Reentrant(outer) => {
-                if refuse_reentrant {
-                    Err(self.reentrant_busy(site, &outer))
-                } else {
-                    report_order_violation(REPORT_REENTRANT, st, site, &outer);
-                    Ok(())
-                }
-            }
+            Verdict::Reentrant(outer) => Err(self.reentrant_busy(site, &outer)),
             Verdict::Inversion(outer) => {
-                report_order_violation(REPORT_ORDER, st, site, &outer);
+                report_order_violation(st, site, &outer);
                 Ok(())
             }
             Verdict::UnrankedUnder(outer) => {
@@ -1486,6 +1540,79 @@ impl<T> TrackedMutex<T> {
                 Ok(())
             }
         }
+    }
+
+    /// Deliver a re-entrant refusal out of [`lock_safe`](Self::lock_safe),
+    /// which has no `Err` to put one in (#1702).
+    ///
+    /// **Why this one does not fail open the way an inversion does.** The
+    /// release fail-open (`doc/design/lock-order.md` §2.1) rests on "refusing
+    /// would convert a *possible* hang into a *certain* crash on a path nobody
+    /// has proven wrong". That argument is sound for an INVERSION, which needs
+    /// a second thread taking the same two locks the other way round before
+    /// anything hangs, and it is simply false here: the inner primitive is not
+    /// re-entrant, so the acquisition this is standing in front of parks this
+    /// thread permanently, every time, with no race required — the certain hang
+    /// is the fall-through, not the refusal. #1702 is that path proven wrong in
+    /// the field.
+    ///
+    /// So the acquisition never happens, and the caller is left in one of three
+    /// well-defined ways:
+    ///
+    /// 1. **A build with the panic armed** (debug, `cargo test`, the E2E lane)
+    ///    panics naming both locks and both sites, whether or not a budget
+    ///    frame is installed. That is deliberately not the plan's literal
+    ///    reading — it said unwind wherever a frame exists — because the frame
+    ///    may be dozens of frames up in an unrelated module, and answering
+    ///    `Busy` there turns the one mechanism that can fail CI on this class
+    ///    into a silently-degraded read. A shipped build has no such choice to
+    ///    make; a test build does, and the loud half is the point of arming it.
+    /// 2. **Under a [`crate::budget::read_budget`] frame**, in a build with the
+    ///    panic off: unwind to that frame with the [`BusyKind::Reentrant`]
+    ///    `Busy`, which its owner already renders — an MCP `isError` saying
+    ///    nothing was executed, a `partial` snapshot section, a command's empty
+    ///    degrade. **This unwinds even when [`crate::budget::unwind_forbidden`]
+    ///    holds**, which is the one narrowing of `lock-liveness.md` §4.1's
+    ///    seal: the seal exists so a sealed frame WAITS rather than tearing a
+    ///    durable write, and it is a good trade because waiting ends. Here it
+    ///    does not end — the alternative to the tear is not "later", it is
+    ///    "never" — and a tear is counted (`budget::torn_writes`) and
+    ///    breadcrumbed where a wedge is neither.
+    /// 3. **No frame** (a cadenced tick under `tick_gate`'s `MutationScope`, an
+    ///    MCP mutate helper thread, a `run_blocking` body): the same panic as
+    ///    (1). `obs`'s hook writes a crash log naming both sites, and the
+    ///    unwind drops every guard on the way out, so the registry is RELEASED
+    ///    — which is the whole point, and the one thing the park could never
+    ///    do. Callers are supervised so the panic ends the tick rather than the
+    ///    thread; see `obs::TickSupervisor`.
+    ///
+    /// **The one cost, stated.** The panic hook runs BEFORE the unwind starts,
+    /// so that crash log is written while this thread still holds the outer
+    /// lock — a file write inside a hold, which is exactly what
+    /// [`stamp_order_report`] exists to avoid. It is accepted here and nowhere
+    /// else: this is a one-shot defect report on a thread that is already
+    /// leaving, the alternative to the write is a hang with no artifact at all
+    /// (#1600 §2.3's whole problem), and the waiters whose latency it lands on
+    /// are about to be released by the very unwind that follows it.
+    #[cold]
+    fn refuse_reentrant(&self, site: &'static Location<'static>, busy: Busy) -> ! {
+        // Composed before either exit so the two say the same sentence.
+        let (outer_file, outer_line) = match &busy.holder {
+            Some(h) => (h.site_file, h.site_line),
+            // Unreachable: `reentrant_busy` always fills `holder` from the
+            // held-lock stack entry it matched. Rendered rather than
+            // `unwrap`ped so a refusal can never become a panic ABOUT the
+            // refusal, which would name neither site.
+            None => ("<unknown>", 0),
+        };
+        let message = reentrant_panic_message(self.state.name, site, outer_file, outer_line);
+        if LOCK_ORDER_PANICS.load(Ordering::Relaxed) {
+            panic!("{message}");
+        }
+        if let Some((_, frame)) = budget::remaining() {
+            budget::unwind_to_frame(frame, busy);
+        }
+        panic!("{message}");
     }
 
     /// Compose the [`BusyKind::Reentrant`] refusal.
@@ -2194,8 +2321,8 @@ mod rank_tests {
         std::thread::spawn(move || {
             let msg = panic_message(std::panic::AssertUnwindSafe(|| {
                 let _held = l.lock_safe();
-                // Today this parks forever, with no cycle for an inversion
-                // search to find — #1600 §1.2's invisible case.
+                // Without the checker this parks forever, with no cycle for an
+                // inversion search to find — #1600 §1.2's invisible case.
                 let _boom = l.lock_safe();
                 // Only reached if the acquisition was granted, which is the
                 // one outcome that is neither a refusal nor a deadlock.
@@ -2305,9 +2432,17 @@ mod rank_tests {
         // own first nesting between the two reads — rare rather than
         // reproducible, which is the worst kind of intermittent to ship.
         //
-        // What the floor pins is that the counter is WIRED. The "once, not
-        // once per acquisition" property is pinned per-LOCK by the drain below,
-        // which cannot race because no other test touches this lock's name.
+        // What the floor can say is narrower than "the counter is WIRED", which
+        // is what this comment used to claim (#1698 review residual). The very
+        // race that forces a floor also lets a SIBLING test's first nesting
+        // satisfy it, so a `+1` here is consistent with this lock's nesting
+        // having been counted and is not evidence of it: the floor pins only
+        // that the process-global counter moved at all across this window.
+        //
+        // The witness for THIS lock is the per-lock `drain_for` below, which
+        // cannot race because no other test touches this lock's name — and it
+        // is also what pins "once, not once per acquisition", against the three
+        // acquisitions above.
         assert!(
             unranked_nestings() >= reports + 1,
             "an unranked lock nested under a ranked one and the counter did not move"
@@ -2327,11 +2462,18 @@ mod rank_tests {
     }
 
     #[test]
-    fn a_release_build_stamps_the_violation_and_carries_on() {
+    fn a_release_build_stamps_an_inversion_and_carries_on() {
         // The fail-open half, which is otherwise unreachable from a test — and
         // a fail-open path nobody has executed is a fail-open path nobody has
-        // checked. The deadlock risk exists in the shipped build already;
-        // turning a possible hang into a certain crash is not an improvement.
+        // checked. An inversion is a POSSIBLE deadlock: it needs a second
+        // thread taking the same two locks the other way round, so turning that
+        // possibility into a certain crash is not an improvement.
+        //
+        // Inversions only, and the name says so since #1702. The re-entrant
+        // half used to ride this same fail-open and is now refused instead —
+        // `a_reentrant_lock_safe_never_parks_even_with_panics_off` is that
+        // half, and the two are separate tests because one assertion pair
+        // cannot state two opposite policies.
         let _serial = SERIAL.lock_safe();
         let _restore = PanicSwitch(set_lock_order_panics(false));
         let outer = TrackedMutex::new_ranked("failopenspec_outer", OUTER, 7u32);
@@ -2362,6 +2504,126 @@ mod rank_tests {
         assert!(
             drain_for("failopenspec_outer").is_empty(),
             "a drained finding must be taken exactly once"
+        );
+    }
+
+    #[test]
+    fn a_reentrant_lock_safe_never_parks_even_with_panics_off() {
+        // The requirement #1702 exists for: **in a SHIPPED build, a re-entrant
+        // `lock_safe` may not block forever.** Until this PR it did — the
+        // release arm stamped a `lock-reentrant` finding and then fell through
+        // to `inner.lock()`, which on a non-reentrant mutex is a permanent
+        // park. `set_lock_order_panics(false)` is the only way to reach that
+        // arm from a test, and a path nobody has executed is a path nobody has
+        // checked.
+        //
+        // **On its own thread, with a bounded wait**, for
+        // `a_reentrant_lock_safe_panics_rather_than_self_deadlocking`'s reason:
+        // the FAILING form of this row is a permanent park, which in-thread
+        // arrives as a CI job timeout naming nothing. Here the timeout on
+        // `recv_timeout` is the assertion, and it is the red this test was
+        // written to produce against the base commit.
+        let _serial = SERIAL.lock_safe();
+        let _restore = PanicSwitch(set_lock_order_panics(false));
+        let lock = std::sync::Arc::new(TrackedMutex::new_ranked("reentreleasespec", OUTER, 4u32));
+        let before = lock_order_violations();
+        let _ = drain_for("reentreleasespec"); // start from an empty slot
+
+        let (tx, rx) = mpsc::channel();
+        let l = lock.clone();
+        std::thread::spawn(move || {
+            // The discriminating half, and it goes first: with the panic switch
+            // off an UNCONTENDED acquisition must still be granted, or every
+            // assertion below would pass just as well against a build that had
+            // stopped acquiring anything at all.
+            //
+            // `line!()` is read on this side of the spawn, two lines above the
+            // acquisition it names, so editing the prose above cannot silently
+            // move the offset off its target. It is sent back rather than
+            // computed on the main thread for the same reason.
+            let held_line = std::line!() + 2;
+            let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+                let held = l.lock_safe();
+                assert_eq!(*held, 4, "an uncontended acquisition must still be granted");
+                let _boom = l.lock_safe();
+                // Only reached if the acquisition was GRANTED, which on a
+                // non-reentrant mutex is the one outcome that is neither a
+                // refusal nor a deadlock.
+                assert_eq!(held_lock_depth(), 2, "a re-entrant acquisition was GRANTED");
+            }));
+            let _ = tx.send((msg, held_lock_depth(), held_line));
+        });
+
+        let (msg, depth, held_line) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the re-entrant acquisition PARKED with the panic switch off — the shipped-build \
+             behaviour #1702 closes",
+        );
+        // With no `read_budget` frame on that thread there is nowhere to unwind
+        // TO, so the refusal is the same panic the armed build raises — same
+        // message, from `reentrant_panic_message`, naming both sites.
+        let msg = msg.expect("the refusal must leave by an unwind, not by returning a guard");
+        assert!(msg.contains("reentreleasespec"), "{msg}");
+        assert!(
+            msg.contains(&format!("lockwatch.rs:{held_line}")),
+            "the refusal must name the line THIS thread already holds it from ({held_line}): {msg}"
+        );
+        assert_eq!(depth, 0, "the unwind left a phantom hold on that thread's stack");
+
+        // Counted and reported, exactly as the fail-open arm used to be: what
+        // changed is that the acquisition does not happen, not that the
+        // evidence went away.
+        assert_eq!(
+            lock_order_violations(),
+            before + 1,
+            "a refused re-entrant acquisition must still be counted"
+        );
+        let found = drain_for("reentreleasespec");
+        assert_eq!(found.len(), 1, "expected exactly one stamped finding: {found:?}");
+        assert_eq!(found[0].kind, REPORT_REENTRANT, "{found:?}");
+        assert_eq!(found[0].event(), "lock-reentrant");
+        assert_eq!(
+            found[0].outer_site_line, held_line,
+            "the finding must name the line the hold it collided with was taken on"
+        );
+    }
+
+    #[test]
+    fn a_reentrant_acquire_unwinds_a_sealed_frame_and_counts_the_tear() {
+        // The one narrowing of `lock-liveness.md` §4.1 (#1702). A frame that
+        // has made a durable write is SEALED: a budget timeout under it waits
+        // instead of unwinding, because a slow mutation is a stall and an
+        // abandoned one is corruption. That trade is only good while waiting
+        // ENDS. A re-entrant acquisition is the case where it does not — the
+        // alternative to the tear is not "later", it is "never" — so this one
+        // unwinds through the seal, and the tear is COUNTED where a wedge
+        // would have been counted as nothing.
+        let _serial = SERIAL.lock_safe();
+        let _restore = PanicSwitch(set_lock_order_panics(false));
+        let lock = TrackedMutex::new_ranked("reentsealspec", OUTER, 5u32);
+        let (_, torn_before) = budget::thread_seal_counts();
+
+        let out: Result<(), Busy> = budget::read_budget(Duration::from_secs(30), || {
+            // Discriminating half: inside a sealed frame an ordinary
+            // acquisition still succeeds and is NOT unwound. Without it this
+            // test would pass against a build that unwound every acquisition
+            // made after a durable write.
+            let held = lock.lock_safe();
+            assert_eq!(*held, 5, "a sealed frame must still be able to take a free lock");
+            budget::note_durable_write("reentsealspec-test");
+            assert!(budget::sealed_for_test(), "the frame must be sealed before the re-entry");
+            let _boom = lock.lock_safe();
+            unreachable!("the re-entrant acquisition must not be granted");
+        });
+
+        let busy = out.expect_err("the frame must be left with a Busy, not completed");
+        assert!(busy.is_reentrant(), "the refusal must be typed as re-entrant: {busy:?}");
+        assert_eq!(busy.lock, "reentsealspec");
+        assert_eq!(held_lock_depth(), 0, "the unwind left a phantom hold on the stack");
+        let (_, torn_after) = budget::thread_seal_counts();
+        assert_eq!(
+            torn_after,
+            torn_before + 1,
+            "a tear through the seal must be COUNTED — that is what makes it better than a wedge"
         );
     }
 
