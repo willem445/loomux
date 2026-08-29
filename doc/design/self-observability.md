@@ -87,8 +87,11 @@ nine hundred times.
 On top of the `Mutex::lock` that was already there — on acquire: two relaxed
 read-modify-writes on the waiter count, three relaxed stores, one release
 read-modify-write on the generation, and one monotonic clock read. On release:
-one clock read, four relaxed loads, four relaxed stores and two release
-read-modify-writes. **No allocation, no formatting, no global lock, no syscall,
+one clock read, four relaxed loads, four relaxed stores, one release STORE
+(`done_pending`) and one release read-modify-write (`generation`) — counted
+apart because the release body runs with the reported mutex still held, so
+what it costs is what every waiter behind it pays, and an RMW is not a store
+(#1605 review n5, corrected in #1608). **No allocation, no formatting, no global lock, no syscall,
 and nothing that can block, on either** — the global registry is touched at
 construction only, and every byte of every report is composed on the watchdog
 thread.

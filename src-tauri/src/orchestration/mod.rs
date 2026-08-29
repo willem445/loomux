@@ -426,7 +426,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Weak};
 use loomux_engine::lockwatch::TrackedMutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::obs::LockExt;
@@ -13551,6 +13551,17 @@ pub struct OrchRegistry {
     /// actually cleared via the toggle), so a LATER re-entry — a fresh edit
     /// — audits again rather than staying silent forever after the first.
     merge_gate_removal_warned: TrackedMutex<HashSet<GroupId>>,
+    /// The published snapshot the polled reads are served from (#1608, plan
+    /// #1600 §3 Phase 1). NOT a `TrackedMutex` and deliberately not a lock at
+    /// all from a reader's side: `views.load()` is a read-lock, a pointer
+    /// clone and a release on a cell whose writer's critical section is a
+    /// pointer swap. That is the whole point — a polled read must not be able
+    /// to wait on anything a background thread can hold.
+    ///
+    /// A plain field rather than an `Arc<ViewPublisher>`: this registry is
+    /// already behind an `Arc` and nothing owns the publisher independently,
+    /// so an inner `Arc` would be an indirection with no second owner.
+    pub(crate) views: views::ViewPublisher,
 }
 
 /// One member of a [`Channel`]: which group/agent pane is connected. Cached
@@ -26507,6 +26518,7 @@ impl OrchRegistry {
             agent_channel: TrackedMutex::new("agent_channel", HashMap::new()),
             channel_seq: AtomicU32::new(0),
             merge_gate_removal_warned: TrackedMutex::new("merge_gate_removal_warned", HashSet::new()),
+            views: views::ViewPublisher::new(),
         }
     }
 
@@ -50542,6 +50554,25 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
 ///    one unconditional re-push of a non-empty set every `QUEUE_DEPTH_REPUSH_MS`,
 ///    which is that suppression's independent release rather than a cadence of
 ///    its own.
+/// Background loop for the polled-view publisher (#1608, plan #1600 §3 Phase
+/// 1): every [`views::VIEW_PUBLISH_INTERVAL`] it recomputes the group-view and
+/// tab-strip payloads for every group the registry knows and publishes them as
+/// one immutable snapshot, so the two polled commands can be served by pointer
+/// clone instead of by acquiring registry mutexes on every tick.
+///
+/// **This is the thread that pays the wait.** If a registry lock is held
+/// pathologically long, exactly one thread parks here — not one per poller per
+/// tick on the shared blocking pool, which is the accumulation #1600 §1.2
+/// derives beta6 from. Readers keep answering with the last snapshot and a
+/// growing `age_ms`, and the frontend badges it stale past
+/// [`views::VIEW_STALE_AFTER_MS`]. Started once at app setup.
+pub fn start_view_publisher(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(views::VIEW_PUBLISH_INTERVAL);
+        reg.views.publish_pass(&reg);
+    });
+}
+
 pub fn start_attention(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || {
         let mut tick: u64 = 0;
@@ -51341,7 +51372,15 @@ pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
 pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.pause_group(&group_id)).await
+    run_blocking(move || {
+        let out = reg.pause_group(&group_id);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Resume a paused group: prompt/kickoff delivery flows again.
@@ -51359,7 +51398,15 @@ pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), St
 pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.resume_group(&group_id)).await
+    run_blocking(move || {
+        let out = reg.resume_group(&group_id);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Whether a group is currently paused (drives the pause/resume button state).
@@ -51477,7 +51524,15 @@ pub async fn orch_set_notify(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_notify(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_notify(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Whether this group has opted OUT of the #260 minimize-on-spawn default
@@ -51527,7 +51582,15 @@ pub async fn orch_set_spawn_expanded(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_spawn_expanded(&group_id, expanded)).await
+    run_blocking(move || {
+        let out = reg.set_spawn_expanded(&group_id, expanded);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Change a live group's max live-agent cap (durable, bounds-checked, audited).
@@ -51555,7 +51618,15 @@ pub async fn orch_set_max_agents(
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_max_agents(&group_id, max_agents, "human")).await
+    run_blocking(move || {
+        let out = reg.set_max_agents(&group_id, max_agents, "human");
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
@@ -51674,7 +51745,15 @@ pub async fn orch_set_autonomous(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_autonomous(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_autonomous(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable the auto-merge gate for a group (durable, audited). Default OFF
@@ -51715,7 +51794,15 @@ pub async fn orch_set_auto_merge(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_auto_merge(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_auto_merge(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable the auto-release gate for a group (durable, audited, independent
@@ -51740,7 +51827,15 @@ pub async fn orch_set_auto_release(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_auto_release(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable full autonomy for a group (#778, durable, audited). A dependent
@@ -51765,7 +51860,15 @@ pub async fn orch_set_full_autonomy(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_full_autonomy(&group_id, enabled, &goal)).await
+    run_blocking(move || {
+        let out = reg.set_full_autonomy(&group_id, enabled, &goal);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable supervised dangerous mode for a group (#83, durable, audited).
@@ -51803,7 +51906,15 @@ pub async fn orch_set_dangerous_mode(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_dangerous_mode(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_dangerous_mode(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 // ---------- the persisted guardrail knobs ----------
@@ -51843,7 +51954,15 @@ pub async fn orch_set_autonomy_budget(
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_autonomy_budget(&group_id, tokens)).await
+    run_blocking(move || {
+        let out = reg.set_autonomy_budget(&group_id, tokens);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Set a group's idle-tick quiet window in minutes (0 → default; floored at 1,
@@ -51866,7 +51985,15 @@ pub async fn orch_set_idle_tick_minutes(
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_idle_tick_minutes(&group_id, minutes)).await
+    run_blocking(move || {
+        let out = reg.set_idle_tick_minutes(&group_id, minutes);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Set a group's idle-tick activity floor in bytes (0 → default; floored at 1,
@@ -51888,7 +52015,15 @@ pub async fn orch_set_idle_activity_floor(
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_idle_activity_floor(&group_id, bytes)).await
+    run_blocking(move || {
+        let out = reg.set_idle_activity_floor(&group_id, bytes);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Set a group's compact-nudge quiet window in minutes (#287; 0 = off,
@@ -52024,6 +52159,62 @@ pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
 /// `orch_session_roles` was the same class with expensive work; this one shows
 /// the work never had to be expensive.
 #[tauri::command]
+/// **The group view's whole 2 s poll, in one read** (#1608, plan #1600 §3
+/// Phase 1). Replaces a `Promise.all` batch of ten `orch_*` commands, every
+/// one of which acquired a registry mutex on an unbounded `lock_safe`.
+///
+/// Being ASYNC was never enough, and this command is why the distinction is
+/// worth stating: #1595 moved five polled commands off the webview thread and
+/// #1600 §1.2 is the release where the same unbounded wait exhausted the
+/// shared 512-thread blocking pool instead — after which `write_pty` could not
+/// be scheduled and no pane accepted input. The body here takes **no registry
+/// lock at all**: it stamps a view lease and reads a published cell, so it
+/// enters the pool and cannot park in it. `perf_dispatch.rs`'s poll-path guard
+/// (test L6) asserts exactly that, by requiring `views.load(` in this body.
+///
+/// The lease is what keeps the expensive half honest: the publisher computes
+/// the eight view-tier sections only while a caller keeps asking, so a
+/// `merge_queue.json` read, a `workflow.yml` parse and a `git` default-branch
+/// resolution stay at one open view's rate rather than every group's.
+///
+/// #904: a refused id answers `Value::Null` — and so does a group created
+/// since the last publish pass, deliberately, because the caller's response to
+/// both is the same: keep the previous render and ask again. See
+/// `command_group` and `doc/design/polled-views.md`.
+///
+/// **Reentrancy.** A read of an immutable snapshot; the only mutation is the
+/// lease stamp, which is last-writer-wins on a monotonic instant and cannot
+/// disagree with itself.
+#[tauri::command]
+pub async fn orch_group_view(app: AppHandle, group_id: String) -> Value {
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.views.note_view_lease(&group_id);
+        views::group_view_payload(&reg.views.load(), &group_id, Instant::now())
+    })
+    .await
+}
+
+/// **The whole tab strip's 4 s poll, in one read** (#1608). Replaces
+/// `orch_group_summary` + `orch_group_usage` issued once per group-bound tab,
+/// so the per-tick IPC fan-out collapses from 2xN to 1 and stops growing with
+/// the human's tab count.
+///
+/// Served from the same published snapshot as [`orch_group_view`], with the
+/// same no-registry-lock property and the same L6 enforcement. Its `meta`
+/// reports the OLDEST group's age, so `stale` means "nothing on this strip is
+/// older than this" — the strip's job is to be right about the tab that is in
+/// trouble, and a payload-wide average would report it fresh because one tab
+/// moved.
+///
+/// Takes no `group_id`: one snapshot serves every group, which is the point.
+#[tauri::command]
+pub async fn orch_strip_view(app: AppHandle) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || views::strip_view_payload(&reg.views.load(), Instant::now())).await
+}
+
 pub async fn orch_group_summary(app: AppHandle, group_id: String) -> Value {
     let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     let reg = reg_of(&app);
@@ -52107,7 +52298,15 @@ pub async fn orch_set_advanced_orchestrator(
 ) -> Result<Value, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_advanced_orchestrator(&group_id, on, "human")).await
+    run_blocking(move || {
+        let out = reg.set_advanced_orchestrator(&group_id, on, "human");
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// The group's current workflow-mode status for the lifecycle UI (Slice C):
@@ -52116,12 +52315,16 @@ pub async fn orch_set_advanced_orchestrator(
 /// satisfiability guarantee) — `{ advanced, name, default_branch: string|null,
 /// blocks: [{id,kind,cli,model,persona}],
 /// gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
-/// Part of the group view's 2 s poll batch — `GroupView.load()`'s ten-invoke
-/// `Promise.all` (`groupview.ts`, `Promise.all` in `load()`), alongside
-/// `orch_group_summary` — not a once-per-open read. (Was "nine-invoke
-/// (groupview.ts:649-672)"; corrected in #1595 after counting the batch, which
-/// is ten and no longer at those lines. Raw line numbers rot silently — the
-/// same lesson `perf_dispatch.rs`'s CITE CONVENTION states.)
+/// **No longer on the group view's poll path** (#1608). It was a member of
+/// `GroupView.load()`'s ten-invoke `Promise.all`; that batch is now a single
+/// `orch_group_view`, served from the published snapshot, and this command's
+/// payload reaches the panel as that read's `workflow` section — computed by
+/// the publisher thread through the same `workflow_status` call below, so the
+/// wire shape is unchanged. What remains here are the non-poll callers
+/// (`tasksview.ts` reads it once on open). See `doc/design/polled-views.md`.
+///
+/// The off-thread argument below still stands and is the reason the PUBLISHER
+/// pays it on a 1 s cadence rather than a poll paying it per tick.
 ///
 /// Off-thread (#743 S4c), and its `default_branch` is memoised per repo (#743
 /// S4a) — resolving that name costs 2-4 blocking `git` spawns, which this was
