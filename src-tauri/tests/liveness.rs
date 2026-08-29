@@ -1479,25 +1479,24 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     );
     assert_eq!(probe_torn, probe_torn_before, "the probe itself tore");
 
-    // Stated rather than left implicit: this row proves no Read tool TEARS, and
-    // that the instrument which would catch one works. That the SWEEP would
-    // catch a misclassified writer is evidenced separately, by the scratch round
-    // that puts `check_mail` back in the Read set and removes the seal.
-    // THE SWEEP'S OWN POPULATION CONTROL, restored now that it can be satisfied.
+    // WHAT THE SWEEP DOES AND DOES NOT SHOW — recorded rather than asserted,
+    // because the obvious assertion is unsound in BOTH directions and each was
+    // tried on CI before this comment existed.
     //
-    // It was asserted, failed on CI, and was replaced by the probe above —
-    // correctly, because at the time no Read tool wrote anything and the control
-    // was reporting exactly that. What made it satisfiable is the fixture:
-    // `check_mail` writes only `if stamped > 0`, so the seeded unread message is
-    // what carries the sweep into `write_mailbox`.
+    // `swept_writes > 0` fails on a CORRECT tree: with `check_mail`,
+    // `queue_orphans` and `list_locks` classified `Mutate` — which is the fix
+    // this review round made — the Read set contains no tool that durably writes
+    // in this fixture. Demanding one demands the classification be wrong.
     //
-    // Without this, `torn == 0` is a claim about a sweep that may have driven
-    // seventeen tools and touched no durable write at all.
+    // `swept_writes == 0` is no better: `group_usage` IS a Read that replaces
+    // `usage.json`, and whether it does so in a given run depends on live agents
+    // having snapshots — a property of the fixture, not of the code.
+    //
+    // So the sweep asserts what it supports: every Read tool was reachable and
+    // driven (above), and none tore. The two stronger claims live where they can
+    // be demonstrated — the probe shows the instrument runs, and `budget.rs`'s
+    // own seal tests redden when the seal is disarmed. Three claims, three
+    // places, each with the counterfactual it actually has.
     let swept_writes = sealed_after - sealed_before;
-    assert!(
-        swept_writes > 0,
-        "the sweep reached no durable write, so `torn == 0` above is about nothing. Either the \
-         fixture stopped seeding the manager's mailbox (`check_mail` returns before \
-         `write_mailbox` when there is nothing unread) or no Read tool writes any more."
-    );
+    let _ = swept_writes;
 }
