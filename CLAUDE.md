@@ -506,7 +506,7 @@ compiles.
   rather than failing, so neither the compiler nor a unit test over a faked registry sees
   it. Signature: the new path is keyed on what the live map or this session knows, the
   reads it replaces on what the CALLER named (#1625 round 2, `views.rs`'s strip lease;
-  #956 rev-507, `modelwire.rs`'s `worth_keeping`).
+  #956 rev-507, `src/modelcatalog.ts`'s `worthKeeping`).
 - **A `Mutex` that serialises tests is locked with `lock_safe`, never
   `.lock().unwrap()`.** One failing test panics under the guard and poisons it,
   so every later test on that lock dies of `PoisonError` — one genuine failure
