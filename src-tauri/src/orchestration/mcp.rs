@@ -228,9 +228,33 @@ pub enum ToolKind {
 /// a line here narrows this silently, which is why the guard asserts a floor
 /// on the population it returns.
 const GATING_HINTS: [Option<&str>; 3] = [None, Some("liaison"), Some("process")];
-/// The tool names ONE role sees. Beside [`all_listed_tool_names`] because a
-/// guard that needs to DRIVE a tool needs a role that actually lists it, not
-/// merely the knowledge that some role does.
+/// Every `(role, role_hint)` pair the listing branches on.
+///
+/// ONE definition, because two call sites derived this separately and one of
+/// them omitted the hint dimension — which is how `session_digest`
+/// (`Role::Worker` + `Some("process")`) came to be reported as a tool the
+/// surface does not list, twice, by two different guards.
+#[doc(hidden)]
+pub fn listing_matrix() -> Vec<(Role, Option<&'static str>)> {
+    let mut out = Vec::new();
+    for role in [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::Reviewer,
+        Role::Planner,
+        Role::Manager,
+        Role::Solo,
+    ] {
+        for hint in GATING_HINTS {
+            out.push((role, hint));
+        }
+    }
+    out
+}
+
+/// The tool names ONE `(role, hint)` sees. Beside [`all_listed_tool_names`]
+/// because a guard that needs to DRIVE a tool needs a role that actually
+/// lists it, not merely the knowledge that some role does.
 #[doc(hidden)]
 pub fn listed_tool_names_for(role: Role, hint: Option<&str>) -> Vec<String> {
     tool_defs(role, hint, &[], true)
@@ -242,21 +266,12 @@ pub fn listed_tool_names_for(role: Role, hint: Option<&str>) -> Vec<String> {
 #[doc(hidden)]
 pub fn all_listed_tool_names() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for role in [
-        Role::Orchestrator,
-        Role::Worker,
-        Role::Reviewer,
-        Role::Planner,
-        Role::Manager,
-        Role::Solo,
-    ] {
+    for (role, hint) in listing_matrix() {
         for manager in [false, true] {
-            for hint in GATING_HINTS {
-                for d in tool_defs(role, hint, &[], manager) {
-                    if let Some(n) = d.get("name").and_then(Value::as_str) {
-                        if !out.iter().any(|e| e == n) {
-                            out.push(n.to_string());
-                        }
+            for d in tool_defs(role, hint, &[], manager) {
+                if let Some(n) = d.get("name").and_then(Value::as_str) {
+                    if !out.iter().any(|e| e == n) {
+                        out.push(n.to_string());
                     }
                 }
             }

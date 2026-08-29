@@ -1361,17 +1361,14 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     //
     // `Caller` is constructible directly, so each tool is driven by a caller
     // whose ROLE actually lists it, without spawning an agent per role.
-    let listed_by: Vec<(Role, Vec<String>)> = [
-        Role::Orchestrator,
-        Role::Worker,
-        Role::Reviewer,
-        Role::Planner,
-        Role::Manager,
-        Role::Solo,
-    ]
-    .into_iter()
-    .map(|role| (role, mcp::listed_tool_names_for(role, None)))
-    .collect();
+    // The matrix comes from `mcp` so this cannot omit a dimension the listing
+    // branches on — which is exactly how `session_digest` (hint-gated) was
+    // reported unreachable here after the same omission had already been fixed
+    // in the sibling guard.
+    let listed_by: Vec<(Role, Option<&str>, Vec<String>)> = mcp::listing_matrix()
+        .into_iter()
+        .map(|(role, hint)| (role, hint, mcp::listed_tool_names_for(role, hint)))
+        .collect();
 
     // Resolve every Read tool to a caller BEFORE anything is held: building the
     // plan takes registry locks of its own, and doing that under the hold would
@@ -1379,14 +1376,14 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     let mut plan: Vec<(&str, Caller)> = Vec::new();
     let mut unreachable: Vec<&str> = Vec::new();
     for name in mcp::READ_TOOLS {
-        match listed_by.iter().find(|(_, names)| names.iter().any(|n| n == name)) {
-            Some((role, _)) => plan.push((
+        match listed_by.iter().find(|(_, _, names)| names.iter().any(|n| n == name)) {
+            Some((role, hint, _)) => plan.push((
                 name,
                 Caller {
                     agent_id: base.agent_id.clone(),
                     group: base.group.clone(),
                     role: *role,
-                    role_hint: None,
+                    role_hint: hint.map(str::to_string),
                 },
             )),
             None => unreachable.push(name),
