@@ -370,15 +370,33 @@ fn a_nudge_is_not_lost_to_a_pass_that_was_already_computing() {
          about nothing"
     );
 
-    // Now the pass that began BEFORE the write finally publishes. Its copy of
-    // this group predates the toggle and carries the earlier stamp.
+    // Now the pass that began BEFORE the write finally publishes.
+    //
+    // **The assertion is on the STAMP, not on `notify`.** A test asserting
+    // `notify == true` here would be a decoration: `publish_pass_at`
+    // recomputes each group from the live registry, and `set_notify(true)`
+    // has already landed, so it reads `true` under the merge rule AND under a
+    // wholesale store. Nothing about the payload can separate the two
+    // implementations, because this harness cannot make a pass carry a value
+    // it read before the write.
+    //
+    // `computed_at` can. Under the merge rule the entry keeps the nudge's
+    // stamp; a wholesale store replaces it with the pass's older one — which
+    // is the lost update, and is also what would then make the payload wrong
+    // in production, where the pass really is holding a pre-write copy.
     views.publish_pass_at(&reg, pass_started);
     assert_eq!(
-        section(&group_view_payload(&views.load(), &g.id, nudged_at), "notify"),
-        &Value::Bool(true),
-        "a pass that was already computing when the nudge landed must NOT revert it: its\
+        views.load().value.groups.get(&g.id).expect("still published").computed_at,
+        nudged_at,
+        "a pass that was already computing when the nudge landed must NOT overwrite it: its\
          copy of this group was read before the write, and the group view re-reads\
          immediately after the toggle rather than on the next tick"
+    );
+    assert_ne!(
+        views.load().value.groups.get(&g.id).expect("still published").computed_at,
+        pass_started,
+        "the two candidate outcomes must DIVERGE, or the assertion above holds under either\
+         implementation"
     );
 
     // ...and the pass is not simply ignored: a LATER pass replaces the nudge
