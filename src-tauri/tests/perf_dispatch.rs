@@ -358,11 +358,15 @@ const ATTR: &str = concat!("#[tauri::", "command]");
 /// The INV-2 markers. A `cheap` body may contain none of them.
 const HAZARD_MARKERS: &[&str] = &["Command::new", "ShellExecuteW", ".output(", "fs::"];
 
-/// Any shape of the delegation INV-1 requires in an async command's own body:
-/// `run_blocking` is the crate's thin wrapper (git.rs, gh.rs, pty.rs),
-/// `spawn_counted` the counted door that wrapper and the four unwrapped sites
-/// (voice.rs, sessions.rs, pty.rs `write_pty`/`change_dir`) both hand off
-/// through, and `spawn_blocking` the runtime call `spawn_counted` itself makes.
+/// Every shape of the delegation INV-1 requires in an async command's own body.
+/// Two patterns and five spellings: this list is the UNION of #1601's and
+/// #1607's, which landed in the same batch and each added its own.
+///
+/// **P1 — hand the whole body to the shared blocking pool.** `run_blocking` is
+/// the crate's thin wrapper (git.rs, gh.rs); `spawn_counted` is the one counted
+/// door that wrapper and the unwrapped sites (`sessions.rs` `list_sessions`,
+/// `voice.rs` `voice_stop`) hand off through (#1601 Phase 0.3); and
+/// `spawn_blocking` is the runtime call `spawn_counted` itself makes.
 ///
 /// `spawn_blocking(` stays on the list even though #1601 left exactly one such
 /// call in the crate (`blocking::spawn_counted`, which is not a command). It is
@@ -371,7 +375,33 @@ const HAZARD_MARKERS: &[&str] = &["Command::new", "ShellExecuteW", ".output(", "
 /// spelling of it — a scan that rejected the runtime call outright would fail a
 /// command that delegates perfectly well and merely skipped the counter, which
 /// is `src-tauri/tests/selfwatch.rs`'s finding to report, with its own message.
-const DELEGATION: &[&str] = &["run_blocking(", "spawn_counted(", "spawn_blocking("];
+///
+/// (#1601's version of this doc also listed `pty.rs` `write_pty`/`change_dir`
+/// among the sites handing off through `spawn_counted`. True when it was
+/// written; false as of #1607, which is what took them off the pool entirely.
+/// Corrected here rather than inherited through the rebase.)
+///
+/// **P8-writer — hand the whole body to a DEDICATED OWNER THREAD with a
+/// body to a DEDICATED OWNER THREAD with a completion reply. `write_pty` and
+/// `change_dir` post to the pane's own writer thread and await its answer, so
+/// they satisfy INV-1's actual property — nothing of the body runs on the
+/// webview thread, and nothing before the first await can block — while
+/// deliberately NOT using the pool. That is the point of 2.3: the shared pool is
+/// a bounded resource (tokio's default 512, unconfigured), and beta6 exhausted
+/// it with parked poll ticks until the app's most latency-critical path could no
+/// longer be scheduled at all (#1600 §1.2). A destination the input path shares
+/// with orchestration polling is the defect, not the fix.
+///
+/// Adding a name here WIDENS what counts as delegation, so it is a decision, not
+/// a list: the bar is that the command's own body ends at an await on work
+/// running somewhere that is not the webview thread. See performance.md §2.
+const DELEGATION: &[&str] = &[
+    "run_blocking(",
+    "spawn_counted(",
+    "spawn_blocking(",
+    "enqueue_frontend_write(",
+    "enqueue_cd(",
+];
 
 #[derive(Debug)]
 struct Site {
@@ -1007,10 +1037,10 @@ fn every_async_command_hands_its_body_to_a_blocking_pool() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "these async commands never call run_blocking(, spawn_counted( or spawn_blocking( in \
-         their own body: {offenders:?}. An async command that does its work inline is polled on the webview \
-         thread and blocks it just as a sync one would (performance.md §1, §2 P1) — hand the \
-         WHOLE body over, with nothing before the first await"
+        "these async commands never call any of {DELEGATION:?} in their own body: \
+         {offenders:?}. An async command that does its work inline is polled on the webview \
+         thread and blocks it just as a sync one would (performance.md §1, §2 P1/P8-writer) — \
+         hand the WHOLE body over, with nothing before the first await"
     );
 }
 
