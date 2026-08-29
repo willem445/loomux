@@ -251,7 +251,8 @@ export class GroupView {
   /** Window-visibility gate around that timer (#743 S6, pollgate.ts). Component
    *  scope (`show()`/`hide()`) and window visibility are different questions:
    *  this panel was already scoped and still polled ten invokes every 2 s
-   *  behind a minimized window. */
+   *  behind a minimized window. (One invoke since #1608 — the gate's reason is
+   *  unchanged: a panel behind a hidden window should poll nothing at all.) */
   private pollGate: PollGate = new PollGate({
     arm: () => {
       // Defensive clear-before-arm, kept from the pre-gate `show()`: a stray
@@ -267,7 +268,8 @@ export class GroupView {
     },
     refresh: () => void this.load(),
   });
-  /** Single-flights `load()`'s ten-invoke `Promise.all`, with a trailing
+  /** Single-flights `load()` — one published read since #1608, a ten-invoke
+   *  `Promise.all` when this gate was written — with a trailing
    *  re-run rather than a bare skip (#1602, plan §3 Phase 2.2 of EPIC #1600;
    *  composed with the repo's existing `refreshgate.ts` per PR #1604 review
    *  N4 — `load()` is not only the 2 s poll tick, it is also the refresh
@@ -275,7 +277,7 @@ export class GroupView {
    *  silently rather than just deferring a tick). A poll tick or gesture
    *  that fires while a previous `load()` is still outstanding — the
    *  backend is slow, or a registry lock is stuck — neither starts a second
-   *  concurrent `Promise.all` (so a stuck backend still cannot pile up
+   *  concurrent read (so a stuck backend still cannot pile up
    *  blocking-pool threads one per tick) nor is lost: it is coalesced into
    *  exactly one catch-up run once the in-flight one finishes. One instance
    *  per open group view (never module-scoped), so a stuck poll in this

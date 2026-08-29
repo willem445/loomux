@@ -85,7 +85,7 @@ const VIEWS: ViewRow[] = [
     kind: "group",
     source: "src/groupview.ts",
     woken: true,
-    why: "a 2 s poll started by show() itself — nine invokes a tick. #361 rev-38 NB2 is where this hook came from.",
+    why: "a 2 s poll started by show() itself — ONE invoke a tick since #1608, ten before it. #361 rev-38 NB2 is where this hook came from.",
   },
   {
     kind: "editor",
