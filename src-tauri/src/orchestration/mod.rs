@@ -22347,8 +22347,16 @@ fn run_queue_drainer(
             // reader of the gate whose hold has no cap, so it is the one whose
             // audit has to say what it keyed on — see
             // `question_active_witnessed`.
-            let reading =
-                question_active_witnessed(&ptys, pty_id, None, reg.delivered_mask_lines(pty_id));
+            let reading = question_active_witnessed(
+                &ptys,
+                pty_id,
+                None,
+                // #1702: the pty->session resolution is spelled out here rather
+                // than hidden inside the record read. This poll holds no
+                // registry guard, which is exactly the fact the old shape made
+                // impossible to check at a glance.
+                reg.delivered_mask_lines(pty_id, reg.session_for_pty(pty_id).as_deref()),
+            );
             let question_seen = reading.witnessed;
             let admission = write_admission(box_pending, reading.active);
             // #903: the streak the last-resort override keys on. Counted here,
@@ -22629,7 +22637,13 @@ fn run_queue_drainer(
                 let submit = submit_sequence(&cli);
                 match drain_stranded_submit(
                     &ptys, &reg.last_delivery, front.from.clone(), pty_id, submit,
-                    reg.delivered_mask_lines(pty_id),
+                    // #1702: unchanged in what it acquires — `delivered_mask_
+                    // lines` already reached `by_pty` + `agents` from here — but
+                    // now visibly so, under the per-pane delivery `lock` this arm
+                    // holds. That nesting predates #1702 and is NOT this PR's to
+                    // change; it is filed, with the reverse-order question, as
+                    // its own row.
+                    reg.delivered_mask_lines(pty_id, reg.session_for_pty(pty_id).as_deref()),
                 ) {
                     StrandedMarkerAction::Press => DeliverOutcome::Done,
                     StrandedMarkerAction::Retire(why) => DeliverOutcome::Retired(why),
@@ -24215,7 +24229,14 @@ pub fn prompt_record_admits_kind(kind: Delivery) -> bool {
 /// registry at all; an absent record is the same legitimate "nothing known"
 /// an untouched pane has, and means the marker rule (#576).
 fn delivered_lines(reg: &Option<Arc<OrchRegistry>>, pty_id: u32) -> Vec<String> {
-    reg.as_ref().map(|r| r.delivered_mask_lines(pty_id)).unwrap_or_default()
+    // #1702: this helper is the one place the delivery path resolves a pty to a
+    // session, and it does so with no registry guard held — `deliver_now` and
+    // the gates that call it take the per-pane delivery lock, never a registry
+    // map. A caller that DOES hold one must pass its own session instead; see
+    // [`OrchRegistry::session_for_pty`].
+    reg.as_ref()
+        .map(|r| r.delivered_mask_lines(pty_id, r.session_for_pty(pty_id).as_deref()))
+        .unwrap_or_default()
 }
 
 /// The evidence floor a MID-LINE anchor must clear (rev-163 N1).
@@ -38849,9 +38870,7 @@ impl OrchRegistry {
         //
         // Phase 2 is where every nested acquisition now happens, and it happens
         // with the registry free. `doc/design/lock-liveness.md` §6 is the
-        // contract;
-        // `liveness.rs`'s `l1702_the_attention_tick_never_holds_agents_across_
-        // its_per_agent_mask_work` is the guard.
+        // contract; `liveness.rs`'s `l6a_`/`l6b_` rows are the guard.
         let roster: Vec<AgentEntry> = self.agents.lock_safe().values().cloned().collect();
 
         // Board-derived gate map: agent id → gate status, across every live
@@ -38952,7 +38971,15 @@ impl OrchRegistry {
             .filter(|a| a.status == AgentStatus::Running)
             .filter_map(|a| tails.get(&a.id).map(|t| (a, t)))
             .map(|(a, t)| {
-                let delivered = a.pty_id.map(|p| self.delivered_mask_lines(p)).unwrap_or_default();
+                // #1702: the session comes off the ROSTER SNAPSHOT, so this
+                // phase resolves nothing and takes neither `by_pty` nor
+                // `agents`. That is the difference between "the deadlock is
+                // unreachable because no lock is held here" and "the tick never
+                // asks the question that deadlocked it".
+                let delivered = a
+                    .pty_id
+                    .map(|p| self.delivered_mask_lines(p, a.session_id.as_deref()))
+                    .unwrap_or_default();
                 let shaped =
                     prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
                 (a.id.clone(), shaped)
@@ -39112,9 +39139,15 @@ impl OrchRegistry {
             .filter(|pty| !agent_ptys.contains(pty))
             .filter_map(|pty| tails.get(&pty).map(|t| (pty, t)))
             .map(|(pty, t)| {
-                // #576 residual: the record is keyed by pty id, which is
-                // exactly what this path has.
-                let delivered = self.delivered_mask_lines(pty);
+                // #576 residual: the pane record is keyed by pty id, which is
+                // exactly what this path has. The SESSION record needs a
+                // resolution, and a plain pane has no snapshot to take it from —
+                // so this path asks, and #1702's whole point is that it asks
+                // here, with no lock held, rather than from inside the map hold
+                // below. Semantics unchanged: a pane with no `by_pty` entry
+                // resolves to `None` exactly as it did before.
+                let session = self.session_for_pty(pty);
+                let delivered = self.delivered_mask_lines(pty, session.as_deref());
                 let shaped =
                     prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
                 (pty, shaped)
@@ -47163,10 +47196,23 @@ impl OrchRegistry {
     /// second way of answering "who holds this pane" is a second thing that can
     /// drift from the first.
     ///
-    /// **Lock order**: `by_pty` is taken and RELEASED before `agents`, and
-    /// neither is held while reaching for [`OrchRegistry::delivered_prompts`] —
-    /// see that field for the order that matters.
-    fn session_for_pty(&self, pty_id: u32) -> Option<String> {
+    /// **This TAKES `by_pty` and then `agents`** — stated as what it acquires
+    /// rather than as an internal ordering, because the ordering is not the fact
+    /// a caller needs. An earlier version of this doc read "`by_pty` is taken
+    /// and RELEASED before `agents`, and neither is held while reaching for
+    /// `delivered_prompts`". Every word of that was true of this body and
+    /// useless to its caller: `attention_tick` was holding `agents` when it
+    /// called in, so the second acquisition here was a re-entrant one on a
+    /// `parking_lot::Mutex`, and the tick parked forever. That is #1702, and it
+    /// was live for four betas.
+    ///
+    /// So the rule a caller reads off this doc is the one a lock-order note
+    /// could not give it: **never call this while holding a registry lock**, and
+    /// prefer not calling it at all — a caller that already has an agent
+    /// snapshot has the session in [`AgentEntry::session_id`] and should pass
+    /// that to [`OrchRegistry::delivered_mask_lines`] instead.
+    #[doc(hidden)] // pub for integration tests
+    pub fn session_for_pty(&self, pty_id: u32) -> Option<String> {
         // Through the EXISTING reverse index, never a fresh scan of `agents`:
         // `by_pty` is already maintained beside every `pty_id` write, and a
         // second way of answering "who holds this pane" is a second thing that
@@ -47215,15 +47261,26 @@ impl OrchRegistry {
         }
     }
 
-    /// #903: the prompt lines loomux has delivered into `pty_id`'s SESSION —
-    /// including ones delivered to a DIFFERENT pane of the same session, which
-    /// is the whole reason this exists.
+    /// #903: the prompt lines loomux has delivered into `session` — including
+    /// ones delivered to a DIFFERENT pane of the same session, which is the
+    /// whole reason this exists.
+    ///
+    /// **Takes the session id, not a pty** (#1702). Resolving a pty in here
+    /// meant every caller silently paid `by_pty` + `agents` inside a function
+    /// whose name promises a record read, and the caller that could least afford
+    /// it — `attention_tick`, which was holding `agents` and already had the
+    /// session in its own roster — is the one that deadlocked on it. The
+    /// resolution now happens at the call site, where whether a lock is held is
+    /// something a reader can see.
+    ///
+    /// `None` is the same "nothing known" an unresolvable pane always produced:
+    /// the marker rule alone, which is the fail-CLOSED direction.
     #[doc(hidden)] // pub for integration tests
-    pub fn delivered_prompt_record(&self, pty_id: u32) -> Vec<String> {
-        let Some(session) = self.session_for_pty(pty_id) else {
+    pub fn delivered_prompt_record(&self, session: Option<&str>) -> Vec<String> {
+        let Some(session) = session else {
             return Vec::new();
         };
-        self.delivered_prompts.lock_safe().get(&session).map(|d| d.claimable()).unwrap_or_default()
+        self.delivered_prompts.lock_safe().get(session).map(|d| d.claimable()).unwrap_or_default()
     }
 
     /// #903: everything the question gate's mask may claim in `pty_id` — the
@@ -47236,10 +47293,15 @@ impl OrchRegistry {
     /// no dialog question row heading the block above the anchor. A single rule
     /// is what stops "which record did this line come from" becoming a thing the
     /// mask has to get right on every row.
+    /// **`session` is supplied by the caller** (#1702) — the pane record is
+    /// keyed by pty and the prompt record by session, and only the caller knows
+    /// whether it already holds the latter. A caller with an agent snapshot
+    /// passes [`AgentEntry::session_id`] and takes NO lock to get it; one with
+    /// only a pty passes [`OrchRegistry::session_for_pty`] at its own call site.
     #[doc(hidden)] // pub for integration tests
-    pub fn delivered_mask_lines(&self, pty_id: u32) -> Vec<String> {
+    pub fn delivered_mask_lines(&self, pty_id: u32, session: Option<&str>) -> Vec<String> {
         let mut lines = self.delivered_notice_lines(pty_id);
-        lines.extend(self.delivered_prompt_record(pty_id));
+        lines.extend(self.delivered_prompt_record(session));
         lines
     }
 

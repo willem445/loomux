@@ -51462,6 +51462,12 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
 
+    // #1702: `delivered_mask_lines` no longer resolves a pty to a session
+    // itself — the caller supplies it, so that the `by_pty` + `agents`
+    // acquisition is visible where a reader can see whether a lock is held.
+    // This row is precisely about that resolution, so it performs it, through
+    // the same seam production uses.
+    let mask = |pty: u32| reg.delivered_mask_lines(pty, reg.session_for_pty(pty).as_deref());
     let session = "39b611be-f2af-4316-8efd-2917faf8f790";
     let brief = "[orch] Round 3 (cap) re-record for #1429 at new head 82875938";
 
@@ -51470,7 +51476,7 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     reg.set_pty_for_test(&first.id, 101);
     reg.record_delivered_prompt(101, brief, Delivery::MidSession);
     assert!(
-        reg.delivered_mask_lines(101).iter().any(|l| l == brief),
+        mask(101).iter().any(|l| l == brief),
         "the pane it was delivered into can see it"
     );
 
@@ -51479,7 +51485,7 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     reg.set_session_for_test(&resumed.id, session);
     reg.set_pty_for_test(&resumed.id, 102);
     assert!(
-        reg.delivered_mask_lines(102).iter().any(|l| l == brief),
+        mask(102).iter().any(|l| l == brief),
         "and so can the pane that replays it — which the per-pane notice record cannot do"
     );
     assert!(
@@ -51495,7 +51501,7 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     // what the compiler had to tell me on the round that added it.
     reg.record_delivered_prompt(101, "[orch] a regrounding-borne line", Delivery::Regrounding);
     assert!(
-        !reg.delivered_mask_lines(101).iter().any(|l| l.contains("regrounding-borne")),
+        !mask(101).iter().any(|l| l.contains("regrounding-borne")),
         "a Regrounding delivery contributes nothing, however ordinary its text looks"
     );
 
@@ -51504,7 +51510,7 @@ fn j7_the_prompt_record_is_keyed_by_session_and_outlives_the_pane() {
     reg.set_session_for_test(&other.id, "9038509b-0000-0000-0000-000000000000");
     reg.set_pty_for_test(&other.id, 103);
     assert!(
-        reg.delivered_mask_lines(103).is_empty(),
+        mask(103).is_empty(),
         "a pane resuming some OTHER session inherits nothing"
     );
 }

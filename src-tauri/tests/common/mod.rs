@@ -40,6 +40,12 @@ pub struct LongLivedSession {
     pub agent_ids: Vec<String>,
     /// `agent id -> pty id`, for the panes it bound.
     pub pty_of: HashMap<String, u32>,
+    /// `agent id -> CLI session id`. Handed back because
+    /// [`loomux_lib::orchestration::OrchRegistry::delivered_mask_lines`] takes
+    /// the session from its CALLER (#1702) rather than resolving a pty through
+    /// `by_pty` + `agents` itself — so a test that wants the record has to hold
+    /// what an agent snapshot would have held.
+    pub session_of: HashMap<String, String>,
     /// The LAST prompt line recorded against each agent's session — the one a
     /// resumed pane would be rendering, and the one still guaranteed to be in
     /// the record after the drop-oldest cap has evicted the rest.
@@ -74,6 +80,7 @@ pub fn fabricate_long_lived_session(
     let mut out = LongLivedSession {
         agent_ids: Vec::new(),
         pty_of: HashMap::new(),
+        session_of: HashMap::new(),
         last_delivered: HashMap::new(),
         deliveries_per_agent,
         outputs: HashMap::new(),
@@ -91,7 +98,8 @@ pub fn fabricate_long_lived_session(
         // `set_session_for_test` is what makes `delivered_prompt_record` reach
         // past its first `?`, and `set_pty_for_test` writes the `by_pty` entry
         // that makes `session_for_pty` reach its second lock at all.
-        reg.set_session_for_test(&a.id, &format!("00000000-0000-4000-8000-{i:012}"));
+        let session = format!("00000000-0000-4000-8000-{i:012}");
+        reg.set_session_for_test(&a.id, &session);
         reg.set_pty_for_test(&a.id, pty);
 
         // A session's worth of deliveries. Each line is DISTINCT: the record
@@ -106,6 +114,7 @@ pub fn fabricate_long_lived_session(
         }
         out.last_delivered.insert(a.id.clone(), last);
         out.pty_of.insert(a.id.clone(), pty);
+        out.session_of.insert(a.id.clone(), session);
         out.outputs.insert(a.id.clone(), 100 + i as u64);
         out.agent_ids.push(a.id);
     }

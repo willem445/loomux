@@ -634,6 +634,20 @@ deadlocking — it holds neither `by_pty` nor `agents` — but it held two
 attention maps across the same four-lock call, which is the identical shape one
 edit away from being the identical defect.
 
+**One signature carries the rule, so a later caller cannot re-create the
+nesting by accident.** `delivered_mask_lines(pty, session)` takes the session
+from its CALLER; it used to take a pty alone and resolve it internally through
+`session_for_pty`, which meant every caller silently paid `by_pty` + `agents`
+inside a function whose name promises a record read. That hidden acquisition is
+the whole defect: `attention_tick` already HAD the session — it was holding the
+map the resolution reads — and asked for it anyway. Now the tick passes
+`AgentEntry::session_id` straight off its phase-1 snapshot and resolves nothing,
+and a caller that has only a pty writes `session_for_pty` at its own call site,
+where whether a lock is held is something a reader can see rather than infer.
+`session_for_pty`'s doc says what it ACQUIRES for the same reason: its previous
+"`by_pty` is taken and RELEASED before `agents`" was true of its body, useless
+to its caller, and is the shape of note that let this ship.
+
 **The bound, which is stated rather than added.** #1702's reported diagnosis was
 that the mask reconciles a record proportional to a session's age, and that is
 false; recording it here is the point of this paragraph, because the next reader
@@ -652,10 +666,16 @@ could only narrow what the mask may claim, which is a change to #903 B2's
 guarantees, and it would buy no bound that is not already held.
 
 **How it is guarded, and what that guard does NOT cover.** The regression guard
-is `l1702_the_attention_tick_never_holds_agents_across_its_per_agent_mask_work`
-in `tests/liveness.rs`, and its fixture is the finding as much as its
-assertions are: the defect survived four betas because *no test in this repo
-could build the shape*. `attention_setup`, the helper every attention test in
+is two rows in `tests/liveness.rs` — `l6a_the_attention_tick_returns_on_the_
+state_that_deadlocked_it` and
+`l6b_the_masks_the_tick_applies_equal_the_unbounded_computation`. They are
+split because they redden for different reasons and a red evidences only the
+assertion it reached: on the pre-fix tick L6a never gets past "did the call
+return", so an equality assertion sharing its body would bank a coverage claim
+no run ever produced.
+
+Their fixture is the finding as much as the assertions are: the defect survived
+four betas because *no test in this repo could build the shape*. `attention_setup`, the helper every attention test in
 `orchestration.rs` uses, spawns agents with no pty, so `pty_id` is `None` and
 the mask is never reached at all; the soak lane wedges a lock deliberately and
 probes, which measures victims of a hold and never constructs a holder out of
@@ -663,9 +683,21 @@ ordinary state. `tests/common/mod.rs` builds the missing subject — pty-bound,
 `by_pty`-mapped, session-bound, session-sized — as a generator, because the
 siblings of this defect want the same subject.
 
-That guard is one site. **There is no class guard**, and a re-entrant
-`lock_safe` on a shipped build must never be able to block forever: Phase 3's
-lock-rank work (#1698) is where that belongs, and #1702 deliberately does not
-depend on it. Until it lands, this section is the rule and review is the
-enforcement — which is the same posture §5's last bullet takes toward source
-scans, for the same reason.
+**And there is now a class guard, which changes what this defect looks like.**
+Phase 3a (#1698) merged while this slice was in flight, so `agents` carries
+`lockorder::AGENTS` (510) and `by_pty` carries `BY_PTY` (500). The pre-fix tick
+therefore fails one line EARLIER than the re-entrant acquire and for a
+different stated reason: holding 510 and reaching for 500 is a descending pair,
+so the checker panics naming both locks before the deadlock can form. The
+timeout and the panic are the same defect through two instruments, which is why
+L6a distinguishes them in its failure message rather than reporting one as the
+other.
+
+That is a better failure than a hang, and it is not a substitute for this
+section. The checker sees a pair of RANKED locks held at once; it does not see
+a long hold, and it does not see the unranked ones — `app` and every `attn_*`
+map are `TrackedMutex::new`, so the `if let` guard `run_attention` was holding
+across an IPC emit and three further locks is invisible to it. Ranks bound the
+ORDER of a nesting; §6's rule is that a registry lock should not span such a
+call at all. Review is still the enforcement for that, as §5's last bullet says
+of source scans, for the same reason.
