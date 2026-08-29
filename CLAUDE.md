@@ -559,6 +559,22 @@ narrow their ask back down to the original ticket on your own judgment.
   the branch — after cleaning the worktree, verify with
   `git ls-remote --heads origin <branch>` and `git push origin --delete
   <branch>` if it survived. Whoever performs the merge owns this step (#662).
+- **A closing-keyword sweep of a squash message must be MULTILINE, and the
+  merge is verified on the issue.** GitHub's scan spans the line break, and in a
+  commit message it is not markdown-aware — no fences, no code spans, only
+  lines — so a `##` heading ending in *fix* above a paragraph opening `#1702`
+  closes that issue, while a line-oriented `grep` positive-controlled on a
+  one-line `Closes #N` returns exit 1 and reads clean. Sweep the concatenation
+  the squash message actually is (title, blank line, body — separate sweeps miss
+  a keyword ending one above a reference opening the next) with
+  `LC_ALL=C.UTF-8 grep -Pzoi '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*:?\s*#[0-9]+'`,
+  then after the merge re-read the state of every issue the body only said
+  `Part of` and reopen what closed. That outcome check is the half that cannot
+  be blind — `closingIssuesReferences` on the PR is markdown-aware and answers
+  EMPTY for a body that closes an issue anyway — and whoever performs the merge
+  owns it as they own the branch delete (cf. #1697, the same blindness in a
+  claim sweep). Signature: a `closed` timeline event carrying the squash
+  commit's SHA on an issue no keyword names (#1702 by `d8bb4e8e`).
 - **Git Bash mangles a `<ref>:<path>` argument when the path starts with a
   dot.** `git rev-parse origin/main:.github/x` is rewritten to
   `origin\main;.github\x` and errors, while `origin/main:src/x` works — so a
@@ -782,6 +798,14 @@ narrow their ask back down to the original ticket on your own judgment.
   published site does not while `docs/_config.yml` has no `mermaid:` key; corroborate with
   byte-identity against a fence already rendering there. Signature: a fence moved between
   files and its rendering "measured" (#1324, `doc/design/group-workflow-diagram.md`).
+  **A hand-wrap inside an inline code span renders as a space**, so a path or
+  identifier broken across a line names something that does not exist — a break
+  at a space is harmless (`` `delivered_mask_lines(pty,` `` / `` `session)` ``), a
+  break inside a token is the defect (`src-tauri/src/orchestration/ mod.rs`). It is
+  outside the trigger list above: the subject is a SPAN, not a table, list or fence,
+  and the PR body counts because the squash makes it permanent. Signature: the fix
+  for one instance ships another one surface over (#1703 B2 in the design note, then
+  R1 in the body it re-posted); the repo-wide backlog and the scanner are #1716.
 - **A claim about the PR body is measured on the POSTED body, never on your
   draft.** Writing it is not posting it: a body rebuilt from sources destroys any
   edit made to the assembled file, so edit the sources, assemble, then re-read the
