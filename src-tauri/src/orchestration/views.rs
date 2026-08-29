@@ -623,22 +623,34 @@ impl ViewPublisher {
         );
         self.strip_tier_computes.fetch_add(1, Ordering::Relaxed);
 
+        // A view tier with NOTHING to inherit is withheld rather than
+        // fabricated (#1609 review N1). The three booleans below would
+        // otherwise fall back to `false` — a positive assertion ("this group
+        // is not paused") on exactly the ground this file refuses for the
+        // first-pass case, and one a human acts on. It bites a group whose
+        // previous entry was STRIP-ONLY: bound to a tab, never view-leased,
+        // so `prev` is `None` while `previous` is not.
+        //
+        // `view: None` is not a new degrade: it is the "not leased yet" state
+        // both payload builders already render, and `viewstale.ts`'s
+        // `view_ready` ladder already re-asks on it.
         let view = if leased {
             self.view_tier_computes.fetch_add(1, Ordering::Relaxed);
             let prev = previous.and_then(|p| p.view.as_ref());
-            Some(GroupViewTier {
+            let tier_partial = Cell::new(false);
+            let mut tier = Some(GroupViewTier {
                 paused: Self::section(
-                    &partial,
+                    &tier_partial,
                     || prev.is_some_and(|v| v.paused),
                     || reg.is_paused(group),
                 ),
                 notify: Self::section(
-                    &partial,
+                    &tier_partial,
                     || prev.is_some_and(|v| v.notify),
                     || reg.notify_enabled(group),
                 ),
                 spawn_expanded: Self::section(
-                    &partial,
+                    &tier_partial,
                     || prev.is_some_and(|v| v.spawn_expanded),
                     || reg.spawn_expanded(group),
                 ),
@@ -667,7 +679,19 @@ impl ViewPublisher {
                     || prev.map(|v| v.locks.clone()).unwrap_or(Value::Null),
                     || reg.lock_state(group),
                 ),
-            })
+            });
+            // The tier is WITHHELD when a section of it went busy with nothing
+            // to inherit — `prev` is `None`, so the three booleans would have
+            // fabricated `false`. Its partial-ness still counts toward the
+            // group, because the group IS partial: it was asked for a view tier
+            // and could not produce one.
+            if tier_partial.get() {
+                partial.set(true);
+                if prev.is_none() {
+                    tier = None;
+                }
+            }
+            tier
         } else {
             None
         };

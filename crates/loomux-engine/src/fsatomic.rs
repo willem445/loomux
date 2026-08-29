@@ -16,13 +16,21 @@
 //! **It has exactly one outward edge now** (#1609), and it is named here rather
 //! than left for a reader to find in the body: [`atomic_write`] calls
 //! [`crate::budget::note_durable_write`]. That is two thread-local reads and,
-//! on the rare path, a breadcrumb — no lock, no wait, no new failure mode — and
-//! it exists because this function is the single door every durable
-//! orchestration state file goes through, which makes it the only place that
-//! can notice a write happening on a read path that a bounded acquisition could
-//! unwind out of (`doc/design/lock-liveness.md` §4). The boundary argument
-//! above is untouched: still `std::fs` only, still no `tauri`, still nothing a
-//! headless daemon cannot link.
+//! on the rare path, a breadcrumb — no lock, no wait, no new failure mode.
+//!
+//! It exists because this function is the durable **REPLACE** primitive: it
+//! destroys the previous contents of a state file, so a bounded acquisition
+//! that unwound after it would leave a world nothing else agrees with. The
+//! call SEALS the surrounding budget frame, which is what makes that
+//! impossible (`doc/design/lock-liveness.md` §4.1).
+//!
+//! **It is not the only durable-write door, and an earlier version of this
+//! note said it was** (#1609 review B3). `append_audit` and
+//! `append_ledger_line` in `orchestration/mod.rs` write state files too, by
+//! append rather than replace, and deliberately do NOT seal — §4.3 carries
+//! that line and the reason. The boundary argument above is untouched: still
+//! `std::fs` only, still no `tauri`, still nothing a headless daemon cannot
+//! link.
 //!
 //! **Deliberately no `tempfile`.** Uniqueness comes from a std atomic, which
 //! keeps this clear of the getrandom-based crates the Windows 10 baseline
@@ -60,12 +68,16 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// rename so a rename can't expose a metadata-only file whose data blocks never
 /// reached disk — exactly the disk-full failure mode.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // #1609 rider R1's detector. Every durable orchestration state file is
-    // written through here, which makes this the one place that can notice a
-    // durable write happening inside a `read_budget` frame and outside any
-    // `MutationScope` — the shape whose unwind could tear it. It REPORTS (a
-    // counter and a bounded breadcrumb) and never refuses; see
-    // `budget::note_durable_write` and `doc/design/lock-liveness.md` §4.
+    // #1609 rider R1. This is a durable REPLACE, so it SEALS the surrounding
+    // budget frame: from here to the end of that frame a timed acquisition
+    // waits instead of unwinding, which is what makes it impossible to
+    // abandon the work that completes this write's invariant. Before the
+    // write the frame keeps its bound. See `budget::note_durable_write` and
+    // `doc/design/lock-liveness.md` §4.1.
+    //
+    // Called BEFORE the write rather than after it, deliberately: the seal
+    // has to be in place for every acquisition that could follow, and the
+    // first of those is `fs::create_dir_all` failing into an early return.
     crate::budget::note_durable_write(
         path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
     );

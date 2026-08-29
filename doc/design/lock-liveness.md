@@ -256,76 +256,112 @@ unheld first pass DOES publish.
 ## 4. Rider R1: why abandoning a read path is safe
 
 The orchestrator made this blocking, and rightly: an unwind through arbitrary
-read code is only safe if no read path is in the middle of writing something when
-it fires. Two halves — the writes, and the guards.
+read code is only safe if no read path is in the middle of writing something
+when it fires.
 
-### 4.1 The criterion, and why it is narrower than it first looks
+**Round 1 of review found the first answer to this insufficient, and the way it
+was insufficient is the reason §4.1 is now a mechanism rather than a list.** The
+original answer enumerated the writes on the read paths and argued each one
+safe. The enumeration declared its own scope as including "MCP `ToolKind::Read`
+arms" and then never looked at them: four of the seventeen wrote durably, one
+(`check_mail`) *consumingly*, and the `MutationScope` the note quoted for the
+one hazard it did enumerate was not in the tree at all. An enumeration is a
+claim about today's call graph, re-verified by nobody, and it failed exactly
+where a claim like that fails — in the part somebody assumed rather than read.
 
-An unwind fires **only** at a `lock_safe()` acquisition that runs out of budget,
-at mutation depth 0. So a write `W` is torn only if, in the same dynamic frame,
-there is a tracked-lock acquisition **between `W` and the point at which `W`'s
-invariant is complete**.
+### 4.1 The rule: a durable write seals its frame
 
-A write with no acquisition after it is *not torn* — it is simply not reached,
-which is the same outcome as any other early return and is what every one of
-these functions already tolerates. That is what makes the audit finite: the
-question is not "does this read path write?" but "does it write and then
-acquire?".
+An unwind can fire **only** at a lock acquisition that runs out of budget. So a
+write is never torn by itself — it is torn by an acquisition that comes *after*
+it, unwinding past the code that would have completed its invariant.
 
-The read-path set is closed and chosen here — publisher sections, MCP token
-resolution, MCP `ToolKind::Read` arms, and the enumerated read commands — so the
-audit is over their transitive writes.
+That gives the rule, and it is the whole of the safety argument:
 
-**`resolve_token`** — the frame #1606's hole actually blames — is a pure read:
-three acquisitions (`by_token`, `agents`, `groups`), zero writes. Nothing to
-tear. This is why `MCP_AUTH_BUDGET` is the safest of the six as well as the most
-valuable.
+> **The first durable write inside a `read_budget` frame SEALS that frame.**
+> From there to the end of it, a timeout waits instead of unwinding — exactly as
+> inside a [`MutationScope`], and for the same reason.
 
-**`default_branch_within`** (`mod.rs`) reads the memo under one acquisition,
-releases, spawns `git`, then re-acquires to insert. The insert is a single leaf
-acquisition with nothing after it: an unwind there discards the subprocess result
-and leaves the memo untouched, and the next caller re-runs the ladder. Cost: one
-wasted `git`. The memo's invariant is `repo -> (stamp, answer)` and a missing
-entry is a legal value of it — it is the initial one.
+`budget::note_durable_write` is where it happens; `budget::unwind_forbidden` is
+what the acquisition path asks. Everything *before* the first durable write
+keeps its bound, so the common case — a read that reads — is unaffected, and a
+read path that writes gives up its bound only for the region that needs it. It
+fails toward a stall, which Phase 0's watchdog reports with the holder named,
+never toward a torn write.
 
-**`group_usage_memoed`** (`mod.rs`) is the one the rider names, and it has three
-unwind points:
+**Why not the other candidate rule.** The alternative was to make every tool arm
+that writes into a `ToolKind::Mutate`. That is right where a tool genuinely
+mutates and is done below — but it cannot be the whole answer, because it only
+reaches writes that are behind a *tool*. The snapshot publisher's `usage.json`
+merge is on a read path with no tool anywhere near it. Nor could a hand-placed
+`MutationScope` per site be: that is the "did we remember" review dependency the
+epic's §2 is about, over seventeen arms plus whatever is added next month — and
+the first version of this note is the evidence, having missed four of them.
 
-- at `cell.lock_safe()`, after `or_insert_with` has put an **empty** cell in the
-  map. That is byte-identical to what the next caller would create; the map's
-  invariant is "group -> its cell" and an empty cell satisfies it.
-- inside `compute_group_usage`, with the cell guard live. `TrackedGuard::drop`
-  runs as the unwind passes (§4.2), the cell keeps its **previous** value, and
-  the memo is derived state: stale or absent costs a recomputation, never a wrong
-  answer.
-- at `*slot = Some(..)` itself — unreachable, because the tuple is fully built
-  before the assignment and the assignment takes no lock.
+**Why seal at the write and not at the function's entry.** Sealing an entry
+point gives up the bound on every path through it, including the ones that never
+write. Sealing at the write is the minimum window that closes the hazard.
 
-**`merge_usage_snapshots`** (`mod.rs`) is the one real hazard, and it is *scoped*
-rather than argued away. It is reached from `group_usage` — an MCP read tool and
-a polled read — and it performs a durable whole-file write of `usage.json`. Today
-nothing acquires after `atomic_write` on the success path, so it happens to be
-untearable; that is a fact about this body, not a property of it, and the failure
-path re-reads. It takes:
+### 4.2 The classification, re-derived from what the arms do
 
-```rust
-let _guard = self.usage_lock.lock_safe();   // still BOUNDED: nothing written yet,
-                                            // so a wedged usage_lock still answers Busy
-let _mutation = MutationScope::enter();     // from here on, no unwind
-```
+The `ToolKind` table was originally written from what tool NAMES sound like,
+which is the same defect this repo has a rule against for source-scanning
+guards. Re-derived from the arms:
 
-The order is the whole point. Entering the scope *before* the entry acquisition
-would make a read path wait unbounded on `usage_lock` — reintroducing precisely
-the bug this phase removes. The scope covers only the region in which a write is
-in flight. `load_usage_snapshots`' corrupt-file branch (`fs::rename` followed by
-an `audit()` that takes `AUDIT_LOCK`) is the one non-`atomic_write` write on a
-read path, and it is inside this scope; it has no other caller.
+| tool | what it does | kind |
+| --- | --- | --- |
+| `check_mail` | marks every message read, prunes, replaces `mailbox.json`, then takes `app` and `AUDIT_LOCK` | **Mutate** |
+| `queue_orphans` | publishes a recovery latch, then a two-phase persist/deliver cascade | **Mutate** |
+| `list_locks` | `with_locks` → `table.sync(declared)`, which drops undeclared resources including live holders, then audits | **Mutate** |
+| `group_usage` | merges and replaces `usage.json` as a cache refresh | Read, sealed |
+| the rest | read registry or on-disk state | Read |
 
-### 4.2 `TrackedGuard::drop` during an unwind
+`check_mail` is the one worth dwelling on: its own doc calls it *"the manager's
+consuming read"*, and the registry it belongs to exists to make *"a message
+silently consumed by nobody"* impossible. Classified as a Read and unwound after
+its write, it produced precisely that — mail marked read and pruned on disk,
+with the caller told nothing had executed.
 
-The rider's second half. Rust drops live locals as an unwind passes through them,
+`group_usage` stays a Read deliberately. Its write is a durable *cache refresh*
+rather than the point of the call, and the seal is what makes it safe; putting
+every usage read on the 30 s mutate deadline would be a heavy answer to a hazard
+the floor already closes.
+
+`pr_checks` was in the Read set and is not a tool at all — `tool_defs` registers
+no such name. A dead row classifies nothing, and a typo'd entry degrades to
+`Mutate` silently, so the classification test now takes its population from what
+`tools/list` actually returns.
+
+### 4.3 Which writes seal: replace, not append
+
+The claim this note used to make — *"every durable orchestration state file goes
+through one door"* — was false, and this PR's own L2a fix made it more so by
+moving the `tool-call` audit line inside the read budget. The measured set of
+durable-write primitives in the orchestration tree is `fsatomic::atomic_write`,
+`append_audit` / `append_ledger_line` (append-only, via `OpenOptions`), and a
+small number of direct `fs::write` / `fs::rename` calls.
+
+They do not all need the same treatment, and the line between them is what
+*tearing* means:
+
+- **A REPLACE destroys the prior value.** If the follow-up work is abandoned,
+  what is left on disk is a world nothing else agrees with. These seal:
+  `atomic_write` (every state file), and `load_usage_snapshots`' corrupt-file
+  `fs::rename`, which moves the live file aside and is followed by the `audit`
+  acquisition that records why.
+- **An APPEND leaves a complete record with nothing depending on it.** These do
+  not seal, and that is deliberate rather than an omission: `append_audit` runs
+  for *every* tool call including every Read, inside the budget, so sealing it
+  would disarm the read budget for the entire MCP surface — the bound would be
+  live only until the first audit line, which is to say never.
+
+`note_agent_ack`, which rider R1 named alongside `audit`: one acquisition, an
+in-memory `max`, nothing after it. Nothing to tear.
+
+### 4.4 `TrackedGuard::drop` during an unwind
+
+Rider R1's second half. Rust drops live locals as an unwind passes through them,
 so a guard held when some deeper acquisition times out gets its `Drop` body: the
-generation counter goes odd -> even, the lock reads FREE to the watchdog, and the
+generation counter goes odd → even, the lock reads FREE to the watchdog, and the
 inner guard's own drop releases the mutex.
 
 The property that makes this true rather than hopeful is that **`Drop` cannot
@@ -335,52 +371,49 @@ no allocation, no indexing, and no arithmetic that can overflow
 (`saturating_sub`). A panic in a drop during an unwind is an abort; this one has
 nothing to panic with.
 
-(The store and the read-modify-write are counted apart rather than lumped as "two
-release read-modify-writes", which is what this paragraph said before rebasing
-onto #1625 — #1608 corrected that figure on `TrackedGuard::drop` itself, and the
-correction is load-bearing for the same reason it was there: this body runs with
-the mutex still held, so what it costs is what every waiter behind it pays.)
+(The store and the read-modify-write are counted apart rather than lumped as
+"two release read-modify-writes", which is what this paragraph said before
+rebasing onto #1625 — #1608 corrected that figure on `TrackedGuard::drop`
+itself, and the correction is load-bearing for the same reason it was there:
+this body runs with the mutex still held, so what it costs is what every waiter
+behind it pays.)
 
 Pinned, not asserted: `budget::tests::an_unwind_leaves_no_tracked_lock_held`
 holds one lock, times out on a second, and after the `Err` checks both that the
-first is re-acquirable **and** that `held_locks()` no longer names it — the second
-being the watchdog-visible half, which is what would otherwise report a holder
-that no longer exists.
+first is re-acquirable **and** that `held_locks()` no longer names it — the
+second being the watchdog-visible half, which is what would otherwise report a
+holder that no longer exists.
 
-### 4.3 The residual, and the detector that bounds it
+### 4.5 R1 is a test, not an argument
 
-§4.1 enumerates the writes on read paths **today**. What an enumeration can never
-cover is the next edit: a write added to a function some read path calls, with
-nothing to say so. That is the "did we remember" review dependency the epic's §2
-is about, and leaving it as prose would be this document repeating the mistake it
-describes.
+`budget::torn_writes()` counts frames that unwound after a durable write — the
+tear itself. The seal makes it structurally zero, and
+`no_read_tool_can_unwind_after_a_durable_write` (`tests/liveness.rs`) is what
+asserts it: every tool the surface classifies as a Read, driven under a budget
+with `app` held — the lock `write_mailbox` takes *after* its durable replace,
+which is the shape the tear needs.
 
-Every durable orchestration state file is written through one door —
-`fsatomic::atomic_write` — so that door notices:
-`budget::note_durable_write` counts, and breadcrumbs `write-on-read-budget`, when
-a durable write happens inside a `read_budget` frame and outside any
-`MutationScope`. `budget::unscoped_durable_writes()` makes it assertable.
+Three claims, kept apart because they are easy to conflate:
 
-**It reports; it does not refuse.** A panic there would be a guard that blocks a
-build, and the rule in `CLAUDE.md` is that a refusing guard ships only after
-running clean over known-good subjects — which cannot be established for a write
-population nobody has enumerated. A counter a test can assert on, plus a bounded
-breadcrumb trail a field report carries, is what is available honestly.
+- the **sweep** proves no Read tool tears;
+- the **probe** beside it — a frame that deliberately writes and then hits a held
+  lock — proves the instrument that would catch one is running. It replaced a
+  population control that asserted "some tool wrote during the sweep", which
+  failed on CI and was right to: no Read tool did, so the sweep's `torn == 0` was
+  vacuous, and even had one written it would have been a fact about the fixture
+  rather than a property;
+- that the sweep catches a **misclassified writer** is evidenced by neither, and
+  is shown by the scratch round that puts `check_mail` back in the Read set and
+  removes the seal.
 
-Two things it does not see, stated here rather than left to be discovered:
+**What is still not covered**, stated rather than left to be found:
 
-- **Writes that are not `atomic_write`** — `fs::rename`, `fs::write`,
-  `fs::create_dir_all`. The one such site on a read path today is named in §4.1
-  and is inside a scope.
-- **Non-durable writes** — in-memory registry state mutated on a read path. The
-  memos in §4.1 are the known instances and are argued individually; a new one
-  would be invisible here.
-
-Giving `atomic_write` this call is `fsatomic`'s first outward edge, which
-contradicted a claim its own header, the engine `lib.rs` account, and
-`engine-extraction.md` all carried; all three are corrected in the same commit.
-The boundary argument is untouched — still `std::fs` only, still nothing a
-headless daemon cannot link.
+- `note_durable_write` is called from the replace-shaped writers named in §4.3.
+  A new durable write that reaches neither of them is invisible to the seal, and
+  the sweep would only catch it if it were on a Read arm and tore during that
+  test.
+- The seal is per frame and per thread. Work handed to another thread inside a
+  read frame does not inherit it; nothing on these paths does that today.
 
 ## 5. What this does not do
 
