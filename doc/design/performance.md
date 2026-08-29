@@ -38,6 +38,60 @@ The budget follows: **nothing on that thread beyond in-memory work.** A
 saturated GUI thread is felt as app-wide sluggishness while total CPU sits at
 15-30% — one thread pinned on a many-core box, not a busy machine.
 
+### 1.1 The other scarce resources
+
+For a long time the paragraph above was the whole model, and every invariant in
+§3 is written about that one thread. `doc/plans/responsiveness-root-cause.md`
+§2.1 is the account of what that cost: the remedy the invariants prescribe is
+always *"move it off the webview thread"*, the **destination** was ungoverned,
+and three releases in a row moved a stall from one scarce resource to another
+while each move looked like a fix.
+
+There are four, and the model names all four:
+
+1. **The webview/GUI thread** — §1 above. Saturating it is felt as
+   sluggishness: the window is slow but everything still works eventually.
+2. **The shared `spawn_blocking` pool.** Every `run_blocking`/`spawn_counted`
+   hand-off in the app lands in ONE pool — `write_pty`, the app's most
+   latency-critical path, alongside every converted `orch_*` poll. Nothing in
+   the tree sets `max_blocking_threads`, so it is tokio's default of **512**.
+   Saturating it does not feel like slowness: `src/ptywrite.ts` keeps one
+   `write_pty` in flight per pane and chains the next on the previous promise
+   (#65's ordering guarantee), so a `write_pty` that is never scheduled stops
+   that pane accepting input **permanently**, while the window keeps painting.
+   Every hand-off is counted through `blocking.rs` `spawn_counted` (#1601
+   Phase 0.3) and the depth is breadcrumbed at 64/128/256.
+3. **The MCP request threads.** `orchestration/mcp.rs` is `tiny_http` with
+   `std::thread::spawn` per request; every tool call resolves its token and
+   then takes registry locks on that thread. This is the orchestrator's only
+   channel, and no invariant here governs it — a hold that parks these threads
+   takes the whole fleet down before a human notices anything at all, which is
+   why the MCP is the FIRST thing to die in the incident chain and the last
+   thing anyone thinks to look at.
+4. **Lock acquisition time, as distinct from hold time.** INV-5 bounds what a
+   HOLDER does. Nothing here bounds what a WAITER pays: `lock_safe` is
+   `Mutex::lock` with poison recovery — no timeout, no try-lock — so a
+   caller's cost is set by a lock's worst holder, not by its own body. This is
+   the resource #1595 classified five commands against without knowing it
+   existed (see `Class::Cheap`'s note in E1). Since #1601 Phase 0.1 every
+   registry lock is a `loomux_engine::lockwatch::TrackedMutex`, so a hold past
+   five seconds is breadcrumbed with its call site, duration and waiter count
+   — and `selfwatch`'s liveness heartbeat separates a stuck GUI thread from a
+   starved backend, which is the distinction that cost a release cycle to make
+   by hand.
+
+**Naming them is not governing them.** #1601 makes 2 and 4 *observable*; it
+bounds nothing and refuses nothing. Resource 2 has since gained its first real
+bound — INV-4's single-flight sentence below (#1602/#1604), which stops a poll
+path accumulating parked pool threads one per tick — and that is the shape the
+rest will take: a rule stated against a resource this section names. What is
+still ungoverned is resource 3 entirely, and resource 4 on every path (a
+bounded acquisition with a typed `Busy`, an isolated pool for pty writes:
+Phases 1 and 2 of the plan). Those are deliberately not written here ahead of
+their code, because an invariant over a model that omitted the scarce resource
+is exactly what produced a *correct* classification of five commands as `cheap`
+that then froze the app.
+
 ## 2. The proven patterns
 
 Each is shipped, tested, and citable — prefer copying one to inventing a shape.
@@ -322,6 +376,8 @@ These are deliberate and stay. Each is argued **in code** at the cite; an E1/E2
 | **X4** | `mq_state_lock` held across git/gh subprocess runs, on the fleet's single gh-poll thread | `orchestration/mod.rs` `OrchRegistry::mq_state_lock` + its doc (~L8914); the holding sites `queue_merge_with` (~L35967) and `mq_drive_group_with` (~L36346); `crates/loomux-engine/src/mqdriver.rs` `MQ_CMD_TIMEOUT` (#888 batch 12a moved it out of `orchestration/`) | One registry-wide lock is deliberate — the driver services one group per tick, so per-group locks buy no usable concurrency at the cost of a lock-ordering question. Every call is bounded by `MQ_CMD_TIMEOUT` (60 s), and the coupling is self-documented. **Scope of the exception: it costs fleet latency, not GUI latency** — nothing here runs on the webview thread. Decoupling is #748, not a licence to widen this. | INV-4, INV-5 |
 | **X5** | The compact-nudge cadence reads every agent's full pty tail (outside the `agents` lock since #743 S7 — the whole-ring *read* is the exception, not the lock scope) | `orchestration/mod.rs` `OrchRegistry::any_compact_pending` + its doc (~L25955) | The elevated cadence is registry-wide and its cost is bounded and stated: ≤256 KiB × 6 wakes/min per agent (sub-1 MiB/s for a large fleet), and the elevated cadence itself cannot run beyond ~20 min by the state machine's own timeouts. Two cheap tightenings are named in-code, neither built speculatively. | INV-5 |
 | **X6** | `AUDIT_LOCK` and `creation` are process-global | `orchestration/mod.rs` `AUDIT_LOCK` (~L10040), `append_audit` (~L10212), `rotate_audit_if_needed` (~L10070); `OrchRegistry::creation` (~L9102) | Both serialize by design. `AUDIT_LOCK` makes append and rotation one unit and is held only for the open+write, never across orchestration work; the JSON is formatted before the lock is taken. `creation` serializes group id choice against orchestrator registration, which is a correctness requirement, and fires once per group launch. Named so each stays a decision rather than an accident. | INV-5 |
+| **X7** | `liveness_stamp` stays sync | `liveness.rs` `liveness_stamp` + its doc; `src/liveness.ts` `startLiveness`; `crates/loomux-engine/src/selfwatch.rs` `liveness` | The blocking pool is one of the two things this command MEASURES (§1.1 resource 2). Delegated, it would stop running at exactly the moment the pool is exhausted, and the heartbeat would then report the webview thread stuck on the one occasion it is the only healthy half left — the opposite of the truth, on the reading a diagnosis would rest on. The body is six relaxed atomic stores and a monotonic clock read: no allocation, no IO, and **no `Mutex` at all**, so there is no acquisition to park on either (the half of `cheap` #1595 added). Filed here rather than as `cheap` because the synchrony is a *requirement*, and a future sweep that mechanically converts the `cheap` rows must not take it. Its 1 Hz timer is also the one in E2's manifest that must NOT be visibility-gated — a hidden window is a state the app can be frozen in — which is argued at that row and at `src/liveness.ts`. | INV-1, INV-4 |
+
 
 An exception is not a precedent. A new one needs its own argument, in code at
 the site, and a row here.

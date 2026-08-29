@@ -423,7 +423,8 @@ use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Weak};
+use loomux_engine::lockwatch::TrackedMutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -12560,12 +12561,12 @@ pub struct OrchRegistry {
     /// synchronization, and `&self` is all its methods need.
     roots: Arc<RootRegistry>,
     /// Absent in unit tests: spawning then skips the pane round-trip.
-    app: Mutex<Option<AppHandle>>,
-    groups: Mutex<HashMap<GroupId, GroupInfo>>,
-    agents: Mutex<HashMap<String, AgentEntry>>,
-    by_token: Mutex<HashMap<String, String>>,
-    by_pty: Mutex<HashMap<u32, String>>,
-    pending_binds: Mutex<HashMap<String, mpsc::Sender<u32>>>,
+    app: TrackedMutex<Option<AppHandle>>,
+    groups: TrackedMutex<HashMap<GroupId, GroupInfo>>,
+    agents: TrackedMutex<HashMap<String, AgentEntry>>,
+    by_token: TrackedMutex<HashMap<String, String>>,
+    by_pty: TrackedMutex<HashMap<u32, String>>,
+    pending_binds: TrackedMutex<HashMap<String, mpsc::Sender<u32>>>,
     /// The `SpawnRequest`s built on the **no-frontend** path, by agent id — the
     /// payload a real frontend would have received, kept only when there is no
     /// frontend to hand it to (see the `app.is_none()` branch of
@@ -12581,7 +12582,7 @@ pub struct OrchRegistry {
     /// unit proves nothing about the caller that feeds it. `spawn_agent_ex` is
     /// the only site that needs this; `register_orchestrator_pane` RETURNS its
     /// request, so its own wiring is already assertable.
-    test_spawn_requests: Mutex<HashMap<String, SpawnRequest>>,
+    test_spawn_requests: TrackedMutex<HashMap<String, SpawnRequest>>,
     /// Per-agent notices produced while compiling a spawn (#802), waiting to be
     /// read ONCE by the `spawn_agent` reply that caused them
     /// ([`Self::take_spawn_notices`]).
@@ -12595,7 +12596,7 @@ pub struct OrchRegistry {
     /// A spawn that never goes through the MCP tool has no reader, so taking it
     /// is not by itself a bound — the insert site prunes ids that are no longer
     /// live agents instead.
-    spawn_notices: Mutex<HashMap<String, Vec<String>>>,
+    spawn_notices: TrackedMutex<HashMap<String, Vec<String>>>,
     /// The `orch-session-learned` payloads produced while there was no
     /// `AppHandle` to emit them to. Empty in production, where every payload
     /// goes to the webview instead — the same seam, and the same reason, as
@@ -12613,7 +12614,7 @@ pub struct OrchRegistry {
     /// `associate_session` binds an id only while the roster record has none,
     /// so this appends at most one entry per agent ever spawned, never one per
     /// watcher poll.
-    test_session_learned: Mutex<Vec<serde_json::Value>>,
+    test_session_learned: TrackedMutex<Vec<serde_json::Value>>,
     port: AtomicU16,
     /// Agent-id counter: `w-3`, `rev-8`, `solo-2`, `orch-1` all mint their
     /// numeric suffix here. **Registry-global, not per-group** — one counter
@@ -12644,16 +12645,16 @@ pub struct OrchRegistry {
     /// **Lock order: takes no other registry lock while held**, and no caller
     /// holds one when it calls in — the same discipline `queue_persist`
     /// follows, and for the same reason (this does file I/O).
-    agent_seq_persist: Mutex<()>,
+    agent_seq_persist: TrackedMutex<()>,
     /// Per-pane delivery locks so two prompts to the SAME pane can't
     /// interleave keystrokes, while a slow delivery (waiting out a busy
     /// CLI) doesn't block deliveries to other panes.
-    delivery: Mutex<HashMap<u32, Arc<Mutex<()>>>>,
+    delivery: TrackedMutex<HashMap<u32, Arc<TrackedMutex<()>>>>,
     /// Outcome of the most recent delivery to each pane (keyed by pty id), so a
     /// delivery can flush a previous prompt still stranded in the input box
     /// before pasting (#81/#84). An `Arc` so a delivery thread can record its
     /// outcome without holding `&self`.
-    last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    last_delivery: Arc<TrackedMutex<HashMap<u32, DeliveryOutcome>>>,
     /// What loomux knows it WROTE into each pane (#576) — the marker-led lines
     /// of every delivery, bounded per pane by [`DeliveredNotices`]. Read by the
     /// question gate's mask so a notice that wrapped, or one whose marker row
@@ -12665,7 +12666,7 @@ pub struct OrchRegistry {
     /// **Lock order: takes no other registry lock while held.** Its writer
     /// (`record_delivered_text`) is called from inside `deliver_now`'s paste
     /// loop, which already holds the per-pane delivery lock.
-    delivered_notices: Arc<Mutex<HashMap<u32, DeliveredNotices>>>,
+    delivered_notices: Arc<TrackedMutex<HashMap<u32, DeliveredNotices>>>,
     /// #903: prompt bodies loomux has delivered, keyed by the agent's CLI
     /// SESSION rather than by pane — see [`DeliveredPrompts`] for why the
     /// keying is the fix and not an optimisation.
@@ -12674,7 +12675,7 @@ pub struct OrchRegistry {
     /// a pty to its session reads `agents`; nothing here holds this map while
     /// reaching for that one, which is the same order
     /// [`OrchRegistry::mark_notice_maskable`] already uses.
-    delivered_prompts: Arc<Mutex<HashMap<String, DeliveredPrompts>>>,
+    delivered_prompts: Arc<TrackedMutex<HashMap<String, DeliveredPrompts>>>,
     /// Per-pane FIFO delivery queue (#445): a hold-cap expiry in
     /// `deliver_now` enqueues here instead of destroying the payload. `Arc`
     /// for the same reason `last_delivery` is — the drainer thread
@@ -12729,7 +12730,7 @@ pub struct OrchRegistry {
     /// Panes whose queue has already fired the one-shot "still queued"
     /// visibility notice (#445) — cleared when the queue empties, so a LATER
     /// long block on the same pane can notify again.
-    queue_still_notified: Arc<Mutex<HashSet<u32>>>,
+    queue_still_notified: Arc<TrackedMutex<HashSet<u32>>>,
     /// Serializes writers of every group's `queue.json` (#468).
     ///
     /// **Lock order: this BEFORE `queues`, never the reverse**, and it is
@@ -12743,7 +12744,7 @@ pub struct OrchRegistry {
     /// every delivery in the registry, and this file is written on a path
     /// (`enqueue_text`) whose whole ordering argument depends on that
     /// critical section staying short.
-    queue_persist: Arc<Mutex<()>>,
+    queue_persist: Arc<TrackedMutex<()>>,
     /// Entries read back out of a group's `queue.json` at startup that have
     /// not yet found a pane to go back to (#467), keyed by group.
     ///
@@ -12756,7 +12757,7 @@ pub struct OrchRegistry {
     /// `queue_orphans` for the orchestrator to re-derive. Nothing expires
     /// them: an entry silently vanishing from here is the exact failure #445
     /// exists to prevent.
-    recovered_queue: Arc<Mutex<HashMap<GroupId, Vec<queue::PersistedEntry>>>>,
+    recovered_queue: Arc<TrackedMutex<HashMap<GroupId, Vec<queue::PersistedEntry>>>>,
     /// `StrandedSubmit` markers a restart made unreplayable (#467), kept
     /// separately from `recovered_queue` and never offered to
     /// `readmit_recovered`.
@@ -12769,18 +12770,18 @@ pub struct OrchRegistry {
     /// orchestrator pane is bound yet, and `deliver_to_orchestrator` is
     /// best-effort by design. "Never silently dropped" cannot rest on a
     /// delivery that is allowed to not happen.
-    recovered_markers: Arc<Mutex<HashMap<GroupId, Vec<queue::PersistedEntry>>>>,
+    recovered_markers: Arc<TrackedMutex<HashMap<GroupId, Vec<queue::PersistedEntry>>>>,
     /// Groups whose `queue.json` has already been read back this process
     /// (#467) — recovery is lazy (first touch by a bind or a
     /// `queue_orphans` call) and must happen exactly once, or a second pass
     /// would re-stage entries a first pass already re-admitted and deliver
     /// them twice.
-    recovered_groups: Arc<Mutex<HashSet<GroupId>>>,
+    recovered_groups: Arc<TrackedMutex<HashSet<GroupId>>>,
     /// Groups whose merge queue has already been reconciled this process
     /// (#581 §4). Separate from `recovered_groups` on purpose: the delivery
     /// queue and the merge queue recover independently, and sharing one mark
     /// would make whichever ran first silently suppress the other.
-    mq_reconciled_groups: Arc<Mutex<HashSet<GroupId>>>,
+    mq_reconciled_groups: Arc<TrackedMutex<HashSet<GroupId>>>,
     /// Serializes every read-modify-write of a `merge_queue.json` (#698).
     ///
     /// The driver tick and the three MCP tools are on different threads, and
@@ -12799,7 +12800,7 @@ pub struct OrchRegistry {
     /// **Never held across a notice delivery.** A delivery enqueues, and an
     /// enqueue can re-enter registry locks — the #467/#468 two-phase rule that
     /// `merge_queue_reconcile` already follows.
-    mq_state_lock: Arc<Mutex<()>>,
+    mq_state_lock: Arc<TrackedMutex<()>>,
     /// Earliest wall-clock at which the driver may service each group again
     /// (#698). Absent = now.
     ///
@@ -12808,7 +12809,7 @@ pub struct OrchRegistry {
     /// condition is a fact about the world rather than about the queue. A
     /// persisted backoff would keep punishing a batch for a network that has
     /// since come back.
-    mq_service_ms: Arc<Mutex<HashMap<GroupId, u64>>>,
+    mq_service_ms: Arc<TrackedMutex<HashMap<GroupId, u64>>>,
     /// Test seam (#698), the merge-queue sibling of `pr_head_override`: when
     /// set, `mq_driver_tick` drives with this runner instead of building a
     /// [`mqdriver::ProcessRunner`] over the group's repo. `None` in the app,
@@ -12822,7 +12823,7 @@ pub struct OrchRegistry {
     /// never both at once, which is precisely the gap that let the door stay
     /// connected to nothing. Same posture as `pr_head_override`: a canned
     /// runner, so no test spawns `git` or `gh` (CLAUDE.md constraint 3).
-    mq_runner_override: Mutex<Option<Arc<dyn mqdriver::MqRunner>>>,
+    mq_runner_override: TrackedMutex<Option<Arc<dyn mqdriver::MqRunner>>>,
     /// #560: each pane's open hold EPISODE — when it began, and what has
     /// already been said about it. Keyed by `pty_id`, in memory only (see
     /// [`HoldEpisode`] for the restart argument).
@@ -12839,7 +12840,7 @@ pub struct OrchRegistry {
     /// divergence unrepresentable rather than merely fixed: there is no way to
     /// clear the one-shot without ending the episode, because they are the
     /// same value.
-    hold_episodes: Arc<Mutex<HashMap<u32, HoldEpisode>>>,
+    hold_episodes: Arc<TrackedMutex<HashMap<u32, HoldEpisode>>>,
     /// #563: the last capacity state each pane's queue was OBSERVED in, so
     /// pressure is reported on the transition up and released on the
     /// transition down.
@@ -12862,7 +12863,7 @@ pub struct OrchRegistry {
     /// come down there is no queue entry left to say whose badge it is.
     /// Remembering who it was raised for is the only reading that survives the
     /// queue itself.
-    queue_pressure: Arc<Mutex<HashMap<u32, (queue::CapacityState, String)>>>,
+    queue_pressure: Arc<TrackedMutex<HashMap<u32, (queue::CapacityState, String)>>>,
     /// #814: the last `orch-queue-depth` set actually pushed to the webview —
     /// what [`OrchRegistry::queue_depth_push`] compares against so an unchanged
     /// reading costs no emit at all.
@@ -12881,7 +12882,7 @@ pub struct OrchRegistry {
     /// [`QUEUE_DEPTH_REPUSH_MS`] for why a suppression that only ever ends when
     /// the reading changes would strand a badge on precisely the stalled pane
     /// the badge is for.
-    queue_depth_emitted: Arc<Mutex<(Vec<queue::QueueDepthItem>, u64)>>,
+    queue_depth_emitted: Arc<TrackedMutex<(Vec<queue::QueueDepthItem>, u64)>>,
     /// #539: unconfirmed-delivery alarms buffered for one coalesced notice
     /// per pane, keyed by `(group, agent_id, eaten)` and holding each buffered
     /// delivery's id (its `submit_sent_ms`) in the order they were raised.
@@ -12911,7 +12912,7 @@ pub struct OrchRegistry {
     /// A bucket only ever exists between a first alarm and its flush, so
     /// this map is empty in the ordinary case and cannot grow without a
     /// pending timer that will drain it.
-    unconfirmed_pending: Arc<Mutex<HashMap<(String, String, bool), Vec<u64>>>>,
+    unconfirmed_pending: Arc<TrackedMutex<HashMap<(String, String, bool), Vec<u64>>>>,
     /// #578: queue notices `notify_queue` could not deliver because the
     /// TARGET was the group's own orchestrator, parked per group until that
     /// orchestrator's next MCP tool call carries them back
@@ -12925,11 +12926,11 @@ pub struct OrchRegistry {
     /// turn*, not a durable record. The durable record is the
     /// `notice-suppressed` audit line, which since #578 carries the notice
     /// text — so a loomux restart loses the relay and not the information.
-    orch_notice_inbox: Arc<Mutex<HashMap<GroupId, OrchNoticeInbox>>>,
+    orch_notice_inbox: Arc<TrackedMutex<HashMap<GroupId, OrchNoticeInbox>>>,
 
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
-    tasks_lock: Mutex<()>,
+    tasks_lock: TrackedMutex<()>,
     /// Serializes every read-modify-write of a group's `questions.json` (#946).
     ///
     /// **A leaf of its own, not `tasks_lock`.** The two files share no
@@ -12955,7 +12956,7 @@ pub struct OrchRegistry {
     /// The answer path's success audit and its pane DELIVERY both happen after
     /// the guard is dropped: an audit write is cheap, but a notice is a
     /// delivery, and a delivery enqueues.
-    questions_lock: Mutex<()>,
+    questions_lock: TrackedMutex<()>,
     /// Serializes every read-modify-write of a group's `needs-you.json` (#1151).
     ///
     /// **A leaf of its own, like `questions_lock`, and for the same reason**: the
@@ -12983,7 +12984,7 @@ pub struct OrchRegistry {
     ///
     /// The resolve path's success audit and its pane DELIVERY both happen after
     /// the guard is dropped: an audit write is cheap, a delivery enqueues.
-    needs_you_lock: Mutex<()>,
+    needs_you_lock: TrackedMutex<()>,
     /// Serializes every read-modify-write of a group's `mailbox.json` (#1161 M2).
     ///
     /// **A leaf of its own, like `questions_lock` and `needs_you_lock`.** The
@@ -13006,7 +13007,7 @@ pub struct OrchRegistry {
     ///
     /// There is no delivery on any path here. That is the point of the feature:
     /// a mailbox write is what happens INSTEAD of typing into the pane.
-    mailbox_lock: Mutex<()>,
+    mailbox_lock: TrackedMutex<()>,
     /// Serializes every read-modify-write of a group's `usage.json` (#743 S4b).
     ///
     /// **A leaf of its own, split out of `tasks_lock`.** The usage store used to
@@ -13021,7 +13022,7 @@ pub struct OrchRegistry {
     /// `AUDIT_LOCK`, on `load_usage_snapshots`' corrupt-file branch — the same
     /// nesting the `tasks_lock` version already had. Callers hold no registry
     /// lock when they take it.
-    usage_lock: Mutex<()>,
+    usage_lock: TrackedMutex<()>,
     /// Per-group memo for the polled usage read (#743 S4b) — the value
     /// [`OrchRegistry::group_usage_within`] serves when the stored one is
     /// younger than the caller's `max_age`.
@@ -13064,7 +13065,7 @@ pub struct OrchRegistry {
     /// first, so the cell costs a fraction more memory and saves an O(roster)
     /// clone per poll. Two cells would let the two drift onto different
     /// windows; a projection computed per caller would put the allocation back.
-    usage_memo: Mutex<HashMap<GroupId, Arc<Mutex<Option<(std::time::Instant, Value, Value)>>>>>,
+    usage_memo: TrackedMutex<HashMap<GroupId, Arc<TrackedMutex<Option<(std::time::Instant, Value, Value)>>>>>,
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
     ///
@@ -13087,12 +13088,12 @@ pub struct OrchRegistry {
     /// the repo and not the group — and the population is the set of repos a
     /// human has opened in one session: single digits, a branch name each.
     /// Eviction machinery would cost more than the thing it reclaims.
-    default_branch_memo: Mutex<HashMap<String, (std::time::Instant, Option<String>)>>,
+    default_branch_memo: TrackedMutex<HashMap<String, (std::time::Instant, Option<String>)>>,
     /// Serializes group creation + orchestrator registration: the group id
     /// is chosen by liveness, and a group only becomes live once its
     /// orchestrator is registered — without this, two concurrent launches
     /// on one repo would share an id.
-    creation: Mutex<()>,
+    creation: TrackedMutex<()>,
     /// Serializes a durable per-group **marker toggle** — the set mutation and
     /// the marker file write/remove that makes it survive a restart — as one
     /// unit (#743 S7 rev-231 N1). `set_notify` / `set_spawn_expanded`, and since
@@ -13157,7 +13158,7 @@ pub struct OrchRegistry {
     /// after #762: a pause marker that disagrees with memory costs a suppressed
     /// or duplicated delivery, not a restored authority, which is why the
     /// consent toggles were worth the widening and these two are still not.
-    marker_io: Mutex<()>,
+    marker_io: TrackedMutex<()>,
     /// Serializes a live **guardrail** edit — the `group.json` read-modify-write
     /// and the in-memory publish that follows it — as one unit (#762, F2 of
     /// #743). `set_max_agents`, `set_advanced_orchestrator`, and every
@@ -13206,23 +13207,23 @@ pub struct OrchRegistry {
     /// `creation`, §4 X6) or by the marker toggles: a group being created has
     /// no guardrail UI to race, and a marker file is a different store with its
     /// own ordering lock.
-    group_file_io: Mutex<()>,
+    group_file_io: TrackedMutex<()>,
     /// Test seam (#222): when set, `pr_head` returns this instead of shelling out
     /// to `gh pr view --json headRefOid`. The verdict↔revision binding has to be
     /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
     /// mirrors `claude_projects_dir`. `None` in the app, always.
-    pr_head_override: Mutex<Option<String>>,
+    pr_head_override: TrackedMutex<Option<String>>,
     /// Test seam (#565), the body half of `pr_head_override`: when set, `pr_body`
     /// returns this instead of shelling out to `gh pr view --json body`. Lets the
     /// integration tests record a verdict against a known body and then edit it —
     /// the race #565 is about — without a live GitHub PR. `None` in the app.
-    pr_body_override: Mutex<Option<String>>,
+    pr_body_override: TrackedMutex<Option<String>>,
     /// Test seam (#1176), the changed-files half of `pr_head_override`: when set,
     /// `pr_changed_files` returns this list instead of shelling out. Lets the
     /// integration tests drive path-based reviewer routing against a known diff
     /// without a live GitHub PR. `None` in the app — and `Some(vec![])` is a real
     /// answer (a PR that changed nothing), which is why this is not `Vec<String>`.
-    pr_files_override: Mutex<Option<Vec<String>>>,
+    pr_files_override: TrackedMutex<Option<Vec<String>>>,
     /// Test seam (#791): when set, `gh_capture` runs THIS program on THIS
     /// deadline instead of the resolved `gh` on `GH_CAPTURE_TIMEOUT`.
     ///
@@ -13236,7 +13237,7 @@ pub struct OrchRegistry {
     /// the call comes back at all. The deadline rides along because the
     /// production bound is 20 seconds and a suite that spends 20 seconds per
     /// timeout assertion is a suite people stop running. `None` in the app.
-    gh_exec_override: Mutex<Option<(PathBuf, Duration)>>,
+    gh_exec_override: TrackedMutex<Option<(PathBuf, Duration)>>,
     /// Groups the human has paused: loomux stops delivering prompts/kickoffs
     /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
     /// `paused` marker file per group so it survives restarts.
@@ -13247,34 +13248,34 @@ pub struct OrchRegistry {
     /// queued. Neither alone is sufficient — see `deliver_prompt`'s pause
     /// branch for the restart case that reaches the drainer without passing
     /// the front door.
-    paused: Mutex<HashSet<GroupId>>,
+    paused: TrackedMutex<HashSet<GroupId>>,
     /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
     /// pruned to the trailing hour on each check.
-    spawn_times: Mutex<HashMap<GroupId, Vec<u64>>>,
+    spawn_times: TrackedMutex<HashMap<GroupId, Vec<u64>>>,
     /// Weak handle to our own `Arc`, set once at startup (`set_self_arc`), so
     /// `&self` methods can hand an owned registry to background threads (e.g.
     /// the copilot session watcher). `Weak` avoids a self-referential `Arc`
     /// cycle that would leak the registry.
-    self_arc: Mutex<Weak<OrchRegistry>>,
+    self_arc: TrackedMutex<Weak<OrchRegistry>>,
     /// Attention routing (#6): latched worker reports awaiting the human's
     /// eyes — agent id → "done" | "blocked". Set by the report tool, cleared on
     /// ack (the human focused the pane) or reassignment.
-    attn_reports: Mutex<HashMap<String, &'static str>>,
+    attn_reports: TrackedMutex<HashMap<String, &'static str>>,
     /// Attention routing: per-agent output-quiet tracking, agent id → (last pty
     /// output total, Unix-ms that total last changed). Kept separate from the
     /// watchdog's counter so the two features never clobber each other's clocks.
-    attn_quiet: Mutex<HashMap<String, (u64, u64)>>,
+    attn_quiet: TrackedMutex<HashMap<String, (u64, u64)>>,
     /// Attention routing: agents whose live `waiting` badge the human has acked
     /// (focused the pane) while the prompt is still on screen. Unlike
     /// `blocked`/`report`, `waiting` is recomputed every scan, so without this it
     /// would re-light ~3s after focus. Cleared when the pane's output next
     /// changes (the menu was answered / the CLI repainted) so a genuinely new
     /// prompt flags again. See `attention_tick`.
-    attn_waiting_ack: Mutex<HashSet<String>>,
+    attn_waiting_ack: TrackedMutex<HashSet<String>>,
     /// Attention routing: the agent → reason set last emitted, so a scan fires a
     /// desktop toast only once per attention onset (the event itself is
     /// re-emitted every tick and the frontend badges idempotently).
-    attn_emitted: Mutex<HashMap<String, String>>,
+    attn_emitted: TrackedMutex<HashMap<String, String>>,
     /// Attention routing (#496 PR-C): agent id → the stranded-delivery state
     /// of its pane — a delivery the late monitor declared `Failed`, and
     /// whether loomux is self-healing it or needs the human. Latched (unlike
@@ -13283,7 +13284,7 @@ pub struct OrchRegistry {
     /// nothing about a wedged pane changes until something submits the
     /// prompt. Cleared by `clear_stranded` when the ledger says the delivery
     /// resolved, and pruned in `attention_tick` when the agent stops running.
-    attn_stranded: Mutex<HashMap<String, StrandedNote>>,
+    attn_stranded: TrackedMutex<HashMap<String, StrandedNote>>,
     /// Attention routing (#946 Q4 / #1091 slice H, the latched-attention
     /// belt): agent ids currently holding delivery on `HeldReason::
     /// InteractiveQuestion` (#420) for their OWN pane. Written only for the
@@ -13312,28 +13313,28 @@ pub struct OrchRegistry {
     /// different signal, populated by a different subsystem. The two sit
     /// beside each other in `attention_tick`'s `reason` match, never merged
     /// into one.
-    attn_question_held: Mutex<HashSet<String>>,
+    attn_question_held: TrackedMutex<HashSet<String>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
-    notify_groups: Mutex<HashSet<GroupId>>,
+    notify_groups: TrackedMutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups whose orchestrator is idle-ticked to run its
     /// monitoring/intake cadence unattended. Durable via an `autonomous` marker
     /// file whose *content* is the enable-time usage-token anchor (see
     /// `set_autonomous` / `autonomy_anchor`), so budget metering survives restarts.
-    autonomous_groups: Mutex<HashSet<GroupId>>,
+    autonomous_groups: TrackedMutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups where the orchestrator may merge an
     /// adequately-tested PR itself instead of holding at the human merge gate.
     /// Default OFF (absent) = today's behavior (human merges). Durable
     /// `auto_merge` marker file, mirroring `notify`/`paused`. The behavior lives
     /// in the orchestrator template; the backend stores/exposes the flag and
     /// mirrors it into the orchestrator's kickoff config.
-    auto_merge_groups: Mutex<HashSet<GroupId>>,
+    auto_merge_groups: TrackedMutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): groups where the orchestrator may publish a
     /// release/tag itself (`gh release …`, pushing a `v*` tag) instead of needing a
     /// per-tag human grant. **Independent of `auto_merge`** — the human can allow
     /// auto-merge while keeping releases manual, or opt into both. Default OFF
     /// (absent), so turning autonomous on never surprise-publishes. Durable
     /// `auto_release` marker; gated behind autonomous exactly like `auto_merge`.
-    auto_release_groups: Mutex<HashSet<GroupId>>,
+    auto_release_groups: TrackedMutex<HashSet<GroupId>>,
     /// Full autonomy (#778): groups whose orchestrator self-selects eligible work
     /// on its idle tick instead of waiting for the human's opt-in label funnel.
     /// A dependent toggle of autonomous mode exactly like `auto_merge` /
@@ -13341,14 +13342,14 @@ pub struct OrchRegistry {
     /// budget suspension force-clears it. Durable `full_autonomy` marker whose
     /// *content* is the enable-time goal string (the autonomous marker's
     /// anchor-in-content precedent: consent and its parameter captured together).
-    full_autonomy_groups: Mutex<HashSet<GroupId>>,
+    full_autonomy_groups: TrackedMutex<HashSet<GroupId>>,
     /// Supervised dangerous mode (#83): groups where the human — present and
     /// supervising — has authorized the orchestrator to merge/release itself
     /// WITHOUT being autonomous. Default OFF. **Mutually exclusive with
     /// `autonomous`**: enabling autonomous force-clears this, and enabling this is
     /// rejected while autonomous. Durable `dangerous_mode` marker; the gate's single
     /// decision point allows a privileged action via `(dangerous && !autonomous)`.
-    dangerous_groups: Mutex<HashSet<GroupId>>,
+    dangerous_groups: TrackedMutex<HashSet<GroupId>>,
     /// Groups that opted BACK OUT of the #260 default (delegate panes open
     /// docked/minimized so a burst of spawns doesn't crowd the orchestrator
     /// out of focus) and want every spawned pane to open expanded into the
@@ -13357,21 +13358,21 @@ pub struct OrchRegistry {
     /// set's *meaning* is inverted from `notify_groups`/`autonomous_groups`
     /// (there, presence enables a default-off feature; here, presence
     /// disables a default-on one). Durable `spawn_expanded` marker file.
-    spawn_expanded_groups: Mutex<HashSet<GroupId>>,
+    spawn_expanded_groups: TrackedMutex<HashSet<GroupId>>,
     /// Autonomous mode (#83): per-group idle-tick delivery timestamps (Unix-ms)
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
-    idle_tick_times: Mutex<HashMap<GroupId, Vec<u64>>>,
+    idle_tick_times: TrackedMutex<HashMap<GroupId, Vec<u64>>>,
     /// Compact-nudge (#287): per-group `/compact` nudge delivery timestamps
     /// (Unix-ms) for the `MAX_COMPACT_NUDGES_PER_HOUR` backstop; pruned to the
     /// trailing hour on each check. Mirrors `idle_tick_times`.
-    compact_nudge_times: Mutex<HashMap<GroupId, Vec<u64>>>,
+    compact_nudge_times: TrackedMutex<HashMap<GroupId, Vec<u64>>>,
     /// Debounced cap-change notices (#79): group → its pending, not-yet-
     /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
     /// clicks in here (persist/enforce/audit stay per-click); the
     /// `start_max_notice_flusher` loop delivers one coalesced notice per burst
     /// once the group falls quiet.
-    pending_max_notice: Mutex<HashMap<GroupId, PendingMaxNotice>>,
+    pending_max_notice: TrackedMutex<HashMap<GroupId, PendingMaxNotice>>,
     /// Which opencode-store degrade (#722) has already been audited for a
     /// group, so a persistent one costs one line instead of one per poll.
     ///
@@ -13385,7 +13386,7 @@ pub struct OrchRegistry {
     /// `Unavailable::Absent` is deliberately never recorded here and never
     /// audited: a group whose opencode panes have not booted has no store yet,
     /// which is the ordinary state, not an incident.
-    opencode_db_degraded: Mutex<HashMap<GroupId, &'static str>>,
+    opencode_db_degraded: TrackedMutex<HashMap<GroupId, &'static str>>,
     /// Per-transcript parse cursors for the usage poll (#1239).
     ///
     /// `compute_usage_snapshot` reads a live agent's transcript on every
@@ -13406,16 +13407,16 @@ pub struct OrchRegistry {
     /// `None` in production. Set via `set_claude_projects_dir` so the usage
     /// reader can be pointed at a fixture tree without touching global env —
     /// safe under parallel test execution.
-    claude_projects_dir: Mutex<Option<PathBuf>>,
+    claude_projects_dir: TrackedMutex<Option<PathBuf>>,
     /// Test-only override of Claude's own custom-agent directory
     /// (`~/.claude/agents`) — the generated per-block contract file (round
     /// #417 correction 6) writes here. `None` in production. Mirrors
     /// `copilot_agents_dir_override`, which mirrors `claude_projects_dir`.
-    claude_agents_dir_override: Mutex<Option<PathBuf>>,
+    claude_agents_dir_override: TrackedMutex<Option<PathBuf>>,
     /// Test-only override of Copilot's own custom-agent directory
     /// (`~/.copilot/agents`) — the generated per-block contract file (#416)
     /// writes here. `None` in production. Mirrors `claude_projects_dir`.
-    copilot_agents_dir_override: Mutex<Option<PathBuf>>,
+    copilot_agents_dir_override: TrackedMutex<Option<PathBuf>>,
     /// Test-only override of the #417 compact-hook script directory
     /// (`compact_hook_dir`, normally a sibling of `shim_dir()` under the real
     /// per-machine loomux data dir). Without this, `compact_hook_dir`
@@ -13426,29 +13427,29 @@ pub struct OrchRegistry {
     /// (rev-4 review round: an intermittent flake in exactly the one test
     /// that reads the script's content back traced to this). `None` in
     /// production. Mirrors `claude_projects_dir`.
-    compact_hook_dir_override: Mutex<Option<PathBuf>>,
+    compact_hook_dir_override: TrackedMutex<Option<PathBuf>>,
     /// Test-only override of Copilot's own user-level hooks directory
     /// (`~/.copilot/hooks`, or `$COPILOT_HOME/hooks`) — the SAME real-shared-
     /// path test-isolation concern `compact_hook_dir_override` documents
     /// applies here too (a single, GLOBAL, machine-wide config file every
     /// test registry would otherwise race on). `None` in production. Mirrors
     /// `claude_projects_dir`.
-    copilot_hooks_dir_override: Mutex<Option<PathBuf>>,
+    copilot_hooks_dir_override: TrackedMutex<Option<PathBuf>>,
     /// Low-disk backstop latch (#134): true once the one-per-episode disk-space
     /// notice has been delivered, cleared when free space recovers past
     /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
-    low_disk_notified: Mutex<bool>,
+    low_disk_notified: TrackedMutex<bool>,
     /// Per-group count of unreadable audit lines already breadcrumbed (#240).
     /// The viewer re-polls `audit_log` in follow mode, so a log that already
     /// carries torn lines — every log written before the append fix — would
     /// otherwise emit a breadcrumb per poll and flood out the crash-forensics
     /// history it shares the file with. Report only when the count *changes*.
-    audit_skips_notified: Mutex<HashMap<GroupId, usize>>,
+    audit_skips_notified: TrackedMutex<HashMap<GroupId, usize>>,
     /// Notification backend (#243): registered self-addressed CI/run watches,
     /// keyed by watch id. Same lifetime class as the `attn_*` maps —
     /// per-live-agent, in-memory only (see `notify.rs`'s module doc and the
     /// design note's persistence rationale).
-    watches: Mutex<HashMap<String, notify::Watch>>,
+    watches: TrackedMutex<HashMap<String, notify::Watch>>,
     /// Watch id sequence (`n-1`, `n-2`, …) — an `AtomicU32` like every other
     /// id this registry mints, so no `getrandom`-pulling crate is needed
     /// (CLAUDE.md constraint 2).
@@ -13459,11 +13460,11 @@ pub struct OrchRegistry {
     /// class as `watches`/`idle_tick_times`: a restart re-fires once on
     /// whatever is currently labeled/terminal (harmless — see
     /// `intake::label_deltas`'s doc) rather than persisting across restarts.
-    intake_seen: Mutex<HashMap<GroupId, intake::IntakeSeenState>>,
+    intake_seen: TrackedMutex<HashMap<GroupId, intake::IntakeSeenState>>,
     /// Idle-tick intake gate (#332): Unix-ms this group's poller last actually
     /// called `gh` (not merely last considered) — `intake::due_intake_polls`'s
     /// per-group interval floor.
-    intake_last_poll_ms: Mutex<HashMap<GroupId, u64>>,
+    intake_last_poll_ms: TrackedMutex<HashMap<GroupId, u64>>,
     /// Unified `gh` poller (#406): Unix-ms the intake half last ran its
     /// due-group SCAN — process-wide, one entry, not per group. Distinct from
     /// `intake_last_poll_ms` above, which is the per-group `gh`-call floor:
@@ -13471,7 +13472,7 @@ pub struct OrchRegistry {
     /// the intake scan at all (`intake_scan_due`), preserving the coarser
     /// scan cadence the intake poller had when it owned its own thread.
     /// `None` until the first wake, so the first tick after launch scans.
-    intake_last_scan_ms: Mutex<Option<u64>>,
+    intake_last_scan_ms: TrackedMutex<Option<u64>>,
     /// Idle-tick intake gate (#332): the composed wake summary from every
     /// poll that found something new since the last delivery, pending
     /// delivery on the next idle tick that actually fires for this group.
@@ -13481,12 +13482,12 @@ pub struct OrchRegistry {
     /// accumulate many polls' worth before anything consumes it. Cleared the
     /// moment a tick consumes it — whether the fire was triggered BY this
     /// signal or a later fallback fire swept it up alongside something else.
-    intake_pending: Mutex<HashMap<GroupId, intake::PendingIntake>>,
+    intake_pending: TrackedMutex<HashMap<GroupId, intake::PendingIntake>>,
     /// Idle-tick intake gate (#332): Unix-ms this group's orchestrator was
     /// last actually woken by an idle tick (a gated fire, a fallback fire, or
     /// any fire while the gate is disabled) — `intake::idle_tick_fallback_due`'s
     /// reference point.
-    idle_tick_last_fired_ms: Mutex<HashMap<GroupId, u64>>,
+    idle_tick_last_fired_ms: TrackedMutex<HashMap<GroupId, u64>>,
     /// Idle-tick fallback backoff (#864): how many consecutive unconditional
     /// fallback wakes this group has taken that found NOTHING — no intake
     /// signal, no pending CI watch, no watchdog stall (the `heartbeat` fire in
@@ -13500,7 +13501,7 @@ pub struct OrchRegistry {
     /// safe direction (the group goes back to its BASE cadence and has to
     /// re-earn the backoff by observing quiet again) and is why nothing
     /// persists it.
-    idle_tick_empty_streak: Mutex<HashMap<GroupId, u32>>,
+    idle_tick_empty_streak: TrackedMutex<HashMap<GroupId, u32>>,
     /// Notification backend (#243): per-group "we last saw this group as
     /// paused at tick-time T" bookkeeping, used by `notify_tick` to freeze
     /// the TTL clock across a pause. A group appears here only while
@@ -13509,31 +13510,31 @@ pub struct OrchRegistry {
     /// first tick that observes it unpaused. See `notify_tick`'s doc for why
     /// this can't simply live on `pause_group`/`resume_group` (they use real
     /// wall-clock time, which isn't the `now` a test injects).
-    paused_watch_since: Mutex<HashMap<GroupId, u64>>,
+    paused_watch_since: TrackedMutex<HashMap<GroupId, u64>>,
     /// Named lock resources (#858): per-group live lock state, keyed by group
     /// id and built lazily from that group's declared `resources:` block. Same
     /// lifetime class as `watches` — **in-memory only, deliberately**: every
     /// pane that could have held a lock dies with the process, so a lock file
     /// surviving a restart could only ever describe holders that no longer
     /// exist.
-    locks: Mutex<HashMap<GroupId, locks::LockTable>>,
+    locks: TrackedMutex<HashMap<GroupId, locks::LockTable>>,
     /// The lock sweep's pause bookkeeping — `paused_watch_since` for holds and
     /// queued requests, and separate from it on purpose: two tick paths
     /// crediting the same map would charge one pause span twice. See
     /// `locks_tick`.
-    paused_locks_since: Mutex<HashMap<GroupId, u64>>,
+    paused_locks_since: TrackedMutex<HashMap<GroupId, u64>>,
     /// Cross-workspace channels (#271): human-connected sets of two-or-more
     /// agent panes that may span different groups, keyed by channel id. Same
     /// lifetime class as `watches` — in-memory only, no persistence across a
     /// restart (see the design note's persistence rationale). One OS
     /// process / one registry means "cross-workspace" is just shared state
     /// here, not a second transport.
-    channels: Mutex<HashMap<String, Channel>>,
+    channels: TrackedMutex<HashMap<String, Channel>>,
     /// agent id -> channel id, the enforcement point for "a pane is in at
     /// most ONE channel at a time" (the justified invariant — see the design
     /// note's Membership section) and an O(1) lookup for `channel_status`
     /// and `channel_send`.
-    agent_channel: Mutex<HashMap<String, String>>,
+    agent_channel: TrackedMutex<HashMap<String, String>>,
     /// Channel id sequence (`chan-1`, `chan-2`, …) — an `AtomicU32` like
     /// every other id this registry mints, so no `getrandom`-pulling crate
     /// is needed (CLAUDE.md constraint 2).
@@ -13548,7 +13549,7 @@ pub struct OrchRegistry {
     /// leaves that state (the file regains `gates.merge`, or the gate is
     /// actually cleared via the toggle), so a LATER re-entry — a fresh edit
     /// — audits again rather than staying silent forever after the first.
-    merge_gate_removal_warned: Mutex<HashSet<GroupId>>,
+    merge_gate_removal_warned: TrackedMutex<HashSet<GroupId>>,
 }
 
 /// One member of a [`Channel`]: which group/agent pane is connected. Cached
@@ -14776,7 +14777,18 @@ const AUDIT_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 /// orchestration work, so it can't meaningfully block a pane. `lock_safe`
 /// keeps a poisoned lock from turning best-effort auditing into a panic
 /// cascade (see `obs::LockExt`).
-static AUDIT_LOCK: Mutex<()> = Mutex::new(());
+static AUDIT_LOCK: std::sync::OnceLock<TrackedMutex<()>> = std::sync::OnceLock::new();
+
+/// [`AUDIT_LOCK`], initialised on first use.
+///
+/// A getter rather than a `static TrackedMutex` because registering a lock with
+/// the watchdog is not a `const` operation — and it must be registered, or the
+/// one lock every refusal path takes under three other registry locks would be
+/// the one lock a hold report cannot name. Same `OnceLock::get_or_init` shape
+/// `obs::data_root` uses.
+fn audit_lock() -> &'static TrackedMutex<()> {
+    AUDIT_LOCK.get_or_init(|| TrackedMutex::new("audit", ()))
+}
 
 thread_local! {
     /// Test-only seam (#240): how long *this thread* pauses between rotation's
@@ -14807,7 +14819,7 @@ pub fn set_rotate_check_pause_for_test(pause: Duration) {
 /// Factored out so the threshold behavior is testable with a tiny cap.
 #[doc(hidden)] // pub for integration tests
 pub fn rotate_audit_if_needed(dir: &Path, cap: u64) {
-    let _guard = AUDIT_LOCK.lock_safe();
+    let _guard = audit_lock().lock_safe();
     rotate_audit_locked(dir, cap);
 }
 
@@ -14916,7 +14928,7 @@ fn append_audit(root: &Path, group: &GroupId, actor: &str, action: &str, detail:
     // Serialize before taking the lock: JSON formatting is the expensive part
     // and no other writer cares about it.
     let _ = fs::create_dir_all(&dir);
-    let _guard = AUDIT_LOCK.lock_safe(); // covers rotate + append as one unit
+    let _guard = audit_lock().lock_safe(); // covers rotate + append as one unit
     rotate_audit_locked(&dir, AUDIT_ROTATE_BYTES);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("audit.jsonl")) {
         let _ = f.write_all(line.as_bytes());
@@ -16600,7 +16612,7 @@ pub struct DeliveryOutcome {
 /// signature pin the value type.
 #[doc(hidden)] // pub for integration tests
 pub fn record_aborted_preenter_outcome(
-    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     pty_id: u32,
     delivery_from: String,
     // #813: the text that is sitting in the box right now. This call site is
@@ -16651,7 +16663,7 @@ pub fn record_aborted_preenter_outcome(
 /// makes to it is precisely the mutation a dedicated test must catch.
 #[doc(hidden)] // pub for integration tests
 pub fn record_inflight_delivery(
-    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     pty_id: u32,
     submit_sent_ms: u64,
     delivery_from: String,
@@ -16695,7 +16707,7 @@ pub struct LedgerView {
 
 #[doc(hidden)] // pub for integration tests
 pub fn observe_ledger(
-    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     pty_id: u32,
     submit_sent_ms: u64,
 ) -> LedgerView {
@@ -16717,7 +16729,7 @@ pub fn observe_ledger(
 /// `record_aborted_preenter_outcome` stored without naming `DeliveryOutcome`
 /// either.
 #[doc(hidden)] // pub for integration tests
-pub fn recorded_confirmed(last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>, pty_id: u32) -> Option<bool> {
+pub fn recorded_confirmed(last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>, pty_id: u32) -> Option<bool> {
     last_delivery.lock_safe().get(&pty_id).map(|o| o.confirmed)
 }
 
@@ -16732,7 +16744,7 @@ pub fn recorded_confirmed(last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>, 
 /// (`DeliveryConfirmation`'s doc) argues against.
 #[doc(hidden)] // pub for integration tests
 pub fn record_stranded_outcome_at_for_test(
-    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     pty_id: u32,
     delivery_from: String,
     submit_sent_ms: u64,
@@ -19447,7 +19459,7 @@ fn run_late_confirmation_monitor(
     submit_sent_ms: u64,
     target_is_orchestrator: bool,
     already_failed: bool,
-    last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    last_delivery: Arc<TrackedMutex<HashMap<u32, DeliveryOutcome>>>,
     reg: Option<Arc<OrchRegistry>>,
     // #517: the brief to re-deliver if this turns out to be a fresh spawn's
     // kickoff that never reached the pane. `None` for every other delivery.
@@ -20151,8 +20163,8 @@ fn deliver_now(
     confirm_autopilot: bool,
     wait_ready: bool,
     cli: String,
-    lock: Arc<Mutex<()>>,
-    last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    lock: Arc<TrackedMutex<()>>,
+    last_delivery: Arc<TrackedMutex<HashMap<u32, DeliveryOutcome>>>,
     target_is_orchestrator: bool,
     reg: Option<Arc<OrchRegistry>>,
     // #517: `Some(brief)` when this is a FRESH spawn's kickoff — the brief
@@ -21544,7 +21556,7 @@ pub fn stranded_marker_action(
 #[doc(hidden)] // pub for integration tests (#496 PR-C drives the REAL replay)
 pub fn drain_stranded_submit(
     ptys: &crate::pty::PtyManager,
-    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     delivery_from: String,
     pty_id: u32,
     submit: &[u8],
@@ -22260,7 +22272,7 @@ fn run_queue_drainer(
             .delivery
             .lock_safe()
             .entry(pty_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(TrackedMutex::new("delivery_pane", ())))
             .clone();
         let root = reg.root.clone();
         let reg_for_call = reg.arc();
@@ -26401,100 +26413,164 @@ impl OrchRegistry {
         Self {
             root,
             roots: Arc::new(RootRegistry::new()),
-            app: Mutex::new(None),
-            groups: Mutex::new(HashMap::new()),
-            agents: Mutex::new(HashMap::new()),
-            by_token: Mutex::new(HashMap::new()),
-            by_pty: Mutex::new(HashMap::new()),
-            pending_binds: Mutex::new(HashMap::new()),
-            test_spawn_requests: Mutex::new(HashMap::new()),
-            spawn_notices: Mutex::new(HashMap::new()),
-            test_session_learned: Mutex::new(Vec::new()),
+            app: TrackedMutex::new("app", None),
+            groups: TrackedMutex::new("groups", HashMap::new()),
+            agents: TrackedMutex::new("agents", HashMap::new()),
+            by_token: TrackedMutex::new("by_token", HashMap::new()),
+            by_pty: TrackedMutex::new("by_pty", HashMap::new()),
+            pending_binds: TrackedMutex::new("pending_binds", HashMap::new()),
+            test_spawn_requests: TrackedMutex::new("test_spawn_requests", HashMap::new()),
+            spawn_notices: TrackedMutex::new("spawn_notices", HashMap::new()),
+            test_session_learned: TrackedMutex::new("test_session_learned", Vec::new()),
             port: AtomicU16::new(0),
             // Seeded from disk on the first mint, not here — see `seq`'s doc.
             seq: AtomicU32::new(0),
             agent_seq_seeded: AtomicBool::new(false),
-            agent_seq_persist: Mutex::new(()),
-            delivery: Mutex::new(HashMap::new()),
-            last_delivery: Arc::new(Mutex::new(HashMap::new())),
-            delivered_notices: Arc::new(Mutex::new(HashMap::new())),
-            delivered_prompts: Arc::new(Mutex::new(HashMap::new())),
+            agent_seq_persist: TrackedMutex::new("agent_seq_persist", ()),
+            delivery: TrackedMutex::new("delivery", HashMap::new()),
+            last_delivery: Arc::new(TrackedMutex::new("last_delivery", HashMap::new())),
+            delivered_notices: Arc::new(TrackedMutex::new("delivered_notices", HashMap::new())),
+            delivered_prompts: Arc::new(TrackedMutex::new("delivered_prompts", HashMap::new())),
             queues: Arc::new(queuestate::QueueMap::new()),
             queue_seq: Arc::new(AtomicU64::new(0)),
-            queue_persist: Arc::new(Mutex::new(())),
-            recovered_queue: Arc::new(Mutex::new(HashMap::new())),
-            recovered_markers: Arc::new(Mutex::new(HashMap::new())),
-            recovered_groups: Arc::new(Mutex::new(HashSet::new())),
-            mq_reconciled_groups: Arc::new(Mutex::new(HashSet::new())),
-            mq_state_lock: Arc::new(Mutex::new(())),
-            mq_service_ms: Arc::new(Mutex::new(HashMap::new())),
-            mq_runner_override: Mutex::new(None),
+            queue_persist: Arc::new(TrackedMutex::new("queue_persist", ())),
+            recovered_queue: Arc::new(TrackedMutex::new("recovered_queue", HashMap::new())),
+            recovered_markers: Arc::new(TrackedMutex::new("recovered_markers", HashMap::new())),
+            recovered_groups: Arc::new(TrackedMutex::new("recovered_groups", HashSet::new())),
+            mq_reconciled_groups: Arc::new(TrackedMutex::new("mq_reconciled_groups", HashSet::new())),
+            mq_state_lock: Arc::new(TrackedMutex::new("mq_state_lock", ())),
+            mq_service_ms: Arc::new(TrackedMutex::new("mq_service_ms", HashMap::new())),
+            mq_runner_override: TrackedMutex::new("mq_runner_override", None),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
-            queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
-            hold_episodes: Arc::new(Mutex::new(HashMap::new())),
-            queue_pressure: Arc::new(Mutex::new(HashMap::new())),
-            queue_depth_emitted: Arc::new(Mutex::new((Vec::new(), 0))),
-            unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
-            orch_notice_inbox: Arc::new(Mutex::new(HashMap::new())),
-            tasks_lock: Mutex::new(()),
-            questions_lock: Mutex::new(()),
-            needs_you_lock: Mutex::new(()),
-            mailbox_lock: Mutex::new(()),
-            usage_lock: Mutex::new(()),
-            usage_memo: Mutex::new(HashMap::new()),
-            default_branch_memo: Mutex::new(HashMap::new()),
-            creation: Mutex::new(()),
-            marker_io: Mutex::new(()),
-            group_file_io: Mutex::new(()),
-            pr_head_override: Mutex::new(None),
-            pr_body_override: Mutex::new(None),
-            pr_files_override: Mutex::new(None),
-            gh_exec_override: Mutex::new(None),
-            paused: Mutex::new(HashSet::new()),
-            spawn_times: Mutex::new(HashMap::new()),
-            self_arc: Mutex::new(Weak::new()),
-            attn_reports: Mutex::new(HashMap::new()),
-            attn_quiet: Mutex::new(HashMap::new()),
-            attn_waiting_ack: Mutex::new(HashSet::new()),
-            attn_emitted: Mutex::new(HashMap::new()),
-            attn_stranded: Mutex::new(HashMap::new()),
-            attn_question_held: Mutex::new(HashSet::new()),
-            notify_groups: Mutex::new(HashSet::new()),
-            autonomous_groups: Mutex::new(HashSet::new()),
-            auto_merge_groups: Mutex::new(HashSet::new()),
-            auto_release_groups: Mutex::new(HashSet::new()),
-            full_autonomy_groups: Mutex::new(HashSet::new()),
-            dangerous_groups: Mutex::new(HashSet::new()),
-            spawn_expanded_groups: Mutex::new(HashSet::new()),
-            idle_tick_times: Mutex::new(HashMap::new()),
-            compact_nudge_times: Mutex::new(HashMap::new()),
-            pending_max_notice: Mutex::new(HashMap::new()),
-            opencode_db_degraded: Mutex::new(HashMap::new()),
+            queue_still_notified: Arc::new(TrackedMutex::new("queue_still_notified", HashSet::new())),
+            hold_episodes: Arc::new(TrackedMutex::new("hold_episodes", HashMap::new())),
+            queue_pressure: Arc::new(TrackedMutex::new("queue_pressure", HashMap::new())),
+            queue_depth_emitted: Arc::new(TrackedMutex::new("queue_depth_emitted", (Vec::new(), 0))),
+            unconfirmed_pending: Arc::new(TrackedMutex::new("unconfirmed_pending", HashMap::new())),
+            orch_notice_inbox: Arc::new(TrackedMutex::new("orch_notice_inbox", HashMap::new())),
+            tasks_lock: TrackedMutex::new("tasks_lock", ()),
+            questions_lock: TrackedMutex::new("questions_lock", ()),
+            needs_you_lock: TrackedMutex::new("needs_you_lock", ()),
+            mailbox_lock: TrackedMutex::new("mailbox_lock", ()),
+            usage_lock: TrackedMutex::new("usage_lock", ()),
+            usage_memo: TrackedMutex::new("usage_memo", HashMap::new()),
+            default_branch_memo: TrackedMutex::new("default_branch_memo", HashMap::new()),
+            creation: TrackedMutex::new("creation", ()),
+            marker_io: TrackedMutex::new("marker_io", ()),
+            group_file_io: TrackedMutex::new("group_file_io", ()),
+            pr_head_override: TrackedMutex::new("pr_head_override", None),
+            pr_body_override: TrackedMutex::new("pr_body_override", None),
+            pr_files_override: TrackedMutex::new("pr_files_override", None),
+            gh_exec_override: TrackedMutex::new("gh_exec_override", None),
+            paused: TrackedMutex::new("paused", HashSet::new()),
+            spawn_times: TrackedMutex::new("spawn_times", HashMap::new()),
+            self_arc: TrackedMutex::new("self_arc", Weak::new()),
+            attn_reports: TrackedMutex::new("attn_reports", HashMap::new()),
+            attn_quiet: TrackedMutex::new("attn_quiet", HashMap::new()),
+            attn_waiting_ack: TrackedMutex::new("attn_waiting_ack", HashSet::new()),
+            attn_emitted: TrackedMutex::new("attn_emitted", HashMap::new()),
+            attn_stranded: TrackedMutex::new("attn_stranded", HashMap::new()),
+            attn_question_held: TrackedMutex::new("attn_question_held", HashSet::new()),
+            notify_groups: TrackedMutex::new("notify_groups", HashSet::new()),
+            autonomous_groups: TrackedMutex::new("autonomous_groups", HashSet::new()),
+            auto_merge_groups: TrackedMutex::new("auto_merge_groups", HashSet::new()),
+            auto_release_groups: TrackedMutex::new("auto_release_groups", HashSet::new()),
+            full_autonomy_groups: TrackedMutex::new("full_autonomy_groups", HashSet::new()),
+            dangerous_groups: TrackedMutex::new("dangerous_groups", HashSet::new()),
+            spawn_expanded_groups: TrackedMutex::new("spawn_expanded_groups", HashSet::new()),
+            idle_tick_times: TrackedMutex::new("idle_tick_times", HashMap::new()),
+            compact_nudge_times: TrackedMutex::new("compact_nudge_times", HashMap::new()),
+            pending_max_notice: TrackedMutex::new("pending_max_notice", HashMap::new()),
+            opencode_db_degraded: TrackedMutex::new("opencode_db_degraded", HashMap::new()),
             usage_cursors: Default::default(),
-            claude_projects_dir: Mutex::new(None),
-            claude_agents_dir_override: Mutex::new(None),
-            copilot_agents_dir_override: Mutex::new(None),
-            compact_hook_dir_override: Mutex::new(None),
-            copilot_hooks_dir_override: Mutex::new(None),
-            low_disk_notified: Mutex::new(false),
-            audit_skips_notified: Mutex::new(HashMap::new()),
-            watches: Mutex::new(HashMap::new()),
+            claude_projects_dir: TrackedMutex::new("claude_projects_dir", None),
+            claude_agents_dir_override: TrackedMutex::new("claude_agents_dir_override", None),
+            copilot_agents_dir_override: TrackedMutex::new("copilot_agents_dir_override", None),
+            compact_hook_dir_override: TrackedMutex::new("compact_hook_dir_override", None),
+            copilot_hooks_dir_override: TrackedMutex::new("copilot_hooks_dir_override", None),
+            low_disk_notified: TrackedMutex::new("low_disk_notified", false),
+            audit_skips_notified: TrackedMutex::new("audit_skips_notified", HashMap::new()),
+            watches: TrackedMutex::new("watches", HashMap::new()),
             notify_seq: AtomicU32::new(0),
-            intake_seen: Mutex::new(HashMap::new()),
-            intake_last_poll_ms: Mutex::new(HashMap::new()),
-            intake_last_scan_ms: Mutex::new(None),
-            intake_pending: Mutex::new(HashMap::new()),
-            idle_tick_last_fired_ms: Mutex::new(HashMap::new()),
-            idle_tick_empty_streak: Mutex::new(HashMap::new()),
-            paused_watch_since: Mutex::new(HashMap::new()),
-            locks: Mutex::new(HashMap::new()),
-            paused_locks_since: Mutex::new(HashMap::new()),
-            channels: Mutex::new(HashMap::new()),
-            agent_channel: Mutex::new(HashMap::new()),
+            intake_seen: TrackedMutex::new("intake_seen", HashMap::new()),
+            intake_last_poll_ms: TrackedMutex::new("intake_last_poll_ms", HashMap::new()),
+            intake_last_scan_ms: TrackedMutex::new("intake_last_scan_ms", None),
+            intake_pending: TrackedMutex::new("intake_pending", HashMap::new()),
+            idle_tick_last_fired_ms: TrackedMutex::new("idle_tick_last_fired_ms", HashMap::new()),
+            idle_tick_empty_streak: TrackedMutex::new("idle_tick_empty_streak", HashMap::new()),
+            paused_watch_since: TrackedMutex::new("paused_watch_since", HashMap::new()),
+            locks: TrackedMutex::new("locks", HashMap::new()),
+            paused_locks_since: TrackedMutex::new("paused_locks_since", HashMap::new()),
+            channels: TrackedMutex::new("channels", HashMap::new()),
+            agent_channel: TrackedMutex::new("agent_channel", HashMap::new()),
             channel_seq: AtomicU32::new(0),
-            merge_gate_removal_warned: Mutex::new(HashSet::new()),
+            merge_gate_removal_warned: TrackedMutex::new("merge_gate_removal_warned", HashSet::new()),
         }
+    }
+
+    /// Hold one named registry lock for `ms`, on a thread of its own, returning
+    /// once that thread has actually acquired it.
+    ///
+    /// Test/diagnostic seam (#1601 Phase 0). The instrument this PR builds
+    /// reports the state the app is in when it stops answering, and the only
+    /// honest way to test that is to CREATE the state — a synthesized snapshot
+    /// exercises the reporting rule but never the recording that feeds it. The
+    /// Rust-level liveness tests and the E2E injected hold both need one real
+    /// registry lock held for a real interval.
+    ///
+    /// **Deliberately not a `#[tauri::command]`, and not reachable from an
+    /// agent.** It is a hang generator; the frontend and the MCP surface have
+    /// no business with one. If the E2E soak lane (plan §3 Phase 4.1) needs to
+    /// reach it, that is a command behind a debug build flag and its own
+    /// argument, not this.
+    ///
+    /// Returns `false` for a name this does not know. The list is a
+    /// representative handful rather than all 82: what a caller needs is a lock
+    /// with the right SHAPE — one the poll path takes (`groups`), one a
+    /// background thread holds for real work (`mq_state_lock`), one on the MCP
+    /// path (`agents`) — and an exhaustive match here would be one more thing
+    /// to keep in step with the struct for no gain.
+    #[doc(hidden)]
+    pub fn hold_lock_for_test(self: &Arc<Self>, name: &str, ms: u64) -> bool {
+        let reg = self.clone();
+        let (tx, rx) = mpsc::channel::<()>();
+        let name = name.to_string();
+        let known = matches!(name.as_str(), "groups" | "agents" | "mq_state_lock" | "tasks_lock");
+        if !known {
+            return false;
+        }
+        std::thread::spawn(move || {
+            // One guard per arm rather than a `Box<dyn Any>`: the arms guard
+            // different types, and the acquisition has to happen at a real
+            // `lock_safe` call site or the recorded site would be this seam
+            // for every lock it can hold.
+            match name.as_str() {
+                "groups" => {
+                    let _g = reg.groups.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                "agents" => {
+                    let _g = reg.agents.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                "mq_state_lock" => {
+                    let _g = reg.mq_state_lock.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                _ => {
+                    let _g = reg.tasks_lock.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+            }
+        });
+        // Return only once the hold is real, so a caller can assert on it
+        // without racing the thread it just started.
+        rx.recv().is_ok()
     }
 
     /// Point the usage reader at a specific Claude transcript root, instead of
@@ -38709,7 +38785,7 @@ impl OrchRegistry {
     pub fn stranded_janitor_pass(
         &self,
         ptys: &crate::pty::PtyManager,
-        last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+        last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     ) {
         // Snapshot the badged panes, then drop both locks before touching a
         // pty: every read below takes the global `ptys` mutex, and holding
@@ -38832,7 +38908,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn stranded_queuefull_pass(
         &self,
-        last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+        last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutcome>>,
     ) {
         // Snapshot first, then drop both locks before touching the queue map —
         // `attention_tick`'s lock order (`attn_stranded`, then `agents`), the
@@ -39283,7 +39359,9 @@ impl OrchRegistry {
         // held only to clone the cell's Arc out.
         let cell = {
             let mut memo = self.usage_memo.lock_safe();
-            memo.entry(group.clone()).or_default().clone()
+            memo.entry(group.clone())
+                .or_insert_with(|| Arc::new(TrackedMutex::new("usage_memo_cell", None)))
+                .clone()
         };
         let mut slot = cell.lock_safe();
         if let Some((at, full, live)) = slot.as_ref() {
@@ -50521,7 +50599,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    match tauri::async_runtime::spawn_blocking(f).await {
+    match crate::blocking::spawn_counted(f).await {
         Ok(v) => v,
         Err(e) => panic!("orchestration command task failed: {e}"),
     }

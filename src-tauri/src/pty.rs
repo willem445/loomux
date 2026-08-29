@@ -1733,7 +1733,7 @@ pub async fn write_pty(
     data: String,
     human: Option<bool>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::blocking::spawn_counted(move || {
         let state = app.try_state::<PtyManager>().ok_or("pty state unavailable")?;
         state.write_from_frontend(id, &data, human.unwrap_or(true))
     })
@@ -1859,7 +1859,7 @@ pub async fn dir_info(path: String) -> DirInfo {
 /// which this does not touch.
 #[tauri::command]
 pub async fn change_dir(app: AppHandle, id: u32, path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::blocking::spawn_counted(move || {
         let state = app.try_state::<PtyManager>().ok_or("pty state unavailable")?;
         state.write_cd(id, &path)
     })

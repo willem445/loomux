@@ -605,6 +605,18 @@
 //! file and emit the event) stays in `mod.rs` with every other registry method,
 //! exactly as `humanq`'s does — the split is the same one, drawn in the same
 //! place, and only the crate the pure half lives in differs.
+//!
+//! [`lockwatch`] and [`selfwatch`] (#1601) are the second pair born here rather
+//! than moved, and for a sharper version of the same reason. They are the app's
+//! self-observability — instrumented mutexes, blocking-pool depth, and the
+//! liveness heartbeat that separates a stuck GUI thread from a starved backend
+//! — and the thing they instrument is the orchestration core, which is on its
+//! way into this crate. Landing them in `src-tauri` would put the instrument on
+//! the far side of the boundary from its subject, and would leave the remote
+//! engine daemon (`doc/design/remote-engine-daemon.md`) with no way to say what
+//! it was doing when it stopped. `src-tauri` owns only the two wires nothing
+//! Tauri-free can own: the `spawn_blocking` hand-offs the depth counter wraps,
+//! and the `liveness_stamp` command the webview stamps through.
 
 pub mod brand;
 pub mod fsatomic;
@@ -612,6 +624,7 @@ pub mod groupid;
 pub mod intake;
 pub mod lessons;
 pub mod locks;
+pub mod lockwatch;
 pub mod mailbox;
 pub mod mergeq;
 pub mod mergeqview;
@@ -626,6 +639,7 @@ pub mod queue;
 pub mod queuestate;
 pub mod report;
 pub mod rootreg;
+pub mod selfwatch;
 pub mod sessions;
 pub mod subproc;
 pub mod termgrid;

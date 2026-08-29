@@ -566,6 +566,33 @@ const TIMERS: TimerRow[] = [
     overlapGate: null,
   },
   {
+    key: "src/liveness.ts@LIVENESS_STAMP_MS",
+    cadenceMs: 1000,
+    policy: "argued",
+    reason:
+      "The webview half of #1601's liveness heartbeat, and the one timer here that must NOT be " +
+      "visibility-gated: a hidden window is one of the states the app can be frozen IN " +
+      "(minimized while an agent works is how this app is normally used), so gating it would " +
+      "blind the instrument exactly where a freeze is least likely to be noticed early. The tick " +
+      "is a rounding subtraction plus one invoke of a SYNC command whose whole body is six " +
+      "relaxed atomic stores — no lock, no IO, no allocation at either end — against a tab strip " +
+      "that polls two invokes per group-bound tab every 4 s and a group view that polls nine " +
+      "every 2 s. The platform still throttles a hidden window's timers, which is why every " +
+      "stamp carries `hidden` and `selfwatch::liveness` answers 'no evidence' rather than " +
+      "'stuck' for a stale stamp from one (Liveness::GuiHidden).",
+    debt: null,
+    // No gate, and the reason is structural rather than an exemption. INV-4's
+    // single-flight sentence (#1602) exists to stop a tick firing while its own
+    // previous call is outstanding from accumulating parked `spawn_blocking`
+    // threads one per tick — the beta6 mechanism. `liveness_stamp` is a SYNC
+    // command (performance.md §4 X7, and it must be: the pool is one of the two
+    // things it measures), so it never reaches that pool at all and the
+    // accumulation is unreachable from here, not merely unlikely. Two stamps
+    // that do overlap leave the later one's values, which is the correct answer
+    // for a claim about *now*.
+    overlapGate: null,
+  },
+  {
     key: "src/pollgate.ts@HIDDEN_RECHECK_MS",
     cadenceMs: 5000,
     policy: "gated",
