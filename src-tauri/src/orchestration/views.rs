@@ -311,19 +311,8 @@ impl ViewPublisher {
         // prevent. Keeping the later stamp is monotone: the NEXT pass, which
         // starts after the write, replaces it with genuinely fresher data.
         let _swap = self.publish_lock.lock_safe();
-        let previous = self.published.load();
-        let mut groups: HashMap<GroupId, Arc<GroupView>> = HashMap::with_capacity(computed.len());
-        for (id, fresh) in computed {
-            match previous.value.groups.get(&id) {
-                Some(prev) if prev.computed_at > fresh.computed_at => {
-                    groups.insert(id, Arc::clone(prev));
-                }
-                _ => {
-                    groups.insert(id, fresh);
-                }
-            }
-        }
-        self.published.store(ViewSnapshot { groups, partial: false }, compute_ms);
+        // MUTATION: wholesale store, the pre-fix behaviour.
+        self.published.store(ViewSnapshot { groups: computed, partial: false }, compute_ms);
     }
 
     /// [`ViewPublisher::publish_pass_at`] at the current instant.
