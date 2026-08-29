@@ -131,6 +131,41 @@ that has panicked three times running, and says so in a `tick-disabled`
 breadcrumb. The transient case now recovers where it used to kill the thread;
 the deterministic case degrades to what it did before, named.
 
+### 2.2 What the refusal costs, in full
+
+The refusal is an unwind, and an unwind out of arbitrary code is the thing
+`lock-liveness.md` rider R1 spent a whole section making safe. R1's argument does
+not carry over unchanged here, and the two places it does not are stated rather
+than left for a reader to find.
+
+**A mutation can be abandoned half-applied.** R1's `MutationScope` exists so a
+budget timeout *never* unwinds out of a multi-map mutation: a slow mutation is a
+stall, an abandoned one is corruption. A re-entrant refusal unwinds anyway,
+inside a scope as much as outside one, so a registry mutation that spans two maps
+can now be left with the first written and the second not. That is a real cost
+and it is accepted for one reason: the alternative on this path is not a
+completed mutation, it is a thread parked forever *holding the first map's lock*
+— which leaves exactly the same half-applied state, plus a wedged registry, plus
+no artifact. The unwind is the same corruption without the wedge, and with a
+crash log naming both sites. What makes it tolerable in practice is that a
+re-entrant acquire is a **programmer error on a fixed code path**, not a
+load-dependent race: it fires deterministically the first time that path runs,
+under `cargo test` and in the E2E lane, where it is a panic that fails the build.
+A shipped build reaching one means a path the suite never exercised, and the
+answer to that is a test, not a wider refusal policy.
+
+**A refusal during an unwind aborts the process.** If a `Drop` running inside an
+unwind reaches a lock its own unwinding frame still holds, the refusal panics
+while a panic is already in flight, and Rust aborts. Nothing in the tree does
+this today — `TrackedGuard::drop` takes no tracked lock, by the rule in
+`lockwatch.rs`'s own header — and the previous behaviour was to deadlock inside
+the unwind instead, which is a wedge with no artifact at all. The abort is
+louder and it still leaves a record: `obs`'s hook has a re-entry path for exactly
+this (a second panic reaching the hook while the first run is in progress) that
+appends one emergency line to the crash log phase one already opened. Stated
+because "this cannot happen today" is a claim about today's `Drop` impls, and
+the next one to take a registry lock would make it false silently.
+
 ### What it costs
 
 Per acquisition, on top of everything Phase 0 and 2.1 already do: **two**
