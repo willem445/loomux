@@ -1355,15 +1355,21 @@ fn the_debt_tier_rules_still_bite_while_the_tier_is_empty() {
 const POLL_SITES: &[(&str, &str, &str)] = &[
     (
         "src/groupview.ts",
-        "] = await Promise.all([",
-        "GroupView.load() -- the group view's 2 s batch",
+        "private async load(): Promise<void> {",
+        "GroupView.load() -- the group view's 2 s poll",
     ),
     (
         "src/tabbar.ts",
-        "const [summary, usage] = await Promise.all([",
-        "TabBar.pollStatus() -- the 4 s tab-strip loop, once per group-bound tab",
+        "private async pollStatusOnce(): Promise<void> {",
+        "TabBar.pollStatusOnce() -- the 4 s tab-strip loop",
     ),
 ];
+
+/// The commands a poll site is ALLOWED to reach: the two that are served from
+/// the published snapshot (#1608, plan #1600 §3 Phase 1). Everything else on a
+/// fixed cadence acquires a registry mutex on an unbounded `lock_safe`, which
+/// is the whole mechanism §1.2 establishes.
+const SNAPSHOT_SERVED: &[&str] = &["orch_group_view", "orch_strip_view"];
 
 /// The frontend's `wrapperName -> "backend_command"` map, read out of
 /// `src/orchestration.ts`'s `invoke<...>("...")` calls: walk BACK from each
@@ -1397,10 +1403,23 @@ fn frontend_command_map() -> BTreeMap<String, String> {
     map
 }
 
-/// The identifiers called inside one `Promise.all([ ... ])` batch.
-fn poll_batch_calls(file: &str, needle: &str) -> Vec<String> {
-    let src = std::fs::read_to_string(crate_root().join("..").join(file))
+/// The identifiers CALLED anywhere inside one poll function's body.
+///
+/// Was "the identifiers inside one `Promise.all([ ... ])` batch" until #1608
+/// collapsed both batches into a single call each. Reading the whole function
+/// body instead is strictly wider than the batch was: a command invoked from
+/// anywhere on the poll path is now in scope, not only one that happened to be
+/// a member of an array literal.
+///
+/// **Stated bound.** Comments are stripped before brace matching, so a `{` in
+/// prose cannot end the body early. String and template literals are NOT
+/// stripped: a brace inside one would still miscount, and the balance
+/// assertion below is what turns that into a loud failure rather than a
+/// silently short body. Neither poll body contains one today.
+fn poll_body_calls(file: &str, needle: &str) -> Vec<String> {
+    let raw = std::fs::read_to_string(crate_root().join("..").join(file))
         .unwrap_or_else(|e| panic!("{file}: {e}"));
+    let src = strip_ts_comments(&raw);
     let at = src.find(needle).unwrap_or_else(|| {
         panic!(
             "{file}: `{needle}` not found -- the poll site moved, and this test is now watching \
@@ -1413,13 +1432,13 @@ fn poll_batch_calls(file: &str, needle: &str) -> Vec<String> {
     let mut i = body_start;
     while i < bytes.len() && depth > 0 {
         match bytes[i] {
-            b'[' => depth += 1,
-            b']' => depth -= 1,
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
             _ => {}
         }
         i += 1;
     }
-    assert!(depth == 0, "{file}: unbalanced Promise.all([ ... ]) -- refusing to guess its extent");
+    assert!(depth == 0, "{file}: unbalanced poll-function body -- refusing to guess its extent");
     let body = &src[body_start..i - 1];
     let mut out: Vec<String> = Vec::new();
     for (idx, _) in body.match_indices('(') {
@@ -1444,7 +1463,38 @@ fn poll_batch_calls(file: &str, needle: &str) -> Vec<String> {
     out
 }
 
-/// **No command on a fixed-cadence poll path may be synchronous** (#1595).
+/// Blank out `//` and `/* */` comments, preserving byte offsets (each removed
+/// byte becomes a space, newlines kept) so nothing downstream shifts.
+fn strip_ts_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = b.to_vec();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'/' && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+        } else if b[i] == b'/' && b[i + 1] == b'*' {
+            while i < b.len() && !(i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/') {
+                if b[i] != b'\n' {
+                    out[i] = b' ';
+                }
+                i += 1;
+            }
+            if i + 1 < b.len() {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                i += 2;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("blanking preserves utf8 boundaries")
+}
+/// **Every command on a fixed-cadence poll path is async AND served from the
+/// published snapshot** (#1595, then L6 of #1600's plan).
 ///
 /// The guard that would have caught #1595 before it shipped, and deliberately
 /// NOT a timing test: "the UI stayed responsive" measured with a clock is flaky
@@ -1454,12 +1504,23 @@ fn poll_batch_calls(file: &str, needle: &str) -> Vec<String> {
 /// as long as whoever holds the registry mutex takes, and `lock_safe` is
 /// `Mutex::lock` with poison recovery: no timeout, no try-lock, no bound.
 ///
+/// **Async was never the property; it was the least of them** (#1608). This
+/// test's own #1595 half "would pass on beta6" -- #1600 §2.2 says so in as
+/// many words -- because beta6's poll commands were all correctly async and
+/// the app still stopped accepting input in every pane. Moving an unbounded
+/// acquisition off the webview thread relocates the victim onto a shared
+/// 512-thread blocking pool; at 2.5-5 parked threads per second that pool is
+/// exhausted in minutes, and `write_pty` can no longer be scheduled. So the
+/// async half stays and a second half is added: a polled command must take no
+/// registry lock at all, which here means its body reads the published
+/// snapshot (`views.load(`, `orchestration/views.rs`).
+///
 /// **Why this reads the FRONTEND.** `SYNC_COMMANDS` can say what a command
 /// costs but not how often it is called, and that fact lives in `groupview.ts`
-/// and `tabbar.ts`. Which is precisely how these five passed two rounds of
+/// and `tabbar.ts`. Which is precisely how those five passed two rounds of
 /// classification (#752's conversions and #743's census) as correctly `cheap`
 /// and still froze the app. Making the poll SITE an input is what stops the
-/// next batch from quietly acquiring a sync member.
+/// next one from quietly acquiring a member that reaches the registry.
 #[test]
 fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
     let sites = commands();
@@ -1474,10 +1535,23 @@ fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
          now checking almost nothing",
         map.len()
     );
+    // Two named specimens, for two different reasons. `groupSummary` is the
+    // wrapper #1595 was about; it is no longer ON a poll path (#1608 took it
+    // off), and it stays here because the extractor must still be able to
+    // resolve an ordinary wrapper. `groupView` is what the group view polls
+    // NOW, so a rename that silently stopped the map resolving it would
+    // otherwise leave the loop below with nothing to check.
     assert_eq!(
         map.get("groupSummary").map(String::as_str),
         Some("orch_group_summary"),
-        "the wrapper map must resolve the command #1595 was about, or it proves nothing"
+        "the wrapper map must resolve the command #1595 was about, or its resolution of \
+         anything else is not evidence"
+    );
+    assert_eq!(
+        map.get("groupView").map(String::as_str),
+        Some("orch_group_view"),
+        "the wrapper map must resolve the command the group view polls TODAY, or the poll-site \
+         loop below resolves nothing and every assertion in it passes vacuously"
     );
     assert!(
         !sync.is_empty(),
@@ -1487,26 +1561,74 @@ fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
 
     let mut checked = 0usize;
     let mut offenders: Vec<String> = Vec::new();
+    let mut unserved: Vec<String> = Vec::new();
+    let mut not_reading_the_cell: Vec<String> = Vec::new();
+    let mut reached: BTreeSet<String> = BTreeSet::new();
     for (file, needle, what) in POLL_SITES {
-        let calls = poll_batch_calls(file, needle);
+        let calls = poll_body_calls(file, needle);
         assert!(
             !calls.is_empty(),
-            "{file}: parsed an EMPTY poll batch -- the extractor broke, not the code"
+            "{file}: parsed an EMPTY poll body -- the extractor broke, not the code"
         );
+        let mut here = 0usize;
         for call in calls {
             let Some(cmd) = map.get(&call) else { continue };
             checked += 1;
+            here += 1;
+            reached.insert(cmd.clone());
             if sync.contains(cmd) {
                 offenders.push(format!("{cmd} (via `{call}`) polled by {what}"));
             }
+            // L6, the half #1608 adds. Being ASYNC only moves the wait off the
+            // webview thread and onto a blocking-pool thread; #1600 §1.2 is the
+            // release where that turned out to be the same defect with a
+            // different victim. What makes a polled read safe is that it takes
+            // no registry lock AT ALL, and the only way to do that here is to
+            // read the published snapshot.
+            if !SNAPSHOT_SERVED.contains(&cmd.as_str()) {
+                unserved.push(format!("{cmd} (via `{call}`) polled by {what}"));
+                continue;
+            }
+            let Some(site) = sites.iter().find(|s| &s.name == cmd) else {
+                not_reading_the_cell.push(format!("{cmd}: named in SNAPSHOT_SERVED but not a command"));
+                continue;
+            };
+            // `code` has comments and string contents blanked, so a mention of
+            // the cell in prose cannot satisfy this.
+            if !site.code.contains("views.load(") {
+                not_reading_the_cell.push(format!("{}:{} {cmd}", site.file, site.line));
+            }
         }
+        assert!(
+            here > 0,
+            "{file}: {what} resolved NO backend command -- the poll site no longer calls one \
+             through a wrapper this test can follow, so every assertion below passes over \
+             nothing. Re-point the extractor rather than deleting it."
+        );
     }
 
+    // Non-vacuity, per poll site AND in total. #1608 collapsed a ten-invoke
+    // batch and a two-per-tab sweep into one call each, so the old `checked >=
+    // 10` would now fail for the RIGHT reason and pass for none -- it counted
+    // the batch, and there is no batch. The property that replaced it is the
+    // one that actually matters: the set of commands the poll path reaches is
+    // exactly the set served from the snapshot, so a poll site that stops
+    // calling one, or starts calling an eleventh, both fail here.
     assert!(
-        checked >= 10,
-        "only {checked} poll-batch entries resolved to backend commands -- expected the group \
-         view's ten-invoke batch plus the tab strip's two, so the extractor is under-matching"
+        checked >= POLL_SITES.len(),
+        "only {checked} poll-path calls resolved to backend commands across {} sites -- the \
+         extractor is under-matching",
+        POLL_SITES.len()
     );
+    let served: BTreeSet<String> = SNAPSHOT_SERVED.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        reached, served,
+        "the set of backend commands reachable from a fixed-cadence poll site must EQUAL the \
+         set served from the published snapshot. A command that appears here and not in \
+         SNAPSHOT_SERVED is a new polled registry read; one in SNAPSHOT_SERVED that is no \
+         longer reached is a row watching nothing."
+    );
+
     assert!(
         offenders.is_empty(),
         "these commands are POLLED and SYNCHRONOUS, so every tick parks the webview/GTK main \
@@ -1514,5 +1636,21 @@ fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
          {offenders:#?}. Make each async over run_blocking and delete its SYNC_COMMANDS row. \
          `cheap` does not save a polled command: it bounds the critical section, and what the UI \
          thread pays is the acquisition."
+    );
+    assert!(
+        unserved.is_empty(),
+        "these commands are on a fixed-cadence poll path and are NOT served from the published \
+         snapshot: {unserved:#?}. Being async is not enough -- #1595 moved five polled commands \
+         off the webview thread and #1600 §1.2 is the release where the same unbounded wait \
+         exhausted the shared blocking pool instead, and stopped every pane accepting input. A \
+         polled read must take no registry lock at all: add it to the publisher \
+         (orchestration/views.rs) and serve it from views.load(), or take it off the poll path."
+    );
+    assert!(
+        not_reading_the_cell.is_empty(),
+        "these commands are named in SNAPSHOT_SERVED but their bodies do not read the published \
+         cell (`views.load(`): {not_reading_the_cell:#?}. The manifest row is the claim; the \
+         body is what makes it true, and a row whose command quietly went back to the registry \
+         would otherwise read as enforcement."
     );
 }
