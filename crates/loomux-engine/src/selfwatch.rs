@@ -279,8 +279,9 @@ pub fn liveness(hb: &Heartbeat, now_ms: u64, stale_ms: u64) -> Liveness {
     if hb.watchdog_ticks == 0 || hb.webview_stamps == 0 {
         return Liveness::Unarmed;
     }
-    let backend_fresh =
-        now_ms.saturating_sub(hb.watchdog_ms) <= stale_ms && hb.watchdog_lag_ms <= stale_ms;
+    // NEUTERED (scratch, #1601): judge the backend on its stamp alone, which
+    // this function reads microseconds after the watchdog wrote it.
+    let backend_fresh = now_ms.saturating_sub(hb.watchdog_ms) <= stale_ms;
     let gui_fresh = now_ms.saturating_sub(hb.webview_ms) <= stale_ms;
     match (backend_fresh, gui_fresh, hb.webview_hidden) {
         (true, true, _) => Liveness::Ok,
