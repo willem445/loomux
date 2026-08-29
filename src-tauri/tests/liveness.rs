@@ -1495,8 +1495,8 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     // MEASURED, not reasoned (#1609 review round 2, B1): the round that puts
     // `check_mail` back in the Read set unsealed — with the two `budget.rs` seal
     // tests `#[ignore]`d so `cargo` reaches this binary at all — run 33257747970,
-    // reddens the PROBE above at line ~1465 and leaves the sweep's own
-    // `torn == 0` GREEN. So the sweep does not catch a misclassified writer, and
+    // reddens the PROBE above ("a frame that wrote durably and then hit a held
+    // lock UNWOUND") and leaves the sweep's own `torn == 0` GREEN. So the sweep does not catch a misclassified writer, and
     // no run has shown it failing. It is a regression guard; the probe is the
     // assertion with a counterfactual.
     //
