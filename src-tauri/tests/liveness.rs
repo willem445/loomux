@@ -33,6 +33,15 @@
 //! `POOL_SERIAL` for the duration, because two of them at once would each be
 //! measuring the other.
 //!
+//! **The symptom when that rule is broken names nothing about this file**, which
+//! is why it is written down rather than left to be rediscovered: L3a fails with
+//! `panicked at tauri-<ver>/src/async_runtime.rs:<line>` and the message
+//! `runtime already initialized`. That is tauri's `set`, refusing because
+//! something else in this binary reached the runtime first — not a real failure
+//! of the property under test. Observed exactly once, on #1607's red-1 scratch
+//! round, where the mutation under test made `enqueue_frontend_write` itself
+//! touch the runtime and a sibling test then won the race.
+//!
 //! # Rows not in this file yet, and why (so their absence is a decision)
 //!
 //! The plan's table has L0-L6. This file lands L3a, L3b and L4 — the rows Phase
