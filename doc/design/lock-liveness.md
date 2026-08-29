@@ -400,9 +400,25 @@ deadlock beats an unnamed wedge, and `a_reentrant_acquire_unwinds_a_sealed_frame
 (`lockwatch.rs`) is what pins both halves: the unwind, and the count.
 
 The narrowing is exactly this wide. A budget TIMEOUT inside a sealed frame still
-waits, unchanged — `a_durable_write_seals_its_budget_frame_so_a_later_timeout_waits`
-(`budget.rs`) is still true of every case the seal was written for, because a
+waits — `a_durable_write_seals_its_budget_frame_so_a_later_timeout_waits`
+(`budget.rs`) still holds for every case the seal was written for, because a
 timeout is a stall and this is not.
+
+**What the narrowing did change about that test is its INSTRUMENT, and the
+reason is worth keeping.** Its "this frame did not tear" assertion was an
+equality on the process-global `torn_writes()`, which is sound only while
+*nothing in the whole binary ever tears*. That was true until this narrowing
+existed, and the moment a sibling test produced a legitimate tear the assertion
+started failing on whichever platform happened to schedule the two in the wrong
+order — measured: `left 1, right 0` on ubuntu and windows, green on macos. An
+absence stated on a shared counter is a claim about the whole process, not about
+your frame. It is now read from `thread_seal_counts()`, the per-thread pair this
+module built for exactly that, which makes the pin stronger rather than looser:
+an exact equality that cannot race, in place of one that could only ever have
+held by luck. The global keeps its own witness — a monotonic floor in
+`a_reentrant_acquire_unwinds_a_sealed_frame_and_counts_the_tear` — because a
+field-report counter nothing asserts on is a counter that can quietly stop
+counting.
 
 **Why not the other candidate rule.** The alternative was to make every tool arm
 that writes into a `ToolKind::Mutate`. That is right where a tool genuinely

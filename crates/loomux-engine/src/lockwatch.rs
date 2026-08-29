@@ -2601,6 +2601,13 @@ mod rank_tests {
         let _restore = PanicSwitch(set_lock_order_panics(false));
         let lock = TrackedMutex::new_ranked("reentsealspec", OUTER, 5u32);
         let (_, torn_before) = budget::thread_seal_counts();
+        // The process-global counter is the FIELD-REPORT number, and it is
+        // checked as a floor rather than a delta because `cargo test` runs this
+        // binary's tests concurrently. It is asserted here because after #1702
+        // nothing else does: `budget.rs`'s seal test had to move off it (its
+        // own assertion is an ABSENCE, which a global cannot state once
+        // anything in the process legitimately tears — which is this test).
+        let global_torn_before = budget::torn_writes();
 
         let out: Result<(), Busy> = budget::read_budget(Duration::from_secs(30), || {
             // Discriminating half: inside a sealed frame an ordinary
@@ -2624,6 +2631,10 @@ mod rank_tests {
             torn_after,
             torn_before + 1,
             "a tear through the seal must be COUNTED — that is what makes it better than a wedge"
+        );
+        assert!(
+            budget::torn_writes() > global_torn_before,
+            "the field-report counter must move too, or a tear is invisible outside a test"
         );
     }
 
