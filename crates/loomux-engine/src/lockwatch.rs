@@ -535,12 +535,19 @@ impl<T> Drop for TrackedGuard<'_, T> {
         if held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
             // Stamp only. `drain_completed_holds` composes and writes it, on
             // the watchdog thread, with this lock long since released.
-            st.done_ms.store(held_ms, Ordering::Relaxed);
-            st.done_thread.store(st.holder_thread.load(Ordering::Relaxed), Ordering::Relaxed);
-            st.done_site.store(st.holder_site.load(Ordering::Relaxed), Ordering::Relaxed);
-            st.done_waiters.store(st.waiters.load(Ordering::Relaxed), Ordering::Relaxed);
-            // Publishes the four stores above.
-            st.done_pending.store(true, Ordering::Release);
+            // NEUTERED (scratch, #1605 review B1): compose and write the
+            // report HERE — allocation, a global lock and file IO, with the
+            // reported mutex still held, which is the shape B1 rejected.
+            let (file, line) = site_of(st.holder_site.load(Ordering::Relaxed));
+            record(HoldReport {
+                lock: st.name,
+                site_file: file,
+                site_line: line,
+                holder_thread: st.holder_thread.load(Ordering::Relaxed),
+                held_ms,
+                waiters: st.waiters.load(Ordering::Relaxed),
+                still_held: false,
+            });
         }
         // odd -> even: the lock is free.
         st.generation.fetch_add(1, Ordering::Release);
