@@ -12557,6 +12557,193 @@ pub struct SpawnRequest {
     pub minimized: bool,
 }
 
+/// The registry's declared lock order (#1610, plan §3 Phase 3a).
+///
+/// **Smaller is outer.** A thread may take a larger rank while holding a
+/// smaller one; taking a smaller one while holding a larger one is an
+/// inversion, and [`loomux_engine::lockwatch`] panics on it in debug and test
+/// builds and breadcrumbs `lock-order-violation` in release.
+///
+/// # Why a table and not thirteen comments
+///
+/// #1600 §3 opens on the problem this closes: seventeen mutexes on one struct
+/// with no declared order, and `resolve_token`'s own comment explaining that
+/// "locking them together would pin a lock order no other call site promises to
+/// respect". Thirteen doc comments in this file DO state an order. Every one of
+/// them is true and none of them can fail a build — which is §2.2's finding
+/// about this repo's guards in one sentence. The consts below are those
+/// thirteen claims, merged, in a form the run time checks.
+///
+/// # What is NOT here, and why that is not a hole
+///
+/// About sixty-five registry fields are still UNRANKED, and a lock with no rank
+/// may nest under anything. That is the plan's design rather than an unfinished
+/// edge: an unranked lock breadcrumbs `lock-rank-unranked` the first time it
+/// nests under anything, so the rows this table is missing announce themselves
+/// from the field instead of waiting to be noticed. The ranked set is exactly
+/// the set someone has already written an ordering claim about — a rank
+/// invented for a lock nobody has reasoned about would be a fact the checker
+/// enforces and no one has checked.
+///
+/// # The gaps
+///
+/// Ranks are spaced so a new lock can be slotted between two existing ones
+/// without renumbering: a renumbering changes every line at once, and a diff in
+/// which every line changed is one nobody can review for ORDER — the single
+/// property these values carry.
+pub mod lockorder {
+    use loomux_engine::lockwatch::LockRank;
+
+    /// `marker_io` — consent-marker IO, outermost.
+    ///
+    /// Its own claim: "`marker_io` is taken FIRST and outermost — the set locks
+    /// and `AUDIT_LOCK` are taken under it, never the reverse."
+    pub const MARKER_IO: LockRank = LockRank::new(100);
+
+    /// `group_file_io` — the `group.json` read-modify-write, outermost.
+    ///
+    /// Its own claim: "taken FIRST and outermost — the `groups` lock and
+    /// `AUDIT_LOCK` may be taken under it, never the reverse."
+    ///
+    /// Ranked BELOW `marker_io` rather than beside it. Nothing takes both
+    /// today; the two are different durable stores with different callers, and
+    /// giving them one rank each (rather than one shared rank) is what keeps
+    /// "same rank" meaning "the same field from two registries" — see
+    /// [`loomux_engine::lockwatch::LockRank`].
+    pub const GROUP_FILE_IO: LockRank = LockRank::new(200);
+
+    /// `queue_persist` — serializes writers of a group's `queue.json`.
+    ///
+    /// Its own claim: "this BEFORE `queues`, never the reverse", and it is
+    /// taken with no other lock held.
+    pub const QUEUE_PERSIST: LockRank = LockRank::new(300);
+
+    /// `queues` — the live per-pane delivery queues (the `QueueMap`'s lock).
+    ///
+    /// Under `queue_persist` (above), and above the two staging maps:
+    /// "Lock order is `queues` -> `recovered_queue` -> `recovered_markers`."
+    pub const QUEUES: LockRank = LockRank::new(400);
+
+    /// `recovered_queue` — entries read back from disk that have not yet found
+    /// a pane. Under `queues`, over `recovered_markers`.
+    pub const RECOVERED_QUEUE: LockRank = LockRank::new(410);
+
+    /// `recovered_markers` — the unreplayable staging half. Innermost of the
+    /// three: `archive_staged_overflow` takes `recovered_queue` then this one,
+    /// "matching `group_queue_entries`".
+    pub const RECOVERED_MARKERS: LockRank = LockRank::new(420);
+
+    /// `by_pty` — the pane -> agent reverse index.
+    ///
+    /// `session_for_pty`'s claim: "`by_pty` is taken and RELEASED before
+    /// `agents`". Released, so the two do not in fact nest today — the rank
+    /// records the order the claim states, which is the order any future site
+    /// that DOES nest them has to follow.
+    pub const BY_PTY: LockRank = LockRank::new(500);
+
+    /// `agents` — the agent table. Under `by_pty`, over `groups`.
+    pub const AGENTS: LockRank = LockRank::new(510);
+
+    /// `groups` — the group table.
+    ///
+    /// Innermost of the core three, and the one `group_file_io` names as
+    /// takeable under itself. #1611 (Phase 3b) collapses `groups`/`agents`/
+    /// `by_token`/`by_pty` into one `Core` lock, at which point these three
+    /// ranks become one; they are separate here because 3a lands first and
+    /// alone.
+    pub const GROUPS: LockRank = LockRank::new(520);
+
+    /// `delivered_prompts` — prompt bodies keyed by CLI session.
+    ///
+    /// Its own claim: "`agents` is taken and RELEASED before this one", so it
+    /// ranks under `agents`.
+    pub const DELIVERED_PROMPTS: LockRank = LockRank::new(600);
+
+    /// `delivered_notices` — what loomux wrote into each pane.
+    ///
+    /// Its own claim: "takes no other registry lock while held", and its writer
+    /// runs inside `deliver_now`'s paste loop. A leaf, ranked near the bottom
+    /// so anything it were to take would be reported.
+    pub const DELIVERED_NOTICES: LockRank = LockRank::new(610);
+
+    /// `agent_seq_persist` — the agent-id mint (seed, bump, persist).
+    ///
+    /// Its own claim: "takes no other registry lock while held, and no caller
+    /// holds one when it calls in". Ranked as a leaf, which enforces the first
+    /// half. The second half — that no caller holds one — is not a rank
+    /// question and is not enforced here.
+    pub const AGENT_SEQ_PERSIST: LockRank = LockRank::new(700);
+
+    /// `tasks_lock` — the task board's read-modify-write.
+    ///
+    /// A leaf except for `AUDIT_LOCK` and the app handle — plus the one nesting
+    /// `needs_you_lock` names: "`tasks_lock` -> `needs_you_lock`, never the
+    /// reverse", because `upsert_task` keeps the board lock across
+    /// `sync_demo_item`.
+    pub const TASKS: LockRank = LockRank::new(800);
+
+    /// `needs_you_lock` — the demo-item store. Under `tasks_lock`, by that
+    /// field's own claim.
+    pub const NEEDS_YOU: LockRank = LockRank::new(810);
+
+    /// `questions_lock` — the question registry's read-modify-write.
+    ///
+    /// "A leaf of its own, not `tasks_lock`", taking only `AUDIT_LOCK` and the
+    /// app handle. Nothing nests it with the siblings below; the relative order
+    /// among the four file leaves is therefore arbitrary, and an inversion
+    /// report on any pair of them would be a genuinely new fact.
+    pub const QUESTIONS: LockRank = LockRank::new(820);
+
+    /// `mailbox_lock` — the mailbox's read-modify-write.
+    ///
+    /// "Lock order: nothing. It is taken alone" — `post_to_manager` resolves
+    /// the manager block through `self.group(..)` BEFORE taking this guard,
+    /// deliberately, so `groups` is never taken under it. That is exactly what
+    /// this rank enforces: `groups` is 520 and this is 830.
+    pub const MAILBOX: LockRank = LockRank::new(830);
+
+    /// `usage_lock` — the usage store's read-modify-write.
+    ///
+    /// "Takes no other registry lock while held" except `AUDIT_LOCK`.
+    pub const USAGE: LockRank = LockRank::new(840);
+
+    /// `AUDIT_LOCK` — the audit append. The innermost leaf.
+    ///
+    /// Four of the file leaves above name it explicitly as the one lock they
+    /// take while held, and `marker_io`/`group_file_io` name it as takeable
+    /// under themselves. Nothing anywhere takes a registry lock while holding
+    /// it, which is what "innermost" means and what this rank enforces.
+    pub const AUDIT: LockRank = LockRank::new(900);
+
+    /// Every const above, with the registry field it ranks.
+    ///
+    /// Not decoration: `src-tauri/tests/liveness.rs` reads this to assert that
+    /// the ranks are DISTINCT (the property that lets re-entrancy be decided by
+    /// lock identity rather than by rank equality) and that every name here is
+    /// still a live lock in a fresh registry — so a field renamed out from
+    /// under a const fails a test instead of silently ranking nothing.
+    pub const ALL: &[(&str, LockRank)] = &[
+        ("marker_io", MARKER_IO),
+        ("group_file_io", GROUP_FILE_IO),
+        ("queue_persist", QUEUE_PERSIST),
+        ("queues", QUEUES),
+        ("recovered_queue", RECOVERED_QUEUE),
+        ("recovered_markers", RECOVERED_MARKERS),
+        ("by_pty", BY_PTY),
+        ("agents", AGENTS),
+        ("groups", GROUPS),
+        ("delivered_prompts", DELIVERED_PROMPTS),
+        ("delivered_notices", DELIVERED_NOTICES),
+        ("agent_seq_persist", AGENT_SEQ_PERSIST),
+        ("tasks_lock", TASKS),
+        ("needs_you_lock", NEEDS_YOU),
+        ("questions_lock", QUESTIONS),
+        ("mailbox_lock", MAILBOX),
+        ("usage_lock", USAGE),
+        ("audit", AUDIT),
+    ];
+}
+
 pub struct OrchRegistry {
     /// Root of persistent state: `<root>/<group>/{group.json,state.json,audit.jsonl,configs/}`.
     root: PathBuf,
@@ -14826,7 +15013,7 @@ static AUDIT_LOCK: std::sync::OnceLock<TrackedMutex<()>> = std::sync::OnceLock::
 /// the one lock a hold report cannot name. Same `OnceLock::get_or_init` shape
 /// `obs::data_root` uses.
 fn audit_lock() -> &'static TrackedMutex<()> {
-    AUDIT_LOCK.get_or_init(|| TrackedMutex::new("audit", ()))
+    AUDIT_LOCK.get_or_init(|| TrackedMutex::new_ranked("audit", lockorder::AUDIT, ()))
 }
 
 thread_local! {
@@ -26453,10 +26640,10 @@ impl OrchRegistry {
             root,
             roots: Arc::new(RootRegistry::new()),
             app: TrackedMutex::new("app", None),
-            groups: TrackedMutex::new("groups", HashMap::new()),
-            agents: TrackedMutex::new("agents", HashMap::new()),
+            groups: TrackedMutex::new_ranked("groups", lockorder::GROUPS, HashMap::new()),
+            agents: TrackedMutex::new_ranked("agents", lockorder::AGENTS, HashMap::new()),
             by_token: TrackedMutex::new("by_token", HashMap::new()),
-            by_pty: TrackedMutex::new("by_pty", HashMap::new()),
+            by_pty: TrackedMutex::new_ranked("by_pty", lockorder::BY_PTY, HashMap::new()),
             pending_binds: TrackedMutex::new("pending_binds", HashMap::new()),
             test_spawn_requests: TrackedMutex::new("test_spawn_requests", HashMap::new()),
             spawn_notices: TrackedMutex::new("spawn_notices", HashMap::new()),
@@ -26465,16 +26652,16 @@ impl OrchRegistry {
             // Seeded from disk on the first mint, not here — see `seq`'s doc.
             seq: AtomicU32::new(0),
             agent_seq_seeded: AtomicBool::new(false),
-            agent_seq_persist: TrackedMutex::new("agent_seq_persist", ()),
+            agent_seq_persist: TrackedMutex::new_ranked("agent_seq_persist", lockorder::AGENT_SEQ_PERSIST, ()),
             delivery: TrackedMutex::new("delivery", HashMap::new()),
             last_delivery: Arc::new(TrackedMutex::new("last_delivery", HashMap::new())),
-            delivered_notices: Arc::new(TrackedMutex::new("delivered_notices", HashMap::new())),
-            delivered_prompts: Arc::new(TrackedMutex::new("delivered_prompts", HashMap::new())),
-            queues: Arc::new(queuestate::QueueMap::new()),
+            delivered_notices: Arc::new(TrackedMutex::new_ranked("delivered_notices", lockorder::DELIVERED_NOTICES, HashMap::new())),
+            delivered_prompts: Arc::new(TrackedMutex::new_ranked("delivered_prompts", lockorder::DELIVERED_PROMPTS, HashMap::new())),
+            queues: Arc::new(queuestate::QueueMap::new_ranked(lockorder::QUEUES)),
             queue_seq: Arc::new(AtomicU64::new(0)),
-            queue_persist: Arc::new(TrackedMutex::new("queue_persist", ())),
-            recovered_queue: Arc::new(TrackedMutex::new("recovered_queue", HashMap::new())),
-            recovered_markers: Arc::new(TrackedMutex::new("recovered_markers", HashMap::new())),
+            queue_persist: Arc::new(TrackedMutex::new_ranked("queue_persist", lockorder::QUEUE_PERSIST, ())),
+            recovered_queue: Arc::new(TrackedMutex::new_ranked("recovered_queue", lockorder::RECOVERED_QUEUE, HashMap::new())),
+            recovered_markers: Arc::new(TrackedMutex::new_ranked("recovered_markers", lockorder::RECOVERED_MARKERS, HashMap::new())),
             recovered_groups: Arc::new(TrackedMutex::new("recovered_groups", HashSet::new())),
             mq_reconciled_groups: Arc::new(TrackedMutex::new("mq_reconciled_groups", HashSet::new())),
             mq_state_lock: Arc::new(TrackedMutex::new("mq_state_lock", ())),
@@ -26488,16 +26675,16 @@ impl OrchRegistry {
             queue_depth_emitted: Arc::new(TrackedMutex::new("queue_depth_emitted", (Vec::new(), 0))),
             unconfirmed_pending: Arc::new(TrackedMutex::new("unconfirmed_pending", HashMap::new())),
             orch_notice_inbox: Arc::new(TrackedMutex::new("orch_notice_inbox", HashMap::new())),
-            tasks_lock: TrackedMutex::new("tasks_lock", ()),
-            questions_lock: TrackedMutex::new("questions_lock", ()),
-            needs_you_lock: TrackedMutex::new("needs_you_lock", ()),
-            mailbox_lock: TrackedMutex::new("mailbox_lock", ()),
-            usage_lock: TrackedMutex::new("usage_lock", ()),
+            tasks_lock: TrackedMutex::new_ranked("tasks_lock", lockorder::TASKS, ()),
+            questions_lock: TrackedMutex::new_ranked("questions_lock", lockorder::QUESTIONS, ()),
+            needs_you_lock: TrackedMutex::new_ranked("needs_you_lock", lockorder::NEEDS_YOU, ()),
+            mailbox_lock: TrackedMutex::new_ranked("mailbox_lock", lockorder::MAILBOX, ()),
+            usage_lock: TrackedMutex::new_ranked("usage_lock", lockorder::USAGE, ()),
             usage_memo: TrackedMutex::new("usage_memo", HashMap::new()),
             default_branch_memo: TrackedMutex::new("default_branch_memo", HashMap::new()),
             creation: TrackedMutex::new("creation", ()),
-            marker_io: TrackedMutex::new("marker_io", ()),
-            group_file_io: TrackedMutex::new("group_file_io", ()),
+            marker_io: TrackedMutex::new_ranked("marker_io", lockorder::MARKER_IO, ()),
+            group_file_io: TrackedMutex::new_ranked("group_file_io", lockorder::GROUP_FILE_IO, ()),
             pr_head_override: TrackedMutex::new("pr_head_override", None),
             pr_body_override: TrackedMutex::new("pr_body_override", None),
             pr_files_override: TrackedMutex::new("pr_files_override", None),
@@ -26547,6 +26734,85 @@ impl OrchRegistry {
             merge_gate_removal_warned: TrackedMutex::new("merge_gate_removal_warned", HashSet::new()),
             views: views::ViewPublisher::new(),
         }
+    }
+
+    /// Run `f` with the named registry lock held ON THE CALLING THREAD (#1610).
+    ///
+    /// `None` for a name this does not know.
+    ///
+    /// The sibling of [`Self::hold_lock_for_test`], and the difference is the
+    /// whole reason it exists: that one holds a lock on a *spawned* thread,
+    /// which is what a contention test needs and what a lock-ORDER test can
+    /// never use. The order checker is per-thread, so a nesting has to happen
+    /// on one thread to be a nesting at all.
+    ///
+    /// **Deliberately not a `#[tauri::command]` and not reachable from an
+    /// agent**, for `hold_lock_for_test`'s reason: this composes deadlocks.
+    ///
+    /// The names are a representative handful rather than all eighty-odd —
+    /// enough to nest a declared pair in both directions and to re-enter one
+    /// lock, which is what L5 asks. `audit` is included because it is the
+    /// innermost rank in the table and the one every refusal path takes.
+    #[doc(hidden)]
+    pub fn with_lock_for_test<R>(&self, name: &str, f: impl FnOnce() -> R) -> Option<R> {
+        // One arm per lock rather than a `Box<dyn Any>` guard: the arms guard
+        // different types, and the acquisition has to happen at a real
+        // `lock_safe` call site or the recorded site would be this seam for
+        // every lock it can hold — which is exactly the half of a violation
+        // report that makes it actionable.
+        Some(match name {
+            "groups" => {
+                let _g = self.groups.lock_safe();
+                f()
+            }
+            "agents" => {
+                let _g = self.agents.lock_safe();
+                f()
+            }
+            "by_pty" => {
+                let _g = self.by_pty.lock_safe();
+                f()
+            }
+            "tasks_lock" => {
+                let _g = self.tasks_lock.lock_safe();
+                f()
+            }
+            "needs_you_lock" => {
+                let _g = self.needs_you_lock.lock_safe();
+                f()
+            }
+            "audit" => {
+                let _g = audit_lock().lock_safe();
+                f()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Try the named registry lock with an explicit budget, on the CALLING
+    /// thread (#1610). `None` for a name this does not know.
+    ///
+    /// Exists so a liveness test can reach [`TrackedMutex::lock_within`]'s
+    /// re-entrancy refusal through a REAL registry field rather than through a
+    /// lock the test built itself — the seam question every one of this repo's
+    /// "the extracted unit is green while the caller is wrong" findings turns
+    /// on. The guard is dropped before returning: the answer under test is
+    /// whether the acquisition was refused, not what it protects.
+    #[doc(hidden)]
+    pub fn lock_within_for_test(
+        &self,
+        name: &str,
+        budget: Duration,
+    ) -> Option<Result<(), loomux_engine::lockwatch::Busy>> {
+        Some(match name {
+            "groups" => self.groups.lock_within(budget).map(|_| ()),
+            "agents" => self.agents.lock_within(budget).map(|_| ()),
+            "by_pty" => self.by_pty.lock_within(budget).map(|_| ()),
+            "tasks_lock" => self.tasks_lock.lock_within(budget).map(|_| ()),
+            "needs_you_lock" => self.needs_you_lock.lock_within(budget).map(|_| ()),
+            "audit" => audit_lock().lock_within(budget).map(|_| ()),
+            _ => return None,
+        })
     }
 
     /// Hold one named registry lock for `ms`, on a thread of its own, returning

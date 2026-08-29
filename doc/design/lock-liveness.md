@@ -13,6 +13,11 @@ second, and neither can be changed without changing what they mean.
 §4 is rider R1 and is the section a reviewer should hold hardest: it is the
 argument that abandoning a read path partway through cannot corrupt anything.
 
+Phase 3a (#1610) adds the other half of the same object — whether the wait can
+end at all, rather than how long it lasts — and lives in
+`doc/design/lock-order.md`. The one thing it changes here is `Busy`, which gains
+a `kind`: see §3.
+
 ---
 
 ## 1. What was unbounded, and what a bound buys
@@ -96,6 +101,7 @@ than the poll tick that owes an answer.
 
 ```rust
 pub struct Busy {
+    pub kind: BusyKind,              // Timeout, or Reentrant (#1610)
     pub lock: &'static str,          // the field name, as given to TrackedMutex::new
     pub waited: Duration,            // what THIS waiter actually paid, not the budget
     pub holder: Option<HolderInfo>,  // sampled without blocking; None if it moved mid-read
@@ -109,6 +115,47 @@ agent's context and a human's screen:
 ```
 `agents` held 42.1 s by src/orchestration/mod.rs:41942 (thread 7), 3 waiters; waited 5.0 s
 ```
+
+### `BusyKind::Reentrant`, and why it is not `Busy::Reentrant`
+
+Phase 3a (#1610, `doc/design/lock-order.md`) added a second reason an
+acquisition can be refused: **this thread already holds the lock**. The plan's
+sketch spells the answer `Busy::Reentrant`, which reads as an enum variant; it
+is a `kind` on the struct instead.
+
+The reason is that the two answers carry the same evidence. A re-entrant
+refusal still names the lock, the site that holds it and how long that hold has
+run — the "holder" is simply this thread's own earlier frame, which is precisely
+the field a reader needs, and the one that turns "you deadlocked" into "you
+deadlocked *there*". Splitting the struct in two would have duplicated all four
+fields to distinguish them and rewritten every consumer — `mcp.rs`'s `rpc_busy`
+and `busy_tool_text`, `views.rs`'s fallbacks, `budget.rs`'s unwind payload — to
+match on a shape whose halves are identical.
+
+Two consequences are worth stating rather than leaving to be found.
+
+**`Display` branches.** The timeout wording ends `, 3 waiters; waited 5.0 s`,
+which for a re-entrant refusal would be true and completely misleading — nothing
+waited, and nothing is going to free up, because the caller is standing on the
+lock itself. So a re-entrant `Busy` renders its own sentence:
+
+```
+`tasks_lock` is already held by this same thread, taken 0.0 s ago at src/orchestration/mod.rs:27011 — a re-entrant acquisition would deadlock, so it was refused
+```
+
+**`retry_after_ms` is the same constant for both.** A re-entrant refusal is a
+defect that retrying the *same call* cannot clear — but the caller that receives
+one is an MCP request or a cadenced tick, and its retry is a fresh request on a
+fresh thread with an empty held-lock stack, which is the only sense in which any
+`Busy` was ever "retryable". Nothing here knows enough to say otherwise, and a
+`retry_after_ms` of 0 would say "hammer it".
+
+`docs/orchestration.md`'s "when an agent reports `loomux busy`" section is
+unchanged and stays true: it describes the answer a *user* can see, which is
+still "nothing was executed, and you can try again". A re-entrant refusal is a
+programmer error that today hangs the app instead, so no shipped path produces
+one; if one ever does, the log line the user is asked to send is the one that
+says which.
 
 The plan's sketch prefixed this with `registry busy: `. Dropped, because every
 caller that renders it already says "busy" in its own first three words, and

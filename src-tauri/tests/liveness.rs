@@ -99,10 +99,11 @@
 //!    tauri or tokio, so the call is unreachable there. If a crate under
 //!    `crates/` ever links Tauri, that scan's root list is the thing to widen.
 
-use loomux_engine::lockwatch::tracked_lock_names;
+use loomux_engine::lockwatch::{tracked_lock_names, tracked_lock_ranks};
 use serde_json::json;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
+use loomux_lib::orchestration::lockorder;
 use loomux_lib::orchestration::{mailbox, Caller, GroupId, Guardrails, OrchRegistry, Role};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -1507,4 +1508,299 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     // places, each with the counterfactual it actually has.
     let swept_writes = sealed_after - sealed_before;
     let _ = swept_writes;
+}
+
+// ---------- L5: the lock-order checker, over the REAL rank table ----------
+//
+// #1600 plan comment 4/4 b, rows L5a-L5c, gated on Phase 3a (#1610).
+//
+// These drive `orchestration::lockorder`'s shipped consts through real
+// `OrchRegistry` fields, not through locks a test built for itself. The
+// distinction is the one every "the extracted unit is green while the caller is
+// wrong" finding in this repo turns on: a checker proved correct on two locks in
+// `lockwatch.rs`'s own unit tests says nothing about whether the table was
+// applied to `groups`, or applied the right way up.
+//
+// **L5c is not a test in this file, and cannot be.** The plan's row is "the
+// whole existing suite green with the checker armed" — which is what the CI run
+// of `tests/orchestration.rs` (and every other binary here) IS, in a debug
+// build, where a violation panics. Writing an assertion for it would be writing
+// a test that asserts the other tests passed. Its stated bound, from the plan:
+// paths the suite does not exercise are covered by the release-mode breadcrumb,
+// not by this run.
+
+/// A short budget for a `lock_within` probe that must answer at once.
+///
+/// Long enough that a loaded runner cannot make a genuinely free lock look
+/// contended, and 200x shorter than the answer a re-entrancy refusal must give
+/// — which is immediate. It is also the WATCHDOG for the failing run: with the
+/// refusal removed, the probe returns a timeout `Busy` after this instead of
+/// parking forever, so the row fails naming an assertion rather than arriving
+/// as a job timeout (the #744 idiom, same as `lockwatch.rs`'s `HOLD_MAX`).
+const REENTRANCY_PROBE_BUDGET: Duration = Duration::from_millis(2_000);
+
+#[test]
+fn l5a_a_planted_inversion_panics_under_the_checker_naming_both_locks() {
+    let (reg, _dir) = test_registry();
+
+    // The DECLARED direction first. Without it this row passes just as well
+    // against a checker that refuses every nesting, which would be a checker
+    // nobody could ship — and the two directions are the same two locks, so
+    // nothing but the ORDER distinguishes the two halves.
+    let ok = reg
+        .with_lock_for_test("agents", || reg.with_lock_for_test("groups", || 7u32))
+        .expect("`agents` is a known lock name")
+        .expect("`groups` is a known lock name");
+    assert_eq!(ok, 7, "`agents` (rank 510) then `groups` (rank 520) is the declared order");
+
+    // Now the inversion: `groups` outermost, `agents` under it. One thread, no
+    // race — which is the point of a rank checker over a soak test. It does not
+    // need the deadlock to happen, only the order that permits it.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = reg.with_lock_for_test("groups", || reg.with_lock_for_test("agents", || ()));
+    }));
+    let payload = panicked.err().expect(
+        "taking `agents` under `groups` must panic under the checker in a debug/test build",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    // Both locks, both ranks, and both call sites — the half of a violation
+    // report that makes it actionable rather than another thing to go looking
+    // for in a 54,000-line module (#1600 §2.3).
+    let needles = [
+        "agents".to_string(),
+        "groups".to_string(),
+        format!("rank {}", lockorder::AGENTS),
+        format!("rank {}", lockorder::GROUPS),
+        // Two needles, not one path: the recorded site is a real `file!()`,
+        // so it is `src-tauri/src/orchestration/mod.rs` on unix and
+        // `src-tauri\src\orchestration\mod.rs` on Windows. Asserting the
+        // slashed form passed on two platforms and failed on the third
+        // (run 33262628789).
+        "orchestration".to_string(),
+        "mod.rs".to_string(),
+    ];
+    for needle in &needles {
+        assert!(msg.contains(needle), "the panic lost {needle:?}: {msg}");
+    }
+    // The sites are the real `lock_safe()` call sites in `mod.rs`, not this
+    // test's line and not the checker's own — `#[track_caller]` is what buys
+    // that, and it is the difference between a report that names code and one
+    // that names the instrument.
+    assert!(!msg.contains("liveness.rs"), "the recorded sites are the seam's, not this test's: {msg}");
+}
+
+#[test]
+fn l5b_a_reentrant_acquisition_answers_busy_instead_of_hanging() {
+    let (reg, _dir) = test_registry();
+
+    // Discriminating half: an uncontended `lock_within` on the same field must
+    // SUCCEED. Without it, "returns Err" is satisfied by a lock that never
+    // grants anything.
+    assert!(
+        reg.lock_within_for_test("tasks_lock", REENTRANCY_PROBE_BUDGET)
+            .expect("`tasks_lock` is a known lock name")
+            .is_ok(),
+        "an uncontended registry lock must be acquired, not reported busy"
+    );
+
+    let started = Instant::now();
+    let busy = reg
+        .with_lock_for_test("tasks_lock", || {
+            reg.lock_within_for_test("tasks_lock", REENTRANCY_PROBE_BUDGET)
+        })
+        .expect("`tasks_lock` is a known lock name")
+        .expect("`tasks_lock` is a known lock name")
+        .err()
+        .expect(
+            "re-acquiring a lock this thread already holds must be refused; today it parks \
+             forever, and one lock is no cycle for an inversion search to find (#1600 §1.2)",
+        );
+
+    assert!(
+        busy.is_reentrant(),
+        "the refusal must say WHY — a re-entrant self-acquisition is a defect, not contention: \
+         {busy:?}"
+    );
+    assert_eq!(busy.lock, "tasks_lock");
+    assert!(
+        started.elapsed() < REENTRANCY_PROBE_BUDGET,
+        "the refusal must be immediate rather than budget-shaped: took {:?}",
+        started.elapsed()
+    );
+    let holder = busy.holder.as_ref().expect("the holder is this thread's own earlier frame");
+    assert!(
+        holder.site_file.ends_with("mod.rs"),
+        "the refusal must name the site that already holds it, which is in the registry, not \
+         here: {}:{}",
+        holder.site_file,
+        holder.site_line
+    );
+    // `Display` reaches an agent's context through `loomux busy:` — a
+    // re-entrant refusal must not read as ordinary contention that a retry
+    // clears.
+    let rendered = busy.to_string();
+    assert!(
+        rendered.contains("already held by this same thread"),
+        "the rendered refusal reads as contention: {rendered}"
+    );
+}
+
+#[test]
+fn l5_every_lockorder_rank_is_distinct() {
+    // Load-bearing rather than tidy. Distinct ranks are what make "two held
+    // locks share a rank" mean "the same field from two different registries" —
+    // which this very binary builds, several times per test — instead of "two
+    // peers that must never nest". Collapse two consts onto one value and the
+    // checker starts refusing nestings that are fine.
+    let mut seen: Vec<(u32, &str)> = Vec::new();
+    for (name, rank) in lockorder::ALL {
+        if let Some((_, other)) = seen.iter().find(|(v, _)| *v == rank.get()) {
+            panic!("`{name}` and `{other}` share rank {rank}; ranks must be distinct");
+        }
+        seen.push((rank.get(), *name));
+    }
+    // Vacuity control: an "every pair differs" over an empty list is true.
+    assert_eq!(seen.len(), lockorder::ALL.len());
+    assert!(lockorder::ALL.len() >= 18, "the table shrank: {}", lockorder::ALL.len());
+}
+
+/// Separate from the distinctness row on purpose: two properties in one test
+/// means whichever assertion runs first masks the other, and a guard nobody can
+/// redden alone is a guard nobody has checked.
+#[test]
+fn l5_every_lockorder_const_names_a_lock_that_still_exists() {
+    // A const that names a field which has been renamed away ranks nothing at
+    // all, silently. `tracked_lock_names()` is every LIVE tracked lock in this
+    // process, so a fresh registry puts all of them there.
+    let (reg, _dir) = test_registry();
+    // `AUDIT_LOCK` is a lazily-initialised static rather than a registry field,
+    // so it is only live once something has taken it. Take it.
+    reg.with_lock_for_test("audit", || ()).expect("`audit` is a known lock name");
+    let live = tracked_lock_names();
+    for (name, _) in lockorder::ALL {
+        assert!(
+            live.contains(name),
+            "`lockorder` ranks `{name}`, which is not a live tracked lock — the field was \
+             renamed and the const now ranks nothing"
+        );
+    }
+    // Vacuity control: the assertion above is an "every" over a list, and it
+    // passes trivially if the list is empty or the scan found nothing.
+    assert!(lockorder::ALL.len() >= 18, "the table shrank: {}", lockorder::ALL.len());
+    assert!(live.len() >= 60, "the live-lock scan found only {} locks", live.len());
+}
+
+/// The rank table is only a table if it is APPLIED (#1610 review B1).
+///
+/// The one claim this whole change exists to abolish is "a doc comment states
+/// an order and nothing can fail a build over it". Moving those claims into
+/// consts does not by itself close it: *"this field carries this rank"* is a
+/// new claim of exactly the same shape, and three guards that look like they
+/// cover it do not —
+///
+/// - the const-names-a-live-lock row reads `tracked_lock_names()`, which is
+///   names only, and a field built with plain `new` registers the same name;
+/// - the distinctness row reads `lockorder::ALL` and never touches a lock;
+/// - `selfwatch.rs`'s named-construction scan floors `named + ranked`, and
+///   reverting a field moves it from one bucket to the other, leaving the sum
+///   and both floors intact.
+///
+/// **And the suite itself is structurally blind to it:** removing a rank can
+/// only remove violations, never create one, so no green run anywhere — on any
+/// platform, in any round — is evidence that a rank is still applied.
+///
+/// Both directions are checked, because one fix closes both and the second is
+/// the one that keeps the DISTINCTNESS property honest: a rank written inline
+/// (`LockRank::new(520)` at a construction site) is invisible to a guard that
+/// only reads `ALL`, and a duplicate rank means those two locks nest freely in
+/// both directions.
+///
+/// Mismatches are COLLECTED rather than asserted one at a time: a table is a
+/// set, and a reader fixing one row wants to see the other four in the same
+/// run.
+#[test]
+fn l5_every_lockorder_const_is_applied_to_its_field() {
+    let (reg, _dir) = test_registry();
+    // `AUDIT_LOCK` is a lazily-initialised static rather than a registry field,
+    // so it is only live once something has taken it. Take it.
+    reg.with_lock_for_test("audit", || ()).expect("`audit` is a known lock name");
+
+    // Normalised to owned scalars so the comparisons below are between a
+    // `&str` and a `u32` rather than between four layers of reference.
+    let live: Vec<(String, Option<u32>)> = tracked_lock_ranks()
+        .into_iter()
+        .map(|(name, rank)| (name.to_string(), rank.map(|r| r.get())))
+        .collect();
+
+    let mut wrong: Vec<String> = Vec::new();
+
+    // Direction 1: every const in the table is applied, to a live lock, at the
+    // rank the table says.
+    for (name, rank) in lockorder::ALL {
+        let want = rank.get();
+        let seen: Vec<Option<u32>> =
+            live.iter().filter(|(n, _)| n.as_str() == *name).map(|(_, r)| *r).collect();
+        if seen.is_empty() {
+            wrong.push(format!(
+                "`{name}`: the table ranks it {want}, but no live tracked lock carries that name"
+            ));
+            continue;
+        }
+        for got in seen {
+            match got {
+                Some(actual) if actual == want => {}
+                Some(actual) => wrong.push(format!(
+                    "`{name}`: the table says rank {want}, the live lock carries {actual}"
+                )),
+                None => wrong.push(format!(
+                    "`{name}`: the table says rank {want}, the live lock is UNRANKED — the const \
+                     enforces nothing and the checker cannot see this field at all"
+                )),
+            }
+        }
+    }
+
+    // Direction 2: no live lock carries a rank the table does not know.
+    for (name, rank) in &live {
+        let Some(rank) = *rank else { continue };
+        if !lockorder::ALL.iter().any(|(n, r)| *n == name.as_str() && r.get() == rank) {
+            wrong.push(format!(
+                "`{name}` is live at rank {rank}, which `lockorder::ALL` does not carry — a rank \
+                 written at a construction site is invisible to the distinctness guard, and two \
+                 locks sharing a rank nest freely in BOTH directions"
+            ));
+        }
+    }
+
+    // De-duplicated, and this is not tidiness. A mismatch is a fact about a
+    // FIELD; the scan sees one entry per LIVE lock of that name, and this
+    // binary runs its tests concurrently, so the repeat count is however many
+    // other tests happened to be holding a registry at that instant. Reporting
+    // the raw list makes the message both unreadable and NON-DETERMINISTIC —
+    // measured, not feared: the first red run of this row printed each of its
+    // three findings six times (#1610 review B1's scratch round).
+    wrong.sort();
+    wrong.dedup();
+    assert!(
+        wrong.is_empty(),
+        "the rank table and the live locks disagree:\n  {}",
+        wrong.join("\n  ")
+    );
+
+    // Vacuity controls. Both assertions above are "every" over a list, and both
+    // pass trivially against an empty table or an empty scan.
+    assert!(lockorder::ALL.len() >= 18, "the table shrank: {}", lockorder::ALL.len());
+    let ranked = live.iter().filter(|(_, r)| r.is_some()).count();
+    assert!(
+        ranked >= lockorder::ALL.len(),
+        "only {ranked} live locks carry a rank at all, against {} consts — the scan is not \
+         seeing the registry",
+        lockorder::ALL.len()
+    );
+    assert!(live.len() >= 60, "the live-lock scan found only {} locks", live.len());
 }

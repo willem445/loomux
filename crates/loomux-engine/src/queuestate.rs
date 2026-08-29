@@ -131,8 +131,22 @@ pub struct QueueMap {
 }
 
 impl QueueMap {
+    /// An UNRANKED queue map — the unit tests below, which take this lock and
+    /// nothing else.
     pub fn new() -> Self {
         Self { inner: TrackedMutex::new("queues", HashMap::new()) }
+    }
+
+    /// A queue map whose lock sits at `rank` in the declared acquisition order
+    /// (#1610).
+    ///
+    /// The registry's own `queues` field is built this way. The rank has to
+    /// come in from OUTSIDE rather than being a const here, because the table
+    /// it belongs to is `orchestration::lockorder` — the order is a fact about
+    /// the registry that owns this map, not about the map, and a second copy of
+    /// one rank in a second crate is the drift the single table exists to stop.
+    pub fn new_ranked(rank: crate::lockwatch::LockRank) -> Self {
+        Self { inner: TrackedMutex::new_ranked("queues", rank, HashMap::new()) }
     }
 
     /// Read the queues. No persistence obligation: nothing changed.

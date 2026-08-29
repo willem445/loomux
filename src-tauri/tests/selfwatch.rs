@@ -577,19 +577,62 @@ fn every_lock_on_the_registry_is_a_tracked_one() {
 
 #[test]
 fn every_registry_lock_is_constructed_with_a_name() {
+    // **Default-deny over CONSTRUCTORS, not a list of the ones that exist.**
+    // This scan used to match the literal `TrackedMutex::new(` and nothing
+    // else. #1610 added `new_ranked` and moved seventeen of this file's
+    // constructions onto it, and the scan's count fell from 85 to 68 while
+    // every one of them still passed a literal name — a guard that had gone
+    // blind to a fifth of the struct and could only say so through its own
+    // vacuity floor. (Counted on the blobs: `git show <base>:` has 85
+    // `TrackedMutex::new("`; head has 68 plus 17 `new_ranked("`.)
+    //
+    // So it now reads every `TrackedMutex::new` occurrence and classifies what
+    // FOLLOWS it. A third constructor added later is refused here by default,
+    // rather than quietly falling outside the scan.
+    const CTOR: &str = "TrackedMutex::new";
     let src = read("src-tauri/src/orchestration/mod.rs");
-    let unnamed: Vec<&str> = src
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.contains("TrackedMutex::new(") && !l.contains("TrackedMutex::new(\""))
-        .collect();
+    let mut named = 0usize;
+    let mut ranked = 0usize;
+    let mut unnamed: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for (at, _) in src.match_indices(CTOR) {
+        let rest = &src[at + CTOR.len()..];
+        let line = || src[at..].lines().next().unwrap_or_default().trim().to_string();
+        if rest.starts_with("(\"") {
+            named += 1;
+        } else if rest.starts_with("_ranked(\"") {
+            ranked += 1;
+        } else if rest.starts_with('(') || rest.starts_with("_ranked(") {
+            // A call, with something other than a string literal for a name.
+            unnamed.push(line());
+        } else if rest.starts_with('_') && !rest.starts_with("_ranked") {
+            // `TrackedMutex::new_something` — a constructor this scan has
+            // never heard of. Prose mentions of `new_ranked` land above and
+            // are not flagged; a prose mention of a genuinely new one is
+            // flagged, which is loud in the right direction.
+            unknown.push(line());
+        }
+        // Anything else (`` `TrackedMutex::new` `` in a doc comment) is a
+        // mention rather than a call.
+    }
     assert!(
         unnamed.is_empty(),
         "a TrackedMutex built without a literal name: {unnamed:?}. The name is the first half of \
          a readable hold report (`mq_state_lock held 340 s by queue_merge_with`)"
     );
-    let named = src.matches("TrackedMutex::new(\"").count();
-    assert!(named >= 80, "the scan found only {named} named constructions; it has stopped reading");
+    assert!(
+        unknown.is_empty(),
+        "a TrackedMutex constructor this scan does not know: {unknown:?}. Teach it here — a \
+         constructor outside the classification is a field the scan silently stops covering"
+    );
+    // The vacuity control, and it is now per-CONSTRUCTOR. A single total is
+    // satisfied by one constructor going to zero while the other absorbs it,
+    // which is exactly what happened in #1610.
+    assert!(
+        named + ranked >= 80,
+        "the scan found only {named} named + {ranked} ranked constructions; it has stopped reading"
+    );
+    assert!(named > 0 && ranked > 0, "one constructor matched nothing: {named} named, {ranked} ranked");
 }
 
 #[test]
