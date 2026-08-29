@@ -144,6 +144,8 @@ pub fn run() {
             orchestration::start_idle_reaper(reg.clone());
             orchestration::start_watchdog(reg.clone());
             orchestration::start_attention(reg.clone());
+            // #1608: the publisher thread behind orch_group_view/orch_strip_view.
+            orchestration::start_view_publisher(reg.clone());
             orchestration::start_max_notice_flusher(reg.clone());
             orchestration::start_idle_tick(reg.clone());
             orchestration::start_compact_nudge(reg.clone());
@@ -265,6 +267,8 @@ pub fn run() {
             orchestration::orch_autonomy,
             orchestration::orch_group_usage,
             orchestration::orch_group_summary,
+            orchestration::orch_group_view,
+            orchestration::orch_strip_view,
             orchestration::orch_workflow_preview,
             orchestration::orch_set_advanced_orchestrator,
             orchestration::orch_workflow_status,

@@ -14,8 +14,9 @@
 // WHAT IT COSTS. One `setInterval` at 1 Hz whose body is a rounding subtraction
 // and one `invoke` of a SYNC command with a six-atomic-store body: no lock, no
 // IO, no allocation on either side. For scale, the tab strip polls every 4 s
-// with two invokes PER group-bound tab and the group view polls every 2 s with
-// nine, and both of those do real work at the far end.
+// and the group view every 2 s, each issuing ONE invoke since #1608 (two per
+// group-bound tab and ten respectively before it), and both of those do real
+// work at the far end.
 //
 // WHY IT IS NOT VISIBILITY-GATED, when `performance.md` INV-4's default is that
 // a timer driving IPC should be. A hidden window is one of the states the app

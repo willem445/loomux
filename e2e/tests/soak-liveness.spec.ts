@@ -15,11 +15,16 @@
 // reads as covering is worse than none:
 //
 // - **The 4 s tab-strip poll: yes.** `src/tabbar.ts` arms it at construction
-//   ("the app's one app-lifetime poll") and `pollStatus` issues
-//   `orch_group_summary` + `orch_group_usage` for every GROUP-BOUND tab. A tab
-//   is group-bound purely because its persisted `groupIds` names a group, so
-//   the corpus's `tabs.json` alone puts that poll under load — no clicking,
-//   and no agent CLI.
+//   ("the app's one app-lifetime poll") and `pollStatus` issues one
+//   `orch_strip_view` covering every GROUP-BOUND tab (it was
+//   `orch_group_summary` + `orch_group_usage` per tab until #1608 served the
+//   strip from a published snapshot). A tab is group-bound purely because its
+//   persisted `groupIds` names a group, so the corpus's `tabs.json` alone puts
+//   that poll under load — no clicking, and no agent CLI. What the collapse
+//   changes for this lane is the SHAPE of the load, not its presence: one
+//   command per sweep still crosses the IPC boundary and still reaches the
+//   backend on a 4 s cadence. It no longer takes a registry lock, which is why
+//   the class assertion below is about the MCP path rather than this one.
 // - **The 2 s group-view poll: no, and it cannot be.** `src/groupview.ts`'s
 //   timer is armed only while the view is shown, and the view can only be
 //   opened from a pane whose `groupBtn` is visible — which
@@ -37,7 +42,9 @@
 //   every pane stops accepting input at once. Both ends are now cut,
 //   independently: #1604 single-flights this sweep, so a tick firing while
 //   the previous one is still outstanding SKIPS and at most one call is
-//   parked however long a lock is held; and #1612 moved `write_pty` off the
+//   parked however long a lock is held — though since #1608 that sweep reads a
+//   published snapshot and takes no registry lock, so a held lock no longer
+//   parks it and the gate has nothing to engage on; and #1612 moved `write_pty` off the
 //   shared pool onto a per-pane writer thread, so even an exhausted pool
 //   could not starve pane input. An earlier version of this header said
 //   raising the hold past ~120 s locally would reach the pane-input half —
@@ -107,6 +114,8 @@ import {
   parseHoldCrumbs,
   readBreadcrumbs,
   readInvokeCounts,
+  tabStatusStats,
+  stripStaleState,
   requestLockHold,
   sleep,
   waitForHoldAcquired,
@@ -118,8 +127,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *  cwd — this checkout itself. Nothing writes to it. */
 const REPO_ROOT = path.resolve(__dirname, "../..");
 
-/** Tabs bound to a group. Each one costs two `orch_*` invokes every 4 s, so
- *  this is the poll load's multiplier. */
+/** Tabs bound to a group. Each one cost two `orch_*` invokes every 4 s until
+ *  #1608; the sweep is now one `orch_strip_view` whatever the tab count, so
+ *  this is no longer the poll load's multiplier — it is how many groups the
+ *  strip resolves, which is what `tabStatusStats` witnesses. */
 const BOUND_TABS = Math.min(4, CORPUS_GROUPS);
 
 /** How long to let the app settle after launch before measuring anything. */
@@ -212,6 +223,9 @@ test.describe("soak: a large corpus and a steady poll load", () => {
     // the same `{}` as an app that never polled.
     const countsBefore = orchInvokeTotal(await assertCounterSeesTheApp(page, "write_pty"));
     const sweepsBefore = await singleFlightStats(page);
+    // Per-command baseline for the strip read, so the floor below measures THIS
+    // soak rather than every orch_strip_view since boot.
+    const stripBefore = (await readInvokeCounts(page))["orch_strip_view"] ?? 0;
 
     // ---- the soak itself: the app is left completely alone ----
     await sleep(SOAK_MS);
@@ -261,31 +275,62 @@ test.describe("soak: a large corpus and a steady poll load", () => {
         `about an idle app. Poll gate: ${JSON.stringify(gate)}`
     ).toBeGreaterThanOrEqual(sweepFloor);
 
-    // And the two instruments have to agree, at the FAN-OUT and not merely at
-    // "something happened". A sweep issues `orch_group_summary` +
-    // `orch_group_usage` per group-bound tab, so a full sweep dispatches
-    // `BOUND_TABS × 2`; measured, `polled` is exactly `sweeps × BOUND_TABS × 2`.
+    // And the two instruments have to agree — but at what, changed under this
+    // spec, and the change is worth stating because it took a witness away.
     //
-    // The floor was `polled >= sweeps`, which has 8× slack and therefore only
-    // catches a corpus that bound NO tabs: one that bound 1 of 4 dispatches 90
-    // against 45 sweeps and passes, running the soak at a quarter of its
-    // intended registry load with `assertCorpusReallyLanded` none the wiser —
-    // it checks groups, sessions and audit bytes, never the binding (#1606
-    // review round 2, N1).
+    // WHAT THIS USED TO ASSERT. A sweep issued `orch_group_summary` +
+    // `orch_group_usage` per group-bound tab, so a full sweep dispatched
+    // `BOUND_TABS × 2` and `polled` tracked `sweeps × BOUND_TABS × 2`. The
+    // floor was raised to half that nominal fan-out in #1606 review round 2
+    // (N1) to catch a corpus that binds only SOME of its tabs: with the older
+    // `polled >= sweeps` floor, one that bound 1 of 4 dispatched 90 against 45
+    // sweeps and passed, running the soak at a quarter of its intended registry
+    // load with `assertCorpusReallyLanded` none the wiser — it checks groups,
+    // sessions and audit bytes, never the binding.
     //
-    // Half the nominal fan-out is safe to pin here, and pinning it does not
-    // reintroduce the arithmetic that went stale on #1604: what that change
-    // made unpredictable is how many sweeps RUN, which is why `sweeps` is read
-    // rather than derived. What each sweep dispatches is untouched by it.
-    const dispatchFloor = Math.floor(sweeps * BOUND_TABS * 2 * 0.5);
+    // WHY IT NO LONGER CAN. #1608 serves the whole strip from one published
+    // snapshot: a sweep now dispatches ONE `orch_strip_view` whatever the tab
+    // count. That is the improvement — the strip's IPC stops growing with the
+    // human's tabs — and it deletes the SCALING the binding witness rode on.
+    // Not a stale constant: the fan-out that carried the signal is gone.
+    //
+    // So the two properties that rode on one assertion are now asserted
+    // separately, and the binding one is read where binding actually lives.
+    // Nearly a tautology, and honestly so: SingleFlight.run counts a run
+    // around a body that reaches stripView unconditionally, so this holds by
+    // construction against a 50% floor. It can still fail if the sweep body
+    // stops reaching the backend, which is what its message says and is worth
+    // keeping for. What it does NOT do any more is witness BINDING — the
+    // `tabStatusStats` assertions below are what carry that (#1625 review
+    // round 2, N2).
+    const stripDispatches = (counts["orch_strip_view"] ?? 0) - stripBefore;
+    const dispatchFloor = Math.floor(sweeps * 0.5);
     expect(
-      polled,
-      `${sweeps} status sweeps ran but only ${polled} orch_* commands were dispatched ` +
-        `(expected at least ${dispatchFloor}, half the ${sweeps} × ${BOUND_TABS} × 2 ` +
-        `fan-out). A sweep issues two per GROUP-BOUND tab, so a shortfall means some or ` +
-        `all of the corpus's tabs.json did not bind and the soak applied less registry ` +
-        `load than it reports. Counts: ${JSON.stringify(counts)}`
+      stripDispatches,
+      `${sweeps} status sweeps ran but only ${stripDispatches} orch_strip_view commands were ` +
+        `dispatched (expected at least ${dispatchFloor}, half of one per sweep). A sweep issues ` +
+        `exactly one since #1608, so a shortfall means the sweep body is not reaching the ` +
+        `backend at all. Counts: ${JSON.stringify(counts)}`
     ).toBeGreaterThanOrEqual(dispatchFloor);
+
+    // THE BINDING WITNESS, replacing the fan-out one #1608 removed. `bound` is
+    // every tab whose persisted `groupIds` names a group; `seen` the subset the
+    // published snapshot carried. A corpus that binds 1 of 4 reddens here — the
+    // case N1 was raised about — and so does one whose groups never reach the
+    // snapshot, which the fan-out floor could not distinguish.
+    const tabs = await tabStatusStats(page);
+    expect(
+      tabs.bound.length,
+      `the strip resolved ${tabs.bound.length} group-bound tabs, expected ${BOUND_TABS}. The ` +
+        `corpus's tabs.json did not bind what it reports, so the soak applied less registry ` +
+        `load than it claims. Bound: ${JSON.stringify(tabs.bound)}`
+    ).toBe(BOUND_TABS);
+    expect(
+      tabs.seen.length,
+      `${tabs.bound.length} tabs are group-bound but only ${tabs.seen.length} of their groups ` +
+        `were in the published snapshot, so the strip rendered stale or absent status for the ` +
+        `rest. Bound: ${JSON.stringify(tabs.bound)}; seen: ${JSON.stringify(tabs.seen)}`
+    ).toBe(tabs.bound.length);
 
     // ---- (4) the two liveness assertions ----
     const pty = await ptyRoundTrip(page, paneTerm, 2, LIVENESS_BOUND_MS);
@@ -332,13 +377,22 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
   //
   // It also carries the OTHER claim this lane makes about the merged tree, and
   // carries it here rather than in the class assertion because an expected
-  // failure absorbs its own assertions: that #1604's single-flight really does
-  // engage when a registry lock is held, so the poll path parks one call and
-  // not a queue of them. The 180 s soak measured 46 sweeps and ZERO skips —
-  // healthy, and therefore no evidence at all about the skip path. A held lock
-  // is the condition the gate was built for, so it is the condition to observe
-  // it under.
-  test("the injector is armed, and a held registry lock makes the poll sweep single-flight", async ({
+  // failure absorbs its own assertions: that a held registry lock does not
+  // stall the poll sweep, which is the INVERSE of what this test asserted
+  // before #1608 and is the point of that change.
+  //
+  // It used to assert `skipped >= 1`: `orch_group_summary` took `groups`, so a
+  // hold parked the sweep, the next tick found it outstanding, and #1604's gate
+  // skipped. #1608 serves the sweep from a published snapshot — no registry
+  // lock, so it settles under a hold and a skip would now mean the poll path is
+  // contending again.
+  //
+  // Stated plainly because it is a loss as well as a gain: `skipped >= 1` has
+  // NO witness left anywhere in this lane, and cannot have one, because the
+  // condition that produced a skip is the condition #1608 removed. The gate
+  // itself is still tested — `test/singleflight.test.ts` covers it directly —
+  // just not through a held registry lock.
+  test("the injector is armed, and a held registry lock does not stall the poll sweep", async ({
     appPage: page,
     appDataDir,
   }) => {
@@ -349,9 +403,13 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     // with whether the injector is armed.
     await expect(page.locator("#tab-bar")).toBeAttached();
 
-    // `groups` rather than `agents`: it is what the polled `orch_group_summary`
-    // takes, so holding it is what stalls a sweep. Long enough to span several
-    // 4 s ticks, short enough to stay cheap.
+    // `groups` rather than `agents`: it is what `resolve_token` takes on every
+    // MCP request, so holding it is what stalls the probe this spec is about.
+    // It used to stall the tab-strip sweep too — `orch_group_summary` took it —
+    // but since #1608 that sweep reads a published snapshot and no longer
+    // acquires a registry lock at all, which is the change that makes the
+    // `test.fail()` below an MCP-side statement rather than a poll-path one.
+    // Long enough to span several 4 s ticks, short enough to stay cheap.
     const holdMs = 12_000;
     const before = await singleFlightStats(page);
     requestLockHold(appDataDir, "groups", holdMs);
@@ -360,7 +418,14 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
 
     // Wait out the hold, then read what the gate did during it.
     const releasedBy = Date.now() + holdMs + 20_000;
-    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) await sleep(200);
+    // Sampled INSIDE the wait, because by the time the hold has released the
+    // publisher has had a second to catch up and the badge is already gone.
+    // `sawStale` is what the human would have seen while the backend was stuck.
+    let sawStale = false;
+    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) {
+      await sleep(200);
+      if (!sawStale) sawStale = (await stripStaleState(page)).stale;
+    }
     expect(holdStillHeld(appDataDir), `the injector never released a ${holdMs}ms hold`).toBe(false);
 
     const after = await singleFlightStats(page);
@@ -413,14 +478,64 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
         `injector claims to have held it (${holdMs}ms): ${crumb?.raw}`
     ).toBeGreaterThanOrEqual(holdMs - 2_000);
 
+    // THE CONTRACT THIS ASSERTS CHANGED UNDER PHASE 1, and the direction is
+    // the whole point of that phase.
+    //
+    // #1606 asserted `skipped >= 1`: holding `groups` stalled the sweep,
+    // because `orch_group_summary` took that mutex, so the next 4 s tick found
+    // its predecessor outstanding and the single-flight gate skipped it. That
+    // was the right assertion against a poll path that contends.
+    //
+    // #1608 serves the strip from a published snapshot. The sweep takes NO
+    // registry lock, so it settles normally while `groups` is held — and a
+    // skip would now mean something is wrong. Keeping `skipped >= 1` would
+    // pin the defect this epic removed.
+    //
+    // What replaces it is INV-6's actual promise: under a hold the surface
+    // keeps answering and says it is stale, rather than parking threads.
+    expect(
+      ran,
+      `no status sweep completed while the \`groups\` mutex was held for ${holdMs}ms. Since ` +
+        `#1608 the sweep reads a published snapshot and takes no registry lock, so a hold ` +
+        `must not stall it — if nothing ran, the poll path is contending again and the ` +
+        `blocking-pool accumulation this epic removed is reachable once more.`
+    ).toBeGreaterThanOrEqual(1);
     expect(
       skipped,
-      `no tick was skipped while the \`groups\` mutex was held for ${holdMs}ms (${ran} sweeps ` +
-        `ran). Either the status sweep does not contend on that mutex — in which case this ` +
-        `lane's claim that #1604 bounds the poll path under a held lock is unevidenced — or ` +
-        `the sweep is settling despite the hold, which would mean the hold is not reaching ` +
-        `the read the sweep makes.`
-    ).toBeGreaterThanOrEqual(1);
+      `${skipped} tick(s) were skipped while \`groups\` was held for ${holdMs}ms. A skip means ` +
+        `a sweep did not settle within its own 4 s tick, which since #1608 it has no reason ` +
+        `to do: the read is a pointer clone. Either something reintroduced a registry ` +
+        `acquisition on the poll path, or the strip read is blocking on something new.`
+    ).toBe(0);
+
+    // ...and the disclosure half. A snapshot the publisher cannot refresh ages,
+    // and the strip has to SAY so — that is what makes a stalled backend a
+    // stale panel rather than a frozen one that looks live (#1604 review N3,
+    // the requirement Phase 1 carries). The publisher parks on the same
+    // `groups` this test holds, so 12 s of hold is well past
+    // VIEW_STALE_AFTER_MS (5 s).
+    expect(
+      sawStale,
+      `the strip never reported itself stale during ${holdMs}ms with \`groups\` held. The ` +
+        `publisher parks on that mutex, so its snapshot cannot have been refreshed past ` +
+        `VIEW_STALE_AFTER_MS (5 s) — a strip that keeps rendering without disclosure is the ` +
+        `silent freeze this phase exists to remove.`
+    ).toBe(true);
+
+    // RELEASED ON EVIDENCE, not on a timer: the badge comes down only because
+    // the publisher got the lock back and stored a fresh snapshot.
+    const clearedBy = Date.now() + 10_000;
+    let cleared = false;
+    while (Date.now() < clearedBy && !cleared) {
+      await sleep(250);
+      cleared = !(await stripStaleState(page)).stale;
+    }
+    expect(
+      cleared,
+      `the strip stayed stale after the hold released. The badge is cleared by the next ` +
+        `successful publish, so if it never clears the publisher did not recover — which ` +
+        `would make the disclosure permanent rather than bounded (INV-6).`
+    ).toBe(true);
   });
 
   // Expected to fail on today's main. See this file's header for why the

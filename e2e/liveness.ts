@@ -375,6 +375,39 @@ export async function singleFlightStats(page: Page): Promise<{ ran: number; skip
   return stats;
 }
 
+/** Which group ids the tab strip resolved on its last status sweep.
+ *
+ *  The soak lane's binding witness since #1608. It used to read binding out of
+ *  the poll's IPC fan-out (two invokes per group-bound tab, so the dispatch
+ *  count scaled with the tab count); #1608 collapses the sweep to one
+ *  `orch_strip_view` regardless of tab count, which is the improvement, and
+ *  that deletes the scaling. Binding is now observable only in frontend state,
+ *  so this reads it from there — and more directly than the fan-out did, since
+ *  it names the ids rather than inferring a count from an invoke total. */
+export async function tabStatusStats(
+  page: Page
+): Promise<{ bound: string[]; seen: string[]; stale: boolean; ageMs: number }> {
+  const stats = await page.evaluate(() => {
+    const f = (window as unknown as {
+      __tabStatusStats?: () => { bound: string[]; seen: string[]; stale: boolean; ageMs: number };
+    }).__tabStatusStats;
+    return f ? f() : null;
+  });
+  if (!stats) {
+    throw new Error(
+      "window.__tabStatusStats is missing — src/tabbar.ts (#1608) is not in this build, so " +
+        "nothing here can say whether the corpus's tabs actually bound"
+    );
+  }
+  return stats;
+}
+
+/** What the tab strip last disclosed about its own freshness. */
+export async function stripStaleState(page: Page): Promise<{ stale: boolean; ageMs: number }> {
+  const stats = await tabStatusStats(page);
+  return { stale: stats.stale, ageMs: stats.ageMs };
+}
+
 /** Total dispatches whose command name starts with `orch_` — the poll load,
  *  independent of which particular commands a given release polls (the
  *  group-view batch has been five, then nine, then ten; pinning a count here

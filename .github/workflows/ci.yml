@@ -201,8 +201,11 @@ jobs:
           # rather than left to e2e/liveness.ts's defaults so the cost of
           # this job is visible where the job is, and tunable without a
           # code change. 180 s is ~45 ticks of src/tabbar.ts's 4 s status
-          # poll per group-bound tab — many dozens of poll invokes, which
-          # is the scale plan #1600 asks for. The hold has to outlast both
+          # poll. That was many dozens of poll invokes when this budget was
+          # set (two per group-bound tab); since #1608 the sweep is one
+          # orch_strip_view per tick, so ~45 for the whole soak. The scale
+          # plan #1600 asks for is now carried by the corpus and the
+          # lock-hold injector rather than by the invoke count. The hold has to outlast both
           # probes, which need ~70 s worst case at these bounds.
           #
           # MEASURED, not estimated, at f6f41833 (run 33235203093): soak

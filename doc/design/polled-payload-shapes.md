@@ -43,7 +43,7 @@ been capped for exactly this (a 654-agent roster measured at 173,245 chars);
 the command the GUI polls had not.
 
 The GUI never wanted the historical rows. `groupview.ts` indexes the array by
-agent id and looks up only the agents `orch_group_summary` reports **live**;
+agent id and looks up only the agents the summary payload reports **live**;
 `tabbar.ts` reads `live_cost_usd` and no row at all. Live agents are bounded by
 the group's `max_agents`; the lifetime roster is bounded by nothing.
 

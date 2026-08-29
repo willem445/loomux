@@ -1367,6 +1367,20 @@ labelled accordingly — *estimated*, *reported*, or *mixed* for a group running
 A CLI with no readable record falls back to whatever dollar figure it prints in its
 own statusline, which disappears when the pane does.
 
+**When the panel says `stale`.** The lifecycle panel and the tab strip's agent
+counts are served from a snapshot orrerix refreshes about once a second, rather
+than by asking the backend a separate question per figure every time — ten of
+them for the panel, and two per tab for the strip. If that refresh
+falls behind — the usual cause is one long-running internal operation holding
+things up — the panel keeps showing you the last figures it has and puts an
+amber **`stale 12s`** badge in its header saying how old they are; the affected
+tab counts go italic and their tooltip says the same. Nothing is lost and there
+is nothing to click: the badge disappears by itself the moment a fresh snapshot
+lands. It is deliberately never cleared by a timer, so a badge that is still up
+means the figures really are still old. Numbers shown while it is up are true,
+just from a moment ago — which is why orrerix shows them rather than blanking
+the panel.
+
 From the lifecycle panel you can:
 
 - **Pause** the group — orrerix stops delivering prompts so its agents finish

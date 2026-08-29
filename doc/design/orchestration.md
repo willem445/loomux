@@ -1249,7 +1249,9 @@ alongside the task board and #7's cost figures.
   count, the role breakdown (orch / worker / reviewer / planner), and uptime — per agent and for the
   group as a whole (measured from the earliest-started live agent, i.e. the orchestrator).
   Uptime needs a spawn timestamp, so `AgentEntry` carries `started_ms` (distinct from
-  `idle_since_ms`, which is about idleness, not age). The panel polls it every 2s and shows
+  `idle_since_ms`, which is about idleness, not age). The panel no longer polls
+  `orch_group_summary` itself (#1608): its 2 s tick reads `orch_group_view`, which carries
+  this payload verbatim out of the published snapshot — see doc/design/polled-views.md. It shows
   each agent's role, name, state (working / ready / idle-for), uptime, and — joined from
   #7's `group_usage` — its session cost, with the group total on the summary line.
 - **End orchestration.** `end_group` / `orch_end_group` kills *every* agent in the group,

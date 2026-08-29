@@ -20,6 +20,7 @@ pub mod e2ehold;
 pub mod humanq;
 pub mod mcp;
 pub mod needsyou;
+pub mod views;
 
 // MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
 // their original paths — whatever a call site in this crate or in the
@@ -428,7 +429,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Weak};
 use loomux_engine::lockwatch::TrackedMutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::obs::LockExt;
@@ -2686,11 +2687,15 @@ const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
 /// #743 S4b: how long a computed group-usage summary may be re-served to the
 /// POLLED command path before it is recomputed.
 ///
-/// One second, chosen against the poll cadences it has to collapse: the group
-/// view's 2 s batch fires `orch_group_usage` and `orch_autonomy` (whose budget
+/// One second, chosen against the poll cadences it had to collapse: the group
+/// view's 2 s batch fired `orch_group_usage` and `orch_autonomy` (whose budget
 /// meter runs the same computation) concurrently in one `Promise.all`, and the
-/// tab bar polls at 4 s per group-bound tab. A window of one second is short
-/// enough that no tick ever *skips* a refresh — every 2 s tick still recomputes
+/// tab bar polled at 4 s per group-bound tab. Since #1608 neither of those is a
+/// caller: the snapshot publisher runs the computation once per
+/// [`views::VIEW_PUBLISH_INTERVAL`], which is deliberately this same second, so
+/// the window still bounds exactly what it always bounded. A window of one
+/// second is short enough that no tick ever *skips* a refresh — every pass still
+/// recomputes
 /// — and long enough that the several reads inside one tick share a single
 /// computation. It is the freshness bound, not a cache lifetime: figures are a
 /// cost meter refreshed twice a second at worst, and every non-polled caller
@@ -2720,7 +2725,9 @@ enum UsageView {
 /// snapshot `mark_dead` ever captured, so the array only grows with how long
 /// the human has been running. Nothing accumulates ACROSS ticks — the array is
 /// replaced wholesale each time — but the size of ONE tick grows with session
-/// length, on a fixed 2 s (group view) / 4 s (per group-bound tab) cadence.
+/// length, on a fixed cadence (a 2 s group view and a 4 s per-group-bound-tab
+/// sweep when #1317 measured it; one 1 s publisher pass since #1608, which
+/// changed which thread pays it, not that it is paid).
 /// That is allocation churn proportional to session length, which is what a
 /// long session feels as GC pressure. The MCP twin was capped for exactly this
 /// (`mcp::summarize_group_usage`: "a 654-agent lifetime roster serialized to
@@ -8833,8 +8840,10 @@ const STATUSLINE_SCAN_BYTES: usize = 64 * 1024;
 /// the read a real pane gets (the `preenter_admission` seam; `self.app` cannot
 /// be resolved headless).
 ///
-/// This sits on the app's hottest poll — `orch_group_usage`, every 2 s from an
-/// open group view and every 4 s from each group-bound tab, per agent — which
+/// This sits on the app's hottest cadenced work — `group_usage_live_within`,
+/// per agent. It was reached every 2 s from an open group view and every 4 s
+/// from each group-bound tab; since #1608 the snapshot publisher is the caller,
+/// once per second, and both surfaces read its output instead — which
 /// is why it reads the last `STATUSLINE_SCAN_BYTES` rather than cloning and
 /// ANSI-stripping the whole ≤256 KiB ring for one number that is by
 /// construction the last thing painted.
@@ -13030,11 +13039,16 @@ pub struct OrchRegistry {
     /// [`OrchRegistry::group_usage_within`] serves when the stored one is
     /// younger than the caller's `max_age`.
     ///
-    /// **Why it exists.** `orch_group_usage` is the heaviest polled command in
-    /// the app (per-live-agent transcript reads plus a `usage.json`
-    /// read-modify-write), and three callers ask for it inside the same ~2 s
-    /// tick: the group view, the tab bar, and `orch_autonomy`'s budget meter.
-    /// The memo makes that one computation instead of three.
+    /// **Why it exists.** `group_usage_live_within` is the heaviest thing on a
+    /// cadence in this app (per-live-agent transcript reads plus a `usage.json`
+    /// read-modify-write). Three callers used to ask for it inside the same ~2 s
+    /// tick — the group view, the tab bar, and `orch_autonomy`'s budget meter —
+    /// and the memo made that one computation instead of three.
+    ///
+    /// Since #1608 the frontend asks for none of them: the snapshot publisher
+    /// computes `usage` and `autonomy` in one pass, so the memo's remaining
+    /// callers are that pass and the `group_usage` MCP tool. It is not redundant
+    /// yet for exactly that reason — see `doc/design/polled-views.md`.
     ///
     /// **`Arc<Mutex<..>>` per group, not one map lock.** The outer map lock is
     /// held only long enough to clone the per-group cell out (pty.rs's
@@ -13072,9 +13086,12 @@ pub struct OrchRegistry {
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
     ///
-    /// `orch_workflow_status` is in the group view's 2 s batch and resolving
+    /// `orch_workflow_status` was in the group view's 2 s batch and resolving
     /// this name costs 2-4 blocking `git` spawns, so it was 2-4 process spawns
-    /// every 2 s per open group view. The name is display-only and already
+    /// every 2 s per open group view. Since #1608 the caller is the snapshot
+    /// publisher's view tier, once per second and only for a group holding a
+    /// view lease — so the memo now bounds a 1 s cadence rather than a 2 s one,
+    /// and the spawns it saves are the same spawns. The name is display-only and already
     /// documented as unboundedly stale (see [`crate::git::default_branch_name`]:
     /// it reads local refs, so it is only as fresh as whatever last fetched);
     /// a coarse TTL therefore adds a *bounded* staleness on top of an unbounded
@@ -13553,6 +13570,22 @@ pub struct OrchRegistry {
     /// actually cleared via the toggle), so a LATER re-entry — a fresh edit
     /// — audits again rather than staying silent forever after the first.
     merge_gate_removal_warned: TrackedMutex<HashSet<GroupId>>,
+    /// The published snapshot the polled reads are served from (#1608, plan
+    /// #1600 §3 Phase 1). NOT a `TrackedMutex` and deliberately not a lock at
+    /// all from a reader's side: `views.load()` is a read-lock, a pointer
+    /// clone and a release on a cell whose writer's critical section is a
+    /// pointer swap. That is the whole point — a polled read must not be able
+    /// to wait on anything a background thread can hold.
+    ///
+    /// A plain field rather than an `Arc<ViewPublisher>`: this registry is
+    /// already behind an `Arc` and nothing owns the publisher independently,
+    /// so an inner `Arc` would be an indirection with no second owner.
+    ///
+    /// `pub` rather than `pub(crate)`: `tests/liveness.rs` drives the two
+    /// published reads directly while a registry lock is held, which is the
+    /// one property this whole slice exists for and cannot be observed
+    /// through the commands (they need an AppHandle, unavailable headless).
+    pub views: views::ViewPublisher,
 }
 
 /// One member of a [`Channel`]: which group/agent pane is connected. Cached
@@ -26509,6 +26542,7 @@ impl OrchRegistry {
             agent_channel: TrackedMutex::new("agent_channel", HashMap::new()),
             channel_seq: AtomicU32::new(0),
             merge_gate_removal_warned: TrackedMutex::new("merge_gate_removal_warned", HashSet::new()),
+            views: views::ViewPublisher::new(),
         }
     }
 
@@ -38095,7 +38129,8 @@ impl OrchRegistry {
         // ONE load for the two things this call reads out of the workflow file
         // — the display `name` and the `board:` policy below (#1175). They used
         // to be two `load_workflow` calls, which is two YAML parses of the same
-        // file on a command that sits in the group view's 2 s poll.
+        // file on a call the publisher makes once a second for every group
+        // holding a view lease (the group view's 2 s poll until #1608).
         let declared = if guardrails.advanced_orchestrator {
             info.as_ref().and_then(|g| workflow::load_workflow(&g.repo).ok().flatten())
         } else {
@@ -38178,8 +38213,8 @@ impl OrchRegistry {
     ///
     /// Takes the policy rather than reading it so [`Self::workflow_status`],
     /// which already loaded this repo's workflow for the file's `name`, does
-    /// not parse the same YAML a second time on a call that sits in the group
-    /// view's 2 s poll.
+    /// not parse the same YAML a second time on a call the publisher makes once
+    /// a second per leased group (the group view's 2 s poll until #1608).
     ///
     /// Counted here, in the backend, rather than shipped as bare limits for the
     /// frontend to tally: [`wip_occupants`] is the one definition of what a cap
@@ -38196,7 +38231,7 @@ impl OrchRegistry {
     /// open plus a YAML parse — for any group with `advanced_orchestrator` on,
     /// whether or not it declares `board:`. [`Self::workflow_status`] hands its
     /// already-loaded workflow straight in and so adds nothing, which is what
-    /// that call sitting on the group view's 2 s poll requires; the `list_tasks`
+    /// that call sitting on a one-second publisher cadence requires; the `list_tasks`
     /// path ([`Self::wip_status_for_agents`]) has no such workflow in hand and
     /// pays one parse per call. A per-call cost on an agent-initiated read is
     /// not the polled cost #743 was about, which is why it is stated here
@@ -50461,6 +50496,25 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for the polled-view publisher (#1608, plan #1600 §3 Phase
+/// 1): every [`views::VIEW_PUBLISH_INTERVAL`] it recomputes the group-view and
+/// tab-strip payloads for every group the registry knows and publishes them as
+/// one immutable snapshot, so the two polled commands can be served by pointer
+/// clone instead of by acquiring registry mutexes on every tick.
+///
+/// **This is the thread that pays the wait.** If a registry lock is held
+/// pathologically long, exactly one thread parks here — not one per poller per
+/// tick on the shared blocking pool, which is the accumulation #1600 §1.2
+/// derives beta6 from. Readers keep answering with the last snapshot and a
+/// growing `age_ms`, and the frontend badges it stale past
+/// [`views::VIEW_STALE_AFTER_MS`]. Started once at app setup.
+pub fn start_view_publisher(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(views::VIEW_PUBLISH_INTERVAL);
+        reg.views.publish_pass(&reg);
+    });
+}
+
 /// Background loop for attention routing (#6): every `ATTENTION_INTERVAL` it
 /// recomputes which panes need the human (idle-with-prompt, worker reports,
 /// human merge gates), pushes the set to the frontend for pane badges, and
@@ -51343,7 +51397,15 @@ pub fn orch_workflow_preview_sync(repo: String, agent_cli: String) -> Value {
 pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.pause_group(&group_id)).await
+    run_blocking(move || {
+        let out = reg.pause_group(&group_id);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Resume a paused group: prompt/kickoff delivery flows again.
@@ -51361,7 +51423,15 @@ pub async fn orch_pause_group(app: AppHandle, group_id: String) -> Result<(), St
 pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.resume_group(&group_id)).await
+    run_blocking(move || {
+        let out = reg.resume_group(&group_id);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Whether a group is currently paused (drives the pause/resume button state).
@@ -51479,7 +51549,15 @@ pub async fn orch_set_notify(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_notify(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_notify(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Whether this group has opted OUT of the #260 minimize-on-spawn default
@@ -51529,7 +51607,15 @@ pub async fn orch_set_spawn_expanded(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_spawn_expanded(&group_id, expanded)).await
+    run_blocking(move || {
+        let out = reg.set_spawn_expanded(&group_id, expanded);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Change a live group's max live-agent cap (durable, bounds-checked, audited).
@@ -51557,17 +51643,31 @@ pub async fn orch_set_max_agents(
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_max_agents(&group_id, max_agents, "human")).await
+    run_blocking(move || {
+        let out = reg.set_max_agents(&group_id, max_agents, "human");
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
 ///
-/// **The app's heaviest polled command** (census #1): a transcript read per live
-/// agent plus a `usage.json` read-modify-write, asked for by the group view's
-/// 2 s batch, the tab bar's 4 s loop for every group-bound tab, and — through
-/// the budget meter — `orch_autonomy` in the same tick. #743 S4b moves the whole
-/// body off the webview thread and serves it through the per-group memo, so
-/// those callers share ONE computation per [`USAGE_POLL_MAX_AGE`] window.
+/// **No longer on any poll path** (#1608), and the heaviest thing that ever was
+/// (census #1): a transcript read per live agent plus a `usage.json`
+/// read-modify-write. It was asked for by the group view's 2 s batch, the tab
+/// bar's 4 s loop for every group-bound tab, and — through the budget meter —
+/// `orch_autonomy` in the same tick. #743 S4b moved the whole body off the
+/// webview thread and served it through the per-group memo so those callers
+/// shared ONE computation per [`USAGE_POLL_MAX_AGE`] window; #1608 removed the
+/// callers instead. The payload reaches both surfaces as the `usage` section of
+/// `orch_group_view`/`orch_strip_view`, computed by the publisher through this
+/// same chain, so the wire shape below is unchanged. This command has no
+/// frontend caller left at all — it stays for the MCP side and for parity with
+/// the other nine.
 ///
 /// **Payload (#1317).** It answers with [`live_usage_view`], not the whole
 /// value: `live_agents` (one row per LIVE agent) plus `agent_count` (the
@@ -51676,7 +51776,15 @@ pub async fn orch_set_autonomous(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_autonomous(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_autonomous(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable the auto-merge gate for a group (durable, audited). Default OFF
@@ -51717,7 +51825,15 @@ pub async fn orch_set_auto_merge(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_auto_merge(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_auto_merge(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable the auto-release gate for a group (durable, audited, independent
@@ -51742,7 +51858,15 @@ pub async fn orch_set_auto_release(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_auto_release(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_auto_release(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable full autonomy for a group (#778, durable, audited). A dependent
@@ -51767,7 +51891,15 @@ pub async fn orch_set_full_autonomy(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_full_autonomy(&group_id, enabled, &goal)).await
+    run_blocking(move || {
+        let out = reg.set_full_autonomy(&group_id, enabled, &goal);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Enable/disable supervised dangerous mode for a group (#83, durable, audited).
@@ -51805,7 +51937,15 @@ pub async fn orch_set_dangerous_mode(
 ) -> Result<(), String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_dangerous_mode(&group_id, enabled)).await
+    run_blocking(move || {
+        let out = reg.set_dangerous_mode(&group_id, enabled);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 // ---------- the persisted guardrail knobs ----------
@@ -51845,7 +51985,15 @@ pub async fn orch_set_autonomy_budget(
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_autonomy_budget(&group_id, tokens)).await
+    run_blocking(move || {
+        let out = reg.set_autonomy_budget(&group_id, tokens);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Set a group's idle-tick quiet window in minutes (0 → default; floored at 1,
@@ -51868,7 +52016,15 @@ pub async fn orch_set_idle_tick_minutes(
 ) -> Result<u32, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_idle_tick_minutes(&group_id, minutes)).await
+    run_blocking(move || {
+        let out = reg.set_idle_tick_minutes(&group_id, minutes);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Set a group's idle-tick activity floor in bytes (0 → default; floored at 1,
@@ -51890,7 +52046,15 @@ pub async fn orch_set_idle_activity_floor(
 ) -> Result<u64, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_idle_activity_floor(&group_id, bytes)).await
+    run_blocking(move || {
+        let out = reg.set_idle_activity_floor(&group_id, bytes);
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// Set a group's compact-nudge quiet window in minutes (#287; 0 = off,
@@ -52002,6 +52166,92 @@ pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
     run_blocking(move || reg.autonomy_state_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
+/// **The group view's whole 2 s poll, in one read** (#1608, plan #1600 §3
+/// Phase 1). Replaces a `Promise.all` batch of ten `orch_*` commands, every
+/// one of which acquired a registry mutex on an unbounded `lock_safe`.
+///
+/// Being ASYNC was never enough, and this command is why the distinction is
+/// worth stating: #1595 moved five polled commands off the webview thread and
+/// #1600 §1.2 is the release where the same unbounded wait exhausted the
+/// shared 512-thread blocking pool instead — after which `write_pty` could not
+/// be scheduled and no pane accepted input. The body here takes **no registry
+/// lock at all**: it stamps a view lease and reads a published cell, so it
+/// enters the pool and cannot park in it. `perf_dispatch.rs`'s poll-path guard
+/// (test L6) asserts exactly that, by requiring `views.load(` in this body.
+///
+/// The lease is what keeps the expensive half honest: the publisher computes
+/// the eight view-tier sections only while a caller keeps asking, so a
+/// `merge_queue.json` read, a `workflow.yml` parse and a `git` default-branch
+/// resolution stay at one open view's rate rather than every group's.
+///
+/// #904: a refused id answers `Value::Null` — and so does a group created
+/// since the last publish pass, deliberately, because the caller's response to
+/// both is the same: keep the previous render and ask again. See
+/// `command_group` and `doc/design/polled-views.md`.
+///
+/// **Reentrancy.** A read of an immutable snapshot; the only mutation is the
+/// lease stamp, which is last-writer-wins on a monotonic instant and cannot
+/// disagree with itself.
+#[tauri::command]
+pub async fn orch_group_view(app: AppHandle, group_id: String) -> Value {
+    let Ok(group_id) = command_group(&group_id) else { return Value::Null };
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        reg.views.note_view_lease(&group_id);
+        views::group_view_payload(&reg.views.load(), &group_id, Instant::now())
+    })
+    .await
+}
+
+/// **The whole tab strip's 4 s poll, in one read** (#1608). Replaces
+/// `orch_group_summary` + `orch_group_usage` issued once per group-bound tab,
+/// so the per-tick IPC fan-out collapses from 2xN to 1 and stops growing with
+/// the human's tab count.
+///
+/// Served from the same published snapshot as [`orch_group_view`], with the
+/// same no-registry-lock property and the same L6 enforcement. Its `meta`
+/// reports the OLDEST group's age, so `stale` means "nothing on this strip is
+/// older than this" — the strip's job is to be right about the tab that is in
+/// trouble, and a payload-wide average would report it fresh because one tab
+/// moved.
+///
+/// **Takes the caller's BOUND group ids, and that is not a per-tab read.** One
+/// snapshot still serves every group and one IPC still serves the whole strip;
+/// what `bound` does is tell the publisher which groups to cover.
+///
+/// It has to, and #1625 review round 2 is why. The publisher's strip tier was
+/// `reg.groups` — the groups this session created or resumed. A tab can be bound
+/// to a RESTORED orchestration, which lives on disk and never enters that map
+/// (`list_recorded` reads the root directory directly), so those tabs got no
+/// entry at all and lost the accrued-cost badge #194 P4 LOW-8 put on them
+/// deliberately. The per-tab reads this replaced had no such gap: they answered
+/// for any id the caller named.
+///
+/// So the strip stamps a lease per bound id, exactly as the group view stamps
+/// one, and the publisher covers `reg.groups` plus every fresh strip lease. A
+/// leased id the registry does not know is computed through the SAME functions
+/// as any other — `group_summary` answers zero live agents, `group_usage_live_within`
+/// reads that group's `usage.json` — so a restored group's entry is
+/// wire-identical to what the commands it replaced returned for it, by
+/// construction rather than by a second disk path.
+///
+/// Ids that fail `command_group` are skipped rather than refused: the whole
+/// call must not fail because one tab carries a stale id.
+#[tauri::command]
+pub async fn orch_strip_view(app: AppHandle, bound: Vec<String>) -> Value {
+    let reg = reg_of(&app);
+    run_blocking(move || {
+        let now = Instant::now();
+        for raw in &bound {
+            if let Ok(g) = command_group(raw) {
+                reg.views.note_strip_lease_at(&g, now);
+            }
+        }
+        views::strip_view_payload(&reg.views.load(), now)
+    })
+    .await
+}
+
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.
 ///
 /// **Off the UI thread** (#1595) — the command whose sync dispatch froze
@@ -52013,11 +52263,19 @@ pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
 /// loop an unbounded acquisition is a frozen window that never repaints and
 /// never processes input, which is a force-quit rather than a slow panel.
 ///
-/// **It is polled from TWO loops, not one**, which is why the freeze arrives a
+/// **It WAS polled from TWO loops, not one**, which is why the freeze arrived a
 /// minute or two in rather than at startup: `GroupView.load()`'s 2 s batch
 /// (`groupview.ts`), and `TabBar.pollStatus()`'s 4 s loop (`tabbar.ts`),
-/// which iterates EVERY group-bound tab and awaits each in turn. So the number
-/// of unbounded main-thread acquisitions per tick scales with open group tabs.
+/// which iterated EVERY group-bound tab and awaited each in turn. So the number
+/// of unbounded main-thread acquisitions per tick scaled with open group tabs.
+///
+/// **Since #1608 it is polled from neither.** Both loops make one
+/// `orch_group_view`/`orch_strip_view` call served from a published snapshot,
+/// and this payload reaches them as that read's `summary` section — computed by
+/// the publisher through this same function, so the shape is unchanged. The only
+/// frontend caller left is `tasksview.ts`, once per open. The paragraphs above
+/// are kept because they are the canonical statement of the #1595 class, not
+/// because they still describe this command's callers.
 ///
 /// **The "cheap in-memory" classification was not wrong about the work — it was
 /// wrong about what makes a sync command safe.** A cheap CRITICAL SECTION is
@@ -52037,7 +52295,9 @@ pub async fn orch_group_summary(app: AppHandle, group_id: String) -> Value {
 /// `notify_when`/`list_notifications` MCP tools use.
 /// **Off the UI thread** (#1595), for the reason spelled out on
 /// [`orch_group_summary`] above: it reads the same registry state under the
-/// same unbounded `lock_safe` acquisition, on the same 2 s poll batch.
+/// same unbounded `lock_safe` acquisition, on the same 2 s poll batch. Since
+/// #1608 neither is polled: both are sections of `orch_group_view`, computed by
+/// the publisher through these same functions.
 #[tauri::command]
 pub async fn orch_group_watches(app: AppHandle, group_id: String) -> Value {
     // #904 / rev-440 B4: an ARRAY, because that is what success returns here and
@@ -52061,10 +52321,12 @@ pub async fn orch_group_watches(app: AppHandle, group_id: String) -> Value {
 /// only caller. It adds no agent-reachable input either way.
 ///
 /// **Off-thread** (performance.md §2 P1): this reconciles against the repo's
-/// declared `resources:`, which reads and parses `.loomux/workflow.yml` — on
-/// the group view's 2 s batch. That is the same read `orch_workflow_status`
-/// already makes on that batch, and the same reason `orch_merge_queue` is
-/// async.
+/// declared `resources:`, which reads and parses `.loomux/workflow.yml`. That
+/// was on the group view's 2 s batch until #1608; the publisher's view tier now
+/// makes the read, once per second and only for a leased group, and the panel
+/// gets it as `orch_group_view`'s `locks` section. It is the same read
+/// `orch_workflow_status` makes on that same pass, and the same reason
+/// `orch_merge_queue` is async.
 ///
 /// This used to add "unlike its neighbours `orch_group_summary`/
 /// `orch_group_watches`: those are pure in-memory registry reads". #1595
@@ -52109,7 +52371,15 @@ pub async fn orch_set_advanced_orchestrator(
 ) -> Result<Value, String> {
     let reg = reg_of(&app);
     let group_id = command_group(&group_id)?;
-    run_blocking(move || reg.set_advanced_orchestrator(&group_id, on, "human")).await
+    run_blocking(move || {
+        let out = reg.set_advanced_orchestrator(&group_id, on, "human");
+        // #1608: republish this group before the command returns, so the
+        // group view's own post-action reload — which is immediate, not on
+        // the next publish tick — cannot read the pre-write snapshot.
+        reg.publish_group_now(&group_id);
+        out
+    })
+    .await
 }
 
 /// The group's current workflow-mode status for the lifecycle UI (Slice C):
@@ -52118,12 +52388,16 @@ pub async fn orch_set_advanced_orchestrator(
 /// satisfiability guarantee) — `{ advanced, name, default_branch: string|null,
 /// blocks: [{id,kind,cli,model,persona}],
 /// gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
-/// Part of the group view's 2 s poll batch — `GroupView.load()`'s ten-invoke
-/// `Promise.all` (`groupview.ts`, `Promise.all` in `load()`), alongside
-/// `orch_group_summary` — not a once-per-open read. (Was "nine-invoke
-/// (groupview.ts:649-672)"; corrected in #1595 after counting the batch, which
-/// is ten and no longer at those lines. Raw line numbers rot silently — the
-/// same lesson `perf_dispatch.rs`'s CITE CONVENTION states.)
+/// **No longer on the group view's poll path** (#1608). It was a member of
+/// `GroupView.load()`'s ten-invoke `Promise.all`; that batch is now a single
+/// `orch_group_view`, served from the published snapshot, and this command's
+/// payload reaches the panel as that read's `workflow` section — computed by
+/// the publisher thread through the same `workflow_status` call below, so the
+/// wire shape is unchanged. What remains here are the non-poll callers
+/// (`tasksview.ts` reads it once on open). See `doc/design/polled-views.md`.
+///
+/// The off-thread argument below still stands and is the reason the PUBLISHER
+/// pays it on a 1 s cadence rather than a poll paying it per tick.
 ///
 /// Off-thread (#743 S4c), and its `default_branch` is memoised per repo (#743
 /// S4a) — resolving that name costs 2-4 blocking `git` spawns, which this was

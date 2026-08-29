@@ -489,13 +489,15 @@ const TIMERS: TimerRow[] = [
     cadenceMs: 4000,
     policy: "gated",
     reason:
-      "App-lifetime tick: armed in the tab strip's constructor and never cleared, and each tick's " +
-      "pollStatus() loops EVERY group-bound tab invoking groupSummary plus groupUsage — the " +
-      "largest standing IPC cost in the app. The PollGate stops the interval outright while the " +
-      "window is hidden (not an early return inside the tick) and runs one catch-up poll on the " +
-      "way back (#743 S6). Cadence tiers by tab position were considered and rejected in-slice: " +
-      "a background tab's badge is what the strip is FOR, and S4 already made groupUsage share " +
-      "one ~1 s backend snapshot across callers.",
+      "App-lifetime tick: armed in the tab strip's constructor and never cleared. Each tick is now " +
+      "ONE invoke for the WHOLE strip (orch_strip_view, #1608): it used to loop EVERY group-bound " +
+      "tab invoking groupSummary plus groupUsage, so the largest standing IPC cost in the app " +
+      "grew with the human's tab count, and every one of those calls took a registry lock. " +
+      "The backend now publishes one snapshot on a 1 s cadence and serves this read by pointer " +
+      "clone, so the cost is O(1) in tabs and the call cannot park. The PollGate still stops the " +
+      "interval outright while the window is hidden (not an early return inside the tick) and " +
+      "runs one catch-up poll on the way back (#743 S6). Cadence tiers by tab position were " +
+      "considered and rejected in-slice: a background tab's badge is what the strip is FOR.",
     debt: null,
     overlapGate: { field: "statusFlight", className: "SingleFlight" },
   },
@@ -519,8 +521,11 @@ const TIMERS: TimerRow[] = [
     reason:
       "Armed by show() and cleared by hide() on every close/eviction path, and gated on window " +
       "visibility inside that scope (#743 S6) — the two are different questions, and a panel left " +
-      "open behind a minimized window used to keep paying Promise.all of nine invokes plus a full " +
-      "render every 2 s. The gate's arm keeps the defensive clear-before-arm show() used to do.",
+      "open behind a minimized window used to keep paying a ten-invoke Promise.all plus a full " +
+      "render every 2 s. The batch is now ONE invoke (orch_group_view, #1608), served from a " +
+      "published snapshot by pointer clone rather than by ten commands each taking a registry " +
+      "lock; the render is unchanged. The gate's arm keeps the defensive clear-before-arm " +
+      "show() used to do.",
     debt: null,
     overlapGate: { field: "loadGate", className: "RefreshGate" },
   },
@@ -576,8 +581,9 @@ const TIMERS: TimerRow[] = [
       "blind the instrument exactly where a freeze is least likely to be noticed early. The tick " +
       "is a rounding subtraction plus one invoke of a SYNC command whose whole body is six " +
       "relaxed atomic stores — no lock, no IO, no allocation at either end — against a tab strip " +
-      "that polls two invokes per group-bound tab every 4 s and a group view that polls nine " +
-      "every 2 s. The platform still throttles a hidden window's timers, which is why every " +
+      "and a group view that each poll ONE invoke per tick since #1608 (two per group-bound tab " +
+      "every 4 s, and ten every 2 s, when this row was written). The platform still throttles a " +
+      "hidden window's timers, which is why every " +
       "stamp carries `hidden` and `selfwatch::liveness` answers 'no evidence' rather than " +
       "'stuck' for a stale stamp from one (Liveness::GuiHidden).",
     debt: null,

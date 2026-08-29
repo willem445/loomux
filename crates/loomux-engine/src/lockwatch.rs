@@ -430,8 +430,11 @@ impl<T> TrackedMutex<T> {
     /// acquisition, on top of the `Mutex::lock` that was already there: two
     /// relaxed read-modify-writes on the waiter count, three relaxed stores,
     /// one release read-modify-write on the generation, and one monotonic clock
-    /// read. Per release: one release read-modify-write, three relaxed loads
-    /// and a comparison. No allocation, no formatting, no global lock, no
+    /// read. Per release (the full accounting is on [`TrackedGuard::drop`]):
+    /// one monotonic clock read, one relaxed load and a comparison on the cold
+    /// path; on the over-threshold path a further three relaxed loads, four
+    /// relaxed stores and one release store, and in both cases one release
+    /// read-modify-write on the generation. No allocation, no formatting, no global lock, no
     /// syscall, and nothing that can block. The clock read is the only item
     /// above a few nanoseconds — tens of nanoseconds on every platform this
     /// ships to — which is why it is a *monotonic* read and not a `SystemTime`,
@@ -527,8 +530,14 @@ impl<T> Drop for TrackedGuard<'_, T> {
     /// still locked and every waiter still queued behind it.
     ///
     /// What is left is: one clock read, four relaxed loads, four relaxed
-    /// stores, and two release read-modify-writes. All of it is on this lock's
-    /// own cache line, and none of it can block.
+    /// stores, one release STORE (`done_pending`, publishing the four stores
+    /// above) and one release read-modify-write (`generation`). All of it is on
+    /// this lock's own cache line, and none of it can block.
+    ///
+    /// The store and the read-modify-write are counted apart deliberately: this
+    /// body runs with the reported mutex still held, so what it costs is what
+    /// every waiter behind it pays, and an RMW is not a store (#1605 review n5,
+    /// corrected in #1608).
     fn drop(&mut self) {
         let st = self.state;
         let held_ms = mono_ms().saturating_sub(self.acquired_ms);
