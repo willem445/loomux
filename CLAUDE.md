@@ -733,6 +733,19 @@ narrow their ask back down to the original ticket on your own judgment.
   on the retracted claim so it cannot come back. Signature: correcting a claim
   reddens a test whose assertion quotes it (#1502 — `test/mailboxbadge.test.ts`
   and `nothing_loomux_sends_mid_session_can_reach_a_manager_pane`).
+- **A reversal of a declined decision dispositions every ground it was
+  declined on.** Re-deciding on a *different* axis (#719 declined a per-pane
+  writer thread on ordering; #1607 re-decided it on isolation) leaves the
+  original grounds unanswered unless you walk them one at a time and say which
+  held, which went false, and which is now a live **residual** — then supersede
+  the clause, not the note, since the retracted reasoning is what a future
+  reader most needs. Signature: prose arguing only the new axis, and the note's
+  own summary layer *upstream* of the clause you narrowed still describing the
+  old answer (#1612 B2 — the `pty-input-path.md` "The fix" preamble). Precedents:
+  `task-hierarchy.md` §2 (#958→#1156, "Two of those three held up"),
+  `question-gate-authorship.md`:199 (#903), `ui-redesign.md`:383 (#1320),
+  `orchestration.md`:1589-1606 (#112→#451, which names an unclosed ground and
+  states this rule in situ), `orchestration.md`:3271 (#328→#416).
 - **A doc naming a file or test that hasn't landed must say so in its tense
   and name the slice** — `` `tests/perf_dispatch.rs` *will* enforce … (#743
   S2/S3) `` — or the pointer waits for that slice. Present tense beside a
