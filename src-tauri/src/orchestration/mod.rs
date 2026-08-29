@@ -26891,6 +26891,19 @@ impl OrchRegistry {
             return false;
         }
         std::thread::spawn(move || {
+            // ARGUED ALLOWLIST ENTRY (#1702 P4). Every hold this seam takes is
+            // deliberately longer than `lockwatch::HOLD_FAIL_MS` — that is
+            // what it is FOR, and the L-series' whole shape is "a victim
+            // answers while a lock is wedged for twenty seconds" — so without
+            // this permit the enforcement would fail the suite on its own
+            // fixtures. Taken here rather than by the caller because the
+            // permit is per-thread and the hold happens on THIS one; taken
+            // before the acquisition so no window exists in which the hold is
+            // live and unpermitted, and dropped with this closure, so a seam
+            // that stops holding stops being exempt.
+            let _permit = loomux_engine::lockwatch::LongHoldPermit::new(
+                "OrchRegistry::hold_lock_for_test - the liveness suite's deliberate wedge",
+            );
             // One guard per arm rather than a `Box<dyn Any>`: the arms guard
             // different types, and the acquisition has to happen at a real
             // `lock_safe` call site or the recorded site would be this seam
@@ -34627,6 +34640,52 @@ impl OrchRegistry {
         Ok(json!({ "agent_id": agent_id, "mcp_args": mcp_args, "delivery_only": delivery_only }))
     }
 
+    /// Record that `agent_id` is now driving `pty_id`: the roster write, the
+    /// reverse index, the audit row and the breadcrumb, in that order.
+    ///
+    /// Extracted from the bind arm of `spawn_agent_bound` (#1702 P4) rather
+    /// than written fresh, and it is a pure move: the four statements below
+    /// are the ones that were inline there, unreordered. The reason it is a
+    /// function is the FIXTURE. The state #1702 deadlocks on is "running,
+    /// pty-bound, `by_pty`-mapped", and until this extraction the only way to
+    /// reach it headlessly was `set_pty_for_test`, which writes two of those
+    /// three fields and neither the audit row nor the crumb. A fixture built
+    /// on a re-implementation proves the algorithm, never the code
+    /// (`.orrerix/lessons.md`), and this defect is precisely one the
+    /// re-implementation could not have shown: `set_pty_for_test` leaves
+    /// `status` alone, and `attention_tick`'s per-agent chain short-circuits
+    /// on a non-`Running` agent before it reaches the mask at all.
+    ///
+    /// Takes no lock across another: the `agents` guard is dropped at the end
+    /// of its block, before `by_pty` — the ordering `lockorder::AGENTS` (510)
+    /// over `BY_PTY` (500) would otherwise make a descending pair, and the
+    /// audit write below is rank 900, the innermost.
+    fn bind_pane(&self, group_id: &GroupId, agent_id: &str, pty_id: u32) {
+        {
+            let mut agents = self.agents.lock_safe();
+            if let Some(a) = agents.get_mut(agent_id) {
+                a.status = AgentStatus::Running;
+                a.pty_id = Some(pty_id);
+            }
+        }
+        self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
+        self.audit(group_id, brand::AUDIT_ACTOR, "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
+        crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id}"));
+    }
+
+    /// Drive [`OrchRegistry::bind_pane`] from a test, which cannot reach the
+    /// real bind: that arm sits behind a `rx.recv_timeout(BIND_TIMEOUT)` fed by
+    /// a Tauri window emitting `orch-spawn-request`, and a headless test has no
+    /// window (`spawn_agent_bound` returns at its `app` check long before).
+    ///
+    /// A one-line delegation on purpose. The value of the seam is that the
+    /// fixture and production share the WRITES; a seam that re-stated any of
+    /// them would be the thing it exists to avoid.
+    #[doc(hidden)] // pub for integration tests
+    pub fn bind_pane_for_test(&self, group_id: &GroupId, agent_id: &str, pty_id: u32) {
+        self.bind_pane(group_id, agent_id, pty_id);
+    }
+
     /// Human-only: bind the pty a newly-spawned solo pane's launcher just
     /// opened to the `AgentEntry` `solo_prepare` created. Unlike `bind` (the
     /// channel-based rendezvous a `spawn_agent_ex` call blocks on),
@@ -38779,13 +38838,38 @@ impl OrchRegistry {
     /// keystroke time — the raw inputs `attention_tick` needs. Empty without an
     /// app handle (unit tests drive `attention_tick` with synthetic maps).
     fn attention_inputs(&self) -> (HashMap<String, u64>, HashMap<String, String>, HashMap<String, u64>) {
+        let Some(app) = self.app.lock_safe().clone() else {
+            return (HashMap::new(), HashMap::new(), HashMap::new());
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        self.attention_inputs_from(&ptys)
+    }
+
+    /// Gather core of [`OrchRegistry::attention_inputs`]: the three maps
+    /// `attention_tick` consumes, read off a `PtyManager` handed in rather than
+    /// resolved from the app handle.
+    ///
+    /// Its three `_from` siblings ([`OrchRegistry::output_totals_from`],
+    /// [`OrchRegistry::compact_signals_from`],
+    /// [`OrchRegistry::pane_attention_inputs_from`]) exist for this reason and
+    /// this one is #1702 P4's: without it a headless test can only drive
+    /// `attention_tick` with SYNTHETIC maps, so the gather — the half that
+    /// decides which panes are in the population and how much of each ring is
+    /// read — is not part of what any liveness row measures. With it, L7a runs
+    /// the tick on the maps production would have built, over
+    /// `register_fake_for_test` panes.
+    ///
+    /// The extraction is a pure move: everything below was `attention_inputs`'s
+    /// body from the snapshot onward, unreordered, and `attention_inputs` is
+    /// now the app-handle resolution alone.
+    #[doc(hidden)] // pub for integration tests
+    pub fn attention_inputs_from(
+        &self,
+        ptys: &crate::pty::PtyManager,
+    ) -> (HashMap<String, u64>, HashMap<String, String>, HashMap<String, u64>) {
         let mut outs = HashMap::new();
         let mut tails = HashMap::new();
         let mut ins = HashMap::new();
-        let Some(app) = self.app.lock_safe().clone() else {
-            return (outs, tails, ins);
-        };
-        let ptys = app.state::<crate::pty::PtyManager>();
         // Snapshot (agent id, pty id) and DROP the agents lock before touching
         // any pty: the reads below each take the global `ptys` mutex, and
         // holding `agents` across all of them pins two locks for the length of
@@ -45495,16 +45579,7 @@ impl OrchRegistry {
 
         match rx.recv_timeout(BIND_TIMEOUT) {
             Ok(pty_id) => {
-                {
-                    let mut agents = self.agents.lock_safe();
-                    if let Some(a) = agents.get_mut(&agent_id) {
-                        a.status = AgentStatus::Running;
-                        a.pty_id = Some(pty_id);
-                    }
-                }
-                self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
-                self.audit(group_id, brand::AUDIT_ACTOR, "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
-                crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id}"));
+                self.bind_pane(group_id, &agent_id, pty_id);
                 // #467: anything a restart left queued for THIS session goes
                 // in before the kickoff below — it arrived first, and
                 // admission order is delivery order.

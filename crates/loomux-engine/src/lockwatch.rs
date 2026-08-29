@@ -463,6 +463,266 @@ pub fn hold_report_ring_for_test(ms: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Hold-duration ENFORCEMENT (#1702 P4)
+// ---------------------------------------------------------------------------
+
+/// The hold a test build refuses. Five seconds — the same figure as
+/// [`DEFAULT_HOLD_WARN_MS`] and [`crate::budget::TICK_LOCK_BUDGET`], and the
+/// coincidence is the argument rather than an accident:
+///
+/// - past it a hold is already *reportable* (`lock-slow`/`lock-freed`), so
+///   nothing here calls a hold bad that the shipped build thought was fine;
+/// - past it every cadenced tick's gate probe has already given up
+///   (`doc/design/lock-liveness.md` section 3), so the app has *visibly*
+///   stopped serving — badges freeze, the publisher's sections go partial;
+/// - so a build that is green while a hold sits above this figure is a build
+///   asserting the opposite of what its own breadcrumbs say.
+///
+/// Lower would refuse holds the app is documented to tolerate; higher would
+/// leave a band where the watchdog reports a wedge and CI calls it a pass.
+/// `the_three_five_second_constants_are_deliberately_equal` pins the three
+/// together, so an edit to one of them is a red rather than a drift.
+pub const HOLD_FAIL_MS: u64 = 5_000;
+
+/// Threads currently permitted to hold a tracked lock past [`HOLD_FAIL_MS`],
+/// each with the reason its permit was taken for.
+///
+/// A `Vec` rather than a set because permits NEST: an injector inside an
+/// injector is two entries for one thread, and the inner one's `Drop` must
+/// leave the outer one standing.
+static LONG_HOLD_PERMITS: Mutex<Vec<(u64, &'static str)>> = Mutex::new(Vec::new());
+
+/// Permission for THIS THREAD to hold a tracked lock past [`HOLD_FAIL_MS`],
+/// for as long as this value is alive.
+///
+/// This is the allowlist, and it is scoped to a thread rather than to a
+/// `file:line` on purpose. A site list has to be maintained against line
+/// numbers that every edit above them moves, and it fails in the dangerous
+/// direction: a stale entry stops matching the injector it was written for
+/// and starts matching whatever moved onto that line, so the list quietly
+/// allows one real hold while failing the deliberate one. A permit taken by
+/// the injector cannot go stale, because it is taken by the code that is
+/// about to hold.
+///
+/// The reviewable allowlist is therefore the set of CONSTRUCTION SITES, which
+/// is a grep rather than a table, and `src-tauri/tests/perf_leaflocks.rs`'s
+/// `only_argued_sites_may_permit_a_long_hold` is the default-deny scan that
+/// holds it to the sites that carry an argument.
+///
+/// `reason` is `&'static str` so nothing here allocates on the permitting
+/// thread and so the reason is a literal a reader can grep for.
+pub struct LongHoldPermit {
+    thread: u64,
+}
+
+impl LongHoldPermit {
+    /// Permit long holds on the calling thread until this value is dropped.
+    ///
+    /// Deliberately NOT `#[doc(hidden)]` or `cfg(test)`-gated: `e2ehold`'s
+    /// injector is a `#[cfg(debug_assertions)]` production path rather than a
+    /// test, and gating this on `cfg(test)` would put the one caller that most
+    /// needs it outside the mechanism.
+    pub fn new(reason: &'static str) -> Self {
+        let thread = this_thread();
+        LONG_HOLD_PERMITS.lock_safe().push((thread, reason));
+        Self { thread }
+    }
+}
+
+impl Drop for LongHoldPermit {
+    fn drop(&mut self) {
+        let mut permits = LONG_HOLD_PERMITS.lock_safe();
+        // The LAST matching entry, so a nested permit's drop leaves the outer
+        // one in place.
+        if let Some(i) = permits.iter().rposition(|(t, _)| *t == self.thread) {
+            permits.remove(i);
+        }
+    }
+}
+
+/// The tracked id of the calling thread — the same value that appears as
+/// `holder_thread` on every [`HoldReport`] and [`LockSnapshot`] this module
+/// produces.
+///
+/// Exists so a caller can identify ITSELF cheaply instead of being identified
+/// by an observer. `tests/liveness.rs` maps a thread to its id today by having
+/// it take a uniquely-named probe lock and sampling [`held_locks`] until the
+/// probe shows up, which needs a sampler thread per measured thread and is a
+/// race; a tick thread that reports its own id needs neither.
+pub fn current_thread_id() -> u64 {
+    this_thread()
+}
+
+/// The reason `thread` is permitted to hold past [`HOLD_FAIL_MS`], if it is.
+pub fn long_hold_permit_for(thread: u64) -> Option<&'static str> {
+    LONG_HOLD_PERMITS.lock_safe().iter().rev().find(|(t, _)| *t == thread).map(|(_, r)| *r)
+}
+
+/// Every thread with a live [`LongHoldPermit`], so a caller can classify a
+/// batch of reports without taking the permit lock once per report.
+pub fn permitted_threads() -> Vec<u64> {
+    LONG_HOLD_PERMITS.lock_safe().iter().map(|(t, _)| *t).collect()
+}
+
+/// Which of `reports` are violations: held past `fail_ms` by a thread that is
+/// not in `permitted`.
+///
+/// Pure — it reads no global — so the RULE is testable without constructing a
+/// permit, a lock or a thread. [`hold_violations`] is the live wrapper.
+pub fn hold_violations_among(
+    reports: &[HoldReport],
+    fail_ms: u64,
+    permitted: &[u64],
+) -> Vec<HoldReport> {
+    reports
+        .iter()
+        .filter(|r| r.held_ms >= fail_ms && !permitted.contains(&r.holder_thread))
+        .cloned()
+        .collect()
+}
+
+/// [`hold_violations_among`] against the live permit registry.
+pub fn hold_violations(reports: &[HoldReport], fail_ms: u64) -> Vec<HoldReport> {
+    hold_violations_among(reports, fail_ms, &permitted_threads())
+}
+
+/// How many hold violations [`enforce_hold_budget`] has classified in this
+/// process. Counted whether or not the panic is armed, so a caller can assert
+/// that a scan SAW something without arming a failure.
+static HOLD_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The running count of classified hold violations.
+pub fn hold_violations_seen() -> u64 {
+    HOLD_VIOLATIONS.load(Ordering::Relaxed)
+}
+
+/// Whether a classified hold violation panics. **Default `false`, and that is
+/// the one place this mechanism deliberately does NOT mirror the rank checker
+/// (#1610). The asymmetry is stated here rather than left to be rediscovered
+/// by whoever "fixes" the default.**
+///
+/// A rank violation is detected on the OFFENDING thread, at the acquisition,
+/// before it blocks — so panicking there unwinds that thread, drops its guards
+/// and releases the registry: the panic IS the rescue, which is why
+/// `LOCK_ORDER_PANICS` defaults to `cfg!(debug_assertions)`. A hold violation
+/// is detected on an OBSERVING thread — whoever drains the reports, which in a
+/// running app is the self-watchdog — and never on the holder, so a panic
+/// there releases nothing and kills the one thread still narrating the wedge.
+/// Armed by default it would trade a reported hang for a silent one, on the
+/// exact instrument #1702 was diagnosed from.
+///
+/// So the failure is armed where a failure is what the caller wants: a
+/// `cargo test` binary arms it through [`assert_no_disallowed_hold_over`], and
+/// the E2E lane's own gated module (`orchestration::e2ehold`, #1702 P5) is the
+/// second arming point. A shipped build and a `tauri dev` build are unchanged:
+/// the watchdog keeps writing the Phase 0 `lock-slow`/`lock-freed` breadcrumb
+/// and nothing here runs at all.
+static HOLD_PANICS: AtomicBool = AtomicBool::new(false);
+
+/// Whether a classified hold violation currently panics.
+pub fn hold_panics() -> bool {
+    HOLD_PANICS.load(Ordering::Relaxed)
+}
+
+/// Arm or disarm the hold-violation panic; returns the previous setting.
+///
+/// The twin of [`set_lock_order_panics`], return value included, so a caller
+/// can restore what it found rather than assume the default.
+pub fn set_hold_panics(on: bool) -> bool {
+    HOLD_PANICS.swap(on, Ordering::Relaxed)
+}
+
+/// The failure text for one violation: which lock, which site, how long it was
+/// held, and what a reader is supposed to do about it.
+pub fn hold_violation_message(v: &HoldReport, fail_ms: u64) -> String {
+    format!(
+        "tracked lock `{}` was held for {} ms at {}:{} (thread {}, {}, {} waiter(s)), past the \
+         {fail_ms} ms a test build refuses. Past that figure every cadenced tick's gate probe \
+         has already skipped its tick and the hold is already breadcrumbed as `{}`. A registry \
+         lock may not be held across a call that can take a registry lock, read a file, or wait \
+         — see doc/design/lock-liveness.md section 7. If this hold is DELIBERATE the site takes \
+         a `lockwatch::LongHoldPermit` and says why; adding one is a reviewed change, not a way \
+         to make this quiet",
+        v.lock,
+        v.held_ms,
+        v.site_file,
+        v.site_line,
+        v.holder_thread,
+        if v.still_held { "still held" } else { "released" },
+        v.waiters,
+        v.event(),
+    )
+}
+
+/// Classify `reports` and, if the panic is armed, fail on the first violation.
+/// Returns every violation it found, armed or not.
+///
+/// The hook, and the whole of the debug/release split: with [`hold_panics`]
+/// off this counts and returns, which is what a shipped build and a
+/// `tauri dev` build do — neither calls it at all.
+pub fn enforce_hold_budget(reports: &[HoldReport], fail_ms: u64) -> Vec<HoldReport> {
+    let violations = hold_violations(reports, fail_ms);
+    HOLD_VIOLATIONS.fetch_add(violations.len() as u64, Ordering::Relaxed);
+    if hold_panics() {
+        if let Some(v) = violations.first() {
+            panic!("{}", hold_violation_message(v, fail_ms));
+        }
+    }
+    violations
+}
+
+/// Every hold this process can currently see — completed and in flight — as
+/// one batch: the input [`enforce_hold_budget`] classifies.
+///
+/// Completed holds are DRAINED (taken exactly once), which is the same
+/// contract the watchdog has; see [`drain_completed_holds`].
+pub fn observed_holds() -> Vec<HoldReport> {
+    let mut out = drain_completed_holds();
+    let now = mono_ms();
+    out.extend(held_locks(now).into_iter().map(|s| HoldReport {
+        lock: s.name,
+        site_file: s.site_file,
+        site_line: s.site_line,
+        holder_thread: s.holder_thread,
+        held_ms: s.held_ms,
+        waiters: s.waiters,
+        still_held: true,
+    }));
+    out
+}
+
+/// Arm the panic, read every hold this process can see, and fail on the first
+/// one over `fail_ms` at a site with no live [`LongHoldPermit`].
+///
+/// This is the enforcement entry point for a `cargo test` binary, and it ARMS
+/// rather than assuming for the reason [`HOLD_PANICS`] gives: the default is
+/// off, so a caller that only asserted would be asserting against a disarmed
+/// mechanism. It restores the previous setting before returning normally; a
+/// panic does not restore it, deliberately — the binary is already failing and
+/// the next assertion in the same process should not be quietly weaker than
+/// this one.
+///
+/// **Its own instrument limit, because an absence assertion is worth exactly
+/// what its instrument can see.** A hold that has ENDED is visible only if
+/// `TrackedGuard::drop` stamped it, and that stamp is gated on
+/// [`hold_warn_ms`] — so below the warn threshold the completed half of this
+/// scan is structurally blind and only in-flight holds are examined. Rather
+/// than let that pass silently it is refused here.
+pub fn assert_no_disallowed_hold_over(fail_ms: u64) {
+    assert!(
+        fail_ms >= hold_warn_ms(),
+        "assert_no_disallowed_hold_over({fail_ms}) is below the {} ms report threshold, so \
+         `TrackedGuard::drop` never stamps a completed hold this scan could find and half of it \
+         is blind. Raise `set_hold_warn_ms` first, or assert at or above the threshold",
+        hold_warn_ms()
+    );
+    let was = set_hold_panics(true);
+    let observed = observed_holds();
+    enforce_hold_budget(&observed, fail_ms);
+    set_hold_panics(was);
+}
+
+// ---------------------------------------------------------------------------
 // Bounded acquisition (#1609, plan §3 Phase 2.1)
 // ---------------------------------------------------------------------------
 
@@ -2765,5 +3025,162 @@ mod rank_tests {
         }));
         assert_eq!(msg.as_deref(), Some("deliberate"));
         assert_eq!(held_lock_depth(), 0, "the unwind left a phantom hold on the stack");
+    }
+
+    // ---------- hold-duration enforcement (#1702 P4) ----------
+
+    /// A synthetic report, so the classifier's RULE is testable without
+    /// building a lock, a thread or a five-second hold.
+    fn report_at(thread: u64, held_ms: u64) -> HoldReport {
+        HoldReport {
+            lock: "holdspec",
+            site_file: "holdspec.rs",
+            site_line: 1,
+            holder_thread: thread,
+            held_ms,
+            waiters: 0,
+            still_held: false,
+        }
+    }
+
+    #[test]
+    fn the_three_five_second_constants_are_deliberately_equal() {
+        // `HOLD_FAIL_MS`'s whole argument is that it is not a NEW number: it is
+        // the figure past which a hold is already reportable and past which a
+        // cadenced tick's gate probe has already skipped. Stated in a doc
+        // comment that is a claim nobody can check; stated here it fails when
+        // one of the three moves and the other two do not.
+        assert_eq!(
+            HOLD_FAIL_MS,
+            DEFAULT_HOLD_WARN_MS,
+            "the hold a test build refuses drifted from the hold the shipped build reports"
+        );
+        assert_eq!(
+            HOLD_FAIL_MS,
+            crate::budget::TICK_LOCK_BUDGET.as_millis() as u64,
+            "the hold a test build refuses drifted from the tick gate's budget"
+        );
+    }
+
+    #[test]
+    fn a_long_hold_is_a_violation_unless_its_thread_is_permitted() {
+        // The rule, in all four crossings of {over, under} x {permitted, not}.
+        let over = report_at(7, HOLD_FAIL_MS);
+        let under = report_at(7, HOLD_FAIL_MS - 1);
+
+        assert_eq!(
+            hold_violations_among(&[over.clone()], HOLD_FAIL_MS, &[]).len(),
+            1,
+            "an over-threshold hold by an unpermitted thread is the whole subject"
+        );
+        assert!(
+            hold_violations_among(&[over.clone()], HOLD_FAIL_MS, &[7]).is_empty(),
+            "a permitted thread's long hold is the deliberate injection this exists to exempt"
+        );
+        assert!(
+            hold_violations_among(&[under.clone()], HOLD_FAIL_MS, &[]).is_empty(),
+            "a hold UNDER the threshold is not a violation however unpermitted its thread"
+        );
+        assert!(
+            hold_violations_among(&[under], HOLD_FAIL_MS, &[7]).is_empty(),
+            "and neither is it when permitted"
+        );
+
+        // The negative control the three above cannot give: a classifier that
+        // simply refused everything would satisfy the first assertion, and one
+        // that permitted everything would satisfy the other three. This pins
+        // that the permit is matched by THREAD rather than applied globally.
+        let other = report_at(8, HOLD_FAIL_MS);
+        let both = hold_violations_among(&[over, other], HOLD_FAIL_MS, &[7]);
+        assert_eq!(both.len(), 1, "the permit must exempt its own thread and no other");
+        assert_eq!(both[0].holder_thread, 8);
+    }
+
+    #[test]
+    fn a_permit_is_scoped_to_its_thread_and_ends_with_it() {
+        let _serial = SERIAL.lock_safe();
+        let me = current_thread_id();
+        assert!(
+            long_hold_permit_for(me).is_none(),
+            "a permit was still live from an earlier test, so nothing below measures this one"
+        );
+        {
+            let _p = LongHoldPermit::new("holdspec outer");
+            assert_eq!(long_hold_permit_for(me), Some("holdspec outer"));
+            {
+                // Nesting: the inner permit's Drop must leave the outer one
+                // standing, which a set-shaped registry would not.
+                let _q = LongHoldPermit::new("holdspec inner");
+                assert_eq!(long_hold_permit_for(me), Some("holdspec inner"));
+            }
+            assert!(
+                long_hold_permit_for(me).is_some(),
+                "the inner permit's drop took the outer one with it"
+            );
+        }
+        assert!(long_hold_permit_for(me).is_none(), "the permit outlived its guard");
+
+        // Another thread is not covered by this one's permit — the property
+        // that makes the allowlist an allowlist rather than a global off
+        // switch.
+        let _p = LongHoldPermit::new("holdspec mine");
+        let other = std::thread::spawn(|| long_hold_permit_for(current_thread_id()).is_none())
+            .join()
+            .expect("the probe thread panicked");
+        assert!(other, "a permit on one thread exempted another");
+    }
+
+    #[test]
+    fn the_enforcement_panics_only_while_it_is_armed() {
+        // The documented escape hatch is a counterfactual, so this performs the
+        // edit rather than describing it (CLAUDE.md): `set_hold_panics(false)`
+        // is what a caller uses to observe violations without failing, and a
+        // dispatch that had folded the disarmed arm in with the armed one would
+        // pass every other test in this file.
+        let _serial = SERIAL.lock_safe();
+        let reports = [report_at(current_thread_id() + 4096, HOLD_FAIL_MS + 1_000)];
+
+        let was = set_hold_panics(false);
+        let seen_before = hold_violations_seen();
+        let quiet = enforce_hold_budget(&reports, HOLD_FAIL_MS);
+        assert_eq!(quiet.len(), 1, "the violation must be CLASSIFIED even while disarmed");
+        assert_eq!(
+            hold_violations_seen(),
+            seen_before + 1,
+            "the counter is what makes a disarmed run observable at all"
+        );
+
+        set_hold_panics(true);
+        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+            enforce_hold_budget(&reports, HOLD_FAIL_MS);
+        }))
+        .expect("armed, an over-threshold unpermitted hold must panic");
+        // The two facts a reader needs from the failure line, and the reason
+        // this asserts on the message rather than merely on the panic: a panic
+        // that named neither would be a worse instrument than the breadcrumb it
+        // replaces.
+        assert!(msg.contains("holdspec.rs:1"), "the panic must name the HOLDER SITE: {msg}");
+        assert!(
+            msg.contains(&format!("{} ms", HOLD_FAIL_MS + 1_000)),
+            "the panic must name the DURATION: {msg}"
+        );
+        set_hold_panics(was);
+    }
+
+    #[test]
+    fn a_scan_below_the_report_threshold_refuses_rather_than_reading_half_of_it() {
+        // `TrackedGuard::drop` stamps a completed hold only past
+        // `hold_warn_ms`, so an assertion below that figure is examining
+        // in-flight holds alone while its name promises both. An instrument
+        // that is blind on half its subject must say so rather than return a
+        // clean answer.
+        let _serial = SERIAL.lock_safe();
+        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+            assert_no_disallowed_hold_over(hold_warn_ms().saturating_sub(1));
+        }));
+        assert!(
+            msg.is_some_and(|m| m.contains("blind")),
+            "a scan under the report threshold must refuse, not answer"
+        );
     }
 }
