@@ -219,6 +219,15 @@ pub enum ToolKind {
 /// is what makes the classification test able to compare the real table
 /// against the real listing instead of against whatever roles a fixture
 /// happened to construct (#1609 review N2).
+///
+/// **It must vary the ROLE HINT too, and the first version did not** — which
+/// made the guard built on it FALSE-BLOCK on `session_digest`, a real tool
+/// gated behind `Role::Worker` + `role_hint == Some("process")`. A union that
+/// omits an input the callee branches on is not a union. The hints are
+/// enumerated from `tool_defs`' own comparisons; a new one added there without
+/// a line here narrows this silently, which is why the guard asserts a floor
+/// on the population it returns.
+const GATING_HINTS: [Option<&str>; 3] = [None, Some("liaison"), Some("process")];
 #[doc(hidden)]
 pub fn all_listed_tool_names() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -231,8 +240,8 @@ pub fn all_listed_tool_names() -> Vec<String> {
         Role::Solo,
     ] {
         for manager in [false, true] {
-            for defs in [tool_defs(role, None, &[], manager)] {
-                for d in defs {
+            for hint in GATING_HINTS {
+                for d in tool_defs(role, hint, &[], manager) {
                     if let Some(n) = d.get("name").and_then(Value::as_str) {
                         if !out.iter().any(|e| e == n) {
                             out.push(n.to_string());
