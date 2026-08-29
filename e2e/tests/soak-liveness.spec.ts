@@ -87,7 +87,6 @@ import {
   LIVENESS_BOUND_MS,
   LOCK_HOLD_MS,
   SOAK_MS,
-  breadcrumbsOfKind,
   holdStillHeld,
   assertCounterSeesTheApp,
   installInvokeCounter,
@@ -99,11 +98,13 @@ import {
   orchInvokeTotal,
   singleFlightStats,
   ptyRoundTrip,
+  parseHoldCrumbs,
   readBreadcrumbs,
   readInvokeCounts,
   requestLockHold,
   sleep,
   waitForHoldAcquired,
+  waitForLockHoldCrumb,
 } from "../liveness";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -347,28 +348,41 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const ran = after.ran - before.ran;
     const skipped = after.skipped - before.skipped;
 
-    // Phase 0 (#1605) put a self-watchdog behind every registry mutex, and
-    // it reports a hold that outlives `lockwatch::DEFAULT_HOLD_WARN_MS`
-    // (5 s). This hold is 12 s, so the app's OWN instrument has to have seen
-    // it — which cross-validates the two independently: an injector that did
-    // not really take the mutex produces no report, and a watchdog that is
-    // not running produces none either. Before Phase 0 this lane had no way
-    // to check its own premise against anything but itself.
-    const crumbs = breadcrumbsOfKind(readBreadcrumbs(appDataDir), ["lock-slow", "lock-freed"]);
+    // Phase 0 (#1605) put a self-watchdog behind every registry mutex, and it
+    // reports a hold outliving `lockwatch::DEFAULT_HOLD_WARN_MS` (5 s) as a
+    // breadcrumb naming the lock, the duration, the waiter count and the
+    // holder's call site. This hold is 12 s on a lock named `groups`, so the
+    // app's OWN instrument has to have seen exactly that — which is the one
+    // thing this lane could not previously check: its own premise. Until now
+    // "the injector really took the mutex" rested on the injector's own state
+    // file, which is the injector agreeing with itself.
+    //
+    // It must name `groups`, and it must have been held for at least the
+    // watchdog's own threshold. An earlier version asserted only a COUNT of
+    // long-hold breadcrumbs and went green on a `lock=usage_memo_cell
+    // held_ms=8538` crumb from unrelated background work — a control that
+    // passes on somebody else's subject is not a control.
+    const crumb = await waitForLockHoldCrumb(appDataDir, "groups", 5_000);
+    const allCrumbs = parseHoldCrumbs(readBreadcrumbs(appDataDir));
     console.log(
       `[soak] during a ${holdMs}ms hold on groups: ${ran} sweeps ran, ${skipped} ticks ` +
-        `skipped; watchdog reported ${crumbs.length} long-hold breadcrumb(s)` +
-        (crumbs.length ? `: ${crumbs[crumbs.length - 1]}` : "")
+        `skipped; watchdog long-hold reports: ${allCrumbs.length} total, ` +
+        `ours ${crumb ? `= ${crumb.raw}` : "NOT FOUND"}`
     );
 
     expect(
-      crumbs.length,
-      `Phase 0's self-watchdog reported no long-hold breadcrumb while this test held the ` +
-        `\`groups\` mutex for ${holdMs}ms — five times its 5 s threshold. Either the ` +
-        `injector is not taking a TRACKED mutex (so the lane's premise is unverified), or ` +
-        `the watchdog thread is not running in this build. Breadcrumb log had ` +
-        `${readBreadcrumbs(appDataDir).length} line(s).`
-    ).toBeGreaterThanOrEqual(1);
+      crumb?.lock,
+      `Phase 0's self-watchdog never reported a long hold on \`groups\` while this test ` +
+        `held it for ${holdMs}ms — more than twice its 5 s threshold. Either the injector ` +
+        `is not taking a TRACKED mutex (so this lane's premise is unverified), or the ` +
+        `watchdog thread is not running in this build. It reported ${allCrumbs.length} ` +
+        `long hold(s) on other locks: ${JSON.stringify(allCrumbs.map((c) => c.lock))}`
+    ).toBe("groups");
+    expect(
+      crumb?.heldMs ?? 0,
+      `the watchdog's reported hold on \`groups\` is shorter than the injector claims to ` +
+        `have held it (${holdMs}ms): ${crumb?.raw}`
+    ).toBeGreaterThanOrEqual(holdMs - 2_000);
 
     expect(
       skipped,

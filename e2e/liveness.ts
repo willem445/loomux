@@ -200,11 +200,61 @@ export function readBreadcrumbs(dataDir: string): string[] {
   }
 }
 
-/** Breadcrumbs whose event field is one of `events`. The line shape is
- *  `<stamp> <event> <detail>`, split on spaces, and `lockwatch` guarantees
- *  every detail VALUE is space-free for exactly this reason. */
-export function breadcrumbsOfKind(lines: string[], events: string[]): string[] {
-  return lines.filter((l) => events.includes(l.split(" ")[1] ?? ""));
+/** One `lock-slow` / `lock-freed` breadcrumb, parsed.
+ *
+ *  The line shape is `<stamp> <event> lock=… held_ms=… waiters=… thread=…
+ *  at=…`, and `lockwatch::spaceless` guarantees every VALUE is space-free
+ *  for exactly this reason. */
+export interface HoldCrumb {
+  event: string;
+  lock: string;
+  heldMs: number;
+  raw: string;
+}
+
+export function parseHoldCrumbs(lines: string[]): HoldCrumb[] {
+  const out: HoldCrumb[] = [];
+  for (const raw of lines) {
+    const parts = raw.split(" ");
+    const event = parts[1] ?? "";
+    if (event !== "lock-slow" && event !== "lock-freed") continue;
+    const field = (key: string) =>
+      parts.find((p) => p.startsWith(`${key}=`))?.slice(key.length + 1) ?? "";
+    out.push({ event, lock: field("lock"), heldMs: Number(field("held_ms")) || 0, raw });
+  }
+  return out;
+}
+
+/**
+ * Waits for the app's self-watchdog to report a long hold ON A NAMED LOCK.
+ *
+ * Both halves of that are load-bearing, and the first version of this had
+ * neither. It asserted a COUNT of long-hold breadcrumbs, which an unrelated
+ * background hold satisfies — the run that introduced it went green on a
+ * `lock=usage_memo_cell held_ms=8538` crumb that had nothing to do with the
+ * injected hold. Naming the lock is what makes this evidence about THIS
+ * test's subject rather than about the app being busy.
+ *
+ * And it waits rather than reading once: a completed hold is stamped by the
+ * guard's drop but composed and written by the watchdog on its NEXT tick
+ * (1 Hz), so reading immediately after the injector reports `released_ms` is
+ * a race the reader loses about as often as it wins.
+ */
+export async function waitForLockHoldCrumb(
+  dataDir: string,
+  lock: string,
+  minHeldMs: number,
+  timeoutMs = 15_000
+): Promise<HoldCrumb | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const hit = parseHoldCrumbs(readBreadcrumbs(dataDir)).find(
+      (c) => c.lock === lock && c.heldMs >= minHeldMs
+    );
+    if (hit) return hit;
+    if (Date.now() >= deadline) return null;
+    await sleep(250);
+  }
 }
 
 export function sleep(ms: number): Promise<void> {

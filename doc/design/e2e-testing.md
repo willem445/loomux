@@ -685,11 +685,21 @@ The armed-injector control uses it for the one thing this lane could not
 previously check: **its own premise**. `lockwatch` reports any tracked hold
 outliving `DEFAULT_HOLD_WARN_MS` (5 s) as a `lock-slow` / `lock-freed`
 breadcrumb naming the lock, the duration, the waiter count and the holder's
-call site. The control's hold is 12 s, so the app's own instrument has to have
-seen it — and the assertion fails if it did not, which distinguishes two
-defects that previously shared a symptom: an injector that never really took a
-tracked mutex, and a watchdog that is not running in this build. Before Phase 0
-the lane could only check its premise against itself.
+call site. The control's hold is 12 s on a lock named `groups`, so the app's own
+instrument has to have seen exactly that — and the assertion fails if it did
+not, which distinguishes two defects that previously shared a symptom: an
+injector that never really took a tracked mutex, and a watchdog that is not
+running in this build. Before Phase 0 the lane could only check its premise
+against itself.
+
+Two details of that assertion are the difference between a control and a
+decoration, and the first version had neither. It must name the LOCK: asserting
+a count of long-hold breadcrumbs passes on any unrelated background hold, and
+the run that introduced it went green on a `lock=usage_memo_cell held_ms=8538`
+crumb with nothing to do with the injected hold. And it must WAIT: a completed
+hold is stamped by the guard's drop but composed and written by the watchdog on
+its next 1 Hz tick, so reading immediately after the injector reports
+`released_ms` is a race the reader loses about as often as it wins.
 
 Two Phase 0 instruments are deliberately **not** used yet, and are named so the
 next person does not have to rediscover them:
