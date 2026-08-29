@@ -476,6 +476,48 @@ Signature that you needed this: the body's *What changed* quotes the exact
 phrasing a later commit on the same branch removed, and the squash then
 republishes it permanently (#1271).
 
+### A claim-purge sweep is wrap-insensitive, or it is blind — and its receipt is NON-ZERO
+
+CLAUDE.md's *correcting a false claim is a multi-surface edit* sends you to grep the
+ENTITY a claim names. `grep` is line-oriented and prose and rustdoc here are
+hand-wrapped, so a multi-word pattern cannot match an instance the wrap split — and
+every control the zero-receipt rule mandates still passes, because the sweep DID match
+the unwrapped copies. The receipt is non-zero and reads as healthy. The
+whitespace-normalisation the quote harvest above already mandates is what the sweep
+needs too; run two passes and reconcile their totals.
+
+```sh
+# 1. the shortest STABLE fragment - the part no rewording or wrap can split
+LC_ALL=C.UTF-8 grep -rn "no timeout" <roots>
+
+# 2. wrap-insensitive, per file. Strip the comment markers BEFORE squeezing:
+#    squeezing first leaves the stripped marker behind as a double space and
+#    the joined pattern silently misses again (measured, on published.rs).
+for f in <files>; do
+  echo -n "$f -> "
+  tr '[:space:]' ' ' < "$f" | sed 's|///||g; s|//!||g' | tr -s ' ' |
+    grep -o "no timeout, no try-lock" | wc -l
+done
+```
+
+Where the two disagree, the difference is what the phrase sweep could not see.
+Worked instance, re-runnable off `git show 24a428a6:<path>` for
+`crates/loomux-engine/src/published.rs`, `src-tauri/tests/perf_dispatch.rs` and
+`src-tauri/src/orchestration/views.rs`: `grep -rn "no timeout, no try-lock"` returns
+**2** (`views.rs:9`, `perf_dispatch.rs:1512`) and misses `published.rs:7` and
+`perf_dispatch.rs:81`, where the phrase reads `no timeout, no` / `try-lock` across a
+comment line break. The fragment sweep and the wrap-insensitive pass both return **4**.
+
+Signature that you needed this: a sweep receipt you already published as complete, and a
+re-sweep that finds more. #1346 went 1 → 2 (*"a second pass that flattens the line breaks
+first finds two"*), #1408 3 → 4, and #1667 ended at nine surfaces, three phrasings, two
+line wraps for one false claim, after three phrase sweeps in a row missed the wrapped
+pair — including the one whose commit message asserted the sweep was done. #1158 and
+#1191 fixed it for a RENAME sweep by whitespace-collapsing before matching; #1283 hit
+the mirror form, a false red from quoting `CLAUDE.md`, which hard-wraps mid-phrase; and
+#1344 — the PR that wrote the zero-receipt rule above — recorded this as a known
+limitation and left it unfixed. That is what this section closes.
+
 ### A diff-shaped sweep is controlled DIFFERENTIALLY, not by a match-somewhere control
 
 A sweep whose pattern reads the **diff** — `+` lines, `-` lines, a `+x` sitting under
@@ -762,6 +804,27 @@ it lands, and a stale id is what makes the whole line look untrustworthy.
   **wiring** instead — the call site, or the gate's consumption of the value —
   and leave the lib function intact, so the lib suite stays green and the
   integration binary is actually reached.
+- **When the mutation ITSELF is the plant, the collateral red can be UNAVOIDABLE
+  and none of the three above has an answer.** Disarming a primitive reddens that
+  primitive's own unit tests, in `crates/`, before cargo can reach
+  `src-tauri/tests/`; there is no plant site that avoids it. Two remedies, both
+  already used here and neither previously written down: `#[ignore = "[scratch]
+  silenced so cargo reaches tests/<file>.rs"]` on the collateral reds (#1361 round
+  3b) — the reason string prints in the log, so the round discloses its own
+  staging — or `--no-fail-fast`, so every binary reports (#1426). Reshaping the
+  mutation to thread between the pins is a third, and it is luck rather than
+  method (#1464); abandoning the round for inspection is what happens when none
+  is found (#1572).
+  **Then read the TARGET binary out of the run before citing it** — the section
+  above says to read which targets ran, and this is how: its own
+  `Running tests/<file>.rs` line AND that binary's own `test result:` totals.
+  Signature: the failing job's totals are the ENGINE binary's while the claim is
+  about an integration one. Run 33255123420 has exactly ONE `Running` line
+  (`loomux_engine`) and `425 passed; 2 failed`, so `tests/liveness.rs` never
+  executed — while a design note said its sweep had been demonstrated on that
+  tree. Remediated at run 33257747970: engine `425 passed; 0 failed; 2 ignored`,
+  then `tests/liveness.rs` `14 passed; 1 failed` (#1667 review round 2, B1).
+
 
 The same stop-at-first-failure also bounds a round that **did** hit its target:
 if the property is pinned in two binaries, the later one never ran, so it is
