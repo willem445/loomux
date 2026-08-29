@@ -155,6 +155,10 @@ pub fn run() {
             // is the thing that issue exists to prevent.
             orchestration::start_gh_poller(reg.clone());
             orchestration::start_workflow_gate_reload(reg.clone());
+            // #1603: a no-op unless this is a dev build AND the opt-in env
+            // var is set. The release arm of `start` is empty, so a shipped
+            // binary contains no injector at all.
+            orchestration::e2ehold::start(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())
         })

@@ -4,22 +4,49 @@
 // class names read straight out of src/launcher.ts, src/pane.ts, src/grid.ts.
 import { type Page } from "@playwright/test";
 
-/** The most recently opened "New pane" launcher form (there can be more than
- *  one welcome-form on screen across empty tabs/panes at once). */
+/** The most recently opened "New pane" launcher form.
+ *
+ *  `:visible` is load-bearing, not tidiness. Every empty pane carries a
+ *  welcome form, and a session restored from `tabs.json` brings up one per
+ *  tab — all of them in the DOM, only the active tab's on screen. Without the
+ *  filter `.last()` picks the LAST tab's hidden form, and the first
+ *  interaction then waits for a form that will never become visible. With a
+ *  single tab (every spec before the soak lane) the filter changes nothing. */
 function latestWelcomeForm(page: Page) {
-  return page.locator(".welcome-form").last();
+  return page.locator(".welcome-form:visible").last();
 }
 
 /** Fills out and submits the launcher form to turn a welcome pane into a
  *  plain shell (terminal) pane — never an agent/orchestrator kind, so this
- *  never spawns a real agent CLI. */
+ *  never spawns a real agent CLI.
+ *
+ *  `shell` picks the shell-kind option (`src/launcher.ts`'s Shell field);
+ *  omitted, the form's own default (PowerShell) stands, which is what every
+ *  spec before the soak lane used. A spec that has to read a child's OUTPUT
+ *  should pass `"cmd"`: PSReadLine redraws the input line as you type, so a
+ *  marker typed into PowerShell arrives in the output stream interleaved
+ *  with re-rendered prefixes, while `cmd.exe` echoes plainly. */
 export async function createTerminalPane(
   page: Page,
-  opts: { name: string; repo?: string }
+  opts: { name: string; repo?: string; shell?: "powershell" | "cmd" | "gitbash" }
 ): Promise<void> {
   const form = latestWelcomeForm(page);
 
   await form.locator('.dlg-field:has(.dlg-label:has-text("Kind")) select').selectOption("terminal");
+  if (opts.shell) {
+    // NOT `.dlg-label:has-text("Shell")`. `field()` (src/launcher.ts) renders
+    // each field's HINT inside the `.dlg-label` element, and `:has-text` is a
+    // case-insensitive SUBSTRING match — so that selector matches every field
+    // whose hint happens to mention a shell, which on the terminal kind is
+    // four of them (measured: strict-mode violation naming 4 selects). The
+    // shell picker is identified here by the one option only it carries
+    // (`shellKindOptions` in src/panesetup.ts; the SSH remote-shell select's
+    // values are `posix`/`cmd`), which no label rewording can break.
+    await form
+      .locator("select")
+      .filter({ has: page.locator('option[value="powershell"]') })
+      .selectOption(opts.shell);
+  }
   await form.locator('.dlg-field:has(.dlg-label:has-text("Pane name")) input').fill(opts.name);
   if (opts.repo) {
     await form.locator('.dlg-field:has(.dlg-label:has-text("Repository")) input').fill(opts.repo);

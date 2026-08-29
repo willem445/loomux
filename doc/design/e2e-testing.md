@@ -341,6 +341,411 @@ label text read straight out of `src/launcher.ts`/`pane.ts`/`grid.ts`. That's
 a real fragility cost (a class rename breaks a test with no relation to the
 behavior it tests) and the most obvious near-term follow-up.
 
+## The soak lane (#1603, plan #1600 §3 Phase 4.1)
+
+Every spec above is a **shape** test: open something, measure the DOM,
+assert a structure. `soak-liveness.spec.ts` is not. It asserts a **liveness**
+property — after the app has run for a while against a large corpus with its
+poll paths ticking, does a keystroke still reach a pane and does the MCP
+still answer? — because that is the property four consecutive hangs (#1564,
+#1592, #1595, and the beta6 field report) broke while every shape guard in
+the repo stayed green. Plan #1600 §2.2 is the argument; this lane is the
+test it asks for.
+
+Two specs, two app launches:
+
+1. **The soak.** Boot against the synthetic corpus, open a plain `cmd` pane,
+   idle for `ORRERIX_SOAK_MS`, then assert a keystroke round-trips through
+   the pane's child and an MCP `ping` answers, both within
+   `ORRERIX_SOAK_BOUND_MS`. Expected to PASS on today's `main` — beta6 fixed
+   the poll-batch path — and to stay as regression protection.
+2. **The class assertion.** Same corpus, plus a deliberately long registry
+   lock hold injected while the app runs, then the same two probes. Expected
+   to **FAIL** on today's `main`; plan #1600's Phases 1 and 2 are what make
+   it pass. See "The expected failure" below.
+
+### What loads the poll paths, and what cannot be loaded
+
+Stated plainly, because a liveness lane that quietly covers less than it
+reads as covering is worse than none:
+
+- **The 4 s tab-strip poll is exercised.** `src/tabbar.ts` arms it at
+  construction — its own comment calls it "the app's one app-lifetime
+  poll" — and `pollStatus` issues `orch_group_summary` + `orch_group_usage`
+  for every **group-bound** tab. A tab is group-bound purely because its
+  persisted `groupIds` names a group, so the corpus's `tabs.json` alone puts
+  that poll under load: no clicking, and no agent CLI.
+- **The 2 s group-view poll is not, and cannot be.** `src/groupview.ts`'s
+  timer is armed only while the view is shown, and the view opens only from
+  a pane whose `groupBtn` is visible — which `applyOrchIdentity` reveals only
+  for a LIVE orchestrator-role pane. That needs a real agent CLI, which
+  CLAUDE.md constraint 3 forbids here. Both polls park threads on the same
+  registry mutexes, so the mechanism is exercised either way; the per-tick
+  fan-out is simply smaller than a real orchestrating session's. Closing that
+  gap needs a safe stand-in agent process — the same standing limitation as
+  the task-board overlay above — not a change to this lane.
+- **Blocking-pool exhaustion is not reachable from the poll path at all, and
+  no hold duration or corpus size changes that.** Plan #1600 §1.2 step 4
+  describes ticks accumulating parked `spawn_blocking` threads until the
+  512-thread pool exhausts, at which point `write_pty` can no longer be
+  scheduled and every pane stops accepting input at once. **Both ends of that
+  chain are now cut, independently.** #1604 single-flights this sweep, so a
+  tick firing while the previous one is still outstanding skips and at most
+  one call is parked however long a lock is held; and #1612 (Phase 2.3) moved
+  `write_pty` off the shared pool onto a per-pane writer thread, so even an
+  exhausted pool could not starve pane input. Two fixes working as designed,
+  and together they mean this lane cannot demonstrate the pane-input half of
+  the chain — nor should it be able to.
+
+  An earlier version of this section did an arithmetic — four bound tabs at
+  two invokes every 4 s, so ~2 parked threads per second, so ~180 of 512 at a
+  90 s hold — and offered a longer hold or a wider corpus as the way to reach
+  saturation. That was true against the base this branch was cut from and is
+  **false on the merged tree**; it is recorded here rather than deleted
+  because it is exactly the kind of stale arithmetic a reader would otherwise
+  reconstruct from the plan.
+
+  That bound is **observed, not reasoned**. The armed-injector control holds
+  `groups` — what the polled `orch_group_summary` takes — for 12 s and reads
+  the gate's own counters: `1 sweeps ran, 2 ticks skipped` (measured at
+  `f6f41833`, run 33235203093). One call parked, two ticks declined to pile
+  on, and Phase 0's watchdog independently reports `waiters=2` on that same
+  lock at the same moment. The 180 s soak in the same run measured `45 status
+  sweeps ran, 0 ticks skipped`, which is a healthy app and therefore says
+  nothing at all about the skip path — which is exactly why the observation is
+  made under a held lock instead.
+
+  What the class assertion still demonstrates is the half #1604 does not
+  govern: `orchestration/mcp.rs` spawns a thread per request and each one
+  parks on the registry mutex, ungoverned by any single-flight. That is why
+  the MCP probe is the one that dies while pane input stays healthy, and why
+  the lane's finding survives the fix that removed the other half.
+
+### The corpus, and the store it is deliberately not written into
+
+`e2e/corpus.ts` writes, into the fixture's own throwaway data dir and before
+the app is spawned, the install shape every hang report was made against:
+orchestration groups with rosters, task files and multi-megabyte
+`audit.jsonl` files, plus a large CLI session store behind them.
+
+The session store is the **copilot** one, and that is a constraint rather
+than a preference. The Claude half (`~/.claude/projects`) has no production
+redirect — `claude_projects_root()` is `dirs::home_dir()` plus a
+thread-local seam only reachable from Rust — so seeding hundreds of
+synthetic sessions there would mean writing into the operator's real
+transcript directory. `copilot_session_state_root()` honours `COPILOT_HOME`,
+so the whole store lives inside the same temp dir the fixture already
+deletes on teardown. The groups carry `agent_cli: "copilot"` for the same
+reason: it is what makes the boot listing's `resumable` check actually
+enumerate the synthetic store instead of skipping it.
+
+`e2e/fixtures.ts` grew two hooks for this and nothing else: `seedDataDir`
+(which may return extra environment variables, since `COPILOT_HOME`'s value
+is not known until the dir exists) and `extraEnv`. Both merge in ABOVE the
+two isolation variables the harness owns, so a spec can add a knob and can
+never take `ORRERIX_DATA_DIR` or the CDP port away.
+
+### The two probes
+
+**A keystroke reaches the pane's child.** xterm.js renders through the WebGL
+addon, so a terminal's contents are not in the DOM and no selector can read
+them. Rather than add a debug hook to product code to expose the buffer, the
+spec listens to the same `pty-output` event the app's own router consumes,
+through the low-level bridge the bundled `listen()` uses underneath — the
+emit-direction twin of the #814 technique above, and covered by the shipped
+ACL (`core:default` covers `core:event`). That payload is **base64 of the raw
+pty bytes**, not text (`src/pty.ts`'s router `atob`s it before handing it to a
+pane); a tap that skips the decode matches nothing and reports it as "no
+output", which is precisely how a working round trip reads as a dead one.
+
+It types `echo <marker>%RANDOM%` and matches `/<marker>\d+/`. That asymmetry
+is the point: the typed text's `%RANDOM%` is followed by `%`, not a digit, so
+the echo of the typed line cannot match — only `cmd.exe` expanding it can. A
+pane that rendered the keystrokes locally but never reached, or never heard
+back from, its child cannot produce a match. (`cmd`, not the launcher's
+default PowerShell: PSReadLine redraws the input line as you type.)
+
+The probe runs in **two separately-bounded phases**, because they are two
+properties that fail for different reasons and can cost wildly different
+amounts of time. `src/ptywrite.ts` keeps one `write_pty` in flight per pane and
+chains the next on the previous promise (#65), so every typed character is a
+full IPC round trip — and how long that takes has been observed to vary by
+orders of magnitude between CI runs of this same spec: once only 19 of 23
+characters echoed within 8 s, and on the next run the whole input phase
+finished in 38 ms. **That cause is not established, and is deliberately not
+guessed at** — guessing from a plausible reading is what §2.3 of plan #1600
+says produced beta5 and beta6, and if the slow case recurs it is worth chasing
+under that plan in its own right rather than being explained away here.
+
+What follows from it is the split. The *input* phase ends when the typed
+marker echoes back and is the one the beta6 report is about; the *answer*
+phase is one write and one read after Enter, and is fast whenever it works at
+all. Collapsing them into one clock produced a probe that timed out mid-typing
+and called it "no output" — a slow input path indistinguishable from a dead
+child. The marker is kept short for the same reason.
+
+`ORRERIX_SOAK_BOUND_MS` bounds each phase, and 20 s is deliberately generous:
+the failure this lane is about is a probe that NEVER answers, not a slow one.
+A latency budget here would be a flake generator wearing an invariant's
+clothes.
+
+**The MCP answers.** Over real HTTP, from the Playwright process, not
+through the webview — the webview is the half that stays alive in the beta6
+mechanism, which is why the window kept painting, so asking it whether the
+backend is well is asking the wrong process. `ping` is the cheapest method
+and still faithful: every method is authenticated first, and `resolve_token`
+locks `by_token`, then `agents`, then `groups`.
+
+The identity comes from `orch_solo_prepare`, which mints a token, registers
+the agent and writes its MCP config file **before** the launcher would spawn
+anything and independently of whether that CLI is even installed — so
+calling it alone yields a valid token and the server's ephemeral port (bound
+at `127.0.0.1:0`, and not otherwise discoverable) with no child process
+anywhere. Constraint 3 is about spawning agent CLIs; this spawns nothing.
+
+Both probes are bounded by their own deadline rather than by Playwright's
+test timeout, because the failure under test is a HANG: an unbounded `await`
+would report every red as "Test timeout exceeded" with no statement of which
+half died.
+
+### The lock-hold injector, and why it is a file
+
+`src-tauri/src/orchestration/e2ehold.rs` is the one piece of this repo that
+deliberately makes the app misbehave. It watches for
+`<data root>/e2e-lock-hold.request`, takes the named registry mutex, writes
+`<data root>/e2e-lock-hold.state` with `acquired_ms`, sleeps out the hold,
+and rewrites the state with `released_ms`.
+
+This design note's own recommendation above is "zero new Tauri commands or
+ACL surface", and #814's queue-badge spec turned a test hook down for the
+same reason. A command would have been permanent product surface — a name in
+`generate_handler!`, an entry in `command_manifest::APP_COMMANDS`, and an
+ACL grant — all present in a *release* build even with the body cfg'd away.
+A file under the app-data root costs none of that, and it is better for the
+test besides: the Playwright process owns that directory, so it can trigger
+a hold and read back when the lock was actually taken without going through
+the very IPC path whose liveness is under test. A probe the app has to
+answer to tell you the app is stuck is not a probe.
+
+It cannot ship enabled, on two independent gates:
+
+1. `#[cfg(debug_assertions)]`. The watcher is compiled only into a
+   dev-profile build; the workspace `[profile.release]` does not set
+   `debug-assertions`, so a release build keeps cargo's default (`false`) and
+   contains an empty `start` and nothing else.
+2. An explicit opt-in: even a dev build starts no thread unless
+   `ORRERIX_E2E_LOCK_HOLD` is exactly `1`, which the soak spec passes through
+   `extraEnv`. `npm run tauri dev` behaves as it always has.
+
+`src-tauri/tests/e2ehold_guard.rs` is what makes those claims checkable
+rather than readable: a shape scan asserting every function that can hold a
+lock, sleep, spawn or write is gated (with a floor on what the scan found,
+so an instrument that stopped matching cannot report "all clean"); a check
+that `[profile.release]` has not turned `debug-assertions` back on; a
+behavioural test that only the exact string `1` arms it; and a check that
+`e2e/liveness.ts` still names the two filenames and the environment
+variable, since there is no shared header between a Rust module and a
+TypeScript spec and a one-sided rename would produce a soak run with no hold
+behind it — green, and meaningless.
+
+### Positive controls
+
+Three, because every one of this lane's assertions has a way of passing
+vacuously:
+
+- **The corpus really landed.** The builder returns what it wrote and the
+  spec asserts group, session and audit-byte counts against it — otherwise a
+  builder that silently failed turns this into a soak against an empty
+  install, which passes.
+- **The polls really ran.** The primary measure is SWEEPS, read from the
+  app's own `__singleFlightStats()` (#1604), with the dispatch counter as a
+  cross-check: sweeps climbing while nothing dispatches means the sweep found
+  no bound tabs, which is the corpus failing to bind rather than a healthy
+  app. Without either, the test asserts only that an app survives being
+  ignored.
+
+  Sweeps rather than an invoke total is a consequence of #1604, not a
+  preference. Before it every 4 s tick issued a sweep, so `ticks × tabs × 2`
+  predicted the dispatch count and a floor could be derived from arithmetic;
+  now a tick may legitimately skip, so the number of sweeps is something to
+  read. **Measured** at `f6f41833` (run 33235203093): 45 sweeps, 0 skipped,
+  360 `orch_*` dispatches across 4 group-bound tabs — exactly 45 × 4 × 2, so
+  every sweep issued its full fan-out. The floor is 40 % of the tick count
+  (18 here, cleared 2.5×) and is deliberately a floor on the property — the
+  poll body ran repeatedly under load — never a pin on the cadence, which
+  would pin this incident's shape, the mistake this lane exists to stop
+  making.
+
+  The counter lives in `src/transport.ts`, not in the spec, and that is a
+  correction rather than a preference. Counting from the spec's side meant
+  patching `window.__TAURI_INTERNALS__.invoke` — which is a **frozen own
+  property** (`writable:false, enumerable:false, configurable:false`,
+  measured on the E2E build). Assignment to it is a silent no-op outside
+  strict mode, `defineProperty` throws, and a `Proxy` cannot help either: a
+  `get` trap is forbidden by the language from returning anything but the
+  real value for a non-writable, non-configurable data property. Fighting
+  that descriptor would also have been a bet on Tauri's internals keeping
+  their present shape. `src/transport.ts` is the ONE module allowed to touch
+  Tauri IPC (CLAUDE.md constraint 5), so a counter there sees every dispatch
+  by construction — the seam the codebase already had.
+
+  It **ships disarmed**: `__invokeStats("arm")` turns it on, and until then
+  `invoke` pays a single null check. Armed, it increments an integer in a map
+  keyed by command name, so what it retains is bounded by the command surface
+  and not by session length. No IPC surface, no ACL grant, no new command —
+  the same shape of devtools instrument `pollgate.ts` already exposes as
+  `__pollGateStats()`.
+- **And the counter itself is checked**, which is not belt-and-braces: a
+  counter that is not counting reports `{}`, bit-for-bit what an app that
+  never polled reports. `invokeStats()` therefore reports `armed` alongside
+  the counts, and `readInvokeCounts` refuses a disarmed reading outright.
+  The spec then calls `assertCounterSeesTheApp` immediately after the
+  baseline round trip — which cannot have succeeded without `write_pty` — so
+  a blind instrument fails there rather than two hundred seconds later
+  wearing a finding's clothes. That is not hypothetical: it is what the third
+  CI run on this branch did.
+- **The hold really held** — and this one could NOT live inside the test it
+  is about. `test.fail()` absorbs every failure in its own test, controls
+  included: an injector that silently never took a lock would leave both
+  probes measuring an idle app, the test would fail, and Playwright would
+  report a healthy expected failure. So the proof is split across two places
+  the marker cannot reach. `src-tauri/tests/e2ehold_guard.rs` proves the
+  mechanism **differentially** against a real `OrchRegistry` — the same
+  public registry read that finishes in milliseconds with nothing held does
+  not finish at all during a 1.5 s hold, and then does once it elapses,
+  because "it did not finish" is evidence only if the same probe could have
+  finished. And a short, non-xfail spec in the same describe proves the
+  injector is compiled in and armed **in the build under test**, which is the
+  one part a Rust test cannot say. The `acquired_ms`/`released_ms` checks
+  still inside the expected failure are diagnostics: they put the reason in
+  the report, and are not counted as evidence.
+
+The MCP probe also carries a negative control: a bogus token must be refused
+with JSON-RPC `-32000`. Without it, "something answered on 127.0.0.1" would
+read as "orrerix's authenticated MCP server answered".
+
+### The expected failure
+
+The class assertion is marked `test.fail()`. It is expected to fail on
+today's `main` — that is the point of it — and `fail` was chosen over `skip`
+deliberately: the assertion runs at full strength, the E2E job stays green
+while the fix is outstanding, and the moment Phases 1/2 land Playwright
+reports "expected to fail but passed", telling whoever landed the fix to
+flip the marker. A `skip` would have gone quiet instead, and quiet is how a
+lane stops being re-armed.
+
+The cost of the marker is that it absorbs its own test's controls — see
+**Positive controls** above for where each of them lives instead. The rule
+this lane follows is that nothing inside an expected failure is ever cited
+as evidence for anything.
+
+**When plan #1600's Phases 1 and 2 land:** delete the `test.fail()` line in
+`e2e/tests/soak-liveness.spec.ts` and this paragraph with it. Nothing else
+about the spec changes.
+
+**Do not expect CI to tell you.** Playwright's unexpected-pass report lands
+inside the `e2e-windows` job, which is `continue-on-error: true` — so when
+the fix arrives the report is a line in a log inside a job that still shows
+green, and no required check moves. What actually carries the obligation is
+#1603 staying open and this paragraph. Whoever lands Phases 1/2 should read
+the E2E log rather than the check mark; if `e2e-windows` ever comes off
+`continue-on-error`, this caveat goes with it.
+
+### Budget
+
+`ci.yml` sets `ORRERIX_SOAK_MS=180000`, `ORRERIX_SOAK_LOCK_HOLD_MS=90000`
+and `ORRERIX_SOAK_BOUND_MS=20000` explicitly, so the cost lives where the
+job does. 180 s is ~45 ticks of the 4 s status timer, and the hold has to
+outlast both probes, which need ~70 s worst case at those bounds.
+
+The cost is **measured**, at `f6f41833` (run 33235203093): soak 3.3 m +
+armed/single-flight/watchdog control 17.6 s + class assertion 48.6 s =
+**~4.4 min** of a 5.5 min suite, inside a 9m22s job whose remainder is mostly
+the debug `tauri build`. A retry of the soak spec adds ~3.3 min. An earlier
+version of this section estimated "roughly eight minutes", about twice the
+lane's real cost — a run settles it, and quoting the split lets the next
+person tune the knobs against a real number. Every
+knob is an environment variable (`ORRERIX_SOAK_MS`,
+`ORRERIX_SOAK_LOCK_HOLD_MS`, `ORRERIX_SOAK_BOUND_MS`, `ORRERIX_SOAK_GROUPS`,
+`ORRERIX_SOAK_SESSIONS`, `ORRERIX_SOAK_AUDIT_LINES`), so a long local soak
+is a matter of setting one, not editing the spec.
+
+### What the lane reads from Phase 0
+
+Phase 0 (#1601, merged as #1605) landed while this lane was in review, and it
+changes what the lane can check about itself. This section used to say Phase 0
+*was being added in parallel* and that nothing here depended on it — true when
+written, and false the moment it merged.
+
+The lane still does not DEPEND on Phase 0: every probe and every control works
+without it, which is what let this land on a base that did not have it. What it
+now does is **cross-validate against it**, and that is worth more than a
+dependency would have been. `obs::breadcrumb` appends `<stamp> <event>
+<detail>` lines to `<data root>/logs/breadcrumbs.log`, and the Playwright
+process owns that directory — so the app's own self-watchdog can be read
+without going through the IPC path whose liveness is under test, exactly as the
+injector's state file is.
+
+The armed-injector control uses it for the one thing this lane could not
+previously check: **its own premise**. `lockwatch` reports any tracked hold
+outliving `DEFAULT_HOLD_WARN_MS` (5 s) as a `lock-slow` / `lock-freed`
+breadcrumb naming the lock, the duration, the waiter count and the holder's
+call site. The control's hold is 12 s on a lock named `groups`, so the app's own
+instrument has to have seen exactly that — and the assertion fails if it did
+not, which distinguishes two defects that previously shared a symptom: an
+injector that never really took a tracked mutex, and a watchdog that is not
+running in this build. Before Phase 0 the lane could only check its premise
+against itself.
+
+Three details of that assertion are the difference between a control and a
+decoration, and it took two measured failures to find them all.
+
+- It must name the **lock**. Asserting a count of long-hold breadcrumbs passes
+  on any unrelated background hold, and the run that introduced it went green on
+  a `lock=usage_memo_cell held_ms=8538` crumb with nothing to do with the
+  injected hold.
+- It must name the **kind**. `lockwatch` emits two events for one hold, meaning
+  different things: `lock-slow` is the watchdog noticing a hold still RUNNING,
+  so its `held_ms` is "so far" and grows tick by tick, while `lock-freed` is the
+  completed report whose duration is final. Reading the first `lock-slow` as if
+  it were final is how a 12 s hold reports as `held_ms=5037` — measured, not
+  hypothesised.
+- It must **wait**. A completed hold is stamped by the guard's drop but composed
+  and written by the watchdog on its next 1 Hz tick, so reading immediately
+  after the injector reports `released_ms` is a race the reader loses about as
+  often as it wins.
+
+The in-progress `lock-slow` reports are logged rather than asserted, because
+they carry something no other instrument in this lane does: the WAITER count.
+`lock=groups held_ms=5178 waiters=2 at=e2ehold.rs:239` is the poll path piling
+up behind the held mutex, named and counted, as it happens.
+
+What the completed report gives is agreement between two instruments that
+share no code: at `f6f41833` the watchdog reported `lock-freed lock=groups
+held_ms=12001 waiters=2 thread=5 at=src-tauri\src\orchestration\e2ehold.rs:239`
+for a hold the injector's own state file put at 12000 ms. One millisecond
+apart, on the same lock, naming the injector's own call site.
+
+Two Phase 0 instruments are deliberately **not** used yet, and are named so the
+next person does not have to rediscover them:
+
+- **The heartbeat** (`selfwatch::liveness`, `src/liveness.ts`) separates "the
+  GUI thread is stuck" from "the backend is stuck" — the exact distinction that
+  cost a release cycle between beta5 and beta6, and one this lane currently
+  infers from which probe died. Reading it would state that directly.
+- **The pool-depth counter** (`selfwatch::pool_in_flight`, fed by
+  `blocking::spawn_counted`) would replace the arithmetic this note retracted
+  above with a measurement. It only breadcrumbs on crossing a step
+  (64/128/256), so a healthy run emits nothing — which is why it is a
+  follow-up rather than an assertion here.
+
+  This entry said "…which `write_pty` now goes through" until #1612. That was
+  true of Phase 0's tree and is false of this one: Phase 2.3 moved the write
+  path off the shared pool entirely, onto a per-pane writer thread, so the
+  depth counter no longer observes the app's most latency-critical path at
+  all. Which is the fix working — but it is also why reading the counter would
+  now say less about pane input than the sentence implied.
+
 ## Running it (the two commands)
 
 Build the isolated test binary once, then run the suite (this recipe used to

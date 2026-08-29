@@ -197,6 +197,24 @@ jobs:
       - name: Run Playwright E2E suite
         run: npx playwright test
         env:
+          # Soak-lane budget (#1603, plan #1600 §3 Phase 4.1). Stated here
+          # rather than left to e2e/liveness.ts's defaults so the cost of
+          # this job is visible where the job is, and tunable without a
+          # code change. 180 s is ~45 ticks of src/tabbar.ts's 4 s status
+          # poll per group-bound tab — many dozens of poll invokes, which
+          # is the scale plan #1600 asks for. The hold has to outlast both
+          # probes, which need ~70 s worst case at these bounds.
+          #
+          # MEASURED, not estimated, at f6f41833 (run 33235203093): soak
+          # 3.3 m + armed/single-flight/watchdog control 17.6 s + class
+          # assertion 48.6 s = ~4.4 min of a 5.5 min suite, inside a 9m22s
+          # job whose remainder is mostly the debug `tauri build`. A retry
+          # of the soak spec adds ~3.3 min. Raising these knobs is what a
+          # long local soak does; see doc/design/e2e-testing.md "The soak
+          # lane".
+          ORRERIX_SOAK_MS: "180000"
+          ORRERIX_SOAK_LOCK_HOLD_MS: "90000"
+          ORRERIX_SOAK_BOUND_MS: "20000"
           # Workspace-root target/ since #888 slice A1 — cargo puts every
           # member's build output in the ROOT target dir, so the exe is no
           # longer under src-tauri/. Must stay in step with e2e/fixtures.ts's

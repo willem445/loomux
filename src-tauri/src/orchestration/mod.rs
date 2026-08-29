@@ -14,6 +14,9 @@
 //! pane, and the audit log (`audit.jsonl`) records the full text.
 
 pub mod digest;
+/// Test-only lock-hold injector for the E2E soak/liveness lane (#1603).
+/// Compiled to an empty `start` in a release build — see the module doc.
+pub mod e2ehold;
 pub mod humanq;
 pub mod mcp;
 pub mod needsyou;

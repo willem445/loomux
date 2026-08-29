@@ -274,9 +274,48 @@ function rmSafely(dir: string): void {
   }
 }
 
-export const test = base.extend<{ appPage: Page }>({
-  // eslint-disable-next-line no-empty-pattern
-  appPage: async ({}, use) => {
+/** Per-spec launch customisation for the `appPage` fixture. Both hooks
+ *  default to a no-op, so a spec that doesn't `test.use({ appLaunch })`
+ *  gets exactly the launch the PoC specs have always had.
+ *
+ *  `seedDataDir` runs AFTER the fresh temp data dir is created and BEFORE
+ *  the app is spawned — the only window in which a synthetic on-disk corpus
+ *  (sessions, orchestration groups, audit logs) can exist before the app's
+ *  boot listing path reads it. It may RETURN extra environment variables,
+ *  which is what a corpus whose location depends on the data dir needs —
+ *  `extraEnv` alone cannot express that, because a spec declares it before
+ *  any dir exists.
+ *
+ *  `extraEnv` is for knobs that need no such knowledge. Both are merged in
+ *  ABOVE the two isolation variables the harness owns, so neither can take
+ *  those away. */
+export interface AppLaunchOptions {
+  seedDataDir?: (
+    dataDir: string
+  ) => void | Record<string, string> | Promise<void | Record<string, string>>;
+  extraEnv?: Record<string, string>;
+}
+
+export const test = base.extend<{
+  appPage: Page;
+  appLaunch: AppLaunchOptions;
+  appDataDir: string;
+}>({
+  appLaunch: [{}, { option: true }],
+
+  /** The app-data root this test's instance runs against, exposed because a
+   *  spec may have to READ it (an agent's generated MCP config, say — that
+   *  file is the only place the ephemeral MCP port is discoverable) or WRITE
+   *  into it. Its own fixture rather than a local inside `appPage` so the
+   *  removal happens in fixture teardown order: `appPage` tears down first,
+   *  killing the process, and only then is the directory removed. */
+  appDataDir: async ({}, use) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "loomux-e2e-data-"));
+    await use(dir);
+    rmSafely(dir);
+  },
+
+  appPage: async ({ appLaunch, appDataDir }, use) => {
     // Visible in the CI log regardless of outcome: if a future edit
     // re-parents or drops the `LOOMUX_E2E_EXE` env block (as happened once —
     // see git history on ci.yml), this line changes from "pinned" to
@@ -294,11 +333,23 @@ export const test = base.extend<{ appPage: Page }>({
       );
     }
 
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "loomux-e2e-data-"));
+    const dataDir = appDataDir;
+
+    // Before the spawn, never after: the boot listing path (#1592) reads
+    // this tree once at startup, so a corpus written afterwards would be a
+    // corpus the app under test never saw.
+    const seededEnv = (await appLaunch.seedDataDir?.(dataDir)) ?? {};
 
     const proc: ChildProcess = spawn(EXE, [], {
       env: {
         ...process.env,
+        // Spec-supplied knobs (`appLaunch.extraEnv`) sit here, ABOVE the
+        // two isolation variables the harness owns, so a spec can add one
+        // but can never override `ORRERIX_DATA_DIR` or the CDP port —
+        // `verifyIsolatedBuild` would then be checking a process this
+        // harness no longer controls.
+        ...seededEnv,
+        ...(appLaunch.extraEnv ?? {}),
         ORRERIX_DATA_DIR: dataDir,
         // Only takes effect at Medium integrity level (a normal dev machine):
         // WebView2 Runtime 150+ drops this env var at High IL as LPE hardening
@@ -380,7 +431,9 @@ export const test = base.extend<{ appPage: Page }>({
       proc.kill();
       if (proc.pid !== undefined) await waitForExit(proc.pid);
       await waitForExit(webview2Pid);
-      rmSafely(dataDir);
+      // The directory itself belongs to the `appDataDir` fixture, which is
+      // torn down after this one — removing it here would race the process
+      // this block has only just asked to exit.
     }
   },
 });
