@@ -141,7 +141,7 @@ function corpusSpec() {
     groups: CORPUS_GROUPS,
     auditLinesPerGroup: CORPUS_AUDIT_LINES,
     sessions: CORPUS_SESSIONS,
-    groupBoundTabs: BOUND_TABS,
+    groupBoundTabs: 1, // MUTATION: bind 1 of 4
     repo: REPO_ROOT,
   };
 }
