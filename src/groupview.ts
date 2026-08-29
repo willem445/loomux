@@ -72,7 +72,7 @@ import { managerAbsenceNotice } from "./group";
 import { getDefaultAgent } from "./agents";
 import { confirmModal } from "./modal";
 import { PollGate } from "./pollgate";
-import { SingleFlight } from "./singleflight";
+import { RefreshGate } from "./refreshgate";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -262,13 +262,20 @@ export class GroupView {
     },
     refresh: () => void this.load(),
   });
-  /** Single-flights `load()`'s ten-invoke `Promise.all` (#1602, plan §3 Phase
-   *  2.2 of EPIC #1600): a poll tick that fires while the previous one is
-   *  still outstanding — the backend is slow, or a registry lock is stuck —
-   *  skips instead of parking another blocking-pool thread on top of it. One
-   *  instance per open group view (never module-scoped), so a stuck poll in
-   *  this panel cannot silence another group's. */
-  private loadFlight = new SingleFlight();
+  /** Single-flights `load()`'s ten-invoke `Promise.all`, with a trailing
+   *  re-run rather than a bare skip (#1602, plan §3 Phase 2.2 of EPIC #1600;
+   *  composed with the repo's existing `refreshgate.ts` per PR #1604 review
+   *  N4 — `load()` is not only the 2 s poll tick, it is also the refresh
+   *  button and ~16 post-action reloads, and a bare skip would drop those
+   *  silently rather than just deferring a tick). A poll tick or gesture
+   *  that fires while a previous `load()` is still outstanding — the
+   *  backend is slow, or a registry lock is stuck — neither starts a second
+   *  concurrent `Promise.all` (so a stuck backend still cannot pile up
+   *  blocking-pool threads one per tick) nor is lost: it is coalesced into
+   *  exactly one catch-up run once the in-flight one finishes. One instance
+   *  per open group view (never module-scoped), so a stuck poll in this
+   *  panel cannot silence another group's. */
+  private loadGate = new RefreshGate();
   private disposed = false;
   /** True once End is clicked once: the second click within the window
    *  actually tears the group down (two-step confirm for a destructive op). */
@@ -756,46 +763,53 @@ export class GroupView {
 
   private async load(): Promise<void> {
     if (this.disposed) return;
-    // #1602: single-flighted — a tick (timer or a manual refresh/action
-    // re-load) that finds the previous `load()` still outstanding skips
-    // rather than issuing a second overlapping `Promise.all`. A rejected
-    // call still releases the flight (the `try`/`catch` below runs inside
-    // `run`'s body, so `loadFlight` never sees a throw and never wedges).
-    await this.loadFlight.run(async () => {
-      try {
-        [
-          this.summary,
-          this.usage,
-          this.paused,
-          this.notify,
-          this.spawnExpandedFlag,
-          this.autonomy,
-          this.watches,
-          this.workflow,
-          this.mergeQueueStatus,
-          this.locks,
-        ] = await Promise.all([
-          groupSummary(this.groupId),
-          groupUsage(this.groupId),
-          groupPaused(this.groupId),
-          notifyEnabled(this.groupId),
-          spawnExpanded(this.groupId),
-          autonomyState(this.groupId),
-          // #904: the backend answers `null` if it refuses the group id; the
-          // watch list is the one field here that is not nullable, and the row
-          // renderer calls `.filter` on it. Coalesce at the seam rather than
-          // pushing a guard into every reader.
-          groupWatches(this.groupId).then((w) => w ?? []),
-          workflowStatus(this.groupId),
-          mergeQueue(this.groupId),
-          lockState(this.groupId),
-        ]);
-      } catch (err) {
-        this.toast(String(err));
-        return;
-      }
-      this.render();
-    });
+    // #1602 + PR #1604 review N4: single-flight with a trailing re-run
+    // (refreshgate.ts), not a bare skip — `load()` is called from the 2 s
+    // poll tick AND from the refresh button and ~16 post-action reloads
+    // below, and those gestures must not be silently dropped just because a
+    // tick happened to be in flight. `begin()`/`end()` bracket the ENTIRE
+    // body, including `render()`, so a throw anywhere in here still releases
+    // the gate (see timelineview.ts's `load()` for why `end()` must run
+    // before anything that can throw, `render()` included, rather than
+    // after).
+    if (!this.loadGate.begin()) return;
+    let ok = true;
+    try {
+      [
+        this.summary,
+        this.usage,
+        this.paused,
+        this.notify,
+        this.spawnExpandedFlag,
+        this.autonomy,
+        this.watches,
+        this.workflow,
+        this.mergeQueueStatus,
+        this.locks,
+      ] = await Promise.all([
+        groupSummary(this.groupId),
+        groupUsage(this.groupId),
+        groupPaused(this.groupId),
+        notifyEnabled(this.groupId),
+        spawnExpanded(this.groupId),
+        autonomyState(this.groupId),
+        // #904: the backend answers `null` if it refuses the group id; the
+        // watch list is the one field here that is not nullable, and the row
+        // renderer calls `.filter` on it. Coalesce at the seam rather than
+        // pushing a guard into every reader.
+        groupWatches(this.groupId).then((w) => w ?? []),
+        workflowStatus(this.groupId),
+        mergeQueue(this.groupId),
+        lockState(this.groupId),
+      ]);
+    } catch (err) {
+      this.toast(String(err));
+      ok = false;
+    } finally {
+      const rerun = this.loadGate.end();
+      if (ok && !this.disposed) this.render();
+      if (rerun && !this.disposed) void this.load();
+    }
   }
 
   private async togglePause(): Promise<void> {

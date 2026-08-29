@@ -200,10 +200,15 @@ scan pins the shape.
   rendering is visibility-aware or argued. A backend tick is bounded per tick
   (#656/#695) and never holds a cross-group lock across subprocess IO — the
   merge-queue driver is the argued exception (§4 X4).
-  A poll body is additionally single-flighted (`src/singleflight.ts`, #1602):
-  a tick firing while its own previous call is still outstanding skips rather
-  than issuing another, so a stuck backend cannot accumulate parked
-  `spawn_blocking` threads one per tick (the beta6 mechanism, EPIC #1600 §1.2).
+  A poll body's calls are additionally never allowed to overlap themselves
+  (#1602): a tick firing while its own previous call is still outstanding is
+  coalesced rather than issuing a second concurrent call, so a stuck backend
+  cannot accumulate parked `spawn_blocking` threads one per tick (the beta6
+  mechanism, EPIC #1600 §1.2). `src/singleflight.ts`'s `SingleFlight` (skip,
+  no rerun) covers a poll body with no other caller; `src/refreshgate.ts`'s
+  `RefreshGate` (skip + exactly one trailing rerun) covers one also reachable
+  from a human gesture, so a dropped tick never drops a click. E2's timer
+  manifest (`test/perfpolicy.test.ts`) pins which rows use which.
   *Enforced: E2 (#743 S3) + review.*
 - **INV-5 — Locks on latency-sensitive paths are leaves.** Map lock → release →
   leaf lock; reads are request-sized rather than clone-then-slice; CPU work

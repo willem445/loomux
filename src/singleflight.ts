@@ -1,32 +1,53 @@
-// Single-flight gate for a fixed-cadence poll (#1602, plan §3 Phase 2.2 of
-// EPIC #1600). The sibling of pollgate.ts (arms/disarms a timer around window
-// visibility) and wakegate.ts (suppresses a wake when nobody is looking at
-// the panel): this gate answers a third, orthogonal question — "the timer
-// fired again, but is the LAST call it made still running?" — for a poll body
-// that is itself an async IPC round trip and can therefore outlive its own
-// tick.
+// Single-flight gate for a fixed-cadence poll with no OTHER caller (#1602,
+// plan §3 Phase 2.2 of EPIC #1600). The sibling of pollgate.ts (arms/disarms
+// a timer around window visibility) and wakegate.ts (suppresses a wake when
+// nobody is looking at the panel): this gate answers a third, orthogonal
+// question — "the timer fired again, but is the LAST call it made still
+// running?" — for a poll body that is itself an async IPC round trip and can
+// therefore outlive its own tick.
 //
-// WHY THIS EXISTS (EPIC #1600 §1.2, the beta6 mechanism). The group view's
-// ten-invoke batch (groupview.ts, 2 s) and the tab strip's per-tab status
-// sweep (tabbar.ts, 4 s) both fire on a bare `setInterval`, which does not
-// wait for the async body's promise to settle. When the backend is slow or a
-// registry lock is stuck, each tick parks another `spawn_blocking` thread on
-// the shared 512-thread pool instead of reusing the one still waiting; at
-// roughly 2-5 threads/s that exhausts the pool in minutes, and once it does,
-// `write_pty`'s own `spawn_blocking` can no longer be scheduled and every
-// pane stops accepting input at once. Refusing to issue a second call while
-// the first is still outstanding makes that accumulation UNREACHABLE from the
-// poll path, regardless of what the hold itself turns out to be — Phase 0/1
-// of the plan diagnose the hold separately; this phase does not need to know
-// what it is.
+// WHY THIS EXISTS (EPIC #1600 §1.2, the beta6 mechanism). The tab strip's
+// per-tab status sweep (tabbar.ts, 4 s) fires on a bare `setInterval`, which
+// does not wait for the async body's promise to settle. When the backend is
+// slow or a registry lock is stuck, each tick parks another `spawn_blocking`
+// thread on the shared 512-thread pool instead of reusing the one still
+// waiting; at roughly 2-5 threads/s that exhausts the pool in minutes, and
+// once it does, `write_pty`'s own `spawn_blocking` can no longer be
+// scheduled and every pane stops accepting input at once. Refusing to issue
+// a second call while the first is still outstanding makes that
+// accumulation UNREACHABLE from the poll path, regardless of what the hold
+// itself turns out to be — Phase 0/1 of the plan diagnose the hold
+// separately; this phase does not need to know what it is.
 //
-// SCOPED PER SITE, NEVER GLOBAL. Each poll site (one open group view, the
-// app's one tab strip) owns its own `SingleFlight` instance, held as a
-// private field the same way `PollGate` is. A shared/global gate would let
-// one group's stuck call silence every other site's poll — the poll-path
-// analogue of the cross-tenant coupling this repo's other guards (GroupId,
-// the membership check) exist to rule out. Never hoist one `SingleFlight` to
-// module scope and hand it to more than one caller.
+// `groupview.ts`'s batch poll wants the SAME overlap-safety property but
+// uses a DIFFERENT gate — `refreshgate.ts`'s `RefreshGate` — because its
+// `load()` is not only the 2 s tick: it is also the refresh button and ~16
+// post-action reloads, and this class's bare skip would drop those gestures
+// silently rather than just deferring a tick (PR #1604 review N4). Reach
+// for THIS class only when the poll body has no other caller a dropped tick
+// could hurt; reach for `RefreshGate` (skip + exactly one trailing rerun)
+// when it might.
+//
+// THE COST THIS BUYS LIVENESS AT (PR #1604 review N3, deferred to Phase 1
+// of the plan). If a call this gate guards never settles — the stuck-lock
+// case it exists for — the gate never clears, and the tab strip keeps
+// showing that tab's last-known status forever: no badge, no timestamp, no
+// toast. The only visible evidence is `__singleFlightStats()` in devtools,
+// which is cumulative and module-global, not "which tab is stuck". That is
+// the deliberate trade this phase makes: liveness (the pool cannot exhaust)
+// over staleness disclosure. EPIC #1600's Phase 1 (a snapshot publisher for
+// polled reads) is what turns a frozen panel into "a stale panel — visible,
+// bounded, recoverable" (§3); it is not attempted here, and a stale-badge
+// on top of this gate is deliberately out of scope until Phase 1 owns the
+// staleness contract a badge would need to be honest about.
+//
+// SCOPED PER SITE, NEVER GLOBAL. Each poll site owns its own `SingleFlight`
+// instance, held as a private field the same way `PollGate` is. A
+// shared/global gate would let one site's stuck call silence every other
+// site's poll — the poll-path analogue of the cross-tenant coupling this
+// repo's other guards (GroupId, the membership check) exist to rule out.
+// Never hoist one `SingleFlight` to module scope and hand it to more than
+// one caller.
 //
 // A REJECTED CALL RELEASES THE GATE. The `finally` below runs on both the
 // resolved and the rejected path, so a poll body that throws (a refused group

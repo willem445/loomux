@@ -103,7 +103,7 @@ test("two SingleFlight instances never interfere — the gate is per site, not g
   assert.equal(a.pending, true);
   assert.equal(b.pending, false, "gate B is untouched by gate A's outstanding call");
 
-  const calls: number[] = [];
+  const calls: string[] = [];
   const rb = await b.run(async () => {
     calls.push("b");
     return "b-result";
