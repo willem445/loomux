@@ -154,8 +154,9 @@ impl PoolWatch {
             }
             // Came back down: re-arm at the shallower step (or below the ladder
             // entirely), and say nothing — a fall is not news.
-            (Some(_), s) => {
-                self.reported = s;
+            (Some(_), _s) => {
+                // NEUTERED (scratch, #1601): never re-arm on the way down,
+                // so a second exhaustion is silent.
                 None
             }
             (None, None) => None,
