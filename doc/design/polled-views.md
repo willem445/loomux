@@ -180,19 +180,34 @@ critical section is a map clone plus a pointer swap — the map holds an `Arc`
 per group, so a single-group republish clones pointers rather than ten
 `serde_json::Value` trees per untouched group.
 
-### The publisher thread is unsupervised, and that is the disclosure
+### The publisher thread is supervised (#1702 — this was the disclosure)
 
-`start_view_publisher` spawns a bare `loop` with no `catch_unwind` and no
+`start_view_publisher` used to spawn a bare `loop` with no `catch_unwind` and no
 restart, like every sibling `start_*` loop in `mod.rs`. A panic inside one
-group's `compute_group` therefore ends it permanently and freezes the snapshot
-for **both** UI surfaces at once — this thread is load-bearing for two whole
-surfaces, where the other loops each drive one badge.
+group's `compute_group` ended it **permanently** and froze the snapshot for
+**both** UI surfaces at once — this thread is load-bearing for two whole
+surfaces, where the other loops each drive one badge. The badge was the only
+thing between a dead publisher and a permanently-frozen, entirely plausible UI,
+which is why it was written down here rather than left to be noticed.
 
-It degrades the way the rest of this design does: `age_ms` grows, the badge
-appears, and the panel says it is stale rather than looking live. That is the
-right failure and it is why this is a disclosure rather than a defect. But the
-badge is the *only* thing between a dead publisher and a permanently-frozen,
-entirely plausible UI, so it is written down here rather than left to be noticed.
+#1702 closed it, for the reason that made it urgent: a re-entrant `lock_safe` is
+now REFUSED by unwinding rather than parking (`doc/design/lock-order.md` §2.1),
+so a class of defect that used to wedge this thread now panics it, and the
+degraded result had to be well defined before that was an improvement. Each pass
+runs under `obs::TickSupervisor`: a panic costs **one pass** and a
+`tick-panicked tick=view-publisher` breadcrumb, and the next tick republishes.
+
+The disclosure that remains is narrower, and it is the supervisor's own bound
+rather than this design's. A body that panics on `TICK_PANIC_LIMIT` consecutive
+passes is latched off — because supervision otherwise turns a deterministic
+panic into one crash log every second, and nothing prunes those — and a
+`tick-disabled tick=view-publisher` breadcrumb says so. At that point the
+snapshot freezes exactly as it used to, and the stale badge is again the only
+thing showing it: same failure, reached after three tries instead of one, and
+named in the log this time.
+
+Either way it degrades the way the rest of this design does: `age_ms` grows, the
+badge appears, and the panel says it is stale rather than looking live.
 
 ## The wire contract
 

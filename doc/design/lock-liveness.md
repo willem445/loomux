@@ -150,12 +150,20 @@ fresh thread with an empty held-lock stack, which is the only sense in which any
 `Busy` was ever "retryable". Nothing here knows enough to say otherwise, and a
 `retry_after_ms` of 0 would say "hammer it".
 
-`docs/orchestration.md`'s "when an agent reports `loomux busy`" section is
-unchanged and stays true: it describes the answer a *user* can see, which is
-still "nothing was executed, and you can try again". A re-entrant refusal is a
-programmer error that today hangs the app instead, so no shipped path produces
-one; if one ever does, the log line the user is asked to send is the one that
-says which.
+`docs/orchestration.md`'s "when an agent reports `loomux busy`" section
+describes the answer a *user* can see, and its core claim — "nothing was
+executed, and you can try again" — is still true of every `busy` answer,
+re-entrant refusals included: the refusal happens *instead of* the acquisition,
+so nothing downstream of it ran.
+
+What changed under it is which paths can produce one. Until #1702 a re-entrant
+refusal came only from `lock_within`, and `lock_safe` hung the app instead, so
+no shipped read path could return one. Now `lock_safe` refuses too, so a
+re-entrant defect on a read path reaches a user as a `loomux busy:` line naming
+both sites rather than as a freeze — and one on a path with no budget frame
+reaches them as a crash log plus a `tick-panicked` breadcrumb. That page gained
+a paragraph for the second shape, because it is a *new* message a user can see;
+the `busy` text itself did not change.
 
 The plan's sketch prefixed this with `registry busy: `. Dropped, because every
 caller that renders it already says "busy" in its own first three words, and
@@ -368,6 +376,34 @@ read path that writes gives up its bound only for the region that needs it. It
 fails toward a stall, which Phase 0's watchdog reports with the holder named,
 never toward a torn write.
 
+**The one narrowing: a re-entrant acquisition unwinds a sealed frame anyway**
+(#1702). The seal's whole argument is the sentence above it — *"a mutation that
+is slow is a stall, a mutation abandoned halfway between two maps is
+corruption"* — and it is a good trade because a stall **ends**. Every other
+thing the seal makes a frame wait for ends: a slow holder finishes, a timed
+acquire eventually gets its lock, and the watchdog names whoever is taking so
+long. A re-entrant acquisition is the one case where waiting does not end at
+all: `parking_lot::Mutex` is not re-entrant, so the thread that reaches
+`inner.lock()` on a lock it already holds parks permanently, and nothing that
+runs later can release it — the frame is the holder. So the choice is not "tear
+now or complete later", it is "tear now or never complete", and the seal yields:
+`lock_safe` unwinds through it with a `BusyKind::Reentrant` `Busy`.
+
+That is not a hole in R1, it is R1's own accounting used honestly. `WROTE` is
+still set, so the unwind is **counted as a tear** (`budget::torn_writes`) and
+breadcrumbed `budget-torn-write` — which is precisely why that counter is
+measured off `WROTE` and not off `SEALED` (§4.1's own note): a tear through the
+seal has to be countable, or the narrowing would be invisible in exactly the
+tree where it fired. A wedge is counted as nothing at all, which is how #1702
+ran for four betas. A named, counted tear on a path that is already a certain
+deadlock beats an unnamed wedge, and `a_reentrant_acquire_unwinds_a_sealed_frame_and_counts_the_tear`
+(`lockwatch.rs`) is what pins both halves: the unwind, and the count.
+
+The narrowing is exactly this wide. A budget TIMEOUT inside a sealed frame still
+waits, unchanged — `a_durable_write_seals_its_budget_frame_so_a_later_timeout_waits`
+(`budget.rs`) is still true of every case the seal was written for, because a
+timeout is a stall and this is not.
+
 **Why not the other candidate rule.** The alternative was to make every tool arm
 that writes into a `ToolKind::Mutate`. That is right where a tool genuinely
 mutates and is done below — but it cannot be the whole answer, because it only
@@ -571,7 +607,9 @@ opposite.
   phase converts silence into a bounded, labelled, retryable answer. Phase 3 is
   what reduces the lock surface so the wedge becomes less likely.
 - **It does not bound mutations.** By design (§2). A mutating path under
-  contention still waits, and Phase 0's watchdog is what reports it.
+  contention still waits, and Phase 0's watchdog is what reports it. The one
+  case a mutating or sealed frame does NOT wait for is a re-entrant
+  acquisition, which is not contention at all — §4.1's narrowing (#1702).
 - **It does not bound the per-pane delivery locks.** Waiting on a busy CLI is the
   feature (#1600 P6), and `mq_state_lock` keeps its existing `MQ_CMD_TIMEOUT`
   rather than gaining a second bound (X4).

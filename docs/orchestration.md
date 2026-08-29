@@ -1403,6 +1403,16 @@ worth knowing if you see one:
   the holder and the duration, in `logs/breadcrumbs.log` under your orrerix
   data directory. If busy answers keep coming, that file is what to send.
 
+**When an agent reports `internal error: … ended without a result`.** This one
+is rare and it is not the same thing as a busy answer: it means the change the
+agent asked for hit a bug inside orrerix and stopped partway rather than
+finishing. The agent is told which read tool to check with — `list_tasks`,
+`list_agents` and so on — and it should look before trying again, because the
+change may have been partly applied. A crash log naming the fault is written
+into `logs/` under your orrerix data directory at the same moment; that file,
+with `logs/breadcrumbs.log`, is what to send. Nothing else stops: the rest of
+orrerix keeps answering, and the agent can carry on with the next thing.
+
 From the lifecycle panel you can:
 
 - **Pause** the group — orrerix stops delivering prompts so its agents finish
