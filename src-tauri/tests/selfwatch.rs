@@ -337,6 +337,33 @@ fn a_hang_is_one_breadcrumb_and_not_one_per_second() {
 
 // ---------- the migration, and the one door ----------
 
+/// This file's ONE registry construction (#464), and the reason it is a helper
+/// rather than a `let` inside the test.
+///
+/// The four `*_agents_dir_override`/`*_hooks_dir_override` fields are in-memory
+/// state on the instance, so a registry built without them falls through to the
+/// REAL `~/.claude/agents` and `~/.copilot/agents` and a spawn against it writes
+/// a generated agent file into the developer's own profile — which is how the
+/// suite once left 1,111 stray files there. `orchestration.rs`'s
+/// `no_registry_construction_bypasses_the_test_agent_dir_overrides` scans every
+/// file under `tests/` for raw constructions and permits exactly one per
+/// sanctioned helper, so this file is listed there with a count of 1.
+///
+/// The test below only holds a lock and spawns nothing, so the leak could not
+/// fire from here today. That is not the standard: the guard is default-deny
+/// because "this particular test does not spawn" is a fact about today's body,
+/// and the next edit to it is exactly what the guard is for.
+fn test_registry() -> (Arc<loomux_lib::orchestration::OrchRegistry>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = loomux_lib::orchestration::OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
+    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
+    (Arc::new(reg), dir)
+}
+
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `<repo>/src-tauri` for this package.
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -495,8 +522,7 @@ fn a_real_registry_lock_shows_up_held_with_its_name() {
     // real background thread, read by the watchdog's own snapshot. Everything
     // above this point tests one layer; this is the only test that says the
     // layers are connected to each other and to `OrchRegistry`.
-    let dir = tempfile::tempdir().unwrap();
-    let reg = Arc::new(loomux_lib::orchestration::OrchRegistry::new(dir.path().to_path_buf()));
+    let (reg, _dir) = test_registry();
 
     assert!(
         !reg.hold_lock_for_test("no_such_lock", 10),
