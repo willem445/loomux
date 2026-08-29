@@ -187,7 +187,7 @@ pub(crate) fn remaining() -> Option<(Duration, u64)> {
 /// same consequence and differ only in how they were entered, one declared by
 /// a caller and one observed at the write.
 pub(crate) fn unwind_forbidden() -> bool {
-    in_mutation() || SEALED.with(|s| s.get())
+    in_mutation()
 }
 
 /// Whether this thread is inside a [`MutationScope`].

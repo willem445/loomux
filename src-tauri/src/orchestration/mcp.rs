@@ -229,7 +229,8 @@ pub fn tool_kind(name: &str) -> ToolKind {
         | "group_usage"
         | "session_digest"
         | "merge_queue_status"
-        | "channel_status" => ToolKind::Read,
+        | "channel_status"
+        | "check_mail" => ToolKind::Read,
 
         // MOVED HERE by review B1, each because it mutates despite its name:
         //
@@ -249,7 +250,7 @@ pub fn tool_kind(name: &str) -> ToolKind {
         // seal (`budget::note_durable_write`) is what makes it safe — putting
         // every usage read on the mutate deadline would be a heavy answer to a
         // hazard the floor already closes. `doc/design/lock-liveness.md` §4.
-        "check_mail" | "queue_orphans" | "list_locks" => ToolKind::Mutate,
+        "queue_orphans" | "list_locks" => ToolKind::Mutate,
 
         // Everything else, including anything unrecognised.
         //
