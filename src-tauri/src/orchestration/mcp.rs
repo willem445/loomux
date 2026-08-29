@@ -547,16 +547,29 @@ pub fn dispatch(
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            reg.audit(&caller.group, &caller.agent_id, "tool-call",
-                json!({ "tool": name, "args": args }));
-            // #535: the shared agent-acknowledgment clock. Stamped HERE — the
-            // one funnel every `tools/call` passes through — so it covers
-            // every tool and every role, with no per-tool opt-in to forget the
-            // way `note_agent_activity` (one tool, orchestrator excluded) has.
-            // Before `call_tool`, deliberately: the claim is "this agent's own
-            // process is alive and executing", which a rejected call proves
-            // just as well as an accepted one. See `note_agent_ack`.
-            reg.note_agent_ack(&caller.agent_id);
+
+            // The pre-call bookkeeping, INSIDE the budget for a read tool
+            // (#1609). It was outside it until L2a caught that: `note_agent_ack`
+            // takes `agents`, so a wedged `agents` parked every tool call HERE,
+            // in front of a budget that only ever covered `call_tool`. A bound
+            // that does not span the whole waited path is not a bound.
+            //
+            // Losing either on a busy read is the right trade: the ack is an
+            // activity clock, and a `tool-call` audit line for a call that
+            // provably did not execute is worth less than an answer. The
+            // `lock-busy` breadcrumb records the incident regardless.
+            let bookkeep = || {
+                reg.audit(&caller.group, &caller.agent_id, "tool-call",
+                    json!({ "tool": name, "args": args }));
+                // #535: the shared agent-acknowledgment clock. Stamped HERE — the
+                // one funnel every `tools/call` passes through — so it covers
+                // every tool and every role, with no per-tool opt-in to forget the
+                // way `note_agent_activity` (one tool, orchestrator excluded) has.
+                // Before `call_tool`, deliberately: the claim is "this agent's own
+                // process is alive and executing", which a rejected call proves
+                // just as well as an accepted one. See `note_agent_ack`.
+                reg.note_agent_ack(&caller.agent_id);
+            };
             // #1609. A READ tool runs under `MCP_READ_BUDGET` and may be
             // abandoned at a lock acquisition; the `Busy` becomes an
             // `isError` RESULT, which is the shape that reaches the model
@@ -567,6 +580,7 @@ pub fn dispatch(
             let out = match tool_kind(name) {
                 ToolKind::Read => {
                     match budget::read_budget(budget::MCP_READ_BUDGET, || {
+                        bookkeep();
                         call_tool(reg, caller, name, &args)
                     }) {
                         Ok(r) => r,
@@ -574,6 +588,7 @@ pub fn dispatch(
                     }
                 }
                 ToolKind::Mutate => {
+                    bookkeep();
                     let _scope = budget::MutationScope::enter();
                     call_tool(reg, caller, name, &args)
                 }

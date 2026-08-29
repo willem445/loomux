@@ -969,6 +969,13 @@ fn l2a_mcp_answers_within_its_budgets_while_a_registry_lock_is_held() {
     let warm = mcp::handle_for_test(&reg, &ping, Some(&token)).expect("a request with an id");
     assert!(warm.get("result").is_some(), "setup: ping must answer normally: {warm}");
 
+    // Resolved NOW, before anything is held. `resolve_token` is an unbudgeted
+    // direct call here, so resolving it under the `groups` hold below would park
+    // this thread for the whole hold — and the read half would then run against
+    // an `agents` hold that had already expired, which is how the first version
+    // of this row passed for the wrong reason.
+    let caller = reg.resolve_token(&token).expect("the token resolves");
+
     assert!(reg.hold_lock_for_test("groups", 20_000), "setup: cannot hold `groups`");
 
     // ---- the auth half: this is #1606's measured hole ----
@@ -1005,10 +1012,11 @@ fn l2a_mcp_answers_within_its_budgets_while_a_registry_lock_is_held() {
 
     // ---- the read-tool half ----
     //
-    // `list_agents` takes `agents`, so it gets past auth only once `groups` is
-    // free; hold `agents` instead and drive `dispatch` directly, which is the
-    // seam that owns the read budget.
-    let caller = reg.resolve_token(&token).expect("the token still resolves");
+    // `list_agents` takes `agents`. Driven through `dispatch`, which is the seam
+    // that owns the read budget — and note that what it covers is the WHOLE arm,
+    // not just `call_tool`: `note_agent_ack` takes `agents` too and runs first,
+    // so a budget around `call_tool` alone would be a bound with an unbounded
+    // wait in front of it. This row is what found that.
     assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
     let call = json!({ "name": "list_agents", "arguments": {} });
     let started = std::time::Instant::now();
