@@ -773,7 +773,8 @@ impl<T> TrackedMutex<T> {
             }),
             waiters: st.waiters.load(Ordering::Relaxed) as usize,
         };
-        if st.busy_reported_gen.swap(generation, Ordering::Relaxed) != generation {
+        st.busy_reported_gen.store(generation, Ordering::Relaxed);
+        {
             st.busy_breadcrumbs.fetch_add(1, Ordering::Relaxed);
             crate::obs::breadcrumb(event, &busy.detail());
         }
