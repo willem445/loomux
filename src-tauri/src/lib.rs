@@ -8,10 +8,18 @@ pub mod filemgr; // pub: the file-manager integration test links its pure fns (#
 mod gh;
 mod git;
 mod gitwatch;
+mod liveness; // the webview half of the #1601 liveness heartbeat
 // winpath (#888 slice A4 batch 13) moved whole into loomux-engine — std +
 // winreg only, no Tauri surface left behind, so the re-export is the entire
 // module rather than a local shim file.
 pub use loomux_engine::winpath;
+// The app's self-observability (#1601 Phase 0): instrumented mutexes, the
+// blocking-pool depth counter, the liveness heartbeat and the watchdog that
+// reports all three. Born in `loomux-engine` rather than moved into it — see
+// that crate's `lib.rs` — so `src-tauri` re-exports rather than wraps. `pub`
+// because `src-tauri/tests/selfwatch.rs` and the delivery-ledger tests in
+// `tests/orchestration.rs` link them.
+pub use loomux_engine::{lockwatch, selfwatch};
 mod metrics;
 mod modelwire; // the list-models control probe (#993)
 mod obs;
@@ -97,6 +105,13 @@ pub fn run() {
         .manage(roots)
         .manage(orch)
         .setup(|app| {
+            // #1601 Phase 0: start the self-watchdog. FIRST in this block, and
+            // deliberately so — it is the thing that reports on everything
+            // started after it, and a startup that wedges in one of the sweeps
+            // below is precisely a case with no evidence today. It takes no
+            // registry lock and no `AppHandle`, so it cannot itself be what
+            // wedges, and it is idempotent.
+            selfwatch::spawn_watchdog();
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
             // #1020: detect each supported CLI's models once, in the
@@ -289,6 +304,7 @@ pub fn run() {
             filehash::fm_hash_start,
             rootreg::admit_root,
             obs::take_startup_notice,
+            liveness::liveness_stamp,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,
             uistate::load_settings,

@@ -177,6 +177,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "admit_root",
     // obs (1)
     "take_startup_notice",
+    "liveness_stamp",
     // uistate (8)
     "load_ui_tabs",
     "save_ui_tabs",

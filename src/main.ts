@@ -108,6 +108,7 @@ import {
 } from "./sessionreconcile";
 import { sessionRestoreRoute } from "./sessionroute";
 import { planGroupResume, partitionByGroup } from "./groupresume";
+import { startLiveness } from "./liveness";
 import {
   IDLE_RESTORE_CARD_STATE,
   errorRestoreCardState,
@@ -2433,6 +2434,11 @@ void sessionsPrefetch.then(() => reconcileSessionIds());
 // pane that starts qualifying mid-window is picked up promptly rather than
 // waiting a full extra minute.
 setInterval(() => void reconcileSessionIds(), 20_000);
+
+// #1601 Phase 0.4: the webview half of the liveness heartbeat. App-lifetime and
+// deliberately ungated - see src/liveness.ts for why a hidden window still
+// stamps, and what the backend does with a stamp that says so.
+startLiveness();
 
 /** Bring a recorded orchestration session back into its group — MCP identity,
  *  badges and task board included — instead of a powerless plain `--resume`.

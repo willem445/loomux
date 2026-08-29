@@ -6,6 +6,7 @@
 //! `rustc-link-arg-tests` (see build.rs / test.manifest), which cargo only
 //! applies to integration-test targets.
 
+use loomux_lib::lockwatch::TrackedMutex;
 use loomux_lib::orchestration::intake;
 // #656: the intake half's per-scan `gh` budget, asserted against the constant
 // itself so the pin follows a future retune instead of pinning today's 4.
@@ -27373,7 +27374,7 @@ fn the_drain_press_declines_over_a_line_the_human_left_before_our_submit() {
     let pm = PtyManager::default();
     let pty_id = 532;
     let captured = pm.register_fake_for_test(pty_id, b"idle input box, nothing pending");
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
 
     // ORDERING IS THE POINT. The human types a line and leaves it sitting
     // BEFORE our delivery records its submit, so `human_typed_since`
@@ -27462,7 +27463,7 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
     // deleting THAT line reds no test (confirmed by trying it and
     // reverting); that gap is the disposition table's own honest residual,
     // not something this test closes.
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     let pty_id = 3;
 
     record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string(), None);
@@ -27516,7 +27517,7 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
 /// ever reachable by inference from these functions' own signatures.
 macro_rules! ledger_with {
     ($pty:expr, $submit_sent_ms:expr) => {{
-        let m: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+        let m: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
         record_inflight_delivery(&m, $pty, $submit_sent_ms, "orrerix".to_string(), None);
         m
     }};
@@ -28180,7 +28181,7 @@ fn a_queued_stranded_submit_presses_enter_through_the_real_replay() {
     let pm = PtyManager::default();
     let pty = 4961u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     // The ledger state a stranded delivery leaves: recorded, unconfirmed.
     record_aborted_preenter_outcome(&last_delivery, pty, "orrerix".to_string(), None);
 
@@ -28526,7 +28527,7 @@ fn a_re_delivery_supersedes_the_monitor_that_triggered_it() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5174u32;
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
 
     // The lost kickoff's own ledger entry: in flight, unconfirmed. Its
     // monitor is watching under this `submit_sent_ms`.
@@ -32871,7 +32872,7 @@ macro_rules! janitor_pane {
         let captured = pm.register_fake_for_test(pty, $tail.as_bytes());
         reg.set_pty_for_test(&wid, pty);
         reg.mark_stranded(&g, &wid, Some($blocker));
-        let ledger: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+        let ledger: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
         record_stranded_outcome_at_for_test(
             &ledger,
             pty,
@@ -33128,13 +33129,13 @@ fn a_pane_with_no_recorded_stranded_text_is_never_judged() {
     pm.note_user_input(pty, "\r", true);
 
     // An empty ledger first: the pane has no delivery record at all.
-    let empty: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let empty: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     record_stranded_outcome_at_for_test(&empty, 9_999, "orrerix".to_string(), now_ms() - 60_000, None);
     reg.stranded_janitor_pass(&pm, &empty);
     assert!(reg.stranded_note(&wid).is_some(), "no record for this pane — nothing to judge");
 
     // Then a record for THIS pane that carries no text.
-    let textless: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let textless: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     record_stranded_outcome_at_for_test(&textless, pty, "orrerix".to_string(), now_ms() - 60_000, None);
     reg.stranded_janitor_pass(&pm, &textless);
     assert!(
@@ -33215,7 +33216,7 @@ macro_rules! queuefull_pane {
             Some(StrandedBlocker::QueueFull),
             "precondition: the refusal is what raises the chip this slice releases"
         );
-        let ledger: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+        let ledger: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
         record_stranded_outcome_at_for_test(
             &ledger,
             pty,
@@ -33523,7 +33524,7 @@ fn a_pane_with_no_delivery_record_has_nothing_to_re_submit() {
     // wedged prompt (#560) — so the pass declines instead.
     let (reg, _d, g, wid, pty, _ledger) = queuefull_pane!();
     drain_below_cap(&reg, &g, pty);
-    let empty: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let empty: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     record_stranded_outcome_at_for_test(&empty, 9_999, "orch".to_string(), now_ms() - 60_000, None);
 
     reg.stranded_queuefull_pass(&empty);
@@ -44428,7 +44429,7 @@ fn a_stale_human_input_block_releases_the_real_stranded_press() {
     let pm = PtyManager::default();
     let pty = 518_10u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     // Our submit is twelve minutes ago; the phantom stamp landed a minute
     // after it, and nothing has touched the pane since. `last > submit` (the
     // latch is SET) and `now - last >= bound` (it has gone stale).
@@ -44462,7 +44463,7 @@ fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
     let pm = PtyManager::default();
     let pty = 518_11u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     // Our submit is five seconds ago, not `now`: `tier1_trusted` is `<=`, so a
     // ledger stamped in the same millisecond as the keystroke below would read
     // as "no human input since our submit" and this test would pass for the
@@ -44497,7 +44498,7 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
     let pm = PtyManager::default();
     let pty = 518_12u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
@@ -44795,7 +44796,7 @@ fn a_human_pressing_enter_in_the_pane_retires_the_queued_marker() {
     let pty = 8131u32;
     // The pane AFTER the human submitted our prompt: the box no longer holds it.
     let captured = pm.register_fake_for_test(pty, CLEARED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     // The ledger a stranded delivery leaves — unconfirmed, carrying the text it
     // left in the box — dated a minute back. `tier1_trusted` compares with `<=`,
     // so a record and a keystroke stamped in the same millisecond would read as
@@ -44847,7 +44848,7 @@ fn the_wired_marker_holds_while_the_pane_still_shows_our_stranded_text() {
     let pm = PtyManager::default();
     let pty = 8132u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
@@ -49534,7 +49535,7 @@ fn the_wired_declined_flush_leaves_the_pane_untouched_when_our_text_is_still_the
     let pm = PtyManager::default();
     let pty = 8241u32;
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let last_delivery: TrackedMutex<HashMap<u32, _>> = TrackedMutex::new("test_last_delivery", HashMap::new());
     record_stranded_outcome_at_for_test(
         &last_delivery,
         pty,
