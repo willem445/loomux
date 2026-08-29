@@ -15,6 +15,7 @@ import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
 import { tabCounts } from "./tabcounts";
 import { PollGate } from "./pollgate";
+import { SingleFlight } from "./singleflight";
 import { IDENTITY } from "./theme.ts";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
@@ -81,6 +82,13 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   /** Visibility gates for this strip's two timers (#743 S6, pollgate.ts). */
   private statusGate: PollGate;
   private previewGate: PollGate;
+  /** Single-flights `pollStatus()` (#1602, plan §3 Phase 2.2 of EPIC #1600):
+   *  one sweep over every group-bound tab per tick, so a tick firing while
+   *  the previous sweep is still awaiting a stuck backend call skips instead
+   *  of starting a second overlapping sweep on top of it — the doubled poll
+   *  site #1595 found late. This strip is a per-app singleton, so one
+   *  instance already scopes the gate to "this poll site", never global. */
+  private statusFlight = new SingleFlight();
   /** The tab whose close is armed for a two-step confirm (destructive close of a
    *  group-owning tab), and its auto-disarm timer. Mirrors the group view's
    *  "End orchestration" arm/confirm (groupview.ts) so ending a project's agents
@@ -524,8 +532,15 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     window.addEventListener("keydown", onKey, true);
   }
 
-  /** Poll each group-bound tab for its live status; re-render if anything moved. */
+  /** Poll each group-bound tab for its live status; re-render if anything
+   *  moved. Single-flighted through `statusFlight` (#1602): a tick that
+   *  fires while the previous sweep hasn't settled skips rather than issuing
+   *  a second full sweep over every group-bound tab. */
   private async pollStatus(): Promise<void> {
+    await this.statusFlight.run(() => this.pollStatusOnce());
+  }
+
+  private async pollStatusOnce(): Promise<void> {
     let changed = false;
     const seen = new Set<string>();
     for (const ws of this.tabs.tabs) {

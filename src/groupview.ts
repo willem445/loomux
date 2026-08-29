@@ -72,6 +72,7 @@ import { managerAbsenceNotice } from "./group";
 import { getDefaultAgent } from "./agents";
 import { confirmModal } from "./modal";
 import { PollGate } from "./pollgate";
+import { RefreshGate } from "./refreshgate";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -261,6 +262,20 @@ export class GroupView {
     },
     refresh: () => void this.load(),
   });
+  /** Single-flights `load()`'s ten-invoke `Promise.all`, with a trailing
+   *  re-run rather than a bare skip (#1602, plan §3 Phase 2.2 of EPIC #1600;
+   *  composed with the repo's existing `refreshgate.ts` per PR #1604 review
+   *  N4 — `load()` is not only the 2 s poll tick, it is also the refresh
+   *  button and ~16 post-action reloads, and a bare skip would drop those
+   *  silently rather than just deferring a tick). A poll tick or gesture
+   *  that fires while a previous `load()` is still outstanding — the
+   *  backend is slow, or a registry lock is stuck — neither starts a second
+   *  concurrent `Promise.all` (so a stuck backend still cannot pile up
+   *  blocking-pool threads one per tick) nor is lost: it is coalesced into
+   *  exactly one catch-up run once the in-flight one finishes. One instance
+   *  per open group view (never module-scoped), so a stuck poll in this
+   *  panel cannot silence another group's. */
+  private loadGate = new RefreshGate();
   private disposed = false;
   /** True once End is clicked once: the second click within the window
    *  actually tears the group down (two-step confirm for a destructive op). */
@@ -748,6 +763,17 @@ export class GroupView {
 
   private async load(): Promise<void> {
     if (this.disposed) return;
+    // #1602 + PR #1604 review N4: single-flight with a trailing re-run
+    // (refreshgate.ts), not a bare skip — `load()` is called from the 2 s
+    // poll tick AND from the refresh button and ~16 post-action reloads
+    // below, and those gestures must not be silently dropped just because a
+    // tick happened to be in flight. `begin()`/`end()` bracket the ENTIRE
+    // body, including `render()`, so a throw anywhere in here still releases
+    // the gate (see timelineview.ts's `load()` for why `end()` must run
+    // before anything that can throw, `render()` included, rather than
+    // after).
+    if (!this.loadGate.begin()) return;
+    let ok = true;
     try {
       [
         this.summary,
@@ -778,9 +804,12 @@ export class GroupView {
       ]);
     } catch (err) {
       this.toast(String(err));
-      return;
+      ok = false;
+    } finally {
+      const rerun = this.loadGate.end();
+      if (ok && !this.disposed) this.render();
+      if (rerun && !this.disposed) void this.load();
     }
-    this.render();
   }
 
   private async togglePause(): Promise<void> {

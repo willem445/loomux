@@ -459,6 +459,21 @@ interface TimerRow {
   policy: VisibilityPolicy;
   reason: string;
   debt: string | null;
+  /** The field holding this timer's overlap-safety gate (#1602, INV-4's
+   *  single-flight sentence) — `null` when this row's overlap safety comes
+   *  from a different, out-of-scope mechanism (`AuditStore`'s own in-flight
+   *  join for the audit/timeline follows, `main.ts`'s `reconcileInFlight`)
+   *  or from carrying no IPC at all (`tabbar.ts`'s synchronous hover
+   *  repaint). `null` here is not a claim that a timer is unsafe — only that
+   *  this particular check does not cover it; only the two rows #1602
+   *  introduced declare one. Two shapes are legal: `SingleFlight`
+   *  (src/singleflight.ts — skip, no rerun) for a poll body with no other
+   *  caller, and `RefreshGate` (refreshgate.ts — skip + exactly one
+   *  trailing rerun, the repo's established mechanism) where the SAME body
+   *  is also reachable from a human gesture that must not be silently
+   *  dropped (PR #1604 review N4 — `groupview.ts`'s `load()` is also the
+   *  refresh button and ~16 post-action reloads). */
+  overlapGate: { field: string; className: "SingleFlight" | "RefreshGate" } | null;
 }
 
 /** Every `setInterval()` in `src/*.ts`. Seeded from the #743 census (plan part
@@ -482,6 +497,7 @@ const TIMERS: TimerRow[] = [
       "a background tab's badge is what the strip is FOR, and S4 already made groupUsage share " +
       "one ~1 s backend snapshot across callers.",
     debt: null,
+    overlapGate: { field: "statusFlight", className: "SingleFlight" },
   },
   {
     key: "src/tabbar.ts@PREVIEW_REFRESH_MS",
@@ -494,6 +510,7 @@ const TIMERS: TimerRow[] = [
       "re-serializing up to eight panes every 700 ms. No IPC per tick; the cost is webview-thread " +
       "render work, which is exactly what INV-4 asks a hidden window not to pay.",
     debt: null,
+    overlapGate: null,
   },
   {
     key: "src/groupview.ts@POLL_MS",
@@ -505,6 +522,7 @@ const TIMERS: TimerRow[] = [
       "open behind a minimized window used to keep paying Promise.all of nine invokes plus a full " +
       "render every 2 s. The gate's arm keeps the defensive clear-before-arm show() used to do.",
     debt: null,
+    overlapGate: { field: "loadGate", className: "RefreshGate" },
   },
   {
     key: "src/auditview.ts@FOLLOW_MS",
@@ -518,6 +536,7 @@ const TIMERS: TimerRow[] = [
       "(#743 S6). Until #1318 the close was the missing one: PollGate pauses this behind a hidden " +
       "WINDOW, and nothing stopped it behind a closed PANEL.",
     debt: null,
+    overlapGate: null,
   },
   {
     key: "src/timelineview.ts@FOLLOW_MS",
@@ -532,6 +551,7 @@ const TIMERS: TimerRow[] = [
       "inside AUDIT_READ_MAX_AGE_MS of the audit viewer's is served that read instead of firing " +
       "its own, because both views read one AuditStore per pane rather than one each.",
     debt: null,
+    overlapGate: null,
   },
   {
     key: "src/main.ts@20_000",
@@ -543,6 +563,7 @@ const TIMERS: TimerRow[] = [
       "reconcileSessionIds, and the 20 s cadence exists so a pane that starts qualifying " +
       "mid-window is picked up promptly. A hidden window pays a predicate, not IPC.",
     debt: null,
+    overlapGate: null,
   },
   {
     key: "src/pollgate.ts@HIDDEN_RECHECK_MS",
@@ -556,6 +577,7 @@ const TIMERS: TimerRow[] = [
       "fallible signal owes an independent release). One boolean read per wake, no IPC, no paint " +
       "— a hidden window still makes zero data polls, which is the point of the slice.",
     debt: null,
+    overlapGate: null,
   },
 ];
 
@@ -1107,6 +1129,7 @@ test("the row rules fire on every shape they are written for, including `throttl
     policy: "argued",
     reason: "x".repeat(60),
     debt: null,
+    overlapGate: null,
   };
   assert.deepEqual(timerRowProblems(timer), []);
   assert.match(timerRowProblems({ ...timer, reason: "short" })[0], /what it costs while hidden/);
@@ -1149,6 +1172,57 @@ test("a timer's `gated` claim and the file's actual gate agree, in both directio
           `equivalence and nothing in the row's prose relaxes it: one timer inside its file's ` +
           `gate and another outside it is an enforcement change, so it goes to #767, not into a ` +
           `reason field`
+      );
+    }
+  }
+});
+
+test("a row naming an overlap gate is really wired to one (#1602)", () => {
+  // N2 on PR #1604: "every poll body is single-flighted" (INV-4's new
+  // sentence, doc/design/performance.md) had no guard — un-wiring either
+  // #1602 poll site left `npm test` at 2383/2383. This pins the two rows
+  // that declare an `overlapGate`: the field must exist as an instance of
+  // the declared class AND actually be driven (`.run(` for `SingleFlight`,
+  // `.begin(` + `.end(` for `RefreshGate`), so removing — or merely
+  // no-longer-calling — either passes silently no longer. Rows with
+  // `overlapGate: null` are untouched here: their overlap safety is a
+  // different, out-of-scope mechanism (this test's own interface doc on
+  // `overlapGate` names each one), not an unchecked claim.
+  //
+  // Two shapes, because review N4 on #1604 found `SingleFlight`'s bare skip
+  // wrong for `groupview.ts`: `load()` is also the refresh button and ~16
+  // post-action reloads, and dropping those silently is worse than dropping
+  // a timer tick, so that site composes with the repo's existing
+  // `RefreshGate` (skip + exactly one trailing rerun) instead of a second
+  // skip-only mechanism.
+  for (const row of TIMERS) {
+    if (row.overlapGate === null) continue;
+    const { field, className } = row.overlapGate;
+    const file = row.key.split("@")[0];
+    const text = readFileSync(new URL(file, REPO), "utf8");
+    assert.match(
+      text,
+      new RegExp(`\\bprivate ${field}\\s*=\\s*new ${className}\\s*\\(`),
+      `${row.key}: declares overlapGate "${field}" (${className}), but ${file} has no ` +
+        `\`private ${field} = new ${className}()\` — un-wiring the gate must redden this, not go silent ` +
+        `(the #1595 lesson: a doubled/undone poll site is invisible unless something declares it)`
+    );
+    const driven =
+      className === "SingleFlight"
+        ? new RegExp(`\\bthis\\.${field}\\.run\\s*\\(`)
+        : new RegExp(`\\bthis\\.${field}\\.begin\\s*\\(`);
+    assert.match(
+      text,
+      driven,
+      `${row.key}: "${field}" (${className}) is declared but its poll body no longer drives it — the ` +
+        `gate exists but nothing routes through it`
+    );
+    if (className === "RefreshGate") {
+      assert.match(
+        text,
+        new RegExp(`\\bthis\\.${field}\\.end\\s*\\(`),
+        `${row.key}: "${field}" calls \`.begin(\` but never \`.end(\` — the gate would wedge \`running\` ` +
+          `forever after the first call`
       );
     }
   }
