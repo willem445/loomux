@@ -1370,56 +1370,47 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
         Role::Solo,
     ]
     .into_iter()
-    .map(|role| {
-        let names = mcp::listed_tool_names_for(role, None);
-        (role, names)
-    })
+    .map(|role| (role, mcp::listed_tool_names_for(role, None)))
     .collect();
 
-    let mut swept: Vec<&str> = Vec::new();
+    // Resolve every Read tool to a caller BEFORE anything is held: building the
+    // plan takes registry locks of its own, and doing that under the hold would
+    // measure the plan rather than the sweep.
+    let mut plan: Vec<(&str, Caller)> = Vec::new();
     let mut unreachable: Vec<&str> = Vec::new();
     for name in mcp::READ_TOOLS {
-        let Some((role, _)) = listed_by.iter().find(|(_, names)| names.iter().any(|n| n == name))
-        else {
-            unreachable.push(name);
-            continue;
-        };
-        let caller = Caller {
-            agent_id: base.agent_id.clone(),
-            group: base.group.clone(),
-            role: *role,
-            role_hint: None,
-        };
-        let call = json!({ "name": name, "arguments": {} });
-        // The answer does not matter — Ok, isError and busy are all fine. What
-        // matters is that no frame unwound after writing.
-        let _ = mcp::dispatch(&reg, &caller, "tools/call", &call);
-        swept.push(name);
+        match listed_by.iter().find(|(_, names)| names.iter().any(|n| n == name)) {
+            Some((role, _)) => plan.push((
+                name,
+                Caller {
+                    agent_id: base.agent_id.clone(),
+                    group: base.group.clone(),
+                    role: *role,
+                    role_hint: None,
+                },
+            )),
+            None => unreachable.push(name),
+        }
     }
-
     assert!(
         unreachable.is_empty(),
         "these Read-classified tools are listed for no role, so this sweep cannot drive them: \
          {unreachable:?}. A tool the budget governs but this row cannot reach is exactly the \
-         gap that let the first scratch round come back green."
+         gap that let the first scratch round for this row come back green."
     );
-    assert!(
-        swept.len() >= 8,
-        "only {} Read tools were swept: {swept:?}",
-        swept.len()
-    );
+    assert!(plan.len() >= 8, "only {} Read tools are reachable: {plan:?}", plan.len());
 
     let (sealed_before, torn_before) = loomux_engine::budget::thread_seal_counts();
 
-    // Held for the whole sweep: `app` is taken after `write_mailbox`'s durable
-    // replace, and by `agent_output_totals` / `attention_inputs` in the app.
+    // Held for the whole sweep: `app` is what `write_mailbox` takes AFTER its
+    // durable replace, so it is the lock a write-then-acquire tear needs.
     assert!(reg.hold_lock_for_test("app", 20_000), "setup: cannot hold `app`");
 
-    for name in &reads {
+    for (name, caller) in &plan {
         let call = json!({ "name": name, "arguments": {} });
-        // The answer does not matter — Ok, isError, busy are all fine. What
+        // The answer does not matter — Ok, isError and busy are all fine. What
         // matters is that no frame unwound after writing.
-        let _ = mcp::dispatch(&reg, &caller, "tools/call", &call);
+        let _ = mcp::dispatch(&reg, caller, "tools/call", &call);
     }
 
     let (sealed_after, torn_after) = loomux_engine::budget::thread_seal_counts();
