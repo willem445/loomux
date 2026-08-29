@@ -445,8 +445,10 @@ impl<T> TrackedMutex<T> {
         let st = &self.state;
         // Registered BEFORE blocking: a waiter that only counts once it has
         // stopped waiting is invisible for exactly the interval it matters.
-        st.waiters.fetch_add(1, Ordering::Relaxed);
+        // NEUTERED (scratch, #1601): count the waiter only once it has
+        // stopped waiting, which is exactly when it is not one.
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        st.waiters.fetch_add(1, Ordering::Relaxed);
         st.waiters.fetch_sub(1, Ordering::Relaxed);
 
         let acquired_ms = mono_ms();
