@@ -48,7 +48,8 @@
 //! ## Protocol
 //!
 //! - The test writes `<data root>/e2e-lock-hold.request`:
-//!   `{"target":"groups","hold_ms":30000}`.
+//!   `{"target":"groups","hold_ms":<milliseconds>}`. The value is the
+//!   spec's own budget knob, not a constant of this protocol.
 //! - The watcher consumes (deletes) it, acquires that registry mutex, and
 //!   writes `<data root>/e2e-lock-hold.state` with `acquired_ms` set, then
 //!   sleeps, then rewrites it with `released_ms` set.

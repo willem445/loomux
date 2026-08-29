@@ -8,20 +8,33 @@
 //! deliverable: this file is what turns it into something a reviewer can
 //! check instead of read.
 //!
-//! Three separate properties, because the claim rests on three separate
-//! things and any one of them could rot on its own:
+//! Four separate properties, because the claim rests on four separate things
+//! and any one of them could rot on its own:
 //!
 //! 1. **Nothing that can hold a lock or sleep survives a release build.** A
 //!    source scan over `e2ehold.rs` that classifies by *shape* (does this
 //!    function's body contain a hazard?) rather than by name, per CLAUDE.md's
-//!    source-scanning-guard convention — a rename must not step over it.
-//! 2. **The release profile really does turn `debug_assertions` off.** Gate
+//!    source-scanning-guard convention — a rename must not step over it. The
+//!    scan recognises a function DEFINITION at any visibility, modifier and
+//!    indentation, and cross-checks that every hazard occurrence in the file
+//!    landed inside one it enumerated: both of its floors count at the MATCH
+//!    site, so they say the instrument ran and never that it saw every
+//!    subject. An earlier version enumerated `fn ` and `pub fn ` only, which
+//!    left an ungated `pub(crate) fn` holding a registry mutex invisible with
+//!    both floors green (#1606 review B3).
+//! 2. **That refusal is performed, not asserted.** Two tests splice a
+//!    hazardous definition into the real source — one an ungated
+//!    `pub(crate) fn`, one a hazard outside every function — and require the
+//!    report to name it. Everything else here is an absence assertion, and an
+//!    absence assertion passes just as well when the instrument cannot see
+//!    the subject.
+//! 3. **The release profile really does turn `debug_assertions` off.** Gate
 //!    (1) is only worth anything while that holds, and it holds today by
 //!    cargo's default rather than by anything written down — so a future
 //!    `[profile.release] debug-assertions = true` (a plausible thing to add
 //!    while chasing a release-only panic) would silently arm the injector in
 //!    a shipped binary with nothing else red.
-//! 3. **The runtime opt-in accepts exactly one value, and a malformed request
+//! 4. **The runtime opt-in accepts exactly one value, and a malformed request
 //!    is refused loudly.** Both are behaviours, not shapes, so both are
 //!    tested by calling them. The second one matters for the same reason the
 //!    spec keeps an `acquired_ms` breadcrumb: a hold that silently never
@@ -48,38 +61,111 @@ fn module_source() -> String {
     read(&crate_root().join("src").join("orchestration").join("e2ehold.rs"))
 }
 
-/// One top-level `fn` item: the attribute/doc block immediately above it, and
-/// the text from its `fn` keyword to the next one.
+/// One function definition: the attribute/doc block immediately above it,
+/// and its body from the `fn` keyword to its matching closing brace.
 struct Item {
     name: String,
     attrs: String,
     body: String,
+    /// 0-based line range the body occupies, used by the attribution
+    /// cross-check below to say which lines belong to no function at all.
+    from: usize,
+    to: usize,
 }
 
-/// Splits the module into its top-level functions.
+/// Whether `line` DECLARES a function, at any indentation and under any
+/// visibility or modifier.
 ///
-/// Deliberately crude — this is one 250-line module, not a parser's job — but
-/// crude in a way that fails LOUD rather than silently scanning nothing: the
-/// tests below assert a floor on what the split found before reading any
-/// verdict from it.
-///
-/// Every `fn` in this module is at top level, so its keyword sits in column 0;
-/// an inherent-impl method is indented. `Target::as_str`/`Target::parse` are
-/// therefore excluded, which is correct — neither can hold anything.
-fn items(src: &str) -> Vec<Item> {
-    let lines: Vec<&str> = src.lines().collect();
-    let mut starts: Vec<usize> = Vec::new();
-    for (n, line) in lines.iter().enumerate() {
-        if line.starts_with("fn ") || line.starts_with("pub fn ") {
-            starts.push(n);
+/// This is deliberately not `starts_with("fn ") || starts_with("pub fn ")`,
+/// which is what it used to be. That pair enumerates two spellings out of many
+/// and silently skips the rest, so an ungated `pub(crate) fn` holding a mutex
+/// never became an `Item`, never entered the hazard set, and never met the
+/// gating assertion — while both of the instrument's own floors stayed green on
+/// the six functions it did see. A guard that decides from a spelling enforces
+/// nothing about the spellings it does not know (#1606 review B3).
+fn is_fn_decl(line: &str) -> bool {
+    let mut rest = line.trim_start();
+
+    // Visibility, if any: `pub`, `pub(crate)`, `pub(super)`, `pub(in ...)`.
+    // Guarded on the following character so `pubescent_fn` is not a visibility.
+    if let Some(after) = rest.strip_prefix("pub") {
+        if after.starts_with('(') {
+            match after.find(')') {
+                Some(i) => rest = after[i + 1..].trim_start(),
+                None => return false,
+            }
+        } else if after.starts_with(char::is_whitespace) {
+            rest = after.trim_start();
         }
     }
 
+    // Modifiers, in any order and any combination.
+    loop {
+        let before = rest;
+        for kw in ["const ", "async ", "unsafe ", "default "] {
+            if let Some(r) = rest.strip_prefix(kw) {
+                rest = r.trim_start();
+            }
+        }
+        if let Some(r) = rest.strip_prefix("extern ") {
+            let r = r.trim_start();
+            rest = match r.strip_prefix('"').and_then(|q| q.find('"').map(|i| &q[i + 1..])) {
+                Some(after_abi) => after_abi.trim_start(),
+                None => r,
+            };
+        }
+        if rest == before {
+            break;
+        }
+    }
+
+    rest.starts_with("fn ")
+}
+
+/// Splits the module into its function definitions.
+///
+/// Bodies are delimited by BRACE DEPTH rather than by "up to the next `fn`",
+/// so text between two functions — a `static`, a `const`, an `impl` header —
+/// belongs to neither, which is what lets the attribution cross-check below
+/// see it. Brace counting is textual; every brace in this module is balanced
+/// and the cross-check is what would notice if that stopped being true, since
+/// a mis-parse moves hazard occurrences out of the items that should hold
+/// them.
+fn items(src: &str) -> Vec<Item> {
+    let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
-    for (i, &decl) in starts.iter().enumerate() {
-        let name = lines[decl]
-            .trim_start_matches("pub ")
-            .trim_start_matches("fn ")
+    let mut i = 0;
+
+    while i < lines.len() {
+        if !is_fn_decl(lines[i]) {
+            i += 1;
+            continue;
+        }
+
+        let mut depth: i32 = 0;
+        let mut opened = false;
+        let mut j = i;
+        while j < lines.len() {
+            for ch in lines[j].chars() {
+                if ch == '{' {
+                    depth += 1;
+                    opened = true;
+                } else if ch == '}' {
+                    depth -= 1;
+                }
+            }
+            if opened && depth <= 0 {
+                break;
+            }
+            j += 1;
+        }
+        let end = (j + 1).min(lines.len());
+
+        let name = lines[i]
+            .trim_start()
+            .rsplit("fn ")
+            .next()
+            .unwrap_or("")
             .split(['(', '<'])
             .next()
             .unwrap_or("")
@@ -87,12 +173,12 @@ fn items(src: &str) -> Vec<Item> {
             .to_string();
 
         // The preamble is the contiguous run of attribute and doc lines
-        // immediately above the `fn`. Walking back from the declaration (not
+        // immediately above the `fn`. Walking BACK from the declaration (not
         // forward from the previous item) is what keeps a NEIGHBOUR's
         // `#[cfg(debug_assertions)]` from being read as this item's — the
-        // exact mis-attribution that would make the scan below pass on an
-        // ungated function sitting under a gated one.
-        let mut top = decl;
+        // exact mis-attribution that would make the scan pass on an ungated
+        // function sitting under a gated one.
+        let mut top = i;
         while top > 0 {
             let prev = lines[top - 1].trim_start();
             if prev.starts_with("#[") || prev.starts_with("//") {
@@ -101,12 +187,15 @@ fn items(src: &str) -> Vec<Item> {
                 break;
             }
         }
-        let attrs = lines[top..decl].join("\n");
 
-        let end = starts.get(i + 1).copied().unwrap_or(lines.len());
-        let body = lines[decl..end].join("\n");
-
-        out.push(Item { name, attrs, body });
+        out.push(Item {
+            name,
+            attrs: lines[top..i].join("\n"),
+            body: lines[i..end].join("\n"),
+            from: i,
+            to: end,
+        });
+        i = end;
     }
     out
 }
@@ -119,40 +208,141 @@ fn items(src: &str) -> Vec<Item> {
 const HAZARDS: &[&str] =
     &["lock_safe()", "thread::sleep", "thread::spawn", "fs::write", "fs::remove_file"];
 
+/// Everything the release-gating scan found, as data — so the assertions can
+/// be made against it AND a synthetic source can be fed through the same
+/// function to prove they would fire.
+struct GateReport {
+    items: usize,
+    hazardous: usize,
+    /// Functions carrying a hazard but no `#[cfg(debug_assertions)]`.
+    ungated: Vec<String>,
+    /// `(line number, line)` for every hazard occurrence that belongs to no
+    /// function at all — the subjects the split could not see.
+    unattributed: Vec<(usize, String)>,
+}
+
+fn gate_report(src: &str) -> GateReport {
+    let items = items(src);
+    let hazardous: Vec<&Item> =
+        items.iter().filter(|i| HAZARDS.iter().any(|h| i.body.contains(h))).collect();
+    let ungated: Vec<String> = hazardous
+        .iter()
+        .filter(|i| !i.attrs.contains("#[cfg(debug_assertions)]"))
+        .map(|i| i.name.clone())
+        .collect();
+
+    // THE CROSS-CHECK. Both floors below count at the MATCH site — they say
+    // the instrument ran, never that it saw every subject. A hazard occurrence
+    // that lands outside every function the split found is exactly the subject
+    // it cannot enumerate, so count at the VERIFIED site too and name what was
+    // skipped (CLAUDE.md: a population control counts at the verified site).
+    let covered: Vec<bool> = {
+        let mut v = vec![false; src.lines().count()];
+        for item in &items {
+            for slot in v.iter_mut().take(item.to.min(v.len())).skip(item.from) {
+                *slot = true;
+            }
+        }
+        v
+    };
+    let unattributed: Vec<(usize, String)> = src
+        .lines()
+        .enumerate()
+        .filter(|(n, line)| {
+            HAZARDS.iter().any(|h| line.contains(h)) && !covered.get(*n).copied().unwrap_or(false)
+        })
+        .map(|(n, line)| (n + 1, line.trim().to_string()))
+        .collect();
+
+    GateReport { items: items.len(), hazardous: hazardous.len(), ungated, unattributed }
+}
+
 #[test]
 fn nothing_that_can_hold_a_lock_or_sleep_is_compiled_into_a_release_build() {
-    let src = module_source();
-    let items = items(&src);
+    let report = gate_report(&module_source());
 
     // Positive controls on the INSTRUMENT, read before its verdict: a split
     // that found no items, or a hazard list that stopped matching, reports
-    // "all clean" in bytes identical to a genuinely clean module. Both halves
-    // are asserted, because either alone can be the vacuous one.
+    // "all clean" in bytes identical to a genuinely clean module.
     assert!(
-        items.len() >= 5,
-        "the item split found only {} top-level fns in e2ehold.rs — it has more than that, so \
-         the scan below would be measuring the split rather than the module",
-        items.len()
+        report.items >= 5,
+        "the split found only {} functions in e2ehold.rs — it has more than that, so the \
+         verdict below would be about the split rather than the module",
+        report.items
     );
-    let hazardous: Vec<&Item> =
-        items.iter().filter(|i| HAZARDS.iter().any(|h| i.body.contains(h))).collect();
     assert!(
-        hazardous.len() >= 3,
+        report.hazardous >= 3,
         "only {} of e2ehold.rs's functions matched any hazard marker — the injector holds a \
          mutex, sleeps, spawns a thread and writes files, so a lower count means the markers \
          stopped matching the module rather than the module getting safer",
-        hazardous.len()
+        report.hazardous
     );
 
-    for item in hazardous {
-        assert!(
-            item.attrs.contains("#[cfg(debug_assertions)]"),
-            "`{}` in e2ehold.rs can hold a lock, sleep, spawn or write, but is not gated on \
-             #[cfg(debug_assertions)] — it would be compiled into a shipped binary. The module \
-             doc's claim is that a release build contains no injector at all.",
-            item.name
-        );
-    }
+    // The population control: every hazard occurrence in the FILE is inside a
+    // function the split enumerated. Without this, a hazard in a shape the
+    // split does not recognise is invisible with both floors still green.
+    assert!(
+        report.unattributed.is_empty(),
+        "e2ehold.rs contains hazard occurrences that belong to no function this scan \
+         enumerated, so the gating verdict below says nothing about them: {:?}",
+        report.unattributed
+    );
+
+    assert!(
+        report.ungated.is_empty(),
+        "these functions in e2ehold.rs can hold a lock, sleep, spawn or write, but are not \
+         gated on #[cfg(debug_assertions)] — they would be compiled into a shipped binary, \
+         against the module doc's claim that a release build contains no injector at all: \
+         {:?}",
+        report.ungated
+    );
+}
+
+#[test]
+fn the_gate_report_really_refuses_an_ungated_definition() {
+    // The counterfactual. Everything above is an absence assertion over the
+    // real module, and an absence assertion passes just as well when the
+    // instrument cannot see the subject — which is precisely how the previous
+    // version of this scan was green while blind to `pub(crate) fn`. So
+    // perform the edit rather than reasoning about it: splice the exact
+    // function #1606's review B3 describes into the real source and require
+    // the report to name it.
+    let src = module_source();
+    let clean = gate_report(&src);
+    assert!(clean.ungated.is_empty(), "control: the real module is supposed to be clean");
+
+    let injected = format!(
+        "{src}\n\npub(crate) fn hold_forever(reg: &OrchRegistry) {{\n    \
+         let _g = reg.groups.lock_safe();\n    \
+         std::thread::sleep(std::time::Duration::from_secs(600));\n}}\n"
+    );
+    let report = gate_report(&injected);
+    assert!(
+        report.ungated.iter().any(|n| n == "hold_forever"),
+        "an ungated `pub(crate) fn` that takes a registry mutex and sleeps for ten minutes \
+         did not reach the gating verdict — the scan is blind to it, and a release build \
+         would carry it. Report: ungated={:?} unattributed={:?} items={}",
+        report.ungated,
+        report.unattributed,
+        report.items
+    );
+}
+
+#[test]
+fn a_hazard_outside_every_function_is_reported_as_unattributed() {
+    // The other half of B3: a hazard that is not in a function at all. The
+    // gating loop cannot judge it, so the scan has to SAY so rather than
+    // report a clean module.
+    let injected = format!(
+        "{}\n\nstatic LEAK: () = {{ let _ = std::fs::write(\"x\", b\"y\"); }};\n",
+        module_source()
+    );
+    let report = gate_report(&injected);
+    assert!(
+        report.unattributed.iter().any(|(_, line)| line.contains("fs::write")),
+        "a hazard sitting outside every function was not reported: {:?}",
+        report.unattributed
+    );
 }
 
 #[test]
@@ -173,16 +363,16 @@ fn the_release_arm_of_start_is_an_empty_stub() {
         .find(|i| i.attrs.contains("#[cfg(not(debug_assertions))]"))
         .expect("no #[cfg(not(debug_assertions))] arm of `start`: a release build would then \
                  either fail to link or take the debug one");
-    for hazard in HAZARDS {
-        assert!(
-            !release.body.contains(hazard),
-            "the release arm of e2ehold::start contains `{hazard}` — it must be an empty stub"
-        );
-    }
-    assert!(
-        release.body.contains("{}"),
-        "the release arm of e2ehold::start is not an empty body:\n{}",
-        release.body.trim()
+
+    // Pinned to the whole body, not to `contains("{}")` (#1606 review N2): a
+    // release arm of `eprintln!("{}", x)` satisfies a contains-check and every
+    // hazard negative while doing something. Signature included, so widening
+    // the stub's parameters is a deliberate re-bless rather than a silent one.
+    let body: String = release.body.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        body,
+        "pub fn start(_reg: Arc<OrchRegistry>) {}",
+        "the release arm of e2ehold::start is not exactly an empty stub"
     );
 }
 
