@@ -357,17 +357,24 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     // "the injector really took the mutex" rested on the injector's own state
     // file, which is the injector agreeing with itself.
     //
-    // It must name `groups`, and it must have been held for at least the
-    // watchdog's own threshold. An earlier version asserted only a COUNT of
-    // long-hold breadcrumbs and went green on a `lock=usage_memo_cell
-    // held_ms=8538` crumb from unrelated background work — a control that
-    // passes on somebody else's subject is not a control.
-    const crumb = await waitForLockHoldCrumb(appDataDir, "groups", 5_000);
+    // It must name `groups`, and it must be the COMPLETED report. Two earlier
+    // versions got this wrong in two different ways, both measured rather
+    // than reasoned: one asserted a COUNT of long-hold breadcrumbs and went
+    // green on a `lock=usage_memo_cell held_ms=8538` crumb from unrelated
+    // background work; the next read the first `lock-slow`, which is the
+    // watchdog noticing a hold still IN PROGRESS, so a 12 s hold reported as
+    // `held_ms=5037`. `lock-freed` is the one whose duration is final.
+    const crumb = await waitForLockHoldCrumb(appDataDir, "groups", "lock-freed", 5_000);
     const allCrumbs = parseHoldCrumbs(readBreadcrumbs(appDataDir));
+    // The in-progress reports are logged rather than asserted, because they
+    // carry something no other instrument here does: the WAITER count, which
+    // is the poll path piling up behind the held mutex as it happens.
+    const slow = allCrumbs.filter((c) => c.lock === "groups" && c.event === "lock-slow");
     console.log(
       `[soak] during a ${holdMs}ms hold on groups: ${ran} sweeps ran, ${skipped} ticks ` +
         `skipped; watchdog long-hold reports: ${allCrumbs.length} total, ` +
-        `ours ${crumb ? `= ${crumb.raw}` : "NOT FOUND"}`
+        `${slow.length} in-progress on groups${slow.length ? ` (last: ${slow[slow.length - 1].raw})` : ""}; ` +
+        `completed ${crumb ? `= ${crumb.raw}` : "NOT FOUND"}`
     );
 
     expect(
@@ -378,10 +385,13 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
         `watchdog thread is not running in this build. It reported ${allCrumbs.length} ` +
         `long hold(s) on other locks: ${JSON.stringify(allCrumbs.map((c) => c.lock))}`
     ).toBe("groups");
+    // The two instruments have to agree about the same event's DURATION, not
+    // merely both have noticed something. 2 s of slack covers the watchdog's
+    // 1 Hz sampling and the injector's own request/acquire gap.
     expect(
       crumb?.heldMs ?? 0,
-      `the watchdog's reported hold on \`groups\` is shorter than the injector claims to ` +
-        `have held it (${holdMs}ms): ${crumb?.raw}`
+      `the watchdog's completed report for \`groups\` disagrees with the duration the ` +
+        `injector claims to have held it (${holdMs}ms): ${crumb?.raw}`
     ).toBeGreaterThanOrEqual(holdMs - 2_000);
 
     expect(

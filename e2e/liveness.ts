@@ -226,30 +226,38 @@ export function parseHoldCrumbs(lines: string[]): HoldCrumb[] {
 }
 
 /**
- * Waits for the app's self-watchdog to report a long hold ON A NAMED LOCK.
+ * Waits for the app's self-watchdog to report a long hold ON A NAMED LOCK,
+ * of a given KIND.
  *
- * Both halves of that are load-bearing, and the first version of this had
- * neither. It asserted a COUNT of long-hold breadcrumbs, which an unrelated
- * background hold satisfies — the run that introduced it went green on a
- * `lock=usage_memo_cell held_ms=8538` crumb that had nothing to do with the
- * injected hold. Naming the lock is what makes this evidence about THIS
- * test's subject rather than about the app being busy.
+ * All three of those are load-bearing, and earlier versions of this had none
+ * of them, then one:
  *
- * And it waits rather than reading once: a completed hold is stamped by the
- * guard's drop but composed and written by the watchdog on its NEXT tick
- * (1 Hz), so reading immediately after the injector reports `released_ms` is
- * a race the reader loses about as often as it wins.
+ * - **The lock name.** Asserting a COUNT of long-hold breadcrumbs is
+ *   satisfied by any unrelated background hold; the run that introduced it
+ *   went green on `lock=usage_memo_cell held_ms=8538`, which had nothing to
+ *   do with the injected hold.
+ * - **The kind.** `lockwatch` emits TWO events for one hold, and they mean
+ *   different things: `lock-slow` is the watchdog noticing a hold that is
+ *   STILL RUNNING, so its `held_ms` is "so far" and grows tick by tick;
+ *   `lock-freed` is the completed report, whose `held_ms` is the final
+ *   duration. Reading the first `lock-slow` as if it were final is how a
+ *   12 s hold reports as `held_ms=5037` — measured, and the reason this
+ *   parameter exists.
+ * - **The wait.** A completed hold is stamped by the guard's drop but
+ *   composed and written by the watchdog on its next 1 Hz tick, so reading
+ *   immediately after the injector reports `released_ms` is a race.
  */
 export async function waitForLockHoldCrumb(
   dataDir: string,
   lock: string,
+  event: "lock-slow" | "lock-freed",
   minHeldMs: number,
   timeoutMs = 15_000
 ): Promise<HoldCrumb | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const hit = parseHoldCrumbs(readBreadcrumbs(dataDir)).find(
-      (c) => c.lock === lock && c.heldMs >= minHeldMs
+      (c) => c.lock === lock && c.event === event && c.heldMs >= minHeldMs
     );
     if (hit) return hit;
     if (Date.now() >= deadline) return null;

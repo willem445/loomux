@@ -692,14 +692,28 @@ injector that never really took a tracked mutex, and a watchdog that is not
 running in this build. Before Phase 0 the lane could only check its premise
 against itself.
 
-Two details of that assertion are the difference between a control and a
-decoration, and the first version had neither. It must name the LOCK: asserting
-a count of long-hold breadcrumbs passes on any unrelated background hold, and
-the run that introduced it went green on a `lock=usage_memo_cell held_ms=8538`
-crumb with nothing to do with the injected hold. And it must WAIT: a completed
-hold is stamped by the guard's drop but composed and written by the watchdog on
-its next 1 Hz tick, so reading immediately after the injector reports
-`released_ms` is a race the reader loses about as often as it wins.
+Three details of that assertion are the difference between a control and a
+decoration, and it took two measured failures to find them all.
+
+- It must name the **lock**. Asserting a count of long-hold breadcrumbs passes
+  on any unrelated background hold, and the run that introduced it went green on
+  a `lock=usage_memo_cell held_ms=8538` crumb with nothing to do with the
+  injected hold.
+- It must name the **kind**. `lockwatch` emits two events for one hold, meaning
+  different things: `lock-slow` is the watchdog noticing a hold still RUNNING,
+  so its `held_ms` is "so far" and grows tick by tick, while `lock-freed` is the
+  completed report whose duration is final. Reading the first `lock-slow` as if
+  it were final is how a 12 s hold reports as `held_ms=5037` — measured, not
+  hypothesised.
+- It must **wait**. A completed hold is stamped by the guard's drop but composed
+  and written by the watchdog on its next 1 Hz tick, so reading immediately
+  after the injector reports `released_ms` is a race the reader loses about as
+  often as it wins.
+
+The in-progress `lock-slow` reports are logged rather than asserted, because
+they carry something no other instrument in this lane does: the WAITER count.
+`lock=groups held_ms=5037 waiters=2 at=e2ehold.rs:239` is the poll path piling
+up behind the held mutex, named and counted, as it happens.
 
 Two Phase 0 instruments are deliberately **not** used yet, and are named so the
 next person does not have to rediscover them:
