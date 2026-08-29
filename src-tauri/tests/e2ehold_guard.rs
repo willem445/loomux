@@ -237,9 +237,14 @@ fn gate_report(src: &str) -> GateReport {
     // it cannot enumerate, so count at the VERIFIED site too and name what was
     // skipped (CLAUDE.md: a population control counts at the verified site).
     let covered: Vec<bool> = {
-        let mut v = vec![false; src.lines().count()];
+        // `total` is hoisted rather than read as `v.len()` inside the loop:
+        // `iter_mut()` holds the mutable borrow, so reading the length there is
+        // E0502.
+        let total = src.lines().count();
+        let mut v = vec![false; total];
         for item in &items {
-            for slot in v.iter_mut().take(item.to.min(v.len())).skip(item.from) {
+            let to = item.to.min(total);
+            for slot in v.iter_mut().take(to).skip(item.from) {
                 *slot = true;
             }
         }
