@@ -174,6 +174,15 @@ Two things to know:
   (`%LOCALAPPDATA%\Orrerix`). Quitting first avoids the whole thing.
   `orrerix update` refuses outright while the app is running rather than
   installing over it.
+- **A few settings may come back to their defaults, once.** The recent-repos
+  list, the default agent, the custom agent command and the editor command are
+  kept by the app's browser profile, which this version moves to a new location
+  along with everything else. It moves by itself on Windows and Linux — unless
+  the previous build is still running, the same reason as the bullet above — and
+  on macOS it is not moved at all, so those settings start fresh there and macOS
+  asks for microphone permission again the first time you use voice input. Your
+  groups, tasks, tabs and logs are somewhere else entirely and are not affected.
+  [Troubleshooting](troubleshooting.html) has the details.
 - **Re-pin your taskbar shortcut.** A shortcut you pinned yourself points at the
   old executable and stops working. The Start-menu and desktop shortcuts the
   installer created are updated for you; pin a fresh one from there.

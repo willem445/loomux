@@ -166,6 +166,13 @@ conservative budget and logs a warning if `vocab.txt` is over-long. Set
 - If the mic can't be opened (no device, or Windows microphone privacy blocks
   it), or the whisper runtime is missing/misconfigured, orrerix surfaces a
   **specific** message rather than failing silently.
+- **macOS asks for the microphone again after updating to 1.2.0.** The
+  permission is granted to an app's bundle identifier, and 1.2.0 changed
+  Orrerix's from `dev.loomux.app` to `dev.orrerix.app` (see
+  [Troubleshooting](../troubleshooting.html)). macOS therefore sees a new app
+  the first time you record, and prompts once. Allow it and nothing else
+  changes; if you had previously *denied* it, the old entry in System Settings →
+  Privacy & Security → Microphone is stale and can be removed.
 - To debug a capture, set `ORRERIX_VOICE_KEEP_WAV=1` — orrerix keeps the scratch
   WAV and logs its path, duration, and level. A near-zero level on a long capture
   is the fingerprint of a silent/starved mic.

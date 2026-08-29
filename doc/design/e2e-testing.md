@@ -81,19 +81,21 @@ test-only hacks:
 **1. WebView2 browser-process sharing (issue #394).** WebView2 keys its
 user-data folder — and therefore its *one shared browser process* — off the
 Tauri app's `identifier` (`%LOCALAPPDATA%\<identifier>\EBWebView`, per #394's
-own investigation). `dev.loomux.app` is baked into `src-tauri/tauri.conf.json`
+own investigation). `dev.orrerix.app` is baked into `src-tauri/tauri.conf.json`
 at build time. `src-tauri/tauri.e2e.conf.json` is a JSON Merge Patch
 (officially supported via `tauri build/dev --config <file>`, per
 `v2.tauri.app/develop/configuration-files`) that overrides `identifier` to
-`dev.loomux.e2e` for E2E builds only. A binary built with that override gets
+`dev.orrerix.e2e` for E2E builds only. A binary built with that override gets
 an entirely separate WebView2 browser process — sharing nothing with a
 running production install, so **even a hard-kill of the E2E process can
 never take down another instance's WebView2 process**, independent of
 graceful vs. abrupt teardown. This was verified empirically while building
 this spike: with a production loomux instance running (the one orchestrating
-this very session), an E2E test run left only `dev.loomux.app`-rooted
-`msedgewebview2.exe` processes behind after the test's own `dev.loomux.e2e`
-instance exited — no cross-talk.
+this very session), an E2E test run left only production-identifier-rooted
+`msedgewebview2.exe` processes behind after the test's own E2E-identifier
+instance exited — no cross-talk. (Both identifiers were still the `dev.loomux.*`
+spellings when that was observed; #1562 flipped them together, which is a rename
+of the two values and not a change to the mechanism the observation is about.)
 
 **2. loomux's own app-data root.** `orchestration/`, `logs/`, `tabs.json`, and
 `running.lock` all lived under three independently-duplicated
@@ -144,8 +146,8 @@ So the isolation guarantee isn't asserted, it's checked: before
 connecting Playwright, before any interaction, before any teardown decision —
 `verifyIsolatedBuild` inspects the OS process tree (`Get-CimInstance
 Win32_Process`, filtered to the exact spawned PID's own WebView2 child) and
-confirms its `--user-data-dir` really is rooted at `dev.loomux.e2e`, not
-`dev.loomux.app` or anything else. A mismatch — or no WebView2 child
+confirms its `--user-data-dir` really is rooted at `dev.orrerix.e2e`, not
+`dev.orrerix.app` or anything else. A mismatch — or no WebView2 child
 appearing at all within the timeout — throws immediately, before the
 `try`/`finally` that would otherwise call `proc.kill()` is even entered. Both
 directions were exercised directly while building this: a correctly-built E2E

@@ -135,6 +135,36 @@ xattr -cr /Applications/Orrerix.app
 The install script does this for you; if you dragged the app from a `.dmg`
 manually, run it yourself.
 
+## Some settings reset once, after updating to 1.2.0
+
+A handful of preferences live in the app's **browser profile** rather than in
+its data folder: the launcher's recent-repos list, the default agent, the custom
+agent command, the editor command, and a few pane and panel sizes. Windows and
+Linux key that profile on the app's identity, which changed in 1.2.0 as the last
+step of the rename — so the profile has to move, and 1.2.0 moves it on first
+launch.
+
+**Everything else is untouched.** Groups, task boards, tabs, SSH profiles and
+logs live under the data folder below, not in the browser profile.
+
+- **Windows and Linux — automatic, with one exception.** The old folder
+  (`%LOCALAPPDATA%\dev.loomux.app` on Windows) is renamed to
+  `dev.orrerix.app` in one step and a `MOVED-TO-ORRERIX.txt` is left behind
+  saying where it went. Nothing is ever deleted. The exception is **an older
+  build still running while the new one starts**: Windows will not rename a
+  folder its `msedgewebview2.exe` still has open, so the move is refused, the
+  new version starts with a fresh profile, and those preferences come back at
+  their defaults. Quitting the old build before installing avoids it. It is not
+  retried once the new profile exists — if you want the old settings back, quit
+  Orrerix, delete `%LOCALAPPDATA%\dev.orrerix.app`, rename
+  `%LOCALAPPDATA%\dev.loomux.app` to `dev.orrerix.app`, and start it again.
+- **macOS — not moved.** The system stores this profile itself, under
+  `~/Library/WebKit/<bundle identifier>`, and it is not a location the app
+  manages. Those preferences therefore start fresh once, and macOS asks for
+  **microphone permission again** the first time you use voice input, because
+  that grant is keyed on the bundle identifier too. The old
+  `~/Library/WebKit/dev.loomux.app` is left alone and can be deleted by hand.
+
 ## Disk & data locations
 
 Orrerix keeps durable state and logs under your platform data dir
