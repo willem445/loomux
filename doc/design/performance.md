@@ -207,6 +207,26 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   order was actually load-bearing; most conversions find their guard already
   written (a lock, an atomic, an idempotent write) and owe only the sentence
   naming it.
+- **P8 — A published view, read by pointer clone.** A read on a FIXED CADENCE
+  does not take the live lock at all: one owned thread computes the payload
+  under the registry locks on a cadence and swaps it into an
+  `RwLock<Arc<Snapshot>>` (`loomux-engine` `published.rs`); every reader is a
+  read-lock, a pointer clone and a release. The writer's critical section holds
+  no IO, no other lock and nothing that can park, so what a reader waits for is
+  bounded by construction rather than by what the producer is doing — which is
+  the property P1 does NOT give a polled read, and #1600 §1.2 is the release
+  where that difference stopped every pane accepting input.
+  Two consequences are the point rather than side effects. A stuck registry
+  parks exactly ONE thread (the publisher's) instead of one per poller per
+  tick, so the shared blocking pool cannot be exhausted from the poll path.
+  And the degraded state is a payload that carries its own age, so the surface
+  can say it is stale (INV-6) instead of silently freezing — which is what a
+  single-flighted poll does when its call never settles (#1604 review N3).
+  Reach for this when a read is CADENCED and its source is contended; an
+  on-demand read is outside it, and pays a snapshot's staleness for nothing.
+  Precedent: `orchestration/views.rs` + `orch_group_view`/`orch_strip_view`
+  (#1608), design note `doc/design/polled-views.md`. The shape a later
+  push-on-change mode would copy is `queue_depth_push`'s compare-before-emit.
 - **P8-writer — a dedicated owner thread with a completion reply.** When a
   command's body must not compete for the *shared* blocking pool, give the
   subject its own thread and keep the completion semantics: the command posts a
@@ -265,7 +285,15 @@ scan pins the shape.
   genuinely trivial — which is the evidence that the work was never the
   property that mattered. E1's scan cannot see either half (one is a call-chain
   fact, the other lives in the frontend); review owns it.
-  *Enforced: E1 (#743 S2) + review.*
+
+  **A polled read reads a `Published` cell; it never takes a registry lock**
+  (#1608). Async is the floor, not the answer: this invariant's own #1595
+  guard would have passed on beta6, because beta6's polled commands were all
+  correctly async and the app still stopped accepting input in every pane. So
+  a command reached from a fixed-cadence poll site must additionally be served
+  from the published snapshot (P8) — `views.load(` in its body — which is
+  mechanical, and is enforced.
+  *Enforced: E1 (#743 S2, then #1608's L6) + review.*
 - **INV-2 — No process spawn and no network round trip on the webview thread,
   ever.** No class permits it: `cheap` bodies additionally must carry no
   `Command::new` / `ShellExecuteW` / `.output(` / `fs::` marker, and only a
