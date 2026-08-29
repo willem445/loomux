@@ -1190,3 +1190,64 @@ fn every_tool_the_mcp_surface_lists_is_classified_read_or_mutate() {
         tools.len()
     );
 }
+
+// ---------- L2e: a partial group with nothing to inherit is WITHHELD ----------
+
+#[test]
+fn a_first_pass_that_goes_partial_publishes_nothing_rather_than_nulls() {
+    // CLAUDE.md's rule (#1671): a snapshot in front of per-item reads inherits
+    // what those reads answered, and the miss is SILENT — an absent entry
+    // renders as "nothing here" rather than failing, so neither the compiler
+    // nor a unit test over a faked registry sees it.
+    //
+    // The busy fallback keeps a section's PREVIOUS value. On a group's FIRST
+    // pass there is no previous value and no previous stamp, so the naive
+    // version publishes an entry whose sections are all `Null` and whose
+    // `computed_at` is this pass — a panel that reads CURRENT while asserting
+    // the group has nothing, with no stale badge to say otherwise.
+    //
+    // The class this bites is not hypothetical: a restored-but-not-resumed
+    // group arrives through a strip lease and has no prior entry by
+    // construction (#1625 round 2), so its first pass is exactly the pass that
+    // can hit a busy section.
+
+    // The discriminating half, on its own registry: a first pass with nothing
+    // held DOES publish the group. Without it, the assertion below passes just
+    // as well against a publisher that never publishes anything.
+    {
+        let (reg, _dir) = test_registry();
+        let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+        reg.views.publish_pass(&reg);
+        assert!(
+            reg.views.load().value.groups.contains_key(&group.id),
+            "setup: an unheld first pass must publish the group, or the assertion below is \
+             about a publisher that does nothing"
+        );
+    }
+
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+    assert!(
+        reg.views.load().value.groups.is_empty(),
+        "setup: this registry has never published, so the group has nothing to inherit"
+    );
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+
+    reg.views.publish_pass(&reg);
+    let snapshot = reg.views.load();
+
+    assert!(
+        !snapshot.value.groups.contains_key(&group.id),
+        "a group whose FIRST pass went partial was published anyway. Its sections are all \
+         null and its stamp is fresh, so the strip renders it as a group with nothing in it \
+         and no stale badge — the silent \"nothing here\" that absence avoids, since absence \
+         already means \"ask again shortly\" to both payload builders"
+    );
+    // And the payload builder agrees, which is what a reader actually sees.
+    assert_eq!(
+        loomux_lib::orchestration::views::group_view_payload(&snapshot, &group.id, std::time::Instant::now()),
+        serde_json::Value::Null,
+        "an absent group must answer Null — the same degrade as a group created since the \
+         last pass"
+    );
+}
