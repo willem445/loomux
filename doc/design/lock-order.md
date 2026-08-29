@@ -183,7 +183,48 @@ and assign ranks until it is silent. Every violation the checker reports is a
 real, previously unwritten ordering fact, and each one is recorded here — with
 whether the *table* was wrong or the *code* was.
 
-<!-- DERIVATION-LOG -->
+**Zero violations, and that is the finding.** Every round ran the whole
+workspace suite in a debug build — where an inversion or a re-entrant
+acquisition panics — on all three platforms, and no round reported either. (The
+run ids are in #1698, which is the dated surface for them; a design note that
+cites one is a note that goes stale on the next push.) So the eighteen ranks are
+not a guess that happened to survive: they are the thirteen documented claims,
+and every acquisition order the suite exercises agrees with them. That green
+suite *is* the plan's L5c row.
+
+That is a stronger result than the method expected, and it is worth saying why
+it is plausible rather than suspicious. Most of the thirteen claims are *leaf*
+claims — "takes no other registry lock while held" — and a leaf claim is
+satisfied by a lock that nests under things and takes nothing, which is what the
+ranks at 600-900 encode. The two claims with real nesting in them
+(`queues` -> `recovered_queue` -> `recovered_markers`, and
+`tasks_lock` -> `needs_you_lock`) name the direction the code already takes, and
+the checker agrees with both. The pairs that would have been *interesting* —
+`groups` against `agents`, `by_pty` against either — turn out never to nest at
+all on the paths the suite runs: every site takes one, uses it and drops it
+before reaching for the next, exactly as `session_for_pty`'s "taken and RELEASED
+before" says. The rank is there for the site that stops doing that.
+
+**What the derivation did find was a blind GUARD, not a wrong rank.**
+`every_registry_lock_is_constructed_with_a_name` (`src-tauri/tests/selfwatch.rs`)
+matched the literal `TrackedMutex::new(`. Moving eighteen fields to `new_ranked`
+dropped its count from 85 to 68 while every one of them still passed a literal
+name — a guard blind to a fifth of the struct, which only its own vacuity floor
+could say. It now classifies what FOLLOWS every `TrackedMutex::new` occurrence
+and default-denies a constructor it has not been taught, with the vacuity
+control per constructor rather than on the total: a single total is satisfied by
+one constructor going to zero while the other absorbs it, which is precisely
+what happened here.
+
+The other two rounds changed no rank either — a platform-dependent test needle (a
+recorded `file!()` is backslashed on Windows, so an `"orchestration/mod.rs"`
+needle passed on two platforms and failed on the third), and the self-review that
+moved every finding off the acquiring thread (§2, *What it costs*).
+
+**The next rows will come from the field, not from here.** Sixty-five fields are
+unranked; the first time each nests under anything, the watchdog writes a
+`lock-rank-unranked` line naming it, the rank it nested under, and both sites.
+That is the channel this section fills from next.
 
 ## 6. What this does not do
 

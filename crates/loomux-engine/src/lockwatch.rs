@@ -2190,7 +2190,7 @@ mod rank_tests {
         let before = lock_order_violations();
         let g1 = a.lock_safe();
         let g2 = b.lock_safe();
-        assert_eq!(held_lock_depth(), 2);
+        assert_eq!(held_lock_depth(), 2, "both holds must be on this thread's stack");
         drop(g2);
         drop(g1);
         assert_eq!(lock_order_violations(), before, "equal ranks were treated as a violation");
