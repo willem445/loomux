@@ -172,7 +172,9 @@ pub struct GroupView {
 /// What one publish pass produced.
 #[derive(Debug, Default)]
 pub struct ViewSnapshot {
-    pub groups: HashMap<GroupId, GroupView>,
+    /// `Arc` per group so a single-group republish clones POINTERS rather
+    /// than ten `serde_json::Value` trees per group it is not touching.
+    pub groups: HashMap<GroupId, Arc<GroupView>>,
     /// Reserved for Phase 2.1: a section that hit a `Busy` timeout kept its
     /// previous value. Always `false` in Phase 1 — there is no bounded
     /// acquisition yet to time out, so no section can be partial.
@@ -193,6 +195,16 @@ pub struct ViewPublisher {
     /// opened a view on — nothing holds it across anything, so unlike a
     /// registry mutex it cannot be the lock a reader waits behind.
     leases: Mutex<HashMap<GroupId, Instant>>,
+    /// Serializes the read-modify-write half of a publish — never the
+    /// compute, which stays outside it. Two publishers exist (the thread's
+    /// full pass and a mutating command's single-group nudge) and both did
+    /// load -> modify -> store, which is a lost update with no lock.
+    ///
+    /// **No reader ever takes this.** `load()` goes to the `Published` cell
+    /// directly, so nothing about the liveness property depends on it, and
+    /// its own critical section is a map clone plus a pointer swap — no
+    /// registry lock, no IO, nothing that can park.
+    publish_lock: Mutex<()>,
     strip_tier_computes: AtomicU64,
     view_tier_computes: AtomicU64,
 }
@@ -208,6 +220,7 @@ impl ViewPublisher {
         Self {
             published: Published::new(ViewSnapshot::default()),
             leases: Mutex::new(HashMap::new()),
+            publish_lock: Mutex::new(()),
             strip_tier_computes: AtomicU64::new(0),
             view_tier_computes: AtomicU64::new(0),
         }
@@ -275,16 +288,41 @@ impl ViewPublisher {
         // this is the release site the `leases` field's doc names.
         {
             let mut leases = self.leases.lock_safe();
-            leases.retain(|g, _| ids.contains(g));
+            let live: std::collections::HashSet<&GroupId> = ids.iter().collect();
+            leases.retain(|g, _| live.contains(g));
         }
 
         let started = Instant::now();
-        let mut groups: HashMap<GroupId, GroupView> = HashMap::with_capacity(ids.len());
+        let mut computed: HashMap<GroupId, Arc<GroupView>> = HashMap::with_capacity(ids.len());
         for id in ids {
             let leased = self.has_view_lease_at(&id, now);
-            groups.insert(id.clone(), self.compute_group(reg, &id, leased, now));
+            computed.insert(id.clone(), Arc::new(self.compute_group(reg, &id, leased, now)));
         }
         let compute_ms = elapsed_ms(started);
+
+        // The swap, under `publish_lock` and with the compute already done.
+        //
+        // A pass stamps every group with its own START instant, so a nudge
+        // that landed WHILE this pass was computing carries a strictly later
+        // stamp — and it must win, because the pass's copy of that group was
+        // read before the write the nudge is reporting. Storing this pass
+        // wholesale would silently revert exactly the toggle the group view
+        // is about to re-read, which is the one thing the nudge exists to
+        // prevent. Keeping the later stamp is monotone: the NEXT pass, which
+        // starts after the write, replaces it with genuinely fresher data.
+        let _swap = self.publish_lock.lock_safe();
+        let previous = self.published.load();
+        let mut groups: HashMap<GroupId, Arc<GroupView>> = HashMap::with_capacity(computed.len());
+        for (id, fresh) in computed {
+            match previous.value.groups.get(&id) {
+                Some(prev) if prev.computed_at > fresh.computed_at => {
+                    groups.insert(id, Arc::clone(prev));
+                }
+                _ => {
+                    groups.insert(id, fresh);
+                }
+            }
+        }
         self.published.store(ViewSnapshot { groups, partial: false }, compute_ms);
     }
 
@@ -309,11 +347,15 @@ impl ViewPublisher {
     pub fn publish_group_at(&self, reg: &OrchRegistry, group: &GroupId, now: Instant) {
         let leased = self.has_view_lease_at(group, now);
         let started = Instant::now();
-        let view = self.compute_group(reg, group, leased, now);
+        let view = Arc::new(self.compute_group(reg, group, leased, now));
         let compute_ms = elapsed_ms(started);
 
+        // Under the same lock as a full pass, and taken AFTER the compute, so
+        // the two publishers cannot lose each other's update.
+        let _swap = self.publish_lock.lock_safe();
         let previous = self.published.load();
-        let mut groups: HashMap<GroupId, GroupView> = previous.value.groups.clone();
+        // Shallow: every other group is an `Arc` clone, not a payload copy.
+        let mut groups: HashMap<GroupId, Arc<GroupView>> = previous.value.groups.clone();
         groups.insert(group.clone(), view);
         self.published.store(ViewSnapshot { groups, partial: previous.value.partial }, compute_ms);
     }
