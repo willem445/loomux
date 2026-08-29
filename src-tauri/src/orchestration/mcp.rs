@@ -212,24 +212,69 @@ pub enum ToolKind {
 /// merely waits longer than it needed to — so the default takes the harmless
 /// side. `tests/liveness.rs`'s classification test is what stops that default
 /// silently becoming the answer for the whole surface.
+/// Every tool name this surface can list, over EVERY role.
+///
+/// `tool_defs` is a pure function of `(role, hint, locks, manager)`, so the
+/// complete population is reachable without building a single agent — which
+/// is what makes the classification test able to compare the real table
+/// against the real listing instead of against whatever roles a fixture
+/// happened to construct (#1609 review N2).
+#[doc(hidden)]
+pub fn all_listed_tool_names() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for role in [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::Reviewer,
+        Role::Planner,
+        Role::Manager,
+        Role::Solo,
+    ] {
+        for manager in [false, true] {
+            for defs in [tool_defs(role, None, &[], manager)] {
+                for d in defs {
+                    if let Some(n) = d.get("name").and_then(Value::as_str) {
+                        if !out.iter().any(|e| e == n) {
+                            out.push(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The names [`tool_kind`] classifies as [`ToolKind::Read`].
+///
+/// Returned as data rather than re-typed in a test, so the test cannot drift
+/// from the table it is checking — the drift that left `pr_checks` sitting in
+/// the Read set while being no tool at all.
+#[doc(hidden)]
+pub const READ_TOOLS: &[&str] = &[
+    "list_agents",
+    "get_state",
+    "list_tasks",
+    "get_task",
+    "list_questions",
+    "list_needs_you",
+    "list_verdicts",
+    "list_notifications",
+    "get_output",
+    "group_usage",
+    "session_digest",
+    "merge_queue_status",
+    "channel_status",
+];
+
 pub fn tool_kind(name: &str) -> ToolKind {
     match name {
         // Reads. Derived from what each arm DOES, not from what its name
         // sounds like — the first version of this table was written from the
         // names and put four writers in here (#1609 review B1).
-        "list_agents"
-        | "get_state"
-        | "list_tasks"
-        | "get_task"
-        | "list_questions"
-        | "list_needs_you"
-        | "list_verdicts"
-        | "list_notifications"
-        | "get_output"
-        | "group_usage"
-        | "session_digest"
-        | "merge_queue_status"
-        | "channel_status" => ToolKind::Read,
+        // One definition, read from `READ_TOOLS` — a `match` arm beside a
+        // constant is two lists that drift.
+        n if READ_TOOLS.contains(&n) => ToolKind::Read,
 
         // MOVED HERE by review B1, each because it mutates despite its name:
         //
@@ -409,10 +454,24 @@ pub fn dispatch_bounded(
         let out = dispatch(&r, &c, &m, &p);
         // `send` fails only when the handler has already answered "still
         // executing" and dropped the receiver. The work still COMPLETED, and
-        // the audit log is the only place that fact can be recorded now — a
-        // late completion nobody can see is indistinguishable from one that
-        // never happened, which is the state an operator would have to guess
-        // about after reading the caller's "it WILL complete".
+        // this is where that fact reaches the audit log — a late completion
+        // nobody can see is indistinguishable from one that never happened,
+        // which is the state an operator would have to guess about after
+        // reading the caller's "it WILL complete".
+        //
+        // Two things this is NOT, stated because the obvious reading of the
+        // sentence above is wrong in both directions (#1609 review N8):
+        //
+        //  - it is not the ONLY record. `dispatch` writes its own `tool-result`
+        //    line from inside this thread, before we get here; the `late: true`
+        //    line is a SECOND one, and a reader reconciling the log will see
+        //    both for one call.
+        //  - it is not guaranteed. In the race where `send` wins as
+        //    `recv_timeout` expires, the handler has already answered "still
+        //    executing" while the value went through — so the caller is told
+        //    to verify and no `late` line is written. Exactly-once is
+        //    unaffected either way: the tool ran once, and `dispatch`'s own
+        //    line records it.
         if let Err(std::sync::mpsc::SendError(late)) = tx.send(out) {
             let (ok, text) = match &late {
                 Ok(v) => (true, v.to_string()),

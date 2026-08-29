@@ -356,7 +356,19 @@ impl ViewPublisher {
         // to discover what this one acquisition already established.
         let mut ids: Vec<GroupId> = match reg.groups.lock_within(budget::TICK_LOCK_BUDGET) {
             Ok(guard) => guard.keys().cloned().collect(),
-            Err(_) => return,
+            Err(busy) => {
+                // Its own breadcrumb (#1609 review N6). `lock_within` writes
+                // `lock-busy`, which names the lock and its holder — but not
+                // that a publish pass was skipped, and a reader working out
+                // why a panel is stale needs the second fact as much as the
+                // first. `tick_gate` writes `tick-skipped` for this reason;
+                // this is the same event from the publisher.
+                crate::obs::breadcrumb(
+                    "tick-skipped",
+                    &format!("tick=views_publish_pass {}", busy.detail()),
+                );
+                return;
+            }
         };
         for leased in self.fresh_strip_leases_at(now) {
             if !ids.contains(&leased) {
@@ -586,10 +598,19 @@ impl ViewPublisher {
     /// [`ViewPublisher::publish_pass_at`]'s entry acquisition is bounded by
     /// `TICK_LOCK_BUDGET` and skips the pass instead.
     ///
-    /// **An expired budget costs a healthy registry nothing.** A section that
+    /// **An expired budget costs an UNCONTENDED lock nothing.** A section that
     /// legitimately spends over a second in transcript reads leaves the deadline
-    /// passed, and `Duration::ZERO` is a `try_lock` that SUCCEEDS on any
-    /// uncontended lock — so slow-but-fine sections do not manufacture partials.
+    /// passed, and `Duration::ZERO` is a `try_lock` that SUCCEEDS on any lock
+    /// nobody else holds — so slow-but-fine sections do not manufacture
+    /// partials.
+    ///
+    /// Not quite "nothing", and the difference is worth stating (#1609 review
+    /// N5): past the deadline every remaining acquisition is a bare `try_lock`,
+    /// so ORDINARY momentary contention — a background thread holding a map for
+    /// microseconds, not a wedge — is enough to mark that section partial. The
+    /// cost is a section showing its previous value for one pass, which is the
+    /// degrade this whole path is built around; but it means a partial is not
+    /// by itself evidence of a wedge.
     fn section<T>(partial: &Cell<bool>, fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
         match budget::read_budget(budget::POLL_LOCK_BUDGET, f) {
             Ok(v) => v,

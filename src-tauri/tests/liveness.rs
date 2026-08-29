@@ -1155,48 +1155,55 @@ fn l2c_every_cadenced_tick_returns_while_the_registry_is_wedged() {
 }
 
 #[test]
-fn every_tool_the_mcp_surface_lists_is_classified_read_or_mutate() {
-    // `tool_kind`'s default arm is `Mutate`, which is the safe side — but it is
-    // also the arm that would silently swallow the whole surface if the table
-    // stopped matching. So the population is taken from what `tools/list`
-    // ACTUALLY returns, per role, rather than from a list written here.
+fn every_read_classified_tool_is_a_tool_the_surface_actually_lists() {
+    // Review N2. The old version of this row could not fail: its
+    // `match tool_kind(name)` loop was total, so "every listed tool reaches a
+    // decision" was a tautology, and the only live assertions were two floors.
+    // It also drove ONE role while claiming a per-role population, so three
+    // role-gated tools were never seen by it.
     //
-    // What this can and cannot say, stated because the default makes it subtle:
-    // it proves every listed tool REACHES a decision and that the Read set is
-    // non-empty on a role that has reads. It cannot prove a tool is on the right
-    // side — that is the reviewable table in `mcp.rs`, and the asymmetry
-    // (a mis-classified read merely waits; a mis-classified mutation can be
-    // abandoned) is why the default is what it is.
-    let (reg, token, _group, _dir) = mcp_fixture();
-    let caller = reg.resolve_token(&token).expect("token resolves");
-    let listed = mcp::dispatch(&reg, &caller, "tools/list", &json!({})).expect("tools/list");
-    let tools = listed["tools"].as_array().expect("an array of tools").clone();
-
+    // The direction that actually bites is the other one, and it had a live
+    // instance: `pr_checks` sat in the Read set and is not a tool at all —
+    // `tool_defs` registers no such name — so the set was 16 real tools plus a
+    // dead row, with nothing red. A typo'd Read entry degrades to `Mutate`
+    // silently, which is fail-safe but also invisible.
+    //
+    // Both populations are now taken from the shipped code: `READ_TOOLS` is the
+    // constant `tool_kind` itself reads, and `all_listed_tool_names()` unions
+    // `tool_defs` over EVERY role — a pure function, so no fixture decides what
+    // this test can see.
+    let listed = mcp::all_listed_tool_names();
     assert!(
-        tools.len() >= 20,
-        "tools/list returned {} tools — the scan has stopped reading the surface it is \
-         supposed to cover",
-        tools.len()
+        listed.len() >= 35,
+        "the listing collapsed to {} tools; this row is comparing against almost nothing",
+        listed.len()
     );
 
-    let mut reads = 0usize;
-    for t in &tools {
-        let name = t["name"].as_str().expect("every tool has a name");
-        match mcp::tool_kind(name) {
-            mcp::ToolKind::Read => reads += 1,
-            mcp::ToolKind::Mutate => {}
-        }
-    }
-    // The vacuity control. Every assertion above is satisfied by a `tool_kind`
-    // whose body is `ToolKind::Mutate` — which is exactly what a table that had
-    // stopped matching would degrade to, and it would be invisible without this.
+    let orphans: Vec<&str> =
+        mcp::READ_TOOLS.iter().copied().filter(|n| !listed.iter().any(|l| l == n)).collect();
     assert!(
-        reads >= 5,
-        "only {reads} of {} listed tools classify as Read. The table has stopped matching and \
-         every tool is falling through to the default arm — the read budget then applies to \
-         nothing at all",
-        tools.len()
+        orphans.is_empty(),
+        "these names are classified ToolKind::Read but are not tools the surface lists: \
+         {orphans:?}. A dead row classifies nothing — and the next typo in that table also \
+         degrades to Mutate in silence, which is safe and unreadable."
     );
+
+    // The other direction, as a floor rather than an equality: a listed tool is
+    // free to be a Mutate, so the two sets are not equal and never should be.
+    // What must hold is that the Read set is not empty — a `READ_TOOLS` that had
+    // shrunk to nothing would make the read budget apply to nothing at all while
+    // every assertion above still passed.
+    assert!(
+        mcp::READ_TOOLS.len() >= 8,
+        "only {} tools classify as Read; the read budget then governs almost nothing",
+        mcp::READ_TOOLS.len()
+    );
+
+    // And the classification really is consulted rather than defaulted: at least
+    // one listed tool must come back Read, and at least one Mutate.
+    let reads = listed.iter().filter(|n| mcp::tool_kind(n) == mcp::ToolKind::Read).count();
+    let mutates = listed.iter().filter(|n| mcp::tool_kind(n) == mcp::ToolKind::Mutate).count();
+    assert!(reads > 0 && mutates > 0, "reads={reads} mutates={mutates}");
 }
 
 // ---------- L2e: a partial group with nothing to inherit is WITHHELD ----------
