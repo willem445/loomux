@@ -67,7 +67,7 @@ static GH_CAPTURE_LEAKED_READERS: std::sync::OnceLock<
     crate::lockwatch::TrackedMutex<Vec<std::thread::JoinHandle<Vec<u8>>>>,
 > = std::sync::OnceLock::new();
 
-/// [`GH_CAPTURE_LEAKED_READERS`], initialised on first use  a getter for the
+/// [`GH_CAPTURE_LEAKED_READERS`], initialised on first use — a getter for the
 /// same reason `orchestration::audit_lock` is one (#1601): registering a lock
 /// with the watchdog is not a `const` operation.
 fn leaked_readers() -> &'static crate::lockwatch::TrackedMutex<Vec<std::thread::JoinHandle<Vec<u8>>>> {

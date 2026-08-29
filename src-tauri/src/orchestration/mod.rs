@@ -14782,7 +14782,7 @@ static AUDIT_LOCK: std::sync::OnceLock<TrackedMutex<()>> = std::sync::OnceLock::
 /// [`AUDIT_LOCK`], initialised on first use.
 ///
 /// A getter rather than a `static TrackedMutex` because registering a lock with
-/// the watchdog is not a `const` operation  and it must be registered, or the
+/// the watchdog is not a `const` operation — and it must be registered, or the
 /// one lock every refusal path takes under three other registry locks would be
 /// the one lock a hold report cannot name. Same `OnceLock::get_or_init` shape
 /// `obs::data_root` uses.
