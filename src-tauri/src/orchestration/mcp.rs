@@ -14,7 +14,7 @@ use super::brand;
 use super::mailbox;
 use super::report;
 use super::workflow;
-use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
+use super::{Caller, Delivery, GroupId, NameSource, OrchRegistry, Role};
 // #1609: the thread-local read budget and the typed `Busy` a timed
 // acquisition answers with. See `doc/design/lock-liveness.md`.
 use loomux_engine::budget;
@@ -209,10 +209,15 @@ fn busy_tool_text(busy: &Busy) -> String {
 /// Whether a tool only READS registry state, or may mutate it.
 ///
 /// The distinction exists for exactly one reason: a read may be abandoned
-/// partway through and a mutation may not. A read tool runs under
-/// [`budget::MCP_READ_BUDGET`] and unwinds on expiry; a mutating tool runs to
-/// completion under a [`budget::MutationScope`], and it is the HANDLER's wait
-/// that is bounded instead.
+/// partway through **by a budget timeout** and a mutation may not. A read tool
+/// runs under [`budget::MCP_READ_BUDGET`] and unwinds on expiry; a mutating
+/// tool is left to run under a [`budget::MutationScope`], and it is the
+/// HANDLER's wait that is bounded instead.
+///
+/// That is a statement about the BUDGET, not a completion guarantee: a
+/// re-entrant `lock_safe` panics a mutate helper thread rather than parking it
+/// (#1702), so a mutation can end without a result — see [`worker_died_text`],
+/// which is what its caller is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     Read,
@@ -223,7 +228,7 @@ pub enum ToolKind {
 ///
 /// **Fail-closed, and that is the whole design.** The default arm is `Mutate`,
 /// so a tool added next month without a line here is treated as mutating: it
-/// runs to completion and is never unwound. The failure mode of a wrong
+/// is left to run, and no budget timeout unwinds it. The failure mode of a wrong
 /// classification is asymmetric — a mutation wrongly called a read can be
 /// abandoned halfway between two maps, while a read wrongly called a mutation
 /// merely waits longer than it needed to — so the default takes the harmless
@@ -404,10 +409,20 @@ fn slowest_hold() -> Option<String> {
 ///
 /// **Deliberately not an unwind, and this is the load-bearing decision of the
 /// whole phase.** A mutating tool that has taken locks may already have
-/// mutated, so it runs to completion on its own thread and completes EXACTLY
-/// ONCE. The alternative — a deadline around the body with the late result
-/// discarded — produces DOUBLE execution the moment the agent retries a
-/// non-idempotent tool, which for `spawn_agent` is the worst outcome available.
+/// mutated, so it is left running on its own thread and runs AT MOST ONCE. The
+/// alternative — a deadline around the body with the late result discarded —
+/// produces DOUBLE execution the moment the agent retries a non-idempotent
+/// tool, which for `spawn_agent` is the worst outcome available.
+///
+/// **At most once, not exactly once** (#1702). The two halves of that
+/// guarantee have different strengths and this doc used to state the weaker
+/// one as though it were the stronger. Nothing can make the tool run TWICE —
+/// that is what the deadline-on-the-wait buys and it is untouched. But a tool
+/// can now fail to complete at all: a re-entrant `lock_safe` panics this
+/// helper thread rather than parking it, which is the improvement, and
+/// [`worker_died_text`] is the answer that improvement owes its caller. A
+/// completion guarantee this function's own sibling contradicts is worth
+/// less than the narrower one that is true.
 ///
 /// So the caller is told the truth and told what not to do with it.
 fn still_executing_text(tool: &str) -> String {
@@ -417,8 +432,37 @@ fn still_executing_text(tool: &str) -> String {
         None => " — verify before re-issuing".to_string(),
     };
     format!(
-        "`{tool}` is still executing after {} s{waiting}. It WILL complete; do NOT re-issue it{verify}.",
+        "`{tool}` is still executing after {} s{waiting}. It is still running — do NOT re-issue \
+         it: a second call would run it twice{verify}.",
         budget::mutate_deadline().as_secs()
+    )
+}
+
+/// The result a MUTATING tool's caller gets when the helper thread DIED —
+/// ended without sending, which the channel reports as `Disconnected` (#1702).
+///
+/// Before this, both `recv_timeout` errors got [`still_executing_text`]: a
+/// caller whose tool had already panicked was made to wait the full
+/// [`budget::MCP_MUTATE_DEADLINE`] and then told the work would complete — the
+/// wording that message carried before #1702 retracted it — of which every
+/// clause was false. #1702 makes that reachable rather than
+/// theoretical — a re-entrant `lock_safe` on a mutate helper thread now panics
+/// instead of parking, which is the improvement, and this is the answer that
+/// improvement owes its caller.
+///
+/// **It says "may have", not "did not".** The thread panicked at an unknown
+/// point, so a partial write is exactly what cannot be ruled out — the one
+/// thing a `loomux busy:` answer CAN say ("nothing was executed") is the thing
+/// this must not. So it names the read tool instead and lets the agent look.
+fn worker_died_text(tool: &str) -> String {
+    let verify = match verify_with(tool) {
+        Some(read_tool) => format!(" — verify with `{read_tool}` before re-issuing"),
+        None => " — verify before re-issuing".to_string(),
+    };
+    format!(
+        "internal error: `{tool}` ended without a result — the thread running it panicked, and \
+         the crash log under the orrerix data directory names where. The tool may have \
+         partially executed{verify}."
     )
 }
 
@@ -509,7 +553,7 @@ pub fn dispatch_bounded(
         // this is where that fact reaches the audit log — a late completion
         // nobody can see is indistinguishable from one that never happened,
         // which is the state an operator would have to guess about after
-        // reading the caller's "it WILL complete".
+        // reading the caller's "it is still running".
         //
         // Two things this is NOT, stated because the obvious reading of the
         // sentence above is wrong in both directions (#1609 review N8):
@@ -543,20 +587,48 @@ pub fn dispatch_bounded(
         }
     });
 
-    match rx.recv_timeout(budget::mutate_deadline()) {
-        Ok(out) => out,
-        Err(_) => {
-            let text = still_executing_text(&tool);
-            crate::obs::breadcrumb(
-                "mcp-mutate-slow",
-                &format!("group={} agent={} tool={tool}", caller.group, caller.agent_id),
-            );
-            Ok(json!({
-                "content": [json!({ "type": "text", "text": text })],
-                "isError": true,
-            }))
+    await_mutate_result(&rx, &tool, budget::mutate_deadline(), &caller.group, &caller.agent_id)
+}
+
+/// Wait for one mutating tool's helper thread, and answer whichever of the
+/// three things happened.
+///
+/// Split out of [`dispatch_bounded`] so the DECISION has a surface a test can
+/// call (#1702). The thread and the `Arc` above it need a live registry;
+/// "which answer does a died helper get" needs neither, and welding it into the
+/// spawn seam is what left the `Disconnected` arm untested and wrong.
+///
+/// 1. `Ok` — the tool finished inside the deadline. Its own result, untouched.
+/// 2. `Timeout` — it is still running. [`still_executing_text`]: it WILL
+///    complete, do not re-issue.
+/// 3. `Disconnected` — the sender was dropped without a send, so the thread
+///    ended without producing a result: it panicked. [`worker_died_text`],
+///    **immediately** rather than after the remaining deadline. Waiting out a
+///    30 s deadline for an answer that has already failed to arrive is a
+///    guaranteed-wasted 30 s of an agent's turn, and the sentence at the end of
+///    it would be false in every clause.
+#[doc(hidden)]
+pub fn await_mutate_result(
+    rx: &std::sync::mpsc::Receiver<Result<Value, (i64, String)>>,
+    tool: &str,
+    deadline: std::time::Duration,
+    group: &GroupId,
+    agent_id: &str,
+) -> Result<Value, (i64, String)> {
+    let (text, event) = match rx.recv_timeout(deadline) {
+        Ok(out) => return out,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            (still_executing_text(tool), "mcp-mutate-slow")
         }
-    }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            (worker_died_text(tool), "mcp-mutate-died")
+        }
+    };
+    crate::obs::breadcrumb(event, &format!("group={group} agent={agent_id} tool={tool}"));
+    Ok(json!({
+        "content": [json!({ "type": "text", "text": text })],
+        "isError": true,
+    }))
 }
 
 /// Resolve a request's token under [`budget::MCP_AUTH_BUDGET`].
@@ -726,10 +798,12 @@ pub fn dispatch(
             // #1609. A READ tool runs under `MCP_READ_BUDGET` and may be
             // abandoned at a lock acquisition; the `Busy` becomes an
             // `isError` RESULT, which is the shape that reaches the model
-            // as something it can retry. A MUTATING tool runs to completion
+            // as something it can retry. A MUTATING tool is left to RUN
             // inside a `MutationScope`, so no enclosing budget can ever
             // unwind it halfway between two maps — its bound is the
-            // handler's WAIT instead (`dispatch_bounded`).
+            // handler's WAIT instead (`dispatch_bounded`). Not a completion
+            // guarantee: a panic on this thread still ends it early, and
+            // `worker_died_text` is what the caller is told (#1702).
             let out = match tool_kind(name) {
                 ToolKind::Read => {
                     match budget::read_budget(budget::MCP_READ_BUDGET, || {

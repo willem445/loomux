@@ -1112,8 +1112,8 @@ fn l2b_a_slow_mutating_tool_answers_and_still_completes_exactly_once() {
         assert!(n <= 1, "the tool ran {n} times — a deadline that abandons work double-executes");
         assert!(
             std::time::Instant::now() < deadline,
-            "the tool never completed after the hold ended; `it WILL complete` is then a false \
-             promise made to an agent"
+            "the tool never completed after the hold ended, so the caller was told to wait for \
+             something that never arrived"
         );
         std::thread::yield_now();
     }

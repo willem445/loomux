@@ -1396,12 +1396,33 @@ agent is told nothing was executed and it can simply try again. Two things are
 worth knowing if you see one:
 
 - **A busy answer never means a half-done change.** Only READS are answered
-  this way. Anything that changes something runs to completion — if one of
-  those takes a long time the agent is told it is *still executing* and
-  explicitly told NOT to re-issue it, because it will finish on its own.
+  this way. Anything that changes something is left to run — if one of those
+  takes a long time the agent is told it is *still executing* and explicitly
+  told NOT to re-issue it, because a slow change finishes on its own. The one
+  way a change does *not* finish is a bug inside orrerix, and that is never
+  reported as busy: it gets the `internal error` answer below, which says so
+  and tells the agent to check.
 - **The breadcrumb log names the culprit.** Each one is recorded once, with
   the holder and the duration, in `logs/breadcrumbs.log` under your orrerix
   data directory. If busy answers keep coming, that file is what to send.
+
+**When an agent reports `internal error: … ended without a result`.** This one
+is rare and it is not the same thing as a busy answer: it means the change the
+agent asked for hit a bug inside orrerix and stopped partway rather than
+finishing. The agent is told which read tool to check with — `list_tasks`,
+`list_agents` and so on — and it should look before trying again, because the
+change may have been partly applied. A crash log naming the fault is written
+into `logs/` under your orrerix data directory at the same moment; that file,
+with `logs/breadcrumbs.log`, is what to send. Nothing else stops: the rest of
+orrerix keeps answering, and the agent can carry on with the next thing.
+
+**When a panel says orrerix "refused that to avoid deadlocking itself".** The
+same class of internal bug, reached from a button rather than from an agent.
+The action you clicked did not run, it may have partly applied, and the rest of
+the app keeps working — so check whatever you were changing before clicking
+again. This one writes no crash log (nothing crashed; orrerix stopped itself on
+purpose), so `logs/breadcrumbs.log` is the file to send. It should never
+appear; if it does, that is worth reporting.
 
 From the lifecycle panel you can:
 
