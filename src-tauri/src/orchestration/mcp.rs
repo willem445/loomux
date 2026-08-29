@@ -228,6 +228,17 @@ pub enum ToolKind {
 /// a line here narrows this silently, which is why the guard asserts a floor
 /// on the population it returns.
 const GATING_HINTS: [Option<&str>; 3] = [None, Some("liaison"), Some("process")];
+/// The tool names ONE role sees. Beside [`all_listed_tool_names`] because a
+/// guard that needs to DRIVE a tool needs a role that actually lists it, not
+/// merely the knowledge that some role does.
+#[doc(hidden)]
+pub fn listed_tool_names_for(role: Role, hint: Option<&str>) -> Vec<String> {
+    tool_defs(role, hint, &[], true)
+        .into_iter()
+        .filter_map(|d| d.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
 #[doc(hidden)]
 pub fn all_listed_tool_names() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
