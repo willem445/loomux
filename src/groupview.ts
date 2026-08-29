@@ -10,18 +10,11 @@
 // overlay mechanics as the git / tasks / audit views (never resizes the PTY).
 
 import {
-  autonomyState,
   endGroup,
-  groupPaused,
-  groupSummary,
-  groupUsage,
-  groupWatches,
-  lockState,
-  notifyEnabled,
+  groupView,
   pauseGroup,
   resumeGroup,
   grantRelease,
-  mergeQueue,
   setAdvancedOrchestrator,
   setAutoMerge,
   setAutoRelease,
@@ -34,9 +27,7 @@ import {
   setMaxAgents,
   setNotify,
   setSpawnExpanded,
-  spawnExpanded,
   workflowPreview,
-  workflowStatus,
   type AutonomyState,
   type GroupSummary,
   type GroupUsage,
@@ -45,6 +36,12 @@ import {
   type MergeQueueStatus,
   type WorkflowStatus,
 } from "./orchestration";
+import {
+  needsViewTierRetry,
+  staleState,
+  VIEW_TIER_RETRY_MS,
+  type GroupViewMeta,
+} from "./viewstale";
 import { watchLine } from "./watchline";
 import { lockRows, lockSummary } from "./locklines";
 import {
@@ -83,6 +80,14 @@ const MAX_MAX_AGENTS = 12;
 /** How often the panel re-polls the backend while open (uptime ticks, cost
  *  and roster drift). Matches the audit viewer's follow cadence. */
 const POLL_MS = 2000;
+
+/** How many times a panel may re-ask for a view tier that has not been
+ *  published yet before falling back to its ordinary cadence. Two, because
+ *  the first covers the ordinary case (the lease stamp and the next publish
+ *  pass crossed) and the second covers one missed pass; past that the panel
+ *  is not waiting on a race, it is waiting on a backend that is not
+ *  publishing — which the stale badge is what discloses. */
+const MAX_VIEW_TIER_RETRIES = 2;
 
 /** Backend default idle-tick activity floor (bytes). Shown as the floor input's
  *  placeholder, and used to render the input blank when it's at the default
@@ -276,6 +281,13 @@ export class GroupView {
    *  per open group view (never module-scoped), so a stuck poll in this
    *  panel cannot silence another group's. */
   private loadGate = new RefreshGate();
+  /** The freshness meta from the last published read, or `null` before the
+   *  first one lands. Drives the header badge (#1608); never a timer of our
+   *  own — the backend decides `stale` and only a successful publish
+   *  clears it. */
+  private viewMeta: GroupViewMeta | null = null;
+  private viewTierRetryTimer: number | null = null;
+  private viewTierRetries = 0;
   private disposed = false;
   /** True once End is clicked once: the second click within the window
    *  actually tears the group down (two-step confirm for a destructive op). */
@@ -287,6 +299,7 @@ export class GroupView {
    *  clamp and keep every control on-screen. */
   private onResize?: () => void;
   private getRepo?: () => string | null;
+  private staleEl: HTMLElement;
   private embedBtn: HTMLButtonElement;
   private closeBtn: HTMLButtonElement;
 
@@ -311,6 +324,11 @@ export class GroupView {
     const head = el("div", "group-head");
     head.append(el("span", "group-title", "orchestration"));
     head.append(el("span", "group-group", groupId));
+    // Staleness badge (#1608, #1604 review N3). Hidden while the panel is
+    // current; a frozen panel that LOOKS live is worse than one that says so.
+    this.staleEl = el("span", "group-stale");
+    this.staleEl.hidden = true;
+    head.append(this.staleEl);
     const refresh = el("button", "pane-btn", "⟳") as HTMLButtonElement;
     refresh.title = "Refresh";
     refresh.addEventListener("click", () => void this.load());
@@ -724,6 +742,7 @@ export class GroupView {
    *  `dispose()` was the only thing that ever cleared, stacking concurrent
    *  polls against the backend. */
   hide(): void {
+    this.clearViewTierRetry();
     // Through the gate, so the visibility subscription and any recheck ticker
     // go with the timer — a panel closed behind a hidden window must leave
     // nothing running at all.
@@ -750,6 +769,7 @@ export class GroupView {
     clearTimeout(this.toastTimer);
     clearTimeout(this.endArmTimer);
     clearTimeout(this.releaseArmTimer);
+    this.clearViewTierRetry();
     this.hide();
     this.el.remove();
   }
@@ -761,47 +781,65 @@ export class GroupView {
     this.toastTimer = window.setTimeout(() => (this.toastEl.hidden = true), 5000);
   }
 
+  /** Refresh the whole panel from ONE backend read (#1608, plan #1600 §3
+   *  Phase 1). This used to be a ten-invoke `Promise.all` batch, each member
+   *  of which acquired registry mutexes on an unbounded `lock_safe` — so one
+   *  long hold anywhere parked ten blocking-pool threads per tick, forever
+   *  (#1600 §1.2). `orch_group_view` serves a published snapshot by pointer
+   *  clone and cannot park; a wedged registry now shows up as a stale badge
+   *  on a panel that still answers, which is what `viewstale.ts` renders.
+   *
+   *  #1602 + PR #1604 review N4: single-flight with a trailing re-run
+   *  (refreshgate.ts), not a bare skip — `load()` is called from the 2 s
+   *  poll tick AND from the refresh button and the post-action reloads
+   *  below, and those gestures must not be silently dropped just because a
+   *  tick happened to be in flight. The gate stays exactly as #1604 left it:
+   *  collapsing ten invokes into one does not remove the reason a second
+   *  caller can arrive mid-flight. `begin()`/`end()` bracket the ENTIRE
+   *  body, including `render()`, so a throw anywhere in here still releases
+   *  the gate (see timelineview.ts's `load()` for why `end()` must run
+   *  before anything that can throw, `render()` included, rather than
+   *  after). */
   private async load(): Promise<void> {
     if (this.disposed) return;
-    // #1602 + PR #1604 review N4: single-flight with a trailing re-run
-    // (refreshgate.ts), not a bare skip — `load()` is called from the 2 s
-    // poll tick AND from the refresh button and ~16 post-action reloads
-    // below, and those gestures must not be silently dropped just because a
-    // tick happened to be in flight. `begin()`/`end()` bracket the ENTIRE
-    // body, including `render()`, so a throw anywhere in here still releases
-    // the gate (see timelineview.ts's `load()` for why `end()` must run
-    // before anything that can throw, `render()` included, rather than
-    // after).
     if (!this.loadGate.begin()) return;
     let ok = true;
+    let retry = false;
     try {
-      [
-        this.summary,
-        this.usage,
-        this.paused,
-        this.notify,
-        this.spawnExpandedFlag,
-        this.autonomy,
-        this.watches,
-        this.workflow,
-        this.mergeQueueStatus,
-        this.locks,
-      ] = await Promise.all([
-        groupSummary(this.groupId),
-        groupUsage(this.groupId),
-        groupPaused(this.groupId),
-        notifyEnabled(this.groupId),
-        spawnExpanded(this.groupId),
-        autonomyState(this.groupId),
-        // #904: the backend answers `null` if it refuses the group id; the
-        // watch list is the one field here that is not nullable, and the row
-        // renderer calls `.filter` on it. Coalesce at the seam rather than
-        // pushing a guard into every reader.
-        groupWatches(this.groupId).then((w) => w ?? []),
-        workflowStatus(this.groupId),
-        mergeQueue(this.groupId),
-        lockState(this.groupId),
-      ]);
+      const view = await groupView(this.groupId);
+      if (view) {
+        this.viewMeta = view.meta;
+        this.summary = view.summary;
+        this.usage = view.usage;
+        if (view.meta.view_ready) {
+          // The eight view-tier sections arrive together or not at all, so
+          // this branch never half-updates the panel. The `??` fallbacks are
+          // unreachable while `view_ready` is true and are here because the
+          // wire type is nullable for the OTHER branch — not because a
+          // default would be an acceptable answer.
+          this.paused = view.paused ?? false;
+          this.notify = view.notify ?? false;
+          this.spawnExpandedFlag = view.spawn_expanded ?? false;
+          this.autonomy = view.autonomy;
+          // #904: the backend answers `null` if it refuses the group id; the
+          // watch list is the one field here that is not nullable, and the
+          // row renderer calls `.filter` on it. Coalesce at the seam rather
+          // than pushing a guard into every reader.
+          this.watches = view.watches ?? [];
+          this.workflow = view.workflow;
+          this.mergeQueueStatus = view.merge_queue;
+          this.locks = view.locks;
+          // Evidence, not a timer: a tier that actually arrived is what
+          // releases the retry budget below.
+          this.viewTierRetries = 0;
+        } else {
+          retry = needsViewTierRetry(view.meta);
+        }
+      }
+      // `view === null` — a refused group id, or a group created since the
+      // last publish pass. One case to us, because the response to both is
+      // the same: keep the previous render and let the next tick fill it in.
+      // That is the rule `tabbar.ts` has always applied per-command.
     } catch (err) {
       this.toast(String(err));
       ok = false;
@@ -809,6 +847,39 @@ export class GroupView {
       const rerun = this.loadGate.end();
       if (ok && !this.disposed) this.render();
       if (rerun && !this.disposed) void this.load();
+      else if (retry && ok && !this.disposed) this.scheduleViewTierRetry();
+    }
+  }
+
+  /** Re-ask once, shortly, when the publisher has not yet computed this
+   *  panel's view tier — the first read after an open, and after a lease
+   *  lapsed while the panel was closed.
+   *
+   *  A BOUNDED ladder, not a retry loop, and bounded in both directions: at
+   *  most one timer outstanding, at most `MAX_VIEW_TIER_RETRIES` of them
+   *  before the panel falls back to its ordinary 2 s cadence, and the budget
+   *  is released by EVIDENCE — a tier that actually arrived — never by
+   *  elapsed time. Without a bound, a backend that never publishes would turn
+   *  a 0.5 Hz poll into a 4 Hz one exactly when it is already in trouble,
+   *  which is the shape `.orrerix/lessons.md` calls out. */
+  private scheduleViewTierRetry(): void {
+    if (this.viewTierRetryTimer !== null) return;
+    if (this.viewTierRetries >= MAX_VIEW_TIER_RETRIES) return;
+    this.viewTierRetries++;
+    this.viewTierRetryTimer = window.setTimeout(() => {
+      this.viewTierRetryTimer = null;
+      if (!this.disposed) void this.load();
+    }, VIEW_TIER_RETRY_MS);
+  }
+
+  /** Cancel an outstanding view-tier re-ask. Called from `hide()` and
+   *  `dispose()`, so a closed panel leaves nothing armed (INV-4/INV-8b: the
+   *  release is keyed on the owner, not on remembering the timer id
+   *  elsewhere). */
+  private clearViewTierRetry(): void {
+    if (this.viewTierRetryTimer !== null) {
+      clearTimeout(this.viewTierRetryTimer);
+      this.viewTierRetryTimer = null;
     }
   }
 
@@ -1188,6 +1259,13 @@ export class GroupView {
 
   private render(): void {
     if (this.disposed) return;
+    // Before the unreadable-group early return below: a panel showing stale
+    // data and a panel that could not be read are different conditions, and
+    // the badge is how the first one says which it is.
+    const stale = staleState(this.viewMeta);
+    this.staleEl.hidden = !stale.stale;
+    this.staleEl.textContent = stale.label;
+    this.staleEl.title = stale.detail;
     // #904 (rev-450 N11): a refused group id resolves every field to `null`,
     // and `load()` has already passed its toast by the time we get here. Return
     // silently and the panel freezes blank on a 2 s poll with nothing said —
