@@ -386,10 +386,13 @@ reads as covering is worse than none:
   the task-board overlay above — not a change to this lane.
 - **Blocking-pool exhaustion is a long-local-run property, not a CI one.**
   Plan #1600 §1.2 step 4 puts saturation of tokio's 512-thread blocking pool
-  minutes into a hold. The CI default (a 30 s hold) reaches roughly a hundred
-  parked threads, so what CI catches is the FIRST symptom in the chain —
-  "MCP dies first" — not the last one. Raising `ORRERIX_SOAK_LOCK_HOLD_MS`
-  past ~120 s locally is what reaches the pane-input half.
+  minutes into a hold. Four group-bound tabs at two invokes every 4 s is
+  ~2 parked threads per second, so the CI default (a 90 s hold) reaches
+  roughly 180 of the 512 — enough for the FIRST symptom in the chain,
+  "MCP dies first", and not the last. Raising
+  `ORRERIX_SOAK_LOCK_HOLD_MS` past ~250 s locally, or
+  `ORRERIX_SOAK_GROUPS` to widen the fan-out, is what reaches the
+  pane-input half.
 
 ### The corpus, and the store it is deliberately not written into
 
@@ -423,13 +426,35 @@ them. Rather than add a debug hook to product code to expose the buffer, the
 spec listens to the same `pty-output` event the app's own router consumes,
 through the low-level bridge the bundled `listen()` uses underneath — the
 emit-direction twin of the #814 technique above, and covered by the shipped
-ACL (`core:default` covers `core:event`). It types `echo
-soak<n>_%RANDOM%_end` and matches `/soak<n>_\d+_end/`. That asymmetry is the
-point: the text typed in contains the literal `%RANDOM%`, so a match on the
-digit form can only have been produced by `cmd.exe` expanding it — a pane
-that rendered the keystrokes locally but never reached, or never heard back
-from, its child cannot produce one. (`cmd`, not the launcher's default
-PowerShell: PSReadLine redraws the input line as you type.)
+ACL (`core:default` covers `core:event`). That payload is **base64 of the raw
+pty bytes**, not text (`src/pty.ts`'s router `atob`s it before handing it to a
+pane); a tap that skips the decode matches nothing and reports it as "no
+output", which is precisely how a working round trip reads as a dead one.
+
+It types `echo <marker>%RANDOM%` and matches `/<marker>\d+/`. That asymmetry
+is the point: the typed text's `%RANDOM%` is followed by `%`, not a digit, so
+the echo of the typed line cannot match — only `cmd.exe` expanding it can. A
+pane that rendered the keystrokes locally but never reached, or never heard
+back from, its child cannot produce a match. (`cmd`, not the launcher's
+default PowerShell: PSReadLine redraws the input line as you type.)
+
+The probe runs in **two separately-bounded phases**, because they are two
+properties that fail for different reasons and cost wildly different amounts
+of time. `src/ptywrite.ts` keeps one `write_pty` in flight per pane and chains
+the next on the previous promise (#65), so every typed character is a full IPC
+round trip — measured at ~420 ms each on a debug build on a CI runner already
+booted against the soak corpus (first run on this branch: 19 of 23 characters
+echoed in 8 s). The *input* phase ends when the typed marker echoes back and
+is the one the beta6 report is about; the *answer* phase is one write and one
+read after Enter, and is fast whenever it works at all. Collapsing them into
+one clock produced a probe that timed out mid-typing and called it "no
+output" — a slow input path indistinguishable from a dead child. The marker is
+kept short for the same reason.
+
+`ORRERIX_SOAK_BOUND_MS` bounds each phase, and 20 s is deliberately generous:
+the failure this lane is about is a probe that NEVER answers, not a slow one.
+A latency budget here would be a flake generator wearing an invariant's
+clothes.
 
 **The MCP answers.** Over real HTTP, from the Playwright process, not
 through the webview — the webview is the half that stays alive in the beta6
@@ -547,12 +572,14 @@ about the spec changes.
 
 ### Budget
 
-`ci.yml` sets `ORRERIX_SOAK_MS=180000` and
-`ORRERIX_SOAK_LOCK_HOLD_MS=30000` explicitly, so the cost lives where the
-job does. 180 s is ~45 ticks of the 4 s status poll per group-bound tab.
-Two launches plus warm-ups and probe budgets put the lane at roughly six
-minutes of the `e2e-windows` job, and up to ~10 if the soak spec takes its
-one retry. Every knob is an environment variable (`ORRERIX_SOAK_MS`,
+`ci.yml` sets `ORRERIX_SOAK_MS=180000`, `ORRERIX_SOAK_LOCK_HOLD_MS=90000`
+and `ORRERIX_SOAK_BOUND_MS=20000` explicitly, so the cost lives where the
+job does. 180 s is ~45 ticks of the 4 s status poll per group-bound tab, and
+the hold has to outlast both probes, which need ~70 s worst case at those
+bounds. Three launches (the soak, the armed-injector control and the class
+assertion) plus warm-ups put the lane at roughly eight minutes of the
+`e2e-windows` job, and up to ~14 if the soak spec takes its one retry. Every
+knob is an environment variable (`ORRERIX_SOAK_MS`,
 `ORRERIX_SOAK_LOCK_HOLD_MS`, `ORRERIX_SOAK_BOUND_MS`, `ORRERIX_SOAK_GROUPS`,
 `ORRERIX_SOAK_SESSIONS`, `ORRERIX_SOAK_AUDIT_LINES`), so a long local soak
 is a matter of setting one, not editing the spec.

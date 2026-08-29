@@ -57,14 +57,27 @@ function envInt(suffix: string, fallback: number): number {
  *  the plan asks for, at a cost this job can afford on every PR. */
 export const SOAK_MS = envInt("SOAK_MS", 180_000);
 
-/** How long the injected registry-lock hold lasts. Default 30 s: long enough
- *  to span the two liveness probes several times over. Raising this past
- *  ~120 s is what a local run does to reach blocking-pool exhaustion, which is
- *  the second half of the beta6 mechanism (plan #1600 §1.2 step 4). */
-export const LOCK_HOLD_MS = envInt("SOAK_LOCK_HOLD_MS", 30_000);
+/** How long the injected registry-lock hold lasts. It has to comfortably
+ *  outlast both probes: a hold that expires mid-probe leaves the rest of the
+ *  measurement taken against an idle app. At the defaults the probes need
+ *  ~70 s worst case, so 90 s. Raising this past ~120 s is what a local run
+ *  does to reach blocking-pool exhaustion, the second half of the beta6
+ *  mechanism (plan #1600 §1.2 step 4). */
+export const LOCK_HOLD_MS = envInt("SOAK_LOCK_HOLD_MS", 90_000);
 
-/** The bound every liveness probe must answer within. */
-export const LIVENESS_BOUND_MS = envInt("SOAK_BOUND_MS", 8_000);
+/** The bound each PHASE of a liveness probe must answer within.
+ *
+ *  20 s, which is generous on purpose and measured rather than guessed. The
+ *  input phase types the command with real key events, and `src/ptywrite.ts`
+ *  keeps exactly one `write_pty` in flight per pane (#65) — so a typed
+ *  character is one full IPC round trip, and on a DEBUG build on a CI VM
+ *  already booted against the soak corpus that measured ~420 ms per
+ *  character (first CI run on this branch: 19 of 23 characters echoed in
+ *  8 s). The failure this lane is about is a probe that never answers, not a
+ *  slow one, so the bound is set to clear a slow machine by a wide margin
+ *  rather than to police latency — a latency budget here would be a flake
+ *  generator wearing an invariant's clothes. */
+export const LIVENESS_BOUND_MS = envInt("SOAK_BOUND_MS", 20_000);
 
 /** Corpus size. Defaults chosen so the fixture build stays under a couple of
  *  seconds while still being the "large corpus" shape #1592 was reported
@@ -241,12 +254,22 @@ export async function installPtyTap(page: Page): Promise<void> {
     w.__soakPtyText = "";
     const handler = internals.transformCallback((raw: unknown) => {
       const payload = (raw as { payload?: { data?: unknown } } | null)?.payload;
-      if (payload && typeof payload.data === "string") {
-        // Bounded: a soak can run for an hour locally, and an unbounded string
-        // in the page would be this harness's own INV-8 violation.
-        const next = (w.__soakPtyText ?? "") + payload.data;
-        w.__soakPtyText = next.length > 65_536 ? next.slice(next.length - 65_536) : next;
+      if (!payload || typeof payload.data !== "string") return;
+      // The payload is BASE64 of the raw pty bytes, not text — `src/pty.ts`'s
+      // own router `atob`s it before handing it to a pane. A tap that skipped
+      // this matches nothing and reports it as "no output", which is exactly
+      // how a working pty round trip reads as a dead one (measured: the first
+      // CI run's failure dump was legible base64).
+      let text: string;
+      try {
+        text = atob(payload.data);
+      } catch {
+        return;
       }
+      // Bounded: a soak can run for an hour locally, and an unbounded string
+      // in the page would be this harness's own INV-8 violation.
+      const next = (w.__soakPtyText ?? "") + text;
+      w.__soakPtyText = next.length > 65_536 ? next.slice(next.length - 65_536) : next;
     });
     await internals.invoke("plugin:event|listen", {
       event: "pty-output",
@@ -280,21 +303,48 @@ export interface ProbeResult {
   detail: string;
 }
 
+/** Waits for `pred` to hold over the ANSI-stripped pty tap, bounded. */
+async function waitForTap(
+  page: Page,
+  pred: (text: string) => boolean,
+  boundMs: number
+): Promise<{ ok: boolean; ms: number; text: string }> {
+  const started = Date.now();
+  for (;;) {
+    const text = stripAnsi(await ptyTapText(page));
+    if (pred(text)) return { ok: true, ms: Date.now() - started, text };
+    if (Date.now() - started >= boundMs) return { ok: false, ms: Date.now() - started, text };
+    await sleep(150);
+  }
+}
+
 /**
  * Types a command into the focused pane and waits for the CHILD's own output
- * to come back — bounded by `boundMs`, never by the test timeout.
+ * to come back. Two separately-bounded phases, never the test timeout.
  *
- * The command is `echo soak<n>_%RANDOM%_end` and the match is
- * `/soak<n>_\d+_end/`. That asymmetry is deliberate and is what makes this a
- * round trip rather than a terminal echo: the text typed in contains the
- * literal `%RANDOM%`, so a match on the digit form can only have been produced
- * by `cmd.exe` expanding it. A pane that rendered the keystrokes locally but
- * never reached — or never heard back from — its child cannot produce it.
+ * **Why two phases.** They are two different properties, they fail for
+ * different reasons, and they cost wildly different amounts of time:
  *
- * This is the assertion the beta6 report is about: `src/ptywrite.ts` keeps one
- * `write_pty` in flight per pane and chains the next on the previous promise
- * (#65), so a `write_pty` that never resolves stops that pane accepting input
- * forever, with the window still painting.
+ * - *Input.* The command is typed with real key events, and `src/ptywrite.ts`
+ *   keeps exactly one `write_pty` in flight per pane, chaining the next on the
+ *   previous promise (#65) — so every character is a full IPC round trip, and
+ *   this phase is the one the beta6 report is actually about: a `write_pty`
+ *   that never resolves stops that pane accepting input forever, with the
+ *   window still painting. It ends when the typed stem echoes back.
+ * - *Answer.* Enter is pressed and the CHILD's own output has to arrive. This
+ *   is one write and one read, so it is fast whenever it works at all.
+ *
+ * Collapsing them into one clock is what the first CI run on this branch did,
+ * and the result was a probe that timed out mid-typing and reported it as "no
+ * output" — a slow input path indistinguishable from a dead child.
+ *
+ * **Why the marker is shaped the way it is.** The command is
+ * `echo <marker>%RANDOM%` and the match is `/<marker>\d+/`. The text typed in
+ * contains the literal `%RANDOM%`, whose next character is `%` and not a
+ * digit, so the echo of the typed line cannot match — only `cmd.exe` expanding
+ * it can. A pane that rendered the keystrokes locally but never reached, or
+ * never heard back from, its child cannot produce a match. The marker is kept
+ * SHORT for the reason above: every character costs a round trip.
  */
 export async function ptyRoundTrip(
   page: Page,
@@ -302,26 +352,43 @@ export async function ptyRoundTrip(
   nonce: number,
   boundMs: number
 ): Promise<ProbeResult> {
-  const marker = `soak${nonce}`;
-  const expected = new RegExp(`${marker}_\\d+_end`);
+  const marker = `zq${nonce}`;
+  const expanded = new RegExp(`${marker}\\d+`);
   const started = Date.now();
 
   await paneTerm.click();
-  await page.keyboard.type(`echo ${marker}_%RANDOM%_end`);
-  await page.keyboard.press("Enter");
+  await page.keyboard.type(`echo ${marker}%RANDOM%`);
 
-  while (Date.now() - started < boundMs) {
-    const text = stripAnsi(await ptyTapText(page));
-    if (expected.test(text)) {
-      return { ok: true, ms: Date.now() - started, detail: `matched ${expected}` };
-    }
-    await sleep(150);
+  const input = await waitForTap(page, (t) => t.includes(marker), boundMs);
+  if (!input.ok) {
+    return {
+      ok: false,
+      ms: Date.now() - started,
+      detail:
+        `INPUT phase: the typed marker "${marker}" never echoed back within ${boundMs}ms, ` +
+        `so the keystrokes did not reach the pane — this is the beta6 symptom itself ` +
+        `(write_pty stops resolving and src/ptywrite.ts's per-pane chain stops ` +
+        `dispatching). Last 400 chars: ${JSON.stringify(input.text.slice(-400))}`,
+    };
   }
-  const tail = stripAnsi(await ptyTapText(page)).slice(-400);
+
+  await page.keyboard.press("Enter");
+  const answer = await waitForTap(page, (t) => expanded.test(t), boundMs);
+  if (!answer.ok) {
+    return {
+      ok: false,
+      ms: Date.now() - started,
+      detail:
+        `ANSWER phase: the keystrokes DID reach the pane (input echoed in ${input.ms}ms), ` +
+        `but no output matching ${expanded} came back within ${boundMs}ms — the child ` +
+        `never answered. Last 400 chars: ${JSON.stringify(answer.text.slice(-400))}`,
+    };
+  }
+
   return {
-    ok: false,
+    ok: true,
     ms: Date.now() - started,
-    detail: `no output matching ${expected} within ${boundMs}ms; last 400 chars of the pty tap: ${JSON.stringify(tail)}`,
+    detail: `input echoed in ${input.ms}ms, child answered ${expanded} in ${answer.ms}ms`,
   };
 }
 

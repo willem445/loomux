@@ -202,13 +202,16 @@ jobs:
           # this job is visible where the job is, and tunable without a
           # code change. 180 s is ~45 ticks of src/tabbar.ts's 4 s status
           # poll per group-bound tab — many dozens of poll invokes, which
-          # is the scale plan #1600 asks for. Two launches (the soak and
-          # the lock-hold class assertion) plus warm-ups and probe budgets
-          # put the lane at roughly 6 minutes of the job, and up to ~10 if
-          # the soak spec takes its one retry. Raising this is what a long
-          # local soak does; see doc/design/e2e-testing.md "The soak lane".
+          # is the scale plan #1600 asks for. The hold has to outlast both
+          # probes, which need ~70 s worst case at these bounds. Three
+          # launches (the soak, the armed-injector control and the
+          # lock-hold class assertion) put the lane at roughly 8 minutes of
+          # the job, and up to ~14 if the soak spec takes its one retry.
+          # Raising these is what a long local soak does; see
+          # doc/design/e2e-testing.md "The soak lane".
           ORRERIX_SOAK_MS: "180000"
-          ORRERIX_SOAK_LOCK_HOLD_MS: "30000"
+          ORRERIX_SOAK_LOCK_HOLD_MS: "90000"
+          ORRERIX_SOAK_BOUND_MS: "20000"
           # Workspace-root target/ since #888 slice A1 — cargo puts every
           # member's build output in the ROOT target dir, so the exe is no
           # longer under src-tauri/. Must stay in step with e2e/fixtures.ts's

@@ -293,18 +293,20 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const paneTerm = paneByName(page, "hold-pane").locator(".pane-term");
     await expect(paneTerm).toBeVisible();
 
-    // Let the poll paths get going, and record how both probes behave BEFORE
-    // the hold. Diagnostics, not a control — the marker on this test absorbs
-    // them (see the file header); spec 1 is where a broken probe reddens.
+    // Let the poll paths get going, then record ONE cheap before-reading.
+    // Diagnostics, not a control — the marker on this test absorbs them (see
+    // the file header); spec 1 is where a broken probe reddens. The pty probe
+    // is deliberately NOT run here: it costs a full input-phase budget, and
+    // buying an absorbed diagnostic with a minute of every CI run is a bad
+    // trade when spec 1 already runs it twice.
     await sleep(WARMUP_MS);
-    const warmPty = await ptyRoundTrip(page, paneTerm, 3, LIVENESS_BOUND_MS);
-    expect(warmPty.ok, `pty round trip BEFORE the hold: ${warmPty.detail}`).toBe(true);
     const warmMcp = await mcpCall(
       await mintMcpEndpoint(page, appDataDir, REPO_ROOT),
       "ping",
       {},
       LIVENESS_BOUND_MS
     );
+    console.log(`[soak] before the hold: mcp ok=${isJsonRpcResult(warmMcp)} in ${warmMcp.ms}ms`);
     expect(isJsonRpcResult(warmMcp), `MCP ping BEFORE the hold: ${warmMcp.detail}`).toBe(true);
 
     // ---- inject the hold ----
