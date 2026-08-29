@@ -483,7 +483,8 @@ pub struct HolderInfo {
 /// duplicated all four fields to distinguish them, and rewritten every consumer
 /// (`mcp.rs`'s `rpc_busy` / `busy_tool_text`, `views.rs`'s fallbacks,
 /// `budget.rs`'s unwind payload) to match on a shape whose halves are the same.
-/// The deviation is recorded in `doc/design/lock-liveness.md` §6.
+/// The deviation is recorded in `doc/design/lock-liveness.md` §3, and the rank
+/// mechanism it belongs to in `doc/design/lock-order.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusyKind {
     /// The budget ran out while someone ELSE held the lock. Phase 2.1's
