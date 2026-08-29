@@ -307,7 +307,16 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
   // can show is that the injector was compiled in and armed — a release build,
   // or a missing opt-in, would leave the class assertion failing for a reason
   // that has nothing to do with the bug class, and reporting as a pass.
-  test("the lock-hold injector is armed in the build under test", async ({
+  //
+  // It also carries the OTHER claim this lane makes about the merged tree, and
+  // carries it here rather than in the class assertion because an expected
+  // failure absorbs its own assertions: that #1604's single-flight really does
+  // engage when a registry lock is held, so the poll path parks one call and
+  // not a queue of them. The 180 s soak measured 46 sweeps and ZERO skips —
+  // healthy, and therefore no evidence at all about the skip path. A held lock
+  // is the condition the gate was built for, so it is the condition to observe
+  // it under.
+  test("the injector is armed, and a held registry lock makes the poll sweep single-flight", async ({
     appPage: page,
     appDataDir,
   }) => {
@@ -317,14 +326,34 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     // injector that was never started, failing for a reason with nothing to do
     // with whether the injector is armed.
     await expect(page.locator("#tab-bar")).toBeAttached();
-    requestLockHold(appDataDir, "agents", 300);
+
+    // `groups` rather than `agents`: it is what the polled `orch_group_summary`
+    // takes, so holding it is what stalls a sweep. Long enough to span several
+    // 4 s ticks, short enough to stay cheap.
+    const holdMs = 12_000;
+    const before = await singleFlightStats(page);
+    requestLockHold(appDataDir, "groups", holdMs);
     const held = await waitForHoldAcquired(appDataDir);
-    expect(held.target, "the injector honoured a different target than requested").toBe("agents");
-    // And it lets go: a leaked guard would wedge every later assertion in this
-    // file behind it.
-    const releasedBy = Date.now() + 15_000;
-    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) await sleep(100);
-    expect(holdStillHeld(appDataDir), "the injector never released a 300ms hold").toBe(false);
+    expect(held.target, "the injector honoured a different target than requested").toBe("groups");
+
+    // Wait out the hold, then read what the gate did during it.
+    const releasedBy = Date.now() + holdMs + 20_000;
+    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) await sleep(200);
+    expect(holdStillHeld(appDataDir), `the injector never released a ${holdMs}ms hold`).toBe(false);
+
+    const after = await singleFlightStats(page);
+    const ran = after.ran - before.ran;
+    const skipped = after.skipped - before.skipped;
+    console.log(`[soak] during a ${holdMs}ms hold on groups: ${ran} sweeps ran, ${skipped} ticks skipped`);
+
+    expect(
+      skipped,
+      `no tick was skipped while the \`groups\` mutex was held for ${holdMs}ms (${ran} sweeps ` +
+        `ran). Either the status sweep does not contend on that mutex — in which case this ` +
+        `lane's claim that #1604 bounds the poll path under a held lock is unevidenced — or ` +
+        `the sweep is settling despite the hold, which would mean the hold is not reaching ` +
+        `the read the sweep makes.`
+    ).toBeGreaterThanOrEqual(1);
   });
 
   // Expected to fail on today's main. See this file's header for why the
