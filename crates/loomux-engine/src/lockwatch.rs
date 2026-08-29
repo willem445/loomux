@@ -2600,7 +2600,6 @@ mod rank_tests {
         let _serial = SERIAL.lock_safe();
         let _restore = PanicSwitch(set_lock_order_panics(false));
         let lock = TrackedMutex::new_ranked("reentsealspec", OUTER, 5u32);
-        let (_, torn_before) = budget::thread_seal_counts();
         // The process-global counter is the FIELD-REPORT number, and it is
         // checked as a floor rather than a delta because `cargo test` runs this
         // binary's tests concurrently. It is asserted here because after #1702
@@ -2609,27 +2608,50 @@ mod rank_tests {
         // anything in the process legitimately tears — which is this test).
         let global_torn_before = budget::torn_writes();
 
-        let out: Result<(), Busy> = budget::read_budget(Duration::from_secs(30), || {
-            // Discriminating half: inside a sealed frame an ordinary
-            // acquisition still succeeds and is NOT unwound. Without it this
-            // test would pass against a build that unwound every acquisition
-            // made after a durable write.
-            let held = lock.lock_safe();
-            assert_eq!(*held, 5, "a sealed frame must still be able to take a free lock");
-            budget::note_durable_write("reentsealspec-test");
-            assert!(budget::sealed_for_test(), "the frame must be sealed before the re-entry");
-            let _boom = lock.lock_safe();
-            unreachable!("the re-entrant acquisition must not be granted");
+        // **On its own thread, with a bounded wait**, for the reason the two
+        // rows above are: the FAILING form of this test is a permanent park —
+        // remove the refusal and the second `lock_safe` is the self-deadlock it
+        // is about, which in-thread hangs the whole test BINARY and arrives as
+        // a job timeout naming nothing. `recv_timeout` turns that into an
+        // assertion, which is what makes it usable as red-before-green
+        // evidence at all.
+        //
+        // The frame, the seal and the tear counter are all THREAD-scoped, so
+        // every one of them is read over there and the findings come back as
+        // plain scalars. A `thread_seal_counts()` read on THIS thread would say
+        // nothing about that one, which is why the delta is computed inside the
+        // spawn rather than around it.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (_, torn_before) = budget::thread_seal_counts();
+            let out: Result<(), Busy> = budget::read_budget(Duration::from_secs(30), || {
+                // Discriminating half: inside a sealed frame an ordinary
+                // acquisition still succeeds and is NOT unwound. Without it
+                // this test would pass against a build that unwound every
+                // acquisition made after a durable write.
+                let held = lock.lock_safe();
+                assert_eq!(*held, 5, "a sealed frame must still be able to take a free lock");
+                budget::note_durable_write("reentsealspec-test");
+                assert!(budget::sealed_for_test(), "the frame must be sealed before the re-entry");
+                let _boom = lock.lock_safe();
+                unreachable!("the re-entrant acquisition must not be granted");
+            });
+            let (_, torn_after) = budget::thread_seal_counts();
+            let found = out.err().map(|b| (b.is_reentrant(), b.lock, format!("{b:?}")));
+            let _ = tx.send((found, torn_after.wrapping_sub(torn_before), held_lock_depth()));
         });
 
-        let busy = out.expect_err("the frame must be left with a Busy, not completed");
-        assert!(busy.is_reentrant(), "the refusal must be typed as re-entrant: {busy:?}");
-        assert_eq!(busy.lock, "reentsealspec");
-        assert_eq!(held_lock_depth(), 0, "the unwind left a phantom hold on the stack");
-        let (_, torn_after) = budget::thread_seal_counts();
+        let (found, torn_delta, depth) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the re-entrant acquisition PARKED inside a SEALED frame — the seal made it wait for \
+             something that never ends, which is the narrowing #1702 adds",
+        );
+        let (is_reentrant, lock_name, rendered) =
+            found.expect("the frame must be left with a Busy, not completed");
+        assert!(is_reentrant, "the refusal must be typed as re-entrant: {rendered}");
+        assert_eq!(lock_name, "reentsealspec");
+        assert_eq!(depth, 0, "the unwind left a phantom hold on that thread's stack");
         assert_eq!(
-            torn_after,
-            torn_before + 1,
+            torn_delta, 1,
             "a tear through the seal must be COUNTED — that is what makes it better than a wedge"
         );
         assert!(
