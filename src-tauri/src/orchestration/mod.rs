@@ -38842,8 +38842,9 @@ impl OrchRegistry {
         // applies, so no agent pane is masked twice.
         let prompt_shaped: HashMap<u32, bool> = outputs
             .keys()
+            .copied()
             .filter(|pty| !agent_ptys.contains(pty))
-            .filter_map(|pty| tails.get(pty).map(|t| (*pty, t)))
+            .filter_map(|pty| tails.get(&pty).map(|t| (pty, t)))
             .map(|(pty, t)| {
                 // #576 residual: the record is keyed by pty id, which is
                 // exactly what this path has.
