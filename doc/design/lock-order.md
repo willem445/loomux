@@ -144,9 +144,9 @@ That is fatal to the third row's whole argument, which is that the unwind
 commands do not get a stated degrade — they get a **frame**, and the frame is
 the barrier: `read_budget`'s own `catch_unwind` catches the typed unwind
 `budget::unwind_to_frame` throws, so the refusal is contained at the command
-boundary and becomes that command's degraded value. `OrchRegistry::
-mutating_command` is that wrapper for the mutating ones, and it adds a
-`MutationScope` so a budget TIMEOUT still waits, unbounded, exactly as R1
+boundary and becomes that command's degraded value.
+`OrchRegistry::mutating_command` is that wrapper for the mutating ones, and it
+adds a `MutationScope` so a budget TIMEOUT still waits, unbounded, exactly as R1
 requires — only the re-entrant refusal unwinds, because it is the one wait that
 never ends.
 
