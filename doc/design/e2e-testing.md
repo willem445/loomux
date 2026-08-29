@@ -393,9 +393,14 @@ reads as covering is worse than none:
   path, which is where the class assertion's remaining failure lives. What it
   no longer exercises from the poll sites is registry contention, because
   there is none to exercise; the lock-hold injector is what supplies that
-  now. The per-tick
-  gap needs a safe stand-in agent process — the same standing limitation as
-  the task-board overlay above — not a change to this lane.
+  now.
+
+  What is still NOT exercised is the per-tick fan-out of a real orchestrating
+  session: this lane drives the tab-strip half, and a session with agents
+  running issues more per tick than a strip does. (The spec header states the
+  same limitation at its own site.) Closing that needs a safe stand-in agent
+  process — the same standing limitation as the task-board overlay above —
+  not a change to this lane.
 - **Blocking-pool exhaustion is not reachable from the poll path at all, and
   no hold duration or corpus size changes that.** Plan #1600 §1.2 step 4
   describes ticks accumulating parked `spawn_blocking` threads until the
@@ -403,7 +408,7 @@ reads as covering is worse than none:
   scheduled and every pane stops accepting input at once. **Both ends of that
   chain are now cut, independently.** #1604 single-flights this sweep, so a
   tick firing while the previous one is still outstanding skips and at most
-  one call is parked however long a lock is held; and #1612 (Phase 2.3) moved
+  one call is parked however long a lock is held; and #1607 (Phase 2.3) moved
   `write_pty` off the shared pool onto a per-pane writer thread, so even an
   exhausted pool could not starve pane input. Two fixes working as designed,
   and together they mean this lane cannot demonstrate the pane-input half of
@@ -419,8 +424,10 @@ reads as covering is worse than none:
 
   That bound was **observed, not reasoned** — and the observation is now
   history rather than a current fact, which is why it is dated rather than
-  deleted. The armed-injector control holds `groups` — what the polled
-  `orch_group_summary` took — for 12 s and read the gate's own counters:
+  deleted. The armed-injector control holds `groups` — which is what
+  `resolve_token` takes on EVERY MCP request, and what the polled
+  `orch_group_summary` took before #1608 — for 12 s and read the gate's own
+  counters:
   `1 sweeps ran, 2 ticks skipped` (measured at `f6f41833`, run 33235203093,
   **before #1608**). Since #1608 the sweep takes no registry lock, so the same
   control measures `3 sweeps ran, 0 ticks skipped` and the spec asserts
@@ -760,7 +767,7 @@ next person does not have to rediscover them:
   (64/128/256), so a healthy run emits nothing — which is why it is a
   follow-up rather than an assertion here.
 
-  This entry said "…which `write_pty` now goes through" until #1612. That was
+  This entry said "…which `write_pty` now goes through" until #1607. That was
   true of Phase 0's tree and is false of this one: Phase 2.3 moved the write
   path off the shared pool entirely, onto a per-pane writer thread, so the
   depth counter no longer observes the app's most latency-critical path at

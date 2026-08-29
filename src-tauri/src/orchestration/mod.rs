@@ -39177,10 +39177,18 @@ impl OrchRegistry {
     /// booted both surface as "not from the store", so the one condition that
     /// needs a human looks exactly like the one that needs nobody.
     ///
-    /// Why a latch and not just an audit call: this runs on `group_usage`,
-    /// which the group view polls every couple of seconds, so an unlatched line
-    /// would be an audit entry every tick for as long as the condition lasted —
-    /// the log flooded worst precisely when something is wrong with it. Keyed
+    /// Why a latch and not just an audit call: this runs on every usage
+    /// computation, and since #1608 the busiest caller is the snapshot
+    /// publisher — `views::compute_group` recomputes the strip tier once per
+    /// `views::VIEW_PUBLISH_INTERVAL` for every live and strip-leased group. So
+    /// an unlatched line would be an audit entry per group per second for as
+    /// long as the condition lasted — the log flooded worst precisely when
+    /// something is wrong with it. (Before #1608 this said "the group view
+    /// polls `group_usage` every couple of seconds". That reading is now false
+    /// twice over: the polled path reaches `group_usage_live_within`, never
+    /// `group_usage`, whose only production caller is the MCP `group_usage`
+    /// tool — and the real cadence is faster, not slower, so the latch matters
+    /// MORE than the old sentence claimed.) Keyed
     /// by KIND rather than message so a varying error string cannot defeat the
     /// latch, and dropped on the first successful read so a recurrence after a
     /// real recovery is diagnosed again instead of being silenced for the
