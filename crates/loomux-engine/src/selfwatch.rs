@@ -284,8 +284,8 @@ pub fn liveness(hb: &Heartbeat, now_ms: u64, stale_ms: u64) -> Liveness {
     let gui_fresh = now_ms.saturating_sub(hb.webview_ms) <= stale_ms;
     match (backend_fresh, gui_fresh, hb.webview_hidden) {
         (true, true, _) => Liveness::Ok,
-        (true, false, false) => Liveness::GuiStuck,
-        (true, false, true) => Liveness::GuiHidden,
+        // NEUTERED (scratch, #1601): a minimized window reads as a hang.
+        (true, false, _) => Liveness::GuiStuck,
         (false, true, _) => Liveness::BackendStuck,
         // A stale stamp from a hidden window is no evidence about the GUI, but
         // the backend half is measured here and stands on its own — so the
