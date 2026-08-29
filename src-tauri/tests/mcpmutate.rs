@@ -108,6 +108,16 @@ fn a_died_tool_with_no_read_tool_says_verify_without_naming_one() {
     let out = mcp::await_mutate_result(&rx, tool, Duration::from_secs(30), &group(), "w-1")
         .expect("a died helper is answered as a tool result");
     let (text, _) = answer(&out);
+    // **This must be the DIED answer's fallback, not any answer's.** Both
+    // messages route through the same `verify_with` miss, so the two clauses
+    // below are shared between them and hold under an implementation that
+    // never distinguishes a died helper at all — measured, not feared: scratch
+    // round 2 collapsed both `recv_timeout` arms back to `still_executing_text`
+    // and this test stayed GREEN while its sibling reddened. Two candidate
+    // outputs have to DIVERGE for a fixture to witness anything, so the
+    // identity of the answer is pinned first and the fallback second.
+    assert!(text.contains("internal error"), "this must be the died answer: {text}");
+    assert!(!text.contains("still executing"), "a died tool is not still executing: {text}");
     assert!(text.contains("verify before re-issuing"), "{text}");
     assert!(!text.contains("verify with"), "no read tool may be named here: {text}");
 }
@@ -123,6 +133,11 @@ fn the_died_answer_is_one_paragraph() {
     let out = mcp::await_mutate_result(&rx, "upsert_task", Duration::from_secs(30), &group(), "w-1")
         .expect("a died helper is answered as a tool result");
     let (text, _) = answer(&out);
+    // Pinned as the DIED answer's shape, for the reason the test above states:
+    // the one-paragraph property is shared with `still_executing_text`, so
+    // without this line the assertions below hold under an implementation that
+    // never produces this message at all.
+    assert!(text.contains("internal error"), "this must be the died answer: {text}");
     assert!(!text.contains('\n'), "a user-facing message is one paragraph: {text:?}");
     assert!(!text.contains("          "), "a source indent leaked into the message: {text:?}");
 }
