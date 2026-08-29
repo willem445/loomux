@@ -366,7 +366,7 @@ fn a_nudge_is_not_lost_to_a_pass_that_was_already_computing() {
     assert_eq!(
         section(&group_view_payload(&views.load(), &g.id, nudged_at), "notify"),
         &Value::Bool(true),
-        "setup: the nudge must be visible before the late pass arrives, or this test is\
+        "setup: the nudge must be visible before the late pass arrives, or this test is \
          about nothing"
     );
 
@@ -388,14 +388,14 @@ fn a_nudge_is_not_lost_to_a_pass_that_was_already_computing() {
     assert_eq!(
         views.load().value.groups.get(&g.id).expect("still published").computed_at,
         nudged_at,
-        "a pass that was already computing when the nudge landed must NOT overwrite it: its\
-         copy of this group was read before the write, and the group view re-reads\
+        "a pass that was already computing when the nudge landed must NOT overwrite it: its \
+         copy of this group was read before the write, and the group view re-reads \
          immediately after the toggle rather than on the next tick"
     );
     assert_ne!(
         views.load().value.groups.get(&g.id).expect("still published").computed_at,
         pass_started,
-        "the two candidate outcomes must DIVERGE, or the assertion above holds under either\
+        "the two candidate outcomes must DIVERGE, or the assertion above holds under either \
          implementation"
     );
 
