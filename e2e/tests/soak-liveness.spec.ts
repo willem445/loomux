@@ -326,6 +326,16 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const pty = await ptyRoundTrip(page, paneTerm, 4, LIVENESS_BOUND_MS);
     const ping = await mcpCall(endpoint, "ping", {}, LIVENESS_BOUND_MS);
 
+    // Playwright prints NOTHING for a test that fails as expected, so the one
+    // artefact this whole lane exists to produce — WHICH half died under a held
+    // lock — would otherwise be invisible in the CI log, and any claim about it
+    // would be a guess. Log it before asserting anything.
+    console.log(
+      `[soak] under a ${LOCK_HOLD_MS}ms hold on groups: ` +
+        `pty ok=${pty.ok} in ${pty.ms}ms (${pty.detail}); ` +
+        `mcp ok=${isJsonRpcResult(ping)} in ${ping.ms}ms (${ping.detail})`
+    );
+
     // Read AFTER the probes: a hold that had already expired would leave both
     // of them measuring an idle app. Absorbed by the marker like everything
     // else here, so its value is the sentence it puts in the report — the

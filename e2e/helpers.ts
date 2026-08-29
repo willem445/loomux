@@ -34,8 +34,17 @@ export async function createTerminalPane(
 
   await form.locator('.dlg-field:has(.dlg-label:has-text("Kind")) select').selectOption("terminal");
   if (opts.shell) {
+    // NOT `.dlg-label:has-text("Shell")`. `field()` (src/launcher.ts) renders
+    // each field's HINT inside the `.dlg-label` element, and `:has-text` is a
+    // case-insensitive SUBSTRING match — so that selector matches every field
+    // whose hint happens to mention a shell, which on the terminal kind is
+    // four of them (measured: strict-mode violation naming 4 selects). The
+    // shell picker is identified here by the one option only it carries
+    // (`shellKindOptions` in src/panesetup.ts; the SSH remote-shell select's
+    // values are `posix`/`cmd`), which no label rewording can break.
     await form
-      .locator('.dlg-field:has(.dlg-label:has-text("Shell")) select')
+      .locator("select")
+      .filter({ has: page.locator('option[value="powershell"]') })
       .selectOption(opts.shell);
   }
   await form.locator('.dlg-field:has(.dlg-label:has-text("Pane name")) input').fill(opts.name);

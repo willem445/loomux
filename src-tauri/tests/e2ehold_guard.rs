@@ -328,6 +328,24 @@ fn wait_for<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
     false
 }
 
+/// The one sanctioned `OrchRegistry::new` in this file (#464). Every test
+/// here routes through it, and `tests/orchestration.rs`'s
+/// `no_registry_construction_bypasses_the_test_agent_dir_overrides` is what
+/// enforces that — a raw construction anywhere else can write a generated
+/// agent file into the operator's REAL `~/.claude`/`~/.copilot` agents dir on
+/// its first spawn. Nothing in this file spawns, but the guard is
+/// default-deny on purpose: "this one is harmless" is exactly the reasoning
+/// that let 1,111 stray files accumulate.
+fn registry_at(dir: &Path) -> Arc<OrchRegistry> {
+    let reg = OrchRegistry::new(dir.join("orchestration"));
+    reg.set_port(45999);
+    reg.set_claude_agents_dir_override(dir.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(dir.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.join("copilot-hooks"));
+    Arc::new(reg)
+}
+
 fn state_of(root: &Path) -> serde_json::Value {
     match std::fs::read_to_string(root.join(e2ehold::STATE_FILE)) {
         Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
@@ -341,7 +359,7 @@ fn with_no_request_pending_a_registry_read_completes_promptly() {
     // not finish" would be evidence about the injector only if the read could
     // have finished — and nothing else here establishes that.
     let dir = tempfile::tempdir().expect("tempdir");
-    let reg = Arc::new(OrchRegistry::new(dir.path().join("orchestration")));
+    let reg = registry_at(dir.path());
 
     assert!(
         !e2ehold::run_once(&reg, dir.path()),
@@ -361,7 +379,7 @@ fn with_no_request_pending_a_registry_read_completes_promptly() {
 #[test]
 fn a_request_really_takes_the_named_lock_and_really_gives_it_back() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let reg = Arc::new(OrchRegistry::new(dir.path().join("orchestration")));
+    let reg = registry_at(dir.path());
 
     // 1.5 s: long enough that a probe blocked on the mutex cannot finish
     // inside the 500 ms window checked below by luck, short enough that the
@@ -422,7 +440,7 @@ fn a_request_really_takes_the_named_lock_and_really_gives_it_back() {
 #[test]
 fn a_refused_request_says_so_in_the_state_file_and_holds_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let reg = Arc::new(OrchRegistry::new(dir.path().join("orchestration")));
+    let reg = registry_at(dir.path());
     std::fs::write(
         dir.path().join(e2ehold::REQUEST_FILE),
         br#"{"target":"nonsense","hold_ms":1500}"#,
