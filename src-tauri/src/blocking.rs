@@ -57,8 +57,8 @@
 /// error, and the four sites that skip `run_blocking` (`pty.rs`
 /// `write_pty`/`change_dir`, `sessions.rs` `list_sessions`, `voice.rs`
 /// `voice_stop`) still each do the thing this module's header says they
-/// deliberately do. What changes is that
-/// none of them reaches the runtime directly any more.
+/// deliberately do. What changes is that none of them reaches the runtime
+/// directly any more.
 ///
 /// **Why one door rather than a counter at each site.** The count only means
 /// anything if it is complete — a report reading `in-flight 480` is a
