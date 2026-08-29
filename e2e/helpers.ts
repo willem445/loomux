@@ -12,14 +12,26 @@ function latestWelcomeForm(page: Page) {
 
 /** Fills out and submits the launcher form to turn a welcome pane into a
  *  plain shell (terminal) pane — never an agent/orchestrator kind, so this
- *  never spawns a real agent CLI. */
+ *  never spawns a real agent CLI.
+ *
+ *  `shell` picks the shell-kind option (`src/launcher.ts`'s Shell field);
+ *  omitted, the form's own default (PowerShell) stands, which is what every
+ *  spec before the soak lane used. A spec that has to read a child's OUTPUT
+ *  should pass `"cmd"`: PSReadLine redraws the input line as you type, so a
+ *  marker typed into PowerShell arrives in the output stream interleaved
+ *  with re-rendered prefixes, while `cmd.exe` echoes plainly. */
 export async function createTerminalPane(
   page: Page,
-  opts: { name: string; repo?: string }
+  opts: { name: string; repo?: string; shell?: "powershell" | "cmd" | "gitbash" }
 ): Promise<void> {
   const form = latestWelcomeForm(page);
 
   await form.locator('.dlg-field:has(.dlg-label:has-text("Kind")) select').selectOption("terminal");
+  if (opts.shell) {
+    await form
+      .locator('.dlg-field:has(.dlg-label:has-text("Shell")) select')
+      .selectOption(opts.shell);
+  }
   await form.locator('.dlg-field:has(.dlg-label:has-text("Pane name")) input').fill(opts.name);
   if (opts.repo) {
     await form.locator('.dlg-field:has(.dlg-label:has-text("Repository")) input').fill(opts.repo);

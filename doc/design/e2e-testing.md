@@ -341,6 +341,217 @@ label text read straight out of `src/launcher.ts`/`pane.ts`/`grid.ts`. That's
 a real fragility cost (a class rename breaks a test with no relation to the
 behavior it tests) and the most obvious near-term follow-up.
 
+## The soak lane (#1603, plan #1600 §3 Phase 4.1)
+
+Every spec above is a **shape** test: open something, measure the DOM,
+assert a structure. `soak-liveness.spec.ts` is not. It asserts a **liveness**
+property — after the app has run for a while against a large corpus with its
+poll paths ticking, does a keystroke still reach a pane and does the MCP
+still answer? — because that is the property four consecutive hangs (#1564,
+#1592, #1595, and the beta6 field report) broke while every shape guard in
+the repo stayed green. Plan #1600 §2.2 is the argument; this lane is the
+test it asks for.
+
+Two specs, two app launches:
+
+1. **The soak.** Boot against the synthetic corpus, open a plain `cmd` pane,
+   idle for `ORRERIX_SOAK_MS`, then assert a keystroke round-trips through
+   the pane's child and an MCP `ping` answers, both within
+   `ORRERIX_SOAK_BOUND_MS`. Expected to PASS on today's `main` — beta6 fixed
+   the poll-batch path — and to stay as regression protection.
+2. **The class assertion.** Same corpus, plus a deliberately long registry
+   lock hold injected while the app runs, then the same two probes. Expected
+   to **FAIL** on today's `main`; plan #1600's Phases 1 and 2 are what make
+   it pass. See "The expected failure" below.
+
+### What loads the poll paths, and what cannot be loaded
+
+Stated plainly, because a liveness lane that quietly covers less than it
+reads as covering is worse than none:
+
+- **The 4 s tab-strip poll is exercised.** `src/tabbar.ts` arms it at
+  construction — its own comment calls it "the app's one app-lifetime
+  poll" — and `pollStatus` issues `orch_group_summary` + `orch_group_usage`
+  for every **group-bound** tab. A tab is group-bound purely because its
+  persisted `groupIds` names a group, so the corpus's `tabs.json` alone puts
+  that poll under load: no clicking, and no agent CLI.
+- **The 2 s group-view poll is not, and cannot be.** `src/groupview.ts`'s
+  timer is armed only while the view is shown, and the view opens only from
+  a pane whose `groupBtn` is visible — which `applyOrchIdentity` reveals only
+  for a LIVE orchestrator-role pane. That needs a real agent CLI, which
+  CLAUDE.md constraint 3 forbids here. Both polls park threads on the same
+  registry mutexes, so the mechanism is exercised either way; the per-tick
+  fan-out is simply smaller than a real orchestrating session's. Closing that
+  gap needs a safe stand-in agent process — the same standing limitation as
+  the task-board overlay above — not a change to this lane.
+- **Blocking-pool exhaustion is a long-local-run property, not a CI one.**
+  Plan #1600 §1.2 step 4 puts saturation of tokio's 512-thread blocking pool
+  minutes into a hold. The CI default (a 30 s hold) reaches roughly a hundred
+  parked threads, so what CI catches is the FIRST symptom in the chain —
+  "MCP dies first" — not the last one. Raising `ORRERIX_SOAK_LOCK_HOLD_MS`
+  past ~120 s locally is what reaches the pane-input half.
+
+### The corpus, and the store it is deliberately not written into
+
+`e2e/corpus.ts` writes, into the fixture's own throwaway data dir and before
+the app is spawned, the install shape every hang report was made against:
+orchestration groups with rosters, task files and multi-megabyte
+`audit.jsonl` files, plus a large CLI session store behind them.
+
+The session store is the **copilot** one, and that is a constraint rather
+than a preference. The Claude half (`~/.claude/projects`) has no production
+redirect — `claude_projects_root()` is `dirs::home_dir()` plus a
+thread-local seam only reachable from Rust — so seeding hundreds of
+synthetic sessions there would mean writing into the operator's real
+transcript directory. `copilot_session_state_root()` honours `COPILOT_HOME`,
+so the whole store lives inside the same temp dir the fixture already
+deletes on teardown. The groups carry `agent_cli: "copilot"` for the same
+reason: it is what makes the boot listing's `resumable` check actually
+enumerate the synthetic store instead of skipping it.
+
+`e2e/fixtures.ts` grew two hooks for this and nothing else: `seedDataDir`
+(which may return extra environment variables, since `COPILOT_HOME`'s value
+is not known until the dir exists) and `extraEnv`. Both merge in ABOVE the
+two isolation variables the harness owns, so a spec can add a knob and can
+never take `ORRERIX_DATA_DIR` or the CDP port away.
+
+### The two probes
+
+**A keystroke reaches the pane's child.** xterm.js renders through the WebGL
+addon, so a terminal's contents are not in the DOM and no selector can read
+them. Rather than add a debug hook to product code to expose the buffer, the
+spec listens to the same `pty-output` event the app's own router consumes,
+through the low-level bridge the bundled `listen()` uses underneath — the
+emit-direction twin of the #814 technique above, and covered by the shipped
+ACL (`core:default` covers `core:event`). It types `echo
+soak<n>_%RANDOM%_end` and matches `/soak<n>_\d+_end/`. That asymmetry is the
+point: the text typed in contains the literal `%RANDOM%`, so a match on the
+digit form can only have been produced by `cmd.exe` expanding it — a pane
+that rendered the keystrokes locally but never reached, or never heard back
+from, its child cannot produce one. (`cmd`, not the launcher's default
+PowerShell: PSReadLine redraws the input line as you type.)
+
+**The MCP answers.** Over real HTTP, from the Playwright process, not
+through the webview — the webview is the half that stays alive in the beta6
+mechanism, which is why the window kept painting, so asking it whether the
+backend is well is asking the wrong process. `ping` is the cheapest method
+and still faithful: every method is authenticated first, and `resolve_token`
+locks `by_token`, then `agents`, then `groups`.
+
+The identity comes from `orch_solo_prepare`, which mints a token, registers
+the agent and writes its MCP config file **before** the launcher would spawn
+anything and independently of whether that CLI is even installed — so
+calling it alone yields a valid token and the server's ephemeral port (bound
+at `127.0.0.1:0`, and not otherwise discoverable) with no child process
+anywhere. Constraint 3 is about spawning agent CLIs; this spawns nothing.
+
+Both probes are bounded by their own deadline rather than by Playwright's
+test timeout, because the failure under test is a HANG: an unbounded `await`
+would report every red as "Test timeout exceeded" with no statement of which
+half died.
+
+### The lock-hold injector, and why it is a file
+
+`src-tauri/src/orchestration/e2ehold.rs` is the one piece of this repo that
+deliberately makes the app misbehave. It watches for
+`<data root>/e2e-lock-hold.request`, takes the named registry mutex, writes
+`<data root>/e2e-lock-hold.state` with `acquired_ms`, sleeps out the hold,
+and rewrites the state with `released_ms`.
+
+This design note's own recommendation above is "zero new Tauri commands or
+ACL surface", and #814's queue-badge spec turned a test hook down for the
+same reason. A command would have been permanent product surface — a name in
+`generate_handler!`, an entry in `command_manifest::APP_COMMANDS`, and an
+ACL grant — all present in a *release* build even with the body cfg'd away.
+A file under the app-data root costs none of that, and it is better for the
+test besides: the Playwright process owns that directory, so it can trigger
+a hold and read back when the lock was actually taken without going through
+the very IPC path whose liveness is under test. A probe the app has to
+answer to tell you the app is stuck is not a probe.
+
+It cannot ship enabled, on two independent gates:
+
+1. `#[cfg(debug_assertions)]`. The watcher is compiled only into a
+   dev-profile build; the workspace `[profile.release]` does not set
+   `debug-assertions`, so a release build keeps cargo's default (`false`) and
+   contains an empty `start` and nothing else.
+2. An explicit opt-in: even a dev build starts no thread unless
+   `ORRERIX_E2E_LOCK_HOLD` is exactly `1`, which the soak spec passes through
+   `extraEnv`. `npm run tauri dev` behaves as it always has.
+
+`src-tauri/tests/e2ehold_guard.rs` is what makes those claims checkable
+rather than readable: a shape scan asserting every function that can hold a
+lock, sleep, spawn or write is gated (with a floor on what the scan found,
+so an instrument that stopped matching cannot report "all clean"); a check
+that `[profile.release]` has not turned `debug-assertions` back on; a
+behavioural test that only the exact string `1` arms it; and a check that
+`e2e/liveness.ts` still names the two filenames and the environment
+variable, since there is no shared header between a Rust module and a
+TypeScript spec and a one-sided rename would produce a soak run with no hold
+behind it — green, and meaningless.
+
+### Positive controls
+
+Three, because every one of this lane's assertions has a way of passing
+vacuously:
+
+- **The corpus really landed.** The builder returns what it wrote and the
+  spec asserts group, session and audit-byte counts against it — otherwise a
+  builder that silently failed turns this into a soak against an empty
+  install, which passes.
+- **The polls really ran.** The spec wraps
+  `window.__TAURI_INTERNALS__.invoke` and counts every dispatch by name,
+  then asserts a floor on `orch_*` calls across the soak window. Without it
+  the test asserts that an app survives being ignored. The floor is on the
+  TOTAL, not on which commands — the group-view batch has been five, then
+  nine, then ten, and pinning a count would pin the last incident's shape,
+  which is the mistake this lane exists to stop making.
+- **The hold really held.** `acquired_ms` must appear before any probe runs,
+  and `released_ms` must still be absent after they finish. A hold that
+  never happened, or that expired early, leaves both probes measuring an
+  idle app — which under `test.fail()` reports as a failure claiming the bug
+  is fixed.
+
+The MCP probe also carries a negative control: a bogus token must be refused
+with JSON-RPC `-32000`. Without it, "something answered on 127.0.0.1" would
+read as "orrerix's authenticated MCP server answered".
+
+### The expected failure
+
+The class assertion is marked `test.fail()`. It is expected to fail on
+today's `main` — that is the point of it — and `fail` was chosen over `skip`
+deliberately: the assertion runs at full strength, the E2E job stays green
+while the fix is outstanding, and the moment Phases 1/2 land Playwright
+reports "expected to fail but passed", telling whoever landed the fix to
+flip the marker. A `skip` would have gone quiet instead, and quiet is how a
+lane stops being re-armed.
+
+**When plan #1600's Phases 1 and 2 land:** delete the `test.fail()` line in
+`e2e/tests/soak-liveness.spec.ts` and this paragraph with it. Nothing else
+about the spec changes.
+
+### Budget
+
+`ci.yml` sets `ORRERIX_SOAK_MS=180000` and
+`ORRERIX_SOAK_LOCK_HOLD_MS=30000` explicitly, so the cost lives where the
+job does. 180 s is ~45 ticks of the 4 s status poll per group-bound tab.
+Two launches plus warm-ups and probe budgets put the lane at roughly six
+minutes of the `e2e-windows` job, and up to ~10 if the soak spec takes its
+one retry. Every knob is an environment variable (`ORRERIX_SOAK_MS`,
+`ORRERIX_SOAK_LOCK_HOLD_MS`, `ORRERIX_SOAK_BOUND_MS`, `ORRERIX_SOAK_GROUPS`,
+`ORRERIX_SOAK_SESSIONS`, `ORRERIX_SOAK_AUDIT_LINES`), so a long local soak
+is a matter of setting one, not editing the spec.
+
+### A follow-up this lane deliberately does not depend on
+
+Phase 0 (#1601) is adding a liveness heartbeat and lock breadcrumbs in
+parallel. Nothing here depends on them, on purpose — the lane had to be able
+to land on today's `main`. Once they exist, the invoke-counter positive
+control and the injector's own state file could both be replaced by reading
+the app's real heartbeat, which would be a crisper statement of the same
+property and would let the lane distinguish "the GUI thread is stuck" from
+"the backend is stuck" without inferring it from which probe died.
+
 ## Running it (the two commands)
 
 Build the isolated test binary once, then run the suite (this recipe used to
