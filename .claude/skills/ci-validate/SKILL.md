@@ -484,39 +484,49 @@ hand-wrapped, so a multi-word pattern cannot match an instance the wrap split �
 every control the zero-receipt rule mandates still passes, because the sweep DID match
 the unwrapped copies. The receipt is non-zero and reads as healthy. The
 whitespace-normalisation the quote harvest above already mandates is what the sweep
-needs too; run two passes and reconcile their totals.
+needs too; run two passes and reconcile their totals. (The section BELOW is the other
+blind non-zero receipt: there the pattern reads the DIFF and misses an insert with no
+context line above it. Same symptom, different cause — this one is the LINE form,
+that one the DIFF form.)
+
+**Discovery is a SINGLE TOKEN.** A phrase can be split by a wrap, so only one token
+cannot — shortening a phrase to a shorter phrase does not reach the property. Take the
+rarest token of the ENTITY the claim names, and widen from there.
 
 ```sh
-# 1. the shortest STABLE fragment - the part no rewording or wrap can split
-LC_ALL=C.UTF-8 grep -rn "no timeout" <roots>
+# 1. DISCOVERY - one token, no space. This pass bounds everything below it.
+LC_ALL=C.UTF-8 grep -rn "try-lock" <roots>
 
-# 2. wrap-insensitive, per file. Strip the comment markers BEFORE squeezing:
-#    squeezing first leaves the stripped marker behind as a double space and
-#    the joined pattern silently misses again (measured, on published.rs).
-for f in <files>; do
-  echo -n "$f -> "
-  tr '[:space:]' ' ' < "$f" | sed 's|///||g; s|//!||g' | tr -s ' ' |
-    grep -o "no timeout, no try-lock" | wc -l
+# 2. CONFIRMATION - recursive over the same ROOTS, never over pass 1's file list:
+#    a list derived from pass 1 cannot surface a file pass 1 missed. Strip the
+#    comment markers BEFORE squeezing - squeezing first leaves the stripped
+#    marker as a double space and the joined pattern silently misses again.
+find <roots> -type f \( -name '*.rs' -o -name '*.md' \) | while read -r f; do
+  n=$(tr '[:space:]' ' ' < "$f" | sed 's|///||g; s|//!||g' | tr -s ' ' |
+      grep -o "no timeout, no try-lock" | wc -l)
+  [ "$n" -gt 0 ] && echo "$f -> $n"
 done
 ```
 
-Where the two disagree, the difference is what the phrase sweep could not see.
-Worked instance, re-runnable off `git show 24a428a6:<path>` for
+Where the two disagree, the difference is what a phrase sweep could not see. Worked
+instance, re-runnable off `git show 24a428a6:<path>`: over
 `crates/loomux-engine/src/published.rs`, `src-tauri/tests/perf_dispatch.rs` and
-`src-tauri/src/orchestration/views.rs`: `grep -rn "no timeout, no try-lock"` returns
+`src-tauri/src/orchestration/views.rs`, `grep -rn "no timeout, no try-lock"` returns
 **2** (`views.rs:9`, `perf_dispatch.rs:1512`) and misses `published.rs:7` and
 `perf_dispatch.rs:81`, where the phrase reads `no timeout, no` / `try-lock` across a
-comment line break. The fragment sweep and the wrap-insensitive pass both return **4**.
+comment line break. Both passes above return **4** over those three, and **5** once the
+roots include `doc/design/` — which pass 2 reaches only because it is recursive.
+
+**The residual, because the two totals agreeing is not proof of completeness.** Both
+passes are bounded by pass 1, so a claim whose chosen token was itself reworded is
+invisible to both and the totals still agree — the same healthy receipt this section
+exists to kill, one level up. That is why pass 1 takes the ENTITY's token and not the
+phrasing you rewrote; where no single token is stable, the sweep cannot certify
+completeness and the claim needs reading, not grepping.
 
 Signature that you needed this: a sweep receipt you already published as complete, and a
-re-sweep that finds more. #1346 went 1 → 2 (*"a second pass that flattens the line breaks
-first finds two"*), #1408 3 → 4, and #1667 ended at nine surfaces, three phrasings, two
-line wraps for one false claim, after three phrase sweeps in a row missed the wrapped
-pair — including the one whose commit message asserted the sweep was done. #1158 and
-#1191 fixed it for a RENAME sweep by whitespace-collapsing before matching; #1283 hit
-the mirror form, a false red from quoting `CLAUDE.md`, which hard-wraps mid-phrase; and
-#1344 — the PR that wrote the zero-receipt rule above — recorded this as a known
-limitation and left it unfixed. That is what this section closes.
+re-sweep that finds more — #1346 went 1 → 2, #1408 3 → 4, #1667 2 → 4
+(#1158, #1191, #1283, #1344).
 
 ### A diff-shaped sweep is controlled DIFFERENTIALLY, not by a match-somewhere control
 
@@ -807,24 +817,19 @@ it lands, and a stale id is what makes the whole line look untrustworthy.
 - **When the mutation ITSELF is the plant, the collateral red can be UNAVOIDABLE
   and none of the three above has an answer.** Disarming a primitive reddens that
   primitive's own unit tests, in `crates/`, before cargo can reach
-  `src-tauri/tests/`; there is no plant site that avoids it. Two remedies, both
-  already used here and neither previously written down: `#[ignore = "[scratch]
-  silenced so cargo reaches tests/<file>.rs"]` on the collateral reds (#1361 round
-  3b) — the reason string prints in the log, so the round discloses its own
-  staging — or `--no-fail-fast`, so every binary reports (#1426). Reshaping the
-  mutation to thread between the pins is a third, and it is luck rather than
-  method (#1464); abandoning the round for inspection is what happens when none
-  is found (#1572).
+  `src-tauri/tests/`; there is no plant site that avoids it. Silence the collateral
+  reds instead: `#[ignore = "[scratch] silenced so cargo reaches tests/<file>.rs"]`
+  — the reason string prints in the log, so the round discloses its own staging
+  — or `--no-fail-fast`, so every binary reports (#1361, #1426). Reshaping the
+  mutation to thread between the pins works when it is available and cannot be
+  relied on; where nothing is, the claim is carried by inspection and says so
+  (#1464, #1572).
   **Then read the TARGET binary out of the run before citing it** — the section
   above says to read which targets ran, and this is how: its own
   `Running tests/<file>.rs` line AND that binary's own `test result:` totals.
-  Signature: the failing job's totals are the ENGINE binary's while the claim is
-  about an integration one. Run 33255123420 has exactly ONE `Running` line
-  (`loomux_engine`) and `425 passed; 2 failed`, so `tests/liveness.rs` never
-  executed — while a design note said its sweep had been demonstrated on that
-  tree. Remediated at run 33257747970: engine `425 passed; 0 failed; 2 ignored`,
-  then `tests/liveness.rs` `14 passed; 1 failed` (#1667 review round 2, B1).
-
+  Signature: the failing job's totals are an EARLIER binary's while the claim is
+  about a later one — one `Running` line in the log where the round needed two, and
+  a design note citing a sweep the run never reached (#1667).
 
 The same stop-at-first-failure also bounds a round that **did** hit its target:
 if the property is pinned in two binaries, the later one never ran, so it is
