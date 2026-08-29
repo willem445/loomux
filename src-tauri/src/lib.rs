@@ -62,6 +62,23 @@ pub fn run() {
     // going first would pin the old root for the whole process and defer the
     // move to the next launch. See `doc/design/rebrand-filesystem.md`.
     obs::init_data_root();
+    // #1562: and settle WHICH webview profile it uses, the same way. The
+    // identifier keys `<data_local_dir>/<identifier>`, where WebView2 (Windows)
+    // and WebKitGTK (Linux) keep the `localStorage` a user's recent repos,
+    // default agent and editor command live in — a directory #1205's move did
+    // not reach, since that one moved the ROAMING base.
+    //
+    // Two things make this the right line to call it on. The identifier is read
+    // out of the context rather than assumed, so an E2E build's
+    // `--config`-overridden identity is inert without this file knowing what it
+    // is; and it runs BEFORE `.run(context)`, which is where the windows
+    // declared in `tauri.conf.json` — and therefore their webviews, and
+    // therefore the profile directory Tauri resolves from the identifier — are
+    // built. Nothing sets `data_directory`: moving the folder first is what
+    // makes the moved profile the one the webview opens. See
+    // `doc/design/rebrand-bundle.md`.
+    let context = tauri::generate_context!();
+    obs::init_webview_profile(&context.config().identifier);
     let startup = obs::check_and_arm();
     // Arm the allocation-failure recorder (#1219). Ordering is load-bearing in
     // both directions: AFTER `init_data_root` so the handle is opened on the
@@ -335,6 +352,6 @@ pub fn run() {
                 obs::mark_clean_exit();
             }
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running loomux");
 }

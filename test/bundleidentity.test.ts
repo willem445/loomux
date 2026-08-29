@@ -1,4 +1,11 @@
-// One binary name, everywhere (#1562 slice A).
+// One binary name and one bundle identifier, everywhere (#1562 slices A and B).
+//
+// Two axes, two halves of this file. The first is the executable's name; the
+// second, at the bottom, is the Tauri bundle identifier. They are independent
+// values that fail the same way — several files spell each one out by hand,
+// and a HALF-rename of either is worse than no rename — so they are policed by
+// the same two instruments, and the identifier half is written as a deliberate
+// mirror of the binary half rather than as something new to learn.
 //
 // The executable's basename is not configured anywhere: `mainBinaryName` is
 // unset in `tauri.conf.json`, so Tauri ships "the output binary from cargo" —
@@ -485,5 +492,332 @@ test("the guard discriminates — it reports findings when the name does not mat
     scan(cargoBinaryName()).offenders.length,
     0,
     "the real binary name must scan clean — see the first test for the offender list"
+  );
+});
+// ---------------------------------------------------------------------------
+// The bundle identifier (#1562 slice B)
+// ---------------------------------------------------------------------------
+//
+// `tauri.conf.json`'s `identifier` is the app's identity to the OS. On Windows
+// and Linux, Tauri resolves the webview's user-data folder from it —
+// `<data_local_dir>/<identifier>`, holding the WebView2 `localStorage` a user's
+// recent repos, default agent and editor command live in — and on macOS it is
+// the `CFBundleIdentifier` the microphone (TCC) grant is keyed on.
+//
+// It is spelled in four places that must agree, in three languages:
+//
+//   - `src-tauri/tauri.conf.json` — what the shipped build actually IS;
+//   - `crates/loomux-engine/src/brand.rs` — `BUNDLE_ID`, what the Rust that
+//     performs the one-time profile move believes it is. A disagreement here is
+//     silent by construction: `init_webview_profile_from` no-ops for any
+//     identifier that is not `BUNDLE_ID`, so the move simply never happens and
+//     every existing user's preferences are quietly reset instead;
+//   - `src-tauri/tauri.e2e.conf.json` — the E2E build's DIFFERENT identifier,
+//     which is the whole of the isolation argument in doc/design/e2e-testing.md
+//     (#394: WebView2 keys its shared browser process off the identifier);
+//   - `e2e/fixtures.ts` — `EXPECTED_IDENTIFIER`, which the harness verifies the
+//     spawned build's WebView2 child is really running under before it drives
+//     anything. Stale, and the harness refuses a build that is fine, or accepts
+//     one that is not.
+//
+// Same two instruments as the binary half: named sites (specific, actionable,
+// blind to a site nobody listed) plus a default-deny shape scan over every
+// `dev.<x>.<y>` token in those files, cross-checked against a raw count of
+// `dev.` in the same file so a pattern that cannot see one of its own subjects
+// fails as a blind instrument rather than passing as "no offenders".
+//
+// What the identifier half does NOT see, stated rather than left to be found:
+// the identifier where it appears WITHOUT its `dev.` prefix, and the profile
+// directory named by a variable (`<data_local_dir>/<identifier>`) rather than
+// spelled. Neither exists today.
+//
+// One more, because it is live rather than hypothetical: `ID_SHAPE` reads two
+// dot-separated segments and stops, so a SUPERSTRING of an identifier —
+// `dev.orrerix.app.other`, a deliberate near-miss specimen in `obs.rs`'s
+// `a_non_production_identifier_never_moves_the_profile` — matches as
+// `dev.orrerix.app` and is counted as the product identifier. Harmless in that
+// direction (it is not reported as an offender when it should not be), and the
+// raw cross-check below stays consistent because both patterns see it once. It
+// would matter if someone introduced a real third-segment identifier, which
+// nothing does. It also cannot check what Tauri does with the
+// value — that the shipped build's WebView2 child really runs under it is what
+// the `e2e-windows` job proves, and nothing here substitutes for reading it.
+
+/** A `pub const <NAME>: &str = "…";` out of brand.rs. */
+function brandConst(name: string): string {
+  const src = read("crates/loomux-engine/src/brand.rs");
+  const m = new RegExp(`^pub const ${name}: &str = "([A-Za-z0-9_.-]+)";`, "m").exec(src);
+  assert.ok(m, `crates/loomux-engine/src/brand.rs must declare ${name}`);
+  return m![1];
+}
+
+/** The `identifier` field of a Tauri config. */
+function configIdentifier(rel: string): string {
+  const id = JSON.parse(read(rel)).identifier;
+  assert.equal(typeof id, "string", `${rel} must carry a string identifier`);
+  return id as string;
+}
+
+/**
+ * Named sites, per identifier. `re` captures the identifier in group 1 and
+ * must be global — several rows match more than once and all of them agree or
+ * none of them do.
+ */
+type IdSite = { file: string; what: string; re: RegExp };
+
+const PROD_SITES: IdSite[] = [
+  {
+    file: "crates/loomux-engine/src/brand.rs",
+    what: "brand::BUNDLE_ID, which decides whether the profile move runs at all",
+    re: /^pub const BUNDLE_ID: &str = "([A-Za-z0-9_.-]+)";/gm,
+  },
+  {
+    file: "e2e/fixtures.ts",
+    what: "the refusal message that names the production identifier a stray WebView2 process would belong to",
+    re: /production-identifier build \(([A-Za-z0-9_.-]+)\)/g,
+  },
+];
+
+const E2E_SITES: IdSite[] = [
+  {
+    file: "e2e/fixtures.ts",
+    what: "EXPECTED_IDENTIFIER, which the harness verifies the spawned build's WebView2 child against",
+    re: /^const EXPECTED_IDENTIFIER = "([A-Za-z0-9_.-]+)";/gm,
+  },
+  {
+    file: "e2e/fixtures.ts",
+    what: "the isolation comment naming the identifier override",
+    re: /`identifier` override \(`([A-Za-z0-9_.-]+)`/g,
+  },
+  {
+    file: ".github/workflows/ci.yml",
+    what: "the e2e-windows job's comment naming the isolated profile's identifier",
+    re: /`tauri\.e2e\.conf\.json`'s `([A-Za-z0-9_.-]+)` identifier/g,
+  },
+];
+
+/** The files the identifier shape scan reads. */
+const ID_SHAPE_FILES = [
+  "src-tauri/tauri.conf.json",
+  "src-tauri/tauri.e2e.conf.json",
+  "e2e/fixtures.ts",
+  ".github/workflows/ci.yml",
+  "crates/loomux-engine/src/brand.rs",
+  // The file that PERFORMS the move, and the one whose disagreement with
+  // tauri.conf.json this guard's header calls silent by construction. It was
+  // missing from this list in the first cut, which left the identifier spelled
+  // in six places there — five doc comments and one test specimen — that
+  // nothing read (rev-lead round 1, N2).
+  "crates/loomux-engine/src/obs.rs",
+];
+
+/** A reverse-DNS identifier token, and the same subjects counted without the name. */
+const ID_SHAPE = /dev\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g;
+const RAW_ID_SHAPE = /dev\./g;
+
+type IdScan = {
+  offenders: string[];
+  siteHits: Map<string, number>;
+  shapeHits: Map<string, number>;
+  seenShapes: Map<string, number>;
+  rawShapes: Map<string, number>;
+  allowedHit: Set<string>;
+  rows: Array<{ token: string; file: string; why: string }>;
+};
+
+/**
+ * The whole identifier guard as a pure function of the two identifiers it
+ * expects, so the test can run it against values the tree does NOT use and
+ * check that it goes red.
+ */
+function scanIdentifiers(prod: string, e2e: string): IdScan {
+  const offenders: string[] = [];
+  const siteHits = new Map<string, number>();
+  const shapeHits = new Map<string, number>();
+  const seenShapes = new Map<string, number>();
+  const rawShapes = new Map<string, number>();
+  const allowedHit = new Set<string>();
+
+  // The one exemption, derived rather than typed: brand.rs is where the
+  // pre-#1562 identifier is spelled on purpose, because the move has to name
+  // the directory it moves FROM. Taken from LEGACY_BUNDLE_ID itself, so the
+  // exemption is only ever as wide as the constant the move actually reads.
+  const rows: Array<{ token: string; file: string; why: string; commentOnly?: boolean }> = [
+    {
+      token: brandConst("LEGACY_BUNDLE_ID"),
+      file: "crates/loomux-engine/src/brand.rs",
+      why: "LEGACY_BUNDLE_ID — the source directory of the one-time webview-profile move, and the one place the old identifier is spelled as a VALUE (see that module's own rule)",
+    },
+    {
+      token: brandConst("LEGACY_BUNDLE_ID"),
+      file: "crates/loomux-engine/src/obs.rs",
+      commentOnly: true,
+      why:
+        "doc comments explaining which directory the move reads FROM. Scoped to comment " +
+        "lines on purpose: the code in that file reaches the old identifier through " +
+        "brand::LEGACY_BUNDLE_ID, never as a literal, so a literal on a CODE line there is " +
+        "still a finding — which is the whole difference between prose about the move and " +
+        "a second place the name is spelled",
+    },
+  ];
+
+  for (const [sites, expected] of [
+    [PROD_SITES, prod],
+    [E2E_SITES, e2e],
+  ] as Array<[IdSite[], string]>) {
+    for (const { file, what, re } of sites) {
+      const key = `${file}: ${what}`;
+      const found = capturesOf(read(file), re);
+      siteHits.set(key, (siteHits.get(key) ?? 0) + found.length);
+      for (const name of found) {
+        if (name !== expected) {
+          offenders.push(`${file}: ${what} names "${name}", not "${expected}"`);
+        }
+      }
+    }
+  }
+
+  for (const file of ID_SHAPE_FILES) {
+    const src = read(file);
+    const lines = src.split(/\r?\n/);
+    rawShapes.set(file, [...src.matchAll(new RegExp(RAW_ID_SHAPE.source, "g"))].length);
+    let mine = 0;
+    let seen = 0;
+    lines.forEach((line, i) => {
+      for (const m of line.matchAll(new RegExp(ID_SHAPE.source, "g"))) {
+        const token = m[0];
+        seen += 1;
+        if (token === prod || token === e2e) {
+          mine += 1;
+          continue;
+        }
+        const isComment = /^\s*(\/\/|#|\*)/.test(line);
+        const row = rows.find(
+          (r) => r.token === token && r.file === file && (!r.commentOnly || isComment)
+        );
+        if (row) {
+          allowedHit.add(`${row.file}|${row.token}`);
+          continue;
+        }
+        offenders.push(
+          `${file}:${i + 1}: "${token}" is neither the product identifier ("${prod}") nor the ` +
+            `E2E one ("${e2e}") nor an argued exemption — ${line.trim()}`
+        );
+      }
+    });
+    shapeHits.set(file, mine);
+    seenShapes.set(file, seen);
+  }
+
+  return { offenders, siteHits, shapeHits, seenShapes, rawShapes, allowedHit, rows };
+}
+
+test("every surface that spells the bundle identifier agrees with src-tauri/tauri.conf.json", () => {
+  const prod = configIdentifier("src-tauri/tauri.conf.json");
+  const e2e = configIdentifier("src-tauri/tauri.e2e.conf.json");
+  const { offenders, siteHits, shapeHits, seenShapes, rawShapes, allowedHit, rows } =
+    scanIdentifiers(prod, e2e);
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `the bundle identifier must be spelled the same everywhere. tauri.conf.json decides it ` +
+      `(it is what the shipped build IS) and every site below has to follow.\n` +
+      offenders.join("\n")
+  );
+
+  // The E2E identifier has to BE a different identifier. If the two ever
+  // converged, an E2E run would share the production build's WebView2 browser
+  // process (#394) — and `verifyIsolatedBuild`, which checks the child's
+  // `--user-data-dir` against EXPECTED_IDENTIFIER, would pass while doing so,
+  // because it would be checking against the value it now also matches.
+  assert.notEqual(
+    e2e,
+    prod,
+    "tauri.e2e.conf.json must override the identifier to something the product does not use — " +
+      "that override IS the E2E isolation (doc/design/e2e-testing.md)"
+  );
+
+  // The legacy identifier has to be a third value. If someone "simplified"
+  // LEGACY_BUNDLE_ID to the current one, the one-time move would rename a
+  // directory onto itself — a no-op that reports success on every arm, with
+  // every existing user's preferences silently reset.
+  assert.notEqual(
+    brandConst("LEGACY_BUNDLE_ID"),
+    prod,
+    "LEGACY_BUNDLE_ID must name the PREVIOUS identifier, not the current one"
+  );
+
+  // Non-vacuity, per site.
+  for (const [key, n] of siteHits) {
+    assert.ok(
+      n > 0,
+      `the pattern for ${key} matched nothing — that site is no longer policed, so it could ` +
+        `drift alone and this test would still pass`
+    );
+  }
+
+  // Non-vacuity, per scanned file, counted at the VERIFIED site.
+  for (const [file, n] of shapeHits) {
+    assert.ok(
+      n > 0,
+      `${file} carries neither "${prod}" nor "${e2e}" any more — either the identifier moved ` +
+        `out of it (drop the row) or the scan has gone blind to it`
+    );
+  }
+
+  // The instrument against a raw count of its own container.
+  for (const file of ID_SHAPE_FILES) {
+    assert.equal(
+      seenShapes.get(file) ?? 0,
+      rawShapes.get(file) ?? 0,
+      `in ${file} the identifier pattern matched ${seenShapes.get(file) ?? 0} of the ` +
+        `${rawShapes.get(file) ?? 0} literal "dev." occurrences — its shape is a guess about ` +
+        `how an identifier may be spelled, and it just came up short on one of its own subjects`
+    );
+  }
+
+  // A stale exemption is one nobody re-checked.
+  for (const row of rows) {
+    assert.ok(
+      allowedHit.has(`${row.file}|${row.token}`),
+      `${row.file} is exempted for "${row.token}" (${row.why}) but nothing in it matches that ` +
+        `any more — drop the row rather than leaving an unexamined exemption behind`
+    );
+  }
+});
+
+test("the identifier guard discriminates — it reports findings when the identifiers do not match", () => {
+  const prod = configIdentifier("src-tauri/tauri.conf.json");
+  const e2e = configIdentifier("src-tauri/tauri.e2e.conf.json");
+
+  // Every assertion above is absence-shaped, and an absence is what a scan that
+  // examined nothing also produces. Both halves must report findings against
+  // identifiers the tree does not use.
+  const bogus = scanIdentifiers("dev.nothing.app", "dev.nothing.e2e");
+  assert.ok(bogus.offenders.length > 0, "scanning for identifiers nothing uses produced no findings");
+  const fromShape = bogus.offenders.filter((o) => /^\S+:\d+: /.test(o));
+  const fromSites = bogus.offenders.filter((o) => !/^\S+:\d+: /.test(o));
+  assert.ok(fromSites.length > 0, "the named-site half produced nothing — the identifier SITES are inert");
+  assert.ok(fromShape.length > 0, "the shape half produced nothing — the identifier shape scan is inert");
+
+  // Half a rename is the actual failure mode, and it must be caught too: the
+  // product config flipped while brand.rs and the harness still say the old
+  // thing is what a reader would see as "the identifier changed and nothing
+  // went red".
+  assert.ok(
+    scanIdentifiers("dev.orrerix.next", e2e).offenders.length > 0,
+    "flipping ONLY the product identifier must be reported — that is the half-rename this guard exists for"
+  );
+  assert.ok(
+    scanIdentifiers(prod, "dev.orrerix.next").offenders.length > 0,
+    "flipping ONLY the E2E identifier must be reported"
+  );
+
+  // And it is not a scan that flags everything.
+  assert.equal(
+    scanIdentifiers(prod, e2e).offenders.length,
+    0,
+    "the real identifiers must scan clean — see the first identifier test for the offender list"
   );
 });

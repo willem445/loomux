@@ -5,7 +5,7 @@
 //! Renaming a product is free right up to the point where the name is also an
 //! *identity somebody else already holds a copy of* — on their disk, in their
 //! shell profile, or in a transcript and a generated config this app itself
-//! wrote months ago. Four of those exist, and they are not the same problem:
+//! wrote months ago. Five of those exist, and they are not the same problem:
 //!
 //! 1. **The app's own data root** (`<platform data dir>/loomux`) — ours, written
 //!    only by us, and the one place a one-time move is defensible. The policy,
@@ -31,6 +31,18 @@
 //!    for the reason argued at [`NOTICE_MARKERS`] — one spelling emitted,
 //!    every spelling accepted, and the accepted set written down exactly
 //!    once (#1153 phase 3).
+//!
+//! 5. **The Tauri bundle identifier** — the app's identity to the *operating
+//!    system*, and the only one of these whose directory is created and
+//!    written by somebody else. WebView2 (Windows) and WebKitGTK (Linux) key
+//!    their browser profile on `<data_local_dir>/<identifier>`, and macOS keys
+//!    the TCC microphone grant on `CFBundleIdentifier`. It moves once, by the
+//!    same machinery as (1) — with one deliberate asymmetry argued in
+//!    `doc/design/rebrand-bundle.md`: a *refused* rename starts a FRESH
+//!    profile instead of falling back to the old directory, because the old
+//!    directory is exactly where a still-running old build's WebView2 browser
+//!    process already is (#394). The decision is
+//!    [`obs::init_webview_profile_from`](crate::obs::init_webview_profile_from).
 //!
 //! Every decision here is a pure function over "what exists / what is set", so
 //! the *policy* is testable without a disk or a mutated process environment
@@ -67,6 +79,36 @@ pub const ENV_PREFIX: &str = "ORRERIX_";
 
 /// The pre-#1153 environment prefix, still honoured as a fallback.
 pub const LEGACY_ENV_PREFIX: &str = "LOOMUX_";
+
+// ---------- the Tauri bundle identifier (#1562) ----------
+
+/// The app's OS identity — `src-tauri/tauri.conf.json`'s `identifier`.
+///
+/// Spelled here *as well as* there because the two are read by different
+/// things at different times: Tauri reads the JSON to key the webview profile
+/// and the macOS bundle, and this crate reads the constant to decide whether
+/// this run is the production build whose profile may be migrated. Nothing in
+/// Rust can see the JSON, so the agreement is pinned from outside both, by
+/// `test/bundleidentity.test.ts`.
+///
+/// The divergence fails **safe rather than silent**:
+/// [`obs::init_webview_profile_from`](crate::obs::init_webview_profile_from)
+/// no-ops for any identifier that is not this one, so a config saying
+/// `dev.orrerix.app` while this constant says something else migrates
+/// *nothing* — it never migrates the wrong directory.
+pub const BUNDLE_ID: &str = "dev.orrerix.app";
+
+/// What the bundle was identified as before #1562 — and, unlike the other
+/// `LEGACY_` constants here, this one is **not** a permanent read path.
+///
+/// It names a directory on the user's disk exactly once, at the first launch
+/// of a build carrying [`BUNDLE_ID`], to move it. After that move the old
+/// directory holds only a signpost, and every later launch takes the
+/// "already migrated" arm without reading this at all. It exists so the move
+/// has a name; deleting it once no install predating #1562 can plausibly
+/// still be out there is a normal deprecation, not a break of anybody's
+/// working setup.
+pub const LEGACY_BUNDLE_ID: &str = "dev.loomux.app";
 
 // ---------- environment ----------
 
@@ -415,6 +457,21 @@ mod tests {
     /// The constants are the deprecation contract: `.loomux/` and `LOOMUX_`
     /// keep working. A change to either literal is a break of every existing
     /// user's repo or shell profile, so it has to break this test first.
+    /// The bundle identifier is an OS identity: it names a directory on
+    /// every existing user's disk (`<data_local_dir>/<identifier>`) and, on
+    /// macOS, the `CFBundleIdentifier` a microphone grant is keyed on.
+    /// Changing either literal changes which directory #1562's one-time move
+    /// reads and which one it writes, so it has to break a test first — and
+    /// the two must BE different, since a "move" from a directory to itself
+    /// is the shape that would quietly do nothing while every arm still
+    /// reported success.
+    #[test]
+    fn the_bundle_identifiers_are_pinned_and_distinct() {
+        assert_eq!(BUNDLE_ID, "dev.orrerix.app");
+        assert_eq!(LEGACY_BUNDLE_ID, "dev.loomux.app");
+        assert_ne!(BUNDLE_ID, LEGACY_BUNDLE_ID, "the move's source and destination must differ");
+    }
+
     #[test]
     fn the_legacy_spellings_are_pinned() {
         assert_eq!(LEGACY_CONFIG_DIR, ".loomux");

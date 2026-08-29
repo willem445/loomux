@@ -7,8 +7,8 @@
 //   logs/, tabs.json, running.lock) at a fresh temp dir per test run, so an
 //   E2E run never touches — or collides with — a real install's state.
 // - The exe under test must be built with `tauri.e2e.conf.json`'s
-//   `identifier` override (`dev.loomux.e2e`, vs the product's
-//   `dev.loomux.app`). WebView2 keys its user-data folder (and thus its
+//   `identifier` override (`dev.orrerix.e2e`, vs the product's
+//   `dev.orrerix.app`). WebView2 keys its user-data folder (and thus its
 //   *shared browser process*, see #394) off that identifier, so a
 //   differently-identified build can never share a running production
 //   instance's WebView2 process.
@@ -74,7 +74,7 @@ const EXE_FROM_ENV = process.env.LOOMUX_E2E_EXE;
 const EXE = EXE_FROM_ENV ?? DEFAULT_EXE;
 
 // Must match `identifier` in src-tauri/tauri.e2e.conf.json.
-const EXPECTED_IDENTIFIER = "dev.loomux.e2e";
+const EXPECTED_IDENTIFIER = "dev.orrerix.e2e";
 
 // A single fixed port, not one per worker: `workers: 1` (playwright.config.ts)
 // means there's never real port contention to avoid, and on CI the port is
@@ -191,7 +191,7 @@ async function verifyIsolatedBuild(
       looksLikeProd
         ? `refusing to proceed: pid ${pid} never spawned its own WebView2 child, and a ` +
           `DIFFERENTLY-IDENTIFIED loomux instance's browser process is already running ` +
-          `(pid ${foreign.pid}) — this looks like a production-identifier build (dev.loomux.app) ` +
+          `(pid ${foreign.pid}) — this looks like a production-identifier build (dev.orrerix.app) ` +
           `that joined that instance's existing WebView2 browser process instead of spawning its ` +
           `own, per #394. Nothing was touched. Observed command line:\n${foreign.cmdLine}`
         : `refusing to proceed: pid ${pid} never spawned its own WebView2 child, and a previous ` +

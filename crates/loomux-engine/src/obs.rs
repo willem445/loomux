@@ -350,22 +350,10 @@ fn resolve_default_root() -> PathBuf {
 /// under the current name, and the stale signpost is left on disk untouched
 /// like everything else this function declines to move.
 fn migrate_default_root(legacy: &Path, new: &Path) -> RootPlan {
-    if holds_only_the_signpost(legacy) {
-        return RootPlan::UseNew;
-    }
-    if fs::rename(legacy, new).is_err() {
-        eprintln!(
-            "orrerix: could not move {} to {} — continuing to use the old location. \
-             (Is an older version still running? It will be retried on the next launch.)",
-            legacy.display(),
-            new.display(),
-        );
-        return RootPlan::UseLegacy;
-    }
-    let _ = fs::create_dir_all(legacy);
-    let _ = fs::write(
-        legacy.join(MOVED_MARKER),
-        format!(
+    let plan = move_once(
+        legacy,
+        new,
+        &format!(
             "loomux is now orrerix.\n\n\
              This app's data moved to:\n\n    {}\n\n\
              Nothing was deleted — the whole directory was renamed. To undo it, quit the app, \
@@ -376,6 +364,43 @@ fn migrate_default_root(legacy: &Path, new: &Path) -> RootPlan {
             brand::env_names("DATA_DIR"),
         ),
     );
+    if plan == RootPlan::UseLegacy {
+        eprintln!(
+            "orrerix: could not move {} to {} — continuing to use the old location. \
+             (Is an older version still running? It will be retried on the next launch.)",
+            legacy.display(),
+            new.display(),
+        );
+    }
+    plan
+}
+
+/// The move itself, with **no policy in it**: rename `legacy` onto `new`, leave
+/// `signpost` behind in the old location, and report which one the caller should
+/// now use. The caller decided this pair should move, and the caller decides what
+/// a refusal means.
+///
+/// Extracted from [`migrate_default_root`] for #1562's webview-profile move,
+/// which needs exactly this mechanism — one atomic rename, a signpost, and never
+/// re-migrating a signpost-only directory — and a **different answer on
+/// refusal**. That difference is why the refusal *message* is the caller's too:
+/// "continuing to use the old location" is true for the data root and false for
+/// the webview profile, so one shared message would have been a lie on one of the
+/// two paths. Nothing here prints.
+///
+/// Everything [`migrate_default_root`]'s doc argues about the mechanism — why
+/// one `fs::rename` and no copy loop, why nothing is ever deleted, why a failed
+/// signpost write is ignored, why a signpost-only directory is not a profile —
+/// is a property of this function and holds for every caller of it.
+fn move_once(legacy: &Path, new: &Path, signpost: &str) -> RootPlan {
+    if holds_only_the_signpost(legacy) {
+        return RootPlan::UseNew;
+    }
+    if fs::rename(legacy, new).is_err() {
+        return RootPlan::UseLegacy;
+    }
+    let _ = fs::create_dir_all(legacy);
+    let _ = fs::write(legacy.join(MOVED_MARKER), signpost);
     RootPlan::UseNew
 }
 
@@ -403,6 +428,185 @@ fn holds_only_the_signpost(dir: &Path) -> bool {
         }
     }
     saw_marker
+}
+
+// ---------- the webview profile (#1562) ----------
+
+/// Whether a [`RootAction`] moves the **webview profile**.
+///
+/// The profile shares [`plan_default_root`] and [`root_action`] with the data
+/// root — same question, same four states — but not their *dispatch*, and this
+/// predicate is the whole of the difference. There is no "use the legacy
+/// directory" answer here at all: every non-moving action means "use
+/// `<data_local_dir>/<BUNDLE_ID>` as it stands", which after a refused move is
+/// a **fresh** profile.
+///
+/// That asymmetry is deliberate; `doc/design/rebrand-bundle.md` carries the
+/// argument. Pointing a new build's webview at the old identifier's folder would
+/// put it in the same WebView2 browser process as the still-running old build —
+/// #394's hazard, and precisely the state a refused rename says we are in. A
+/// fresh profile costs a one-time reset of some `localStorage` preferences;
+/// joining that process costs a wedged webview.
+///
+/// It also settles what [`RootPlan`]'s documented revert means here. Flipping
+/// `plan_default_root`'s `(false, true)` arm to `UseLegacy` stops the data-root
+/// migration; it must stop this one too **without** redirecting this run at the
+/// old directory, and it does, because `UseLegacy` is simply not a mover here.
+fn profile_moves(action: RootAction) -> bool {
+    matches!(action, RootAction::MoveThenUseNew)
+}
+
+/// Settle the webview profile for this run, moving a pre-#1562
+/// `<data_local_dir>/dev.loomux.app` to `<data_local_dir>/dev.orrerix.app` if
+/// this is the first launch that finds only the old one. Call once, early, from
+/// a real app's startup — `src-tauri/src/lib.rs`, before Tauri builds a window.
+///
+/// `identifier` is the **running build's** identifier, read out of the Tauri
+/// context rather than assumed, so a `--config` override (the E2E build's
+/// `dev.orrerix.e2e`) is inert here without this module having to know it
+/// exists.
+///
+/// **Timing is the whole of the wiring, and there is deliberately no
+/// `data_directory` to set.** On Windows and Linux Tauri resolves the profile
+/// itself, as `<LocalData>/<identifier>`, whenever a webview is created with
+/// none set (`tauri::manager::webview`), and the windows declared in
+/// `tauri.conf.json` are built inside `.run(context)` — after this. Moving the
+/// directory *before* the webview exists is therefore what makes the moved
+/// profile the one the webview opens, on every arm: the returned path is what
+/// this run will use, not a request. macOS has no Tauri-managed path at all
+/// (WKWebView stores under `~/Library/WebKit/<CFBundleIdentifier>`), which is
+/// why the flip is a documented one-time reset there and this returns the path
+/// only where one is keyed on the identifier.
+///
+/// `None` means "not this run's business, and nothing was touched": a
+/// platform where this path is not the profile, a non-production identifier, or
+/// an explicitly-named data root.
+pub fn init_webview_profile(identifier: &str) -> Option<PathBuf> {
+    // The platform guard lives HERE, on the real-environment wrapper, and not
+    // in `_from` — same layering as `data_root`/`data_root_from`. It is a fact
+    // about the machine, not about the policy, so the policy stays testable on
+    // every platform over a temp dir (all six unit tests drive `_from`).
+    if !PROFILE_IS_TAURI_MANAGED {
+        return None;
+    }
+    init_webview_profile_from(identifier, dirs::data_local_dir(), brand::env_os("DATA_DIR").value)
+}
+
+/// Is `<data_local_dir>/<identifier>` the webview profile on this platform?
+///
+/// **Tauri's own `cfg`, deliberately copied rather than approximated**
+/// (`tauri::manager::webview`: the resolution is
+/// `#[cfg(any(target_os = "linux", target_os = "windows"))]`). If this list and
+/// that one ever disagree, this code moves a directory nothing reads, or
+/// declines to move the one that matters.
+///
+/// On macOS WKWebView stores under `~/Library/WebKit/<CFBundleIdentifier>`,
+/// which is not this path and is not a directory this app may move — so the
+/// flip is a documented one-time reset there instead
+/// (`docs/troubleshooting.md`, `doc/design/rebrand-bundle.md`).
+///
+/// **This constant is what makes that claim structural.** Without it the macOS
+/// run would still compute `~/Library/Application Support/dev.loomux.app` and
+/// rename it if it existed, leaving a signpost describing a browser profile in
+/// a directory that never was one. Nothing in this tree creates that directory
+/// today, so the claim held — but it held by that absence rather than by a
+/// guard, and an absence is not something the next person to add a
+/// `app_local_data_dir` caller would know they were relying on (rev-lead round
+/// 1, N1).
+const PROFILE_IS_TAURI_MANAGED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+
+/// [`init_webview_profile`] with its two environment readings as parameters —
+/// the local-data base and the data-root override — so every arm is reachable
+/// in a test over a temp dir, with no mutated process environment and no
+/// dependency on which platform the test happens to run on.
+pub fn init_webview_profile_from(
+    identifier: &str,
+    base: Option<PathBuf>,
+    env_override: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    init_webview_profile_using(identifier, base, env_override, |legacy, new| {
+        move_once(legacy, new, &profile_signpost(new))
+    })
+}
+
+/// [`init_webview_profile_from`] with the MOVE ITSELF as a parameter.
+///
+/// The refusal arm is the one this whole design turns on, and it is the one arm
+/// a test cannot otherwise reach. Reaching it needs an `fs::rename` that fails
+/// **with the destination absent** — because a destination that exists sends
+/// [`plan_default_root`] down the "already migrated" arm and no move is
+/// attempted at all. In the field that is a Windows case: the old build is
+/// still running and its `msedgewebview2.exe` holds the source open.
+///
+/// The provocation that looks portable is not. A destination that is an
+/// existing **file** is `ENOTDIR` on unix, but on Windows `fs::rename`
+/// **succeeds** and moves the directory over the file. That is measured, not
+/// assumed: this function's first cut was tested that way and went green on
+/// ubuntu and macos while `windows-latest` failed on "the old profile must be
+/// left intact" (#1688, CI run 33255271096).
+///
+/// So rather than pin the asymmetry on one platform — or on a fixture whose
+/// behaviour differs by OS underneath a test that claims not to care — the
+/// verdict is handed in, and [`move_once`]'s own refusal is pinned separately
+/// against the real filesystem with a provocation that IS refused everywhere
+/// (an occupied destination directory). The two compose to the end-to-end
+/// claim, and each half is checkable on every platform.
+fn init_webview_profile_using(
+    identifier: &str,
+    base: Option<PathBuf>,
+    env_override: Option<std::ffi::OsString>,
+    mv: impl FnOnce(&Path, &Path) -> RootPlan,
+) -> Option<PathBuf> {
+    // Only the production build migrates. An E2E build (`dev.orrerix.e2e`) or
+    // any other `--config` identifier keys a profile directory of its own, has
+    // no pre-#1562 counterpart, and must never rename the real install's folder
+    // out from under an app the developer has open — the same rule, and the same
+    // reason, as the explicit-root guard below.
+    if identifier != brand::BUNDLE_ID {
+        return None;
+    }
+    // An operator who named a data root has named it: this run is a dev or test
+    // instance deliberately kept off the platform default, and #394's whole
+    // point is that such a run touches nothing a real install owns. Read through
+    // `override_root` so "is an explicit root in force" has one answer across
+    // every guard that asks it.
+    if override_root(env_override).is_some() {
+        return None;
+    }
+    let base = base?;
+    let new = base.join(brand::BUNDLE_ID);
+    let legacy = base.join(brand::LEGACY_BUNDLE_ID);
+    if profile_moves(root_action(plan_default_root(new.is_dir(), legacy.is_dir())))
+        && mv(&legacy, &new) == RootPlan::UseLegacy
+    {
+        eprintln!(
+            "orrerix: could not move {} to {} — this run starts with a fresh browser profile, \
+             so saved preferences (recent repos, default agent, editor command) will be reset. \
+             (Is an older version still running? Its WebView2 browser process holds the old \
+             folder open. It will be retried on the next launch.)",
+            legacy.display(),
+            new.display(),
+        );
+    }
+    // ALWAYS the new directory, including when the move was refused. See
+    // `profile_moves` for why the legacy folder is never an answer here.
+    Some(new)
+}
+
+/// The signpost left in `<data_local_dir>/dev.loomux.app` after the profile
+/// moves. It names what moved in the reader's terms rather than ours: nobody
+/// knows what an `EBWebView` folder is, and the reason to care about it is the
+/// settings inside.
+fn profile_signpost(new: &Path) -> String {
+    format!(
+        "loomux is now orrerix.\n\n\
+         This app's browser profile — and the saved settings kept in it, such as your recent \
+         repos, your default agent and your editor command — moved to:\n\n    {}\n\n\
+         Nothing was deleted — the whole directory was renamed. To undo it, quit the app, \
+         delete this directory, and rename the one above back to \"{}\".\n",
+        new.display(),
+        brand::LEGACY_BUNDLE_ID,
+    )
 }
 
 /// `<user data dir>/orrerix` (or `$ORRERIX_DATA_DIR` / `$LOOMUX_DATA_DIR` if
@@ -1641,6 +1845,267 @@ mod tests {
             "no signpost may claim a move that did not happen"
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ---------- the webview profile (#1562) ----------
+
+    /// A temp base standing in for `dirs::data_local_dir()`.
+    fn wv_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("orrerix-wv-{tag}-{}", now_ms()))
+    }
+
+    /// A profile's worth of nesting: WebView2 keeps the `localStorage` this
+    /// migration exists for four levels down, so a "move" that only carried
+    /// top-level entries would carry nothing anybody would miss.
+    fn wv_prefs(profile: &Path) -> PathBuf {
+        profile.join("EBWebView").join("Default").join("Local Storage").join("leveldb")
+    }
+
+    /// The move happens, carries the whole profile, signposts the old
+    /// location — and happens exactly ONCE: a second launch finds the new
+    /// directory and leaves everything alone.
+    #[test]
+    fn the_webview_profile_moves_once_and_leaves_a_signpost() {
+        let base = wv_base("move");
+        let legacy = base.join(brand::LEGACY_BUNDLE_ID);
+        let new = base.join(brand::BUNDLE_ID);
+        fs::create_dir_all(wv_prefs(&legacy)).unwrap();
+        fs::write(wv_prefs(&legacy).join("000003.log"), "recent repos live here").unwrap();
+
+        assert_eq!(
+            init_webview_profile_from(brand::BUNDLE_ID, Some(base.clone()), None),
+            Some(new.clone()),
+            "the run must be told to use the new identifier's directory"
+        );
+        assert_eq!(
+            fs::read_to_string(wv_prefs(&new).join("000003.log")).unwrap(),
+            "recent repos live here",
+            "the nested leveldb the prefs actually live in must move, byte for byte"
+        );
+        let marker = fs::read_to_string(legacy.join(MOVED_MARKER)).unwrap();
+        assert!(marker.contains(&new.display().to_string()), "signpost must name the new dir");
+        assert!(
+            marker.contains(brand::LEGACY_BUNDLE_ID),
+            "signpost must name the directory to rename back to, got: {marker}"
+        );
+
+        // …and only once. The second launch sees both directories (the signpost
+        // recreated the old one) and must take the already-migrated arm.
+        fs::write(new.join("written-by-the-new-build"), "x").unwrap();
+        assert_eq!(
+            init_webview_profile_from(brand::BUNDLE_ID, Some(base.clone()), None),
+            Some(new.clone())
+        );
+        assert!(
+            new.join("written-by-the-new-build").is_file(),
+            "a second launch must not move anything over the profile in use"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The signpost recreates the old directory, so a user who later deletes
+    /// the new one leaves the marker standing alone. That is our own leftover,
+    /// not a profile, and adopting it would sit a fresh signpost in the very
+    /// directory it points at. Same rule as the data root's, through the same
+    /// [`move_once`].
+    #[test]
+    fn a_signpost_only_webview_dir_is_never_re_migrated() {
+        let base = wv_base("signpost");
+        let legacy = base.join(brand::LEGACY_BUNDLE_ID);
+        let new = base.join(brand::BUNDLE_ID);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(MOVED_MARKER), "moved").unwrap();
+
+        assert_eq!(
+            init_webview_profile_from(brand::BUNDLE_ID, Some(base.clone()), None),
+            Some(new.clone())
+        );
+        assert!(legacy.join(MOVED_MARKER).is_file(), "the stale signpost is left alone");
+        assert!(!new.exists(), "and the marker directory was not adopted as a profile");
+
+        // The discriminating half: one real file beside the marker makes it a
+        // profile again, and then it does move.
+        fs::write(legacy.join("EBWebView-something"), "state").unwrap();
+        assert_eq!(
+            init_webview_profile_from(brand::BUNDLE_ID, Some(base.clone()), None),
+            Some(new.clone())
+        );
+        assert!(new.join("EBWebView-something").is_file(), "real state must still migrate");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Only the production identifier migrates. The E2E build's identifier —
+    /// and any other `--config` override — keys a directory of its own with no
+    /// pre-#1562 counterpart, and must never rename the real install's folder
+    /// out from under an app the developer has open (#394).
+    ///
+    /// `LEGACY_BUNDLE_ID` is in the loop on purpose: a build still identified
+    /// as `dev.loomux.app` asking to migrate would be asking to rename a
+    /// directory onto itself while it is the one in use.
+    #[test]
+    fn a_non_production_identifier_never_moves_the_profile() {
+        let base = wv_base("otherid");
+        let legacy = base.join(brand::LEGACY_BUNDLE_ID);
+        let new = base.join(brand::BUNDLE_ID);
+        fs::create_dir_all(wv_prefs(&legacy)).unwrap();
+
+        for id in ["dev.orrerix.e2e", brand::LEGACY_BUNDLE_ID, "dev.orrerix.app.other", ""] {
+            assert_eq!(
+                init_webview_profile_from(id, Some(base.clone()), None),
+                None,
+                "{id:?} is not the production identifier — nothing here is its business"
+            );
+        }
+        assert!(wv_prefs(&legacy).is_dir(), "the real profile must be untouched");
+        assert!(!new.exists(), "and nothing may be created under the new identifier");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An operator who named a data root has named it: that run is deliberately
+    /// off the platform default and touches nothing a real install owns. The
+    /// second half is the pair to `a_rejected_override_is_not_treated_as_an_explicit_root`
+    /// — a value `override_root` REJECTS is not an explicit root, so the move
+    /// still happens, and this guard cannot be tripped by an empty variable.
+    #[test]
+    fn an_explicit_root_skips_the_profile_move() {
+        let base = wv_base("explicit");
+        let legacy = base.join(brand::LEGACY_BUNDLE_ID);
+        let new = base.join(brand::BUNDLE_ID);
+        fs::create_dir_all(wv_prefs(&legacy)).unwrap();
+
+        let explicit = std::env::temp_dir().join("orrerix-explicit-root");
+        assert_eq!(
+            init_webview_profile_from(
+                brand::BUNDLE_ID,
+                Some(base.clone()),
+                Some(explicit.into_os_string())
+            ),
+            None,
+            "an explicit root means this call did nothing at all"
+        );
+        assert!(wv_prefs(&legacy).is_dir(), "the platform profile must be untouched");
+        assert!(!new.exists());
+
+        assert_eq!(
+            init_webview_profile_from(
+                brand::BUNDLE_ID,
+                Some(base.clone()),
+                Some(std::ffi::OsString::from(""))
+            ),
+            Some(new.clone()),
+            "an empty override is rejected, so it is NOT an explicit root and the move runs"
+        );
+        assert!(wv_prefs(&new).is_dir(), "…and it really moved");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// **The one arm where this policy differs from the data root's.** A
+    /// refused rename must NOT hand this run the legacy directory: that is
+    /// where the still-running old build's WebView2 browser process already
+    /// is, and joining it is #394's hazard. The run starts fresh under the new
+    /// identifier instead, and the old profile is left completely alone.
+    ///
+    /// Three parts, because the refusal and what the dispatch does with it are
+    /// refused by different things and only one of them can be provoked
+    /// portably — see [`init_webview_profile_using`] for the measurement that
+    /// forced the split.
+    #[test]
+    fn a_refused_profile_move_yields_the_new_dir_not_the_legacy_one() {
+        let base = wv_base("refused");
+        let legacy = base.join(brand::LEGACY_BUNDLE_ID);
+        let new = base.join(brand::BUNDLE_ID);
+        fs::create_dir_all(wv_prefs(&legacy)).unwrap();
+
+        // 1. The dispatch, handed a refusal. `mv` stands in for an `fs::rename`
+        //    the OS said no to; what is under test is what this function then
+        //    does, and the answer must be the NEW directory. `consulted` is the
+        //    control that keeps that from being vacuous: an assertion about a
+        //    refused move proves nothing if no move was ever attempted.
+        let consulted = std::cell::Cell::new(0usize);
+        let got = init_webview_profile_using(brand::BUNDLE_ID, Some(base.clone()), None, |l, n| {
+            consulted.set(consulted.get() + 1);
+            assert_eq!(l, legacy.as_path(), "the mover is handed the legacy identifier's dir");
+            assert_eq!(n, new.as_path(), "…and the new identifier's dir");
+            RootPlan::UseLegacy
+        });
+        assert_eq!(consulted.get(), 1, "the move must actually have been attempted");
+        assert_eq!(
+            got,
+            Some(new.clone()),
+            "a refused move must still point this run at the NEW identifier — a fresh \
+             profile, never the folder the old build's browser process is holding open"
+        );
+        assert!(wv_prefs(&legacy).is_dir(), "and the old profile is left completely alone");
+        assert!(!new.exists(), "nothing creates it here — the webview opens a fresh one");
+
+        // 2. …and the real mover really does refuse, and really does leave
+        //    everything alone when it does. Provoked with an occupied
+        //    destination DIRECTORY: the one provocation `rename` refuses on
+        //    every platform this ships on.
+        let occupied = base.join("occupied-destination");
+        fs::create_dir_all(occupied.join("in-the-way")).unwrap();
+        assert_eq!(
+            move_once(&legacy, &occupied, "a signpost that must never be written"),
+            RootPlan::UseLegacy,
+            "precondition: an occupied destination must really be refused by the OS"
+        );
+        assert!(wv_prefs(&legacy).is_dir(), "a refused move leaves the profile intact");
+        assert!(
+            !legacy.join(MOVED_MARKER).exists(),
+            "no signpost may claim a move that did not happen"
+        );
+
+        // 3. The asymmetry itself: the DATA root, refused the same way, falls
+        //    back to the legacy directory. If these two ever agree, one is wrong.
+        let droot = base.join("dataroot");
+        let dlegacy = droot.join(brand::LEGACY_NAME);
+        let dnew = droot.join(brand::NAME);
+        fs::create_dir_all(dlegacy.join("orchestration")).unwrap();
+        fs::create_dir_all(dnew.join("occupied")).unwrap();
+        assert_eq!(
+            migrate_default_root(&dlegacy, &dnew),
+            RootPlan::UseLegacy,
+            "the data root's refused move keeps the OLD root — \"all my groups are gone\" \
+             is the failure it is avoiding, and it is why the profile's answer differs"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The platform guard, pinned per platform rather than by restating its own
+    /// `cfg` — which would be a tautology. Each leg of CI asserts the value it
+    /// must have there, so widening or narrowing the `cfg` list reddens on the
+    /// platform it changed.
+    #[test]
+    fn the_profile_is_only_tauri_managed_where_tauri_manages_it() {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        assert!(
+            PROFILE_IS_TAURI_MANAGED,
+            "Tauri resolves <LocalData>/<identifier> here, so there is a profile to move"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !PROFILE_IS_TAURI_MANAGED,
+            "macOS stores under ~/Library/WebKit/<CFBundleIdentifier> — nothing here to move, \
+             and <data_local_dir>/<identifier> is a directory this app must not touch"
+        );
+    }
+
+    /// The profile shares `plan_default_root`/`root_action` with the data root,
+    /// including the revert documented on [`RootPlan`] — so this pins what that
+    /// revert means HERE: stop moving, and still use the new directory. Exactly
+    /// one action moves, and `UseLegacy` is not it.
+    #[test]
+    fn exactly_one_action_moves_the_profile_and_the_documented_revert_is_not_it() {
+        use RootAction::*;
+        let movers: Vec<RootAction> =
+            [UseNew, UseLegacy, MoveThenUseNew].into_iter().filter(|a| profile_moves(*a)).collect();
+        assert_eq!(movers, vec![MoveThenUseNew], "only MoveThenUseNew may move; got {movers:?}");
+        assert!(
+            !profile_moves(root_action(RootPlan::UseLegacy)),
+            "the documented data-root revert must stop the profile move too — and because \
+             every non-moving action here resolves to the new directory, it stops it without \
+             pointing this run at the old one"
+        );
     }
 
     #[test]

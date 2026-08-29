@@ -11,12 +11,9 @@ rename cannot reach into.
 | `src-tauri/Cargo.toml` `[package] name` | `loomux` | the executable (`…\Orrerix\<name>.exe`, `Orrerix.app/Contents/MacOS/<name>`, `/usr/bin/<name>`), `target/release/<name>.pdb`, WER dump names `<name>.exe.<pid>.dmp`, the `--webview-exe-name=<name>.exe` argument WebView2 passes its browser process, and `cargo … -p <name>` |
 | `src-tauri/tauri.conf.json` `identifier` | `dev.loomux.app` | the WebView2 / WebKitGTK profile dir `<data_local_dir>/<identifier>`, macOS `CFBundleIdentifier` (and therefore the TCC microphone grant), the NSIS uninstaller's "delete app data" target |
 
-They are independent, and they move in two slices. **Slice A — the binary — has
-landed, and is what the "Before" column above describes leaving behind. Slice B
-— the identifier — has NOT: `tauri.conf.json` still reads
-`"identifier": "dev.loomux.app"`, and the section on it near the end of this
-note is a design recorded ahead of its implementation, not a description of
-shipped behaviour.** This note carries both anyway, because the questions a
+They are independent, and they moved in two slices — slice A the binary, slice B
+the identifier. **Both have landed**, and the "Value before #1562" column above
+is what each one left behind. This note carries both, because the questions a
 reader arrives with — *what is my exe called, what happens when I upgrade, why
 is that thing still called loomux* — do not split along that line.
 
@@ -211,16 +208,7 @@ argument for it — but its only effect is at a stable release, betas cannot
 exercise it, and it is the kind of change whose first real test is a user's
 machine. It is deferred to the stable-release decision, which is the human's.
 
-## The identifier, and the asymmetry in its migration — PLANNED, NOT SHIPPED
-
-> **Nothing in this section has landed.** `src-tauri/tauri.conf.json` still reads
-> `"identifier": "dev.loomux.app"`, no `init_webview_profile` exists, and no
-> profile is migrated by any build you can install today. This is #1562's slice
-> B, recorded here ahead of its implementation so the two axes stay in one
-> place — every "moves", "is", and "does" below describes what slice B *will*
-> do, and is a design decision to implement against, not behaviour to rely on.
-> The tracking issue is #1562; if it is closed and this warning is still here,
-> the warning is what is stale.
+## The identifier, and the asymmetry in its migration
 
 The identifier keys exactly one directory this app depends on:
 `<data_local_dir>/<identifier>`, holding WebView2's `EBWebView` profile. #1205
@@ -238,17 +226,151 @@ that is the whole reason this is not a copy of the data-root migration:
 
 > **A refused rename does not fall back to the legacy directory.** For the data
 > root, `UseLegacy` is the safe arm — "all my groups are gone" otherwise. For the
-> webview profile it is the unsafe one: pointing the new build's
-> `data_directory` at the old folder puts it in the **same WebView2 browser
-> process as the still-running old build**, which is the #394 hazard the E2E
-> identifier split exists to avoid. So the refused arm is "fresh profile", and
-> the cost is a one-time reset of those localStorage prefs for a user who
-> launches the new build while the old one is still open.
+> webview profile it is the unsafe one: pointing the new build's webview at the
+> old folder puts it in the **same WebView2 browser process as the still-running
+> old build**, which is the #394 hazard the E2E identifier split exists to
+> avoid. So the refused arm is "fresh profile", and the cost is a one-time reset
+> of those localStorage prefs for a user who launches the new build while the
+> old one is still open.
 
 macOS has no Tauri-managed path here at all — WKWebView stores under
 `~/Library/WebKit/<CFBundleIdentifier>` — so it takes a documented one-time
 prefs reset plus a fresh microphone (TCC) grant on first voice use, rather than
-a migration.
+a migration. `docs/troubleshooting.md` and `docs/features/voice-prompts.md` are
+where a user meets both.
+
+What the flip leaves behind on Windows, and does not clean up: the old
+`<data_local_dir>/dev.loomux.app` stays on disk forever — holding just the
+signpost after a successful move, or the whole old profile after a refused one.
+Nothing deletes it, and the uninstaller will not either: as the table at the top
+of this note records, the NSIS "delete app data" checkbox targets
+`$LOCALAPPDATA\${BUNDLEID}`, which after the flip is the *new* identifier. That
+is the same "nothing is ever deleted, on any path" rule the data-root migration
+ships under, stated here so nobody reads the uninstaller as covering it.
+
+### How it is wired: timing, not a `data_directory`
+
+There is deliberately **no `data_directory` set anywhere**, and the reason is
+worth stating because "set the webview's data directory from the plan result" is
+the obvious-looking shape and is not the one that works.
+
+Tauri already computes the path this migration is about. In
+`tauri::manager::webview`, when a webview is created with no `data_directory`
+of its own:
+
+```rust
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+if pending.webview_attributes.data_directory.is_none() {
+  let local_app_data = manager.path().resolve(
+    &app_manager.config.identifier,
+    crate::path::BaseDirectory::LocalData,
+  );
+  …
+}
+```
+
+— and `BaseDirectory::LocalData` is `dirs::data_local_dir()`. So the profile is
+`<data_local_dir>/<identifier>` whether we say so or not, and the *only* thing
+that decides what is inside it is what is on disk at that path when the webview
+is built.
+
+That is why the call site is a line in `run()` rather than a builder argument.
+The windows declared in `tauri.conf.json` are created by Tauri's own `setup`,
+**before** the `setup` closure this app passes runs (`tauri::app::setup` builds
+every `window_config` with `create: true`, then calls the user closure), and
+that is all inside `.run(context)`. Moving the directory before that point is
+therefore both necessary and sufficient: every arm of the plan ends at
+`<data_local_dir>/dev.orrerix.app`, which is the path Tauri resolves anyway.
+Setting `data_directory` explicitly would mean giving up the config-declared
+window and building it programmatically, to say the same path back to Tauri that
+it had already computed — more moving parts, and one more place for the identity
+to disagree with itself.
+
+The return value of `init_webview_profile` is therefore a **report of what this
+run will use**, not a request. It is `None` on the two paths that touch nothing:
+a non-production identifier, and an explicitly-named data root.
+
+### Where the code lives, and why there
+
+| | |
+| --- | --- |
+| `brand::BUNDLE_ID` / `LEGACY_BUNDLE_ID` | The identifier and its predecessor, in the module whose whole job is being the one place the old name is spelled. |
+| `obs::move_once(legacy, new, signpost)` | The mechanism, with no policy in it: one `fs::rename`, a signpost, never re-migrate a signpost-only directory. Extracted from `migrate_default_root`, which is now a thin wrapper over it — so the data-root migration's three tests still pin that path byte for byte. |
+| `obs::profile_moves(action)` | The dispatch, and the whole of the asymmetry: only `MoveThenUseNew` moves, and there is no "use the legacy directory" answer at all. |
+| `obs::init_webview_profile{,_from,_using}` | The two guards (production identifier, no explicit root) and the call into `move_once`. `_from` takes the base directory and the data-root override as parameters; `_using` additionally takes the move itself, for the reason in the next section. Between them every arm is reachable over a temp dir, on every platform, with no mutated process environment. |
+| `src-tauri/src/lib.rs` | The one caller, immediately after `obs::init_data_root()`. It reads the identifier out of `context.config()` rather than assuming it, which is what makes an E2E build's `--config` override inert without this code having to know the override exists. |
+
+The refusal *message* is the caller's rather than `move_once`'s, because
+"continuing to use the old location" is true for the data root and false here —
+a shared message would have been a lie on one of the two paths.
+
+**Why `move_once` is not simply reused with a different return-value
+interpretation:** it is. The difference is entirely in `profile_moves`, which
+also settles what `RootPlan`'s documented policy revert means on this path.
+Flipping `plan_default_root`'s `(false, true)` arm to `UseLegacy` stops the
+data-root migration; here it stops the profile move *without* redirecting the
+run at the old directory, because `UseLegacy` is not a mover in this dispatch.
+
+### Why the refusal arm takes the move as a parameter
+
+`fs::rename` does not fail the same way on every platform, and the difference
+lands exactly on this design's one interesting arm.
+
+Reaching the refusal at all needs a rename that fails **with the destination
+absent** — a destination that exists sends `plan_default_root` down the
+"already migrated" arm and no move is attempted. In the field that is a Windows
+case: the old build is still running and its `msedgewebview2.exe` holds the
+source directory open.
+
+The fixture that looks portable is not. A destination that is an existing
+**file** is `ENOTDIR` on unix, so the rename is refused — but on Windows
+`fs::rename` **succeeds** and moves the directory over the file. This is
+measured rather than reasoned: the first cut of
+`a_refused_profile_move_yields_the_new_dir_not_the_legacy_one` used that fixture
+and went green on `ubuntu-22.04` and `macos-latest` while `windows-latest`
+failed on `the old profile must be left intact` (#1688, CI run 33255271096).
+A test that claims to be about a policy, and whose fixture quietly means
+something different on one of the three platforms it ships on, is worse than no
+test — so the two halves were separated instead:
+
+- `init_webview_profile_using` takes the verdict, so **what the dispatch does
+  with a refusal** is checked on every platform, with a call-counter control so
+  "a refused move yields the new directory" cannot pass without a move having
+  been attempted;
+- `move_once`'s **own** refusal is pinned against the real filesystem with the
+  one provocation that is refused everywhere — an occupied destination
+  directory — asserting it leaves the profile intact and writes no signpost.
+
+The two compose to the end-to-end claim, and neither half rests on a platform
+difference nobody wrote down.
+
+### The lockstep guard for the identifier
+
+`test/bundleidentity.test.ts` grew a second half, mirroring the binary one: the
+identifier is spelled in four places, in three languages, and they must agree.
+
+The failure it exists for is **silent by construction**. A `tauri.conf.json`
+that says `dev.orrerix.app` while `brand::BUNDLE_ID` says something else does
+not crash and does not migrate the wrong directory — `init_webview_profile_from`
+no-ops for any identifier that is not `BUNDLE_ID`, so the move simply never
+happens and every existing user's preferences are reset instead, with nothing
+red anywhere. Two more shapes have the same property: an E2E identifier that
+converged with the product's would put E2E runs back in the production build's
+WebView2 browser process (#394) while `verifyIsolatedBuild` still passed, since
+it would be checking against the value it now matches; and a `LEGACY_BUNDLE_ID`
+"simplified" to the current one would rename a directory onto itself, reporting
+success on every arm. All three are asserted.
+
+The one exemption is derived, not typed: `brand.rs` is where the pre-#1562
+identifier is spelled on purpose, and the scan takes that string from
+`LEGACY_BUNDLE_ID` itself rather than hardcoding it.
+
+Two things it cannot do, stated rather than left to be discovered. It cannot see
+the identifier spelled without its `dev.` prefix, or a profile path named by a
+variable rather than a literal — neither exists today. And it cannot check what
+Tauri *does* with the value: that the shipped build's WebView2 child really runs
+under `dev.orrerix.e2e` is what the `e2e-windows` job proves, by inspecting the
+OS process tree, and nothing in the unit suite substitutes for reading it.
 
 ## What stays `loomux` on purpose, in both slices
 
