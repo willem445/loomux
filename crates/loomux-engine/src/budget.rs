@@ -158,6 +158,18 @@ thread_local! {
     /// [`note_durable_write`] for why that is the rule.
     static SEALED: Cell<bool> = const { Cell::new(false) };
 
+    /// Whether a durable write has happened in the current budget frame AT
+    /// ALL — set even when the frame was already exempt from unwinding.
+    ///
+    /// Deliberately NOT the same flag as `SEALED`, and the difference is the
+    /// whole of whether [`torn_writes`] can detect anything. A tear is "this
+    /// frame wrote and then unwound"; sealing is what PREVENTS one. Counting
+    /// tears off the seal flag makes the count structurally zero in a broken
+    /// tree as well as a sound one, because an unsealed frame is exactly the
+    /// one that can unwind — which is how the first version of this invariant
+    /// came to pass five scratch rounds in a row while enforcing nothing.
+    static WROTE: Cell<bool> = const { Cell::new(false) };
+
     /// Seals and tears on THIS thread, as `(sealed, torn)`.
     ///
     /// The process-global counters beside them are the field-report numbers;
@@ -253,10 +265,12 @@ pub fn read_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> Result<T, Busy
     // already wrote durably stays sealed after this one returns, and this one
     // starts unsealed so its own bound is live until it writes something.
     let sealed_before = SEALED.with(|x| x.replace(false));
+    let wrote_before = WROTE.with(|x| x.replace(false));
 
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
-    let sealed_here = SEALED.with(|x| x.replace(sealed_before));
+    let _sealed_here = SEALED.with(|x| x.replace(sealed_before));
+    let wrote_here = WROTE.with(|x| x.replace(wrote_before));
     BUDGET.with(|b| b.set(prev));
 
     match out {
@@ -264,13 +278,18 @@ pub fn read_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> Result<T, Busy
         Err(payload) => match payload.downcast::<BudgetTimeout>() {
             // Ours.
             Ok(t) if t.frame == frame => {
-                // Structurally unreachable: `note_durable_write` seals the
-                // frame, and a sealed frame never unwinds. Counted rather
-                // than asserted so the invariant is a NUMBER a test can
-                // check — `torn_writes()` is what makes rider R1 a test
-                // instead of an argument. A panic here would take the app
-                // down over a bookkeeping slip.
-                if sealed_here {
+                // THE TEAR: this frame performed a durable write and is now
+                // unwinding out of it. `note_durable_write` seals the frame
+                // precisely so this cannot happen, so a non-zero count means
+                // the seal was bypassed — a durable write that reached
+                // neither seal door, or a mutation the seal was removed from.
+                //
+                // Measured off WROTE, never off the seal flag: a sealed frame
+                // never unwinds, so counting tears off SEALED gives zero in a
+                // broken tree as readily as a sound one. Counted rather than
+                // asserted so the invariant is a NUMBER a test can check; a
+                // panic here would take the app down over bookkeeping.
+                if wrote_here {
                     THREAD_SEALS.with(|c| {
                         let (s, t) = c.get();
                         c.set((s, t + 1));
@@ -397,6 +416,9 @@ pub fn note_durable_write(what: &str) {
     if BUDGET.with(|b| b.get()).is_none() {
         return;
     }
+    // Recorded FIRST and unconditionally: a frame that wrote is a frame a
+    // tear can be measured against, whether or not it was already exempt.
+    WROTE.with(|w| w.set(true));
     if SEALED.with(|s| s.replace(true)) || in_mutation() {
         return; // already sealed, or a declared mutation: nothing to report.
     }
