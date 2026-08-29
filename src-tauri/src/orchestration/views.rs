@@ -509,7 +509,8 @@ pub fn group_view_payload(
 /// group to be stale about, and reporting age 0 forever would make an app with
 /// no groups indistinguishable from a wedged one.
 pub fn strip_view_payload(snapshot: &Stamped<ViewSnapshot>, now: Instant) -> Value {
-    let oldest = snapshot.value.groups.values().min_by_key(|g| g.computed_at);
+    // MUTATION: the NEWEST group instead of the oldest.
+    let oldest = snapshot.value.groups.values().max_by_key(|g| g.computed_at);
     let (computed_at, computed_unix_ms, compute_ms) = match oldest {
         Some(g) => (g.computed_at, g.computed_unix_ms, g.compute_ms),
         None => (snapshot.published_at, snapshot.published_unix_ms, snapshot.compute_ms),

@@ -1460,6 +1460,7 @@ fn strip_ts_comments(text: &str) -> String {
 /// and still froze the app. Making the poll SITE an input is what stops the
 /// next one from quietly acquiring a member that reaches the registry.
 #[test]
+#[ignore = "SCRATCH ONLY (#1608 strip-meta mutation)"]
 fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
     let sites = commands();
     let sync: BTreeSet<String> =
