@@ -1584,14 +1584,6 @@ fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
          extractor is under-matching",
         POLL_SITES.len()
     );
-    let served: BTreeSet<String> = SNAPSHOT_SERVED.iter().map(|s| s.to_string()).collect();
-    assert_eq!(
-        reached, served,
-        "the set of backend commands reachable from a fixed-cadence poll site must EQUAL the \
-         set served from the published snapshot. A command that appears here and not in \
-         SNAPSHOT_SERVED is a new polled registry read; one in SNAPSHOT_SERVED that is no \
-         longer reached is a row watching nothing."
-    );
 
     assert!(
         offenders.is_empty(),
@@ -1616,5 +1608,14 @@ fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
          cell (`views.load(`): {not_reading_the_cell:#?}. The manifest row is the claim; the \
          body is what makes it true, and a row whose command quietly went back to the registry \
          would otherwise read as enforcement."
+    );
+
+    let served: BTreeSet<String> = SNAPSHOT_SERVED.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        reached, served,
+        "the set of backend commands reachable from a fixed-cadence poll site must EQUAL the \
+         set served from the published snapshot. A command that appears here and not in \
+         SNAPSHOT_SERVED is a new polled registry read; one in SNAPSHOT_SERVED that is no \
+         longer reached is a row watching nothing."
     );
 }
