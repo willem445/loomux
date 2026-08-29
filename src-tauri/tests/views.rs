@@ -20,7 +20,9 @@ use serde_json::Value;
 
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, ViewPublisher};
 use loomux_lib::orchestration::views::VIEW_USAGE_MAX_AGE;
-use loomux_lib::orchestration::{mergeqview, GroupId, Guardrails, OrchRegistry, Role};
+use loomux_lib::orchestration::{
+    mergeqview, GroupId, Guardrails, OrchRegistry, Role, UsageSnapshot,
+};
 
 fn rails() -> Guardrails {
     Guardrails {
@@ -277,21 +279,32 @@ fn a_lapsed_lease_drops_the_view_tier_rather_than_carrying_it_forward() {
 /// Built the way the app leaves one behind: a group dir with a `usage.json`
 /// carrying accrued cost. That file is the whole point — it is what the tab
 /// strip's badge shows for a group with no live agents (#194 P4 LOW-8).
-fn restored_group_on_disk(dir: &std::path::Path, id: &str, cost: f64) -> GroupId {
+fn restored_group_on_disk(reg: &OrchRegistry, dir: &std::path::Path, id: &str, cost: f64) -> GroupId {
     let g = GroupId::parse(id).expect("well-formed id");
-    let gdir = dir.join(id);
-    std::fs::create_dir_all(&gdir).expect("group dir");
-    std::fs::write(
-        gdir.join("usage.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "agents": [{
-                "agent_id": "w-1", "name": "w", "role": "worker",
-                "cost_usd": cost, "tokens": 1234, "cost_source": "estimated"
-            }]
-        }))
-        .expect("usage json"),
-    )
-    .expect("write usage.json");
+    std::fs::create_dir_all(dir.join(id)).expect("group dir");
+    // Through the SHIPPED writer, not by hand. `usage.json` is a flat array of
+    // `UsageSnapshot`; a hand-written blob of the wrong shape does not fail —
+    // `load_usage_snapshots` treats an unparseable file as empty — so the
+    // fixture would silently describe a group with no cost, which is the very
+    // state this test exists to rule out.
+    reg.upsert_usage_snapshot(
+        &g,
+        UsageSnapshot {
+            key: "sess-1".to_string(),
+            agent_id: "w-1".to_string(),
+            name: "w".to_string(),
+            role: "worker".to_string(),
+            source: "transcript".to_string(),
+            input_tokens: 1_000,
+            output_tokens: 234,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: Some(cost),
+            estimated: true,
+            model: Some("claude-opus-4-8".to_string()),
+            updated_ms: 0,
+        },
+    );
     g
 }
 
@@ -302,7 +315,7 @@ fn a_restored_group_a_tab_is_bound_to_is_published_wire_identically() {
     // entry and lost its accrued-cost badge — a badge the per-tab reads this
     // replaced always produced, because they answered for ANY bound id.
     let (reg, d) = test_registry();
-    let restored = restored_group_on_disk(d.path(), "restored-0001", 4.25);
+    let restored = restored_group_on_disk(&reg, d.path(), "restored-0001", 4.25);
     assert!(
         reg.group(restored.as_str()).is_none(),
         "setup: the fixture must NOT be in the registry, or this test is about a live group"
@@ -360,8 +373,8 @@ fn a_restored_group_no_tab_is_bound_to_is_not_computed() {
     // without limit on a long-lived machine, which is why the strip names what
     // it is bound to rather than the publisher scanning the root.
     let (reg, d) = test_registry();
-    let leased = restored_group_on_disk(d.path(), "restored-0002", 1.5);
-    let unleased = restored_group_on_disk(d.path(), "restored-0003", 9.0);
+    let leased = restored_group_on_disk(&reg, d.path(), "restored-0002", 1.5);
+    let unleased = restored_group_on_disk(&reg, d.path(), "restored-0003", 9.0);
 
     let views = ViewPublisher::new();
     let now = Instant::now();
@@ -387,7 +400,7 @@ fn a_lapsed_strip_lease_stops_a_restored_group_being_computed() {
     // in `groups`, so membership could not release it and the map would grow
     // for the life of the process.
     let (reg, d) = test_registry();
-    let g = restored_group_on_disk(d.path(), "restored-0004", 2.0);
+    let g = restored_group_on_disk(&reg, d.path(), "restored-0004", 2.0);
 
     let views = ViewPublisher::new();
     let t0 = Instant::now();
