@@ -438,21 +438,25 @@ which is the shape the tear needs.
 
 Three claims, kept apart because they are easy to conflate:
 
-- the **sweep** proves no Read tool tears;
+- the **sweep** drives every Read tool with a caller that can run it and asserts
+  none tore. It is a REGRESSION GUARD and nothing more: no run has shown it
+  failing, including the one cut to make it fail — see below;
 - the **probe** beside it — a frame that deliberately writes and then hits a held
-  lock — proves the instrument that would catch one is running. It replaced a
+  lock — proves the instrument that would catch one is running, and it is the
+  assertion in this test with a counterfactual. It replaced a
   population control that asserted "some tool wrote during the sweep", which
   failed on CI and was right to: no Read tool did, so the sweep's `torn == 0` was
   vacuous, and even had one written it would have been a fact about the fixture
   rather than a property;
-- that the sweep catches a **misclassified writer** is evidenced by neither, and
-  is shown by the scratch round that puts `check_mail` back in the Read set and
-  removes the seal.
+- the **seal's own necessity** is carried by neither of those, but by
+  `budget.rs`'s two seal tests, which redden when it is disarmed.
 
 ### What has actually been observed
 
-This section exists because the bullet above used to claim a counterfactual
-that had never run (#1609 review round 2, B1). The scratch round in question
+This section exists because the list above once claimed a counterfactual that
+had never run (#1609 review round 2, B1) — a claim now corrected in the bullets
+themselves rather than only refuted here, which is what round 3 found still
+outstanding. The scratch round in question
 mutated the classification AND the seal, so the engine binary reddened first
 and `cargo` never reached `tests/liveness.rs` — the sweep's behaviour on that
 tree was simply unknown, while the note said it had been shown.
