@@ -619,6 +619,7 @@
 //! and the `liveness_stamp` command the webview stamps through.
 
 pub mod brand;
+pub mod budget;
 pub mod fsatomic;
 pub mod groupid;
 pub mod intake;
