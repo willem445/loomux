@@ -1645,13 +1645,12 @@ fn l5b_a_reentrant_acquisition_answers_busy_instead_of_hanging() {
 }
 
 #[test]
-fn l5_every_rank_is_distinct_and_names_a_lock_that_still_exists() {
-    // Two properties, and the first is load-bearing rather than tidy. Distinct
-    // ranks are what make "two held locks share a rank" mean "the same field
-    // from two different registries" — which this very binary builds, several
-    // times per test — instead of "two peers that must never nest". Collapse
-    // two consts onto one value and the checker starts refusing nestings that
-    // are fine.
+fn l5_every_lockorder_rank_is_distinct() {
+    // Load-bearing rather than tidy. Distinct ranks are what make "two held
+    // locks share a rank" mean "the same field from two different registries" —
+    // which this very binary builds, several times per test — instead of "two
+    // peers that must never nest". Collapse two consts onto one value and the
+    // checker starts refusing nestings that are fine.
     let mut seen: Vec<(u32, &str)> = Vec::new();
     for (name, rank) in lockorder::ALL {
         if let Some((_, other)) = seen.iter().find(|(v, _)| *v == rank.get()) {
@@ -1659,11 +1658,19 @@ fn l5_every_rank_is_distinct_and_names_a_lock_that_still_exists() {
         }
         seen.push((rank.get(), *name));
     }
+    // Vacuity control: an "every pair differs" over an empty list is true.
     assert_eq!(seen.len(), lockorder::ALL.len());
+    assert!(lockorder::ALL.len() >= 18, "the table shrank: {}", lockorder::ALL.len());
+}
 
-    // And the second: a const that names a field which has been renamed away
-    // ranks nothing at all, silently. `tracked_lock_names()` is every LIVE
-    // tracked lock in this process, so a fresh registry puts all of them there.
+/// Separate from the distinctness row on purpose: two properties in one test
+/// means whichever assertion runs first masks the other, and a guard nobody can
+/// redden alone is a guard nobody has checked.
+#[test]
+fn l5_every_lockorder_const_names_a_lock_that_still_exists() {
+    // A const that names a field which has been renamed away ranks nothing at
+    // all, silently. `tracked_lock_names()` is every LIVE tracked lock in this
+    // process, so a fresh registry puts all of them there.
     let (reg, _dir) = test_registry();
     // `AUDIT_LOCK` is a lazily-initialised static rather than a registry field,
     // so it is only live once something has taken it. Take it.

@@ -1900,6 +1900,7 @@ mod bounded_tests {
 #[cfg(test)]
 mod rank_tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// Every test here reads or writes PROCESS-GLOBAL state — the violation
     /// counter, the unranked-report counter, and the panic switch — so they run
@@ -2038,18 +2039,37 @@ mod rank_tests {
     #[test]
     fn a_reentrant_lock_safe_panics_rather_than_self_deadlocking() {
         let _serial = SERIAL.lock_safe();
-        let lock = TrackedMutex::new_ranked("reentpanicspec", OUTER, ());
-        let held_line = std::line!() + 2;
-        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
-            let _held = lock.lock_safe();
-            // Today this parks forever, with no cycle for an inversion search
-            // to find — #1600 §1.2's invisible case.
-            let _boom = lock.lock_safe();
-        }))
-        .expect("a re-entrant lock_safe must panic in a debug/test build");
+        let lock = std::sync::Arc::new(TrackedMutex::new_ranked("reentpanicspec", OUTER, ()));
+
+        // **On its own thread, with a bounded wait.** Not fussiness: this is
+        // the one row whose FAILING form is a permanent park — remove the
+        // refusal and the second `lock_safe` is the self-deadlock the test is
+        // about, which in-thread would arrive as a CI job timeout naming
+        // nothing. The thread is left parked deliberately; the run ends and
+        // the process exits (`completes_within`'s idiom in `tests/liveness.rs`).
+        let (tx, rx) = mpsc::channel();
+        let l = lock.clone();
+        let held_line = std::line!() + 3;
+        std::thread::spawn(move || {
+            let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+                let _held = l.lock_safe();
+                // Today this parks forever, with no cycle for an inversion
+                // search to find — #1600 §1.2's invisible case.
+                let _boom = l.lock_safe();
+                // Only reached if the acquisition was granted, which is the
+                // one outcome that is neither a refusal nor a deadlock.
+                assert_eq!(held_lock_depth(), 2, "a re-entrant acquisition was GRANTED");
+            }));
+            let _ = tx.send((msg, held_lock_depth()));
+        });
+
+        let (msg, depth) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the re-entrant acquisition PARKED — which is exactly the defect #1610 closes");
+        let msg = msg.expect("a re-entrant lock_safe must panic in a debug/test build");
         assert!(msg.contains("reentpanicspec"), "{msg}");
         assert!(msg.contains(&format!("lockwatch.rs:{held_line}")), "{msg}");
-        assert_eq!(held_lock_depth(), 0);
+        assert_eq!(depth, 0, "the unwind left a phantom hold on that thread's stack");
     }
 
     #[test]
