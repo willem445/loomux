@@ -78,9 +78,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Called BEFORE the write rather than after it, deliberately: the seal
     // has to be in place for every acquisition that could follow, and the
     // first of those is `fs::create_dir_all` failing into an early return.
-    crate::budget::note_durable_write(
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
-    );
+    // [scratch] the REPLACE primitive no longer seals.
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // Ensure the destination dir exists — group state dirs always do, but the #83
     // grant subdirs (`merge_grants/`, `release_grants/`) may be fresh.
