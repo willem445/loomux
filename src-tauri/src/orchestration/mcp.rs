@@ -214,7 +214,9 @@ pub enum ToolKind {
 /// silently becoming the answer for the whole surface.
 pub fn tool_kind(name: &str) -> ToolKind {
     match name {
-        // Pure reads of registry or on-disk state.
+        // Reads. Derived from what each arm DOES, not from what its name
+        // sounds like — the first version of this table was written from the
+        // names and put four writers in here (#1609 review B1).
         "list_agents"
         | "get_state"
         | "list_tasks"
@@ -222,17 +224,40 @@ pub fn tool_kind(name: &str) -> ToolKind {
         | "list_questions"
         | "list_needs_you"
         | "list_verdicts"
-        | "list_locks"
         | "list_notifications"
         | "get_output"
         | "group_usage"
         | "session_digest"
         | "merge_queue_status"
-        | "queue_orphans"
-        | "pr_checks"
-        | "check_mail"
         | "channel_status" => ToolKind::Read,
+
+        // MOVED HERE by review B1, each because it mutates despite its name:
+        //
+        // - `check_mail` is a CONSUMING read in its own doc's words: it marks
+        //   every message read, prunes, and atomically replaces `mailbox.json`
+        //   — then takes `app` and `AUDIT_LOCK`. Unwinding at either left the
+        //   human's mail consumed on disk while the caller was told nothing
+        //   had executed. It is a mutation and is classified as one.
+        // - `queue_orphans` publishes a recovery LATCH and then runs a
+        //   two-phase persist/deliver cascade; abandoning it mid-cascade
+        //   loses the previous process's backlog for this process's life.
+        // - `list_locks` reaches `with_locks` -> `table.sync(declared)`, which
+        //   DROPS undeclared resources including live holders, then audits.
+        //
+        // `group_usage` deliberately stays a Read: its `usage.json` merge is a
+        // durable cache refresh rather than the point of the call, and the
+        // seal (`budget::note_durable_write`) is what makes it safe — putting
+        // every usage read on the mutate deadline would be a heavy answer to a
+        // hazard the floor already closes. `doc/design/lock-liveness.md` §4.
+        "check_mail" | "queue_orphans" | "list_locks" => ToolKind::Mutate,
+
         // Everything else, including anything unrecognised.
+        //
+        // `pr_checks` used to be listed above as a Read. It is not a tool at
+        // all — `tool_defs` registers no such name — so it was a dead row that
+        // classified nothing, and a typo in this table degrades to `Mutate`
+        // silently. The classification test now pins the Read set against what
+        // `tools/list` actually returns (#1609 review N2).
         _ => ToolKind::Mutate,
     }
 }
@@ -346,9 +371,12 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
 /// cannot live inside the pure seam: the mutating-tool deadline, and the helper
 /// thread that outlives it.
 ///
-/// Every other method — `initialize`, `tools/list`, `ping`, and every READ tool
-/// — goes straight through, because their bound is already inside `dispatch`
-/// (a read tool's `MCP_READ_BUDGET` frame) or they take no lock at all.
+/// Every other method goes straight through, because its bound is already
+/// inside `dispatch`: a read tool's `MCP_READ_BUDGET` frame, and — since
+/// review B4 — `tools/list`'s own. `initialize` and `ping` take no lock at
+/// all; that claim used to cover `tools/list` too and was wrong, because
+/// `lock_menu` and `manager_block` both reach `groups` (and `lock_menu` can
+/// reach `locks`).
 ///
 /// **Why the deadline is here rather than in `dispatch`.** `dispatch` is the
 /// HTTP-free seam the integration suite drives directly, by `&OrchRegistry`
@@ -536,14 +564,28 @@ pub fn dispatch(
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({
-            "tools": tool_defs(
-                caller.role,
-                caller.role_hint.as_deref(),
-                &reg.lock_menu(&caller.group),
-                reg.manager_block(&caller.group).is_some(),
-            )
-        })),
+        // Bounded (#1609 review B4). `lock_menu` reaches `groups` (and, on the
+        // unreadable-workflow branch, `locks`) and `manager_block` reaches
+        // `groups`; auth's budget frame has already exited by the time this
+        // runs, so before this it was an unbounded acquisition on the ONE
+        // method every agent CLI issues at session start and on every
+        // reconnect — the accumulation half of #1600 §1.2, on the worst
+        // possible method to have it on.
+        //
+        // A pure read: `lock_menu`, `manager_block` and `tool_defs` write
+        // nothing, so the frame can unwind safely and the busy answer is the
+        // protocol-level one — the caller has no tool result to attach it to.
+        "tools/list" => budget::read_budget(budget::MCP_READ_BUDGET, || {
+            json!({
+                "tools": tool_defs(
+                    caller.role,
+                    caller.role_hint.as_deref(),
+                    &reg.lock_menu(&caller.group),
+                    reg.manager_block(&caller.group).is_some(),
+                )
+            })
+        })
+        .map_err(|busy| (MCP_BUSY_CODE, format!("loomux busy: {busy}; retry"))),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));

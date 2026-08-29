@@ -149,6 +149,14 @@ thread_local! {
 
     /// How many [`MutationScope`]s this thread is inside.
     static MUTATION_DEPTH: Cell<u32> = const { Cell::new(0) };
+
+    /// Whether a DURABLE WRITE has happened inside the current budget frame.
+    ///
+    /// Set by [`note_durable_write`], cleared by [`read_budget`] on the way
+    /// out. While it is set, this thread behaves exactly as it does inside a
+    /// [`MutationScope`]: a timeout WAITS instead of unwinding. See
+    /// [`note_durable_write`] for why that is the rule.
+    static SEALED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// What is left of this thread's budget, and which frame owns it.
@@ -159,6 +167,17 @@ pub(crate) fn remaining() -> Option<(Duration, u64)> {
     BUDGET.with(|b| {
         b.get().map(|(deadline, frame)| (deadline.saturating_duration_since(Instant::now()), frame))
     })
+}
+
+/// Whether an unwind is FORBIDDEN on this thread right now — because it is
+/// inside a [`MutationScope`], or because a durable write has already landed
+/// in this budget frame ([`note_durable_write`]).
+///
+/// The acquisition path asks this, not `in_mutation` alone: the two have the
+/// same consequence and differ only in how they were entered, one declared by
+/// a caller and one observed at the write.
+pub(crate) fn unwind_forbidden() -> bool {
+    in_mutation() || SEALED.with(|s| s.get())
 }
 
 /// Whether this thread is inside a [`MutationScope`].
@@ -220,16 +239,36 @@ pub fn read_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> Result<T, Busy
         _ => (deadline, frame),
     };
     BUDGET.with(|b| b.set(Some(active)));
+    // The seal belongs to the FRAME, not to the thread: an outer frame that
+    // already wrote durably stays sealed after this one returns, and this one
+    // starts unsealed so its own bound is live until it writes something.
+    let sealed_before = SEALED.with(|x| x.replace(false));
 
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
+    let sealed_here = SEALED.with(|x| x.replace(sealed_before));
     BUDGET.with(|b| b.set(prev));
 
     match out {
         Ok(v) => Ok(v),
         Err(payload) => match payload.downcast::<BudgetTimeout>() {
             // Ours.
-            Ok(t) if t.frame == frame => Err(t.busy),
+            Ok(t) if t.frame == frame => {
+                // Structurally unreachable: `note_durable_write` seals the
+                // frame, and a sealed frame never unwinds. Counted rather
+                // than asserted so the invariant is a NUMBER a test can
+                // check — `torn_writes()` is what makes rider R1 a test
+                // instead of an argument. A panic here would take the app
+                // down over a bookkeeping slip.
+                if sealed_here {
+                    TORN_WRITES.fetch_add(1, Ordering::Relaxed);
+                    crate::obs::breadcrumb(
+                        "budget-torn-write",
+                        &format!("lock={} seen={}", t.busy.lock, TORN_WRITES.load(Ordering::Relaxed)),
+                    );
+                }
+                Err(t.busy)
+            }
             // An outer frame's — this one is not the deadline's owner.
             Ok(t) => std::panic::resume_unwind(t),
             // A genuine panic. Untouched, hook already run, crash log already
@@ -276,64 +315,104 @@ impl Drop for MutationScope {
 }
 
 // ---------------------------------------------------------------------------
-// The R1 detector
+// The durable-write seal — rider R1, as a mechanism rather than an argument
 // ---------------------------------------------------------------------------
 
-/// Durable writes seen on an unscoped read path since the process started.
-static UNSCOPED_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Budget frames that performed a durable write and were therefore sealed.
+///
+/// The POPULATION control for [`torn_writes`]: zero torn writes means nothing
+/// if no read path ever wrote anything, which is exactly what a test over a
+/// faked registry would report.
+static SEALED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// How many of those get a breadcrumb before the counter goes quiet.
+/// Budget frames that unwound AFTER a durable write — the tear this exists to
+/// make impossible. Structurally zero; see [`read_budget`].
+static TORN_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// How many seals get a breadcrumb before the trail goes quiet.
 ///
 /// Bounded because a read path that writes every poll tick would otherwise
-/// produce a breadcrumb every two seconds forever — turning the evidence trail
-/// into the noise it exists to cut through, which is the same argument
-/// [`crate::lockwatch::TrackedMutex::busy`]'s edge-trigger makes. The counter
-/// keeps the whole truth regardless; only the narration is capped.
-const UNSCOPED_WRITE_BREADCRUMBS: u64 = 8;
+/// produce a breadcrumb every second forever — turning the evidence trail into
+/// the noise it exists to cut through, which is the same argument
+/// [`crate::lockwatch::TrackedMutex::busy`]'s edge-trigger makes. The counters
+/// keep the whole truth regardless; only the narration is capped.
+const SEAL_BREADCRUMBS: u64 = 8;
 
-/// Report a durable write that is happening inside a [`read_budget`] frame and
-/// OUTSIDE any [`MutationScope`].
+/// A durable write is happening. If it is inside a [`read_budget`] frame, SEAL
+/// that frame: from here to the end of it, a timeout waits instead of
+/// unwinding.
 ///
-/// This is rider R1's residual, made detectable instead of merely argued.
-/// `doc/design/lock-liveness.md` §4 enumerates the writes that occur on read
-/// paths today and shows each is either harmless under an unwind or scoped. The
-/// part an enumeration cannot cover is the next edit: a write added to a
-/// function some read path calls, with nothing to say so. Every durable
-/// orchestration state file goes through
-/// [`crate::fsatomic::atomic_write`], so that is where this is called from, and
-/// the answer to "did anyone remember" stops being a review dependency.
+/// # The rule this implements, and why it is this one
 ///
-/// **It reports; it does not refuse.** A panic here would be a guard that
-/// blocks a build, and this repo's rule is that a refusing guard ships only
-/// after it has run clean over known-good subjects — which cannot be
-/// established for a write path nobody has enumerated yet. So: a counter a test
-/// can assert on, and a bounded breadcrumb trail a field report carries.
+/// Rider R1 asked for the writes on read paths to be proved or scoped. Round 1
+/// of review showed the enumeration answering it was incomplete — four
+/// `ToolKind::Read` arms wrote durably and were never looked at, one of them
+/// (`check_mail`) *consumingly*. Two structural rules were available:
 ///
-/// **What it does NOT see**, stated where it lives: writes that are not
-/// `atomic_write` — `fs::rename`, `fs::write`, `fs::create_dir_all`. The one
-/// such site on a read path today is `load_usage_snapshots`' corrupt-file
-/// rename, and it is inside `merge_usage_snapshots`' scope; §4 names it.
+/// 1. every tool arm that writes durably becomes `ToolKind::Mutate`; or
+/// 2. every durable write on a read path is followed by mutation semantics, so
+///    a timeout waits.
+///
+/// **(2), implemented here rather than site by site.** (1) alone cannot reach
+/// the writes that are not behind a tool at all — the snapshot publisher's
+/// `usage.json` merge is on a read path with no tool anywhere near it — and a
+/// hand-placed `MutationScope` per site is the "did we remember" review
+/// dependency the epic's §2 is about, over seventeen arms plus whatever is
+/// added next month. Classification is still corrected where a tool genuinely
+/// mutates (see `mcp::tool_kind`); this is the floor underneath it.
+///
+/// **Why sealing at the WRITE and not at the function's entry.** The tear is
+/// never the write itself — an unwind can only fire at a lock acquisition, so a
+/// write is torn only by an acquisition that comes AFTER it. Sealing at the
+/// write is therefore the minimum window that closes the hazard: everything
+/// before the first durable write keeps its bound, and a read path that never
+/// writes is never affected at all. Scoping the whole function would give up
+/// the bound on paths that mostly do not write.
+///
+/// **What it costs.** A read path that writes durably becomes unbounded *after*
+/// that write. That is the same trade [`MutationScope`] makes, narrowed to the
+/// smallest region that needs it, and it fails toward a stall — which Phase 0's
+/// watchdog reports with the holder named — rather than toward a torn write.
+///
+/// The seal is per FRAME: [`read_budget`] clears it on entry and restores what
+/// it found on exit, so an inner frame's write does not silently disarm the
+/// outer one's bound for the rest of a long request.
 pub fn note_durable_write(what: &str) {
-    // Cheap and in this order on purpose: two thread-local reads, and the
-    // common answer is "no budget installed", which costs one of them.
-    if BUDGET.with(|b| b.get()).is_none() || in_mutation() {
+    // Cheap and in this order on purpose: the common answer is "no budget
+    // installed", which costs one thread-local read.
+    if BUDGET.with(|b| b.get()).is_none() {
         return;
     }
-    let n = UNSCOPED_WRITES.fetch_add(1, Ordering::Relaxed);
-    if n < UNSCOPED_WRITE_BREADCRUMBS {
+    if SEALED.with(|s| s.replace(true)) || in_mutation() {
+        return; // already sealed, or a declared mutation: nothing to report.
+    }
+    let n = SEALED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    if n < SEAL_BREADCRUMBS {
         crate::obs::breadcrumb(
-            "write-on-read-budget",
+            "budget-sealed",
             &format!("what={} seen={}", what.replace(' ', "_"), n + 1),
         );
     }
 }
 
-/// How many durable writes have happened on an unscoped read path. The R1
-/// residual, made assertable: a test that drives every read entry point under a
-/// budget and finds this unmoved has checked the property rather than the
-/// prose.
-pub fn unscoped_durable_writes() -> u64 {
-    UNSCOPED_WRITES.load(Ordering::Relaxed)
+/// How many budget frames have been sealed by a durable write. The population
+/// control: a `torn_writes() == 0` assertion is vacuous unless this moved.
+pub fn sealed_frames() -> u64 {
+    SEALED_FRAMES.load(Ordering::Relaxed)
+}
+
+/// How many budget frames unwound after a durable write. **The invariant: this
+/// is zero.** `tests/liveness.rs` drives every read entry point under a held
+/// lock and asserts it, which is what makes rider R1 a test rather than a
+/// paragraph.
+pub fn torn_writes() -> u64 {
+    TORN_WRITES.load(Ordering::Relaxed)
+}
+
+/// Whether this thread's current budget frame has been sealed. For tests.
+#[doc(hidden)]
+pub fn sealed_for_test() -> bool {
+    SEALED.with(|s| s.get())
 }
 
 /// This thread's mutation depth. For tests and for a diagnostic dump; the
@@ -581,40 +660,77 @@ mod tests {
     }
 
     #[test]
-    fn the_r1_detector_fires_on_exactly_the_unwindable_shape() {
-        // Rider R1's residual is "a write added to a read path by a later
-        // edit". `note_durable_write` is what notices; this pins WHICH shape it
-        // notices, because a detector that fires on everything gets muted and
-        // one that fires on nothing is indistinguishable from a clean tree.
+    fn a_durable_write_seals_its_budget_frame_so_a_later_timeout_waits() {
+        // Review round 1, B1/B2. The tear is never the write itself — an unwind
+        // can only fire at a lock acquisition, so a write is torn by an
+        // acquisition that comes AFTER it. `check_mail` was the live instance:
+        // it atomically replaces `mailbox.json` with every message marked read,
+        // and THEN takes `app` and `AUDIT_LOCK`. An unwind at either left the
+        // human's mail consumed on disk while the caller was told "Nothing was
+        // executed".
         //
-        // Deltas, not absolutes: the counter is process-global and every other
-        // test in this binary that writes a file goes through the same door.
-        let before = unscoped_durable_writes();
-        note_durable_write("outside-any-budget.json");
-        assert_eq!(
-            unscoped_durable_writes(),
-            before,
-            "a write with no budget installed is an ordinary mutation and must not be counted"
-        );
+        // The seal closes it structurally: the first durable write in a frame
+        // disarms unwinding for the rest of that frame.
+        let lock = Arc::new(TrackedMutex::new("sealspec", 7u32));
+        hold_for(lock.clone(), Duration::from_millis(600));
 
-        let _ = read_budget(Duration::from_secs(1), || {
-            let _scope = MutationScope::enter();
-            note_durable_write("scoped.json");
+        let sealed_before = sealed_frames();
+        let torn_before = torn_writes();
+        let started = Instant::now();
+
+        let out = read_budget(Duration::from_millis(50), || {
+            note_durable_write("sealspec.json");
+            // The acquisition AFTER the write — the only shape that can tear it.
+            *lock.lock_safe()
+        });
+        let waited = started.elapsed();
+
+        assert_eq!(
+            out.expect("a frame that has already written durably must WAIT, not unwind"),
+            7
+        );
+        // And it really did wait past the budget: without this the assertion
+        // above passes against a lock that was never held.
+        assert!(
+            waited >= Duration::from_millis(300),
+            "it returned in {waited:?}, so the hold was not in its way and this proves nothing"
+        );
+        assert_eq!(
+            sealed_frames(),
+            sealed_before + 1,
+            "the write must SEAL the frame — that is the mechanism, not a report"
+        );
+        assert_eq!(
+            torn_writes(),
+            torn_before,
+            "a sealed frame must never unwind; torn_writes is the invariant rider R1 asks for"
+        );
+    }
+
+    #[test]
+    fn the_seal_belongs_to_the_frame_and_not_to_the_thread() {
+        // Without this, one inner write would disarm every later read on the
+        // same thread — an MCP request thread serves one request, but the
+        // publisher thread runs pass after pass forever, and a single corrupt
+        // `usage.json` rename would silently unbound it for the process's life.
+        assert!(!sealed_for_test(), "a test thread starts unsealed");
+
+        let inner = read_budget(Duration::from_millis(200), || {
+            read_budget(Duration::from_millis(100), || {
+                note_durable_write("inner.json");
+                sealed_for_test()
+            })
         });
         assert_eq!(
-            unscoped_durable_writes(),
-            before,
-            "a write inside a MutationScope cannot be unwound out of, so it must not be counted"
+            inner.expect("outer").expect("inner"),
+            true,
+            "the inner frame must be sealed by its own write"
         );
+        assert!(!sealed_for_test(), "the seal must not outlive the frames that set it");
 
-        // The positive control, and the only shape that IS the hazard: inside a
-        // budget, outside a scope.
-        let _ = read_budget(Duration::from_secs(1), || note_durable_write("unscoped.json"));
-        assert_eq!(
-            unscoped_durable_writes(),
-            before + 1,
-            "the detector did not fire on a durable write inside a read_budget frame — the one \
-             shape an unwind could tear"
-        );
+        // A write with no budget installed seals nothing: there is no frame to
+        // seal and nothing that could unwind.
+        note_durable_write("no-budget.json");
+        assert!(!sealed_for_test());
     }
 }

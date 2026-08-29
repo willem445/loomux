@@ -1316,3 +1316,85 @@ fn a_partial_group_keeps_the_previous_stamp_so_the_badge_can_tell() {
         "the payload must report the stalest part's age, not this pass's"
     );
 }
+
+// ---------- L2g: rider R1 as an ENFORCED invariant, not an argument ----------
+
+#[test]
+fn no_read_tool_can_unwind_after_a_durable_write() {
+    // Review round 1 turned R1 from "prove or scope" into this. The enumeration
+    // that answered it was incomplete — four `ToolKind::Read` arms wrote
+    // durably and were never looked at, one of them (`check_mail`) consumingly —
+    // and an enumeration is the wrong instrument anyway: it is a claim about
+    // today's call graph, re-verified by nobody.
+    //
+    // So the property is measured instead. `budget::torn_writes()` counts budget
+    // frames that unwound AFTER a durable write, which is the tear itself; the
+    // seal (`budget::note_durable_write`) makes it structurally zero. This row
+    // drives every tool the surface CLASSIFIES AS A READ, under a budget, with a
+    // registry lock held, and asserts that number did not move.
+    //
+    // Two things make it non-vacuous, and both are needed:
+    //
+    //  - the population control below (`sealed_frames` must MOVE), so "zero
+    //    torn" cannot be "zero writes" — which is exactly what this test would
+    //    report against a registry whose read paths never wrote anything;
+    //  - the lock it holds is `app`, which `write_mailbox` takes AFTER
+    //    atomically replacing `mailbox.json`. That is the shape the tear needs,
+    //    and it is the one the review found live.
+    let (reg, token, _group, _dir) = mcp_fixture();
+    let caller = reg.resolve_token(&token).expect("the token resolves");
+
+    // The Read set, taken from what the surface actually lists rather than a
+    // list written here — a tool renamed out of `tools/list` must not silently
+    // leave this loop covering one fewer arm.
+    let listed = mcp::dispatch(&reg, &caller, "tools/list", &json!({})).expect("tools/list");
+    let reads: Vec<String> = listed["tools"]
+        .as_array()
+        .expect("an array of tools")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .filter(|n| mcp::tool_kind(n) == mcp::ToolKind::Read)
+        .collect();
+    assert!(
+        reads.len() >= 8,
+        "only {} listed tools classify as Read — the table has stopped matching and this row \
+         is covering almost nothing: {reads:?}",
+        reads.len()
+    );
+
+    let torn_before = loomux_engine::budget::torn_writes();
+    let sealed_before = loomux_engine::budget::sealed_frames();
+
+    // Held for the whole sweep: `app` is taken after `write_mailbox`'s durable
+    // replace, and by `agent_output_totals` / `attention_inputs` in the app.
+    assert!(reg.hold_lock_for_test("app", 20_000), "setup: cannot hold `app`");
+
+    for name in &reads {
+        let call = json!({ "name": name, "arguments": {} });
+        // The answer does not matter — Ok, isError, busy are all fine. What
+        // matters is that no frame unwound after writing.
+        let _ = mcp::dispatch(&reg, &caller, "tools/call", &call);
+    }
+
+    let torn = loomux_engine::budget::torn_writes() - torn_before;
+    assert_eq!(
+        torn, 0,
+        "{torn} read-tool frame(s) unwound AFTER performing a durable write. That is the \
+         tear rider R1 is about: the caller is told `Nothing was executed` while a state file \
+         has already been replaced. Either the tool mutates and belongs in ToolKind::Mutate, \
+         or its write needs to reach `budget::note_durable_write` so the frame seals."
+    );
+
+    // The population control. Without it this row passes just as well against a
+    // sweep in which no read path wrote anything at all — which is precisely
+    // what a faked registry would produce, and precisely the shape of test the
+    // review found wanting.
+    let sealed = loomux_engine::budget::sealed_frames() - sealed_before;
+    assert!(
+        sealed > 0,
+        "no read tool performed a durable write during this sweep, so `torn == 0` above is \
+         vacuous. Either the fixture stopped exercising a writing read (`group_usage` merges \
+         `usage.json`) or the seal stopped being reached — both make this row stop meaning \
+         anything"
+    );
+}
