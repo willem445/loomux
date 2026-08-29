@@ -499,6 +499,14 @@ compiles.
   gesture can beat, or by a `.catch(() => empty())`; every individual step succeeds, so
   the loss is silent. Worked example: `BoardPrefsStore` (`src/boardprefs.ts`) and
   `doc/design/board-tree-view.md` (#1299 B1/N5).
+- **A cache or snapshot placed in FRONT of per-item reads inherits everything those
+  reads answered.** Enumerate what the replaced path could do that the new one cannot —
+  which item classes it served (live AND persisted-only), and what it recovered from (a
+  re-probe, a reopen). The miss is SILENT: an absent entry renders as "nothing here"
+  rather than failing, so neither the compiler nor a unit test over a faked registry sees
+  it. Signature: the new path is keyed on what the live map or this session knows, the
+  reads it replaces on what the CALLER named (#1625 round 2, `views.rs`'s strip lease;
+  #956 rev-507, `modelwire.rs`'s `worth_keeping`).
 - **A `Mutex` that serialises tests is locked with `lock_safe`, never
   `.lock().unwrap()`.** One failing test panics under the guard and poisons it,
   so every later test on that lock dies of `PoisonError` — one genuine failure
