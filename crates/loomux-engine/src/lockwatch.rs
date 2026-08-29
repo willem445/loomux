@@ -72,7 +72,7 @@
 
 use crate::obs::LockExt;
 use std::panic::Location;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
