@@ -459,7 +459,41 @@ tree was simply unknown, while the note said it had been shown.
 
 The stageable form is the same mutation plus `#[ignore]` on the two `budget.rs`
 seal tests, so the engine binary passes and the integration binaries run.
-SCRATCH_RESULT_PLACEHOLDER
+That round was cut (`scratch/1609-r3-red`, run **33257747970**) and it settles
+the question in a way worth stating exactly, because it is not the answer the
+retracted sentence claimed.
+
+**`tests/liveness.rs` was reached** — the engine binary reports
+`425 passed; 0 failed; 2 ignored`, so the `#[ignore]`s did their job — and L2g
+**failed**:
+
+```
+test no_read_tool_can_unwind_after_a_durable_write ... FAILED
+panicked at src-tauri/tests/liveness.rs:1465:
+a frame that wrote durably and then hit a held lock UNWOUND. The seal is not
+engaging, so `torn == 0` above measures a mechanism that is not running
+test result: FAILED. 14 passed; 1 failed
+```
+
+**The assertion that fired is the PROBE, at line 1465 — not the sweep.** The
+sweep's own `assert_eq!(torn, 0, ..)` runs first, at line 1438, and it PASSED on
+the defective tree: `check_mail` was back in the Read set, unsealed, and driven
+by a caller that lists it, and the sweep still saw no tear.
+
+So the honest division is the one §4.5 already draws, now measured rather than
+reasoned:
+
+- the **probe** is the assertion with a counterfactual. It is what reddens when
+  the seal stops engaging, and it is why L2g is a test rather than a formality;
+- the **sweep** does NOT catch a misclassified writer, on the evidence. It
+  remains a regression guard — it drives every Read tool with a caller that can
+  run it and asserts none tore — but no run has shown it failing, and this round
+  is the one that would have.
+
+Why the sweep stayed green is not established here and is deliberately not
+guessed at; what is established is that it did. The claim this section replaced
+said the sweep catches such a writer, and the round cut to prove it proved the
+opposite.
 
 **What is still not covered**, stated rather than left to be found:
 

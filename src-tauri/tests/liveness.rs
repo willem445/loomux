@@ -1492,6 +1492,14 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     // `usage.json`, and whether it does so in a given run depends on live agents
     // having snapshots — a property of the fixture, not of the code.
     //
+    // MEASURED, not reasoned (#1609 review round 2, B1): the round that puts
+    // `check_mail` back in the Read set unsealed — with the two `budget.rs` seal
+    // tests `#[ignore]`d so `cargo` reaches this binary at all — run 33257747970,
+    // reddens the PROBE above at line ~1465 and leaves the sweep's own
+    // `torn == 0` GREEN. So the sweep does not catch a misclassified writer, and
+    // no run has shown it failing. It is a regression guard; the probe is the
+    // assertion with a counterfactual.
+    //
     // So the sweep asserts what it supports: every Read tool was reachable and
     // driven (above), and none tore. The two stronger claims live where they can
     // be demonstrated — the probe shows the instrument runs, and `budget.rs`'s
