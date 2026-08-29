@@ -295,7 +295,7 @@ impl ViewPublisher {
         let started = Instant::now();
         let mut computed: HashMap<GroupId, Arc<GroupView>> = HashMap::with_capacity(ids.len());
         for id in ids {
-            let leased = self.has_view_lease_at(&id, now);
+            let leased = true; // MUTATION MA: lease ignored
             computed.insert(id.clone(), Arc::new(self.compute_group(reg, &id, leased, now)));
         }
         let compute_ms = elapsed_ms(started);
@@ -433,7 +433,7 @@ fn meta(
         "compute_ms": compute_ms,
         // Entered on the clock; released ONLY by the next successful store,
         // which is what moves `computed_at`. See the module doc.
-        "stale": age_ms > VIEW_STALE_AFTER_MS,
+        "stale": age_ms >= VIEW_STALE_AFTER_MS, // MUTATION MC
         "partial": partial,
     })
 }
@@ -509,7 +509,8 @@ pub fn group_view_payload(
 /// group to be stale about, and reporting age 0 forever would make an app with
 /// no groups indistinguishable from a wedged one.
 pub fn strip_view_payload(snapshot: &Stamped<ViewSnapshot>, now: Instant) -> Value {
-    let oldest = snapshot.value.groups.values().min_by_key(|g| g.computed_at);
+    // MUTATION MB: snapshot stamp instead of the oldest group's
+    let oldest: Option<&Arc<GroupView>> = None;
     let (computed_at, computed_unix_ms, compute_ms) = match oldest {
         Some(g) => (g.computed_at, g.computed_unix_ms, g.compute_ms),
         None => (snapshot.published_at, snapshot.published_unix_ms, snapshot.compute_ms),
