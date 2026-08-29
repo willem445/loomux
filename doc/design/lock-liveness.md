@@ -905,6 +905,19 @@ So the failure is armed where a failure is what the caller wants:
   hook at all; the watchdog keeps writing the Phase 0 `lock-slow`/`lock-freed`
   breadcrumb, which is what the field diagnosis of #1702 was built from.
 
+**What CLAUDE.md constraint 10 asks of this, discharged.** That constraint says
+a change turning a WAIT into a panic owes a measured cost per executing-thread
+class, because an unwind that merely releases a lock on a pool thread aborts the
+process on the GUI one. This hook introduces a panic, so it owes that — and
+discharges it by REACHABILITY rather than by measurement: the panic fires only
+while `HOLD_PANICS` is armed, the only arming points are a `cargo test` binary
+and `e2ehold`'s `#[cfg(debug_assertions)]` module, and no `#[tauri::command]` —
+sync or async — calls `enforce_hold_budget` at all. So the GUI-thread class
+cannot reach it, and the class that can is a test harness whose whole purpose is
+to fail. The residual, stated because nothing enforces it: that is a fact about
+today's call graph, not a structural barrier, and a future caller reaching this
+hook from a sync command would owe constraint 10's measurement in full.
+
 `set_hold_panics(false)` is the documented way to observe violations without
 failing, and it is a counterfactual rather than a promise:
 `the_enforcement_panics_only_while_it_is_armed` performs the edit and checks
