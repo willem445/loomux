@@ -274,10 +274,17 @@ generation counter goes odd -> even, the lock reads FREE to the watchdog, and th
 inner guard's own drop releases the mutex.
 
 The property that makes this true rather than hopeful is that **`Drop` cannot
-panic**. Its body is one clock read, four relaxed loads, four relaxed stores and
-two release read-modify-writes — no allocation, no indexing, and no arithmetic
-that can overflow (`saturating_sub`). A panic in a drop during an unwind is an
-abort; this one has nothing to panic with.
+panic**. Its body is one clock read, four relaxed loads, four relaxed stores, one
+release store (`done_pending`) and one release read-modify-write (`generation`) —
+no allocation, no indexing, and no arithmetic that can overflow
+(`saturating_sub`). A panic in a drop during an unwind is an abort; this one has
+nothing to panic with.
+
+(The store and the read-modify-write are counted apart rather than lumped as "two
+release read-modify-writes", which is what this paragraph said before rebasing
+onto #1625 — #1608 corrected that figure on `TrackedGuard::drop` itself, and the
+correction is load-bearing for the same reason it was there: this body runs with
+the mutex still held, so what it costs is what every waiter behind it pays.)
 
 Pinned, not asserted: `budget::tests::an_unwind_leaves_no_tracked_lock_held`
 holds one lock, times out on a second, and after the `Err` checks both that the
