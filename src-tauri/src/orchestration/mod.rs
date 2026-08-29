@@ -26509,6 +26509,70 @@ impl OrchRegistry {
         }
     }
 
+    /// Hold one named registry lock for `ms`, on a thread of its own, returning
+    /// once that thread has actually acquired it.
+    ///
+    /// Test/diagnostic seam (#1601 Phase 0). The instrument this PR builds
+    /// reports the state the app is in when it stops answering, and the only
+    /// honest way to test that is to CREATE the state — a synthesized snapshot
+    /// exercises the reporting rule but never the recording that feeds it. The
+    /// Rust-level liveness tests and the E2E injected hold both need one real
+    /// registry lock held for a real interval.
+    ///
+    /// **Deliberately not a `#[tauri::command]`, and not reachable from an
+    /// agent.** It is a hang generator; the frontend and the MCP surface have
+    /// no business with one. If the E2E soak lane (plan §3 Phase 4.1) needs to
+    /// reach it, that is a command behind a debug build flag and its own
+    /// argument, not this.
+    ///
+    /// Returns `false` for a name this does not know. The list is a
+    /// representative handful rather than all 82: what a caller needs is a lock
+    /// with the right SHAPE — one the poll path takes (`groups`), one a
+    /// background thread holds for real work (`mq_state_lock`), one on the MCP
+    /// path (`agents`) — and an exhaustive match here would be one more thing
+    /// to keep in step with the struct for no gain.
+    #[doc(hidden)]
+    pub fn hold_lock_for_test(self: &Arc<Self>, name: &str, ms: u64) -> bool {
+        let reg = self.clone();
+        let (tx, rx) = mpsc::channel::<()>();
+        let name = name.to_string();
+        let known = matches!(name.as_str(), "groups" | "agents" | "mq_state_lock" | "tasks_lock");
+        if !known {
+            return false;
+        }
+        std::thread::spawn(move || {
+            // One guard per arm rather than a `Box<dyn Any>`: the arms guard
+            // different types, and the acquisition has to happen at a real
+            // `lock_safe` call site or the recorded site would be this seam
+            // for every lock it can hold.
+            match name.as_str() {
+                "groups" => {
+                    let _g = reg.groups.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                "agents" => {
+                    let _g = reg.agents.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                "mq_state_lock" => {
+                    let _g = reg.mq_state_lock.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                _ => {
+                    let _g = reg.tasks_lock.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+            }
+        });
+        // Return only once the hold is real, so a caller can assert on it
+        // without racing the thread it just started.
+        rx.recv().is_ok()
+    }
+
     /// Point the usage reader at a specific Claude transcript root, instead of
     /// `~/.claude/projects`. Test-only seam (see `claude_projects_dir`).
     #[doc(hidden)]
