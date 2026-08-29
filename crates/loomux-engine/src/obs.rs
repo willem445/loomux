@@ -1007,27 +1007,12 @@ impl TickSupervisor {
         if self.latched {
             return None;
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-            Ok(v) => {
-                self.consecutive_panics = 0;
-                Some(v)
-            }
-            Err(_) => {
-                self.consecutive_panics += 1;
-                breadcrumb(
-                    TICK_PANIC_EVENT,
-                    &format!("tick={} consecutive={}", self.tick, self.consecutive_panics),
-                );
-                if self.consecutive_panics >= TICK_PANIC_LIMIT {
-                    self.latched = true;
-                    breadcrumb(
-                        TICK_DISABLED_EVENT,
-                        &format!("tick={} panics={}", self.tick, self.consecutive_panics),
-                    );
-                }
-                None
-            }
-        }
+        // NEUTERED (round 1, neuter B): the catch is removed, so a
+        // panicking body unwinds out of the supervisor and takes the
+        // loop thread with it, as the bare loops did before #1702.
+        let v = body();
+        self.consecutive_panics = 0;
+        Some(v)
     }
 
     /// Whether this supervisor has stopped calling its body. Test-only: the
