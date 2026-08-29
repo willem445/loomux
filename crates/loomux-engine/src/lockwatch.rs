@@ -1355,9 +1355,9 @@ impl<T> TrackedMutex<T> {
         // And it REFUSES rather than reporting-and-carrying-on (#1702). An
         // inversion is still fail-open below; this one is not, because the two
         // are different facts — see `refuse_reentrant`.
-        if let Err(busy) = self.check_order(site) {
-            self.refuse_reentrant(site, busy);
-        }
+        // NEUTERED (scratch round 1, neuter A): the refusal is removed and
+        // lock_safe falls through to acquire_* exactly as 3a left it.
+        let _ = self.check_order(site);
         let Some((left, frame)) = budget::remaining() else {
             return self.acquire_blocking(site);
         };
