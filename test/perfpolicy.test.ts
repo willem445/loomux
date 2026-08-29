@@ -581,8 +581,9 @@ const TIMERS: TimerRow[] = [
       "blind the instrument exactly where a freeze is least likely to be noticed early. The tick " +
       "is a rounding subtraction plus one invoke of a SYNC command whose whole body is six " +
       "relaxed atomic stores — no lock, no IO, no allocation at either end — against a tab strip " +
-      "that polls two invokes per group-bound tab every 4 s and a group view that polls nine " +
-      "every 2 s. The platform still throttles a hidden window's timers, which is why every " +
+      "and a group view that each poll ONE invoke per tick since #1608 (two per group-bound tab " +
+      "every 4 s, and ten every 2 s, when this row was written). The platform still throttles a " +
+      "hidden window's timers, which is why every " +
       "stamp carries `hidden` and `selfwatch::liveness` answers 'no evidence' rather than " +
       "'stuck' for a stale stamp from one (Liveness::GuiHidden).",
     debt: null,
