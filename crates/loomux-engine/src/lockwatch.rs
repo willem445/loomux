@@ -569,7 +569,7 @@ impl LockWatch {
             if self.warned.contains(&(s.id, s.generation)) {
                 continue;
             }
-            self.warned.push((s.id, s.generation));
+            // NEUTERED (scratch, #1601): never remember a reported hold.
             out.push(HoldReport {
                 lock: s.name,
                 site_file: s.site_file,
