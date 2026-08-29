@@ -1452,8 +1452,9 @@ export interface GroupUsage {
   /** One row per **live** agent — NOT one per agent the group has ever had
    *  (#1317). The backend's own value carries the whole lifetime roster, which
    *  grows with session length and is what `mcp::summarize_group_usage` caps
-   *  on the MCP side; this polled command projects it to the live rows, which
-   *  are bounded by the group's max-agents setting.
+   *  on the MCP side; this command projects it to the live rows, which are
+   *  bounded by the group's max-agents setting. (It reaches the UI as the
+   *  `usage` section of a published snapshot since #1608, not as a poll.)
    *
    *  Nothing is hidden by the cut: every `lifetime_*` total above still sums
    *  the whole roster, and `agent_count` names its size. The key is

@@ -1375,7 +1375,14 @@ fn frontend_command_map() -> BTreeMap<String, String> {
 /// anywhere on the poll path is now in scope, not only one that happened to be
 /// a member of an array literal.
 ///
-/// **Stated bound.** Comments are stripped before brace matching, so a `{` in
+/// **Stated bound, part one: depth.** What is in scope is anything called in
+/// that ONE function body — not helpers it delegates to. Neither poll body
+/// delegates today (each is a single `invoke` wrapper call plus rendering), so
+/// nothing is missed; a poll site that grew a helper would need this widened or
+/// the helper inlined. A source scan cannot follow call chains, which is the
+/// same residue `performance.md` §3 states for E1 as a whole.
+///
+/// **Stated bound, part two: parsing.** Comments are stripped before brace matching, so a `{` in
 /// prose cannot end the body early. String and template literals are NOT
 /// stripped: a brace inside one would still miscount, and the balance
 /// assertion below is what turns that into a loud failure rather than a
@@ -1560,7 +1567,16 @@ fn no_command_on_a_fixed_cadence_poll_path_is_synchronous() {
             // `code` has comments and string contents blanked, so a mention of
             // the cell in prose cannot satisfy this.
             if !site.code.contains("views.load(") {
-                not_reading_the_cell.push(format!("{}:{} {cmd}", site.file, site.line));
+                not_reading_the_cell.push(format!("{}:{} {cmd} (no `views.load(`)", site.file, site.line));
+            }
+            // The property, not only the proxy (#1625 review N2). Reading the
+            // published cell is what a served command SHOULD do; taking a
+            // registry lock is what it must NOT do, and a body could do both.
+            if site.code.contains("lock_safe(") {
+                not_reading_the_cell.push(format!(
+                    "{}:{} {cmd} (takes a lock: `lock_safe(` in its body)",
+                    site.file, site.line
+                ));
             }
         }
         assert!(

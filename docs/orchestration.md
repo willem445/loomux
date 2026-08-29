@@ -1369,7 +1369,8 @@ own statusline, which disappears when the pane does.
 
 **When the panel says `stale`.** The lifecycle panel and the tab strip's agent
 counts are served from a snapshot orrerix refreshes about once a second, rather
-than by asking the backend ten separate questions every time. If that refresh
+than by asking the backend a separate question per figure every time — ten of
+them for the panel, and two per tab for the strip. If that refresh
 falls behind — the usual cause is one long-running internal operation holding
 things up — the panel keeps showing you the last figures it has and puts an
 amber **`stale 12s`** badge in its header saying how old they are; the affected

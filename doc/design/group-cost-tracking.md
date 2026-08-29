@@ -121,10 +121,12 @@ flag.
 
 ## Reading the transcript incrementally — the cursor contract (#1239)
 
-The usage poll is the app's hottest path: `orch_group_usage` is asked for by
-the group view, the tab bar and `orch_autonomy` inside the same tick, and
-`USAGE_POLL_MAX_AGE` (1 s) is the floor on how often the three of them share
-one computation. That computation reads *every live agent's* transcript.
+The usage poll is the app's hottest path. `orch_group_usage` was asked for by
+the group view, the tab bar and `orch_autonomy` inside the same tick, with
+`USAGE_POLL_MAX_AGE` (1 s) as the floor on how often the three of them shared
+one computation. Since #1608 the snapshot publisher is the caller — one pass per
+second, the same window — and the two UI surfaces read the result out of a
+published snapshot instead (`doc/design/polled-views.md`). That computation reads *every live agent's* transcript.
 
 Reading it whole, every time, is the defect #1239 names. On a multi-day
 session the file is tens of MiB; the poll opened it, ran `serde_json` over

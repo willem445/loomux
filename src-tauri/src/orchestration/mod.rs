@@ -2684,11 +2684,15 @@ const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
 /// #743 S4b: how long a computed group-usage summary may be re-served to the
 /// POLLED command path before it is recomputed.
 ///
-/// One second, chosen against the poll cadences it has to collapse: the group
-/// view's 2 s batch fires `orch_group_usage` and `orch_autonomy` (whose budget
+/// One second, chosen against the poll cadences it had to collapse: the group
+/// view's 2 s batch fired `orch_group_usage` and `orch_autonomy` (whose budget
 /// meter runs the same computation) concurrently in one `Promise.all`, and the
-/// tab bar polls at 4 s per group-bound tab. A window of one second is short
-/// enough that no tick ever *skips* a refresh — every 2 s tick still recomputes
+/// tab bar polled at 4 s per group-bound tab. Since #1608 neither of those is a
+/// caller: the snapshot publisher runs the computation once per
+/// [`views::VIEW_PUBLISH_INTERVAL`], which is deliberately this same second, so
+/// the window still bounds exactly what it always bounded. A window of one
+/// second is short enough that no tick ever *skips* a refresh — every pass still
+/// recomputes
 /// — and long enough that the several reads inside one tick share a single
 /// computation. It is the freshness bound, not a cache lifetime: figures are a
 /// cost meter refreshed twice a second at worst, and every non-polled caller
@@ -2718,7 +2722,9 @@ enum UsageView {
 /// snapshot `mark_dead` ever captured, so the array only grows with how long
 /// the human has been running. Nothing accumulates ACROSS ticks — the array is
 /// replaced wholesale each time — but the size of ONE tick grows with session
-/// length, on a fixed 2 s (group view) / 4 s (per group-bound tab) cadence.
+/// length, on a fixed cadence (a 2 s group view and a 4 s per-group-bound-tab
+/// sweep when #1317 measured it; one 1 s publisher pass since #1608, which
+/// changed which thread pays it, not that it is paid).
 /// That is allocation churn proportional to session length, which is what a
 /// long session feels as GC pressure. The MCP twin was capped for exactly this
 /// (`mcp::summarize_group_usage`: "a 654-agent lifetime roster serialized to
@@ -13028,11 +13034,16 @@ pub struct OrchRegistry {
     /// [`OrchRegistry::group_usage_within`] serves when the stored one is
     /// younger than the caller's `max_age`.
     ///
-    /// **Why it exists.** `orch_group_usage` is the heaviest polled command in
-    /// the app (per-live-agent transcript reads plus a `usage.json`
-    /// read-modify-write), and three callers ask for it inside the same ~2 s
-    /// tick: the group view, the tab bar, and `orch_autonomy`'s budget meter.
-    /// The memo makes that one computation instead of three.
+    /// **Why it exists.** `group_usage_live_within` is the heaviest thing on a
+    /// cadence in this app (per-live-agent transcript reads plus a `usage.json`
+    /// read-modify-write). Three callers used to ask for it inside the same ~2 s
+    /// tick — the group view, the tab bar, and `orch_autonomy`'s budget meter —
+    /// and the memo made that one computation instead of three.
+    ///
+    /// Since #1608 the frontend asks for none of them: the snapshot publisher
+    /// computes `usage` and `autonomy` in one pass, so the memo's remaining
+    /// callers are that pass and the `group_usage` MCP tool. It is not redundant
+    /// yet for exactly that reason — see `doc/design/polled-views.md`.
     ///
     /// **`Arc<Mutex<..>>` per group, not one map lock.** The outer map lock is
     /// held only long enough to clone the per-group cell out (pty.rs's
@@ -13070,9 +13081,12 @@ pub struct OrchRegistry {
     /// Per-REPO memo for the display-only default-branch name (#743 S4a),
     /// keyed by repo path so two groups on one repo share the answer.
     ///
-    /// `orch_workflow_status` is in the group view's 2 s batch and resolving
+    /// `orch_workflow_status` was in the group view's 2 s batch and resolving
     /// this name costs 2-4 blocking `git` spawns, so it was 2-4 process spawns
-    /// every 2 s per open group view. The name is display-only and already
+    /// every 2 s per open group view. Since #1608 the caller is the snapshot
+    /// publisher's view tier, once per second and only for a group holding a
+    /// view lease — so the memo now bounds a 1 s cadence rather than a 2 s one,
+    /// and the spawns it saves are the same spawns. The name is display-only and already
     /// documented as unboundedly stale (see [`crate::git::default_branch_name`]:
     /// it reads local refs, so it is only as fresh as whatever last fetched);
     /// a coarse TTL therefore adds a *bounded* staleness on top of an unbounded
@@ -50476,6 +50490,25 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for the polled-view publisher (#1608, plan #1600 §3 Phase
+/// 1): every [`views::VIEW_PUBLISH_INTERVAL`] it recomputes the group-view and
+/// tab-strip payloads for every group the registry knows and publishes them as
+/// one immutable snapshot, so the two polled commands can be served by pointer
+/// clone instead of by acquiring registry mutexes on every tick.
+///
+/// **This is the thread that pays the wait.** If a registry lock is held
+/// pathologically long, exactly one thread parks here — not one per poller per
+/// tick on the shared blocking pool, which is the accumulation #1600 §1.2
+/// derives beta6 from. Readers keep answering with the last snapshot and a
+/// growing `age_ms`, and the frontend badges it stale past
+/// [`views::VIEW_STALE_AFTER_MS`]. Started once at app setup.
+pub fn start_view_publisher(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(views::VIEW_PUBLISH_INTERVAL);
+        reg.views.publish_pass(&reg);
+    });
+}
+
 /// Background loop for attention routing (#6): every `ATTENTION_INTERVAL` it
 /// recomputes which panes need the human (idle-with-prompt, worker reports,
 /// human merge gates), pushes the set to the frontend for pane badges, and
@@ -50559,25 +50592,6 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
 ///    one unconditional re-push of a non-empty set every `QUEUE_DEPTH_REPUSH_MS`,
 ///    which is that suppression's independent release rather than a cadence of
 ///    its own.
-/// Background loop for the polled-view publisher (#1608, plan #1600 §3 Phase
-/// 1): every [`views::VIEW_PUBLISH_INTERVAL`] it recomputes the group-view and
-/// tab-strip payloads for every group the registry knows and publishes them as
-/// one immutable snapshot, so the two polled commands can be served by pointer
-/// clone instead of by acquiring registry mutexes on every tick.
-///
-/// **This is the thread that pays the wait.** If a registry lock is held
-/// pathologically long, exactly one thread parks here — not one per poller per
-/// tick on the shared blocking pool, which is the accumulation #1600 §1.2
-/// derives beta6 from. Readers keep answering with the last snapshot and a
-/// growing `age_ms`, and the frontend badges it stale past
-/// [`views::VIEW_STALE_AFTER_MS`]. Started once at app setup.
-pub fn start_view_publisher(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(views::VIEW_PUBLISH_INTERVAL);
-        reg.views.publish_pass(&reg);
-    });
-}
-
 pub fn start_attention(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || {
         let mut tick: u64 = 0;
@@ -51636,12 +51650,18 @@ pub async fn orch_set_max_agents(
 
 /// Aggregate per-pane session cost/usage into one group summary for the UI.
 ///
-/// **The app's heaviest polled command** (census #1): a transcript read per live
-/// agent plus a `usage.json` read-modify-write, asked for by the group view's
-/// 2 s batch, the tab bar's 4 s loop for every group-bound tab, and — through
-/// the budget meter — `orch_autonomy` in the same tick. #743 S4b moves the whole
-/// body off the webview thread and serves it through the per-group memo, so
-/// those callers share ONE computation per [`USAGE_POLL_MAX_AGE`] window.
+/// **No longer on any poll path** (#1608), and the heaviest thing that ever was
+/// (census #1): a transcript read per live agent plus a `usage.json`
+/// read-modify-write. It was asked for by the group view's 2 s batch, the tab
+/// bar's 4 s loop for every group-bound tab, and — through the budget meter —
+/// `orch_autonomy` in the same tick. #743 S4b moved the whole body off the
+/// webview thread and served it through the per-group memo so those callers
+/// shared ONE computation per [`USAGE_POLL_MAX_AGE`] window; #1608 removed the
+/// callers instead. The payload reaches both surfaces as the `usage` section of
+/// `orch_group_view`/`orch_strip_view`, computed by the publisher through this
+/// same chain, so the wire shape below is unchanged. This command has no
+/// frontend caller left at all — it stays for the MCP side and for parity with
+/// the other nine.
 ///
 /// **Payload (#1317).** It answers with [`live_usage_view`], not the whole
 /// value: `live_agents` (one row per LIVE agent) plus `agent_count` (the
@@ -52207,11 +52227,19 @@ pub async fn orch_strip_view(app: AppHandle) -> Value {
 /// loop an unbounded acquisition is a frozen window that never repaints and
 /// never processes input, which is a force-quit rather than a slow panel.
 ///
-/// **It is polled from TWO loops, not one**, which is why the freeze arrives a
+/// **It WAS polled from TWO loops, not one**, which is why the freeze arrived a
 /// minute or two in rather than at startup: `GroupView.load()`'s 2 s batch
 /// (`groupview.ts`), and `TabBar.pollStatus()`'s 4 s loop (`tabbar.ts`),
-/// which iterates EVERY group-bound tab and awaits each in turn. So the number
-/// of unbounded main-thread acquisitions per tick scales with open group tabs.
+/// which iterated EVERY group-bound tab and awaited each in turn. So the number
+/// of unbounded main-thread acquisitions per tick scaled with open group tabs.
+///
+/// **Since #1608 it is polled from neither.** Both loops make one
+/// `orch_group_view`/`orch_strip_view` call served from a published snapshot,
+/// and this payload reaches them as that read's `summary` section — computed by
+/// the publisher through this same function, so the shape is unchanged. The only
+/// frontend caller left is `tasksview.ts`, once per open. The paragraphs above
+/// are kept because they are the canonical statement of the #1595 class, not
+/// because they still describe this command's callers.
 ///
 /// **The "cheap in-memory" classification was not wrong about the work — it was
 /// wrong about what makes a sync command safe.** A cheap CRITICAL SECTION is
@@ -52255,10 +52283,12 @@ pub async fn orch_group_watches(app: AppHandle, group_id: String) -> Value {
 /// only caller. It adds no agent-reachable input either way.
 ///
 /// **Off-thread** (performance.md §2 P1): this reconciles against the repo's
-/// declared `resources:`, which reads and parses `.loomux/workflow.yml` — on
-/// the group view's 2 s batch. That is the same read `orch_workflow_status`
-/// already makes on that batch, and the same reason `orch_merge_queue` is
-/// async.
+/// declared `resources:`, which reads and parses `.loomux/workflow.yml`. That
+/// was on the group view's 2 s batch until #1608; the publisher's view tier now
+/// makes the read, once per second and only for a leased group, and the panel
+/// gets it as `orch_group_view`'s `locks` section. It is the same read
+/// `orch_workflow_status` makes on that same pass, and the same reason
+/// `orch_merge_queue` is async.
 ///
 /// This used to add "unlike its neighbours `orch_group_summary`/
 /// `orch_group_watches`: those are pure in-memory registry reads". #1595

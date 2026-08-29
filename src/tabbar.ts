@@ -122,8 +122,9 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     // strip only re-renders when a value actually differs.
     //
     // Visibility-gated (#743 S6). This is the app's one app-lifetime poll —
-    // armed here and never cleared — and every tick invokes groupSummary AND
-    // groupUsage for EVERY group-bound tab, so behind a minimized window it was
+    // armed here and never cleared — and every tick used to invoke groupSummary
+    // AND groupUsage for EVERY group-bound tab (one orch_strip_view since
+    // #1608), so behind a minimized window it was
     // the largest standing IPC cost in the app while feeding a strip nobody
     // could see. The gate stops the timer outright while the window is hidden
     // and runs one catch-up poll when it comes back, so the strip is current by
@@ -575,6 +576,22 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       // The backend is not answering this tick. Keep every badge exactly as it
       // is — a stale-but-true count beats a fabricated zero — and let the next
       // tick try again. Same rule the per-command version applied per group.
+      //
+      // But say so (#1625 review N6): a strip whose `orch_strip_view` fails
+      // every tick would otherwise show no disclosure at all, which is the
+      // silent freeze this slice exists to remove. The call can no longer PARK,
+      // so this is now the only path by which the strip can go quiet — and it is
+      // exactly the surface #1604 review N3 was raised about.
+      if (!this.stripStale.stale) {
+        this.stripStale = {
+          stale: true,
+          label: "stale",
+          detail:
+            "The tab counts could not be refreshed. They are the last values the backend " +
+            "reported; they update themselves as soon as it answers again.",
+        };
+        this.render();
+      }
       return;
     }
     // The strip's freshness is the OLDEST group's, so this says "nothing on
