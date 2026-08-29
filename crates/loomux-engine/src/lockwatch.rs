@@ -1277,14 +1277,19 @@ impl<T> TrackedMutex<T> {
     /// path a further three relaxed loads, four relaxed stores and one release
     /// store, and in both cases one release read-modify-write on the generation.
     ///
-    /// **The order checker adds (#1610)**: on acquisition, one thread-local
-    /// borrow plus a scan of the held-lock stack — zero comparisons when this
-    /// thread holds nothing, which is the overwhelmingly common case, and at
-    /// most [`HELD_STACK_CAP`] otherwise — and one store into a fixed array.
-    /// On release, one thread-local borrow and a scan from the top of that
-    /// array, which finds its own entry on the first comparison unless a guard
-    /// was dropped out of order. The stack is per-thread, so none of it is a
-    /// shared cache line and none of it can contend.
+    /// **The order checker adds (#1610)**: on acquisition, TWO independent
+    /// thread-local accesses — `check_order`'s [`inspect_held`] and
+    /// `record_acquired`'s [`push_held`], each a TLS lookup plus a `RefCell`
+    /// flag check — around a scan of the held-lock stack, which is zero
+    /// comparisons when this thread holds nothing (the overwhelmingly common
+    /// case) and at most [`HELD_STACK_CAP`] otherwise, plus one store into a
+    /// fixed array. Two rather than one because the check must run BEFORE the
+    /// acquisition and the push only after it succeeds; folding them would
+    /// mean pushing a hold that may never happen. On release there is ONE
+    /// access ([`pop_held`]) and a scan from the top of that array, which
+    /// finds its own entry on the first comparison unless a guard was dropped
+    /// out of order. The stack is per-thread, so none of it is a shared cache
+    /// line and none of it can contend.
     ///
     /// No allocation, no formatting, no global lock, no syscall, and nothing that
     /// can block. The clock read is the only item above a few nanoseconds — tens
@@ -1769,6 +1774,36 @@ pub fn tracked_lock_names() -> Vec<&'static str> {
     out
 }
 
+/// Every live tracked lock's name paired with the rank it was CONSTRUCTED
+/// with, sorted by name, duplicates kept (#1610 review B1).
+///
+/// [`tracked_lock_names`]'s sibling, and the difference is the whole reason it
+/// exists. A name is registered identically by [`TrackedMutex::new`] and
+/// [`TrackedMutex::new_ranked`], so a guard reading names alone cannot tell a
+/// ranked field from one that has quietly been reverted to unranked — and
+/// removing a rank can only remove violations, never create one, so no green
+/// suite anywhere is evidence about it. The rank is the half that makes "this
+/// field carries this rank" a claim a build can fail.
+///
+/// Like [`tracked_lock_names`] this acquires nothing tracked, so calling it can
+/// never wait; and like it, duplicates are kept, because two live locks under
+/// one name is a real state (two registries in one test process, or the
+/// per-pane delivery locks) and a caller checking a table wants to see all of
+/// them rather than whichever one a de-dup happened to keep.
+pub fn tracked_lock_ranks() -> Vec<(&'static str, Option<LockRank>)> {
+    let mut reg = REGISTRY.lock_safe();
+    let mut out = Vec::new();
+    reg.retain(|weak| match weak.upgrade() {
+        Some(state) => {
+            out.push((state.name, (state.rank != UNRANKED).then(|| LockRank(state.rank))));
+            true
+        }
+        None => false,
+    });
+    out.sort_unstable_by_key(|(name, _)| *name);
+    out
+}
+
 /// The watchdog's lock half: turns a series of snapshots into at-most-one
 /// report per hold.
 ///
@@ -2231,10 +2266,16 @@ mod rank_tests {
 
     /// The findings this drain produced for `lock`, and only for `lock`.
     ///
-    /// Filtered by NAME rather than asserted as a total: the drain is
-    /// process-global and other tests in this binary nest unranked locks of
-    /// their own (`budget.rs`'s `nestspec`), so a total is a race against
-    /// whatever ran next rather than a measurement.
+    /// Filtered by NAME rather than asserted as a total, because the drain and
+    /// the counters beside it are PROCESS-global while `SERIAL` only serializes
+    /// this module. The concrete offender, named because a hazard reasoned
+    /// about in the abstract gets mis-located: `budget.rs`'s
+    /// `an_unwind_leaves_no_tracked_lock_held` takes `unwindheldspec` and then,
+    /// while holding it, takes `unwindblockedspec` — one thread, two unranked
+    /// locks, freshly constructed each run, outside this module's guard. Every
+    /// run of it notes a first nesting. (`nestspec`, three tests down, holds its
+    /// lock on a SPAWNED thread and nests nothing; it is not the offender, and
+    /// the first version of this note said it was — #1610 review N3.)
     fn drain_for(lock: &str) -> Vec<OrderReport> {
         drain_lock_order_reports().into_iter().filter(|r| r.lock == lock).collect()
     }
@@ -2258,11 +2299,18 @@ mod rank_tests {
             violations,
             "an unranked lock may nest under anything; it is not a violation"
         );
-        assert_eq!(
-            unranked_nestings(),
-            reports + 1,
-            "three nestings of one unranked lock must be noted ONCE — the table converges on \
-             names, and one finding per acquisition would be a report per acquisition"
+        // A FLOOR, not an equality (#1610 review N3). `UNRANKED_NESTINGS` is
+        // process-global and `SERIAL` only serializes this module, so
+        // `reports + 1` is a race against `budget.rs`'s unwind test landing its
+        // own first nesting between the two reads — rare rather than
+        // reproducible, which is the worst kind of intermittent to ship.
+        //
+        // What the floor pins is that the counter is WIRED. The "once, not
+        // once per acquisition" property is pinned per-LOCK by the drain below,
+        // which cannot race because no other test touches this lock's name.
+        assert!(
+            unranked_nestings() >= reports + 1,
+            "an unranked lock nested under a ranked one and the counter did not move"
         );
 
         // And the finding the watchdog would write says which rank it nested

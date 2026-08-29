@@ -579,10 +579,12 @@ fn every_lock_on_the_registry_is_a_tracked_one() {
 fn every_registry_lock_is_constructed_with_a_name() {
     // **Default-deny over CONSTRUCTORS, not a list of the ones that exist.**
     // This scan used to match the literal `TrackedMutex::new(` and nothing
-    // else. #1610 added `new_ranked`, moved eighteen fields onto it, and the
-    // scan's count fell from 86 to 68 while every one of those eighteen still
-    // passed a literal name — a guard that had gone blind to a fifth of the
-    // struct and could only say so through its own vacuity floor.
+    // else. #1610 added `new_ranked` and moved seventeen of this file's
+    // constructions onto it, and the scan's count fell from 85 to 68 while
+    // every one of them still passed a literal name — a guard that had gone
+    // blind to a fifth of the struct and could only say so through its own
+    // vacuity floor. (Counted on the blobs: `git show <base>:` has 85
+    // `TrackedMutex::new("`; head has 68 plus 17 `new_ranked("`.)
     //
     // So it now reads every `TrackedMutex::new` occurrence and classifies what
     // FOLLOWS it. A third constructor added later is refused here by default,

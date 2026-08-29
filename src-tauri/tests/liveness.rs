@@ -99,7 +99,7 @@
 //!    tauri or tokio, so the call is unreachable there. If a crate under
 //!    `crates/` ever links Tauri, that scan's root list is the thing to widen.
 
-use loomux_engine::lockwatch::tracked_lock_names;
+use loomux_engine::lockwatch::{tracked_lock_names, tracked_lock_ranks};
 use serde_json::json;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
@@ -1692,5 +1692,106 @@ fn l5_every_lockorder_const_names_a_lock_that_still_exists() {
     // Vacuity control: the assertion above is an "every" over a list, and it
     // passes trivially if the list is empty or the scan found nothing.
     assert!(lockorder::ALL.len() >= 18, "the table shrank: {}", lockorder::ALL.len());
+    assert!(live.len() >= 60, "the live-lock scan found only {} locks", live.len());
+}
+
+/// The rank table is only a table if it is APPLIED (#1610 review B1).
+///
+/// The one claim this whole change exists to abolish is "a doc comment states
+/// an order and nothing can fail a build over it". Moving those claims into
+/// consts does not by itself close it: *"this field carries this rank"* is a
+/// new claim of exactly the same shape, and three guards that look like they
+/// cover it do not —
+///
+/// - the const-names-a-live-lock row reads `tracked_lock_names()`, which is
+///   names only, and a field built with plain `new` registers the same name;
+/// - the distinctness row reads `lockorder::ALL` and never touches a lock;
+/// - `selfwatch.rs`'s named-construction scan floors `named + ranked`, and
+///   reverting a field moves it from one bucket to the other, leaving the sum
+///   and both floors intact.
+///
+/// **And the suite itself is structurally blind to it:** removing a rank can
+/// only remove violations, never create one, so no green run anywhere — on any
+/// platform, in any round — is evidence that a rank is still applied.
+///
+/// Both directions are checked, because one fix closes both and the second is
+/// the one that keeps the DISTINCTNESS property honest: a rank written inline
+/// (`LockRank::new(520)` at a construction site) is invisible to a guard that
+/// only reads `ALL`, and a duplicate rank means those two locks nest freely in
+/// both directions.
+///
+/// Mismatches are COLLECTED rather than asserted one at a time: a table is a
+/// set, and a reader fixing one row wants to see the other four in the same
+/// run.
+#[test]
+fn l5_every_lockorder_const_is_applied_to_its_field() {
+    let (reg, _dir) = test_registry();
+    // `AUDIT_LOCK` is a lazily-initialised static rather than a registry field,
+    // so it is only live once something has taken it. Take it.
+    reg.with_lock_for_test("audit", || ()).expect("`audit` is a known lock name");
+
+    // Normalised to owned scalars so the comparisons below are between a
+    // `&str` and a `u32` rather than between four layers of reference.
+    let live: Vec<(String, Option<u32>)> = tracked_lock_ranks()
+        .into_iter()
+        .map(|(name, rank)| (name.to_string(), rank.map(|r| r.get())))
+        .collect();
+
+    let mut wrong: Vec<String> = Vec::new();
+
+    // Direction 1: every const in the table is applied, to a live lock, at the
+    // rank the table says.
+    for (name, rank) in lockorder::ALL {
+        let want = rank.get();
+        let seen: Vec<Option<u32>> =
+            live.iter().filter(|(n, _)| n.as_str() == *name).map(|(_, r)| *r).collect();
+        if seen.is_empty() {
+            wrong.push(format!(
+                "`{name}`: the table ranks it {want}, but no live tracked lock carries that name"
+            ));
+            continue;
+        }
+        for got in seen {
+            match got {
+                Some(actual) if actual == want => {}
+                Some(actual) => wrong.push(format!(
+                    "`{name}`: the table says rank {want}, the live lock carries {actual}"
+                )),
+                None => wrong.push(format!(
+                    "`{name}`: the table says rank {want}, the live lock is UNRANKED — the const \
+                     enforces nothing and the checker cannot see this field at all"
+                )),
+            }
+        }
+    }
+
+    // Direction 2: no live lock carries a rank the table does not know.
+    for (name, rank) in &live {
+        let Some(rank) = *rank else { continue };
+        if !lockorder::ALL.iter().any(|(n, r)| *n == name.as_str() && r.get() == rank) {
+            wrong.push(format!(
+                "`{name}` is live at rank {rank}, which `lockorder::ALL` does not carry — a rank \
+                 written at a construction site is invisible to the distinctness guard, and two \
+                 locks sharing a rank nest freely in BOTH directions"
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "the rank table and the live locks disagree:\n  {}",
+        wrong.join("\n  ")
+    );
+
+    // Vacuity controls. Both assertions above are "every" over a list, and both
+    // pass trivially against an empty table or an empty scan.
+    assert!(lockorder::ALL.len() >= 18, "the table shrank: {}", lockorder::ALL.len());
+    let ranked = live.iter().filter(|(_, r)| r.is_some()).count();
+    assert!(
+        ranked >= lockorder::ALL.len(),
+        "only {ranked} live locks carry a rank at all, against {} consts — the scan is not \
+         seeing the registry",
+        lockorder::ALL.len()
+    );
     assert!(live.len() >= 60, "the live-lock scan found only {} locks", live.len());
 }

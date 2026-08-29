@@ -77,12 +77,16 @@ fail-open path nobody has executed is a fail-open path nobody has checked.
 
 ### What it costs
 
-Per acquisition, on top of everything Phase 0 and 2.1 already do: one
-thread-local borrow, a scan of the held-lock stack (zero comparisons when the
-thread holds nothing, which is the overwhelmingly common case, and at most 32
-otherwise), and one store into a fixed array. Per release: one thread-local
-borrow and a scan from the top, which finds its own entry on the first
-comparison unless a guard was dropped out of order.
+Per acquisition, on top of everything Phase 0 and 2.1 already do: **two**
+independent thread-local accesses — the check before the acquisition and the
+push after it succeeds, each a TLS lookup plus a `RefCell` flag check — around
+a scan of the held-lock stack (zero comparisons when the thread holds nothing,
+which is the overwhelmingly common case, and at most 32 otherwise), plus one
+store into a fixed array. Two rather than one because the check has to run
+before the acquisition and the push only after it succeeds; folding them would
+mean pushing a hold that may never happen. Per release there is **one** access
+and a scan from the top, which finds its own entry on the first comparison
+unless a guard was dropped out of order.
 
 No allocation, no destructor at thread teardown, and nothing shared between
 threads — which matters because the MCP server spawns one thread per request and
@@ -114,10 +118,18 @@ would fail tests that have nothing wrong with them.
 
 So the rule is split:
 
-- every ranked FIELD gets a **distinct** rank (`lockorder::ALL` plus
-  `l5_every_lockorder_rank_is_distinct` keep that true, with
-  `l5_every_lockorder_const_names_a_lock_that_still_exists` beside it for the
-  other way the table goes stale);
+- every ranked FIELD gets a **distinct** rank. Three rows keep that true, and
+  they are separate tests because two properties in one test means whichever
+  assertion runs first masks the other: `l5_every_lockorder_rank_is_distinct`
+  (no two consts share a value), `l5_every_lockorder_const_names_a_lock_that_still_exists`
+  (a const still names a real lock), and `l5_every_lockorder_const_is_applied_to_its_field`
+  — the one that makes "this field carries this rank" a claim a build can fail.
+  That third row is not optional decoration: **removing a rank can only remove
+  violations, never create one**, so a green suite is structurally incapable of
+  noticing that a field has quietly gone unranked (#1610 review B1). It checks
+  the converse too — no live lock may carry a rank `ALL` does not know — because
+  a rank written inline at a construction site is invisible to the distinctness
+  row, and two locks sharing a rank nest freely in *both* directions;
 - **equal ranks nest freely** — they can only be the same field twice;
 - **re-entrancy is decided on the lock's identity**, the id `lockwatch` mints
   per lock, which is strictly what the epic's case is about and also catches it
@@ -183,14 +195,18 @@ and assign ranks until it is silent. Every violation the checker reports is a
 real, previously unwritten ordering fact, and each one is recorded here — with
 whether the *table* was wrong or the *code* was.
 
-**Zero violations, and that is the finding.** Every round ran the whole
-workspace suite in a debug build — where an inversion or a re-entrant
-acquisition panics — on all three platforms, and no round reported either. (The
-run ids are in #1698, which is the dated surface for them; a design note that
-cites one is a note that goes stale on the next push.) So the eighteen ranks are
-not a guess that happened to survive: they are the thirteen documented claims,
-and every acquisition order the suite exercises agrees with them. That green
-suite *is* the plan's L5c row.
+**Zero violations, and that is the finding — dated to the round that actually
+ran everything.** CI is a bare `cargo test --locked --workspace`, which stops at
+the first failing test TARGET, so an intermediate round with any red in it left
+targets unrun and is evidence about a subset rather than about the suite. The
+claim belongs to the final round, which is green on all three platforms plus
+E2E and therefore ran every target on each: in a debug build, where an inversion
+or a re-entrant acquisition panics, it reported neither. (The run ids are in
+#1698, which is the dated surface for them; a design note that cites one is a
+note that goes stale on the next push.) So the eighteen ranks are not a guess
+that happened to survive: they are the thirteen documented claims, and every
+acquisition order the suite exercises agrees with them. That green suite *is*
+the plan's L5c row.
 
 That is a stronger result than the method expected, and it is worth saying why
 it is plausible rather than suspicious. Most of the thirteen claims are *leaf*
@@ -207,9 +223,11 @@ before" says. The rank is there for the site that stops doing that.
 
 **What the derivation did find was a blind GUARD, not a wrong rank.**
 `every_registry_lock_is_constructed_with_a_name` (`src-tauri/tests/selfwatch.rs`)
-matched the literal `TrackedMutex::new(`. Moving eighteen fields to `new_ranked`
-dropped its count from 85 to 68 while every one of them still passed a literal
-name — a guard blind to a fifth of the struct, which only its own vacuity floor
+matched the literal `TrackedMutex::new(`. Seventeen of the eighteen ranked
+fields are constructed in the scanned file (the eighteenth, `queues`, is built
+in `crates/loomux-engine/src/queuestate.rs` through `QueueMap::new_ranked`), and
+moving those seventeen to `new_ranked` dropped its count from 85 to 68 while
+every one of them still passed a literal name — a guard blind to a fifth of the struct, which only its own vacuity floor
 could say. It now classifies what FOLLOWS every `TrackedMutex::new` occurrence
 and default-denies a constructor it has not been taught, with the vacuity
 control per constructor rather than on the total: a single total is satisfied by
