@@ -326,6 +326,14 @@ control that makes the result mean anything, and it is the pre-#1607 path
 verbatim: a `spawn_blocking` hand-off of `write_from_frontend` on that same
 saturated pool, asserted NOT to complete. **L3b** wedges one pane through the
 seam and asserts the other pane's write lands while the wedged one still reports
-nothing and still has nothing in its pipe. Both use `register_fake_for_test` /
-`register_gated_fake_for_test`, which register the pane's real writer thread —
-so the harness drives the shipped path, not a test-only variant of it.
+nothing and still has nothing in its pipe — and that #1601's counted-pool depth
+is unmoved throughout, which is the mechanical form of "the input path never
+enters the pool" and is stronger than "the write completed". A third test pins
+the ordering this change *adds*: a `cd` posted between two keystrokes on one
+pane lands between them, which is what the table row above now claims. **L0**
+is the negative control the others are read against — with `agents` held via
+#1601's `hold_lock_for_test`, `group_summary` does not return, so the harness
+is demonstrably able to observe a stall at all. All of them use
+`register_fake_for_test` / `register_gated_fake_for_test`, which register the
+pane's real writer thread — so the harness drives the shipped path, not a
+test-only variant of it.

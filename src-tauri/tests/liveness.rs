@@ -42,26 +42,31 @@
 //! round, where the mutation under test made `enqueue_frontend_write` itself
 //! touch the runtime and a sibling test then won the race.
 //!
-//! # Rows not in this file yet, and why (so their absence is a decision)
+//! # Which of the plan's rows are here, and the one that is deliberately NOT
 //!
-//! The plan's table has L0-L6. This file lands L3a, L3b and L4 — the rows Phase
-//! 2.3 gates — and **not** these two, both for the same mechanical reason: an
-//! `#[ignore]`d test still has to COMPILE, and these name APIs that do not exist
-//! on this branch.
+//! The plan's table has L0-L6. Phase 2.3 gates L0, L3a, L3b and L4. The first
+//! three are here and live: L0 and L3b's pool-depth clause were held back while
+//! Phase 0 (#1601) was unmerged — an `#[ignore]`d test still has to COMPILE,
+//! and both name APIs that did not exist yet — and landed once #1605 did.
 //!
-//! - **L0** (negative control: `group_summary` does not return while `agents`
-//!   is held) needs `OrchRegistry::hold_lock_for_test`, Phase 0 interface item
-//!   3 (#1601, PR #1605). There is no headless substitute: the shipped paths
-//!   that hold `agents` across a pty read (`orchestrator_activity`) need an
-//!   `AppHandle`, and `output_totals_from`/`compact_signals_from` deliberately
-//!   snapshot-then-release (#743 S7). What L0 documents about the POOL half of
-//!   the class is covered here meanwhile — see L3a's control, which is the
-//!   beta6 mechanism itself.
-//! - **L3b's second clause** ("Phase 0's pool-depth counter reads 0 throughout")
-//!   needs #1601's counted `spawn_blocking` door. L3b's FIRST clause does not,
-//!   and lands live below.
+//! **L4 is not here, and that is a decision rather than an omission.** It would
+//! have asserted that `async_runtime::spawn_blocking(` appears in exactly one
+//! file, once. Phase 0 shipped precisely that guard first, as
+//! `there_is_exactly_one_door_onto_the_blocking_pool` in
+//! `src-tauri/tests/selfwatch.rs`, and shipped it *better*: it carries two
+//! vacuity controls to this file's one (it also asserts it can still find the
+//! one permitted call), and it matches the bare `spawn_blocking(` rather than
+//! the qualified path, so an aliased import cannot walk past it. Two source
+//! scans asserting one property is how a mechanism drifts — one gets updated,
+//! the other quietly stops meaning anything — so this file defers to that one.
 //!
-//! Both are for the post-#1601 lift pass, which also un-`#[ignore]`s L4.
+//! The single axis this file's version would have added, recorded so it is a
+//! known gap rather than a forgotten one: it walked `crates/` as well as
+//! `src-tauri/src`. That is vacuous today, because the pool in question is
+//! `tauri::async_runtime`'s and `loomux-engine` is Tauri-free by construction
+//! (`doc/design/engine-extraction.md`) — there is nothing there that could
+//! call it. If a crate under `crates/` ever links Tauri, that scan's root list
+//! is the thing to widen.
 
 use loomux_lib::orchestration::{Guardrails, OrchRegistry};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
@@ -101,11 +106,9 @@ fn completes_within<T: Send + 'static>(t: Duration, f: impl FnOnce() -> T + Send
 /// `~/.claude/agents` or `~/.copilot/agents`. Copied from `perf_leaflocks.rs`,
 /// which is the reference instance.
 ///
-/// Unused by the rows this file lands with — L3a/L3b/L4 are pty-side and need
-/// no registry — and kept because it is half of the harness contract above: L0,
-/// L1 and every L2 row is a registry test, and the alternative is each appending
-/// worker re-deriving the agent-dir overrides and one of them forgetting one.
-#[allow(dead_code)]
+/// Used by L0, and by every registry row the Phase 1 / 2.1 / 3a workers append:
+/// the alternative is each of them re-deriving the agent-dir overrides and one
+/// forgetting one, which is the leak #464 exists to stop.
 fn test_registry() -> (Arc<OrchRegistry>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
@@ -118,9 +121,52 @@ fn test_registry() -> (Arc<OrchRegistry>, tempfile::TempDir) {
 }
 
 /// Guardrails for a registry fixture. See `test_registry`'s note.
-#[allow(dead_code)]
 fn rails() -> Guardrails {
     Guardrails { max_agents: 4, agent_cli: "claude".into(), ..Guardrails::default() }
+}
+
+// ---------- L0: the negative control — what the class actually looks like ----------
+
+#[test]
+fn l0_a_registry_read_does_not_return_while_its_lock_is_held() {
+    // The control every other row in this file is measured against, and the
+    // only one here that is SUPPOSED to fail to make progress. It documents the
+    // class #1600 is about — an unbounded `lock_safe` acquisition on a path a
+    // human or an agent waits behind — so that "X completed within GRACE"
+    // elsewhere means something. Without a demonstration that this harness can
+    // observe a stall at all, every positive result in this file is consistent
+    // with a harness that cannot see one.
+    //
+    // `hold_lock_for_test` is #1601 Phase 0's seam (interface item 3) and is
+    // what made this row landable: it takes the named registry lock on its own
+    // thread at a real `lock_safe` call site and returns only once the hold is
+    // real, so there is no race with the thread it just started.
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    // Baseline first: with nothing held, the read answers. This is the
+    // discriminating half — without it the assertion below would pass just as
+    // well against a `group_summary` that never returns under any conditions,
+    // or a GroupId this registry has never heard of.
+    let (r, g) = (reg.clone(), group.id.clone());
+    assert!(
+        completes_within(GRACE, move || r.group_summary(&g)),
+        "setup: group_summary did not answer with NO lock held, so the assertion below would \
+         not be about the lock"
+    );
+
+    // Now hold `agents` for longer than the probe window and ask again.
+    assert!(
+        reg.hold_lock_for_test("agents", 4_000),
+        "setup: hold_lock_for_test refused the lock name 'agents'"
+    );
+    let (r, g) = (reg.clone(), group.id.clone());
+    assert!(
+        !completes_within(SETTLE, move || r.group_summary(&g)),
+        "group_summary returned while `agents` was held. That is not a pass — this row is the \
+         NEGATIVE control, and it silently stops documenting the class the moment the read \
+         either stops taking the lock or the seam stops holding it"
+    );
 }
 
 // ---------- the shared blocking pool fixture ----------
@@ -301,6 +347,23 @@ fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
     let healthy_captured = pm.register_fake_for_test(HEALTHY, b"");
     let (wedged_captured, gate) = pm.register_gated_fake_for_test(WEDGED);
 
+    // The plan's second clause for this row (#1601 Phase 0.3's counter): the
+    // input path must never ENTER the pool, which is a stronger statement than
+    // "the write completed" and is the one that would still be true if the
+    // pool happened to be empty. Baselined rather than asserted flat against
+    // zero: this is a process-global counter, so pinning it to a literal would
+    // make this row a hostage to anything else in the binary that hands off.
+    // Today nothing here does — L3a saturates the pool with
+    // `tauri::async_runtime::spawn_blocking` directly, which is not counted —
+    // and the precondition below says so out loud rather than assuming it.
+    let pool_before = loomux_engine::selfwatch::pool_in_flight();
+    assert_eq!(
+        pool_before, 0,
+        "setup: {pool_before} hand-offs were already in flight before this test did anything. \
+         Some other test in this binary is using `blocking::spawn_counted`; this row's \
+         assertions below need a quiet baseline to mean anything"
+    );
+
     // Wedge pane 1 THROUGH THE SEAM, so what parks is its own writer thread —
     // the thing 2.3 introduces — and not a thread the test happens to own.
     let mut wedged_reply = pm
@@ -324,6 +387,20 @@ fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
          per-pane (#1607)"
     );
     assert_eq!(&*healthy_captured.lock().unwrap(), b"still typing");
+
+    // The counter clause. One pane is wedged mid-`write_all` and another has
+    // just completed a write, so if the input path touched the pool at all this
+    // is the moment it would show: the wedged job would still be occupying a
+    // slot. It reads the baseline instead, which is the mechanical statement of
+    // "the app's most latency-critical path competes for pool threads with
+    // nothing" — the property beta6 turned on and the reason 2.3 exists.
+    assert_eq!(
+        loomux_engine::selfwatch::pool_in_flight(),
+        pool_before,
+        "the pty input path entered the counted blocking pool. A wedged pane would then hold a \
+         pool slot for as long as its child declines to drain, which is the shared-resource \
+         exhaustion #1600 §1.2 is about (#1601 Phase 0.3's counter, #1607 Phase 2.3)"
+    );
 
     // ...and the wedged pane is still wedged, which is the half that must NOT
     // change. If its write had resolved early, the bytes would be buffered
@@ -408,117 +485,5 @@ fn a_cd_and_the_keystrokes_around_it_land_in_arrival_order() {
     assert!(
         middle.contains(MARKER),
         "the cd did not land between the two keystrokes at all. Captured: {s:?}"
-    );
-}
-
-// ---------- L4: one door onto the blocking pool ----------
-
-/// Kept split so the marker never appears as a whole token in this file — the
-/// walk reads `src/` only today, and splitting it is what keeps this file
-/// unable to be its own specimen if that is ever widened
-/// (`perf_dispatch.rs`'s convention).
-const RAW_POOL_CALL: &str = concat!("async_runtime::", "spawn_blocking(");
-
-/// Blank every comment, newlines preserved, so a marker in prose is not read as
-/// code. Two blind spots, both stated rather than assumed, per the
-/// source-scanning-guard convention — and note which direction each fails in,
-/// because only one of them is dangerous for a default-deny guard:
-///
-/// - **False POSITIVE (harmless-ish): strings are not blanked.** A marker
-///   inside a string literal would count as a call. No file in the scanned
-///   roots has one today. `perf_dispatch.rs`'s `DELEGATION` does hold
-///   `"spawn_blocking("` as a literal, but it is under `src-tauri/tests`, which
-///   is not walked — and it is the UNQUALIFIED spelling, so it would not match
-///   this qualified marker even if it were.
-/// - **False NEGATIVE (the one that matters): a `//` inside a string literal
-///   blanks the rest of that line**, so a real call sitting after one on the
-///   same line is invisible. A guard that must default-deny cannot see what it
-///   blanked. Nothing in the scanned roots has that shape today; a URL in a
-///   string followed by a call on one line would create it.
-///
-/// One scope correction while we are here: the walk takes `crates/` WHOLESALE,
-/// including any test directories under it. Only `src-tauri/tests` is outside
-/// it, and that is because it is not under either root, not because the walk
-/// excludes tests.
-fn code_only(text: &str) -> String {
-    let b = text.as_bytes();
-    let mut out = b.to_vec();
-    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
-        for i in from..to.min(out.len()) {
-            if out[i] != b'\n' {
-                out[i] = b' ';
-            }
-        }
-    };
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
-            let start = i;
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            blank(&mut out, start, i);
-        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-            let start = i;
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(b.len());
-            blank(&mut out, start, i);
-        } else {
-            i += 1;
-        }
-    }
-    String::from_utf8(out).expect("blanking preserves UTF-8 boundaries")
-}
-
-fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
-#[test]
-#[ignore = "gated on #1601 (Phase 0.3). MEASURED, not derived: `async_runtime::spawn_blocking(` over src-tauri/src + crates is 8 at base 442a50f6 and 6 at this head, Phase 2.3 (#1607) having removed pty.rs's two. Of those 6, blocking.rs's IS spawn_counted's own door and stays — so FIVE sites move in Phase 0: gh.rs, git.rs, orchestration/mod.rs, sessions.rs, voice.rs. Lift this in the post-#1601 pass, re-measuring both ends first"]
-fn l4_the_blocking_pool_has_exactly_one_door() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("repo root is src-tauri's parent");
-    let mut files = Vec::new();
-    rs_files(&root.join("src-tauri/src"), &mut files);
-    rs_files(&root.join("crates"), &mut files);
-    assert!(
-        files.len() > 20,
-        "the walk found only {} .rs files — it did not descend, so a clean result would mean \
-         nothing (vacuity guard)",
-        files.len()
-    );
-
-    let mut sites: Vec<(String, usize)> = Vec::new();
-    for f in &files {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
-        let n = code_only(&text).matches(RAW_POOL_CALL).count();
-        if n > 0 {
-            // `/`-separated so the expectation reads the same on all three
-            // platforms in the matrix.
-            let rel = f.strip_prefix(root).unwrap_or(f).display().to_string().replace('\\', "/");
-            sites.push((rel, n));
-        }
-    }
-    sites.sort();
-
-    let expected = vec![("src-tauri/src/blocking.rs".to_string(), 1usize)];
-    assert_eq!(
-        sites, expected,
-        "the blocking pool must have exactly ONE door, so its depth can be counted and its \
-         saturation diagnosed (#1600 §2.1, Phase 0.3). Every other module delegates through \
-         `blocking::spawn_counted`/`run_blocking`"
     );
 }
