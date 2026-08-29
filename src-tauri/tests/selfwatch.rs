@@ -382,9 +382,16 @@ fn every_lock_on_the_registry_is_a_tracked_one() {
         if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
             continue;
         }
-        if ty.starts_with("Mutex<") || ty.starts_with("Arc<Mutex<") {
+        // Any `Mutex<` that is not a `TrackedMutex<`, wherever it sits in the
+        // type. Anchoring on the type's PREFIX would have missed
+        // `std::sync::Mutex<..>` and `parking_lot::Mutex<..>` — the two
+        // spellings a reader reaching for a plain mutex is most likely to
+        // write, since the bare name is no longer imported in that file.
+        let mutexes = ty.matches("Mutex<").count();
+        let tracked_here = ty.matches("TrackedMutex<").count();
+        if mutexes > tracked_here {
             plain.push(name.to_string());
-        } else if ty.starts_with("TrackedMutex<") || ty.starts_with("Arc<TrackedMutex<") {
+        } else if tracked_here > 0 {
             tracked += 1;
         }
     }
@@ -401,6 +408,16 @@ fn every_lock_on_the_registry_is_a_tracked_one() {
         tracked >= 80,
         "the scan found only {tracked} tracked registry locks; it has stopped reading the struct"
     );
+
+    // THE RESIDUAL, stated where the scan lives rather than left to be found.
+    // This reads one line per field, so a field whose type is written across
+    // two lines is invisible to it, as is one behind a type ALIAS
+    // (`type Guarded<T> = Mutex<T>;`) or produced by a macro. None appears in
+    // the struct today — the count above is the whole population — and the
+    // compiler is what would catch the consequence anyway: a plain `Mutex` has
+    // no inherent `lock_safe`, so a field that evaded this scan would fall
+    // through to the `LockExt` trait and keep compiling. That last clause is
+    // exactly why the scan is worth having: the failure is SILENT, not loud.
 }
 
 #[test]
