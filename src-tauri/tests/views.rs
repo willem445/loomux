@@ -471,28 +471,62 @@ fn stale_is_entered_on_the_clock_and_released_only_by_a_publish() {
 #[test]
 fn the_strip_meta_reports_the_oldest_group_not_the_newest() {
     let (reg, _d) = test_registry();
-    let old = reg.create_group("C:/tmp/old", rails()).unwrap();
-    let _fresh = reg.create_group("C:/tmp/fresh", rails()).unwrap();
+    // `left_behind` is never recomputed after the pass; `fresher` is.
+    let _left_behind = reg.create_group("C:/tmp/left-behind", rails()).unwrap();
+    let fresher = reg.create_group("C:/tmp/fresher", rails()).unwrap();
 
     let views = ViewPublisher::new();
-    let t0 = Instant::now();
-    views.publish_pass_at(&reg, t0);
 
-    // Republish ONE group far in the future of the other. The strip payload
-    // must age itself against the group left behind: the tab strip's job is to
-    // be right about the tab that is in trouble, and a snapshot-wide stamp
-    // would report the whole strip as fresh because one tab moved.
-    let read_at = t0 + Duration::from_millis(VIEW_STALE_AFTER_MS_FOR_TEST + 500);
-    views.publish_group_at(&reg, &old.id, read_at);
+    // THREE candidate implementations have to give three different answers
+    // here, or this test only rules out whichever one it happens to differ
+    // from. Stamping the pass in the PAST relative to the real clock is what
+    // separates "the oldest group" from "the snapshot's own publication",
+    // which an earlier version of this fixture could not do: it stamped the
+    // pass at `Instant::now()`, so the snapshot stamp and the oldest group's
+    // stamp were the same instant and both read as stale.
+    //
+    //   oldest group   -> ~600_000 ms  (stale)      <- the contract
+    //   newest group   -> ~0 ms                (fresh)
+    //   snapshot stamp -> ~0 ms                (fresh)      <- the store really did happen now
+    let long_ago = Instant::now()
+        .checked_sub(Duration::from_secs(600))
+        .expect("the test host has more than 600s of uptime");
+    views.publish_pass_at(&reg, long_ago);
+
+    // One tab moves; every other tab is still 600 s behind.
+    let read_at = Instant::now();
+    views.publish_group_at(&reg, &fresher.id, read_at);
+
     let snap = views.load();
     let meta = strip_view_payload(&snap, read_at);
     let meta = section(&meta, "meta");
+    let age = meta.get("age_ms").and_then(Value::as_u64).expect("meta.age_ms is a number");
+
+    // The AGE, not just the flag: the flag alone cannot say WHICH of the three
+    // candidates produced it.
+    assert!(
+        age >= 600_000,
+        "the strip must age itself against the group left behind (~600s), not against the \
+         one just recomputed and not against the snapshot's own publication (both ~0ms). \
+         Got age_ms={age}: {meta}"
+    );
     assert_eq!(
         meta.get("stale"),
         Some(&Value::Bool(true)),
-        "one group is {}ms old, so the strip is stale even though another was just recomputed: \
-         {meta}",
-        VIEW_STALE_AFTER_MS_FOR_TEST + 500
+        "...and it is therefore stale, even though a tab was just recomputed: {meta}"
+    );
+
+    // The fixture provably contains BOTH a stale group and a fresh one, so
+    // the assertions above are a choice between them rather than a reading of
+    // a population that only has one member.
+    let fresh_age = section(&group_view_payload(&snap, &fresher.id, read_at), "meta")
+        .get("age_ms")
+        .and_then(Value::as_u64)
+        .expect("meta.age_ms is a number");
+    assert!(
+        fresh_age < 1_000,
+        "setup: the recomputed group must really be fresh, or the strip has nothing to \
+         choose between. Got {fresh_age}ms"
     );
 }
 
