@@ -873,8 +873,10 @@ is actually parked is one frame deeper.
 
 Nothing is changed here for it: the memo cell's hold-across-compute is argued
 where it is written, the plan's §4 row 10 carries it, and narrowing it is a
-change to the stampede behaviour rather than to this slice. What is recorded is
-that the shape exists and that this mechanism is what surfaced it.
+change to the stampede behaviour rather than to this slice. It is tracked on
+**#1723**, in the same family as row 11's per-second `usage.json` write. What is
+recorded here is that the shape exists and that this mechanism is what surfaced
+it.
 
 ### The panic is armed, not default — and the asymmetry with the rank checker
 
