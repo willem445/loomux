@@ -1818,34 +1818,34 @@ fn l5_every_lockorder_const_is_applied_to_its_field() {
 // bank a coverage claim no run ever produced. L6b is that equality, and its own
 // counterfactual is a tick that returns while masking nothing.
 //
-// **What the pre-fix red actually looks like now depends on the base**, and the
-// rows are written so the failure line says which:
+// **What the pre-fix red looks like depends on the base**, and the rows are
+// written so the failure line says which:
 //
-//   - on `main` BEFORE Phase 3a (#1698): `attention_tick` takes `agents`
-//     (lockorder::AGENTS, 510) and re-acquires it through
-//     `delivered_mask_lines` -> `delivered_prompt_record` -> `session_for_pty`.
-//     `parking_lot::Mutex` is not re-entrant and the tick runs inside
-//     `tick_gate`'s `MutationScope`, where an expired budget waits rather than
-//     unwinding — so the thread parks forever and the row reports a TIMEOUT.
+//   - on `main` BEFORE Phase 3a (#1698): `attention_tick` takes `agents` and
+//     re-acquires it through `delivered_mask_lines` -> `delivered_prompt_record`
+//     -> `session_for_pty`. `parking_lot::Mutex` is not re-entrant and the tick
+//     runs inside `tick_gate`'s `MutationScope`, where an expired budget waits
+//     rather than unwinding — so the thread parks forever and the row reports a
+//     TIMEOUT.
 //   - on `main` WITH 3a: the same path takes `by_pty` (rank 500) while holding
 //     `agents` (510) one line EARLIER than the re-entrant acquire, which is a
 //     descending pair, so the rank checker panics naming both locks before the
 //     deadlock can form. The row reports a PANIC, with the checker's message.
 //
-// Both are the same defect seen through different instruments, and neither is
-// "a slow machine" — which is why the runner below distinguishes them instead
-// of reporting one timeout for both.
+// Both are the same defect through different instruments, which is why the
+// runner below distinguishes them instead of reporting one as the other.
 
 /// Guardrails for a fixture that needs more than [`rails`]'s four panes.
 fn rails_for(max_agents: u32) -> Guardrails {
     Guardrails { max_agents, ..rails() }
 }
 
-/// A lock name no other test uses, so the sampler can identify the thread
-/// running the tick without a process-wide serial guard: tests in this binary
-/// run in parallel and `lockwatch::held_locks` is global, so filtering on the
-/// name `agents` alone would be reading other tests' registries too.
+/// Lock names no other test uses, so the sampler can identify the thread it is
+/// measuring without a process-wide serial guard: tests in this binary run in
+/// parallel and `lockwatch::held_locks` is global, so filtering on the name
+/// `agents` alone would be reading other tests' registries too.
 const L6A_PROBE: &str = "l6a_tick_probe";
+const L6A_CONTROL_PROBE: &str = "l6a_control_probe";
 const L6B_PROBE: &str = "l6b_tick_probe";
 
 /// Agents in the fixture fleet.
@@ -1859,10 +1859,13 @@ const L6_DELIVERIES: usize = 4_000;
 const L6_TAIL_BYTES: usize = 16 * 1024;
 /// The sampler's cadence. Not a wait — this file's "never a sleep" rule is
 /// about waiting for a condition, and every wait below is a bounded
-/// `recv_timeout`. A hold of the size these rows exist to catch lasts seconds
-/// to forever, so ~2000 samples a second is far more resolution than the defect
-/// needs, at no spin cost.
+/// `recv_timeout`.
 const L6_SAMPLE_EVERY: Duration = Duration::from_micros(500);
+/// How long L6a's instrument control holds `agents` deliberately, and the floor
+/// the sampler must report for it. Both are far above `L6_SAMPLE_EVERY` and far
+/// below anything that would make the row slow.
+const L6_CONTROL_HOLD: Duration = Duration::from_millis(250);
+const L6_CONTROL_FLOOR_MS: u64 = 50;
 
 /// The subject both L6 rows measure.
 ///
@@ -1928,9 +1931,9 @@ fn l6_fixture() -> L6Fixture {
     L6Fixture { reg, _dir, fx, tails, reference }
 }
 
-/// How the measured tick ended.
-enum TickEnd {
-    Returned(Vec<loomux_lib::orchestration::AttentionItem>),
+/// How a measured body ended.
+enum Ran<R> {
+    Done(R),
     /// The thread panicked — under Phase 3a this is the rank checker refusing
     /// the inversion, and its message names both locks.
     Panicked(String),
@@ -1938,68 +1941,50 @@ enum TickEnd {
     Parked,
 }
 
-struct Measured {
-    end: TickEnd,
-    /// The longest `agents` hold observed FOR THE TICK'S OWN THREAD.
+struct Sampled<R> {
+    ran: Ran<R>,
+    /// The longest `agents` hold observed FOR THE MEASURED THREAD.
     max_hold_ms: u64,
-    /// How many samples saw such a hold. Zero is a legitimate reading for a
-    /// sub-millisecond hold and is not, on its own, evidence of anything.
+    /// How many samples saw such a hold.
     samples: usize,
-    /// The sampler's positive control: it identified the tick thread through
-    /// the probe lock, so it was running and could attribute a hold to it.
+    /// Weak control: the sampler identified the measured thread through its
+    /// probe lock, so it was running and could attribute a hold to it. This is
+    /// NOT evidence that it can see a hold of any particular duration — that is
+    /// what `L6_CONTROL_HOLD` is for.
     saw_probe: bool,
-    tick1_us: u128,
-    tick2_us: u128,
 }
 
-/// Run two `attention_tick` passes on their own thread and measure the `agents`
-/// hold while they run.
+/// Run `body` on its own thread and report the longest `agents` hold that
+/// thread took while it ran.
 ///
-/// Two passes because one cannot reach the defect: the quiet clock is
-/// established on the first sighting, so `quiet_for` is zero there and the `&&`
-/// chain short-circuits before the mask. The second, five seconds on (past the
-/// four-second attention window), is the one that reaches
-/// `delivered_mask_lines`.
-fn run_two_ticks_measured(f: &L6Fixture, probe_name: &'static str) -> Measured {
+/// The thread is identified by a uniquely-named probe lock it holds and then
+/// releases before `body` starts, so the probe can never be mistaken for the
+/// thing being measured, and the sampler needs no process-wide serial guard.
+fn measure_agents_hold<R: Send + 'static>(
+    probe_name: &'static str,
+    body: impl FnOnce() -> R + Send + 'static,
+) -> Sampled<R> {
     use loomux_engine::lockwatch::{held_locks, mono_ms, TrackedMutex};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
-    let (done_tx, done_rx) = mpsc::channel::<(Vec<loomux_lib::orchestration::AttentionItem>, u128, u128)>();
+    let (done_tx, done_rx) = mpsc::channel::<R>();
     let stop = Arc::new(AtomicBool::new(false));
-    let now = 1_000_000_000_000u64;
-
-    let t_reg = f.reg.clone();
-    let t_out = f.fx.outputs.clone();
-    let t_tails = f.tails.clone();
-    let t_in = f.fx.no_input.clone();
     let t_stop = stop.clone();
-    let tick = std::thread::spawn(move || {
-        // Held only so the sampler can learn THIS thread's tracked-lock id, and
-        // released before the measurement starts so it can never be mistaken
-        // for the thing being measured.
+
+    let worker = std::thread::spawn(move || {
         let probe = TrackedMutex::new(probe_name, ());
         let held = probe.lock_safe();
         let _ = ready_rx.recv_timeout(GRACE);
         drop(held);
-        let t0 = Instant::now();
-        t_reg.attention_tick(now, &t_out, &t_tails, &t_in);
-        let tick1 = t0.elapsed().as_micros();
-        let t1 = Instant::now();
-        let items = t_reg.attention_tick(now + 5_000, &t_out, &t_tails, &t_in);
-        let tick2 = t1.elapsed().as_micros();
+        let out = body();
         t_stop.store(true, Ordering::Relaxed);
-        let _ = done_tx.send((items, tick1, tick2));
+        let _ = done_tx.send(out);
     });
 
     let s_stop = stop.clone();
     let sampler = std::thread::spawn(move || {
-        // Phase 1 — identify the tick thread through the uniquely-named probe.
-        // This is the sampler's POSITIVE CONTROL: the measurement below reports
-        // a maximum over holds it observed, and a maximum of zero is
-        // byte-identical to an instrument that never ran. Reaching the end of
-        // this loop with an id proves the sampler is running, is reading
-        // `held_locks`, and can attribute a hold to the thread it cares about.
+        // Phase 1 — identify the measured thread through the probe.
         let deadline = Instant::now() + GRACE;
         let mut who = None;
         while Instant::now() < deadline {
@@ -2013,8 +1998,8 @@ fn run_two_ticks_measured(f: &L6Fixture, probe_name: &'static str) -> Measured {
         let _ = ready_tx.send(());
 
         // Phase 2 — the measurement, bounded by its own deadline as well as by
-        // the stop flag, because the failure these rows guard against is
-        // precisely the case where the flag is never set.
+        // the stop flag, because the failure L6a guards against is precisely
+        // the case where the flag is never set.
         let deadline = Instant::now() + GRACE;
         let (mut max_ms, mut samples) = (0u64, 0usize);
         while !s_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
@@ -2033,56 +2018,109 @@ fn run_two_ticks_measured(f: &L6Fixture, probe_name: &'static str) -> Measured {
     stop.store(true, Ordering::Relaxed);
     let (saw_probe, max_hold_ms, samples) = sampler.join().expect("the sampler thread panicked");
 
-    let (end, tick1_us, tick2_us) = match got {
-        Ok((items, a, b)) => (TickEnd::Returned(items), a, b),
-        Err(_) if tick.is_finished() => {
-            // It ended without sending: it panicked. Recover the message, which
-            // under Phase 3a is the rank checker naming both locks.
-            let msg = match tick.join() {
+    let ran = match got {
+        Ok(r) => Ran::Done(r),
+        Err(_) if worker.is_finished() => {
+            let msg = match worker.join() {
                 Err(p) => p
                     .downcast_ref::<String>()
                     .cloned()
                     .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_else(|| "<non-string panic payload>".to_string()),
-                Ok(()) => "<thread finished without sending and without panicking>".to_string(),
+                Ok(_) => "<thread finished without sending and without panicking>".to_string(),
             };
-            (TickEnd::Panicked(msg), 0, 0)
+            Ran::Panicked(msg)
         }
         // Deliberately NOT joined: it is parked on a lock this process still
         // holds, and the harness exits when the run ends — the same posture
         // `completes_within` documents at the top of this file.
-        Err(_) => (TickEnd::Parked, 0, 0),
+        Err(_) => Ran::Parked,
     };
-    Measured { end, max_hold_ms, samples, saw_probe, tick1_us, tick2_us }
+    Sampled { ran, max_hold_ms, samples, saw_probe }
+}
+
+/// Two `attention_tick` passes, measured. Two because one cannot reach the
+/// defect: the quiet clock is established on the first sighting, so `quiet_for`
+/// is zero there and the `&&` chain short-circuits before the mask. The second,
+/// five seconds on (past the four-second attention window), is the one that
+/// reaches `delivered_mask_lines`.
+fn measured_ticks(
+    f: &L6Fixture,
+    probe: &'static str,
+) -> Sampled<(Vec<loomux_lib::orchestration::AttentionItem>, u128, u128)> {
+    let reg = f.reg.clone();
+    let outputs = f.fx.outputs.clone();
+    let tails = f.tails.clone();
+    let inputs = f.fx.no_input.clone();
+    let now = 1_000_000_000_000u64;
+    measure_agents_hold(probe, move || {
+        let t0 = Instant::now();
+        reg.attention_tick(now, &outputs, &tails, &inputs);
+        let first = t0.elapsed().as_micros();
+        let t1 = Instant::now();
+        let items = reg.attention_tick(now + 5_000, &outputs, &tails, &inputs);
+        (items, first, t1.elapsed().as_micros())
+    })
 }
 
 /// L6a (#1702) — the deadlock witness. `attention_tick` must RETURN on the
 /// state that used to wedge it, and must not hold `agents` while it works.
 ///
 /// Phase 2.1's budgets bound what a WAITER pays; what broke here was a HOLD, so
-/// the second assertion measures the hold directly off `lockwatch::held_locks`
-/// rather than timing a victim.
+/// the hold is measured directly off `lockwatch::held_locks` rather than by
+/// timing a victim.
 #[test]
 fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
     let f = l6_fixture();
-    let m = run_two_ticks_measured(&f, L6A_PROBE);
 
+    // ---- the instrument control, and it is the whole reason this row can
+    // report a zero honestly ----------------------------------------------
+    //
+    // The hold assertion below is an ABSENCE ("no long hold was seen"), and an
+    // absence is byte-identical to an instrument that cannot see the thing.
+    // `saw_probe` alone does not close that: it proves the sampler ran and can
+    // attribute a hold to the right thread, not that it would CATCH one. So a
+    // deliberate `agents` hold of known duration is taken here, on a measured
+    // thread, and the sampler must report it. Without this, a fix that stopped
+    // taking `agents` at all and a sampler that was blind would produce the
+    // same reading.
+    let reg = f.reg.clone();
+    let control = measure_agents_hold(L6A_CONTROL_PROBE, move || {
+        reg.with_lock_for_test("agents", || std::thread::sleep(L6_CONTROL_HOLD))
+            .expect("`agents` is a known lock name");
+    });
+    assert!(
+        matches!(control.ran, Ran::Done(())),
+        "setup: the control hold itself did not complete, so nothing below is measurable"
+    );
+    assert!(
+        control.max_hold_ms >= L6_CONTROL_FLOOR_MS,
+        "the sampler saw a longest `agents` hold of {} ms over {} samples while a hold of {:?} \
+         was deliberately taken on the measured thread (saw_probe={}). The instrument cannot \
+         see what this row is about, so its reading on the real tick would mean nothing",
+        control.max_hold_ms,
+        control.samples,
+        L6_CONTROL_HOLD,
+        control.saw_probe
+    );
+
+    // ---- the measurement -------------------------------------------------
+    let m = measured_ticks(&f, L6A_PROBE);
     assert!(
         m.saw_probe,
         "the sampler never identified the tick thread through its probe lock, so it observed \
-         nothing and the hold assertion below would pass against an instrument that had not \
-         started"
+         nothing"
     );
-    match &m.end {
-        TickEnd::Returned(_) => {}
-        TickEnd::Panicked(msg) => panic!(
+    let (_items, tick1_us, tick2_us) = match m.ran {
+        Ran::Done(t) => t,
+        Ran::Panicked(msg) => panic!(
             "attention_tick PANICKED instead of returning. On a base carrying Phase 3a this is \
              the #1702 defect caught by the rank checker — the tick holds `agents` (rank 510) \
              and reaches `by_pty` (rank 500) through delivered_mask_lines -> \
              delivered_prompt_record -> session_for_pty, one line before it would re-acquire \
              `agents` itself. The checker said: {msg}"
         ),
-        TickEnd::Parked => panic!(
+        Ran::Parked => panic!(
             "attention_tick did not return within {GRACE:?} and did not panic. That is the \
              #1702 defect on a base without the rank checker: the tick takes `agents` and \
              re-acquires it through delivered_mask_lines -> delivered_prompt_record -> \
@@ -2090,7 +2128,7 @@ fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
              The longest `agents` hold observed for that thread was {} ms over {} samples",
             m.max_hold_ms, m.samples
         ),
-    }
+    };
 
     let tick_budget = bg::TICK_LOCK_BUDGET.as_millis() as u64;
     assert!(
@@ -2098,19 +2136,17 @@ fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
         "the tick held `agents` for {} ms (over {} samples), past the {tick_budget} ms tick \
          budget. Every phase of attention_tick that takes a registry lock must be a bounded \
          in-memory pass: no pty read, no board file, no delivery record. The two passes took \
-         {} and {} us in total",
+         {tick1_us} and {tick2_us} us",
         m.max_hold_ms,
-        m.samples,
-        m.tick1_us,
-        m.tick2_us
+        m.samples
     );
 }
 
 /// L6b (#1702) — moving the mask off the lock must not move what it decides.
 ///
 /// The counterfactual this row owns is NOT the deadlock (L6a has that): it is a
-/// tick that returns promptly while masking nothing, which L6a would pass and
-/// this must not.
+/// tick that returns promptly while masking nothing, which L6a passes and this
+/// must not.
 #[test]
 fn l6b_the_masks_the_tick_applies_equal_the_unbounded_computation() {
     use loomux_lib::orchestration::{
@@ -2170,14 +2206,14 @@ fn l6b_the_masks_the_tick_applies_equal_the_unbounded_computation() {
          is not claiming the line this fixture was built around"
     );
 
-    let m = run_two_ticks_measured(&f, L6B_PROBE);
-    let items = match m.end {
-        TickEnd::Returned(items) => items,
-        TickEnd::Panicked(msg) => panic!(
+    let m = measured_ticks(&f, L6B_PROBE);
+    let (items, _, _) = match m.ran {
+        Ran::Done(t) => t,
+        Ran::Panicked(msg) => panic!(
             "could not compare outputs: attention_tick panicked. This row's own assertion was \
              never reached — see L6a, which owns that failure. The panic was: {msg}"
         ),
-        TickEnd::Parked => panic!(
+        Ran::Parked => panic!(
             "could not compare outputs: attention_tick did not return within {GRACE:?}. This \
              row's own assertion was never reached — see L6a, which owns that failure"
         ),
