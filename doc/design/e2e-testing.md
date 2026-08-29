@@ -401,6 +401,15 @@ reads as covering is worse than none:
   because it is exactly the kind of stale arithmetic a reader would otherwise
   reconstruct from the plan.
 
+  That bound is **observed, not reasoned**. The armed-injector control holds
+  `groups` — what the polled `orch_group_summary` takes — for 12 s and reads
+  the gate's own counters: `1 sweeps ran, 2 ticks skipped` (measured at
+  `96e27608`, run 33233077315). One call parked, two ticks declined to pile
+  on. The 180 s soak in the same run measured `45 status sweeps ran, 0 ticks
+  skipped`, which is a healthy app and therefore says nothing at all about
+  the skip path — which is exactly why the observation is made under a held
+  lock instead.
+
   What the class assertion still demonstrates is the half #1604 does not
   govern: `orchestration/mcp.rs` spawns a thread per request and each one
   parks on the registry mutex, ungoverned by any single-flight. That is why
@@ -543,12 +552,24 @@ vacuously:
   spec asserts group, session and audit-byte counts against it — otherwise a
   builder that silently failed turns this into a soak against an empty
   install, which passes.
-- **The polls really ran.** The app counts its own dispatches, and the spec
-  asserts a floor on `orch_*` calls across the soak window. Without it the
-  test asserts that an app survives being ignored. The floor is on the TOTAL,
-  not on which commands — the group-view batch has been five, then nine, then
-  ten, and pinning a count would pin the last incident's shape, which is the
-  mistake this lane exists to stop making.
+- **The polls really ran.** The primary measure is SWEEPS, read from the
+  app's own `__singleFlightStats()` (#1604), with the dispatch counter as a
+  cross-check: sweeps climbing while nothing dispatches means the sweep found
+  no bound tabs, which is the corpus failing to bind rather than a healthy
+  app. Without either, the test asserts only that an app survives being
+  ignored.
+
+  Sweeps rather than an invoke total is a consequence of #1604, not a
+  preference. Before it every 4 s tick issued a sweep, so `ticks × tabs × 2`
+  predicted the dispatch count and a floor could be derived from arithmetic;
+  now a tick may legitimately skip, so the number of sweeps is something to
+  read. **Measured** at `96e27608` (run 33233077315): 45 sweeps, 0 skipped,
+  360 `orch_*` dispatches across 4 group-bound tabs — exactly 45 × 4 × 2, so
+  every sweep issued its full fan-out. The floor is 40 % of the tick count
+  (18 here, cleared 2.5×) and is deliberately a floor on the property — the
+  poll body ran repeatedly under load — never a pin on the cadence, which
+  would pin this incident's shape, the mistake this lane exists to stop
+  making.
 
   The counter lives in `src/transport.ts`, not in the spec, and that is a
   correction rather than a preference. Counting from the spec's side meant
@@ -629,11 +650,16 @@ the E2E log rather than the check mark; if `e2e-windows` ever comes off
 
 `ci.yml` sets `ORRERIX_SOAK_MS=180000`, `ORRERIX_SOAK_LOCK_HOLD_MS=90000`
 and `ORRERIX_SOAK_BOUND_MS=20000` explicitly, so the cost lives where the
-job does. 180 s is ~45 ticks of the 4 s status poll per group-bound tab, and
-the hold has to outlast both probes, which need ~70 s worst case at those
-bounds. Three launches (the soak, the armed-injector control and the class
-assertion) plus warm-ups put the lane at roughly eight minutes of the
-`e2e-windows` job, and up to ~14 if the soak spec takes its one retry. Every
+job does. 180 s is ~45 ticks of the 4 s status timer, and the hold has to
+outlast both probes, which need ~70 s worst case at those bounds.
+
+The cost is **measured**, at `96e27608` (run 33233077315): soak 3.3 m +
+armed/single-flight control 20.8 s + class assertion 46.2 s = **~4.4 min**
+of a 5.8 min suite, inside an 8m51s job whose remainder is mostly the debug
+`tauri build`. A retry of the soak spec adds ~3.3 min. An earlier version of
+this section estimated "roughly eight minutes", about twice the lane's real
+cost — a run settles it, and quoting the split lets the next person tune the
+knobs against a real number. Every
 knob is an environment variable (`ORRERIX_SOAK_MS`,
 `ORRERIX_SOAK_LOCK_HOLD_MS`, `ORRERIX_SOAK_BOUND_MS`, `ORRERIX_SOAK_GROUPS`,
 `ORRERIX_SOAK_SESSIONS`, `ORRERIX_SOAK_AUDIT_LINES`), so a long local soak
