@@ -443,7 +443,9 @@ impl PtyManager {
     /// rather than preserves.
     pub fn enqueue_cd(&self, id: u32, path: String) -> Result<WriteReceiver, String> {
         let (reply, rx) = tauri::async_runtime::channel(1);
-        self.enqueue(id, WriterJob::Cd { path, reply })?;
+        // SCRATCH ONLY: cd routed AROUND the pane's writer queue.
+        let out = self.write_ctx().write_cd(id, &path);
+        let _ = reply.try_send(out);
         Ok(rx)
     }
 
