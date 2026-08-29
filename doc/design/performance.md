@@ -81,12 +81,16 @@ There are four, and the model names all four:
    by hand.
 
 **Naming them is not governing them.** #1601 makes 2 and 4 *observable*; it
-bounds nothing and refuses nothing. The invariants that bound them — a
-single-flight poll path, a bounded acquisition with a typed `Busy`, an
-isolated pool for pty writes — are Phases 1 and 2 of that plan, and they are
-deliberately not written here yet: an invariant over a model that omitted the
-scarce resource is exactly what produced a *correct* classification of five
-commands as `cheap` that then froze the app.
+bounds nothing and refuses nothing. Resource 2 has since gained its first real
+bound — INV-4's single-flight sentence below (#1602/#1604), which stops a poll
+path accumulating parked pool threads one per tick — and that is the shape the
+rest will take: a rule stated against a resource this section names. What is
+still ungoverned is resource 3 entirely, and resource 4 on every path (a
+bounded acquisition with a typed `Busy`, an isolated pool for pty writes:
+Phases 1 and 2 of the plan). Those are deliberately not written here ahead of
+their code, because an invariant over a model that omitted the scarce resource
+is exactly what produced a *correct* classification of five commands as `cheap`
+that then froze the app.
 
 ## 2. The proven patterns
 

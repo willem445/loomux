@@ -581,6 +581,16 @@ const TIMERS: TimerRow[] = [
       "stamp carries `hidden` and `selfwatch::liveness` answers 'no evidence' rather than " +
       "'stuck' for a stale stamp from one (Liveness::GuiHidden).",
     debt: null,
+    // No gate, and the reason is structural rather than an exemption. INV-4's
+    // single-flight sentence (#1602) exists to stop a tick firing while its own
+    // previous call is outstanding from accumulating parked `spawn_blocking`
+    // threads one per tick — the beta6 mechanism. `liveness_stamp` is a SYNC
+    // command (performance.md §4 X7, and it must be: the pool is one of the two
+    // things it measures), so it never reaches that pool at all and the
+    // accumulation is unreachable from here, not merely unlikely. Two stamps
+    // that do overlap leave the later one's values, which is the correct answer
+    // for a claim about *now*.
+    overlapGate: null,
   },
   {
     key: "src/pollgate.ts@HIDDEN_RECHECK_MS",
