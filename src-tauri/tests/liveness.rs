@@ -194,6 +194,21 @@ fn await_reply(rx: Result<WriteReceiver, String>) -> Result<(), String> {
     rx.blocking_recv().unwrap_or_else(|| Err("pty writer gone".to_string()))
 }
 
+/// [`await_reply`] under a deadline: `None` means it never answered, which is
+/// the defect shape, and `Some(result)` carries what it answered. The bounded
+/// version exists because a test that simply blocks on a reply hangs the CI job
+/// instead of failing it.
+fn await_reply_within(
+    t: Duration,
+    rx: Result<WriteReceiver, String>,
+) -> Option<Result<(), String>> {
+    let (tx, out) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(await_reply(rx));
+    });
+    out.recv_timeout(t).ok()
+}
+
 // ---------- L3a: the input path does not use the shared blocking pool ----------
 
 #[test]
@@ -223,12 +238,20 @@ fn l3a_a_keystroke_lands_while_the_blocking_pool_is_saturated() {
     tauri::async_runtime::spawn_blocking(move || {
         let _ = control_tx.send(control_pm.write_from_frontend(CONTROL_PANE, "never lands", true));
     });
-    assert!(
-        control_rx.recv_timeout(SETTLE).is_err(),
-        "setup: a spawn_blocking hand-off completed while {POOL_MAX_BLOCKING} tasks are parked in \
-         a {POOL_MAX_BLOCKING}-thread pool. The pool is not saturated (did tauri::async_runtime \
-         get initialized before pool()?), so the assertion below would pass without testing \
-         anything"
+    // `Timeout` specifically, not any error. `RecvTimeoutError` has two
+    // variants and `Disconnected` — the closure dropped without running, or
+    // panicking before its send — satisfies `is_err()` just as well while
+    // meaning the OPPOSITE of what this control claims. Distinguishing "queued
+    // behind a full pool" from "never happened" is the control's entire job, so
+    // it has to name which one it saw.
+    assert_eq!(
+        control_rx.recv_timeout(SETTLE),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "setup: the pre-2.3 spawn_blocking hand-off did not sit QUEUED while {POOL_MAX_BLOCKING} \
+         tasks are parked in a {POOL_MAX_BLOCKING}-thread pool. Timeout means the pool is \
+         saturated and the assertion below is meaningful; Ok means it is not saturated (did \
+         tauri::async_runtime get initialized before pool()? — see the module header); \
+         Disconnected means the task never ran at all"
     );
     assert!(
         control_captured.lock().unwrap().is_empty(),
@@ -330,6 +353,64 @@ fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
     assert_eq!(&*wedged_captured.lock().unwrap(), b"wedged");
 }
 
+// ---------- the ordering this change ADDS, rather than preserves ----------
+
+#[test]
+fn a_cd_and_the_keystrokes_around_it_land_in_arrival_order() {
+    // `doc/design/pty-input-path.md`'s ordering table says `write_pty` vs
+    // `change_dir` on one pane is "ordered by arrival again (#1607)" — it was
+    // ordered before #719, "either order" while both bodies went to a shared
+    // pool, and ordered again now that both go to one pane-owned queue.
+    //
+    // That is the one ordering property this change ADDS rather than preserves,
+    // and a claim in a design note with no test under it is exactly the kind of
+    // thing that goes quietly false. It is also the only coverage `enqueue_cd`
+    // has: `tests/ptywrite.rs` drives `write_cd`'s BODY, which is the half that
+    // did not change.
+    //
+    // Fail-able by construction — the two candidate outputs diverge. Route the
+    // `cd` around the writer (write it at enqueue time) and its bytes land
+    // FIRST, so the buffer stops starting with `a`. Give it a second queue and
+    // `b` can overtake it, so the buffer stops ending with `b`.
+    const PANE: u32 = 90321;
+    const MARKER: &str = "ord-marker-dir";
+    let pm = Arc::new(PtyManager::default());
+    let captured = pm.register_fake_for_test(PANE, b"");
+
+    // Enqueue is the arrival point — an in-memory send — so this IS the
+    // arrival order, posted from one thread with no interleaving to argue about.
+    let a = pm.enqueue_frontend_write(PANE, "a".to_string(), true).expect("enqueue a");
+    let cd = pm.enqueue_cd(PANE, MARKER.to_string()).expect("enqueue cd");
+    let b = pm.enqueue_frontend_write(PANE, "b".to_string(), true).expect("enqueue b");
+
+    for (what, rx) in [("a", a), ("cd", cd), ("b", b)] {
+        assert_eq!(
+            await_reply_within(GRACE, Ok(rx)),
+            Some(Ok(())),
+            "the {what} job never completed — every job posted to a pane's writer must be \
+             answered exactly once"
+        );
+    }
+
+    let out = captured.lock().unwrap().clone();
+    let s = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        s.starts_with('a'),
+        "the cd (or the later keystroke) reached the pane ahead of the keystroke posted before \
+         it — cd is not going through the pane's writer queue. Captured: {s:?}"
+    );
+    assert!(
+        s.ends_with('b'),
+        "the keystroke posted last did not land last — the pane has more than one path to its \
+         stdin. Captured: {s:?}"
+    );
+    let middle = &s[1..s.len() - 1];
+    assert!(
+        middle.contains(MARKER),
+        "the cd did not land between the two keystrokes at all. Captured: {s:?}"
+    );
+}
+
 // ---------- L4: one door onto the blocking pool ----------
 
 /// Kept split so the marker never appears as a whole token in this file — the
@@ -339,10 +420,26 @@ fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
 const RAW_POOL_CALL: &str = concat!("async_runtime::", "spawn_blocking(");
 
 /// Blank every comment, newlines preserved, so a marker in prose is not read as
-/// code. Strings are not blanked: no source file in the scanned roots contains
-/// this marker inside a string literal, and the one file that does hold it as a
-/// literal (`perf_dispatch.rs`'s `DELEGATION`) is under `tests/`, which is not
-/// walked. Stated rather than assumed, per the source-scanning-guard convention.
+/// code. Two blind spots, both stated rather than assumed, per the
+/// source-scanning-guard convention — and note which direction each fails in,
+/// because only one of them is dangerous for a default-deny guard:
+///
+/// - **False POSITIVE (harmless-ish): strings are not blanked.** A marker
+///   inside a string literal would count as a call. No file in the scanned
+///   roots has one today. `perf_dispatch.rs`'s `DELEGATION` does hold
+///   `"spawn_blocking("` as a literal, but it is under `src-tauri/tests`, which
+///   is not walked — and it is the UNQUALIFIED spelling, so it would not match
+///   this qualified marker even if it were.
+/// - **False NEGATIVE (the one that matters): a `//` inside a string literal
+///   blanks the rest of that line**, so a real call sitting after one on the
+///   same line is invisible. A guard that must default-deny cannot see what it
+///   blanked. Nothing in the scanned roots has that shape today; a URL in a
+///   string followed by a call on one line would create it.
+///
+/// One scope correction while we are here: the walk takes `crates/` WHOLESALE,
+/// including any test directories under it. Only `src-tauri/tests` is outside
+/// it, and that is because it is not under either root, not because the walk
+/// excludes tests.
 fn code_only(text: &str) -> String {
     let b = text.as_bytes();
     let mut out = b.to_vec();
@@ -389,7 +486,7 @@ fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 }
 
 #[test]
-#[ignore = "gated on #1601 (Phase 0.3): the six other raw sites move behind blocking::spawn_counted there. Phase 2.3 (#1607) removed pty.rs's two; lift this in the post-#1601 pass"]
+#[ignore = "gated on #1601 (Phase 0.3). MEASURED, not derived: `async_runtime::spawn_blocking(` over src-tauri/src + crates is 8 at base 442a50f6 and 6 at this head, Phase 2.3 (#1607) having removed pty.rs's two. Of those 6, blocking.rs's IS spawn_counted's own door and stays — so FIVE sites move in Phase 0: gh.rs, git.rs, orchestration/mod.rs, sessions.rs, voice.rs. Lift this in the post-#1601 pass, re-measuring both ends first"]
 fn l4_the_blocking_pool_has_exactly_one_door() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

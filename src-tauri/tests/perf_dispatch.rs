@@ -1023,7 +1023,13 @@ fn the_scan_still_tells_async_from_sync() {
 }
 
 #[test]
-fn every_async_command_hands_its_body_to_a_blocking_pool() {
+fn every_async_command_hands_its_whole_body_off_the_webview_thread() {
+    // Named for the property, not for one destination: since #1607 two of the
+    // commands this passes (`write_pty`, `change_dir`) satisfy it precisely by
+    // NOT handing their body to a blocking pool — they hand it to the pane's
+    // own writer thread (P8-writer). The old name said "to a blocking pool",
+    // which a CI log reader would have had to disbelieve.
+    //
     // INV-1's delegation half. `async` alone is NOT the property: Tauri polls a
     // command's future on the webview thread, so an async command that runs its
     // work inline before the first await freezes the GUI exactly as a sync one

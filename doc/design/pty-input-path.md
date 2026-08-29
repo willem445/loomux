@@ -30,8 +30,8 @@ pipe stopped every pty command in the app, on every pane. That is the
 
 A third, smaller one: a synchronous command runs on the webview main thread
 (the #716/#724 finding — and Tauri polls an *async* command's future there too,
-up to its first real await, so work placed before the `spawn_blocking` call
-does not escape either). So the wedge was also on the thread that paints.
+up to its first real await, so work placed before that await does not escape
+either). So the wedge was also on the thread that paints.
 
 ## The fix, and the three things it deliberately does not change
 
@@ -39,10 +39,19 @@ does not escape either). So the wedge was also on the thread that paints.
 clones the handle out under the map lock and releases the map lock *before*
 touching the pipe. The map lock's hold shrinks from "however long the child
 takes" to a hashmap lookup and an `Arc` clone. `write_pty` and `change_dir`
-additionally became `async` and hand their **whole** body to
-`spawn_blocking` — including `note_user_input`, whose throttled
-`phantom-input-gated` breadcrumb (#496 N1) is a file write that had no business
-on the painting thread.
+additionally became `async` and hand their **whole** body off the webview
+thread — including `note_user_input`, whose throttled `phantom-input-gated`
+breadcrumb (#496 N1) is a file write that had no business on the painting
+thread.
+
+**Where that body goes changed once, in #1607, and this paragraph is dated
+accordingly.** #719/#734 handed it to `spawn_blocking` — the *shared* blocking
+pool. Since #1607 it goes to a thread that belongs to the pane
+(`spawn_pane_writer`), because the shared pool is a bounded resource
+orchestration polling can exhaust. Everything else in this paragraph is
+unaffected: the lock scope, the ordering, and the fact that nothing is left on
+the painting thread are all properties of the *hand-off*, not of its
+destination. See "719 revisited on isolation" at the end of this note.
 
 ### 1. Ordering — no queue, so no reordering
 
@@ -56,10 +65,11 @@ to keep resolving that promise when the bytes are actually out — which is why
 `write_pty` awaits the blocking write instead of returning at hand-off. A
 per-pane writer thread with a queue was the other candidate shape; it buys a
 FIFO guarantee that the frontend chain already provides, and pays for it by
-breaking the two properties below. (**That last sentence is the one #1607
-narrows** — it is true of a queue that returns at hand-off and false of one that
-replies on completion. See "719 revisited on isolation" at the end of this note;
-every other claim in this section stands.)
+breaking the two properties below. (**#1607 narrows that last clause** — the
+cost is true of a queue that returns at hand-off and false of one that replies
+on completion. See "719 revisited on isolation" at the end of this note, which
+lists both places in this file that #1607 supersedes; every other claim in this
+section stands.)
 
 What async *does* give up is the accidental mutual exclusion between
 **different** commands that main-thread dispatch provided (the same one #716
@@ -218,11 +228,26 @@ considered the question because the resource is not in the performance model
 (#1600 §2.1) — every invariant there is about the webview thread, and the
 destination work is moved TO is ungoverned.
 
-### The one sentence that is superseded, and it is half a sentence
+### What is superseded: two places, and one of them is only half a sentence
 
-§1: *"A per-pane writer thread with a queue was the other candidate shape; it
-buys a FIFO guarantee that the frontend chain already provides, and pays for it
-by breaking the two properties below."*
+**First, "The fix" preamble**, which described the hand-off's *destination*:
+*"hand their **whole** body to `spawn_blocking`"*, plus the reference to "the
+`spawn_blocking` call" in the paragraph above it. Both are corrected in place —
+the destination is now the pane's own writer thread — and the paragraph carries
+a dated note saying so. Nothing else in the preamble moves: it is about lock
+scope and about getting the body off the painting thread, and both hold whatever
+thread the body lands on.
+
+That correction matters more than its size. It sits **upstream** of the section
+below, in the paragraph that introduces the whole note, so a reader who stopped
+after "The fix" would have taken away the pre-2.3 description and never reached
+the narrowing 150 lines later. An earlier revision of this note claimed the
+superseded text was "half of one sentence" in §1 and that everything else stood;
+that was itself false, and is corrected here rather than softened.
+
+**Second, half of one sentence in §1**: *"A per-pane writer thread with a queue
+was the other candidate shape; it buys a FIFO guarantee that the frontend chain
+already provides, and pays for it by breaking the two properties below."*
 
 - **"it buys a FIFO guarantee the frontend chain already provides" — STANDS,
   unchanged.** The per-pane thread is still not where a pane's keystroke
@@ -236,8 +261,9 @@ by breaking the two properties below."*
   `tauri::async_runtime::channel(1)` used as a oneshot, and `write_pty` resolves
   on that reply, not on the enqueue.
 
-Everything else in §1, §2 and §3 stands as written, and each is worth naming
-because each is the thing a reviewer should check has not quietly moved:
+With those two corrected, everything else in §1, §2 and §3 stands as written —
+and each is worth naming individually, because each is the thing a reviewer
+should check has not quietly moved:
 
 - **§1's ordering guarantee** — still the frontend chain, still #65. The one
   row of §1's table that moves is `write_pty` vs `change_dir`, which is ordered

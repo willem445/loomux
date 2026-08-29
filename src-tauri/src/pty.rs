@@ -282,6 +282,13 @@ struct WriteCtx<'a> {
 /// between still gets the same `Err` — the job runs, the map no longer holds the
 /// pane, and the body returns it from where it always did.
 ///
+/// One transitive consequence, for whoever writes the next test here: while a
+/// writer thread is parked in a wedged `write_all` it holds that upgraded map
+/// alive, so EVERY other pane's handle — and therefore every other pane's
+/// writer thread — outlives a dropped `PtyManager` until that write returns.
+/// Irrelevant in production, where the manager is app-lifetime state; it bites
+/// only a test that registers a gated fake and never opens its gate.
+///
 /// The loop is a plain `recv()`, so it exits when the last `Sender` drops AND
 /// the queue has drained: a job already enqueued when the pane closed still gets
 /// run and still gets its reply, instead of leaving an awaiting `write_pty`
@@ -388,9 +395,24 @@ impl PtyManager {
     /// is what makes it legal for `write_pty` to run it BEFORE its first await.
     /// Tauri polls an async command's future on the webview thread up to that
     /// first real await (the #716/#724 finding, performance.md §1), so anything
-    /// here that could block would be blocking the thread that paints. Nothing
-    /// here can: no IO, no leaf lock, no unbounded wait. The map lock is held
-    /// for the lookup and the clone, exactly as `writer_handle` holds it.
+    /// here that could block would be blocking the thread that paints. There is
+    /// no IO and no leaf lock here, and the map lock's HOLD is a lookup and a
+    /// `Sender` clone, exactly as `writer_handle` holds it.
+    ///
+    /// **The residual, stated rather than denied.** What this adds that the
+    /// pool version did not is an ACQUISITION of the `ptys` map lock on the
+    /// webview thread — #734 left only `try_state` and the `spawn_blocking`
+    /// call there and took no lock at all. A hold is bounded by its own body;
+    /// an acquisition is bounded by the LONGEST hold anywhere, and the longest
+    /// in this file is `output_tail`, which clones the whole ring
+    /// (`OUTPUT_RING_CAP`, 256 KiB) byte-by-byte out of a `VecDeque` with the
+    /// map guard alive across it — reachable from an agent through MCP's
+    /// `agent_output_tail` at whatever rate that agent calls it. So the bound
+    /// is "one whole-ring clone", sub-millisecond to about a millisecond, not
+    /// "nothing". That is nowhere near the class of stall this epic is about,
+    /// which is why it was taken; it is written down because a residual the
+    /// doc denies is worse than one it names, and shortening `output_tail`'s
+    /// hold is a separate slice from this one.
     ///
     /// The awaited reply is what preserves the two properties #719 refused to
     /// give up. Ordering: the command still resolves only once the bytes are
@@ -426,9 +448,18 @@ impl PtyManager {
     }
 
     /// Post one job to a pane's writer thread. `pty not found` covers both a
-    /// pane that was never registered and one already reaped; a send failure
-    /// means the thread is gone while the handle somehow is not, which is not a
-    /// state this file can produce — reported rather than unwrapped.
+    /// pane that was never registered and one already reaped.
+    ///
+    /// A send failure means the writer thread is gone while its handle is not.
+    /// One thing produces that: a PANIC inside the thread's job, which drops
+    /// the receiver and leaves the `Sender` sitting in a live `PtyHandle` — so
+    /// that pane returns `pty writer gone` for every write from then on, where
+    /// the pool version lost one write to a `JoinError` and served the next
+    /// keystroke normally. No panicking path is known today (`note_user_input`
+    /// is all `unwrap_or`, `lock_safe` cannot poison, `write_all` returns a
+    /// `Result`), which is why this is an error rather than a supervisor. It is
+    /// described rather than called impossible: "impossible" is what a future
+    /// `unwrap` in that body would quietly falsify.
     fn enqueue(&self, id: u32, job: WriterJob) -> Result<(), String> {
         let jobs = {
             let ptys = self.ptys.lock_safe();
@@ -1968,7 +1999,8 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 /// until `write_pty`'s task could no longer be scheduled, its promise never
 /// resolved, and `src/ptywrite.ts`'s per-pane chain stopped dispatching — every
 /// pane, at once, refusing input while the window kept painting (#1600 §1.2).
-/// The body now goes to a thread that belongs to this pane (`PaneWriter`), so
+/// The body now goes to a thread that belongs to this pane
+/// ([`spawn_pane_writer`], reached through [`PtyHandle`]'s `writer_jobs`), so
 /// the app's most latency-critical path competes for threads with nothing.
 ///
 /// The alternative shapes were considered and rejected in the plan: a bigger

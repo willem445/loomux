@@ -203,11 +203,14 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   command's body must not compete for the *shared* blocking pool, give the
   subject its own thread and keep the completion semantics: the command posts a
   job carrying a reply channel and awaits that reply, so it still resolves when
-  the work is actually done. Precedent: `pty.rs` `PaneWriter` — `PtyHandle`'s
-  `writer_jobs` sender, `PtyManager::enqueue_frontend_write` / `enqueue_cd`, and
-  the thread `spawn_pane_writer` starts beside each pane's reader thread (#1607,
-  epic #1600 Phase 2.3); `doc/design/pty-input-path.md` § "719 revisited on
-  isolation" carries the argument.
+  the work is actually done. Precedent: `pty.rs` `spawn_pane_writer` — the
+  thread it starts beside each pane's reader thread — with `PtyHandle`'s
+  `writer_jobs` sender, the `WriterJob` it carries, and
+  `PtyManager::enqueue_frontend_write` / `enqueue_cd` (#1607, epic #1600 Phase
+  2.3); `doc/design/pty-input-path.md` § "719 revisited on isolation" carries
+  the argument. There is no `PaneWriter` *type* — the pattern has a name and the
+  pane's writer does not, because it is a thread plus a channel rather than a
+  struct; grep the four symbols above.
   **When to reach for it, which is rarely.** P1 is still the default: the pool
   exists so a hundred one-off command bodies do not each own a thread. This is
   for a path with a named OWNER, a long life and a latency contract the pool
