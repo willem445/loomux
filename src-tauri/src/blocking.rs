@@ -72,18 +72,26 @@
 /// Returns exactly what awaiting a `spawn_blocking` handle returns, so it is a
 /// substitution and not a policy: `run_blocking` below still re-raises a
 /// panicked body, `gh.rs` and `git.rs` still flatten it into their own domain
-/// error, and the four sites that skip `run_blocking` (`pty.rs`
-/// `write_pty`/`change_dir`, `sessions.rs` `list_sessions`, `voice.rs`
-/// `voice_stop`) still each do the thing this module's header says they
-/// deliberately do. What changes is that none of them reaches the runtime
-/// directly any more.
+/// error, and the two sites that skip `run_blocking` (`sessions.rs`
+/// `list_sessions`, `voice.rs` `voice_stop`) still each do the thing this
+/// module's header says they deliberately do. What changes is that neither of
+/// them reaches the runtime directly any more.
+///
+/// That set was four when #1601 wrote this line: it also named `pty.rs`
+/// `write_pty`/`change_dir`. #1607 took those two off the pool entirely rather
+/// than moving them behind this door — see the module header — so they are no
+/// longer sites that skip `run_blocking`, they are sites that hand off to a
+/// thread per pane and never enter the pool at all.
 ///
 /// **Why one door rather than a counter at each site.** The count only means
 /// anything if it is complete — a report reading `in-flight 480` is a
 /// diagnosis, and one reading `in-flight 480 plus however many sites nobody
 /// wrapped` is not. Eight hand-wrapped sites is a convention, checked by
 /// whoever remembers; one door is a property a source scan can pin, and
-/// `src-tauri/tests/selfwatch.rs` pins it.
+/// `src-tauri/tests/selfwatch.rs` pins it. (That "eight" is #1601's count of
+/// the alternative it rejected, dated to `bfbab80f` and left as written — it
+/// is a statement about a counterfactual, not about this tree. The tree's own
+/// figures are in the module header, measured.)
 ///
 /// **Where the ticket is taken is the whole point.** It is taken HERE, before
 /// the hand-off, and moved into the task — so the depth counts work that is

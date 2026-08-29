@@ -21,9 +21,10 @@ use loomux_engine::{lockwatch, selfwatch};
 /// `cheap` row.** INV-1's default is that a command delegates its body to the
 /// blocking pool — and this command must NOT, because the pool is one of the
 /// two things it is measuring. Once the pool is exhausted (the plan's §1.2
-/// mechanism: the state in which `write_pty` can no longer be scheduled and
-/// every pane stops accepting input), a delegated `liveness_stamp` would never
-/// run either. The webview would then look stuck at exactly the moment it is
+/// mechanism, whose beta6 symptom was `write_pty` no longer being schedulable;
+/// #1607 moved the input path off this pool, so that particular symptom is
+/// gone while the exhaustion it measures is not), a delegated `liveness_stamp`
+/// would never run either. The webview would then look stuck at exactly the moment it is
 /// the only healthy half left, and the instrument would report the opposite of
 /// the truth on the one occasion anybody reads it.
 ///

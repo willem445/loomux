@@ -52,13 +52,21 @@ There are four, and the model names all four:
 1. **The webview/GUI thread** — §1 above. Saturating it is felt as
    sluggishness: the window is slow but everything still works eventually.
 2. **The shared `spawn_blocking` pool.** Every `run_blocking`/`spawn_counted`
-   hand-off in the app lands in ONE pool — `write_pty`, the app's most
-   latency-critical path, alongside every converted `orch_*` poll. Nothing in
-   the tree sets `max_blocking_threads`, so it is tokio's default of **512**.
-   Saturating it does not feel like slowness: `src/ptywrite.ts` keeps one
+   hand-off in the app lands in ONE pool — every converted `orch_*` poll, every
+   gesture command, the `gh` and `git` families. Nothing in the tree sets
+   `max_blocking_threads`, so it is tokio's default of **512**.
+   Saturating it does not feel like slowness, and beta6 is what that looks
+   like: the pty input path was in this pool too, `src/ptywrite.ts` keeps one
    `write_pty` in flight per pane and chains the next on the previous promise
-   (#65's ordering guarantee), so a `write_pty` that is never scheduled stops
-   that pane accepting input **permanently**, while the window keeps painting.
+   (#65's ordering guarantee), so a `write_pty` that could not be scheduled
+   stopped that pane accepting input **permanently** while the window kept
+   painting — every pane at once.
+   **The input path is no longer one of this resource's tenants** (#1607, Phase
+   2.3): it went to a thread per pane, P8-writer below. That removes the
+   *victim* beta6 was noticed through and none of the mechanism — the pool is
+   still shared, still 512, and still exhaustible by everything else in the
+   list above, which is why this entry stays and why INV-4's single-flight
+   sentence matters.
    Every hand-off is counted through `blocking.rs` `spawn_counted` (#1601
    Phase 0.3) and the depth is breadcrumbed at 64/128/256.
 3. **The MCP request threads.** `orchestration/mcp.rs` is `tiny_http` with

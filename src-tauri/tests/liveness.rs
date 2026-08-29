@@ -33,6 +33,19 @@
 //! `POOL_SERIAL` for the duration, because two of them at once would each be
 //! measuring the other.
 //!
+//! **And the second rule, about the other shared fixture: the pool-depth
+//! COUNTER.** `selfwatch::pool_in_flight()` is process-global, so a test that
+//! reads it is reading every other test's hand-offs too. Any test that reaches
+//! `blocking::spawn_counted` — directly, or through a command that delegates —
+//! must hold `POOL_SERIAL`, and so must any test that ASSERTS on the counter.
+//! L3b does both. Nothing in this binary counts today (L3a saturates with
+//! `tauri::async_runtime::spawn_blocking` directly, which is uncounted, and L0
+//! calls `group_summary` on the caller's thread), which is exactly why the rule
+//! is written down now: the first appender to add a counted hand-off would
+//! otherwise make L3b's counter assertion fire with "the pty input path entered
+//! the counted blocking pool" — a false accusation, on the row whose job is to
+//! be believed.
+//!
 //! **The symptom when that rule is broken names nothing about this file**, which
 //! is why it is written down rather than left to be rediscovered: L3a fails with
 //! `panicked at tauri-<ver>/src/async_runtime.rs:<line>` and the message
@@ -60,13 +73,22 @@
 //! scans asserting one property is how a mechanism drifts — one gets updated,
 //! the other quietly stops meaning anything — so this file defers to that one.
 //!
-//! The single axis this file's version would have added, recorded so it is a
-//! known gap rather than a forgotten one: it walked `crates/` as well as
-//! `src-tauri/src`. That is vacuous today, because the pool in question is
-//! `tauri::async_runtime`'s and `loomux-engine` is Tauri-free by construction
-//! (`doc/design/engine-extraction.md`) — there is nothing there that could
-//! call it. If a crate under `crates/` ever links Tauri, that scan's root list
-//! is the thing to widen.
+//! **Two axes this file's version would have added, recorded as KNOWN gaps
+//! rather than forgotten ones.** Neither is a reason to ship a second scan.
+//!
+//! 1. **"once", not just "one file".** L4 asserted the marker appears in
+//!    exactly one file, exactly ONCE. `selfwatch.rs` asserts only that at least
+//!    one permitted call exists in `blocking.rs` — there is no cap. A second
+//!    `spawn_blocking(` added *inside* `blocking.rs` but outside
+//!    `spawn_counted` would bypass the counter and stay green. Closing it is a
+//!    count assertion in `selfwatch.rs`, which belongs to whoever owns that
+//!    file rather than to this slice.
+//! 2. **The `crates/` root.** L4 walked it; `selfwatch.rs` walks `src-tauri/src`
+//!    only. Vacuous today: the pool is `tauri::async_runtime`'s, and
+//!    `loomux-engine` is Tauri-free by construction
+//!    (`doc/design/engine-extraction.md`) — neither crate's manifest carries
+//!    tauri or tokio, so the call is unreachable there. If a crate under
+//!    `crates/` ever links Tauri, that scan's root list is the thing to widen.
 
 use loomux_lib::orchestration::{Guardrails, OrchRegistry};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
@@ -339,6 +361,13 @@ fn l3a_a_keystroke_lands_while_the_blocking_pool_is_saturated() {
 fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
     const WEDGED: u32 = 90311;
     const HEALTHY: u32 = 90312;
+    // Held because this row ASSERTS on the process-global pool counter, not
+    // because it saturates anything — see the counter rule in the module
+    // header. The baseline check below guards the read at the start; the lock
+    // is what stops a concurrent counted hand-off landing between that read and
+    // the assertion at the end, which would accuse the input path of entering
+    // the pool when it never did.
+    let _serial = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let pm = Arc::new(PtyManager::default());
 
     // Register the healthy pane FIRST: registration takes the map lock, so
