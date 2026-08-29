@@ -38820,10 +38820,43 @@ impl OrchRegistry {
         tails: &HashMap<String, String>,
         last_inputs: &HashMap<String, u64>,
     ) -> Vec<AttentionItem> {
+        // #1702, phase 1 of 3 — the ROSTER SNAPSHOT. `agents` is taken here,
+        // cloned from, and RELEASED before anything else in this function runs:
+        // `compute_group_usage`'s shape, and for a sharper reason than cost.
+        //
+        // This lock used to be held across the whole per-agent loop below, which
+        // put `delivered_mask_lines` under it — and that call reaches
+        // `session_for_pty`, whose second line is `self.agents.lock_safe()`.
+        // `TrackedMutex`'s inner primitive is `parking_lot::Mutex`, which is not
+        // re-entrant, and this tick runs inside `tick_gate`'s `MutationScope`,
+        // where an expired budget does NOT unwind — `lock_safe` falls through to
+        // `acquire_blocking` and waits, unbounded. So the tick did not merely
+        // hold the registry's busiest lock for a long time: it DEADLOCKED on it,
+        // the first time any pty-bound, `by_pty`-mapped agent went quiet past
+        // `ATTENTION_QUIET_MS`. Both halves of that nesting entered in one
+        // commit (#903), which is why #1702's field trace is a single hold
+        // growing 38 s → 336 s across separate retries, never released, and
+        // re-forming within seconds of every restart.
+        //
+        // The rule this function now keeps — and the one a later edit must not
+        // break — is that NO phase holds a registry lock across a call that can
+        // take another one:
+        //
+        //   phase 1  snapshot the roster             short `agents` hold
+        //   phase 2  masks and prompt-wait per agent NOTHING held
+        //   phase 3  decide and apply                one short hold of the
+        //                                            attention maps
+        //
+        // Phase 2 is where every nested acquisition now happens, and it happens
+        // with the registry free. `doc/design/lock-liveness.md` §6 is the
+        // contract;
+        // `liveness.rs`'s `l1702_the_attention_tick_never_holds_agents_across_
+        // its_per_agent_mask_work` is the guard.
+        let roster: Vec<AgentEntry> = self.agents.lock_safe().values().cloned().collect();
+
         // Board-derived gate map: agent id → gate status, across every live
         // group. Read once per group (a small fs read) rather than per agent.
-        let groups: HashSet<GroupId> =
-            self.agents.lock_safe().values().map(|a| a.group.clone()).collect();
+        let groups: HashSet<GroupId> = roster.iter().map(|a| a.group.clone()).collect();
         let mut gate_of: HashMap<String, String> = HashMap::new();
         // #1091 slice D: pending-question count per asker, across every live
         // group — DERIVED from the #946 Q1 `questions.json` registry, exactly
@@ -38876,6 +38909,59 @@ impl OrchRegistry {
             }
         }
 
+        // #1702, phase 2 — the per-agent mask, computed with NO lock held. This
+        // is the work that used to run under `agents`; it reaches four other
+        // registry locks (`delivered_notices`, `by_pty`, `agents`,
+        // `delivered_prompts`) and so may only run from a phase holding none.
+        //
+        // What it costs is BOUNDED, and saying so is the other half of #1702:
+        // the issue's premise was that this scales with a session's age, and it
+        // does not. `delivered_mask_lines` unions two drop-oldest records that
+        // are capped where they are WRITTEN — `DELIVERED_NOTICES_PER_PANE` (24)
+        // lines of the pane's notice record and
+        // `DELIVERED_PROMPT_LINES_PER_SESSION` (16) of the session's prompt
+        // record — so `delivered` is at most 40 lines however many thousands of
+        // deliveries a session has taken, and the maps holding them are capped
+        // by pane and by session as well (`DELIVERED_NOTICE_PANES`,
+        // `DELIVERED_PROMPT_SESSIONS`), which is what bounds the memory. The
+        // other operand is capped too: `attention_tail` reads only the trailing
+        // `ATTENTION_SCAN_BYTES` (4096) of the ring, so a tail is ~100 rows.
+        // One agent's mask is therefore ~100 × 40 short string comparisons —
+        // tens of microseconds, with nothing in it proportional to session age.
+        // That is why no SECOND cap is added here: capping an already-capped
+        // record could only narrow what the mask may claim, which is a change to
+        // #903 B2's guarantees, and it would buy no bound that is not already
+        // held.
+        //
+        // Computed for every running agent that has a tail, rather than only for
+        // the ones the cheap terms below would admit. The old code let `&&`
+        // short-circuit this away, but those terms read the quiet clock, which
+        // lives in a map phase 3 owns — keeping the short-circuit would mean
+        // reading one of this predicate's inputs under a lock and the rest
+        // outside it. A pure function of (tail, record) is the same value
+        // whenever it is evaluated, so the tick's outputs are unchanged; only
+        // the cost of an agent the terms would have rejected moves, and it moves
+        // off the lock.
+        //
+        // A pane with no pty bound has taken no delivery, so an empty record is
+        // the truth rather than a gap — the same `unwrap_or_default` the old
+        // in-loop expression had, kept here so an agent with a tail and no pty
+        // is still masked against an empty record rather than skipped.
+        let prompt_shaped: HashMap<String, bool> = roster
+            .iter()
+            .filter(|a| a.status == AgentStatus::Running)
+            .filter_map(|a| tails.get(&a.id).map(|t| (a, t)))
+            .map(|(a, t)| {
+                let delivered = a.pty_id.map(|p| self.delivered_mask_lines(p)).unwrap_or_default();
+                let shaped =
+                    prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
+                (a.id.clone(), shaped)
+            })
+            .collect();
+
+        // #1702, phase 3 — decide and apply, under one short hold of the
+        // attention maps. Nothing below reads a pty, a board file or a delivery
+        // record; every input it needs was gathered above.
         let reports = self.attn_reports.lock_safe().clone();
         let mut quiet = self.attn_quiet.lock_safe();
         let mut waiting_ack = self.attn_waiting_ack.lock_safe();
@@ -38884,13 +38970,14 @@ impl OrchRegistry {
         // same lock order as the other attention maps.
         let mut stranded = self.attn_stranded.lock_safe();
         // #946 Q4 / #1091 slice H: the latched-attention belt's own map,
-        // taken in the same lock order (after `attn_stranded`, before
-        // `agents`) for the same reason every other attention map is taken
-        // here rather than re-locked per agent.
+        // taken in the same lock order (after `attn_stranded`) for the same
+        // reason every other attention map is taken here rather than re-locked
+        // per agent. It used to read "before `agents`"; `agents` is not taken
+        // in this phase at all any more (#1702), and describing an order that
+        // no longer exists is how the next reader re-creates it.
         let mut question_held = self.attn_question_held.lock_safe();
-        let agents = self.agents.lock_safe();
         let mut out = Vec::new();
-        for a in agents.values() {
+        for a in &roster {
             if a.status != AgentStatus::Running {
                 quiet.remove(&a.id);
                 waiting_ack.remove(&a.id);
@@ -38932,16 +39019,10 @@ impl OrchRegistry {
                 // that WRAPPED does not raise a chip either. A pane with no
                 // pty bound has taken no delivery, so an empty record is the
                 // truth rather than a gap.
-                && tails
-                    .get(&a.id)
-                    .map(|t| {
-                        let delivered = a
-                            .pty_id
-                            .map(|p| self.delivered_mask_lines(p))
-                            .unwrap_or_default();
-                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
-                    })
-                    .unwrap_or(false);
+                // #1702: computed in phase 2, off every lock. `unwrap_or(false)`
+                // is the same default the in-loop expression had — no entry
+                // means this agent had no tail this tick.
+                && prompt_shaped.get(&a.id).copied().unwrap_or(false);
 
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if question_held.contains(a.id.as_str()) {
@@ -39011,6 +39092,33 @@ impl OrchRegistry {
         last_inputs: &HashMap<u32, u64>,
         agent_ptys: &HashSet<u32>,
     ) -> Vec<AttentionItem> {
+        // #1702: the same per-pane mask work `attention_tick` moved out of its
+        // locks, hoisted out of this one's for the same reason.
+        //
+        // This path did NOT deadlock — it holds neither `by_pty` nor `agents`,
+        // which are the two `delivered_mask_lines` reaches for — so it is a
+        // sibling by shape rather than a second instance of the bug. What it did
+        // do is hold `attn_quiet` and `attn_waiting_ack` across a call that
+        // takes four other registry locks, which is a lock-order edge one edit
+        // away from being the same defect, and is the shape #1702 asks every
+        // periodic tick to stop having. Computed here, with nothing held; the
+        // per-pane cost is bounded exactly as phase 2's is.
+        //
+        // Keyed by pty and gated on the same `agent_ptys` skip the loop below
+        // applies, so no agent pane is masked twice.
+        let prompt_shaped: HashMap<u32, bool> = outputs
+            .keys()
+            .filter(|pty| !agent_ptys.contains(pty))
+            .filter_map(|pty| tails.get(pty).map(|t| (*pty, t)))
+            .map(|(pty, t)| {
+                // #576 residual: the record is keyed by pty id, which is
+                // exactly what this path has.
+                let delivered = self.delivered_mask_lines(pty);
+                let shaped =
+                    prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
+                (pty, shaped)
+            })
+            .collect();
         let mut quiet = self.attn_quiet.lock_safe();
         let mut waiting_ack = self.attn_waiting_ack.lock_safe();
         let mut out = Vec::new();
@@ -39037,15 +39145,10 @@ impl OrchRegistry {
                 // likely of the two to hold a notice — but a human pasting one
                 // in to read it is enough, and the two readings must not
                 // disagree about what counts as a question.
-                && tails
-                    .get(&pty)
-                    .map(|t| {
-                        // #576 residual: the record is keyed by pty id, which
-                        // is exactly what this path has.
-                        let delivered = self.delivered_mask_lines(pty);
-                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
-                    })
-                    .unwrap_or(false);
+                // #1702: computed above, off every lock. `unwrap_or(false)` is
+                // the same default the in-loop expression had — no entry means
+                // this pane had no tail this tick.
+                && prompt_shaped.get(&pty).copied().unwrap_or(false);
             if waiting {
                 out.push(AttentionItem {
                     agent_id: String::new(),
