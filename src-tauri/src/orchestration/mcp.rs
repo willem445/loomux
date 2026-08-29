@@ -18,7 +18,7 @@ use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
 // #1609: the thread-local read budget and the typed `Busy` a timed
 // acquisition answers with. See `doc/design/lock-liveness.md`.
 use loomux_engine::budget;
-use loomux_engine::lockwatch::Busy;
+use loomux_engine::lockwatch::{Busy, BUSY_RETRY_AFTER_MS};
 use serde_json::{json, Value};
 use std::io::Read as _;
 use std::path::Path;
