@@ -132,10 +132,19 @@ webview2-com-sys  unsafe extern "system" fn Invoke   <- the abort site
             the command body
 ```
 
-There is **no `catch_unwind` anywhere on that path** — zero occurrences in
-`tauri`, `tauri-runtime-wry`, `webview2-com` and `webview2-com-sys`, and `wry`'s
-only ones are Objective-C exception traps in its macOS backend. That `Invoke`
-thunk is a plain `extern "system"` with no `-unwind` ABI. So an unwind reaching
+There is **no `catch_unwind` anywhere on that path** — zero occurrences in all
+five locked crates: `tauri` 2.11.5, `tauri-runtime-wry` 2.11.4, `webview2-com`
+and `webview2-com-sys` 0.38.2, and `wry` 0.55.1. That `Invoke` thunk is a plain
+`extern "system"` with no `-unwind` ABI.
+
+This sentence used to except `wry`, saying its only occurrences were
+Objective-C exception traps in its macOS backend. That was false at the locked
+version and is corrected per #1734: `wry` 0.55.1 carries none at all, and its
+`wkwebview` backend — 18 `.rs` files, present in the vendored crate — has none
+either, so the exception the sentence made was for something that is not there.
+The figure is a measurement over the locked sources rather than a reading of
+them, and a zero is only worth what its instrument is: the same sweep returns 7
+on `rayon-core`, so it is not blind. So an unwind reaching
 it does not degrade anything: Rust's abort-on-unwind shim fires in that frame
 and **the process aborts**.
 
