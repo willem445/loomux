@@ -254,6 +254,67 @@ impl Drop for MutationScope {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The R1 detector
+// ---------------------------------------------------------------------------
+
+/// Durable writes seen on an unscoped read path since the process started.
+static UNSCOPED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// How many of those get a breadcrumb before the counter goes quiet.
+///
+/// Bounded because a read path that writes every poll tick would otherwise
+/// produce a breadcrumb every two seconds forever — turning the evidence trail
+/// into the noise it exists to cut through, which is the same argument
+/// [`crate::lockwatch::TrackedMutex::busy`]'s edge-trigger makes. The counter
+/// keeps the whole truth regardless; only the narration is capped.
+const UNSCOPED_WRITE_BREADCRUMBS: u64 = 8;
+
+/// Report a durable write that is happening inside a [`read_budget`] frame and
+/// OUTSIDE any [`MutationScope`].
+///
+/// This is rider R1's residual, made detectable instead of merely argued.
+/// `doc/design/lock-liveness.md` §4 enumerates the writes that occur on read
+/// paths today and shows each is either harmless under an unwind or scoped. The
+/// part an enumeration cannot cover is the next edit: a write added to a
+/// function some read path calls, with nothing to say so. Every durable
+/// orchestration state file goes through
+/// [`crate::fsatomic::atomic_write`], so that is where this is called from, and
+/// the answer to "did anyone remember" stops being a review dependency.
+///
+/// **It reports; it does not refuse.** A panic here would be a guard that
+/// blocks a build, and this repo's rule is that a refusing guard ships only
+/// after it has run clean over known-good subjects — which cannot be
+/// established for a write path nobody has enumerated yet. So: a counter a test
+/// can assert on, and a bounded breadcrumb trail a field report carries.
+///
+/// **What it does NOT see**, stated where it lives: writes that are not
+/// `atomic_write` — `fs::rename`, `fs::write`, `fs::create_dir_all`. The one
+/// such site on a read path today is `load_usage_snapshots`' corrupt-file
+/// rename, and it is inside `merge_usage_snapshots`' scope; §4 names it.
+pub fn note_durable_write(what: &str) {
+    // Cheap and in this order on purpose: two thread-local reads, and the
+    // common answer is "no budget installed", which costs one of them.
+    if BUDGET.with(|b| b.get()).is_none() || in_mutation() {
+        return;
+    }
+    let n = UNSCOPED_WRITES.fetch_add(1, Ordering::Relaxed);
+    if n < UNSCOPED_WRITE_BREADCRUMBS {
+        crate::obs::breadcrumb(
+            "write-on-read-budget",
+            &format!("what={} seen={}", what.replace(' ', "_"), n + 1),
+        );
+    }
+}
+
+/// How many durable writes have happened on an unscoped read path. The R1
+/// residual, made assertable: a test that drives every read entry point under a
+/// budget and finds this unmoved has checked the property rather than the
+/// prose.
+pub fn unscoped_durable_writes() -> u64 {
+    UNSCOPED_WRITES.load(Ordering::Relaxed)
+}
+
 /// This thread's mutation depth. For tests and for a diagnostic dump; the
 /// acquisition path uses [`in_mutation`].
 #[doc(hidden)]
@@ -480,5 +541,43 @@ mod tests {
             panic!("out through the scope");
         });
         assert_eq!(mutation_depth_for_test(), 0, "a scope leaked its depth on an unwind");
+    }
+
+    #[test]
+    fn the_r1_detector_fires_on_exactly_the_unwindable_shape() {
+        // Rider R1's residual is "a write added to a read path by a later
+        // edit". `note_durable_write` is what notices; this pins WHICH shape it
+        // notices, because a detector that fires on everything gets muted and
+        // one that fires on nothing is indistinguishable from a clean tree.
+        //
+        // Deltas, not absolutes: the counter is process-global and every other
+        // test in this binary that writes a file goes through the same door.
+        let before = unscoped_durable_writes();
+        note_durable_write("outside-any-budget.json");
+        assert_eq!(
+            unscoped_durable_writes(),
+            before,
+            "a write with no budget installed is an ordinary mutation and must not be counted"
+        );
+
+        let _ = read_budget(Duration::from_secs(1), || {
+            let _scope = MutationScope::enter();
+            note_durable_write("scoped.json");
+        });
+        assert_eq!(
+            unscoped_durable_writes(),
+            before,
+            "a write inside a MutationScope cannot be unwound out of, so it must not be counted"
+        );
+
+        // The positive control, and the only shape that IS the hazard: inside a
+        // budget, outside a scope.
+        let _ = read_budget(Duration::from_secs(1), || note_durable_write("unscoped.json"));
+        assert_eq!(
+            unscoped_durable_writes(),
+            before + 1,
+            "the detector did not fire on a durable write inside a read_budget frame — the one \
+             shape an unwind could tear"
+        );
     }
 }
