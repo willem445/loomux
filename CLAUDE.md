@@ -507,6 +507,17 @@ compiles.
   `Drop` guard, for the same reason. Signature: extra tests reddening with
   `Result::unwrap() on an Err value: PoisonError` beside the one you
   expected (`SERIAL` in `crates/loomux-engine/src/obs.rs`, #1236).
+- **An instrument's own cost lands inside the critical section it measures.**
+  `Drop::drop` runs BEFORE the struct's fields drop, so a guard newtype that formats,
+  allocates, takes a global lock or writes a file in its `Drop` does all of it with the
+  inner `MutexGuard` — a field — still alive, and every waiter queued behind the hold
+  pays for it. "A hold that has already lasted seconds is not a hot path" is the
+  exculpation to distrust: an over-threshold hold is exactly the one with waiters. Stamp
+  into atomics on the release path and compose off-thread, and pin it by making the
+  global resource *unavailable* and timing a release — reading the code is what missed
+  it. Signature: a `Drop` impl on a type owning a lock guard, above a comment arguing
+  the hot-path rule does not apply here (#1605 B1; `performance.md` INV-5 and X6;
+  `crates/loomux-engine/src/lockwatch.rs`).
 
 ## Refinements & scope increases from the user
 
@@ -538,6 +549,15 @@ narrow their ask back down to the original ticket on your own judgment.
   AND the PR which half you dropped and what the surviving reason is — naming the surfaces that
   really carry it. Signature: a routed reason offers "recapped in `<X>`" and `<X>` names none of
   the things it is said to recap (#1429 N1, adjudicated for the worker in review round 5).
+- **A number in the brief that SIZES the work is measured before you build to it.** A
+  plan's counts are dated to the tree they were written on, and under-scoping to a wrong
+  one is silently GREEN — the tests you write pass over the fraction you did, and nothing
+  points at the rest. Re-measure every count that decides scope, anchored to a named blob,
+  and correct them in an appended dated section rather than rewriting the accepted argument
+  in place, so the plan stays checkable for the next phase reading it. Signature: the
+  plan's figure is close to a *narrower* population's count — "17 `Mutex` fields" against
+  the 16 behind an `Arc`, where the struct declares 82 — and its other figures went stale
+  by a rebase (#1605; `doc/plans/responsiveness-root-cause.md` §6).
 
 ## Git & GitHub workflow
 
