@@ -383,11 +383,36 @@ impl ViewPublisher {
 
         let started = Instant::now();
         let mut computed: HashMap<GroupId, Arc<GroupView>> = HashMap::with_capacity(ids.len());
+        // Ids computed but deliberately NOT published this pass; carried
+        // forward from whatever the swap-time snapshot has for them.
+        let mut withheld: Vec<GroupId> = Vec::new();
         for id in ids {
             let leased = self.has_view_lease_at(&id, now);
             let previous = prior.value.groups.get(&id).map(|g| g.as_ref());
-            computed
-                .insert(id.clone(), Arc::new(self.compute_group(reg, &id, leased, now, previous)));
+            let view = self.compute_group(reg, &id, leased, now, previous);
+            // A group that went partial with NOTHING to inherit must not be
+            // published (#1671's rule: a snapshot in front of per-item reads
+            // inherits what those reads answered).
+            //
+            // Its every busy section is `Null` and — with no previous stamp to
+            // take — its `computed_at` is THIS pass, so it would render as a
+            // group that simply has nothing, with no stale badge to say
+            // otherwise. That is the silent "nothing here" the rule names, and
+            // the class it bites is the one #1625 round 2 already found: a
+            // restored-but-not-resumed group arrives through a STRIP LEASE and
+            // has no prior entry by construction, so its first pass is exactly
+            // the pass that can hit this.
+            //
+            // Withholding is not a new degrade: absence already means "a group
+            // created since the last pass — keep your previous render, ask again
+            // shortly" to both payload builders, and the next pass retries. An
+            // entry full of nulls is strictly worse, because it asserts
+            // something.
+            if view.partial && previous.is_none() {
+                withheld.push(id);
+                continue;
+            }
+            computed.insert(id.clone(), Arc::new(view));
         }
         let compute_ms = elapsed_ms(started);
 
@@ -412,6 +437,15 @@ impl ViewPublisher {
                 _ => {
                     groups.insert(id, fresh);
                 }
+            }
+        }
+        // A withheld group had no entry when this pass STARTED; a nudge may
+        // have published one while it ran. Dropping that would turn a
+        // withheld-and-retried group into a group the strip loses, which is the
+        // very miss the withholding exists to avoid.
+        for id in withheld {
+            if let Some(prev) = previous.value.groups.get(&id) {
+                groups.insert(id, Arc::clone(prev));
             }
         }
         // Derived, never tracked separately, so the snapshot flag and the
@@ -467,6 +501,12 @@ impl ViewPublisher {
         let prior = self.published.load();
         let prev_group = prior.value.groups.get(group).map(|g| g.as_ref());
         let view = Arc::new(self.compute_group(reg, group, leased, now, prev_group));
+        // The same rule as the full pass: an all-`Null` entry stamped fresh
+        // asserts "this group has nothing" where absence says "ask again
+        // shortly". A nudge that cannot read is a nudge that publishes nothing.
+        if view.partial && prev_group.is_none() {
+            return;
+        }
         let compute_ms = elapsed_ms(started);
 
         // Under the same lock as a full pass, taken AFTER the compute, and

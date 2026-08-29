@@ -218,6 +218,41 @@ deadline around the body with the late result discarded, which produces **double
 execution** when the agent retries a non-idempotent tool — the worst possible
 outcome for `spawn_agent`. Exactly-once beats a tidy timeout.
 
+### What the busy fallback inherits, and the one case it cannot
+
+CLAUDE.md: *a cache or snapshot placed in front of per-item reads inherits
+everything those reads answered* — enumerate what the replaced path could do
+that the new one cannot, because the miss is SILENT.
+
+The replaced path here is not a per-item command; it is the SAME section read,
+run unbounded. So the enumeration is short, and it has exactly one gap:
+
+| the section read could... | the busy fallback... |
+| --- | --- |
+| answer for a live group | inherits that group's previous value |
+| answer for a restored, strip-leased group | inherits its previous value |
+| answer on a group's FIRST pass | **has nothing to inherit** |
+
+The third row is the whole of the risk, and the class it bites is the one #1625
+round 2 already found: a restored-but-not-resumed group arrives through a strip
+lease and has no prior entry by construction, so its first published pass is
+exactly the pass that can hit a busy section.
+
+Publishing it anyway would put an entry in the snapshot whose every busy section
+is `Null` and whose `computed_at` is this pass — fresh, so no stale badge — which
+renders as *this group has nothing*. That is an assertion, and a false one.
+
+So a group that goes partial with nothing to inherit is **withheld**: not
+published at all, and retried next pass. Absence is not a new degrade — it
+already means "a group created since the last pass; keep your previous render and
+ask again shortly" to both payload builders. `publish_pass_at` carries a withheld
+id forward from the swap-time snapshot if a nudge published one meanwhile, so
+withholding can never itself lose a group.
+
+Pinned by `a_first_pass_that_goes_partial_publishes_nothing_rather_than_nulls`
+(`tests/liveness.rs`), whose discriminating half is a second registry proving an
+unheld first pass DOES publish.
+
 ## 4. Rider R1: why abandoning a read path is safe
 
 The orchestrator made this blocking, and rightly: an unwind through arbitrary
