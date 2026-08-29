@@ -222,6 +222,22 @@ compiles.
    recurring, and do not add any other package's entry alongside it —
    widening this the "convenient" way is exactly the self-approval this
    constraint exists to prevent.
+10. **Never let a panic or unwind escape a synchronous `#[tauri::command]`.**
+    Tauri runs a non-`async` command inline on the webview/GUI thread inside
+    WebView2's COM callback; nothing on that path has a `catch_unwind` and the
+    `extern "system" Invoke` thunk has no `-unwind` ABI, so an unwind aborts
+    the process rather than degrading anything. Registry-taking sync commands
+    route through `OrchRegistry::mutating_command`/`read_command` — the
+    `read_budget` frame is the barrier — and `src-tauri/tests/synccommands.rs`
+    default-denies the class so the next one cannot forget. So a change that
+    turns a WAIT into a panic or an unwind owes a **measured** cost per
+    executing-thread class, traced to the ABI boundary in the vendored sources
+    rather than asserted: the unwind that releases a lock on a pool thread
+    takes the app down on this one. Signature: a closed caller-class
+    enumeration stated on permanent surfaces, with no measurement for the class
+    that runs on the GUI thread (#1713 B1). Chain, armed-build asymmetry and
+    residual: `doc/design/lock-order.md` §2.1; a *genuine* panic there still
+    aborts (#1717).
 
 ## Code conventions
 
