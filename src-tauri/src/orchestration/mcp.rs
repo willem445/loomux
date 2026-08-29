@@ -296,7 +296,7 @@ fn still_executing_text(tool: &str) -> String {
     };
     format!(
         "`{tool}` is still executing after {} s{waiting}. It WILL complete; do NOT re-issue it{verify}.",
-        budget::MCP_MUTATE_DEADLINE.as_secs()
+        budget::mutate_deadline().as_secs()
     )
 }
 
@@ -404,7 +404,7 @@ pub fn dispatch_bounded(
         }
     });
 
-    match rx.recv_timeout(budget::MCP_MUTATE_DEADLINE) {
+    match rx.recv_timeout(budget::mutate_deadline()) {
         Ok(out) => out,
         Err(_) => {
             let text = still_executing_text(&tool);

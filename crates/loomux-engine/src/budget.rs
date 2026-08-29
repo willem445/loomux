@@ -99,7 +99,28 @@ pub const MCP_READ_BUDGET: Duration = Duration::from_secs(15);
 ///
 /// A deadline on the WAIT, never on the work: see `doc/design/lock-liveness.md`
 /// §3. The tool keeps executing on its own thread and completes exactly once.
+///
+/// The SHIPPED value. Code reads [`mutate_deadline`], which is this unless a
+/// test has overridden it — the same shape (and the same reason)
+/// [`crate::lockwatch::set_hold_warn_ms`] has: a liveness test whose subject is
+/// a 30-second bound would otherwise add 30 seconds to every run of the suite,
+/// and what the test is about is the SHAPE of the answer, not the number.
 pub const MCP_MUTATE_DEADLINE: Duration = Duration::from_secs(30);
+
+static MUTATE_DEADLINE_MS: AtomicU64 = AtomicU64::new(30_000);
+
+/// How long the MCP handler waits for a mutating tool. [`MCP_MUTATE_DEADLINE`]
+/// unless a test has moved it.
+pub fn mutate_deadline() -> Duration {
+    Duration::from_millis(MUTATE_DEADLINE_MS.load(Ordering::Relaxed))
+}
+
+/// Move the mutating-tool deadline. Process-wide; returns the previous value so
+/// a caller can restore it from a `Drop` guard rather than remembering to.
+#[doc(hidden)]
+pub fn set_mutate_deadline_for_test(d: Duration) -> Duration {
+    Duration::from_millis(MUTATE_DEADLINE_MS.swap(d.as_millis() as u64, Ordering::Relaxed))
+}
 
 /// A human's one-shot read command (`orch_tasks`, `orch_audit`, …).
 ///
