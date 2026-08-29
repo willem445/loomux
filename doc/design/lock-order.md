@@ -149,7 +149,7 @@ a diff in which every line changed is one nobody can review for order.
 | 400 | `queues` | "`queues` -> `recovered_queue` -> `recovered_markers`" |
 | 410 | `recovered_queue` | same claim, plus `archive_staged_overflow` |
 | 420 | `recovered_markers` | same claim |
-| 500 | `by_pty` | "`by_pty` is taken and RELEASED before `agents`" |
+| 500 | `by_pty` | `session_for_pty` takes it, then `agents`, releasing this one first (stated from the code, not from that doc — see lock-liveness §6) |
 | 510 | `agents` | same claim; and `delivered_prompts` below |
 | 520 | `groups` | `group_file_io`'s claim puts it under that one |
 | 600 | `delivered_prompts` | "`agents` is taken and RELEASED before this one" |

@@ -2130,13 +2130,27 @@ fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
         ),
     };
 
-    let tick_budget = bg::TICK_LOCK_BUDGET.as_millis() as u64;
+    // The ceiling is the floor the control above just PROVED the sampler can
+    // see — not `TICK_LOCK_BUDGET` (5 s), which this row used to assert and
+    // which is two orders of magnitude looser than anything it can support
+    // (#1703 review B1). An assertion may only refuse what its instrument is
+    // demonstrated to detect; at 5 s it would pass a phase that had regrown an
+    // `fs` read and was holding `agents` for 4999 ms on every 3 s tick, while
+    // this row's own message claimed every phase was a bounded in-memory pass.
+    //
+    // Observed on the fixed tick: 0 ms over 0 samples, so this passes with the
+    // whole 50 ms to spare. If it ever flakes on a loaded runner, the cause is
+    // the sampler catching a DESCHEDULED holder rather than a real hold, and
+    // the fix is to raise `L6_CONTROL_HOLD` and `L6_CONTROL_FLOOR_MS`
+    // together — never the ceiling alone, which would decouple what this
+    // refuses from what the control proves it can see.
     assert!(
-        m.max_hold_ms < tick_budget,
-        "the tick held `agents` for {} ms (over {} samples), past the {tick_budget} ms tick \
-         budget. Every phase of attention_tick that takes a registry lock must be a bounded \
-         in-memory pass: no pty read, no board file, no delivery record. The two passes took \
-         {tick1_us} and {tick2_us} us",
+        m.max_hold_ms < L6_CONTROL_FLOOR_MS,
+        "the tick held `agents` for {} ms (over {} samples), at or past the \
+         {L6_CONTROL_FLOOR_MS} ms this row refuses — which is the same figure the control \
+         above proves the sampler can see. Every phase of attention_tick that takes a \
+         registry lock must be a bounded in-memory pass: no pty read, no board file, no \
+         delivery record. The two passes took {tick1_us} and {tick2_us} us",
         m.max_hold_ms,
         m.samples
     );

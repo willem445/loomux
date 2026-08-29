@@ -666,8 +666,8 @@ could only narrow what the mask may claim, which is a change to #903 B2's
 guarantees, and it would buy no bound that is not already held.
 
 **How it is guarded, and what that guard does NOT cover.** The regression guard
-is two rows in `tests/liveness.rs` — `l6a_the_attention_tick_returns_on_the_
-state_that_deadlocked_it` and
+is two rows in `tests/liveness.rs`:
+`l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it` and
 `l6b_the_masks_the_tick_applies_equal_the_unbounded_computation`. They are
 split because they redden for different reasons and a red evidences only the
 assertion it reached: on the pre-fix tick L6a never gets past "did the call
@@ -692,6 +692,14 @@ so the checker panics naming both locks before the deadlock can form. The
 timeout and the panic are the same defect through two instruments, which is why
 L6a distinguishes them in its failure message rather than reporting one as the
 other.
+
+L6a refuses an observed `agents` hold of 50 ms or more, which is the figure a
+deliberate 250 ms hold on the measured thread proves the sampler reports — the
+assertion and the instrument's demonstrated sensitivity are deliberately the
+same number, so the row cannot refuse something it has not been shown to see.
+Between 50 ms and 250 ms the sensitivity is argued from the 500 us sampling
+cadence rather than measured, and phase 1's true hold (microseconds) is below
+the sampler's floor entirely: this is a CEILING, not a measurement of the hold.
 
 That is a better failure than a hang, and it is not a substitute for this
 section. The checker sees a pair of RANKED locks held at once; it does not see

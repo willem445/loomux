@@ -12635,10 +12635,15 @@ pub mod lockorder {
 
     /// `by_pty` — the pane -> agent reverse index.
     ///
-    /// `session_for_pty`'s claim: "`by_pty` is taken and RELEASED before
-    /// `agents`". Released, so the two do not in fact nest today — the rank
-    /// records the order the claim states, which is the order any future site
+    /// `session_for_pty` takes this and then `agents`, and RELEASES this one
+    /// first — a `let`-statement temporary — so the two do not in fact nest
+    /// today. The rank records that order, which is the order any future site
     /// that DOES nest them has to follow.
+    ///
+    /// Stated as what the code does rather than as a quotation from that
+    /// function's doc (#1702): the doc used to promise exactly this and the
+    /// promise was worthless to its CALLER, which was holding `agents` when it
+    /// called in. See `doc/design/lock-liveness.md` §6.
     pub const BY_PTY: LockRank = LockRank::new(500);
 
     /// `agents` — the agent table. Under `by_pty`, over `groups`.
@@ -38989,6 +38994,21 @@ impl OrchRegistry {
         // #1702, phase 3 — decide and apply, under one short hold of the
         // attention maps. Nothing below reads a pty, a board file or a delivery
         // record; every input it needs was gathered above.
+        //
+        // `roster` is phase 1's SNAPSHOT, and by here it is up to a phase-2
+        // duration old (~12 ms on a six-agent fixture). That is deliberate and
+        // it has one consequence worth knowing before editing this loop:
+        // `mark_dead` sets an agent `Dead`, DROPS `agents`, and only then
+        // prunes `attn_quiet`/`attn_waiting_ack`/`attn_reports`/`attn_emitted`
+        // — so a kill landing in that window has its prune undone by the
+        // `quiet.entry(...).or_insert(...)` below, and one stale chip can be
+        // emitted for a pane that is already dead. It reconciles on the next
+        // tick, whose first branch removes all four entries for any agent no
+        // longer `Running`, and the cadence is 3 s. The alternative — re-taking
+        // `agents` here to re-check liveness — is exactly the coupling #1702
+        // exists to remove, so this is a chosen trade rather than an oversight.
+        // Under the pre-#1702 shape it could not happen: the tick held `agents`
+        // across the whole loop, which serialised `mark_dead` against it.
         let reports = self.attn_reports.lock_safe().clone();
         let mut quiet = self.attn_quiet.lock_safe();
         let mut waiting_ack = self.attn_waiting_ack.lock_safe();
