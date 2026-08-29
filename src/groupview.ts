@@ -72,6 +72,7 @@ import { managerAbsenceNotice } from "./group";
 import { getDefaultAgent } from "./agents";
 import { confirmModal } from "./modal";
 import { PollGate } from "./pollgate";
+import { SingleFlight } from "./singleflight";
 
 /** Hard bounds on the live-agent cap, mirroring the launcher's input range and
  *  the backend's `MAX_AGENTS_CEILING`. The backend re-validates; these only
@@ -261,6 +262,13 @@ export class GroupView {
     },
     refresh: () => void this.load(),
   });
+  /** Single-flights `load()`'s ten-invoke `Promise.all` (#1602, plan §3 Phase
+   *  2.2 of EPIC #1600): a poll tick that fires while the previous one is
+   *  still outstanding — the backend is slow, or a registry lock is stuck —
+   *  skips instead of parking another blocking-pool thread on top of it. One
+   *  instance per open group view (never module-scoped), so a stuck poll in
+   *  this panel cannot silence another group's. */
+  private loadFlight = new SingleFlight();
   private disposed = false;
   /** True once End is clicked once: the second click within the window
    *  actually tears the group down (two-step confirm for a destructive op). */
@@ -748,39 +756,46 @@ export class GroupView {
 
   private async load(): Promise<void> {
     if (this.disposed) return;
-    try {
-      [
-        this.summary,
-        this.usage,
-        this.paused,
-        this.notify,
-        this.spawnExpandedFlag,
-        this.autonomy,
-        this.watches,
-        this.workflow,
-        this.mergeQueueStatus,
-        this.locks,
-      ] = await Promise.all([
-        groupSummary(this.groupId),
-        groupUsage(this.groupId),
-        groupPaused(this.groupId),
-        notifyEnabled(this.groupId),
-        spawnExpanded(this.groupId),
-        autonomyState(this.groupId),
-        // #904: the backend answers `null` if it refuses the group id; the
-        // watch list is the one field here that is not nullable, and the row
-        // renderer calls `.filter` on it. Coalesce at the seam rather than
-        // pushing a guard into every reader.
-        groupWatches(this.groupId).then((w) => w ?? []),
-        workflowStatus(this.groupId),
-        mergeQueue(this.groupId),
-        lockState(this.groupId),
-      ]);
-    } catch (err) {
-      this.toast(String(err));
-      return;
-    }
-    this.render();
+    // #1602: single-flighted — a tick (timer or a manual refresh/action
+    // re-load) that finds the previous `load()` still outstanding skips
+    // rather than issuing a second overlapping `Promise.all`. A rejected
+    // call still releases the flight (the `try`/`catch` below runs inside
+    // `run`'s body, so `loadFlight` never sees a throw and never wedges).
+    await this.loadFlight.run(async () => {
+      try {
+        [
+          this.summary,
+          this.usage,
+          this.paused,
+          this.notify,
+          this.spawnExpandedFlag,
+          this.autonomy,
+          this.watches,
+          this.workflow,
+          this.mergeQueueStatus,
+          this.locks,
+        ] = await Promise.all([
+          groupSummary(this.groupId),
+          groupUsage(this.groupId),
+          groupPaused(this.groupId),
+          notifyEnabled(this.groupId),
+          spawnExpanded(this.groupId),
+          autonomyState(this.groupId),
+          // #904: the backend answers `null` if it refuses the group id; the
+          // watch list is the one field here that is not nullable, and the row
+          // renderer calls `.filter` on it. Coalesce at the seam rather than
+          // pushing a guard into every reader.
+          groupWatches(this.groupId).then((w) => w ?? []),
+          workflowStatus(this.groupId),
+          mergeQueue(this.groupId),
+          lockState(this.groupId),
+        ]);
+      } catch (err) {
+        this.toast(String(err));
+        return;
+      }
+      this.render();
+    });
   }
 
   private async togglePause(): Promise<void> {
