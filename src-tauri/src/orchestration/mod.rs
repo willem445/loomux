@@ -50521,7 +50521,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    match tauri::async_runtime::spawn_blocking(f).await {
+    match crate::blocking::spawn_counted(f).await {
         Ok(v) => v,
         Err(e) => panic!("orchestration command task failed: {e}"),
     }

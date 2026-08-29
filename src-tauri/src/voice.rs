@@ -106,7 +106,7 @@ pub async fn voice_stop(
     let recording = state.recording.clone();
     let transcribing = state.transcribing.clone();
     let bundled = win::bundled_whisper_dir(&app);
-    tauri::async_runtime::spawn_blocking(move || win::stop_blocking(&recording, &transcribing, bundled))
+    crate::blocking::spawn_counted(move || win::stop_blocking(&recording, &transcribing, bundled))
         .await
         .map_err(|e| format!("voice task failed: {e}"))?
 }

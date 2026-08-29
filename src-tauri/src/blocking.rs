@@ -15,7 +15,12 @@
 //! modules, not about delegation — so folding them in here is a separate
 //! change, not a drive-by in a perf slice.
 //!
-//! **And the four raw `spawn_blocking` call sites are left raw, deliberately.**
+//! **And the four call sites that hand off WITHOUT this helper still do,
+//! deliberately** — they call [`spawn_counted`] rather than `run_blocking`.
+//! (Until #1601 they called `tauri::async_runtime::spawn_blocking` directly and
+//! this paragraph called them "raw"; Phase 0.3 routed every hand-off in the
+//! crate through the one counted door, which changed what they call and not
+//! what they DO with the result — which is what the paragraph is about.)
 //! `pty.rs` `write_pty`/`change_dir` (#734), `sessions.rs` `list_sessions` and
 //! `voice.rs` `voice_stop` (#58) each converted before this module existed and
 //! each does something with the join failure that this helper would change:
@@ -43,6 +48,43 @@
 //! launch-intent lock, `gitwatch`'s dispatch ticket); the rest already had one
 //! and it simply became load-bearing.
 
+/// **The one door onto the blocking pool** (#1601 Phase 0.3), and the only
+/// `tauri::async_runtime::spawn_blocking` call left in `src-tauri/src`.
+///
+/// Returns exactly what awaiting a `spawn_blocking` handle returns, so it is a
+/// substitution and not a policy: `run_blocking` below still re-raises a
+/// panicked body, `gh.rs` and `git.rs` still flatten it into their own domain
+/// error, and the four sites that skip `run_blocking` (`pty.rs`
+/// `write_pty`/`change_dir`, `sessions.rs` `list_sessions`, `voice.rs`
+/// `voice_stop`) still each do the thing this module's header says they
+/// deliberately do. What changes is that
+/// none of them reaches the runtime directly any more.
+///
+/// **Why one door rather than a counter at each site.** The count only means
+/// anything if it is complete — a report reading `in-flight 480` is a
+/// diagnosis, and one reading `in-flight 480 plus however many sites nobody
+/// wrapped` is not. Eight hand-wrapped sites is a convention, checked by
+/// whoever remembers; one door is a property a source scan can pin, and
+/// `src-tauri/tests/selfwatch.rs` pins it.
+///
+/// **Where the ticket is taken is the whole point.** It is taken HERE, before
+/// the hand-off, and moved into the task — so the depth counts work that is
+/// still QUEUED as well as work that is running. A counter incremented inside
+/// the closure would read 512 at saturation and go no higher, hiding the queue
+/// behind it, which is the number the plan's §1.2 mechanism actually turns on.
+pub async fn spawn_counted<T, F>(f: F) -> Result<T, tauri::Error>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let ticket = loomux_engine::selfwatch::pool_enter();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ticket = ticket;
+        f()
+    })
+    .await
+}
+
 /// Run `f` on the blocking pool and await it. A panicking body **stays a
 /// panic**: it is re-raised here rather than degraded into an invented return
 /// value, because moving work off the main thread must not change what a bug
@@ -54,7 +96,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    match tauri::async_runtime::spawn_blocking(f).await {
+    match spawn_counted(f).await {
         Ok(v) => v,
         Err(e) => panic!("blocking command task failed: {e}"),
     }
