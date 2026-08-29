@@ -109,6 +109,62 @@ sha2 = "0.10"
 # also declares it, per batch 3's rule.
 dirs = "6"
 
+# `lockwatch::TrackedMutex`'s inner primitive (#1609, plan §3 Phase 2.1).
+#
+# Phase 2.1 bounds every acquisition a human or an agent waits behind:
+# `lock_within(budget)` answers `Busy` instead of parking forever. std's
+# `Mutex` has no timed acquire at all — `try_lock` plus a `Condvar` the guard's
+# `Drop` notifies is the std-only shape, and it is the fallback named in the
+# plan — so the primitive is `parking_lot::Mutex`, whose `try_lock_for` IS the
+# operation. Only the inner primitive changes; `lock_safe`'s signature and the
+# 448 call sites in `orchestration/mod.rs` do not.
+#
+# Clear under both bans in the header above, and the getrandom half is
+# REPRODUCED here rather than recalled, per CLAUDE.md constraint 2. Run
+# 2026-08-29 at Cargo.lock's `parking_lot 0.12.5`, on this workspace:
+#
+#   $ cargo tree --locked -e normal --target x86_64-pc-windows-msvc -p parking_lot
+#   parking_lot v0.12.5
+#   |-- lock_api v0.4.14
+#   |   `-- scopeguard v1.2.0
+#   `-- parking_lot_core v0.9.12
+#       |-- cfg-if v1.0.4
+#       |-- smallvec v1.15.2
+#       `-- windows-link v0.2.1
+#
+# Six crates, no getrandom at any depth. (`redox_syscall`, which the crate's
+# manifest lists, is `cfg(target_os = "redox")` and does not appear under this
+# target at all.) The inverse queries, one per getrandom version in the lock:
+#
+#   $ cargo tree --locked -e normal --target x86_64-pc-windows-msvc -i getrandom@0.2.17
+#   warning: nothing to print.
+#   $ ... -i getrandom@0.3.4   -> getrandom <- tauri <- {orrerix, tauri-plugin-dialog}
+#   $ ... -i getrandom@0.4.3   -> getrandom <- uuid <- {cfb, schemars, tauri-codegen,
+#                                                       tauri-utils} <- ... <- tauri
+#
+# Neither surviving edge passes through parking_lot: both are tauri's own, and
+# both predate this line. Declaring parking_lot therefore adds no getrandom
+# edge and no load-time `ProcessPrng` import to orrerix.exe.
+#
+# It also adds no PACKAGE to `Cargo.lock` — it is already in the shipped
+# binary's linked graph, and the reverse query says by which path:
+#
+#   $ cargo tree --locked -e normal --target x86_64-pc-windows-msvc -i parking_lot@0.12.5
+#   parking_lot v0.12.5
+#   `-- tao v0.35.3
+#       `-- tauri-runtime-wry v2.11.4
+#           `-- tauri v2.11.5 <- orrerix
+#
+# `tao` is wry's windowing layer, compiled on every desktop target, so
+# parking_lot's `WaitOnAddress`/`WakeByAddressSingle` imports (via
+# `windows-link`) are in orrerix.exe today. The query prints a SECOND tree,
+# `parking_lot <- string_cache <- ... <- tauri-utils <- tauri-codegen <-
+# tauri-macros (proc-macro)`; that one is build-time only and is named here so
+# a future reader does not mistake it for a second runtime path. The lockfile
+# delta for this line is one `"parking_lot"` entry under `loomux-engine`'s own
+# dependency list, and no new `[[package]]` block.
+parking_lot = "0.12"
+
 # `winpath::fresh_path` (slice A4 batch 13) reads the machine + user PATH
 # registry values so a CLI installed while loomux is already running is still
 # found by new panes and probes. Target-gated to mirror `src-tauri/Cargo.toml`'s

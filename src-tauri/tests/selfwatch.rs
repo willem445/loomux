@@ -214,34 +214,46 @@ fn the_release_path_takes_no_global_lock_while_the_mutex_is_still_held() {
     drop(restore);
 }
 
-/// #1605 review N2. "Same poison-tolerant semantics as `obs::LockExt::lock_safe`"
-/// is the load-bearing claim of a whole-registry type swap, and nothing pinned
-/// it. `try_lock_safe`'s three-arm match is new logic with no production caller
-/// yet and is what Phase 2.1 will build on, so its `Poisoned` arm returning
-/// `None` instead of the inner value would be a silent behaviour change.
+/// #1605 review N2, repointed by #1609. The claim it was written for —
+/// "same POISON-TOLERANT semantics as `obs::LockExt::lock_safe`" — is gone
+/// with the std inner primitive: `TrackedMutex` is `parking_lot::Mutex`
+/// now, and parking_lot has no poison state to be tolerant of.
+///
+/// The assertion is NOT relaxed to fit that, because the property a caller
+/// actually depended on survives the swap intact and is what is pinned here:
+/// **a holder that dies does not take the lock with it, and the next
+/// acquirer sees what it wrote** (#53's "at worst slightly stale, never
+/// memory-unsafe"). Under std that was `into_inner` recovering a poisoned
+/// guard; under parking_lot the guard simply unlocks as the unwind passes
+/// through it. Same outcome, one fewer concept.
+///
+/// `obs`'s own `lock_safe_recovers_a_poisoned_mutex` stays exactly as it was:
+/// it covers `LockExt` over the std mutexes that remain elsewhere (`pty.rs`,
+/// and `lockwatch`'s own registry and report ring), which DO still poison.
 #[test]
-fn a_poisoned_tracked_mutex_is_recovered_rather_than_propagated() {
-    let lock = Arc::new(TrackedMutex::new("poisonspec", 41u32));
+fn a_panicking_holder_releases_the_tracked_lock() {
+    let lock = Arc::new(TrackedMutex::new("deadholderspec", 41u32));
 
     let poisoner = {
         let lock = lock.clone();
         std::thread::spawn(move || {
             let mut g = lock.lock_safe();
             *g = 42;
-            panic!("poisoning the lock on purpose");
+            panic!("dying with the lock held, on purpose");
         })
     };
     assert!(poisoner.join().is_err(), "the fixture is only a witness if that thread panicked");
 
-    // Blocking acquire: recovered, and the write the panicking thread made is
-    // still there — "at worst slightly stale, never memory-unsafe" (#53).
-    assert_eq!(*lock.lock_safe(), 42, "a poisoned lock must yield its value, not panic");
+    // Blocking acquire: the lock is free and the write the dying thread made
+    // is still there — "at worst slightly stale, never memory-unsafe" (#53).
+    assert_eq!(*lock.lock_safe(), 42, "a dead holder must not swallow its own write");
 
-    // Non-blocking acquire: the same answer. `WouldBlock` and `Poisoned` are
-    // different facts and only the first means "someone else has it".
+    // Non-blocking acquire: the same answer. `None` from `try_lock_safe` means
+    // one thing only — someone else has it — and a lock whose holder is gone is
+    // not that.
     let g = lock
         .try_lock_safe()
-        .expect("a poisoned-but-free lock is FREE; refusing it would report the wrong fact");
+        .expect("a lock whose holder died is FREE; refusing it would report the wrong fact");
     assert_eq!(*g, 42);
     drop(g);
 

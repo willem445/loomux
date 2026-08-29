@@ -1,5 +1,6 @@
 //! Instrumented mutexes (#1601, plan §3 Phase 0.1/0.2) — what was holding a
-//! lock when the app stopped answering.
+//! lock when the app stopped answering — and, since #1609 (Phase 2.1), a
+//! bound on how long a waiter pays for it.
 //!
 //! # Why this exists
 //!
@@ -11,18 +12,30 @@
 //! a mutex does not die — so the total evidence for the last three incidents
 //! was a human saying "it froze".
 //!
-//! This module is the missing artifact. It does not fix anything, bound
-//! anything, or change any behaviour; it makes the state a hang leaves behind
-//! *reportable*, so the next remedy is chosen against evidence instead of
-//! against a story that fits.
+//! This module is the missing artifact. Phase 0 fixed nothing, bounded
+//! nothing and changed no behaviour; it made the state a hang leaves behind
+//! *reportable*, so the next remedy would be chosen against evidence instead
+//! of against a story that fits.
+//!
+//! #1609 is that next remedy, and it lives here too because it is the same
+//! object seen from the other side: [`TrackedMutex::lock_within`] and
+//! [`Busy`] turn one waiter's unbounded park into a typed answer that NAMES
+//! the holder the instrument above already knows about. The policy half —
+//! the thread-local budget, [`crate::budget::MutationScope`] and the six
+//! budget constants — is [`crate::budget`], and the contract both halves
+//! publish is `doc/design/lock-liveness.md`.
 //!
 //! # The shape
 //!
-//! [`TrackedMutex`] is `std::sync::Mutex` plus a small block of atomics, and
-//! its [`lock_safe`](TrackedMutex::lock_safe) has the SAME signature and the
-//! same poison-tolerant semantics as [`crate::obs::LockExt::lock_safe`] — so
-//! the call sites in `orchestration/mod.rs` are untouched and the migration is
-//! a type swap on the registry's fields.
+//! [`TrackedMutex`] is `parking_lot::Mutex` plus a small block of atomics,
+//! and its [`lock_safe`](TrackedMutex::lock_safe) has the SAME signature as
+//! [`crate::obs::LockExt::lock_safe`] — so the call sites in
+//! `orchestration/mod.rs` are untouched and the migration was a type swap on
+//! the registry's fields. (Phase 0 shipped it over std's `Mutex`; #1609
+//! swapped the inner primitive for the one that has a timed acquire. The
+//! one observable difference is poisoning, which parking_lot does not have
+//! at all — see [`TrackedMutex`]'s own note for why that is the same
+//! outcome `lock_safe`'s `into_inner` recovery already produced.)
 //!
 //! Two things are reported, and they are complementary rather than redundant:
 //!
@@ -70,11 +83,17 @@
 //! moved. The mutex itself serialises the writers, so there is exactly one
 //! writer per generation and no CAS loop is needed.
 
+use crate::budget;
 use crate::obs::LockExt;
+// The inner primitive (#1609). Aliased rather than imported under its own
+// name so the std `Mutex` below — this module's OWN registry and report
+// ring, which are not tracked and must not be — still reads as std's at a
+// glance.
+use parking_lot::{Mutex as InnerMutex, MutexGuard as InnerGuard};
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 /// How long a hold must last before it is reported, by default.
 ///
@@ -181,6 +200,19 @@ struct LockState {
     done_thread: AtomicU64,
     done_site: AtomicPtr<Location<'static>>,
     done_waiters: AtomicU32,
+
+    /// The hold generation this lock last wrote a `lock-busy` breadcrumb
+    /// for (#1609). `u64::MAX` = never; `0` = a busy whose holder could not
+    /// be sampled. See [`TrackedMutex::busy`] for why the two sentinels
+    /// differ.
+    busy_reported_gen: AtomicU64,
+    /// How many `lock-busy` / `lock-busy-in-mutation` breadcrumbs this lock
+    /// has actually written. The edge-trigger above is a claim about a COUNT
+    /// ("once per hold, not once per waiter"), and a claim about a count
+    /// needs a count to check it — parsing the breadcrumb file would make
+    /// every test that asserts it depend on the log-dir override and on
+    /// nothing else in the process writing at the same time.
+    busy_breadcrumbs: AtomicU64,
 }
 
 impl LockState {
@@ -198,6 +230,8 @@ impl LockState {
             done_thread: AtomicU64::new(0),
             done_site: AtomicPtr::new(std::ptr::null_mut()),
             done_waiters: AtomicU32::new(0),
+            busy_reported_gen: AtomicU64::new(u64::MAX),
+            busy_breadcrumbs: AtomicU64::new(0),
         }
     }
 
@@ -384,15 +418,152 @@ pub fn hold_report_ring_for_test(ms: u64) {
     let _ = rx.recv();
 }
 
+// ---------------------------------------------------------------------------
+// Bounded acquisition (#1609, plan §3 Phase 2.1)
+// ---------------------------------------------------------------------------
+
+/// A fixed backoff hint, in milliseconds, handed to a caller that got [`Busy`].
+///
+/// Deliberately a constant rather than a prediction. Nothing here knows when
+/// the holder will release — that is the whole point of the failure this bounds
+/// — and the obvious derivation is worse than useless: a number scaled DOWN
+/// from how long the lock has already been held says "try again sooner" exactly
+/// when the evidence says the opposite. Five seconds is short enough that a
+/// transient contention spike costs one retry and long enough that an agent
+/// retrying a wedged registry is not a busy-wait.
+pub const BUSY_RETRY_AFTER_MS: u64 = 5_000;
+
+/// Who was holding a lock when someone else's budget ran out.
+///
+/// `Option`al on [`Busy`] because it is sampled with the seqlock read that
+/// never blocks (see the module's "Reading a hold coherently"): if the hold
+/// ended or was replaced mid-read the honest answer is "not sampled", not a
+/// torn one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HolderInfo {
+    /// The `#[track_caller]` site the holder acquired from.
+    pub site_file: &'static str,
+    pub site_line: u32,
+    /// How long the holder had held it when the waiter gave up.
+    pub held_ms: u64,
+    /// The holder's tracked thread id (see `THREAD_ID`).
+    pub thread: u64,
+}
+
+/// A tracked-lock acquisition that ran out of budget.
+///
+/// This is the typed value the whole of Phase 2.1 converts a hang into: a
+/// polled view keeps its previous value and marks itself partial, an MCP call
+/// answers a retryable error, a cadenced tick skips. Every field is here so the
+/// answer can NAME the cause rather than say "busy" — the epic's §2.3 is that
+/// four incidents produced no evidence at all, and an unexplained "busy" is the
+/// same defect one layer up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Busy {
+    /// The lock's name, as given to [`TrackedMutex::new`].
+    pub lock: &'static str,
+    /// How long this waiter actually waited before giving up. Not the budget:
+    /// a nested acquisition inherits whatever the frame had LEFT, so the two
+    /// differ and the measured one is the one a reader can act on.
+    pub waited: Duration,
+    /// The holder, when it could be sampled without waiting.
+    pub holder: Option<HolderInfo>,
+    /// Threads still blocked on this lock, NOT counting the one this `Busy`
+    /// answers — that waiter has already stopped waiting.
+    pub waiters: usize,
+}
+
+impl Busy {
+    /// The backoff hint, in milliseconds. See [`BUSY_RETRY_AFTER_MS`].
+    pub fn retry_after_ms(&self) -> u64 {
+        BUSY_RETRY_AFTER_MS
+    }
+
+    /// The breadcrumb `detail`: one line of `key=value` fields.
+    ///
+    /// Space-free values throughout, for the same reason
+    /// [`HoldReport::detail`] is: a breadcrumb line is `stamp event detail`
+    /// split on spaces.
+    pub fn detail(&self) -> String {
+        match &self.holder {
+            Some(h) => format!(
+                "lock={} waited_ms={} waiters={} held_ms={} thread={} at={}:{}",
+                spaceless(self.lock),
+                self.waited.as_millis(),
+                self.waiters,
+                h.held_ms,
+                h.thread,
+                spaceless(h.site_file),
+                h.site_line,
+            ),
+            None => format!(
+                "lock={} waited_ms={} waiters={} holder=unsampled",
+                spaceless(self.lock),
+                self.waited.as_millis(),
+                self.waiters,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for Busy {
+    /// One line, and it is a PUBLIC CONTRACT: this text is what reaches an
+    /// agent's context inside `loomux busy: <this>. Nothing was executed; retry
+    /// in ~N s.` and what a human reads in the group view's partial badge. See
+    /// `doc/design/lock-liveness.md` §3.
+    ///
+    /// The plan's sketch prefixed it with `registry busy: `. Dropped, because
+    /// every caller that renders this already says "busy" in its own first
+    /// three words and "loomux busy: registry busy: `agents` …" is a sentence
+    /// nobody would write on purpose. The lock's name still leads.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`{}` ", self.lock)?;
+        match &self.holder {
+            Some(h) => write!(
+                f,
+                "held {} by {}:{} (thread {})",
+                secs(Duration::from_millis(h.held_ms)),
+                h.site_file,
+                h.site_line,
+                h.thread
+            )?,
+            // Not an error and not a shrug: the holder released or was replaced
+            // between the timeout and the sample, which is itself informative.
+            None => write!(f, "held by a caller that released before it could be sampled")?,
+        }
+        write!(f, ", {} waiters; waited {}", self.waiters, secs(self.waited))
+    }
+}
+
+impl std::error::Error for Busy {}
+
+/// `42.1 s` — one decimal, because these are seconds-scale by construction (a
+/// sub-second wait never produces a `Busy`; the tightest budget is 1 s).
+fn secs(d: Duration) -> String {
+    format!("{:.1} s", d.as_secs_f64())
+}
+
 /// A `Mutex` that says who is holding it, since when, from where, and how many
-/// threads are behind them.
+/// threads are behind them — and, since #1609, one a waiter can put a bound on.
 ///
 /// A drop-in for `std::sync::Mutex` at the call sites that use
 /// [`crate::obs::LockExt::lock_safe`]: the inherent `lock_safe` below shadows
 /// the trait method, so a field's type changing from `Mutex<T>` to
 /// `TrackedMutex<T>` changes nothing at the places that lock it.
+///
+/// **The inner primitive is `parking_lot::Mutex`, not std's** (#1609). std has
+/// no timed acquire at all, and [`lock_within`](Self::lock_within) — the
+/// operation the whole of Phase 2.1 is built on — is `try_lock_for`. The one
+/// observable consequence is POISONING, and it is a narrowing of a concept
+/// rather than a change of behaviour: parking_lot has no poison state, so a
+/// holder that panics simply releases the lock and the next acquirer sees
+/// whatever it wrote. That is byte-for-byte the outcome `lock_safe`'s
+/// `into_inner` recovery produced under std (#53's "at worst slightly stale,
+/// never memory-unsafe"), reached by there being nothing to recover from.
+/// `obs::LockExt::lock_safe` keeps its own recovery for the std mutexes that
+/// remain elsewhere (`pty.rs`, and this module's own report ring).
 pub struct TrackedMutex<T> {
-    inner: Mutex<T>,
+    inner: InnerMutex<T>,
     state: Arc<LockState>,
 }
 
@@ -419,75 +590,190 @@ impl<T> TrackedMutex<T> {
         }
         reg.push(Arc::downgrade(&state));
         drop(reg);
-        Self { inner: Mutex::new(value), state }
+        Self { inner: InnerMutex::new(value), state }
     }
 
-    /// Poison-tolerant lock, tracked. Same contract as
-    /// [`crate::obs::LockExt::lock_safe`]: a mutex poisoned by some other
-    /// thread's panic is recovered rather than propagated (#53).
+    /// Acquire, honouring whatever budget this THREAD is running under.
+    ///
+    /// With no [`crate::budget::read_budget`] frame installed — which is every
+    /// call site that existed before #1609, and every mutating one after it —
+    /// this is an unbounded acquire and behaves exactly as Phase 0 left it.
+    ///
+    /// Under a budget, three outcomes:
+    ///
+    /// 1. acquired within the remaining time: an ordinary guard, tracked
+    ///    identically to any other;
+    /// 2. ran out, at mutation depth 0: unwinds to the owning `read_budget`
+    ///    frame with a [`Busy`], via
+    ///    [`crate::budget::unwind_to_frame`] — no panic hook, no crash log;
+    /// 3. ran out, inside a [`crate::budget::MutationScope`]: breadcrumbs
+    ///    `lock-busy-in-mutation` (edge-triggered, see [`Busy`] below) and then
+    ///    waits, unbounded. A slow mutation is a stall; an abandoned one is
+    ///    corruption.
     ///
     /// **The cost, since this is the app's hottest shared path.** Per
-    /// acquisition, on top of the `Mutex::lock` that was already there: two
-    /// relaxed read-modify-writes on the waiter count, three relaxed stores,
-    /// one release read-modify-write on the generation, and one monotonic clock
-    /// read. Per release (the full accounting is on [`TrackedGuard::drop`]):
-    /// one monotonic clock read, one relaxed load and a comparison on the cold
-    /// path; on the over-threshold path a further three relaxed loads, four
-    /// relaxed stores and one release store, and in both cases one release
-    /// read-modify-write on the generation. No allocation, no formatting, no global lock, no
-    /// syscall, and nothing that can block. The clock read is the only item
-    /// above a few nanoseconds — tens of nanoseconds on every platform this
-    /// ships to — which is why it is a *monotonic* read and not a `SystemTime`,
-    /// and why the cheaper alternative (stamping holds against the watchdog's
-    /// 1 Hz tick, one atomic load) was rejected: it would floor every reported
-    /// duration at a second, on the one instrument whose whole job is to say
-    /// how long something took.
+    /// acquisition, on top of the `Mutex::lock` that was already there: one
+    /// thread-local read for the budget, two relaxed read-modify-writes on the
+    /// waiter count, three relaxed stores, one release read-modify-write on the
+    /// generation, and one monotonic clock read. Per release (the full
+    /// accounting is on [`TrackedGuard::drop`]): one monotonic clock read, one
+    /// relaxed load and a comparison on the cold path; on the over-threshold
+    /// path a further three relaxed loads, four relaxed stores and one release
+    /// store, and in both cases one release read-modify-write on the generation.
+    /// No allocation, no formatting, no global lock, no syscall, and nothing that
+    /// can block. The clock read is the only item above a few nanoseconds — tens
+    /// of nanoseconds on every platform this ships to — which is why it is a
+    /// *monotonic* read and not a `SystemTime`, and why the cheaper alternative
+    /// (stamping holds against the watchdog's 1 Hz tick, one atomic load) was
+    /// rejected: it would floor every reported duration at a second, on the one
+    /// instrument whose whole job is to say how long something took.
+    ///
+    /// The budget read is a thread-local load on EVERY acquisition, budget or
+    /// not. When one is installed the bounded path adds the deadline comparison
+    /// in [`crate::budget::remaining`] and its own wait measurement — both on an
+    /// acquisition that was already going to block, which is the only place they
+    /// can land.
     #[track_caller]
     pub fn lock_safe(&self) -> TrackedGuard<'_, T> {
         let site = Location::caller();
+        let Some((left, frame)) = budget::remaining() else {
+            return self.acquire_blocking(site);
+        };
+        let in_mutation = budget::in_mutation();
+        let event = if in_mutation { "lock-busy-in-mutation" } else { "lock-busy" };
+        match self.acquire_within(site, left, event) {
+            Ok(g) => g,
+            Err(busy) => {
+                if in_mutation {
+                    // The breadcrumb was already written by `acquire_within`,
+                    // edge-triggered — so a mutation that takes twenty locks
+                    // under an expired budget reports the HOLD once, not once
+                    // per acquisition.
+                    self.acquire_blocking(site)
+                } else {
+                    budget::unwind_to_frame(frame, busy)
+                }
+            }
+        }
+    }
+
+    /// Acquire, or give up after `budget` and say who has it.
+    ///
+    /// The explicit form, for a caller that has somewhere to put an `Err` —
+    /// a cadenced tick's entry acquisition skips its tick, and Phase 3's
+    /// re-entrancy check will use the same shape. Ignores the thread-local
+    /// budget entirely: an explicit bound is a decision, and silently making it
+    /// tighter because of an enclosing frame would make this function's own
+    /// argument unverifiable at its call site.
+    ///
+    /// `Duration::ZERO` is a legal budget and means "take it if it is free".
+    #[track_caller]
+    pub fn lock_within(&self, budget: Duration) -> Result<TrackedGuard<'_, T>, Busy> {
+        self.acquire_within(Location::caller(), budget, "lock-busy")
+    }
+
+    /// Take the lock if it is free RIGHT NOW, never blocking.
+    ///
+    /// `None` means genuinely held by someone else — there is no third answer
+    /// to distinguish, because the inner primitive does not poison (see
+    /// [`TrackedMutex`]).
+    ///
+    /// A successful acquisition is recorded exactly as a blocking one is, so a
+    /// hold taken this way is as visible to the watchdog as any other. A
+    /// FAILED one touches the waiter count not at all: nothing waited, and it
+    /// writes no breadcrumb — "the lock was busy this instant" is not news, and
+    /// this is the one entry point with no budget behind it.
+    #[track_caller]
+    pub fn try_lock_safe(&self) -> Option<TrackedGuard<'_, T>> {
+        let site = Location::caller();
+        let guard = self.inner.try_lock()?;
+        Some(self.record_acquired(guard, site))
+    }
+
+    /// The unbounded acquire. Phase 0's path, unchanged.
+    fn acquire_blocking(&self, site: &'static Location<'static>) -> TrackedGuard<'_, T> {
         let st = &self.state;
         // Registered BEFORE blocking: a waiter that only counts once it has
         // stopped waiting is invisible for exactly the interval it matters.
         st.waiters.fetch_add(1, Ordering::Relaxed);
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.inner.lock();
         st.waiters.fetch_sub(1, Ordering::Relaxed);
+        self.record_acquired(guard, site)
+    }
 
+    /// The bounded acquire. `event` is the breadcrumb an expiry writes.
+    fn acquire_within(
+        &self,
+        site: &'static Location<'static>,
+        budget: Duration,
+        event: &'static str,
+    ) -> Result<TrackedGuard<'_, T>, Busy> {
+        let st = &self.state;
+        st.waiters.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let got = self.inner.try_lock_for(budget);
+        let waited = started.elapsed();
+        st.waiters.fetch_sub(1, Ordering::Relaxed);
+        match got {
+            Some(guard) => Ok(self.record_acquired(guard, site)),
+            None => Err(self.busy(waited, event)),
+        }
+    }
+
+    /// Stamp a fresh hold. Shared by every acquisition path so a guard obtained
+    /// three different ways is one thing to the watchdog.
+    fn record_acquired(
+        &self,
+        guard: InnerGuard<'_, T>,
+        site: &'static Location<'static>,
+    ) -> TrackedGuard<'_, T> {
+        let st = &self.state;
         let acquired_ms = mono_ms();
         st.holder_thread.store(this_thread(), Ordering::Relaxed);
         st.holder_site.store(site as *const _ as *mut _, Ordering::Relaxed);
         st.acquired_ms.store(acquired_ms, Ordering::Relaxed);
         // Publishes the three stores above; even -> odd marks the lock held.
         st.generation.fetch_add(1, Ordering::Release);
-
         TrackedGuard { guard, state: st, acquired_ms }
     }
 
-    /// Take the lock if it is free RIGHT NOW, never blocking.
+    /// Compose the [`Busy`], and breadcrumb it ONCE per (lock, hold).
     ///
-    /// Poison-tolerant like [`lock_safe`](Self::lock_safe) — a mutex some other
-    /// thread panicked under is recovered rather than reported as unavailable,
-    /// because "the data may be slightly stale" is not the same fact as "the
-    /// lock is busy" and a caller choosing between the two deserves the right
-    /// one. `None` means genuinely held by someone else.
+    /// **Edge-triggered, like `queue_pressure`'s notices.** A wedged registry
+    /// has every waiter in the app queued behind one hold; a breadcrumb per
+    /// waiter would turn the evidence trail into the noise it exists to cut
+    /// through, and would put a file write on the latency path of every one of
+    /// them. The key is the hold's own odd generation, so a SECOND hold of the
+    /// same lock that also goes busy is a new edge and does report.
     ///
-    /// A successful acquisition is recorded exactly as a blocking one is, so a
-    /// hold taken this way is as visible to the watchdog as any other. A
-    /// FAILED one touches the waiter count not at all: nothing waited.
-    #[track_caller]
-    pub fn try_lock_safe(&self) -> Option<TrackedGuard<'_, T>> {
-        let site = Location::caller();
-        let guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
+    /// `u64::MAX` is the "never reported" sentinel and `0` is "no holder could
+    /// be sampled"; they differ so the first unsampled `Busy` on a lock still
+    /// breadcrumbs. Real generations are odd and start at 1, so neither
+    /// sentinel can collide with one.
+    ///
+    /// This runs on the waiter's thread with NO tracked lock held — the waiter
+    /// has already given up — so it is allowed to allocate, format and write,
+    /// which is the rule [`TrackedGuard::drop`] cannot follow.
+    fn busy(&self, waited: Duration, event: &'static str) -> Busy {
         let st = &self.state;
-        let acquired_ms = mono_ms();
-        st.holder_thread.store(this_thread(), Ordering::Relaxed);
-        st.holder_site.store(site as *const _ as *mut _, Ordering::Relaxed);
-        st.acquired_ms.store(acquired_ms, Ordering::Relaxed);
-        st.generation.fetch_add(1, Ordering::Release);
-        Some(TrackedGuard { guard, state: st, acquired_ms })
+        let snap = st.sample(mono_ms());
+        let generation = snap.as_ref().map(|s| s.generation).unwrap_or(0);
+        let busy = Busy {
+            lock: st.name,
+            waited,
+            holder: snap.map(|s| HolderInfo {
+                site_file: s.site_file,
+                site_line: s.site_line,
+                held_ms: s.held_ms,
+                thread: s.holder_thread,
+            }),
+            waiters: st.waiters.load(Ordering::Relaxed) as usize,
+        };
+        if st.busy_reported_gen.swap(generation, Ordering::Relaxed) != generation {
+            st.busy_breadcrumbs.fetch_add(1, Ordering::Relaxed);
+            crate::obs::breadcrumb(event, &busy.detail());
+        }
+        busy
     }
 
     /// This lock's name, as given to [`TrackedMutex::new`].
@@ -499,12 +785,19 @@ impl<T> TrackedMutex<T> {
     pub fn waiters(&self) -> u32 {
         self.state.waiters.load(Ordering::Relaxed)
     }
+
+    /// How many busy breadcrumbs this lock has written. The edge-trigger in
+    /// [`TrackedMutex::busy`], made assertable.
+    #[doc(hidden)]
+    pub fn busy_breadcrumbs(&self) -> u64 {
+        self.state.busy_breadcrumbs.load(Ordering::Relaxed)
+    }
 }
 
 /// A held [`TrackedMutex`]. Derefs to the guarded value exactly like a
 /// `MutexGuard`, and clears the hold record when it drops.
 pub struct TrackedGuard<'a, T> {
-    guard: MutexGuard<'a, T>,
+    guard: InnerGuard<'a, T>,
     state: &'a Arc<LockState>,
     acquired_ms: u64,
 }
@@ -538,6 +831,18 @@ impl<T> Drop for TrackedGuard<'_, T> {
     /// body runs with the reported mutex still held, so what it costs is what
     /// every waiter behind it pays, and an RMW is not a store (#1605 review n5,
     /// corrected in #1608).
+    ///
+    /// **It runs identically during an UNWIND** (#1609, rider R1), which is
+    /// what makes [`crate::budget::read_budget`]'s exit safe rather than merely
+    /// convenient. Rust drops live locals as an unwind passes through them, so
+    /// a guard held when some deeper acquisition times out gets this body: the
+    /// generation goes odd -> even, the lock reads FREE to the watchdog, and
+    /// `self.guard`'s own drop releases the mutex. Nothing below can panic —
+    /// there is no allocation, no indexing and no arithmetic that can overflow
+    /// (`saturating_sub`) — so this cannot become the double-panic that turns
+    /// an unwind into an abort. `doc/design/lock-liveness.md` §4.2 carries the
+    /// argument and `budget::tests::an_unwind_leaves_no_tracked_lock_held` pins
+    /// it.
     fn drop(&mut self) {
         let st = self.state;
         let held_ms = mono_ms().saturating_sub(self.acquired_ms);
@@ -720,5 +1025,150 @@ impl LockWatch {
 pub fn record_all(reports: Vec<HoldReport>) {
     for r in reports {
         record(r);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the BOUNDED half (#1609). The observing half's tests live in
+// `src-tauri/tests/selfwatch.rs`, where they were written; these are here
+// because they need nothing from `src-tauri` and a test that can run in the
+// engine crate should.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    /// A generous timeout for "this should have answered by now" on a loaded
+    /// CI runner. Every assertion below is a "did it answer at all" question,
+    /// never a latency measurement.
+    const GRACE: Duration = Duration::from_secs(10);
+
+    /// Hold `lock` on its own thread until the returned sender is dropped,
+    /// returning only once the hold is REAL.
+    ///
+    /// The handshake is the point: a test that merely spawns a holder and hopes
+    /// is measuring the scheduler. Returns the line the hold was taken on so a
+    /// caller can check the recorded call site is the HOLDER's rather than this
+    /// helper's — which is what `#[track_caller]` on `lock_safe` buys.
+    fn hold<T: Send + 'static>(lock: Arc<TrackedMutex<T>>) -> (mpsc::Sender<()>, u32) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let line = std::line!() + 2;
+        std::thread::spawn(move || {
+            let _g = lock.lock_safe();
+            let _ = held_tx.send(());
+            let _ = release_rx.recv();
+        });
+        held_rx.recv_timeout(GRACE).expect("setup: the holder thread never acquired the lock");
+        (release_tx, line)
+    }
+
+    #[test]
+    fn lock_within_answers_busy_and_names_the_holder() {
+        let lock = Arc::new(TrackedMutex::new("withinspec", 7u32));
+
+        // The discriminating half FIRST. Without it, the assertion below passes
+        // just as well against a `lock_within` that never succeeds at all.
+        let g = lock
+            .lock_within(Duration::from_millis(50))
+            .expect("an uncontended lock must be acquired, not reported busy");
+        assert_eq!(*g, 7);
+        drop(g);
+        assert_eq!(
+            lock.busy_breadcrumbs(),
+            0,
+            "an uncontended acquisition wrote a busy breadcrumb; the instrument would then be \
+             reporting on every healthy lock in the app"
+        );
+
+        let (release, holder_line) = hold(lock.clone());
+        let busy = lock
+            .lock_within(Duration::from_millis(50))
+            .err()
+            .expect("a held lock must answer Busy within the budget, not park");
+
+        assert_eq!(busy.lock, "withinspec");
+        let holder = busy.holder.expect("the holder was sampled: it is parked, so nothing moved");
+        assert!(
+            holder.site_file.ends_with("lockwatch.rs"),
+            "the recorded site was {}:{}",
+            holder.site_file,
+            holder.site_line
+        );
+        // The call site is the HOLDER's `lock_safe()` line, not `acquire_blocking`'s
+        // and not this assertion's. `#[track_caller]` is what makes a breadcrumb
+        // name the code that took the lock rather than the instrument.
+        assert_eq!(
+            holder.site_line, holder_line,
+            "the recorded line is not the one the hold was taken on"
+        );
+        assert!(busy.waited >= Duration::from_millis(40), "waited {:?}", busy.waited);
+        assert_eq!(busy.retry_after_ms(), BUSY_RETRY_AFTER_MS);
+
+        // The Display is a public contract (it reaches an agent's context).
+        let rendered = busy.to_string();
+        for needle in ["`withinspec`", "held ", "lockwatch.rs", "waiters", "waited "] {
+            assert!(rendered.contains(needle), "Display lost {needle:?}: {rendered}");
+        }
+        drop(release);
+    }
+
+    #[test]
+    fn one_hold_breadcrumbs_once_however_many_waiters_give_up() {
+        // The property the plan asks for in as many words: "edge-triggered …
+        // never per waiter". A wedged registry has every thread in the app
+        // queued behind one hold, so a breadcrumb per waiter turns the evidence
+        // trail into the noise it exists to cut through.
+        const WAITERS: usize = 6;
+        let lock = Arc::new(TrackedMutex::new("edgespec", 0u32));
+        let (release, _) = hold(lock.clone());
+
+        let mut threads = Vec::new();
+        for _ in 0..WAITERS {
+            let l = lock.clone();
+            threads.push(std::thread::spawn(move || {
+                l.lock_within(Duration::from_millis(60)).err().map(|b| b.waiters)
+            }));
+        }
+        let seen: Vec<Option<usize>> = threads.into_iter().map(|t| t.join().expect("waiter")).collect();
+        assert!(
+            seen.iter().all(Option::is_some),
+            "every waiter must have been refused while the lock was held: {seen:?}"
+        );
+        assert_eq!(
+            lock.busy_breadcrumbs(),
+            1,
+            "{WAITERS} waiters produced {} breadcrumbs; the edge-trigger is not edge-triggered",
+            lock.busy_breadcrumbs()
+        );
+        drop(release);
+
+        // A SECOND hold that also goes busy is a new edge and must report — an
+        // edge-trigger keyed on the lock alone would go silent forever after
+        // the first incident, which is the failure mode worth pinning.
+        let (release2, _) = hold(lock.clone());
+        assert!(lock.lock_within(Duration::from_millis(60)).is_err());
+        assert_eq!(
+            lock.busy_breadcrumbs(),
+            2,
+            "a new hold going busy did not report; the key is the lock rather than the hold"
+        );
+        drop(release2);
+    }
+
+    #[test]
+    fn a_zero_budget_is_a_try_lock_rather_than_an_error() {
+        // `Duration::ZERO` is a legal budget — `read_budget` hands it out the
+        // moment a deadline passes, and every acquisition after that point
+        // takes this path. It must still SUCCEED on a free lock, or an expired
+        // budget would turn a healthy registry into a busy one.
+        let lock = TrackedMutex::new("zerospec", 1u32);
+        assert!(lock.lock_within(Duration::ZERO).is_ok(), "a free lock must be taken at zero budget");
+        let lock = Arc::new(lock);
+        let (release, _) = hold(lock.clone());
+        assert!(lock.lock_within(Duration::ZERO).is_err(), "a held lock must be refused at once");
+        drop(release);
     }
 }
