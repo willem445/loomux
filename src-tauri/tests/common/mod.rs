@@ -100,13 +100,19 @@ pub fn fabricate_long_lived_session(
         // that makes `session_for_pty` reach its second lock at all.
         let session = format!("00000000-0000-4000-8000-{i:012}");
         reg.set_session_for_test(&a.id, &session);
-        // The SHIPPED bind (#1702 P4), not `set_pty_for_test`. Both write
-        // `pty_id` and the `by_pty` entry; only this one also sets
-        // `status = Running` — and `attention_tick`'s per-agent chain
-        // short-circuits on a non-`Running` agent BEFORE it reaches the mask,
-        // so a fixture built on the seam would be measuring a pane the tick
-        // never looks at. It writes the `agent-bind` audit row and breadcrumb
-        // too, which is what a real session's log carries.
+        // The SHIPPED bind (#1702 P4), not `set_pty_for_test`. The reason is
+        // that the seam is a SECOND write site for the same fields, free to
+        // drift out of step with the real one — a fixture built on a
+        // re-implementation proves the algorithm rather than the code
+        // (`.orrerix/lessons.md`) — and that it writes neither the
+        // `agent-bind` audit row nor the breadcrumb a real session's log
+        // carries.
+        //
+        // Not because the seam would leave `status` wrong: `spawn_agent`
+        // already marked this agent `Running` on its no-app-handle branch, so
+        // headlessly that write is redundant. See `bind_pane`'s own doc — the
+        // first version of this comment claimed otherwise and scratch round j3
+        // falsified it.
         reg.bind_pane_for_test(group, &a.id, pty);
 
         // A session's worth of deliveries. Each line is DISTINCT: the record

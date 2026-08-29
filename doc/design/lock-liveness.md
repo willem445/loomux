@@ -930,10 +930,22 @@ Everything is written through a **production** path — `spawn_agent`,
 `bind_pane_for_test`, `mark_dead`, `record_delivered_prompt`, `audit`,
 `upsert_task`, `ask_human` — and that is load-bearing rather than stylistic.
 `bind_pane` was extracted out of `spawn_agent_bound`'s bind arm for it: the
-older `set_pty_for_test` writes `pty_id` and the `by_pty` entry but not
-`status`, and `attention_tick`'s per-agent chain short-circuits on a
-non-`Running` agent before it reaches the mask — so a fixture built on the seam
-could have been just as green on the broken tick as on the fixed one.
+older `set_pty_for_test` is a SECOND write site for the same fields, free to
+drift out of step with the real one, and it writes neither the `agent-bind`
+audit row nor the breadcrumb a real session's log carries. A fixture built on a
+re-implementation proves the algorithm rather than the code
+(`.orrerix/lessons.md`).
+
+What the extraction does **not** buy is a `status` the seam would have got
+wrong, and that correction is recorded here because the first version of this
+section claimed it did. Headlessly `spawn_agent_bound` returns at its `app`
+check having already marked the agent `Running`, so `bind_pane`'s status write
+is redundant on every path a test can drive — deleting it reddens nothing
+(scratch round j3). It is not dead code: in production the arm is reached only
+through the app handle, where that branch never ran and the agent is still
+`Starting`. That path needs a Tauri window, so the decision is covered by
+inspection rather than by a watched red, and j3 is what establishes it.
+
 `attention_inputs_from(&PtyManager)` is the same extraction for the gather, so
 L7a runs the tick on the maps production would have built over
 `register_fake_for_test` panes, rather than on synthetic ones.

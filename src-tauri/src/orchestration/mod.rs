@@ -34648,13 +34648,25 @@ impl OrchRegistry {
     /// are the ones that were inline there, unreordered. The reason it is a
     /// function is the FIXTURE. The state #1702 deadlocks on is "running,
     /// pty-bound, `by_pty`-mapped", and until this extraction the only way to
-    /// reach it headlessly was `set_pty_for_test`, which writes two of those
-    /// three fields and neither the audit row nor the crumb. A fixture built
-    /// on a re-implementation proves the algorithm, never the code
-    /// (`.orrerix/lessons.md`), and this defect is precisely one the
-    /// re-implementation could not have shown: `set_pty_for_test` leaves
-    /// `status` alone, and `attention_tick`'s per-agent chain short-circuits
-    /// on a non-`Running` agent before it reaches the mask at all.
+    /// reach it headlessly was `set_pty_for_test` — a second write site for
+    /// the same three fields, free to drift out of step with this one, and
+    /// writing neither the audit row nor the crumb a real session's log
+    /// carries. A fixture built on a re-implementation proves the algorithm
+    /// rather than the code (`.orrerix/lessons.md`), and that is the whole of
+    /// the argument.
+    ///
+    /// **It is NOT that the seam would leave `status` wrong**, and the
+    /// correction is recorded because the first version of this doc claimed it
+    /// was. Headlessly, `spawn_agent_bound` returns at its `app` check having
+    /// ALREADY marked the agent `Running` ("Test mode: no frontend"), so the
+    /// status write below is redundant on every path a test can drive:
+    /// deleting it reddens nothing at all (#1702 P4, scratch round j3).
+    ///
+    /// It is not dead code either — in production this arm is reached only
+    /// through the app handle, where that test-mode branch never ran and the
+    /// agent is still `Starting`. That path needs a Tauri window, so no test
+    /// in this repo can drive the decision; it is covered by inspection, and
+    /// j3 is what establishes that rather than leaving it implied.
     ///
     /// Takes no lock across another: the `agents` guard is dropped at the end
     /// of its block, before `by_pty` — the ordering `lockorder::AGENTS` (510)
