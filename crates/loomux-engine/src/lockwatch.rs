@@ -722,11 +722,15 @@ impl<T> TrackedMutex<T> {
 
     /// Stamp a fresh hold. Shared by every acquisition path so a guard obtained
     /// three different ways is one thing to the watchdog.
-    fn record_acquired(
-        &self,
-        guard: InnerGuard<'_, T>,
+    ///
+    /// `'a` is named rather than elided because the returned [`TrackedGuard`]
+    /// borrows from BOTH arguments — the inner guard, and `self.state` for the
+    /// tracking — and elision would give those two different lifetimes.
+    fn record_acquired<'a>(
+        &'a self,
+        guard: InnerGuard<'a, T>,
         site: &'static Location<'static>,
-    ) -> TrackedGuard<'_, T> {
+    ) -> TrackedGuard<'a, T> {
         let st = &self.state;
         let acquired_ms = mono_ms();
         st.holder_thread.store(this_thread(), Ordering::Relaxed);
