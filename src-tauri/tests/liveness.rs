@@ -662,9 +662,9 @@ fn l1_a_published_read_returns_while_every_holdable_registry_lock_is_held() {
         // `group_summary` takes first — so the control is asserted against a
         // read whose parking is known, not against every lock's shape.
         //
-        // (`tests/liveness.rs` L0 states the same class as a test of its own;
-        // it arrives with #1612. This is the in-test control, so L1 is
-        // non-vacuous standing alone, before or after that lands.)
+        // (L0 above states the same class as a test of its own — it landed with
+        // #1607. This is the in-test control, so L1 is non-vacuous standing
+        // alone, independently of L0.)
         if name == "agents" {
             let probe = reg.clone();
             let gid = g.id.clone();
@@ -801,4 +801,113 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
          and a publish that never completes afterwards would mean the badge can never clear"
     );
     assert!(!stale_at(recovered), "one successful publish is the evidence that clears the badge");
+}
+
+// ---------- L2d: the budget mechanism, through a REAL registry read ----------
+//
+// `crates/loomux-engine/src/budget.rs` unit-tests `read_budget` and
+// `MutationScope` against a `TrackedMutex` built for the purpose. That proves
+// the mechanism; it does not prove the mechanism survives contact with
+// `orchestration/mod.rs`, and the difference is the whole risk of Phase 2.1:
+// the unwind travels through real registry code, which owns guards, `Drop`
+// impls and (in principle) a `catch_unwind` of its own that could swallow a
+// typed payload it has never heard of.
+//
+// So these two rows drive SHIPPED registry functions. `group_summary` is the
+// one L0 already uses as its negative control, which is what makes the pair
+// legible: L0 says this read does not return while `agents` is held, and L2d
+// says the same read under a budget does.
+
+/// The budget these rows measure against. The publisher's, because
+/// `group_summary` is a section of the published payload.
+const L2D_BUDGET: Duration = loomux_engine::budget::POLL_LOCK_BUDGET;
+
+#[test]
+fn l2d_a_read_budget_around_a_real_registry_read_answers_busy_instead_of_parking() {
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    // The discriminating half. Without it, `is_err()` below is satisfied just as
+    // well by a `read_budget` that never succeeds at all — and by a GroupId this
+    // registry has never heard of.
+    let ok = loomux_engine::budget::read_budget(L2D_BUDGET, || reg.group_summary(&group.id));
+    assert!(
+        ok.is_ok(),
+        "setup: an uncontended registry read must COMPLETE under a budget. If this fails, \
+         every Busy below is about the budget mechanism rather than about the lock"
+    );
+
+    // `agents` is what `group_summary` takes, and the hold outlives the budget
+    // by 3x so the answer cannot come from the hold expiring.
+    assert!(
+        reg.hold_lock_for_test("agents", 4_000),
+        "setup: hold_lock_for_test refused the lock name 'agents'"
+    );
+
+    let started = std::time::Instant::now();
+    let busy = loomux_engine::budget::read_budget(L2D_BUDGET, || reg.group_summary(&group.id))
+        .err()
+        .expect(
+            "a registry read under a budget must answer Busy. Parking here is the beta6 defect \
+             this phase exists to remove; an Ok means the unwind never fired",
+        );
+    let waited = started.elapsed();
+
+    assert_eq!(
+        busy.lock, "agents",
+        "the Busy must name the lock that actually blocked, or the breadcrumb it writes sends \
+         the next diagnosis somewhere else"
+    );
+    // It answered on the BUDGET, not on the hold expiring. Without this the row
+    // passes against a mechanism that simply waited the hold out.
+    assert!(
+        waited < Duration::from_millis(3_000),
+        "it answered after {waited:?}, which is the hold expiring rather than the budget firing"
+    );
+    // The unwind left no wreckage: the lock the read was ABOUT is not tracked as
+    // held by the abandoned frame, and the registry still answers afterwards.
+    assert!(
+        completes_within(GRACE, {
+            let (r, g) = (reg.clone(), group.id.clone());
+            move || r.group_summary(&g)
+        }),
+        "after the hold ended, the same read must work again — an unwind that left a guard \
+         behind would have wedged `agents` permanently, which is worse than the bug"
+    );
+}
+
+#[test]
+fn l2d_a_timeout_inside_a_mutation_scope_waits_rather_than_unwinding() {
+    // The safety lever, on a real read path. A mutating frame must never be
+    // abandoned partway between two maps, so inside a `MutationScope` the same
+    // timeout WAITS — and this row is what makes `doc/design/lock-liveness.md`
+    // §4's argument checkable rather than merely stated.
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    assert!(
+        reg.hold_lock_for_test("agents", SHORT_HOLD_MS),
+        "setup: hold_lock_for_test refused the lock name 'agents'"
+    );
+
+    let started = std::time::Instant::now();
+    let out = loomux_engine::budget::read_budget(L2D_BUDGET, || {
+        let _scope = loomux_engine::budget::MutationScope::enter();
+        reg.group_summary(&group.id)
+    });
+    let waited = started.elapsed();
+
+    assert!(
+        out.is_ok(),
+        "inside a MutationScope a budget timeout must WAIT for the lock, not unwind to the \
+         frame — a mutation abandoned between two maps is corruption, which is the one \
+         outcome this trade refuses"
+    );
+    // And it really did wait past the budget rather than winning a race: without
+    // this the assertion above passes against a lock that was never held.
+    assert!(
+        waited >= L2D_BUDGET,
+        "it returned in {waited:?}, inside the {L2D_BUDGET:?} budget — the hold was not in its \
+         way, so this row proves nothing about what a timeout does"
+    );
 }

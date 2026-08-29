@@ -28,9 +28,14 @@
 //!
 //! # The two tiers, and why
 //!
-//! - **Strip tier** (`summary`, `usage`) — computed for **every** group, every
-//!   tick. The tab strip already polls every group-bound tab, so this adds no
-//!   work; it just moves it off the poll path.
+//! - **Strip tier** (`summary`, `usage`) — computed every tick for every group
+//!   the registry knows, PLUS every id a tab strip has named as bound within
+//!   [`STRIP_LEASE_MS`]. The second half is not redundant and is not an
+//!   optimisation: a tab can be bound to a RESTORED orchestration, which lives
+//!   on disk and never enters `groups`, so a strip tier built from the registry
+//!   alone drops those tabs' badges entirely (#1625 review round 2). The tab
+//!   strip already polled every group-bound tab, so this adds no work; it just
+//!   moves it off the poll path.
 //! - **View tier** (the other eight) — computed only for a group holding a
 //!   *view lease*. [`orch_group_view`](super::orch_group_view) stamps
 //!   `lease(group) = now`; the publisher computes the view tier while that
