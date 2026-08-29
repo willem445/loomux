@@ -24,27 +24,38 @@
 //! the call sites in `orchestration/mod.rs` are untouched and the migration is
 //! a type swap on the registry's fields.
 //!
-//! Two reporters, and they are complementary rather than redundant:
+//! Two things are reported, and they are complementary rather than redundant:
 //!
-//! - **The guard's `Drop`** reports a hold that exceeded the threshold, with
-//!   the exact total. It cannot miss a *completed* hold, however briefly the
-//!   watchdog happened to be looking elsewhere.
-//! - **The watchdog** ([`LockWatch::tick`], driven by [`crate::selfwatch`])
-//!   reports a hold that is STILL in flight. That is the case `Drop` can never
-//!   report, and it is the beta6 case: a hold that never ends has no drop to
-//!   run.
+//! - **A hold that ENDED** past the threshold, with its exact total. The guard's
+//!   `Drop` stamps it; [`drain_completed_holds`] composes and writes it. This
+//!   cannot miss a completed hold, however briefly the watchdog happened to be
+//!   looking elsewhere.
+//! - **A hold STILL in flight** ([`LockWatch::tick`]). That is the case a drop
+//!   can never report, and it is the beta6 case: a hold that never ends has no
+//!   drop to run.
 //!
 //! Together they cover every hold past the threshold — one of the two always
 //! fires, and neither depends on the other being wired.
 //!
-//! # What an acquisition costs
+//! Both are *composed* on the watchdog thread ([`crate::selfwatch`]), and that
+//! split is the point rather than an implementation detail: see
+//! [`TrackedGuard::drop`].
 //!
-//! Everything on the acquire path is a fixed number of atomic operations on
-//! this lock's own cache line plus one monotonic clock read. There is **no
-//! allocation, no formatting, no global lock and no syscall** on the acquire or
-//! the release path — the global registry is touched at CONSTRUCTION only, and
-//! the reporting path runs solely when a hold has already lasted seconds, which
-//! by definition is not a hot path. See [`TrackedMutex::lock_safe`].
+//! # What acquiring and releasing cost
+//!
+//! Both paths are a fixed number of atomic operations on this lock's own cache
+//! line plus one monotonic clock read. There is **no allocation, no formatting,
+//! no global lock and no syscall on either** — the global registry is touched
+//! at CONSTRUCTION only, and every byte of every report is produced on the
+//! watchdog thread, with no tracked lock held. See [`TrackedMutex::lock_safe`]
+//! and [`TrackedGuard::drop`].
+//!
+//! It was not always so, and the reasoning that got it wrong is worth keeping.
+//! The release path used to write its own report, excused by "a hold that has
+//! already lasted seconds is not a hot path". That is true of the HOLDER and
+//! false of everyone else: a hold long enough to report is precisely the one
+//! with waiters queued behind it, so the file write landed on every waiter's
+//! latency path — the path this whole plan is about (#1605 review B1).
 //!
 //! # Reading a hold coherently
 //!
@@ -148,6 +159,28 @@ struct LockState {
     /// BEFORE the blocking call, so a waiter is counted while it waits rather
     /// than once it has stopped waiting.
     waiters: AtomicU32,
+
+    // ---- the completed-hold slot (#1605 review B1) ----
+    //
+    // A hold that ENDS past the threshold is news, and composing that news is
+    // allocation, formatting, a process-global lock and a file write. None of
+    // that may happen on the release path, because `Drop::drop` runs BEFORE the
+    // struct's fields drop and `TrackedGuard.guard` is a field — so anything
+    // done there is done with the reported mutex still locked, and every waiter
+    // queued behind it pays for it. A hold that has already lasted seconds is
+    // exactly the one with waiters queued behind it, so "not a hot path" was
+    // the wrong exculpation: it is not the HOLDER's latency path, it is every
+    // WAITER's, and that is the path this whole plan is about.
+    //
+    // So the release path only STAMPS, in atomics, and [`drain_completed_holds`]
+    // — called from the watchdog thread, holding no tracked lock — does the
+    // composing. This is what the plan's §3 Phase 0.2 says anyway: the watchdog
+    // reports, "off every hot path".
+    done_pending: AtomicBool,
+    done_ms: AtomicU64,
+    done_thread: AtomicU64,
+    done_site: AtomicPtr<Location<'static>>,
+    done_waiters: AtomicU32,
 }
 
 impl LockState {
@@ -160,7 +193,33 @@ impl LockState {
             holder_site: AtomicPtr::new(std::ptr::null_mut()),
             acquired_ms: AtomicU64::new(0),
             waiters: AtomicU32::new(0),
+            done_pending: AtomicBool::new(false),
+            done_ms: AtomicU64::new(0),
+            done_thread: AtomicU64::new(0),
+            done_site: AtomicPtr::new(std::ptr::null_mut()),
+            done_waiters: AtomicU32::new(0),
         }
+    }
+
+    /// Take the pending completed-hold report, if there is one.
+    ///
+    /// The `swap` is what makes this exactly-once across any number of
+    /// concurrent drainers, and the `Acquire` pairs with the `Release` store in
+    /// [`TrackedGuard::drop`] that published the four fields below it.
+    fn take_completed(&self) -> Option<HoldReport> {
+        if !self.done_pending.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        let (file, line) = site_of(self.done_site.load(Ordering::Relaxed));
+        Some(HoldReport {
+            lock: self.name,
+            site_file: file,
+            site_line: line,
+            holder_thread: self.done_thread.load(Ordering::Relaxed),
+            held_ms: self.done_ms.load(Ordering::Relaxed),
+            waiters: self.done_waiters.load(Ordering::Relaxed),
+            still_held: false,
+        })
     }
 
     /// A coherent read of this lock's hold, or `None` if it is free (or if the
@@ -282,8 +341,11 @@ fn spaceless(s: &str) -> String {
 
 /// Record a report: one breadcrumb, plus the in-memory tail.
 ///
-/// Only ever called for a hold that has ALREADY lasted seconds, so the file
-/// write it performs is not on any path a latency claim depends on.
+/// **Only ever called from the watchdog thread**, which holds no tracked lock.
+/// That is the whole of why this is allowed to allocate, format, take a global
+/// lock and write a file: none of it happens while any reported mutex is held.
+/// It used to be called from `TrackedGuard::drop` — see the completed-hold slot
+/// on [`LockState`] for why that was wrong, and for the shape that replaced it.
 fn record(report: HoldReport) {
     crate::obs::breadcrumb(report.event(), &report.detail());
     let mut ring = REPORTS.lock_safe();
@@ -301,6 +363,25 @@ pub fn recent_reports() -> Vec<HoldReport> {
 /// Drop every recorded report (tests, and a future "start a fresh capture").
 pub fn clear_reports() {
     REPORTS.lock_safe().clear();
+}
+
+/// Hold the report ring for `ms` on a thread of its own, returning once it is
+/// actually held.
+///
+/// Test seam (#1605 review B1). The property under test — the release path
+/// takes no process-global lock — is only observable by making that lock
+/// unavailable and watching a release happen anyway. Reading the code proves
+/// nothing here: the defect this closes was invisible for exactly as long as
+/// everyone read `Drop::drop` as running after the guard's fields dropped.
+#[doc(hidden)]
+pub fn hold_report_ring_for_test(ms: u64) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _held = REPORTS.lock_safe();
+        let _ = tx.send(());
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    });
+    let _ = rx.recv();
 }
 
 /// A `Mutex` that says who is holding it, since when, from where, and how many
@@ -439,28 +520,62 @@ impl<T> std::ops::DerefMut for TrackedGuard<'_, T> {
 }
 
 impl<T> Drop for TrackedGuard<'_, T> {
+    /// **Nothing here may allocate, format, take a global lock, or make a
+    /// syscall** — see the completed-hold slot on [`LockState`] for why. Rust
+    /// runs this body BEFORE dropping the struct's fields, and `self.guard` is
+    /// a field, so every instruction below executes with the reported mutex
+    /// still locked and every waiter still queued behind it.
+    ///
+    /// What is left is: one clock read, four relaxed loads, four relaxed
+    /// stores, and two release read-modify-writes. All of it is on this lock's
+    /// own cache line, and none of it can block.
     fn drop(&mut self) {
         let st = self.state;
         let held_ms = mono_ms().saturating_sub(self.acquired_ms);
-        let waiters = st.waiters.load(Ordering::Relaxed);
-        let thread = st.holder_thread.load(Ordering::Relaxed);
-        let (file, line) = site_of(st.holder_site.load(Ordering::Relaxed));
-        // odd -> even: the lock is free. Published before the report so a
-        // watchdog tick racing this drop sees the release rather than a hold it
-        // would double-report.
-        st.generation.fetch_add(1, Ordering::Release);
         if held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
-            record(HoldReport {
-                lock: st.name,
-                site_file: file,
-                site_line: line,
-                holder_thread: thread,
-                held_ms,
-                waiters,
-                still_held: false,
-            });
+            // Stamp only. `drain_completed_holds` composes and writes it, on
+            // the watchdog thread, with this lock long since released.
+            st.done_ms.store(held_ms, Ordering::Relaxed);
+            st.done_thread.store(st.holder_thread.load(Ordering::Relaxed), Ordering::Relaxed);
+            st.done_site.store(st.holder_site.load(Ordering::Relaxed), Ordering::Relaxed);
+            st.done_waiters.store(st.waiters.load(Ordering::Relaxed), Ordering::Relaxed);
+            // Publishes the four stores above.
+            st.done_pending.store(true, Ordering::Release);
         }
+        // odd -> even: the lock is free.
+        st.generation.fetch_add(1, Ordering::Release);
     }
+}
+
+/// Every completed over-threshold hold since the last call, taken exactly once.
+///
+/// Called from the watchdog thread (and from tests, which have no watchdog).
+/// This is where the composing happens — allocation, `format!`, the report ring
+/// and the breadcrumb write — precisely because none of it may happen where the
+/// hold ENDS. See [`TrackedGuard::drop`].
+///
+/// **Its bound, stated because it is a real one.** Each lock holds ONE pending
+/// slot, so a second over-threshold release on the same lock before a drain
+/// overwrites the first. At the shipped settings that cannot happen: two holds
+/// of one mutex cannot overlap, so each must last at least the threshold (5 s)
+/// and the watchdog drains every second. It becomes reachable only if the
+/// watchdog is itself starved for longer than the threshold — a state the
+/// watchdog reports as [`crate::selfwatch::Liveness::BackendStuck`] on its next
+/// tick — or if a caller lowers the threshold below the drain interval, which
+/// only tests do (and they drain explicitly).
+pub fn drain_completed_holds() -> Vec<HoldReport> {
+    let mut reg = REGISTRY.lock_safe();
+    let mut out = Vec::new();
+    reg.retain(|weak| match weak.upgrade() {
+        Some(state) => {
+            if let Some(r) = state.take_completed() {
+                out.push(r);
+            }
+            true
+        }
+        None => false,
+    });
+    out
 }
 
 /// A coherent read of one lock's current hold. Produced by [`held_locks`].

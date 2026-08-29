@@ -382,6 +382,12 @@ fn run_watchdog() {
         last_ms = now;
         watchdog_stamp(now, lag);
 
+        // Holds that ENDED past the threshold. The release path only stamped
+        // them (it may not allocate or write while the mutex is held — see
+        // `TrackedGuard::drop`); composing and writing them is this thread's
+        // job, which is what plan §3 Phase 0.2 means by "off every hot path".
+        lockwatch::record_all(lockwatch::drain_completed_holds());
+        // …and holds still in flight, which no drop will ever report.
         lockwatch::record_all(locks.tick(&lockwatch::held_locks(now), lockwatch::hold_warn_ms()));
 
         if let Some(r) = pool.tick(pool_take_peak()) {

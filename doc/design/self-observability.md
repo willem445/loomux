@@ -82,20 +82,47 @@ writers, so there is exactly one writer per generation and no CAS loop is needed
 which is what lets the watchdog report a fifteen-minute hang **once** instead of
 nine hundred times.
 
-### 3.4 What an acquisition costs
+### 3.4 What acquiring and releasing cost
 
-On top of the `Mutex::lock` that was already there: two relaxed
+On top of the `Mutex::lock` that was already there — on acquire: two relaxed
 read-modify-writes on the waiter count, three relaxed stores, one release
 read-modify-write on the generation, and one monotonic clock read. On release:
-one release read-modify-write, three relaxed loads and a comparison. **No
-allocation, no formatting, no global lock, no syscall, and nothing that can
-block** — the global registry is touched at construction only, and the reporting
-path runs solely for a hold that has already lasted seconds.
+one clock read, four relaxed loads, four relaxed stores and two release
+read-modify-writes. **No allocation, no formatting, no global lock, no syscall,
+and nothing that can block, on either** — the global registry is touched at
+construction only, and every byte of every report is composed on the watchdog
+thread.
 
 The clock read is the only item above a few nanoseconds. A cheaper design was
 available and rejected: stamping holds against the watchdog's 1 Hz tick would
 cost one atomic load, and would floor every reported duration at a second — on
 the one instrument whose entire job is to say how long something took.
+
+**The release path did not always look like this, and the reasoning that got it
+wrong is the part worth keeping.** It used to compose and write its own report —
+a `format!`, the report ring's process-global mutex, and `create_dir_all` +
+`metadata` + `open` + `write_all` — excused by the sentence "a hold that has
+already lasted seconds is not a hot path".
+
+That sentence is true of the *holder* and false of everyone else. `Drop::drop`
+runs **before** the struct's fields drop, and the `MutexGuard` is a field, so all
+of it executed with the reported mutex still locked. And a hold long enough to be
+worth reporting is precisely the one with waiters queued behind it — so the file
+write was not on the holder's latency path, it was on **every waiter's**, which
+is the path this whole plan is about. `performance.md` X4's `mq_state_lock` makes
+it concrete: a merge-queue tick whose `gh` call takes more than five seconds is
+routine, and it would have appended a breadcrumb inside that lock's critical
+section with every MCP request thread waiting behind it. The feedback ran the
+wrong way — the worse the app behaved, the more IO inside contended sections.
+
+So the release path now only *stamps*, in atomics, and
+`lockwatch::drain_completed_holds` composes it on the watchdog thread. The repo
+already held this line elsewhere: X6 credits `AUDIT_LOCK` for being "held only
+for the open+write ... the JSON is formatted before the lock is taken". Found in
+review (#1605 B1), and pinned by
+`the_release_path_takes_no_global_lock_while_the_mutex_is_still_held`, which
+makes the report ring unavailable and asks whether a release completes anyway —
+because reading the code is what missed it the first time.
 
 ### 3.5 The pool is counted at the hand-off, through one door
 
@@ -155,11 +182,16 @@ against a real requirement rather than against a convenience.
 
 ## 4. What this does not do
 
-It does not bound a wait, refuse an acquisition, single-flight a poll, or
-isolate the pty write path from the shared pool. Those are Phases 1 and 2 of the
-plan and each is a behaviour change with its own argument to make. `#1601`
-exists so that those changes are chosen against evidence — which is the one
-thing the last three attempts did not have.
+It does not bound a wait, refuse an acquisition, or isolate the pty write path
+from the shared pool. Those are Phases 1 and 2 of the plan and each is a
+behaviour change with its own argument to make. `#1601` exists so that those
+changes are chosen against evidence — which is the one thing the last three
+attempts did not have.
+
+(It does not single-flight a poll either, and that one is no longer a Phase 1
+job: #1602/#1604 landed it in parallel with this, and `performance.md` INV-4
+carries the rule. Named here because this list read as the complete set of what
+is still missing, and a list like that goes stale the moment a sibling merges.)
 
 ## 5. Reading the output
 

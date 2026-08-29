@@ -122,12 +122,17 @@ fn a_hold_past_the_threshold_is_reported_on_release_with_its_total() {
     std::thread::sleep(Duration::from_millis(80));
     drop(guard);
 
+    // The drain is the watchdog's job in the app; a test binary has no watchdog,
+    // so it stands in for one. The split is deliberate — see
+    // `the_release_path_takes_no_global_lock_while_the_mutex_is_still_held`.
+    lockwatch::record_all(lockwatch::drain_completed_holds());
+
     let reports = lockwatch::recent_reports();
     let r = reports
         .iter()
         .find(|r| r.lock == "dropspec")
         .expect("a hold past the threshold must be reported when it ends");
-    assert!(!r.still_held, "a hold reported by the guard's drop has ended");
+    assert!(!r.still_held, "a completed hold is reported as ended");
     assert!(r.held_ms >= 30, "the total must be the real duration, got {}", r.held_ms);
     assert_eq!(r.site_line, line, "and it must name the site that took it");
     assert_eq!(r.event(), "lock-freed");
@@ -148,11 +153,103 @@ fn a_hold_past_the_threshold_is_reported_on_release_with_its_total() {
     {
         let _quick = lock.lock_safe();
     }
+    lockwatch::record_all(lockwatch::drain_completed_holds());
     assert!(
         !lockwatch::recent_reports().iter().any(|r| r.lock == "dropspec"),
         "a hold under the threshold must not be reported"
     );
     drop(restore);
+}
+
+/// #1605 review B1. `Drop::drop` runs BEFORE the struct's fields drop, and
+/// `TrackedGuard.guard` is a field — so anything the release path does, it does
+/// with the reported mutex still locked and every waiter still queued behind it.
+/// The release path used to compose and write its report there.
+///
+/// Reading the code is what missed it, so this does not read the code: it makes
+/// the process-global report ring UNAVAILABLE and asks whether a release still
+/// completes. It also asks whether the report survives the detour, because a
+/// release that got fast by dropping the report on the floor would pass the
+/// first half alone.
+#[test]
+fn the_release_path_takes_no_global_lock_while_the_mutex_is_still_held() {
+    let _serial = SERIAL.lock_safe();
+    let restore = HoldWarn::set(20);
+    lockwatch::clear_reports();
+
+    // Far longer than any release may take, and far longer than SETTLE below.
+    const RING_HELD_MS: u64 = 2_000;
+    const SETTLE_MS: u128 = 250;
+    lockwatch::hold_report_ring_for_test(RING_HELD_MS);
+
+    let lock = TrackedMutex::new("ringspec", 0u32);
+    let guard = lock.lock_safe();
+    std::thread::sleep(Duration::from_millis(60)); // past the threshold
+    let started = Instant::now();
+    drop(guard);
+    let released = started.elapsed();
+
+    assert!(
+        released.as_millis() < SETTLE_MS,
+        "the release path waited {released:?} for a lock it must never take — a report composed \
+         while the mutex is still held is paid for by every waiter queued behind it, which is the \
+         latency path this whole change is about"
+    );
+    // …and the mutex really is free, not merely released-quickly-in-appearance.
+    assert!(
+        lock.try_lock_safe().is_some(),
+        "the mutex must be free the instant the release path returns"
+    );
+
+    // The stamp survived: once the ring is available the report is still there,
+    // with its real duration. A release that got fast by losing the report is
+    // not the fix.
+    let recovered = lockwatch::drain_completed_holds();
+    let r = recovered
+        .iter()
+        .find(|r| r.lock == "ringspec")
+        .expect("the completed hold must still be pending for the watchdog to pick up");
+    assert!(r.held_ms >= 60, "with its real total, got {}", r.held_ms);
+    assert!(!r.still_held);
+    drop(restore);
+}
+
+/// #1605 review N2. "Same poison-tolerant semantics as `obs::LockExt::lock_safe`"
+/// is the load-bearing claim of a whole-registry type swap, and nothing pinned
+/// it. `try_lock_safe`'s three-arm match is new logic with no production caller
+/// yet and is what Phase 2.1 will build on, so its `Poisoned` arm returning
+/// `None` instead of the inner value would be a silent behaviour change.
+#[test]
+fn a_poisoned_tracked_mutex_is_recovered_rather_than_propagated() {
+    let lock = Arc::new(TrackedMutex::new("poisonspec", 41u32));
+
+    let poisoner = {
+        let lock = lock.clone();
+        std::thread::spawn(move || {
+            let mut g = lock.lock_safe();
+            *g = 42;
+            panic!("poisoning the lock on purpose");
+        })
+    };
+    assert!(poisoner.join().is_err(), "the fixture is only a witness if that thread panicked");
+
+    // Blocking acquire: recovered, and the write the panicking thread made is
+    // still there — "at worst slightly stale, never memory-unsafe" (#53).
+    assert_eq!(*lock.lock_safe(), 42, "a poisoned lock must yield its value, not panic");
+
+    // Non-blocking acquire: the same answer. `WouldBlock` and `Poisoned` are
+    // different facts and only the first means "someone else has it".
+    let g = lock
+        .try_lock_safe()
+        .expect("a poisoned-but-free lock is FREE; refusing it would report the wrong fact");
+    assert_eq!(*g, 42);
+    drop(g);
+
+    // The negative control, so the assertion above is not satisfied by a
+    // try-lock that simply always succeeds.
+    let held = lock.lock_safe();
+    assert!(lock.try_lock_safe().is_none(), "a genuinely held lock must still be refused");
+    drop(held);
 }
 
 /// Restores the process-global hold threshold on the way out, so one test's
@@ -437,14 +534,33 @@ fn every_lock_on_the_registry_is_a_tracked_one() {
     );
 
     // THE RESIDUAL, stated where the scan lives rather than left to be found.
-    // This reads one line per field, so a field whose type is written across
-    // two lines is invisible to it, as is one behind a type ALIAS
-    // (`type Guarded<T> = Mutex<T>;`) or produced by a macro. None appears in
-    // the struct today — the count above is the whole population — and the
-    // compiler is what would catch the consequence anyway: a plain `Mutex` has
-    // no inherent `lock_safe`, so a field that evaded this scan would fall
-    // through to the `LockExt` trait and keep compiling. That last clause is
-    // exactly why the scan is worth having: the failure is SILENT, not loud.
+    //
+    // This reads each field's DECLARED TYPE, one line per field. Three shapes
+    // are therefore invisible to it, and the third is not hypothetical:
+    //
+    //  1. a field whose type is written across two lines;
+    //  2. a type ALIAS (`type Guarded<T> = Mutex<T>;`) or a macro-produced field;
+    //  3. **a field whose type is a struct that OWNS mutexes.** The declared
+    //     type is a plain name, and the locks are a level down.
+    //
+    // Class 3 had two live instances when this scan was written, and the note
+    // here used to claim the count above was the whole population — which was
+    // false, and false in the direction that matters (#1605 review N1). They
+    // are named rather than counted, because a number cannot be checked:
+    //
+    //  - `usage_cursors: TranscriptCursors` (`usage.rs`) owns two, and they
+    //    were the pair most worth finding: on `orch_group_usage`, one of the
+    //    ten polled reads, with `fs::metadata` and `fold_appended` INSIDE the
+    //    per-transcript guard. Both are `TrackedMutex` now.
+    //  - `roots: Arc<RootRegistry>` (`rootreg.rs`) owns an `RwLock`, which this
+    //    scan would not match even at the top level. Left alone: its critical
+    //    sections are a `BTreeSet` insert and a prefix comparison, with no IO
+    //    and no poll path, so a hold report on it would never say anything.
+    //
+    // What the compiler does NOT do here, which is why the scan exists at all:
+    // a plain `Mutex` has no inherent `lock_safe`, so a field that evades this
+    // scan falls through to the `LockExt` trait and keeps compiling. The
+    // failure is silent, not loud.
 }
 
 #[test]
