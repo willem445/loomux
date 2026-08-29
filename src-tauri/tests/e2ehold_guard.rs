@@ -73,6 +73,13 @@ struct Item {
     to: usize,
 }
 
+/// Leading-whitespace width. The axis `decl_lines` uses to tell a declaration
+/// the splitter should have enumerated from one nested inside a body it
+/// consumed.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
 /// Whether `line` DECLARES a function, at any indentation and under any
 /// visibility or modifier.
 ///
@@ -83,13 +90,6 @@ struct Item {
 /// gating assertion — while both of the instrument's own floors stayed green on
 /// the six functions it did see. A guard that decides from a spelling enforces
 /// nothing about the spellings it does not know (#1606 review B3).
-/// Leading-whitespace width. The axis `decl_lines` uses to tell a declaration
-/// the splitter should have enumerated from one nested inside a body it
-/// consumed.
-fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
 fn is_fn_decl(line: &str) -> bool {
     let mut rest = line.trim_start();
 

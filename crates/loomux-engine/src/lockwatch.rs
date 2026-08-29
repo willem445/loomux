@@ -639,12 +639,16 @@ impl<T> TrackedMutex<T> {
         let Some((left, frame)) = budget::remaining() else {
             return self.acquire_blocking(site);
         };
-        let in_mutation = budget::in_mutation();
-        let event = if in_mutation { "lock-busy-in-mutation" } else { "lock-busy" };
+        // `unwind_forbidden`, not `in_mutation`: a frame that has already made a
+        // durable write is sealed (#1609 review B1/B2), and a sealed frame must
+        // wait for exactly the reason a declared mutation must — an acquisition
+        // after a write is the only thing that can tear it.
+        let must_wait = budget::unwind_forbidden();
+        let event = if must_wait { "lock-busy-in-mutation" } else { "lock-busy" };
         match self.acquire_within(site, left, event) {
             Ok(g) => g,
             Err(busy) => {
-                if in_mutation {
+                if must_wait {
                     // The breadcrumb was already written by `acquire_within`,
                     // edge-triggered — so a mutation that takes twenty locks
                     // under an expired budget reports the HOLD once, not once

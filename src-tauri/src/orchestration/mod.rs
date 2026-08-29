@@ -26576,7 +26576,13 @@ impl OrchRegistry {
         let reg = self.clone();
         let (tx, rx) = mpsc::channel::<()>();
         let name = name.to_string();
-        let known = matches!(name.as_str(), "groups" | "agents" | "mq_state_lock" | "tasks_lock");
+        // `app` is here for #1609 review B1: it is what `write_mailbox` takes
+        // AFTER atomically replacing `mailbox.json`, so it is the lock a test
+        // has to hold to produce a write-then-acquire tear at all. Widening
+        // this seam widens `l1_...`'s coverage too, which that test's own
+        // `classify` helper invites.
+        let known =
+            matches!(name.as_str(), "groups" | "agents" | "mq_state_lock" | "tasks_lock" | "app");
         if !known {
             return false;
         }
@@ -26598,6 +26604,11 @@ impl OrchRegistry {
                 }
                 "mq_state_lock" => {
                     let _g = reg.mq_state_lock.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                "app" => {
+                    let _g = reg.app.lock_safe();
                     let _ = tx.send(());
                     std::thread::sleep(Duration::from_millis(ms));
                 }
@@ -39342,6 +39353,13 @@ impl OrchRegistry {
                 // killed-agent history, so preserve it for inspection and
                 // start fresh rather than overwrite it on the next upsert.
                 let bad = path.with_extension("json.bad");
+                // A durable REPLACE — it moves the live file aside — and the
+                // `self.audit` below it is a tracked acquisition, so this is
+                // the exact write-then-acquire shape a budget unwind tears
+                // (#1609 review B2). Sealing here is what makes the audit line
+                // reachable: without it a spent budget could unwind between
+                // the rename and the record of why it happened.
+                budget::note_durable_write("usage.json.bad");
                 let _ = fs::rename(&path, &bad);
                 self.audit(group, brand::AUDIT_ACTOR, "usage-corrupt",
                     json!({ "error": e.to_string(), "preserved": bad.to_string_lossy() }));
