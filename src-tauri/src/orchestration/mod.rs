@@ -50697,16 +50697,66 @@ impl OrchRegistry {
     }
 }
 
+/// The sleep a supervised loop falls back to when it could not compute its own
+/// next interval, because the closure that computes it panicked (#1702).
+///
+/// One minute: long enough that a loop whose interval read is broken cannot
+/// spin the CPU, short enough that it keeps trying often enough to recover if
+/// whatever broke clears. Only two loops compute an interval at all
+/// (`compact_nudge_poll_interval`); for the rest this is unreachable, because
+/// returning a constant cannot panic.
+const TICK_FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Spawn a cadenced background loop whose body is SUPERVISED — a panic inside
+/// it ends that tick and is breadcrumbed, rather than ending the thread
+/// (#1702, `obs::TickSupervisor`).
+///
+/// **The supervision lives here rather than at each call site on purpose.** Ten
+/// loops that each had to remember a `catch_unwind` is exactly the "did we
+/// remember to do this one" review dependency #1600 §2 is about, and the
+/// eleventh loop written next month is the one that would forget. A loop
+/// written through this helper cannot: there is no `std::thread::spawn` in its
+/// call site to leave unwrapped.
+///
+/// `interval` is a closure rather than a `Duration` because two of these loops
+/// choose their next sleep from registry state
+/// ([`compact_nudge_poll_interval`]), which reads locks and can therefore panic
+/// exactly as a body can. It runs under the same supervisor, and a panicked
+/// interval falls back to [`TICK_FALLBACK_INTERVAL`] so the thread cannot spin.
+///
+/// `start_attention` and `start_view_publisher` are deliberately NOT written
+/// through this: the first runs three independent bodies on one thread and
+/// wants three supervisors, so one broken pass cannot latch the other two off;
+/// the second is one body but with a name of its own. Both use
+/// `obs::TickSupervisor` directly.
+fn spawn_tick_loop(
+    tick: &'static str,
+    mut interval: impl FnMut() -> Duration + Send + 'static,
+    mut body: impl FnMut() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let mut sup = crate::obs::TickSupervisor::new(tick);
+        loop {
+            let wait = sup.run_for(&mut interval).unwrap_or(TICK_FALLBACK_INTERVAL);
+            std::thread::sleep(wait);
+            sup.run(&mut body);
+        }
+    });
+}
+
 /// Background loop that enforces the idle-worker auto-kill guardrail: every
 /// `IDLE_REAP_INTERVAL` it kills each worker/reviewer whose idle time has
 /// crossed its group's `idle_kill_minutes` (groups with the guardrail off
 /// are skipped inside `reap_idle_agents`, and so is a **liaison** block —
 /// `idle_reap_candidates` owns both exclusions). Started once at app setup.
 pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(IDLE_REAP_INTERVAL);
-        reg.reap_idle_agents(now_ms());
-    });
+    spawn_tick_loop(
+        "idle-reaper",
+        || IDLE_REAP_INTERVAL,
+        move || {
+            reg.reap_idle_agents(now_ms());
+        },
+    );
 }
 
 /// Background loop for the stalled-agent watchdog: every `WATCHDOG_INTERVAL`
@@ -50715,10 +50765,13 @@ pub fn start_idle_reaper(reg: Arc<OrchRegistry>) {
 /// `watchdog_stall_minutes`. Groups with the guardrail off and paused groups
 /// are skipped inside `run_watchdog`. Started once at app setup.
 pub fn start_watchdog(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(WATCHDOG_INTERVAL);
-        reg.run_watchdog(now_ms());
-    });
+    spawn_tick_loop(
+        "watchdog",
+        || WATCHDOG_INTERVAL,
+        move || {
+            reg.run_watchdog(now_ms());
+        },
+    );
 }
 
 /// What one wake of the unified `gh` poller did (#406) — returned so a test
@@ -50792,10 +50845,13 @@ pub fn intake_scan_due(now: u64, last_scan_ms: Option<u64>) -> bool {
 /// (`notify::due_watches`, `intake::due_intake_polls`); only the thread and
 /// its clock are shared. Started once at app setup, beside `start_watchdog`.
 pub fn start_gh_poller(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(notify::NOTIFY_POLL_INTERVAL);
-        reg.run_gh_poll_tick();
-    });
+    spawn_tick_loop(
+        "gh-poller",
+        || notify::NOTIFY_POLL_INTERVAL,
+        move || {
+            reg.run_gh_poll_tick();
+        },
+    );
 }
 
 /// Background loop for autonomous mode (#83): every `IDLE_TICK_INTERVAL` it
@@ -50807,10 +50863,13 @@ pub fn start_gh_poller(reg: Arc<OrchRegistry>) {
 /// (any orchestrator action resets the quiet clock) and hard-capped per hour.
 /// Started once at app setup.
 pub fn start_idle_tick(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(IDLE_TICK_INTERVAL);
-        reg.run_idle_tick(now_ms());
-    });
+    spawn_tick_loop(
+        "idle-tick",
+        || IDLE_TICK_INTERVAL,
+        move || {
+            reg.run_idle_tick(now_ms());
+        },
+    );
 }
 
 /// Round 10 (#428 follow-up): which cadence the compact-nudge loop's NEXT
@@ -50846,10 +50905,14 @@ pub fn compact_nudge_poll_interval(any_pending: bool) -> Duration {
 /// wake, and the loop drops back to the normal cadence the wake after the
 /// last open arm resolves. Started once at app setup.
 pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(compact_nudge_poll_interval(reg.any_compact_pending()));
-        reg.run_compact_nudge(now_ms());
-    });
+    let cadence = reg.clone();
+    spawn_tick_loop(
+        "compact-nudge",
+        move || compact_nudge_poll_interval(cadence.any_compact_pending()),
+        move || {
+            reg.run_compact_nudge(now_ms());
+        },
+    );
 }
 
 /// Background loop for the merge-gate hot-reload (#385): every
@@ -50862,10 +50925,13 @@ pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
 /// NOT folded into the unified poller of #406, whose subject is the shared
 /// GitHub API budget.)
 pub fn start_workflow_gate_reload(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(WORKFLOW_GATE_POLL_INTERVAL);
-        reg.run_workflow_gate_reload();
-    });
+    spawn_tick_loop(
+        "workflow-gate-reload",
+        || WORKFLOW_GATE_POLL_INTERVAL,
+        move || {
+            reg.run_workflow_gate_reload();
+        },
+    );
 }
 
 /// Free bytes on the disk that hosts `path`: the mounted volume whose mount
@@ -50885,10 +50951,13 @@ fn free_disk_bytes(path: &Path) -> Option<u64> {
 /// threshold, sends one latched notice per group orchestrator. Started once at
 /// app setup. Slow cadence keeps the sysinfo scan negligible.
 pub fn start_disk_monitor(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(DISK_CHECK_INTERVAL);
-        reg.run_disk_monitor();
-    });
+    spawn_tick_loop(
+        "disk-monitor",
+        || DISK_CHECK_INTERVAL,
+        move || {
+            reg.run_disk_monitor();
+        },
+    );
 }
 
 /// Background loop for the debounced cap-change notice (#79): every
@@ -50897,10 +50966,13 @@ pub fn start_disk_monitor(reg: Arc<OrchRegistry>) {
 /// orchestrator as one re-plan prompt instead of one per click. Started once
 /// at app setup.
 pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(MAX_NOTICE_FLUSH_INTERVAL);
-        reg.flush_due_max_notices(now_ms());
-    });
+    spawn_tick_loop(
+        "max-notice-flusher",
+        || MAX_NOTICE_FLUSH_INTERVAL,
+        move || {
+            reg.flush_due_max_notices(now_ms());
+        },
+    );
 }
 
 /// Background loop for the polled-view publisher (#1608, plan #1600 §3 Phase
@@ -50915,10 +50987,21 @@ pub fn start_max_notice_flusher(reg: Arc<OrchRegistry>) {
 /// derives beta6 from. Readers keep answering with the last snapshot and a
 /// growing `age_ms`, and the frontend badges it stale past
 /// [`views::VIEW_STALE_AFTER_MS`]. Started once at app setup.
+///
+/// **The pass is supervised** (#1702, `obs::TickSupervisor`). It was not, and
+/// `doc/design/polled-views.md` disclosed that: a panic inside one group's
+/// `compute_group` ended this thread permanently and froze the snapshot for
+/// BOTH polled surfaces at once, with only the stale badge between a dead
+/// publisher and a plausible-looking frozen UI. A panic now costs one pass and
+/// a `tick-panicked` breadcrumb; the badge still covers the interval, which is
+/// what makes the degrade the same one the rest of that design already has.
 pub fn start_view_publisher(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(views::VIEW_PUBLISH_INTERVAL);
-        reg.views.publish_pass(&reg);
+    std::thread::spawn(move || {
+        let mut sup = crate::obs::TickSupervisor::new("view-publisher");
+        loop {
+            std::thread::sleep(views::VIEW_PUBLISH_INTERVAL);
+            sup.run(|| reg.views.publish_pass(&reg));
+        }
     });
 }
 
@@ -51005,17 +51088,27 @@ pub fn start_view_publisher(reg: Arc<OrchRegistry>) {
 ///    one unconditional re-push of a non-empty set every `QUEUE_DEPTH_REPUSH_MS`,
 ///    which is that suppression's independent release rather than a cadence of
 ///    its own.
+///
+/// **Three supervisors on one thread** (#1702). This loop runs three
+/// independent bodies, and they are supervised separately rather than as one
+/// pass: a panic in the janitor is not a reason to stop emitting attention
+/// badges, and `obs::TickSupervisor`'s consecutive-panic latch would otherwise
+/// take all three down for one broken one. `spawn_tick_loop` cannot express
+/// that, which is why this loop is still written out.
 pub fn start_attention(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || {
         let mut tick: u64 = 0;
+        let mut sup_janitor = crate::obs::TickSupervisor::new("attention-stranded-janitor");
+        let mut sup_readmit = crate::obs::TickSupervisor::new("attention-queuefull-readmit");
+        let mut sup_attention = crate::obs::TickSupervisor::new("attention");
         loop {
             std::thread::sleep(ATTENTION_INTERVAL);
             tick = tick.wrapping_add(1);
             if tick % STRANDED_JANITOR_EVERY_N_TICKS == 0 {
-                reg.run_stranded_janitor();
-                reg.run_stranded_queuefull_readmit();
+                sup_janitor.run(|| reg.run_stranded_janitor());
+                sup_readmit.run(|| reg.run_stranded_queuefull_readmit());
             }
-            reg.run_attention(now_ms());
+            sup_attention.run(|| reg.run_attention(now_ms()));
         }
     });
 }
@@ -51058,6 +51151,18 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
 /// degraded to an invented empty payload: moving work off the main thread must
 /// not change what a bug does, and no command here can honestly synthesise the
 /// answer it failed to compute.
+///
+/// **The residual that leaves, stated** (#1702). A command body is one of the
+/// three no-frame caller classes a re-entrant `lock_safe` now panics on, so
+/// this is a path that refusal can reach — and unlike a cadenced tick, there is
+/// no supervisor here, because there is nothing to supervise: the command is
+/// one shot. The re-raise takes the panic to Tauri's own boundary, so the
+/// webview's `invoke` promise for that one call never settles and its panel
+/// stays on whatever it last had. That is a degraded SURFACE rather than a
+/// wedge — the registry lock is released by the unwind, every other command
+/// keeps answering, and the crash log names both sites — and it is left as it
+/// is deliberately: inventing a value here is the "a guard that does not hold
+/// is a lie every caller would act on" trade in a different costume.
 async fn run_blocking<T, F>(f: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,

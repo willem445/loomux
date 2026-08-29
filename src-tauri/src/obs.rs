@@ -34,7 +34,7 @@
 pub use loomux_engine::obs::{
     breadcrumb, check_and_arm, data_root, init_data_root, init_webview_profile,
     install_alloc_error_reporting, install_panic_hook, logs_dir, mark_clean_exit, LockExt,
-    StartupCheck,
+    StartupCheck, TickSupervisor,
 };
 
 use std::sync::Mutex;
