@@ -1586,8 +1586,20 @@ impl<T> TrackedMutex<T> {
     ///    do. Callers are supervised so the panic ends the tick rather than the
     ///    thread; see `obs::TickSupervisor`.
     ///
-    /// **The one cost, stated.** The panic hook runs BEFORE the unwind starts,
-    /// so that crash log is written while this thread still holds the outer
+    /// **Two costs beyond the hang it removes**, both argued in
+    /// `doc/design/lock-order.md` §2.2 rather than only here. A mutation can be
+    /// abandoned half-applied, because this unwinds inside a
+    /// [`crate::budget::MutationScope`] as much as outside one — accepted
+    /// because the alternative on this path leaves the SAME half-applied state
+    /// plus a wedged registry and no artifact. And a refusal raised from a
+    /// `Drop` running inside an unwind is a double panic, which aborts;
+    /// nothing here does that today ([`TrackedGuard::drop`] takes no tracked
+    /// lock, by this module's own rule), and the behaviour it replaces was a
+    /// deadlock inside that unwind.
+    ///
+    /// **The one cost that is paid every time, stated.** The panic hook runs
+    /// BEFORE the unwind starts, so that crash log is written while this
+    /// thread still holds the outer
     /// lock — a file write inside a hold, which is exactly what
     /// [`stamp_order_report`] exists to avoid. It is accepted here and nowhere
     /// else: this is a one-shot defect report on a thread that is already
