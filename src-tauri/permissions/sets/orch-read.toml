@@ -15,6 +15,8 @@ permissions = [
     "allow-orch-autonomy",
     "allow-orch-group-usage",
     "allow-orch-group-summary",
+    "allow-orch-group-view",
+    "allow-orch-strip-view",
     "allow-orch-workflow-preview",
     "allow-orch-workflow-status",
     "allow-orch-group-watches",

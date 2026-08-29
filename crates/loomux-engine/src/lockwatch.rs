@@ -527,8 +527,14 @@ impl<T> Drop for TrackedGuard<'_, T> {
     /// still locked and every waiter still queued behind it.
     ///
     /// What is left is: one clock read, four relaxed loads, four relaxed
-    /// stores, and two release read-modify-writes. All of it is on this lock's
-    /// own cache line, and none of it can block.
+    /// stores, one release STORE (`done_pending`, publishing the four stores
+    /// above) and one release read-modify-write (`generation`). All of it is on
+    /// this lock's own cache line, and none of it can block.
+    ///
+    /// The store and the read-modify-write are counted apart deliberately: this
+    /// body runs with the reported mutex still held, so what it costs is what
+    /// every waiter behind it pays, and an RMW is not a store (#1605 review n5,
+    /// corrected in #1608).
     fn drop(&mut self) {
         let st = self.state;
         let held_ms = mono_ms().saturating_sub(self.acquired_ms);

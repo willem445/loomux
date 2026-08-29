@@ -540,3 +540,21 @@ pub fn strip_view_payload(snapshot: &Stamped<ViewSnapshot>, now: Instant) -> Val
 fn elapsed_ms(started: Instant) -> u32 {
     started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
 }
+
+impl OrchRegistry {
+    /// Recompute and republish ONE group's view immediately — the write-side
+    /// nudge appended to every mutation the group view re-reads after.
+    ///
+    /// Called from the mutating `#[tauri::command]`'s own blocking body, AFTER
+    /// the write returns, so no registry guard from that write is still held
+    /// when the recompute takes its own locks.
+    ///
+    /// **Unconditional, including after a REJECTED write.** A refusal (an
+    /// out-of-range cap, a toggle that needs autonomous on) is exactly when the
+    /// panel most needs to re-sync to the state that really holds, and the
+    /// group view reloads after an error too. Republishing after a failure
+    /// costs one recompute and cannot write anything.
+    pub fn publish_group_now(&self, group: &GroupId) {
+        self.views.publish_group_now(self, group);
+    }
+}
