@@ -1259,3 +1259,60 @@ fn a_first_pass_that_goes_partial_publishes_nothing_rather_than_nulls() {
          last pass"
     );
 }
+
+// ---------- L2f: a partial group inherits its stalest part's AGE ----------
+
+#[test]
+fn a_partial_group_keeps_the_previous_stamp_so_the_badge_can_tell() {
+    // This is the rule that makes `viewstale.ts`'s existing pair of labels
+    // correct with NO frontend change, and it was the load-bearing choice in
+    // this slice — so it needs its own pin rather than riding on the fact that
+    // the frontend was not edited.
+    //
+    // A group that kept a section's previous value keeps that value's AGE too.
+    // Stamp it with THIS pass instead and the panel reads current — `stale` is
+    // derived from `age_ms`, so a fresh stamp means no badge — while showing a
+    // frozen number. That is the silent freeze #1604 review N3 is about, and it
+    // is invisible: every field is present and well-formed.
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    reg.views.publish_pass(&reg);
+    let first = reg.views.load();
+    let before = first.value.groups.get(&group.id).expect("published").clone();
+    assert!(!before.partial, "setup: an unheld pass must not be partial");
+
+    // Something to distinguish the two passes by. `computed_unix_ms` is a
+    // wall-clock stamp, so the passes must be separated by at least a
+    // millisecond for the assertion below to mean anything.
+    std::thread::sleep(Duration::from_millis(5));
+
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+    reg.views.publish_pass(&reg);
+    let after = reg.views.load();
+    let now = after.value.groups.get(&group.id).expect("still published — it has a previous value to inherit").clone();
+
+    assert!(now.partial, "a pass that could not read `agents` must mark the group partial");
+    assert_eq!(
+        now.computed_at, before.computed_at,
+        "a partial group must keep its PREVIOUS stamp. With a fresh one, `age_ms` restarts \
+         and `stale` never flips, so the panel reads current while showing the value it \
+         could not refresh"
+    );
+    assert_eq!(
+        now.computed_unix_ms, before.computed_unix_ms,
+        "the wall-clock stamp a human reads must move with `computed_at`, or the badge and \
+         the timestamp beside it disagree"
+    );
+
+    // And the property as the frontend actually sees it: `partial` reaches the
+    // payload, and the age it is paired with is the OLD one.
+    let payload =
+        loomux_lib::orchestration::views::group_view_payload(&after, &group.id, std::time::Instant::now());
+    assert_eq!(payload["meta"]["partial"], serde_json::Value::Bool(true));
+    assert_eq!(
+        payload["meta"]["published_at_ms"].as_u64(),
+        Some(before.computed_unix_ms),
+        "the payload must report the stalest part's age, not this pass's"
+    );
+}
