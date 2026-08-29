@@ -35901,6 +35901,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("rootreg.rs", 1),        // registry_at
         ("manager_lifecycle.rs", 1), // relaunch_registry
         ("manager_prose.rs", 1),  // test_registry (#1161 M4)
+        ("views.rs", 1),          // test_registry (#1608)
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);

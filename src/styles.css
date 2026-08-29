@@ -424,6 +424,16 @@ body.dragging-tab, body.dragging-tab * { cursor: grabbing !important; }
   padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, var(--ink) 4%, transparent);
 }
 .tab.active .tab-status { color: var(--ink); }
+/* The strip's own staleness (#1608). The count and cost shown are real but
+   old, so this dims them and tints the chip rather than hiding or zeroing
+   anything: a stale-but-true badge beats a fabricated fresh one, and the age
+   is in the chip's tooltip. No extra element, so a stale tab is exactly as
+   wide as a fresh one and the strip does not reflow when it flips. */
+.tab-status.stale, .tab.active .tab-status.stale {
+  color: var(--state-attention);
+  background: color-mix(in srgb, var(--state-attention) 12%, transparent);
+  font-style: italic;
+}
 .tab-paused { flex: none; font-size: 10px; color: var(--state-attention); }
 
 /* Attention (#63, finding 1): an unmistakable alert on a tab whose (maybe
@@ -3406,6 +3416,19 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
 .group-group {
   flex: 1; min-width: 0; color: var(--ink-dim); font-size: 10.5px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Staleness badge (#1608, plan #1600 Phase 1). The group view is served from
+   a published snapshot; when the publisher falls behind, the payload carries
+   its own age and this says so. Hidden entirely while current — a badge that
+   is always there is a badge nobody reads — and deliberately not alarming:
+   stale is a degraded surface that recovers itself, not an error. */
+.group-stale {
+  flex: none; font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+  padding: 1px 6px; border-radius: 999px;
+  color: var(--state-attention);
+  background: color-mix(in srgb, var(--state-attention) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--state-attention) 34%, transparent);
+  cursor: default;
 }
 .group-summary {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: none;
