@@ -39245,7 +39245,18 @@ impl OrchRegistry {
                 notify_desktop(&format!("orrerix · {}", i.name), &i.detail);
             }
         }
-        if let Some(app) = self.app.lock_safe().clone() {
+        // #1702: bound BEFORE the branch, for `emit_session_learned`'s reason
+        // one screen up — an `if let` scrutinee's temporaries live for the whole
+        // body in edition 2021, so branching on `self.app.lock_safe().clone()`
+        // directly holds that guard across the `emit` below AND across
+        // `queue_depth_push`, which takes `queues`, `hold_episodes` and
+        // `queue_depth_emitted`. `app` is the registry's most-taken lock; this
+        // tick was holding it across an IPC serialization of the whole attention
+        // set every three seconds, and nesting three more registry locks under
+        // it. Same rule as the phases in `attention_tick`: nothing holds a
+        // registry lock across a call that can take one.
+        let app = self.app.lock_safe().clone();
+        if let Some(app) = app {
             let _ = app.emit("orch-attention", &items);
             // #814: the delivery-queue badge rides this tick rather than owning a
             // cadence of its own. Two reasons, both structural. The age it shows
