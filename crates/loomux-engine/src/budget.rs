@@ -157,6 +157,16 @@ thread_local! {
     /// [`MutationScope`]: a timeout WAITS instead of unwinding. See
     /// [`note_durable_write`] for why that is the rule.
     static SEALED: Cell<bool> = const { Cell::new(false) };
+
+    /// Seals and tears on THIS thread, as `(sealed, torn)`.
+    ///
+    /// The process-global counters beside them are the field-report numbers;
+    /// these are what a TEST can assert on. `cargo test` runs a binary's tests
+    /// concurrently, so a delta on a global counter is a race against whatever
+    /// sibling happens to write next — which is not a hypothetical: the first
+    /// version of the seal test failed with `left 2, right 1` against a
+    /// mechanism that was working correctly.
+    static THREAD_SEALS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// What is left of this thread's budget, and which frame owns it.
@@ -261,6 +271,10 @@ pub fn read_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> Result<T, Busy
                 // instead of an argument. A panic here would take the app
                 // down over a bookkeeping slip.
                 if sealed_here {
+                    THREAD_SEALS.with(|c| {
+                        let (s, t) = c.get();
+                        c.set((s, t + 1));
+                    });
                     TORN_WRITES.fetch_add(1, Ordering::Relaxed);
                     crate::obs::breadcrumb(
                         "budget-torn-write",
@@ -386,6 +400,10 @@ pub fn note_durable_write(what: &str) {
     if SEALED.with(|s| s.replace(true)) || in_mutation() {
         return; // already sealed, or a declared mutation: nothing to report.
     }
+    THREAD_SEALS.with(|c| {
+        let (s, t) = c.get();
+        c.set((s + 1, t));
+    });
     let n = SEALED_FRAMES.fetch_add(1, Ordering::Relaxed);
     if n < SEAL_BREADCRUMBS {
         crate::obs::breadcrumb(
@@ -413,6 +431,12 @@ pub fn torn_writes() -> u64 {
 #[doc(hidden)]
 pub fn sealed_for_test() -> bool {
     SEALED.with(|s| s.get())
+}
+
+/// `(seals, tears)` on THIS thread. The parallelism-safe form of
+/// [`sealed_frames`] / [`torn_writes`] — see `THREAD_SEALS`.
+pub fn thread_seal_counts() -> (u64, u64) {
+    THREAD_SEALS.with(|c| c.get())
 }
 
 /// This thread's mutation depth. For tests and for a diagnostic dump; the
@@ -678,16 +702,28 @@ mod tests {
         let torn_before = torn_writes();
         let started = Instant::now();
 
+        // The seal is read INSIDE the frame, because that is where it lives:
+        // `read_budget` restores what it found on the way out, so a check after
+        // the call would be asking the wrong question. It is also the only
+        // parallelism-safe form — `sealed_frames()` is a process-global counter
+        // and `cargo test` runs these concurrently, so an exact delta on it
+        // races whatever sibling test happens to write next (measured: this
+        // assertion first failed with left 2, right 1, against a mechanism that
+        // was working).
         let out = read_budget(Duration::from_millis(50), || {
             note_durable_write("sealspec.json");
+            let sealed_here = sealed_for_test();
             // The acquisition AFTER the write — the only shape that can tear it.
-            *lock.lock_safe()
+            (*lock.lock_safe(), sealed_here)
         });
         let waited = started.elapsed();
 
-        assert_eq!(
-            out.expect("a frame that has already written durably must WAIT, not unwind"),
-            7
+        let (value, sealed_here) =
+            out.expect("a frame that has already written durably must WAIT, not unwind");
+        assert_eq!(value, 7);
+        assert!(
+            sealed_here,
+            "the write must SEAL the frame — that is the mechanism, not a report"
         );
         // And it really did wait past the budget: without this the assertion
         // above passes against a lock that was never held.
@@ -695,10 +731,12 @@ mod tests {
             waited >= Duration::from_millis(300),
             "it returned in {waited:?}, so the hold was not in its way and this proves nothing"
         );
-        assert_eq!(
-            sealed_frames(),
-            sealed_before + 1,
-            "the write must SEAL the frame — that is the mechanism, not a report"
+        // The global counter only has to MOVE: an exact delta would be a race
+        // against every other test in this binary, and the per-frame assertion
+        // above is the precise one.
+        assert!(
+            sealed_frames() > sealed_before,
+            "the seal counter did not move, so nothing recorded the write"
         );
         assert_eq!(
             torn_writes(),
