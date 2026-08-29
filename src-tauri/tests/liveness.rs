@@ -2114,7 +2114,8 @@ fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
 #[test]
 fn l6b_the_masks_the_tick_applies_equal_the_unbounded_computation() {
     use loomux_lib::orchestration::{
-        DELIVERED_NOTICES_PER_PANE, DELIVERED_PROMPT_LINES_PER_SESSION,
+        mask_loomux_notices_with_record, prompt_wait_detected, DELIVERED_NOTICES_PER_PANE,
+        DELIVERED_PROMPT_LINES_PER_SESSION,
     };
     use std::collections::HashSet;
 
@@ -2147,13 +2148,26 @@ fn l6b_the_masks_the_tick_applies_equal_the_unbounded_computation() {
         );
     }
 
-    // The discriminating control: a unanimous reference would hold against a
-    // tick that ignored the record entirely.
+    // The discriminating control, in two halves, because "the reference is
+    // mixed" is not enough on its own: a pane can fail to flag because its text
+    // is not a question, which would make this row pass against a tick that had
+    // stopped masking entirely.
     assert!(
         f.reference.values().any(|v| *v) && f.reference.values().any(|v| !*v),
         "setup: the reference is unanimous ({:?}), so the equality below would not distinguish \
          a masking tick from one that had stopped masking",
         f.reference
+    );
+    let masked_pane = &f.fx.agent_ids[0];
+    assert!(
+        prompt_wait_detected(&mask_loomux_notices_with_record(&f.tails[masked_pane], &[])),
+        "setup: pane 0's tail is not prompt-shaped WITHOUT the record, so the fact that it does \
+         not flag says nothing about masking — it would not flag under any implementation"
+    );
+    assert!(
+        !f.reference[masked_pane],
+        "setup: pane 0's tail IS prompt-shaped and the record does not suppress it, so the mask \
+         is not claiming the line this fixture was built around"
     );
 
     let m = run_two_ticks_measured(&f, L6B_PROBE);

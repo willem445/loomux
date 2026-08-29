@@ -107,8 +107,16 @@ pub fn fabricate_long_lived_session(
         // a record of one entry and prove nothing about churn.
         let mut last = String::new();
         for d in 0..deliveries_per_agent {
+            // QUESTION-SHAPED on purpose. A pane whose tail ends in a recorded
+            // line that is not prompt-shaped tells you nothing: it fails to
+            // flag whether or not the mask claimed it, so a fixture built that
+            // way cannot distinguish a masking tick from one that has stopped
+            // masking. This is #576/rev-126's actual subject — a relayed report
+            // sitting in the tail, reading as a live dialog — and
+            // `prompt_wait_detected` must see it as one until the record
+            // claims it.
             last = format!(
-                "[orch] delivery {d} to {name}: continue with the plan as written and report back"
+                "[orch] delivery {d} to {name} reports blocked: shall I continue? (y/n)"
             );
             reg.record_delivered_prompt(pty, &last, Delivery::MidSession);
         }
