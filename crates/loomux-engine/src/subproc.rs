@@ -17,7 +17,7 @@
 //! this crate ahead of it. That ordering was the point of batch 7: nothing that
 //! locks can move before `lock_safe` has.
 
-use std::sync::{mpsc, Mutex};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::obs::LockExt;
@@ -63,14 +63,24 @@ pub const GH_CAPTURE_MAX_LEAKED_READERS: usize = 16;
 /// Reader threads abandoned by a timed-out `capture_with_timeout`, held so
 /// they can be counted rather than forgotten. Process-wide because the leak
 /// is: the bound has to survive across ticks, and there is one poll loop.
-static GH_CAPTURE_LEAKED_READERS: Mutex<Vec<std::thread::JoinHandle<Vec<u8>>>> = Mutex::new(Vec::new());
+static GH_CAPTURE_LEAKED_READERS: std::sync::OnceLock<
+    crate::lockwatch::TrackedMutex<Vec<std::thread::JoinHandle<Vec<u8>>>>,
+> = std::sync::OnceLock::new();
+
+/// [`GH_CAPTURE_LEAKED_READERS`], initialised on first use  a getter for the
+/// same reason `orchestration::audit_lock` is one (#1601): registering a lock
+/// with the watchdog is not a `const` operation.
+fn leaked_readers() -> &'static crate::lockwatch::TrackedMutex<Vec<std::thread::JoinHandle<Vec<u8>>>> {
+    GH_CAPTURE_LEAKED_READERS
+        .get_or_init(|| crate::lockwatch::TrackedMutex::new("gh_capture_leaked_readers", Vec::new()))
+}
 
 /// Drop the handles of readers that have since ended and report how many are
 /// still blocked. A reader ends as soon as its pipe closes, which in the
 /// ordinary stall is the moment its child is killed — so this normally
 /// returns 0 and the ceiling below is never approached.
 fn sweep_leaked_readers() -> usize {
-    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    let mut leaked = leaked_readers().lock_safe();
     leaked.retain(|reader| !reader.is_finished());
     leaked.len()
 }
@@ -178,7 +188,7 @@ fn abandon_child_and_readers(
 ) -> String {
     let _ = child.kill();
     let _ = wait_bounded(child, GH_CAPTURE_REAP_TIMEOUT);
-    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    let mut leaked = leaked_readers().lock_safe();
     leaked.push(out_reader);
     leaked.push(err_reader);
     reason
@@ -275,7 +285,7 @@ pub fn gh_capture_live_readers() -> usize {
 /// makes "both handles were handed to the ceiling" observable on its own terms.
 #[doc(hidden)] // pub for integration tests
 pub fn gh_capture_parked_readers() -> usize {
-    GH_CAPTURE_LEAKED_READERS.lock_safe().len()
+    leaked_readers().lock_safe().len()
 }
 
 /// Empty the backlog and hand back what was parked, so a test can start from a
@@ -293,7 +303,7 @@ pub fn gh_capture_parked_readers() -> usize {
 /// a reader that ended, and it is confined to a test process.
 #[doc(hidden)] // pub for integration tests
 pub fn drain_parked_readers_for_test() -> Vec<std::thread::JoinHandle<Vec<u8>>> {
-    std::mem::take(&mut *GH_CAPTURE_LEAKED_READERS.lock_safe())
+    std::mem::take(&mut *leaked_readers().lock_safe())
 }
 
 /// Park `n` controllable blocked readers in the backlog, as a real abandoned
@@ -303,7 +313,7 @@ pub fn drain_parked_readers_for_test() -> Vec<std::thread::JoinHandle<Vec<u8>>> 
 #[doc(hidden)] // pub for integration tests
 pub fn seed_leaked_readers_for_test(n: usize) -> Vec<mpsc::Sender<()>> {
     let mut holds = Vec::new();
-    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    let mut leaked = leaked_readers().lock_safe();
     for _ in 0..n {
         let (tx, rx) = mpsc::channel::<()>();
         holds.push(tx);

@@ -545,6 +545,23 @@ const TIMERS: TimerRow[] = [
     debt: null,
   },
   {
+    key: "src/liveness.ts@LIVENESS_STAMP_MS",
+    cadenceMs: 1000,
+    policy: "argued",
+    reason:
+      "The webview half of #1601's liveness heartbeat, and the one timer here that must NOT be " +
+      "visibility-gated: a hidden window is one of the states the app can be frozen IN " +
+      "(minimized while an agent works is how this app is normally used), so gating it would " +
+      "blind the instrument exactly where a freeze is least likely to be noticed early. The tick " +
+      "is a rounding subtraction plus one invoke of a SYNC command whose whole body is six " +
+      "relaxed atomic stores — no lock, no IO, no allocation at either end — against a tab strip " +
+      "that polls two invokes per group-bound tab every 4 s and a group view that polls nine " +
+      "every 2 s. The platform still throttles a hidden window's timers, which is why every " +
+      "stamp carries `hidden` and `selfwatch::liveness` answers 'no evidence' rather than " +
+      "'stuck' for a stale stamp from one (Liveness::GuiHidden).",
+    debt: null,
+  },
+  {
     key: "src/pollgate.ts@HIDDEN_RECHECK_MS",
     cadenceMs: 5000,
     policy: "gated",

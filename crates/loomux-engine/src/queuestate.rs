@@ -44,7 +44,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
-use std::sync::{Mutex, MutexGuard};
+use crate::lockwatch::{TrackedGuard, TrackedMutex};
 
 use crate::obs::LockExt;
 
@@ -112,10 +112,10 @@ pub trait QueueSnapshotWriter {
 
 /// Read-only access to [`QueueMap`]'s contents.
 ///
-/// A wrapper rather than the bare `MutexGuard` precisely because a
-/// `MutexGuard` also derefs MUTABLY: handing one out would reopen the door
-/// this module exists to close, from a method named `read`.
-pub struct QueueRead<'a>(MutexGuard<'a, QueueEntries>);
+/// A wrapper rather than the bare lock guard precisely because a guard also
+/// derefs MUTABLY: handing one out would reopen the door this module exists to
+/// close, from a method named `read`.
+pub struct QueueRead<'a>(TrackedGuard<'a, QueueEntries>);
 
 impl Deref for QueueRead<'_> {
     type Target = QueueEntries;
@@ -127,12 +127,12 @@ impl Deref for QueueRead<'_> {
 /// The live delivery queues (#445/#468) — the `queues` field of
 /// `OrchRegistry`, with its persistence obligation made structural (#562).
 pub struct QueueMap {
-    inner: Mutex<QueueEntries>,
+    inner: TrackedMutex<QueueEntries>,
 }
 
 impl QueueMap {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self { inner: TrackedMutex::new("queues", HashMap::new()) }
     }
 
     /// Read the queues. No persistence obligation: nothing changed.
@@ -195,12 +195,12 @@ impl Default for QueueMap {
 /// case #497 identified as the one a property test over a fixed event set
 /// can never cover.
 pub struct DrainerRegistry {
-    inner: Mutex<HashMap<u32, u64>>,
+    inner: TrackedMutex<HashMap<u32, u64>>,
 }
 
 impl DrainerRegistry {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self { inner: TrackedMutex::new("queue_draining", HashMap::new()) }
     }
 
     /// Whether a drainer is registered for `pty_id` right now.

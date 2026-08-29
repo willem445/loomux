@@ -124,18 +124,19 @@ const DEBT_OWNERS: &[(&str, &str)] = &[
     // refuses a row that names an owner nobody declared.
 ];
 
-/// The 20 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
+/// The 21 synchronous `#[tauri::command]`s at this commit, seeded verbatim from
 /// #743's census (planning comments parts 1-2, reconciled against
 /// `APP_COMMANDS`) with #726's 16 git conversions, #752's 8 polled
 /// orchestration conversions, #762's 40 orchestration mutation and lifecycle
 /// conversions, #746's 25 gesture conversions, #1592's 1 and #1595's 5 already
-/// removed. This is today's truth, not the target state.
+/// removed, and #1601's 1 added. This is today's truth, not the target state.
 ///
 /// Reconciliation against the census's own totals, so a reader can check this
 /// list rather than trust it: census A=20, T=4, C=20, B=91 of 135. Here
 /// 115 async = 20 A + #726's 16 + #752's 8 + #762's 40 + #746's 25 + #1592's 1
-/// + #1595's 5; 15 `cheap` = the 20 C − #1595's 5; 5 `exception` = the 4 T plus
-/// `resize_pty` (census B, but §4 X1 argues it stays sync); 0 `debt` = 91 B
+/// + #1595's 5; 15 `cheap` = the 20 C − #1595's 5; 6 `exception` = the 4 T plus
+/// `resize_pty` (census B, but §4 X1 argues it stays sync) plus `liveness_stamp`
+/// (#1601, born argued — §4 X7); 0 `debt` = 91 B
 /// − 16 (#726) − 8 (#752) − 40 (#762) − 25 (#746) − 1 (`resize_pty`) − 1 (#1592).
 ///
 /// **#1595 moved five `cheap` rows, and the reason matters more than the
@@ -200,6 +201,21 @@ const SYNC_COMMANDS: &[Row] = &[
         reason: "Starts the cancellable hashing walk on a raw thread and returns; it streams \
                  fm-hash batches whose handler-side cost is E2's own debt row, not this one. See \
                  performance.md §4 X3.",
+        issue: None,
+    },
+    Row {
+        name: "liveness_stamp",
+        class: Class::Exception,
+        reason: "Stays sync because the blocking pool is one of the two things it MEASURES \
+                 (#1601 Phase 0.4): delegated, it would stop running at exactly the moment \
+                 the pool is exhausted, and the heartbeat would then report the webview \
+                 thread stuck on the one occasion it is the only healthy half left. The \
+                 body is six relaxed atomic stores and a monotonic clock read — no \
+                 allocation, no IO, and no `Mutex` at all, so there is no ACQUISITION to \
+                 park on either (the #1595 half of `Class::Cheap`'s note). Filed \
+                 `exception` rather than `cheap` because the synchrony is a REQUIREMENT, \
+                 and a future sweep that mechanically converts the cheap rows must not take \
+                 it. See performance.md §4 X7 and the doc on `liveness_stamp` itself.",
         issue: None,
     },
     // ---------------------------------------------------------------------
@@ -342,10 +358,20 @@ const ATTR: &str = concat!("#[tauri::", "command]");
 /// The INV-2 markers. A `cheap` body may contain none of them.
 const HAZARD_MARKERS: &[&str] = &["Command::new", "ShellExecuteW", ".output(", "fs::"];
 
-/// Either shape of the delegation INV-1 requires in an async command's own
-/// body: `run_blocking` is the crate's thin wrapper (git.rs, gh.rs, pty.rs),
-/// `spawn_blocking` the runtime call it wraps (voice.rs, sessions.rs).
-const DELEGATION: &[&str] = &["run_blocking(", "spawn_blocking("];
+/// Any shape of the delegation INV-1 requires in an async command's own body:
+/// `run_blocking` is the crate's thin wrapper (git.rs, gh.rs, pty.rs),
+/// `spawn_counted` the counted door that wrapper and the four unwrapped sites
+/// (voice.rs, sessions.rs, pty.rs `write_pty`/`change_dir`) both hand off
+/// through, and `spawn_blocking` the runtime call `spawn_counted` itself makes.
+///
+/// `spawn_blocking(` stays on the list even though #1601 left exactly one such
+/// call in the crate (`blocking::spawn_counted`, which is not a command). It is
+/// the shape a NEW conversion written from the old precedent will use, and this
+/// scan's job is to accept a correct delegation, not to insist on today's
+/// spelling of it — a scan that rejected the runtime call outright would fail a
+/// command that delegates perfectly well and merely skipped the counter, which
+/// is `src-tauri/tests/selfwatch.rs`'s finding to report, with its own message.
+const DELEGATION: &[&str] = &["run_blocking(", "spawn_counted(", "spawn_blocking("];
 
 #[derive(Debug)]
 struct Site {
@@ -981,8 +1007,8 @@ fn every_async_command_hands_its_body_to_a_blocking_pool() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "these async commands never call run_blocking( or spawn_blocking( in their own body: \
-         {offenders:?}. An async command that does its work inline is polled on the webview \
+        "these async commands never call run_blocking(, spawn_counted( or spawn_blocking( in \
+         their own body: {offenders:?}. An async command that does its work inline is polled on the webview \
          thread and blocks it just as a sync one would (performance.md §1, §2 P1) — hand the \
          WHOLE body over, with nothing before the first await"
     );

@@ -44,7 +44,8 @@
 //! | watchdog | webview | verdict |
 //! | --- | --- | --- |
 //! | fresh | fresh | [`Liveness::Ok`] |
-//! | fresh | stale | [`Liveness::GuiStuck`] — beta5's shape |
+//! | fresh | stale, window visible | [`Liveness::GuiStuck`] — beta5's shape |
+//! | fresh | stale, window hidden | [`Liveness::GuiHidden`] — no evidence |
 //! | stale | fresh | [`Liveness::BackendStuck`] — beta6's shape |
 //! | stale | stale | [`Liveness::BothStuck`] |
 
@@ -239,6 +240,24 @@ pub enum Liveness {
     /// The backend is ticking and the webview has stopped stamping — beta5's
     /// shape: the GUI thread is parked.
     GuiStuck,
+    /// The webview has stopped stamping and its last stamp said the window was
+    /// HIDDEN. Not an alarm, and deliberately not folded into either
+    /// [`Liveness::Ok`] or [`Liveness::GuiStuck`].
+    ///
+    /// The platform throttles a hidden window's timers — a minimized window may
+    /// legitimately stamp once a minute — so a stale stamp from one is not
+    /// evidence of anything. Calling that `GuiStuck` would fire the alarm every
+    /// time the human minimizes the app, which is how an instrument stops being
+    /// read; calling it `Ok` would claim a health check that was never made.
+    /// This says "no evidence", which is the true answer.
+    ///
+    /// The residual, stated rather than left to be found: a GUI genuinely
+    /// wedged while the window is hidden is reported as this, not as
+    /// `GuiStuck`. Nothing here can separate the two — the webview is the only
+    /// witness to its own liveness, and a hidden one is not being asked. What
+    /// bounds it is that the human's next interaction un-hides the window, and
+    /// the very next tick after that reads `GuiStuck` for real.
+    GuiHidden,
     /// The webview is stamping and the watchdog is not being scheduled, or its
     /// stamp has gone stale — beta6's shape: the window is alive and everything
     /// behind it is starved.
@@ -263,11 +282,17 @@ pub fn liveness(hb: &Heartbeat, now_ms: u64, stale_ms: u64) -> Liveness {
     let backend_fresh =
         now_ms.saturating_sub(hb.watchdog_ms) <= stale_ms && hb.watchdog_lag_ms <= stale_ms;
     let gui_fresh = now_ms.saturating_sub(hb.webview_ms) <= stale_ms;
-    match (backend_fresh, gui_fresh) {
-        (true, true) => Liveness::Ok,
-        (true, false) => Liveness::GuiStuck,
-        (false, true) => Liveness::BackendStuck,
-        (false, false) => Liveness::BothStuck,
+    match (backend_fresh, gui_fresh, hb.webview_hidden) {
+        (true, true, _) => Liveness::Ok,
+        (true, false, false) => Liveness::GuiStuck,
+        (true, false, true) => Liveness::GuiHidden,
+        (false, true, _) => Liveness::BackendStuck,
+        // A stale stamp from a hidden window is no evidence about the GUI, but
+        // the backend half is measured here and stands on its own — so the
+        // verdict names the half it can actually speak for rather than
+        // upgrading itself to `BothStuck` on a reading it just declined to use.
+        (false, false, true) => Liveness::BackendStuck,
+        (false, false, false) => Liveness::BothStuck,
     }
 }
 
@@ -276,7 +301,10 @@ impl Liveness {
     /// the two that are not news.
     pub fn event(self) -> Option<&'static str> {
         match self {
-            Liveness::Unarmed | Liveness::Ok => None,
+            // `GuiHidden` is silent for the same reason it exists: it is the
+            // absence of evidence, and a breadcrumb per minimize would train a
+            // reader to skip this event class.
+            Liveness::Unarmed | Liveness::Ok | Liveness::GuiHidden => None,
             Liveness::GuiStuck => Some("live-gui-stuck"),
             Liveness::BackendStuck => Some("live-backend-stuck"),
             Liveness::BothStuck => Some("live-both-stuck"),
