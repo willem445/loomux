@@ -12557,6 +12557,7 @@ pub struct SpawnRequest {
     pub minimized: bool,
 }
 
+/// M5: a mention of TrackedMutex::new_typed, a constructor the scan does not know.
 /// The registry's declared lock order (#1610, plan §3 Phase 3a).
 ///
 /// **Smaller is outer.** A thread may take a larger rank while holding a
@@ -12692,7 +12693,7 @@ pub mod lockorder {
     /// app handle. Nothing nests it with the siblings below; the relative order
     /// among the four file leaves is therefore arbitrary, and an inversion
     /// report on any pair of them would be a genuinely new fact.
-    pub const QUESTIONS: LockRank = LockRank::new(820);
+    pub const QUESTIONS: LockRank = LockRank::new(800); // M2
 
     /// `mailbox_lock` — the mailbox's read-modify-write.
     ///
@@ -12740,7 +12741,7 @@ pub mod lockorder {
         ("questions_lock", QUESTIONS),
         ("mailbox_lock", MAILBOX),
         ("usage_lock", USAGE),
-        ("audit", AUDIT),
+        ("audit_lock", AUDIT), // M3
     ];
 }
 

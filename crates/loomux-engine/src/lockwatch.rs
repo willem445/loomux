@@ -854,6 +854,7 @@ fn inspect_held(lock_id: u64, rank: u32) -> Verdict {
 /// Record a hold on this thread's stack. `None` = not tracked (over capacity,
 /// or the thread-local was unavailable), which the guard remembers so its drop
 /// pops nothing.
+#[allow(unreachable_code, unused_variables)]
 fn push_held(
     lock_id: u64,
     name: &'static str,
@@ -861,6 +862,7 @@ fn push_held(
     site: &'static Location<'static>,
     acquired_ms: u64,
 ) -> Option<u64> {
+    return None; // M1: the held-lock stack records nothing
     HELD.try_with(|h| {
         let mut stack = h.try_borrow_mut().ok()?;
         if stack.len >= HELD_STACK_CAP {
@@ -1451,11 +1453,13 @@ impl<T> TrackedMutex<T> {
     /// `Result` and can refuse; `lock_safe` returns a guard and cannot.
     ///
     /// [`lock_within`]: Self::lock_within
+    #[allow(unreachable_code, unused_variables)]
     fn check_order(
         &self,
         site: &'static Location<'static>,
         refuse_reentrant: bool,
     ) -> Result<(), Busy> {
+        return Ok(()); // M1: the checker decides nothing
         let st = &self.state;
         match inspect_held(st.id, st.rank) {
             Verdict::Clear => Ok(()),
