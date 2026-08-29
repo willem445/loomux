@@ -12,12 +12,21 @@
 // slow or a registry lock is stuck, each tick parks another `spawn_blocking`
 // thread on the shared 512-thread pool instead of reusing the one still
 // waiting; at roughly 2-5 threads/s that exhausts the pool in minutes, and
-// once it does, `write_pty`'s own `spawn_blocking` can no longer be
-// scheduled and every pane stops accepting input at once. Refusing to issue
-// a second call while the first is still outstanding makes that
-// accumulation UNREACHABLE from the poll path, regardless of what the hold
-// itself turns out to be — Phase 0/1 of the plan diagnose the hold
-// separately; this phase does not need to know what it is.
+// once it does, nothing else can be scheduled on it. In beta6 the victim
+// that made this visible was `write_pty`, which shared the pool: every pane
+// stopped accepting input at once. Refusing to issue a second call while the
+// first is still outstanding makes that accumulation UNREACHABLE from the
+// poll path, regardless of what the hold itself turns out to be — Phase 0/1
+// of the plan diagnose the hold separately; this phase does not need to know
+// what it is.
+//
+// **`write_pty` is no longer one of the victims (#1607, Phase 2.3):** the pty
+// input path moved off the shared pool onto a thread per pane, so pane input
+// survives a full pool now. That does not make this gate redundant, and the
+// distinction is worth keeping straight — 2.3 saved ONE tenant of the pool,
+// while this makes the poll path stop exhausting it for ALL of them (every
+// other converted `orch_*` command, and the MCP the orchestrator talks
+// through). Two independent fixes to one mechanism, deliberately.
 //
 // `groupview.ts`'s batch poll wants the SAME overlap-safety property but
 // uses a DIFFERENT gate — `refreshgate.ts`'s `RefreshGate` — because its
