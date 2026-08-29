@@ -16,6 +16,7 @@ import { sessionIdFromCommand } from "./panerestore";
 import type { AutonomyState } from "./autonomy";
 import type { NeedsYouView, OrchQuestion } from "./decisions";
 import type { WorkflowPreview } from "./roster";
+import type { GroupViewMeta, ViewMeta } from "./viewstale";
 import { showToast } from "./toast";
 import { showContextMenu } from "./contextmenu";
 import { buildPaneMenu, type PaneConnectState, type PaneMenuAction, type PendingConnect } from "./panemenu";
@@ -1665,6 +1666,66 @@ export interface EndGroupResult {
 /** Live-agent count, role breakdown, and uptime for the lifecycle panel. */
 export const groupSummary = (groupId: string): Promise<GroupSummary | null> =>
   invoke<GroupSummary | null>("orch_group_summary", { groupId });
+
+// ---------- the published view (#1608, plan #1600 §3 Phase 1) ----------
+//
+// ONE invoke replaces the group view's ten and the tab strip's two-per-tab.
+// The backend publishes an immutable snapshot on a 1 s cadence and serves
+// these two commands by pointer clone, so neither takes a registry lock and
+// neither can park (`doc/design/polled-views.md`). The ten single-payload
+// wrappers above STAY: `tasksview.ts` reads summary and workflow status when
+// it opens, and a once-per-open read is not what Phase 1 is about.
+
+/** The two sections the tab strip renders for one group. */
+export interface StripGroupView {
+  summary: GroupSummary | null;
+  usage: GroupUsage | null;
+}
+
+/** `orch_strip_view()` — every live group's strip pair in one read.
+ *
+ *  `meta.age_ms` is the OLDEST group's age, so it means "nothing in this
+ *  payload is older than this": the strip's job is to be right about the tab
+ *  that is in trouble, and a payload-wide average would report the whole strip
+ *  as fresh because one tab happened to move. */
+export interface StripViewPayload {
+  meta: ViewMeta;
+  groups: Record<string, StripGroupView>;
+}
+
+/** `orch_group_view(groupId)` — the whole group panel in one read.
+ *
+ *  The eight view-tier sections are present TOGETHER or not at all, and
+ *  `meta.view_ready` says which. Absent means the publisher has not picked up
+ *  this panel's view lease yet (a first open, or a reopen after the lease
+ *  lapsed); the caller keeps its previous render and re-asks on the short
+ *  bounded ladder in `viewstale.ts`. They are never defaulted — a fabricated
+ *  `paused: false` is a wrong answer rendered as a right one. */
+export interface GroupViewPayload {
+  meta: GroupViewMeta;
+  summary: GroupSummary | null;
+  usage: GroupUsage | null;
+  paused: boolean | null;
+  notify: boolean | null;
+  spawn_expanded: boolean | null;
+  autonomy: AutonomyState | null;
+  watches: GroupWatch[] | null;
+  workflow: WorkflowStatus | null;
+  merge_queue: MergeQueueStatus | null;
+  locks: LockState | null;
+}
+
+/** The whole group panel in one read. `null` for a refused group id, and for
+ *  a group created since the last publish pass — one case to the caller,
+ *  because the response to both is the same: keep the previous render and ask
+ *  again. That is the rule `tabbar.ts` already applied per-command. */
+export const groupView = (groupId: string): Promise<GroupViewPayload | null> =>
+  invoke<GroupViewPayload | null>("orch_group_view", { groupId });
+
+/** Every group-bound tab's strip pair in one read — the 2xN invokes the strip
+ *  used to make per tick collapse to 1, regardless of how many tabs are open. */
+export const stripView = (): Promise<StripViewPayload> =>
+  invoke<StripViewPayload>("orch_strip_view", {});
 
 /** End a whole orchestration: kill all its agents and (optionally) remove
  *  their worktrees. Destructive and human-initiated — the caller confirms
