@@ -2894,10 +2894,15 @@ fn only_argued_sites_may_permit_a_long_hold() {
                 continue;
             }
             sites_seen += 1;
-            match PERMITTED_LONG_HOLDS
-                .iter()
-                .position(|(f, item, _)| key.ends_with(f) && enclosing.contains(*item.split("::").last().unwrap_or(item)))
-            {
+            // A row names its item as a reader would write it
+            // (`OrchRegistry::hold_lock_for_test`); the scan sees the bare `fn`
+            // name. Compared on the last `::` segment, and by EQUALITY rather
+            // than `contains`, so a row cannot match a longer name that merely
+            // ends with it.
+            match PERMITTED_LONG_HOLDS.iter().position(|(f, item, _)| {
+                let want = item.rsplit("::").next().unwrap_or(item);
+                key.ends_with(f) && enclosing == want
+            }) {
                 Some(i) => row_hits[i] += 1,
                 None => offenders.push(format!("{key} (in `{enclosing}`)")),
             }
