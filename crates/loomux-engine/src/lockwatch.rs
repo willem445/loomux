@@ -1094,7 +1094,10 @@ mod bounded_tests {
             .expect("a held lock must answer Busy within the budget, not park");
 
         assert_eq!(busy.lock, "withinspec");
-        let holder = busy.holder.expect("the holder was sampled: it is parked, so nothing moved");
+        // `as_ref`: the `Display` assertion below reads the whole `Busy`, and
+        // `Option::expect` would move the holder out from under it.
+        let holder =
+            busy.holder.as_ref().expect("the holder was sampled: it is parked, so nothing moved");
         assert!(
             holder.site_file.ends_with("lockwatch.rs"),
             "the recorded site was {}:{}",
