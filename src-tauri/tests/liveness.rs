@@ -100,6 +100,7 @@
 //!    `crates/` ever links Tauri, that scan's root list is the thing to widen.
 
 use loomux_engine::lockwatch::tracked_lock_names;
+use serde_json::json;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
 use loomux_lib::orchestration::{GroupId, Guardrails, OrchRegistry, Role};

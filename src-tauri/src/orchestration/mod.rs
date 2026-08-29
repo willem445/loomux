@@ -52369,8 +52369,11 @@ pub async fn orch_strip_view(app: AppHandle, bound: Vec<String>) -> Value {
 /// v1.2.0-beta5. `group_summary` takes the `agents` mutex (and then, in a
 /// separate statement, `groups`), both shared with the background threads:
 /// the idle reaper, the watchdog, the gh poller, and `note_agent_activity` on
-/// the pty output path. `lock_safe` is `Mutex::lock` with poison recovery —
-/// no timeout, no try-lock — so the acquisition is UNBOUNDED. On the GTK main
+/// the pty output path. A bare `lock_safe` is an infallible acquire, so the
+/// acquisition was UNBOUNDED. (#1609 added a bounded form — `lock_within`, and
+/// `budget::read_budget` for a whole read path — but a caller only gets it by
+/// running under a budget frame, which this command, being sync on the
+/// webview thread, did not.) On the GTK main
 /// loop an unbounded acquisition is a frozen window that never repaints and
 /// never processes input, which is a force-quit rather than a slow panel.
 ///

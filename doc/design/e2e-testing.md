@@ -647,31 +647,34 @@ vacuously:
   finished. And a short, non-xfail spec in the same describe proves the
   injector is compiled in and armed **in the build under test**, which is the
   one part a Rust test cannot say. The `acquired_ms`/`released_ms` checks
-  still inside the expected failure are diagnostics: they put the reason in
-  the report, and are not counted as evidence.
+  inside the test use `expect.soft`, so both probes are evaluated and both
+  land in the report — which half died is the artefact this lane exists to
+  produce. Soft is not weak: the test still fails.
 
 The MCP probe also carries a negative control: a bogus token must be refused
 with JSON-RPC `-32000`. Without it, "something answered on 127.0.0.1" would
 read as "orrerix's authenticated MCP server answered".
 
-### The expected failure
+### The class assertion, and the marker it used to carry
 
-The class assertion is marked `test.fail()`. It is expected to fail on
-today's `main` — that is the point of it — and `fail` was chosen over `skip`
-deliberately: the assertion runs at full strength, the E2E job stays green
-while the fix is outstanding, and the moment Phases 1/2 land Playwright
-reports "expected to fail but passed", telling whoever landed the fix to
-flip the marker. A `skip` would have gone quiet instead, and quiet is how a
-lane stops being re-armed.
+The class assertion was marked `test.fail()` from #1606 until #1609 (plan
+Phase 2.1) landed. `fail` was chosen over `skip` deliberately: the assertion
+ran at full strength, the E2E job stayed green while the fix was outstanding,
+and the moment the fix landed Playwright would report "expected to fail but
+passed" — telling whoever landed it to flip the marker. A `skip` would have
+gone quiet instead, and quiet is how a lane stops being re-armed.
 
-The cost of the marker is that it absorbs its own test's controls — see
-**Positive controls** above for where each of them lives instead. The rule
-this lane follows is that nothing inside an expected failure is ever cited
-as evidence for anything.
+It is armed now. What made it pass is the MCP half: `resolve_token` runs under
+`MCP_AUTH_BUDGET`, so a ping during a held lock ANSWERS — with a retryable
+`-32001`, not a result. The registry is still deliberately unavailable; what
+changed is that the server can say so within a bound. The spec asserts the
+code and its `data` shape, not merely that something came back.
 
-**When plan #1600's Phases 1 and 2 land:** delete the `test.fail()` line in
-`e2e/tests/soak-liveness.spec.ts` and this paragraph with it. Nothing else
-about the spec changes.
+The controls stay OUTSIDE the test — see **Positive controls** above. That was
+forced by the marker, which absorbed every failure inside its own test, and it
+remains right without it: a control inside the test it controls can only fail
+the same way the test does, so it cannot tell "the property broke" from "the
+fixture broke".
 
 **Do not expect CI to tell you.** Playwright's unexpected-pass report lands
 inside the `e2e-windows` job, which is `continue-on-error: true` — so when

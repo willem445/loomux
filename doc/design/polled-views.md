@@ -12,9 +12,12 @@ Two frontend loops used to read the orchestration registry directly:
 - `tabbar.ts` `pollStatusOnce()` — every 4 s, `orch_group_summary` +
   `orch_group_usage` for **every group-bound tab**, awaited in turn.
 
-Every one of those acquires an `OrchRegistry` mutex, and `lock_safe` is
-`Mutex::lock` with poison recovery: no timeout, no try-lock, no bound. So one
-long hold anywhere in the registry parks every poller for as long as it lasts.
+Every one of those acquires an `OrchRegistry` mutex, and `lock_safe` was an
+infallible acquire — no timeout, no try-lock, no bound. So one long hold
+anywhere in the registry parked every poller for as long as it lasted. (#1609
+added a bounded form; see `doc/design/lock-liveness.md`. It does not make this
+section stale: a bounded poller would still be a poller waiting, and Phase 1
+removes the acquisition rather than bounding it.)
 
 They now make **one** call each, and neither takes a registry lock at all.
 
