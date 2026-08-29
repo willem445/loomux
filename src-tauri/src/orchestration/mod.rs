@@ -51579,8 +51579,11 @@ pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), S
 /// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
 /// the webview/GTK main-loop thread, and `is_paused` takes a registry mutex shared
 /// with the background threads (idle reaper, watchdog, gh poller, and the pty
-/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
-/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// path's `note_agent_activity`). A bare `lock_safe` is an infallible
+/// acquire — there was no timed form of it anywhere until #1609, and a
+/// command like this one gets the bounded form only by running under a
+/// budget frame, which a sync command on the webview thread does not — so
+/// the acquisition is
 /// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
 /// not a slow one. That is #1595's freeze, and it is the same class as #1593's
 /// `orch_session_roles`: cheap work, fatal thread.
@@ -51647,8 +51650,11 @@ pub async fn orch_dismiss_stranded(app: AppHandle, agent_id: String) -> bool {
 /// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
 /// the webview/GTK main-loop thread, and `notify_enabled` takes a registry mutex shared
 /// with the background threads (idle reaper, watchdog, gh poller, and the pty
-/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
-/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// path's `note_agent_activity`). A bare `lock_safe` is an infallible
+/// acquire — there was no timed form of it anywhere until #1609, and a
+/// command like this one gets the bounded form only by running under a
+/// budget frame, which a sync command on the webview thread does not — so
+/// the acquisition is
 /// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
 /// not a slow one. That is #1595's freeze, and it is the same class as #1593's
 /// `orch_session_roles`: cheap work, fatal thread.
@@ -51707,8 +51713,11 @@ pub async fn orch_set_notify(
 /// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
 /// the webview/GTK main-loop thread, and `spawn_expanded` takes a registry mutex shared
 /// with the background threads (idle reaper, watchdog, gh poller, and the pty
-/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
-/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// path's `note_agent_activity`). A bare `lock_safe` is an infallible
+/// acquire — there was no timed form of it anywhere until #1609, and a
+/// command like this one gets the bounded form only by running under a
+/// budget frame, which a sync command on the webview thread does not — so
+/// the acquisition is
 /// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
 /// not a slow one. That is #1595's freeze, and it is the same class as #1593's
 /// `orch_session_roles`: cheap work, fatal thread.

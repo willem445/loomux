@@ -78,8 +78,9 @@ enum Class {
     /// **"Briefly held" is a fact about the HOLDER, and what a sync command
     /// pays is the ACQUISITION** (#1595). If any other thread can hold the same
     /// lock, this class says nothing about how long the webview thread waits —
-    /// `lock_safe` is `Mutex::lock` with poison recovery: no timeout, no
-    /// try-lock, no bound. #1595's five rows were all correctly classified by
+    /// a bare `lock_safe` is an infallible acquire with no bound (#1609 added
+    /// a timed form; a sync command gets it only under a budget frame, which
+    /// one on the webview thread has none of). #1595's five rows were all correctly classified by
     /// the rule above (genuinely in-memory, no INV-2 marker to find) and all
     /// five froze the app, because they were on a fixed-cadence poll and the
     /// registry mutex they take is shared with the idle reaper, the watchdog,

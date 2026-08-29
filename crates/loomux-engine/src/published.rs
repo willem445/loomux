@@ -4,8 +4,9 @@
 //! # Why this exists
 //!
 //! The app's polled reads used to acquire the live registry's mutexes on every
-//! tick. `lock_safe` is `Mutex::lock` with poison recovery — no timeout, no
-//! try-lock — so a single long hold anywhere parks every poller, and post-#1595
+//! tick. `lock_safe` was an infallible acquire with no timed form anywhere in
+//! the tree (#1609 added one; a poller only gets it by running under a budget
+//! frame) — so a single long hold anywhere parked every poller, and post-#1595
 //! each of those pollers parks a *blocking-pool* thread rather than the webview
 //! thread. At 2.5-5 parked threads per second, tokio's default 512 is reached
 //! in minutes, and from then on `write_pty` cannot be scheduled and no pane
