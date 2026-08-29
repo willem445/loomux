@@ -103,7 +103,7 @@ use loomux_engine::lockwatch::tracked_lock_names;
 use serde_json::json;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
-use loomux_lib::orchestration::{GroupId, Guardrails, OrchRegistry, Role};
+use loomux_lib::orchestration::{Caller, GroupId, Guardrails, OrchRegistry, Role};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1349,32 +1349,66 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     //    atomically replacing `mailbox.json`. That is the shape the tear needs,
     //    and it is the one the review found live.
     let (reg, token, group, _dir) = mcp_fixture();
-    let caller = reg.resolve_token(&token).expect("the token resolves");
+    let base = reg.resolve_token(&token).expect("the token resolves");
 
-    // The Read set, taken from what the surface actually lists rather than a
-    // list written here — a tool renamed out of `tools/list` must not silently
-    // leave this loop covering one fewer arm.
-    let listed = mcp::dispatch(&reg, &caller, "tools/list", &json!({})).expect("tools/list");
-    let reads: Vec<String> = listed["tools"]
-        .as_array()
-        .expect("an array of tools")
-        .iter()
-        .filter_map(|t| t["name"].as_str().map(str::to_string))
-        .filter(|n| mcp::tool_kind(n) == mcp::ToolKind::Read)
-        .collect();
+    // The population is `READ_TOOLS` — every name the budget treats as a read —
+    // NOT one role's listing. That distinction is the whole of why the first
+    // scratch round for this row came back green: L2g swept `tools/list` for an
+    // ORCHESTRATOR, and `check_mail` (the tool this property exists for) is in
+    // the MANAGER tier, so the sweep never drove it. That is the same defect the
+    // review found in the classification test, and the same one it found in
+    // `tool_kind` itself — a population that excludes its own subject.
+    //
+    // `Caller` is constructible directly, so each tool is driven by a caller
+    // whose ROLE actually lists it, without spawning an agent per role.
+    let listed_by: Vec<(Role, Vec<String>)> = [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::Reviewer,
+        Role::Planner,
+        Role::Manager,
+        Role::Solo,
+    ]
+    .into_iter()
+    .map(|role| {
+        let names = mcp::listed_tool_names_for(role, None);
+        (role, names)
+    })
+    .collect();
+
+    let mut swept: Vec<&str> = Vec::new();
+    let mut unreachable: Vec<&str> = Vec::new();
+    for name in mcp::READ_TOOLS {
+        let Some((role, _)) = listed_by.iter().find(|(_, names)| names.iter().any(|n| n == name))
+        else {
+            unreachable.push(name);
+            continue;
+        };
+        let caller = Caller {
+            agent_id: base.agent_id.clone(),
+            group: base.group.clone(),
+            role: *role,
+            role_hint: None,
+        };
+        let call = json!({ "name": name, "arguments": {} });
+        // The answer does not matter — Ok, isError and busy are all fine. What
+        // matters is that no frame unwound after writing.
+        let _ = mcp::dispatch(&reg, &caller, "tools/call", &call);
+        swept.push(name);
+    }
+
     assert!(
-        reads.len() >= 8,
-        "only {} listed tools classify as Read — the table has stopped matching and this row \
-         is covering almost nothing: {reads:?}",
-        reads.len()
+        unreachable.is_empty(),
+        "these Read-classified tools are listed for no role, so this sweep cannot drive them: \
+         {unreachable:?}. A tool the budget governs but this row cannot reach is exactly the \
+         gap that let the first scratch round come back green."
+    );
+    assert!(
+        swept.len() >= 8,
+        "only {} Read tools were swept: {swept:?}",
+        swept.len()
     );
 
-    // PER-THREAD counts, not the process-global ones. `cargo test` runs this
-    // binary's tests concurrently, so a delta on a global counter is a race:
-    // a sibling test's seal would satisfy the population control below while
-    // this sweep sealed nothing, which is the exact vacuity it exists to stop.
-    // Every Read tool runs INLINE on this thread (only Mutate tools go to the
-    // helper thread), so the per-thread counters see the whole sweep.
     let (sealed_before, torn_before) = loomux_engine::budget::thread_seal_counts();
 
     // Held for the whole sweep: `app` is taken after `write_mailbox`'s durable
