@@ -371,17 +371,29 @@ reads as covering is worse than none:
 
 - **The 4 s tab-strip poll is exercised.** `src/tabbar.ts` arms it at
   construction — its own comment calls it "the app's one app-lifetime
-  poll" — and `pollStatus` issues `orch_group_summary` + `orch_group_usage`
-  for every **group-bound** tab. A tab is group-bound purely because its
-  persisted `groupIds` names a group, so the corpus's `tabs.json` alone puts
-  that poll under load: no clicking, and no agent CLI.
+  poll" — and `pollStatus` issues one `orch_strip_view` covering every
+  **group-bound** tab (it issued `orch_group_summary` + `orch_group_usage`
+  per tab until #1608 served the strip from a published snapshot). A tab is
+  group-bound purely because its persisted `groupIds` names a group, so the
+  corpus's `tabs.json` alone puts that poll under load: no clicking, and no
+  agent CLI.
 - **The 2 s group-view poll is not, and cannot be.** `src/groupview.ts`'s
   timer is armed only while the view is shown, and the view opens only from
   a pane whose `groupBtn` is visible — which `applyOrchIdentity` reveals only
   for a LIVE orchestrator-role pane. That needs a real agent CLI, which
-  CLAUDE.md constraint 3 forbids here. Both polls park threads on the same
-  registry mutexes, so the mechanism is exercised either way; the per-tick
-  fan-out is simply smaller than a real orchestrating session's. Closing that
+  CLAUDE.md constraint 3 forbids here.
+
+  **This is the sentence #1608 changed, and it mattered.** It used to read
+  "both polls park threads on the same registry mutexes, so the mechanism is
+  exercised either way" — which was the justification for the whole lane
+  exercising the beta6 mechanism from the strip alone. Since #1608 neither
+  poll parks on a registry mutex: both read a published snapshot. What the
+  soak still exercises is the IPC and command-dispatch path under load, the
+  boot listing against a large corpus, and — through the injector — the MCP
+  path, which is where the class assertion's remaining failure lives. What it
+  no longer exercises from the poll sites is registry contention, because
+  there is none to exercise; the lock-hold injector is what supplies that
+  now. The per-tick
   gap needs a safe stand-in agent process — the same standing limitation as
   the task-board overlay above — not a change to this lane.
 - **Blocking-pool exhaustion is not reachable from the poll path at all, and
@@ -405,10 +417,15 @@ reads as covering is worse than none:
   because it is exactly the kind of stale arithmetic a reader would otherwise
   reconstruct from the plan.
 
-  That bound is **observed, not reasoned**. The armed-injector control holds
-  `groups` — what the polled `orch_group_summary` takes — for 12 s and reads
-  the gate's own counters: `1 sweeps ran, 2 ticks skipped` (measured at
-  `f6f41833`, run 33235203093). One call parked, two ticks declined to pile
+  That bound was **observed, not reasoned** — and the observation is now
+  history rather than a current fact, which is why it is dated rather than
+  deleted. The armed-injector control holds `groups` — what the polled
+  `orch_group_summary` took — for 12 s and read the gate's own counters:
+  `1 sweeps ran, 2 ticks skipped` (measured at `f6f41833`, run 33235203093,
+  **before #1608**). Since #1608 the sweep takes no registry lock, so the same
+  control measures `3 sweeps ran, 0 ticks skipped` and the spec asserts
+  exactly that: settling under a hold is the contract, and a skip would mean
+  the poll path is contending again. One call parked, two ticks declined to pile
   on, and Phase 0's watchdog independently reports `waiters=2` on that same
   lock at the same moment. The 180 s soak in the same run measured `45 status
   sweeps ran, 0 ticks skipped`, which is a healthy app and therefore says
@@ -568,9 +585,13 @@ vacuously:
   preference. Before it every 4 s tick issued a sweep, so `ticks × tabs × 2`
   predicted the dispatch count and a floor could be derived from arithmetic;
   now a tick may legitimately skip, so the number of sweeps is something to
-  read. **Measured** at `f6f41833` (run 33235203093): 45 sweeps, 0 skipped,
-  360 `orch_*` dispatches across 4 group-bound tabs — exactly 45 × 4 × 2, so
-  every sweep issued its full fan-out. The floor is 40 % of the tick count
+  read. **Measured** at `f6f41833` (run 33235203093, before #1608): 45
+  sweeps, 0 skipped, 360 `orch_*` dispatches across 4 group-bound tabs —
+  exactly 45 × 4 × 2, so every sweep issued its full fan-out. Since #1608 a
+  sweep dispatches ONE `orch_strip_view` whatever the tab count, so the floor
+  is on `orch_strip_view` dispatches (≈ one per sweep) and the binding half of
+  what that fan-out witnessed moved to `tabStatusStats` — see
+  `doc/design/polled-views.md`. The floor is 40 % of the tick count
   (18 here, cleared 2.5×) and is deliberately a floor on the property — the
   poll body ran repeatedly under load — never a pin on the cadence, which
   would pin this incident's shape, the mistake this lane exists to stop

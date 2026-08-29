@@ -42,7 +42,9 @@
 //   every pane stops accepting input at once. Both ends are now cut,
 //   independently: #1604 single-flights this sweep, so a tick firing while
 //   the previous one is still outstanding SKIPS and at most one call is
-//   parked however long a lock is held; and #1612 moved `write_pty` off the
+//   parked however long a lock is held — though since #1608 that sweep reads a
+//   published snapshot and takes no registry lock, so a held lock no longer
+//   parks it and the gate has nothing to engage on; and #1612 moved `write_pty` off the
 //   shared pool onto a per-pane writer thread, so even an exhausted pool
 //   could not starve pane input. An earlier version of this header said
 //   raising the hold past ~120 s locally would reach the pane-input half —
@@ -125,8 +127,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  *  cwd — this checkout itself. Nothing writes to it. */
 const REPO_ROOT = path.resolve(__dirname, "../..");
 
-/** Tabs bound to a group. Each one costs two `orch_*` invokes every 4 s, so
- *  this is the poll load's multiplier. */
+/** Tabs bound to a group. Each one cost two `orch_*` invokes every 4 s until
+ *  #1608; the sweep is now one `orch_strip_view` whatever the tab count, so
+ *  this is no longer the poll load's multiplier — it is how many groups the
+ *  strip resolves, which is what `tabStatusStats` witnesses. */
 const BOUND_TABS = Math.min(4, CORPUS_GROUPS);
 
 /** How long to let the app settle after launch before measuring anything. */
@@ -276,7 +280,7 @@ test.describe("soak: a large corpus and a steady poll load", () => {
     //
     // WHAT THIS USED TO ASSERT. A sweep issued `orch_group_summary` +
     // `orch_group_usage` per group-bound tab, so a full sweep dispatched
-    // `BOUND_TABS × 2` and `polled` was exactly `sweeps × BOUND_TABS × 2`. The
+    // `BOUND_TABS × 2` and `polled` tracked `sweeps × BOUND_TABS × 2`. The
     // floor was raised to half that nominal fan-out in #1606 review round 2
     // (N1) to catch a corpus that binds only SOME of its tabs: with the older
     // `polled >= sweeps` floor, one that bound 1 of 4 dispatched 90 against 45
@@ -292,6 +296,13 @@ test.describe("soak: a large corpus and a steady poll load", () => {
     //
     // So the two properties that rode on one assertion are now asserted
     // separately, and the binding one is read where binding actually lives.
+    // Nearly a tautology, and honestly so: SingleFlight.run counts a run
+    // around a body that reaches stripView unconditionally, so this holds by
+    // construction against a 50% floor. It can still fail if the sweep body
+    // stops reaching the backend, which is what its message says and is worth
+    // keeping for. What it does NOT do any more is witness BINDING — the
+    // `tabStatusStats` assertions below are what carry that (#1625 review
+    // round 2, N2).
     const stripDispatches = (counts["orch_strip_view"] ?? 0) - stripBefore;
     const dispatchFloor = Math.floor(sweeps * 0.5);
     expect(
@@ -366,13 +377,22 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
   //
   // It also carries the OTHER claim this lane makes about the merged tree, and
   // carries it here rather than in the class assertion because an expected
-  // failure absorbs its own assertions: that #1604's single-flight really does
-  // engage when a registry lock is held, so the poll path parks one call and
-  // not a queue of them. The 180 s soak measured 46 sweeps and ZERO skips —
-  // healthy, and therefore no evidence at all about the skip path. A held lock
-  // is the condition the gate was built for, so it is the condition to observe
-  // it under.
-  test("the injector is armed, and a held registry lock makes the poll sweep single-flight", async ({
+  // failure absorbs its own assertions: that a held registry lock does not
+  // stall the poll sweep, which is the INVERSE of what this test asserted
+  // before #1608 and is the point of that change.
+  //
+  // It used to assert `skipped >= 1`: `orch_group_summary` took `groups`, so a
+  // hold parked the sweep, the next tick found it outstanding, and #1604's gate
+  // skipped. #1608 serves the sweep from a published snapshot — no registry
+  // lock, so it settles under a hold and a skip would now mean the poll path is
+  // contending again.
+  //
+  // Stated plainly because it is a loss as well as a gain: `skipped >= 1` has
+  // NO witness left anywhere in this lane, and cannot have one, because the
+  // condition that produced a skip is the condition #1608 removed. The gate
+  // itself is still tested — `test/singleflight.test.ts` covers it directly —
+  // just not through a held registry lock.
+  test("the injector is armed, and a held registry lock does not stall the poll sweep", async ({
     appPage: page,
     appDataDir,
   }) => {

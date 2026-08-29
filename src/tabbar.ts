@@ -13,46 +13,13 @@ import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, stripView } from "./orchestration";
-import { staleState, type StaleState } from "./viewstale";
+import {
+  recordSweepFailure,
+  recordSweepSuccess,
+  staleState,
+  type StaleState,
+} from "./viewstale";
 
-/** Which group ids the tab strip resolved on its last status sweep: `bound`
- *  is every tab whose persisted `groupIds` names a group, `seen` the subset
- *  the published snapshot actually carried.
- *
- *  This exists for the E2E soak lane (#1603/#1606), and it exists because
- *  #1608 removed the instrument that lane was using. That spec witnessed
- *  "the corpus's tabs.json really bound its tabs" from the poll's IPC
- *  FAN-OUT — two invokes per group-bound tab, so the dispatch count scaled
- *  with the tab count. Collapsing the sweep to one `orch_strip_view` is the
- *  point of #1608 and it deletes that scaling, so the binding fact is no
- *  longer observable in the IPC at all. It is observable HERE, and more
- *  directly than the fan-out ever witnessed it.
- *
- *  Module-global and last-sweep-only, the same shape as
- *  `__singleFlightStats` / `__pollGateStats` / `__wakeGateStats`. Reading it
- *  costs nothing and it is never read by product code. */
-export interface TabStatusStats {
-  bound: string[];
-  seen: string[];
-  /** What the strip last disclosed about its own freshness — the same
-   *  `staleState` the chips render. Read by the soak lane to assert that a
-   *  stalled backend produces a stale BADGE rather than a silently frozen
-   *  strip (#1604 review N3, carried by #1608). */
-  stale: boolean;
-  ageMs: number;
-}
-
-let lastBound: string[] = [];
-let lastSeen: string[] = [];
-let lastStale = false;
-let lastAgeMs = 0;
-
-export function tabStatusStats(): TabStatusStats {
-  return { bound: [...lastBound], seen: [...lastSeen], stale: lastStale, ageMs: lastAgeMs };
-}
-
-(globalThis as unknown as { __tabStatusStats?: () => TabStatusStats }).__tabStatusStats =
-  tabStatusStats;
 
 import { tabCounts } from "./tabcounts";
 import { PollGate } from "./pollgate";
@@ -645,6 +612,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         };
         this.render();
       }
+      // The witness has to see this too (#1625 review round 2, B6). `seen` is
+      // empty because this sweep resolved nothing; `bound` is what the strip
+      // still believes is bound, which is a fact about tabs rather than about
+      // the failed read.
+      recordSweepFailure(boundNow);
       return;
     }
     // The strip's freshness is the OLDEST group's, so this says "nothing on
@@ -687,10 +659,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         changed = true;
       }
     }
-    lastBound = boundIds;
-    lastSeen = seenIds;
-    lastStale = stale.stale;
-    lastAgeMs = strip.meta.age_ms;
+    recordSweepSuccess(boundIds, seenIds, stale.stale, strip.meta.age_ms);
     if (changed) this.render();
   }
 

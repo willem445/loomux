@@ -34586,7 +34586,8 @@ fn killed_agent_stays_in_lifetime_total_but_not_live() {
 //
 // `orch_group_usage` answered the whole LIFETIME roster — one row per agent
 // the group ever had, rebuilt and re-serialized every 2 s by the group view
-// and every 4 s per group-bound tab. `groupview.ts` indexes that array by id
+// and every 4 s per group-bound tab when #1317 measured it (one publisher pass
+// per second since #1608). `groupview.ts` indexes that array by id
 // and looks up only the agents `orch_group_summary` reports LIVE, so every
 // historical row was payload with no reader, growing with session length on a
 // fixed cadence. `live_usage_view` is the cut; these two tests pin that it
@@ -49110,7 +49111,8 @@ fn the_polled_orchestration_commands_are_async_and_delegate_off_thread() {
     }
 }
 
-/// #743 S4a: `orch_workflow_status` is in the group view's 2 s batch, and
+/// #743 S4a: `orch_workflow_status` was in the group view's 2 s batch (since
+/// #1608 the publisher makes the call, once a second per leased group), and
 /// resolving the repo's default-branch NAME costs 2-4 blocking `git` spawns.
 /// Inside the memo's window the polled read must serve the stored answer — and
 /// the window must be a bound, not a freeze.
@@ -49189,9 +49191,10 @@ fn write_usage_transcript(dir: &Path, sid: &str, input: u64, output: u64) {
     fs::write(dir.join(format!("{sid}.jsonl")), text).unwrap();
 }
 
-/// #743 S4b: `orch_group_usage` is the heaviest polled command in the app, and
-/// three callers ask for it inside the same ~2 s tick (group view, tab bar, and
-/// `orch_autonomy`'s budget meter). Inside one window they must share ONE
+/// #743 S4b: `group_usage_live_within` is the heaviest thing on a cadence in
+/// this app. Three callers asked for it inside the same ~2 s tick (group view,
+/// tab bar, and `orch_autonomy`'s budget meter) until #1608 made the publisher
+/// the only frontend-facing caller. Inside one window they must share ONE
 /// computation; past it, the next caller recomputes.
 #[test]
 fn group_usage_serves_one_snapshot_per_window_and_recomputes_past_it() {

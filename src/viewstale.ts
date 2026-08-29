@@ -151,3 +151,60 @@ export function needsViewTierRetry(meta: GroupViewMeta | null | undefined): bool
  *  one, and long enough that the re-ask lands after the pass the lease stamp
  *  triggered. */
 export const VIEW_TIER_RETRY_MS = 250;
+
+// ---------- the tab strip's binding/disclosure witness ----------
+//
+// State, not DOM, so it lives here rather than in tabbar.ts and both of its
+// paths are directly testable. That placement is the point: while it lived
+// beside the sweep it was reachable only through a real strip talking to a
+// real backend, so its failure-path blind spot (#1625 review round 2, B6)
+// could be argued about but not reddened.
+//
+// Read by the E2E soak lane through `__tabStatusStats()`, which is the
+// binding witness that replaced the IPC fan-out #1608 removed.
+
+export interface TabStatusStats {
+  /** Every tab whose persisted `groupIds` names a group. A fact about tabs,
+   *  so it survives a failed read. */
+  bound: string[];
+  /** The subset the published snapshot actually carried. Empty after a
+   *  failed read, because that sweep resolved nothing. */
+  seen: string[];
+  /** What the strip last disclosed about its own freshness — the same value
+   *  the chips render, on BOTH paths. */
+  stale: boolean;
+  /** Age of the snapshot the strip last rendered. `Infinity` after a failed
+   *  read: the last good snapshot's age is unknown and unbounded, and
+   *  reporting the previous number would be the same lie in another field. */
+  ageMs: number;
+}
+
+let sweep: TabStatusStats = { bound: [], seen: [], stale: false, ageMs: 0 };
+
+/** A sweep that got a payload. */
+export function recordSweepSuccess(
+  bound: string[],
+  seen: string[],
+  stale: boolean,
+  ageMs: number
+): void {
+  sweep = { bound: [...bound], seen: [...seen], stale, ageMs };
+}
+
+/** A sweep whose read threw.
+ *
+ *  Recording this is the whole of B6. The strip renders its stale badge on
+ *  this path, so a witness that skipped it reported `stale: false` for a
+ *  strip that was visibly stale — and the soak lane's "did it recover?"
+ *  assertion reads exactly that field, so it passed in the state it exists to
+ *  catch. */
+export function recordSweepFailure(bound: string[]): void {
+  sweep = { bound: [...bound], seen: [], stale: true, ageMs: Number.POSITIVE_INFINITY };
+}
+
+export function tabStatusStats(): TabStatusStats {
+  return { bound: [...sweep.bound], seen: [...sweep.seen], stale: sweep.stale, ageMs: sweep.ageMs };
+}
+
+(globalThis as unknown as { __tabStatusStats?: () => TabStatusStats }).__tabStatusStats =
+  tabStatusStats;

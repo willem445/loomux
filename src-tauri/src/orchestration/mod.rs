@@ -8840,8 +8840,10 @@ const STATUSLINE_SCAN_BYTES: usize = 64 * 1024;
 /// the read a real pane gets (the `preenter_admission` seam; `self.app` cannot
 /// be resolved headless).
 ///
-/// This sits on the app's hottest poll — `orch_group_usage`, every 2 s from an
-/// open group view and every 4 s from each group-bound tab, per agent — which
+/// This sits on the app's hottest cadenced work — `group_usage_live_within`,
+/// per agent. It was reached every 2 s from an open group view and every 4 s
+/// from each group-bound tab; since #1608 the snapshot publisher is the caller,
+/// once per second, and both surfaces read its output instead — which
 /// is why it reads the last `STATUSLINE_SCAN_BYTES` rather than cloning and
 /// ANSI-stripping the whole ≤256 KiB ring for one number that is by
 /// construction the last thing painted.
@@ -38127,7 +38129,8 @@ impl OrchRegistry {
         // ONE load for the two things this call reads out of the workflow file
         // — the display `name` and the `board:` policy below (#1175). They used
         // to be two `load_workflow` calls, which is two YAML parses of the same
-        // file on a command that sits in the group view's 2 s poll.
+        // file on a call the publisher makes once a second for every group
+        // holding a view lease (the group view's 2 s poll until #1608).
         let declared = if guardrails.advanced_orchestrator {
             info.as_ref().and_then(|g| workflow::load_workflow(&g.repo).ok().flatten())
         } else {
@@ -38210,8 +38213,8 @@ impl OrchRegistry {
     ///
     /// Takes the policy rather than reading it so [`Self::workflow_status`],
     /// which already loaded this repo's workflow for the file's `name`, does
-    /// not parse the same YAML a second time on a call that sits in the group
-    /// view's 2 s poll.
+    /// not parse the same YAML a second time on a call the publisher makes once
+    /// a second per leased group (the group view's 2 s poll until #1608).
     ///
     /// Counted here, in the backend, rather than shipped as bare limits for the
     /// frontend to tally: [`wip_occupants`] is the one definition of what a cap
@@ -38228,7 +38231,7 @@ impl OrchRegistry {
     /// open plus a YAML parse — for any group with `advanced_orchestrator` on,
     /// whether or not it declares `board:`. [`Self::workflow_status`] hands its
     /// already-loaded workflow straight in and so adds nothing, which is what
-    /// that call sitting on the group view's 2 s poll requires; the `list_tasks`
+    /// that call sitting on a one-second publisher cadence requires; the `list_tasks`
     /// path ([`Self::wip_status_for_agents`]) has no such workflow in hand and
     /// pays one parse per call. A per-call cost on an agent-initiated read is
     /// not the polled cost #743 was about, which is why it is stated here
@@ -52292,7 +52295,9 @@ pub async fn orch_group_summary(app: AppHandle, group_id: String) -> Value {
 /// `notify_when`/`list_notifications` MCP tools use.
 /// **Off the UI thread** (#1595), for the reason spelled out on
 /// [`orch_group_summary`] above: it reads the same registry state under the
-/// same unbounded `lock_safe` acquisition, on the same 2 s poll batch.
+/// same unbounded `lock_safe` acquisition, on the same 2 s poll batch. Since
+/// #1608 neither is polled: both are sections of `orch_group_view`, computed by
+/// the publisher through these same functions.
 #[tauri::command]
 pub async fn orch_group_watches(app: AppHandle, group_id: String) -> Value {
     // #904 / rev-440 B4: an ARRAY, because that is what success returns here and

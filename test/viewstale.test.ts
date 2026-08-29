@@ -6,6 +6,9 @@ import {
   formatAge,
   needsViewTierRetry,
   staleState,
+  recordSweepFailure,
+  recordSweepSuccess,
+  tabStatusStats,
   VIEW_TIER_RETRY_MS,
   type GroupViewMeta,
   type ViewMeta,
@@ -153,4 +156,41 @@ test("the retry delay is shorter than the backend's publish interval", () => {
     VIEW_TIER_RETRY_MS > 0 && VIEW_TIER_RETRY_MS < 1000,
     `VIEW_TIER_RETRY_MS must sit inside one publish interval, got ${VIEW_TIER_RETRY_MS}`
   );
+});
+
+// ---------- the tab strip's binding/disclosure witness (#1608; B6) ----------
+
+test("a successful sweep records what it resolved", () => {
+  recordSweepSuccess(["g1", "g2"], ["g1"], false, 120);
+  const s = tabStatusStats();
+  assert.deepEqual(s.bound, ["g1", "g2"]);
+  assert.deepEqual(s.seen, ["g1"], "seen is the subset the snapshot carried, not every bound tab");
+  assert.equal(s.stale, false);
+  assert.equal(s.ageMs, 120);
+});
+
+test("a FAILED sweep is recorded too, and reports itself stale", () => {
+  // B6. The strip renders its stale badge on this path, so a witness that
+  // skipped it reported `stale: false` for a visibly stale strip — and the soak
+  // lane's "did it recover?" assertion reads that field, so it passed in the
+  // very state it exists to catch.
+  recordSweepSuccess(["g1", "g2"], ["g1", "g2"], false, 90);
+  recordSweepFailure(["g1", "g2"]);
+  const s = tabStatusStats();
+  assert.equal(s.stale, true, "a strip whose read threw is stale, not fresh");
+  assert.deepEqual(s.seen, [], "that sweep resolved nothing, so it saw nothing");
+  assert.deepEqual(s.bound, ["g1", "g2"], "binding is a fact about tabs; a failed read does not unbind them");
+  assert.equal(
+    s.ageMs,
+    Number.POSITIVE_INFINITY,
+    "the last good snapshot's age is unknown and unbounded — carrying the previous number " +
+      "forward would be the same lie in another field"
+  );
+});
+
+test("the witness never hands out its own array, so a caller cannot mutate it", () => {
+  recordSweepSuccess(["g1"], ["g1"], false, 10);
+  const first = tabStatusStats();
+  first.bound.push("injected");
+  assert.deepEqual(tabStatusStats().bound, ["g1"], "the recorded state is not aliased to a caller");
 });

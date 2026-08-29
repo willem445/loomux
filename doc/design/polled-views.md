@@ -281,6 +281,31 @@ widening of this slice.
 `Busy`, and `partial` above); what Phase 1 changes is that exactly one thread
 pays that wait instead of every poller, and that the surface says so.
 
+## What this changed in the E2E soak lane (#1603/#1606)
+
+Two of that lane's assertions were about the poll path this phase rewrote, so both had
+to move with it. Recorded here as well as in the spec, because a reader arriving from
+either side should find the same story.
+
+**A held registry lock no longer makes the strip's sweep skip.** #1606 asserted
+`skipped >= 1`: `orch_group_summary` took `groups`, so a hold parked the sweep and
+#1604's single-flight gate declined the next tick. The sweep now reads a published
+snapshot and takes no registry lock, so it settles under a hold — the assertion is
+inverted to `skipped === 0`, plus the disclosure half this phase owes: under the hold the
+strip keeps answering **and** reports `stale`, clearing on the next successful publish.
+
+Stated as a loss too: `skipped >= 1` has no witness left in that lane and cannot have
+one, because the condition that produced a skip is the condition this phase removed. The
+gate itself is still covered directly by `test/singleflight.test.ts`.
+
+**The binding witness had to be replaced.** #1606 read "the corpus really bound its
+tabs" out of the poll's IPC fan-out — two invokes per group-bound tab, so the dispatch
+count scaled with the tab count. Collapsing the sweep to one `orch_strip_view` deletes
+that scaling, so the witness was gone structurally rather than stale.
+`__tabStatusStats()` (`src/tabbar.ts`) replaces it, naming the group ids the strip
+resolved and which of those the snapshot carried — and it reports on the strip's FAILURE
+path too, so a strip whose reads are throwing cannot masquerade as recovered.
+
 ## Enforcement
 
 `src-tauri/tests/perf_dispatch.rs`'s poll-path guard (E1, test **L6** in the
