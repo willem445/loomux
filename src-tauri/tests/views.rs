@@ -336,6 +336,64 @@ fn a_nudge_recomputes_one_group_and_leaves_every_other_stamp_alone() {
     assert!(after.seq > before.seq, "a nudge publishes");
 }
 
+#[test]
+fn a_nudge_is_not_lost_to_a_pass_that_was_already_computing() {
+    // The lost update the two publishers had before `publish_lock` and the
+    // later-stamp-wins merge. A full pass stamps every group with the instant
+    // it STARTED, so a nudge that lands while that pass is still computing
+    // carries a strictly later stamp — and storing the pass wholesale would
+    // revert exactly the toggle the group view is about to re-read, which is
+    // the one thing the nudge exists to prevent.
+    //
+    // Injected rather than raced: the two publishes run in the order a real
+    // interleaving produces (the nudge's write lands first, the pass's older
+    // snapshot arrives after it), with the stamps that interleaving gives
+    // them. A sleep-and-hope race would be flaky in exactly the direction
+    // that reads as a pass.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+
+    let views = ViewPublisher::new();
+    let pass_started = Instant::now();
+    views.note_view_lease_at(&g.id, pass_started);
+    views.publish_pass_at(&reg, pass_started);
+
+    // The human toggles; the mutating command nudges. Its stamp is LATER than
+    // the pass that is (in the real interleaving) still computing.
+    reg.set_notify(&g.id, true).expect("set_notify");
+    let nudged_at = pass_started + Duration::from_millis(40);
+    views.publish_group_at(&reg, &g.id, nudged_at);
+    assert_eq!(
+        section(&group_view_payload(&views.load(), &g.id, nudged_at), "notify"),
+        &Value::Bool(true),
+        "setup: the nudge must be visible before the late pass arrives, or this test is\
+         about nothing"
+    );
+
+    // Now the pass that began BEFORE the write finally publishes. Its copy of
+    // this group predates the toggle and carries the earlier stamp.
+    views.publish_pass_at(&reg, pass_started);
+    assert_eq!(
+        section(&group_view_payload(&views.load(), &g.id, nudged_at), "notify"),
+        &Value::Bool(true),
+        "a pass that was already computing when the nudge landed must NOT revert it: its\
+         copy of this group was read before the write, and the group view re-reads\
+         immediately after the toggle rather than on the next tick"
+    );
+
+    // ...and the pass is not simply ignored: a LATER pass replaces the nudge
+    // with genuinely fresher data, so the merge is monotone rather than a
+    // latch that would pin this group at its nudged stamp forever.
+    let later_pass = nudged_at + Duration::from_secs(1);
+    views.publish_pass_at(&reg, later_pass);
+    assert_eq!(
+        views.load().value.groups.get(&g.id).expect("republished").computed_at,
+        later_pass,
+        "a pass that started AFTER the write must win — keeping the later stamp is a merge \
+         rule, not a latch"
+    );
+}
+
 // ---------- staleness (INV-6, #1604 review N3) ----------
 
 #[test]

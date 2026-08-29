@@ -130,6 +130,29 @@ invoke, not from memory. Nudging does not grant a view lease, so a mutation
 arriving from the MCP side on a group nobody is looking at stays a strip-tier
 recompute.
 
+### Two publishers, one rule: the later stamp wins
+
+There are two writers — the thread's full pass, and a mutating command's
+single-group nudge — and each is a read-modify-write of the same cell. Without
+mutual exclusion that is a lost update, and the losing case is the one that
+matters: a pass stamps every group with the instant it STARTED, so a nudge that
+lands while that pass is still computing carries a strictly later stamp, and a
+pass stored wholesale would revert exactly the toggle the group view is about
+to re-read.
+
+So `publish_lock` serializes the swap (never the compute, which stays outside
+it), and a pass MERGES per group rather than replacing the map: an existing
+entry with a later `computed_at` is kept. That is monotone rather than a latch
+— the next pass starts after the write and replaces the nudged entry with
+genuinely fresher data. `a_nudge_is_not_lost_to_a_pass_that_was_already_computing`
+pins both halves, including that a later pass does win.
+
+**No reader takes `publish_lock`.** `load()` goes to the `Published` cell
+directly, so nothing about the liveness property depends on it, and its own
+critical section is a map clone plus a pointer swap — the map holds an `Arc`
+per group, so a single-group republish clones pointers rather than ten
+`serde_json::Value` trees per untouched group.
+
 ## The wire contract
 
 ```
