@@ -1069,10 +1069,19 @@ fn l2a_mcp_answers_within_its_budgets_while_a_registry_lock_is_held() {
 }
 
 #[test]
-fn l2b_a_slow_mutating_tool_answers_and_still_completes_exactly_once() {
-    // The exactly-once property, which is why a mutating tool is NOT unwound.
-    // A deadline that abandoned the work would double-execute on the retry the
+fn l2b_a_slow_mutating_tool_answers_early_and_is_never_double_executed() {
+    // The AT-MOST-once property, which is why a mutating tool is NOT unwound: a
+    // deadline that abandoned the work would double-execute on the retry the
     // message tells the caller not to make.
+    //
+    // The name says "never double-executed" rather than "completes exactly
+    // once" because the second is the claim #1702 P3 retracted (see
+    // `doc/design/lock-liveness.md`): a helper thread that PANICS never
+    // completes at all, so the guarantee the shipped code makes is at most
+    // once, not exactly once. This row drives the non-panicking case — a tool
+    // slow only because a lock is held — where the work does land, and what it
+    // pins is that it lands ONCE. A test name is a surface a retracted claim
+    // can survive on, and this one used to carry it.
     const HOLD_MS: u64 = 3_000;
     let _deadline = MutateDeadline::set(Duration::from_millis(300));
     let (reg, token, group, _dir) = mcp_fixture();
@@ -1081,7 +1090,7 @@ fn l2b_a_slow_mutating_tool_answers_and_still_completes_exactly_once() {
 
     let call = json!({
         "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-        "params": { "name": "upsert_task", "arguments": { "title": "l2b-exactly-once" } },
+        "params": { "name": "upsert_task", "arguments": { "title": "l2b-lands-once" } },
     });
     let started = std::time::Instant::now();
     let out = mcp::handle_for_test(&reg, &call, Some(&token)).expect("a request with an id");
@@ -1105,7 +1114,7 @@ fn l2b_a_slow_mutating_tool_answers_and_still_completes_exactly_once() {
     // Now let the hold expire and prove the tool completed EXACTLY once.
     let deadline = std::time::Instant::now() + Duration::from_millis(HOLD_MS) + GRACE;
     loop {
-        let n = reg.tasks(&group).iter().filter(|t| t.title == "l2b-exactly-once").count();
+        let n = reg.tasks(&group).iter().filter(|t| t.title == "l2b-lands-once").count();
         if n == 1 {
             break;
         }
