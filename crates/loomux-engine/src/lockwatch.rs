@@ -361,6 +361,34 @@ impl<T> TrackedMutex<T> {
         TrackedGuard { guard, state: st, acquired_ms }
     }
 
+    /// Take the lock if it is free RIGHT NOW, never blocking.
+    ///
+    /// Poison-tolerant like [`lock_safe`](Self::lock_safe) — a mutex some other
+    /// thread panicked under is recovered rather than reported as unavailable,
+    /// because "the data may be slightly stale" is not the same fact as "the
+    /// lock is busy" and a caller choosing between the two deserves the right
+    /// one. `None` means genuinely held by someone else.
+    ///
+    /// A successful acquisition is recorded exactly as a blocking one is, so a
+    /// hold taken this way is as visible to the watchdog as any other. A
+    /// FAILED one touches the waiter count not at all: nothing waited.
+    #[track_caller]
+    pub fn try_lock_safe(&self) -> Option<TrackedGuard<'_, T>> {
+        let site = Location::caller();
+        let guard = match self.inner.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let st = &self.state;
+        let acquired_ms = mono_ms();
+        st.holder_thread.store(this_thread(), Ordering::Relaxed);
+        st.holder_site.store(site as *const _ as *mut _, Ordering::Relaxed);
+        st.acquired_ms.store(acquired_ms, Ordering::Relaxed);
+        st.generation.fetch_add(1, Ordering::Release);
+        Some(TrackedGuard { guard, state: st, acquired_ms })
+    }
+
     /// This lock's name, as given to [`TrackedMutex::new`].
     pub fn name(&self) -> &'static str {
         self.state.name

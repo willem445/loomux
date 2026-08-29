@@ -38,6 +38,56 @@ The budget follows: **nothing on that thread beyond in-memory work.** A
 saturated GUI thread is felt as app-wide sluggishness while total CPU sits at
 15-30% — one thread pinned on a many-core box, not a busy machine.
 
+### 1.1 The other scarce resources
+
+For a long time the paragraph above was the whole model, and every invariant in
+§3 is written about that one thread. `doc/plans/responsiveness-root-cause.md`
+§2.1 is the account of what that cost: the remedy the invariants prescribe is
+always *"move it off the webview thread"*, the **destination** was ungoverned,
+and three releases in a row moved a stall from one scarce resource to another
+while each move looked like a fix.
+
+There are four, and the model names all four:
+
+1. **The webview/GUI thread** — §1 above. Saturating it is felt as
+   sluggishness: the window is slow but everything still works eventually.
+2. **The shared `spawn_blocking` pool.** Every `run_blocking`/`spawn_counted`
+   hand-off in the app lands in ONE pool — `write_pty`, the app's most
+   latency-critical path, alongside every converted `orch_*` poll. Nothing in
+   the tree sets `max_blocking_threads`, so it is tokio's default of **512**.
+   Saturating it does not feel like slowness: `src/ptywrite.ts` keeps one
+   `write_pty` in flight per pane and chains the next on the previous promise
+   (#65's ordering guarantee), so a `write_pty` that is never scheduled stops
+   that pane accepting input **permanently**, while the window keeps painting.
+   Every hand-off is counted through `blocking.rs` `spawn_counted` (#1601
+   Phase 0.3) and the depth is breadcrumbed at 64/128/256.
+3. **The MCP request threads.** `orchestration/mcp.rs` is `tiny_http` with
+   `std::thread::spawn` per request; every tool call resolves its token and
+   then takes registry locks on that thread. This is the orchestrator's only
+   channel, and no invariant here governs it — a hold that parks these threads
+   takes the whole fleet down before a human notices anything at all, which is
+   why the MCP is the FIRST thing to die in the incident chain and the last
+   thing anyone thinks to look at.
+4. **Lock acquisition time, as distinct from hold time.** INV-5 bounds what a
+   HOLDER does. Nothing here bounds what a WAITER pays: `lock_safe` is
+   `Mutex::lock` with poison recovery — no timeout, no try-lock — so a
+   caller's cost is set by a lock's worst holder, not by its own body. This is
+   the resource #1595 classified five commands against without knowing it
+   existed (see `Class::Cheap`'s note in E1). Since #1601 Phase 0.1 every
+   registry lock is a `loomux_engine::lockwatch::TrackedMutex`, so a hold past
+   five seconds is breadcrumbed with its call site, duration and waiter count
+   — and `selfwatch`'s liveness heartbeat separates a stuck GUI thread from a
+   starved backend, which is the distinction that cost a release cycle to make
+   by hand.
+
+**Naming them is not governing them.** #1601 makes 2 and 4 *observable*; it
+bounds nothing and refuses nothing. The invariants that bound them — a
+single-flight poll path, a bounded acquisition with a typed `Busy`, an
+isolated pool for pty writes — are Phases 1 and 2 of that plan, and they are
+deliberately not written here yet: an invariant over a model that omitted the
+scarce resource is exactly what produced a *correct* classification of five
+commands as `cheap` that then froze the app.
+
 ## 2. The proven patterns
 
 Each is shipped, tested, and citable — prefer copying one to inventing a shape.
