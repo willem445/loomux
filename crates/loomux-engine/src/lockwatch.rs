@@ -1,6 +1,8 @@
 //! Instrumented mutexes (#1601, plan §3 Phase 0.1/0.2) — what was holding a
 //! lock when the app stopped answering — and, since #1609 (Phase 2.1), a
-//! bound on how long a waiter pays for it.
+//! bound on how long a waiter pays for it; and since #1610 (Phase 3a), a
+//! runtime check that the order they are taken in is the order that was
+//! declared.
 //!
 //! # Why this exists
 //!
@@ -57,11 +59,19 @@
 //! # What acquiring and releasing cost
 //!
 //! Both paths are a fixed number of atomic operations on this lock's own cache
-//! line plus one monotonic clock read. There is **no allocation, no formatting,
-//! no global lock and no syscall on either** — the global registry is touched
-//! at CONSTRUCTION only, and every byte of every report is produced on the
-//! watchdog thread, with no tracked lock held. See [`TrackedMutex::lock_safe`]
-//! and [`TrackedGuard::drop`].
+//! line, one monotonic clock read, and — since #1610 — one push or pop on a
+//! thread-local fixed array. There is **no allocation, no formatting, no global
+//! lock and no syscall on either** — the global registry is touched at
+//! CONSTRUCTION only, the held-lock stack is per-thread and never shared, and
+//! every byte of every report is produced on the watchdog thread, with no
+//! tracked lock held. See [`TrackedMutex::lock_safe`] and
+//! [`TrackedGuard::drop`].
+//!
+//! The two paths that DO write a file from the acquiring thread are both
+//! bounded and both named: a lock-order violation ([`report_order_violation`],
+//! once per defect, and a build that hits it often has a deadlock to fix
+//! first) and an unranked lock's first nesting ([`note_unranked_nesting`],
+//! once per lock and at most [`UNRANKED_REPORT_CAP`] times per process).
 //!
 //! It was not always so, and the reasoning that got it wrong is worth keeping.
 //! The release path used to write its own report, excused by "a hold that has
@@ -213,13 +223,25 @@ struct LockState {
     /// every test that asserts it depend on the log-dir override and on
     /// nothing else in the process writing at the same time.
     busy_breadcrumbs: AtomicU64,
+
+    /// This lock's position in the declared acquisition order (#1610), or
+    /// [`UNRANKED`] for one built with [`TrackedMutex::new`]. Written once at
+    /// construction and never again, so every read of it is `Relaxed` and no
+    /// ordering question arises.
+    rank: u32,
+    /// Whether this lock's first nesting under another has already been
+    /// reported. Only meaningful while `rank == UNRANKED`; see
+    /// [`note_unranked_nesting`].
+    unranked_reported: AtomicBool,
 }
 
 impl LockState {
-    fn new(name: &'static str) -> Self {
+    fn new(name: &'static str, rank: u32) -> Self {
         Self {
             id: NEXT_LOCK_ID.fetch_add(1, Ordering::Relaxed),
             name,
+            rank,
+            unranked_reported: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             holder_thread: AtomicU64::new(0),
             holder_site: AtomicPtr::new(std::ptr::null_mut()),
@@ -450,7 +472,33 @@ pub struct HolderInfo {
     pub thread: u64,
 }
 
-/// A tracked-lock acquisition that ran out of budget.
+/// Why an acquisition was refused (#1610).
+///
+/// The plan's 3a sketch spells the re-entrant answer `Busy::Reentrant`, which
+/// reads as an enum VARIANT. It is a `kind` on the struct instead, and the
+/// reason is that the two answers carry the same evidence: both name the lock,
+/// the holder's site and how long that hold has run — for a re-entrant
+/// acquisition the "holder" is this thread's own earlier frame, which is
+/// precisely the field a reader needs. Splitting the struct in two would have
+/// duplicated all four fields to distinguish them, and rewritten every consumer
+/// (`mcp.rs`'s `rpc_busy` / `busy_tool_text`, `views.rs`'s fallbacks,
+/// `budget.rs`'s unwind payload) to match on a shape whose halves are the same.
+/// The deviation is recorded in `doc/design/lock-liveness.md` §6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusyKind {
+    /// The budget ran out while someone ELSE held the lock. Phase 2.1's
+    /// ordinary case: contention, and a retry can succeed.
+    Timeout,
+    /// This THREAD already holds the lock. A defect rather than contention —
+    /// the inner primitive is not re-entrant, so the acquisition that was
+    /// refused here would have self-deadlocked permanently. #1600 §1.2 names
+    /// this case as the one invisible to an inversion search, because one lock
+    /// is no cycle.
+    Reentrant,
+}
+
+/// A tracked-lock acquisition that was refused — because it ran out of budget,
+/// or (#1610) because this thread already holds the lock.
 ///
 /// This is the typed value the whole of Phase 2.1 converts a hang into: a
 /// polled view keeps its previous value and marks itself partial, an MCP call
@@ -460,6 +508,8 @@ pub struct HolderInfo {
 /// same defect one layer up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Busy {
+    /// Why this acquisition was refused.
+    pub kind: BusyKind,
     /// The lock's name, as given to [`TrackedMutex::new`].
     pub lock: &'static str,
     /// How long this waiter actually waited before giving up. Not the budget:
@@ -475,8 +525,22 @@ pub struct Busy {
 
 impl Busy {
     /// The backoff hint, in milliseconds. See [`BUSY_RETRY_AFTER_MS`].
+    ///
+    /// The same constant for both [`BusyKind`]s, and that is a judgement rather
+    /// than an oversight. A re-entrant refusal is a defect that a retry of the
+    /// *same* call cannot clear — but the caller this reaches is an MCP request
+    /// or a cadenced tick, and its retry is a fresh request on a fresh thread
+    /// with an empty held-lock stack, which is the only sense in which any
+    /// `Busy` was ever "retryable". Nothing here knows enough to say otherwise,
+    /// and a `retry_after_ms` of 0 would say "hammer it".
     pub fn retry_after_ms(&self) -> u64 {
         BUSY_RETRY_AFTER_MS
+    }
+
+    /// Whether this refusal is a re-entrant self-acquisition (#1610) rather
+    /// than contention.
+    pub fn is_reentrant(&self) -> bool {
+        matches!(self.kind, BusyKind::Reentrant)
     }
 
     /// The breadcrumb `detail`: one line of `key=value` fields.
@@ -485,9 +549,16 @@ impl Busy {
     /// [`HoldReport::detail`] is: a breadcrumb line is `stamp event detail`
     /// split on spaces.
     pub fn detail(&self) -> String {
+        // The `kind` leads, so a grep for `lock-busy` in a field report can be
+        // split into contention and defect without parsing the rest.
+        let kind = match self.kind {
+            BusyKind::Timeout => "timeout",
+            BusyKind::Reentrant => "reentrant",
+        };
         match &self.holder {
             Some(h) => format!(
-                "lock={} waited_ms={} waiters={} held_ms={} thread={} at={}:{}",
+                "kind={} lock={} waited_ms={} waiters={} held_ms={} thread={} at={}:{}",
+                kind,
                 spaceless(self.lock),
                 self.waited.as_millis(),
                 self.waiters,
@@ -497,7 +568,8 @@ impl Busy {
                 h.site_line,
             ),
             None => format!(
-                "lock={} waited_ms={} waiters={} holder=unsampled",
+                "kind={} lock={} waited_ms={} waiters={} holder=unsampled",
+                kind,
                 spaceless(self.lock),
                 self.waited.as_millis(),
                 self.waiters,
@@ -518,6 +590,30 @@ impl std::fmt::Display for Busy {
     /// nobody would write on purpose. The lock's name still leads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "`{}` ", self.lock)?;
+        // A re-entrant refusal renders as its OWN sentence rather than as a
+        // timeout with odd numbers in it (#1610). The timeout wording ends
+        // "waited 0.0 s", which for this case would be true and completely
+        // misleading — nothing waited, and nothing is going to free up: the
+        // caller is standing on the lock itself. The reader of this line is an
+        // agent deciding whether to retry, so the line has to say which of the
+        // two situations it is in.
+        if self.is_reentrant() {
+            return match &self.holder {
+                Some(h) => write!(
+                    f,
+                    "is already held by this same thread, taken {} ago at {}:{} — a re-entrant \
+                     acquisition would deadlock, so it was refused",
+                    secs(Duration::from_millis(h.held_ms)),
+                    h.site_file,
+                    h.site_line,
+                ),
+                None => write!(
+                    f,
+                    "is already held by this same thread — a re-entrant acquisition would \
+                     deadlock, so it was refused"
+                ),
+            };
+        }
         match &self.holder {
             Some(h) => write!(
                 f,
@@ -541,6 +637,433 @@ impl std::error::Error for Busy {}
 /// sub-second wait never produces a `Busy`; the tightest budget is 1 s).
 fn secs(d: Duration) -> String {
     format!("{:.1} s", d.as_secs_f64())
+}
+
+// ---------------------------------------------------------------------------
+// Lock ranks (#1610, plan §3 Phase 3a)
+// ---------------------------------------------------------------------------
+//
+// The epic's §3 opens on the thing this closes: 17 mutexes on one struct with
+// **no declared lock order**, and `resolve_token`'s own comment saying why —
+// "locking them together would pin a lock order no other call site promises to
+// respect". Thirteen doc comments in `orchestration/mod.rs` DO state an order.
+// A comment cannot fail a build, which is §2.2's whole finding about this
+// repo's guard culture, so those thirteen claims are moved here as ranks and
+// checked at run time.
+//
+// The check is per-THREAD and needs no second thread to fire: a cycle between
+// two locks deadlocks only when two threads race, but the ordering FACT that
+// permits it is visible on one thread the first time it takes them the wrong
+// way round. That is why this finds inversions a soak test cannot — it does not
+// need the race to happen, only the order.
+
+/// The sentinel a lock built with [`TrackedMutex::new`] carries.
+///
+/// `u32::MAX` rather than `0`, so `LockRank::new(0)` stays a legal outermost
+/// rank. Nothing ever COMPARES this value: every comparison below filters it
+/// out explicitly, because "unranked" is an absence of an opinion rather than a
+/// position in the order.
+const UNRANKED: u32 = u32::MAX;
+
+/// Where a lock sits in the registry's acquisition order.
+///
+/// **Smaller is OUTER.** A thread may take rank 500 while holding rank 100;
+/// taking rank 100 while holding rank 500 is an inversion — the shape that
+/// deadlocks the moment another thread does it the declared way round.
+///
+/// Sparse integers rather than an enum, on purpose: the table in
+/// `orchestration::lockorder` leaves gaps between families so a new lock can be
+/// slotted between two existing ones without renumbering. A renumbering touches
+/// every const at once, and a diff in which every line changed is one no
+/// reviewer can read for ORDER — the single property these values carry.
+///
+/// **Every ranked FIELD has a distinct rank**, which is load-bearing rather
+/// than tidy. It makes "two held locks share a rank" mean "the same field, from
+/// two different registries" — something a test process really does build,
+/// several times per test — instead of "two peers that must never nest". So
+/// re-entrancy is decided by lock IDENTITY (the registry id minted in
+/// `LockState`), never by rank equality, and equal ranks nest freely.
+/// `orchestration::lockorder::ALL`, and the test over it, are what keep the
+/// distinctness true.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct LockRank(u32);
+
+impl LockRank {
+    /// A rank. `u32::MAX` is the unranked sentinel and is refused — at compile
+    /// time for a `const`, which is how every real one is written.
+    pub const fn new(v: u32) -> Self {
+        assert!(v != UNRANKED, "u32::MAX is reserved for unranked locks");
+        Self(v)
+    }
+
+    /// The underlying value, for a table's own uniqueness test.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for LockRank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// How deep the order checker follows one thread's nesting.
+///
+/// Thirty-two, against a deepest DECLARED nesting of three (`queues` ->
+/// `recovered_queue` -> `recovered_markers`). Past it the checker stops
+/// TRACKING rather than starts refusing: an over-deep hold is invisible to the
+/// locks taken under it, which is the same fail-open direction
+/// [`report_order_violation`] takes in release. A checker that panicked on its
+/// own capacity would be an instrument that crashes the app it is watching.
+const HELD_STACK_CAP: usize = 32;
+
+/// One acquisition this thread is currently inside, as the checker sees it.
+///
+/// `Copy`, with only scalar and pointer fields: the stack below is a fixed
+/// array, so a push is a store and a pop is a length decrement — no allocation
+/// and no destructor. That is what lets this ride the app's hottest shared path
+/// (see [`TrackedMutex::lock_safe`]'s cost note, which counts it).
+#[derive(Clone, Copy)]
+struct HeldEntry {
+    /// Per-thread and monotonic. Identifies THIS acquisition, so a guard
+    /// dropped out of order removes its own entry rather than whatever is on
+    /// top — Rust permits `drop(outer)` while `inner` is still alive, and a
+    /// stack that assumed LIFO would then blame the wrong lock for every check
+    /// that followed.
+    token: u64,
+    /// The lock's registry id. Re-entrancy is decided on this — see
+    /// [`LockRank`] for why not on rank equality.
+    lock_id: u64,
+    name: &'static str,
+    /// [`UNRANKED`] for a lock built with [`TrackedMutex::new`].
+    rank: u32,
+    /// The `#[track_caller]` site this hold was taken at, stored as a pointer
+    /// for the same reason `LockState`'s `holder_site` is, and read back
+    /// through the same [`site_of`].
+    site: *const Location<'static>,
+    acquired_ms: u64,
+}
+
+const EMPTY_HELD: HeldEntry = HeldEntry {
+    token: 0,
+    lock_id: 0,
+    name: "",
+    rank: UNRANKED,
+    site: std::ptr::null(),
+    acquired_ms: 0,
+};
+
+/// This thread's held locks, outermost first.
+struct HeldStack {
+    entries: [HeldEntry; HELD_STACK_CAP],
+    len: usize,
+    next_token: u64,
+}
+
+impl HeldStack {
+    const EMPTY: Self = Self { entries: [EMPTY_HELD; HELD_STACK_CAP], len: 0, next_token: 1 };
+}
+
+thread_local! {
+    /// The tracked locks this thread is inside right now.
+    ///
+    /// A fixed array in a `RefCell` rather than a `Vec`: a `Vec` would allocate
+    /// on the acquisition path, which is the one thing this module's cost
+    /// argument forbids everywhere else. `HeldEntry` has no destructor, so this
+    /// also costs nothing at thread teardown — which matters because the MCP
+    /// server spawns one thread per request.
+    static HELD: std::cell::RefCell<HeldStack> = const { std::cell::RefCell::new(HeldStack::EMPTY) };
+}
+
+/// What the checker found when a thread reached for one more lock.
+enum Verdict {
+    /// Nothing to say.
+    Clear,
+    /// This exact lock is ALREADY held by this thread. Not a contention
+    /// question: the inner primitive is not re-entrant, so the acquisition
+    /// self-deadlocks permanently — the case #1600 §1.2 names as invisible to
+    /// an inversion search, because one lock is no cycle.
+    Reentrant(HeldEntry),
+    /// A ranked lock is being taken while a strictly INNER one is held.
+    Inversion(HeldEntry),
+    /// An unranked lock is nesting under something. Not an error — the table
+    /// has no opinion about it yet — but it is exactly the fact the table is
+    /// missing, so it is reported once so the table can converge.
+    UnrankedUnder(HeldEntry),
+}
+
+/// Decide what taking `(lock_id, rank)` would mean on this thread, right now.
+///
+/// Reads the thread-local stack and nothing else: no atomic on another lock's
+/// cache line, no clock, no allocation. Returns [`Verdict::Clear`] if the
+/// thread-local is unavailable (teardown) or already borrowed — the checker
+/// declines to have an opinion rather than panicking inside somebody's `drop`.
+fn inspect_held(lock_id: u64, rank: u32) -> Verdict {
+    HELD.try_with(|h| {
+        let Ok(stack) = h.try_borrow() else {
+            return Verdict::Clear;
+        };
+        if stack.len == 0 {
+            return Verdict::Clear;
+        }
+        // The innermost RANKED hold — a maximum rather than "the last one
+        // pushed", so an unranked lock taken between two ranked ones cannot
+        // hide the ranked one underneath it.
+        let mut innermost: Option<HeldEntry> = None;
+        for e in &stack.entries[..stack.len] {
+            if e.lock_id == lock_id {
+                return Verdict::Reentrant(*e);
+            }
+            if e.rank != UNRANKED && innermost.map_or(true, |i| e.rank > i.rank) {
+                innermost = Some(*e);
+            }
+        }
+        if rank == UNRANKED {
+            return Verdict::UnrankedUnder(stack.entries[stack.len - 1]);
+        }
+        match innermost {
+            // Strictly less: equal ranks are two instances of ONE field (two
+            // registries in one test process), not two peers. See [`LockRank`].
+            Some(i) if rank < i.rank => Verdict::Inversion(i),
+            _ => Verdict::Clear,
+        }
+    })
+    .unwrap_or(Verdict::Clear)
+}
+
+/// Record a hold on this thread's stack. `None` = not tracked (over capacity,
+/// or the thread-local was unavailable), which the guard remembers so its drop
+/// pops nothing.
+fn push_held(
+    lock_id: u64,
+    name: &'static str,
+    rank: u32,
+    site: &'static Location<'static>,
+    acquired_ms: u64,
+) -> Option<u64> {
+    HELD.try_with(|h| {
+        let mut stack = h.try_borrow_mut().ok()?;
+        if stack.len >= HELD_STACK_CAP {
+            return None;
+        }
+        let token = stack.next_token;
+        stack.next_token = token.wrapping_add(1);
+        let len = stack.len;
+        stack.entries[len] =
+            HeldEntry { token, lock_id, name, rank, site: site as *const _, acquired_ms };
+        stack.len = len + 1;
+        Some(token)
+    })
+    .ok()
+    .flatten()
+}
+
+/// Remove the hold `token` names.
+///
+/// **Runs inside [`TrackedGuard::drop`], with the reported mutex still held**,
+/// so it obeys that body's rules: no allocation, no formatting, no global lock,
+/// no syscall, and nothing that can panic (`try_with` and `try_borrow_mut`,
+/// both of which decline rather than unwind — a panic here during an unwind
+/// would be the double-panic that aborts).
+///
+/// Searches from the top because the overwhelmingly common case IS the top, and
+/// shifts only when a guard was dropped out of order.
+fn pop_held(token: u64) {
+    let _ = HELD.try_with(|h| {
+        let Ok(mut stack) = h.try_borrow_mut() else {
+            return;
+        };
+        for i in (0..stack.len).rev() {
+            if stack.entries[i].token == token {
+                for j in i..stack.len - 1 {
+                    stack.entries[j] = stack.entries[j + 1];
+                }
+                stack.len -= 1;
+                return;
+            }
+        }
+    });
+}
+
+/// How many tracked locks this thread is inside.
+///
+/// The stack's own vacuity control: a checker that never pushed anything
+/// reports no violation, which is byte-identical to one that found nothing
+/// wrong.
+#[doc(hidden)]
+pub fn held_lock_depth() -> usize {
+    HELD.try_with(|h| h.try_borrow().map(|s| s.len).unwrap_or(0)).unwrap_or(0)
+}
+
+/// The breadcrumb an inversion writes. A stable string on purpose: it is what a
+/// field report gets grepped for.
+const ORDER_EVENT: &str = "lock-order-violation";
+/// The breadcrumb a re-entrant acquisition writes.
+const REENTRANT_EVENT: &str = "lock-reentrant";
+/// The breadcrumb an unranked lock's first nesting writes.
+const UNRANKED_EVENT: &str = "lock-rank-unranked";
+
+/// Ordering violations and re-entrant acquisitions seen this process.
+static LOCK_ORDER_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a violation PANICS.
+///
+/// Debug and test builds: yes — a violation is a defect, and the plan asks for
+/// a panic naming both locks and both sites. Release: no, and the fail-open is
+/// deliberate rather than timid. The deadlock risk exists in the shipped build
+/// today; refusing the acquisition would convert a *possible* hang into a
+/// *certain* crash on a path nobody has proven wrong, and the crash trail is
+/// what this whole epic is for.
+static LOCK_ORDER_PANICS: AtomicBool = AtomicBool::new(cfg!(debug_assertions));
+
+/// Unranked-nesting reports written this process, capped by
+/// [`UNRANKED_REPORT_CAP`].
+static UNRANKED_NESTINGS: AtomicU64 = AtomicU64::new(0);
+
+/// How many unranked-nesting breadcrumbs one process may write, ever.
+///
+/// The report is already edge-triggered per LOCK (one `AtomicBool` on
+/// `LockState`), which bounds the app at one line per unranked field — about
+/// sixty-five, once, and precisely the data the table needs to converge. The
+/// cap is for the other process shape: the test binary builds registries in the
+/// hundreds, each with its own fresh locks, so a per-lock edge alone would
+/// authorise tens of thousands of file appends. A hard ceiling makes the cost
+/// of this mechanism a constant rather than a function of how many registries
+/// something happened to construct.
+const UNRANKED_REPORT_CAP: u64 = 128;
+
+/// Ordering violations and re-entrant acquisitions this process has seen.
+pub fn lock_order_violations() -> u64 {
+    LOCK_ORDER_VIOLATIONS.load(Ordering::Relaxed)
+}
+
+/// Unranked locks that have nested under another lock for the FIRST time.
+///
+/// Counts every one of them; only the first [`UNRANKED_REPORT_CAP`] also write
+/// a breadcrumb, so this is the number a test can assert on without depending
+/// on how many registries the process happened to build before it.
+pub fn unranked_nestings() -> u64 {
+    UNRANKED_NESTINGS.load(Ordering::Relaxed)
+}
+
+/// Whether a violation currently panics.
+pub fn lock_order_panics() -> bool {
+    LOCK_ORDER_PANICS.load(Ordering::Relaxed)
+}
+
+/// Switch the panic off (or back on), returning the previous setting.
+///
+/// Process-wide, so a test that flips it flips it for every test running
+/// concurrently in the same binary — take a serial guard around it, the way
+/// `obs`'s `SERIAL` does. It exists because the RELEASE behaviour (breadcrumb,
+/// fail open) is otherwise unreachable from a test, and a fail-open path nobody
+/// has executed is a fail-open path nobody has checked.
+#[doc(hidden)]
+pub fn set_lock_order_panics(on: bool) -> bool {
+    LOCK_ORDER_PANICS.swap(on, Ordering::Relaxed)
+}
+
+/// `510`, or `unranked`.
+fn rank_text(rank: u32) -> String {
+    if rank == UNRANKED {
+        "unranked".to_string()
+    } else {
+        rank.to_string()
+    }
+}
+
+/// Report an inversion or a re-entrant acquisition: panic in debug, breadcrumb
+/// in release.
+///
+/// **Both locks and both sites, in both surfaces.** A violation report that
+/// names only the lock being taken is the report that sends the next reader
+/// back into a 54,000-line module to guess what was already held — which is
+/// exactly the state #1600 §2.3 describes.
+///
+/// `#[cold]`, and it allocates and writes a file. Both are fine HERE and
+/// nowhere else in this module: this runs once per defect, not once per
+/// acquisition, and a build in which it runs often has a deadlock to fix first.
+#[cold]
+fn report_order_violation(
+    event: &'static str,
+    inner_name: &'static str,
+    inner_rank: u32,
+    inner_site: &'static Location<'static>,
+    outer: &HeldEntry,
+) {
+    LOCK_ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    let (outer_file, outer_line) = site_of(outer.site as *mut _);
+    let detail = format!(
+        "inner={} inner_rank={} inner_at={}:{} outer={} outer_rank={} outer_at={}:{}",
+        spaceless(inner_name),
+        rank_text(inner_rank),
+        spaceless(inner_site.file()),
+        inner_site.line(),
+        spaceless(outer.name),
+        rank_text(outer.rank),
+        spaceless(outer_file),
+        outer_line,
+    );
+    if LOCK_ORDER_PANICS.load(Ordering::Relaxed) {
+        if event == REENTRANT_EVENT {
+            panic!(
+                "{REENTRANT_EVENT}: `{inner_name}` at {}:{} is ALREADY held by this thread, taken \
+                 at {outer_file}:{outer_line} — this mutex is not re-entrant, so the acquisition \
+                 would self-deadlock",
+                inner_site.file(),
+                inner_site.line(),
+            );
+        }
+        panic!(
+            "{ORDER_EVENT}: `{inner_name}` (rank {}) at {}:{} acquired while `{}` (rank {}) is \
+             held by this thread, taken at {outer_file}:{outer_line} — the declared order is \
+             outer rank first; see orchestration::lockorder",
+            rank_text(inner_rank),
+            inner_site.file(),
+            inner_site.line(),
+            outer.name,
+            rank_text(outer.rank),
+        );
+    }
+    crate::obs::breadcrumb(event, &detail);
+}
+
+/// Report the first time an UNRANKED lock nests under anything.
+///
+/// The convergence half of the plan's design: a lock with no rank is allowed to
+/// nest under anything, so the table can be filled in one family at a time
+/// instead of all at once — but every such nesting is an ordering fact the
+/// table does not yet carry, and a fact nobody wrote down is the state §3 is
+/// about. One line per unranked lock, capped process-wide
+/// ([`UNRANKED_REPORT_CAP`]).
+///
+/// Written on the ACQUIRING thread with the outer lock still held, which is a
+/// cost this module refuses everywhere else. It is admitted here for a bounded
+/// reason: at most [`UNRANKED_REPORT_CAP`] appends per process, ever, against a
+/// steady-state cost of one relaxed load on the nested-acquisition path.
+#[cold]
+fn note_unranked_nesting(st: &LockState, site: &'static Location<'static>, outer: &HeldEntry) {
+    if st.unranked_reported.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if UNRANKED_NESTINGS.fetch_add(1, Ordering::Relaxed) >= UNRANKED_REPORT_CAP {
+        return;
+    }
+    let (outer_file, outer_line) = site_of(outer.site as *mut _);
+    crate::obs::breadcrumb(
+        UNRANKED_EVENT,
+        &format!(
+            "lock={} at={}:{} under={} outer_rank={} outer_at={}:{}",
+            spaceless(st.name),
+            spaceless(site.file()),
+            site.line(),
+            spaceless(outer.name),
+            rank_text(outer.rank),
+            spaceless(outer_file),
+            outer_line,
+        ),
+    );
 }
 
 /// A `Mutex` that says who is holding it, since when, from where, and how many
@@ -577,7 +1100,28 @@ impl<T> TrackedMutex<T> {
     /// Names need not be unique — the per-pane delivery locks all share one —
     /// because the call site and the lock id distinguish them.
     pub fn new(name: &'static str, value: T) -> Self {
-        let state = Arc::new(LockState::new(name));
+        Self::build(name, UNRANKED, value)
+    }
+
+    /// Wrap `value`, registering it under `name` at `rank` in the declared
+    /// acquisition order (#1610).
+    ///
+    /// The rank is what turns `orchestration/mod.rs`'s thirteen "Lock order:"
+    /// doc claims from prose into something that fails a build. See
+    /// [`LockRank`] for the direction (smaller is outer) and
+    /// `orchestration::lockorder` for the table itself.
+    ///
+    /// A lock built with the plain [`new`](Self::new) is UNRANKED: it may nest
+    /// under anything and anything may nest under it, so the table can be
+    /// filled in one family at a time rather than all at once. Its first
+    /// nesting is breadcrumbed once (`lock-rank-unranked`), which is how the
+    /// missing rows announce themselves instead of waiting to be noticed.
+    pub fn new_ranked(name: &'static str, rank: LockRank, value: T) -> Self {
+        Self::build(name, rank.get(), value)
+    }
+
+    fn build(name: &'static str, rank: u32, value: T) -> Self {
+        let state = Arc::new(LockState::new(name, rank));
         let mut reg = REGISTRY.lock_safe();
         // Bounded even with no watchdog running. Every snapshot prunes dead
         // entries, and in the app one runs every second — but a test binary has
@@ -620,6 +1164,16 @@ impl<T> TrackedMutex<T> {
     /// relaxed load and a comparison on the cold path; on the over-threshold
     /// path a further three relaxed loads, four relaxed stores and one release
     /// store, and in both cases one release read-modify-write on the generation.
+    ///
+    /// **The order checker adds (#1610)**: on acquisition, one thread-local
+    /// borrow plus a scan of the held-lock stack — zero comparisons when this
+    /// thread holds nothing, which is the overwhelmingly common case, and at
+    /// most [`HELD_STACK_CAP`] otherwise — and one store into a fixed array.
+    /// On release, one thread-local borrow and a scan from the top of that
+    /// array, which finds its own entry on the first comparison unless a guard
+    /// was dropped out of order. The stack is per-thread, so none of it is a
+    /// shared cache line and none of it can contend.
+    ///
     /// No allocation, no formatting, no global lock, no syscall, and nothing that
     /// can block. The clock read is the only item above a few nanoseconds — tens
     /// of nanoseconds on every platform this ships to — which is why it is a
@@ -636,6 +1190,14 @@ impl<T> TrackedMutex<T> {
     #[track_caller]
     pub fn lock_safe(&self) -> TrackedGuard<'_, T> {
         let site = Location::caller();
+        // BEFORE any acquisition attempt (#1610). A re-entrant acquisition
+        // parks forever, so a checker that ran after the acquire would be a
+        // checker that never runs on the case it exists for.
+        //
+        // `lock_safe` returns a guard, so it has nowhere to put a refusal:
+        // its answers are a debug panic naming both locks, or — in release —
+        // the breadcrumb and then exactly what it would have done anyway.
+        let _ = self.check_order(site, false);
         let Some((left, frame)) = budget::remaining() else {
             return self.acquire_blocking(site);
         };
@@ -671,9 +1233,17 @@ impl<T> TrackedMutex<T> {
     /// argument unverifiable at its call site.
     ///
     /// `Duration::ZERO` is a legal budget and means "take it if it is free".
+    /// **A re-entrant acquisition is refused here rather than panicking**
+    /// (#1610). This entry point has an `Err` to put it in, and the answer it
+    /// gives — [`BusyKind::Reentrant`], naming the frame that already holds
+    /// the lock — is strictly more useful than a hang and strictly less
+    /// destructive than a crash. That is the plan's 3a rule: `Busy::Reentrant`
+    /// from `lock_within`, a debug panic from `lock_safe`.
     #[track_caller]
     pub fn lock_within(&self, budget: Duration) -> Result<TrackedGuard<'_, T>, Busy> {
-        self.acquire_within(Location::caller(), budget, "lock-busy")
+        let site = Location::caller();
+        self.check_order(site, true)?;
+        self.acquire_within(site, budget, "lock-busy")
     }
 
     /// Take the lock if it is free RIGHT NOW, never blocking.
@@ -687,10 +1257,20 @@ impl<T> TrackedMutex<T> {
     /// FAILED one touches the waiter count not at all: nothing waited, and it
     /// writes no breadcrumb — "the lock was busy this instant" is not news, and
     /// this is the one entry point with no budget behind it.
+    ///
+    /// **The order check runs AFTER the try succeeds** (#1610), not before, and
+    /// that is the one place in this module where the check is not on the
+    /// blocking side. Nothing here can hang — a `try_lock` that would have
+    /// deadlocked simply returns `None` — so the reason to check early is
+    /// absent, while the reason not to is real: refusing or panicking on a
+    /// speculative acquisition that was never going to be taken would report a
+    /// violation that did not happen. A try that SUCCEEDS, on the other hand,
+    /// establishes a real nesting, and every nesting is an ordering fact.
     #[track_caller]
     pub fn try_lock_safe(&self) -> Option<TrackedGuard<'_, T>> {
         let site = Location::caller();
         let guard = self.inner.try_lock()?;
+        let _ = self.check_order(site, false);
         Some(self.record_acquired(guard, site))
     }
 
@@ -742,7 +1322,101 @@ impl<T> TrackedMutex<T> {
         st.acquired_ms.store(acquired_ms, Ordering::Relaxed);
         // Publishes the three stores above; even -> odd marks the lock held.
         st.generation.fetch_add(1, Ordering::Release);
-        TrackedGuard { guard, state: st, acquired_ms }
+        // The order checker's own record (#1610), pushed HERE so a guard
+        // obtained three different ways is one entry to it as well. `None`
+        // means the stack declined to track this hold (over capacity, or a
+        // thread-local that is gone), and the guard's drop then pops nothing.
+        let held = push_held(st.id, st.name, st.rank, site, acquired_ms);
+        TrackedGuard { guard, state: st, acquired_ms, held }
+    }
+
+    /// The lock-order check (#1610). Runs before any acquisition that can
+    /// block, and after one that cannot ([`try_lock_safe`](Self::try_lock_safe)).
+    ///
+    /// Returns `Err` only when `refuse_reentrant` is set — [`lock_within`]'s
+    /// contract. It is a parameter rather than a mode because the two entry
+    /// points genuinely differ in what they can say: `lock_within` returns a
+    /// `Result` and can refuse; `lock_safe` returns a guard and cannot.
+    ///
+    /// [`lock_within`]: Self::lock_within
+    fn check_order(
+        &self,
+        site: &'static Location<'static>,
+        refuse_reentrant: bool,
+    ) -> Result<(), Busy> {
+        let st = &self.state;
+        match inspect_held(st.id, st.rank) {
+            Verdict::Clear => Ok(()),
+            Verdict::Reentrant(outer) => {
+                if refuse_reentrant {
+                    Err(self.reentrant_busy(site, &outer))
+                } else {
+                    report_order_violation(REENTRANT_EVENT, st.name, st.rank, site, &outer);
+                    Ok(())
+                }
+            }
+            Verdict::Inversion(outer) => {
+                report_order_violation(ORDER_EVENT, st.name, st.rank, site, &outer);
+                Ok(())
+            }
+            Verdict::UnrankedUnder(outer) => {
+                // The load, not the swap, is the steady-state cost: after the
+                // one report this lock is ever going to write, every later
+                // nested acquisition pays a relaxed load and returns.
+                if !st.unranked_reported.load(Ordering::Relaxed) {
+                    note_unranked_nesting(st, site, &outer);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Compose the [`BusyKind::Reentrant`] refusal, and breadcrumb it once per
+    /// hold.
+    ///
+    /// The "holder" it names is this thread's own earlier frame, taken from the
+    /// held-lock stack rather than sampled off the lock — which is both cheaper
+    /// and strictly more accurate, since the stack entry cannot have been
+    /// replaced under the read.
+    ///
+    /// Edge-triggered on the hold's own generation, reusing
+    /// [`busy`](Self::busy)'s counter for exactly its reason: a cadenced caller
+    /// that re-enters every tick must not write a breadcrumb every tick.
+    fn reentrant_busy(&self, site: &'static Location<'static>, outer: &HeldEntry) -> Busy {
+        let st = &self.state;
+        let (file, line) = site_of(outer.site as *mut _);
+        let busy = Busy {
+            kind: BusyKind::Reentrant,
+            lock: st.name,
+            // Nothing waited. See `Display`, which renders this case as its own
+            // sentence rather than as a timeout of zero.
+            waited: Duration::ZERO,
+            holder: Some(HolderInfo {
+                site_file: file,
+                site_line: line,
+                held_ms: mono_ms().saturating_sub(outer.acquired_ms),
+                thread: this_thread(),
+            }),
+            waiters: st.waiters.load(Ordering::Relaxed) as usize,
+        };
+        LOCK_ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+        let generation = st.generation.load(Ordering::Acquire);
+        if st.busy_reported_gen.swap(generation, Ordering::Relaxed) != generation {
+            st.busy_breadcrumbs.fetch_add(1, Ordering::Relaxed);
+            // Both sites, like every other violation report: the `Busy`'s own
+            // detail names the frame that HOLDS it, and the acquiring site is
+            // appended because the caller reading the log has neither.
+            crate::obs::breadcrumb(
+                REENTRANT_EVENT,
+                &format!(
+                    "{} inner_at={}:{}",
+                    busy.detail(),
+                    spaceless(site.file()),
+                    site.line()
+                ),
+            );
+        }
+        busy
     }
 
     /// Compose the [`Busy`], and breadcrumb it ONCE per (lock, hold).
@@ -767,6 +1441,7 @@ impl<T> TrackedMutex<T> {
         let snap = st.sample(mono_ms());
         let generation = snap.as_ref().map(|s| s.generation).unwrap_or(0);
         let busy = Busy {
+            kind: BusyKind::Timeout,
             lock: st.name,
             waited,
             holder: snap.map(|s| HolderInfo {
@@ -808,6 +1483,11 @@ pub struct TrackedGuard<'a, T> {
     guard: InnerGuard<'a, T>,
     state: &'a Arc<LockState>,
     acquired_ms: u64,
+    /// This hold's entry in the thread's held-lock stack (#1610), or `None` if
+    /// the stack declined to track it. Carried on the GUARD rather than looked
+    /// up at drop time because a guard may be dropped out of order, and the
+    /// token is the only thing that identifies which entry is this one's.
+    held: Option<u64>,
 }
 
 impl<T> std::ops::Deref for TrackedGuard<'_, T> {
@@ -832,8 +1512,11 @@ impl<T> Drop for TrackedGuard<'_, T> {
     ///
     /// What is left is: one clock read, four relaxed loads, four relaxed
     /// stores, one release STORE (`done_pending`, publishing the four stores
-    /// above) and one release read-modify-write (`generation`). All of it is on
-    /// this lock's own cache line, and none of it can block.
+    /// above), one release read-modify-write (`generation`), and — since
+    /// #1610 — one thread-local borrow plus a scan from the top of a fixed
+    /// array to remove this hold's own entry ([`pop_held`]). All of it is on
+    /// this lock's own cache line or on this THREAD's own storage, and none of
+    /// it can block.
     ///
     /// The store and the read-modify-write are counted apart deliberately: this
     /// body runs with the reported mutex still held, so what it costs is what
@@ -853,6 +1536,14 @@ impl<T> Drop for TrackedGuard<'_, T> {
     /// it.
     fn drop(&mut self) {
         let st = self.state;
+        // The order checker's pop (#1610). First, so that anything below is
+        // reasoning about a thread that is already out of this lock — and
+        // cheap enough to belong in this body: a bounds-checked scan from the
+        // top of a fixed array, no allocation and nothing that can panic (see
+        // `pop_held`).
+        if let Some(token) = self.held {
+            pop_held(token);
+        }
         let held_ms = mono_ms().saturating_sub(self.acquired_ms);
         if held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
             // Stamp only. `drain_completed_holds` composes and writes it, on
@@ -1197,5 +1888,282 @@ mod bounded_tests {
         let (release, _) = hold(lock.clone());
         assert!(lock.lock_within(Duration::ZERO).is_err(), "a held lock must be refused at once");
         drop(release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lock-rank unit tests (#1610). The registry-level rows — L5a/L5b over the real
+// `lockorder` table — are `src-tauri/tests/liveness.rs`; these are the ones that
+// need nothing from `src-tauri` and can therefore run here.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+
+    /// Every test here reads or writes PROCESS-GLOBAL state — the violation
+    /// counter, the unranked-report counter, and the panic switch — so they run
+    /// one at a time. `lock_safe` rather than `.lock().unwrap()`: one failing
+    /// test under this guard would otherwise poison it and report N failures
+    /// for one defect (`.orrerix/lessons.md`, and `obs::SERIAL`'s own note).
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Restores the panic switch however the test leaves — including through a
+    /// failed assertion, which is an unwind like any other. A global overridden
+    /// by a harness and restored on the happy path only is a global that stays
+    /// overridden the first time something goes wrong.
+    struct PanicSwitch(bool);
+    impl Drop for PanicSwitch {
+        fn drop(&mut self) {
+            set_lock_order_panics(self.0);
+        }
+    }
+
+    const OUTER: LockRank = LockRank::new(100);
+    const INNER: LockRank = LockRank::new(200);
+
+    /// The panic payload as a `String`, or `None` if `f` did not panic.
+    fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
+        match std::panic::catch_unwind(f) {
+            Ok(()) => None,
+            Err(payload) => Some(
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+            ),
+        }
+    }
+
+    #[test]
+    fn the_declared_direction_is_not_a_violation() {
+        // The discriminating half, and it goes FIRST. Without it, every
+        // assertion below passes just as well against a checker that refuses
+        // every nesting — which would be a checker nobody could ship.
+        let _serial = SERIAL.lock_safe();
+        let outer = TrackedMutex::new_ranked("orderspec_outer", OUTER, 1u32);
+        let inner = TrackedMutex::new_ranked("orderspec_inner", INNER, 2u32);
+        let before = lock_order_violations();
+
+        let g1 = outer.lock_safe();
+        let g2 = inner.lock_safe();
+        assert_eq!((*g1, *g2), (1, 2));
+        assert_eq!(held_lock_depth(), 2, "both holds must be on this thread's stack");
+        drop(g2);
+        drop(g1);
+        assert_eq!(held_lock_depth(), 0, "the stack must be empty again once both guards drop");
+        assert_eq!(
+            lock_order_violations(),
+            before,
+            "taking locks in the DECLARED order reported a violation"
+        );
+    }
+
+    #[test]
+    fn an_inversion_panics_naming_both_locks_and_both_sites() {
+        let _serial = SERIAL.lock_safe();
+        let outer = TrackedMutex::new_ranked("invspec_outer", OUTER, ());
+        let inner = TrackedMutex::new_ranked("invspec_inner", INNER, ());
+        let before = lock_order_violations();
+
+        // The inner-ranked lock first, then the outer one under it: the
+        // inversion, taken on ONE thread and needing no race to be visible.
+        let held_line = std::line!() + 2;
+        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+            let _held = inner.lock_safe();
+            let _boom = outer.lock_safe();
+        }))
+        .expect("an inversion must panic in a debug/test build");
+
+        // BOTH locks and BOTH sites. A report naming only the lock being taken
+        // is the one that sends the next reader back into a 54k-line module to
+        // guess what was already held (#1600 §2.3).
+        for needle in ["invspec_outer", "invspec_inner", "lockwatch.rs", "rank 100", "rank 200"] {
+            assert!(msg.contains(needle), "the panic lost {needle:?}: {msg}");
+        }
+        assert!(
+            msg.contains(&format!("lockwatch.rs:{held_line}")),
+            "the panic must name the line the ALREADY-HELD lock was taken on ({held_line}): {msg}"
+        );
+        assert_eq!(
+            lock_order_violations(),
+            before + 1,
+            "the violation was not counted"
+        );
+        assert_eq!(held_lock_depth(), 0, "the unwind must leave no hold on the stack");
+    }
+
+    #[test]
+    fn a_reentrant_lock_within_is_refused_rather_than_parking() {
+        let _serial = SERIAL.lock_safe();
+        let lock = TrackedMutex::new_ranked("reentspec", OUTER, ());
+
+        // Discriminating half first: an uncontended `lock_within` must SUCCEED,
+        // or the refusal below would be evidence of nothing.
+        assert!(lock.lock_within(Duration::from_millis(50)).is_ok());
+
+        let held_line = std::line!() + 1;
+        let held = lock.lock_safe();
+        let started = Instant::now();
+        // A budget 80x the answer this must give. If the refusal is removed,
+        // this returns a TIMEOUT `Busy` late instead of parking forever, so the
+        // failure names an assertion rather than arriving as a job timeout.
+        let busy = lock
+            .lock_within(Duration::from_millis(4_000))
+            .err()
+            .expect("a re-entrant acquisition must be refused, not granted");
+        assert!(
+            busy.is_reentrant(),
+            "a re-entrant acquisition was reported as ordinary contention: {busy:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the refusal must be immediate, not budget-shaped: took {:?}",
+            started.elapsed()
+        );
+        let holder = busy.holder.as_ref().expect("the holder is this thread's own frame");
+        assert_eq!(
+            holder.site_line, held_line,
+            "the refusal must name the line THIS thread already holds it from"
+        );
+        // `Display` is a public contract: it reaches an agent's context through
+        // `loomux busy:`. A re-entrant refusal must not read as contention.
+        let rendered = busy.to_string();
+        assert!(rendered.contains("already held by this same thread"), "{rendered}");
+        assert!(!rendered.contains("waiters"), "the timeout wording leaked in: {rendered}");
+        drop(held);
+    }
+
+    #[test]
+    fn a_reentrant_lock_safe_panics_rather_than_self_deadlocking() {
+        let _serial = SERIAL.lock_safe();
+        let lock = TrackedMutex::new_ranked("reentpanicspec", OUTER, ());
+        let held_line = std::line!() + 2;
+        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock_safe();
+            // Today this parks forever, with no cycle for an inversion search
+            // to find — #1600 §1.2's invisible case.
+            let _boom = lock.lock_safe();
+        }))
+        .expect("a re-entrant lock_safe must panic in a debug/test build");
+        assert!(msg.contains("reentpanicspec"), "{msg}");
+        assert!(msg.contains(&format!("lockwatch.rs:{held_line}")), "{msg}");
+        assert_eq!(held_lock_depth(), 0);
+    }
+
+    #[test]
+    fn two_locks_at_the_same_rank_nest_freely() {
+        // The test process builds several registries, so two live locks really
+        // do share a rank — they are the same FIELD twice, not two peers.
+        // Refusing that nesting would fail tests that have nothing wrong with
+        // them, which is why re-entrancy is decided on lock identity instead.
+        let _serial = SERIAL.lock_safe();
+        let a = TrackedMutex::new_ranked("twinspec", OUTER, ());
+        let b = TrackedMutex::new_ranked("twinspec", OUTER, ());
+        let before = lock_order_violations();
+        let g1 = a.lock_safe();
+        let g2 = b.lock_safe();
+        assert_eq!(held_lock_depth(), 2);
+        drop(g2);
+        drop(g1);
+        assert_eq!(lock_order_violations(), before, "equal ranks were treated as a violation");
+    }
+
+    #[test]
+    fn a_guard_dropped_out_of_order_removes_its_own_entry() {
+        // Rust permits `drop(outer)` while `inner` is alive. A stack that
+        // assumed LIFO would pop the wrong entry and then judge every later
+        // acquisition against a lock that is no longer held.
+        //
+        // The fixture is built so the two outcomes DIVERGE: with the right
+        // entry removed the stack holds rank 300 and taking rank 200 is an
+        // inversion; with the wrong one removed it holds rank 100 and the same
+        // acquisition is perfectly legal. A non-discriminating fixture here
+        // would pass under both implementations.
+        let _serial = SERIAL.lock_safe();
+        let a = TrackedMutex::new_ranked("ooospec_a", LockRank::new(100), ());
+        let b = TrackedMutex::new_ranked("ooospec_b", LockRank::new(300), ());
+        let c = TrackedMutex::new_ranked("ooospec_c", LockRank::new(200), ());
+
+        let g_a = a.lock_safe();
+        let g_b = b.lock_safe();
+        drop(g_a); // out of order: `a` is at the BOTTOM of the stack
+        assert_eq!(held_lock_depth(), 1, "one hold is still live");
+
+        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+            let _g = c.lock_safe();
+        }))
+        .expect(
+            "rank 200 under a held rank 300 is an inversion; no panic means the drop removed              the top of the stack instead of its own entry",
+        );
+        assert!(msg.contains("ooospec_b"), "the surviving hold must be `b`: {msg}");
+        assert!(!msg.contains("ooospec_a"), "`a` was released and must not be blamed: {msg}");
+        drop(g_b);
+        assert_eq!(held_lock_depth(), 0);
+    }
+
+    #[test]
+    fn an_unranked_lock_nests_under_a_ranked_one_and_is_reported_once() {
+        let _serial = SERIAL.lock_safe();
+        let ranked = TrackedMutex::new_ranked("unrankedspec_outer", INNER, ());
+        let plain = TrackedMutex::new("unrankedspec_plain", ());
+        let violations = lock_order_violations();
+        let reports = unranked_nestings();
+
+        let g = ranked.lock_safe();
+        drop(plain.lock_safe());
+        drop(plain.lock_safe());
+        drop(plain.lock_safe());
+        drop(g);
+
+        assert_eq!(
+            lock_order_violations(),
+            violations,
+            "an unranked lock may nest under anything; it is not a violation"
+        );
+        assert_eq!(
+            unranked_nestings(),
+            reports + 1,
+            "three nestings of one unranked lock must report ONCE — the table converges on \
+             names, and a line per acquisition would be a file write on a hot path"
+        );
+    }
+
+    #[test]
+    fn a_release_build_breadcrumbs_the_violation_and_carries_on() {
+        // The fail-open half, which is otherwise unreachable from a test — and
+        // a fail-open path nobody has executed is a fail-open path nobody has
+        // checked. The deadlock risk exists in the shipped build already;
+        // turning a possible hang into a certain crash is not an improvement.
+        let _serial = SERIAL.lock_safe();
+        let _restore = PanicSwitch(set_lock_order_panics(false));
+        let outer = TrackedMutex::new_ranked("failopenspec_outer", OUTER, 7u32);
+        let inner = TrackedMutex::new_ranked("failopenspec_inner", INNER, 9u32);
+        let before = lock_order_violations();
+
+        let held = inner.lock_safe();
+        let taken = outer.lock_safe();
+        assert_eq!(*taken, 7, "the inversion must still ACQUIRE — that is what fail-open means");
+        assert_eq!(lock_order_violations(), before + 1, "the violation must still be counted");
+        drop(taken);
+        drop(held);
+    }
+
+    #[test]
+    fn the_held_stack_unwinds_with_the_thread() {
+        // `TrackedGuard::drop` runs during an unwind (#1609 rider R1), and the
+        // stack pop rides in it — so a `read_budget` timeout, which is an
+        // unwind, cannot leave phantom holds behind that make every later
+        // acquisition on that thread look like an inversion.
+        let _serial = SERIAL.lock_safe();
+        let lock = TrackedMutex::new_ranked("unwindstackspec", OUTER, ());
+        assert_eq!(held_lock_depth(), 0);
+        let msg = panic_message(std::panic::AssertUnwindSafe(|| {
+            let _g = lock.lock_safe();
+            assert_eq!(held_lock_depth(), 1, "the hold must be on the stack while it is held");
+            panic!("deliberate");
+        }));
+        assert_eq!(msg.as_deref(), Some("deliberate"));
+        assert_eq!(held_lock_depth(), 0, "the unwind left a phantom hold on the stack");
     }
 }
