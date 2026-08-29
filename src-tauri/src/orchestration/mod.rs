@@ -12878,9 +12878,15 @@ pub struct OrchRegistry {
     /// SESSION rather than by pane — see [`DeliveredPrompts`] for why the
     /// keying is the fix and not an optimisation.
     ///
-    /// **Lock order: `agents` is taken and RELEASED before this one.** Resolving
-    /// a pty to its session reads `agents`; nothing here holds this map while
-    /// reaching for that one, which is the same order
+    /// **Lock order: takes no other registry lock while held**, and since #1702
+    /// it does not depend on one being taken before it either: the pty-to-session
+    /// resolution that reads `agents` moved OUT of
+    /// [`OrchRegistry::delivered_prompt_record`] to its callers, so a caller
+    /// that already holds the session (an agent snapshot) reaches this map
+    /// having taken nothing at all. Where a caller does resolve — the delivery
+    /// path, and `plain_pane_attention` — `by_pty` then `agents` are taken and
+    /// released as statement temporaries first, so the order is still `agents`
+    /// before this one and nothing nests. Same order
     /// [`OrchRegistry::mark_notice_maskable`] already uses.
     delivered_prompts: Arc<TrackedMutex<HashMap<String, DeliveredPrompts>>>,
     /// Per-pane FIFO delivery queue (#445): a hold-cap expiry in
