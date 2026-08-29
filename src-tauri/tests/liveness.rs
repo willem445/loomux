@@ -773,6 +773,23 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
     // evidence rather than on a timer. `SHORT_HOLD_MS` is what makes it
     // observable inside `GRACE` — the hold really does elapse during the call.
     let recovered = Instant::now();
+
+    // The control BRACKETS the republish at one instant, which is the only
+    // placement that discriminates: stale at `recovered` before it, not stale
+    // at `recovered` after it. Reading it afterwards — as this first did —
+    // measures the snapshot the republish has already re-stamped, so it
+    // asserts the pre-republish world's staleness while looking at the
+    // post-republish one.
+    //
+    // It can only be true because `published_at` is 60 s back: with
+    // `Instant::now()` both worlds sit under the 5 s threshold and neither
+    // this control nor the assertion it guards could ever fail.
+    assert!(
+        stale_at(recovered),
+        "control: the snapshot must be stale at `recovered` BEFORE the republish, or the \
+         assertion after it is a reading of one outcome rather than a choice between two"
+    );
+
     assert!(
         completes_within(GRACE, {
             let reg = reg.clone();
@@ -781,14 +798,6 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
         }),
         "the publisher must RECOVER once the hold ends: it parks behind `groups` by design, \
          and a publish that never completes afterwards would mean the badge can never clear"
-    );
-    // Discriminating because `published_at` is 60 s in the past: without the
-    // republish this reads stale, with it it does not.
-    assert!(
-        stale_at(published_at + Duration::from_secs(1)),
-        "control: the snapshot this test started from IS stale at `recovered`, so the \
-         assertion below is a choice between two different outcomes rather than a reading \
-         of one"
     );
     assert!(!stale_at(recovered), "one successful publish is the evidence that clears the badge");
 }
