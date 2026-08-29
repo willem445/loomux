@@ -112,6 +112,57 @@ on what the caller has:
 | under a `read_budget` frame, panic off | `budget::unwind_to_frame` with the `BusyKind::Reentrant` `Busy`. The frame's owner already renders it: an MCP `isError`, a `partial` snapshot section, a command's empty degrade |
 | no frame, panic off (a tick body under `tick_gate`'s `MutationScope`, an MCP mutate helper thread, a `run_blocking` body) | the same panic. `obs`'s hook writes a crash log naming both sites, and the unwind drops every guard — so the registry is **released**, which is the whole point |
 
+#### The fourth class, and why it is frame-mandatory instead
+
+That third row is a list of the threads on which an unwind is a *degrade*. There
+is a caller class for which it is not, and #1713 review B1 is that it was missing
+from this table: a **synchronous `#[tauri::command]`**.
+
+Tauri dispatches a non-`async` command by calling it **inline, on the
+webview/GUI thread, inside the WebView2 COM callback's own stack frame**. The
+chain, traced through the vendored crate sources rather than assumed:
+
+```
+webview2-com-sys  unsafe extern "system" fn Invoke   <- the abort site
+  wry (webview2 backend)   custom_protocol_handler(..)
+    tauri-runtime-wry      protocol(..)
+      tauri  ipc/protocol.rs   webview.on_message(..)
+        tauri  manager  run_invoke_handler(invoke)
+          tauri-macros  body_blocking   let result = $path(args..)
+            the command body
+```
+
+There is **no `catch_unwind` anywhere on that path** — zero occurrences in
+`tauri`, `tauri-runtime-wry`, `webview2-com` and `webview2-com-sys`, and `wry`'s
+only ones are Objective-C exception traps in its macOS backend. That `Invoke`
+thunk is a plain `extern "system"` with no `-unwind` ABI. So an unwind reaching
+it does not degrade anything: Rust's abort-on-unwind shim fires in that frame
+and **the process aborts**.
+
+That is fatal to the third row's whole argument, which is that the unwind
+*releases* the registry and costs one caller. Here it costs the app. So these
+commands do not get a stated degrade — they get a **frame**, and the frame is
+the barrier: `read_budget`'s own `catch_unwind` catches the typed unwind
+`budget::unwind_to_frame` throws, so the refusal is contained at the command
+boundary and becomes that command's degraded value. `OrchRegistry::
+mutating_command` is that wrapper for the mutating ones, and it adds a
+`MutationScope` so a budget TIMEOUT still waits, unbounded, exactly as R1
+requires — only the re-entrant refusal unwinds, because it is the one wait that
+never ends.
+
+**It is a class, so it is guarded as one.** `src-tauri/tests/synccommands.rs`
+scans every synchronous `#[tauri::command]` in the module and default-denies:
+each must either take no `OrchRegistry` at all (structurally unable to reach a
+tracked lock — an argued row per exemption, each asserted to still name a live
+registry-free command) or route through a command-boundary frame. The eighth one
+added is the one that would otherwise forget, and a per-site audit is what let
+#1702 ship four times.
+
+**This does not make a genuine panic in one of those commands survivable.** Any
+panic in a sync command has always aborted the process on Windows for exactly
+the reason above, and still does; that hazard predates #1702 and is tracked
+separately. What the frame contains is the one unwind this epic introduced.
+
 Two consequences are paid for rather than waved at.
 
 **It unwinds a SEALED frame** — the one narrowing of `lock-liveness.md` §4.1,
@@ -402,6 +453,8 @@ That is the channel this section fills from next.
 - **It does not make a refused re-entrant caller's work happen.** The refusal
   buys liveness, not correctness: the tick that was going to deadlock now
   panics, so its pass produces nothing and its badges hold their last value
-  until the underlying re-entrancy is fixed (for `attention_tick`, that is
-  #1702's own point fix). A registry that answers is strictly better than one
-  that does not, and it is not the same thing as a registry that is right.
+  until the underlying re-entrancy is fixed. `attention_tick`'s own is fixed —
+  #1703 restructured it into snapshot/compute/apply so it no longer re-takes
+  `agents` — and this guard is what makes the NEXT one a bounded failure
+  instead of a wedge. A registry that answers is strictly better than one that
+  does not, and it is not the same thing as a registry that is right.

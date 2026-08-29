@@ -32088,6 +32088,57 @@ impl OrchRegistry {
         }
     }
 
+    /// [`read_command`](Self::read_command)'s sibling for a command that
+    /// MUTATES, and the containment barrier the GUI thread needs (#1702).
+    ///
+    /// **Why a synchronous command needs one at all.** Tauri dispatches a
+    /// non-`async` `#[tauri::command]` by calling it inline, on the webview/GUI
+    /// thread, *inside the WebView2 COM callback's own stack frame* — the chain
+    /// is `body_blocking` -> `run_invoke_handler` -> `ipc/protocol.rs` -> wry ->
+    /// `webview2-com-sys`'s `unsafe extern "system" fn Invoke`. Traced through
+    /// the vendored sources for #1713 review B1: there is **no `catch_unwind`
+    /// anywhere on that path**, and that `Invoke` thunk is a plain
+    /// `extern "system"` with no `-unwind` ABI. So a panic unwinding out of a
+    /// sync command does not degrade anything — Rust's abort-on-unwind shim
+    /// fires in that frame and the **process aborts**.
+    ///
+    /// That is fatal to `refuse_reentrant`'s third case, whose whole argument
+    /// is that unwinding *releases* the registry and costs one caller. On this
+    /// thread it costs the app. So these commands are given a
+    /// [`budget::read_budget`] frame, and the frame is the barrier: its own
+    /// `catch_unwind` catches the typed unwind `budget::unwind_to_frame`
+    /// throws, so the refusal is contained here and becomes `on_refused()`
+    /// instead of ever reaching the COM boundary.
+    ///
+    /// **The `MutationScope` is what keeps R1 true through that.** A frame
+    /// alone would make a budget TIMEOUT unwind these mid-mutation, which is
+    /// exactly the corruption rider R1 exists to prevent. Inside the scope a
+    /// timeout waits, unbounded, as it always did; only the re-entrant refusal
+    /// unwinds, because it is the one wait that never ends
+    /// (`doc/design/lock-liveness.md` §4.1). So this changes what a *defect*
+    /// does and changes nothing about what contention does.
+    ///
+    /// It does NOT make a genuine panic in one of these commands survivable —
+    /// that still reaches the boundary and still aborts, exactly as it did
+    /// before #1702. What it contains is the one unwind this epic introduced.
+    fn mutating_command<T>(
+        name: &'static str,
+        on_refused: impl FnOnce() -> T,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _scope = budget::MutationScope::enter();
+        match budget::read_budget(budget::COMMAND_READ_BUDGET, f) {
+            Ok(v) => v,
+            Err(busy) => {
+                crate::obs::breadcrumb(
+                    "command-refused",
+                    &format!("command={name} {}", busy.detail()),
+                );
+                on_refused()
+            }
+        }
+    }
+
     /// Gate one cadenced backend tick (#1609, plan §3 Phase 2.1 item 3).
     ///
     /// `None` means SKIP this tick: the registry is wedged, and a tick that
@@ -51372,17 +51423,28 @@ pub fn start_attention(reg: Arc<OrchRegistry>) {
 /// not change what a bug does, and no command here can honestly synthesise the
 /// answer it failed to compute.
 ///
-/// **The residual that leaves, stated** (#1702). A command body is one of the
-/// three no-frame caller classes a re-entrant `lock_safe` now panics on, so
-/// this is a path that refusal can reach — and unlike a cadenced tick, there is
-/// no supervisor here, because there is nothing to supervise: the command is
-/// one shot. The re-raise takes the panic to Tauri's own boundary, so the
-/// webview's `invoke` promise for that one call never settles and its panel
-/// stays on whatever it last had. That is a degraded SURFACE rather than a
-/// wedge — the registry lock is released by the unwind, every other command
-/// keeps answering, and the crash log names both sites — and it is left as it
-/// is deliberately: inventing a value here is the "a guard that does not hold
-/// is a lie every caller would act on" trade in a different costume.
+/// **The residual that leaves, stated** (#1702). An `async` command body run
+/// through here is one of the three no-frame caller classes a re-entrant
+/// `lock_safe` now panics on, so this is a path that refusal can reach — and
+/// unlike a cadenced tick there is no supervisor, because there is nothing to
+/// supervise: the command is one shot. The re-raise takes the panic to Tauri's
+/// own boundary, so the webview's `invoke` promise for that one call never
+/// settles and its panel stays on whatever it last had. That is a degraded
+/// SURFACE rather than a wedge — the registry lock is released by the unwind,
+/// every other command keeps answering, and the crash log names both sites —
+/// and it is left as it is deliberately: inventing a value here is the "a guard
+/// that does not hold is a lie every caller would act on" trade in a different
+/// costume.
+///
+/// **Why that reasoning does NOT extend to a SYNCHRONOUS command** (#1713
+/// review B1). It rests on the unwind costing one caller, which is true here
+/// because this body runs on the blocking pool. A non-`async` command runs
+/// inline in the WebView2 COM callback's frame, where an unwind reaches a plain
+/// `extern "system"` thunk with no `catch_unwind` anywhere in between and
+/// ABORTS the process. Those commands are given a frame instead — see
+/// [`OrchRegistry::mutating_command`] and `doc/design/lock-order.md` §2.1 for
+/// the measured call chain — and `src-tauri/tests/synccommands.rs` keeps that
+/// true for the next one added.
 async fn run_blocking<T, F>(f: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
@@ -51457,6 +51519,21 @@ fn reg_of(app: &AppHandle) -> Arc<OrchRegistry> {
 /// None of this is reachable from today's webview, which only ever sends ids the
 /// backend minted. It is reachable from the caller this whole change exists for
 /// — #888's remote client — which is why it is fixed now rather than filed.
+/// What a synchronous command's caller is told when its body was refused
+/// rather than run (#1702) — see [`OrchRegistry::mutating_command`].
+///
+/// **One paragraph, and it promises only what this path delivers.** It does not
+/// say "nothing was applied": the refusal fires at an acquisition, and the body
+/// may have completed earlier work before reaching it, so the honest word is
+/// "may". It does not point at a crash log either — this unwind goes through
+/// `budget::unwind_to_frame`, which is a `resume_unwind` and runs no panic
+/// hook, so no crash log exists. What does exist is the breadcrumb this helper
+/// writes and the `lock-reentrant` finding the watchdog composes beside it.
+pub const COMMAND_REFUSED: &str = "loomux refused that to avoid deadlocking itself — an internal lock \
+                              was already held by the same operation. It may have partly applied, \
+                              so check before retrying; logs/breadcrumbs.log under your orrerix \
+                              data directory names the fault.";
+
 fn command_group(raw: &str) -> Result<GroupId, String> {
     GroupId::parse(raw).map_err(|e| format!("invalid group id: {e}"))
 }
@@ -52201,14 +52278,16 @@ pub async fn orch_group_paused(app: AppHandle, group_id: String) -> bool {
 /// so the badge clears. Live reasons (waiting/gate) are recomputed each scan.
 #[tauri::command]
 pub fn orch_ack_attention(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String) {
-    reg.ack_attention(&agent_id);
+    OrchRegistry::mutating_command("orch_ack_attention", || (), || reg.ack_attention(&agent_id));
 }
 
 /// The human turned to a plain (non-agent) pane flagged `waiting` (#40): ack it
 /// by pty id, since it has no agent identity to key on.
 #[tauri::command]
 pub fn orch_ack_attention_pty(reg: tauri::State<Arc<OrchRegistry>>, pty_id: u32) {
-    reg.ack_attention_pty(pty_id);
+    OrchRegistry::mutating_command("orch_ack_attention_pty", || (), || {
+        reg.ack_attention_pty(pty_id)
+    });
 }
 
 /// The human explicitly dismissed a pane's "stuck prompt" chip (#825 M1): the
@@ -53246,7 +53325,7 @@ pub async fn orch_channel_disconnect(
 /// Every live channel, for the frontend's cross-tab indicators.
 #[tauri::command]
 pub fn orch_channel_list(reg: tauri::State<Arc<OrchRegistry>>) -> Value {
-    reg.channel_list()
+    OrchRegistry::read_command("orch_channel_list", || json!([]), || reg.channel_list())
 }
 
 /// The channel one pane belongs to, or `null` — for a single pane's header
@@ -53254,7 +53333,9 @@ pub fn orch_channel_list(reg: tauri::State<Arc<OrchRegistry>>) -> Value {
 #[tauri::command]
 pub fn orch_channel_for_pane(reg: tauri::State<Arc<OrchRegistry>>, group: String, agent: String) -> Value {
     let Ok(group) = command_group(&group) else { return Value::Null };
-    reg.channel_for_pane(&group, &agent)
+    OrchRegistry::read_command("orch_channel_for_pane", || Value::Null, || {
+        reg.channel_for_pane(&group, &agent)
+    })
 }
 
 /// Human-only: reassign a channel's sender without reconnecting (#271 W3
@@ -53312,7 +53393,9 @@ pub async fn orch_solo_prepare(
 /// created. See `OrchRegistry::solo_bind`.
 #[tauri::command]
 pub fn orch_solo_bind(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
-    reg.solo_bind(&agent_id, pty_id)
+    OrchRegistry::mutating_command("orch_solo_bind", || Err(COMMAND_REFUSED.to_string()), || {
+        reg.solo_bind(&agent_id, pty_id)
+    })
 }
 
 /// Start the solo-pane copilot autopilot consent watcher (#364). See
@@ -53323,7 +53406,9 @@ pub fn orch_confirm_solo_copilot_autopilot(
     pty_id: u32,
     cli: String,
 ) -> Result<(), String> {
-    reg.confirm_solo_copilot_autopilot(pty_id, &cli)
+    OrchRegistry::mutating_command("orch_confirm_solo_copilot_autopilot", || {
+        Err(COMMAND_REFUSED.to_string())
+    }, || reg.confirm_solo_copilot_autopilot(pty_id, &cli))
 }
 
 /// Adopt an already-running pane (no channel identity yet) as a
@@ -54483,7 +54568,9 @@ pub fn resume_recorded_session(
 
 #[tauri::command]
 pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
-    reg.bind(&agent_id, pty_id)
+    OrchRegistry::mutating_command("bind_agent", || Err(COMMAND_REFUSED.to_string()), || {
+        reg.bind(&agent_id, pty_id)
+    })
 }
 
 /// The human renamed an agent pane in-place (F2 / double-click). Sync the

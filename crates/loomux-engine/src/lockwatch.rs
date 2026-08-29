@@ -1586,6 +1586,18 @@ impl<T> TrackedMutex<T> {
     ///    do. Callers are supervised so the panic ends the tick rather than the
     ///    thread; see `obs::TickSupervisor`.
     ///
+    /// **That third list is the threads on which an unwind is a DEGRADE, and it
+    /// is not every no-frame caller** (#1713 review B1). A synchronous
+    /// `#[tauri::command]` runs inline in the WebView2 COM callback's own stack
+    /// frame, and there is no `catch_unwind` between the command body and
+    /// `webview2-com-sys`'s plain `extern "system" fn Invoke` — so an unwind
+    /// there aborts the PROCESS rather than costing one caller. Those commands
+    /// are therefore a **frame-mandatory** class rather than a no-frame one:
+    /// they run inside `OrchRegistry::mutating_command` / `read_command`, whose
+    /// `read_budget` frame catches the unwind at the boundary, and
+    /// `src-tauri/tests/synccommands.rs` default-denies any that does not.
+    /// `doc/design/lock-order.md` §2.1 carries the measured call chain.
+    ///
     /// **Two costs beyond the hang it removes**, both argued in
     /// `doc/design/lock-order.md` §2.2 rather than only here. A mutation can be
     /// abandoned half-applied, because this unwinds inside a
