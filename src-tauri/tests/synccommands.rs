@@ -317,3 +317,69 @@ fn the_command_boundary_wrappers_really_install_a_frame() {
     assert!(!budget_active_for_test(), "the frame must not outlive the wrapper");
     assert_eq!(mutation_depth_for_test(), 0, "nor the scope");
 }
+
+/// Every `name: "…"` row in `tests/perf_dispatch.rs`'s `SYNC_COMMANDS` manifest.
+///
+/// Read out of that file's SOURCE because test binaries do not share code. That
+/// is the honest cost of the cross-check below, and it is why the check is a
+/// containment rather than an equality: this list carries the whole app's sync
+/// commands (pty, filemgr, gitwatch, obs) plus that file's own fixture names.
+fn perf_dispatch_manifest() -> Vec<String> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/perf_dispatch.rs");
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+    src.lines()
+        .filter_map(|l| l.trim().strip_prefix("name: \""))
+        .filter_map(|r| r.split('"').next())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn this_scan_and_perf_dispatch_agree_on_which_orchestration_commands_are_sync() {
+    // **This file duplicates a mechanism the repo already has, deliberately.**
+    // `tests/perf_dispatch.rs` also enumerates every `#[tauri::command]` and
+    // default-denies an unargued sync one — for a DIFFERENT property (#743
+    // INV-1: what a sync command costs on the webview thread). This scan asks
+    // whether it has a command-boundary frame (#1702). Same population, two
+    // questions, and folding either into the other would make one file answer
+    // two unrelated things.
+    //
+    // What that costs is a second parse of the same surface, and theirs is the
+    // better one: `code_only` strips comments and handles `cfg` arms, where
+    // this scan's header admits a body that merely NAMES a wrapper in a comment
+    // would satisfy it. So the two are pinned against each other here. Two
+    // independent scanners that agree are stronger than one; two that silently
+    // disagree mean one has gone blind, and the population floor above cannot
+    // tell which.
+    //
+    // Containment, not equality, in BOTH directions and for different reasons.
+    let mine: Vec<String> = sync_commands(&module_src()).into_iter().map(|c| c.name).collect();
+    let manifest = perf_dispatch_manifest();
+    assert!(manifest.len() >= 20, "the manifest read found {} rows — the extraction is blind", manifest.len());
+
+    // Direction 1: anything this scan calls a sync command must be argued over
+    // there. A miss here means their manifest is stale or this scan
+    // over-matched — either way somebody has to look.
+    let missing: Vec<&String> = mine.iter().filter(|n| !manifest.contains(n)).collect();
+    assert!(
+        missing.is_empty(),
+        "sync commands this scan found that perf_dispatch's SYNC_COMMANDS does not argue: {missing:?}"
+    );
+
+    // Direction 2 is the one that guards THIS file. A manifest row whose `fn`
+    // lives in `mod.rs` must have been found by the scan above; if it was not,
+    // this scan is blind to a command it is supposed to be guarding, and the
+    // frame check silently covers a smaller set than it claims. Matched by a
+    // different path than the scan uses — name-to-file rather than
+    // attribute-to-fn — so the two are not blind in the same way.
+    let src = module_src();
+    let blind: Vec<&String> = manifest
+        .iter()
+        .filter(|n| src.contains(&format!("pub fn {n}(")) && !mine.contains(n))
+        .collect();
+    assert!(
+        blind.is_empty(),
+        "perf_dispatch argues these as sync commands in mod.rs and this scan did not see them — \
+         the frame guard is covering less than it claims: {blind:?}"
+    );
+}
