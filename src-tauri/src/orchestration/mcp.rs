@@ -14,7 +14,7 @@ use super::brand;
 use super::mailbox;
 use super::report;
 use super::workflow;
-use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
+use super::{Caller, Delivery, GroupId, NameSource, OrchRegistry, Role};
 // #1609: the thread-local read budget and the typed `Busy` a timed
 // acquisition answers with. See `doc/design/lock-liveness.md`.
 use loomux_engine::budget;
@@ -422,6 +422,33 @@ fn still_executing_text(tool: &str) -> String {
     )
 }
 
+/// The result a MUTATING tool's caller gets when the helper thread DIED —
+/// ended without sending, which the channel reports as `Disconnected` (#1702).
+///
+/// Before this, both `recv_timeout` errors got [`still_executing_text`]: a
+/// caller whose tool had already panicked was made to wait the full
+/// [`budget::MCP_MUTATE_DEADLINE`] and then told the work "WILL complete", of
+/// which every clause is false. #1702 makes that reachable rather than
+/// theoretical — a re-entrant `lock_safe` on a mutate helper thread now panics
+/// instead of parking, which is the improvement, and this is the answer that
+/// improvement owes its caller.
+///
+/// **It says "may have", not "did not".** The thread panicked at an unknown
+/// point, so a partial write is exactly what cannot be ruled out — the one
+/// thing a `loomux busy:` answer CAN say ("nothing was executed") is the thing
+/// this must not. So it names the read tool instead and lets the agent look.
+fn worker_died_text(tool: &str) -> String {
+    let verify = match verify_with(tool) {
+        Some(read_tool) => format!(" — verify with `{read_tool}` before re-issuing"),
+        None => " — verify before re-issuing".to_string(),
+    };
+    format!(
+        "internal error: `{tool}` ended without a result — the thread running it panicked, and \
+         the crash log under the orrerix data directory names where. The tool may have \
+         partially executed{verify}."
+    )
+}
+
 fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
     if !req.url().starts_with("/mcp") {
         respond(req, 404, json!({ "error": "not found" }).to_string());
@@ -543,20 +570,48 @@ pub fn dispatch_bounded(
         }
     });
 
-    match rx.recv_timeout(budget::mutate_deadline()) {
-        Ok(out) => out,
-        Err(_) => {
-            let text = still_executing_text(&tool);
-            crate::obs::breadcrumb(
-                "mcp-mutate-slow",
-                &format!("group={} agent={} tool={tool}", caller.group, caller.agent_id),
-            );
-            Ok(json!({
-                "content": [json!({ "type": "text", "text": text })],
-                "isError": true,
-            }))
+    await_mutate_result(&rx, &tool, budget::mutate_deadline(), &caller.group, &caller.agent_id)
+}
+
+/// Wait for one mutating tool's helper thread, and answer whichever of the
+/// three things happened.
+///
+/// Split out of [`dispatch_bounded`] so the DECISION has a surface a test can
+/// call (#1702). The thread and the `Arc` above it need a live registry;
+/// "which answer does a died helper get" needs neither, and welding it into the
+/// spawn seam is what left the `Disconnected` arm untested and wrong.
+///
+/// 1. `Ok` — the tool finished inside the deadline. Its own result, untouched.
+/// 2. `Timeout` — it is still running. [`still_executing_text`]: it WILL
+///    complete, do not re-issue.
+/// 3. `Disconnected` — the sender was dropped without a send, so the thread
+///    ended without producing a result: it panicked. [`worker_died_text`],
+///    **immediately** rather than after the remaining deadline. Waiting out a
+///    30 s deadline for an answer that has already failed to arrive is a
+///    guaranteed-wasted 30 s of an agent's turn, and the sentence at the end of
+///    it would be false in every clause.
+#[doc(hidden)]
+pub fn await_mutate_result(
+    rx: &std::sync::mpsc::Receiver<Result<Value, (i64, String)>>,
+    tool: &str,
+    deadline: std::time::Duration,
+    group: &GroupId,
+    agent_id: &str,
+) -> Result<Value, (i64, String)> {
+    let (text, event) = match rx.recv_timeout(deadline) {
+        Ok(out) => return out,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            (still_executing_text(tool), "mcp-mutate-slow")
         }
-    }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            (worker_died_text(tool), "mcp-mutate-died")
+        }
+    };
+    crate::obs::breadcrumb(event, &format!("group={group} agent={agent_id} tool={tool}"));
+    Ok(json!({
+        "content": [json!({ "type": "text", "text": text })],
+        "isError": true,
+    }))
 }
 
 /// Resolve a request's token under [`budget::MCP_AUTH_BUDGET`].
