@@ -404,11 +404,12 @@ reads as covering is worse than none:
   That bound is **observed, not reasoned**. The armed-injector control holds
   `groups` — what the polled `orch_group_summary` takes — for 12 s and reads
   the gate's own counters: `1 sweeps ran, 2 ticks skipped` (measured at
-  `96e27608`, run 33233077315). One call parked, two ticks declined to pile
-  on. The 180 s soak in the same run measured `45 status sweeps ran, 0 ticks
-  skipped`, which is a healthy app and therefore says nothing at all about
-  the skip path — which is exactly why the observation is made under a held
-  lock instead.
+  `f6f41833`, run 33235203093). One call parked, two ticks declined to pile
+  on, and Phase 0's watchdog independently reports `waiters=2` on that same
+  lock at the same moment. The 180 s soak in the same run measured `45 status
+  sweeps ran, 0 ticks skipped`, which is a healthy app and therefore says
+  nothing at all about the skip path — which is exactly why the observation is
+  made under a held lock instead.
 
   What the class assertion still demonstrates is the half #1604 does not
   govern: `orchestration/mcp.rs` spawns a thread per request and each one
@@ -563,7 +564,7 @@ vacuously:
   preference. Before it every 4 s tick issued a sweep, so `ticks × tabs × 2`
   predicted the dispatch count and a floor could be derived from arithmetic;
   now a tick may legitimately skip, so the number of sweeps is something to
-  read. **Measured** at `96e27608` (run 33233077315): 45 sweeps, 0 skipped,
+  read. **Measured** at `f6f41833` (run 33235203093): 45 sweeps, 0 skipped,
   360 `orch_*` dispatches across 4 group-bound tabs — exactly 45 × 4 × 2, so
   every sweep issued its full fan-out. The floor is 40 % of the tick count
   (18 here, cleared 2.5×) and is deliberately a floor on the property — the
@@ -653,13 +654,13 @@ and `ORRERIX_SOAK_BOUND_MS=20000` explicitly, so the cost lives where the
 job does. 180 s is ~45 ticks of the 4 s status timer, and the hold has to
 outlast both probes, which need ~70 s worst case at those bounds.
 
-The cost is **measured**, at `96e27608` (run 33233077315): soak 3.3 m +
-armed/single-flight control 20.8 s + class assertion 46.2 s = **~4.4 min**
-of a 5.8 min suite, inside an 8m51s job whose remainder is mostly the debug
-`tauri build`. A retry of the soak spec adds ~3.3 min. An earlier version of
-this section estimated "roughly eight minutes", about twice the lane's real
-cost — a run settles it, and quoting the split lets the next person tune the
-knobs against a real number. Every
+The cost is **measured**, at `f6f41833` (run 33235203093): soak 3.3 m +
+armed/single-flight/watchdog control 17.6 s + class assertion 48.6 s =
+**~4.4 min** of a 5.5 min suite, inside a 9m22s job whose remainder is mostly
+the debug `tauri build`. A retry of the soak spec adds ~3.3 min. An earlier
+version of this section estimated "roughly eight minutes", about twice the
+lane's real cost — a run settles it, and quoting the split lets the next
+person tune the knobs against a real number. Every
 knob is an environment variable (`ORRERIX_SOAK_MS`,
 `ORRERIX_SOAK_LOCK_HOLD_MS`, `ORRERIX_SOAK_BOUND_MS`, `ORRERIX_SOAK_GROUPS`,
 `ORRERIX_SOAK_SESSIONS`, `ORRERIX_SOAK_AUDIT_LINES`), so a long local soak
@@ -712,8 +713,14 @@ decoration, and it took two measured failures to find them all.
 
 The in-progress `lock-slow` reports are logged rather than asserted, because
 they carry something no other instrument in this lane does: the WAITER count.
-`lock=groups held_ms=5037 waiters=2 at=e2ehold.rs:239` is the poll path piling
+`lock=groups held_ms=5178 waiters=2 at=e2ehold.rs:239` is the poll path piling
 up behind the held mutex, named and counted, as it happens.
+
+What the completed report gives is agreement between two instruments that
+share no code: at `f6f41833` the watchdog reported `lock-freed lock=groups
+held_ms=12001 waiters=2 thread=5 at=src-tauri\src\orchestration\e2ehold.rs:239`
+for a hold the injector's own state file put at 12000 ms. One millisecond
+apart, on the same lock, naming the injector's own call site.
 
 Two Phase 0 instruments are deliberately **not** used yet, and are named so the
 next person does not have to rediscover them:
