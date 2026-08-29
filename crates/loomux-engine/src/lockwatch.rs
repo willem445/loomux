@@ -449,7 +449,9 @@ impl<T> Drop for TrackedGuard<'_, T> {
         // watchdog tick racing this drop sees the release rather than a hold it
         // would double-report.
         st.generation.fetch_add(1, Ordering::Release);
-        if held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
+        // NEUTERED (scratch, #1601): unreachable, so a released hold is
+        // never reported however long it lasted.
+        if held_ms == u64::MAX && held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
             record(HoldReport {
                 lock: st.name,
                 site_file: file,
