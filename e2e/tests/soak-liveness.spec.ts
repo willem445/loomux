@@ -26,16 +26,24 @@
 //   `applyOrchIdentity` reveals only for a LIVE orchestrator-role pane. That
 //   needs a real agent CLI running, which CLAUDE.md constraint 3 forbids for
 //   automated E2E. So the poll load here is the tab-strip half; both halves
-//   park threads on the same registry mutexes, so the mechanism is exercised,
-//   but the per-tick fan-out is smaller than a real orchestrating session's.
+//   contend on the same registry mutexes, so the mechanism is exercised, but
+//   the per-tick fan-out is smaller than a real orchestrating session's.
 //   Closing that gap needs a safe stand-in agent process
 //   (doc/design/e2e-testing.md's standing limitation), not a change here.
-// - **Blocking-pool exhaustion: only on a long local run.** Plan #1600 §1.2
-//   step 4 puts saturation of tokio's 512-thread blocking pool minutes into a
-//   hold. The CI defaults (a 30 s hold) reach roughly a hundred parked
-//   threads, so what CI catches is the FIRST symptom in the chain — "MCP dies
-//   first" — not the last one. Raising `ORRERIX_SOAK_LOCK_HOLD_MS` past ~120 s
-//   locally is what reaches the pane-input half.
+// - **Blocking-pool exhaustion: NOT reachable from the poll path at all, and
+//   no hold duration changes that.** Plan #1600 §1.2 step 4 describes ticks
+//   accumulating parked `spawn_blocking` threads until the 512-thread pool
+//   exhausts. #1604 single-flights this sweep, so a tick firing while the
+//   previous one is still outstanding SKIPS: at most one call is parked,
+//   however long a lock is held. That is the fix working, and it means this
+//   lane cannot demonstrate the pane-input half of the chain — an earlier
+//   version of this header said raising the hold past ~120 s locally would
+//   reach it, which was true against the base this branch was cut from and is
+//   false here. What the class assertion still demonstrates is the half
+//   #1604 does not govern: `orchestration/mcp.rs` spawns a thread per request
+//   and each parks on the registry mutex, ungoverned by any single-flight,
+//   which is exactly why the MCP probe is the one that dies while pane input
+//   stays healthy.
 //
 // ## The expected failure
 //
@@ -88,6 +96,7 @@ import {
   mcpCall,
   mintMcpEndpoint,
   orchInvokeTotal,
+  singleFlightStats,
   ptyRoundTrip,
   readInvokeCounts,
   requestLockHold,
@@ -193,31 +202,68 @@ test.describe("soak: a large corpus and a steady poll load", () => {
     // a counter that has not seen one is blind — and a blind counter reports
     // the same `{}` as an app that never polled.
     const countsBefore = orchInvokeTotal(await assertCounterSeesTheApp(page, "write_pty"));
+    const sweepsBefore = await singleFlightStats(page);
 
     // ---- the soak itself: the app is left completely alone ----
     await sleep(SOAK_MS);
 
     // The soak's own positive control. Without it this test asserts that an
-    // app survives being ignored: if the tab-strip poll were disarmed, or the
+    // app survives being ignored: if the tab-strip sweep were disarmed, or the
     // corpus's tabs failed to bind, the app would idle doing nothing at all
     // and both probes below would pass.
+    //
+    // The primary measure is SWEEPS, not invokes, and that is a consequence of
+    // #1604. Before it, every 4 s tick issued a sweep, so `ticks × tabs × 2`
+    // predicted the invoke count and a floor could be derived from arithmetic.
+    // Now a tick whose predecessor has not settled skips — legitimately, that
+    // is the fix — so the number of sweeps is something to READ rather than
+    // derive, and a floor derived from the old model would be pricing a
+    // mechanism this base no longer has.
     const counts = await readInvokeCounts(page);
+    const sweepsAfter = await singleFlightStats(page);
+    const sweeps = sweepsAfter.ran - sweepsBefore.ran;
+    const skipped = sweepsAfter.skipped - sweepsBefore.skipped;
     const polled = orchInvokeTotal(counts) - countsBefore;
     const ticks = Math.floor(SOAK_MS / 4_000);
-    // 0.4 of the nominal rate: the poll gate suppresses while the window is
-    // hidden and a tick can be skipped, so this is a floor on "the poll paths
-    // really ran, many dozens of times", not a pin on the cadence.
-    const floor = Math.max(2, Math.floor(ticks * BOUND_TABS * 2 * 0.4));
     const gate = await page.evaluate(
       () => (window as unknown as { __pollGateStats?: () => unknown }).__pollGateStats?.() ?? null
     );
+
+    // Logged on SUCCESS, not only on failure (#1606 review N4): a green run
+    // that records nothing leaves the next person to re-derive this floor from
+    // the same arithmetic that just went stale under them.
+    console.log(
+      `[soak] over ${SOAK_MS}ms: ${sweeps} status sweeps ran, ${skipped} ticks skipped ` +
+        `(of ~${ticks} opportunities); ${polled} orch_* invokes across ${BOUND_TABS} ` +
+        `group-bound tabs; poll gate ${JSON.stringify(gate)}; counts ${JSON.stringify(counts)}`
+    );
+
+    // A floor on SWEEPS. 0.4 of the tick count, because a skip is expected
+    // rather than a defect now and the property being asserted is "the poll
+    // body ran repeatedly under load", not a cadence. Deliberately not a pin:
+    // pinning the rate would pin this incident's shape, which is the mistake
+    // this lane exists to stop making.
+    const sweepFloor = Math.max(2, Math.floor(ticks * 0.4));
+    expect(
+      sweeps,
+      `only ${sweeps} tab-strip status sweeps ran during a ${SOAK_MS}ms soak (expected at ` +
+        `least ${sweepFloor} of ~${ticks} opportunities, ${skipped} skipped). The poll path ` +
+        `this lane exists to load was not running, so the liveness result below would be ` +
+        `about an idle app. Poll gate: ${JSON.stringify(gate)}`
+    ).toBeGreaterThanOrEqual(sweepFloor);
+
+    // And the two instruments have to agree. A sweep issues
+    // `orch_group_summary` + `orch_group_usage` per group-bound tab, so any
+    // sweep that ran dispatched something — sweeps climbing while dispatches
+    // do not would mean the sweep is running and finding no bound tabs, which
+    // is the corpus failing to bind rather than the app being healthy.
     expect(
       polled,
-      `only ${polled} orch_* invokes during a ${SOAK_MS}ms soak with ${BOUND_TABS} group-bound ` +
-        `tabs (expected at least ${floor}). The poll paths this lane exists to load were not ` +
-        `running, so the liveness result below would be about an idle app. ` +
-        `Per-command counts: ${JSON.stringify(counts)}; poll gate: ${JSON.stringify(gate)}`
-    ).toBeGreaterThanOrEqual(floor);
+      `${sweeps} status sweeps ran but only ${polled} orch_* commands were dispatched. A ` +
+        `sweep issues two per group-bound tab, so this means the sweep found no bound ` +
+        `tabs — the corpus's tabs.json did not bind, and the soak applied no registry ` +
+        `load at all. Counts: ${JSON.stringify(counts)}`
+    ).toBeGreaterThanOrEqual(sweeps);
 
     // ---- (4) the two liveness assertions ----
     const pty = await ptyRoundTrip(page, paneTerm, 2, LIVENESS_BOUND_MS);

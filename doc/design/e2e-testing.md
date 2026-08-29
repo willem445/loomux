@@ -384,15 +384,28 @@ reads as covering is worse than none:
   fan-out is simply smaller than a real orchestrating session's. Closing that
   gap needs a safe stand-in agent process — the same standing limitation as
   the task-board overlay above — not a change to this lane.
-- **Blocking-pool exhaustion is a long-local-run property, not a CI one.**
-  Plan #1600 §1.2 step 4 puts saturation of tokio's 512-thread blocking pool
-  minutes into a hold. Four group-bound tabs at two invokes every 4 s is
-  ~2 parked threads per second, so the CI default (a 90 s hold) reaches
-  roughly 180 of the 512 — enough for the FIRST symptom in the chain,
-  "MCP dies first", and not the last. Raising
-  `ORRERIX_SOAK_LOCK_HOLD_MS` past ~250 s locally, or
-  `ORRERIX_SOAK_GROUPS` to widen the fan-out, is what reaches the
-  pane-input half.
+- **Blocking-pool exhaustion is not reachable from the poll path at all, and
+  no hold duration or corpus size changes that.** Plan #1600 §1.2 step 4
+  describes ticks accumulating parked `spawn_blocking` threads until the
+  512-thread pool exhausts. **#1604 single-flights this sweep**: a tick that
+  fires while the previous one is still outstanding skips, so at most one
+  call is parked however long a lock is held. That is the fix working as
+  designed, and it means this lane cannot demonstrate the pane-input half of
+  the chain.
+
+  An earlier version of this section did an arithmetic — four bound tabs at
+  two invokes every 4 s, so ~2 parked threads per second, so ~180 of 512 at a
+  90 s hold — and offered a longer hold or a wider corpus as the way to reach
+  saturation. That was true against the base this branch was cut from and is
+  **false on the merged tree**; it is recorded here rather than deleted
+  because it is exactly the kind of stale arithmetic a reader would otherwise
+  reconstruct from the plan.
+
+  What the class assertion still demonstrates is the half #1604 does not
+  govern: `orchestration/mcp.rs` spawns a thread per request and each one
+  parks on the registry mutex, ungoverned by any single-flight. That is why
+  the MCP probe is the one that dies while pane input stays healthy, and why
+  the lane's finding survives the fix that removed the other half.
 
 ### The corpus, and the store it is deliberately not written into
 
@@ -603,6 +616,14 @@ as evidence for anything.
 **When plan #1600's Phases 1 and 2 land:** delete the `test.fail()` line in
 `e2e/tests/soak-liveness.spec.ts` and this paragraph with it. Nothing else
 about the spec changes.
+
+**Do not expect CI to tell you.** Playwright's unexpected-pass report lands
+inside the `e2e-windows` job, which is `continue-on-error: true` — so when
+the fix arrives the report is a line in a log inside a job that still shows
+green, and no required check moves. What actually carries the obligation is
+#1603 staying open and this paragraph. Whoever lands Phases 1/2 should read
+the E2E log rather than the check mark; if `e2e-windows` ever comes off
+`continue-on-error`, this caveat goes with it.
 
 ### Budget
 

@@ -52,17 +52,27 @@ function envInt(suffix: string, fallback: number): number {
 // ---------------------------------------------------------------------------
 
 /** How long the app idles under poll load before anything is asserted.
- *  Default 180 s: `src/tabbar.ts`'s status poll is 4 s, so that is ~45 ticks
- *  per bound tab — many dozens of poll invokes in total, which is the scale
- *  the plan asks for, at a cost this job can afford on every PR. */
+ *  Default 180 s: `src/tabbar.ts`'s status sweep is on a 4 s timer, so that
+ *  is ~45 opportunities to run — many dozens, which is the scale the plan
+ *  asks for, at a cost this job can afford on every PR. How many of those
+ *  opportunities become a sweep is what the spec MEASURES rather than
+ *  assumes, since #1604 single-flights it. */
 export const SOAK_MS = envInt("SOAK_MS", 180_000);
 
 /** How long the injected registry-lock hold lasts. It has to comfortably
  *  outlast both probes: a hold that expires mid-probe leaves the rest of the
  *  measurement taken against an idle app. At the defaults the probes need
- *  ~70 s worst case, so 90 s. Raising this past ~120 s is what a local run
- *  does to reach blocking-pool exhaustion, the second half of the beta6
- *  mechanism (plan #1600 §1.2 step 4). */
+ *  ~70 s worst case, so 90 s.
+ *
+ *  It is NOT a knob for reaching blocking-pool exhaustion, and an earlier
+ *  version of this comment said it was. #1604 single-flights the tab-strip
+ *  sweep, so that path parks at most ONE outstanding call however long a
+ *  lock is held — the accumulation plan #1600 §1.2 step 4 describes is
+ *  unreachable from the poll path on this base, by design, and no hold
+ *  duration brings it back. What this hold still demonstrates is the half
+ *  #1604 does not govern: `mcp.rs` spawns a thread per request and each one
+ *  parks on the registry mutex, which is why the MCP probe is the one that
+ *  dies. */
 export const LOCK_HOLD_MS = envInt("SOAK_LOCK_HOLD_MS", 90_000);
 
 /** The bound each PHASE of a liveness probe must answer within.
@@ -251,6 +261,33 @@ export async function assertCounterSeesTheApp(
     );
   }
   return counts;
+}
+
+/** The app's single-flight counters (`src/singleflight.ts`, #1604), which
+ *  count the tab-strip status SWEEP itself: `ran` is a sweep that executed,
+ *  `skipped` a 4 s tick that found the previous sweep still outstanding and
+ *  declined to start a second.
+ *
+ *  This is the soak's primary evidence that the poll path ran, and it
+ *  replaces reasoning from tick arithmetic. Before #1604 a tick always
+ *  issued a sweep, so ticks × tabs × 2 predicted the invoke count; now a
+ *  tick may legitimately produce nothing, so the number of sweeps has to be
+ *  read rather than derived. Counters are module-global and cumulative, so
+ *  the spec takes a delta across the soak window rather than an absolute. */
+export async function singleFlightStats(page: Page): Promise<{ ran: number; skipped: number }> {
+  const stats = await page.evaluate(() => {
+    const f = (window as unknown as {
+      __singleFlightStats?: () => { ran: number; skipped: number };
+    }).__singleFlightStats;
+    return f ? f() : null;
+  });
+  if (!stats) {
+    throw new Error(
+      "window.__singleFlightStats is missing — src/singleflight.ts (#1604) is not in this " +
+        "build, so nothing here can say how many status sweeps actually ran"
+    );
+  }
+  return stats;
 }
 
 /** Total dispatches whose command name starts with `orch_` — the poll load,
