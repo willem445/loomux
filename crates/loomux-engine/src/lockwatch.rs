@@ -532,7 +532,9 @@ impl<T> Drop for TrackedGuard<'_, T> {
     fn drop(&mut self) {
         let st = self.state;
         let held_ms = mono_ms().saturating_sub(self.acquired_ms);
-        if held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
+        // NEUTERED (scratch, #1601): unreachable, so a released hold is
+        // never reported however long it lasted.
+        if held_ms == u64::MAX && held_ms >= HOLD_WARN_MS.load(Ordering::Relaxed) {
             // Stamp only. `drain_completed_holds` composes and writes it, on
             // the watchdog thread, with this lock long since released.
             st.done_ms.store(held_ms, Ordering::Relaxed);
