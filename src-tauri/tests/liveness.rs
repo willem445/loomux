@@ -2104,6 +2104,14 @@ fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
         m.tick1_us,
         m.tick2_us
     );
+
+    panic!(
+        "[scratch] TIMING (this panic IS the measurement — every assertion in this row passed \
+         above it): agents={L6_AGENTS} deliveries_per_agent={L6_DELIVERIES} \
+         tail_bytes={L6_TAIL_BYTES} tick1_us={} tick2_us={} max_agents_hold_ms={} \
+         hold_samples={} saw_probe={}",
+        m.tick1_us, m.tick2_us, m.max_hold_ms, m.samples, m.saw_probe
+    );
 }
 
 /// L6b (#1702) — moving the mask off the lock must not move what it decides.
