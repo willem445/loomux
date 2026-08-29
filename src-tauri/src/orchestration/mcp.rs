@@ -15,6 +15,10 @@ use super::mailbox;
 use super::report;
 use super::workflow;
 use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
+// #1609: the thread-local read budget and the typed `Busy` a timed
+// acquisition answers with. See `doc/design/lock-liveness.md`.
+use loomux_engine::budget;
+use loomux_engine::lockwatch::Busy;
 use serde_json::{json, Value};
 use std::io::Read as _;
 use std::path::Path;
@@ -131,6 +135,171 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Bounded acquisition on the MCP surface (#1609, plan §3 Phase 2.1)
+// ---------------------------------------------------------------------------
+//
+// This is the half of Phase 2.1 that closes a MEASURED hole rather than a
+// reasoned one. The E2E soak lane (#1606) holds `groups` for 90 s and probes:
+// a keystroke lands (Phase 2.3), the polled views answer (Phase 1), and an MCP
+// `ping` — which takes no registry lock of its own — gets no answer in 20 s.
+// `OrchRegistry::resolve_token` takes `groups` before dispatch, so every
+// request parks before reaching its arm, `ping` included.
+//
+// Both shapes below are PUBLIC CONTRACTS: an agent's model reads them and
+// decides what to do next. `doc/design/lock-liveness.md` §3 is where they are
+// specified; changing the wording here changes what an agent is told.
+
+/// JSON-RPC error code for "the registry is busy, this is retryable".
+///
+/// In the implementation-defined `-32000..=-32099` server range, one below
+/// `-32000` which this server already uses for an auth refusal — a refusal is
+/// permanent for that token and a busy is not, so they must never be one code.
+pub const MCP_BUSY_CODE: i64 = -32001;
+
+/// The busy error envelope: protocol-level, because token resolution runs
+/// BEFORE the caller is known and there is no tool result to attach it to.
+fn rpc_busy(id: &Value, busy: &Busy) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": MCP_BUSY_CODE,
+            "message": format!("loomux busy: {busy}; retry"),
+            "data": { "retryable": true, "retry_after_ms": busy.retry_after_ms() },
+        },
+    })
+    .to_string()
+}
+
+/// The busy text a READ tool answers with.
+///
+/// A tool RESULT (`isError: true`), not a protocol error — MCP separates the
+/// two, and a busy read is an execution failure rather than a malformed
+/// request. The result shape is also the one that reaches the model's context
+/// as something it can act on.
+///
+/// "Nothing was executed" is true by construction, not by hope: a read tool
+/// that ran out of budget unwound out of `call_tool` at a lock acquisition,
+/// holding nothing and having written nothing (`lock-liveness.md` §4).
+fn busy_tool_text(busy: &Busy) -> String {
+    format!(
+        "loomux busy: {busy}. Nothing was executed; retry in ~{} s.",
+        busy.retry_after_ms().div_ceil(1000)
+    )
+}
+
+/// Whether a tool only READS registry state, or may mutate it.
+///
+/// The distinction exists for exactly one reason: a read may be abandoned
+/// partway through and a mutation may not. A read tool runs under
+/// [`budget::MCP_READ_BUDGET`] and unwinds on expiry; a mutating tool runs to
+/// completion under a [`budget::MutationScope`], and it is the HANDLER's wait
+/// that is bounded instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Read,
+    Mutate,
+}
+
+/// Classify one tool.
+///
+/// **Fail-closed, and that is the whole design.** The default arm is `Mutate`,
+/// so a tool added next month without a line here is treated as mutating: it
+/// runs to completion and is never unwound. The failure mode of a wrong
+/// classification is asymmetric — a mutation wrongly called a read can be
+/// abandoned halfway between two maps, while a read wrongly called a mutation
+/// merely waits longer than it needed to — so the default takes the harmless
+/// side. `tests/liveness.rs`'s classification test is what stops that default
+/// silently becoming the answer for the whole surface.
+pub fn tool_kind(name: &str) -> ToolKind {
+    match name {
+        // Pure reads of registry or on-disk state.
+        "list_agents"
+        | "get_state"
+        | "list_tasks"
+        | "get_task"
+        | "list_questions"
+        | "list_needs_you"
+        | "list_verdicts"
+        | "list_locks"
+        | "list_notifications"
+        | "get_output"
+        | "group_usage"
+        | "session_digest"
+        | "merge_queue_status"
+        | "queue_orphans"
+        | "pr_checks"
+        | "check_mail"
+        | "channel_status" => ToolKind::Read,
+        // Everything else, including anything unrecognised.
+        _ => ToolKind::Mutate,
+    }
+}
+
+/// A read tool a caller can use to check whether a slow mutation landed.
+///
+/// Named per tool rather than guessed, because the sentence it goes into is an
+/// instruction an agent will follow. `None` where there is no honest answer —
+/// the message then says to verify before re-issuing without naming a tool that
+/// would not tell them.
+fn verify_with(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "upsert_task" | "remove_task" => "list_tasks",
+        "spawn_agent" | "kill_agent" | "rename_agent" | "focus_agent" => "list_agents",
+        "set_state" => "get_state",
+        "ask_human" | "withdraw_question" => "list_questions",
+        "request_attention" | "withdraw_attention" => "list_needs_you",
+        "review_verdict" => "list_verdicts",
+        "queue_merge" | "cancel_queued_merge" => "merge_queue_status",
+        "acquire_lock" | "release_lock" => "list_locks",
+        "notify_when" | "cancel_notification" => "list_notifications",
+        _ => return None,
+    })
+}
+
+/// What the longest-held tracked lock is right now, rendered for a human.
+///
+/// Phase 0's instrument, read from the one place a caller is about to be told
+/// "this is taking a while": saying WHICH lock and WHO has it is the difference
+/// between a diagnosis and a shrug, and it costs a non-blocking sample.
+fn slowest_hold() -> Option<String> {
+    let now = loomux_engine::lockwatch::mono_ms();
+    let mut held = loomux_engine::lockwatch::held_locks(now);
+    held.sort_by_key(|s| std::cmp::Reverse(s.held_ms));
+    held.first().map(|s| {
+        format!(
+            "waiting on `{}`, held {:.0} s by {}:{}",
+            s.name,
+            s.held_ms as f64 / 1000.0,
+            s.site_file,
+            s.site_line
+        )
+    })
+}
+
+/// The result a MUTATING tool's caller gets when the handler's wait expires.
+///
+/// **Deliberately not an unwind, and this is the load-bearing decision of the
+/// whole phase.** A mutating tool that has taken locks may already have
+/// mutated, so it runs to completion on its own thread and completes EXACTLY
+/// ONCE. The alternative — a deadline around the body with the late result
+/// discarded — produces DOUBLE execution the moment the agent retries a
+/// non-idempotent tool, which for `spawn_agent` is the worst outcome available.
+///
+/// So the caller is told the truth and told what not to do with it.
+fn still_executing_text(tool: &str) -> String {
+    let waiting = slowest_hold().map(|w| format!(" ({w})")).unwrap_or_default();
+    let verify = match verify_with(tool) {
+        Some(read_tool) => format!(" — verify with `{read_tool}` first"),
+        None => " — verify before re-issuing".to_string(),
+    };
+    format!(
+        "`{tool}` is still executing after {} s{waiting}. It WILL complete; do NOT re-issue it{verify}.",
+        budget::MCP_MUTATE_DEADLINE.as_secs()
+    )
+}
+
 fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
     if !req.url().starts_with("/mcp") {
         respond(req, 404, json!({ "error": "not found" }).to_string());
@@ -163,37 +332,169 @@ fn handle(reg: Arc<OrchRegistry>, mut req: tiny_http::Request) {
         }
     };
 
-    let id = msg.get("id").cloned().unwrap_or(Value::Null);
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+    // Auth, dispatch and both #1609 busy shapes live in `respond_to`, which
+    // `handle_for_test` also calls — one definition of the order, rather than
+    // an HTTP copy and a test copy that drift apart.
+    match respond_to(&reg, &msg, token.as_deref()) {
+        // A notification (no id) needs no body.
+        None => respond(req, 202, String::new()),
+        Some(reply) => respond(req, 200, reply),
+    }
+}
 
-    // Notifications (no id) need no body — ack and move on.
-    if msg.get("id").is_none() {
-        respond(req, 202, String::new());
-        return;
+/// [`dispatch`], plus the two things that need the request's own `Arc` and so
+/// cannot live inside the pure seam: the mutating-tool deadline, and the helper
+/// thread that outlives it.
+///
+/// Every other method — `initialize`, `tools/list`, `ping`, and every READ tool
+/// — goes straight through, because their bound is already inside `dispatch`
+/// (a read tool's `MCP_READ_BUDGET` frame) or they take no lock at all.
+///
+/// **Why the deadline is here rather than in `dispatch`.** `dispatch` is the
+/// HTTP-free seam the integration suite drives directly, by `&OrchRegistry`
+/// reference; a helper thread needs an owned `Arc`, and `OrchRegistry::arc()`
+/// is `None` for the bare registries most tests build. Threading the deadline
+/// through `dispatch` would therefore have made it silently absent in exactly
+/// the harness that is supposed to prove it. It is also honestly a TRANSPORT
+/// property: what it bounds is how long one HTTP request thread waits, not how
+/// long the work takes. The plan's L2b row named `dispatch`; it is driven
+/// through [`handle_for_test`] instead, which is the seam the plan's own L2a
+/// row introduces.
+pub fn dispatch_bounded(
+    reg: &Arc<OrchRegistry>,
+    caller: &Caller,
+    method: &str,
+    params: &Value,
+) -> Result<Value, (i64, String)> {
+    let tool = match method {
+        "tools/call" => params.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+        _ => return dispatch(reg, caller, method, params),
+    };
+    if tool_kind(&tool) != ToolKind::Mutate {
+        return dispatch(reg, caller, method, params);
     }
 
-    let caller = match token.as_deref().and_then(|t| reg.resolve_token(t)) {
-        Some(c) => c,
-        None => {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (r, c, m, p, t) =
+        (reg.clone(), caller.clone(), method.to_string(), params.clone(), tool.clone());
+    std::thread::spawn(move || {
+        let out = dispatch(&r, &c, &m, &p);
+        // `send` fails only when the handler has already answered "still
+        // executing" and dropped the receiver. The work still COMPLETED, and
+        // the audit log is the only place that fact can be recorded now — a
+        // late completion nobody can see is indistinguishable from one that
+        // never happened, which is the state an operator would have to guess
+        // about after reading the caller's "it WILL complete".
+        if let Err(std::sync::mpsc::SendError(late)) = tx.send(out) {
+            let (ok, text) = match &late {
+                Ok(v) => (true, v.to_string()),
+                Err((_, m)) => (false, m.clone()),
+            };
+            r.audit(
+                &c.group,
+                &c.agent_id,
+                "tool-result",
+                json!({
+                    "tool": t,
+                    "ok": ok,
+                    "late": true,
+                    "text": text.chars().take(500).collect::<String>(),
+                }),
+            );
+        }
+    });
+
+    match rx.recv_timeout(budget::MCP_MUTATE_DEADLINE) {
+        Ok(out) => out,
+        Err(_) => {
+            let text = still_executing_text(&tool);
+            crate::obs::breadcrumb(
+                "mcp-mutate-slow",
+                &format!("group={} agent={} tool={tool}", caller.group, caller.agent_id),
+            );
+            Ok(json!({
+                "content": [json!({ "type": "text", "text": text })],
+                "isError": true,
+            }))
+        }
+    }
+}
+
+/// Resolve a request's token under [`budget::MCP_AUTH_BUDGET`].
+///
+/// Three outcomes, and they are three different facts a caller must be able to
+/// tell apart: resolved, refused (this token is not one we manage — permanent),
+/// and busy (we could not look — retryable). Before #1609 the third silently
+/// became "no answer at all", which is the measured hole.
+fn resolve_caller_bounded(
+    reg: &OrchRegistry,
+    token: Option<&str>,
+    method: &str,
+    id: &Value,
+) -> Result<Caller, String> {
+    match budget::read_budget(budget::MCP_AUTH_BUDGET, || {
+        token.and_then(|t| reg.resolve_token(t))
+    }) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => {
             // Breadcrumb the rejection (method + whether a token was present),
             // never the token value or body.
             crate::obs::breadcrumb(
                 "mcp-auth-fail",
                 &format!("method={method} token_present={}", token.is_some()),
             );
-            respond(req, 200, rpc_error(&id, -32000,
-                &format!("unknown or missing {} token — this MCP server only serves agents it manages",
-                    brand::AGENT_TOKEN_HEADER)));
-            return;
+            Err(rpc_error(
+                id,
+                -32000,
+                &format!(
+                    "unknown or missing {} token — this MCP server only serves agents it manages",
+                    brand::AGENT_TOKEN_HEADER
+                ),
+            ))
         }
+        Err(busy) => {
+            crate::obs::breadcrumb("mcp-busy-auth", &format!("method={method} {}", busy.detail()));
+            Err(rpc_busy(id, &busy))
+        }
+    }
+}
+
+/// [`handle`] with the HTTP stripped off: takes a parsed request, returns the
+/// parsed response envelope (or `None` for a notification, which is acked with
+/// no body).
+///
+/// The seam the plan's L2a/L2b rows drive. It exists because the two shapes
+/// this phase adds — the `-32001` busy envelope and the still-executing tool
+/// result — are produced OUTSIDE `dispatch`, so a test that drives `dispatch`
+/// cannot see either of them. `handle` is this function plus `tiny_http`, so
+/// there is one definition of the auth-and-dispatch order rather than two that
+/// can drift.
+#[doc(hidden)]
+pub fn handle_for_test(reg: &Arc<OrchRegistry>, msg: &Value, token: Option<&str>) -> Option<Value> {
+    let reply = respond_to(reg, msg, token)?;
+    Some(serde_json::from_str(&reply).unwrap_or(Value::Null))
+}
+
+/// The whole of a request's handling, minus the transport: auth under a budget,
+/// then dispatch with the mutating-tool deadline. Returns the response body as
+/// a JSON string, or `None` for a notification (which is acked with no body).
+fn respond_to(reg: &Arc<OrchRegistry>, msg: &Value, token: Option<&str>) -> Option<String> {
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+
+    // Notifications (no id) need no body — ack and move on.
+    msg.get("id")?;
+
+    let caller = match resolve_caller_bounded(reg, token, &method, &id) {
+        Ok(c) => c,
+        Err(refusal) => return Some(refusal),
     };
 
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    match dispatch(&reg, &caller, &method, &params) {
-        Ok(result) => respond(req, 200,
-            json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()),
-        Err((code, m)) => respond(req, 200, rpc_error(&id, code, &m)),
-    }
+    Some(match dispatch_bounded(reg, &caller, &method, &params) {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+        Err((code, m)) => rpc_error(&id, code, &m),
+    })
 }
 
 /// Protocol dispatch, separated from HTTP so tests can drive it directly.
@@ -256,7 +557,27 @@ pub fn dispatch(
             // process is alive and executing", which a rejected call proves
             // just as well as an accepted one. See `note_agent_ack`.
             reg.note_agent_ack(&caller.agent_id);
-            let out = call_tool(reg, caller, name, &args);
+            // #1609. A READ tool runs under `MCP_READ_BUDGET` and may be
+            // abandoned at a lock acquisition; the `Busy` becomes an
+            // `isError` RESULT, which is the shape that reaches the model
+            // as something it can retry. A MUTATING tool runs to completion
+            // inside a `MutationScope`, so no enclosing budget can ever
+            // unwind it halfway between two maps — its bound is the
+            // handler's WAIT instead (`dispatch_bounded`).
+            let out = match tool_kind(name) {
+                ToolKind::Read => {
+                    match budget::read_budget(budget::MCP_READ_BUDGET, || {
+                        call_tool(reg, caller, name, &args)
+                    }) {
+                        Ok(r) => r,
+                        Err(busy) => Err(busy_tool_text(&busy)),
+                    }
+                }
+                ToolKind::Mutate => {
+                    let _scope = budget::MutationScope::enter();
+                    call_tool(reg, caller, name, &args)
+                }
+            };
             let (text, is_error) = match out {
                 Ok(t) => (t, false),
                 Err(t) => (t, true),
