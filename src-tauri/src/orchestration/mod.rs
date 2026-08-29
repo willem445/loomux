@@ -12635,10 +12635,15 @@ pub mod lockorder {
 
     /// `by_pty` — the pane -> agent reverse index.
     ///
-    /// `session_for_pty`'s claim: "`by_pty` is taken and RELEASED before
-    /// `agents`". Released, so the two do not in fact nest today — the rank
-    /// records the order the claim states, which is the order any future site
+    /// `session_for_pty` takes this and then `agents`, and RELEASES this one
+    /// first — a `let`-statement temporary — so the two do not in fact nest
+    /// today. The rank records that order, which is the order any future site
     /// that DOES nest them has to follow.
+    ///
+    /// Stated as what the code does rather than as a quotation from that
+    /// function's doc (#1702): the doc used to promise exactly this and the
+    /// promise was worthless to its CALLER, which was holding `agents` when it
+    /// called in. See `doc/design/lock-liveness.md` §6.
     pub const BY_PTY: LockRank = LockRank::new(500);
 
     /// `agents` — the agent table. Under `by_pty`, over `groups`.
@@ -12655,8 +12660,14 @@ pub mod lockorder {
 
     /// `delivered_prompts` — prompt bodies keyed by CLI session.
     ///
-    /// Its own claim: "`agents` is taken and RELEASED before this one", so it
-    /// ranks under `agents`.
+    /// Ranks under `agents` because a caller that has to RESOLVE a pty to its
+    /// session takes `by_pty` and then `agents` first, releasing both before
+    /// this map is taken. Stated from the code rather than quoted from that
+    /// field's doc: the doc used to make exactly this claim, #1702 moved the
+    /// resolution out of the record read to the callers, and a rank that cites
+    /// a sentence which may be rewritten is a rank nobody can re-check. A
+    /// caller holding an agent snapshot resolves nothing and reaches this map
+    /// having taken no registry lock at all.
     pub const DELIVERED_PROMPTS: LockRank = LockRank::new(600);
 
     /// `delivered_notices` — what loomux wrote into each pane.
@@ -12873,9 +12884,15 @@ pub struct OrchRegistry {
     /// SESSION rather than by pane — see [`DeliveredPrompts`] for why the
     /// keying is the fix and not an optimisation.
     ///
-    /// **Lock order: `agents` is taken and RELEASED before this one.** Resolving
-    /// a pty to its session reads `agents`; nothing here holds this map while
-    /// reaching for that one, which is the same order
+    /// **Lock order: takes no other registry lock while held**, and since #1702
+    /// it does not depend on one being taken before it either: the pty-to-session
+    /// resolution that reads `agents` moved OUT of
+    /// [`OrchRegistry::delivered_prompt_record`] to its callers, so a caller
+    /// that already holds the session (an agent snapshot) reaches this map
+    /// having taken nothing at all. Where a caller does resolve — the delivery
+    /// path, and `plain_pane_attention` — `by_pty` then `agents` are taken and
+    /// released as statement temporaries first, so the order is still `agents`
+    /// before this one and nothing nests. Same order
     /// [`OrchRegistry::mark_notice_maskable`] already uses.
     delivered_prompts: Arc<TrackedMutex<HashMap<String, DeliveredPrompts>>>,
     /// Per-pane FIFO delivery queue (#445): a hold-cap expiry in
@@ -22347,8 +22364,16 @@ fn run_queue_drainer(
             // reader of the gate whose hold has no cap, so it is the one whose
             // audit has to say what it keyed on — see
             // `question_active_witnessed`.
-            let reading =
-                question_active_witnessed(&ptys, pty_id, None, reg.delivered_mask_lines(pty_id));
+            let reading = question_active_witnessed(
+                &ptys,
+                pty_id,
+                None,
+                // #1702: the pty->session resolution is spelled out here rather
+                // than hidden inside the record read. This poll holds no
+                // registry guard, which is exactly the fact the old shape made
+                // impossible to check at a glance.
+                reg.delivered_mask_lines(pty_id, reg.session_for_pty(pty_id).as_deref()),
+            );
             let question_seen = reading.witnessed;
             let admission = write_admission(box_pending, reading.active);
             // #903: the streak the last-resort override keys on. Counted here,
@@ -22629,7 +22654,13 @@ fn run_queue_drainer(
                 let submit = submit_sequence(&cli);
                 match drain_stranded_submit(
                     &ptys, &reg.last_delivery, front.from.clone(), pty_id, submit,
-                    reg.delivered_mask_lines(pty_id),
+                    // #1702: unchanged in what it acquires — `delivered_mask_
+                    // lines` already reached `by_pty` + `agents` from here — but
+                    // now visibly so, under the per-pane delivery `lock` this arm
+                    // holds. That nesting predates #1702 and is NOT this PR's to
+                    // change; it is filed, with the reverse-order question, as
+                    // its own row.
+                    reg.delivered_mask_lines(pty_id, reg.session_for_pty(pty_id).as_deref()),
                 ) {
                     StrandedMarkerAction::Press => DeliverOutcome::Done,
                     StrandedMarkerAction::Retire(why) => DeliverOutcome::Retired(why),
@@ -24215,7 +24246,14 @@ pub fn prompt_record_admits_kind(kind: Delivery) -> bool {
 /// registry at all; an absent record is the same legitimate "nothing known"
 /// an untouched pane has, and means the marker rule (#576).
 fn delivered_lines(reg: &Option<Arc<OrchRegistry>>, pty_id: u32) -> Vec<String> {
-    reg.as_ref().map(|r| r.delivered_mask_lines(pty_id)).unwrap_or_default()
+    // #1702: this helper is the one place the delivery path resolves a pty to a
+    // session, and it does so with no registry guard held — `deliver_now` and
+    // the gates that call it take the per-pane delivery lock, never a registry
+    // map. A caller that DOES hold one must pass its own session instead; see
+    // [`OrchRegistry::session_for_pty`].
+    reg.as_ref()
+        .map(|r| r.delivered_mask_lines(pty_id, r.session_for_pty(pty_id).as_deref()))
+        .unwrap_or_default()
 }
 
 /// The evidence floor a MID-LINE anchor must clear (rev-163 N1).
@@ -38820,10 +38858,41 @@ impl OrchRegistry {
         tails: &HashMap<String, String>,
         last_inputs: &HashMap<String, u64>,
     ) -> Vec<AttentionItem> {
+        // #1702, phase 1 of 3 — the ROSTER SNAPSHOT. `agents` is taken here,
+        // cloned from, and RELEASED before anything else in this function runs:
+        // `compute_group_usage`'s shape, and for a sharper reason than cost.
+        //
+        // This lock used to be held across the whole per-agent loop below, which
+        // put `delivered_mask_lines` under it — and that call reaches
+        // `session_for_pty`, whose second line is `self.agents.lock_safe()`.
+        // `TrackedMutex`'s inner primitive is `parking_lot::Mutex`, which is not
+        // re-entrant, and this tick runs inside `tick_gate`'s `MutationScope`,
+        // where an expired budget does NOT unwind — `lock_safe` falls through to
+        // `acquire_blocking` and waits, unbounded. So the tick did not merely
+        // hold the registry's busiest lock for a long time: it DEADLOCKED on it,
+        // the first time any pty-bound, `by_pty`-mapped agent went quiet past
+        // `ATTENTION_QUIET_MS`. Both halves of that nesting entered in one
+        // commit (#903), which is why #1702's field trace is a single hold
+        // growing 38 s → 336 s across separate retries, never released, and
+        // re-forming within seconds of every restart.
+        //
+        // The rule this function now keeps — and the one a later edit must not
+        // break — is that NO phase holds a registry lock across a call that can
+        // take another one:
+        //
+        //   phase 1  snapshot the roster             short `agents` hold
+        //   phase 2  masks and prompt-wait per agent NOTHING held
+        //   phase 3  decide and apply                one short hold of the
+        //                                            attention maps
+        //
+        // Phase 2 is where every nested acquisition now happens, and it happens
+        // with the registry free. `doc/design/lock-liveness.md` §6 is the
+        // contract; `liveness.rs`'s `l6a_`/`l6b_` rows are the guard.
+        let roster: Vec<AgentEntry> = self.agents.lock_safe().values().cloned().collect();
+
         // Board-derived gate map: agent id → gate status, across every live
         // group. Read once per group (a small fs read) rather than per agent.
-        let groups: HashSet<GroupId> =
-            self.agents.lock_safe().values().map(|a| a.group.clone()).collect();
+        let groups: HashSet<GroupId> = roster.iter().map(|a| a.group.clone()).collect();
         let mut gate_of: HashMap<String, String> = HashMap::new();
         // #1091 slice D: pending-question count per asker, across every live
         // group — DERIVED from the #946 Q1 `questions.json` registry, exactly
@@ -38876,6 +38945,82 @@ impl OrchRegistry {
             }
         }
 
+        // #1702, phase 2 — the per-agent mask, computed with NO lock held. This
+        // is the work that used to run under `agents`; it reaches four other
+        // registry locks (`delivered_notices`, `by_pty`, `agents`,
+        // `delivered_prompts`) and so may only run from a phase holding none.
+        //
+        // What it costs is BOUNDED, and saying so is the other half of #1702:
+        // the issue's premise was that this scales with a session's age, and it
+        // does not. `delivered_mask_lines` unions two drop-oldest records that
+        // are capped where they are WRITTEN — `DELIVERED_NOTICES_PER_PANE` (24)
+        // lines of the pane's notice record and
+        // `DELIVERED_PROMPT_LINES_PER_SESSION` (16) of the session's prompt
+        // record — so `delivered` is at most 40 lines however many thousands of
+        // deliveries a session has taken, and the maps holding them are capped
+        // by pane and by session as well (`DELIVERED_NOTICE_PANES`,
+        // `DELIVERED_PROMPT_SESSIONS`), which is what bounds the memory. The
+        // other operand is capped too: `attention_tail` reads only the trailing
+        // `ATTENTION_SCAN_BYTES` (4096) of the ring, so a tail is ~100 rows.
+        // One agent's mask is therefore ~100 × 40 short string comparisons —
+        // tens of microseconds, with nothing in it proportional to session age.
+        // That is why no SECOND cap is added here: capping an already-capped
+        // record could only narrow what the mask may claim, which is a change to
+        // #903 B2's guarantees, and it would buy no bound that is not already
+        // held.
+        //
+        // Computed for every running agent that has a tail, rather than only for
+        // the ones the cheap terms below would admit. The old code let `&&`
+        // short-circuit this away, but those terms read the quiet clock, which
+        // lives in a map phase 3 owns — keeping the short-circuit would mean
+        // reading one of this predicate's inputs under a lock and the rest
+        // outside it. A pure function of (tail, record) is the same value
+        // whenever it is evaluated, so the tick's outputs are unchanged; only
+        // the cost of an agent the terms would have rejected moves, and it moves
+        // off the lock.
+        //
+        // A pane with no pty bound has taken no delivery, so an empty record is
+        // the truth rather than a gap — the same `unwrap_or_default` the old
+        // in-loop expression had, kept here so an agent with a tail and no pty
+        // is still masked against an empty record rather than skipped.
+        let prompt_shaped: HashMap<String, bool> = roster
+            .iter()
+            .filter(|a| a.status == AgentStatus::Running)
+            .filter_map(|a| tails.get(&a.id).map(|t| (a, t)))
+            .map(|(a, t)| {
+                // #1702: the session comes off the ROSTER SNAPSHOT, so this
+                // phase resolves nothing and takes neither `by_pty` nor
+                // `agents`. That is the difference between "the deadlock is
+                // unreachable because no lock is held here" and "the tick never
+                // asks the question that deadlocked it".
+                let delivered = a
+                    .pty_id
+                    .map(|p| self.delivered_mask_lines(p, a.session_id.as_deref()))
+                    .unwrap_or_default();
+                let shaped =
+                    prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
+                (a.id.clone(), shaped)
+            })
+            .collect();
+
+        // #1702, phase 3 — decide and apply, under one short hold of the
+        // attention maps. Nothing below reads a pty, a board file or a delivery
+        // record; every input it needs was gathered above.
+        //
+        // `roster` is phase 1's SNAPSHOT, and by here it is up to a phase-2
+        // duration old (~12 ms on a six-agent fixture). That is deliberate and
+        // it has one consequence worth knowing before editing this loop:
+        // `mark_dead` sets an agent `Dead`, DROPS `agents`, and only then
+        // prunes `attn_quiet`/`attn_waiting_ack`/`attn_reports`/`attn_emitted`
+        // — so a kill landing in that window has its prune undone by the
+        // `quiet.entry(...).or_insert(...)` below, and one stale chip can be
+        // emitted for a pane that is already dead. It reconciles on the next
+        // tick, whose first branch removes all four entries for any agent no
+        // longer `Running`, and the cadence is 3 s. The alternative — re-taking
+        // `agents` here to re-check liveness — is exactly the coupling #1702
+        // exists to remove, so this is a chosen trade rather than an oversight.
+        // Under the pre-#1702 shape it could not happen: the tick held `agents`
+        // across the whole loop, which serialised `mark_dead` against it.
         let reports = self.attn_reports.lock_safe().clone();
         let mut quiet = self.attn_quiet.lock_safe();
         let mut waiting_ack = self.attn_waiting_ack.lock_safe();
@@ -38884,13 +39029,14 @@ impl OrchRegistry {
         // same lock order as the other attention maps.
         let mut stranded = self.attn_stranded.lock_safe();
         // #946 Q4 / #1091 slice H: the latched-attention belt's own map,
-        // taken in the same lock order (after `attn_stranded`, before
-        // `agents`) for the same reason every other attention map is taken
-        // here rather than re-locked per agent.
+        // taken in the same lock order (after `attn_stranded`) for the same
+        // reason every other attention map is taken here rather than re-locked
+        // per agent. It used to read "before `agents`"; `agents` is not taken
+        // in this phase at all any more (#1702), and describing an order that
+        // no longer exists is how the next reader re-creates it.
         let mut question_held = self.attn_question_held.lock_safe();
-        let agents = self.agents.lock_safe();
         let mut out = Vec::new();
-        for a in agents.values() {
+        for a in &roster {
             if a.status != AgentStatus::Running {
                 quiet.remove(&a.id);
                 waiting_ack.remove(&a.id);
@@ -38932,16 +39078,10 @@ impl OrchRegistry {
                 // that WRAPPED does not raise a chip either. A pane with no
                 // pty bound has taken no delivery, so an empty record is the
                 // truth rather than a gap.
-                && tails
-                    .get(&a.id)
-                    .map(|t| {
-                        let delivered = a
-                            .pty_id
-                            .map(|p| self.delivered_mask_lines(p))
-                            .unwrap_or_default();
-                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
-                    })
-                    .unwrap_or(false);
+                // #1702: computed in phase 2, off every lock. `unwrap_or(false)`
+                // is the same default the in-loop expression had — no entry
+                // means this agent had no tail this tick.
+                && prompt_shaped.get(&a.id).copied().unwrap_or(false);
 
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if question_held.contains(a.id.as_str()) {
@@ -39011,6 +39151,40 @@ impl OrchRegistry {
         last_inputs: &HashMap<u32, u64>,
         agent_ptys: &HashSet<u32>,
     ) -> Vec<AttentionItem> {
+        // #1702: the same per-pane mask work `attention_tick` moved out of its
+        // locks, hoisted out of this one's for the same reason.
+        //
+        // This path did NOT deadlock — it holds neither `by_pty` nor `agents`,
+        // which are the two `delivered_mask_lines` reaches for — so it is a
+        // sibling by shape rather than a second instance of the bug. What it did
+        // do is hold `attn_quiet` and `attn_waiting_ack` across a call that
+        // takes four other registry locks, which is a lock-order edge one edit
+        // away from being the same defect, and is the shape #1702 asks every
+        // periodic tick to stop having. Computed here, with nothing held; the
+        // per-pane cost is bounded exactly as phase 2's is.
+        //
+        // Keyed by pty and gated on the same `agent_ptys` skip the loop below
+        // applies, so no agent pane is masked twice.
+        let prompt_shaped: HashMap<u32, bool> = outputs
+            .keys()
+            .copied()
+            .filter(|pty| !agent_ptys.contains(pty))
+            .filter_map(|pty| tails.get(&pty).map(|t| (pty, t)))
+            .map(|(pty, t)| {
+                // #576 residual: the pane record is keyed by pty id, which is
+                // exactly what this path has. The SESSION record needs a
+                // resolution, and a plain pane has no snapshot to take it from —
+                // so this path asks, and #1702's whole point is that it asks
+                // here, with no lock held, rather than from inside the map hold
+                // below. Semantics unchanged: a pane with no `by_pty` entry
+                // resolves to `None` exactly as it did before.
+                let session = self.session_for_pty(pty);
+                let delivered = self.delivered_mask_lines(pty, session.as_deref());
+                let shaped =
+                    prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
+                (pty, shaped)
+            })
+            .collect();
         let mut quiet = self.attn_quiet.lock_safe();
         let mut waiting_ack = self.attn_waiting_ack.lock_safe();
         let mut out = Vec::new();
@@ -39037,15 +39211,10 @@ impl OrchRegistry {
                 // likely of the two to hold a notice — but a human pasting one
                 // in to read it is enough, and the two readings must not
                 // disagree about what counts as a question.
-                && tails
-                    .get(&pty)
-                    .map(|t| {
-                        // #576 residual: the record is keyed by pty id, which
-                        // is exactly what this path has.
-                        let delivered = self.delivered_mask_lines(pty);
-                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
-                    })
-                    .unwrap_or(false);
+                // #1702: computed above, off every lock. `unwrap_or(false)` is
+                // the same default the in-loop expression had — no entry means
+                // this pane had no tail this tick.
+                && prompt_shaped.get(&pty).copied().unwrap_or(false);
             if waiting {
                 out.push(AttentionItem {
                     agent_id: String::new(),
@@ -39142,7 +39311,18 @@ impl OrchRegistry {
                 notify_desktop(&format!("orrerix · {}", i.name), &i.detail);
             }
         }
-        if let Some(app) = self.app.lock_safe().clone() {
+        // #1702: bound BEFORE the branch, for `emit_session_learned`'s reason
+        // one screen up — an `if let` scrutinee's temporaries live for the whole
+        // body in edition 2021, so branching on `self.app.lock_safe().clone()`
+        // directly holds that guard across the `emit` below AND across
+        // `queue_depth_push`, which takes `queues`, `hold_episodes` and
+        // `queue_depth_emitted`. `app` is the registry's most-taken lock; this
+        // tick was holding it across an IPC serialization of the whole attention
+        // set every three seconds, and nesting three more registry locks under
+        // it. Same rule as the phases in `attention_tick`: nothing holds a
+        // registry lock across a call that can take one.
+        let app = self.app.lock_safe().clone();
+        if let Some(app) = app {
             let _ = app.emit("orch-attention", &items);
             // #814: the delivery-queue badge rides this tick rather than owning a
             // cadence of its own. Two reasons, both structural. The age it shows
@@ -47048,10 +47228,23 @@ impl OrchRegistry {
     /// second way of answering "who holds this pane" is a second thing that can
     /// drift from the first.
     ///
-    /// **Lock order**: `by_pty` is taken and RELEASED before `agents`, and
-    /// neither is held while reaching for [`OrchRegistry::delivered_prompts`] —
-    /// see that field for the order that matters.
-    fn session_for_pty(&self, pty_id: u32) -> Option<String> {
+    /// **This TAKES `by_pty` and then `agents`** — stated as what it acquires
+    /// rather than as an internal ordering, because the ordering is not the fact
+    /// a caller needs. An earlier version of this doc read "`by_pty` is taken
+    /// and RELEASED before `agents`, and neither is held while reaching for
+    /// `delivered_prompts`". Every word of that was true of this body and
+    /// useless to its caller: `attention_tick` was holding `agents` when it
+    /// called in, so the second acquisition here was a re-entrant one on a
+    /// `parking_lot::Mutex`, and the tick parked forever. That is #1702, and it
+    /// was live for four betas.
+    ///
+    /// So the rule a caller reads off this doc is the one a lock-order note
+    /// could not give it: **never call this while holding a registry lock**, and
+    /// prefer not calling it at all — a caller that already has an agent
+    /// snapshot has the session in [`AgentEntry::session_id`] and should pass
+    /// that to [`OrchRegistry::delivered_mask_lines`] instead.
+    #[doc(hidden)] // pub for integration tests
+    pub fn session_for_pty(&self, pty_id: u32) -> Option<String> {
         // Through the EXISTING reverse index, never a fresh scan of `agents`:
         // `by_pty` is already maintained beside every `pty_id` write, and a
         // second way of answering "who holds this pane" is a second thing that
@@ -47100,15 +47293,26 @@ impl OrchRegistry {
         }
     }
 
-    /// #903: the prompt lines loomux has delivered into `pty_id`'s SESSION —
-    /// including ones delivered to a DIFFERENT pane of the same session, which
-    /// is the whole reason this exists.
+    /// #903: the prompt lines loomux has delivered into `session` — including
+    /// ones delivered to a DIFFERENT pane of the same session, which is the
+    /// whole reason this exists.
+    ///
+    /// **Takes the session id, not a pty** (#1702). Resolving a pty in here
+    /// meant every caller silently paid `by_pty` + `agents` inside a function
+    /// whose name promises a record read, and the caller that could least afford
+    /// it — `attention_tick`, which was holding `agents` and already had the
+    /// session in its own roster — is the one that deadlocked on it. The
+    /// resolution now happens at the call site, where whether a lock is held is
+    /// something a reader can see.
+    ///
+    /// `None` is the same "nothing known" an unresolvable pane always produced:
+    /// the marker rule alone, which is the fail-CLOSED direction.
     #[doc(hidden)] // pub for integration tests
-    pub fn delivered_prompt_record(&self, pty_id: u32) -> Vec<String> {
-        let Some(session) = self.session_for_pty(pty_id) else {
+    pub fn delivered_prompt_record(&self, session: Option<&str>) -> Vec<String> {
+        let Some(session) = session else {
             return Vec::new();
         };
-        self.delivered_prompts.lock_safe().get(&session).map(|d| d.claimable()).unwrap_or_default()
+        self.delivered_prompts.lock_safe().get(session).map(|d| d.claimable()).unwrap_or_default()
     }
 
     /// #903: everything the question gate's mask may claim in `pty_id` — the
@@ -47121,10 +47325,15 @@ impl OrchRegistry {
     /// no dialog question row heading the block above the anchor. A single rule
     /// is what stops "which record did this line come from" becoming a thing the
     /// mask has to get right on every row.
+    /// **`session` is supplied by the caller** (#1702) — the pane record is
+    /// keyed by pty and the prompt record by session, and only the caller knows
+    /// whether it already holds the latter. A caller with an agent snapshot
+    /// passes [`AgentEntry::session_id`] and takes NO lock to get it; one with
+    /// only a pty passes [`OrchRegistry::session_for_pty`] at its own call site.
     #[doc(hidden)] // pub for integration tests
-    pub fn delivered_mask_lines(&self, pty_id: u32) -> Vec<String> {
+    pub fn delivered_mask_lines(&self, pty_id: u32, session: Option<&str>) -> Vec<String> {
         let mut lines = self.delivered_notice_lines(pty_id);
-        lines.extend(self.delivered_prompt_record(pty_id));
+        lines.extend(self.delivered_prompt_record(session));
         lines
     }
 

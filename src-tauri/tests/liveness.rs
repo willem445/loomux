@@ -109,6 +109,10 @@ use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// The session-sized fixture generator (#1702). `tests/common/mod.rs`, so it is
+/// compiled INTO this target rather than built as a test target of its own.
+mod common;
+
 /// Long enough that a loaded CI runner never trips it, short enough that a real
 /// regression fails the job rather than hanging it. Every use is a "did this
 /// make progress at all" question, not a latency measurement — the fixes this
@@ -1803,4 +1807,442 @@ fn l5_every_lockorder_const_is_applied_to_its_field() {
         lockorder::ALL.len()
     );
     assert!(live.len() >= 60, "the live-lock scan found only {} locks", live.len());
+}
+
+// ---------- L6: the attention tick on a long-lived session (#1702) ----------
+//
+// Two rows, and they are split rather than merged because they redden for
+// different reasons and a red evidences only the assertion it REACHED
+// (CLAUDE.md). L6a is the deadlock witness: on the pre-fix tick it never gets
+// past "did the call return", so an equality assertion sharing its body would
+// bank a coverage claim no run ever produced. L6b is that equality, and its own
+// counterfactual is a tick that returns while masking nothing.
+//
+// **What the pre-fix red looks like depends on the base**, and the rows are
+// written so the failure line says which:
+//
+//   - on `main` BEFORE Phase 3a (#1698): `attention_tick` takes `agents` and
+//     re-acquires it through `delivered_mask_lines` -> `delivered_prompt_record`
+//     -> `session_for_pty`. `parking_lot::Mutex` is not re-entrant and the tick
+//     runs inside `tick_gate`'s `MutationScope`, where an expired budget waits
+//     rather than unwinding — so the thread parks forever and the row reports a
+//     TIMEOUT.
+//   - on `main` WITH 3a: the same path takes `by_pty` (rank 500) while holding
+//     `agents` (510) one line EARLIER than the re-entrant acquire, which is a
+//     descending pair, so the rank checker panics naming both locks before the
+//     deadlock can form. The row reports a PANIC, with the checker's message.
+//
+// Both are the same defect through different instruments, which is why the
+// runner below distinguishes them instead of reporting one as the other.
+
+/// Guardrails for a fixture that needs more than [`rails`]'s four panes.
+fn rails_for(max_agents: u32) -> Guardrails {
+    Guardrails { max_agents, ..rails() }
+}
+
+/// Lock names no other test uses, so the sampler can identify the thread it is
+/// measuring without a process-wide serial guard: tests in this binary run in
+/// parallel and `lockwatch::held_locks` is global, so filtering on the name
+/// `agents` alone would be reading other tests' registries too.
+const L6A_PROBE: &str = "l6a_tick_probe";
+const L6A_CONTROL_PROBE: &str = "l6a_control_probe";
+const L6B_PROBE: &str = "l6b_tick_probe";
+
+/// Agents in the fixture fleet.
+const L6_AGENTS: usize = 6;
+/// Prompt deliveries recorded against EACH agent's session. Field-sized: the
+/// pane #1702 was reported on had taken thousands.
+const L6_DELIVERIES: usize = 4_000;
+/// 16 KiB of rendered tail per pane — four times the `ATTENTION_SCAN_BYTES`
+/// window production actually reads, so the fixture is strictly harder than the
+/// real subject rather than a scaled-down model of it.
+const L6_TAIL_BYTES: usize = 16 * 1024;
+/// The sampler's cadence. Not a wait — this file's "never a sleep" rule is
+/// about waiting for a condition, and every wait below is a bounded
+/// `recv_timeout`.
+const L6_SAMPLE_EVERY: Duration = Duration::from_micros(500);
+/// How long L6a's instrument control holds `agents` deliberately, and the floor
+/// the sampler must report for it. Both are far above `L6_SAMPLE_EVERY` and far
+/// below anything that would make the row slow.
+const L6_CONTROL_HOLD: Duration = Duration::from_millis(250);
+const L6_CONTROL_FLOOR_MS: u64 = 50;
+
+/// The subject both L6 rows measure.
+///
+/// The fixture is as much the finding as the assertions are: #1702 survived four
+/// betas because *no test in this repo could build the state that triggers it*.
+/// `attention_setup`, the helper every attention test in `orchestration.rs`
+/// uses, spawns agents with no pty, so `pty_id` is `None`, the per-agent mask is
+/// never reached, and the whole class is unreachable from that file however many
+/// cases it adds. The soak lane has the mirror gap: it wedges a lock and probes,
+/// which measures VICTIMS of a hold and never constructs a holder out of
+/// ordinary state. So the trigger — running, pty-bound, `by_pty`-mapped,
+/// session-bound, quiet past the attention window — is what
+/// `common::fabricate_long_lived_session` exists to produce.
+struct L6Fixture {
+    reg: Arc<OrchRegistry>,
+    _dir: tempfile::TempDir,
+    fx: common::LongLivedSession,
+    tails: std::collections::HashMap<String, String>,
+    /// What the mask says, computed from the same shipped helpers with no
+    /// registry lock involved anywhere — "the unbounded computation".
+    reference: std::collections::HashMap<String, bool>,
+}
+
+fn l6_fixture() -> L6Fixture {
+    use loomux_lib::orchestration::{mask_loomux_notices_with_record, prompt_wait_detected};
+    use std::collections::HashMap;
+
+    let (reg, _dir) = test_registry();
+    let g = reg
+        .create_group("C:/tmp/repo", rails_for(L6_AGENTS as u32 + 2))
+        .expect("create a group");
+    let fx = common::fabricate_long_lived_session(&reg, &g.id, L6_AGENTS, L6_DELIVERIES);
+    assert_eq!(
+        fx.agent_ids.len(),
+        L6_AGENTS,
+        "setup: the fixture got fewer panes than it asked for, so everything below would be \
+         measuring a smaller subject than it claims"
+    );
+
+    // Pane 0's tail ends with the very line loomux last delivered into its
+    // session — #576/rev-126's case, the one the record exists to mask — so the
+    // mask must claim it and that pane must NOT flag. Every other pane ends on a
+    // real CLI dialog and must flag. A fixture where every pane answered the
+    // same way would pass just as well against a tick that had stopped masking.
+    let mut tails: HashMap<String, String> = HashMap::new();
+    for (i, id) in fx.agent_ids.iter().enumerate() {
+        let ending =
+            if i == 0 { fx.last_delivered[id].clone() } else { common::DIALOG_ENDING.to_string() };
+        tails.insert(id.clone(), common::padded_tail(L6_TAIL_BYTES, &ending));
+    }
+
+    let reference: HashMap<String, bool> = fx
+        .agent_ids
+        .iter()
+        .map(|id| {
+            let delivered =
+                reg.delivered_mask_lines(fx.pty_of[id], fx.session_of.get(id).map(|s| s.as_str()));
+            let masked = mask_loomux_notices_with_record(&tails[id], &delivered);
+            (id.clone(), prompt_wait_detected(&masked))
+        })
+        .collect();
+
+    L6Fixture { reg, _dir, fx, tails, reference }
+}
+
+/// How a measured body ended.
+enum Ran<R> {
+    Done(R),
+    /// The thread panicked — under Phase 3a this is the rank checker refusing
+    /// the inversion, and its message names both locks.
+    Panicked(String),
+    /// Neither returned nor panicked inside the grace window: parked.
+    Parked,
+}
+
+struct Sampled<R> {
+    ran: Ran<R>,
+    /// The longest `agents` hold observed FOR THE MEASURED THREAD.
+    max_hold_ms: u64,
+    /// How many samples saw such a hold.
+    samples: usize,
+    /// Weak control: the sampler identified the measured thread through its
+    /// probe lock, so it was running and could attribute a hold to it. This is
+    /// NOT evidence that it can see a hold of any particular duration — that is
+    /// what `L6_CONTROL_HOLD` is for.
+    saw_probe: bool,
+}
+
+/// Run `body` on its own thread and report the longest `agents` hold that
+/// thread took while it ran.
+///
+/// The thread is identified by a uniquely-named probe lock it holds and then
+/// releases before `body` starts, so the probe can never be mistaken for the
+/// thing being measured, and the sampler needs no process-wide serial guard.
+fn measure_agents_hold<R: Send + 'static>(
+    probe_name: &'static str,
+    body: impl FnOnce() -> R + Send + 'static,
+) -> Sampled<R> {
+    use loomux_engine::lockwatch::{held_locks, mono_ms, TrackedMutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<R>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let t_stop = stop.clone();
+
+    let worker = std::thread::spawn(move || {
+        let probe = TrackedMutex::new(probe_name, ());
+        let held = probe.lock_safe();
+        let _ = ready_rx.recv_timeout(GRACE);
+        drop(held);
+        let out = body();
+        t_stop.store(true, Ordering::Relaxed);
+        let _ = done_tx.send(out);
+    });
+
+    let s_stop = stop.clone();
+    let sampler = std::thread::spawn(move || {
+        // Phase 1 — identify the measured thread through the probe.
+        let deadline = Instant::now() + GRACE;
+        let mut who = None;
+        while Instant::now() < deadline {
+            if let Some(s) = held_locks(mono_ms()).into_iter().find(|s| s.name == probe_name) {
+                who = Some(s.holder_thread);
+                break;
+            }
+            std::thread::sleep(L6_SAMPLE_EVERY);
+        }
+        let Some(who) = who else { return (false, 0u64, 0usize) };
+        let _ = ready_tx.send(());
+
+        // Phase 2 — the measurement, bounded by its own deadline as well as by
+        // the stop flag, because the failure L6a guards against is precisely
+        // the case where the flag is never set.
+        let deadline = Instant::now() + GRACE;
+        let (mut max_ms, mut samples) = (0u64, 0usize);
+        while !s_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            for s in held_locks(mono_ms()) {
+                if s.name == "agents" && s.holder_thread == who {
+                    samples += 1;
+                    max_ms = max_ms.max(s.held_ms);
+                }
+            }
+            std::thread::sleep(L6_SAMPLE_EVERY);
+        }
+        (true, max_ms, samples)
+    });
+
+    let got = done_rx.recv_timeout(GRACE);
+    stop.store(true, Ordering::Relaxed);
+    let (saw_probe, max_hold_ms, samples) = sampler.join().expect("the sampler thread panicked");
+
+    let ran = match got {
+        Ok(r) => Ran::Done(r),
+        Err(_) if worker.is_finished() => {
+            let msg = match worker.join() {
+                Err(p) => p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+                Ok(_) => "<thread finished without sending and without panicking>".to_string(),
+            };
+            Ran::Panicked(msg)
+        }
+        // Deliberately NOT joined: it is parked on a lock this process still
+        // holds, and the harness exits when the run ends — the same posture
+        // `completes_within` documents at the top of this file.
+        Err(_) => Ran::Parked,
+    };
+    Sampled { ran, max_hold_ms, samples, saw_probe }
+}
+
+/// Two `attention_tick` passes, measured. Two because one cannot reach the
+/// defect: the quiet clock is established on the first sighting, so `quiet_for`
+/// is zero there and the `&&` chain short-circuits before the mask. The second,
+/// five seconds on (past the four-second attention window), is the one that
+/// reaches `delivered_mask_lines`.
+fn measured_ticks(
+    f: &L6Fixture,
+    probe: &'static str,
+) -> Sampled<(Vec<loomux_lib::orchestration::AttentionItem>, u128, u128)> {
+    let reg = f.reg.clone();
+    let outputs = f.fx.outputs.clone();
+    let tails = f.tails.clone();
+    let inputs = f.fx.no_input.clone();
+    let now = 1_000_000_000_000u64;
+    measure_agents_hold(probe, move || {
+        let t0 = Instant::now();
+        reg.attention_tick(now, &outputs, &tails, &inputs);
+        let first = t0.elapsed().as_micros();
+        let t1 = Instant::now();
+        let items = reg.attention_tick(now + 5_000, &outputs, &tails, &inputs);
+        (items, first, t1.elapsed().as_micros())
+    })
+}
+
+/// L6a (#1702) — the deadlock witness. `attention_tick` must RETURN on the
+/// state that used to wedge it, and must not hold `agents` while it works.
+///
+/// Phase 2.1's budgets bound what a WAITER pays; what broke here was a HOLD, so
+/// the hold is measured directly off `lockwatch::held_locks` rather than by
+/// timing a victim.
+#[test]
+fn l6a_the_attention_tick_returns_on_the_state_that_deadlocked_it() {
+    let f = l6_fixture();
+
+    // ---- the instrument control, and it is the whole reason this row can
+    // report a zero honestly ----------------------------------------------
+    //
+    // The hold assertion below is an ABSENCE ("no long hold was seen"), and an
+    // absence is byte-identical to an instrument that cannot see the thing.
+    // `saw_probe` alone does not close that: it proves the sampler ran and can
+    // attribute a hold to the right thread, not that it would CATCH one. So a
+    // deliberate `agents` hold of known duration is taken here, on a measured
+    // thread, and the sampler must report it. Without this, a fix that stopped
+    // taking `agents` at all and a sampler that was blind would produce the
+    // same reading.
+    let reg = f.reg.clone();
+    let control = measure_agents_hold(L6A_CONTROL_PROBE, move || {
+        reg.with_lock_for_test("agents", || std::thread::sleep(L6_CONTROL_HOLD))
+            .expect("`agents` is a known lock name");
+    });
+    assert!(
+        matches!(control.ran, Ran::Done(())),
+        "setup: the control hold itself did not complete, so nothing below is measurable"
+    );
+    assert!(
+        control.max_hold_ms >= L6_CONTROL_FLOOR_MS,
+        "the sampler saw a longest `agents` hold of {} ms over {} samples while a hold of {:?} \
+         was deliberately taken on the measured thread (saw_probe={}). The instrument cannot \
+         see what this row is about, so its reading on the real tick would mean nothing",
+        control.max_hold_ms,
+        control.samples,
+        L6_CONTROL_HOLD,
+        control.saw_probe
+    );
+
+    // ---- the measurement -------------------------------------------------
+    let m = measured_ticks(&f, L6A_PROBE);
+    assert!(
+        m.saw_probe,
+        "the sampler never identified the tick thread through its probe lock, so it observed \
+         nothing"
+    );
+    let (_items, tick1_us, tick2_us) = match m.ran {
+        Ran::Done(t) => t,
+        Ran::Panicked(msg) => panic!(
+            "attention_tick PANICKED instead of returning. On a base carrying Phase 3a this is \
+             the #1702 defect caught by the rank checker — the tick holds `agents` (rank 510) \
+             and reaches `by_pty` (rank 500) through delivered_mask_lines -> \
+             delivered_prompt_record -> session_for_pty, one line before it would re-acquire \
+             `agents` itself. The checker said: {msg}"
+        ),
+        Ran::Parked => panic!(
+            "attention_tick did not return within {GRACE:?} and did not panic. That is the \
+             #1702 defect on a base without the rank checker: the tick takes `agents` and \
+             re-acquires it through delivered_mask_lines -> delivered_prompt_record -> \
+             session_for_pty, and parking_lot's mutex is not re-entrant, so it parks forever. \
+             The longest `agents` hold observed for that thread was {} ms over {} samples",
+            m.max_hold_ms, m.samples
+        ),
+    };
+
+    // The ceiling is the floor the control above just PROVED the sampler can
+    // see — not `TICK_LOCK_BUDGET` (5 s), which this row used to assert and
+    // which is two orders of magnitude looser than anything it can support
+    // (#1703 review B1). An assertion may only refuse what its instrument is
+    // demonstrated to detect; at 5 s it would pass a phase that had regrown an
+    // `fs` read and was holding `agents` for 4999 ms on every 3 s tick, while
+    // this row's own message claimed every phase was a bounded in-memory pass.
+    //
+    // Observed on the fixed tick: 0 ms over 0 samples, so this passes with the
+    // whole 50 ms to spare. If it ever flakes on a loaded runner, the cause is
+    // the sampler catching a DESCHEDULED holder rather than a real hold, and
+    // the fix is to raise `L6_CONTROL_HOLD` and `L6_CONTROL_FLOOR_MS`
+    // together — never the ceiling alone, which would decouple what this
+    // refuses from what the control proves it can see.
+    assert!(
+        m.max_hold_ms < L6_CONTROL_FLOOR_MS,
+        "the tick held `agents` for {} ms (over {} samples), at or past the \
+         {L6_CONTROL_FLOOR_MS} ms this row refuses — which is the same figure the control \
+         above proves the sampler can see. Every phase of attention_tick that takes a \
+         registry lock must be a bounded in-memory pass: no pty read, no board file, no \
+         delivery record. The two passes took {tick1_us} and {tick2_us} us",
+        m.max_hold_ms,
+        m.samples
+    );
+}
+
+/// L6b (#1702) — moving the mask off the lock must not move what it decides.
+///
+/// The counterfactual this row owns is NOT the deadlock (L6a has that): it is a
+/// tick that returns promptly while masking nothing, which L6a passes and this
+/// must not.
+#[test]
+fn l6b_the_masks_the_tick_applies_equal_the_unbounded_computation() {
+    use loomux_lib::orchestration::{
+        mask_loomux_notices_with_record, prompt_wait_detected, DELIVERED_NOTICES_PER_PANE,
+        DELIVERED_PROMPT_LINES_PER_SESSION,
+    };
+    use std::collections::HashSet;
+
+    let f = l6_fixture();
+
+    // The bound #1702 STATES rather than adds. The issue's premise was that the
+    // record grows with the session; it does not, because both halves of
+    // `delivered_mask_lines` are drop-oldest and capped where they are written.
+    // Four thousand deliveries per session, and the record is still at most
+    // forty lines — which is what makes "add no second cap" a checked claim
+    // instead of a sentence in a PR body.
+    for id in &f.fx.agent_ids {
+        let record = f
+            .reg
+            .delivered_mask_lines(f.fx.pty_of[id], f.fx.session_of.get(id).map(|s| s.as_str()));
+        assert!(
+            record.len() <= DELIVERED_NOTICES_PER_PANE + DELIVERED_PROMPT_LINES_PER_SESSION,
+            "the delivered record for {id} is {} lines after {L6_DELIVERIES} deliveries; the \
+             two caps that bound it allow at most {}",
+            record.len(),
+            DELIVERED_NOTICES_PER_PANE + DELIVERED_PROMPT_LINES_PER_SESSION
+        );
+        // The vacuity control that ceiling needs: an EMPTY record satisfies any
+        // ceiling, and would also mean the fixture never wired the session and
+        // every mask in this row ran against nothing.
+        assert!(
+            !record.is_empty(),
+            "the fixture recorded {L6_DELIVERIES} deliveries for {id} and the record is empty, \
+             so the ceiling above is satisfied by there being no record at all"
+        );
+    }
+
+    // The discriminating control, in two halves, because "the reference is
+    // mixed" is not enough on its own: a pane can fail to flag because its text
+    // is not a question, which would make this row pass against a tick that had
+    // stopped masking entirely.
+    assert!(
+        f.reference.values().any(|v| *v) && f.reference.values().any(|v| !*v),
+        "setup: the reference is unanimous ({:?}), so the equality below would not distinguish \
+         a masking tick from one that had stopped masking",
+        f.reference
+    );
+    let masked_pane = &f.fx.agent_ids[0];
+    assert!(
+        prompt_wait_detected(&mask_loomux_notices_with_record(&f.tails[masked_pane], &[])),
+        "setup: pane 0's tail is not prompt-shaped WITHOUT the record, so the fact that it does \
+         not flag says nothing about masking — it would not flag under any implementation"
+    );
+    assert!(
+        !f.reference[masked_pane],
+        "setup: pane 0's tail IS prompt-shaped and the record does not suppress it, so the mask \
+         is not claiming the line this fixture was built around"
+    );
+
+    let m = measured_ticks(&f, L6B_PROBE);
+    let (items, _, _) = match m.ran {
+        Ran::Done(t) => t,
+        Ran::Panicked(msg) => panic!(
+            "could not compare outputs: attention_tick panicked. This row's own assertion was \
+             never reached — see L6a, which owns that failure. The panic was: {msg}"
+        ),
+        Ran::Parked => panic!(
+            "could not compare outputs: attention_tick did not return within {GRACE:?}. This \
+             row's own assertion was never reached — see L6a, which owns that failure"
+        ),
+    };
+
+    let flagged: HashSet<String> = items
+        .iter()
+        .filter(|i| i.reason == "waiting")
+        .map(|i| i.agent_id.clone())
+        .collect();
+    let expected: HashSet<String> =
+        f.reference.iter().filter(|(_, v)| **v).map(|(k, _)| k.clone()).collect();
+    assert_eq!(
+        flagged, expected,
+        "moving the mask off the lock must not move what it decides: the tick flagged \
+         {flagged:?} and the same masking computed outside it says {expected:?}"
+    );
 }
