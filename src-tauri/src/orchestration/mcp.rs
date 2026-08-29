@@ -209,10 +209,15 @@ fn busy_tool_text(busy: &Busy) -> String {
 /// Whether a tool only READS registry state, or may mutate it.
 ///
 /// The distinction exists for exactly one reason: a read may be abandoned
-/// partway through and a mutation may not. A read tool runs under
-/// [`budget::MCP_READ_BUDGET`] and unwinds on expiry; a mutating tool runs to
-/// completion under a [`budget::MutationScope`], and it is the HANDLER's wait
-/// that is bounded instead.
+/// partway through **by a budget timeout** and a mutation may not. A read tool
+/// runs under [`budget::MCP_READ_BUDGET`] and unwinds on expiry; a mutating
+/// tool is left to run under a [`budget::MutationScope`], and it is the
+/// HANDLER's wait that is bounded instead.
+///
+/// That is a statement about the BUDGET, not a completion guarantee: a
+/// re-entrant `lock_safe` panics a mutate helper thread rather than parking it
+/// (#1702), so a mutation can end without a result — see [`worker_died_text`],
+/// which is what its caller is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     Read,
@@ -223,7 +228,7 @@ pub enum ToolKind {
 ///
 /// **Fail-closed, and that is the whole design.** The default arm is `Mutate`,
 /// so a tool added next month without a line here is treated as mutating: it
-/// runs to completion and is never unwound. The failure mode of a wrong
+/// is left to run, and no budget timeout unwinds it. The failure mode of a wrong
 /// classification is asymmetric — a mutation wrongly called a read can be
 /// abandoned halfway between two maps, while a read wrongly called a mutation
 /// merely waits longer than it needed to — so the default takes the harmless
@@ -404,10 +409,20 @@ fn slowest_hold() -> Option<String> {
 ///
 /// **Deliberately not an unwind, and this is the load-bearing decision of the
 /// whole phase.** A mutating tool that has taken locks may already have
-/// mutated, so it runs to completion on its own thread and completes EXACTLY
-/// ONCE. The alternative — a deadline around the body with the late result
-/// discarded — produces DOUBLE execution the moment the agent retries a
-/// non-idempotent tool, which for `spawn_agent` is the worst outcome available.
+/// mutated, so it is left running on its own thread and runs AT MOST ONCE. The
+/// alternative — a deadline around the body with the late result discarded —
+/// produces DOUBLE execution the moment the agent retries a non-idempotent
+/// tool, which for `spawn_agent` is the worst outcome available.
+///
+/// **At most once, not exactly once** (#1702). The two halves of that
+/// guarantee have different strengths and this doc used to state the weaker
+/// one as though it were the stronger. Nothing can make the tool run TWICE —
+/// that is what the deadline-on-the-wait buys and it is untouched. But a tool
+/// can now fail to complete at all: a re-entrant `lock_safe` panics this
+/// helper thread rather than parking it, which is the improvement, and
+/// [`worker_died_text`] is the answer that improvement owes its caller. A
+/// completion guarantee this function's own sibling contradicts is worth
+/// less than the narrower one that is true.
 ///
 /// So the caller is told the truth and told what not to do with it.
 fn still_executing_text(tool: &str) -> String {
@@ -781,10 +796,12 @@ pub fn dispatch(
             // #1609. A READ tool runs under `MCP_READ_BUDGET` and may be
             // abandoned at a lock acquisition; the `Busy` becomes an
             // `isError` RESULT, which is the shape that reaches the model
-            // as something it can retry. A MUTATING tool runs to completion
+            // as something it can retry. A MUTATING tool is left to RUN
             // inside a `MutationScope`, so no enclosing budget can ever
             // unwind it halfway between two maps — its bound is the
-            // handler's WAIT instead (`dispatch_bounded`).
+            // handler's WAIT instead (`dispatch_bounded`). Not a completion
+            // guarantee: a panic on this thread still ends it early, and
+            // `worker_died_text` is what the caller is told (#1702).
             let out = match tool_kind(name) {
                 ToolKind::Read => {
                     match budget::read_budget(budget::MCP_READ_BUDGET, || {

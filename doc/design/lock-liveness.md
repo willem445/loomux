@@ -281,9 +281,10 @@ loomux busy: <Busy>. Nothing was executed; retry in ~5 s.
 "Nothing was executed" is load-bearing and it is true by construction: a read
 tool that unwound took no lock it still holds and wrote nothing (§4).
 
-**Mutating tools are deliberately NOT unwound.** A mutating tool that has taken
-locks may already have mutated, so it runs to completion on a helper thread and
-the handler waits `recv_timeout(MCP_MUTATE_DEADLINE)`. On timeout the caller gets:
+**Mutating tools are deliberately NOT unwound by a budget.** A mutating tool
+that has taken locks may already have mutated, so it is left running on a helper
+thread and the handler waits `recv_timeout(MCP_MUTATE_DEADLINE)`. On timeout the
+caller gets:
 
 ```
 <tool> is still executing after 30 s (waiting on `agents`, held 47 s by …).
@@ -293,7 +294,20 @@ It WILL complete; do NOT re-issue — verify with <read tool> first.
 The late completion is audited with `late: true`. The rejected alternative was a
 deadline around the body with the late result discarded, which produces **double
 execution** when the agent retries a non-idempotent tool — the worst possible
-outcome for `spawn_agent`. Exactly-once beats a tidy timeout.
+outcome for `spawn_agent`. At-most-once beats a tidy timeout.
+
+**At most once, not exactly once** (#1702). This section used to say
+"exactly-once", and the two halves of that have different strengths. Nothing can
+make a mutating tool run TWICE — that is what the deadline-on-the-wait buys, and
+nothing since has touched it. Completion is the half that is conditional: a
+re-entrant `lock_safe` panics the helper thread instead of parking it (§4.1's
+narrowing, `lock-order.md` §2.1), so the tool can end without a result. That is
+not a hole in the design, it is the design working — a thread that would
+otherwise have wedged the registry forever is released — but it means the
+handler owes the caller a third answer, and `worker_died_text` is it: an
+`isError` naming the crash log and the read tool to verify with, saying the tool
+**may have** partially executed. `docs/orchestration.md` carries the
+user-facing half of the same correction.
 
 ### What the busy fallback inherits, and the one case it cannot
 

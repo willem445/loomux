@@ -50937,7 +50937,18 @@ const TICK_FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
 /// through this: the first runs three independent bodies on one thread and
 /// wants three supervisors, so one broken pass cannot latch the other two off;
 /// the second is one body but with a name of its own. Both use
-/// `obs::TickSupervisor` directly.
+/// `obs::TickSupervisor` directly. Eight loops here plus those two is the
+/// whole of `mod.rs`'s cadenced set.
+///
+/// **One cadenced loop in this app is still unsupervised, and it is not in this
+/// file**: `gitwatch::start` (`src-tauri/src/gitwatch.rs`) is the only
+/// remaining bare `thread::spawn(move || loop { .. })` in the tree, and its
+/// body reaches `lock_safe` through `poll_changed`. It is not a re-entrancy
+/// site — `poll_changed` is snapshot, then stat, then re-acquire — so #1702
+/// left it alone rather than widening past the plan's scope (§2 item 3a names
+/// `mod.rs`'s `start_*` loops and `start_view_publisher`). Named here so "the
+/// ticks are supervised" is read as a claim about this file, which is what it
+/// is, rather than about the app (#1713 review N3).
 fn spawn_tick_loop(
     tick: &'static str,
     mut interval: impl FnMut() -> Duration + Send + 'static,

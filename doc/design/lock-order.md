@@ -131,6 +131,16 @@ that has panicked three times running, and says so in a `tick-disabled`
 breadcrumb. The transient case now recovers where it used to kill the thread;
 the deterministic case degrades to what it did before, named.
 
+**The latch is permanent, and for eight of the ten ticks it is visible only in a
+log file.** There is no un-latch short of relaunching. The publisher has a
+surfaced degraded state — the stale badge, which `polled-views.md` states — but a
+latched `watchdog` or `attention` tick shows up as one `tick-disabled` line in
+`breadcrumbs.log` and nothing else, and the symptom it produces (badges quietly
+holding their last value) is exactly the shape nobody thinks to grep for.
+Accepted as shipped, because the behaviour before #1702 was the same freeze with
+no line at all; a surfaced degraded state for the other eight is a follow-up
+rather than a widening of this change (#1713 review N4).
+
 ### 2.2 What the refusal costs, in full
 
 The refusal is an unwind, and an unwind out of arbitrary code is the thing
@@ -155,16 +165,28 @@ A shipped build reaching one means a path the suite never exercised, and the
 answer to that is a test, not a wider refusal policy.
 
 **A refusal during an unwind aborts the process.** If a `Drop` running inside an
-unwind reaches a lock its own unwinding frame still holds, the refusal panics
-while a panic is already in flight, and Rust aborts. Nothing in the tree does
-this today — `TrackedGuard::drop` takes no tracked lock, by the rule in
-`lockwatch.rs`'s own header — and the previous behaviour was to deadlock inside
-the unwind instead, which is a wedge with no artifact at all. The abort is
-louder and it still leaves a record: `obs`'s hook has a re-entry path for exactly
-this (a second panic reaching the hook while the first run is in progress) that
-appends one emergency line to the crash log phase one already opened. Stated
-because "this cannot happen today" is a claim about today's `Drop` impls, and
-the next one to take a registry lock would make it false silently.
+unwind reaches a lock **its own unwinding frame still holds**, the refusal panics
+while a panic is already in flight, and Rust aborts. The previous behaviour was
+to deadlock inside that unwind instead, which is a wedge with no artifact at all;
+the abort is louder and still leaves a record, because `obs`'s hook has a
+re-entry path for exactly this — a second panic reaching the hook while the first
+run is in progress appends one emergency line to the crash log phase one already
+opened.
+
+**The invariant is that narrow one, and it is not "no `Drop` takes a tracked
+lock".** A `Drop` that takes one already exists, and it exists specifically to
+run during an unwind: `DrainerGuard::drop` (`orchestration/mod.rs`) calls
+`queuestate::DrainerRegistry::release`, which takes the `queue_draining`
+`TrackedMutex`, and its own doc says *"The guard's `Drop` runs on unwind exactly
+like it does on a normal `return`."* It is safe, and not because it is old — it
+is safe because the drainer never holds `queue_draining` across the drain, so the
+`Drop` is not re-entering a lock its unwinding frame holds. Every method on
+`DrainerRegistry` takes that lock and releases it inside one scope.
+
+So a contributor writing the eighth `Drop` here should ask the narrow question —
+*can the frame this `Drop` unwinds out of already hold the lock I am about to
+take?* — rather than the broad one, which has a false answer and would send them
+looking for a rule nothing follows.
 
 ### What it costs
 

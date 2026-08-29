@@ -98,7 +98,10 @@ pub const MCP_READ_BUDGET: Duration = Duration::from_secs(15);
 /// is still running.
 ///
 /// A deadline on the WAIT, never on the work: see `doc/design/lock-liveness.md`
-/// §3. The tool keeps executing on its own thread and completes exactly once.
+/// §3. The tool keeps executing on its own thread and runs AT MOST once —
+/// nothing can make it run twice, which is what this deadline-on-the-wait
+/// buys. It is not a completion guarantee: a panic on that thread ends it
+/// early, and the caller is told so rather than told to wait (#1702).
 ///
 /// The SHIPPED value. Code reads [`mutate_deadline`], which is this unless a
 /// test has overridden it — the same shape (and the same reason)

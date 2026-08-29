@@ -1396,9 +1396,12 @@ agent is told nothing was executed and it can simply try again. Two things are
 worth knowing if you see one:
 
 - **A busy answer never means a half-done change.** Only READS are answered
-  this way. Anything that changes something runs to completion — if one of
-  those takes a long time the agent is told it is *still executing* and
-  explicitly told NOT to re-issue it, because it will finish on its own.
+  this way. Anything that changes something is left to run — if one of those
+  takes a long time the agent is told it is *still executing* and explicitly
+  told NOT to re-issue it, because a slow change finishes on its own. The one
+  way a change does *not* finish is a bug inside orrerix, and that is never
+  reported as busy: it gets the `internal error` answer below, which says so
+  and tells the agent to check.
 - **The breadcrumb log names the culprit.** Each one is recorded once, with
   the holder and the duration, in `logs/breadcrumbs.log` under your orrerix
   data directory. If busy answers keep coming, that file is what to send.
