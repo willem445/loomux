@@ -423,7 +423,7 @@ use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Weak};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use loomux_engine::lockwatch::TrackedMutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -13248,7 +13248,7 @@ pub struct OrchRegistry {
     /// queued. Neither alone is sufficient — see `deliver_prompt`'s pause
     /// branch for the restart case that reaches the drainer without passing
     /// the front door.
-    paused: TrackedMutex<HashSet<GroupId>>,
+    paused: Mutex<HashSet<GroupId>>,
     /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
     /// pruned to the trailing hour on each check.
     spawn_times: TrackedMutex<HashMap<GroupId, Vec<u64>>>,
@@ -26463,7 +26463,7 @@ impl OrchRegistry {
             pr_body_override: TrackedMutex::new("pr_body_override", None),
             pr_files_override: TrackedMutex::new("pr_files_override", None),
             gh_exec_override: TrackedMutex::new("gh_exec_override", None),
-            paused: TrackedMutex::new("paused", HashSet::new()),
+            paused: Mutex::new(HashSet::new()),
             spawn_times: TrackedMutex::new("spawn_times", HashMap::new()),
             self_arc: TrackedMutex::new("self_arc", Weak::new()),
             attn_reports: TrackedMutex::new("attn_reports", HashMap::new()),
