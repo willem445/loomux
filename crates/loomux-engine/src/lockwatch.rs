@@ -1049,8 +1049,23 @@ mod bounded_tests {
     /// never a latency measurement.
     const GRACE: Duration = Duration::from_secs(10);
 
-    /// Hold `lock` on its own thread until the returned sender is dropped,
-    /// returning only once the hold is REAL.
+    /// How long a `hold` fixture keeps its lock if the test never releases it.
+    ///
+    /// **This is a watchdog, not a duration the assertions depend on.** Every
+    /// bounded-acquisition test here budgets in the tens of milliseconds, so a
+    /// PASSING run never reaches this. It exists for the FAILING run: the
+    /// natural way to redden any of these rows is to neuter the bound, and a
+    /// neutered `lock_within` parks forever — which arrives as a CI job
+    /// timeout naming nothing, not as a red naming an assertion. With a
+    /// deadline on the holder, the same neuter returns late with the wrong
+    /// answer and the assertion says so (the #744 idiom).
+    ///
+    /// Four seconds is the same value `hold_lock_for_test` uses in
+    /// `tests/liveness.rs`, and a 40-80x margin over the budgets below.
+    const HOLD_MAX: Duration = Duration::from_secs(4);
+    /// Hold `lock` on its own thread until the returned sender is dropped —
+    /// or until [`HOLD_MAX`], whichever comes first — returning only once the
+    /// hold is REAL.
     ///
     /// The handshake is the point: a test that merely spawns a holder and hopes
     /// is measuring the scheduler. Returns the line the hold was taken on so a
@@ -1063,7 +1078,8 @@ mod bounded_tests {
         std::thread::spawn(move || {
             let _g = lock.lock_safe();
             let _ = held_tx.send(());
-            let _ = release_rx.recv();
+            // `recv_timeout`, never `recv`: see HOLD_MAX.
+            let _ = release_rx.recv_timeout(HOLD_MAX);
         });
         held_rx.recv_timeout(GRACE).expect("setup: the holder thread never acquired the lock");
         (release_tx, line)
