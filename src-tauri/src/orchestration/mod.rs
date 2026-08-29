@@ -13561,7 +13561,12 @@ pub struct OrchRegistry {
     /// A plain field rather than an `Arc<ViewPublisher>`: this registry is
     /// already behind an `Arc` and nothing owns the publisher independently,
     /// so an inner `Arc` would be an indirection with no second owner.
-    pub(crate) views: views::ViewPublisher,
+    ///
+    /// `pub` rather than `pub(crate)`: `tests/liveness.rs` drives the two
+    /// published reads directly while a registry lock is held, which is the
+    /// one property this whole slice exists for and cannot be observed
+    /// through the commands (they need an AppHandle, unavailable headless).
+    pub views: views::ViewPublisher,
 }
 
 /// One member of a [`Channel`]: which group/agent pane is connected. Cached
@@ -52135,30 +52140,6 @@ pub async fn orch_autonomy(app: AppHandle, group_id: String) -> Value {
     run_blocking(move || reg.autonomy_state_within(&group_id, USAGE_POLL_MAX_AGE)).await
 }
 
-/// Live-agent count, role breakdown, and uptime for the lifecycle panel.
-///
-/// **Off the UI thread** (#1595) — the command whose sync dispatch froze
-/// v1.2.0-beta5. `group_summary` takes the `agents` mutex (and then, in a
-/// separate statement, `groups`), both shared with the background threads:
-/// the idle reaper, the watchdog, the gh poller, and `note_agent_activity` on
-/// the pty output path. `lock_safe` is `Mutex::lock` with poison recovery —
-/// no timeout, no try-lock — so the acquisition is UNBOUNDED. On the GTK main
-/// loop an unbounded acquisition is a frozen window that never repaints and
-/// never processes input, which is a force-quit rather than a slow panel.
-///
-/// **It is polled from TWO loops, not one**, which is why the freeze arrives a
-/// minute or two in rather than at startup: `GroupView.load()`'s 2 s batch
-/// (`groupview.ts`), and `TabBar.pollStatus()`'s 4 s loop (`tabbar.ts`),
-/// which iterates EVERY group-bound tab and awaits each in turn. So the number
-/// of unbounded main-thread acquisitions per tick scales with open group tabs.
-///
-/// **The "cheap in-memory" classification was not wrong about the work — it was
-/// wrong about what makes a sync command safe.** A cheap CRITICAL SECTION is
-/// not a cheap ACQUISITION while another thread holds the lock, and being on a
-/// fixed cadence means the question is re-asked every tick forever. #1593's
-/// `orch_session_roles` was the same class with expensive work; this one shows
-/// the work never had to be expensive.
-#[tauri::command]
 /// **The group view's whole 2 s poll, in one read** (#1608, plan #1600 §3
 /// Phase 1). Replaces a `Promise.all` batch of ten `orch_*` commands, every
 /// one of which acquired a registry mutex on an unbounded `lock_safe`.
@@ -52215,6 +52196,30 @@ pub async fn orch_strip_view(app: AppHandle) -> Value {
     run_blocking(move || views::strip_view_payload(&reg.views.load(), Instant::now())).await
 }
 
+/// Live-agent count, role breakdown, and uptime for the lifecycle panel.
+///
+/// **Off the UI thread** (#1595) — the command whose sync dispatch froze
+/// v1.2.0-beta5. `group_summary` takes the `agents` mutex (and then, in a
+/// separate statement, `groups`), both shared with the background threads:
+/// the idle reaper, the watchdog, the gh poller, and `note_agent_activity` on
+/// the pty output path. `lock_safe` is `Mutex::lock` with poison recovery —
+/// no timeout, no try-lock — so the acquisition is UNBOUNDED. On the GTK main
+/// loop an unbounded acquisition is a frozen window that never repaints and
+/// never processes input, which is a force-quit rather than a slow panel.
+///
+/// **It is polled from TWO loops, not one**, which is why the freeze arrives a
+/// minute or two in rather than at startup: `GroupView.load()`'s 2 s batch
+/// (`groupview.ts`), and `TabBar.pollStatus()`'s 4 s loop (`tabbar.ts`),
+/// which iterates EVERY group-bound tab and awaits each in turn. So the number
+/// of unbounded main-thread acquisitions per tick scales with open group tabs.
+///
+/// **The "cheap in-memory" classification was not wrong about the work — it was
+/// wrong about what makes a sync command safe.** A cheap CRITICAL SECTION is
+/// not a cheap ACQUISITION while another thread holds the lock, and being on a
+/// fixed cadence means the question is re-asked every tick forever. #1593's
+/// `orch_session_roles` was the same class with expensive work; this one shows
+/// the work never had to be expensive.
+#[tauri::command]
 pub async fn orch_group_summary(app: AppHandle, group_id: String) -> Value {
     let Ok(group_id) = command_group(&group_id) else { return Value::Null };
     let reg = reg_of(&app);

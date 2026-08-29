@@ -35904,6 +35904,7 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("manager_prose.rs", 1),  // test_registry (#1161 M4)
         ("selfwatch.rs", 1),      // test_registry (#1601 Phase 0)
         ("views.rs", 1),          // test_registry (#1608)
+        ("liveness.rs", 1),       // test_registry (#1608 L0/L1)
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);
