@@ -54568,9 +54568,7 @@ pub fn resume_recorded_session(
 
 #[tauri::command]
 pub fn bind_agent(reg: tauri::State<Arc<OrchRegistry>>, agent_id: String, pty_id: u32) -> Result<(), String> {
-    OrchRegistry::mutating_command("bind_agent", || Err(COMMAND_REFUSED.to_string()), || {
-        reg.bind(&agent_id, pty_id)
-    })
+    reg.bind(&agent_id, pty_id)
 }
 
 /// The human renamed an agent pane in-place (F2 / double-click). Sync the
