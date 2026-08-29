@@ -495,34 +495,40 @@ rarest token of the ENTITY the claim names, and widen from there.
 
 ```sh
 # 1. DISCOVERY - one token, no space. This pass bounds everything below it.
-LC_ALL=C.UTF-8 grep -rn "try-lock" <roots>
+LC_ALL=C.UTF-8 grep -rn --include='*.rs' --include='*.md' 'try-lock' <roots>
 
-# 2. CONFIRMATION - recursive over the same ROOTS, never over pass 1's file list:
-#    a list derived from pass 1 cannot surface a file pass 1 missed. Strip the
-#    comment markers BEFORE squeezing - squeezing first leaves the stripped
-#    marker as a double space and the joined pattern silently misses again.
-find <roots> -type f \( -name '*.rs' -o -name '*.md' \) | while read -r f; do
-  n=$(tr '[:space:]' ' ' < "$f" | sed 's|///||g; s|//!||g' | tr -s ' ' |
-      grep -o "no timeout, no try-lock" | wc -l)
-  [ "$n" -gt 0 ] && echo "$f -> $n"
-done
+# 2. CONFIRMATION - ONE grep, recursive over the same ROOTS, never over a file
+#    list derived from pass 1 (such a list cannot surface a file pass 1 missed).
+#    -z makes each FILE one record, so the pattern may cross a line break; spell
+#    every space of the phrase as [\s/!]* to absorb the break and whatever
+#    comment marker the next line starts with. -P needs a UTF-8 locale (the
+#    zero-receipt rule above), and the exit status is grep's own: 0 found, 1 not.
+LC_ALL=C.UTF-8 grep -rPzoH --include='*.rs' --include='*.md' \
+  'no timeout,[\s/!]*no[\s/!]*try-lock' <roots>
 ```
 
+Matches print NUL-separated; `| tr '\0' '\n'` renders them, and discards the exit
+status while doing it — the same trade as the `| wc -l` the zero-receipt rule warns
+about. Quote the sweep without the pipeline.
+
 Where the two disagree, the difference is what a phrase sweep could not see. Worked
-instance, re-runnable off `git show 24a428a6:<path>`: over
+instance, re-runnable off `git archive 24a428a6 crates src-tauri doc`: the plain phrase
+`grep -r "no timeout, no try-lock"` returns **2** over
 `crates/loomux-engine/src/published.rs`, `src-tauri/tests/perf_dispatch.rs` and
-`src-tauri/src/orchestration/views.rs`, `grep -rn "no timeout, no try-lock"` returns
-**2** (`views.rs:9`, `perf_dispatch.rs:1512`) and misses `published.rs:7` and
-`perf_dispatch.rs:81`, where the phrase reads `no timeout, no` / `try-lock` across a
-comment line break. Both passes above return **4** over those three, and **5** once the
-roots include `doc/design/` — which pass 2 reaches only because it is recursive.
+`src-tauri/src/orchestration/views.rs` (`views.rs:9`, `perf_dispatch.rs:1512`) and misses
+`published.rs:7` and `perf_dispatch.rs:81`, where the phrase reads `no timeout, no` /
+`try-lock` across a comment line break. Pass 2 returns **4** over those three and **5**
+over the whole 187-file tree, the fifth being `doc/design/polled-views.md` — which only
+a recursive pass reaches. It is one process: **0.15s** over those 187 files, exit **0**;
+the same sweep for a term the tree does not carry exits **1**.
 
 **The residual, because the two totals agreeing is not proof of completeness.** Both
-passes are bounded by pass 1, so a claim whose chosen token was itself reworded is
-invisible to both and the totals still agree — the same healthy receipt this section
-exists to kill, one level up. That is why pass 1 takes the ENTITY's token and not the
-phrasing you rewrote; where no single token is stable, the sweep cannot certify
-completeness and the claim needs reading, not grepping.
+are bounded by the TOKEN you chose — pass 1 greps it, pass 2's phrase contains it —
+so a claim whose token was itself reworded is invisible to both while the totals still
+agree: the same healthy receipt this section exists to kill, one level up. That is why
+pass 1 takes the ENTITY's token and not the phrasing you rewrote; where no single token
+is stable, the sweep cannot certify completeness and the claim needs reading, not
+grepping.
 
 Signature that you needed this: a sweep receipt you already published as complete, and a
 re-sweep that finds more — #1346 went 1 → 2, #1408 3 → 4, #1667 2 → 4
