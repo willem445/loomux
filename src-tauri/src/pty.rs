@@ -430,7 +430,19 @@ impl PtyManager {
         human: bool,
     ) -> Result<WriteReceiver, String> {
         let (reply, rx) = tauri::async_runtime::channel(1);
-        self.enqueue(id, WriterJob::Frontend { data, human, reply })?;
+        // SCRATCH ONLY: the pre-2.3 routing, through Phase 0's counted door.
+        let ptys = self.ptys.clone();
+        let throttle = self.neutral_gate_throttle.clone();
+        if !self.ptys.lock_safe().contains_key(&id) {
+            return Err("pty not found".to_string());
+        }
+        tauri::async_runtime::spawn(async move {
+            let _ = crate::blocking::spawn_counted(move || {
+                let ctx = WriteCtx { ptys: &*ptys, neutral_gate_throttle: &*throttle };
+                let _ = reply.try_send(ctx.write_from_frontend(id, &data, human));
+            })
+            .await;
+        });
         Ok(rx)
     }
 

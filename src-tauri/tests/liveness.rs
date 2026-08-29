@@ -258,6 +258,7 @@ fn await_reply_within(
 // ---------- L3a: the input path does not use the shared blocking pool ----------
 
 #[test]
+#[ignore = "SCRATCH ROUND ONLY (#1607 red-3b): ignored so this round's red is attributable to exactly one assertion."]
 fn l3a_a_keystroke_lands_while_the_blocking_pool_is_saturated() {
     const PANE: u32 = 90301;
     const CONTROL_PANE: u32 = 90302;
@@ -433,6 +434,7 @@ fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
 // ---------- the ordering this change ADDS, rather than preserves ----------
 
 #[test]
+#[ignore = "SCRATCH ROUND ONLY (#1607 red-3b): ignored so this round's red is attributable to exactly one assertion."]
 fn a_cd_and_the_keystrokes_around_it_land_in_arrival_order() {
     // `doc/design/pty-input-path.md`'s ordering table says `write_pty` vs
     // `change_dir` on one pane is "ordered by arrival again (#1607)" — it was
