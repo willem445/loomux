@@ -103,7 +103,7 @@ use loomux_engine::lockwatch::tracked_lock_names;
 use serde_json::json;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
-use loomux_lib::orchestration::{Caller, GroupId, Guardrails, OrchRegistry, Role};
+use loomux_lib::orchestration::{mailbox, Caller, GroupId, Guardrails, OrchRegistry, Role};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -937,16 +937,37 @@ impl Drop for MutateDeadline {
 /// A registry with an agent whose token the MCP surface will resolve, plus that
 /// token. `set_self_arc` because `dispatch_bounded` spawns the mutating helper
 /// on the registry's own `Arc`.
+/// A roster that DECLARES a manager, so `post_to_manager` is not refused and
+/// `check_mail` is a listed tool. Parsed from YAML rather than hand-built, so a
+/// new field on `Block` cannot give this fixture a shape a real workflow file
+/// would not produce — the `manager_lifecycle.rs` idiom.
+const WITH_MANAGER: &str = "version: 1\nblocks:\n  - id: manager\n    kind: manager\n  - id: worker\n    kind: worker\n";
+
+fn rails_with_manager() -> Guardrails {
+    let blocks = loomux_lib::orchestration::workflow::parse_workflow(WITH_MANAGER)
+        .expect("the fixture roster must parse")
+        .blocks;
+    Guardrails { blocks, ..rails() }
+}
+
 fn mcp_fixture() -> (Arc<OrchRegistry>, String, GroupId, tempfile::TempDir) {
     let (reg, dir) = test_registry();
     // `dispatch_bounded` runs a mutating tool on the registry's own `Arc`; a
     // registry that never had `set_self_arc` called has none, and L2b would then
     // be measuring a path the app does not take.
     reg.set_self_arc();
-    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+    let group =
+        reg.create_group("C:/tmp/repo", rails_with_manager()).expect("create a group");
     let agent = reg
         .spawn_agent(&group.id, Role::Orchestrator, "orch", "", false, None)
         .expect("a fake agent to carry a resolvable token");
+    // Seed one UNREAD message. `check_mail` writes only when it stamps
+    // something read (`if stamped > 0`), so against an empty mailbox the sweep
+    // drives the tool without ever reaching `write_mailbox` — which is why the
+    // scratch rounds for L2g kept coming back green while the sweep looked
+    // complete.
+    reg.post_to_manager(&group.id, "orch", "seed for the L2g sweep", mailbox::Kind::Note)
+        .expect("the roster declares a manager, so a post is accepted");
     (reg, agent.token, group.id, dir)
 }
 
