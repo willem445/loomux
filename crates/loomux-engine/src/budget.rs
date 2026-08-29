@@ -744,7 +744,27 @@ mod tests {
         hold_for(lock.clone(), Duration::from_millis(600));
 
         let sealed_before = sealed_frames();
-        let torn_before = torn_writes();
+        // The tear count is read from THIS THREAD's counter, never from the
+        // process-global `torn_writes()` (#1702). The assertion below is an
+        // ABSENCE — "this frame did not tear" — and an absence stated on a
+        // global is only sound while nothing in the whole binary ever tears.
+        // That was true when this test was written and is not any more: #1702
+        // narrowed §4.1's seal so a RE-ENTRANT acquisition unwinds through it,
+        // and `lockwatch`'s
+        // `a_reentrant_acquire_unwinds_a_sealed_frame_and_counts_the_tear`
+        // deliberately produces one — on its own thread, concurrently with
+        // this. Measured, not feared: this assertion went `left 1, right 0` on
+        // ubuntu and windows and passed on macos, which is a scheduling order,
+        // not a mechanism.
+        //
+        // The thread-local counter is the instrument this module built for
+        // exactly that (`THREAD_SEALS`: "the process-global counters beside
+        // them are the field-report numbers; these are what a TEST can assert
+        // on"), and moving to it makes the pin STRONGER rather than looser — an
+        // exact equality that cannot race, in place of one that could only ever
+        // have held by luck. Its own positive control — that a tear IS counted
+        // when one really happens — is the `lockwatch` row named above.
+        let torn_before = thread_seal_counts().1;
         let started = Instant::now();
 
         // The seal is read INSIDE the frame, because that is where it lives:
@@ -784,9 +804,11 @@ mod tests {
             "the seal counter did not move, so nothing recorded the write"
         );
         assert_eq!(
-            torn_writes(),
+            thread_seal_counts().1,
             torn_before,
-            "a sealed frame must never unwind; torn_writes is the invariant rider R1 asks for"
+            "a sealed frame must not unwind on a TIMEOUT; the tear count is the invariant rider \
+             R1 asks for. (#1702's re-entrant refusal is the one narrowing, and it is a \
+             different trigger — see lock-liveness.md §4.1)"
         );
     }
 
