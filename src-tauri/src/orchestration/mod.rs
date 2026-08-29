@@ -31794,13 +31794,7 @@ impl OrchRegistry {
     /// question is "can the registry serve anyone right now", not "may I have
     /// this lock". A wedge arriving in the gap is the mid-tick case above.
     fn tick_gate(&self, tick: &'static str) -> Option<budget::MutationScope> {
-        match self.agents.lock_within(budget::TICK_LOCK_BUDGET) {
-            Ok(probe) => drop(probe),
-            Err(busy) => {
-                crate::obs::breadcrumb("tick-skipped", &format!("tick={tick} {}", busy.detail()));
-                return None;
-            }
-        }
+        drop(self.agents.lock_safe());
         match self.groups.lock_within(budget::TICK_LOCK_BUDGET) {
             Ok(probe) => drop(probe),
             Err(busy) => {
