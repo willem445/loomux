@@ -428,6 +428,9 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Weak};
+// #1609: the thread-local read budget, MutationScope and the six budget
+// constants. See `doc/design/lock-liveness.md`.
+use loomux_engine::budget;
 use loomux_engine::lockwatch::TrackedMutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -31726,7 +31729,90 @@ impl OrchRegistry {
     /// Kill every idle worker/reviewer past its group's timeout, notifying
     /// each group's orchestrator so it can respawn on demand. Returns the
     /// killed agent ids. Called on a timer by `start_idle_reaper`.
+    /// Run a human one-shot READ command under [`budget::COMMAND_READ_BUDGET`]
+    /// (#1609, plan §3 Phase 2.1 item 4).
+    ///
+    /// On `Busy` the command degrades to `on_busy()` and breadcrumbs. The
+    /// degrade is not invented here: it is the SAME empty value each of these
+    /// commands already returns for an unvalidated group id, because
+    /// `command_group` gives them no error channel to report anything else
+    /// through. A blank panel plus a breadcrumb naming the holder beats a panel
+    /// that never paints — and beats a wrong number, which is the one thing an
+    /// empty list cannot be mistaken for.
+    ///
+    /// Takes no `self`: it is called from inside `run_blocking(move || ..)` in
+    /// the module-level `#[tauri::command]` functions, which have moved `reg`
+    /// into the closure and have no receiver — so the call spells
+    /// `OrchRegistry::read_command(..)`.
+    fn read_command<T>(
+        name: &'static str,
+        on_busy: impl FnOnce() -> T,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        match budget::read_budget(budget::COMMAND_READ_BUDGET, f) {
+            Ok(v) => v,
+            Err(busy) => {
+                crate::obs::breadcrumb(
+                    "command-busy",
+                    &format!("command={name} {}", busy.detail()),
+                );
+                on_busy()
+            }
+        }
+    }
+
+    /// Gate one cadenced backend tick (#1609, plan §3 Phase 2.1 item 3).
+    ///
+    /// `None` means SKIP this tick: the registry is wedged, and a tick that
+    /// runs anyway just adds one more parked thread to the pile #1600 §1.2 is
+    /// about. `Some(scope)` means run, with the body inside a
+    /// [`budget::MutationScope`] so no enclosing budget can ever unwind a
+    /// half-applied mutation out of a tick.
+    ///
+    /// **It probes `agents` and `groups` rather than "the tick's own entry
+    /// lock", and that is a deliberate correction to the plan's wording.** The
+    /// entry lock is not a usable concept here: three of these ticks enter
+    /// through `agent_output_totals`/`attention_inputs`, whose first
+    /// acquisition is `app` — a trivial cell that says nothing about whether
+    /// the registry is wedged — and then park on `agents` two frames down.
+    /// Bounding whichever lock happens to be lexically first would produce a
+    /// gate that passes and a tick that parks anyway. `agents` and `groups` are
+    /// the registry's two core maps — every agent-scoped and every
+    /// group-scoped read goes through one of them — so a tick that clears both
+    /// is one the registry can currently serve. (Stated structurally rather
+    /// than as a share of the acquisition sites: that count depends on how you
+    /// match a call site, and two honest countings of this file disagree.)
+    ///
+    /// **What this buys, and what it does not.** It stops a cadenced loop
+    /// ADDING a parked thread to a registry that is ALREADY wedged, which is
+    /// the accumulation half of the incident chain. It does NOT bound a tick
+    /// that wedges midway: that tick waits, by design, because its body
+    /// mutates and an abandoned mutation is worse than a slow one. Phase 0's
+    /// watchdog is what reports that case, with the holder named.
+    ///
+    /// The probe is released immediately and is not mutual exclusion — the
+    /// question is "can the registry serve anyone right now", not "may I have
+    /// this lock". A wedge arriving in the gap is the mid-tick case above.
+    fn tick_gate(&self, tick: &'static str) -> Option<budget::MutationScope> {
+        match self.agents.lock_within(budget::TICK_LOCK_BUDGET) {
+            Ok(probe) => drop(probe),
+            Err(busy) => {
+                crate::obs::breadcrumb("tick-skipped", &format!("tick={tick} {}", busy.detail()));
+                return None;
+            }
+        }
+        match self.groups.lock_within(budget::TICK_LOCK_BUDGET) {
+            Ok(probe) => drop(probe),
+            Err(busy) => {
+                crate::obs::breadcrumb("tick-skipped", &format!("tick={tick} {}", busy.detail()));
+                return None;
+            }
+        }
+        Some(budget::MutationScope::enter())
+    }
+
     pub fn reap_idle_agents(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("reap_idle_agents") else { return Vec::new() };
         let mut killed = Vec::new();
         for id in self.idle_reap_candidates(now) {
             let Some(a) = self.agent(&id) else { continue };
@@ -32032,6 +32118,7 @@ impl OrchRegistry {
     /// One full watchdog cycle: read pty counters, then tick. Called on a
     /// timer by `start_watchdog`.
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("run_watchdog") else { return Vec::new() };
         let outputs = self.agent_output_totals();
         // Same registry state `notify_tick`/`list_notifications` read (#248) —
         // no second store. Agent id -> its live watch ids: `watchdog_tick`
@@ -32985,6 +33072,13 @@ impl OrchRegistry {
     /// `gh_poll_tick`, so tests drive the decision half with a synthetic
     /// result map and no subprocess.
     pub fn run_gh_poll_tick(&self) -> GhPollTick {
+        // `GhPollTick::default()` is the same "nothing happened this tick"
+        // value a poll with no watches produces, so a skip is indistinguishable
+        // from a quiet tick to every caller — which is what makes skipping safe
+        // rather than a second code path.
+        let Some(_tick) = self.tick_gate("run_gh_poll_tick") else {
+            return GhPollTick::default();
+        };
         let now = now_ms();
         let results = self.poll_watches(now);
         self.gh_poll_tick(now, &results)
@@ -34854,6 +34948,7 @@ impl OrchRegistry {
     /// read pty counters and tick the still-autonomous orchestrators. Called on a
     /// timer by `start_idle_tick`; `now` injected so tests drive it deterministically.
     pub fn run_idle_tick(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("run_idle_tick") else { return Vec::new() };
         self.enforce_autonomy_budgets(now);
         let (outputs, inputs) = self.orchestrator_activity();
         self.idle_tick_tick(now, &outputs, &inputs)
@@ -36315,6 +36410,7 @@ impl OrchRegistry {
     /// timer by `start_compact_nudge`; `now` injected so tests drive it
     /// deterministically.
     pub fn run_compact_nudge(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("run_compact_nudge") else { return Vec::new() };
         let outputs = self.agent_output_totals();
         let manual_signals = self.agent_compact_signals();
         let signals = self.agent_context_signals();
@@ -37254,6 +37350,7 @@ impl OrchRegistry {
     /// board/state live — the surface a disk-full write corrupts) and run one
     /// `disk_tick`. Best-effort: if the disk can't be read, do nothing.
     pub fn run_disk_monitor(&self) {
+        let Some(_tick) = self.tick_gate("run_disk_monitor") else { return () };
         if let Some(free) = free_disk_bytes(&self.root) {
             self.disk_tick(free);
         }
@@ -38288,6 +38385,7 @@ impl OrchRegistry {
     /// `take_due_max_notices` and never reaches the orchestrator.
     #[doc(hidden)] // pub for integration tests
     pub fn flush_due_max_notices(&self, now: u64) {
+        let Some(_tick) = self.tick_gate("flush_due_max_notices") else { return () };
         let due = take_due_max_notices(&mut self.pending_max_notice.lock_safe(), now);
         for (group, from, to) in due {
             // Best-effort, like the exit notice: a dead/paused orchestrator
@@ -38732,6 +38830,7 @@ impl OrchRegistry {
     }
 
     pub fn run_attention(&self, now: u64) {
+        let Some(_tick) = self.tick_gate("run_attention") else { return () };
         let (outputs, tails, last_inputs) = self.attention_inputs();
         // Also scan plain (non-agent) panes for an interactive prompt (#40).
         let (p_out, p_tails, p_ins, agent_ptys) = self.pane_attention_inputs();
@@ -41492,6 +41591,7 @@ impl OrchRegistry {
     /// once — the lock-ordering discipline every other tick in this file
     /// follows). Called on a timer by `start_workflow_gate_reload`.
     pub fn run_workflow_gate_reload(&self) {
+        let Some(_tick) = self.tick_gate("run_workflow_gate_reload") else { return () };
         let paused = self.paused.lock_safe().clone();
         let ids: Vec<GroupId> = self
             .groups
@@ -50328,7 +50428,10 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
 /// What one wake of the unified `gh` poller did (#406) — returned so a test
 /// can pin that a single tick services BOTH features, and which halves ran,
 /// without a thread or a `gh` subprocess.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Default` is what a SKIPPED tick returns (#1609): the same "nothing
+// happened" value a poll with no watches produces, so a skip needs no second
+// code path in any caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GhPollTick {
     /// Watch ids the notify half resolved this tick (fired, expired, or
     /// cancelled) — `notify_tick`'s return, unchanged.
@@ -53798,7 +53901,8 @@ pub async fn orch_agent_renamed(
 #[tauri::command]
 pub async fn orch_session_roles(app: AppHandle) -> Vec<SessionRole> {
     let reg = reg_of(&app);
-    run_blocking(move || reg.session_roles()).await
+    run_blocking(move || OrchRegistry::read_command("orch_session_roles", Vec::new, || reg.session_roles()))
+        .await
 }
 
 /// Every orchestration group loomux has a record of, for the session
@@ -53825,7 +53929,10 @@ pub async fn orch_session_roles(app: AppHandle) -> Vec<SessionRole> {
 #[tauri::command]
 pub async fn orch_list_recorded(app: AppHandle) -> Vec<RecordedOrchestration> {
     let reg = reg_of(&app);
-    run_blocking(move || reg.recorded_orchestrations()).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_list_recorded", Vec::new, || reg.recorded_orchestrations())
+    })
+    .await
 }
 
 /// Restore a recorded orchestration session (see `resume_recorded_session`).
@@ -54082,7 +54189,12 @@ pub async fn orch_questions_list(app: AppHandle, group_id: String) -> Vec<humanq
     // #904: no error channel; an unvalidated id yields the same empty list a
     // group with no questions does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
-    run_blocking(move || reg.questions(&group_id).unwrap_or_default()).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_questions_list", Vec::new, || {
+            reg.questions(&group_id).unwrap_or_default()
+        })
+    })
+    .await
 }
 
 /// The human answers a pending question, from the app's own webview.
@@ -54133,7 +54245,10 @@ pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
     // #904: no error channel, so an unvalidated id yields the same 0 a group
     // with no mail does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return 0 };
-    run_blocking(move || reg.mailbox_unread(&group_id)).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_mailbox_status", || 0, || reg.mailbox_unread(&group_id))
+    })
+    .await
 }
 
 // ---------- needs-you items (human side, #1151) ----------
@@ -54176,7 +54291,12 @@ pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> NeedsYouRe
     // #904: no error channel; an unvalidated id yields the same empty view a
     // group with no items does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return NeedsYouRead::default() };
-    run_blocking(move || reg.needs_you_read(&group_id).unwrap_or_default()).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_needs_you_list", NeedsYouRead::default, || {
+            reg.needs_you_read(&group_id).unwrap_or_default()
+        })
+    })
+    .await
 }
 
 /// The human closes out a needs-you item, from the app's own webview.
@@ -54263,13 +54383,15 @@ pub async fn orch_tasks(
     // back as `expect_link_etag` on every write that replaces `deps` or `links`.
     // Derived here rather than stored — see `BoardTask`.
     run_blocking(move || {
-        reg.tasks(&group_id)
-            .into_iter()
-            .map(|t| {
-                let with_notes = wanted.contains(&t.id);
-                board_task(t, with_notes)
-            })
-            .collect()
+        OrchRegistry::read_command("orch_tasks", Vec::new, || {
+            reg.tasks(&group_id)
+                .into_iter()
+                .map(|t| {
+                    let with_notes = wanted.contains(&t.id);
+                    board_task(t, with_notes)
+                })
+                .collect()
+        })
     })
     .await
 }
