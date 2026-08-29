@@ -258,6 +258,7 @@ fn l3a_a_keystroke_lands_while_the_blocking_pool_is_saturated() {
 // ---------- L3b: a wedged pane parks its own thread and nothing else's ----------
 
 #[test]
+#[ignore = "SCRATCH ROUND ONLY (#1607 red-2): ignored so it cannot initialize tauri's async_runtime before L3a's pool() installs the small one. Under red-1's mutation enqueue_frontend_write touches the runtime itself, so L3b racing L3a made L3a panic in tauri's set() instead of failing on its own assertion. No behaviour changes here — this only removes the harness race the mutation introduces."]
 fn l3b_a_wedged_pane_does_not_stop_another_panes_frontend_write() {
     const WEDGED: u32 = 90311;
     const HEALTHY: u32 = 90312;

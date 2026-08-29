@@ -408,7 +408,22 @@ impl PtyManager {
         human: bool,
     ) -> Result<WriteReceiver, String> {
         let (reply, rx) = tauri::async_runtime::channel(1);
-        self.enqueue(id, WriterJob::Frontend { data, human, reply })?;
+        // SCRATCH ROUND ONLY (#1607 red-1) — do not merge. The ONE behaviour
+        // set aside: the frontend write is routed back through the SHARED
+        // blocking pool, which is exactly what `write_pty` did before this PR
+        // (#734's `spawn_blocking(move || state.write_from_frontend(..))`).
+        // The seam, the reply channel, the writer thread and every other
+        // caller are left wired, so the only thing that moves is the
+        // destination. tests/liveness.rs L3a must now fail by timeout.
+        let ptys = self.ptys.clone();
+        let throttle = self.neutral_gate_throttle.clone();
+        if !self.ptys.lock_safe().contains_key(&id) {
+            return Err("pty not found".to_string());
+        }
+        tauri::async_runtime::spawn_blocking(move || {
+            let ctx = WriteCtx { ptys: &*ptys, neutral_gate_throttle: &*throttle };
+            let _ = reply.try_send(ctx.write_from_frontend(id, &data, human));
+        });
         Ok(rx)
     }
 
