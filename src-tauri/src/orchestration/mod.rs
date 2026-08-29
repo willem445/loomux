@@ -26678,8 +26678,8 @@ impl OrchRegistry {
             tasks_lock: TrackedMutex::new_ranked("tasks_lock", lockorder::TASKS, ()),
             questions_lock: TrackedMutex::new_ranked("questions_lock", lockorder::QUESTIONS, ()),
             needs_you_lock: TrackedMutex::new_ranked("needs_you_lock", lockorder::NEEDS_YOU, ()),
-            mailbox_lock: TrackedMutex::new_ranked("mailbox_lock", lockorder::MAILBOX, ()),
-            usage_lock: TrackedMutex::new_ranked("usage_lock", lockorder::USAGE, ()),
+            mailbox_lock: TrackedMutex::new_ranked("mailbox_lock", lockorder::USAGE, ()), // R2: wrong const
+            usage_lock: TrackedMutex::new("usage_lock", ()), // R1: silently unranked
             usage_memo: TrackedMutex::new("usage_memo", HashMap::new()),
             default_branch_memo: TrackedMutex::new("default_branch_memo", HashMap::new()),
             creation: TrackedMutex::new("creation", ()),
