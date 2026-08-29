@@ -6,14 +6,22 @@
 //!
 //! # 0.3 — how deep the shared blocking pool is
 //!
-//! `write_pty` and every converted `orch_*` command hand their bodies to the
-//! SAME `tauri::async_runtime::spawn_blocking` pool, and nothing in the tree
-//! sets `max_blocking_threads`, so it is tokio's default of 512. The plan's §1.2
-//! mechanism ends there: once the pool is full, `write_pty` can no longer be
-//! scheduled, its promise never resolves, and `src/ptywrite.ts`'s per-pane chain
-//! stops dispatching — every pane stops accepting input at once, while the
-//! window keeps painting. A report that reads `in-flight 512` is a diagnosis
-//! instead of a mystery.
+//! Every converted `orch_*` command, every gesture command and the `gh`/`git`
+//! families hand their bodies to the SAME `tauri::async_runtime::spawn_blocking`
+//! pool, and nothing in the tree sets `max_blocking_threads`, so it is tokio's
+//! default of 512. A report that reads `in-flight 512` is a diagnosis instead of
+//! a mystery.
+//!
+//! **What that looked like in beta6**, which is why this counter exists: the pty
+//! input path was a tenant of this pool too, so once it filled, `write_pty`
+//! could no longer be scheduled, its promise never resolved, and
+//! `src/ptywrite.ts`'s per-pane chain stopped dispatching — every pane stopped
+//! accepting input at once, while the window kept painting (the plan's §1.2).
+//! **That tenant is gone as of #1607** (epic #1600 Phase 2.3): the input path
+//! moved to a thread per pane, so a full pool no longer takes the panes down
+//! with it. The pool is still shared, still 512, and still exhaustible by
+//! everything else in the list above — this counter measures the resource, not
+//! that one victim.
 //!
 //! [`pool_enter`] is taken at the HAND-OFF, not inside the task, so the counter
 //! is "submitted and not yet finished" — queued work included. That is the

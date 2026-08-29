@@ -15,21 +15,39 @@
 //! modules, not about delegation — so folding them in here is a separate
 //! change, not a drive-by in a perf slice.
 //!
-//! **And the four call sites that hand off WITHOUT this helper still do,
+//! **And the two call sites that hand off WITHOUT this helper still do,
 //! deliberately** — they call [`spawn_counted`] rather than `run_blocking`.
 //! (Until #1601 they called `tauri::async_runtime::spawn_blocking` directly and
 //! this paragraph called them "raw"; Phase 0.3 routed every hand-off in the
 //! crate through the one counted door, which changed what they call and not
 //! what they DO with the result — which is what the paragraph is about.)
-//! `pty.rs` `write_pty`/`change_dir` (#734), `sessions.rs` `list_sessions` and
-//! `voice.rs` `voice_stop` (#58) each converted before this module existed and
-//! each does something with the join failure that this helper would change:
-//! two map it into their `Result` as a domain error the frontend toasts, and
-//! `list_sessions` degrades it to an empty list because every caller of that
-//! one is already written to assume "best-effort, resumable on failure". Those
-//! are decisions with their own doc comments, not boilerplate waiting to be
-//! deduplicated. #746 converted commands in all three of those files and did
-//! not touch their neighbours' error handling on the way past.
+//! `sessions.rs` `list_sessions` and `voice.rs` `voice_stop` (#58) each
+//! converted before this module existed and each does something with the join
+//! failure that this helper would change: `voice_stop` maps it into its
+//! `Result` as a domain error the frontend toasts, and `list_sessions` degrades
+//! it to an empty list because every caller of that one is already written to
+//! assume "best-effort, resumable on failure". Those are decisions with their
+//! own doc comments, not boilerplate waiting to be deduplicated. #746 converted
+//! commands in both of those files and did not touch their neighbours' error
+//! handling on the way past.
+//!
+//! **That set was FOUR under #1601 and is two (#1607).** `pty.rs`
+//! `write_pty`/`change_dir` were the other two. They did not move behind
+//! `run_blocking` — they left the pool altogether: epic #1600 Phase 2.3 put
+//! the input path on a thread per pane (P8-writer), because this pool is a
+//! bounded shared resource and beta6 exhausted it with parked orchestration
+//! poll ticks until keystrokes could not be scheduled at all (#1600 §1.2).
+//! Their bodies now go to `PtyManager::enqueue_frontend_write` /
+//! `enqueue_cd` and await the writer thread's completion reply.
+//!
+//! **The counts, measured at this tree rather than carried:**
+//! `async_runtime::spawn_blocking(` over `src-tauri/src` + `crates` is **1**
+//! — this module's own door, which is the property
+//! `tests/selfwatch.rs`'s `there_is_exactly_one_door_onto_the_blocking_pool`
+//! pins. `spawn_counted(` is **6**: `run_blocking`'s own use here, the three
+//! private wrappers (`gh.rs`, `git.rs`, `orchestration/mod.rs`), and the two
+//! named above. Re-measure both before quoting either — a figure in a comment
+//! is dated to the commit it was measured on.
 //!
 //! **What the command owes on top of calling this.** Delegation is only half of
 //! INV-1: `spawn_blocking` moves the body, and Tauri still polls the future on
@@ -54,18 +72,26 @@
 /// Returns exactly what awaiting a `spawn_blocking` handle returns, so it is a
 /// substitution and not a policy: `run_blocking` below still re-raises a
 /// panicked body, `gh.rs` and `git.rs` still flatten it into their own domain
-/// error, and the four sites that skip `run_blocking` (`pty.rs`
-/// `write_pty`/`change_dir`, `sessions.rs` `list_sessions`, `voice.rs`
-/// `voice_stop`) still each do the thing this module's header says they
-/// deliberately do. What changes is that none of them reaches the runtime
-/// directly any more.
+/// error, and the two sites that skip `run_blocking` (`sessions.rs`
+/// `list_sessions`, `voice.rs` `voice_stop`) still each do the thing this
+/// module's header says they deliberately do. What changes is that neither of
+/// them reaches the runtime directly any more.
+///
+/// That set was four when #1601 wrote this line: it also named `pty.rs`
+/// `write_pty`/`change_dir`. #1607 took those two off the pool entirely rather
+/// than moving them behind this door — see the module header — so they are no
+/// longer sites that skip `run_blocking`, they are sites that hand off to a
+/// thread per pane and never enter the pool at all.
 ///
 /// **Why one door rather than a counter at each site.** The count only means
 /// anything if it is complete — a report reading `in-flight 480` is a
 /// diagnosis, and one reading `in-flight 480 plus however many sites nobody
 /// wrapped` is not. Eight hand-wrapped sites is a convention, checked by
 /// whoever remembers; one door is a property a source scan can pin, and
-/// `src-tauri/tests/selfwatch.rs` pins it.
+/// `src-tauri/tests/selfwatch.rs` pins it. (That "eight" is #1601's count of
+/// the alternative it rejected, dated to `bfbab80f` and left as written — it
+/// is a statement about a counterfactual, not about this tree. The tree's own
+/// figures are in the module header, measured.)
 ///
 /// **Where the ticket is taken is the whole point.** It is taken HERE, before
 /// the hand-off, and moved into the task — so the depth counts work that is

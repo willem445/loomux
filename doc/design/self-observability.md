@@ -184,7 +184,10 @@ against a real requirement rather than against a convenience.
 
 It does not bound a wait, refuse an acquisition, or isolate the pty write path
 from the shared pool. Those are Phases 1 and 2 of the plan and each is a
-behaviour change with its own argument to make. `#1601` exists so that those
+behaviour change with its own argument to make. (The pty half is no longer
+pending: #1607 landed Phase 2.3 in parallel with this, putting the input path
+on a thread per pane — `doc/design/pty-input-path.md` § "719 revisited on
+isolation". Bounding a wait and refusing an acquisition are still ahead.) `#1601` exists so that those
 changes are chosen against evidence — which is the one thing the last three
 attempts did not have.
 

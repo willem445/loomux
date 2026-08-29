@@ -2437,6 +2437,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tempfile",
  "tiny_http",
+ "tokio",
  "windows 0.57.0",
  "winreg 0.55.0",
 ]
