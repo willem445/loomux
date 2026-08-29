@@ -476,6 +476,64 @@ Signature that you needed this: the body's *What changed* quotes the exact
 phrasing a later commit on the same branch removed, and the squash then
 republishes it permanently (#1271).
 
+### A claim-purge sweep is wrap-insensitive, or it is blind — and its receipt is NON-ZERO
+
+CLAUDE.md's *correcting a false claim is a multi-surface edit* sends you to grep the
+ENTITY a claim names. `grep` is line-oriented and prose and rustdoc here are
+hand-wrapped, so a multi-word pattern cannot match an instance the wrap split — and
+every control the zero-receipt rule mandates still passes, because the sweep DID match
+the unwrapped copies. The receipt is non-zero and reads as healthy. The
+whitespace-normalisation the quote harvest above already mandates is what the sweep
+needs too; run two passes and reconcile their totals. (The section BELOW is the other
+blind non-zero receipt: there the pattern reads the DIFF and misses an insert with no
+context line above it. Same symptom, different cause — this one is the LINE form,
+that one the DIFF form.)
+
+**Discovery is a SINGLE TOKEN.** A phrase can be split by a wrap, so only one token
+cannot — shortening a phrase to a shorter phrase does not reach the property. Take the
+rarest token of the ENTITY the claim names, and widen from there.
+
+```sh
+# 1. DISCOVERY - one token, no space. This pass bounds everything below it.
+LC_ALL=C.UTF-8 grep -rn --include='*.rs' --include='*.md' 'try-lock' <roots>
+
+# 2. CONFIRMATION - ONE grep, recursive over the same ROOTS, never over a file
+#    list derived from pass 1 (such a list cannot surface a file pass 1 missed).
+#    -z makes each FILE one record, so the pattern may cross a line break; spell
+#    every space of the phrase as [\s/!]* to absorb the break and whatever
+#    comment marker the next line starts with. -P needs a UTF-8 locale (the
+#    zero-receipt rule above), and the exit status is grep's own: 0 found, 1 not.
+LC_ALL=C.UTF-8 grep -rPzoH --include='*.rs' --include='*.md' \
+  'no timeout,[\s/!]*no[\s/!]*try-lock' <roots>
+```
+
+Matches print NUL-separated; `| tr '\0' '\n'` renders them, and discards the exit
+status while doing it — the same trade as the `| wc -l` the zero-receipt rule warns
+about. Quote the sweep without the pipeline.
+
+Where the two disagree, the difference is what a phrase sweep could not see. Worked
+instance, re-runnable off `git archive 24a428a6 crates src-tauri doc`: the plain phrase
+`grep -r "no timeout, no try-lock"` returns **2** over
+`crates/loomux-engine/src/published.rs`, `src-tauri/tests/perf_dispatch.rs` and
+`src-tauri/src/orchestration/views.rs` (`views.rs:9`, `perf_dispatch.rs:1512`) and misses
+`published.rs:7` and `perf_dispatch.rs:81`, where the phrase reads `no timeout, no` /
+`try-lock` across a comment line break. Pass 2 returns **4** over those three and **5**
+over the whole 187-file tree, the fifth being `doc/design/polled-views.md` — which only
+a recursive pass reaches. It is one process: **0.15s** over those 187 files, exit **0**;
+the same sweep for a term the tree does not carry exits **1**.
+
+**The residual, because the two totals agreeing is not proof of completeness.** Both
+are bounded by the TOKEN you chose — pass 1 greps it, pass 2's phrase contains it —
+so a claim whose token was itself reworded is invisible to both while the totals still
+agree: the same healthy receipt this section exists to kill, one level up. That is why
+pass 1 takes the ENTITY's token and not the phrasing you rewrote; where no single token
+is stable, the sweep cannot certify completeness and the claim needs reading, not
+grepping.
+
+Signature that you needed this: a sweep receipt you already published as complete, and a
+re-sweep that finds more — #1346 went 1 → 2, #1408 3 → 4, #1667 2 → 4
+(#1158, #1191, #1283, #1344).
+
 ### A diff-shaped sweep is controlled DIFFERENTIALLY, not by a match-somewhere control
 
 A sweep whose pattern reads the **diff** — `+` lines, `-` lines, a `+x` sitting under
@@ -762,6 +820,22 @@ it lands, and a stale id is what makes the whole line look untrustworthy.
   **wiring** instead — the call site, or the gate's consumption of the value —
   and leave the lib function intact, so the lib suite stays green and the
   integration binary is actually reached.
+- **When the mutation ITSELF is the plant, the collateral red can be UNAVOIDABLE
+  and none of the three above has an answer.** Disarming a primitive reddens that
+  primitive's own unit tests, in `crates/`, before cargo can reach
+  `src-tauri/tests/`; there is no plant site that avoids it. Silence the collateral
+  reds instead: `#[ignore = "[scratch] silenced so cargo reaches tests/<file>.rs"]`
+  — the reason string prints in the log, so the round discloses its own staging
+  — or `--no-fail-fast`, so every binary reports (#1361, #1426). Reshaping the
+  mutation to thread between the pins works when it is available and cannot be
+  relied on; where nothing is, the claim is carried by inspection and says so
+  (#1464, #1572).
+  **Then read the TARGET binary out of the run before citing it** — the section
+  above says to read which targets ran, and this is how: its own
+  `Running tests/<file>.rs` line AND that binary's own `test result:` totals.
+  Signature: the failing job's totals are an EARLIER binary's while the claim is
+  about a later one — one `Running` line in the log where the round needed two, and
+  a design note citing a sweep the run never reached (#1667).
 
 The same stop-at-first-failure also bounds a round that **did** hit its target:
 if the property is pinned in two binaries, the later one never ran, so it is
