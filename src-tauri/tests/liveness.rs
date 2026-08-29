@@ -1562,7 +1562,8 @@ fn l1702_the_attention_tick_never_holds_agents_across_its_per_agent_mask_work() 
         DELIVERED_NOTICES_PER_PANE, DELIVERED_PROMPT_LINES_PER_SESSION,
     };
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static TIMING: AtomicU64 = AtomicU64::new(0);
 
     /// A lock name no other test uses, so the sampler can identify the thread
     /// running the tick without a process-wide serial guard. Tests in this
@@ -1676,8 +1677,13 @@ fn l1702_the_attention_tick_never_holds_agents_across_its_per_agent_mask_work() 
         // tick, five seconds on (past the four-second attention window), is the
         // one that reaches `delivered_mask_lines` — and, on the pre-fix shape,
         // the one that never returns.
+        let t0 = Instant::now();
         t_reg.attention_tick(now, &t_out, &t_tails, &t_in);
+        let first_us = t0.elapsed().as_micros();
+        let t1 = Instant::now();
         let items = t_reg.attention_tick(now + 5_000, &t_out, &t_tails, &t_in);
+        let second_us = t1.elapsed().as_micros();
+        TIMING.store(((first_us as u64) << 32) | (second_us as u64 & 0xffff_ffff), Ordering::Relaxed);
         t_stop.store(true, Ordering::Relaxed);
         let _ = done_tx.send(items);
     });
@@ -1757,5 +1763,15 @@ fn l1702_the_attention_tick_never_holds_agents_across_its_per_agent_mask_work() 
         flagged, expected,
         "moving the mask off the lock must not move what it decides: the tick flagged \
          {flagged:?} and the same masking computed outside it says {expected:?}"
+    );
+    let t = TIMING.load(Ordering::Relaxed);
+    panic!(
+        "[scratch] TIMING (this panic is the measurement, not a failure): \
+         agents={AGENTS} deliveries_per_agent={DELIVERIES} tail_bytes={TAIL_BYTES} \
+         tick1_us={} tick2_us={} max_agents_hold_ms={max_hold_ms} hold_samples={samples} \
+         flagged={}",
+        t >> 32,
+        t & 0xffff_ffff,
+        flagged.len()
     );
 }
