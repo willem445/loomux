@@ -43,7 +43,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use loomux_engine::lockwatch::TrackedMutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Exact token counts for a session, split by kind so the UI can show tokens
@@ -814,12 +815,28 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
 ///   zero, which is exactly the pre-#1239 cost. The failure mode of every
 ///   guard here is "as slow as it used to be", never a wrong total.
 ///
-/// **`Arc<Mutex<..>>` per transcript, not one map lock** — the same map-lock →
-/// release → leaf-lock rule the usage memo follows. The outer lock is held
-/// only long enough to clone one cell out, so a full re-parse for one agent
-/// never blocks another agent's tick.
+/// **`Arc<TrackedMutex<..>>` per transcript, not one map lock** — the same
+/// map-lock → release → leaf-lock rule the usage memo follows. The outer lock
+/// is held only long enough to clone one cell out, so a full re-parse for one
+/// agent never blocks another agent's tick.
+///
+/// **Both are `TrackedMutex` (#1601, #1605 review N1), and this is the pair
+/// that most needed to be.** They are reachable from `OrchRegistry` (through
+/// the `usage_cursors` field), they are on `orch_group_usage` — one of the ten
+/// polled reads — and the per-transcript cell is held across `fs::metadata`
+/// and `fold_appended`, which is real file IO inside the critical section. A
+/// registry-wide scan could not see them, because it reads each field's
+/// declared TYPE and this field's type is a struct that OWNS its mutexes;
+/// `every_lock_on_the_registry_is_a_tracked_one` now names that blind spot
+/// instead of claiming the population is complete.
+///
+/// Tracking makes that hold VISIBLE. It does not make it short — bounding IO
+/// under a polled path's guard is Phase 1/2 of
+/// `doc/plans/responsiveness-root-cause.md`, not this change. What #1601 buys
+/// here is that if this IS the hold that wedges a build, the breadcrumb names
+/// it instead of a human having to guess.
 pub struct TranscriptCursors {
-    cursors: Mutex<HashMap<(PathBuf, String), CursorEntry>>,
+    cursors: TrackedMutex<HashMap<(PathBuf, String), CursorEntry>>,
     /// How long any one cursor may fold incrementally before it is discarded
     /// and re-parsed from zero. [`CURSOR_REVALIDATE_AFTER`] in production;
     /// a parameter only so the tests can exercise the timer without waiting
@@ -836,7 +853,7 @@ impl Default for TranscriptCursors {
 struct CursorEntry {
     /// Last time this cursor was asked for — drives [`CURSOR_TTL`] eviction.
     used: Instant,
-    cursor: Arc<Mutex<Option<TranscriptCursor>>>,
+    cursor: Arc<TrackedMutex<Option<TranscriptCursor>>>,
 }
 
 impl TranscriptCursors {
@@ -850,7 +867,7 @@ impl TranscriptCursors {
     /// type through `Default` and therefore never takes another value.
     #[doc(hidden)] // pub for integration tests
     pub fn with_revalidate_after(revalidate_after: Duration) -> Self {
-        TranscriptCursors { cursors: Mutex::new(HashMap::new()), revalidate_after }
+        TranscriptCursors { cursors: TrackedMutex::new("usage_cursors", HashMap::new()), revalidate_after }
     }
 
     /// A Claude session's usage, parsing only what was appended since this
@@ -883,7 +900,7 @@ impl TranscriptCursors {
                 .entry((root.to_path_buf(), session_id.to_string()))
                 .or_insert_with(|| CursorEntry {
                     used: Instant::now(),
-                    cursor: Arc::new(Mutex::new(None)),
+                    cursor: Arc::new(TrackedMutex::new("usage_cursor_cell", None)),
                 });
             entry.used = Instant::now();
             entry.cursor.clone()
