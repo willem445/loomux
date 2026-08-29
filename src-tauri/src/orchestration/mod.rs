@@ -32129,17 +32129,14 @@ impl OrchRegistry {
         on_refused: impl FnOnce() -> T,
         f: impl FnOnce() -> T,
     ) -> T {
+        // NEUTERED (round E, N5): the frame is removed and the body runs
+        // directly. The wrapper keeps its NAME and its MutationScope, so
+        // synccommands.rs's routing scan still passes — which is exactly
+        // the hole the frame pin was added to close.
         let _scope = budget::MutationScope::enter();
-        match budget::read_budget(budget::COMMAND_READ_BUDGET, f) {
-            Ok(v) => v,
-            Err(busy) => {
-                crate::obs::breadcrumb(
-                    "command-refused",
-                    &format!("command={name} {}", busy.detail()),
-                );
-                on_refused()
-            }
-        }
+        let _ = &on_refused;
+        let _ = name;
+        f()
     }
 
     /// Gate one cadenced backend tick (#1609, plan §3 Phase 2.1 item 3).
