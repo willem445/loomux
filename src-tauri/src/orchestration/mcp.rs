@@ -132,7 +132,29 @@ fn respond(req: tiny_http::Request, code: u16, body: String) {
 }
 
 fn rpc_error(id: &Value, code: i64, message: &str) -> String {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
+    let mut err = json!({ "code": code, "message": message });
+    // The `data` block is part of what `MCP_BUSY_CODE` MEANS, so it is
+    // attached here rather than by each producer (#1609 review round 2, B2).
+    // `tools/list`'s bound answers a `Busy` as an ordinary
+    // `Err((code, message))` out of `dispatch`, which rendered a busy error
+    // with no `data` at all — a second shape for one code, while
+    // `doc/design/lock-liveness.md` §3 and `e2e/liveness.ts`'s
+    // `jsonRpcErrorData` both specify exactly one. A client that follows the
+    // documented contract (branch on `data.retryable`, back off by
+    // `data.retry_after_ms`) got `null` and had to string-match the message.
+    //
+    // Attaching it at the one place every error envelope is rendered makes
+    // the code and its data inseparable: a future producer of this code
+    // cannot forget the half a machine reads.
+    if code == MCP_BUSY_CODE {
+        if let Some(o) = err.as_object_mut() {
+            o.insert(
+                "data".into(),
+                json!({ "retryable": true, "retry_after_ms": BUSY_RETRY_AFTER_MS }),
+            );
+        }
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "error": err }).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -160,16 +182,11 @@ pub const MCP_BUSY_CODE: i64 = -32001;
 /// The busy error envelope: protocol-level, because token resolution runs
 /// BEFORE the caller is known and there is no tool result to attach it to.
 fn rpc_busy(id: &Value, busy: &Busy) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": MCP_BUSY_CODE,
-            "message": format!("loomux busy: {busy}; retry"),
-            "data": { "retryable": true, "retry_after_ms": busy.retry_after_ms() },
-        },
-    })
-    .to_string()
+    // Delegates so there is ONE renderer for this code. `retry_after_ms` is a
+    // flat constant (see `BUSY_RETRY_AFTER_MS`), so nothing per-`Busy` is lost
+    // by rendering it centrally — and if it ever stops being flat, this is the
+    // one call that has to start passing it through.
+    rpc_error(id, MCP_BUSY_CODE, &format!("loomux busy: {busy}; retry"))
 }
 
 /// The busy text a READ tool answers with.
