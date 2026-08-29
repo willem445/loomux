@@ -2623,6 +2623,12 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
         "a tick reported no tracked thread id, so a hold it took could not have been \
          attributed to it"
     );
+
+    // [scratch m1] libtest captures a PASSING test's stdout, so the percentiles
+    // above never reach the CI log on a green run. This round fails the row
+    // after every measurement has been printed, purely so the figures are
+    // readable per platform. Nothing above this line differs from the base.
+    panic!("[scratch m1] measurement dump - see the printed L7a lines above");
 }
 
 /// Take an over-threshold hold at a site with NO [`LongHoldPermit`] and return
