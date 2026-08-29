@@ -600,12 +600,10 @@ pub fn await_mutate_result(
 ) -> Result<Value, (i64, String)> {
     let (text, event) = match rx.recv_timeout(deadline) {
         Ok(out) => return out,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            (still_executing_text(tool), "mcp-mutate-slow")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            (worker_died_text(tool), "mcp-mutate-died")
-        }
+        // NEUTERED (scratch round 2, neuter C): both recv_timeout errors get
+        // the still-executing answer again, as they did before #1702 — a died
+        // helper is told the work WILL complete.
+        Err(_) => (still_executing_text(tool), "mcp-mutate-slow"),
     };
     crate::obs::breadcrumb(event, &format!("group={group} agent={agent_id} tool={tool}"));
     Ok(json!({
