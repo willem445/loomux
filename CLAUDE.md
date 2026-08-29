@@ -462,6 +462,21 @@ compiles.
   so (#1361 B1, `an_edit_below_the_anchor_window_is_not_detected_by_any_guard` +
   `the_revalidation_timer_bounds_that_blind_spot`, and its non-vacuity control
   `an_unexpired_cursor_is_not_revalidated`).
+- **A release-mode fail-open is argued and EXECUTED per detected KIND, not per
+  switch.** One `cfg!(debug_assertions)` flag over a `match` with several violation
+  arms carries ONE justification, sound for whichever arm its author had in mind:
+  *"a POSSIBLE hang beats a CERTAIN crash"* is true of an inversion and false of a
+  re-entrant self-acquisition, which parks forever on a non-reentrant mutex — the
+  detector then watches its own defect happen and lets it. Enumerate per arm what the
+  release build does NEXT and check that against the invariant the detector exists to
+  protect; an arm whose fail-open no test can execute because the test would HANG is
+  the arm whose fail-open is CERTAIN rather than possible, and the inexecutability is
+  the finding, not an exemption from *a fail-open path nobody has executed is a
+  fail-open path nobody has checked*. Signature: the switch's doc argues one hazard
+  while its `match` has two or more `report(…); Ok(())` arms and the release-mode test
+  names one of them, cleared at review as "release is a breadcrumb, never a panic"
+  (#1698: `LOCK_ORDER_PANICS`, `check_order`'s `Verdict::Reentrant` under `lock_safe`;
+  the live instance is #1702).
 - **A per-CLI identity string is read off the source, never branched on it.**
   `source === "claude" ? "claude" : "copilot"` is right only while there are
   exactly two CLIs; a third silently inherits the else-branch and the pane
