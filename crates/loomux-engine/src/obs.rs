@@ -908,6 +908,136 @@ fn breadcrumb_bytes_in(dir: &Path, event: &str, detail: &[u8]) {
 
 // FMT-FREE REGION END (#1219)
 
+// ---------- cadenced-tick supervision (#1702) ----------
+
+/// The breadcrumb a supervised tick body writes when it panics. A stable
+/// string: it is what a field report gets grepped for, and it matches the
+/// `tick=<name>` shape `tick-skipped` already uses.
+const TICK_PANIC_EVENT: &str = "tick-panicked";
+
+/// The breadcrumb a supervisor writes ONCE, when it stops running a body that
+/// has panicked [`TICK_PANIC_LIMIT`] times in a row.
+const TICK_DISABLED_EVENT: &str = "tick-disabled";
+
+/// How many CONSECUTIVE panics a supervised body gets before its supervisor
+/// stops calling it.
+///
+/// Three, and the bound is not decoration. Supervision turns a panicking tick
+/// from a one-shot thread death into a repeat: the panic hook writes a crash
+/// log *per panic* and nothing prunes those, so a body that panics
+/// deterministically on a 3 s cadence writes a crash log every 3 s for as long
+/// as the app runs. A body that has panicked three times running is
+/// deterministically broken, and a fourth call buys nothing — so the loop keeps
+/// its thread and its other bodies, and this one stops.
+///
+/// What that gives up is stated where it is felt: the transient case (a panic
+/// on one group's data, one pass) now recovers, where before it killed the
+/// thread; the deterministic case degrades to what it did before, except that a
+/// breadcrumb says which tick and that its siblings on the same thread keep
+/// running. Any successful pass resets the count, so an intermittent body is
+/// never latched off by three failures spread across an hour.
+pub const TICK_PANIC_LIMIT: u32 = 3;
+
+/// Runs one cadenced loop's tick body so that a panic inside it ends the TICK
+/// rather than the thread (#1702).
+///
+/// # Why this exists
+///
+/// Every `start_*` loop in `orchestration/mod.rs` was a bare `loop { sleep;
+/// body }` with no `catch_unwind` and no restart, so a panic anywhere in a body
+/// ended that loop permanently — badges frozen, snapshots frozen, no restart
+/// short of relaunching the app, and (for the view publisher) two whole UI
+/// surfaces stuck on their last value. That was a *disclosed* hazard rather
+/// than an unnoticed one (`doc/design/polled-views.md`), and #1702 makes it
+/// load-bearing: a re-entrant `lock_safe` now refuses by unwinding, so a defect
+/// that used to wedge a tick thread now panics one, and the degraded result has
+/// to be well defined before that is an improvement.
+///
+/// # The unwind-safety argument
+///
+/// `catch_unwind` is called through [`std::panic::AssertUnwindSafe`], and the
+/// assertion is checkable rather than hopeful. What a body touches is the
+/// registry's own state, behind `TrackedMutex`es whose inner primitive is
+/// `parking_lot` — which has no poisoning at all, so a holder that panics
+/// releases the lock and the next acquirer sees whatever it had written. That
+/// is the state the *unsupervised* loop left behind too: the panic and its
+/// partial write happen identically either way. The only thing this changes is
+/// whether anything runs afterwards, and a later tick reading a half-updated
+/// map is exactly the case every one of these bodies already handles, because
+/// each recomputes from the registry every pass rather than carrying state
+/// across ticks.
+///
+/// A `budget::BudgetTimeout` payload cannot reach here from a tick
+/// body — its own `read_budget` frame catches it, and a tick body installs none
+/// — and if one ever did, breadcrumbing it and taking the next tick is the same
+/// degrade as any other panic. It is not silently converted into a value.
+pub struct TickSupervisor {
+    tick: &'static str,
+    consecutive_panics: u32,
+    latched: bool,
+}
+
+impl TickSupervisor {
+    /// A supervisor for the body named `tick`. The name is what a breadcrumb
+    /// carries, so it is the tick's own identity (`attention`, `watchdog`,
+    /// `view-publisher`), not the function it happens to be called from.
+    pub fn new(tick: &'static str) -> Self {
+        Self { tick, consecutive_panics: 0, latched: false }
+    }
+
+    /// Run one tick body whose value nobody wants — which is every cadenced
+    /// loop's actual tick.
+    ///
+    /// Separate from [`run_for`](Self::run_for) rather than a `let _ =` at each
+    /// of a dozen call sites: `Option` is `#[must_use]`, so those sites would
+    /// all have to discard something, and a `let _ =` in a supervised loop
+    /// reads as an ignored error rather than as "this body returns nothing".
+    pub fn run(&mut self, body: impl FnOnce()) {
+        let _ = self.run_for(body);
+    }
+
+    /// Run one tick and keep its value. `Some(v)` when the body returned,
+    /// `None` when it panicked — or when this supervisor has latched off, in
+    /// which case the body is not called at all.
+    ///
+    /// The caller keeps looping either way: the value exists for the loops that
+    /// need the body's answer to pick their next sleep, not as a signal to
+    /// stop.
+    pub fn run_for<T>(&mut self, body: impl FnOnce() -> T) -> Option<T> {
+        if self.latched {
+            return None;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            Ok(v) => {
+                self.consecutive_panics = 0;
+                Some(v)
+            }
+            Err(_) => {
+                self.consecutive_panics += 1;
+                breadcrumb(
+                    TICK_PANIC_EVENT,
+                    &format!("tick={} consecutive={}", self.tick, self.consecutive_panics),
+                );
+                if self.consecutive_panics >= TICK_PANIC_LIMIT {
+                    self.latched = true;
+                    breadcrumb(
+                        TICK_DISABLED_EVENT,
+                        &format!("tick={} panics={}", self.tick, self.consecutive_panics),
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Whether this supervisor has stopped calling its body. Test-only: the
+    /// shipped loops never ask, they just keep calling [`run`](Self::run).
+    #[doc(hidden)]
+    pub fn is_latched(&self) -> bool {
+        self.latched
+    }
+}
+
 // ---------- panic hook ----------
 
 /// Install the crash-logging panic hook. Wraps the existing hook (so dev-build
@@ -2825,5 +2955,92 @@ mod tests {
         // stamp <event> <detail>, one line.
         assert!(line.contains(" delivery agent=w-3 outcome=typed"));
         assert_eq!(line.lines().count(), 1);
+    }
+
+    // ---------- #1702: cadenced-tick supervision ----------
+
+    #[test]
+    fn a_panicking_tick_body_is_breadcrumbed_and_the_next_tick_still_runs() {
+        // The property every `start_*` loop and `start_view_publisher` now
+        // depends on: a panic ends the TICK, not the thread. Before #1702 the
+        // second `run` below was unreachable — the panic unwound out of the
+        // `loop` and the thread was gone.
+        let _serial = SERIAL.lock_safe();
+        let tmp = tempfile::tempdir().unwrap();
+        with_log_dir(tmp.path(), || {
+            let mut sup = TickSupervisor::new("attention");
+            let mut passes = 0u32;
+
+            // Discriminating half first: an ordinary body's value comes back,
+            // or "it kept going" below would be evidence about a supervisor
+            // that never runs anything.
+            assert_eq!(sup.run_for(|| 7u32), Some(7), "a body that returns must return its value");
+
+            assert_eq!(sup.run_for(|| panic!("planted")), None::<()>, "a panic must not be a value");
+            sup.run(|| passes += 1);
+            assert_eq!(passes, 1, "the tick after a panic must still run");
+            assert!(!sup.is_latched(), "one panic is not three");
+
+            let crumbs = fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap();
+            assert_eq!(
+                crumbs.lines().filter(|l| l.contains(" tick-panicked ")).count(),
+                1,
+                "exactly one panic, exactly one crumb: {crumbs:?}"
+            );
+            assert!(crumbs.contains("tick-panicked tick=attention consecutive=1"), "{crumbs:?}");
+            assert!(
+                !crumbs.contains("tick-disabled"),
+                "a single panic must not latch the tick off: {crumbs:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_body_that_panics_every_pass_is_latched_off_and_a_recovery_resets_the_count() {
+        // The bound on the crash-log burst supervision would otherwise create
+        // (`TICK_PANIC_LIMIT`), and its release. Both halves are here because
+        // the latch is only defensible if an intermittent body is NOT latched:
+        // a test of the limit alone would pass against a supervisor that
+        // latched on the third panic ever, spread across an hour.
+        let _serial = SERIAL.lock_safe();
+        let tmp = tempfile::tempdir().unwrap();
+        with_log_dir(tmp.path(), || {
+            // Two panics, then a success, then two more: five panics-or-passes
+            // in which no THREE consecutive panics occur, so nothing latches.
+            let mut sup = TickSupervisor::new("watchdog");
+            for _ in 0..(TICK_PANIC_LIMIT - 1) {
+                sup.run(|| panic!("planted"));
+            }
+            sup.run(|| {});
+            assert!(!sup.is_latched(), "a success must reset the consecutive count");
+            for _ in 0..(TICK_PANIC_LIMIT - 1) {
+                sup.run(|| panic!("planted"));
+            }
+            assert!(!sup.is_latched(), "{TICK_PANIC_LIMIT} in a ROW, not {TICK_PANIC_LIMIT} total");
+
+            // The limit-th consecutive panic latches, and the body stops being
+            // called at all — which is the property that bounds the crash logs.
+            let mut called_after_latch = 0u32;
+            sup.run(|| panic!("planted"));
+            assert!(sup.is_latched(), "the {TICK_PANIC_LIMIT}th consecutive panic must latch");
+            assert_eq!(sup.run_for(|| called_after_latch += 1), None);
+            assert_eq!(called_after_latch, 0, "a latched supervisor must not call its body");
+
+            let crumbs = fs::read_to_string(tmp.path().join("breadcrumbs.log")).unwrap();
+            assert_eq!(
+                crumbs.lines().filter(|l| l.contains(" tick-disabled ")).count(),
+                1,
+                "the disable is announced exactly once, not once per skipped tick: {crumbs:?}"
+            );
+            assert!(
+                crumbs.contains(&format!("tick-disabled tick=watchdog panics={TICK_PANIC_LIMIT}")),
+                "{crumbs:?}"
+            );
+            assert_eq!(
+                crumbs.lines().filter(|l| l.contains(" tick-panicked ")).count(),
+                (TICK_PANIC_LIMIT as usize - 1) * 2 + 1,
+                "one crumb per panic that actually ran, and none after the latch: {crumbs:?}"
+            );
+        });
     }
 }
