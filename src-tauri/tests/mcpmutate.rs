@@ -72,11 +72,31 @@ fn a_slow_mutating_tool_is_told_it_is_running_and_not_to_re_issue() {
     assert!(text.contains("still executing"), "{text}");
     assert!(text.contains("do NOT re-issue it"), "the anti-double-execution half: {text}");
     assert!(text.contains("run it twice"), "and its reason: {text}");
+    assert!(text.contains("list_agents"), "the read tool to verify with: {text}");
+}
+
+#[test]
+fn the_slow_tool_message_no_longer_promises_completion() {
+    // **Split from the row above deliberately** (#1713 review N7 evidence). A
+    // red evidences only the assertion it REACHED: with the negative sitting
+    // last in that test, restoring the pre-#1702 wording reddened on
+    // `run it twice` — the positive — and the negative, which is the pin N7 is
+    // actually about, was never exercised. One neuter now reddens BOTH rows,
+    // because the old message lacks "run it twice" AND carries the promise.
+    //
+    // This is the one assertion that stops the retracted claim coming back,
+    // and it is the reason this row exists rather than a `contains` on the new
+    // wording: a rewording that dropped the promise by accident would satisfy
+    // the positives, and only this says the promise itself is gone.
+    let (_tx, rx) = mpsc::channel::<Result<Value, (i64, String)>>();
+    let out =
+        mcp::await_mutate_result(&rx, "spawn_agent", Duration::from_millis(50), &group(), "w-1")
+            .expect("the busy answer is a tool result, not a protocol error");
+    let (text, _) = answer(&out);
     assert!(
         !text.contains("WILL complete"),
         "the retracted completion promise came back: {text}"
     );
-    assert!(text.contains("list_agents"), "the read tool to verify with: {text}");
 }
 
 #[test]
