@@ -100,9 +100,10 @@
 //!    `crates/` ever links Tauri, that scan's root list is the thing to widen.
 
 use loomux_engine::lockwatch::tracked_lock_names;
+use serde_json::json;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
-use loomux_lib::orchestration::{Guardrails, OrchRegistry};
+use loomux_lib::orchestration::{mailbox, Caller, GroupId, Guardrails, OrchRegistry, Role};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -662,9 +663,9 @@ fn l1_a_published_read_returns_while_every_holdable_registry_lock_is_held() {
         // `group_summary` takes first — so the control is asserted against a
         // read whose parking is known, not against every lock's shape.
         //
-        // (`tests/liveness.rs` L0 states the same class as a test of its own;
-        // it arrives with #1612. This is the in-test control, so L1 is
-        // non-vacuous standing alone, before or after that lands.)
+        // (L0 above states the same class as a test of its own — it landed with
+        // #1607. This is the in-test control, so L1 is non-vacuous standing
+        // alone, independently of L0.)
         if name == "agents" {
             let probe = reg.clone();
             let gid = g.id.clone();
@@ -801,4 +802,709 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
          and a publish that never completes afterwards would mean the badge can never clear"
     );
     assert!(!stale_at(recovered), "one successful publish is the evidence that clears the badge");
+}
+
+// ---------- L2d: the budget mechanism, through a REAL registry read ----------
+//
+// `crates/loomux-engine/src/budget.rs` unit-tests `read_budget` and
+// `MutationScope` against a `TrackedMutex` built for the purpose. That proves
+// the mechanism; it does not prove the mechanism survives contact with
+// `orchestration/mod.rs`, and the difference is the whole risk of Phase 2.1:
+// the unwind travels through real registry code, which owns guards, `Drop`
+// impls and (in principle) a `catch_unwind` of its own that could swallow a
+// typed payload it has never heard of.
+//
+// So these two rows drive SHIPPED registry functions. `group_summary` is the
+// one L0 already uses as its negative control, which is what makes the pair
+// legible: L0 says this read does not return while `agents` is held, and L2d
+// says the same read under a budget does.
+
+/// The budget these rows measure against. The publisher's, because
+/// `group_summary` is a section of the published payload.
+const L2D_BUDGET: Duration = loomux_engine::budget::POLL_LOCK_BUDGET;
+
+#[test]
+fn l2d_a_read_budget_around_a_real_registry_read_answers_busy_instead_of_parking() {
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    // The discriminating half. Without it, `is_err()` below is satisfied just as
+    // well by a `read_budget` that never succeeds at all — and by a GroupId this
+    // registry has never heard of.
+    let ok = loomux_engine::budget::read_budget(L2D_BUDGET, || reg.group_summary(&group.id));
+    assert!(
+        ok.is_ok(),
+        "setup: an uncontended registry read must COMPLETE under a budget. If this fails, \
+         every Busy below is about the budget mechanism rather than about the lock"
+    );
+
+    // `agents` is what `group_summary` takes, and the hold outlives the budget
+    // by 3x so the answer cannot come from the hold expiring.
+    assert!(
+        reg.hold_lock_for_test("agents", 4_000),
+        "setup: hold_lock_for_test refused the lock name 'agents'"
+    );
+
+    let started = std::time::Instant::now();
+    let busy = loomux_engine::budget::read_budget(L2D_BUDGET, || reg.group_summary(&group.id))
+        .err()
+        .expect(
+            "a registry read under a budget must answer Busy. Parking here is the beta6 defect \
+             this phase exists to remove; an Ok means the unwind never fired",
+        );
+    let waited = started.elapsed();
+
+    assert_eq!(
+        busy.lock, "agents",
+        "the Busy must name the lock that actually blocked, or the breadcrumb it writes sends \
+         the next diagnosis somewhere else"
+    );
+    // It answered on the BUDGET, not on the hold expiring. Without this the row
+    // passes against a mechanism that simply waited the hold out.
+    assert!(
+        waited < Duration::from_millis(3_000),
+        "it answered after {waited:?}, which is the hold expiring rather than the budget firing"
+    );
+    // The unwind left no wreckage: the lock the read was ABOUT is not tracked as
+    // held by the abandoned frame, and the registry still answers afterwards.
+    assert!(
+        completes_within(GRACE, {
+            let (r, g) = (reg.clone(), group.id.clone());
+            move || r.group_summary(&g)
+        }),
+        "after the hold ended, the same read must work again — an unwind that left a guard \
+         behind would have wedged `agents` permanently, which is worse than the bug"
+    );
+}
+
+#[test]
+fn l2d_a_timeout_inside_a_mutation_scope_waits_rather_than_unwinding() {
+    // The safety lever, on a real read path. A mutating frame must never be
+    // abandoned partway between two maps, so inside a `MutationScope` the same
+    // timeout WAITS — and this row is what makes `doc/design/lock-liveness.md`
+    // §4's argument checkable rather than merely stated.
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    assert!(
+        reg.hold_lock_for_test("agents", SHORT_HOLD_MS),
+        "setup: hold_lock_for_test refused the lock name 'agents'"
+    );
+
+    let started = std::time::Instant::now();
+    let out = loomux_engine::budget::read_budget(L2D_BUDGET, || {
+        let _scope = loomux_engine::budget::MutationScope::enter();
+        reg.group_summary(&group.id)
+    });
+    let waited = started.elapsed();
+
+    assert!(
+        out.is_ok(),
+        "inside a MutationScope a budget timeout must WAIT for the lock, not unwind to the \
+         frame — a mutation abandoned between two maps is corruption, which is the one \
+         outcome this trade refuses"
+    );
+    // And it really did wait past the budget rather than winning a race: without
+    // this the assertion above passes against a lock that was never held.
+    assert!(
+        waited >= L2D_BUDGET,
+        "it returned in {waited:?}, inside the {L2D_BUDGET:?} budget — the hold was not in its \
+         way, so this row proves nothing about what a timeout does"
+    );
+}
+
+// ---------- L2a-L2c: the MCP surface and the cadenced loops ----------
+
+use loomux_engine::budget as bg;
+use loomux_lib::orchestration::mcp;
+
+/// Restores the mutating-tool deadline however the scope ends — the
+/// `HoldWarn` idiom from `tests/selfwatch.rs`, for the same reason: a test that
+/// fails while it is moved leaves every later test measuring against a number
+/// nobody set.
+struct MutateDeadline(Duration);
+impl MutateDeadline {
+    fn set(d: Duration) -> Self {
+        Self(bg::set_mutate_deadline_for_test(d))
+    }
+}
+impl Drop for MutateDeadline {
+    fn drop(&mut self) {
+        bg::set_mutate_deadline_for_test(self.0);
+    }
+}
+
+/// A registry with an agent whose token the MCP surface will resolve, plus that
+/// token. `set_self_arc` because `dispatch_bounded` spawns the mutating helper
+/// on the registry's own `Arc`.
+/// A roster that DECLARES a manager, so `post_to_manager` is not refused and
+/// `check_mail` is a listed tool. Parsed from YAML rather than hand-built, so a
+/// new field on `Block` cannot give this fixture a shape a real workflow file
+/// would not produce — the `manager_lifecycle.rs` idiom.
+const WITH_MANAGER: &str = "version: 1\nblocks:\n  - id: manager\n    kind: manager\n  - id: worker\n    kind: worker\n";
+
+fn rails_with_manager() -> Guardrails {
+    let blocks = loomux_lib::orchestration::workflow::parse_workflow(WITH_MANAGER)
+        .expect("the fixture roster must parse")
+        .blocks;
+    Guardrails { blocks, ..rails() }
+}
+
+fn mcp_fixture() -> (Arc<OrchRegistry>, String, GroupId, tempfile::TempDir) {
+    let (reg, dir) = test_registry();
+    // `dispatch_bounded` runs a mutating tool on the registry's own `Arc`; a
+    // registry that never had `set_self_arc` called has none, and L2b would then
+    // be measuring a path the app does not take.
+    reg.set_self_arc();
+    let group =
+        reg.create_group("C:/tmp/repo", rails_with_manager()).expect("create a group");
+    let agent = reg
+        .spawn_agent(&group.id, Role::Orchestrator, "orch", "", false, None)
+        .expect("a fake agent to carry a resolvable token");
+    // Seed one UNREAD message. `check_mail` writes only when it stamps
+    // something read (`if stamped > 0`), so against an empty mailbox the sweep
+    // drives the tool without ever reaching `write_mailbox` — which is why the
+    // scratch rounds for L2g kept coming back green while the sweep looked
+    // complete.
+    reg.post_to_manager(&group.id, "orch", "seed for the L2g sweep", mailbox::Kind::Update)
+        .expect("the roster declares a manager, so a post is accepted");
+    (reg, agent.token, group.id, dir)
+}
+
+/// Wall-clock ms, for the tick functions that take a `now`. They all skip in
+/// L2c, so the value only has to be plausible.
+fn now_ms_local() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[test]
+fn l2a_mcp_answers_within_its_budgets_while_a_registry_lock_is_held() {
+    let (reg, token, _group, _dir) = mcp_fixture();
+
+    // Baseline: both halves answer normally. Without this, every assertion
+    // below is satisfied by an MCP surface that is broken in some other way.
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    let warm = mcp::handle_for_test(&reg, &ping, Some(&token)).expect("a request with an id");
+    assert!(warm.get("result").is_some(), "setup: ping must answer normally: {warm}");
+
+    // Resolved NOW, before anything is held. `resolve_token` is an unbudgeted
+    // direct call here, so resolving it under the `groups` hold below would park
+    // this thread for the whole hold — and the read half would then run against
+    // an `agents` hold that had already expired, which is how the first version
+    // of this row passed for the wrong reason.
+    let caller = reg.resolve_token(&token).expect("the token resolves");
+
+    assert!(reg.hold_lock_for_test("groups", 20_000), "setup: cannot hold `groups`");
+
+    // ---- the auth half: this is #1606's measured hole ----
+    //
+    // `ping` takes no registry lock of its own, and never reached its arm: every
+    // request resolves its token first, and `resolve_token` takes `groups`.
+    let started = std::time::Instant::now();
+    let busy = mcp::handle_for_test(&reg, &ping, Some(&token)).expect("a request with an id");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < bg::MCP_AUTH_BUDGET + GRACE,
+        "the MCP did not answer a ping in {waited:?} while `groups` was held. That is the \
+         defect this phase removes, measured: #1606 logged `mcp ok=false in 20004ms`"
+    );
+    let err = busy.get("error").unwrap_or_else(|| panic!("expected an error envelope: {busy}"));
+    assert_eq!(
+        err.get("code").and_then(|c| c.as_i64()),
+        Some(mcp::MCP_BUSY_CODE),
+        "a busy registry must answer the RETRYABLE code, not the permanent auth refusal \
+         (-32000) — a caller that cannot tell them apart either retries forever or gives up \
+         forever: {busy}"
+    );
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or_default();
+    assert!(msg.starts_with("loomux busy:"), "message is a public contract: {msg}");
+    assert!(msg.contains("groups"), "the answer must NAME the lock that blocked: {msg}");
+    // The `data` shape is the half a client machine-reads.
+    let data = err.get("data").unwrap_or_else(|| panic!("no data block: {busy}"));
+    assert_eq!(data.get("retryable").and_then(|r| r.as_bool()), Some(true));
+    assert!(
+        data.get("retry_after_ms").and_then(|r| r.as_u64()).is_some_and(|m| m > 0),
+        "retry_after_ms must be a positive hint: {data}"
+    );
+
+    // ---- the read-tool half ----
+    //
+    // `list_agents` takes `agents`. Driven through `dispatch`, which is the seam
+    // that owns the read budget — and note that what it covers is the WHOLE arm,
+    // not just `call_tool`: `note_agent_ack` takes `agents` too and runs first,
+    // so a budget around `call_tool` alone would be a bound with an unbounded
+    // wait in front of it. This row is what found that.
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+    let call = json!({ "name": "list_agents", "arguments": {} });
+    let started = std::time::Instant::now();
+    let out = mcp::dispatch(&reg, &caller, "tools/call", &call).expect("a tool RESULT, not a protocol error");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < bg::MCP_READ_BUDGET + GRACE,
+        "a read tool did not answer in {waited:?} with `agents` held"
+    );
+    assert_eq!(
+        out.get("isError").and_then(|e| e.as_bool()),
+        Some(true),
+        "a busy read is an EXECUTION failure, so it is an isError result rather than a \
+         protocol error — that is the shape that reaches the model's context: {out}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("loomux busy:"), "read-tool text is a public contract: {text}");
+    assert!(text.contains("agents"), "the text must name the lock that blocked: {text}");
+    assert!(
+        text.contains("Nothing was executed"),
+        "the caller has to be told it may retry safely: {text}"
+    );
+}
+
+#[test]
+fn l2b_a_slow_mutating_tool_answers_and_still_completes_exactly_once() {
+    // The exactly-once property, which is why a mutating tool is NOT unwound.
+    // A deadline that abandoned the work would double-execute on the retry the
+    // message tells the caller not to make.
+    const HOLD_MS: u64 = 3_000;
+    let _deadline = MutateDeadline::set(Duration::from_millis(300));
+    let (reg, token, group, _dir) = mcp_fixture();
+
+    assert!(reg.hold_lock_for_test("tasks_lock", HOLD_MS), "setup: cannot hold `tasks_lock`");
+
+    let call = json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": { "name": "upsert_task", "arguments": { "title": "l2b-exactly-once" } },
+    });
+    let started = std::time::Instant::now();
+    let out = mcp::handle_for_test(&reg, &call, Some(&token)).expect("a request with an id");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < bg::mutate_deadline() + GRACE,
+        "the handler waited {waited:?} on a mutating tool — the point of the deadline is that \
+         the orchestrator's turn is not spent on it"
+    );
+    let text = out["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("still executing"),
+        "the caller must be told the work is IN FLIGHT, not that it failed: {out}"
+    );
+    assert!(
+        text.contains("do NOT re-issue"),
+        "the instruction not to retry is the whole reason this is not an unwind: {text}"
+    );
+
+    // Now let the hold expire and prove the tool completed EXACTLY once.
+    let deadline = std::time::Instant::now() + Duration::from_millis(HOLD_MS) + GRACE;
+    loop {
+        let n = reg.tasks(&group).iter().filter(|t| t.title == "l2b-exactly-once").count();
+        if n == 1 {
+            break;
+        }
+        assert!(n <= 1, "the tool ran {n} times — a deadline that abandons work double-executes");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tool never completed after the hold ended; `it WILL complete` is then a false \
+             promise made to an agent"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn l2c_every_cadenced_tick_returns_while_the_registry_is_wedged() {
+    // Nine loops, each of which used to park a thread for as long as a hold
+    // lasted. Driven CONCURRENTLY rather than in sequence: they are independent,
+    // the property is "each returns", and nine sequential 5 s skips would put 45
+    // seconds into every run of this suite to measure one bound nine times.
+    let (reg, _dir) = test_registry();
+    let _group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+
+    let ticks: Vec<(&'static str, Box<dyn Fn(&OrchRegistry) + Send + Sync>)> = vec![
+        ("reap_idle_agents", Box::new(|r: &OrchRegistry| { r.reap_idle_agents(now_ms_local()); })),
+        ("run_watchdog", Box::new(|r: &OrchRegistry| { r.run_watchdog(now_ms_local()); })),
+        ("run_attention", Box::new(|r: &OrchRegistry| r.run_attention(now_ms_local()))),
+        ("run_idle_tick", Box::new(|r: &OrchRegistry| { r.run_idle_tick(now_ms_local()); })),
+        ("run_compact_nudge", Box::new(|r: &OrchRegistry| { r.run_compact_nudge(now_ms_local()); })),
+        ("run_gh_poll_tick", Box::new(|r: &OrchRegistry| { r.run_gh_poll_tick(); })),
+        ("run_workflow_gate_reload", Box::new(|r: &OrchRegistry| r.run_workflow_gate_reload())),
+        ("run_disk_monitor", Box::new(|r: &OrchRegistry| r.run_disk_monitor())),
+        ("flush_due_max_notices", Box::new(|r: &OrchRegistry| r.flush_due_max_notices(now_ms_local()))),
+    ];
+
+    let (tx, rx) = mpsc::channel();
+    let n = ticks.len();
+    for (name, f) in ticks {
+        let (r, tx) = (reg.clone(), tx.clone());
+        std::thread::spawn(move || {
+            f(&r);
+            let _ = tx.send(name);
+        });
+    }
+    drop(tx);
+
+    let mut returned = Vec::new();
+    let deadline = bg::TICK_LOCK_BUDGET + GRACE;
+    while returned.len() < n {
+        match rx.recv_timeout(deadline) {
+            Ok(name) => returned.push(name),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        returned.len(),
+        n,
+        "only {}/{n} cadenced ticks returned within {deadline:?} while `agents` was held. The \
+         ones missing are: {:?}. A tick that never returns is one parked thread per cadence \
+         for as long as the hold lasts — #1600 §1.2 step 3.",
+        returned.len(),
+        {
+            let mut missing = vec![
+                "reap_idle_agents", "run_watchdog", "run_attention", "run_idle_tick",
+                "run_compact_nudge", "run_gh_poll_tick", "run_workflow_gate_reload",
+                "run_disk_monitor", "flush_due_max_notices",
+            ];
+            missing.retain(|m| !returned.contains(m));
+            missing
+        }
+    );
+}
+
+#[test]
+fn every_read_classified_tool_is_a_tool_the_surface_actually_lists() {
+    // Review N2. The old version of this row could not fail: its
+    // `match tool_kind(name)` loop was total, so "every listed tool reaches a
+    // decision" was a tautology, and the only live assertions were two floors.
+    // It also drove ONE role while claiming a per-role population, so three
+    // role-gated tools were never seen by it.
+    //
+    // The direction that actually bites is the other one, and it had a live
+    // instance: `pr_checks` sat in the Read set and is not a tool at all —
+    // `tool_defs` registers no such name — so the set was 16 real tools plus a
+    // dead row, with nothing red. A typo'd Read entry degrades to `Mutate`
+    // silently, which is fail-safe but also invisible.
+    //
+    // Both populations are now taken from the shipped code: `READ_TOOLS` is the
+    // constant `tool_kind` itself reads, and `all_listed_tool_names()` unions
+    // `tool_defs` over EVERY role — a pure function, so no fixture decides what
+    // this test can see.
+    let listed = mcp::all_listed_tool_names();
+    assert!(
+        listed.len() >= 35,
+        "the listing collapsed to {} tools; this row is comparing against almost nothing",
+        listed.len()
+    );
+
+    let orphans: Vec<&str> =
+        mcp::READ_TOOLS.iter().copied().filter(|n| !listed.iter().any(|l| l == n)).collect();
+    assert!(
+        orphans.is_empty(),
+        "these names are classified ToolKind::Read but are not tools the surface lists: \
+         {orphans:?}. A dead row classifies nothing — and the next typo in that table also \
+         degrades to Mutate in silence, which is safe and unreadable."
+    );
+
+    // The other direction, as a floor rather than an equality: a listed tool is
+    // free to be a Mutate, so the two sets are not equal and never should be.
+    // What must hold is that the Read set is not empty — a `READ_TOOLS` that had
+    // shrunk to nothing would make the read budget apply to nothing at all while
+    // every assertion above still passed.
+    assert!(
+        mcp::READ_TOOLS.len() >= 8,
+        "only {} tools classify as Read; the read budget then governs almost nothing",
+        mcp::READ_TOOLS.len()
+    );
+
+    // And the classification really is consulted rather than defaulted: at least
+    // one listed tool must come back Read, and at least one Mutate.
+    let reads = listed.iter().filter(|n| mcp::tool_kind(n) == mcp::ToolKind::Read).count();
+    let mutates = listed.iter().filter(|n| mcp::tool_kind(n) == mcp::ToolKind::Mutate).count();
+    assert!(reads > 0 && mutates > 0, "reads={reads} mutates={mutates}");
+}
+
+// ---------- L2e: a partial group with nothing to inherit is WITHHELD ----------
+
+#[test]
+fn a_first_pass_that_goes_partial_publishes_nothing_rather_than_nulls() {
+    // CLAUDE.md's rule (#1671): a snapshot in front of per-item reads inherits
+    // what those reads answered, and the miss is SILENT — an absent entry
+    // renders as "nothing here" rather than failing, so neither the compiler
+    // nor a unit test over a faked registry sees it.
+    //
+    // The busy fallback keeps a section's PREVIOUS value. On a group's FIRST
+    // pass there is no previous value and no previous stamp, so the naive
+    // version publishes an entry whose sections are all `Null` and whose
+    // `computed_at` is this pass — a panel that reads CURRENT while asserting
+    // the group has nothing, with no stale badge to say otherwise.
+    //
+    // The class this bites is not hypothetical: a restored-but-not-resumed
+    // group arrives through a strip lease and has no prior entry by
+    // construction (#1625 round 2), so its first pass is exactly the pass that
+    // can hit a busy section.
+
+    // The discriminating half, on its own registry: a first pass with nothing
+    // held DOES publish the group. Without it, the assertion below passes just
+    // as well against a publisher that never publishes anything.
+    {
+        let (reg, _dir) = test_registry();
+        let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+        reg.views.publish_pass(&reg);
+        assert!(
+            reg.views.load().value.groups.contains_key(&group.id),
+            "setup: an unheld first pass must publish the group, or the assertion below is \
+             about a publisher that does nothing"
+        );
+    }
+
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+    assert!(
+        reg.views.load().value.groups.is_empty(),
+        "setup: this registry has never published, so the group has nothing to inherit"
+    );
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+
+    reg.views.publish_pass(&reg);
+    let snapshot = reg.views.load();
+
+    assert!(
+        !snapshot.value.groups.contains_key(&group.id),
+        "a group whose FIRST pass went partial was published anyway. Its sections are all \
+         null and its stamp is fresh, so the strip renders it as a group with nothing in it \
+         and no stale badge — the silent \"nothing here\" that absence avoids, since absence \
+         already means \"ask again shortly\" to both payload builders"
+    );
+    // And the payload builder agrees, which is what a reader actually sees.
+    assert_eq!(
+        loomux_lib::orchestration::views::group_view_payload(&snapshot, &group.id, std::time::Instant::now()),
+        serde_json::Value::Null,
+        "an absent group must answer Null — the same degrade as a group created since the \
+         last pass"
+    );
+}
+
+// ---------- L2f: a partial group inherits its stalest part's AGE ----------
+
+#[test]
+fn a_partial_group_keeps_the_previous_stamp_so_the_badge_can_tell() {
+    // This is the rule that makes `viewstale.ts`'s existing pair of labels
+    // correct with NO frontend change, and it was the load-bearing choice in
+    // this slice — so it needs its own pin rather than riding on the fact that
+    // the frontend was not edited.
+    //
+    // A group that kept a section's previous value keeps that value's AGE too.
+    // Stamp it with THIS pass instead and the panel reads current — `stale` is
+    // derived from `age_ms`, so a fresh stamp means no badge — while showing a
+    // frozen number. That is the silent freeze #1604 review N3 is about, and it
+    // is invisible: every field is present and well-formed.
+    let (reg, _dir) = test_registry();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    reg.views.publish_pass(&reg);
+    let first = reg.views.load();
+    let before = first.value.groups.get(&group.id).expect("published").clone();
+    assert!(!before.partial, "setup: an unheld pass must not be partial");
+
+    // Something to distinguish the two passes by. `computed_unix_ms` is a
+    // wall-clock stamp, so the passes must be separated by at least a
+    // millisecond for the assertion below to mean anything.
+    std::thread::sleep(Duration::from_millis(5));
+
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+    reg.views.publish_pass(&reg);
+    let after = reg.views.load();
+    let now = after.value.groups.get(&group.id).expect("still published — it has a previous value to inherit").clone();
+
+    assert!(now.partial, "a pass that could not read `agents` must mark the group partial");
+    assert_eq!(
+        now.computed_at, before.computed_at,
+        "a partial group must keep its PREVIOUS stamp. With a fresh one, `age_ms` restarts \
+         and `stale` never flips, so the panel reads current while showing the value it \
+         could not refresh"
+    );
+    assert_eq!(
+        now.computed_unix_ms, before.computed_unix_ms,
+        "the wall-clock stamp a human reads must move with `computed_at`, or the badge and \
+         the timestamp beside it disagree"
+    );
+
+    // And the property as the frontend actually sees it: `partial` reaches the
+    // payload, and the age it is paired with is the OLD one.
+    let payload =
+        loomux_lib::orchestration::views::group_view_payload(&after, &group.id, std::time::Instant::now());
+    assert_eq!(payload["meta"]["partial"], serde_json::Value::Bool(true));
+    assert_eq!(
+        payload["meta"]["published_at_ms"].as_u64(),
+        Some(before.computed_unix_ms),
+        "the payload must report the stalest part's age, not this pass's"
+    );
+}
+
+// ---------- L2g: rider R1 as an ENFORCED invariant, not an argument ----------
+
+#[test]
+fn no_read_tool_can_unwind_after_a_durable_write() {
+    // Review round 1 turned R1 from "prove or scope" into this. The enumeration
+    // that answered it was incomplete — four `ToolKind::Read` arms wrote
+    // durably and were never looked at, one of them (`check_mail`) consumingly —
+    // and an enumeration is the wrong instrument anyway: it is a claim about
+    // today's call graph, re-verified by nobody.
+    //
+    // So the property is measured instead. `budget::torn_writes()` counts budget
+    // frames that unwound AFTER a durable write, which is the tear itself; the
+    // seal (`budget::note_durable_write`) makes it structurally zero. This row
+    // drives every tool the surface CLASSIFIES AS A READ, under a budget, with a
+    // registry lock held, and asserts that number did not move.
+    //
+    // Two things make it non-vacuous, and both are needed:
+    //
+    //  - the population control below (`sealed_frames` must MOVE), so "zero
+    //    torn" cannot be "zero writes" — which is exactly what this test would
+    //    report against a registry whose read paths never wrote anything;
+    //  - the lock it holds is `app`, which `write_mailbox` takes AFTER
+    //    atomically replacing `mailbox.json`. That is the shape the tear needs,
+    //    and it is the one the review found live.
+    let (reg, token, group, _dir) = mcp_fixture();
+    let base = reg.resolve_token(&token).expect("the token resolves");
+
+    // The population is `READ_TOOLS` — every name the budget treats as a read —
+    // NOT one role's listing. That distinction is the whole of why the first
+    // scratch round for this row came back green: L2g swept `tools/list` for an
+    // ORCHESTRATOR, and `check_mail` (the tool this property exists for) is in
+    // the MANAGER tier, so the sweep never drove it. That is the same defect the
+    // review found in the classification test, and the same one it found in
+    // `tool_kind` itself — a population that excludes its own subject.
+    //
+    // `Caller` is constructible directly, so each tool is driven by a caller
+    // whose ROLE actually lists it, without spawning an agent per role.
+    // The matrix comes from `mcp` so this cannot omit a dimension the listing
+    // branches on — which is exactly how `session_digest` (hint-gated) was
+    // reported unreachable here after the same omission had already been fixed
+    // in the sibling guard.
+    let listed_by: Vec<(Role, Option<&str>, Vec<String>)> = mcp::listing_matrix()
+        .into_iter()
+        .map(|(role, hint)| (role, hint, mcp::listed_tool_names_for(role, hint)))
+        .collect();
+
+    // Resolve every Read tool to a caller BEFORE anything is held: building the
+    // plan takes registry locks of its own, and doing that under the hold would
+    // measure the plan rather than the sweep.
+    let mut plan: Vec<(&str, Caller)> = Vec::new();
+    let mut unreachable: Vec<&str> = Vec::new();
+    for name in mcp::READ_TOOLS {
+        match listed_by.iter().find(|(_, _, names)| names.iter().any(|n| n == name)) {
+            Some((role, hint, _)) => plan.push((
+                name,
+                Caller {
+                    agent_id: base.agent_id.clone(),
+                    group: base.group.clone(),
+                    role: *role,
+                    role_hint: hint.map(str::to_string),
+                },
+            )),
+            None => unreachable.push(name),
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "these Read-classified tools are listed for no role, so this sweep cannot drive them: \
+         {unreachable:?}. A tool the budget governs but this row cannot reach is exactly the \
+         gap that let the first scratch round for this row come back green."
+    );
+    assert!(plan.len() >= 8, "only {} Read tools are reachable: {plan:?}", plan.len());
+
+    let (sealed_before, torn_before) = loomux_engine::budget::thread_seal_counts();
+
+    // Held for the whole sweep: `app` is what `write_mailbox` takes AFTER its
+    // durable replace, so it is the lock a write-then-acquire tear needs.
+    assert!(reg.hold_lock_for_test("app", 20_000), "setup: cannot hold `app`");
+
+    for (name, caller) in &plan {
+        let call = json!({ "name": name, "arguments": {} });
+        // The answer does not matter — Ok, isError and busy are all fine. What
+        // matters is that no frame unwound after writing.
+        let _ = mcp::dispatch(&reg, caller, "tools/call", &call);
+    }
+
+    let (sealed_after, torn_after) = loomux_engine::budget::thread_seal_counts();
+    let torn = torn_after - torn_before;
+    assert_eq!(
+        torn, 0,
+        "{torn} read-tool frame(s) unwound AFTER performing a durable write. That is the \
+         tear rider R1 is about: the caller is told `Nothing was executed` while a state file \
+         has already been replaced. Either the tool mutates and belongs in ToolKind::Mutate, \
+         or its write needs to reach `budget::note_durable_write` so the frame seals."
+    );
+
+    // THE POSITIVE CONTROL — and deliberately not "did some tool happen to
+    // write". The first version asserted exactly that and failed on CI: no Read
+    // tool wrote durably during the sweep, so `torn == 0` was vacuous. The
+    // control caught its own test, which is what a control is for, but it also
+    // showed the row was resting on a tool INCIDENTALLY writing. That is a fact
+    // about today's fixture, not a property of anything.
+    //
+    // So the instrument is demonstrated directly: a frame that writes and then
+    // hits a held lock must SEAL and WAIT. If that stops holding, the sweep
+    // above is measuring a mechanism that is not running, and this says so.
+    let (probe_seals_before, probe_torn_before) = loomux_engine::budget::thread_seal_counts();
+    assert!(reg.hold_lock_for_test("agents", 4_000), "setup: cannot hold `agents`");
+    let probe_started = std::time::Instant::now();
+    let probe = loomux_engine::budget::read_budget(loomux_engine::budget::POLL_LOCK_BUDGET, || {
+        loomux_engine::budget::note_durable_write("l2g-probe.json");
+        // The acquisition AFTER the write — the only shape that tears.
+        reg.group_summary(&group)
+    });
+    let probe_waited = probe_started.elapsed();
+    let (probe_seals, probe_torn) = loomux_engine::budget::thread_seal_counts();
+
+    assert!(
+        probe.is_ok(),
+        "a frame that wrote durably and then hit a held lock UNWOUND. The seal is not \
+         engaging, so `torn == 0` above measures a mechanism that is not running"
+    );
+    assert!(
+        probe_waited >= loomux_engine::budget::POLL_LOCK_BUDGET,
+        "the probe returned in {probe_waited:?}, inside its own budget — the hold was not in \
+         its way, so it demonstrates nothing about what a sealed frame does"
+    );
+    assert_eq!(
+        probe_seals - probe_seals_before,
+        1,
+        "the probe's durable write did not seal its frame"
+    );
+    assert_eq!(probe_torn, probe_torn_before, "the probe itself tore");
+
+    // WHAT THE SWEEP DOES AND DOES NOT SHOW — recorded rather than asserted,
+    // because the obvious assertion is unsound in BOTH directions and each was
+    // tried on CI before this comment existed.
+    //
+    // `swept_writes > 0` fails on a CORRECT tree: with `check_mail`,
+    // `queue_orphans` and `list_locks` classified `Mutate` — which is the fix
+    // this review round made — the Read set contains no tool that durably writes
+    // in this fixture. Demanding one demands the classification be wrong.
+    //
+    // `swept_writes == 0` is no better: `group_usage` IS a Read that replaces
+    // `usage.json`, and whether it does so in a given run depends on live agents
+    // having snapshots — a property of the fixture, not of the code.
+    //
+    // MEASURED, not reasoned (#1609 review round 2, B1): the round that puts
+    // `check_mail` back in the Read set unsealed — with the two `budget.rs` seal
+    // tests `#[ignore]`d so `cargo` reaches this binary at all — run 33257747970,
+    // reddens the PROBE above ("a frame that wrote durably and then hit a held
+    // lock UNWOUND") and leaves the sweep's own `torn == 0` GREEN. So the sweep does not catch a misclassified writer, and
+    // no run has shown it failing. It is a regression guard; the probe is the
+    // assertion with a counterfactual.
+    //
+    // So the sweep asserts what it supports: every Read tool was reachable and
+    // driven (above), and none tore. The two stronger claims live where they can
+    // be demonstrated — the probe shows the instrument runs, and `budget.rs`'s
+    // own seal tests redden when the seal is disarmed. Three claims, three
+    // places, each with the counterfactual it actually has.
+    let swept_writes = sealed_after - sealed_before;
+    let _ = swept_writes;
 }

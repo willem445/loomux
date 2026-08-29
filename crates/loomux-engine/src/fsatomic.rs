@@ -7,11 +7,30 @@
 //!
 //! It is here (#888 slice A3 batch 9) because durability is not a desktop
 //! concern: `std::fs` only, no `tauri`, no pane, and a headless daemon writes
-//! exactly the same files the app does. It has no outward edge at all — not
-//! even `lock_safe` — which is what let it move in the same batch as
-//! [`crate::subproc`] without sharing anything with it. The two are deliberately
-//! separate modules: a bounded subprocess capture and a crash-safe file replace
-//! answer different failure modes and share no design story.
+//! exactly the same files the app does. Through batch 9 it had no outward edge
+//! at all — not even `lock_safe` — which is what let it move in the same batch
+//! as [`crate::subproc`] without sharing anything with it. The two are
+//! deliberately separate modules: a bounded subprocess capture and a crash-safe
+//! file replace answer different failure modes and share no design story.
+//!
+//! **It has exactly one outward edge now** (#1609), and it is named here rather
+//! than left for a reader to find in the body: [`atomic_write`] calls
+//! [`crate::budget::note_durable_write`]. That is two thread-local reads and,
+//! on the rare path, a breadcrumb — no lock, no wait, no new failure mode.
+//!
+//! It exists because this function is the durable **REPLACE** primitive: it
+//! destroys the previous contents of a state file, so a bounded acquisition
+//! that unwound after it would leave a world nothing else agrees with. The
+//! call SEALS the surrounding budget frame, which is what makes that
+//! impossible (`doc/design/lock-liveness.md` §4.1).
+//!
+//! **It is not the only durable-write door, and an earlier version of this
+//! note said it was** (#1609 review B3). `append_audit` and
+//! `append_ledger_line` in `orchestration/mod.rs` write state files too, by
+//! append rather than replace, and deliberately do NOT seal — §4.3 carries
+//! that line and the reason. The boundary argument above is untouched: still
+//! `std::fs` only, still no `tauri`, still nothing a headless daemon cannot
+//! link.
 //!
 //! **Deliberately no `tempfile`.** Uniqueness comes from a std atomic, which
 //! keeps this clear of the getrandom-based crates the Windows 10 baseline
@@ -49,6 +68,19 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// rename so a rename can't expose a metadata-only file whose data blocks never
 /// reached disk — exactly the disk-full failure mode.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // #1609 rider R1. This is a durable REPLACE, so it SEALS the surrounding
+    // budget frame: from here to the end of that frame a timed acquisition
+    // waits instead of unwinding, which is what makes it impossible to
+    // abandon the work that completes this write's invariant. Before the
+    // write the frame keeps its bound. See `budget::note_durable_write` and
+    // `doc/design/lock-liveness.md` §4.1.
+    //
+    // Called BEFORE the write rather than after it, deliberately: the seal
+    // has to be in place for every acquisition that could follow, and the
+    // first of those is `fs::create_dir_all` failing into an early return.
+    crate::budget::note_durable_write(
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
+    );
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // Ensure the destination dir exists — group state dirs always do, but the #83
     // grant subdirs (`merge_grants/`, `release_grants/`) may be fresh.

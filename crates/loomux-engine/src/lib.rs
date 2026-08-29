@@ -305,7 +305,14 @@
 //!
 //! `subproc` has exactly one outward edge, [`obs::LockExt`] (`lock_safe` on the
 //! abandoned-reader backlog), which batch 7 brought across for precisely this;
-//! `fsatomic` has none. Both left every caller of the day in `src-tauri` —
+//! `fsatomic` had none as of batch 9 and has exactly one now — #1609 gave
+//! [`fsatomic::atomic_write`] a call to [`budget::note_durable_write`], because
+//! it is the durable REPLACE primitive and a bounded acquisition must not be
+//! able to unwind after one. It is not the only durable-write door (the
+//! append-only audit writers are the others, and do not seal — see
+//! `doc/design/lock-liveness.md` §4.3). Two
+//! thread-local reads; still `std`-only, still Tauri-free. Both left every
+//! caller of the day in `src-tauri` —
 //! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
 //! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite
@@ -619,6 +626,7 @@
 //! and the `liveness_stamp` command the webview stamps through.
 
 pub mod brand;
+pub mod budget;
 pub mod fsatomic;
 pub mod groupid;
 pub mod intake;

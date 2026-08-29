@@ -19,7 +19,14 @@ pub use loomux_engine::winpath;
 // that crate's `lib.rs` — so `src-tauri` re-exports rather than wraps. `pub`
 // because `src-tauri/tests/selfwatch.rs` and the delivery-ledger tests in
 // `tests/orchestration.rs` link them.
-pub use loomux_engine::{lockwatch, selfwatch};
+//
+// `budget` is the Phase 2.1 half (#1609) and is BOUNDING rather than
+// observing: the thread-local read budget, `MutationScope`, and the six
+// budget constants every waited path is measured against. It rides here
+// because it is the same mechanism seen from the other side — `lockwatch`
+// says who is holding, `budget` says how long a waiter may pay for it — and
+// because `tests/liveness.rs` links it.
+pub use loomux_engine::{budget, lockwatch, selfwatch};
 mod metrics;
 mod modelwire; // the list-models control probe (#993)
 mod obs;

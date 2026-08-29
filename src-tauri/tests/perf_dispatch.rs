@@ -78,8 +78,9 @@ enum Class {
     /// **"Briefly held" is a fact about the HOLDER, and what a sync command
     /// pays is the ACQUISITION** (#1595). If any other thread can hold the same
     /// lock, this class says nothing about how long the webview thread waits —
-    /// `lock_safe` is `Mutex::lock` with poison recovery: no timeout, no
-    /// try-lock, no bound. #1595's five rows were all correctly classified by
+    /// a bare `lock_safe` is an infallible acquire with no bound (#1609 added
+    /// a timed form; a sync command gets it only under a budget frame, which
+    /// one on the webview thread has none of). #1595's five rows were all correctly classified by
     /// the rule above (genuinely in-memory, no INV-2 marker to find) and all
     /// five froze the app, because they were on a fixed-cadence poll and the
     /// registry mutex they take is shared with the idle reaper, the watchdog,
@@ -1508,8 +1509,10 @@ fn strip_ts_comments(text: &str) -> String {
 /// on CI and passes for the wrong reason on a fast machine. The property that
 /// matters is structural -- Tauri dispatches a sync command on the webview/GTK
 /// main-loop thread, so a POLLED sync command parks that thread every tick for
-/// as long as whoever holds the registry mutex takes, and `lock_safe` is
-/// `Mutex::lock` with poison recovery: no timeout, no try-lock, no bound.
+/// as long as whoever holds the registry mutex takes, and `lock_safe` was an
+/// infallible acquire: no timeout, no try-lock, no bound. (#1609 added a
+/// bounded form, which a sync command on the webview thread does not get:
+/// it runs under no budget frame.)
 ///
 /// **Async was never the property; it was the least of them** (#1608). This
 /// test's own #1595 half "would pass on beta6" -- #1600 §2.2 says so in as

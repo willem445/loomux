@@ -77,9 +77,14 @@ There are four, and the model names all four:
    why the MCP is the FIRST thing to die in the incident chain and the last
    thing anyone thinks to look at.
 4. **Lock acquisition time, as distinct from hold time.** INV-5 bounds what a
-   HOLDER does. Nothing here bounds what a WAITER pays: `lock_safe` is
-   `Mutex::lock` with poison recovery — no timeout, no try-lock — so a
-   caller's cost is set by a lock's worst holder, not by its own body. This is
+   HOLDER does. A bare `lock_safe` still does not bound what a WAITER pays —
+   it is an infallible acquire, so a caller's cost is set by a lock's worst
+   holder, not by its own body. (Through #1601 there was no bounded form at
+   all; #1609 added two — `TrackedMutex::lock_within(budget)`, and
+   `budget::read_budget`, which bounds every `lock_safe` on the thread
+   underneath it. Which paths run under one is the subject of INV-1 below;
+   the mechanism and its safety argument are `doc/design/lock-liveness.md`.)
+   This is
    the resource #1595 classified five commands against without knowing it
    existed (see `Class::Cheap`'s note in E1). Since #1601 Phase 0.1 every
    registry lock is a `loomux_engine::lockwatch::TrackedMutex`, so a hold past
@@ -277,9 +282,11 @@ scan pins the shape.
 
   **`cheap` bounds the critical section, not the acquisition** (#1595). A
   command may be in-memory only and still park the webview thread for an
-  unbounded time, because `lock_safe` is `Mutex::lock` with poison recovery —
-  no timeout, no try-lock — and the registry mutexes are shared with background
-  threads. So `cheap` requires a second, non-mechanical answer: **no lock a
+  unbounded time, because a bare `lock_safe` is an infallible acquire and the
+  registry mutexes are shared with background threads. (#1609 gave the waiter
+  side a bounded form — see §1 resource 4 — but a command only gets it by
+  running under a `read_budget` frame, so `cheap` is unchanged for one that
+  does not.) So `cheap` requires a second, non-mechanical answer: **no lock a
   background thread can hold, OR not on a poll path.** Both fail it. #1592 and
   #1595 were the same defect with opposite work profiles — one expensive, one
   genuinely trivial — which is the evidence that the work was never the
@@ -293,7 +300,17 @@ scan pins the shape.
   a command reached from a fixed-cadence poll site must additionally be served
   from the published snapshot (P8) — `views.load(` in its body — which is
   mechanical, and is enforced.
-  *Enforced: E1 (#743 S2, then #1608's L6) + review.*
+
+  **An acquisition on a waited path is BOUNDED** (#1609). Every path a human
+  or an agent waits behind runs under a budget: the publisher's sections, the
+  MCP auth and read tools, the cadenced ticks' gate, and the human one-shot
+  read commands. A budget that expires yields a typed `Busy` — a partial
+  panel, a retryable JSON-RPC error, a skipped tick — never an unbounded
+  wait. Mutating paths are deliberately EXEMPT and wait: an abandoned
+  mutation is worse than a slow one, and `MutationScope` is what makes that
+  exemption structural rather than a convention. `doc/design/lock-liveness.md`
+  carries the mechanism and the safety argument.
+  *Enforced: E1 (#743 S2, then #1608's L6) + `tests/liveness.rs` L2a-L2d + review.*
 - **INV-2 — No process spawn and no network round trip on the webview thread,
   ever.** No class permits it: `cheap` bodies additionally must carry no
   `Command::new` / `ShellExecuteW` / `.output(` / `fs::` marker, and only a

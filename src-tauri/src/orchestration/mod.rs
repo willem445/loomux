@@ -428,6 +428,9 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Weak};
+// #1609: the thread-local read budget, MutationScope and the six budget
+// constants. See `doc/design/lock-liveness.md`.
+use loomux_engine::budget;
 use loomux_engine::lockwatch::TrackedMutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -26573,7 +26576,13 @@ impl OrchRegistry {
         let reg = self.clone();
         let (tx, rx) = mpsc::channel::<()>();
         let name = name.to_string();
-        let known = matches!(name.as_str(), "groups" | "agents" | "mq_state_lock" | "tasks_lock");
+        // `app` is here for #1609 review B1: it is what `write_mailbox` takes
+        // AFTER atomically replacing `mailbox.json`, so it is the lock a test
+        // has to hold to produce a write-then-acquire tear at all. Widening
+        // this seam widens `l1_...`'s coverage too, which that test's own
+        // `classify` helper invites.
+        let known =
+            matches!(name.as_str(), "groups" | "agents" | "mq_state_lock" | "tasks_lock" | "app");
         if !known {
             return false;
         }
@@ -26595,6 +26604,11 @@ impl OrchRegistry {
                 }
                 "mq_state_lock" => {
                     let _g = reg.mq_state_lock.lock_safe();
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                "app" => {
+                    let _g = reg.app.lock_safe();
                     let _ = tx.send(());
                     std::thread::sleep(Duration::from_millis(ms));
                 }
@@ -31726,7 +31740,102 @@ impl OrchRegistry {
     /// Kill every idle worker/reviewer past its group's timeout, notifying
     /// each group's orchestrator so it can respawn on demand. Returns the
     /// killed agent ids. Called on a timer by `start_idle_reaper`.
+    /// Run a human one-shot READ command under [`budget::COMMAND_READ_BUDGET`]
+    /// (#1609, plan §3 Phase 2.1 item 4).
+    ///
+    /// On `Busy` the command degrades to `on_busy()` and breadcrumbs. The
+    /// degrade is not invented here: it is the SAME empty value each of these
+    /// commands already returns for an unvalidated group id, because
+    /// `command_group` gives them no error channel to report anything else
+    /// through. A blank panel plus a breadcrumb naming the holder beats a panel
+    /// that never paints.
+    ///
+    /// **What this degrade does NOT do, and it is a real gap** (#1609 review
+    /// N3): unlike the publisher path there is no `partial` flag and no badge,
+    /// so a human sees a confidently empty board or a vanished unread chip with
+    /// nothing saying it could not be read. The "same value as an unvalidated
+    /// id" argument is true and is also weaker than it sounds — an unvalidated
+    /// id is a programmer error, while a `Busy` is a real group with real mail.
+    ///
+    /// It is not closed here because these commands have no meta channel to
+    /// carry the disclosure: giving them one is a wire-shape change to each of
+    /// the six, which is a bigger change than this slice should make on its own
+    /// initiative. The breadcrumb is what an operator has meanwhile, and
+    /// `doc/design/lock-liveness.md` §3 carries the row.
+    ///
+    /// Takes no `self`: it is called from inside `run_blocking(move || ..)` in
+    /// the module-level `#[tauri::command]` functions, which have moved `reg`
+    /// into the closure and have no receiver — so the call spells
+    /// `OrchRegistry::read_command(..)`.
+    fn read_command<T>(
+        name: &'static str,
+        on_busy: impl FnOnce() -> T,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        match budget::read_budget(budget::COMMAND_READ_BUDGET, f) {
+            Ok(v) => v,
+            Err(busy) => {
+                crate::obs::breadcrumb(
+                    "command-busy",
+                    &format!("command={name} {}", busy.detail()),
+                );
+                on_busy()
+            }
+        }
+    }
+
+    /// Gate one cadenced backend tick (#1609, plan §3 Phase 2.1 item 3).
+    ///
+    /// `None` means SKIP this tick: the registry is wedged, and a tick that
+    /// runs anyway just adds one more parked thread to the pile #1600 §1.2 is
+    /// about. `Some(scope)` means run, with the body inside a
+    /// [`budget::MutationScope`] so no enclosing budget can ever unwind a
+    /// half-applied mutation out of a tick.
+    ///
+    /// **It probes `agents` and `groups` rather than "the tick's own entry
+    /// lock", and that is a deliberate correction to the plan's wording.** The
+    /// entry lock is not a usable concept here: three of these ticks enter
+    /// through `agent_output_totals`/`attention_inputs`, whose first
+    /// acquisition is `app` — a trivial cell that says nothing about whether
+    /// the registry is wedged — and then park on `agents` two frames down.
+    /// Bounding whichever lock happens to be lexically first would produce a
+    /// gate that passes and a tick that parks anyway. `agents` and `groups` are
+    /// the registry's two core maps — every agent-scoped and every
+    /// group-scoped read goes through one of them — so a tick that clears both
+    /// is one the registry can currently serve. (Stated structurally rather
+    /// than as a share of the acquisition sites: that count depends on how you
+    /// match a call site, and two honest countings of this file disagree.)
+    ///
+    /// **What this buys, and what it does not.** It stops a cadenced loop
+    /// ADDING a parked thread to a registry that is ALREADY wedged, which is
+    /// the accumulation half of the incident chain. It does NOT bound a tick
+    /// that wedges midway: that tick waits, by design, because its body
+    /// mutates and an abandoned mutation is worse than a slow one. Phase 0's
+    /// watchdog is what reports that case, with the holder named.
+    ///
+    /// The probe is released immediately and is not mutual exclusion — the
+    /// question is "can the registry serve anyone right now", not "may I have
+    /// this lock". A wedge arriving in the gap is the mid-tick case above.
+    fn tick_gate(&self, tick: &'static str) -> Option<budget::MutationScope> {
+        match self.agents.lock_within(budget::TICK_LOCK_BUDGET) {
+            Ok(probe) => drop(probe),
+            Err(busy) => {
+                crate::obs::breadcrumb("tick-skipped", &format!("tick={tick} {}", busy.detail()));
+                return None;
+            }
+        }
+        match self.groups.lock_within(budget::TICK_LOCK_BUDGET) {
+            Ok(probe) => drop(probe),
+            Err(busy) => {
+                crate::obs::breadcrumb("tick-skipped", &format!("tick={tick} {}", busy.detail()));
+                return None;
+            }
+        }
+        Some(budget::MutationScope::enter())
+    }
+
     pub fn reap_idle_agents(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("reap_idle_agents") else { return Vec::new() };
         let mut killed = Vec::new();
         for id in self.idle_reap_candidates(now) {
             let Some(a) = self.agent(&id) else { continue };
@@ -32032,6 +32141,7 @@ impl OrchRegistry {
     /// One full watchdog cycle: read pty counters, then tick. Called on a
     /// timer by `start_watchdog`.
     pub fn run_watchdog(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("run_watchdog") else { return Vec::new() };
         let outputs = self.agent_output_totals();
         // Same registry state `notify_tick`/`list_notifications` read (#248) —
         // no second store. Agent id -> its live watch ids: `watchdog_tick`
@@ -32985,6 +33095,13 @@ impl OrchRegistry {
     /// `gh_poll_tick`, so tests drive the decision half with a synthetic
     /// result map and no subprocess.
     pub fn run_gh_poll_tick(&self) -> GhPollTick {
+        // `GhPollTick::default()` is the same "nothing happened this tick"
+        // value a poll with no watches produces, so a skip is indistinguishable
+        // from a quiet tick to every caller — which is what makes skipping safe
+        // rather than a second code path.
+        let Some(_tick) = self.tick_gate("run_gh_poll_tick") else {
+            return GhPollTick::default();
+        };
         let now = now_ms();
         let results = self.poll_watches(now);
         self.gh_poll_tick(now, &results)
@@ -34854,6 +34971,7 @@ impl OrchRegistry {
     /// read pty counters and tick the still-autonomous orchestrators. Called on a
     /// timer by `start_idle_tick`; `now` injected so tests drive it deterministically.
     pub fn run_idle_tick(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("run_idle_tick") else { return Vec::new() };
         self.enforce_autonomy_budgets(now);
         let (outputs, inputs) = self.orchestrator_activity();
         self.idle_tick_tick(now, &outputs, &inputs)
@@ -36315,6 +36433,7 @@ impl OrchRegistry {
     /// timer by `start_compact_nudge`; `now` injected so tests drive it
     /// deterministically.
     pub fn run_compact_nudge(&self, now: u64) -> Vec<String> {
+        let Some(_tick) = self.tick_gate("run_compact_nudge") else { return Vec::new() };
         let outputs = self.agent_output_totals();
         let manual_signals = self.agent_compact_signals();
         let signals = self.agent_context_signals();
@@ -37254,6 +37373,7 @@ impl OrchRegistry {
     /// board/state live — the surface a disk-full write corrupts) and run one
     /// `disk_tick`. Best-effort: if the disk can't be read, do nothing.
     pub fn run_disk_monitor(&self) {
+        let Some(_tick) = self.tick_gate("run_disk_monitor") else { return () };
         if let Some(free) = free_disk_bytes(&self.root) {
             self.disk_tick(free);
         }
@@ -38288,6 +38408,7 @@ impl OrchRegistry {
     /// `take_due_max_notices` and never reaches the orchestrator.
     #[doc(hidden)] // pub for integration tests
     pub fn flush_due_max_notices(&self, now: u64) {
+        let Some(_tick) = self.tick_gate("flush_due_max_notices") else { return () };
         let due = take_due_max_notices(&mut self.pending_max_notice.lock_safe(), now);
         for (group, from, to) in due {
             // Best-effort, like the exit notice: a dead/paused orchestrator
@@ -38732,6 +38853,7 @@ impl OrchRegistry {
     }
 
     pub fn run_attention(&self, now: u64) {
+        let Some(_tick) = self.tick_gate("run_attention") else { return () };
         let (outputs, tails, last_inputs) = self.attention_inputs();
         // Also scan plain (non-agent) panes for an interactive prompt (#40).
         let (p_out, p_tails, p_ins, agent_ptys) = self.pane_attention_inputs();
@@ -39177,10 +39299,18 @@ impl OrchRegistry {
     /// booted both surface as "not from the store", so the one condition that
     /// needs a human looks exactly like the one that needs nobody.
     ///
-    /// Why a latch and not just an audit call: this runs on `group_usage`,
-    /// which the group view polls every couple of seconds, so an unlatched line
-    /// would be an audit entry every tick for as long as the condition lasted —
-    /// the log flooded worst precisely when something is wrong with it. Keyed
+    /// Why a latch and not just an audit call: this runs on every usage
+    /// computation, and since #1608 the busiest caller is the snapshot
+    /// publisher — `views::compute_group` recomputes the strip tier once per
+    /// `views::VIEW_PUBLISH_INTERVAL` for every live and strip-leased group. So
+    /// an unlatched line would be an audit entry per group per second for as
+    /// long as the condition lasted — the log flooded worst precisely when
+    /// something is wrong with it. (Before #1608 this said "the group view
+    /// polls `group_usage` every couple of seconds". That reading is now false
+    /// twice over: the polled path reaches `group_usage_live_within`, never
+    /// `group_usage`, whose only production caller is the MCP `group_usage`
+    /// tool — and the real cadence is faster, not slower, so the latch matters
+    /// MORE than the old sentence claimed.) Keyed
     /// by KIND rather than message so a varying error string cannot defeat the
     /// latch, and dropped on the first successful read so a recurrence after a
     /// real recovery is diagnosed again instead of being silenced for the
@@ -39235,6 +39365,13 @@ impl OrchRegistry {
                 // killed-agent history, so preserve it for inspection and
                 // start fresh rather than overwrite it on the next upsert.
                 let bad = path.with_extension("json.bad");
+                // A durable REPLACE — it moves the live file aside — and the
+                // `self.audit` below it is a tracked acquisition, so this is
+                // the exact write-then-acquire shape a budget unwind tears
+                // (#1609 review B2). Sealing here is what makes the audit line
+                // reachable: without it a spent budget could unwind between
+                // the rename and the record of why it happened.
+                budget::note_durable_write("usage.json.bad");
                 let _ = fs::rename(&path, &bad);
                 self.audit(group, brand::AUDIT_ACTOR, "usage-corrupt",
                     json!({ "error": e.to_string(), "preserved": bad.to_string_lossy() }));
@@ -41484,6 +41621,7 @@ impl OrchRegistry {
     /// once — the lock-ordering discipline every other tick in this file
     /// follows). Called on a timer by `start_workflow_gate_reload`.
     pub fn run_workflow_gate_reload(&self) {
+        let Some(_tick) = self.tick_gate("run_workflow_gate_reload") else { return () };
         let paused = self.paused.lock_safe().clone();
         let ids: Vec<GroupId> = self
             .groups
@@ -50320,7 +50458,10 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
 /// What one wake of the unified `gh` poller did (#406) — returned so a test
 /// can pin that a single tick services BOTH features, and which halves ran,
 /// without a thread or a `gh` subprocess.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Default` is what a SKIPPED tick returns (#1609): the same "nothing
+// happened" value a poll with no watches produces, so a skip needs no second
+// code path in any caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GhPollTick {
     /// Watch ids the notify half resolved this tick (fired, expired, or
     /// cancelled) — `notify_tick`'s return, unchanged.
@@ -51438,8 +51579,11 @@ pub async fn orch_resume_group(app: AppHandle, group_id: String) -> Result<(), S
 /// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
 /// the webview/GTK main-loop thread, and `is_paused` takes a registry mutex shared
 /// with the background threads (idle reaper, watchdog, gh poller, and the pty
-/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
-/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// path's `note_agent_activity`). A bare `lock_safe` is an infallible
+/// acquire — there was no timed form of it anywhere until #1609, and a
+/// command like this one gets the bounded form only by running under a
+/// budget frame, which a sync command on the webview thread does not — so
+/// the acquisition is
 /// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
 /// not a slow one. That is #1595's freeze, and it is the same class as #1593's
 /// `orch_session_roles`: cheap work, fatal thread.
@@ -51506,8 +51650,11 @@ pub async fn orch_dismiss_stranded(app: AppHandle, agent_id: String) -> bool {
 /// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
 /// the webview/GTK main-loop thread, and `notify_enabled` takes a registry mutex shared
 /// with the background threads (idle reaper, watchdog, gh poller, and the pty
-/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
-/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// path's `note_agent_activity`). A bare `lock_safe` is an infallible
+/// acquire — there was no timed form of it anywhere until #1609, and a
+/// command like this one gets the bounded form only by running under a
+/// budget frame, which a sync command on the webview thread does not — so
+/// the acquisition is
 /// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
 /// not a slow one. That is #1595's freeze, and it is the same class as #1593's
 /// `orch_session_roles`: cheap work, fatal thread.
@@ -51566,8 +51713,11 @@ pub async fn orch_set_notify(
 /// **Off the UI thread** (#1595). Tauri dispatches a SYNC command directly on
 /// the webview/GTK main-loop thread, and `spawn_expanded` takes a registry mutex shared
 /// with the background threads (idle reaper, watchdog, gh poller, and the pty
-/// path's `note_agent_activity`). `lock_safe` is `Mutex::lock` with poison
-/// recovery — there is no timeout and no try-lock — so the acquisition is
+/// path's `note_agent_activity`). A bare `lock_safe` is an infallible
+/// acquire — there was no timed form of it anywhere until #1609, and a
+/// command like this one gets the bounded form only by running under a
+/// budget frame, which a sync command on the webview thread does not — so
+/// the acquisition is
 /// UNBOUNDED, and on the UI thread an unbounded acquisition is a frozen app,
 /// not a slow one. That is #1595's freeze, and it is the same class as #1593's
 /// `orch_session_roles`: cheap work, fatal thread.
@@ -52258,8 +52408,11 @@ pub async fn orch_strip_view(app: AppHandle, bound: Vec<String>) -> Value {
 /// v1.2.0-beta5. `group_summary` takes the `agents` mutex (and then, in a
 /// separate statement, `groups`), both shared with the background threads:
 /// the idle reaper, the watchdog, the gh poller, and `note_agent_activity` on
-/// the pty output path. `lock_safe` is `Mutex::lock` with poison recovery —
-/// no timeout, no try-lock — so the acquisition is UNBOUNDED. On the GTK main
+/// the pty output path. A bare `lock_safe` is an infallible acquire, so the
+/// acquisition was UNBOUNDED. (#1609 added a bounded form — `lock_within`, and
+/// `budget::read_budget` for a whole read path — but a caller only gets it by
+/// running under a budget frame, which this command, being sync on the
+/// webview thread, did not.) On the GTK main
 /// loop an unbounded acquisition is a frozen window that never repaints and
 /// never processes input, which is a force-quit rather than a slow panel.
 ///
@@ -53790,7 +53943,8 @@ pub async fn orch_agent_renamed(
 #[tauri::command]
 pub async fn orch_session_roles(app: AppHandle) -> Vec<SessionRole> {
     let reg = reg_of(&app);
-    run_blocking(move || reg.session_roles()).await
+    run_blocking(move || OrchRegistry::read_command("orch_session_roles", Vec::new, || reg.session_roles()))
+        .await
 }
 
 /// Every orchestration group loomux has a record of, for the session
@@ -53817,7 +53971,10 @@ pub async fn orch_session_roles(app: AppHandle) -> Vec<SessionRole> {
 #[tauri::command]
 pub async fn orch_list_recorded(app: AppHandle) -> Vec<RecordedOrchestration> {
     let reg = reg_of(&app);
-    run_blocking(move || reg.recorded_orchestrations()).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_list_recorded", Vec::new, || reg.recorded_orchestrations())
+    })
+    .await
 }
 
 /// Restore a recorded orchestration session (see `resume_recorded_session`).
@@ -54074,7 +54231,12 @@ pub async fn orch_questions_list(app: AppHandle, group_id: String) -> Vec<humanq
     // #904: no error channel; an unvalidated id yields the same empty list a
     // group with no questions does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return Vec::new() };
-    run_blocking(move || reg.questions(&group_id).unwrap_or_default()).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_questions_list", Vec::new, || {
+            reg.questions(&group_id).unwrap_or_default()
+        })
+    })
+    .await
 }
 
 /// The human answers a pending question, from the app's own webview.
@@ -54125,7 +54287,10 @@ pub async fn orch_mailbox_status(app: AppHandle, group_id: String) -> usize {
     // #904: no error channel, so an unvalidated id yields the same 0 a group
     // with no mail does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return 0 };
-    run_blocking(move || reg.mailbox_unread(&group_id)).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_mailbox_status", || 0, || reg.mailbox_unread(&group_id))
+    })
+    .await
 }
 
 // ---------- needs-you items (human side, #1151) ----------
@@ -54168,7 +54333,12 @@ pub async fn orch_needs_you_list(app: AppHandle, group_id: String) -> NeedsYouRe
     // #904: no error channel; an unvalidated id yields the same empty view a
     // group with no items does. See `command_group`.
     let Ok(group_id) = command_group(&group_id) else { return NeedsYouRead::default() };
-    run_blocking(move || reg.needs_you_read(&group_id).unwrap_or_default()).await
+    run_blocking(move || {
+        OrchRegistry::read_command("orch_needs_you_list", NeedsYouRead::default, || {
+            reg.needs_you_read(&group_id).unwrap_or_default()
+        })
+    })
+    .await
 }
 
 /// The human closes out a needs-you item, from the app's own webview.
@@ -54255,13 +54425,15 @@ pub async fn orch_tasks(
     // back as `expect_link_etag` on every write that replaces `deps` or `links`.
     // Derived here rather than stored — see `BoardTask`.
     run_blocking(move || {
-        reg.tasks(&group_id)
-            .into_iter()
-            .map(|t| {
-                let with_notes = wanted.contains(&t.id);
-                board_task(t, with_notes)
-            })
-            .collect()
+        OrchRegistry::read_command("orch_tasks", Vec::new, || {
+            reg.tasks(&group_id)
+                .into_iter()
+                .map(|t| {
+                    let with_notes = wanted.contains(&t.id);
+                    board_task(t, with_notes)
+                })
+                .collect()
+        })
     })
     .await
 }

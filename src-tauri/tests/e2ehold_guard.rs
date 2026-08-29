@@ -73,6 +73,13 @@ struct Item {
     to: usize,
 }
 
+/// Leading-whitespace width. The axis `decl_lines` uses to tell a declaration
+/// the splitter should have enumerated from one nested inside a body it
+/// consumed.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
 /// Whether `line` DECLARES a function, at any indentation and under any
 /// visibility or modifier.
 ///
@@ -228,10 +235,16 @@ struct GateReport {
     /// `(line number, line)` for every hazard occurrence that belongs to no
     /// function at all — the subjects the split could not see.
     unattributed: Vec<(usize, String)>,
-    /// Lines that DECLARE a function. Must equal `items`: a declaration that
-    /// produced no item is one the split lost, which is the over-spanning
-    /// direction of a brace mis-parse.
+    /// Lines that DECLARE a function the splitter is supposed to enumerate —
+    /// top-level or impl-level. Must equal `items`: a declaration that produced
+    /// no item is one the split lost, which is the over-spanning direction of a
+    /// brace mis-parse.
     decl_lines: usize,
+    /// Declarations nested inside another function's body, which `items()`
+    /// never sees because it resumes past a consumed body. Reported rather than
+    /// asserted: it is zero today, and counting it in `decl_lines` would
+    /// false-block this guard the first time one exists (#1606 review R5).
+    nested_decl_lines: usize,
 }
 
 fn gate_report(src: &str) -> GateReport {
@@ -277,7 +290,24 @@ fn gate_report(src: &str) -> GateReport {
         hazardous: hazardous.len(),
         ungated,
         unattributed,
-        decl_lines: src.lines().filter(|l| is_fn_decl(l)).count(),
+        // Declarations the SPLITTER is supposed to enumerate: top-level (`fn`
+        // at column 0) and impl-level (four spaces). A `fn` nested inside
+        // another function BODY is not one — `items()` resumes past a consumed
+        // body and never sees it — so counting it here would FALSE-BLOCK this
+        // guard the first time anyone writes a nested helper in `e2ehold.rs`
+        // (#1606 review R5).
+        //
+        // Indentation is the axis deliberately, and it is the only one
+        // available: a swallowed function and a nested one are
+        // indistinguishable to a brace walk, which is the very thing under
+        // test, so a depth measured that way would be derived from the
+        // instrument it is meant to check. Indentation is independent of it.
+        // The residual: a nested `fn` written at four spaces or less would
+        // still be counted — this file is not rustfmt-enforced, so that is a
+        // convention rather than a guarantee — and `nested_decl_lines` is
+        // reported beside it so the split is legible rather than silent.
+        decl_lines: src.lines().filter(|l| is_fn_decl(l) && indent_of(l) <= 4).count(),
+        nested_decl_lines: src.lines().filter(|l| is_fn_decl(l) && indent_of(l) > 4).count(),
     }
 }
 
@@ -309,11 +339,13 @@ fn nothing_that_can_hold_a_lock_or_sleep_is_compiled_into_a_release_build() {
     // wrong function's attributes.
     assert_eq!(
         report.items, report.decl_lines,
-        "e2ehold.rs has {} function declarations but the split produced {} items — one \
-         or more were swallowed, most likely by an unbalanced brace inside a string \
-         literal. A swallowed function is judged by its swallower's #[cfg], so the \
-         release-gating verdict below says nothing about it.",
-        report.decl_lines, report.items
+        "e2ehold.rs has {} top-level/impl-level function declarations but the split \
+         produced {} items — one or more were swallowed, most likely by an unbalanced \
+         brace inside a string literal. A swallowed function is judged by its \
+         swallower's #[cfg], so the release-gating verdict below says nothing about it. \
+         ({} further declarations are nested inside a body; those are deliberately not \
+         counted here — see `decl_lines`.)",
+        report.decl_lines, report.items, report.nested_decl_lines
     );
 
     // The population control: every hazard occurrence in the FILE is inside a
