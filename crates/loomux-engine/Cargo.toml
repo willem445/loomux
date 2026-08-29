@@ -132,9 +132,11 @@ dirs = "6"
 #       |-- smallvec v1.15.2
 #       `-- windows-link v0.2.1
 #
-# Six crates, no getrandom at any depth. (`redox_syscall`, which the crate's
-# manifest lists, is `cfg(target_os = "redox")` and does not appear under this
-# target at all.) The inverse queries, one per getrandom version in the lock:
+# `parking_lot` plus six dependencies, and no getrandom at any depth. Two
+# crates its lock stanza names are correctly absent from the tree above
+# because neither is compiled for this target: `redox_syscall`
+# (`cfg(target_os = "redox")`) and `libc` (unix-only in parking_lot_core).
+# The inverse queries, one per getrandom version in the lock:
 #
 #   $ cargo tree --locked -e normal --target x86_64-pc-windows-msvc -i getrandom@0.2.17
 #   warning: nothing to print.

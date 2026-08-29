@@ -140,7 +140,7 @@ is a policy nobody can review as a whole.
 | `MCP_AUTH_BUDGET` | 5 s | every MCP request, before dispatch | JSON-RPC `-32001`, retryable |
 | `MCP_READ_BUDGET` | 15 s | a read-only MCP tool | `isError` result, nothing executed |
 | `MCP_MUTATE_DEADLINE` | 30 s | the handler's WAIT for a mutating tool | "still executing", do not re-issue |
-| `COMMAND_READ_BUDGET` | 10 s | a human's one-shot read command | the command's existing empty degrade |
+| `COMMAND_READ_BUDGET` | 10 s | a human's one-shot read command | the command's existing empty degrade — **undisclosed**, see below |
 
 The shape of the reasoning is the same in each case: the budget is set by **what
 the caller does with the answer**, never by how long the work "should" take.
@@ -177,6 +177,21 @@ known to be wrong. `MCP_AUTH_BUDGET` is the tightest of the MCP three because it
 is paid by every request including `ping` — it is the constant that answers
 #1606's measured hole. `MCP_MUTATE_DEADLINE` is a deadline on the **wait**, never
 on the work; see below.
+
+### The one degrade that does not disclose itself
+
+Every other row above tells the reader something happened: the publisher sets
+`meta.partial`, the MCP answers a busy error or an `isError` result, a skipped
+tick breadcrumbs. The human one-shot read commands do not. A `Busy` there
+returns the same empty value the command already returns for an unvalidated
+group id — an empty board, a zero unread count — and the only trace is a
+breadcrumb the human never sees.
+
+That is a real gap rather than a considered degrade, and it is left open
+deliberately: `command_group` gives these commands no error channel, so
+disclosing it means adding a meta channel to each of the six, which is a wire
+change larger than this slice should make on its own initiative. It is the
+same class the publisher path closes with `partial`, one layer over.
 
 ### The two MCP shapes
 

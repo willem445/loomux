@@ -122,7 +122,7 @@ pub fn set_mutate_deadline_for_test(d: Duration) -> Duration {
     Duration::from_millis(MUTATE_DEADLINE_MS.swap(d.as_millis() as u64, Ordering::Relaxed))
 }
 
-/// A human's one-shot read command (`orch_tasks`, `orch_audit`, …).
+/// A human's one-shot read command (`orch_tasks`, `orch_questions_list`, …).
 ///
 /// Ten seconds: a human who clicked something is owed an answer well inside
 /// their patience, and these commands degrade to an empty value rather than an

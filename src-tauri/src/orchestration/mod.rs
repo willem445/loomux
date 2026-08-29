@@ -31748,8 +31748,20 @@ impl OrchRegistry {
     /// commands already returns for an unvalidated group id, because
     /// `command_group` gives them no error channel to report anything else
     /// through. A blank panel plus a breadcrumb naming the holder beats a panel
-    /// that never paints — and beats a wrong number, which is the one thing an
-    /// empty list cannot be mistaken for.
+    /// that never paints.
+    ///
+    /// **What this degrade does NOT do, and it is a real gap** (#1609 review
+    /// N3): unlike the publisher path there is no `partial` flag and no badge,
+    /// so a human sees a confidently empty board or a vanished unread chip with
+    /// nothing saying it could not be read. The "same value as an unvalidated
+    /// id" argument is true and is also weaker than it sounds — an unvalidated
+    /// id is a programmer error, while a `Busy` is a real group with real mail.
+    ///
+    /// It is not closed here because these commands have no meta channel to
+    /// carry the disclosure: giving them one is a wire-shape change to each of
+    /// the six, which is a bigger change than this slice should make on its own
+    /// initiative. The breadcrumb is what an operator has meanwhile, and
+    /// `doc/design/lock-liveness.md` §3 carries the row.
     ///
     /// Takes no `self`: it is called from inside `run_blocking(move || ..)` in
     /// the module-level `#[tauri::command]` functions, which have moved `reg`
