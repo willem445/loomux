@@ -271,7 +271,16 @@ struct WriteCtx<'a> {
 ///
 /// `ptys` is WEAK on purpose — see [`WriteCtx`]. An upgrade that fails means the
 /// manager itself is gone, which is the same condition as "pty not found" and is
-/// reported as such rather than panicking.
+/// reported as such rather than panicking. The upgrade holds a strong reference
+/// for the duration of ONE job, so a manager dropped while a write is parked
+/// keeps its map alive until that write returns — the same window a direct
+/// caller's `&PtyManager` already held open, not a new one.
+///
+/// Where "pty not found" comes from moves, and the error a caller sees does not:
+/// the lookup that produces it is now `PtyManager::enqueue`'s, before the job is
+/// posted, rather than `writer_handle`'s inside the body. A pane reaped in
+/// between still gets the same `Err` — the job runs, the map no longer holds the
+/// pane, and the body returns it from where it always did.
 ///
 /// The loop is a plain `recv()`, so it exits when the last `Sender` drops AND
 /// the queue has drained: a job already enqueued when the pane closed still gets
