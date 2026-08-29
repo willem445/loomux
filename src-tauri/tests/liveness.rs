@@ -2404,17 +2404,27 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
         planted.contains("ms"),
         "the enforcement did not name the DURATION: {planted}"
     );
-    // And the control's own control: an ALLOWLISTED long hold must NOT fire.
-    // Without this pair the row cannot tell an enforcement that works from one
-    // that refuses everything, and the suite's own 20 s fixtures would be the
-    // first casualty.
+
+    // And the other direction: the suite's own deliberate wedge really does
+    // take a permit. Without it every 20-30 s hold L1/L2a/L2c/L7b install would
+    // be a violation, and the pair above cannot tell an enforcement that works
+    // from one that refuses everything.
+    //
+    // Asserted on the permit REGISTRY rather than by holding for five seconds
+    // and scanning: `hold_lock_for_test` takes its permit BEFORE the
+    // acquisition and returns only once the hold is real, so by the time it
+    // returns the registration has happened — deterministically, with no sleep,
+    // and in 50 ms rather than 5 s. What a permit then MEANS to the classifier
+    // is pinned by `lockwatch`'s own
+    // `a_long_hold_is_a_violation_unless_its_thread_is_permitted` and
+    // `a_retired_permit_still_exempts_the_thread_that_earned_it`.
+    let permitted_before = loomux_engine::lockwatch::permitted_threads().len();
+    assert!(f.reg.hold_lock_for_test("tasks_lock", 50), "setup: cannot hold `tasks_lock`");
     assert!(
-        f.reg.hold_lock_for_test("tasks_lock", L7_PLANTED_HOLD.as_millis() as u64),
-        "setup: cannot hold `tasks_lock`"
-    );
-    std::thread::sleep(L7_PLANTED_HOLD + Duration::from_millis(200));
-    loomux_engine::lockwatch::assert_no_disallowed_hold_over(
-        loomux_engine::lockwatch::HOLD_FAIL_MS,
+        loomux_engine::lockwatch::permitted_threads().len() > permitted_before,
+        "`hold_lock_for_test` took no LongHoldPermit, so every deliberate 20-second wedge in \
+         this binary is a hold-budget violation and the enforcement would fail the suite on \
+         its own fixtures"
     );
 
     // ---- the measurement -------------------------------------------------
@@ -2453,6 +2463,12 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
     drop(tx);
 
     let mut runs: Vec<TickRun> = Vec::new();
+    // Collected so the hold scan below can be scoped to the threads THIS row
+    // created. It has to be: `cargo` runs this binary's tests in one process on
+    // many threads, and the hold registry is process-global, so an unscoped
+    // scan here is also an assertion about every neighbouring row's deliberate
+    // fixtures — see `assert_no_disallowed_hold_over_on`, whose doc records the
+    // real one that failed this row's first run.
     let deadline = bg::TICK_LOCK_BUDGET + GRACE;
     while runs.len() < n {
         match rx.recv_timeout(deadline) {
@@ -2503,9 +2519,9 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
     let out = loomux_lib::orchestration::mcp::dispatch(&f.reg, &caller, "tools/call", &call)
         .expect("a tool RESULT, not a protocol error");
     let mcp_took = t0.elapsed();
-    assert_eq!(
+    assert_ne!(
         out.get("isError").and_then(|e| e.as_bool()),
-        None,
+        Some(true),
         "the MCP read must SUCCEED on an uncontended day-old session — a busy answer here \
          would mean the measurement below is of a refusal, not of a read: {out}"
     );
@@ -2539,8 +2555,10 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
     // The whole point of the row. Every tick above has returned, so any hold
     // they took has ended and been stamped; anything still in flight is a hold
     // that outlived its tick.
-    loomux_engine::lockwatch::assert_no_disallowed_hold_over(
+    let tick_threads: Vec<u64> = runs.iter().map(|r| r.thread).collect();
+    loomux_engine::lockwatch::assert_no_disallowed_hold_over_on(
         loomux_engine::lockwatch::HOLD_FAIL_MS,
+        &tick_threads,
     );
 
     // ---- the distribution, printed rather than asserted ------------------
@@ -2606,16 +2624,20 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
 /// it, and it deliberately does NOT go through `hold_lock_for_test` — that
 /// seam carries a permit, which is exactly the thing being controlled for.
 fn plant_an_unpermitted_hold() -> String {
-    use loomux_engine::lockwatch::{assert_no_disallowed_hold_over, TrackedMutex, HOLD_FAIL_MS};
+    use loomux_engine::lockwatch::{
+        assert_no_disallowed_hold_over_on, current_thread_id, TrackedMutex, HOLD_FAIL_MS,
+    };
 
     let lock = Arc::new(TrackedMutex::new("l7a_planted_hold", ()));
-    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = mpsc::channel::<u64>();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let holder = {
         let lock = lock.clone();
         std::thread::spawn(move || {
             let _held = lock.lock_safe();
-            let _ = ready_tx.send(());
+            // Its own id, so the scan below is scoped to THIS hold. Reported
+            // after the acquisition, because that is what stamps the site.
+            let _ = ready_tx.send(current_thread_id());
             // Held until this test says otherwise, rather than for a fixed
             // sleep: the scan has to land while the hold is in flight, and a
             // sleep long enough to guarantee that on a loaded runner would be
@@ -2623,13 +2645,15 @@ fn plant_an_unpermitted_hold() -> String {
             let _ = release_rx.recv_timeout(GRACE * 3);
         })
     };
-    ready_rx.recv_timeout(GRACE).expect("the planted hold never started");
+    let holder_thread = ready_rx.recv_timeout(GRACE).expect("the planted hold never started");
     // Wait out the threshold. Not a poll for a condition — this file's "never
     // a sleep" rule is about waiting for something to happen; here the elapsed
     // time IS the subject.
     std::thread::sleep(L7_PLANTED_HOLD);
 
-    let caught = std::panic::catch_unwind(|| assert_no_disallowed_hold_over(HOLD_FAIL_MS));
+    let caught = std::panic::catch_unwind(|| {
+        assert_no_disallowed_hold_over_on(HOLD_FAIL_MS, &[holder_thread])
+    });
     let _ = release_tx.send(());
     let _ = holder.join();
     // The enforcement does not restore the arming on a panic, deliberately —
@@ -2674,9 +2698,9 @@ fn l7b_a_wedged_day_old_registry_still_answers_busy_within_budget() {
     let call = json!({ "name": "list_tasks", "arguments": {} });
     let warm = loomux_lib::orchestration::mcp::dispatch(&f.reg, &caller, "tools/call", &call)
         .expect("a tool RESULT");
-    assert_eq!(
+    assert_ne!(
         warm.get("isError").and_then(|e| e.as_bool()),
-        None,
+        Some(true),
         "setup: the read must succeed uncontended: {warm}"
     );
 
@@ -2723,5 +2747,192 @@ fn l7b_a_wedged_day_old_registry_still_answers_busy_within_budget() {
     assert!(
         VIEW_STALE_AFTER_MS > 0,
         "the stale window is what makes a frozen number legible as one"
+    );
+}
+
+// ---------- the long-hold allowlist, default-deny (#1702 P4) ----------
+
+/// The sites that may construct a [`loomux_engine::lockwatch::LongHoldPermit`],
+/// each with the reason it is allowed to hold a tracked lock past
+/// `HOLD_FAIL_MS`.
+///
+/// **Default-deny**: any other construction site fails the scan below. That is
+/// the whole mechanism — the enforcement is only as strong as this list is
+/// short, and a permit is the one way to make a five-second hold invisible to
+/// CI, so adding one has to be a reviewed change rather than a way to quiet a
+/// red.
+///
+/// Both rows carry the same argument in different clothes: the site's ENTIRE
+/// PURPOSE is to hold a lock longer than the app ever should, so that something
+/// else can be observed surviving it. Neither is a production path that got
+/// slow.
+const PERMITTED_LONG_HOLDS: &[(&str, &str, &str)] = &[
+    (
+        "orchestration/mod.rs",
+        "OrchRegistry::hold_lock_for_test",
+        "the liveness suite's deliberate wedge: L1/L2a/L2c/L7b hold a registry lock for 20-30 s \
+         and probe that everything else still answers. Exempting it is what stops the \
+         enforcement failing the suite on its own fixtures",
+    ),
+    (
+        "orchestration/e2ehold.rs",
+        "e2ehold::hold",
+        "the soak lane's injected hold (#1606): 90 s by design, behind #[cfg(debug_assertions)] \
+         plus a single-value opt-in, and the subject of e2ehold_guard.rs's four properties",
+    ),
+];
+
+/// Every PRODUCTION source root, so a permit taken in the engine crate is as
+/// visible as one taken in `src-tauri`.
+///
+/// `lockwatch` itself is where `LongHoldPermit` is DEFINED, and the scan below
+/// has to see that file: a scan whose roots missed the defining crate would be
+/// unfalsifiable in the direction that matters, since the type could then grow
+/// a second construction site next to its own declaration and nothing would
+/// notice.
+const PERMIT_ROOTS: &[(&str, &str)] = &[
+    ("src-tauri", concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+    ("loomux-engine", concat!(env!("CARGO_MANIFEST_DIR"), "/../crates/loomux-engine/src")),
+];
+
+fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Only the argued sites may permit a long hold (#1702 P4).
+///
+/// **What it decides on, and why not a name.** CLAUDE.md's source-scanning
+/// rule: a guard that decides from a binding's name enforces nothing, because a
+/// rename walks past it. The axis here is name-independent and cannot compile
+/// any other way — the type has one constructor, so `LongHoldPermit::new(` is
+/// the shape, and the allowlist is keyed on the FILE the call sits in plus the
+/// enclosing item's name, which is what a reviewer would read anyway.
+///
+/// **Both directions are asserted.** An unlisted construction site fails
+/// (default-deny), and a listed row that no longer matches anything also fails
+/// (a stale row is a row watching nothing — the same defect as an allowlist
+/// entry that has drifted off its subject).
+///
+/// **What it cannot see, stated rather than left to be discovered.** It is a
+/// textual scan over `.rs` files: a permit constructed through a type alias, a
+/// re-export under another name, or a macro would not match. None exists, and
+/// the compiler rather than this scan is what makes a permit reachable only
+/// through that one constructor.
+#[test]
+fn only_argued_sites_may_permit_a_long_hold() {
+    let mut files: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    for (label, root) in PERMIT_ROOTS {
+        let mut found = Vec::new();
+        collect_rs(std::path::Path::new(root), &mut found);
+        // Per root, not on the total: a mistyped root contributes nothing and
+        // would hide behind the other root's file count, and `collect_rs`
+        // returns silently on an unreadable directory — so without this a wrong
+        // path is indistinguishable from a clean scan.
+        assert!(
+            !found.is_empty(),
+            "no `.rs` under the {label} root ({root}) — a root that scans nothing is a tripwire \
+             that cannot fire"
+        );
+        files.extend(found.into_iter().map(|p| (*label, p)));
+    }
+
+    // The anchor: the file that DEFINES the type must be in scope. Matched on
+    // content rather than on a path, so #888 may move `lockwatch` again and
+    // this fails loudly instead of quietly scanning past it.
+    assert!(
+        files.iter().any(|(_, p)| std::fs::read_to_string(p)
+            .is_ok_and(|s| s.contains("pub struct LongHoldPermit"))),
+        "the scan never reached the file that DEFINES `LongHoldPermit`, so a second constructor \
+         written beside its own declaration would be invisible — add its root to PERMIT_ROOTS"
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut row_hits = vec![0usize; PERMITTED_LONG_HOLDS.len()];
+    let mut sites_seen = 0usize;
+
+    for (_, path) in &files {
+        let src = std::fs::read_to_string(path).unwrap();
+        // The file key a row names: the last two path components, so
+        // `orchestration/mod.rs` distinguishes it from any other `mod.rs`.
+        let key = {
+            let mut parts: Vec<String> = path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect();
+            let tail = parts.split_off(parts.len().saturating_sub(2));
+            tail.join("/")
+        };
+        // The enclosing item, tracked as the scan walks: the nearest `fn` line
+        // above the call. A structural fact about the file rather than a
+        // heuristic about a name — the row records it so a reviewer can find
+        // the site, and a MOVE to a different function is a real change to what
+        // was argued.
+        let mut enclosing = String::from("<file scope>");
+        for line in src.lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.split(" fn ").nth(1) {
+                if let Some(name) = rest.split('(').next() {
+                    if !t.starts_with("//") && !t.starts_with("///") {
+                        enclosing = name.trim().to_string();
+                    }
+                }
+            }
+            if t.starts_with("//") || t.starts_with("///") {
+                // A comment may spell the construct literally — the permit's
+                // own doc and the two argued sites' comments all do.
+                continue;
+            }
+            if !t.contains("LongHoldPermit::new(") {
+                continue;
+            }
+            sites_seen += 1;
+            match PERMITTED_LONG_HOLDS
+                .iter()
+                .position(|(f, item, _)| key.ends_with(f) && enclosing.contains(*item.split("::").last().unwrap_or(item)))
+            {
+                Some(i) => row_hits[i] += 1,
+                None => offenders.push(format!("{key} (in `{enclosing}`)")),
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a `LongHoldPermit` may only be constructed at a site argued in \
+         PERMITTED_LONG_HOLDS — it exempts its thread from the hold-duration enforcement, \
+         which is the one way to make a five-second registry hold invisible to CI. \
+         Unlisted:\n  {}",
+        offenders.join("\n  ")
+    );
+
+    // The other direction: a row that matches nothing is watching nothing, and
+    // reads as coverage. Required exactly once each, so a site that was
+    // DUPLICATED is as loud as one that was deleted.
+    for (i, (file, item, why)) in PERMITTED_LONG_HOLDS.iter().enumerate() {
+        assert_eq!(
+            row_hits[i], 1,
+            "PERMITTED_LONG_HOLDS names {file}/{item} ({why}) and the scan matched it \
+             {} times, not once — the row is stale, or the permit was duplicated",
+            row_hits[i]
+        );
+    }
+
+    // Vacuity control. Every assertion above is satisfied by a scan that
+    // matched nothing at all — no offenders, and `row_hits` would then be zero
+    // and caught by the loop above, but only because the rows exist. This pins
+    // that the SHAPE is findable at all, independently of the table.
+    assert_eq!(
+        sites_seen,
+        PERMITTED_LONG_HOLDS.len(),
+        "the scan found {sites_seen} `LongHoldPermit::new(` call sites against {} argued rows",
+        PERMITTED_LONG_HOLDS.len()
     );
 }

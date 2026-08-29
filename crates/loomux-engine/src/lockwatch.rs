@@ -534,7 +534,7 @@ static LONG_HOLD_PERMITS: Mutex<Vec<PermitEntry>> = Mutex::new(Vec::new());
 /// about to hold.
 ///
 /// The reviewable allowlist is therefore the set of CONSTRUCTION SITES, which
-/// is a grep rather than a table, and `src-tauri/tests/perf_leaflocks.rs`'s
+/// is a grep rather than a table, and `src-tauri/tests/liveness.rs`'s
 /// `only_argued_sites_may_permit_a_long_hold` is the default-deny scan that
 /// holds it to the sites that carry an argument.
 ///
@@ -750,6 +750,33 @@ pub fn observed_holds() -> Vec<HoldReport> {
 /// scan is structurally blind and only in-flight holds are examined. Rather
 /// than let that pass silently it is refused here.
 pub fn assert_no_disallowed_hold_over(fail_ms: u64) {
+    assert_no_disallowed_hold_over_on(fail_ms, &[]);
+}
+
+/// [`assert_no_disallowed_hold_over`] restricted to holds taken by `threads`;
+/// an empty slice means every thread.
+///
+/// **Why a Rust test row almost always wants the scoped form.** `cargo` runs a
+/// binary's tests on many threads in ONE process, and this scan reads a
+/// process-global registry — so an unscoped assertion in one test is also an
+/// assertion about every other test's deliberate fixtures. That is not
+/// hypothetical: L7a's first run failed on a 14.6 s `usage_memo_cell` hold
+/// belonging to a neighbouring row, taken by a thread that was itself parked
+/// on the `agents` wedge that row had deliberately installed.
+///
+/// The neighbour's HOLDER is exempt — `hold_lock_for_test` takes a permit —
+/// but its VICTIM is not, and a victim that parks while holding a lock of its
+/// own is a real long hold by every measure this module has. So a row that
+/// wants to say "no tick of MINE held a lock too long" scopes to the threads it
+/// created ([`current_thread_id`], reported by the thread itself), and the
+/// unscoped form is for a whole-process context — the E2E lane — where there
+/// are no neighbours and every long hold really is a finding.
+///
+/// Note that completed holds are DRAINED whichever form is used: a scoped call
+/// takes other threads' completed reports out of the ring along with its own
+/// and then ignores them. Nothing in a test binary reads that ring except this
+/// mechanism, so the cost is stated rather than paid.
+pub fn assert_no_disallowed_hold_over_on(fail_ms: u64, threads: &[u64]) {
     assert!(
         fail_ms >= hold_warn_ms(),
         "assert_no_disallowed_hold_over({fail_ms}) is below the {} ms report threshold, so \
@@ -758,7 +785,10 @@ pub fn assert_no_disallowed_hold_over(fail_ms: u64) {
         hold_warn_ms()
     );
     let was = set_hold_panics(true);
-    let observed = observed_holds();
+    let mut observed = observed_holds();
+    if !threads.is_empty() {
+        observed.retain(|r| threads.contains(&r.holder_thread));
+    }
     enforce_hold_budget(&observed, fail_ms);
     set_hold_panics(was);
 }
