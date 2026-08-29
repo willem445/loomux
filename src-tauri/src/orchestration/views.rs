@@ -690,10 +690,7 @@ impl ViewPublisher {
         // With no previous entry there is no age to inherit, so a first pass
         // that goes partial is stamped fresh. Its sections are `Null`, which the
         // payload builders already treat as "not published yet".
-        let (computed_at, computed_unix_ms) = match (partial, previous) {
-            (true, Some(p)) => (p.computed_at, p.computed_unix_ms),
-            _ => (at, super::now_ms()),
-        };
+        let (computed_at, computed_unix_ms) = (at, super::now_ms());
 
         GroupView {
             summary,
