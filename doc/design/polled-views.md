@@ -1,6 +1,6 @@
 # Polled views: the published snapshot the group view and tab strip read
 
-Status: implemented (main). Issues: #1608 (this slice), #1600 (the epic and its
+Status: implemented (#1625, not yet on main). Issues: #1608 (this slice), #1600 (the epic and its
 plan §3 Phase 1), #1604 review N3 (the staleness requirement, deferred here so
 the app has one staleness mechanism rather than two), #1595 and #1592 (the two
 releases whose remedies this replaces).
@@ -152,6 +152,20 @@ directly, so nothing about the liveness property depends on it, and its own
 critical section is a map clone plus a pointer swap — the map holds an `Arc`
 per group, so a single-group republish clones pointers rather than ten
 `serde_json::Value` trees per untouched group.
+
+### The publisher thread is unsupervised, and that is the disclosure
+
+`start_view_publisher` spawns a bare `loop` with no `catch_unwind` and no
+restart, like every sibling `start_*` loop in `mod.rs`. A panic inside one
+group's `compute_group` therefore ends it permanently and freezes the snapshot
+for **both** UI surfaces at once — this thread is load-bearing for two whole
+surfaces, where the other loops each drive one badge.
+
+It degrades the way the rest of this design does: `age_ms` grows, the badge
+appears, and the panel says it is stale rather than looking live. That is the
+right failure and it is why this is a disclosure rather than a defect. But the
+badge is the *only* thing between a dead publisher and a permanently-frozen,
+entirely plausible UI, so it is written down here rather than left to be noticed.
 
 ## The wire contract
 

@@ -345,15 +345,52 @@ impl ViewPublisher {
     /// a view lease, so a mutation from the MCP side on an unviewed group stays
     /// a strip-tier recompute.
     pub fn publish_group_at(&self, reg: &OrchRegistry, group: &GroupId, now: Instant) {
+        // A well-formed id the registry does not know produces no entry
+        // (#1625 review N4). `publish_pass_at` only ever inserts registry-known
+        // ids, so without this a nudge after a refused write on an unknown
+        // group would add a phantom that `orch_strip_view` lists and whose
+        // stamp its oldest-age `min_by_key` weighs, until the next full pass
+        // dropped it. Self-healing within a tick, but it is a group the app
+        // does not have, so it should never be published at all.
+        if reg.group(group.as_str()).is_none() {
+            return;
+        }
         let leased = self.has_view_lease_at(group, now);
         let started = Instant::now();
         let view = Arc::new(self.compute_group(reg, group, leased, now));
         let compute_ms = elapsed_ms(started);
 
-        // Under the same lock as a full pass, and taken AFTER the compute, so
-        // the two publishers cannot lose each other's update.
+        // Under the same lock as a full pass, taken AFTER the compute, and
+        // obeying THE SAME later-stamp-wins rule.
+        //
+        // Inserting unconditionally here was a real lost update, not a
+        // cosmetic asymmetry (#1625 review B2). Two nudges overlap whenever a
+        // human clicks twice: the first may be computing a leased group's
+        // view tier — a `merge_queue.json` read, a `workflow.yml` parse and a
+        // cold default-branch resolution, which `orch_workflow_status`'s own
+        // doc puts at 2-4 blocking `git` spawns — while the second's compute
+        // is warm and finishes first. The slow one then landed last and
+        // published sections it had read BEFORE the second write, reverting
+        // the toggle the human just clicked and dragging `computed_at`
+        // backwards with it. That is precisely what this nudge exists to
+        // prevent the group view from re-reading.
+        //
+        // Keeping a later entry is strictly safe: a nudge runs only AFTER its
+        // own write has returned, so any entry stamped later than this one was
+        // computed after that write landed and already contains it.
         let _swap = self.publish_lock.lock_safe();
         let previous = self.published.load();
+        if previous
+            .value
+            .groups
+            .get(group)
+            .is_some_and(|prev| prev.computed_at > view.computed_at)
+        {
+            // Nothing to publish, and deliberately no store: an identical
+            // republish would bump `seq`, and a reader comparing `seq` would
+            // read that as a new publication when nothing moved.
+            return;
+        }
         // Shallow: every other group is an `Arc` clone, not a payload copy.
         let mut groups: HashMap<GroupId, Arc<GroupView>> = previous.value.groups.clone();
         groups.insert(group.clone(), view);

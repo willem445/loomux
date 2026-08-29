@@ -412,6 +412,98 @@ fn a_nudge_is_not_lost_to_a_pass_that_was_already_computing() {
     );
 }
 
+#[test]
+fn a_slow_nudge_does_not_overwrite_a_faster_one_that_landed_first() {
+    // The OTHER swap site. `publish_pass_at` merged by stamp from the start;
+    // `publish_group_at` inserted unconditionally, so the same lost update
+    // was still live nudge -> nudge — the direction that reverts a toggle a
+    // human just clicked (#1625 review B2).
+    //
+    // Two nudges overlap whenever a human clicks twice. The first can be
+    // computing a leased group's view tier (a merge_queue.json read, a
+    // workflow.yml parse, a cold default-branch resolution) while the
+    // second's compute is warm and lands first. Injected rather than raced:
+    // the publishes run in the order the real interleaving produces, with
+    // the stamps that interleaving gives them.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+
+    let views = ViewPublisher::new();
+    let slow_started = Instant::now();
+    views.note_view_lease_at(&g.id, slow_started);
+    views.publish_pass_at(&reg, slow_started);
+
+    // The SECOND click's nudge: started later, computed faster, lands first.
+    let fast = slow_started + Duration::from_millis(50);
+    views.publish_group_at(&reg, &g.id, fast);
+    assert_eq!(
+        views.load().value.groups.get(&g.id).expect("published").computed_at,
+        fast,
+        "setup: the faster nudge must be the published one before the slow one lands, or \
+         this test is about nothing"
+    );
+
+    // The FIRST click's nudge finally lands, carrying sections it read before
+    // the second write. It must NOT overwrite.
+    views.publish_group_at(&reg, &g.id, slow_started);
+    assert_eq!(
+        views.load().value.groups.get(&g.id).expect("published").computed_at,
+        fast,
+        "a slow nudge landing after a faster one must not overwrite it: its sections were \
+         read before the second write, so publishing them reverts the toggle the human just \
+         clicked and drags computed_at backwards"
+    );
+    assert_ne!(
+        views.load().value.groups.get(&g.id).expect("published").computed_at,
+        slow_started,
+        "the two candidate outcomes must DIVERGE, or the assertion above holds under either \
+         implementation"
+    );
+
+    // ...and it is a merge rule, not a latch: a LATER nudge still wins.
+    let later = fast + Duration::from_secs(1);
+    views.publish_group_at(&reg, &g.id, later);
+    assert_eq!(
+        views.load().value.groups.get(&g.id).expect("published").computed_at,
+        later,
+        "a nudge stamped after the published one must win — otherwise the first click would \
+         pin this group forever"
+    );
+}
+
+#[test]
+fn a_nudge_for_a_group_the_registry_does_not_know_publishes_nothing() {
+    // #1625 review N4. `publish_group_now` is deliberately unconditional
+    // after a REJECTED write, which is right — a refusal is when the panel
+    // most needs to re-sync. But a well-formed id the registry never had must
+    // not become an entry the tab strip lists and ages.
+    let (reg, _d) = test_registry();
+    let known = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let views = ViewPublisher::new();
+    let now = Instant::now();
+    views.publish_pass_at(&reg, now);
+    let before = views.load().value.groups.len();
+
+    let ghost = loomux_engine::groupid::GroupId::parse("never-created").expect("well-formed id");
+    views.publish_group_at(&reg, &ghost, now);
+    assert_eq!(
+        views.load().value.groups.len(),
+        before,
+        "a nudge for an unknown group must add no entry"
+    );
+    assert_eq!(
+        group_view_payload(&views.load(), &ghost, now),
+        Value::Null,
+        "and it must still read as absent"
+    );
+    // Non-vacuity: the publisher is working at all.
+    assert!(
+        group_view_payload(&views.load(), &known.id, now).is_object(),
+        "the known group must still be published, or the assertions above pass because \
+         nothing is published at all"
+    );
+}
+
 // ---------- staleness (INV-6, #1604 review N3) ----------
 
 #[test]

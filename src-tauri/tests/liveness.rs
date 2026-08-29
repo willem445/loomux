@@ -540,6 +540,12 @@ const HOLD_MS: u64 = 30_000;
 /// subject is RECOVERY rather than liveness-under-hold.
 const SHORT_HOLD_MS: u64 = 1_500;
 
+/// Whether the published snapshot has no groups in it — the state in which both
+/// payload builders take an early exit rather than assembling anything.
+fn views_snapshot_is_empty(reg: &Arc<OrchRegistry>) -> bool {
+    reg.views.load().value.groups.is_empty()
+}
+
 /// Split ONE snapshot of the tracked-lock names into the ones Phase 0's seam
 /// can hold and the ones it refuses.
 ///
@@ -604,11 +610,18 @@ fn l1_a_published_read_returns_while_every_holdable_registry_lock_is_held() {
     // `holdable + refused == total` holds by construction and could never
     // fail. What CAN fail is the seam accepting a name this snapshot never
     // listed — which would mean the two are reading different registries.
-    for name in &holdable {
+    // `holdable` is BUILT from `names`, so asserting membership in `names`
+    // would be a second tautology in place of the first. What CAN fail: the
+    // four names Phase 0 documents its seam as knowing must all be holdable.
+    // A renamed registry field, or a seam that stopped matching, reddens here
+    // instead of quietly shrinking this test's coverage to nothing while its
+    // own message still reports a count.
+    for expected in ["agents", "groups", "mq_state_lock", "tasks_lock"] {
         assert!(
-            names.contains(name),
-            "the hold seam accepted `{name}`, which is not in the tracked-lock snapshot this \
-             test iterated — the seam and the registry have come apart"
+            holdable.iter().any(|h| h == expected),
+            "`{expected}` is documented as holdable by hold_lock_for_test but was refused. \
+             Holdable: {holdable:?}. Either the registry field was renamed or the seam broke; \
+             either way this test now covers fewer locks than it reports."
         );
     }
     assert!(
@@ -616,6 +629,19 @@ fn l1_a_published_read_returns_while_every_holdable_registry_lock_is_held() {
         "every one of the {total} tracked locks was holdable, so the residual this test \
          reports is empty — the seam is documented as knowing four names, so this means it \
          stopped refusing rather than that it grew"
+    );
+
+    // Publish first (#1625 review N1). Without this the loop probes an EMPTY
+    // snapshot: `group_view_payload` takes its `return Value::Null` early exit
+    // and `strip_view_payload` its no-groups branch, so the class property is
+    // exercised but the POPULATED path never is. One pass makes the strip probe
+    // walk a real map and the group probe assemble a real payload, under a hold.
+    reg.views.note_view_lease(&g.id);
+    reg.views.publish_pass_at(&reg, Instant::now());
+    assert!(
+        !views_snapshot_is_empty(&reg),
+        "setup: the snapshot must be populated, or the probes below take their empty-map \
+         early exits and this loop proves less than it reports"
     );
 
     // THE PROPERTY. For each lock the seam can hold: both published reads must
@@ -685,7 +711,18 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
 
     // One good publish, then the registry wedges.
-    let published_at = Instant::now();
+    //
+    // Stamped in the PAST, and that is what makes the release assertion at
+    // the end of this test able to fail (#1625 review B3ii). With
+    // `Instant::now()` the un-republished world was ALSO under the 5 s
+    // threshold at `recovered`, so `!stale_at(recovered)` held whether or
+    // not the republish did anything — the two candidate outcomes did not
+    // diverge, and the only way it could ever have moved was a setup pass
+    // slower than 5 s, i.e. a flake. Sixty seconds back makes the
+    // un-republished world unambiguously stale.
+    let published_at = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("the test host has more than 60s of uptime");
     reg.views.note_view_lease_at(&g.id, published_at);
     reg.views.publish_pass_at(&reg, published_at);
     // SHORT, unlike the holds above: this test's last step needs the hold to
@@ -744,6 +781,14 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
         }),
         "the publisher must RECOVER once the hold ends: it parks behind `groups` by design, \
          and a publish that never completes afterwards would mean the badge can never clear"
+    );
+    // Discriminating because `published_at` is 60 s in the past: without the
+    // republish this reads stale, with it it does not.
+    assert!(
+        stale_at(published_at + Duration::from_secs(1)),
+        "control: the snapshot this test started from IS stale at `recovered`, so the \
+         assertion below is a choice between two different outcomes rather than a reading \
+         of one"
     );
     assert!(!stale_at(recovered), "one successful publish is the evidence that clears the badge");
 }
