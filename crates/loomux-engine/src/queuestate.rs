@@ -312,9 +312,9 @@ mod tests {
     impl QueueSnapshotWriter for SpyWriter<'_> {
         fn write_queue_snapshot(&self, group: &crate::groupid::GroupId) {
             self.writes.borrow_mut().push(group.to_string());
-            // `try_lock`, never `lock`: asserting the lock is free must not
-            // be able to HANG the suite if it ever stops being free.
-            self.lock_free_at_write.borrow_mut().push(self.map.inner.try_lock().is_ok());
+            // A try-lock, never a blocking one: asserting the lock is free must
+            // not be able to HANG the suite if it ever stops being free.
+            self.lock_free_at_write.borrow_mut().push(self.map.inner.try_lock_safe().is_some());
         }
     }
 
