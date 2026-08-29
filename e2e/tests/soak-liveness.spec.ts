@@ -256,7 +256,16 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
   // can show is that the injector was compiled in and armed — a release build,
   // or a missing opt-in, would leave the class assertion failing for a reason
   // that has nothing to do with the bug class, and reporting as a pass.
-  test("the lock-hold injector is armed in the build under test", async ({ appDataDir }) => {
+  test("the lock-hold injector is armed in the build under test", async ({
+    appPage: page,
+    appDataDir,
+  }) => {
+    // `appPage` is named, and used, on purpose: Playwright instantiates
+    // fixtures LAZILY, so a test that asked only for `appDataDir` would get a
+    // temp directory and no running app — and would then sit waiting for an
+    // injector that was never started, failing for a reason with nothing to do
+    // with whether the injector is armed.
+    await expect(page.locator("#tab-bar")).toBeAttached();
     requestLockHold(appDataDir, "agents", 300);
     const held = await waitForHoldAcquired(appDataDir);
     expect(held.target, "the injector honoured a different target than requested").toBe("agents");
