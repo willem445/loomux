@@ -98,8 +98,12 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 
 - **P1 — `spawn_blocking` the whole body.** The command is a thin `async fn`
   whose entire body is handed off, nothing before the first await. Precedent:
-  `git.rs` (all 22 commands, #399 + #726), `gh.rs` (all 11 commands, #724),
-  `pty.rs` `write_pty` (~L1580) and `change_dir` (~L1685), both #734. `git.rs`
+  `git.rs` (all 22 commands, #399 + #726), `gh.rs` (all 11 commands, #724).
+  (`pty.rs` `write_pty`/`change_dir` were the #734 instance and are no longer:
+  #1607 moved them to **P8-writer** below, because the *destination* — the
+  shared pool — is what beta6 exhausted. They are still the reference for the
+  half of P1 that is not about the pool: nothing before the first await.)
+  `git.rs`
   is the one to copy: it is the largest instance, and the only one whose
   conversion had to give something up — the freeze it removed was also an
   accidental mutual exclusion (INV-7), so it carries the worked example of
@@ -170,8 +174,12 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 - **P6 — Backpressure, not queues, for pipes.** A full pipe parks the writer;
   that is the bounded-memory answer. Do not add a backend write queue to
   "smooth" it — an unbounded queue converts a stall into unbounded memory.
-  Precedent: `pty.rs` `write_pty`'s doc (~L1570, the argument) and
-  `doc/design/pty-input-path.md` §2.
+  Precedent: `pty.rs` `PtyManager::enqueue_frontend_write`'s doc (the argument,
+  moved there by #1607 with the seam) and `doc/design/pty-input-path.md` §2.
+  Note what P8-writer below does NOT relax: that queue is legal precisely
+  because its job carries a completion reply, so the command still resolves on
+  the bytes and the pane still stops accepting chunks when its child stops
+  draining.
 - **P7 — A dispatch ticket, when the conversion took an ORDER away.** P1
   removes an accidental mutual exclusion: one thread ran every command body, so
   arrival order *was* application order and nothing had to say so. Where
@@ -191,6 +199,28 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
   order was actually load-bearing; most conversions find their guard already
   written (a lock, an atomic, an idempotent write) and owe only the sentence
   naming it.
+- **P8-writer — a dedicated owner thread with a completion reply.** When a
+  command's body must not compete for the *shared* blocking pool, give the
+  subject its own thread and keep the completion semantics: the command posts a
+  job carrying a reply channel and awaits that reply, so it still resolves when
+  the work is actually done. Precedent: `pty.rs` `PaneWriter` — `PtyHandle`'s
+  `writer_jobs` sender, `PtyManager::enqueue_frontend_write` / `enqueue_cd`, and
+  the thread `spawn_pane_writer` starts beside each pane's reader thread (#1607,
+  epic #1600 Phase 2.3); `doc/design/pty-input-path.md` § "719 revisited on
+  isolation" carries the argument.
+  **When to reach for it, which is rarely.** P1 is still the default: the pool
+  exists so a hundred one-off command bodies do not each own a thread. This is
+  for a path with a named OWNER, a long life and a latency contract the pool
+  cannot honour — here, one pane's stdin channel, which ConPTY's own guidance
+  says to service on its own thread anyway. The disqualifying question is
+  "how many of these can exist?": bounded by something the UI bounds (panes,
+  windows) is fine, unbounded by a request rate is not — that is a thread leak
+  wearing a pattern's clothes.
+  **What it costs, stated so the trade is visible.** A thread per subject, and a
+  second place work can queue. Both are why the completion reply is not
+  optional: a queue that returns at hand-off would make the command's promise a
+  claim about bytes that may never be written, which is exactly the shape P6
+  refuses.
 
 ## 3. The invariants
 
@@ -206,7 +236,8 @@ mechanically caught. The manifest review discipline carries that residue; the
 scan pins the shape.
 
 - **INV-1 — Command dispatch.** Every `#[tauri::command]` either delegates its
-  **whole** body via `spawn_blocking`/`run_blocking` (P1), or is sync and
+  **whole** body via `spawn_blocking`/`run_blocking` (P1) or to a dedicated
+  owner thread with a completion reply (P8-writer), or is sync and
   enumerated in E1's `SYNC_COMMANDS` manifest as `(name, class, reason, issue)`
   with class `cheap` (in-memory only), `exception` (§4), or `debt` (an existing
   offender, owning issue named). A new unargued sync command is refused by a

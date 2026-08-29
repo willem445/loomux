@@ -56,7 +56,10 @@ to keep resolving that promise when the bytes are actually out — which is why
 `write_pty` awaits the blocking write instead of returning at hand-off. A
 per-pane writer thread with a queue was the other candidate shape; it buys a
 FIFO guarantee that the frontend chain already provides, and pays for it by
-breaking the two properties below.
+breaking the two properties below. (**That last sentence is the one #1607
+narrows** — it is true of a queue that returns at hand-off and false of one that
+replies on completion. See "719 revisited on isolation" at the end of this note;
+every other claim in this section stands.)
 
 What async *does* give up is the accidental mutual exclusion between
 **different** commands that main-thread dispatch provided (the same one #716
@@ -66,7 +69,7 @@ The complete list of what that touches, and why none of it is load-bearing:
 | pair | before | now | why it is fine |
 | --- | --- | --- | --- |
 | `write_pty` vs `write_pty`, same pane | ordered | ordered | the frontend chain, not the backend, is what orders these — one invoke in flight per pane (#65) |
-| `write_pty` vs `change_dir`, same pane | ordered by arrival | either order | each write is still atomic under the pane's writer lock, so neither can land inside the other; a human is steering the folder picker or typing, not both in one instant |
+| `write_pty` vs `change_dir`, same pane | ordered by arrival | **ordered by arrival again (#1607)**; between #719 and #1607, either order | both now go to the same per-pane writer thread, which runs its queue in arrival order. While they went to a shared pool it was either order, and that was fine for the reason #719 gave: each write is still atomic under the pane's writer lock, so neither can land inside the other, and a human is steering the folder picker or typing, not both in one instant |
 | `write_pty` vs `resize_pty` | ordered by arrival | either order | there is no contract between a keystroke and a geometry change, and a resize the pane disagrees with is re-fired by the next fit tick |
 | anything, across panes | ordered | either order | panes share no input state |
 
@@ -88,9 +91,10 @@ completion for the same reason plus a sharper one: its `Ok` has always meant
 that returned early would silently turn both into claims about bytes that may
 never be written.
 
-What the fix costs instead is one parked blocking-pool thread per wedged pane,
-bounded by the pane count — against, before, one frozen GUI thread for all of
-them.
+What the fix costs instead is one parked thread per wedged pane, bounded by the
+pane count — against, before, one frozen GUI thread for all of them. Which
+thread that is changed in #1607 and the bound did not: it was a slot in the
+shared blocking pool, and it is now the pane's own writer thread.
 
 ### 3. `note_user_input` runs before the write, not after
 
@@ -185,7 +189,88 @@ and WriteFile with synchronous I/O"), which is why the input write blocks at all
 Before #719 loomux serviced the output channel on its own reader thread but
 dispatched the input channel's blocking write from the webview thread, under a
 lock shared with every other pane. This change puts the input channel on its own
-thread too, which is what the warning asks for.
+thread too, which is what the warning asks for — and #1607 makes it literal: the
+input channel now has a thread of its own per pane, exactly as the output
+channel has had since before #719.
+
+## 719 revisited on isolation (#1607, epic #1600 Phase 2.3)
+
+#719 declined a per-pane writer thread. #1607 built one. Both are right, because
+they answer different questions — and the discipline this note owes its next
+reader is to say exactly which sentence moved.
+
+### What changed underneath, and why the old answer stopped being complete
+
+#719's fix put the whole body on `tauri::async_runtime::spawn_blocking`. That
+pool is shared with every converted `orch_*` command and has no configured size
+anywhere in this tree, so it is tokio's default of 512. In the beta6 field
+report (#1600 §1.2) a registry mutex was held for a very long time; every polled
+`orch_*` tick then parked a blocking-pool thread on it, at roughly 2.5-5 per
+second, and none returned. Minutes later the pool was full. From that instant
+`write_pty`'s task could not be scheduled at all, its promise never resolved,
+`src/ptywrite.ts`'s per-pane chain stopped dispatching, and **every pane at once
+refused input** while the window kept painting.
+
+Nothing about that is a lock-scope bug, which is what #719 was about. It is a
+*shared bounded resource* bug: the app's most latency-critical path was queued
+behind orchestration's polling for a resource neither of them owns. #719 never
+considered the question because the resource is not in the performance model
+(#1600 §2.1) — every invariant there is about the webview thread, and the
+destination work is moved TO is ungoverned.
+
+### The one sentence that is superseded, and it is half a sentence
+
+§1: *"A per-pane writer thread with a queue was the other candidate shape; it
+buys a FIFO guarantee that the frontend chain already provides, and pays for it
+by breaking the two properties below."*
+
+- **"it buys a FIFO guarantee the frontend chain already provides" — STANDS,
+  unchanged.** The per-pane thread is still not where a pane's keystroke
+  ordering comes from; `src/ptywrite.ts`'s one-invoke-in-flight chain is, and
+  #1607 does not touch it. The thread's FIFO remains redundant for that purpose,
+  and it is not why it was built.
+- **"and pays for it by breaking the two properties below" — SUPERSEDED, and
+  only for the shape #1607 ships.** That cost is real for a queue that *returns
+  at hand-off*, which is the only shape #719 weighed. It does not apply to a
+  queue whose job carries a **completion reply**: `WriterJob` holds a
+  `tauri::async_runtime::channel(1)` used as a oneshot, and `write_pty` resolves
+  on that reply, not on the enqueue.
+
+Everything else in §1, §2 and §3 stands as written, and each is worth naming
+because each is the thing a reviewer should check has not quietly moved:
+
+- **§1's ordering guarantee** — still the frontend chain, still #65. The one
+  row of §1's table that moves is `write_pty` vs `change_dir`, which is ordered
+  by arrival *again* now that both go to one pane-owned queue. That is a
+  property regained, not one traded.
+- **§2's back pressure** — unchanged, and this is the load-bearing one. A pane
+  whose child has stopped draining still stops resolving, so the frontend chain
+  still stops dispatching and the unsent remainder still waits in the pane's own
+  JS queue. Nothing accumulates backend-side. `tests/liveness.rs` L3b pins both
+  halves: the healthy pane's write lands while the wedged one is parked, *and*
+  the wedged one has neither reported completion nor put any bytes in the pipe.
+- **§2's `write_bytes` carve-out** — unchanged and deliberately not routed
+  through the writer. Its caller is an orchestration background thread, never
+  the frontend's pool, so it was never what beta6 starved; and its `Ok` must go
+  on meaning "*this thread* wrote the bytes" for `record_delivered_text` (#576)
+  and the echo-verified typing loop.
+- **§3's ordering** — `note_user_input` still runs before the write. It is the
+  same body (`write_from_frontend`), now executed by the pane's writer thread
+  rather than a pool thread; both callers share one implementation, so there is
+  no second copy to drift.
+
+### Why a thread per pane rather than a small dedicated pool
+
+A pool of size *k* is the beta6 mechanism again with an arbitrary *k*: it is a
+cliff at *k* wedged panes. Sizing *k* to the pane count IS a thread per pane,
+plus bookkeeping. The alternatives that only move the cliff — raising
+`max_blocking_threads`, a second runtime, a global `async_runtime::set` with a
+bigger pool — were rejected for the same reason. A fire-and-forget queue was
+rejected on #719's own grounds, which still hold.
+
+The cost is one thread per open pane. That is bounded by the UI, it is the same
+count of *parked* threads a wedged pane already cost, and it is what ConPTY's
+own guidance asks for.
 
 ## Locking rules this establishes
 
@@ -206,3 +291,15 @@ global map lock is free, another pane's write lands, and the human-input
 signals are already readable; plus that a write still does not return until its
 bytes are out, that a pane's own writes concatenate in order, and that a write
 to a dead pane errors rather than panics.
+
+`src-tauri/tests/liveness.rs` (#1607) covers the isolation half, which no lock
+test can reach. **L3a** installs a tokio runtime with `max_blocking_threads(2)`
+as the app's `tauri::async_runtime`, parks two tasks in it, and asserts a
+frontend write still completes and its bytes land. Its setup assertion is the
+control that makes the result mean anything, and it is the pre-#1607 path
+verbatim: a `spawn_blocking` hand-off of `write_from_frontend` on that same
+saturated pool, asserted NOT to complete. **L3b** wedges one pane through the
+seam and asserts the other pane's write lands while the wedged one still reports
+nothing and still has nothing in its pipe. Both use `register_fake_for_test` /
+`register_gated_fake_for_test`, which register the pane's real writer thread —
+so the harness drives the shipped path, not a test-only variant of it.
