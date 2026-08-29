@@ -281,6 +281,41 @@ portable-pty = "0.9"
 # shipped binary. No new crate — tauri is already a normal dependency.
 tauri = { version = "2", features = ["test"] }
 
+# Liveness tests (#1607, epic #1600 Phase 2.3): `tests/liveness.rs` L3a builds a
+# tokio runtime with `max_blocking_threads(2)` and installs it via
+# `tauri::async_runtime::set`, so the blocking pool the app shares can be
+# SATURATED deterministically — two parked tasks instead of the 512 beta6 needed.
+# That is the only way to ask the question 2.3 is about ("does a keystroke still
+# land when the pool is full?") without a 512-thread test.
+#
+# NO NEW PACKAGE, and no getrandom exposure. `tokio` is already in Cargo.lock as
+# tauri's own normal dependency (v1.52.3) — `tauri::async_runtime` is a re-export
+# of it — so this line adds a direct edge to a crate the shipped binary already
+# links, not a crate. It is also a DEV-dependency, which per the audit rules
+# stated above ("what the ban actually tests") can never reach orrerix.exe's
+# load-time imports whatever it pulled. `default-features = false` plus the one
+# feature the test needs keeps even the dev graph from widening: `rt-multi-thread`
+# brings the scheduler and nothing else (no `net`, no `time`, no `process`), and
+# `sync` is not requested because tauri already enables it — the reply channel
+# `tauri::async_runtime::channel` hands out is tokio's, reached through the
+# re-export rather than through this line.
+#
+# THE EVIDENCE, measured where an agent worker can measure it — Cargo.lock, not
+# `cargo tree` (local cargo is banned in this repo, see CLAUDE.md; a tree quoted
+# from memory would be a fabricated audit). `Cargo.lock`'s `tokio` entry is
+# v1.52.3 and its `dependencies` list is, in full:
+#
+#   bytes, libc, mio, pin-project-lite, socket2, windows-sys 0.61.2
+#
+# No getrandom, and every one of those six is ALREADY a lock entry via tauri.
+# The lock records the union of a package's possible dependencies rather than a
+# feature-resolved set (the disagreement `rusqlite`'s note above warns about),
+# which makes it the CONSERVATIVE instrument here: the real graph under
+# `default-features = false` is a subset of what is listed. The only Cargo.lock
+# change this line makes is one word — `"tokio"` joining the `orrerix` package's
+# own dependency list, between `tiny_http` and `windows`.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+
 # `[profile.release]` USED TO BE HERE and is now in the workspace-root
 # Cargo.toml (#888 slice A1). Cargo reads profiles from the root manifest only
 # and merely WARNS about a profile in a member, so leaving it here would have
