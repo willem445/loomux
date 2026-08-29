@@ -451,7 +451,11 @@ impl<T> TrackedMutex<T> {
 
         let acquired_ms = mono_ms();
         st.holder_thread.store(this_thread(), Ordering::Relaxed);
-        st.holder_site.store(site as *const _ as *mut _, Ordering::Relaxed);
+        // NEUTERED (scratch, #1601): record the site only on the FIRST
+        // acquisition, so every later hold reports an earlier one's site.
+        if st.holder_site.load(Ordering::Relaxed).is_null() {
+            st.holder_site.store(site as *const _ as *mut _, Ordering::Relaxed);
+        }
         st.acquired_ms.store(acquired_ms, Ordering::Relaxed);
         // Publishes the three stores above; even -> odd marks the lock held.
         st.generation.fetch_add(1, Ordering::Release);
