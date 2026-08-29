@@ -176,7 +176,7 @@ Two things to know:
   installing over it.
 - **A few settings may come back to their defaults, once.** The recent-repos
   list, the default agent, the custom agent command and the editor command are
-  kept by the app's browser profile, which this version moves to a new location
+  kept by the app's browser profile, which 1.2.0-beta7 moves to a new location
   along with everything else. It moves by itself on Windows and Linux — unless
   the previous build is still running, the same reason as the bullet above — and
   on macOS it is not moved at all, so those settings start fresh there and macOS

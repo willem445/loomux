@@ -529,7 +529,17 @@ test("the guard discriminates — it reports findings when the name does not mat
 // What the identifier half does NOT see, stated rather than left to be found:
 // the identifier where it appears WITHOUT its `dev.` prefix, and the profile
 // directory named by a variable (`<data_local_dir>/<identifier>`) rather than
-// spelled. Neither exists today. It also cannot check what Tauri does with the
+// spelled. Neither exists today.
+//
+// One more, because it is live rather than hypothetical: `ID_SHAPE` reads two
+// dot-separated segments and stops, so a SUPERSTRING of an identifier —
+// `dev.orrerix.app.other`, a deliberate near-miss specimen in `obs.rs`'s
+// `a_non_production_identifier_never_moves_the_profile` — matches as
+// `dev.orrerix.app` and is counted as the product identifier. Harmless in that
+// direction (it is not reported as an offender when it should not be), and the
+// raw cross-check below stays consistent because both patterns see it once. It
+// would matter if someone introduced a real third-segment identifier, which
+// nothing does. It also cannot check what Tauri does with the
 // value — that the shipped build's WebView2 child really runs under it is what
 // the `e2e-windows` job proves, and nothing here substitutes for reading it.
 
@@ -593,6 +603,12 @@ const ID_SHAPE_FILES = [
   "e2e/fixtures.ts",
   ".github/workflows/ci.yml",
   "crates/loomux-engine/src/brand.rs",
+  // The file that PERFORMS the move, and the one whose disagreement with
+  // tauri.conf.json this guard's header calls silent by construction. It was
+  // missing from this list in the first cut, which left the identifier spelled
+  // in six places there — five doc comments and one test specimen — that
+  // nothing read (rev-lead round 1, N2).
+  "crates/loomux-engine/src/obs.rs",
 ];
 
 /** A reverse-DNS identifier token, and the same subjects counted without the name. */
@@ -626,11 +642,22 @@ function scanIdentifiers(prod: string, e2e: string): IdScan {
   // pre-#1562 identifier is spelled on purpose, because the move has to name
   // the directory it moves FROM. Taken from LEGACY_BUNDLE_ID itself, so the
   // exemption is only ever as wide as the constant the move actually reads.
-  const rows = [
+  const rows: Array<{ token: string; file: string; why: string; commentOnly?: boolean }> = [
     {
       token: brandConst("LEGACY_BUNDLE_ID"),
       file: "crates/loomux-engine/src/brand.rs",
-      why: "LEGACY_BUNDLE_ID — the source directory of the one-time webview-profile move, and the one place the old identifier is spelled (see that module's own rule)",
+      why: "LEGACY_BUNDLE_ID — the source directory of the one-time webview-profile move, and the one place the old identifier is spelled as a VALUE (see that module's own rule)",
+    },
+    {
+      token: brandConst("LEGACY_BUNDLE_ID"),
+      file: "crates/loomux-engine/src/obs.rs",
+      commentOnly: true,
+      why:
+        "doc comments explaining which directory the move reads FROM. Scoped to comment " +
+        "lines on purpose: the code in that file reaches the old identifier through " +
+        "brand::LEGACY_BUNDLE_ID, never as a literal, so a literal on a CODE line there is " +
+        "still a finding — which is the whole difference between prose about the move and " +
+        "a second place the name is spelled",
     },
   ];
 
@@ -664,7 +691,10 @@ function scanIdentifiers(prod: string, e2e: string): IdScan {
           mine += 1;
           continue;
         }
-        const row = rows.find((r) => r.token === token && r.file === file);
+        const isComment = /^\s*(\/\/|#|\*)/.test(line);
+        const row = rows.find(
+          (r) => r.token === token && r.file === file && (!r.commentOnly || isComment)
+        );
         if (row) {
           allowedHit.add(`${row.file}|${row.token}`);
           continue;

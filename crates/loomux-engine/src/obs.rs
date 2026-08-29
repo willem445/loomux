@@ -479,10 +479,41 @@ fn profile_moves(action: RootAction) -> bool {
 /// only where one is keyed on the identifier.
 ///
 /// `None` means "not this run's business, and nothing was touched": a
-/// non-production identifier, or an explicitly-named data root.
+/// platform where this path is not the profile, a non-production identifier, or
+/// an explicitly-named data root.
 pub fn init_webview_profile(identifier: &str) -> Option<PathBuf> {
+    // The platform guard lives HERE, on the real-environment wrapper, and not
+    // in `_from` — same layering as `data_root`/`data_root_from`. It is a fact
+    // about the machine, not about the policy, so the policy stays testable on
+    // every platform over a temp dir (all six unit tests drive `_from`).
+    if !PROFILE_IS_TAURI_MANAGED {
+        return None;
+    }
     init_webview_profile_from(identifier, dirs::data_local_dir(), brand::env_os("DATA_DIR").value)
 }
+
+/// Is `<data_local_dir>/<identifier>` the webview profile on this platform?
+///
+/// **Tauri's own `cfg`, deliberately copied rather than approximated**
+/// (`tauri::manager::webview`: the resolution is
+/// `#[cfg(any(target_os = "linux", target_os = "windows"))]`). If this list and
+/// that one ever disagree, this code moves a directory nothing reads, or
+/// declines to move the one that matters.
+///
+/// On macOS WKWebView stores under `~/Library/WebKit/<CFBundleIdentifier>`,
+/// which is not this path and is not a directory this app may move — so the
+/// flip is a documented one-time reset there instead
+/// (`docs/troubleshooting.md`, `doc/design/rebrand-bundle.md`).
+///
+/// **This constant is what makes that claim structural.** Without it the macOS
+/// run would still compute `~/Library/Application Support/dev.loomux.app` and
+/// rename it if it existed, leaving a signpost describing a browser profile in
+/// a directory that never was one. Nothing in this tree creates that directory
+/// today, so the claim held — but it held by that absence rather than by a
+/// guard, and an absence is not something the next person to add a
+/// `app_local_data_dir` caller would know they were relying on (rev-lead round
+/// 1, N1).
+const PROFILE_IS_TAURI_MANAGED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
 
 /// [`init_webview_profile`] with its two environment readings as parameters —
 /// the local-data base and the data-root override — so every arm is reachable
@@ -2038,6 +2069,25 @@ mod tests {
              is the failure it is avoiding, and it is why the profile's answer differs"
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The platform guard, pinned per platform rather than by restating its own
+    /// `cfg` — which would be a tautology. Each leg of CI asserts the value it
+    /// must have there, so widening or narrowing the `cfg` list reddens on the
+    /// platform it changed.
+    #[test]
+    fn the_profile_is_only_tauri_managed_where_tauri_manages_it() {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        assert!(
+            PROFILE_IS_TAURI_MANAGED,
+            "Tauri resolves <LocalData>/<identifier> here, so there is a profile to move"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !PROFILE_IS_TAURI_MANAGED,
+            "macOS stores under ~/Library/WebKit/<CFBundleIdentifier> — nothing here to move, \
+             and <data_local_dir>/<identifier> is a directory this app must not touch"
+        );
     }
 
     /// The profile shares `plan_default_root`/`root_action` with the data root,

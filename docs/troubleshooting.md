@@ -135,14 +135,14 @@ xattr -cr /Applications/Orrerix.app
 The install script does this for you; if you dragged the app from a `.dmg`
 manually, run it yourself.
 
-## Some settings reset once, after updating to 1.2.0
+## Some settings reset once, after updating to 1.2.0-beta7
 
 A handful of preferences live in the app's **browser profile** rather than in
 its data folder: the launcher's recent-repos list, the default agent, the custom
 agent command, the editor command, and a few pane and panel sizes. Windows and
-Linux key that profile on the app's identity, which changed in 1.2.0 as the last
-step of the rename — so the profile has to move, and 1.2.0 moves it on first
-launch.
+Linux key that profile on the app's identity, which changed in **1.2.0-beta7**
+as the last step of the rename — so the profile has to move, and that version
+moves it on first launch. Every later 1.2.0 build is already past it.
 
 **Everything else is untouched.** Groups, task boards, tabs, SSH profiles and
 logs live under the data folder below, not in the browser profile.

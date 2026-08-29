@@ -166,8 +166,8 @@ conservative budget and logs a warning if `vocab.txt` is over-long. Set
 - If the mic can't be opened (no device, or Windows microphone privacy blocks
   it), or the whisper runtime is missing/misconfigured, orrerix surfaces a
   **specific** message rather than failing silently.
-- **macOS asks for the microphone again after updating to 1.2.0.** The
-  permission is granted to an app's bundle identifier, and 1.2.0 changed
+- **macOS asks for the microphone again after updating to 1.2.0-beta7.** The
+  permission is granted to an app's bundle identifier, and that version changed
   Orrerix's from `dev.loomux.app` to `dev.orrerix.app` (see
   [Troubleshooting](../troubleshooting.html)). macOS therefore sees a new app
   the first time you record, and prompts once. Allow it and nothing else
