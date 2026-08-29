@@ -102,7 +102,7 @@
 use loomux_engine::lockwatch::tracked_lock_names;
 use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
-use loomux_lib::orchestration::{Guardrails, OrchRegistry};
+use loomux_lib::orchestration::{GroupId, Guardrails, OrchRegistry, Role};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -909,5 +909,283 @@ fn l2d_a_timeout_inside_a_mutation_scope_waits_rather_than_unwinding() {
         waited >= L2D_BUDGET,
         "it returned in {waited:?}, inside the {L2D_BUDGET:?} budget — the hold was not in its \
          way, so this row proves nothing about what a timeout does"
+    );
+}
+
+// ---------- L2a-L2c: the MCP surface and the cadenced loops ----------
+
+use loomux_engine::budget as bg;
+use loomux_lib::orchestration::mcp;
+
+/// Restores the mutating-tool deadline however the scope ends — the
+/// `HoldWarn` idiom from `tests/selfwatch.rs`, for the same reason: a test that
+/// fails while it is moved leaves every later test measuring against a number
+/// nobody set.
+struct MutateDeadline(Duration);
+impl MutateDeadline {
+    fn set(d: Duration) -> Self {
+        Self(bg::set_mutate_deadline_for_test(d))
+    }
+}
+impl Drop for MutateDeadline {
+    fn drop(&mut self) {
+        bg::set_mutate_deadline_for_test(self.0);
+    }
+}
+
+/// A registry with an agent whose token the MCP surface will resolve, plus that
+/// token. `set_self_arc` because `dispatch_bounded` spawns the mutating helper
+/// on the registry's own `Arc`.
+fn mcp_fixture() -> (Arc<OrchRegistry>, String, GroupId, tempfile::TempDir) {
+    let (reg, dir) = test_registry();
+    // `dispatch_bounded` runs a mutating tool on the registry's own `Arc`; a
+    // registry that never had `set_self_arc` called has none, and L2b would then
+    // be measuring a path the app does not take.
+    reg.set_self_arc();
+    let group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+    let agent = reg
+        .spawn_agent(&group.id, Role::Orchestrator, "orch", "", false, None)
+        .expect("a fake agent to carry a resolvable token");
+    (reg, agent.token, group.id, dir)
+}
+
+/// Wall-clock ms, for the tick functions that take a `now`. They all skip in
+/// L2c, so the value only has to be plausible.
+fn now_ms_local() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[test]
+fn l2a_mcp_answers_within_its_budgets_while_a_registry_lock_is_held() {
+    let (reg, token, _group, _dir) = mcp_fixture();
+
+    // Baseline: both halves answer normally. Without this, every assertion
+    // below is satisfied by an MCP surface that is broken in some other way.
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    let warm = mcp::handle_for_test(&reg, &ping, Some(&token)).expect("a request with an id");
+    assert!(warm.get("result").is_some(), "setup: ping must answer normally: {warm}");
+
+    assert!(reg.hold_lock_for_test("groups", 20_000), "setup: cannot hold `groups`");
+
+    // ---- the auth half: this is #1606's measured hole ----
+    //
+    // `ping` takes no registry lock of its own, and never reached its arm: every
+    // request resolves its token first, and `resolve_token` takes `groups`.
+    let started = std::time::Instant::now();
+    let busy = mcp::handle_for_test(&reg, &ping, Some(&token)).expect("a request with an id");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < bg::MCP_AUTH_BUDGET + GRACE,
+        "the MCP did not answer a ping in {waited:?} while `groups` was held. That is the \
+         defect this phase removes, measured: #1606 logged `mcp ok=false in 20004ms`"
+    );
+    let err = busy.get("error").unwrap_or_else(|| panic!("expected an error envelope: {busy}"));
+    assert_eq!(
+        err.get("code").and_then(|c| c.as_i64()),
+        Some(mcp::MCP_BUSY_CODE),
+        "a busy registry must answer the RETRYABLE code, not the permanent auth refusal \
+         (-32000) — a caller that cannot tell them apart either retries forever or gives up \
+         forever: {busy}"
+    );
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or_default();
+    assert!(msg.starts_with("loomux busy:"), "message is a public contract: {msg}");
+    assert!(msg.contains("groups"), "the answer must NAME the lock that blocked: {msg}");
+    // The `data` shape is the half a client machine-reads.
+    let data = err.get("data").unwrap_or_else(|| panic!("no data block: {busy}"));
+    assert_eq!(data.get("retryable").and_then(|r| r.as_bool()), Some(true));
+    assert!(
+        data.get("retry_after_ms").and_then(|r| r.as_u64()).is_some_and(|m| m > 0),
+        "retry_after_ms must be a positive hint: {data}"
+    );
+
+    // ---- the read-tool half ----
+    //
+    // `list_agents` takes `agents`, so it gets past auth only once `groups` is
+    // free; hold `agents` instead and drive `dispatch` directly, which is the
+    // seam that owns the read budget.
+    let caller = reg.resolve_token(&token).expect("the token still resolves");
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+    let call = json!({ "name": "list_agents", "arguments": {} });
+    let started = std::time::Instant::now();
+    let out = mcp::dispatch(&reg, &caller, "tools/call", &call).expect("a tool RESULT, not a protocol error");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < bg::MCP_READ_BUDGET + GRACE,
+        "a read tool did not answer in {waited:?} with `agents` held"
+    );
+    assert_eq!(
+        out.get("isError").and_then(|e| e.as_bool()),
+        Some(true),
+        "a busy read is an EXECUTION failure, so it is an isError result rather than a \
+         protocol error — that is the shape that reaches the model's context: {out}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("loomux busy:"), "read-tool text is a public contract: {text}");
+    assert!(text.contains("agents"), "the text must name the lock that blocked: {text}");
+    assert!(
+        text.contains("Nothing was executed"),
+        "the caller has to be told it may retry safely: {text}"
+    );
+}
+
+#[test]
+fn l2b_a_slow_mutating_tool_answers_and_still_completes_exactly_once() {
+    // The exactly-once property, which is why a mutating tool is NOT unwound.
+    // A deadline that abandoned the work would double-execute on the retry the
+    // message tells the caller not to make.
+    const HOLD_MS: u64 = 3_000;
+    let _deadline = MutateDeadline::set(Duration::from_millis(300));
+    let (reg, token, group, _dir) = mcp_fixture();
+
+    assert!(reg.hold_lock_for_test("tasks_lock", HOLD_MS), "setup: cannot hold `tasks_lock`");
+
+    let call = json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": { "name": "upsert_task", "arguments": { "title": "l2b-exactly-once" } },
+    });
+    let started = std::time::Instant::now();
+    let out = mcp::handle_for_test(&reg, &call, Some(&token)).expect("a request with an id");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < bg::mutate_deadline() + GRACE,
+        "the handler waited {waited:?} on a mutating tool — the point of the deadline is that \
+         the orchestrator's turn is not spent on it"
+    );
+    let text = out["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("still executing"),
+        "the caller must be told the work is IN FLIGHT, not that it failed: {out}"
+    );
+    assert!(
+        text.contains("do NOT re-issue"),
+        "the instruction not to retry is the whole reason this is not an unwind: {text}"
+    );
+
+    // Now let the hold expire and prove the tool completed EXACTLY once.
+    let deadline = std::time::Instant::now() + Duration::from_millis(HOLD_MS) + GRACE;
+    loop {
+        let n = reg.tasks(&group).iter().filter(|t| t.title == "l2b-exactly-once").count();
+        if n == 1 {
+            break;
+        }
+        assert!(n <= 1, "the tool ran {n} times — a deadline that abandons work double-executes");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tool never completed after the hold ended; `it WILL complete` is then a false \
+             promise made to an agent"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn l2c_every_cadenced_tick_returns_while_the_registry_is_wedged() {
+    // Nine loops, each of which used to park a thread for as long as a hold
+    // lasted. Driven CONCURRENTLY rather than in sequence: they are independent,
+    // the property is "each returns", and nine sequential 5 s skips would put 45
+    // seconds into every run of this suite to measure one bound nine times.
+    let (reg, _dir) = test_registry();
+    let _group = reg.create_group("C:/tmp/repo", rails()).expect("create a group");
+
+    assert!(reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+
+    let ticks: Vec<(&'static str, Box<dyn Fn(&OrchRegistry) + Send + Sync>)> = vec![
+        ("reap_idle_agents", Box::new(|r: &OrchRegistry| { r.reap_idle_agents(now_ms_local()); })),
+        ("run_watchdog", Box::new(|r: &OrchRegistry| { r.run_watchdog(now_ms_local()); })),
+        ("run_attention", Box::new(|r: &OrchRegistry| r.run_attention(now_ms_local()))),
+        ("run_idle_tick", Box::new(|r: &OrchRegistry| { r.run_idle_tick(now_ms_local()); })),
+        ("run_compact_nudge", Box::new(|r: &OrchRegistry| { r.run_compact_nudge(now_ms_local()); })),
+        ("run_gh_poll_tick", Box::new(|r: &OrchRegistry| { r.run_gh_poll_tick(); })),
+        ("run_workflow_gate_reload", Box::new(|r: &OrchRegistry| r.run_workflow_gate_reload())),
+        ("run_disk_monitor", Box::new(|r: &OrchRegistry| r.run_disk_monitor())),
+        ("flush_due_max_notices", Box::new(|r: &OrchRegistry| r.flush_due_max_notices(now_ms_local()))),
+    ];
+
+    let (tx, rx) = mpsc::channel();
+    let n = ticks.len();
+    for (name, f) in ticks {
+        let (r, tx) = (reg.clone(), tx.clone());
+        std::thread::spawn(move || {
+            f(&r);
+            let _ = tx.send(name);
+        });
+    }
+    drop(tx);
+
+    let mut returned = Vec::new();
+    let deadline = bg::TICK_LOCK_BUDGET + GRACE;
+    while returned.len() < n {
+        match rx.recv_timeout(deadline) {
+            Ok(name) => returned.push(name),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        returned.len(),
+        n,
+        "only {}/{n} cadenced ticks returned within {deadline:?} while `agents` was held. The \
+         ones missing are: {:?}. A tick that never returns is one parked thread per cadence \
+         for as long as the hold lasts — #1600 §1.2 step 3.",
+        returned.len(),
+        {
+            let mut missing = vec![
+                "reap_idle_agents", "run_watchdog", "run_attention", "run_idle_tick",
+                "run_compact_nudge", "run_gh_poll_tick", "run_workflow_gate_reload",
+                "run_disk_monitor", "flush_due_max_notices",
+            ];
+            missing.retain(|m| !returned.contains(m));
+            missing
+        }
+    );
+}
+
+#[test]
+fn every_tool_the_mcp_surface_lists_is_classified_read_or_mutate() {
+    // `tool_kind`'s default arm is `Mutate`, which is the safe side — but it is
+    // also the arm that would silently swallow the whole surface if the table
+    // stopped matching. So the population is taken from what `tools/list`
+    // ACTUALLY returns, per role, rather than from a list written here.
+    //
+    // What this can and cannot say, stated because the default makes it subtle:
+    // it proves every listed tool REACHES a decision and that the Read set is
+    // non-empty on a role that has reads. It cannot prove a tool is on the right
+    // side — that is the reviewable table in `mcp.rs`, and the asymmetry
+    // (a mis-classified read merely waits; a mis-classified mutation can be
+    // abandoned) is why the default is what it is.
+    let (reg, token, _group, _dir) = mcp_fixture();
+    let caller = reg.resolve_token(&token).expect("token resolves");
+    let listed = mcp::dispatch(&reg, &caller, "tools/list", &json!({})).expect("tools/list");
+    let tools = listed["tools"].as_array().expect("an array of tools").clone();
+
+    assert!(
+        tools.len() >= 20,
+        "tools/list returned {} tools — the scan has stopped reading the surface it is \
+         supposed to cover",
+        tools.len()
+    );
+
+    let mut reads = 0usize;
+    for t in &tools {
+        let name = t["name"].as_str().expect("every tool has a name");
+        match mcp::tool_kind(name) {
+            mcp::ToolKind::Read => reads += 1,
+            mcp::ToolKind::Mutate => {}
+        }
+    }
+    // The vacuity control. Every assertion above is satisfied by a `tool_kind`
+    // whose body is `ToolKind::Mutate` — which is exactly what a table that had
+    // stopped matching would degrade to, and it would be invisible without this.
+    assert!(
+        reads >= 5,
+        "only {reads} of {} listed tools classify as Read. The table has stopped matching and \
+         every tool is falling through to the default arm — the read budget then applies to \
+         nothing at all",
+        tools.len()
     );
 }
