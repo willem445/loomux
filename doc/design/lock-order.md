@@ -152,7 +152,7 @@ a diff in which every line changed is one nobody can review for order.
 | 500 | `by_pty` | `session_for_pty` takes it, then `agents`, releasing this one first (stated from the code, not from that doc — see lock-liveness §6) |
 | 510 | `agents` | same claim; and `delivered_prompts` below |
 | 520 | `groups` | `group_file_io`'s claim puts it under that one |
-| 600 | `delivered_prompts` | "`agents` is taken and RELEASED before this one" |
+| 600 | `delivered_prompts` | a caller resolving pty -> session takes `by_pty` then `agents` and releases both before this map; one holding a snapshot takes neither (stated from the code — see lock-liveness §6) |
 | 610 | `delivered_notices` | "takes no other registry lock while held" |
 | 700 | `agent_seq_persist` | "takes no other registry lock while held" |
 | 800 | `tasks_lock` | `needs_you_lock`'s claim puts that one under it |
@@ -218,8 +218,12 @@ ranks at 600-900 encode. The two claims with real nesting in them
 the checker agrees with both. The pairs that would have been *interesting* —
 `groups` against `agents`, `by_pty` against either — turn out never to nest at
 all on the paths the suite runs: every site takes one, uses it and drops it
-before reaching for the next, exactly as `session_for_pty`'s "taken and RELEASED
-before" says. The rank is there for the site that stops doing that.
+before reaching for the next — `session_for_pty` included, whose two
+acquisitions are both statement temporaries. (That function's doc used to SAY
+so; #1702 replaced the wording, because a promise about one body's internal
+order is worth nothing to a caller that is already holding the outer lock. The
+behaviour it described is unchanged, which is why the rank is.) The rank is
+there for the site that stops doing that.
 
 **What the derivation did find was a blind GUARD, not a wrong rank.**
 `every_registry_lock_is_constructed_with_a_name` (`src-tauri/tests/selfwatch.rs`)

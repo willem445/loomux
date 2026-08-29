@@ -12660,8 +12660,14 @@ pub mod lockorder {
 
     /// `delivered_prompts` — prompt bodies keyed by CLI session.
     ///
-    /// Its own claim: "`agents` is taken and RELEASED before this one", so it
-    /// ranks under `agents`.
+    /// Ranks under `agents` because a caller that has to RESOLVE a pty to its
+    /// session takes `by_pty` and then `agents` first, releasing both before
+    /// this map is taken. Stated from the code rather than quoted from that
+    /// field's doc: the doc used to make exactly this claim, #1702 moved the
+    /// resolution out of the record read to the callers, and a rank that cites
+    /// a sentence which may be rewritten is a rank nobody can re-check. A
+    /// caller holding an agent snapshot resolves nothing and reaches this map
+    /// having taken no registry lock at all.
     pub const DELIVERED_PROMPTS: LockRank = LockRank::new(600);
 
     /// `delivered_notices` — what loomux wrote into each pane.

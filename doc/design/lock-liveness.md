@@ -615,9 +615,9 @@ treating re-entrancy as a shape to remove rather than a failure to bound.
 a call that can take a registry lock. Not "across a slow call" — the cost is
 irrelevant to this failure, and the site that produced #1702's minutes-long
 holds does string work measured in microseconds. `session_for_pty`'s own doc
-already promised the narrower half of this ("`by_pty` is taken and RELEASED
-before `agents`"), and that promise is worth nothing to a caller that is
-holding `agents` before it arrives — a lock-order note describes what one
+USED TO promise the narrower half of this — "`by_pty` is taken and RELEASED
+before `agents`", wording this change removed — and that promise was worth
+nothing to a caller that is holding `agents` before it arrives — a lock-order note describes what one
 function does, where what a reader needs is what is true at the call site.
 
 **The shape `attention_tick` now has**, and the shape any tick doing per-item
