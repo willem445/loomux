@@ -91,6 +91,7 @@
 //!
 //! See `doc/design/polled-views.md` for the wire contract this file implements.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,6 +99,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use loomux_engine::budget;
 use loomux_engine::published::{Published, Stamped};
 
 use crate::obs::LockExt;
@@ -180,6 +182,13 @@ pub struct GroupView {
     pub computed_unix_ms: u64,
     /// What this group's pass cost, in ms.
     pub compute_ms: u32,
+    /// At least one section of THIS group kept its previous value because
+    /// the acquisition it needed ran out of budget (#1609).
+    ///
+    /// Per group rather than per snapshot, because the badge is per panel: a
+    /// busy section while computing group A says nothing about group B, and
+    /// a snapshot-level flag would put "partly stale" on every panel open.
+    pub partial: bool,
 }
 
 /// What one publish pass produced.
@@ -188,9 +197,15 @@ pub struct ViewSnapshot {
     /// `Arc` per group so a single-group republish clones POINTERS rather
     /// than ten `serde_json::Value` trees per group it is not touching.
     pub groups: HashMap<GroupId, Arc<GroupView>>,
-    /// Reserved for Phase 2.1: a section that hit a `Busy` timeout kept its
-    /// previous value. Always `false` in Phase 1 — there is no bounded
-    /// acquisition yet to time out, so no section can be partial.
+    /// Whether ANY group in this snapshot is partial — a section that hit a
+    /// `Busy` timeout and kept its previous value (#1609).
+    ///
+    /// Derived from the per-group flags rather than tracked separately, so
+    /// the two can never disagree. [`group_view_payload`] reports the GROUP's
+    /// own flag; this one is what [`strip_view_payload`] reports, because the
+    /// strip is one payload over many groups and its age is already the
+    /// oldest group's — "nothing in this payload is better than this" is the
+    /// claim both fields make together.
     pub partial: bool,
 }
 
@@ -330,9 +345,17 @@ impl ViewPublisher {
         // to a restored orchestration, which lives on disk and never enters
         // `groups`. Covering only the first half is what dropped those tabs'
         // badges (#1625 review round 2).
-        let mut ids: Vec<GroupId> = {
-            let guard = reg.groups.lock_safe();
-            guard.keys().cloned().collect()
+        // The pass's ENTRY acquisition is BOUNDED (#1609). A wedged `groups`
+        // used to park the publisher thread here for as long as the hold
+        // lasted; now the pass is skipped and the previous snapshot stands and
+        // ages, which is INV-6's shape — a skipped tick is bounded by the next
+        // tick, and the stale badge is what says so. Skipping here is also what
+        // keeps `section`'s aggregate cost off the table in the fully-wedged
+        // case: there is no point paying `sections x POLL_LOCK_BUDGET` per group
+        // to discover what this one acquisition already established.
+        let mut ids: Vec<GroupId> = match reg.groups.lock_within(budget::TICK_LOCK_BUDGET) {
+            Ok(guard) => guard.keys().cloned().collect(),
+            Err(_) => return,
         };
         for leased in self.fresh_strip_leases_at(now) {
             if !ids.contains(&leased) {
@@ -352,11 +375,18 @@ impl ViewPublisher {
             });
         }
 
+        // Read BEFORE computing: a section that runs out of budget falls back
+        // to its previously published value, so the pass needs the old snapshot
+        // in hand. Lock-free — one `Arc` clone.
+        let prior = self.published.load();
+
         let started = Instant::now();
         let mut computed: HashMap<GroupId, Arc<GroupView>> = HashMap::with_capacity(ids.len());
         for id in ids {
             let leased = self.has_view_lease_at(&id, now);
-            computed.insert(id.clone(), Arc::new(self.compute_group(reg, &id, leased, now)));
+            let previous = prior.value.groups.get(&id).map(|g| g.as_ref());
+            computed
+                .insert(id.clone(), Arc::new(self.compute_group(reg, &id, leased, now, previous)));
         }
         let compute_ms = elapsed_ms(started);
 
@@ -383,7 +413,10 @@ impl ViewPublisher {
                 }
             }
         }
-        self.published.store(ViewSnapshot { groups, partial: false }, compute_ms);
+        // Derived, never tracked separately, so the snapshot flag and the
+        // per-group flags cannot disagree.
+        let partial = groups.values().any(|g| g.partial);
+        self.published.store(ViewSnapshot { groups, partial }, compute_ms);
     }
 
     /// [`ViewPublisher::publish_pass_at`] at the current instant.
@@ -427,7 +460,12 @@ impl ViewPublisher {
         }
         let leased = self.has_view_lease_at(group, now);
         let started = Instant::now();
-        let view = Arc::new(self.compute_group(reg, group, leased, now));
+        // Named apart from the `previous` SNAPSHOT taken under the swap lock
+        // below: this one is read before the compute (it is what a busy section
+        // falls back to), that one decides the later-stamp-wins race.
+        let prior = self.published.load();
+        let prev_group = prior.value.groups.get(group).map(|g| g.as_ref());
+        let view = Arc::new(self.compute_group(reg, group, leased, now, prev_group));
         let compute_ms = elapsed_ms(started);
 
         // Under the same lock as a full pass, taken AFTER the compute, and
@@ -464,7 +502,12 @@ impl ViewPublisher {
         // Shallow: every other group is an `Arc` clone, not a payload copy.
         let mut groups: HashMap<GroupId, Arc<GroupView>> = previous.value.groups.clone();
         groups.insert(group.clone(), view);
-        self.published.store(ViewSnapshot { groups, partial: previous.value.partial }, compute_ms);
+        // Re-derived over the whole map rather than inherited from the previous
+        // snapshot: this nudge may be exactly the republish that CLEARS the only
+        // partial group, and carrying the old flag forward would leave the strip
+        // claiming a partial that no longer exists.
+        let partial = groups.values().any(|g| g.partial);
+        self.published.store(ViewSnapshot { groups, partial }, compute_ms);
     }
 
     /// [`ViewPublisher::publish_group_at`] at the current instant — the call
@@ -480,41 +523,145 @@ impl ViewPublisher {
     /// Every section is the SAME registry call its command makes today — the
     /// wire-identity property, held by construction rather than by a second
     /// implementation that has to be kept in step.
+    /// Compute ONE published section under [`budget::POLL_LOCK_BUDGET`].
+    ///
+    /// On `Busy` the section keeps `fallback` — its previous published value —
+    /// and the group is marked partial. No breadcrumb here on purpose: the
+    /// `lock-busy` edge-trigger inside `lock_within` already names the lock and
+    /// its holder ONCE per hold, and a line per section per pass would be a
+    /// breadcrumb every second for as long as a hold lasted — the evidence
+    /// trail drowning exactly when it is needed.
+    ///
+    /// **The aggregate cost is stated rather than capped**, because capping it
+    /// cannot be done with one constant: an enclosing `read_budget` frame would
+    /// always own the deadline (nesting takes the TIGHTER one, and two frames
+    /// with the same budget make the outer one earlier), so every timeout would
+    /// unwind past these frames and lose the per-section localisation that is
+    /// the whole point. So a wedged registry costs a group up to
+    /// `sections x POLL_LOCK_BUDGET` per pass. That is affordable for reasons
+    /// Phase 1 bought: the publisher is ONE thread, so a slow pass costs passes
+    /// rather than pool threads; the delay is disclosed by the same stale badge;
+    /// and the fully-wedged case never reaches here at all, because
+    /// [`ViewPublisher::publish_pass_at`]'s entry acquisition is bounded by
+    /// `TICK_LOCK_BUDGET` and skips the pass instead.
+    ///
+    /// **An expired budget costs a healthy registry nothing.** A section that
+    /// legitimately spends over a second in transcript reads leaves the deadline
+    /// passed, and `Duration::ZERO` is a `try_lock` that SUCCEEDS on any
+    /// uncontended lock — so slow-but-fine sections do not manufacture partials.
+    fn section<T>(partial: &Cell<bool>, fallback: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
+        match budget::read_budget(budget::POLL_LOCK_BUDGET, f) {
+            Ok(v) => v,
+            Err(_) => {
+                partial.set(true);
+                fallback()
+            }
+        }
+    }
+
     fn compute_group(
         &self,
         reg: &OrchRegistry,
         group: &GroupId,
         leased: bool,
         at: Instant,
+        previous: Option<&GroupView>,
     ) -> GroupView {
         let started = Instant::now();
-        let summary = reg.group_summary(group);
-        let usage = reg.group_usage_live_within(group, VIEW_USAGE_MAX_AGE);
+        let partial = Cell::new(false);
+
+        let summary = Self::section(
+            &partial,
+            || previous.map(|p| p.summary.clone()).unwrap_or(Value::Null),
+            || reg.group_summary(group),
+        );
+        let usage = Self::section(
+            &partial,
+            || previous.map(|p| p.usage.clone()).unwrap_or(Value::Null),
+            || reg.group_usage_live_within(group, VIEW_USAGE_MAX_AGE),
+        );
         self.strip_tier_computes.fetch_add(1, Ordering::Relaxed);
 
         let view = if leased {
             self.view_tier_computes.fetch_add(1, Ordering::Relaxed);
+            let prev = previous.and_then(|p| p.view.as_ref());
             Some(GroupViewTier {
-                paused: reg.is_paused(group),
-                notify: reg.notify_enabled(group),
-                spawn_expanded: reg.spawn_expanded(group),
-                autonomy: reg.autonomy_state_within(group, VIEW_USAGE_MAX_AGE),
-                watches: reg.group_watches(group),
-                workflow: reg.workflow_status(group),
-                merge_queue: mergeqview::merge_queue_view(&reg.group_dir(group)),
-                locks: reg.lock_state(group),
+                paused: Self::section(
+                    &partial,
+                    || prev.is_some_and(|v| v.paused),
+                    || reg.is_paused(group),
+                ),
+                notify: Self::section(
+                    &partial,
+                    || prev.is_some_and(|v| v.notify),
+                    || reg.notify_enabled(group),
+                ),
+                spawn_expanded: Self::section(
+                    &partial,
+                    || prev.is_some_and(|v| v.spawn_expanded),
+                    || reg.spawn_expanded(group),
+                ),
+                autonomy: Self::section(
+                    &partial,
+                    || prev.map(|v| v.autonomy.clone()).unwrap_or(Value::Null),
+                    || reg.autonomy_state_within(group, VIEW_USAGE_MAX_AGE),
+                ),
+                watches: Self::section(
+                    &partial,
+                    || prev.map(|v| v.watches.clone()).unwrap_or(Value::Null),
+                    || reg.group_watches(group),
+                ),
+                workflow: Self::section(
+                    &partial,
+                    || prev.map(|v| v.workflow.clone()).unwrap_or(Value::Null),
+                    || reg.workflow_status(group),
+                ),
+                merge_queue: Self::section(
+                    &partial,
+                    || prev.map(|v| v.merge_queue.clone()).unwrap_or(Value::Null),
+                    || mergeqview::merge_queue_view(&reg.group_dir(group)),
+                ),
+                locks: Self::section(
+                    &partial,
+                    || prev.map(|v| v.locks.clone()).unwrap_or(Value::Null),
+                    || reg.lock_state(group),
+                ),
             })
         } else {
             None
+        };
+
+        let partial = partial.get();
+        // A group that kept a section's previous value keeps that value's AGE
+        // too (#1609). This is what makes `viewstale.ts`'s existing pair of
+        // labels correct without a frontend change: `age_ms` becomes the age of
+        // the group's STALEST part, `stale` flips on the same 5 s threshold as
+        // everything else, and `partial` is what distinguishes "part of this
+        // panel" from "all of it". Stamping a partial group with a fresh `at`
+        // would publish a panel that reads current while showing a frozen
+        // number — the silent-freeze failure #1604 review N3 is about.
+        //
+        // A permanently-busy section therefore pins the whole group's age. That
+        // is INV-6's "entered on the clock, released only on evidence", and the
+        // badge already says the right thing: "Some of this panel could not be
+        // refreshed... The rest is current."
+        //
+        // With no previous entry there is no age to inherit, so a first pass
+        // that goes partial is stamped fresh. Its sections are `Null`, which the
+        // payload builders already treat as "not published yet".
+        let (computed_at, computed_unix_ms) = match (partial, previous) {
+            (true, Some(p)) => (p.computed_at, p.computed_unix_ms),
+            _ => (at, super::now_ms()),
         };
 
         GroupView {
             summary,
             usage,
             view,
-            computed_at: at,
-            computed_unix_ms: super::now_ms(),
+            computed_at,
+            computed_unix_ms,
             compute_ms: elapsed_ms(started),
+            partial,
         }
     }
 }
@@ -564,7 +711,9 @@ pub fn group_view_payload(
         g.computed_at,
         g.computed_unix_ms,
         g.compute_ms,
-        snapshot.value.partial,
+        // This GROUP's flag, not the snapshot's: a busy section while
+        // computing another group says nothing about this panel.
+        g.partial,
         now,
     );
     if let Some(obj) = meta.as_object_mut() {
