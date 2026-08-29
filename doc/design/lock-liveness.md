@@ -200,7 +200,14 @@ rather than a message someone can reword later.
 
 **Auth, and read tools that run out of budget.** Token resolution runs under
 `read_budget(MCP_AUTH_BUDGET)`. `Busy` becomes a JSON-RPC error — protocol level,
-because at that point the caller is not yet known:
+because at that point the caller is not yet known.
+
+`tools/list` is the **second** protocol-level producer of this code: it runs under
+`read_budget(MCP_READ_BUDGET)` (its `lock_menu`/`manager_block` both reach
+`groups`) and has no tool result to attach a busy to either. Both render through
+`rpc_error`, which attaches the `data` block for this code ITSELF — so there is
+one envelope shape per code by construction rather than by each producer
+remembering (#1609 review round 2, B2):
 
 ```json
 {"code": -32001, "message": "loomux busy: <Busy>; retry",
@@ -240,18 +247,29 @@ everything those reads answered* — enumerate what the replaced path could do
 that the new one cannot, because the miss is SILENT.
 
 The replaced path here is not a per-item command; it is the SAME section read,
-run unbounded. So the enumeration is short, and it has exactly one gap:
+run unbounded. So the enumeration is short, and it has **two** gaps — one per
+granularity, and the second arrived with the view-tier fix in review round 1
+(N1):
 
 | the section read could... | the busy fallback... |
 | --- | --- |
 | answer for a live group | inherits that group's previous value |
 | answer for a restored, strip-leased group | inherits its previous value |
-| answer on a group's FIRST pass | **has nothing to inherit** |
+| answer on a group's FIRST pass | **has nothing to inherit** — group withheld |
+| answer a VIEW-TIER section for a group whose previous entry was strip-only | **has no previous tier to inherit** — tier withheld (`view: None`) |
 
-The third row is the whole of the risk, and the class it bites is the one #1625
-round 2 already found: a restored-but-not-resumed group arrives through a strip
-lease and has no prior entry by construction, so its first published pass is
-exactly the pass that can hit a busy section.
+The third row is the sharper of the two, and the class it bites is the one
+#1625 round 2 already found: a restored-but-not-resumed group arrives through a
+strip lease and has no prior entry by construction, so its first published pass
+is exactly the pass that can hit a busy section.
+
+The fourth is the same shape one granularity down: a group bound to a tab but
+never view-leased has a previous entry with `view: None`, so a busy tier
+section has nothing to fall back to. Its three booleans would otherwise
+fabricate `false` — "this group is not paused" — which is an assertion a human
+acts on. Both are answered the same way, and it is the same answer the first
+row already relies on: absence is a state both payload builders render, and an
+entry full of defaults is strictly worse because it asserts something.
 
 Publishing it anyway would put an entry in the snapshot whose every busy section
 is `Null` and whose `computed_at` is this pass — fresh, so no stale badge — which
@@ -369,6 +387,16 @@ They do not all need the same treatment, and the line between them is what
   would disarm the read budget for the entire MCP surface — the bound would be
   live only until the first audit line, which is to say never.
 
+  **`append_audit` is not purely an append, and classifying it by its name
+  would be the defect §4.2 is about** (#1609 review round 2, N-B). It reaches
+  `rotate_audit_locked`, which does `fs::rename(audit.jsonl -> audit.1.jsonl)`
+  — destroying the previous generation, which is a REPLACE by the definition
+  above. It is still right not to seal it, but for a reason that has to be
+  stated rather than assumed: **no tracked acquisition sits between that rename
+  and the append that follows it**, so there is no point at which a timeout
+  could fire and leave the rotation half-applied. The exemption is about the
+  shape of the code, not the shape of the name.
+
 `note_agent_ack`, which rider R1 named alongside `audit`: one acquisition, an
 in-memory `max`, nothing after it. Nothing to tear.
 
@@ -421,6 +449,18 @@ Three claims, kept apart because they are easy to conflate:
   is shown by the scratch round that puts `check_mail` back in the Read set and
   removes the seal.
 
+### What has actually been observed
+
+This section exists because the bullet above used to claim a counterfactual
+that had never run (#1609 review round 2, B1). The scratch round in question
+mutated the classification AND the seal, so the engine binary reddened first
+and `cargo` never reached `tests/liveness.rs` — the sweep's behaviour on that
+tree was simply unknown, while the note said it had been shown.
+
+The stageable form is the same mutation plus `#[ignore]` on the two `budget.rs`
+seal tests, so the engine binary passes and the integration binaries run.
+SCRATCH_RESULT_PLACEHOLDER
+
 **What is still not covered**, stated rather than left to be found:
 
 - `note_durable_write` is called from the replace-shaped writers named in §4.3.
@@ -429,6 +469,16 @@ Three claims, kept apart because they are easy to conflate:
   test.
 - The seal is per frame and per thread. Work handed to another thread inside a
   read frame does not inherit it; nothing on these paths does that today.
+- **The converse of per-frame scoping**, which the line above reads as a pure
+  virtue (#1609 review round 2, N-C): `read_budget` restores both `SEALED` and
+  `WROTE` on exit, so an INNER frame's durable write leaves the OUTER frame
+  neither sealed nor counted for its remaining acquisitions. A nested read
+  frame whose inner half writes is therefore both tearable and invisible to
+  `torn_writes()`. Vacuous today — the five production `read_budget` call sites
+  (auth, `tools/list`, the read-tool arm, `read_command`, the publisher's
+  `section`) are each outermost and none nests — but it is a property of the
+  mechanism rather than of today's call sites, so it belongs in this list
+  rather than in whoever first nests one.
 
 ## 5. What this does not do
 
