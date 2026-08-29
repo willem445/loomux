@@ -2704,6 +2704,17 @@ fn l7b_a_wedged_day_old_registry_still_answers_busy_within_budget() {
         "setup: the read must succeed uncontended: {warm}"
     );
 
+    // Publish once, so there IS a snapshot for the wedged read below to serve.
+    // Without it `group_view_payload` answers `null` for a group nothing has
+    // ever published, and the assertion would be about an empty publisher
+    // rather than about a registry that cannot be read.
+    f.reg.views.publish_pass(&f.reg);
+    assert!(
+        group_view_payload(&f.reg.views.load(), &f.group, Instant::now()).is_object(),
+        "setup: the group is not published even uncontended, so the wedged read below would \
+         answer `null` for a reason that has nothing to do with the wedge"
+    );
+
     assert!(f.reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
 
     let started = Instant::now();
@@ -2821,11 +2832,24 @@ fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// (a stale row is a row watching nothing — the same defect as an allowlist
 /// entry that has drifted off its subject).
 ///
-/// **What it cannot see, stated rather than left to be discovered.** It is a
-/// textual scan over `.rs` files: a permit constructed through a type alias, a
-/// re-export under another name, or a macro would not match. None exists, and
-/// the compiler rather than this scan is what makes a permit reachable only
-/// through that one constructor.
+/// **What it cannot see, stated rather than left to be discovered.**
+///
+/// - It is a textual scan over `.rs` files: a permit constructed through a type
+///   alias, a re-export under another name, or a macro would not match. None
+///   exists, and the compiler rather than this scan is what makes a permit
+///   reachable only through that one constructor.
+/// - The population is PRODUCTION code, so a file is scanned only as far as its
+///   first `#[cfg(test)]`. `lockwatch`'s own unit tests construct four permits
+///   deliberately — they are what pins what a permit MEANS — and listing each
+///   would put four rows in the table for one argument. The cost is that a
+///   permit taken inside a `#[cfg(test)]` module is out of population; such a
+///   permit cannot reach a shipped build, and a Rust liveness row is scoped to
+///   its own threads (`assert_no_disallowed_hold_over_on`) so it cannot be
+///   silenced by one either.
+/// - It assumes a file's `#[cfg(test)]` module is LAST. That assumption is
+///   self-checking rather than trusted: truncating a file early would swallow a
+///   production site, and the vacuity control at the bottom then finds fewer
+///   sites than the table has rows.
 #[test]
 fn only_argued_sites_may_permit_a_long_hold() {
     let mut files: Vec<(&str, std::path::PathBuf)> = Vec::new();
@@ -2878,17 +2902,28 @@ fn only_argued_sites_may_permit_a_long_hold() {
         let mut enclosing = String::from("<file scope>");
         for line in src.lines() {
             let t = line.trim_start();
-            if let Some(rest) = t.split(" fn ").nth(1) {
-                if let Some(name) = rest.split('(').next() {
-                    if !t.starts_with("//") && !t.starts_with("///") {
-                        enclosing = name.trim().to_string();
-                    }
-                }
+            // A `#[cfg(test)]` module ends the PRODUCTION population. Files
+            // here put theirs last, and the vacuity control at the bottom is
+            // what makes the assumption self-checking: swallow a production
+            // site and `sites_seen` falls short of the table.
+            if t.starts_with("#[cfg(test)]") {
+                break;
             }
-            if t.starts_with("//") || t.starts_with("///") {
+            if t.starts_with("//") {
                 // A comment may spell the construct literally — the permit's
-                // own doc and the two argued sites' comments all do.
+                // own doc and the two argued sites' comments all do — and it
+                // must not move `enclosing` either.
                 continue;
+            }
+            // The enclosing item: the nearest `fn` line above the call. The
+            // leading space is load-bearing — a bare `fn foo(` at the start of
+            // a trimmed line has no space before `fn`, so splitting on `" fn "`
+            // alone silently keeps the PREVIOUS item's name and reports every
+            // site inside a private fn under whichever `pub fn` came last.
+            if let Some(rest) = format!(" {t}").split(" fn ").nth(1).map(str::to_string) {
+                if let Some(name) = rest.split('(').next() {
+                    enclosing = name.trim().to_string();
+                }
             }
             if !t.contains("LongHoldPermit::new(") {
                 continue;
