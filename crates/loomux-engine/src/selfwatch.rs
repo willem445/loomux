@@ -87,7 +87,8 @@ pub struct PoolTicket {
 /// closure being handed off; dropping it early undercounts exactly the depth
 /// this exists to measure.
 pub fn pool_enter() -> PoolTicket {
-    let depth = POOL_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+    // NEUTERED (scratch, #1601): the hand-off is not counted.
+    let depth = POOL_IN_FLIGHT.load(Ordering::Relaxed);
     POOL_PEAK.fetch_max(depth, Ordering::Relaxed);
     PoolTicket { _private: () }
 }
