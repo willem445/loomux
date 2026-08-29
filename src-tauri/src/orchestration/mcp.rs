@@ -432,8 +432,8 @@ fn still_executing_text(tool: &str) -> String {
         None => " — verify before re-issuing".to_string(),
     };
     format!(
-        "`{tool}` is still executing after {} s{waiting}. Do NOT re-issue it: it is still \
-         running, and a second call would run it twice{verify}.",
+        "`{tool}` is still executing after {} s{waiting}. It is still running — do NOT re-issue \
+         it: a second call would run it twice{verify}.",
         budget::mutate_deadline().as_secs()
     )
 }
@@ -443,8 +443,9 @@ fn still_executing_text(tool: &str) -> String {
 ///
 /// Before this, both `recv_timeout` errors got [`still_executing_text`]: a
 /// caller whose tool had already panicked was made to wait the full
-/// [`budget::MCP_MUTATE_DEADLINE`] and then told the work "WILL complete", of
-/// which every clause is false. #1702 makes that reachable rather than
+/// [`budget::MCP_MUTATE_DEADLINE`] and then told the work would complete — the
+/// wording that message carried before #1702 retracted it — of which every
+/// clause was false. #1702 makes that reachable rather than
 /// theoretical — a re-entrant `lock_safe` on a mutate helper thread now panics
 /// instead of parking, which is the improvement, and this is the answer that
 /// improvement owes its caller.
@@ -552,7 +553,7 @@ pub fn dispatch_bounded(
         // this is where that fact reaches the audit log — a late completion
         // nobody can see is indistinguishable from one that never happened,
         // which is the state an operator would have to guess about after
-        // reading the caller's "it WILL complete".
+        // reading the caller's "it is still running".
         //
         // Two things this is NOT, stated because the obvious reading of the
         // sentence above is wrong in both directions (#1609 review N8):

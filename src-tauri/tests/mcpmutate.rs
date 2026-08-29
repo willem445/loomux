@@ -70,7 +70,7 @@ fn a_slow_mutating_tool_is_told_it_is_running_and_not_to_re_issue() {
     let (text, is_error) = answer(&out);
     assert!(is_error, "a caller must be able to see this is not the tool's answer");
     assert!(text.contains("still executing"), "{text}");
-    assert!(text.contains("Do NOT re-issue it"), "the anti-double-execution half: {text}");
+    assert!(text.contains("do NOT re-issue it"), "the anti-double-execution half: {text}");
     assert!(text.contains("run it twice"), "and its reason: {text}");
     assert!(
         !text.contains("WILL complete"),
