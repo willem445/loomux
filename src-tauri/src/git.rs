@@ -20,8 +20,8 @@ use std::process::Command;
 /// network share) or, for fetch/push/pull, an entire remote round trip — which
 /// is unbounded. So each is a thin `async fn` wrapper that hands the real work
 /// — still a plain, directly unit-testable `*_sync` function — to a
-/// blocking-pool thread via `tauri::async_runtime::spawn_blocking` and awaits
-/// it here instead.
+/// blocking-pool thread via `blocking::spawn_counted` (#1601 Phase 0.3 routed
+/// every hand-off through that one counted door) and awaits it here instead.
 ///
 /// #399 converted only the pane's open/refresh path; #726 finished the module,
 /// and the `every_tauri_command_in_this_module_is_async_and_delegates` test
@@ -107,7 +107,7 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    match tauri::async_runtime::spawn_blocking(f).await {
+    match crate::blocking::spawn_counted(f).await {
         Ok(result) => result,
         Err(e) => Err(format!("git task panicked: {e}")),
     }

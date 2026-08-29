@@ -49,7 +49,7 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    match tauri::async_runtime::spawn_blocking(f).await {
+    match crate::blocking::spawn_counted(f).await {
         Ok(result) => result,
         Err(e) => Err(format!("gh task panicked: {e}")),
     }
