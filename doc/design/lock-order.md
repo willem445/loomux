@@ -38,13 +38,21 @@ as invisible:
 gives a lock its rank; plain `new` leaves it unranked. Every acquisition path
 consults a **per-thread stack of held locks** before it can block:
 
-| what the checker sees | what it does |
-| --- | --- |
-| this exact lock is already on this thread's stack | **re-entrant**: `Err(Busy)` with `BusyKind::Reentrant` from `lock_within`; a debug panic from `lock_safe` |
-| the rank being taken is *strictly below* the innermost rank held | **inversion**: debug panic naming both locks and both sites; in release a `lock-order-violation` finding, then acquire anyway |
-| equal ranks | allowed — see §3 |
-| the lock is unranked and something is held | a `lock-rank-unranked` finding, once per lock; not an error |
-| anything else | nothing |
+| what the checker sees | kind | in an ARMED build (debug, `cargo test`, the E2E lane) | in a SHIPPED build (release) |
+| --- | --- | --- | --- |
+| this exact lock is already on this thread's stack | **re-entrant** | panic naming both locks and both sites | **refused, never taken.** `Err(Busy)` with `BusyKind::Reentrant` from `lock_within`; from `lock_safe`, an unwind — to the `read_budget` frame if there is one, else a panic (§2.1) |
+| the rank being taken is *strictly below* the innermost rank held | **inversion** | panic naming both locks and both sites | a `lock-order-violation` finding, then **acquire anyway** (§2.1) |
+| equal ranks | not a violation | allowed — see §3 | allowed |
+| the lock is unranked and something is held | a missing table row | a `lock-rank-unranked` finding, once per lock; not an error | same |
+| anything else | — | nothing | nothing |
+
+**The two kinds get different release answers, and that is the point of the
+column rather than an inconsistency.** The shipped behaviour is decided per
+detected KIND, not by one switch read at one place: `LOCK_ORDER_PANICS` chooses
+the *shape* of the report, and what a violation does about the acquisition in
+front of it is chosen by which violation it is. §2.1 is the argument; §6 is why
+the earlier single-switch version of it was right for one kind and wrong for the
+other.
 
 The check is per-thread and **needs no second thread to fire**. That is the
 whole reason it finds what a soak test cannot: it does not need the race to
@@ -65,15 +73,63 @@ for the whole program) rather than a borrowed name from a `LockState` that may
 have been dropped. The site is the more useful half anyway — it is the line to
 go and read.
 
-### Fail open in release, and why that is not timidity
+### 2.1 An inversion fails open. A re-entrant acquisition is refused.
 
-A shipped build records the finding and then does exactly what it would have
-done anyway. The deadlock risk is already in the shipped binary; refusing the
-acquisition would convert a *possible* hang into a *certain* crash on a path
-nobody has proven wrong, and the crash trail is the thing this whole epic exists
-to produce. `set_lock_order_panics` makes that path reachable from a test, which
-is why `a_release_build_stamps_the_violation_and_carries_on` exists — a
-fail-open path nobody has executed is a fail-open path nobody has checked.
+The two verdicts got the same answer in 3a and it was wrong for one of them
+(#1702). They are different facts:
+
+- an **inversion** is a *possible* deadlock. It needs a second thread to take
+  the same two locks the other way round, at the same moment. Nothing hangs
+  until that happens, and it may never happen on the path in front of you;
+- a **re-entrant acquire** on a non-reentrant mutex is a *certain* deadlock. It
+  needs nothing and nobody: the thread that reaches it parks permanently, every
+  time.
+
+So an inversion still fails open, and it is not timidity. A shipped build
+records the finding and then does exactly what it would have done anyway;
+refusing would convert that possibility into a certain crash on a path nobody
+has proven wrong, and the crash trail is the thing this whole epic exists to
+produce. `set_lock_order_panics` makes that path reachable from a test, which is
+why `a_release_build_stamps_an_inversion_and_carries_on` exists — a fail-open
+path nobody has executed is a fail-open path nobody has checked.
+
+The re-entrant half used to ride the same argument, and #1702 is that path
+proven wrong in the field: `attention_tick` held `agents` across a call chain
+that re-took `agents`, and four betas in a row shipped a hang whose whole
+evidence was a human saying "it froze". Applied there, the fail-open sentence
+reads "refusing would convert a certain hang into a certain crash" — which is a
+trade with no upside, because the crash releases the registry and the hang does
+not. **The requirement is therefore that a re-entrant `lock_safe` can never
+block forever in a shipped build**, and `lock_safe` never reaches `inner.lock()`
+on a lock this thread already holds.
+
+`lock_safe` returns a guard, so the refusal is an unwind. Which unwind depends
+on what the caller has:
+
+| where the caller is | what happens |
+| --- | --- |
+| any build with the panic armed (debug, `cargo test`, the E2E lane) | panic naming both locks and both sites — the one mechanism that turns this class into a CI failure, so it is not softened by whether a budget frame happens to be installed |
+| under a `read_budget` frame, panic off | `budget::unwind_to_frame` with the `BusyKind::Reentrant` `Busy`. The frame's owner already renders it: an MCP `isError`, a `partial` snapshot section, a command's empty degrade |
+| no frame, panic off (a tick body under `tick_gate`'s `MutationScope`, an MCP mutate helper thread, a `run_blocking` body) | the same panic. `obs`'s hook writes a crash log naming both sites, and the unwind drops every guard — so the registry is **released**, which is the whole point |
+
+Two consequences are paid for rather than waved at.
+
+**It unwinds a SEALED frame** — the one narrowing of `lock-liveness.md` §4.1,
+argued there.
+
+**The crash log in the no-frame case is written while the outer lock is still
+held**, because the panic hook runs before the unwind starts. That is the one
+file write this module otherwise forbids on a lock-holding thread (§2, *What it
+costs*). It is accepted here and nowhere else: a one-shot defect report on a
+thread that is already leaving, whose alternative is a hang with no artifact at
+all, and whose waiters are released by the unwind immediately after it.
+
+**And the panic is bounded where it can repeat.** A cadenced tick that reaches a
+re-entrant acquire reaches it every tick, and nothing prunes crash logs — so
+supervision (`obs::TickSupervisor`, `TICK_PANIC_LIMIT`) stops calling a body
+that has panicked three times running, and says so in a `tick-disabled`
+breadcrumb. The transient case now recovers where it used to kill the thread;
+the deterministic case degrades to what it did before, named.
 
 ### What it costs
 
@@ -129,7 +185,15 @@ So the rule is split:
   noticing that a field has quietly gone unranked (#1610 review B1). It checks
   the converse too — no live lock may carry a rank `ALL` does not know — because
   a rank written inline at a construction site is invisible to the distinctness
-  row, and two locks sharing a rank nest freely in *both* directions;
+  row, and two locks sharing a rank nest freely in *both* directions.
+  **That converse direction reads the LIVE registry, so it can only see locks
+  that have been constructed** (#1698 review residual): the registry's fields
+  are all built by the time the test builds an `OrchRegistry`, but the
+  dynamically-created ones are not — `usage_memo_cell` and the per-pane
+  `delivery` locks come into existence when their group or pane does. A future
+  ranked lock built lazily is therefore invisible to this row until the test
+  forces its construction, and the fix when one is added is to force it there
+  rather than to widen the scan;
 - **equal ranks nest freely** — they can only be the same field twice;
 - **re-entrancy is decided on the lock's identity**, the id `lockwatch` mints
   per lock, which is strictly what the epic's case is about and also catches it
@@ -256,5 +320,27 @@ That is the channel this section fills from next.
   runtime instrument: it reports the orders that actually happened. The suite is
   what exercises them, and the release-mode breadcrumb is what covers everything
   the suite does not — which is the same bound the plan states for L5c.
-- **It does not stop a deadlock.** In release it reports one and gets out of the
-  way (§2). What it removes is the case where a hang left no evidence at all.
+- **It does not stop an INVERSION deadlock.** In release it reports one and gets
+  out of the way (§2.1). What it removes there is the case where a hang left no
+  evidence at all. It *does* stop a re-entrant one, in every build — that is
+  #1702, and the difference between the two is §2.1's whole subject.
+
+  **Why the earlier version of this bullet was half wrong.** 3a shipped one
+  fail-open decision, taken once, at one switch, and applied to whatever
+  verdict happened to arrive there. The sentence justifying it — *"refusing
+  would convert a possible hang into a certain crash on a path nobody has
+  proven wrong"* — is a good argument, and every clause of it is a claim about
+  an **inversion**: *possible* (it needs a second thread), and *nobody has
+  proven wrong* (no field report named one). Neither clause survives being
+  carried over to a re-entrant acquire, which is certain rather than possible
+  and which #1702 had already proven wrong in the field. The defect was not the
+  argument; it was that one switch executed it for two kinds while only one had
+  been argued. So the fail-open decision is now argued **per kind** and executed
+  per kind — that is what §2's table has a kind column for, and what makes the
+  two release cells legitimately different rather than inconsistent.
+- **It does not make a refused re-entrant caller's work happen.** The refusal
+  buys liveness, not correctness: the tick that was going to deadlock now
+  panics, so its pass produces nothing and its badges hold their last value
+  until the underlying re-entrancy is fixed (for `attention_tick`, that is
+  #1702's own point fix). A registry that answers is strictly better than one
+  that does not, and it is not the same thing as a registry that is right.
