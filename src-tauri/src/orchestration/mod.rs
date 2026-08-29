@@ -38966,6 +38966,7 @@ impl OrchRegistry {
         // the truth rather than a gap — the same `unwrap_or_default` the old
         // in-loop expression had, kept here so an agent with a tail and no pty
         // is still masked against an empty record rather than skipped.
+        #[allow(unused_variables)]
         let prompt_shaped: HashMap<String, bool> = roster
             .iter()
             .filter(|a| a.status == AgentStatus::Running)
@@ -39003,6 +39004,8 @@ impl OrchRegistry {
         // in this phase at all any more (#1702), and describing an order that
         // no longer exists is how the next reader re-creates it.
         let mut question_held = self.attn_question_held.lock_safe();
+        // [scratch] main's nesting, restored: the guard spans the whole loop.
+        let _agents_held = self.agents.lock_safe();
         let mut out = Vec::new();
         for a in &roster {
             if a.status != AgentStatus::Running {
@@ -39049,7 +39052,23 @@ impl OrchRegistry {
                 // #1702: computed in phase 2, off every lock. `unwrap_or(false)`
                 // is the same default the in-loop expression had — no entry
                 // means this agent had no tail this tick.
-                && prompt_shaped.get(&a.id).copied().unwrap_or(false);
+                // [scratch] main's in-loop mask, with the pty->session
+                // resolution main performed inside delivered_mask_lines.
+                && tails
+                    .get(&a.id)
+                    .map(|t| {
+                        let delivered = a
+                            .pty_id
+                            .map(|p| {
+                                self.delivered_mask_lines(
+                                    p,
+                                    self.session_for_pty(p).as_deref(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
+                    })
+                    .unwrap_or(false);
 
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if question_held.contains(a.id.as_str()) {
