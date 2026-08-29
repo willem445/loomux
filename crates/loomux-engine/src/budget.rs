@@ -419,7 +419,7 @@ pub fn note_durable_write(what: &str) {
     // Recorded FIRST and unconditionally: a frame that wrote is a frame a
     // tear can be measured against, whether or not it was already exempt.
     WROTE.with(|w| w.set(true));
-    if SEALED.with(|s| s.replace(true)) || in_mutation() {
+    if SEALED.with(|s| s.get()) || in_mutation() {
         return; // already sealed, or a declared mutation: nothing to report.
     }
     THREAD_SEALS.with(|c| {
