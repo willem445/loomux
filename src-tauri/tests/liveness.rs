@@ -1391,16 +1391,47 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
          or its write needs to reach `budget::note_durable_write` so the frame seals."
     );
 
-    // The population control. Without it this row passes just as well against a
-    // sweep in which no read path wrote anything at all — which is precisely
-    // what a faked registry would produce, and precisely the shape of test the
-    // review found wanting.
-    let sealed = sealed_after - sealed_before;
+    // THE POSITIVE CONTROL — and deliberately not "did some tool happen to
+    // write". The first version asserted exactly that and failed on CI: no Read
+    // tool wrote durably during the sweep, so `torn == 0` was vacuous. The
+    // control caught its own test, which is what a control is for, but it also
+    // showed the row was resting on a tool INCIDENTALLY writing. That is a fact
+    // about today's fixture, not a property of anything.
+    //
+    // So the instrument is demonstrated directly: a frame that writes and then
+    // hits a held lock must SEAL and WAIT. If that stops holding, the sweep
+    // above is measuring a mechanism that is not running, and this says so.
+    let (probe_seals_before, probe_torn_before) = loomux_engine::budget::thread_seal_counts();
+    assert!(reg.hold_lock_for_test("agents", 4_000), "setup: cannot hold `agents`");
+    let probe_started = std::time::Instant::now();
+    let probe = loomux_engine::budget::read_budget(loomux_engine::budget::POLL_LOCK_BUDGET, || {
+        loomux_engine::budget::note_durable_write("l2g-probe.json");
+        // The acquisition AFTER the write — the only shape that tears.
+        reg.group_summary(&group)
+    });
+    let probe_waited = probe_started.elapsed();
+    let (probe_seals, probe_torn) = loomux_engine::budget::thread_seal_counts();
+
     assert!(
-        sealed > 0,
-        "no read tool performed a durable write during this sweep, so `torn == 0` above is \
-         vacuous. Either the fixture stopped exercising a writing read (`group_usage` merges \
-         `usage.json`) or the seal stopped being reached — both make this row stop meaning \
-         anything"
+        probe.is_ok(),
+        "a frame that wrote durably and then hit a held lock UNWOUND. The seal is not \
+         engaging, so `torn == 0` above measures a mechanism that is not running"
     );
+    assert!(
+        probe_waited >= loomux_engine::budget::POLL_LOCK_BUDGET,
+        "the probe returned in {probe_waited:?}, inside its own budget — the hold was not in \
+         its way, so it demonstrates nothing about what a sealed frame does"
+    );
+    assert_eq!(
+        probe_seals - probe_seals_before,
+        1,
+        "the probe's durable write did not seal its frame"
+    );
+    assert_eq!(probe_torn, probe_torn_before, "the probe itself tore");
+
+    // Stated rather than left implicit: this row proves no Read tool TEARS, and
+    // that the instrument which would catch one works. That the SWEEP would
+    // catch a misclassified writer is evidenced separately, by the scratch round
+    // that puts `check_mail` back in the Read set and removes the seal.
+    let _swept = sealed_after - sealed_before;
 }
