@@ -150,6 +150,18 @@ adds a `MutationScope` so a budget TIMEOUT still waits, unbounded, exactly as R1
 requires — only the re-entrant refusal unwinds, because it is the one wait that
 never ends.
 
+**The barrier holds in a SHIPPED build, and deliberately not in an armed one.**
+`refuse_reentrant` reads `LOCK_ORDER_PANICS` *first*: only the disarmed path
+reaches `budget::remaining()` and `unwind_to_frame`. In an armed build — debug,
+`cargo test`, and the E2E lane, which builds with `debug_assertions` — the
+refusal is a plain `panic!`, and `read_budget` resumes any payload that is not
+its own `BudgetTimeout`, so it passes straight through the frame, reaches the
+COM boundary and aborts. That is the intended asymmetry rather than a hole in
+it: an abort in the E2E lane is a loud CI failure, which is the whole point of
+arming the panic, and a shipped build is the one that must degrade instead. Said
+here because the sentence above reads unconditional, and a reader could
+otherwise conclude the E2E lane is protected (#1713 review N6).
+
 **It is a class, so it is guarded as one.** `src-tauri/tests/synccommands.rs`
 scans every synchronous `#[tauri::command]` in the module and default-denies:
 each must either take no `OrchRegistry` at all (structurally unable to reach a

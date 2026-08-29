@@ -1416,6 +1416,14 @@ into `logs/` under your orrerix data directory at the same moment; that file,
 with `logs/breadcrumbs.log`, is what to send. Nothing else stops: the rest of
 orrerix keeps answering, and the agent can carry on with the next thing.
 
+**When a panel says orrerix "refused that to avoid deadlocking itself".** The
+same class of internal bug, reached from a button rather than from an agent.
+The action you clicked did not run, it may have partly applied, and the rest of
+the app keeps working — so check whatever you were changing before clicking
+again. This one writes no crash log (nothing crashed; orrerix stopped itself on
+purpose), so `logs/breadcrumbs.log` is the file to send. It should never
+appear; if it does, that is worth reporting.
+
 From the lifecycle panel you can:
 
 - **Pause** the group — orrerix stops delivering prompts so its agents finish

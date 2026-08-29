@@ -2613,9 +2613,17 @@ mod rank_tests {
 
     #[test]
     fn a_reentrant_acquire_unwinds_a_mutation_scope_to_its_frame() {
-        // The exact configuration `OrchRegistry::mutating_command` builds for a
+        // The configuration `OrchRegistry::mutating_command` builds for a
         // synchronous `#[tauri::command]` (#1713 review B1): a `read_budget`
-        // frame with a `MutationScope` inside it. That pairing is what makes
+        // frame and a `MutationScope`. **Not byte-for-byte the same** — the
+        // helper enters the scope OUTSIDE the frame and this enters it inside
+        // (#1713 review N5). The properties are insensitive to that today,
+        // because `refuse_reentrant` never reads `in_mutation()` or
+        // `unwind_forbidden()` and the unwind originates inside `f` either way;
+        // said plainly rather than claimed identical, since the next person to
+        // make the refusal consult the scope would need to know which is which.
+        // That the helper really installs both is pinned separately, on the
+        // shipped helper, in `src-tauri/tests/synccommands.rs`. That pairing is what makes
         // the GUI-thread fix correct, and it has to hold as a MECHANISM rather
         // than as a claim in a doc comment — on that thread an unwind that
         // escapes the frame reaches a plain `extern "system"` thunk and aborts

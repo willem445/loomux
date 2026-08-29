@@ -44,11 +44,25 @@ fn a_completed_mutating_tool_is_answered_with_its_own_result() {
 }
 
 #[test]
-fn a_slow_mutating_tool_is_still_told_it_will_complete() {
-    // The `Timeout` arm, unchanged by #1702 and pinned here so the new
-    // `Disconnected` arm below is a DIFFERENCE rather than the only behaviour
-    // this seam has. `_tx` is held so the channel is open and empty, which is
-    // what a tool that is genuinely still running looks like.
+fn a_slow_mutating_tool_is_told_it_is_running_and_not_to_re_issue() {
+    // The `Timeout` arm, still a DIFFERENCE from the `Disconnected` arm below
+    // rather than the only behaviour this seam has. `_tx` is held so the
+    // channel is open and empty, which is what a tool that is genuinely still
+    // running looks like.
+    //
+    // **This test used to ENFORCE the claim #1702 retracted** (#1713 review
+    // N7). The at-most-once sweep corrected seven doc surfaces and did not
+    // reach the message itself, so the function's doc said a tool "can now
+    // fail to complete at all" while the string it returned still said "It
+    // WILL complete" — and this assertion held that string in place, which is
+    // CLAUDE.md's "a TEST is one of those surfaces" exactly: correcting the
+    // claim reddens a test whose assertion quotes it, and the pressure is to
+    // revert the fix rather than the pin.
+    //
+    // What survives is the load-bearing half: do NOT re-issue, because a
+    // second call runs a non-idempotent tool twice. That is at-most-once,
+    // which is true. The completion promise is gone, and the negative below
+    // is what stops it coming back.
     let (_tx, rx) = mpsc::channel::<Result<Value, (i64, String)>>();
     let out =
         mcp::await_mutate_result(&rx, "spawn_agent", Duration::from_millis(50), &group(), "w-1")
@@ -56,8 +70,28 @@ fn a_slow_mutating_tool_is_still_told_it_will_complete() {
     let (text, is_error) = answer(&out);
     assert!(is_error, "a caller must be able to see this is not the tool's answer");
     assert!(text.contains("still executing"), "{text}");
-    assert!(text.contains("WILL complete"), "{text}");
+    assert!(text.contains("Do NOT re-issue it"), "the anti-double-execution half: {text}");
+    assert!(text.contains("run it twice"), "and its reason: {text}");
+    assert!(
+        !text.contains("WILL complete"),
+        "the retracted completion promise came back: {text}"
+    );
     assert!(text.contains("list_agents"), "the read tool to verify with: {text}");
+}
+
+#[test]
+fn the_slow_tool_message_is_one_paragraph() {
+    // `still_executing_text` had no shape pin, which is how a `\n` escape got
+    // into it while N7 was being fixed — caught by `od`, not by the suite.
+    // Pinned on the VALUE beside the content, like its died-helper sibling.
+    let (_tx, rx) = mpsc::channel::<Result<Value, (i64, String)>>();
+    let out =
+        mcp::await_mutate_result(&rx, "upsert_task", Duration::from_millis(50), &group(), "w-1")
+            .expect("the busy answer is a tool result");
+    let (text, _) = answer(&out);
+    assert!(!text.contains('\n'), "a user-facing message is one paragraph: {text:?}");
+    assert!(!text.contains("          "), "a source indent leaked into the message: {text:?}");
+    assert!(text.contains("still executing"), "and it is the slow-tool message: {text}");
 }
 
 #[test]

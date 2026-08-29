@@ -42,6 +42,7 @@
 //!   bodies onto the async runtime rather than running them in the COM frame,
 //!   so an unwind there is a task failure and not an abort.
 
+use loomux_lib::orchestration::OrchRegistry;
 use std::path::Path;
 
 /// A command exempt because its signature makes a tracked-lock acquisition
@@ -60,7 +61,15 @@ const NO_REGISTRY: &[(&str, &str)] = &[
 ];
 
 /// The wrappers that install a command-boundary frame.
-const FRAMED: &[&str] = &["read_command", "mutating_command", "run_blocking"];
+///
+/// `run_blocking` is deliberately NOT a row (#1713 review N8). It is an
+/// `async fn`, and this population is async-excluded by construction, so a
+/// synchronous command cannot call it — the row could only ever be satisfied by
+/// that text turning up in a body for some other reason, which is this header's
+/// own stated blind spot pointed at a case that cannot legitimately arise. A
+/// row that can only fire wrongly is a row that widens the exemption silently,
+/// and unlike `NO_REGISTRY` these are not re-checked against anything.
+const FRAMED: &[&str] = &["read_command", "mutating_command"];
 
 struct SyncCommand {
     name: String,
@@ -247,4 +256,64 @@ fn the_refusal_message_is_one_paragraph() {
     // placeholder string.
     assert!(msg.contains("may have partly applied"), "{msg}");
     assert!(msg.contains("breadcrumbs.log"), "{msg}");
+}
+
+#[test]
+fn the_command_boundary_wrappers_really_install_a_frame() {
+    // #1713 review N5. The B1 fix rests on TWO things: every sync command
+    // routes through a wrapper, and the wrapper installs a frame. The scan
+    // above pins the first by matching the wrapper's NAME in the body text,
+    // and says nothing at all about the second.
+    //
+    // The mutation that stayed green without this row: delete the
+    // `budget::read_budget(..)` call from `mutating_command` and call `f()`
+    // directly, keeping the name and the `MutationScope`. The scan still
+    // passes (the name is in every body), every lockwatch re-entrancy row
+    // still passes (they build their own frames, and structurally cannot call
+    // this helper — it lives in `src-tauri` and they live in the engine), and
+    // all five sync mutating commands are back to aborting the process on a
+    // re-entrant acquire — which is the exact defect B1 was.
+    //
+    // So this asks the SHIPPED helper what it installed, rather than a
+    // re-implementation of it.
+    use loomux_engine::budget::{budget_active_for_test, mutation_depth_for_test};
+
+    // Discriminating half, first: outside any wrapper there is no frame and no
+    // scope. Without it, "a frame is installed" below would be a statement
+    // about the ambient state of the test thread rather than about the helper.
+    assert!(!budget_active_for_test(), "the test thread starts with no budget frame");
+    assert_eq!(mutation_depth_for_test(), 0, "and no mutation scope");
+
+    let (framed, depth) = OrchRegistry::mutating_command(
+        "frame_probe",
+        || (false, 0),
+        || (budget_active_for_test(), mutation_depth_for_test()),
+    );
+    assert!(
+        framed,
+        "mutating_command must install a read_budget frame — that frame's own catch_unwind is \
+         the barrier keeping a re-entrant refusal off the COM boundary, and without it every \
+         sync mutating command aborts the process instead of degrading"
+    );
+    assert!(
+        depth > 0,
+        "…and a MutationScope, so a budget TIMEOUT still waits unbounded (rider R1) while only \
+         the re-entrant refusal unwinds"
+    );
+
+    let (framed, depth) = OrchRegistry::read_command(
+        "frame_probe",
+        || (false, 0),
+        || (budget_active_for_test(), mutation_depth_for_test()),
+    );
+    assert!(framed, "read_command must install a frame too — two sync commands rely on it");
+    assert_eq!(
+        depth, 0,
+        "a READ command must NOT enter a mutation scope; that is the whole difference between \
+         the two wrappers, and a test that let both pass would not distinguish them"
+    );
+
+    // Neither may leak past its own call.
+    assert!(!budget_active_for_test(), "the frame must not outlive the wrapper");
+    assert_eq!(mutation_depth_for_test(), 0, "nor the scope");
 }

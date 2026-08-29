@@ -432,7 +432,8 @@ fn still_executing_text(tool: &str) -> String {
         None => " — verify before re-issuing".to_string(),
     };
     format!(
-        "`{tool}` is still executing after {} s{waiting}. It WILL complete; do NOT re-issue it{verify}.",
+        "`{tool}` is still executing after {} s{waiting}. Do NOT re-issue it: it is still \
+         running, and a second call would run it twice{verify}.",
         budget::mutate_deadline().as_secs()
     )
 }

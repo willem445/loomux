@@ -288,8 +288,17 @@ caller gets:
 
 ```
 <tool> is still executing after 30 s (waiting on `agents`, held 47 s by …).
-It WILL complete; do NOT re-issue — verify with <read tool> first.
+Do NOT re-issue it: it is still running, and a second call would run it twice
+— verify with <read tool> first.
 ```
+
+That message used to end *"It WILL complete; do NOT re-issue"*. The completion
+half is gone (#1702): a re-entrant `lock_safe` panics the helper thread rather
+than parking it, so a mutating tool can end without a result, and the sentence
+an agent actually reads was the last surviving instance of the claim the
+at-most-once correction retracted everywhere else. What it kept is the half that
+is still true and still load-bearing — do not re-issue, because a second call
+runs a non-idempotent tool twice.
 
 The late completion is audited with `late: true`. The rejected alternative was a
 deadline around the body with the late result discarded, which produces **double

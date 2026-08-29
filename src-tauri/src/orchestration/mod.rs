@@ -32071,7 +32071,8 @@ impl OrchRegistry {
     /// the module-level `#[tauri::command]` functions, which have moved `reg`
     /// into the closure and have no receiver — so the call spells
     /// `OrchRegistry::read_command(..)`.
-    fn read_command<T>(
+    #[doc(hidden)]
+    pub fn read_command<T>(
         name: &'static str,
         on_busy: impl FnOnce() -> T,
         f: impl FnOnce() -> T,
@@ -32122,7 +32123,8 @@ impl OrchRegistry {
     /// that still reaches the boundary and still aborts, exactly as it did
     /// before #1702 — the pre-existing hazard, tracked on #1717. What this
     /// contains is the one unwind this epic introduced.
-    fn mutating_command<T>(
+    #[doc(hidden)]
+    pub fn mutating_command<T>(
         name: &'static str,
         on_refused: impl FnOnce() -> T,
         f: impl FnOnce() -> T,
@@ -51464,6 +51466,21 @@ fn reg_of(app: &AppHandle) -> Arc<OrchRegistry> {
     app.state::<Arc<OrchRegistry>>().inner().clone()
 }
 
+/// What a synchronous command's caller is told when its body was refused
+/// rather than run (#1702) — see [`OrchRegistry::mutating_command`].
+///
+/// **One paragraph, and it promises only what this path delivers.** It does not
+/// say "nothing was applied": the refusal fires at an acquisition, and the body
+/// may have completed earlier work before reaching it, so the honest word is
+/// "may". It does not point at a crash log either — this unwind goes through
+/// `budget::unwind_to_frame`, which is a `resume_unwind` and runs no panic
+/// hook, so no crash log exists. What does exist is the breadcrumb this helper
+/// writes and the `lock-reentrant` finding the watchdog composes beside it.
+pub const COMMAND_REFUSED: &str = "loomux refused that to avoid deadlocking itself — an internal lock \
+                              was already held by the same operation. It may have partly applied, \
+                              so check before retrying; logs/breadcrumbs.log under your orrerix \
+                              data directory names the fault.";
+
 /// **The trust boundary** (#904): where a group id stops being a string the
 /// caller chose and becomes a [`GroupId`] the backend has checked.
 ///
@@ -51520,21 +51537,6 @@ fn reg_of(app: &AppHandle) -> Arc<OrchRegistry> {
 /// None of this is reachable from today's webview, which only ever sends ids the
 /// backend minted. It is reachable from the caller this whole change exists for
 /// — #888's remote client — which is why it is fixed now rather than filed.
-/// What a synchronous command's caller is told when its body was refused
-/// rather than run (#1702) — see [`OrchRegistry::mutating_command`].
-///
-/// **One paragraph, and it promises only what this path delivers.** It does not
-/// say "nothing was applied": the refusal fires at an acquisition, and the body
-/// may have completed earlier work before reaching it, so the honest word is
-/// "may". It does not point at a crash log either — this unwind goes through
-/// `budget::unwind_to_frame`, which is a `resume_unwind` and runs no panic
-/// hook, so no crash log exists. What does exist is the breadcrumb this helper
-/// writes and the `lock-reentrant` finding the watchdog composes beside it.
-pub const COMMAND_REFUSED: &str = "loomux refused that to avoid deadlocking itself — an internal lock \
-                              was already held by the same operation. It may have partly applied, \
-                              so check before retrying; logs/breadcrumbs.log under your orrerix \
-                              data directory names the fault.";
-
 fn command_group(raw: &str) -> Result<GroupId, String> {
     GroupId::parse(raw).map_err(|e| format!("invalid group id: {e}"))
 }
