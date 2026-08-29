@@ -1362,8 +1362,13 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
         reads.len()
     );
 
-    let torn_before = loomux_engine::budget::torn_writes();
-    let sealed_before = loomux_engine::budget::sealed_frames();
+    // PER-THREAD counts, not the process-global ones. `cargo test` runs this
+    // binary's tests concurrently, so a delta on a global counter is a race:
+    // a sibling test's seal would satisfy the population control below while
+    // this sweep sealed nothing, which is the exact vacuity it exists to stop.
+    // Every Read tool runs INLINE on this thread (only Mutate tools go to the
+    // helper thread), so the per-thread counters see the whole sweep.
+    let (sealed_before, torn_before) = loomux_engine::budget::thread_seal_counts();
 
     // Held for the whole sweep: `app` is taken after `write_mailbox`'s durable
     // replace, and by `agent_output_totals` / `attention_inputs` in the app.
@@ -1376,7 +1381,8 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
         let _ = mcp::dispatch(&reg, &caller, "tools/call", &call);
     }
 
-    let torn = loomux_engine::budget::torn_writes() - torn_before;
+    let (sealed_after, torn_after) = loomux_engine::budget::thread_seal_counts();
+    let torn = torn_after - torn_before;
     assert_eq!(
         torn, 0,
         "{torn} read-tool frame(s) unwound AFTER performing a durable write. That is the \
@@ -1389,7 +1395,7 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     // sweep in which no read path wrote anything at all — which is precisely
     // what a faked registry would produce, and precisely the shape of test the
     // review found wanting.
-    let sealed = loomux_engine::budget::sealed_frames() - sealed_before;
+    let sealed = sealed_after - sealed_before;
     assert!(
         sealed > 0,
         "no read tool performed a durable write during this sweep, so `torn == 0` above is \
