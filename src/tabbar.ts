@@ -12,7 +12,8 @@ import { safeStyleDeclarations, compositeScale, type PreviewNode, type PreviewFi
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
-import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
+import { pauseGroup, resumeGroup, stripView } from "./orchestration";
+import { staleState, type StaleState } from "./viewstale";
 import { tabCounts } from "./tabcounts";
 import { PollGate } from "./pollgate";
 import { SingleFlight } from "./singleflight";
@@ -89,6 +90,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
    *  site #1595 found late. This strip is a per-app singleton, so one
    *  instance already scopes the gate to "this poll site", never global. */
   private statusFlight = new SingleFlight();
+  /** What the strip's last published read said about its own freshness
+   *  (#1608). Strip-wide rather than per-tab because the publisher computes
+   *  every group in one pass: when it is behind, it is behind on all of them,
+   *  and a per-tab badge would claim a distinction that does not exist. */
+  private stripStale: StaleState = { stale: false, label: "", detail: "" };
   /** The tab whose close is armed for a two-step confirm (destructive close of a
    *  group-owning tab), and its auto-disarm timer. Mirrors the group view's
    *  "End orchestration" arm/confirm (groupview.ts) so ending a project's agents
@@ -319,6 +325,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         const cost = st?.cost != null ? ` · $${st.cost.toFixed(2)}` : "";
         status.textContent = `✦${counts.agents}${cost}`;
         status.title = `${counts.agents} live agent(s)${cost ? `, ${cost.slice(3)} so far` : ""}`;
+        this.markStale(status);
         tab.appendChild(status);
       } else if (st?.cost != null && (groupId || counts.dormantOrch)) {
         // No live agents, but the group's accrued cost is still worth showing —
@@ -327,6 +334,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         status.className = "tab-status";
         status.textContent = `$${st.cost.toFixed(2)}`;
         status.title = `$${st.cost.toFixed(2)} accrued (no live agents)`;
+        this.markStale(status);
         tab.appendChild(status);
       }
       // Orchestration marker: a live icon when a group is running in this tab, or
@@ -532,6 +540,16 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     window.addEventListener("keydown", onKey, true);
   }
 
+  /** Annotate a tab's status chip when the published strip is stale
+   *  (#1608, #1604 review N3). A class rather than a second element, so the
+   *  disclosure costs no layout and cannot push a tab wider; the age goes in
+   *  the tooltip, where a human who wants to know how bad it is will look. */
+  private markStale(status: HTMLElement): void {
+    if (!this.stripStale.stale) return;
+    status.classList.add("stale");
+    status.title = `${status.title} — ${this.stripStale.label} ${this.stripStale.detail}`;
+  }
+
   /** Poll each group-bound tab for its live status; re-render if anything
    *  moved. Single-flighted through `statusFlight` (#1602): a tick that
    *  fires while the previous sweep hasn't settled skips rather than issuing
@@ -543,29 +561,51 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private async pollStatusOnce(): Promise<void> {
     let changed = false;
     const seen = new Set<string>();
+
+    // ONE read for the WHOLE strip (#1608, plan #1600 §3 Phase 1). This used
+    // to be `groupSummary` + `groupUsage` per group-bound tab, awaited in
+    // turn — so a strip with five bound tabs made ten registry-locking calls
+    // every 4 s, and the fan-out grew with the human's tab count. The backend
+    // publishes one snapshot on a cadence and serves it by pointer clone, so
+    // the cost here is O(1) in tabs and the call cannot park.
+    let strip;
+    try {
+      strip = await stripView();
+    } catch {
+      // The backend is not answering this tick. Keep every badge exactly as it
+      // is — a stale-but-true count beats a fabricated zero — and let the next
+      // tick try again. Same rule the per-command version applied per group.
+      return;
+    }
+    // The strip's freshness is the OLDEST group's, so this says "nothing on
+    // this strip is older than that" (#1604 review N3: a single-flighted poll
+    // whose call never settles used to freeze these badges with nothing said).
+    const stale = staleState(strip.meta);
+    if (stale.label !== this.stripStale.label || stale.stale !== this.stripStale.stale) {
+      this.stripStale = stale;
+      changed = true;
+    }
+
     for (const ws of this.tabs.tabs) {
       const groupId = this.tabs.groupForWorkspace(ws.id);
       if (!groupId) continue;
       seen.add(ws.id);
-      try {
-        const [summary, usage] = await Promise.all([groupSummary(groupId), groupUsage(groupId)]);
-        // #904: the backend answers `null` if it refuses the group id. A tab
-        // badge has no way to say "unknown", and a stale-but-true count beats
-        // a fabricated zero — so leave the previous status in place rather
-        // than writing one built from a refusal.
-        if (!summary || !usage) continue;
-        const next: TabStatus = {
-          agents: summary.live_agents,
-          cost: usage.live_cost_usd,
-          paused: summary.paused,
-        };
-        const prev = this.status.get(ws.id);
-        if (!prev || prev.agents !== next.agents || prev.cost !== next.cost || prev.paused !== next.paused) {
-          this.status.set(ws.id, next);
-          changed = true;
-        }
-      } catch {
-        /* a group not yet known to the backend — skip this tick */
+      const g = strip.groups[groupId];
+      // #904: the backend answers `null` for a group it refuses, and omits one
+      // created since the last publish pass. A tab badge has no way to say
+      // "unknown", and a stale-but-true count beats a fabricated zero — so
+      // leave the previous status in place rather than writing one built from
+      // a refusal.
+      if (!g || !g.summary || !g.usage) continue;
+      const next: TabStatus = {
+        agents: g.summary.live_agents,
+        cost: g.usage.live_cost_usd,
+        paused: g.summary.paused,
+      };
+      const prev = this.status.get(ws.id);
+      if (!prev || prev.agents !== next.agents || prev.cost !== next.cost || prev.paused !== next.paused) {
+        this.status.set(ws.id, next);
+        changed = true;
       }
     }
     // Drop status for tabs that lost their group / closed.

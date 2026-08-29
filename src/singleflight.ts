@@ -37,18 +37,28 @@
 // could hurt; reach for `RefreshGate` (skip + exactly one trailing rerun)
 // when it might.
 //
-// THE COST THIS BUYS LIVENESS AT (PR #1604 review N3, deferred to Phase 1
-// of the plan). If a call this gate guards never settles — the stuck-lock
-// case it exists for — the gate never clears, and the tab strip keeps
-// showing that tab's last-known status forever: no badge, no timestamp, no
-// toast. The only visible evidence is `__singleFlightStats()` in devtools,
-// which is cumulative and module-global, not "which tab is stuck". That is
-// the deliberate trade this phase makes: liveness (the pool cannot exhaust)
-// over staleness disclosure. EPIC #1600's Phase 1 (a snapshot publisher for
-// polled reads) is what turns a frozen panel into "a stale panel — visible,
-// bounded, recoverable" (§3); it is not attempted here, and a stale-badge
-// on top of this gate is deliberately out of scope until Phase 1 owns the
-// staleness contract a badge would need to be honest about.
+// THE COST THIS BOUGHT LIVENESS AT, AND WHERE IT WENT (PR #1604 review N3,
+// closed by Phase 1 of the plan). If a call an overlap gate guards never
+// settles — the stuck-lock case these gates exist for — the gate never clears
+// and the surface behind it keeps rendering its last payload. That was true of
+// BOTH #1604 poll sites, not just this one: the tab strip through this class,
+// and the group view through `refreshgate.ts`'s `RefreshGate` — a frozen panel
+// and a frozen badge row, neither of which said so. The only evidence either
+// way was `__singleFlightStats()` in devtools, which is cumulative and
+// module-global, not "which surface is stuck".
+//
+// #1608 removes the cause and discloses the remainder. A polled read now serves
+// a PUBLISHED snapshot (`orch_group_view` / `orch_strip_view`) by pointer
+// clone, taking no registry lock, so it cannot be the call that never settles;
+// and when the publisher itself is behind, the payload carries its own age and
+// `src/viewstale.ts` renders a stale badge on BOTH surfaces — the group view's
+// header and the tab strip's status chips. A gate that skips is therefore no
+// longer a gate that hides: what it skips is a call that would have returned
+// the same snapshot the last one did.
+//
+// A skip is still invisible on any surface NOT served from a published
+// snapshot, so a future poll site guarded by this class owes its own staleness
+// answer — the badge is a property of the payload, not of the gate.
 //
 // SCOPED PER SITE, NEVER GLOBAL. Each poll site owns its own `SingleFlight`
 // instance, held as a private field the same way `PollGate` is. A
