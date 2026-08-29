@@ -17,9 +17,10 @@ argument that abandoning a read path partway through cannot corrupt anything.
 
 ## 1. What was unbounded, and what a bound buys
 
-`obs::LockExt::lock_safe` — and `TrackedMutex::lock_safe` after Phase 0's type
-swap — is `Mutex::lock` with poison recovery. It has no timeout and no try-lock,
-so **a caller's cost is set by a lock's worst holder, not by its own body.**
+`lock_safe` is an infallible acquire: it returns a guard, so it has nowhere to
+report a refusal and can only wait. Until #1609 there was no timed form of it
+anywhere in the tree, so **a caller's cost was set by a lock's worst holder,
+not by its own body.**
 That is `performance.md` §1's resource 4, and it is the one every remedy of the
 last three betas moved a victim of without removing.
 
@@ -135,7 +136,7 @@ is a policy nobody can review as a whole.
 | constant | value | paid by | on expiry |
 | --- | --- | --- | --- |
 | `POLL_LOCK_BUDGET` | 1 s | each publisher section | keep the previous value, set `meta.partial` |
-| `TICK_LOCK_BUDGET` | 5 s | a cadenced loop's entry acquisition | skip the tick, breadcrumb once |
+| `TICK_LOCK_BUDGET` | 5 s | a cadenced loop's gate probe | skip the tick, breadcrumb once |
 | `MCP_AUTH_BUDGET` | 5 s | every MCP request, before dispatch | JSON-RPC `-32001`, retryable |
 | `MCP_READ_BUDGET` | 15 s | a read-only MCP tool | `isError` result, nothing executed |
 | `MCP_MUTATE_DEADLINE` | 30 s | the handler's WAIT for a mutating tool | "still executing", do not re-issue |
@@ -144,9 +145,32 @@ is a policy nobody can review as a whole.
 The shape of the reasoning is the same in each case: the budget is set by **what
 the caller does with the answer**, never by how long the work "should" take.
 
+### The tick gate probes, rather than bounding "the entry acquisition"
+
+The plan says to bound each cadenced tick's own entry acquisition. That is not
+a usable instruction here, and `OrchRegistry::tick_gate` deviates from it
+deliberately: three of these ticks enter through
+`agent_output_totals`/`attention_inputs`, whose first acquisition is `app` — a
+trivial cell that says nothing about whether the registry is wedged — and then
+park on `agents` two frames down. Bounding the lexically-first lock would give
+a gate that passes and a tick that parks anyway.
+
+So the gate probes `agents` and `groups`, the registry's two core maps, and
+releases them at once. It is not mutual exclusion: the question is "can the
+registry serve anyone right now", not "may I have this lock".
+
+What it buys is that a cadenced loop does not ADD a parked thread to an
+already-wedged registry — the accumulation half of §1.2. What it does not buy
+is a bound on a tick that wedges midway: that tick waits, because its body
+mutates, and Phase 0's watchdog is what reports it.
+
 `POLL_LOCK_BUDGET` is 1 s because the publisher's own cadence is the recovery — a
 section that misses this pass is retried next pass, and waiting longer buys a
-fresher number at the cost of the tick it exists to serve. `TICK_LOCK_BUDGET` is
+fresher number at the cost of the tick it exists to serve. A busy section keeps
+its previously published value AND that value's age: `age_ms` becomes the age of
+the group's stalest part, so `viewstale.ts`'s existing "partly stale" label is
+correct with no frontend change, and a panel can never read current while
+showing a frozen number. `TICK_LOCK_BUDGET` is
 5 s because that is already the threshold past which a hold is *reportable*
 (`DEFAULT_HOLD_WARN_MS`), so a tick skips only when something is independently
 known to be wrong. `MCP_AUTH_BUDGET` is the tightest of the MCP three because it
@@ -155,10 +179,6 @@ is paid by every request including `ping` — it is the constant that answers
 on the work; see below.
 
 ### The two MCP shapes
-
-> **Status:** the two shapes below are specified here and land with this PR's
-> `mcp.rs` half, which waits on #1625 (Phase 1) merging — they are not in the
-> engine-only half. This paragraph goes when they do.
 
 Both are contracts an agent's model reads, so the wording is part of the design
 rather than a message someone can reword later.

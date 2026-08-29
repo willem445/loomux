@@ -300,7 +300,17 @@ scan pins the shape.
   a command reached from a fixed-cadence poll site must additionally be served
   from the published snapshot (P8) — `views.load(` in its body — which is
   mechanical, and is enforced.
-  *Enforced: E1 (#743 S2, then #1608's L6) + review.*
+
+  **An acquisition on a waited path is BOUNDED** (#1609). Every path a human
+  or an agent waits behind runs under a budget: the publisher's sections, the
+  MCP auth and read tools, the cadenced ticks' gate, and the human one-shot
+  read commands. A budget that expires yields a typed `Busy` — a partial
+  panel, a retryable JSON-RPC error, a skipped tick — never an unbounded
+  wait. Mutating paths are deliberately EXEMPT and wait: an abandoned
+  mutation is worse than a slow one, and `MutationScope` is what makes that
+  exemption structural rather than a convention. `doc/design/lock-liveness.md`
+  carries the mechanism and the safety argument.
+  *Enforced: E1 (#743 S2, then #1608's L6) + `tests/liveness.rs` L2a-L2d + review.*
 - **INV-2 — No process spawn and no network round trip on the webview thread,
   ever.** No class permits it: `cheap` bodies additionally must carry no
   `Command::new` / `ShellExecuteW` / `.output(` / `fs::` marker, and only a

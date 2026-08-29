@@ -5,9 +5,10 @@
 //! Two loops used to poll the registry directly: the group view's 2 s batch of
 //! **ten** `orch_*` commands (`groupview.ts` `load()`), and the tab strip's 4 s
 //! sweep of **two per group-bound tab** (`tabbar.ts` `pollStatusOnce()`). Each
-//! of those commands acquires registry mutexes, and `lock_safe` is
-//! `Mutex::lock` with poison recovery — no timeout, no try-lock. So one long
-//! hold anywhere parks every poller; post-#1595 each parks a *blocking-pool*
+//! of those commands acquires registry mutexes, and `lock_safe` was an
+//! infallible acquire — no timeout, no try-lock (#1609 added a bounded form;
+//! this file uses it per SECTION, below). So one long
+//! hold anywhere parked every poller; post-#1595 each parked a *blocking-pool*
 //! thread; at 2.5-5/s tokio's default 512 is reached in minutes; and from then
 //! on `write_pty` cannot be scheduled and no pane accepts input. #1600 §1.2.
 //!

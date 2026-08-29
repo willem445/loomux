@@ -44,48 +44,58 @@
 //   the previous one is still outstanding SKIPS and at most one call is
 //   parked however long a lock is held — though since #1608 that sweep reads a
 //   published snapshot and takes no registry lock, so a held lock no longer
-//   parks it and the gate has nothing to engage on; and #1612 moved `write_pty` off the
+//   parks it and the gate has nothing to engage on; and #1607 moved `write_pty` off the
 //   shared pool onto a per-pane writer thread, so even an exhausted pool
 //   could not starve pane input. An earlier version of this header said
 //   raising the hold past ~120 s locally would reach the pane-input half —
 //   true against the base this branch was cut from, false here, and now
 //   false twice over.
 //
-//   What the class assertion still demonstrates is the half neither fix
+//   What the class assertion demonstrates is the half neither of those fixes
 //   governs: `orchestration/mcp.rs` spawns a thread per request and each
 //   parks on the registry mutex, ungoverned by any single-flight and served
-//   by no pool. That is exactly why the MCP probe is the one that dies while
-//   pane input stays healthy — and why the pty probe passing is now a
-//   REGRESSION guard on #1612 rather than a coin-flip.
+//   by no pool. That is exactly why the MCP probe is the one that died while
+//   pane input stayed healthy — and it is what #1609 closes.
 //
-// ## The expected failure
+//   The pty probe is NOT a regression guard on #1607, and saying so was an
+//   overclaim (#1606 review R2). A revert of #1607 would not redden it:
+//   single-flighting keeps at most one poll call outstanding and the MCP
+//   threads are its own, so the shared pool never fills here and `write_pty`
+//   gets a slot whether or not it has its own writer thread. What the probe
+//   does say is what `liveness.ts` says at `ptyRoundTrip`: pool exhaustion is
+//   no longer among the ways it can fail, so a red points at the writer
+//   thread or the ConPTY write behind it.
 //
-// The class assertion below is marked `test.fail()`. It is expected to FAIL on
-// today's `main` — that is the whole point: under the beta6 mechanism a long
-// registry hold takes the MCP down immediately, and Phases 1 and 2 of plan
-// #1600 are what make it pass. `test.fail()` was chosen over `test.skip()`
-// deliberately: the assertion runs at full strength, the E2E job stays green
-// while the fix is outstanding, and the moment the fix lands Playwright
-// reports "expected to fail but passed" — so the person who lands it is told
-// to flip the marker, rather than the lane quietly never being re-armed.
+// ## The class assertion is ARMED (#1609)
 //
-// **What that marker costs, stated rather than left implicit**: it absorbs
-// EVERY failure inside its own test, its positive controls included. An
-// injector that silently never took a lock would leave both probes measuring
-// an idle app, the test would fail, and Playwright would report a healthy
-// expected failure. So none of that test's controls live inside it:
+// It was marked `test.fail()` from #1606 until Phase 2.1 landed, because under
+// the beta6 mechanism a long registry hold took the MCP down immediately and
+// nothing in the tree bounded it. #1609 bounds `resolve_token` under
+// `MCP_AUTH_BUDGET`, so the ping now ANSWERS during a hold — with a retryable
+// `-32001`, not a result: the registry is deliberately still unavailable, and
+// what changed is that saying so is now possible. The marker is gone and the
+// assertion is hard.
+//
+// **The controls still live OUTSIDE this test, and that is not left over from
+// the marker.** While `test.fail()` was on, it absorbed every failure inside
+// its own test — an injector that silently never took a lock would have left
+// both probes measuring an idle app and reported a healthy expected failure.
+// That hazard is gone, but the placement is still right: a positive control
+// inside the test it controls can only ever fail the same way the test does,
+// so it cannot distinguish "the property broke" from "the fixture broke":
 //
 // - *the probes work at all* is spec 1's job — it runs both at t=0 and after
-//   the soak, and it is not an expected failure, so a broken probe reddens
-//   there;
+//   the soak, so a broken probe reddens there;
 // - *a hold really takes the mutex, and gives it back* is
 //   `src-tauri/tests/e2ehold_guard.rs`'s job, proven differentially against a
 //   real registry with no marker anywhere near it;
 // - *the injector is armed in THIS build* is the short non-xfail test that
 //   runs first in the same describe below.
 //
-// The assertions still inside the expected failure are diagnostics: they put
-// the reason in the report. They are not evidence, and are not treated as any.
+// The probe assertions inside the test use `expect.soft` so BOTH are
+// evaluated and both land in the report — the artefact this lane exists to
+// produce is WHICH half died, and a hard assertion on the first one would
+// hide the second. Soft is not weak here: the test still fails.
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -105,6 +115,8 @@ import {
   installInvokeCounter,
   installPtyTap,
   isJsonRpcResult,
+  jsonRpcErrorData,
+  MCP_BUSY_CODE,
   jsonRpcErrorCode,
   mcpCall,
   mintMcpEndpoint,
@@ -407,8 +419,8 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     // MCP request, so holding it is what stalls the probe this spec is about.
     // It used to stall the tab-strip sweep too — `orch_group_summary` took it —
     // but since #1608 that sweep reads a published snapshot and no longer
-    // acquires a registry lock at all, which is the change that makes the
-    // `test.fail()` below an MCP-side statement rather than a poll-path one.
+    // acquires a registry lock at all, which is the change that made the class
+    // assertion below an MCP-side statement rather than a poll-path one.
     // Long enough to span several 4 s ticks, short enough to stay cheap.
     const holdMs = 12_000;
     const before = await singleFlightStats(page);
@@ -538,14 +550,12 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     ).toBe(true);
   });
 
-  // Expected to fail on today's main. See this file's header for why the
-  // marker is `fail` rather than `skip`, what it absorbs, and what is supposed
-  // to happen to it when plan #1600's Phases 1 and 2 land.
+  // Armed since #1609 (Phase 2.1). See this file's header for what the
+  // `test.fail()` marker was for and why it is gone.
   test("the app still accepts pane input and the MCP still answers while a registry lock is held", async ({
     appPage: page,
     appDataDir,
   }) => {
-    test.fail();
     test.setTimeout(LOCK_HOLD_MS + 300_000);
     assertCorpusReallyLanded();
 
@@ -590,10 +600,9 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const pty = await ptyRoundTrip(page, paneTerm, 4, LIVENESS_BOUND_MS);
     const ping = await mcpCall(endpoint, "ping", {}, LIVENESS_BOUND_MS);
 
-    // Playwright prints NOTHING for a test that fails as expected, so the one
-    // artefact this whole lane exists to produce — WHICH half died under a held
-    // lock — would otherwise be invisible in the CI log, and any claim about it
-    // would be a guess. Log it before asserting anything.
+    // The one artefact this whole lane exists to produce is WHICH half died
+    // under a held lock. Logged before anything is asserted so it is in the CI
+    // log even on a pass, and so a claim about it is never a guess.
     console.log(
       `[soak] under a ${LOCK_HOLD_MS}ms hold on groups: ` +
         `pty ok=${pty.ok} in ${pty.ms}ms (${pty.detail}); ` +
@@ -601,9 +610,9 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     );
 
     // Read AFTER the probes: a hold that had already expired would leave both
-    // of them measuring an idle app. Absorbed by the marker like everything
-    // else here, so its value is the sentence it puts in the report — the
-    // unabsorbed version of this check is the armed-injector test above.
+    // of them measuring an idle app. Now that the marker is gone this is a real
+    // gate rather than a sentence in a report — if it fails, neither probe
+    // result below is evidence about anything.
     const stillHeld = holdStillHeld(appDataDir);
     expect(
       stillHeld,
@@ -616,10 +625,37 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
       `with a registry lock held for ${LOCK_HOLD_MS}ms, a keystroke did not round-trip through ` +
         `the pane's child within ${LIVENESS_BOUND_MS}ms. ${pty.detail}`
     ).toBe(true);
+
+    // The MCP half, and the shape matters as much as the fact.
+    //
+    // NOT `isJsonRpcResult`: that predicate requires `result !== undefined`,
+    // i.e. it asserts the registry was AVAILABLE — which under a deliberate
+    // 90 s hold it is not, and never will be. What #1609 changed is that the
+    // server can now SAY so within a bound instead of never answering. So the
+    // liveness property is "it answered", and the contract is that the answer
+    // is the retryable busy rather than anything else.
+    const pingCode = jsonRpcErrorCode(ping);
     expect.soft(
-      isJsonRpcResult(ping),
-      `with a registry lock held for ${LOCK_HOLD_MS}ms, the MCP did not answer a ping within ` +
+      isJsonRpcResult(ping) || pingCode === MCP_BUSY_CODE,
+      `with a registry lock held for ${LOCK_HOLD_MS}ms, the MCP did not ANSWER a ping within ` +
         `${LIVENESS_BOUND_MS}ms. ${ping.detail} body=${JSON.stringify(ping.body)}`
     ).toBe(true);
+    expect.soft(
+      pingCode,
+      `the MCP answered, but not with the retryable busy code. Under a held lock the ` +
+        `contract is ${MCP_BUSY_CODE} (loomux busy), not -32000 (permanent auth refusal) ` +
+        `and not a result. body=${JSON.stringify(ping.body)}`
+    ).toBe(MCP_BUSY_CODE);
+    const busyData = jsonRpcErrorData(ping);
+    expect.soft(
+      busyData?.retryable,
+      `the busy error must carry data.retryable — it is what tells a client this is ` +
+        `worth re-issuing. body=${JSON.stringify(ping.body)}`
+    ).toBe(true);
+    expect.soft(
+      typeof busyData?.retry_after_ms,
+      `the busy error must carry a numeric data.retry_after_ms backoff hint. ` +
+        `body=${JSON.stringify(ping.body)}`
+    ).toBe("number");
   });
 });

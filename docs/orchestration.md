@@ -1381,6 +1381,28 @@ means the figures really are still old. Numbers shown while it is up are true,
 just from a moment ago — which is why orrerix shows them rather than blanking
 the panel.
 
+**When it says `partly stale`.** Same badge, narrower claim: most of the panel
+refreshed and one part of it could not. The figures you are looking at are
+still true, and the age on the badge is the age of the OLDEST part — so a
+`partly stale 40s` panel is telling you that one section is 40 seconds behind,
+not that everything is. It clears itself the same way.
+
+**When an agent reports `loomux busy`.** Agents talk to orrerix over a small
+local server, and if some internal operation is holding things up, a call that
+would otherwise have waited indefinitely is answered instead with a message
+beginning `loomux busy:` — naming what is held, for how long, and by which part
+of orrerix. This is a normal, retryable answer, not an error to report: the
+agent is told nothing was executed and it can simply try again. Two things are
+worth knowing if you see one:
+
+- **A busy answer never means a half-done change.** Only READS are answered
+  this way. Anything that changes something runs to completion — if one of
+  those takes a long time the agent is told it is *still executing* and
+  explicitly told NOT to re-issue it, because it will finish on its own.
+- **The breadcrumb log names the culprit.** Each one is recorded once, with
+  the holder and the duration, in `logs/breadcrumbs.log` under your orrerix
+  data directory. If busy answers keep coming, that file is what to send.
+
 From the lifecycle panel you can:
 
 - **Pause** the group — orrerix stops delivering prompts so its agents finish

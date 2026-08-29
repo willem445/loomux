@@ -526,7 +526,7 @@ async function waitForTap(
  *   that never resolves stops that pane accepting input forever, with the
  *   window still painting. It ends when the typed stem echoes back.
  *
- *   The SYMPTOM is unchanged by #1612 and the frontend chain is why: one
+ *   The SYMPTOM is unchanged by #1607 and the frontend chain is why: one
  *   write in flight per pane means one unresolved promise is still enough to
  *   wedge that pane. What changed is the cause it can have. `write_pty` no
  *   longer hands off to the shared blocking pool at all — it enqueues to the
@@ -744,4 +744,24 @@ export function isJsonRpcResult(r: McpResult): boolean {
 export function jsonRpcErrorCode(r: McpResult): number | null {
   const b = r.body as { error?: { code?: unknown } } | undefined;
   return typeof b?.error?.code === "number" ? b.error.code : null;
+}
+
+/** The JSON-RPC code orrerix answers when a registry lock is held past a
+ *  budget (#1609). Mirrors `mcp::MCP_BUSY_CODE` in
+ *  `src-tauri/src/orchestration/mcp.rs`; the two are one contract, and
+ *  `doc/design/lock-liveness.md` §3 is where it is specified.
+ *
+ *  It is a DIFFERENT fact from -32000, the auth refusal: that one is
+ *  permanent for a token and this one is retryable, so a caller that cannot
+ *  tell them apart either retries forever or gives up forever. */
+export const MCP_BUSY_CODE = -32001;
+
+/** The `data` block on a busy error — `{ retryable, retry_after_ms }`. Part
+ *  of the same contract: it is the half a client machine-reads, rather than
+ *  parsing the human message. */
+export function jsonRpcErrorData(
+  r: McpResult
+): { retryable?: unknown; retry_after_ms?: unknown } | null {
+  const b = r.body as { error?: { data?: Record<string, unknown> } } | undefined;
+  return b?.error?.data ?? null;
 }
