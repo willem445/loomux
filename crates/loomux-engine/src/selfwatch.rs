@@ -395,6 +395,11 @@ fn run_watchdog() {
         // `TrackedGuard::drop`); composing and writing them is this thread's
         // job, which is what plan §3 Phase 0.2 means by "off every hot path".
         lockwatch::record_all(lockwatch::drain_completed_holds());
+        // Lock-ORDER findings (#1610), stamped by the acquiring thread for
+        // the same reason a completed hold is: composing one is allocation,
+        // formatting and a file write, and the acquiring thread is holding a
+        // lock with waiters queued behind it.
+        lockwatch::record_order_reports(lockwatch::drain_lock_order_reports());
         // …and holds still in flight, which no drop will ever report.
         lockwatch::record_all(locks.tick(&lockwatch::held_locks(now), lockwatch::hold_warn_ms()));
 

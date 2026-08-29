@@ -41,9 +41,9 @@ consults a **per-thread stack of held locks** before it can block:
 | what the checker sees | what it does |
 | --- | --- |
 | this exact lock is already on this thread's stack | **re-entrant**: `Err(Busy)` with `BusyKind::Reentrant` from `lock_within`; a debug panic from `lock_safe` |
-| the rank being taken is *strictly below* the innermost rank held | **inversion**: debug panic naming both locks and both sites; release breadcrumb `lock-order-violation`, then acquire anyway |
+| the rank being taken is *strictly below* the innermost rank held | **inversion**: debug panic naming both locks and both sites; in release a `lock-order-violation` finding, then acquire anyway |
 | equal ranks | allowed — see §3 |
-| the lock is unranked and something is held | breadcrumb `lock-rank-unranked`, once per lock; not an error |
+| the lock is unranked and something is held | a `lock-rank-unranked` finding, once per lock; not an error |
 | anything else | nothing |
 
 The check is per-thread and **needs no second thread to fire**. That is the
@@ -51,20 +51,28 @@ whole reason it finds what a soak test cannot: it does not need the race to
 happen, only the order that permits it. One test process taking `groups` then
 `agents` once is enough to say the ordering fact exists.
 
-**Both locks and both sites, in both surfaces.** A report naming only the lock
-being taken sends the next reader back into a 54,000-line module to guess what
-was already held, which is the state #1600 §2.3 describes. So the panic and the
-breadcrumb both carry the acquiring lock, its rank and its `#[track_caller]`
-site, and the same three for the hold it collided with.
+**Both ends, in both surfaces.** A report naming only the lock being taken
+sends the next reader back into a 54,000-line module to guess what was already
+held, which is the state #1600 §2.3 describes. So both surfaces carry the
+acquiring lock's name, rank and `#[track_caller]` site, and the rank and site of
+the hold it collided with.
+
+The one asymmetry, stated because a reader will notice it: the panic also names
+the outer lock by NAME and the breadcrumb does not. The panic composes on the
+spot, with the held-lock stack entry in hand; the breadcrumb composes a second
+later on the watchdog thread, from a slot that keeps a `&'static Location` (valid
+for the whole program) rather than a borrowed name from a `LockState` that may
+have been dropped. The site is the more useful half anyway — it is the line to
+go and read.
 
 ### Fail open in release, and why that is not timidity
 
-A shipped build breadcrumbs and then does exactly what it would have done
-anyway. The deadlock risk is already in the shipped binary; refusing the
+A shipped build records the finding and then does exactly what it would have
+done anyway. The deadlock risk is already in the shipped binary; refusing the
 acquisition would convert a *possible* hang into a *certain* crash on a path
 nobody has proven wrong, and the crash trail is the thing this whole epic exists
 to produce. `set_lock_order_panics` makes that path reachable from a test, which
-is why `a_release_build_breadcrumbs_the_violation_and_carries_on` exists — a
+is why `a_release_build_stamps_the_violation_and_carries_on` exists — a
 fail-open path nobody has executed is a fail-open path nobody has checked.
 
 ### What it costs
@@ -82,10 +90,18 @@ threads — which matters because the MCP server spawns one thread per request a
 this lock's own cache line. The stack is a fixed `[HeldEntry; 32]` rather than a
 `Vec` for exactly that reason.
 
-Two paths *do* write a file from the acquiring thread, and both are bounded:
-a violation report (once per defect — a build that hits it often has a deadlock
-to fix first) and an unranked lock's first nesting (once per lock, and at most
-128 per process, because the test binary builds registries in the hundreds).
+**A finding writes no file where it is made.** It stamps one slot on the lock —
+four atomic stores — and the watchdog composes and writes it a second later,
+beside the completed-hold reports it already drains. That is not tidiness: a
+finding is made on a thread that is holding a lock, so a breadcrumb there would
+land on the latency path of every waiter queued behind that hold. #1605 review
+B1 established the rule for the release path (`TrackedGuard::drop` may not
+allocate, format, take a global lock or make a syscall) and it applies here
+unchanged — more so, because a real inversion on a hot path recurs every time
+that path runs, where a slow hold at least has to be slow.
+
+The one exception is the **debug panic**, which allocates and formats on the
+spot. That is a build that is stopping.
 
 ## 3. Ranks are unique per field, and re-entrancy is decided by identity
 
@@ -99,7 +115,9 @@ would fail tests that have nothing wrong with them.
 So the rule is split:
 
 - every ranked FIELD gets a **distinct** rank (`lockorder::ALL` plus
-  `l5_every_rank_is_distinct_and_names_a_lock_that_still_exists` keep that true);
+  `l5_every_lockorder_rank_is_distinct` keep that true, with
+  `l5_every_lockorder_const_names_a_lock_that_still_exists` beside it for the
+  other way the table goes stale);
 - **equal ranks nest freely** — they can only be the same field twice;
 - **re-entrancy is decided on the lock's identity**, the id `lockwatch` mints
   per lock, which is strictly what the epic's case is about and also catches it

@@ -67,11 +67,10 @@
 //! tracked lock held. See [`TrackedMutex::lock_safe`] and
 //! [`TrackedGuard::drop`].
 //!
-//! The two paths that DO write a file from the acquiring thread are both
-//! bounded and both named: a lock-order violation ([`report_order_violation`],
-//! once per defect, and a build that hits it often has a deadlock to fix
-//! first) and an unranked lock's first nesting ([`note_unranked_nesting`],
-//! once per lock and at most [`UNRANKED_REPORT_CAP`] times per process).
+//! A lock-ORDER finding (#1610) writes no file from the acquiring thread
+//! either: it stamps one slot in atomics and the watchdog composes it, which
+//! is the same split, for the same reason. See [`stamp_order_report`]. The
+//! one exception is the DEBUG panic, which is a build that is stopping.
 //!
 //! It was not always so, and the reasoning that got it wrong is worth keeping.
 //! The release path used to write its own report, excused by "a hold that has
@@ -101,7 +100,7 @@ use crate::obs::LockExt;
 // glance.
 use parking_lot::{Mutex as InnerMutex, MutexGuard as InnerGuard};
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -233,6 +232,21 @@ struct LockState {
     /// reported. Only meaningful while `rank == UNRANKED`; see
     /// [`note_unranked_nesting`].
     unranked_reported: AtomicBool,
+
+    // ---- the deferred lock-order report slot (#1610) ----
+    //
+    // Same shape, and the same reason, as the completed-hold slot above: a
+    // lock-order finding is MADE on the acquiring thread with the outer lock
+    // still held, and composing one is allocation, formatting, a
+    // process-global lock and a file write. See `stamp_order_report`.
+    /// `REPORT_NONE` when empty; otherwise what `drain_lock_order_reports`
+    /// should compose.
+    report_kind: AtomicU8,
+    /// The acquiring site, and the site of the hold it collided with.
+    report_site: AtomicPtr<Location<'static>>,
+    report_outer_site: AtomicPtr<Location<'static>>,
+    /// The collided hold's rank, or `UNRANKED`.
+    report_outer_rank: AtomicU32,
 }
 
 impl LockState {
@@ -242,6 +256,10 @@ impl LockState {
             name,
             rank,
             unranked_reported: AtomicBool::new(false),
+            report_kind: AtomicU8::new(REPORT_NONE),
+            report_site: AtomicPtr::new(std::ptr::null_mut()),
+            report_outer_site: AtomicPtr::new(std::ptr::null_mut()),
+            report_outer_rank: AtomicU32::new(UNRANKED),
             generation: AtomicU64::new(0),
             holder_thread: AtomicU64::new(0),
             holder_site: AtomicPtr::new(std::ptr::null_mut()),
@@ -918,32 +936,16 @@ static LOCK_ORDER_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 /// what this whole epic is for.
 static LOCK_ORDER_PANICS: AtomicBool = AtomicBool::new(cfg!(debug_assertions));
 
-/// Unranked-nesting reports written this process, capped by
-/// [`UNRANKED_REPORT_CAP`].
+/// Unranked locks that have nested under another lock for the first time.
 static UNRANKED_NESTINGS: AtomicU64 = AtomicU64::new(0);
-
-/// How many unranked-nesting breadcrumbs one process may write, ever.
-///
-/// The report is already edge-triggered per LOCK (one `AtomicBool` on
-/// `LockState`), which bounds the app at one line per unranked field — about
-/// sixty-five, once, and precisely the data the table needs to converge. The
-/// cap is for the other process shape: the test binary builds registries in the
-/// hundreds, each with its own fresh locks, so a per-lock edge alone would
-/// authorise tens of thousands of file appends. A hard ceiling makes the cost
-/// of this mechanism a constant rather than a function of how many registries
-/// something happened to construct.
-const UNRANKED_REPORT_CAP: u64 = 128;
 
 /// Ordering violations and re-entrant acquisitions this process has seen.
 pub fn lock_order_violations() -> u64 {
     LOCK_ORDER_VIOLATIONS.load(Ordering::Relaxed)
 }
 
-/// Unranked locks that have nested under another lock for the FIRST time.
-///
-/// Counts every one of them; only the first [`UNRANKED_REPORT_CAP`] also write
-/// a breadcrumb, so this is the number a test can assert on without depending
-/// on how many registries the process happened to build before it.
+/// Unranked locks that have nested under another lock for the FIRST time —
+/// the rows `orchestration::lockorder` does not yet carry.
 pub fn unranked_nestings() -> u64 {
     UNRANKED_NESTINGS.load(Ordering::Relaxed)
 }
@@ -974,97 +976,205 @@ fn rank_text(rank: u32) -> String {
     }
 }
 
-/// Report an inversion or a re-entrant acquisition: panic in debug, breadcrumb
-/// in release.
+/// What a deferred lock-order report is about ([`OrderReport::kind`]).
 ///
-/// **Both locks and both sites, in both surfaces.** A violation report that
-/// names only the lock being taken is the report that sends the next reader
-/// back into a 54,000-line module to guess what was already held — which is
-/// exactly the state #1600 §2.3 describes.
+/// A `u8` rather than an enum because it lives in an atomic; `0` is the empty
+/// slot. Public alongside the field, so a caller reading one can classify it
+/// without parsing [`OrderReport::event`].
+pub const REPORT_NONE: u8 = 0;
+/// A ranked lock taken while a strictly INNER one was held.
+pub const REPORT_ORDER: u8 = 1;
+/// A lock re-acquired by a thread that already holds it.
+pub const REPORT_REENTRANT: u8 = 2;
+/// An unranked lock nesting under something, for the first time.
+pub const REPORT_UNRANKED: u8 = 3;
+
+/// One lock-order finding, composed on the watchdog thread by
+/// [`drain_lock_order_reports`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderReport {
+    /// The lock being ACQUIRED when the finding was made.
+    pub lock: &'static str,
+    pub rank: Option<LockRank>,
+    pub site_file: &'static str,
+    pub site_line: u32,
+    /// The hold it collided with. Only its SITE and rank are kept: the name
+    /// would need the other lock's `LockState` to still be alive at drain time,
+    /// and a `&'static Location` is valid for the whole program (see
+    /// [`site_of`]). The site is also the more useful half — it is the line to
+    /// go and read.
+    pub outer_rank: Option<LockRank>,
+    pub outer_site_file: &'static str,
+    pub outer_site_line: u32,
+    pub kind: u8,
+}
+
+impl OrderReport {
+    /// The breadcrumb `event` this report is written under.
+    pub fn event(&self) -> &'static str {
+        match self.kind {
+            REPORT_REENTRANT => REENTRANT_EVENT,
+            REPORT_UNRANKED => UNRANKED_EVENT,
+            _ => ORDER_EVENT,
+        }
+    }
+
+    /// The breadcrumb `detail`: one line of `key=value` fields, space-free
+    /// throughout for [`HoldReport::detail`]'s reason.
+    pub fn detail(&self) -> String {
+        format!(
+            "lock={} rank={} at={}:{} outer_rank={} outer_at={}:{}",
+            spaceless(self.lock),
+            rank_text(self.rank.map_or(UNRANKED, LockRank::get)),
+            spaceless(self.site_file),
+            self.site_line,
+            rank_text(self.outer_rank.map_or(UNRANKED, LockRank::get)),
+            spaceless(self.outer_site_file),
+            self.outer_site_line,
+        )
+    }
+}
+
+/// Stamp a finding into this lock's one deferred-report slot.
 ///
-/// `#[cold]`, and it allocates and writes a file. Both are fine HERE and
-/// nowhere else in this module: this runs once per defect, not once per
-/// acquisition, and a build in which it runs often has a deadlock to fix first.
+/// **Runs on the acquiring thread, with the outer lock still held**, so it obeys
+/// the same rules [`TrackedGuard::drop`] does: four relaxed stores and one
+/// release store, no allocation, no formatting, no global lock, no syscall.
+///
+/// That is the whole reason this is not a `breadcrumb!` call. #1605 review B1
+/// found the release path writing its own report and established why it may
+/// not: a report is composed precisely when there are waiters queued behind the
+/// hold, so the file write lands on every one of THEIR latency paths, which is
+/// the path this epic is about. A violation report is the same shape — worse,
+/// because a real inversion on a hot path recurs every time that path runs.
+///
+/// **Its bound, stated because it is a real one.** One slot per lock, so a
+/// second finding on the same lock before a drain overwrites the first.
+/// [`lock_order_violations`] counts every one regardless, so nothing is lost
+/// numerically; what a burst loses is the second finding's SITES, and the
+/// watchdog drains every second. Exactly the bound [`drain_completed_holds`]
+/// carries, for exactly the same reason.
+fn stamp_order_report(
+    st: &LockState,
+    kind: u8,
+    site: &'static Location<'static>,
+    outer: &HeldEntry,
+) {
+    st.report_site.store(site as *const _ as *mut _, Ordering::Relaxed);
+    st.report_outer_site.store(outer.site as *mut _, Ordering::Relaxed);
+    st.report_outer_rank.store(outer.rank, Ordering::Relaxed);
+    // Publishes the three stores above.
+    st.report_kind.store(kind, Ordering::Release);
+}
+
+/// Every stamped lock-order finding since the last call, taken exactly once.
+///
+/// Called from the watchdog thread ([`crate::selfwatch`]) beside
+/// [`drain_completed_holds`], and from tests, which have no watchdog. The
+/// composing — allocation, `format!`, the breadcrumb write — happens here
+/// precisely because none of it may happen where the finding is MADE. See
+/// [`stamp_order_report`].
+pub fn drain_lock_order_reports() -> Vec<OrderReport> {
+    let mut reg = REGISTRY.lock_safe();
+    let mut out = Vec::new();
+    reg.retain(|weak| match weak.upgrade() {
+        Some(state) => {
+            let kind = state.report_kind.swap(REPORT_NONE, Ordering::Acquire);
+            if kind != REPORT_NONE {
+                let (file, line) = site_of(state.report_site.load(Ordering::Relaxed));
+                let (ofile, oline) = site_of(state.report_outer_site.load(Ordering::Relaxed));
+                let outer_rank = state.report_outer_rank.load(Ordering::Relaxed);
+                out.push(OrderReport {
+                    lock: state.name,
+                    rank: (state.rank != UNRANKED).then(|| LockRank(state.rank)),
+                    site_file: file,
+                    site_line: line,
+                    outer_rank: (outer_rank != UNRANKED).then(|| LockRank(outer_rank)),
+                    outer_site_file: ofile,
+                    outer_site_line: oline,
+                    kind,
+                });
+            }
+            true
+        }
+        None => false,
+    });
+    out
+}
+
+/// Write a batch of lock-order findings out. Separate from the drain so the
+/// decision stays where it is cheap and the IO stays in one place — the same
+/// split [`LockWatch::tick`] and [`record_all`] have.
+pub fn record_order_reports(reports: Vec<OrderReport>) {
+    for r in reports {
+        crate::obs::breadcrumb(r.event(), &r.detail());
+    }
+}
+
+/// Report an inversion or a re-entrant acquisition: panic in debug, stamp for
+/// the watchdog in release.
+///
+/// **Both locks and both sites, in both surfaces.** A report naming only the
+/// lock being taken is the report that sends the next reader back into a
+/// 54,000-line module to guess what was already held — which is exactly the
+/// state #1600 §2.3 describes. The panic can name the outer lock's NAME as well
+/// as its site, because it composes on the spot; the breadcrumb names its site
+/// and rank, for [`OrderReport`]'s reason.
+///
+/// `#[cold]`, and in debug it allocates and panics. That is fine there and
+/// nowhere else: a debug build that reaches this is stopping.
 #[cold]
 fn report_order_violation(
-    event: &'static str,
-    inner_name: &'static str,
-    inner_rank: u32,
+    kind: u8,
+    st: &LockState,
     inner_site: &'static Location<'static>,
     outer: &HeldEntry,
 ) {
     LOCK_ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    if !LOCK_ORDER_PANICS.load(Ordering::Relaxed) {
+        stamp_order_report(st, kind, inner_site, outer);
+        return;
+    }
+    let inner_name = st.name;
     let (outer_file, outer_line) = site_of(outer.site as *mut _);
-    let detail = format!(
-        "inner={} inner_rank={} inner_at={}:{} outer={} outer_rank={} outer_at={}:{}",
-        spaceless(inner_name),
-        rank_text(inner_rank),
-        spaceless(inner_site.file()),
-        inner_site.line(),
-        spaceless(outer.name),
-        rank_text(outer.rank),
-        spaceless(outer_file),
-        outer_line,
-    );
-    if LOCK_ORDER_PANICS.load(Ordering::Relaxed) {
-        if event == REENTRANT_EVENT {
-            panic!(
-                "{REENTRANT_EVENT}: `{inner_name}` at {}:{} is ALREADY held by this thread, taken \
-                 at {outer_file}:{outer_line} — this mutex is not re-entrant, so the acquisition \
-                 would self-deadlock",
-                inner_site.file(),
-                inner_site.line(),
-            );
-        }
+    if kind == REPORT_REENTRANT {
         panic!(
-            "{ORDER_EVENT}: `{inner_name}` (rank {}) at {}:{} acquired while `{}` (rank {}) is \
-             held by this thread, taken at {outer_file}:{outer_line} — the declared order is \
-             outer rank first; see orchestration::lockorder",
-            rank_text(inner_rank),
+            "{REENTRANT_EVENT}: `{inner_name}` at {}:{} is ALREADY held by this thread, taken \
+             at {outer_file}:{outer_line} — this mutex is not re-entrant, so the acquisition \
+             would self-deadlock",
             inner_site.file(),
             inner_site.line(),
-            outer.name,
-            rank_text(outer.rank),
         );
     }
-    crate::obs::breadcrumb(event, &detail);
+    panic!(
+        "{ORDER_EVENT}: `{inner_name}` (rank {}) at {}:{} acquired while `{}` (rank {}) is \
+         held by this thread, taken at {outer_file}:{outer_line} — the declared order is \
+         outer rank first; see orchestration::lockorder",
+        rank_text(st.rank),
+        inner_site.file(),
+        inner_site.line(),
+        outer.name,
+        rank_text(outer.rank),
+    );
 }
 
-/// Report the first time an UNRANKED lock nests under anything.
+/// Note the first time an UNRANKED lock nests under anything.
 ///
-/// The convergence half of the plan's design: a lock with no rank is allowed to
-/// nest under anything, so the table can be filled in one family at a time
-/// instead of all at once — but every such nesting is an ordering fact the
-/// table does not yet carry, and a fact nobody wrote down is the state §3 is
-/// about. One line per unranked lock, capped process-wide
-/// ([`UNRANKED_REPORT_CAP`]).
+/// The convergence half of the plan's design: a lock with no rank may nest
+/// under anything, so the table can be filled in one family at a time instead
+/// of all at once — but every such nesting is an ordering fact the table does
+/// not yet carry, and a fact nobody wrote down is the state §3 is about.
 ///
-/// Written on the ACQUIRING thread with the outer lock still held, which is a
-/// cost this module refuses everywhere else. It is admitted here for a bounded
-/// reason: at most [`UNRANKED_REPORT_CAP`] appends per process, ever, against a
-/// steady-state cost of one relaxed load on the nested-acquisition path.
+/// Once per lock, ever, and it does not panic even in debug: an unranked
+/// nesting is a gap in the table, not a defect in the code. Like every other
+/// finding here it only STAMPS — see [`stamp_order_report`].
 #[cold]
 fn note_unranked_nesting(st: &LockState, site: &'static Location<'static>, outer: &HeldEntry) {
     if st.unranked_reported.swap(true, Ordering::Relaxed) {
         return;
     }
-    if UNRANKED_NESTINGS.fetch_add(1, Ordering::Relaxed) >= UNRANKED_REPORT_CAP {
-        return;
-    }
-    let (outer_file, outer_line) = site_of(outer.site as *mut _);
-    crate::obs::breadcrumb(
-        UNRANKED_EVENT,
-        &format!(
-            "lock={} at={}:{} under={} outer_rank={} outer_at={}:{}",
-            spaceless(st.name),
-            spaceless(site.file()),
-            site.line(),
-            spaceless(outer.name),
-            rank_text(outer.rank),
-            spaceless(outer_file),
-            outer_line,
-        ),
-    );
+    UNRANKED_NESTINGS.fetch_add(1, Ordering::Relaxed);
+    stamp_order_report(st, REPORT_UNRANKED, site, outer);
 }
 
 /// A `Mutex` that says who is holding it, since when, from where, and how many
@@ -1352,12 +1462,12 @@ impl<T> TrackedMutex<T> {
                 if refuse_reentrant {
                     Err(self.reentrant_busy(site, &outer))
                 } else {
-                    report_order_violation(REENTRANT_EVENT, st.name, st.rank, site, &outer);
+                    report_order_violation(REPORT_REENTRANT, st, site, &outer);
                     Ok(())
                 }
             }
             Verdict::Inversion(outer) => {
-                report_order_violation(ORDER_EVENT, st.name, st.rank, site, &outer);
+                report_order_violation(REPORT_ORDER, st, site, &outer);
                 Ok(())
             }
             Verdict::UnrankedUnder(outer) => {
@@ -1401,22 +1511,14 @@ impl<T> TrackedMutex<T> {
             waiters: st.waiters.load(Ordering::Relaxed) as usize,
         };
         LOCK_ORDER_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
-        let generation = st.generation.load(Ordering::Acquire);
-        if st.busy_reported_gen.swap(generation, Ordering::Relaxed) != generation {
-            st.busy_breadcrumbs.fetch_add(1, Ordering::Relaxed);
-            // Both sites, like every other violation report: the `Busy`'s own
-            // detail names the frame that HOLDS it, and the acquiring site is
-            // appended because the caller reading the log has neither.
-            crate::obs::breadcrumb(
-                REENTRANT_EVENT,
-                &format!(
-                    "{} inner_at={}:{}",
-                    busy.detail(),
-                    spaceless(site.file()),
-                    site.line()
-                ),
-            );
-        }
+        // STAMP, never write. This runs while THIS thread holds the very lock
+        // it is reporting on, so a breadcrumb here would put a file write
+        // inside that hold and on every waiter's latency path behind it —
+        // #1605 review B1's finding, which applies to a finding about the
+        // hold exactly as it applies to a report of one. The slot coalesces
+        // per lock per watchdog tick, which also gives the edge-trigger a
+        // cadenced re-entrant caller needs.
+        stamp_order_report(st, REPORT_REENTRANT, site, outer);
         busy
     }
 
@@ -2123,6 +2225,16 @@ mod rank_tests {
         assert_eq!(held_lock_depth(), 0);
     }
 
+    /// The findings this drain produced for `lock`, and only for `lock`.
+    ///
+    /// Filtered by NAME rather than asserted as a total: the drain is
+    /// process-global and other tests in this binary nest unranked locks of
+    /// their own (`budget.rs`'s `nestspec`), so a total is a race against
+    /// whatever ran next rather than a measurement.
+    fn drain_for(lock: &str) -> Vec<OrderReport> {
+        drain_lock_order_reports().into_iter().filter(|r| r.lock == lock).collect()
+    }
+
     #[test]
     fn an_unranked_lock_nests_under_a_ranked_one_and_is_reported_once() {
         let _serial = SERIAL.lock_safe();
@@ -2130,7 +2242,7 @@ mod rank_tests {
         let plain = TrackedMutex::new("unrankedspec_plain", ());
         let violations = lock_order_violations();
         let reports = unranked_nestings();
-
+        let held_line = std::line!() + 1;
         let g = ranked.lock_safe();
         drop(plain.lock_safe());
         drop(plain.lock_safe());
@@ -2145,13 +2257,25 @@ mod rank_tests {
         assert_eq!(
             unranked_nestings(),
             reports + 1,
-            "three nestings of one unranked lock must report ONCE — the table converges on \
-             names, and a line per acquisition would be a file write on a hot path"
+            "three nestings of one unranked lock must be noted ONCE — the table converges on \
+             names, and one finding per acquisition would be a report per acquisition"
         );
+
+        // And the finding the watchdog would write says which rank it nested
+        // under and where, which is the whole point: a row for the table.
+        let found = drain_for("unrankedspec_plain");
+        assert_eq!(found.len(), 1, "expected exactly one stamped finding: {found:?}");
+        assert_eq!(found[0].rank, None, "the nesting lock is the UNRANKED one");
+        assert_eq!(found[0].outer_rank, Some(INNER));
+        assert_eq!(
+            found[0].outer_site_line, held_line,
+            "the finding must name the line the outer hold was taken on"
+        );
+        assert!(found[0].detail().contains("unrankedspec_plain"), "{}", found[0].detail());
     }
 
     #[test]
-    fn a_release_build_breadcrumbs_the_violation_and_carries_on() {
+    fn a_release_build_stamps_the_violation_and_carries_on() {
         // The fail-open half, which is otherwise unreachable from a test — and
         // a fail-open path nobody has executed is a fail-open path nobody has
         // checked. The deadlock risk exists in the shipped build already;
@@ -2161,13 +2285,32 @@ mod rank_tests {
         let outer = TrackedMutex::new_ranked("failopenspec_outer", OUTER, 7u32);
         let inner = TrackedMutex::new_ranked("failopenspec_inner", INNER, 9u32);
         let before = lock_order_violations();
+        let _ = drain_for("failopenspec_outer"); // start from an empty slot
 
+        let held_line = std::line!() + 1;
         let held = inner.lock_safe();
+        let taken_line = std::line!() + 1;
         let taken = outer.lock_safe();
         assert_eq!(*taken, 7, "the inversion must still ACQUIRE — that is what fail-open means");
         assert_eq!(lock_order_violations(), before + 1, "the violation must still be counted");
         drop(taken);
         drop(held);
+
+        // The finding is STAMPED, not written here: composing it is allocation
+        // and a file write, and this thread was holding a reported lock. Both
+        // locks and both sites survive the deferral, which is the property that
+        // makes the release-mode trail worth having at all.
+        let found = drain_for("failopenspec_outer");
+        assert_eq!(found.len(), 1, "expected exactly one stamped finding: {found:?}");
+        assert_eq!(found[0].rank, Some(OUTER));
+        assert_eq!(found[0].outer_rank, Some(INNER));
+        assert_eq!(found[0].site_line, taken_line, "the acquiring site");
+        assert_eq!(found[0].outer_site_line, held_line, "the site of the hold it collided with");
+        assert_eq!(found[0].event(), "lock-order-violation");
+        assert!(
+            drain_for("failopenspec_outer").is_empty(),
+            "a drained finding must be taken exactly once"
+        );
     }
 
     #[test]
