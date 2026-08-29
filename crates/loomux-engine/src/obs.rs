@@ -493,6 +493,39 @@ pub fn init_webview_profile_from(
     base: Option<PathBuf>,
     env_override: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
+    init_webview_profile_using(identifier, base, env_override, |legacy, new| {
+        move_once(legacy, new, &profile_signpost(new))
+    })
+}
+
+/// [`init_webview_profile_from`] with the MOVE ITSELF as a parameter.
+///
+/// The refusal arm is the one this whole design turns on, and it is the one arm
+/// a test cannot otherwise reach. Reaching it needs an `fs::rename` that fails
+/// **with the destination absent** — because a destination that exists sends
+/// [`plan_default_root`] down the "already migrated" arm and no move is
+/// attempted at all. In the field that is a Windows case: the old build is
+/// still running and its `msedgewebview2.exe` holds the source open.
+///
+/// The provocation that looks portable is not. A destination that is an
+/// existing **file** is `ENOTDIR` on unix, but on Windows `fs::rename`
+/// **succeeds** and moves the directory over the file. That is measured, not
+/// assumed: this function's first cut was tested that way and went green on
+/// ubuntu and macos while `windows-latest` failed on "the old profile must be
+/// left intact" (#1688, CI run 33255271096).
+///
+/// So rather than pin the asymmetry on one platform — or on a fixture whose
+/// behaviour differs by OS underneath a test that claims not to care — the
+/// verdict is handed in, and [`move_once`]'s own refusal is pinned separately
+/// against the real filesystem with a provocation that IS refused everywhere
+/// (an occupied destination directory). The two compose to the end-to-end
+/// claim, and each half is checkable on every platform.
+fn init_webview_profile_using(
+    identifier: &str,
+    base: Option<PathBuf>,
+    env_override: Option<std::ffi::OsString>,
+    mv: impl FnOnce(&Path, &Path) -> RootPlan,
+) -> Option<PathBuf> {
     // Only the production build migrates. An E2E build (`dev.orrerix.e2e`) or
     // any other `--config` identifier keys a profile directory of its own, has
     // no pre-#1562 counterpart, and must never rename the real install's folder
@@ -513,7 +546,7 @@ pub fn init_webview_profile_from(
     let new = base.join(brand::BUNDLE_ID);
     let legacy = base.join(brand::LEGACY_BUNDLE_ID);
     if profile_moves(root_action(plan_default_root(new.is_dir(), legacy.is_dir())))
-        && move_once(&legacy, &new, &profile_signpost(&new)) == RootPlan::UseLegacy
+        && mv(&legacy, &new) == RootPlan::UseLegacy
     {
         eprintln!(
             "orrerix: could not move {} to {} — this run starts with a fresh browser profile, \
@@ -1941,45 +1974,67 @@ mod tests {
     /// is, and joining it is #394's hazard. The run starts fresh under the new
     /// identifier instead, and the old profile is left completely alone.
     ///
-    /// Provoked by making the destination an existing FILE, which `rename`
-    /// refuses on every platform this ships on — and, unlike an occupied
-    /// destination *directory*, still reads as "the new profile is not there"
-    /// to `plan_default_root`, so the move is actually attempted.
-    ///
-    /// The data root's answer to the identical situation is asserted beside it,
-    /// because the asymmetry is the design and a comment claiming it is not a
-    /// pin.
+    /// Three parts, because the refusal and what the dispatch does with it are
+    /// refused by different things and only one of them can be provoked
+    /// portably — see [`init_webview_profile_using`] for the measurement that
+    /// forced the split.
     #[test]
     fn a_refused_profile_move_yields_the_new_dir_not_the_legacy_one() {
         let base = wv_base("refused");
         let legacy = base.join(brand::LEGACY_BUNDLE_ID);
         let new = base.join(brand::BUNDLE_ID);
         fs::create_dir_all(wv_prefs(&legacy)).unwrap();
-        fs::write(&new, "not a directory").unwrap();
 
+        // 1. The dispatch, handed a refusal. `mv` stands in for an `fs::rename`
+        //    the OS said no to; what is under test is what this function then
+        //    does, and the answer must be the NEW directory. `consulted` is the
+        //    control that keeps that from being vacuous: an assertion about a
+        //    refused move proves nothing if no move was ever attempted.
+        let consulted = std::cell::Cell::new(0usize);
+        let got = init_webview_profile_using(brand::BUNDLE_ID, Some(base.clone()), None, |l, n| {
+            consulted.set(consulted.get() + 1);
+            assert_eq!(l, legacy.as_path(), "the mover is handed the legacy identifier's dir");
+            assert_eq!(n, new.as_path(), "…and the new identifier's dir");
+            RootPlan::UseLegacy
+        });
+        assert_eq!(consulted.get(), 1, "the move must actually have been attempted");
         assert_eq!(
-            init_webview_profile_from(brand::BUNDLE_ID, Some(base.clone()), None),
+            got,
             Some(new.clone()),
             "a refused move must still point this run at the NEW identifier — a fresh \
              profile, never the folder the old build's browser process is holding open"
         );
-        assert!(wv_prefs(&legacy).is_dir(), "the old profile must be left intact");
+        assert!(wv_prefs(&legacy).is_dir(), "and the old profile is left completely alone");
+        assert!(!new.exists(), "nothing creates it here — the webview opens a fresh one");
+
+        // 2. …and the real mover really does refuse, and really does leave
+        //    everything alone when it does. Provoked with an occupied
+        //    destination DIRECTORY: the one provocation `rename` refuses on
+        //    every platform this ships on.
+        let occupied = base.join("occupied-destination");
+        fs::create_dir_all(occupied.join("in-the-way")).unwrap();
+        assert_eq!(
+            move_once(&legacy, &occupied, "a signpost that must never be written"),
+            RootPlan::UseLegacy,
+            "precondition: an occupied destination must really be refused by the OS"
+        );
+        assert!(wv_prefs(&legacy).is_dir(), "a refused move leaves the profile intact");
         assert!(
             !legacy.join(MOVED_MARKER).exists(),
             "no signpost may claim a move that did not happen"
         );
 
-        // The asymmetry itself: the DATA root, refused the same way, falls back
-        // to the legacy directory. If these two ever agree, one of them is wrong.
+        // 3. The asymmetry itself: the DATA root, refused the same way, falls
+        //    back to the legacy directory. If these two ever agree, one is wrong.
         let droot = base.join("dataroot");
         let dlegacy = droot.join(brand::LEGACY_NAME);
         let dnew = droot.join(brand::NAME);
         fs::create_dir_all(dlegacy.join("orchestration")).unwrap();
-        fs::write(&dnew, "not a directory").unwrap();
+        fs::create_dir_all(dnew.join("occupied")).unwrap();
         assert_eq!(
             migrate_default_root(&dlegacy, &dnew),
             RootPlan::UseLegacy,
-            "the data root's refused move keeps the old root — \"all my groups are gone\" \
+            "the data root's refused move keeps the OLD root — \"all my groups are gone\" \
              is the failure it is avoiding, and it is why the profile's answer differs"
         );
         let _ = fs::remove_dir_all(&base);

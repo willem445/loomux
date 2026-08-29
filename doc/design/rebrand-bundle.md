@@ -297,7 +297,7 @@ a non-production identifier, and an explicitly-named data root.
 | `brand::BUNDLE_ID` / `LEGACY_BUNDLE_ID` | The identifier and its predecessor, in the module whose whole job is being the one place the old name is spelled. |
 | `obs::move_once(legacy, new, signpost)` | The mechanism, with no policy in it: one `fs::rename`, a signpost, never re-migrate a signpost-only directory. Extracted from `migrate_default_root`, which is now a thin wrapper over it — so the data-root migration's three tests still pin that path byte for byte. |
 | `obs::profile_moves(action)` | The dispatch, and the whole of the asymmetry: only `MoveThenUseNew` moves, and there is no "use the legacy directory" answer at all. |
-| `obs::init_webview_profile{,_from}` | The two guards (production identifier, no explicit root) and the call into `move_once`. The `_from` variant takes the base directory and the data-root override as parameters, so every arm is reachable over a temp dir with no mutated process environment. |
+| `obs::init_webview_profile{,_from,_using}` | The two guards (production identifier, no explicit root) and the call into `move_once`. `_from` takes the base directory and the data-root override as parameters; `_using` additionally takes the move itself, for the reason in the next section. Between them every arm is reachable over a temp dir, on every platform, with no mutated process environment. |
 | `src-tauri/src/lib.rs` | The one caller, immediately after `obs::init_data_root()`. It reads the identifier out of `context.config()` rather than assuming it, which is what makes an E2E build's `--config` override inert without this code having to know the override exists. |
 
 The refusal *message* is the caller's rather than `move_once`'s, because
@@ -310,6 +310,39 @@ also settles what `RootPlan`'s documented policy revert means on this path.
 Flipping `plan_default_root`'s `(false, true)` arm to `UseLegacy` stops the
 data-root migration; here it stops the profile move *without* redirecting the
 run at the old directory, because `UseLegacy` is not a mover in this dispatch.
+
+### Why the refusal arm takes the move as a parameter
+
+`fs::rename` does not fail the same way on every platform, and the difference
+lands exactly on this design's one interesting arm.
+
+Reaching the refusal at all needs a rename that fails **with the destination
+absent** — a destination that exists sends `plan_default_root` down the
+"already migrated" arm and no move is attempted. In the field that is a Windows
+case: the old build is still running and its `msedgewebview2.exe` holds the
+source directory open.
+
+The fixture that looks portable is not. A destination that is an existing
+**file** is `ENOTDIR` on unix, so the rename is refused — but on Windows
+`fs::rename` **succeeds** and moves the directory over the file. This is
+measured rather than reasoned: the first cut of
+`a_refused_profile_move_yields_the_new_dir_not_the_legacy_one` used that fixture
+and went green on `ubuntu-22.04` and `macos-latest` while `windows-latest`
+failed on `the old profile must be left intact` (#1688, CI run 33255271096).
+A test that claims to be about a policy, and whose fixture quietly means
+something different on one of the three platforms it ships on, is worse than no
+test — so the two halves were separated instead:
+
+- `init_webview_profile_using` takes the verdict, so **what the dispatch does
+  with a refusal** is checked on every platform, with a call-counter control so
+  "a refused move yields the new directory" cannot pass without a move having
+  been attempted;
+- `move_once`'s **own** refusal is pinned against the real filesystem with the
+  one provocation that is refused everywhere — an occupied destination
+  directory — asserting it leaves the profile intact and writes no signpost.
+
+The two compose to the end-to-end claim, and neither half rests on a platform
+difference nobody wrote down.
 
 ### The lockstep guard for the identifier
 
