@@ -1225,8 +1225,9 @@ impl<T> TrackedMutex<T> {
     /// A lock built with the plain [`new`](Self::new) is UNRANKED: it may nest
     /// under anything and anything may nest under it, so the table can be
     /// filled in one family at a time rather than all at once. Its first
-    /// nesting is breadcrumbed once (`lock-rank-unranked`), which is how the
-    /// missing rows announce themselves instead of waiting to be noticed.
+    /// nesting is noted once and reaches the breadcrumb log through the
+    /// watchdog as `lock-rank-unranked`, which is how the missing rows announce
+    /// themselves instead of waiting to be noticed.
     pub fn new_ranked(name: &'static str, rank: LockRank, value: T) -> Self {
         Self::build(name, rank.get(), value)
     }
@@ -1482,17 +1483,20 @@ impl<T> TrackedMutex<T> {
         }
     }
 
-    /// Compose the [`BusyKind::Reentrant`] refusal, and breadcrumb it once per
-    /// hold.
+    /// Compose the [`BusyKind::Reentrant`] refusal.
     ///
     /// The "holder" it names is this thread's own earlier frame, taken from the
     /// held-lock stack rather than sampled off the lock — which is both cheaper
     /// and strictly more accurate, since the stack entry cannot have been
     /// replaced under the read.
     ///
-    /// Edge-triggered on the hold's own generation, reusing
-    /// [`busy`](Self::busy)'s counter for exactly its reason: a cadenced caller
-    /// that re-enters every tick must not write a breadcrumb every tick.
+    /// Unlike [`busy`](Self::busy), this writes nothing: it stamps the deferred
+    /// slot ([`stamp_order_report`]) and lets the watchdog compose it. `busy` is
+    /// allowed its breadcrumb because the waiter has already given up and holds
+    /// nothing; a re-entrant caller is standing on the very lock it is
+    /// reporting on. The one slot per lock also coalesces a cadenced re-entrant
+    /// caller to one finding per watchdog tick, which is the edge-trigger
+    /// `busy` gets from its generation key.
     fn reentrant_busy(&self, site: &'static Location<'static>, outer: &HeldEntry) -> Busy {
         let st = &self.state;
         let (file, line) = site_of(outer.site as *mut _);
