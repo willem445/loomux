@@ -475,7 +475,9 @@ impl<T> TrackedMutex<T> {
         let site = Location::caller();
         let guard = match self.inner.try_lock() {
             Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            // NEUTERED (scratch, #1605 review N2): report a poisoned lock as
+            // busy — a different fact, and the wrong one.
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
         let st = &self.state;
