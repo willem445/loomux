@@ -127,10 +127,19 @@ fn is_fn_decl(line: &str) -> bool {
 /// Bodies are delimited by BRACE DEPTH rather than by "up to the next `fn`",
 /// so text between two functions — a `static`, a `const`, an `impl` header —
 /// belongs to neither, which is what lets the attribution cross-check below
-/// see it. Brace counting is textual; every brace in this module is balanced
-/// and the cross-check is what would notice if that stopped being true, since
-/// a mis-parse moves hazard occurrences out of the items that should hold
-/// them.
+/// see it.
+///
+/// Brace counting is textual, so a mis-parse is possible in two directions and
+/// each needs its own check. UNDER-spanning moves hazard occurrences OUT of
+/// the items that should hold them, and `unattributed` sees that. OVER-spanning
+/// moves them IN: an unbalanced `{` inside a string literal stops `depth` ever
+/// returning to zero, so the item swallows the following function's lines, the
+/// scan resumes past it, and that function is never an `Item` at all — while
+/// its hazards read as covered and attributed to the swallowing item. If the
+/// swallower is gated, an ungated hazardous function is then invisible to both
+/// floors, the attribution check AND the gating loop, all green. `decl_lines`
+/// below is what closes it: every line that DECLARES a function must have
+/// produced one (#1606 review round 2, N2).
 fn items(src: &str) -> Vec<Item> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
@@ -219,6 +228,10 @@ struct GateReport {
     /// `(line number, line)` for every hazard occurrence that belongs to no
     /// function at all — the subjects the split could not see.
     unattributed: Vec<(usize, String)>,
+    /// Lines that DECLARE a function. Must equal `items`: a declaration that
+    /// produced no item is one the split lost, which is the over-spanning
+    /// direction of a brace mis-parse.
+    decl_lines: usize,
 }
 
 fn gate_report(src: &str) -> GateReport {
@@ -259,7 +272,13 @@ fn gate_report(src: &str) -> GateReport {
         .map(|(n, line)| (n + 1, line.trim().to_string()))
         .collect();
 
-    GateReport { items: items.len(), hazardous: hazardous.len(), ungated, unattributed }
+    GateReport {
+        items: items.len(),
+        hazardous: hazardous.len(),
+        ungated,
+        unattributed,
+        decl_lines: src.lines().filter(|l| is_fn_decl(l)).count(),
+    }
 }
 
 #[test]
@@ -281,6 +300,20 @@ fn nothing_that_can_hold_a_lock_or_sleep_is_compiled_into_a_release_build() {
          mutex, sleeps, spawns a thread and writes files, so a lower count means the markers \
          stopped matching the module rather than the module getting safer",
         report.hazardous
+    );
+
+    // Every function DECLARATION produced an item. A declaration that did not
+    // is one an over-spanning brace swallowed, and a swallowed function is
+    // invisible to every other check here: its hazards are attributed to the
+    // swallower, so `unattributed` stays empty and the gating loop judges the
+    // wrong function's attributes.
+    assert_eq!(
+        report.items, report.decl_lines,
+        "e2ehold.rs has {} function declarations but the split produced {} items — one \
+         or more were swallowed, most likely by an unbalanced brace inside a string \
+         literal. A swallowed function is judged by its swallower's #[cfg], so the \
+         release-gating verdict below says nothing about it.",
+        report.decl_lines, report.items
     );
 
     // The population control: every hazard occurrence in the FILE is inside a
@@ -330,6 +363,46 @@ fn the_gate_report_really_refuses_an_ungated_definition() {
         report.ungated,
         report.unattributed,
         report.items
+    );
+}
+
+#[test]
+fn an_over_spanning_brace_cannot_swallow_a_function() {
+    // The counterfactual for the check above, because this file's own doctrine
+    // is that a refusal is PERFORMED rather than asserted.
+    //
+    // The splice is the smallest edit that defeats every OTHER check here: a
+    // GATED function whose string literal carries one unmatched brace, followed
+    // by an ungated one that holds a registry mutex. `depth` never returns to
+    // zero, so the gated item swallows the ungated function to EOF; the hazard
+    // is then attributed to a `#[cfg(debug_assertions)]` item, `unattributed`
+    // is empty, both floors are met, and the gating loop finds nothing.
+    let src = module_source();
+    let clean = gate_report(&src);
+    assert_eq!(clean.items, clean.decl_lines, "control: the real module is supposed to balance");
+
+    let injected = format!(
+        "{src}\n\n#[cfg(debug_assertions)]\nfn brace_in_a_string() {{\n    \
+         let _s = \"{{\";\n}}\n\n\
+         pub(crate) fn swallowed_hazard(reg: &OrchRegistry) {{\n    \
+         let _g = reg.groups.lock_safe();\n}}\n"
+    );
+    let report = gate_report(&injected);
+
+    // Every other check is satisfied — which is the point of the test.
+    assert!(report.ungated.is_empty(), "precondition: the swallowed hazard is not caught by gating");
+    assert!(
+        report.unattributed.is_empty(),
+        "precondition: the swallowed hazard is not caught by attribution"
+    );
+    // …and this is the one that has to notice.
+    assert!(
+        report.decl_lines > report.items,
+        "an over-spanning brace swallowed a function and nothing noticed: {} declarations, \
+         {} items, ungated={:?}",
+        report.decl_lines,
+        report.items,
+        report.ungated
     );
 }
 

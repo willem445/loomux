@@ -255,18 +255,31 @@ test.describe("soak: a large corpus and a steady poll load", () => {
         `about an idle app. Poll gate: ${JSON.stringify(gate)}`
     ).toBeGreaterThanOrEqual(sweepFloor);
 
-    // And the two instruments have to agree. A sweep issues
-    // `orch_group_summary` + `orch_group_usage` per group-bound tab, so any
-    // sweep that ran dispatched something — sweeps climbing while dispatches
-    // do not would mean the sweep is running and finding no bound tabs, which
-    // is the corpus failing to bind rather than the app being healthy.
+    // And the two instruments have to agree, at the FAN-OUT and not merely at
+    // "something happened". A sweep issues `orch_group_summary` +
+    // `orch_group_usage` per group-bound tab, so a full sweep dispatches
+    // `BOUND_TABS × 2`; measured, `polled` is exactly `sweeps × BOUND_TABS × 2`.
+    //
+    // The floor was `polled >= sweeps`, which has 8× slack and therefore only
+    // catches a corpus that bound NO tabs: one that bound 1 of 4 dispatches 90
+    // against 45 sweeps and passes, running the soak at a quarter of its
+    // intended registry load with `assertCorpusReallyLanded` none the wiser —
+    // it checks groups, sessions and audit bytes, never the binding (#1606
+    // review round 2, N1).
+    //
+    // Half the nominal fan-out is safe to pin here, and pinning it does not
+    // reintroduce the arithmetic that went stale on #1604: what that change
+    // made unpredictable is how many sweeps RUN, which is why `sweeps` is read
+    // rather than derived. What each sweep dispatches is untouched by it.
+    const dispatchFloor = Math.floor(sweeps * BOUND_TABS * 2 * 0.5);
     expect(
       polled,
-      `${sweeps} status sweeps ran but only ${polled} orch_* commands were dispatched. A ` +
-        `sweep issues two per group-bound tab, so this means the sweep found no bound ` +
-        `tabs — the corpus's tabs.json did not bind, and the soak applied no registry ` +
-        `load at all. Counts: ${JSON.stringify(counts)}`
-    ).toBeGreaterThanOrEqual(sweeps);
+      `${sweeps} status sweeps ran but only ${polled} orch_* commands were dispatched ` +
+        `(expected at least ${dispatchFloor}, half the ${sweeps} × ${BOUND_TABS} × 2 ` +
+        `fan-out). A sweep issues two per GROUP-BOUND tab, so a shortfall means some or ` +
+        `all of the corpus's tabs.json did not bind and the soak applied less registry ` +
+        `load than it reports. Counts: ${JSON.stringify(counts)}`
+    ).toBeGreaterThanOrEqual(dispatchFloor);
 
     // ---- (4) the two liveness assertions ----
     const pty = await ptyRoundTrip(page, paneTerm, 2, LIVENESS_BOUND_MS);
