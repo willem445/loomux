@@ -181,22 +181,37 @@ pub fn start(_reg: Arc<OrchRegistry>) {}
 #[cfg(debug_assertions)]
 fn watch(reg: &OrchRegistry) {
     let root = crate::obs::data_root();
-    let request = root.join(REQUEST_FILE);
-    let state = root.join(STATE_FILE);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-        let Ok(text) = std::fs::read_to_string(&request) else { continue };
-        // Consume before acting: a request is honoured exactly once, and a
-        // hold that panics cannot leave the file behind to be re-honoured on
-        // the next tick.
-        let _ = std::fs::remove_file(&request);
-        match parse_request(&text) {
-            Ok((target, hold_ms)) => hold(reg, &state, target, hold_ms),
-            Err(e) => {
-                write_state(&state, &json!({ "error": e, "requested_ms": super::now_ms() }));
-            }
+        run_once(reg, &root);
+    }
+}
+
+/// Honours at most one pending request under `root`, BLOCKING for the hold's
+/// duration if it finds one. Returns whether there was one.
+///
+/// Split out of the watcher, and public, for one reason: the E2E spec that
+/// uses this injector is an expected failure (`test.fail()`), and that marker
+/// absorbs every assertion inside its own test — including the ones checking
+/// that the hold really happened. So the proof that a request actually takes
+/// the named mutex has to live where no such marker can reach it, which is
+/// `tests/e2ehold_guard.rs` calling this directly against a temp root.
+#[cfg(debug_assertions)]
+pub fn run_once(reg: &OrchRegistry, root: &std::path::Path) -> bool {
+    let request = root.join(REQUEST_FILE);
+    let state = root.join(STATE_FILE);
+    let Ok(text) = std::fs::read_to_string(&request) else { return false };
+    // Consume before acting: a request is honoured exactly once, and a hold
+    // that panics cannot leave the file behind to be re-honoured on the next
+    // tick.
+    let _ = std::fs::remove_file(&request);
+    match parse_request(&text) {
+        Ok((target, hold_ms)) => hold(reg, &state, target, hold_ms),
+        Err(e) => {
+            write_state(&state, &json!({ "error": e, "requested_ms": super::now_ms() }));
         }
     }
+    true
 }
 
 #[cfg(debug_assertions)]

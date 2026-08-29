@@ -506,11 +506,21 @@ vacuously:
   TOTAL, not on which commands — the group-view batch has been five, then
   nine, then ten, and pinning a count would pin the last incident's shape,
   which is the mistake this lane exists to stop making.
-- **The hold really held.** `acquired_ms` must appear before any probe runs,
-  and `released_ms` must still be absent after they finish. A hold that
-  never happened, or that expired early, leaves both probes measuring an
-  idle app — which under `test.fail()` reports as a failure claiming the bug
-  is fixed.
+- **The hold really held** — and this one could NOT live inside the test it
+  is about. `test.fail()` absorbs every failure in its own test, controls
+  included: an injector that silently never took a lock would leave both
+  probes measuring an idle app, the test would fail, and Playwright would
+  report a healthy expected failure. So the proof is split across two places
+  the marker cannot reach. `src-tauri/tests/e2ehold_guard.rs` proves the
+  mechanism **differentially** against a real `OrchRegistry` — the same
+  public registry read that finishes in milliseconds with nothing held does
+  not finish at all during a 1.5 s hold, and then does once it elapses,
+  because "it did not finish" is evidence only if the same probe could have
+  finished. And a short, non-xfail spec in the same describe proves the
+  injector is compiled in and armed **in the build under test**, which is the
+  one part a Rust test cannot say. The `acquired_ms`/`released_ms` checks
+  still inside the expected failure are diagnostics: they put the reason in
+  the report, and are not counted as evidence.
 
 The MCP probe also carries a negative control: a bogus token must be refused
 with JSON-RPC `-32000`. Without it, "something answered on 127.0.0.1" would
@@ -525,6 +535,11 @@ while the fix is outstanding, and the moment Phases 1/2 land Playwright
 reports "expected to fail but passed", telling whoever landed the fix to
 flip the marker. A `skip` would have gone quiet instead, and quiet is how a
 lane stops being re-armed.
+
+The cost of the marker is that it absorbs its own test's controls — see
+**Positive controls** above for where each of them lives instead. The rule
+this lane follows is that nothing inside an expected failure is ever cited
+as evidence for anything.
 
 **When plan #1600's Phases 1 and 2 land:** delete the `test.fail()` line in
 `e2e/tests/soak-liveness.spec.ts` and this paragraph with it. Nothing else

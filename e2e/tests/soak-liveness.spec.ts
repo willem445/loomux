@@ -47,6 +47,24 @@
 // while the fix is outstanding, and the moment the fix lands Playwright
 // reports "expected to fail but passed" — so the person who lands it is told
 // to flip the marker, rather than the lane quietly never being re-armed.
+//
+// **What that marker costs, stated rather than left implicit**: it absorbs
+// EVERY failure inside its own test, its positive controls included. An
+// injector that silently never took a lock would leave both probes measuring
+// an idle app, the test would fail, and Playwright would report a healthy
+// expected failure. So none of that test's controls live inside it:
+//
+// - *the probes work at all* is spec 1's job — it runs both at t=0 and after
+//   the soak, and it is not an expected failure, so a broken probe reddens
+//   there;
+// - *a hold really takes the mutex, and gives it back* is
+//   `src-tauri/tests/e2ehold_guard.rs`'s job, proven differentially against a
+//   real registry with no marker anywhere near it;
+// - *the injector is armed in THIS build* is the short non-xfail test that
+//   runs first in the same describe below.
+//
+// The assertions still inside the expected failure are diagnostics: they put
+// the reason in the report. They are not evidence, and are not treated as any.
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -232,15 +250,31 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     appLaunch: { seedDataDir: seedCorpus, extraEnv: { [HOLD_ENV_VAR]: "1" } },
   });
 
-  // Expected to fail on today's main. See this file's header for why the
-  // marker is `fail` rather than `skip`, and what is supposed to happen to it
-  // when plan #1600's Phases 1 and 2 land.
-  test.fail();
+  // The one E2E-level control that the expected-failure marker below cannot
+  // absorb: this build, launched this way, really does honour a hold request.
+  // Everything about the mechanism is proven in Rust; what only a real launch
+  // can show is that the injector was compiled in and armed — a release build,
+  // or a missing opt-in, would leave the class assertion failing for a reason
+  // that has nothing to do with the bug class, and reporting as a pass.
+  test("the lock-hold injector is armed in the build under test", async ({ appDataDir }) => {
+    requestLockHold(appDataDir, "agents", 300);
+    const held = await waitForHoldAcquired(appDataDir);
+    expect(held.target, "the injector honoured a different target than requested").toBe("agents");
+    // And it lets go: a leaked guard would wedge every later assertion in this
+    // file behind it.
+    const releasedBy = Date.now() + 15_000;
+    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) await sleep(100);
+    expect(holdStillHeld(appDataDir), "the injector never released a 300ms hold").toBe(false);
+  });
 
+  // Expected to fail on today's main. See this file's header for why the
+  // marker is `fail` rather than `skip`, what it absorbs, and what is supposed
+  // to happen to it when plan #1600's Phases 1 and 2 land.
   test("the app still accepts pane input and the MCP still answers while a registry lock is held", async ({
     appPage: page,
     appDataDir,
   }) => {
+    test.fail();
     test.setTimeout(LOCK_HOLD_MS + 300_000);
     assertCorpusReallyLanded();
 
@@ -250,10 +284,9 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const paneTerm = paneByName(page, "hold-pane").locator(".pane-term");
     await expect(paneTerm).toBeVisible();
 
-    // Let the poll paths get going, and prove both probes work BEFORE the
-    // hold. A probe that was already broken would otherwise make this test
-    // "fail as expected" for a reason that has nothing to do with the hold —
-    // which is exactly the way an expected-failure marker rots into noise.
+    // Let the poll paths get going, and record how both probes behave BEFORE
+    // the hold. Diagnostics, not a control — the marker on this test absorbs
+    // them (see the file header); spec 1 is where a broken probe reddens.
     await sleep(WARMUP_MS);
     const warmPty = await ptyRoundTrip(page, paneTerm, 3, LIVENESS_BOUND_MS);
     expect(warmPty.ok, `pty round trip BEFORE the hold: ${warmPty.detail}`).toBe(true);
@@ -284,10 +317,10 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const pty = await ptyRoundTrip(page, paneTerm, 4, LIVENESS_BOUND_MS);
     const ping = await mcpCall(endpoint, "ping", {}, LIVENESS_BOUND_MS);
 
-    // The positive control, read AFTER the probes: a hold that had already
-    // expired would leave both of them measuring an idle app, and this test
-    // would then "pass" — which, under `test.fail()`, reports as a failure
-    // claiming the bug is fixed.
+    // Read AFTER the probes: a hold that had already expired would leave both
+    // of them measuring an idle app. Absorbed by the marker like everything
+    // else here, so its value is the sentence it puts in the report — the
+    // unabsorbed version of this check is the armed-injector test above.
     const stillHeld = holdStillHeld(appDataDir);
     expect(
       stillHeld,

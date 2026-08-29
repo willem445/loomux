@@ -4,10 +4,16 @@
 // class names read straight out of src/launcher.ts, src/pane.ts, src/grid.ts.
 import { type Page } from "@playwright/test";
 
-/** The most recently opened "New pane" launcher form (there can be more than
- *  one welcome-form on screen across empty tabs/panes at once). */
+/** The most recently opened "New pane" launcher form.
+ *
+ *  `:visible` is load-bearing, not tidiness. Every empty pane carries a
+ *  welcome form, and a session restored from `tabs.json` brings up one per
+ *  tab — all of them in the DOM, only the active tab's on screen. Without the
+ *  filter `.last()` picks the LAST tab's hidden form, and the first
+ *  interaction then waits for a form that will never become visible. With a
+ *  single tab (every spec before the soak lane) the filter changes nothing. */
 function latestWelcomeForm(page: Page) {
-  return page.locator(".welcome-form").last();
+  return page.locator(".welcome-form:visible").last();
 }
 
 /** Fills out and submits the launcher form to turn a welcome pane into a

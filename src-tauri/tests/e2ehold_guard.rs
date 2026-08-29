@@ -29,8 +29,12 @@
 //!    assertion it was supposed to fail.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use loomux_lib::orchestration::e2ehold::{self, Target};
+use loomux_lib::orchestration::OrchRegistry;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -282,4 +286,163 @@ fn the_protocol_constants_reach_the_playwright_side_unrenamed() {
     // The ceiling is quoted in the module doc and in doc/design/e2e-testing.md;
     // pin the number so the three cannot drift apart silently.
     assert_eq!(e2ehold::MAX_HOLD_MS, 300_000);
+}
+
+// ---------------------------------------------------------------------------
+// The injector's own behaviour.
+//
+// This is the control the E2E spec structurally cannot carry. Its class
+// assertion is marked `test.fail()`, and that marker absorbs EVERY failure
+// inside its own test — so an injector that silently never took a lock would
+// leave the spec's probes measuring an idle app, the spec would fail, and
+// Playwright would report a healthy expected failure. "The hold really
+// happened" therefore has to be proven somewhere no marker reaches.
+//
+// It is proven DIFFERENTIALLY rather than by a single "it blocked" reading:
+// a probe that never completes is indistinguishable from a probe that could
+// not have completed anyway, so the same probe is run against the same
+// registry with NO hold in flight and has to finish promptly.
+// ---------------------------------------------------------------------------
+
+/// A registry read that takes the `agents` mutex, run on its own thread.
+/// `OrchRegistry::agent` is public and locks `agents` and nothing else, so it
+/// is the narrowest possible observer of that lock's availability.
+fn probe_agents_lock(reg: Arc<OrchRegistry>) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    let handle = std::thread::spawn(move || {
+        let _ = reg.agent("no-such-agent");
+        flag.store(true, Ordering::SeqCst);
+    });
+    (handle, done)
+}
+
+fn wait_for<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+fn state_of(root: &Path) -> serde_json::Value {
+    match std::fs::read_to_string(root.join(e2ehold::STATE_FILE)) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+#[test]
+fn with_no_request_pending_a_registry_read_completes_promptly() {
+    // The differential control for the test below. Without it, "the read did
+    // not finish" would be evidence about the injector only if the read could
+    // have finished — and nothing else here establishes that.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reg = Arc::new(OrchRegistry::new(dir.path().join("orchestration")));
+
+    assert!(
+        !e2ehold::run_once(&reg, dir.path()),
+        "run_once claimed to have honoured a request when none was written"
+    );
+    assert_eq!(state_of(dir.path()), serde_json::Value::Null, "a state file appeared with no request");
+
+    let (handle, done) = probe_agents_lock(reg);
+    assert!(
+        wait_for(|| done.load(Ordering::SeqCst), Duration::from_secs(5)),
+        "a registry read did not complete within 5s with NOTHING holding the lock — the probe \
+         itself is broken, so the held-lock test below would prove nothing"
+    );
+    handle.join().expect("probe thread");
+}
+
+#[test]
+fn a_request_really_takes_the_named_lock_and_really_gives_it_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reg = Arc::new(OrchRegistry::new(dir.path().join("orchestration")));
+
+    // 1.5 s: long enough that a probe blocked on the mutex cannot finish
+    // inside the 500 ms window checked below by luck, short enough that the
+    // suite does not pay for it.
+    std::fs::write(
+        dir.path().join(e2ehold::REQUEST_FILE),
+        br#"{"target":"agents","hold_ms":1500}"#,
+    )
+    .expect("write request");
+
+    let injector_reg = reg.clone();
+    let root = dir.path().to_path_buf();
+    let injector = std::thread::spawn(move || e2ehold::run_once(&injector_reg, &root));
+
+    assert!(
+        wait_for(
+            || state_of(dir.path())["acquired_ms"].as_u64().unwrap_or(0) > 0,
+            Duration::from_secs(5)
+        ),
+        "the injector never reported acquiring the lock: {}",
+        state_of(dir.path())
+    );
+    assert!(
+        state_of(dir.path())["released_ms"].is_null(),
+        "the injector reported releasing the lock before the hold could have elapsed"
+    );
+
+    // The actual claim: a registry read that takes `agents` cannot proceed.
+    let (handle, done) = probe_agents_lock(reg.clone());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !done.load(Ordering::SeqCst),
+        "a registry read completed while the `agents` mutex was supposedly held for 1500ms — \
+         the injector is not holding anything, so every E2E result taken under it would be a \
+         measurement of an idle app"
+    );
+
+    // And it is a HOLD, not a leak: the read completes once the hold elapses.
+    assert!(
+        wait_for(|| done.load(Ordering::SeqCst), Duration::from_secs(10)),
+        "the registry read never completed even after the hold should have expired — the \
+         injector leaked the guard"
+    );
+    handle.join().expect("probe thread");
+
+    assert!(injector.join().expect("injector thread"), "run_once did not report honouring the request");
+    let final_state = state_of(dir.path());
+    assert!(
+        final_state["released_ms"].as_u64().unwrap_or(0) >= final_state["acquired_ms"].as_u64().unwrap_or(0),
+        "released_ms is not at or after acquired_ms: {final_state}"
+    );
+    assert!(
+        !dir.path().join(e2ehold::REQUEST_FILE).exists(),
+        "the request file survived — it would be honoured again on the next tick"
+    );
+}
+
+#[test]
+fn a_refused_request_says_so_in_the_state_file_and_holds_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reg = Arc::new(OrchRegistry::new(dir.path().join("orchestration")));
+    std::fs::write(
+        dir.path().join(e2ehold::REQUEST_FILE),
+        br#"{"target":"nonsense","hold_ms":1500}"#,
+    )
+    .expect("write request");
+
+    assert!(e2ehold::run_once(&reg, dir.path()));
+    let state = state_of(dir.path());
+    assert!(
+        state["error"].as_str().unwrap_or_default().contains("unknown target"),
+        "a bad request did not record why it was refused: {state}"
+    );
+    assert!(state["acquired_ms"].is_null(), "a refused request still reported an acquisition");
+
+    // And nothing is held afterwards, so a typo in a fixture degrades to a
+    // loud spec failure rather than a wedged app.
+    let (handle, done) = probe_agents_lock(reg);
+    assert!(
+        wait_for(|| done.load(Ordering::SeqCst), Duration::from_secs(5)),
+        "a refused request left the `agents` mutex held"
+    );
+    handle.join().expect("probe thread");
 }
