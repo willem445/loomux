@@ -15,16 +15,25 @@
 //! modules, not about delegation — so folding them in here is a separate
 //! change, not a drive-by in a perf slice.
 //!
-//! **And the four raw `spawn_blocking` call sites are left raw, deliberately.**
-//! `pty.rs` `write_pty`/`change_dir` (#734), `sessions.rs` `list_sessions` and
-//! `voice.rs` `voice_stop` (#58) each converted before this module existed and
-//! each does something with the join failure that this helper would change:
-//! two map it into their `Result` as a domain error the frontend toasts, and
-//! `list_sessions` degrades it to an empty list because every caller of that
-//! one is already written to assume "best-effort, resumable on failure". Those
-//! are decisions with their own doc comments, not boilerplate waiting to be
-//! deduplicated. #746 converted commands in all three of those files and did
-//! not touch their neighbours' error handling on the way past.
+//! **And the two raw `spawn_blocking` call sites are left raw, deliberately.**
+//! `sessions.rs` `list_sessions` and `voice.rs` `voice_stop` (#58) each
+//! converted before this module existed and each does something with the join
+//! failure that this helper would change: `voice_stop` maps it into its
+//! `Result` as a domain error the frontend toasts, and `list_sessions` degrades
+//! it to an empty list because every caller of that one is already written to
+//! assume "best-effort, resumable on failure". Those are decisions with their
+//! own doc comments, not boilerplate waiting to be deduplicated. #746 converted
+//! commands in both of those files and did not touch their neighbours' error
+//! handling on the way past.
+//!
+//! **That list was FOUR and is two (#1607).** `pty.rs` `write_pty` and
+//! `change_dir` were the other two, raw since #734. They are not deduplicated
+//! into this helper — they no longer reach the blocking pool at all. Epic #1600
+//! Phase 2.3 moved the input path onto a thread per pane (P8-writer), because
+//! this pool is a bounded shared resource and beta6 exhausted it with parked
+//! orchestration poll ticks until keystrokes could not be scheduled (#1600
+//! §1.2). Their bodies now go to `PtyManager::enqueue_frontend_write` /
+//! `enqueue_cd`, and the command awaits the writer thread's completion reply.
 //!
 //! **What the command owes on top of calling this.** Delegation is only half of
 //! INV-1: `spawn_blocking` moves the body, and Tauri still polls the future on

@@ -284,26 +284,25 @@ fn spawn_pane_writer(
 ) -> std::sync::mpsc::Sender<WriterJob> {
     let (tx, rx) = std::sync::mpsc::channel::<WriterJob>();
     std::thread::spawn(move || {
+        // Every arm answers its job's `reply` exactly once. `try_send` cannot
+        // be full (capacity 1, one reply per job); `Closed` means the awaiting
+        // command's future was dropped — the window went away mid-write — and
+        // there is simply nobody left to tell.
         while let Ok(job) = rx.recv() {
-            let (data, reply) = match job {
-                WriterJob::Frontend { data, human, reply } => (Ok((data, human)), reply),
-                WriterJob::Cd { path, reply } => (Err(path), reply),
+            let Some(map) = ptys.upgrade() else {
+                let (WriterJob::Frontend { reply, .. } | WriterJob::Cd { reply, .. }) = job;
+                let _ = reply.try_send(Err("pty not found".to_string()));
+                continue;
             };
-            let result = match ptys.upgrade() {
-                Some(map) => {
-                    let ctx = WriteCtx { ptys: &map, neutral_gate_throttle: &neutral_gate_throttle };
-                    match &data {
-                        Ok((data, human)) => ctx.write_from_frontend(id, data, *human),
-                        Err(path) => ctx.write_cd(id, path),
-                    }
+            let ctx = WriteCtx { ptys: &map, neutral_gate_throttle: &neutral_gate_throttle };
+            match job {
+                WriterJob::Frontend { data, human, reply } => {
+                    let _ = reply.try_send(ctx.write_from_frontend(id, &data, human));
                 }
-                None => Err("pty not found".to_string()),
-            };
-            // Capacity 1, one reply per job, so this cannot be full. `Closed`
-            // means the awaiting command's future was dropped (the window went
-            // away mid-write); the bytes went out either way, and there is
-            // nobody left to tell.
-            let _ = reply.try_send(result);
+                WriterJob::Cd { path, reply } => {
+                    let _ = reply.try_send(ctx.write_cd(id, &path));
+                }
+            }
         }
     });
     tx
