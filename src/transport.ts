@@ -143,8 +143,59 @@ export function engineTransport(): EngineTransport {
   return active;
 }
 
+/** Per-command dispatch counts, or `null` while the counter is disarmed.
+ *  Disarmed is the shipped state and the only state anything reaches
+ *  without an explicit call — see `invokeStats`. */
+let invokeCounts: Record<string, number> | null = null;
+
+export interface InvokeStats {
+  /** Whether counting is on. False in every build nobody has armed. */
+  armed: boolean;
+  /** Dispatches since arming, by command name. A snapshot, not the live map. */
+  counts: Record<string, number>;
+}
+
+/** Dispatch accounting for the app's ONE IPC seam, reachable from devtools
+ *  (and from an E2E spec over CDP) as `__invokeStats()` — the same shape of
+ *  hand-validation instrument `pollgate.ts` exposes as `__pollGateStats()`.
+ *
+ *  **Why it is here and not in the test.** The E2E soak lane (#1603) has to
+ *  be able to say "the poll paths really ran" before it reads anything into a
+ *  liveness result — without that, the test asserts only that an app survives
+ *  being ignored. Counting from the spec's side meant patching
+ *  `window.__TAURI_INTERNALS__.invoke`, which is a frozen own property
+ *  (`writable:false, configurable:false`, measured on the E2E build) that a
+ *  Proxy is forbidden by the language from intercepting. Fighting that
+ *  descriptor would also have been a bet on Tauri's internals staying
+ *  shaped as they are. This module is the answer the codebase already had:
+ *  CLAUDE.md constraint 5 makes it the only module that touches Tauri IPC,
+ *  so a counter here sees every dispatch every bridge makes, by
+ *  construction.
+ *
+ *  **Why it cannot ship enabled.** It is off until someone calls
+ *  `__invokeStats("arm")`. Disarmed, `invoke` pays one null check; armed, it
+ *  increments an integer in a map keyed by COMMAND NAME, so the retained set
+ *  is bounded by the command surface (~160) and not by session length — INV-8
+ *  by construction rather than by a prune. There is no IPC surface, no ACL
+ *  grant and no new command: this is a local counter behind a read function.
+ */
+export function invokeStats(arm?: "arm"): InvokeStats {
+  if (arm === "arm") invokeCounts ??= {};
+  return { armed: invokeCounts !== null, counts: { ...(invokeCounts ?? {}) } };
+}
+
+/** Test-only: forget both the counts and the armed state. Not exposed on
+ *  `globalThis` — the unit tests need it so one test's arming cannot decide
+ *  another's result, and nothing else has a reason to. */
+export function resetInvokeStatsForTest(): void {
+  invokeCounts = null;
+}
+
+(globalThis as unknown as { __invokeStats?: typeof invokeStats }).__invokeStats = invokeStats;
+
 /** Call a backend command. Resolved against the live transport on every call. */
 export function invoke<T>(cmd: string, args?: EngineArgs): Promise<T> {
+  if (invokeCounts !== null) invokeCounts[cmd] = (invokeCounts[cmd] ?? 0) + 1;
   return active.invoke<T>(cmd, args);
 }
 

@@ -21,7 +21,10 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  invoke,
+  invokeStats,
   pickDirectory,
+  resetInvokeStatsForTest,
   setEngineTransport,
   tauriTransport,
   type EngineArgs,
@@ -450,4 +453,108 @@ test("the transport surface is exactly the declared capability set", () => {
     "onCloseRequested",
     "pickDirectory",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// The dispatch counter (#1603).
+//
+// It exists so the E2E soak lane can say "the poll paths really ran" before it
+// reads anything into a liveness result — a soak that asserts nothing about the
+// load it applied is a test that an app survives being ignored. Its failure
+// mode is silent and symmetrical with the thing it measures: a counter that is
+// not counting returns an empty map, which is bit-for-bit what an app that
+// never dispatched returns. So the property that matters is not "it counts" but
+// "a caller can tell the difference", which is what `armed` is for.
+// ---------------------------------------------------------------------------
+
+test("the dispatch counter is OFF until it is armed, and says so", () => {
+  resetInvokeStatsForTest();
+
+  const before = invokeStats();
+  assert.equal(before.armed, false, "a build nobody armed reports itself armed");
+
+  void invoke("cmd_while_disarmed", { a: 1 });
+
+  const after = invokeStats();
+  assert.equal(after.armed, false);
+  assert.deepEqual(
+    after.counts,
+    {},
+    "a disarmed counter recorded a dispatch — the shipped state is supposed to be inert"
+  );
+});
+
+test("an armed counter records every dispatch through the seam, by command name", () => {
+  resetInvokeStatsForTest();
+  invokeStats("arm");
+
+  void invoke("cmd_alpha", {});
+  void invoke("cmd_beta", {});
+  void invoke("cmd_alpha", {});
+
+  const stats = invokeStats();
+  assert.equal(stats.armed, true);
+  assert.equal(stats.counts.cmd_alpha, 2);
+  assert.equal(stats.counts.cmd_beta, 1);
+});
+
+test("the counter is read through the seam every module already uses", async () => {
+  // Not a restatement of the test above: that one calls `invoke` directly,
+  // which is the one call site a counter placed anywhere would catch. This one
+  // goes through `pty.ts`, a real bridge module that imports `invoke` from
+  // here — so it pins the property the E2E lane actually depends on, which is
+  // that a dispatch made by ORDINARY app code is seen. A counter attached to a
+  // single call site would pass the first test and fail this one.
+  resetInvokeStatsForTest();
+  invokeStats("arm");
+
+  await pty.writePty(7, "hello");
+
+  assert.equal(
+    invokeStats().counts.write_pty,
+    1,
+    "a dispatch made by a bridge module did not reach the counter"
+  );
+});
+
+test("a snapshot cannot be written back through", () => {
+  // `counts` is handed out by value. A caller mutating what it got must not be
+  // able to rewrite the record — an instrument whose readings are editable by
+  // its reader is not an instrument.
+  resetInvokeStatsForTest();
+  invokeStats("arm");
+  void invoke("cmd_snapshot", {});
+
+  const snapshot = invokeStats();
+  snapshot.counts.cmd_snapshot = 999;
+  snapshot.counts.cmd_never_dispatched = 5;
+
+  const fresh = invokeStats();
+  assert.equal(fresh.counts.cmd_snapshot, 1);
+  assert.equal(fresh.counts.cmd_never_dispatched, undefined);
+});
+
+test("arming twice does not discard what has already been counted", () => {
+  // The E2E lane arms once at launch and reads twice, and a spec that re-armed
+  // defensively would otherwise zero its own baseline without saying so.
+  resetInvokeStatsForTest();
+  invokeStats("arm");
+  void invoke("cmd_kept", {});
+  invokeStats("arm");
+
+  assert.equal(invokeStats().counts.cmd_kept, 1);
+
+  // Leave the module disarmed: this file's other tests dispatch through the
+  // same seam, and a counter left armed would make their behaviour depend on
+  // the order this one happened to run in.
+  resetInvokeStatsForTest();
+});
+
+test("__invokeStats is reachable the way a devtools or CDP caller reaches it", () => {
+  // The E2E spec calls it off `window`, exactly as `pollgate.ts` exposes
+  // `__pollGateStats`. A rename here would leave the spec throwing "not in this
+  // build" against a build that has it under another name.
+  const exposed = (globalThis as unknown as { __invokeStats?: typeof invokeStats }).__invokeStats;
+  assert.equal(typeof exposed, "function", "__invokeStats is not on globalThis");
+  assert.equal(exposed, invokeStats, "__invokeStats is not the module's own function");
 });

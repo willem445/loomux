@@ -530,24 +530,41 @@ vacuously:
   spec asserts group, session and audit-byte counts against it — otherwise a
   builder that silently failed turns this into a soak against an empty
   install, which passes.
-- **The polls really ran.** The spec wraps
-  `window.__TAURI_INTERNALS__.invoke` and counts every dispatch by name,
-  then asserts a floor on `orch_*` calls across the soak window. Without it
-  the test asserts that an app survives being ignored. The floor is on the
-  TOTAL, not on which commands — the group-view batch has been five, then
-  nine, then ten, and pinning a count would pin the last incident's shape,
-  which is the mistake this lane exists to stop making.
+- **The polls really ran.** The app counts its own dispatches, and the spec
+  asserts a floor on `orch_*` calls across the soak window. Without it the
+  test asserts that an app survives being ignored. The floor is on the TOTAL,
+  not on which commands — the group-view batch has been five, then nine, then
+  ten, and pinning a count would pin the last incident's shape, which is the
+  mistake this lane exists to stop making.
+
+  The counter lives in `src/transport.ts`, not in the spec, and that is a
+  correction rather than a preference. Counting from the spec's side meant
+  patching `window.__TAURI_INTERNALS__.invoke` — which is a **frozen own
+  property** (`writable:false, enumerable:false, configurable:false`,
+  measured on the E2E build). Assignment to it is a silent no-op outside
+  strict mode, `defineProperty` throws, and a `Proxy` cannot help either: a
+  `get` trap is forbidden by the language from returning anything but the
+  real value for a non-writable, non-configurable data property. Fighting
+  that descriptor would also have been a bet on Tauri's internals keeping
+  their present shape. `src/transport.ts` is the ONE module allowed to touch
+  Tauri IPC (CLAUDE.md constraint 5), so a counter there sees every dispatch
+  by construction — the seam the codebase already had.
+
+  It **ships disarmed**: `__invokeStats("arm")` turns it on, and until then
+  `invoke` pays a single null check. Armed, it increments an integer in a map
+  keyed by command name, so what it retains is bounded by the command surface
+  and not by session length. No IPC surface, no ACL grant, no new command —
+  the same shape of devtools instrument `pollgate.ts` already exposes as
+  `__pollGateStats()`.
 - **And the counter itself is checked**, which is not belt-and-braces: a
-  wrapper that failed to install reports `{}`, bit-for-bit what an app that
-  never polled reports. A plain assignment to a non-writable property is a
-  silent no-op outside strict mode, so the installer tries assignment,
-  `defineProperty` and finally a `Proxy` over the whole internals object,
-  verifying after each that it actually took and refusing loudly if none did.
-  The spec then calls `assertCounterSeesTheApp` immediately after the baseline
-  round trip — which cannot have succeeded without `write_pty` — so a blind
-  instrument fails there rather than two hundred seconds later wearing a
-  finding's clothes. That is not hypothetical: it is what the third CI run on
-  this branch did.
+  counter that is not counting reports `{}`, bit-for-bit what an app that
+  never polled reports. `invokeStats()` therefore reports `armed` alongside
+  the counts, and `readInvokeCounts` refuses a disarmed reading outright.
+  The spec then calls `assertCounterSeesTheApp` immediately after the
+  baseline round trip — which cannot have succeeded without `write_pty` — so
+  a blind instrument fails there rather than two hundred seconds later
+  wearing a finding's clothes. That is not hypothetical: it is what the third
+  CI run on this branch did.
 - **The hold really held** — and this one could NOT live inside the test it
   is about. `test.fail()` absorbs every failure in its own test, controls
   included: an injector that silently never took a lock would leave both
