@@ -484,13 +484,42 @@ pub fn hold_report_ring_for_test(ms: u64) {
 /// together, so an edit to one of them is a red rather than a drift.
 pub const HOLD_FAIL_MS: u64 = 5_000;
 
-/// Threads currently permitted to hold a tracked lock past [`HOLD_FAIL_MS`],
-/// each with the reason its permit was taken for.
+/// One thread's permission to hold a tracked lock past [`HOLD_FAIL_MS`].
+///
+/// `live` goes false when the [`LongHoldPermit`] drops, and the entry STAYS.
+/// That is not an oversight and it is the subtle half of this mechanism, so it
+/// is written where the field is:
+///
+/// A hold is classified from two sources. An IN-FLIGHT one is read off
+/// [`held_locks`] while the permit is still live, so the live set answers it.
+/// A COMPLETED one is read off [`drain_completed_holds`], and the stamp that
+/// produces it happens in `TrackedGuard::drop` — which runs BEFORE the
+/// injector's permit drops, and is drained some time after BOTH. So an
+/// injector's deliberate hold is reported by a drain whose live set no longer
+/// contains the thread that took it, and a live-set-only classification would
+/// fail the suite on its own fixtures, intermittently, depending on when the
+/// drain landed. The alternative — stamping the permit onto the report inside
+/// `TrackedGuard::drop` — is not available: that body may not take a global
+/// lock (see its doc), which is the whole reason the reporting is deferred.
+///
+/// Keeping the retired entry costs nothing in precision, because a tracked
+/// thread id is minted once per thread from a monotonic counter and is never
+/// reused: a retired entry can only ever match the injector thread that earned
+/// it, and both permitting sites are dedicated threads that do nothing else
+/// afterwards. It costs one `usize`-ish entry per injected hold — the liveness
+/// suite makes about fifteen.
+struct PermitEntry {
+    thread: u64,
+    reason: &'static str,
+    live: bool,
+}
+
+/// Every permit this process has taken, live and retired.
 ///
 /// A `Vec` rather than a set because permits NEST: an injector inside an
 /// injector is two entries for one thread, and the inner one's `Drop` must
 /// leave the outer one standing.
-static LONG_HOLD_PERMITS: Mutex<Vec<(u64, &'static str)>> = Mutex::new(Vec::new());
+static LONG_HOLD_PERMITS: Mutex<Vec<PermitEntry>> = Mutex::new(Vec::new());
 
 /// Permission for THIS THREAD to hold a tracked lock past [`HOLD_FAIL_MS`],
 /// for as long as this value is alive.
@@ -524,7 +553,7 @@ impl LongHoldPermit {
     /// needs it outside the mechanism.
     pub fn new(reason: &'static str) -> Self {
         let thread = this_thread();
-        LONG_HOLD_PERMITS.lock_safe().push((thread, reason));
+        LONG_HOLD_PERMITS.lock_safe().push(PermitEntry { thread, reason, live: true });
         Self { thread }
     }
 }
@@ -532,10 +561,12 @@ impl LongHoldPermit {
 impl Drop for LongHoldPermit {
     fn drop(&mut self) {
         let mut permits = LONG_HOLD_PERMITS.lock_safe();
-        // The LAST matching entry, so a nested permit's drop leaves the outer
-        // one in place.
-        if let Some(i) = permits.iter().rposition(|(t, _)| *t == self.thread) {
-            permits.remove(i);
+        // Retire the LAST live entry for this thread, so a nested permit's drop
+        // leaves the outer one live. The entry itself stays — see
+        // [`PermitEntry::live`] for why a completed hold cannot be classified
+        // against the live set alone.
+        if let Some(e) = permits.iter_mut().rev().find(|e| e.thread == self.thread && e.live) {
+            e.live = false;
         }
     }
 }
@@ -553,15 +584,25 @@ pub fn current_thread_id() -> u64 {
     this_thread()
 }
 
-/// The reason `thread` is permitted to hold past [`HOLD_FAIL_MS`], if it is.
+/// The reason `thread` holds a LIVE permit right now, if it does.
+///
+/// The narrow view, for a diagnostic or a test asking "is this thread inside
+/// its permit". Classification uses [`permitted_threads`], which is wider on
+/// purpose — see [`PermitEntry::live`].
 pub fn long_hold_permit_for(thread: u64) -> Option<&'static str> {
-    LONG_HOLD_PERMITS.lock_safe().iter().rev().find(|(t, _)| *t == thread).map(|(_, r)| *r)
+    LONG_HOLD_PERMITS
+        .lock_safe()
+        .iter()
+        .rev()
+        .find(|e| e.thread == thread && e.live)
+        .map(|e| e.reason)
 }
 
-/// Every thread with a live [`LongHoldPermit`], so a caller can classify a
-/// batch of reports without taking the permit lock once per report.
+/// Every thread that has EVER taken a [`LongHoldPermit`] — the set
+/// classification exempts, and the reason it is not the live set is on
+/// [`PermitEntry::live`].
 pub fn permitted_threads() -> Vec<u64> {
-    LONG_HOLD_PERMITS.lock_safe().iter().map(|(t, _)| *t).collect()
+    LONG_HOLD_PERMITS.lock_safe().iter().map(|e| e.thread).collect()
 }
 
 /// Which of `reports` are violations: held past `fail_ms` by a thread that is
@@ -3097,7 +3138,49 @@ mod rank_tests {
     }
 
     #[test]
-    fn a_permit_is_scoped_to_its_thread_and_ends_with_it() {
+    fn a_retired_permit_still_exempts_the_thread_that_earned_it() {
+        // The race this closes is invisible to every other test here, because
+        // every other test hands the classifier a report it built itself.
+        //
+        // In the real sequence the injector's guard releases FIRST — that is
+        // what stamps the completed-hold report — and its permit drops a moment
+        // later, when the closure ends. The drain that turns the stamp into a
+        // report happens after both. So a classifier reading the LIVE permit
+        // set would see a long hold by a thread with no permit and fail the
+        // suite on its own deliberate fixture, intermittently, depending on
+        // when the drain landed.
+        let _serial = SERIAL.lock_safe();
+        let (tx, rx) = mpsc::channel::<u64>();
+        std::thread::spawn(move || {
+            let id = current_thread_id();
+            {
+                let _p = LongHoldPermit::new("holdspec retired");
+            }
+            // The permit is gone; the thread is still the injector that earned
+            // it, and a report stamped while it was live is only now drainable.
+            let _ = tx.send(id);
+        })
+        .join()
+        .expect("the injector thread panicked");
+        let injector = rx.recv().expect("the injector never reported its id");
+
+        assert!(
+            long_hold_permit_for(injector).is_none(),
+            "the LIVE view must show the permit as gone, or this test is not about a retired one"
+        );
+        assert!(
+            permitted_threads().contains(&injector),
+            "a retired permit must still exempt its own thread, or every deliberate hold in the \
+             suite becomes a violation as soon as its injector finishes"
+        );
+        assert!(
+            hold_violations(&[report_at(injector, HOLD_FAIL_MS + 1)], HOLD_FAIL_MS).is_empty(),
+            "the live classifier must exempt a retired permit's thread"
+        );
+    }
+
+    #[test]
+    fn a_live_permit_is_scoped_to_its_thread_and_nests() {
         let _serial = SERIAL.lock_safe();
         let me = current_thread_id();
         assert!(
@@ -3118,7 +3201,7 @@ mod rank_tests {
                 "the inner permit's drop took the outer one with it"
             );
         }
-        assert!(long_hold_permit_for(me).is_none(), "the permit outlived its guard");
+        assert!(long_hold_permit_for(me).is_none(), "the LIVE permit outlived its guard");
 
         // Another thread is not covered by this one's permit — the property
         // that makes the allowlist an allowlist rather than a global off

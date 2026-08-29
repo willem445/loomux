@@ -2246,3 +2246,482 @@ fn l6b_the_masks_the_tick_applies_equal_the_unbounded_computation() {
          {flagged:?} and the same masking computed outside it says {expected:?}"
     );
 }
+
+// ---------- L7: a day-old session, and the hold budget (#1702 P4) ----------
+//
+// L6 asked whether the attention tick RETURNS on the state that deadlocked it,
+// and whether it decides the same thing off the lock as on it. Both questions
+// are about one function on a six-pane fixture.
+//
+// L7 asks the question the field asked and the suite never did: with a
+// registry the size a day of orchestrating leaves behind — hundreds of dead
+// agents nothing prunes, a four-hundred-row board, a pending-question set at
+// its cap, an audit log past the viewer's own window, and a live fleet in the
+// exact state #1702 wedges on — does EVERY cadenced tick still return inside
+// its budget, and does any of them hold a registry lock while it works?
+//
+// The second half is the one Phase 2.1 structurally could not ask. A budget is
+// paid by a WAITER, so every guard in this repo measures the victim of a hold;
+// #1702 answered `Busy` correctly for three minutes while the holder sat one
+// frame away from its own lock. `lockwatch`'s hold-duration enforcement is the
+// other side of that, and L7a is where the suite spends it.
+
+/// Serialises the rows that read the PROCESS-GLOBAL hold registry.
+///
+/// `lockwatch::observed_holds` drains completed holds and samples in-flight
+/// ones for the whole process, so two rows doing it at once would each be
+/// classifying the other's deliberate holds. Every other test in this binary
+/// takes its long holds through `hold_lock_for_test`, which carries a
+/// `LongHoldPermit` and is therefore exempt by construction — this guard is
+/// only needed between the rows that plant an UNPERMITTED one.
+static HOLD_SERIAL: Mutex<()> = Mutex::new(());
+
+/// How long L7's deliberate unpermitted hold runs for: past `HOLD_FAIL_MS`
+/// with enough margin that a loaded runner cannot land the scan early.
+const L7_PLANTED_HOLD: Duration =
+    Duration::from_millis(loomux_engine::lockwatch::HOLD_FAIL_MS + 400);
+
+/// Attention passes L7a times for its percentiles. Small: this is a
+/// distribution over a fixed subject, not a benchmark — what it exists to
+/// publish is an ORDER OF MAGNITUDE beside the 5 s budget, and thirty samples
+/// settle that.
+const L7_SAMPLES: usize = 30;
+
+/// Guardrails for the day-old fixture.
+///
+/// `max_spawns_per_hour: 0` disables the rate backstop, which is not a fudge:
+/// the backstop counts admitted spawns in a rolling HOUR and the fixture
+/// builds a day's worth of them inside one second, so leaving it on would
+/// measure the backstop instead of the session. `max_agents` is the real
+/// ceiling (12) because the live fleet is what it bounds, and the dead fleet
+/// is unbounded in production precisely because nothing prunes it.
+fn day_old_rails() -> Guardrails {
+    Guardrails { max_agents: 12, max_spawns_per_hour: 0, ..rails() }
+}
+
+/// The day-old session, plus the pty manager its panes are registered in.
+struct L7Fixture {
+    reg: Arc<OrchRegistry>,
+    _dir: tempfile::TempDir,
+    ptys: PtyManager,
+    fx: common::DayOldSession,
+    group: GroupId,
+}
+
+fn l7_fixture() -> L7Fixture {
+    let (reg, _dir) = test_registry();
+    reg.set_self_arc();
+    let g = reg.create_group("C:/tmp/repo", day_old_rails()).expect("create a group");
+    let fx = common::seed_day_old_session(&reg, &g.id, common::SessionScale::default());
+
+    // Every live pane gets a REAL pty entry carrying its rendered tail, so
+    // `attention_inputs_from` builds the maps `attention_tick` consumes rather
+    // than the test handing it synthetic ones. That is the half of the gather
+    // no liveness row has ever run: which panes are in the population, and how
+    // much of each ring is read, are decisions `attention_inputs_from` makes.
+    let ptys = PtyManager::default();
+    for id in &fx.live.agent_ids {
+        let _ring = ptys.register_fake_for_test(fx.live.pty_of[id], fx.tails[id].as_bytes());
+    }
+
+    // The fixture's own claims, asserted rather than assumed. Each one is a
+    // scale this row's failure message will quote, and a fixture that quietly
+    // came up smaller would make every measurement below a statement about a
+    // subject nobody built.
+    let scale = fx.scale;
+    assert_eq!(
+        fx.live.agent_ids.len(),
+        scale.live_bound,
+        "setup: the live fleet is short, so the trigger state may not be present at all"
+    );
+    assert_eq!(
+        fx.dead_ids.len(),
+        scale.dead,
+        "setup: a guardrail refused part of the dead fleet, so the roster scan below is \
+         measuring a smaller population than it claims"
+    );
+    assert_eq!(fx.board_rows, scale.board_rows, "setup: the board came up short");
+    assert_eq!(
+        fx.pending_questions, scale.pending_questions,
+        "setup: the pending-question set is not at its cap, so the axis is unexercised"
+    );
+    assert!(
+        fx.audit_window.1,
+        "setup: the audit log did not overflow the viewer's window ({} entries), so the log \
+         axis is smaller than a day-old session's",
+        fx.audit_window.0
+    );
+
+    L7Fixture { reg, _dir, ptys, fx, group: g.id }
+}
+
+/// One tick, as it is driven: on its own thread, reporting the tracked thread
+/// id it ran on so a hold can be attributed to it without a sampler.
+struct TickRun {
+    name: &'static str,
+    thread: u64,
+    took: Duration,
+}
+
+/// L7a (#1702 P4) — every cadenced tick, a representative MCP read and a
+/// representative sync command, run against a day-old session, each inside its
+/// budget and none of them holding a registry lock past the hold budget.
+///
+/// **Why the hold half needs its own mechanism.** `TICK_LOCK_BUDGET` bounds
+/// what a tick WAITS. Nothing in this repo bounded what a tick HOLDS, and that
+/// is the half #1702 went through: every budget answered correctly, every
+/// guard stayed green, and one thread sat on `agents` forever.
+#[test]
+fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
+    // `unwrap_or_else(into_inner)` rather than `unwrap`, for the reason
+    // `POOL_SERIAL`'s two callers use it and CLAUDE.md states: one failing test
+    // poisons the guard and every later test on it then dies of `PoisonError`,
+    // reporting one genuine failure as N and making a mutation round's reds
+    // unattributable.
+    let _serial = HOLD_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = l7_fixture();
+    let now = now_ms_local();
+
+    // ---- the instrument control, before anything is measured -------------
+    //
+    // The hold assertion below is an ABSENCE, which is byte-identical to an
+    // instrument that cannot see the thing. So a deliberate over-threshold
+    // hold is taken at a site with NO permit, on a thread whose id this test
+    // knows, and the enforcement must catch it — naming that site and that
+    // duration. Without this, a scan that had gone blind and a tick that never
+    // takes a lock would read exactly the same.
+    //
+    // This doubles as the planted-6-s red the enforcement owes: it is the
+    // failure the mechanism exists to produce, run on every CI job rather than
+    // once on a scratch branch.
+    let planted = plant_an_unpermitted_hold();
+    assert!(
+        planted.contains("l7a_planted_hold"),
+        "the enforcement did not name the HOLDER SITE, which is the whole of what makes a \
+         report actionable: {planted}"
+    );
+    assert!(
+        planted.contains("ms"),
+        "the enforcement did not name the DURATION: {planted}"
+    );
+    // And the control's own control: an ALLOWLISTED long hold must NOT fire.
+    // Without this pair the row cannot tell an enforcement that works from one
+    // that refuses everything, and the suite's own 20 s fixtures would be the
+    // first casualty.
+    assert!(
+        f.reg.hold_lock_for_test("tasks_lock", L7_PLANTED_HOLD.as_millis() as u64),
+        "setup: cannot hold `tasks_lock`"
+    );
+    std::thread::sleep(L7_PLANTED_HOLD + Duration::from_millis(200));
+    loomux_engine::lockwatch::assert_no_disallowed_hold_over(
+        loomux_engine::lockwatch::HOLD_FAIL_MS,
+    );
+
+    // ---- the measurement -------------------------------------------------
+    //
+    // Concurrently, as L2c drives them: they are independent, the property is
+    // "each returns", and running them in sequence would only make the row
+    // slower without making it stricter.
+    let ticks: Vec<(&'static str, Box<dyn Fn(&OrchRegistry) + Send + Sync>)> = vec![
+        ("reap_idle_agents", Box::new(move |r: &OrchRegistry| { r.reap_idle_agents(now); })),
+        ("run_watchdog", Box::new(move |r: &OrchRegistry| { r.run_watchdog(now); })),
+        ("run_attention", Box::new(move |r: &OrchRegistry| r.run_attention(now))),
+        ("run_idle_tick", Box::new(move |r: &OrchRegistry| { r.run_idle_tick(now); })),
+        ("run_compact_nudge", Box::new(move |r: &OrchRegistry| { r.run_compact_nudge(now); })),
+        ("run_gh_poll_tick", Box::new(|r: &OrchRegistry| { r.run_gh_poll_tick(); })),
+        ("run_workflow_gate_reload", Box::new(|r: &OrchRegistry| r.run_workflow_gate_reload())),
+        ("run_disk_monitor", Box::new(|r: &OrchRegistry| r.run_disk_monitor())),
+        ("flush_due_max_notices", Box::new(move |r: &OrchRegistry| r.flush_due_max_notices(now))),
+        // The publisher, which is a cadenced tick in every sense that matters
+        // here even though it is not in `start_*`'s list: it runs once a second
+        // per group, and `compute_group`'s roster scan is O(agents ever
+        // spawned) — plan row 13 following row 1.
+        ("view_publisher", Box::new(|r: &OrchRegistry| r.views.publish_pass(r))),
+    ];
+
+    let (tx, rx) = mpsc::channel::<TickRun>();
+    let n = ticks.len();
+    for (name, func) in ticks {
+        let (r, tx) = (f.reg.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let thread = loomux_engine::lockwatch::current_thread_id();
+            let t0 = Instant::now();
+            func(&r);
+            let _ = tx.send(TickRun { name, thread, took: t0.elapsed() });
+        });
+    }
+    drop(tx);
+
+    let mut runs: Vec<TickRun> = Vec::new();
+    let deadline = bg::TICK_LOCK_BUDGET + GRACE;
+    while runs.len() < n {
+        match rx.recv_timeout(deadline) {
+            Ok(r) => runs.push(r),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        runs.len(),
+        n,
+        "only {}/{n} ticks returned within {deadline:?} on a {}-agent roster. A tick that never \
+         returns is one parked thread per cadence for as long as the hold lasts. Returned: {:?}",
+        runs.len(),
+        f.fx.roster_size(),
+        runs.iter().map(|r| r.name).collect::<Vec<_>>()
+    );
+
+    // Every tick inside the budget its own gate probe gives it. Not a latency
+    // measurement — the figures below are two orders of magnitude under this —
+    // but the number a tick that had regrown a whole-file read would cross.
+    for r in &runs {
+        assert!(
+            r.took < bg::TICK_LOCK_BUDGET,
+            "`{}` took {:?} on a day-old session ({} agents, {} board rows, {} audit entries in \
+             the viewer's window), past its own {:?} budget",
+            r.name,
+            r.took,
+            f.fx.roster_size(),
+            f.fx.board_rows,
+            f.fx.audit_window.0,
+            bg::TICK_LOCK_BUDGET
+        );
+    }
+
+    // ---- a representative MCP read, at session scale ---------------------
+    //
+    // `list_tasks` reads the 400-row board through the shipped dispatch, under
+    // the shipped `MCP_READ_BUDGET` frame. Chosen over `list_agents` because
+    // the board is the axis that is genuinely unbounded (#1472): the roster is
+    // in memory, the board is a whole-file parse per call.
+    let orch = f
+        .reg
+        .spawn_agent(&f.group, Role::Orchestrator, "orch-1", "", false, None)
+        .expect("an orchestrator to carry a resolvable token");
+    let caller = f.reg.resolve_token(&orch.token).expect("the token resolves");
+    let call = json!({ "name": "list_tasks", "arguments": {} });
+    let t0 = Instant::now();
+    let out = loomux_lib::orchestration::mcp::dispatch(&f.reg, &caller, "tools/call", &call)
+        .expect("a tool RESULT, not a protocol error");
+    let mcp_took = t0.elapsed();
+    assert_eq!(
+        out.get("isError").and_then(|e| e.as_bool()),
+        None,
+        "the MCP read must SUCCEED on an uncontended day-old session — a busy answer here \
+         would mean the measurement below is of a refusal, not of a read: {out}"
+    );
+    assert!(
+        mcp_took < bg::MCP_READ_BUDGET,
+        "an MCP read of a {}-row board took {mcp_took:?}, past {:?}",
+        f.fx.board_rows,
+        bg::MCP_READ_BUDGET
+    );
+
+    // ---- a representative SYNC command, at session scale -----------------
+    //
+    // Driven through the shipped `mutating_command` wrapper rather than a
+    // rebuilt frame: the wrapper IS the containment #1713 added for this class
+    // (a sync command runs inside the WebView2 COM frame, where an unwind
+    // aborts the process), so a test that assembled its own would be measuring
+    // its own re-implementation. `synccommands.rs` covers WHICH commands carry
+    // the frame; this covers what one costs on a day-old registry.
+    let victim = f.fx.live.agent_ids[0].clone();
+    let t0 = Instant::now();
+    OrchRegistry::mutating_command("l7a_ack_attention", || (), || f.reg.ack_attention(&victim));
+    let sync_took = t0.elapsed();
+    assert!(
+        sync_took < bg::COMMAND_READ_BUDGET,
+        "a sync command took {sync_took:?} on a day-old session, past {:?}",
+        bg::COMMAND_READ_BUDGET
+    );
+
+    // ---- the hold budget -------------------------------------------------
+    //
+    // The whole point of the row. Every tick above has returned, so any hold
+    // they took has ended and been stamped; anything still in flight is a hold
+    // that outlived its tick.
+    loomux_engine::lockwatch::assert_no_disallowed_hold_over(
+        loomux_engine::lockwatch::HOLD_FAIL_MS,
+    );
+
+    // ---- the distribution, printed rather than asserted ------------------
+    //
+    // A percentile is a measurement, and this file's rule is that an assertion
+    // may only refuse what its instrument is demonstrated to detect (#1703
+    // review B1). What a p95 supports is a REPORT — the figure a PR body and a
+    // future regression are compared against — so it is printed with its
+    // subject named, and the budget assertion above is what refuses.
+    let (outputs, tails, inputs) = f.reg.attention_inputs_from(&f.ptys);
+    assert_eq!(
+        tails.len(),
+        f.fx.live.agent_ids.len(),
+        "setup: the real gather did not produce a tail per live pane ({} of {}), so the \
+         percentiles below are over a smaller subject than the fixture built",
+        tails.len(),
+        f.fx.live.agent_ids.len()
+    );
+    let mut samples: Vec<u128> = Vec::with_capacity(L7_SAMPLES);
+    for i in 0..L7_SAMPLES {
+        // Past `ATTENTION_QUIET_MS` on every pass after the first, which is
+        // what puts the per-agent chain through the mask rather than short-
+        // circuiting on a quiet clock it has only just established.
+        let t = Instant::now();
+        let _ = f.reg.attention_tick(now + 5_000 * (i as u64 + 1), &outputs, &tails, &inputs);
+        samples.push(t.elapsed().as_micros());
+    }
+    samples.sort_unstable();
+    let p = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+    println!(
+        "L7a attention_tick on a day-old session ({} agents / {} live+bound / {} board rows / \
+         {} deliveries per session): p50 {} us, p95 {} us, max {} us, over {L7_SAMPLES} passes \
+         (TICK_LOCK_BUDGET is {} ms)",
+        f.fx.roster_size(),
+        f.fx.live.agent_ids.len(),
+        f.fx.board_rows,
+        f.fx.scale.deliveries_per_agent,
+        p(0.50),
+        p(0.95),
+        samples[samples.len() - 1],
+        bg::TICK_LOCK_BUDGET.as_millis()
+    );
+    for r in &runs {
+        println!("L7a tick `{}` took {:?}", r.name, r.took);
+    }
+    println!("L7a mcp list_tasks {mcp_took:?}; sync ack_attention {sync_took:?}");
+
+    // A vacuity control for the two `println!`s above and for the whole row:
+    // every tick reported a tracked thread id, which is what
+    // `assert_no_disallowed_hold_over` would have attributed a hold to.
+    assert!(
+        runs.iter().all(|r| r.thread != 0),
+        "a tick reported no tracked thread id, so a hold it took could not have been \
+         attributed to it"
+    );
+}
+
+/// Take an over-threshold hold at a site with NO [`LongHoldPermit`] and return
+/// the enforcement's own failure text.
+///
+/// The positive control every absence assertion in L7a rests on. It uses a
+/// lock this test constructs, so nothing else in the process can be holding
+/// it, and it deliberately does NOT go through `hold_lock_for_test` — that
+/// seam carries a permit, which is exactly the thing being controlled for.
+fn plant_an_unpermitted_hold() -> String {
+    use loomux_engine::lockwatch::{assert_no_disallowed_hold_over, TrackedMutex, HOLD_FAIL_MS};
+
+    let lock = Arc::new(TrackedMutex::new("l7a_planted_hold", ()));
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let holder = {
+        let lock = lock.clone();
+        std::thread::spawn(move || {
+            let _held = lock.lock_safe();
+            let _ = ready_tx.send(());
+            // Held until this test says otherwise, rather than for a fixed
+            // sleep: the scan has to land while the hold is in flight, and a
+            // sleep long enough to guarantee that on a loaded runner would be
+            // longer than the row can afford.
+            let _ = release_rx.recv_timeout(GRACE * 3);
+        })
+    };
+    ready_rx.recv_timeout(GRACE).expect("the planted hold never started");
+    // Wait out the threshold. Not a poll for a condition — this file's "never
+    // a sleep" rule is about waiting for something to happen; here the elapsed
+    // time IS the subject.
+    std::thread::sleep(L7_PLANTED_HOLD);
+
+    let caught = std::panic::catch_unwind(|| assert_no_disallowed_hold_over(HOLD_FAIL_MS));
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    // The enforcement does not restore the arming on a panic, deliberately —
+    // see its doc. This control is the one caller that must, because the
+    // process is NOT failing.
+    loomux_engine::lockwatch::set_hold_panics(false);
+
+    let err = caught.expect_err(
+        "a five-second hold at a site with no LongHoldPermit did not fail the build. That is \
+         the enforcement being blind, and every absence assertion in L7a rests on it",
+    );
+    err.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
+}
+
+/// L7b (#1702 P4) — the same day-old session with a registry lock wedged: the
+/// MCP answers `Busy` inside its budget and the published view goes stale and
+/// clears, rather than either of them waiting on the roster the dead fleet
+/// grew.
+///
+/// L2a and L1 ask this on a four-pane registry. The reason it is worth asking
+/// again at scale is that both properties are bounds on a WAIT, and a wait that
+/// is bounded correctly can still be preceded by an unbounded amount of work:
+/// #1592's boot hang and #1625's publisher were both "the bound was fine, the
+/// thing in front of it was not".
+#[test]
+fn l7b_a_wedged_day_old_registry_still_answers_busy_within_budget() {
+    let f = l7_fixture();
+    let orch = f
+        .reg
+        .spawn_agent(&f.group, Role::Orchestrator, "orch-1", "", false, None)
+        .expect("an orchestrator to carry a resolvable token");
+    // Resolved BEFORE anything is held: `resolve_token` takes `groups`, so
+    // resolving it under the hold would park this thread for the whole hold and
+    // the read half would then run against an expired one (L2a's own note).
+    let caller = f.reg.resolve_token(&orch.token).expect("the token resolves");
+
+    // Baseline, so every assertion below is not satisfied by a surface that is
+    // broken some other way.
+    let call = json!({ "name": "list_tasks", "arguments": {} });
+    let warm = loomux_lib::orchestration::mcp::dispatch(&f.reg, &caller, "tools/call", &call)
+        .expect("a tool RESULT");
+    assert_eq!(
+        warm.get("isError").and_then(|e| e.as_bool()),
+        None,
+        "setup: the read must succeed uncontended: {warm}"
+    );
+
+    assert!(f.reg.hold_lock_for_test("agents", 20_000), "setup: cannot hold `agents`");
+
+    let started = Instant::now();
+    let busy = loomux_lib::orchestration::mcp::dispatch(&f.reg, &caller, "tools/call", &call)
+        .expect("a tool RESULT, not a protocol error");
+    let waited = started.elapsed();
+    assert!(
+        waited < bg::MCP_READ_BUDGET + GRACE,
+        "an MCP read did not answer in {waited:?} on a {}-agent roster with `agents` held",
+        f.fx.roster_size()
+    );
+    assert_eq!(
+        busy.get("isError").and_then(|e| e.as_bool()),
+        Some(true),
+        "a wedged registry must answer a busy RESULT: {busy}"
+    );
+    let text = busy["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("loomux busy:"), "read-tool text is a public contract: {text}");
+
+    // The published view: it must still ANSWER — a pointer clone off the last
+    // published snapshot — while the registry it was computed from is wedged.
+    // That is L1's property, asked on the population the dead fleet grew,
+    // because `compute_group`'s roster scan is O(agents ever spawned).
+    let started = Instant::now();
+    let payload = group_view_payload(&f.reg.views.load(), &f.group, Instant::now());
+    let view_took = started.elapsed();
+    assert!(
+        view_took < bg::POLL_LOCK_BUDGET + GRACE,
+        "a published read took {view_took:?} while `agents` was held on a {}-agent roster — a \
+         published read is a pointer clone and must not touch the registry at all",
+        f.fx.roster_size()
+    );
+    assert!(
+        payload.is_object(),
+        "a published read must answer with a payload rather than nothing while the registry is \
+         wedged: {payload}"
+    );
+
+    // The stale flag is the disclosure half: a panel may show a frozen number,
+    // and must never show it as current.
+    assert!(
+        VIEW_STALE_AFTER_MS > 0,
+        "the stale window is what makes a frozen number legible as one"
+    );
+}
