@@ -966,7 +966,7 @@ fn mcp_fixture() -> (Arc<OrchRegistry>, String, GroupId, tempfile::TempDir) {
     // drives the tool without ever reaching `write_mailbox` — which is why the
     // scratch rounds for L2g kept coming back green while the sweep looked
     // complete.
-    reg.post_to_manager(&group.id, "orch", "seed for the L2g sweep", mailbox::Kind::Note)
+    reg.post_to_manager(&group.id, "orch", "seed for the L2g sweep", mailbox::Kind::Update)
         .expect("the roster declares a manager, so a post is accepted");
     (reg, agent.token, group.id, dir)
 }
