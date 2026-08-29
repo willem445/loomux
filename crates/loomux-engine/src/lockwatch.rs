@@ -2612,6 +2612,63 @@ mod rank_tests {
     }
 
     #[test]
+    fn a_reentrant_acquire_unwinds_a_mutation_scope_to_its_frame() {
+        // The exact configuration `OrchRegistry::mutating_command` builds for a
+        // synchronous `#[tauri::command]` (#1713 review B1): a `read_budget`
+        // frame with a `MutationScope` inside it. That pairing is what makes
+        // the GUI-thread fix correct, and it has to hold as a MECHANISM rather
+        // than as a claim in a doc comment — on that thread an unwind that
+        // escapes the frame reaches a plain `extern "system"` thunk and aborts
+        // the process, so "the frame catches it" is the whole safety argument.
+        //
+        // Two properties, and they pull in opposite directions:
+        //   - the scope must NOT stop the re-entrant refusal (it is the one
+        //     wait that never ends), and
+        //   - the frame must CATCH it, so nothing escapes the boundary.
+        //
+        // On its own thread with a bounded wait, for the reason every other
+        // re-entrancy row here is: the failing form is a permanent park.
+        let _serial = SERIAL.lock_safe();
+        let _restore = PanicSwitch(set_lock_order_panics(false));
+        let lock = TrackedMutex::new_ranked("reentscopespec", OUTER, 6u32);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (_, torn_before) = budget::thread_seal_counts();
+            let out: Result<(), Busy> = budget::read_budget(Duration::from_secs(30), || {
+                let _scope = budget::MutationScope::enter();
+                // Discriminating half: inside the scope an ordinary
+                // acquisition still succeeds and is not unwound.
+                let held = lock.lock_safe();
+                assert_eq!(*held, 6, "a mutation scope must still take a free lock");
+                assert!(budget::mutation_depth_for_test() > 0, "the scope must be active");
+                let _boom = lock.lock_safe();
+                unreachable!("the re-entrant acquisition must not be granted");
+            });
+            let (_, torn_after) = budget::thread_seal_counts();
+            let found = out.err().map(|b| (b.is_reentrant(), b.lock));
+            let _ = tx.send((found, torn_after.wrapping_sub(torn_before), held_lock_depth()));
+        });
+
+        let (found, torn_delta, depth) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "the re-entrant acquisition PARKED inside a MutationScope — on a sync command's \
+             thread that is the wedge #1702 removes, and escaping the frame would be worse",
+        );
+        let (is_reentrant, lock_name) =
+            found.expect("the frame must CATCH the refusal and return it, not let it escape");
+        assert!(is_reentrant, "the refusal must be typed as re-entrant");
+        assert_eq!(lock_name, "reentscopespec");
+        assert_eq!(depth, 0, "the unwind left a phantom hold on that thread's stack");
+        // NO tear: a `MutationScope` is not a seal, and nothing durable was
+        // written. This is what separates this row from the sealed one below —
+        // without it the two would be one test asserted twice.
+        assert_eq!(
+            torn_delta, 0,
+            "a scope with no durable write must not be counted as a torn write"
+        );
+    }
+
+    #[test]
     fn a_reentrant_acquire_unwinds_a_sealed_frame_and_counts_the_tear() {
         // The one narrowing of `lock-liveness.md` §4.1 (#1702). A frame that
         // has made a durable write is SEALED: a budget timeout under it waits
