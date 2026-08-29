@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, ViewPublisher};
 use loomux_lib::orchestration::views::VIEW_USAGE_MAX_AGE;
-use loomux_lib::orchestration::{mergeqview, Guardrails, OrchRegistry, Role};
+use loomux_lib::orchestration::{mergeqview, GroupId, Guardrails, OrchRegistry, Role};
 
 fn rails() -> Guardrails {
     Guardrails {
@@ -266,6 +266,143 @@ fn a_lapsed_lease_drops_the_view_tier_rather_than_carrying_it_forward() {
     );
     // The strip tier is unaffected: the tab strip polls every group forever.
     assert!(section(&group_view_payload(&views.load(), &g.id, lapsed), "summary").is_object());
+}
+
+// ---------- restored (disk-only) groups: the strip lease ----------
+
+/// A group that exists on DISK but not in the registry — a restored
+/// orchestration the human has not resumed. `list_recorded` finds these by
+/// reading the root directory; nothing puts them in `groups`.
+///
+/// Built the way the app leaves one behind: a group dir with a `usage.json`
+/// carrying accrued cost. That file is the whole point — it is what the tab
+/// strip's badge shows for a group with no live agents (#194 P4 LOW-8).
+fn restored_group_on_disk(dir: &std::path::Path, id: &str, cost: f64) -> GroupId {
+    let g = GroupId::parse(id).expect("well-formed id");
+    let gdir = dir.join(id);
+    std::fs::create_dir_all(&gdir).expect("group dir");
+    std::fs::write(
+        gdir.join("usage.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "agents": [{
+                "agent_id": "w-1", "name": "w", "role": "worker",
+                "cost_usd": cost, "tokens": 1234, "cost_source": "estimated"
+            }]
+        }))
+        .expect("usage json"),
+    )
+    .expect("write usage.json");
+    g
+}
+
+#[test]
+fn a_restored_group_a_tab_is_bound_to_is_published_wire_identically() {
+    // THE REGRESSION #1625 review round 2 found, pinned. The publisher covered
+    // `reg.groups` only, so a tab bound to a restored orchestration got no
+    // entry and lost its accrued-cost badge — a badge the per-tab reads this
+    // replaced always produced, because they answered for ANY bound id.
+    let (reg, d) = test_registry();
+    let restored = restored_group_on_disk(d.path(), "restored-0001", 4.25);
+    assert!(
+        reg.group(restored.as_str()).is_none(),
+        "setup: the fixture must NOT be in the registry, or this test is about a live group"
+    );
+
+    let views = ViewPublisher::new();
+    let now = Instant::now();
+    views.note_strip_lease_at(&restored, now);
+    views.publish_pass_at(&reg, now);
+
+    let snap = views.load();
+    let payload = group_view_payload(&snap, &restored, now);
+    assert!(
+        payload.is_object(),
+        "a strip-leased restored group must be published, not absent: {payload}"
+    );
+
+    // WIRE IDENTITY against the commands this replaced, for the two sections
+    // the strip renders. Same rule as the ten-command test: the publisher must
+    // call the SAME registry function, so a restored group's entry cannot
+    // drift from what the per-tab reads returned for it.
+    let mut hits: BTreeMap<&'static str, usize> = BTreeMap::new();
+    assert_same_payload(
+        "summary",
+        section(&payload, "summary"),
+        &reg.group_summary(&restored),
+        &mut hits,
+    );
+    assert_same_payload(
+        "usage",
+        section(&payload, "usage"),
+        &reg.group_usage_live_within(&restored, VIEW_USAGE_MAX_AGE),
+        &mut hits,
+    );
+
+    // ...and the badge's actual number survived the trip. Without this the two
+    // comparisons above hold just as well between two empty payloads, which is
+    // precisely the state the regression produced.
+    let usage = section(&payload, "usage");
+    let cost = usage
+        .get("lifetime_cost_usd")
+        .or_else(|| usage.get("live_cost_usd"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    assert!(
+        cost > 0.0,
+        "the restored group's accrued cost did not reach the payload — the badge #194 P4 \
+         LOW-8 exists for would render empty. usage: {usage}"
+    );
+}
+
+#[test]
+fn a_restored_group_no_tab_is_bound_to_is_not_computed() {
+    // The bound half of the lease. Publishing every on-disk group would grow
+    // without limit on a long-lived machine, which is why the strip names what
+    // it is bound to rather than the publisher scanning the root.
+    let (reg, d) = test_registry();
+    let leased = restored_group_on_disk(d.path(), "restored-0002", 1.5);
+    let unleased = restored_group_on_disk(d.path(), "restored-0003", 9.0);
+
+    let views = ViewPublisher::new();
+    let now = Instant::now();
+    views.note_strip_lease_at(&leased, now);
+    views.publish_pass_at(&reg, now);
+
+    let snap = views.load();
+    assert!(
+        group_view_payload(&snap, &leased, now).is_object(),
+        "the leased restored group must be published"
+    );
+    assert_eq!(
+        group_view_payload(&snap, &unleased, now),
+        Value::Null,
+        "a restored group NO tab is bound to must not be computed — otherwise every group \
+         ever recorded on this machine is published every second"
+    );
+}
+
+#[test]
+fn a_lapsed_strip_lease_stops_a_restored_group_being_computed() {
+    // Released by AGE, not by registry membership — a restored group is never
+    // in `groups`, so membership could not release it and the map would grow
+    // for the life of the process.
+    let (reg, d) = test_registry();
+    let g = restored_group_on_disk(d.path(), "restored-0004", 2.0);
+
+    let views = ViewPublisher::new();
+    let t0 = Instant::now();
+    views.note_strip_lease_at(&g, t0);
+    views.publish_pass_at(&reg, t0);
+    assert!(group_view_payload(&views.load(), &g, t0).is_object(), "setup: published while leased");
+
+    let lapsed = t0 + Duration::from_millis(STRIP_LEASE_MS_FOR_TEST + 1);
+    views.publish_pass_at(&reg, lapsed);
+    assert_eq!(
+        group_view_payload(&views.load(), &g, lapsed),
+        Value::Null,
+        "a lapsed strip lease must stop the group being computed, or a tab closed hours ago \
+         is still costing a usage.json read every second"
+    );
 }
 
 // ---------- the write-side nudge ----------
@@ -677,10 +814,16 @@ fn an_empty_registry_still_publishes_a_readable_strip() {
 // value it is checking (the repo's "a pin must not build its expectation from
 // the code under test" rule).
 const VIEW_LEASE_MS_FOR_TEST: u64 = 10_000;
+const STRIP_LEASE_MS_FOR_TEST: u64 = 10_000;
 const VIEW_STALE_AFTER_MS_FOR_TEST: u64 = 5_000;
 
 #[test]
 fn the_published_constants_are_the_ones_these_tests_were_written_against() {
+    assert_eq!(
+        loomux_lib::orchestration::views::STRIP_LEASE_MS,
+        STRIP_LEASE_MS_FOR_TEST,
+        "the strip lease moved; the lapse test's arithmetic was written against the old value"
+    );
     assert_eq!(
         loomux_lib::orchestration::views::VIEW_LEASE_MS,
         VIEW_LEASE_MS_FOR_TEST,

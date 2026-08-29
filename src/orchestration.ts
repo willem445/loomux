@@ -1724,9 +1724,16 @@ export const groupView = (groupId: string): Promise<GroupViewPayload | null> =>
   invoke<GroupViewPayload | null>("orch_group_view", { groupId });
 
 /** Every group-bound tab's strip pair in one read — the 2xN invokes the strip
- *  used to make per tick collapse to 1, regardless of how many tabs are open. */
-export const stripView = (): Promise<StripViewPayload> =>
-  invoke<StripViewPayload>("orch_strip_view", {});
+ *  used to make per tick collapse to 1, regardless of how many tabs are open.
+ *
+ *  `bound` is the caller's group-bound tab ids. It is NOT a per-tab read: one
+ *  IPC still serves the whole strip. It exists because the publisher cannot
+ *  otherwise know about a tab bound to a RESTORED orchestration — one that
+ *  lives on disk and is not in the backend's in-memory group map — and those
+ *  tabs lost their accrued-cost badge without it (#1625 review round 2). Each
+ *  call stamps a short lease per id, so a closed tab stops being computed. */
+export const stripView = (bound: string[]): Promise<StripViewPayload> =>
+  invoke<StripViewPayload>("orch_strip_view", { bound });
 
 /** End a whole orchestration: kill all its agents and (optionally) remove
  *  their worktrees. Destructive and human-initiated — the caller confirms

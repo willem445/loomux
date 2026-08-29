@@ -52212,11 +52212,41 @@ pub async fn orch_group_view(app: AppHandle, group_id: String) -> Value {
 /// trouble, and a payload-wide average would report it fresh because one tab
 /// moved.
 ///
-/// Takes no `group_id`: one snapshot serves every group, which is the point.
+/// **Takes the caller's BOUND group ids, and that is not a per-tab read.** One
+/// snapshot still serves every group and one IPC still serves the whole strip;
+/// what `bound` does is tell the publisher which groups to cover.
+///
+/// It has to, and #1625 review round 2 is why. The publisher's strip tier was
+/// `reg.groups` — the groups this session created or resumed. A tab can be bound
+/// to a RESTORED orchestration, which lives on disk and never enters that map
+/// (`list_recorded` reads the root directory directly), so those tabs got no
+/// entry at all and lost the accrued-cost badge #194 P4 LOW-8 put on them
+/// deliberately. The per-tab reads this replaced had no such gap: they answered
+/// for any id the caller named.
+///
+/// So the strip stamps a lease per bound id, exactly as the group view stamps
+/// one, and the publisher covers `reg.groups` plus every fresh strip lease. A
+/// leased id the registry does not know is computed through the SAME functions
+/// as any other — `group_summary` answers zero live agents, `group_usage_live_within`
+/// reads that group's `usage.json` — so a restored group's entry is
+/// wire-identical to what the commands it replaced returned for it, by
+/// construction rather than by a second disk path.
+///
+/// Ids that fail `command_group` are skipped rather than refused: the whole
+/// call must not fail because one tab carries a stale id.
 #[tauri::command]
-pub async fn orch_strip_view(app: AppHandle) -> Value {
+pub async fn orch_strip_view(app: AppHandle, bound: Vec<String>) -> Value {
     let reg = reg_of(&app);
-    run_blocking(move || views::strip_view_payload(&reg.views.load(), Instant::now())).await
+    run_blocking(move || {
+        let now = Instant::now();
+        for raw in &bound {
+            if let Ok(g) = command_group(raw) {
+                reg.views.note_strip_lease_at(&g, now);
+            }
+        }
+        views::strip_view_payload(&reg.views.load(), now)
+    })
+    .await
 }
 
 /// Live-agent count, role breakdown, and uptime for the lifecycle panel.

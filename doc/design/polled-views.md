@@ -83,8 +83,32 @@ opens, and a once-per-open read is not what this phase is about.
 
 | tier | sections | computed for |
 |---|---|---|
-| strip | `summary`, `usage` | every group, every tick |
+| strip | `summary`, `usage` | every group in the registry, plus every group holding a **strip lease**, every tick |
 | view | the other eight | only a group holding a **view lease** |
+
+**Both tiers are lease-driven, and the strip's lease is not an optimisation —
+it is a correctness requirement.** The registry's group map holds what this
+session created or resumed. A tab can be bound to a *restored* orchestration,
+which lives on disk and never enters that map (`list_recorded` reads the root
+directory directly). Publishing only registry-known groups therefore dropped
+those tabs' status entirely, losing the accrued-cost badge #194 P4 LOW-8 put
+there on purpose — a regression against the per-tab reads this replaced, which
+answered for **any** id the caller named. Found by the E2E soak lane's binding
+witness on its first run (#1625 review round 2).
+
+So `orch_strip_view` takes the caller's bound ids and stamps a strip lease per
+id, and the publisher covers `reg.groups` ∪ fresh strip leases. Still one IPC
+per sweep. A leased id the registry does not know is computed through the SAME
+functions as any other — `group_summary` answers zero live agents,
+`group_usage_live_within` reads that group's `usage.json` — so its entry is
+wire-identical to what the commands it replaced returned for it, by
+construction rather than by a second disk path.
+
+Two things were rejected. Reading `tabs.json` backend-side couples the
+publisher to a UI persistence file. Publishing every on-disk group is unbounded
+on a long-lived machine — which is what the lease's expiry-by-age exists to
+prevent: a strip lease is released by AGE, never by registry membership, since
+membership could not release a group that was never a member.
 
 `orch_group_view` stamps `lease(group) = now`; the publisher computes the view
 tier while that lease is younger than `VIEW_LEASE_MS` (10 s — five poll

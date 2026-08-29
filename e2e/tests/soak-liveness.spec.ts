@@ -113,6 +113,7 @@ import {
   readBreadcrumbs,
   readInvokeCounts,
   tabStatusStats,
+  stripStaleState,
   requestLockHold,
   sleep,
   waitForHoldAcquired,
@@ -397,7 +398,14 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
 
     // Wait out the hold, then read what the gate did during it.
     const releasedBy = Date.now() + holdMs + 20_000;
-    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) await sleep(200);
+    // Sampled INSIDE the wait, because by the time the hold has released the
+    // publisher has had a second to catch up and the badge is already gone.
+    // `sawStale` is what the human would have seen while the backend was stuck.
+    let sawStale = false;
+    while (Date.now() < releasedBy && holdStillHeld(appDataDir)) {
+      await sleep(200);
+      if (!sawStale) sawStale = (await stripStaleState(page)).stale;
+    }
     expect(holdStillHeld(appDataDir), `the injector never released a ${holdMs}ms hold`).toBe(false);
 
     const after = await singleFlightStats(page);
@@ -450,14 +458,64 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
         `injector claims to have held it (${holdMs}ms): ${crumb?.raw}`
     ).toBeGreaterThanOrEqual(holdMs - 2_000);
 
+    // THE CONTRACT THIS ASSERTS CHANGED UNDER PHASE 1, and the direction is
+    // the whole point of that phase.
+    //
+    // #1606 asserted `skipped >= 1`: holding `groups` stalled the sweep,
+    // because `orch_group_summary` took that mutex, so the next 4 s tick found
+    // its predecessor outstanding and the single-flight gate skipped it. That
+    // was the right assertion against a poll path that contends.
+    //
+    // #1608 serves the strip from a published snapshot. The sweep takes NO
+    // registry lock, so it settles normally while `groups` is held — and a
+    // skip would now mean something is wrong. Keeping `skipped >= 1` would
+    // pin the defect this epic removed.
+    //
+    // What replaces it is INV-6's actual promise: under a hold the surface
+    // keeps answering and says it is stale, rather than parking threads.
+    expect(
+      ran,
+      `no status sweep completed while the \`groups\` mutex was held for ${holdMs}ms. Since ` +
+        `#1608 the sweep reads a published snapshot and takes no registry lock, so a hold ` +
+        `must not stall it — if nothing ran, the poll path is contending again and the ` +
+        `blocking-pool accumulation this epic removed is reachable once more.`
+    ).toBeGreaterThanOrEqual(1);
     expect(
       skipped,
-      `no tick was skipped while the \`groups\` mutex was held for ${holdMs}ms (${ran} sweeps ` +
-        `ran). Either the status sweep does not contend on that mutex — in which case this ` +
-        `lane's claim that #1604 bounds the poll path under a held lock is unevidenced — or ` +
-        `the sweep is settling despite the hold, which would mean the hold is not reaching ` +
-        `the read the sweep makes.`
-    ).toBeGreaterThanOrEqual(1);
+      `${skipped} tick(s) were skipped while \`groups\` was held for ${holdMs}ms. A skip means ` +
+        `a sweep did not settle within its own 4 s tick, which since #1608 it has no reason ` +
+        `to do: the read is a pointer clone. Either something reintroduced a registry ` +
+        `acquisition on the poll path, or the strip read is blocking on something new.`
+    ).toBe(0);
+
+    // ...and the disclosure half. A snapshot the publisher cannot refresh ages,
+    // and the strip has to SAY so — that is what makes a stalled backend a
+    // stale panel rather than a frozen one that looks live (#1604 review N3,
+    // the requirement Phase 1 carries). The publisher parks on the same
+    // `groups` this test holds, so 12 s of hold is well past
+    // VIEW_STALE_AFTER_MS (5 s).
+    expect(
+      sawStale,
+      `the strip never reported itself stale during ${holdMs}ms with \`groups\` held. The ` +
+        `publisher parks on that mutex, so its snapshot cannot have been refreshed past ` +
+        `VIEW_STALE_AFTER_MS (5 s) — a strip that keeps rendering without disclosure is the ` +
+        `silent freeze this phase exists to remove.`
+    ).toBe(true);
+
+    // RELEASED ON EVIDENCE, not on a timer: the badge comes down only because
+    // the publisher got the lock back and stored a fresh snapshot.
+    const clearedBy = Date.now() + 10_000;
+    let cleared = false;
+    while (Date.now() < clearedBy && !cleared) {
+      await sleep(250);
+      cleared = !(await stripStaleState(page)).stale;
+    }
+    expect(
+      cleared,
+      `the strip stayed stale after the hold released. The badge is cleared by the next ` +
+        `successful publish, so if it never clears the publisher did not recover — which ` +
+        `would make the disclosure permanent rather than bounded (INV-6).`
+    ).toBe(true);
   });
 
   // Expected to fail on today's main. See this file's header for why the

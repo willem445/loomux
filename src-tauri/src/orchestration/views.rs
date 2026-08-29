@@ -110,6 +110,14 @@ pub const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(1000);
 /// four ticks of slack before the tier is dropped.
 pub const VIEW_LEASE_MS: u64 = 10_000;
 
+/// How long a STRIP lease stays fresh after `orch_strip_view` stamps it.
+///
+/// Same window as the view lease, and for the same reason: five poll periods
+/// of the surface that stamps it (the strip polls at 4 s, so this is two and a
+/// half ticks of slack — tighter than the view's four, because a tab that
+/// stops being bound should stop being computed promptly).
+pub const STRIP_LEASE_MS: u64 = 10_000;
+
 /// Past this age a payload is `stale` and the frontend badges it. The same
 /// number as Phase 0's long-hold breadcrumb threshold, deliberately: one
 /// definition of "stuck" in the app, not two.
@@ -195,6 +203,18 @@ pub struct ViewPublisher {
     /// opened a view on — nothing holds it across anything, so unlike a
     /// registry mutex it cannot be the lock a reader waits behind.
     leases: Mutex<HashMap<GroupId, Instant>>,
+    /// `group -> when the tab strip last named it as bound`.
+    ///
+    /// The strip's tier cannot be derived from the registry alone: a tab can
+    /// be bound to a RESTORED orchestration, which lives on disk and is not in
+    /// `groups` at all. Publishing only registry-known groups dropped those
+    /// tabs' badges entirely (#1625 review round 2) — a regression against the
+    /// per-tab reads this replaced, which answered for any bound id.
+    ///
+    /// Released beside `leases` in [`ViewPublisher::publish_pass_at`]: an entry
+    /// whose lease has aged out is dropped, so a closed tab stops being
+    /// computed within one lease window.
+    strip_leases: Mutex<HashMap<GroupId, Instant>>,
     /// Serializes the read-modify-write half of a publish — never the
     /// compute, which stays outside it. Two publishers exist (the thread's
     /// full pass and a mutating command's single-group nudge) and both did
@@ -220,6 +240,7 @@ impl ViewPublisher {
         Self {
             published: Published::new(ViewSnapshot::default()),
             leases: Mutex::new(HashMap::new()),
+            strip_leases: Mutex::new(HashMap::new()),
             publish_lock: Mutex::new(()),
             strip_tier_computes: AtomicU64::new(0),
             view_tier_computes: AtomicU64::new(0),
@@ -247,6 +268,26 @@ impl ViewPublisher {
     /// [`ViewPublisher::note_view_lease_at`] at the current instant.
     pub fn note_view_lease(&self, group: &GroupId) {
         self.note_view_lease_at(group, Instant::now());
+    }
+
+    /// Stamp a group's STRIP lease at `now` — the tab strip naming a group it
+    /// is bound to. Called by `orch_strip_view` for every id its caller sends,
+    /// so the publisher covers a bound tab whether or not the registry knows
+    /// its group.
+    pub fn note_strip_lease_at(&self, group: &GroupId, now: Instant) {
+        self.strip_leases.lock_safe().insert(group.clone(), now);
+    }
+
+    /// Group ids whose strip lease is younger than [`STRIP_LEASE_MS`] at `now`.
+    fn fresh_strip_leases_at(&self, now: Instant) -> Vec<GroupId> {
+        self.strip_leases
+            .lock_safe()
+            .iter()
+            .filter(|(_, at)| {
+                now.saturating_duration_since(**at).as_millis() as u64 <= STRIP_LEASE_MS
+            })
+            .map(|(g, _)| g.clone())
+            .collect()
     }
 
     /// Whether `group` holds a view lease younger than [`VIEW_LEASE_MS`] at
@@ -279,17 +320,31 @@ impl ViewPublisher {
     /// and holding `groups` across them would reintroduce exactly the
     /// cross-group hold this file exists to remove (INV-5).
     pub fn publish_pass_at(&self, reg: &OrchRegistry, now: Instant) {
-        let ids: Vec<GroupId> = {
+        // Every group the registry knows, PLUS every group a tab strip has
+        // named as bound. The second half is not redundant: a tab can be bound
+        // to a restored orchestration, which lives on disk and never enters
+        // `groups`. Covering only the first half is what dropped those tabs'
+        // badges (#1625 review round 2).
+        let mut ids: Vec<GroupId> = {
             let guard = reg.groups.lock_safe();
             guard.keys().cloned().collect()
         };
+        for leased in self.fresh_strip_leases_at(now) {
+            if !ids.contains(&leased) {
+                ids.push(leased);
+            }
+        }
 
         // Leases for groups the registry no longer knows are dropped here —
         // this is the release site the `leases` field's doc names.
         {
-            let mut leases = self.leases.lock_safe();
             let live: std::collections::HashSet<&GroupId> = ids.iter().collect();
-            leases.retain(|g, _| live.contains(g));
+            self.leases.lock_safe().retain(|g, _| live.contains(g));
+            // Strip leases are released by AGE, not by registry membership —
+            // the whole point is that a leased group need not be in `groups`.
+            self.strip_leases.lock_safe().retain(|_, at| {
+                now.saturating_duration_since(*at).as_millis() as u64 <= STRIP_LEASE_MS
+            });
         }
 
         let started = Instant::now();
@@ -352,7 +407,17 @@ impl ViewPublisher {
         // stamp its oldest-age `min_by_key` weighs, until the next full pass
         // dropped it. Self-healing within a tick, but it is a group the app
         // does not have, so it should never be published at all.
-        if reg.group(group.as_str()).is_none() {
+        // ...unless a tab strip has named it: a restored orchestration is not
+        // in `groups` and is still a group the UI is entitled to see.
+        if reg.group(group.as_str()).is_none()
+            && !self
+                .strip_leases
+                .lock_safe()
+                .get(group)
+                .is_some_and(|at| {
+                    now.saturating_duration_since(*at).as_millis() as u64 <= STRIP_LEASE_MS
+                })
+        {
             return;
         }
         let leased = self.has_view_lease_at(group, now);

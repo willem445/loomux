@@ -384,10 +384,12 @@ export async function singleFlightStats(page: Page): Promise<{ ran: number; skip
  *  that deletes the scaling. Binding is now observable only in frontend state,
  *  so this reads it from there — and more directly than the fan-out did, since
  *  it names the ids rather than inferring a count from an invoke total. */
-export async function tabStatusStats(page: Page): Promise<{ bound: string[]; seen: string[] }> {
+export async function tabStatusStats(
+  page: Page
+): Promise<{ bound: string[]; seen: string[]; stale: boolean; ageMs: number }> {
   const stats = await page.evaluate(() => {
     const f = (window as unknown as {
-      __tabStatusStats?: () => { bound: string[]; seen: string[] };
+      __tabStatusStats?: () => { bound: string[]; seen: string[]; stale: boolean; ageMs: number };
     }).__tabStatusStats;
     return f ? f() : null;
   });
@@ -398,6 +400,12 @@ export async function tabStatusStats(page: Page): Promise<{ bound: string[]; see
     );
   }
   return stats;
+}
+
+/** What the tab strip last disclosed about its own freshness. */
+export async function stripStaleState(page: Page): Promise<{ stale: boolean; ageMs: number }> {
+  const stats = await tabStatusStats(page);
+  return { stale: stats.stale, ageMs: stats.ageMs };
 }
 
 /** Total dispatches whose command name starts with `orch_` — the poll load,

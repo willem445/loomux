@@ -34,13 +34,21 @@ import { staleState, type StaleState } from "./viewstale";
 export interface TabStatusStats {
   bound: string[];
   seen: string[];
+  /** What the strip last disclosed about its own freshness — the same
+   *  `staleState` the chips render. Read by the soak lane to assert that a
+   *  stalled backend produces a stale BADGE rather than a silently frozen
+   *  strip (#1604 review N3, carried by #1608). */
+  stale: boolean;
+  ageMs: number;
 }
 
 let lastBound: string[] = [];
 let lastSeen: string[] = [];
+let lastStale = false;
+let lastAgeMs = 0;
 
 export function tabStatusStats(): TabStatusStats {
-  return { bound: [...lastBound], seen: [...lastSeen] };
+  return { bound: [...lastBound], seen: [...lastSeen], stale: lastStale, ageMs: lastAgeMs };
 }
 
 (globalThis as unknown as { __tabStatusStats?: () => TabStatusStats }).__tabStatusStats =
@@ -606,9 +614,17 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     // every 4 s, and the fan-out grew with the human's tab count. The backend
     // publishes one snapshot on a cadence and serves it by pointer clone, so
     // the cost here is O(1) in tabs and the call cannot park.
+    // The bound ids go WITH the request: the publisher covers a restored
+    // orchestration only if a strip says it is bound to one (see stripView).
+    const boundNow: string[] = [];
+    for (const ws of this.tabs.tabs) {
+      const g = this.tabs.groupForWorkspace(ws.id);
+      if (g && !boundNow.includes(g)) boundNow.push(g);
+    }
+
     let strip;
     try {
-      strip = await stripView();
+      strip = await stripView(boundNow);
     } catch {
       // The backend is not answering this tick. Keep every badge exactly as it
       // is — a stale-but-true count beats a fabricated zero — and let the next
@@ -673,6 +689,8 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     }
     lastBound = boundIds;
     lastSeen = seenIds;
+    lastStale = stale.stale;
+    lastAgeMs = strip.meta.age_ms;
     if (changed) this.render();
   }
 
