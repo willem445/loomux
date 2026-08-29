@@ -163,7 +163,7 @@ pub(crate) fn remaining() -> Option<(Duration, u64)> {
 
 /// Whether this thread is inside a [`MutationScope`].
 pub(crate) fn in_mutation() -> bool {
-    MUTATION_DEPTH.with(|d| d.get()) > 0
+    false
 }
 
 /// The typed unwind payload. Carries the frame it is addressed to, so a nested
