@@ -87,6 +87,7 @@ import {
   LIVENESS_BOUND_MS,
   LOCK_HOLD_MS,
   SOAK_MS,
+  breadcrumbsOfKind,
   holdStillHeld,
   assertCounterSeesTheApp,
   installInvokeCounter,
@@ -98,6 +99,7 @@ import {
   orchInvokeTotal,
   singleFlightStats,
   ptyRoundTrip,
+  readBreadcrumbs,
   readInvokeCounts,
   requestLockHold,
   sleep,
@@ -344,7 +346,29 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     const after = await singleFlightStats(page);
     const ran = after.ran - before.ran;
     const skipped = after.skipped - before.skipped;
-    console.log(`[soak] during a ${holdMs}ms hold on groups: ${ran} sweeps ran, ${skipped} ticks skipped`);
+
+    // Phase 0 (#1605) put a self-watchdog behind every registry mutex, and
+    // it reports a hold that outlives `lockwatch::DEFAULT_HOLD_WARN_MS`
+    // (5 s). This hold is 12 s, so the app's OWN instrument has to have seen
+    // it — which cross-validates the two independently: an injector that did
+    // not really take the mutex produces no report, and a watchdog that is
+    // not running produces none either. Before Phase 0 this lane had no way
+    // to check its own premise against anything but itself.
+    const crumbs = breadcrumbsOfKind(readBreadcrumbs(appDataDir), ["lock-slow", "lock-freed"]);
+    console.log(
+      `[soak] during a ${holdMs}ms hold on groups: ${ran} sweeps ran, ${skipped} ticks ` +
+        `skipped; watchdog reported ${crumbs.length} long-hold breadcrumb(s)` +
+        (crumbs.length ? `: ${crumbs[crumbs.length - 1]}` : "")
+    );
+
+    expect(
+      crumbs.length,
+      `Phase 0's self-watchdog reported no long-hold breadcrumb while this test held the ` +
+        `\`groups\` mutex for ${holdMs}ms — five times its 5 s threshold. Either the ` +
+        `injector is not taking a TRACKED mutex (so the lane's premise is unverified), or ` +
+        `the watchdog thread is not running in this build. Breadcrumb log had ` +
+        `${readBreadcrumbs(appDataDir).length} line(s).`
+    ).toBeGreaterThanOrEqual(1);
 
     expect(
       skipped,

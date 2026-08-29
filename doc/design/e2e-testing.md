@@ -665,15 +665,44 @@ knob is an environment variable (`ORRERIX_SOAK_MS`,
 `ORRERIX_SOAK_SESSIONS`, `ORRERIX_SOAK_AUDIT_LINES`), so a long local soak
 is a matter of setting one, not editing the spec.
 
-### A follow-up this lane deliberately does not depend on
+### What the lane reads from Phase 0
 
-Phase 0 (#1601) is adding a liveness heartbeat and lock breadcrumbs in
-parallel. Nothing here depends on them, on purpose — the lane had to be able
-to land on today's `main`. Once they exist, the invoke-counter positive
-control and the injector's own state file could both be replaced by reading
-the app's real heartbeat, which would be a crisper statement of the same
-property and would let the lane distinguish "the GUI thread is stuck" from
-"the backend is stuck" without inferring it from which probe died.
+Phase 0 (#1601, merged as #1605) landed while this lane was in review, and it
+changes what the lane can check about itself. This section used to say Phase 0
+*was being added in parallel* and that nothing here depended on it — true when
+written, and false the moment it merged.
+
+The lane still does not DEPEND on Phase 0: every probe and every control works
+without it, which is what let this land on a base that did not have it. What it
+now does is **cross-validate against it**, and that is worth more than a
+dependency would have been. `obs::breadcrumb` appends `<stamp> <event>
+<detail>` lines to `<data root>/logs/breadcrumbs.log`, and the Playwright
+process owns that directory — so the app's own self-watchdog can be read
+without going through the IPC path whose liveness is under test, exactly as the
+injector's state file is.
+
+The armed-injector control uses it for the one thing this lane could not
+previously check: **its own premise**. `lockwatch` reports any tracked hold
+outliving `DEFAULT_HOLD_WARN_MS` (5 s) as a `lock-slow` / `lock-freed`
+breadcrumb naming the lock, the duration, the waiter count and the holder's
+call site. The control's hold is 12 s, so the app's own instrument has to have
+seen it — and the assertion fails if it did not, which distinguishes two
+defects that previously shared a symptom: an injector that never really took a
+tracked mutex, and a watchdog that is not running in this build. Before Phase 0
+the lane could only check its premise against itself.
+
+Two Phase 0 instruments are deliberately **not** used yet, and are named so the
+next person does not have to rediscover them:
+
+- **The heartbeat** (`selfwatch::liveness`, `src/liveness.ts`) separates "the
+  GUI thread is stuck" from "the backend is stuck" — the exact distinction that
+  cost a release cycle between beta5 and beta6, and one this lane currently
+  infers from which probe died. Reading it would state that directly.
+- **The pool-depth counter** (`selfwatch::pool_in_flight`, fed by
+  `blocking::spawn_counted`, which `write_pty` now goes through) would replace
+  the arithmetic this note retracted above with a measurement. It only
+  breadcrumbs on crossing a step (64/128/256), so a healthy run emits nothing —
+  which is why it is a follow-up rather than an assertion here.
 
 ## Running it (the two commands)
 

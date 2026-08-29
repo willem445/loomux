@@ -180,6 +180,33 @@ export function holdStillHeld(dataDir: string): boolean {
   return typeof s?.acquired_ms === "number" && (s.released_ms ?? null) === null;
 }
 
+/** Phase 0's breadcrumb log (#1605), read straight off disk.
+ *
+ *  `obs::breadcrumb` appends `<stamp> <event> <detail>` lines to
+ *  `<data root>/logs/breadcrumbs.log`, and the Playwright process owns that
+ *  directory — so the app's own self-watchdog can be read without going
+ *  through the IPC path whose liveness is under test, exactly as the
+ *  injector's state file is. Absent means the watchdog has had nothing to
+ *  report, which on a healthy run is the normal case: returns `[]` rather
+ *  than throwing, and callers that need it to be non-empty say so. */
+export function readBreadcrumbs(dataDir: string): string[] {
+  try {
+    return fs
+      .readFileSync(path.join(dataDir, "logs", "breadcrumbs.log"), "utf8")
+      .split(/\r?\n/)
+      .filter((l) => l.trim() !== "");
+  } catch {
+    return [];
+  }
+}
+
+/** Breadcrumbs whose event field is one of `events`. The line shape is
+ *  `<stamp> <event> <detail>`, split on spaces, and `lockwatch` guarantees
+ *  every detail VALUE is space-free for exactly this reason. */
+export function breadcrumbsOfKind(lines: string[], events: string[]): string[] {
+  return lines.filter((l) => events.includes(l.split(" ")[1] ?? ""));
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
