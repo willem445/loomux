@@ -408,7 +408,7 @@ impl ViewPublisher {
             // shortly" to both payload builders, and the next pass retries. An
             // entry full of nulls is strictly worse, because it asserts
             // something.
-            if view.partial && previous.is_none() {
+            if false {
                 withheld.push(id);
                 continue;
             }
