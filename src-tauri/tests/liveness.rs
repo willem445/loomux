@@ -1777,6 +1777,15 @@ fn l5_every_lockorder_const_is_applied_to_its_field() {
         }
     }
 
+    // De-duplicated, and this is not tidiness. A mismatch is a fact about a
+    // FIELD; the scan sees one entry per LIVE lock of that name, and this
+    // binary runs its tests concurrently, so the repeat count is however many
+    // other tests happened to be holding a registry at that instant. Reporting
+    // the raw list makes the message both unreadable and NON-DETERMINISTIC —
+    // measured, not feared: the first red run of this row printed each of its
+    // three findings six times (#1610 review B1's scratch round).
+    wrong.sort();
+    wrong.dedup();
     assert!(
         wrong.is_empty(),
         "the rank table and the live locks disagree:\n  {}",
