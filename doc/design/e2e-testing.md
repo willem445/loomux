@@ -387,11 +387,15 @@ reads as covering is worse than none:
 - **Blocking-pool exhaustion is not reachable from the poll path at all, and
   no hold duration or corpus size changes that.** Plan #1600 §1.2 step 4
   describes ticks accumulating parked `spawn_blocking` threads until the
-  512-thread pool exhausts. **#1604 single-flights this sweep**: a tick that
-  fires while the previous one is still outstanding skips, so at most one
-  call is parked however long a lock is held. That is the fix working as
-  designed, and it means this lane cannot demonstrate the pane-input half of
-  the chain.
+  512-thread pool exhausts, at which point `write_pty` can no longer be
+  scheduled and every pane stops accepting input at once. **Both ends of that
+  chain are now cut, independently.** #1604 single-flights this sweep, so a
+  tick firing while the previous one is still outstanding skips and at most
+  one call is parked however long a lock is held; and #1612 (Phase 2.3) moved
+  `write_pty` off the shared pool onto a per-pane writer thread, so even an
+  exhausted pool could not starve pane input. Two fixes working as designed,
+  and together they mean this lane cannot demonstrate the pane-input half of
+  the chain — nor should it be able to.
 
   An earlier version of this section did an arithmetic — four bound tabs at
   two invokes every 4 s, so ~2 parked threads per second, so ~180 of 512 at a
@@ -730,10 +734,17 @@ next person does not have to rediscover them:
   cost a release cycle between beta5 and beta6, and one this lane currently
   infers from which probe died. Reading it would state that directly.
 - **The pool-depth counter** (`selfwatch::pool_in_flight`, fed by
-  `blocking::spawn_counted`, which `write_pty` now goes through) would replace
-  the arithmetic this note retracted above with a measurement. It only
-  breadcrumbs on crossing a step (64/128/256), so a healthy run emits nothing —
-  which is why it is a follow-up rather than an assertion here.
+  `blocking::spawn_counted`) would replace the arithmetic this note retracted
+  above with a measurement. It only breadcrumbs on crossing a step
+  (64/128/256), so a healthy run emits nothing — which is why it is a
+  follow-up rather than an assertion here.
+
+  This entry said "…which `write_pty` now goes through" until #1612. That was
+  true of Phase 0's tree and is false of this one: Phase 2.3 moved the write
+  path off the shared pool entirely, onto a per-pane writer thread, so the
+  depth counter no longer observes the app's most latency-critical path at
+  all. Which is the fix working — but it is also why reading the counter would
+  now say less about pane input than the sentence implied.
 
 ## Running it (the two commands)
 

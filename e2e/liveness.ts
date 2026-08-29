@@ -492,6 +492,14 @@ async function waitForTap(
  *   this phase is the one the beta6 report is actually about: a `write_pty`
  *   that never resolves stops that pane accepting input forever, with the
  *   window still painting. It ends when the typed stem echoes back.
+ *
+ *   The SYMPTOM is unchanged by #1612 and the frontend chain is why: one
+ *   write in flight per pane means one unresolved promise is still enough to
+ *   wedge that pane. What changed is the cause it can have. `write_pty` no
+ *   longer hands off to the shared blocking pool at all — it enqueues to the
+ *   pane's own writer thread and awaits that thread's reply — so pool
+ *   exhaustion is no longer among the ways this probe can fail, and a red
+ *   here now points at the writer thread or the ConPTY write behind it.
  * - *Answer.* Enter is pressed and the CHILD's own output has to arrive. This
  *   is one write and one read, so it is fast whenever it works at all.
  *

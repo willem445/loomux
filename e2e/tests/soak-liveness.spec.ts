@@ -30,20 +30,26 @@
 //   the per-tick fan-out is smaller than a real orchestrating session's.
 //   Closing that gap needs a safe stand-in agent process
 //   (doc/design/e2e-testing.md's standing limitation), not a change here.
-// - **Blocking-pool exhaustion: NOT reachable from the poll path at all, and
-//   no hold duration changes that.** Plan #1600 §1.2 step 4 describes ticks
-//   accumulating parked `spawn_blocking` threads until the 512-thread pool
-//   exhausts. #1604 single-flights this sweep, so a tick firing while the
-//   previous one is still outstanding SKIPS: at most one call is parked,
-//   however long a lock is held. That is the fix working, and it means this
-//   lane cannot demonstrate the pane-input half of the chain — an earlier
-//   version of this header said raising the hold past ~120 s locally would
-//   reach it, which was true against the base this branch was cut from and is
-//   false here. What the class assertion still demonstrates is the half
-//   #1604 does not govern: `orchestration/mcp.rs` spawns a thread per request
-//   and each parks on the registry mutex, ungoverned by any single-flight,
-//   which is exactly why the MCP probe is the one that dies while pane input
-//   stays healthy.
+// - **Blocking-pool exhaustion: NOT reachable, at either end of the chain,
+//   and no hold duration changes that.** Plan #1600 §1.2 step 4 describes
+//   ticks accumulating parked `spawn_blocking` threads until the 512-thread
+//   pool exhausts, at which point `write_pty` can no longer be scheduled and
+//   every pane stops accepting input at once. Both ends are now cut,
+//   independently: #1604 single-flights this sweep, so a tick firing while
+//   the previous one is still outstanding SKIPS and at most one call is
+//   parked however long a lock is held; and #1612 moved `write_pty` off the
+//   shared pool onto a per-pane writer thread, so even an exhausted pool
+//   could not starve pane input. An earlier version of this header said
+//   raising the hold past ~120 s locally would reach the pane-input half —
+//   true against the base this branch was cut from, false here, and now
+//   false twice over.
+//
+//   What the class assertion still demonstrates is the half neither fix
+//   governs: `orchestration/mcp.rs` spawns a thread per request and each
+//   parks on the registry mutex, ungoverned by any single-flight and served
+//   by no pool. That is exactly why the MCP probe is the one that dies while
+//   pane input stays healthy — and why the pty probe passing is now a
+//   REGRESSION guard on #1612 rather than a coin-flip.
 //
 // ## The expected failure
 //
