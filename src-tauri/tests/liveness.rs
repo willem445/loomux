@@ -1341,7 +1341,7 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     //  - the lock it holds is `app`, which `write_mailbox` takes AFTER
     //    atomically replacing `mailbox.json`. That is the shape the tear needs,
     //    and it is the one the review found live.
-    let (reg, token, _group, _dir) = mcp_fixture();
+    let (reg, token, group, _dir) = mcp_fixture();
     let caller = reg.resolve_token(&token).expect("the token resolves");
 
     // The Read set, taken from what the surface actually lists rather than a
