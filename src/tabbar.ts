@@ -14,6 +14,38 @@ import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, stripView } from "./orchestration";
 import { staleState, type StaleState } from "./viewstale";
+
+/** Which group ids the tab strip resolved on its last status sweep: `bound`
+ *  is every tab whose persisted `groupIds` names a group, `seen` the subset
+ *  the published snapshot actually carried.
+ *
+ *  This exists for the E2E soak lane (#1603/#1606), and it exists because
+ *  #1608 removed the instrument that lane was using. That spec witnessed
+ *  "the corpus's tabs.json really bound its tabs" from the poll's IPC
+ *  FAN-OUT — two invokes per group-bound tab, so the dispatch count scaled
+ *  with the tab count. Collapsing the sweep to one `orch_strip_view` is the
+ *  point of #1608 and it deletes that scaling, so the binding fact is no
+ *  longer observable in the IPC at all. It is observable HERE, and more
+ *  directly than the fan-out ever witnessed it.
+ *
+ *  Module-global and last-sweep-only, the same shape as
+ *  `__singleFlightStats` / `__pollGateStats` / `__wakeGateStats`. Reading it
+ *  costs nothing and it is never read by product code. */
+export interface TabStatusStats {
+  bound: string[];
+  seen: string[];
+}
+
+let lastBound: string[] = [];
+let lastSeen: string[] = [];
+
+export function tabStatusStats(): TabStatusStats {
+  return { bound: [...lastBound], seen: [...lastSeen] };
+}
+
+(globalThis as unknown as { __tabStatusStats?: () => TabStatusStats }).__tabStatusStats =
+  tabStatusStats;
+
 import { tabCounts } from "./tabcounts";
 import { PollGate } from "./pollgate";
 import { SingleFlight } from "./singleflight";
@@ -562,6 +594,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private async pollStatusOnce(): Promise<void> {
     let changed = false;
     const seen = new Set<string>();
+    // The binding witness the soak lane reads (see `tabStatusStats`). Rebuilt
+    // each sweep rather than accumulated, so a tab that loses its group stops
+    // being counted.
+    const boundIds: string[] = [];
+    const seenIds: string[] = [];
 
     // ONE read for the WHOLE strip (#1608, plan #1600 §3 Phase 1). This used
     // to be `groupSummary` + `groupUsage` per group-bound tab, awaited in
@@ -607,7 +644,9 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
       const groupId = this.tabs.groupForWorkspace(ws.id);
       if (!groupId) continue;
       seen.add(ws.id);
+      boundIds.push(groupId);
       const g = strip.groups[groupId];
+      if (g) seenIds.push(groupId);
       // #904: the backend answers `null` for a group it refuses, and omits one
       // created since the last publish pass. A tab badge has no way to say
       // "unknown", and a stale-but-true count beats a fabricated zero — so
@@ -632,6 +671,8 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         changed = true;
       }
     }
+    lastBound = boundIds;
+    lastSeen = seenIds;
     if (changed) this.render();
   }
 

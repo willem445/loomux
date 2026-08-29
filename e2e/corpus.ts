@@ -11,9 +11,10 @@
 //    written; a "group" is the on-disk state a real orchestration leaves
 //    behind. The app under test reads them exactly as it reads a real
 //    install's, and that read is the point: `recorded_orchestrations` walks
-//    every group dir and streams every audit log (#1592), and the polled
-//    `orch_group_summary`/`orch_group_usage` reads take registry locks per
-//    group-bound tab.
+//    every group dir and streams every audit log (#1592). The strip's polled
+//    reads took registry locks per group-bound tab until #1608 served them
+//    from a published snapshot; the boot listing above is what still makes
+//    this corpus expensive.
 // 2. **Never the operator's real session store.** The Claude half of that
 //    store (`~/.claude/projects`) has NO production redirect —
 //    `claude_projects_root()` is `dirs::home_dir()` plus a thread-local seam
@@ -40,9 +41,11 @@ export interface CorpusSpec {
   /** Synthetic copilot session directories under the redirected COPILOT_HOME. */
   sessions: number;
   /** Tabs in `tabs.json`, each bound to one group. `src/tabbar.ts`'s 4 s
-   *  `pollStatus` iterates the BOUND tabs and issues two `orch_*` invokes for
-   *  each, so this is the knob that sets how much polling the soak generates.
-   *  Clamped to `groups`. */
+   *  `pollStatus` iterates the BOUND tabs and reads one `orch_strip_view`
+   *  covering all of them (two `orch_*` invokes PER TAB until #1608). So this
+   *  knob no longer scales the soak's IPC load — it scales how many tabs the
+   *  strip resolves, which is what the lane's binding witness reads
+   *  (`tabStatusStats`). Clamped to `groups`. */
   groupBoundTabs: number;
   /** An existing directory to name as each group's repo. */
   repo: string;

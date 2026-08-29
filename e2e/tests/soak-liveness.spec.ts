@@ -15,11 +15,16 @@
 // reads as covering is worse than none:
 //
 // - **The 4 s tab-strip poll: yes.** `src/tabbar.ts` arms it at construction
-//   ("the app's one app-lifetime poll") and `pollStatus` issues
-//   `orch_group_summary` + `orch_group_usage` for every GROUP-BOUND tab. A tab
-//   is group-bound purely because its persisted `groupIds` names a group, so
-//   the corpus's `tabs.json` alone puts that poll under load — no clicking,
-//   and no agent CLI.
+//   ("the app's one app-lifetime poll") and `pollStatus` issues one
+//   `orch_strip_view` covering every GROUP-BOUND tab (it was
+//   `orch_group_summary` + `orch_group_usage` per tab until #1608 served the
+//   strip from a published snapshot). A tab is group-bound purely because its
+//   persisted `groupIds` names a group, so the corpus's `tabs.json` alone puts
+//   that poll under load — no clicking, and no agent CLI. What the collapse
+//   changes for this lane is the SHAPE of the load, not its presence: one
+//   command per sweep still crosses the IPC boundary and still reaches the
+//   backend on a 4 s cadence. It no longer takes a registry lock, which is why
+//   the class assertion below is about the MCP path rather than this one.
 // - **The 2 s group-view poll: no, and it cannot be.** `src/groupview.ts`'s
 //   timer is armed only while the view is shown, and the view can only be
 //   opened from a pane whose `groupBtn` is visible — which
@@ -107,6 +112,7 @@ import {
   parseHoldCrumbs,
   readBreadcrumbs,
   readInvokeCounts,
+  tabStatusStats,
   requestLockHold,
   sleep,
   waitForHoldAcquired,
@@ -212,6 +218,9 @@ test.describe("soak: a large corpus and a steady poll load", () => {
     // the same `{}` as an app that never polled.
     const countsBefore = orchInvokeTotal(await assertCounterSeesTheApp(page, "write_pty"));
     const sweepsBefore = await singleFlightStats(page);
+    // Per-command baseline for the strip read, so the floor below measures THIS
+    // soak rather than every orch_strip_view since boot.
+    const stripBefore = (await readInvokeCounts(page))["orch_strip_view"] ?? 0;
 
     // ---- the soak itself: the app is left completely alone ----
     await sleep(SOAK_MS);
@@ -261,31 +270,55 @@ test.describe("soak: a large corpus and a steady poll load", () => {
         `about an idle app. Poll gate: ${JSON.stringify(gate)}`
     ).toBeGreaterThanOrEqual(sweepFloor);
 
-    // And the two instruments have to agree, at the FAN-OUT and not merely at
-    // "something happened". A sweep issues `orch_group_summary` +
-    // `orch_group_usage` per group-bound tab, so a full sweep dispatches
-    // `BOUND_TABS × 2`; measured, `polled` is exactly `sweeps × BOUND_TABS × 2`.
+    // And the two instruments have to agree — but at what, changed under this
+    // spec, and the change is worth stating because it took a witness away.
     //
-    // The floor was `polled >= sweeps`, which has 8× slack and therefore only
-    // catches a corpus that bound NO tabs: one that bound 1 of 4 dispatches 90
-    // against 45 sweeps and passes, running the soak at a quarter of its
-    // intended registry load with `assertCorpusReallyLanded` none the wiser —
-    // it checks groups, sessions and audit bytes, never the binding (#1606
-    // review round 2, N1).
+    // WHAT THIS USED TO ASSERT. A sweep issued `orch_group_summary` +
+    // `orch_group_usage` per group-bound tab, so a full sweep dispatched
+    // `BOUND_TABS × 2` and `polled` was exactly `sweeps × BOUND_TABS × 2`. The
+    // floor was raised to half that nominal fan-out in #1606 review round 2
+    // (N1) to catch a corpus that binds only SOME of its tabs: with the older
+    // `polled >= sweeps` floor, one that bound 1 of 4 dispatched 90 against 45
+    // sweeps and passed, running the soak at a quarter of its intended registry
+    // load with `assertCorpusReallyLanded` none the wiser — it checks groups,
+    // sessions and audit bytes, never the binding.
     //
-    // Half the nominal fan-out is safe to pin here, and pinning it does not
-    // reintroduce the arithmetic that went stale on #1604: what that change
-    // made unpredictable is how many sweeps RUN, which is why `sweeps` is read
-    // rather than derived. What each sweep dispatches is untouched by it.
-    const dispatchFloor = Math.floor(sweeps * BOUND_TABS * 2 * 0.5);
+    // WHY IT NO LONGER CAN. #1608 serves the whole strip from one published
+    // snapshot: a sweep now dispatches ONE `orch_strip_view` whatever the tab
+    // count. That is the improvement — the strip's IPC stops growing with the
+    // human's tabs — and it deletes the SCALING the binding witness rode on.
+    // Not a stale constant: the fan-out that carried the signal is gone.
+    //
+    // So the two properties that rode on one assertion are now asserted
+    // separately, and the binding one is read where binding actually lives.
+    const stripDispatches = (counts["orch_strip_view"] ?? 0) - stripBefore;
+    const dispatchFloor = Math.floor(sweeps * 0.5);
     expect(
-      polled,
-      `${sweeps} status sweeps ran but only ${polled} orch_* commands were dispatched ` +
-        `(expected at least ${dispatchFloor}, half the ${sweeps} × ${BOUND_TABS} × 2 ` +
-        `fan-out). A sweep issues two per GROUP-BOUND tab, so a shortfall means some or ` +
-        `all of the corpus's tabs.json did not bind and the soak applied less registry ` +
-        `load than it reports. Counts: ${JSON.stringify(counts)}`
+      stripDispatches,
+      `${sweeps} status sweeps ran but only ${stripDispatches} orch_strip_view commands were ` +
+        `dispatched (expected at least ${dispatchFloor}, half of one per sweep). A sweep issues ` +
+        `exactly one since #1608, so a shortfall means the sweep body is not reaching the ` +
+        `backend at all. Counts: ${JSON.stringify(counts)}`
     ).toBeGreaterThanOrEqual(dispatchFloor);
+
+    // THE BINDING WITNESS, replacing the fan-out one #1608 removed. `bound` is
+    // every tab whose persisted `groupIds` names a group; `seen` the subset the
+    // published snapshot carried. A corpus that binds 1 of 4 reddens here — the
+    // case N1 was raised about — and so does one whose groups never reach the
+    // snapshot, which the fan-out floor could not distinguish.
+    const tabs = await tabStatusStats(page);
+    expect(
+      tabs.bound.length,
+      `the strip resolved ${tabs.bound.length} group-bound tabs, expected ${BOUND_TABS}. The ` +
+        `corpus's tabs.json did not bind what it reports, so the soak applied less registry ` +
+        `load than it claims. Bound: ${JSON.stringify(tabs.bound)}`
+    ).toBe(BOUND_TABS);
+    expect(
+      tabs.seen.length,
+      `${tabs.bound.length} tabs are group-bound but only ${tabs.seen.length} of their groups ` +
+        `were in the published snapshot, so the strip rendered stale or absent status for the ` +
+        `rest. Bound: ${JSON.stringify(tabs.bound)}; seen: ${JSON.stringify(tabs.seen)}`
+    ).toBe(tabs.bound.length);
 
     // ---- (4) the two liveness assertions ----
     const pty = await ptyRoundTrip(page, paneTerm, 2, LIVENESS_BOUND_MS);
@@ -349,9 +382,13 @@ test.describe("soak: THE class assertion — a long registry-lock hold", () => {
     // with whether the injector is armed.
     await expect(page.locator("#tab-bar")).toBeAttached();
 
-    // `groups` rather than `agents`: it is what the polled `orch_group_summary`
-    // takes, so holding it is what stalls a sweep. Long enough to span several
-    // 4 s ticks, short enough to stay cheap.
+    // `groups` rather than `agents`: it is what `resolve_token` takes on every
+    // MCP request, so holding it is what stalls the probe this spec is about.
+    // It used to stall the tab-strip sweep too — `orch_group_summary` took it —
+    // but since #1608 that sweep reads a published snapshot and no longer
+    // acquires a registry lock at all, which is the change that makes the
+    // `test.fail()` below an MCP-side statement rather than a poll-path one.
+    // Long enough to span several 4 s ticks, short enough to stay cheap.
     const holdMs = 12_000;
     const before = await singleFlightStats(page);
     requestLockHold(appDataDir, "groups", holdMs);
