@@ -38976,10 +38976,11 @@ impl OrchRegistry {
                 // `agents`. That is the difference between "the deadlock is
                 // unreachable because no lock is held here" and "the tick never
                 // asks the question that deadlocked it".
-                let delivered = a
-                    .pty_id
-                    .map(|p| self.delivered_mask_lines(p, a.session_id.as_deref()))
-                    .unwrap_or_default();
+                // [scratch] the mask reconciles nothing: the record is empty,
+                // so every delivered line the pane is rendering reads as the
+                // CLI's own question. The tick still returns promptly.
+                let delivered: Vec<String> = Vec::new();
+                let _ = a.pty_id;
                 let shaped =
                     prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
                 (a.id.clone(), shaped)
