@@ -1576,7 +1576,13 @@ fn l5a_a_planted_inversion_panics_under_the_checker_naming_both_locks() {
         "groups".to_string(),
         format!("rank {}", lockorder::AGENTS),
         format!("rank {}", lockorder::GROUPS),
-        "orchestration/mod.rs".to_string(),
+        // Two needles, not one path: the recorded site is a real `file!()`,
+        // so it is `src-tauri/src/orchestration/mod.rs` on unix and
+        // `src-tauri\src\orchestration\mod.rs` on Windows. Asserting the
+        // slashed form passed on two platforms and failed on the third
+        // (run 33262628789).
+        "orchestration".to_string(),
+        "mod.rs".to_string(),
     ];
     for needle in &needles {
         assert!(msg.contains(needle), "the panic lost {needle:?}: {msg}");
