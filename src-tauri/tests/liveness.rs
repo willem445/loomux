@@ -100,11 +100,12 @@
 //!    `crates/` ever links Tauri, that scan's root list is the thing to widen.
 
 use loomux_engine::lockwatch::tracked_lock_names;
+use serde_json::Value;
 use loomux_lib::orchestration::views::{group_view_payload, strip_view_payload, VIEW_STALE_AFTER_MS};
 use loomux_lib::orchestration::{Guardrails, OrchRegistry};
 use loomux_lib::pty::{PtyManager, WriteReceiver};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Long enough that a loaded CI runner never trips it, short enough that a real
 /// regression fails the job rather than hanging it. Every use is a "did this
