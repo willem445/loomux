@@ -67,16 +67,19 @@ export const LOCK_HOLD_MS = envInt("SOAK_LOCK_HOLD_MS", 90_000);
 
 /** The bound each PHASE of a liveness probe must answer within.
  *
- *  20 s, which is generous on purpose and measured rather than guessed. The
- *  input phase types the command with real key events, and `src/ptywrite.ts`
- *  keeps exactly one `write_pty` in flight per pane (#65) — so a typed
- *  character is one full IPC round trip, and on a DEBUG build on a CI VM
- *  already booted against the soak corpus that measured ~420 ms per
- *  character (first CI run on this branch: 19 of 23 characters echoed in
- *  8 s). The failure this lane is about is a probe that never answers, not a
- *  slow one, so the bound is set to clear a slow machine by a wide margin
- *  rather than to police latency — a latency budget here would be a flake
- *  generator wearing an invariant's clothes. */
+ *  20 s, and generous on purpose. The input phase types with real key events,
+ *  and `src/ptywrite.ts` keeps exactly one `write_pty` in flight per pane
+ *  (#65), so every character is a full IPC round trip. How long that takes
+ *  has been observed to VARY by orders of magnitude between CI runs of this
+ *  same spec: once only 19 of 23 characters echoed within 8 s, and on the next
+ *  run the whole input phase finished in 38 ms. The cause is not established
+ *  and is deliberately not guessed at here — guessing is what plan #1600 §4
+ *  says produced beta5 and beta6. What follows from it is this bound and the
+ *  two-phase split: the failure this lane is about is a probe that NEVER
+ *  answers, not a slow one, so the bound clears a slow machine by a wide
+ *  margin rather than policing latency, which would be a flake generator
+ *  wearing an invariant's clothes. If the slow case recurs it is worth
+ *  chasing under #1600 in its own right. */
 export const LIVENESS_BOUND_MS = envInt("SOAK_BOUND_MS", 20_000);
 
 /** Corpus size. Defaults chosen so the fixture build stays under a couple of
@@ -186,26 +189,100 @@ export function sleep(ms: number): Promise<void> {
  *  call time (node_modules/@tauri-apps/api/core.js), so wrapping the property
  *  intercepts every dispatch the real frontend makes, through
  *  `src/transport.ts` and every bridge above it. */
-export async function installInvokeCounter(page: Page): Promise<void> {
-  await page.evaluate(() => {
+export async function installInvokeCounter(page: Page): Promise<string> {
+  const how = await page.evaluate(() => {
+    type Invoke = (cmd: string, args?: unknown, options?: unknown) => Promise<unknown>;
     const w = window as unknown as {
-      __TAURI_INTERNALS__?: {
-        invoke(cmd: string, args?: unknown, options?: unknown): Promise<unknown>;
-        __soakOriginalInvoke?: (cmd: string, args?: unknown, options?: unknown) => Promise<unknown>;
-      };
+      __TAURI_INTERNALS__?: { invoke: Invoke; __soakOriginalInvoke?: Invoke };
       __soakInvokeCounts?: Record<string, number>;
     };
     const internals = w.__TAURI_INTERNALS__;
     if (!internals) throw new Error("__TAURI_INTERNALS__ missing — not running inside the app");
-    if (internals.__soakOriginalInvoke) return;
-    internals.__soakOriginalInvoke = internals.invoke.bind(internals);
+    if (internals.__soakOriginalInvoke) return "already installed";
+
+    const original: Invoke = internals.invoke.bind(internals);
     w.__soakInvokeCounts = {};
-    internals.invoke = (cmd: string, args?: unknown, options?: unknown) => {
+    const counting: Invoke = (cmd, args, options) => {
       const counts = w.__soakInvokeCounts as Record<string, number>;
       counts[cmd] = (counts[cmd] ?? 0) + 1;
-      return internals.__soakOriginalInvoke!(cmd, args, options);
+      return original(cmd, args, options);
     };
+    internals.__soakOriginalInvoke = original;
+
+    // Three ways in, tried in order, because a plain assignment to a
+    // non-writable property is a SILENT no-op outside strict mode — and a
+    // counter that silently did not install reports zero dispatches, which
+    // reads exactly like an app that never polled. Each step checks that it
+    // actually took rather than assuming it did.
+    internals.invoke = counting;
+    if (internals.invoke === counting) return "assignment";
+
+    try {
+      Object.defineProperty(internals, "invoke", {
+        value: counting,
+        writable: true,
+        configurable: true,
+      });
+      if (internals.invoke === counting) return "defineProperty";
+    } catch {
+      // fall through to the proxy
+    }
+
+    try {
+      // `@tauri-apps/api`'s `invoke` reads `window.__TAURI_INTERNALS__` at
+      // CALL time (node_modules/@tauri-apps/api/core.js), so swapping the
+      // whole object still intercepts every dispatch the app makes.
+      const proxy = new Proxy(internals, {
+        get: (target, prop, recv) => (prop === "invoke" ? counting : Reflect.get(target, prop, recv)),
+      });
+      Object.defineProperty(window, "__TAURI_INTERNALS__", {
+        value: proxy,
+        writable: true,
+        configurable: true,
+      });
+      if (w.__TAURI_INTERNALS__?.invoke === counting) return "proxy";
+    } catch {
+      // fall through to the refusal
+    }
+
+    throw new Error(
+      "could not intercept __TAURI_INTERNALS__.invoke by assignment, defineProperty or " +
+        "proxy; descriptor=" +
+        JSON.stringify(Object.getOwnPropertyDescriptor(internals, "invoke"))
+    );
   });
+  return how;
+}
+
+/**
+ * Proves the counter is on the app's OWN dispatch path, using invokes the app
+ * has already been made to perform.
+ *
+ * This is not belt-and-braces. The counter's whole job is to make a later
+ * reading of "the poll paths ran" trustworthy, and its failure mode is silent:
+ * a wrapper that never got installed reports `{}`, which is bit-for-bit what
+ * an app that never polled reports. That is not hypothetical — it is what the
+ * third CI run on this branch did, reporting zero `orch_*` dispatches over a
+ * three-minute soak whose own baseline probe had just driven `write_pty`
+ * successfully. So: call this once something is KNOWN to have been invoked,
+ * and let a blind instrument fail here, loudly, instead of two hundred
+ * seconds later wearing a finding's clothes.
+ */
+export async function assertCounterSeesTheApp(
+  page: Page,
+  command: string
+): Promise<Record<string, number>> {
+  const counts = await readInvokeCounts(page);
+  if ((counts[command] ?? 0) < 1) {
+    throw new Error(
+      `the invoke counter recorded no \`${command}\` even though the app has just ` +
+        `completed an operation that requires it. The counter is not on the app's ` +
+        `dispatch path, so any count it reports later — a zero most of all — is a ` +
+        `fact about this instrument and not about the app. Counts seen: ` +
+        `${JSON.stringify(counts)}`
+    );
+  }
+  return counts;
 }
 
 export async function readInvokeCounts(page: Page): Promise<Record<string, number>> {

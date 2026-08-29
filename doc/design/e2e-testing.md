@@ -439,17 +439,23 @@ back from, its child cannot produce a match. (`cmd`, not the launcher's
 default PowerShell: PSReadLine redraws the input line as you type.)
 
 The probe runs in **two separately-bounded phases**, because they are two
-properties that fail for different reasons and cost wildly different amounts
-of time. `src/ptywrite.ts` keeps one `write_pty` in flight per pane and chains
-the next on the previous promise (#65), so every typed character is a full IPC
-round trip — measured at ~420 ms each on a debug build on a CI runner already
-booted against the soak corpus (first run on this branch: 19 of 23 characters
-echoed in 8 s). The *input* phase ends when the typed marker echoes back and
-is the one the beta6 report is about; the *answer* phase is one write and one
-read after Enter, and is fast whenever it works at all. Collapsing them into
-one clock produced a probe that timed out mid-typing and called it "no
-output" — a slow input path indistinguishable from a dead child. The marker is
-kept short for the same reason.
+properties that fail for different reasons and can cost wildly different
+amounts of time. `src/ptywrite.ts` keeps one `write_pty` in flight per pane and
+chains the next on the previous promise (#65), so every typed character is a
+full IPC round trip — and how long that takes has been observed to vary by
+orders of magnitude between CI runs of this same spec: once only 19 of 23
+characters echoed within 8 s, and on the next run the whole input phase
+finished in 38 ms. **That cause is not established, and is deliberately not
+guessed at** — guessing from a plausible reading is what §2.3 of plan #1600
+says produced beta5 and beta6, and if the slow case recurs it is worth chasing
+under that plan in its own right rather than being explained away here.
+
+What follows from it is the split. The *input* phase ends when the typed
+marker echoes back and is the one the beta6 report is about; the *answer*
+phase is one write and one read after Enter, and is fast whenever it works at
+all. Collapsing them into one clock produced a probe that timed out mid-typing
+and called it "no output" — a slow input path indistinguishable from a dead
+child. The marker is kept short for the same reason.
 
 `ORRERIX_SOAK_BOUND_MS` bounds each phase, and 20 s is deliberately generous:
 the failure this lane is about is a probe that NEVER answers, not a slow one.
@@ -531,6 +537,17 @@ vacuously:
   TOTAL, not on which commands — the group-view batch has been five, then
   nine, then ten, and pinning a count would pin the last incident's shape,
   which is the mistake this lane exists to stop making.
+- **And the counter itself is checked**, which is not belt-and-braces: a
+  wrapper that failed to install reports `{}`, bit-for-bit what an app that
+  never polled reports. A plain assignment to a non-writable property is a
+  silent no-op outside strict mode, so the installer tries assignment,
+  `defineProperty` and finally a `Proxy` over the whole internals object,
+  verifying after each that it actually took and refusing loudly if none did.
+  The spec then calls `assertCounterSeesTheApp` immediately after the baseline
+  round trip — which cannot have succeeded without `write_pty` — so a blind
+  instrument fails there rather than two hundred seconds later wearing a
+  finding's clothes. That is not hypothetical: it is what the third CI run on
+  this branch did.
 - **The hold really held** — and this one could NOT live inside the test it
   is about. `test.fail()` absorbs every failure in its own test, controls
   included: an injector that silently never took a lock would leave both

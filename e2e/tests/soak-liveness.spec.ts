@@ -80,6 +80,7 @@ import {
   LOCK_HOLD_MS,
   SOAK_MS,
   holdStillHeld,
+  assertCounterSeesTheApp,
   installInvokeCounter,
   installPtyTap,
   isJsonRpcResult,
@@ -160,7 +161,7 @@ test.describe("soak: a large corpus and a steady poll load", () => {
         `${BOUND_TABS} group-bound tabs; soak ${SOAK_MS}ms; bound ${LIVENESS_BOUND_MS}ms`
     );
 
-    await installInvokeCounter(page);
+    console.log(`[soak] invoke counter installed via: ${await installInvokeCounter(page)}`);
     await installPtyTap(page);
 
     // One plain shell pane to type into. `cmd` rather than the form's default
@@ -187,7 +188,11 @@ test.describe("soak: a large corpus and a steady poll load", () => {
     );
     expect(isJsonRpcResult(baselineMcp), `MCP ping at t=0: ${baselineMcp.detail}`).toBe(true);
 
-    const countsBefore = orchInvokeTotal(await readInvokeCounts(page));
+    // Check the INSTRUMENT before trusting any number it produces. The
+    // baseline round trip above cannot have succeeded without `write_pty`, so
+    // a counter that has not seen one is blind — and a blind counter reports
+    // the same `{}` as an app that never polled.
+    const countsBefore = orchInvokeTotal(await assertCounterSeesTheApp(page, "write_pty"));
 
     // ---- the soak itself: the app is left completely alone ----
     await sleep(SOAK_MS);
