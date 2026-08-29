@@ -106,8 +106,10 @@ pub fn pool_in_flight() -> i64 {
 /// The highest depth since the last call, re-arming the high-water mark at the
 /// current depth. Called by the watchdog, once per tick.
 pub fn pool_take_peak() -> i64 {
+    // NEUTERED (scratch, #1601): report the instant, not the peak.
     let now = POOL_IN_FLIGHT.load(Ordering::Relaxed);
-    POOL_PEAK.swap(now, Ordering::Relaxed).max(now)
+    POOL_PEAK.store(now, Ordering::Relaxed);
+    now
 }
 
 /// The highest [`POOL_STEPS`] entry at or below `depth`, if any.
