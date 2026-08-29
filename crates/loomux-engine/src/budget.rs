@@ -442,9 +442,32 @@ pub fn sealed_frames() -> u64 {
 }
 
 /// How many budget frames unwound after a durable write. **The invariant: this
-/// is zero.** `tests/liveness.rs` drives every read entry point under a held
-/// lock and asserts it, which is what makes rider R1 a test rather than a
-/// paragraph.
+/// is zero.**
+///
+/// **What this is, exactly, and what it is not.** It is a RUNTIME TRIPWIRE,
+/// not the counterfactual for the seal — and the difference is worth stating
+/// because the first version of this comment claimed the stronger thing.
+///
+/// A tear needs `WROTE` set, and only [`note_durable_write`] sets it — which
+/// also seals. So in a tree where the doors are wired, a counted tear is
+/// unreachable by construction: the only mutation that produces one is
+/// disarming the seal while leaving the recording, and that reddens this
+/// module's own seal tests first (demonstrated: #1609 review round 2, scratch
+/// round 6, which reddened
+/// `a_durable_write_seals_its_budget_frame_so_a_later_timeout_waits` and
+/// `the_seal_belongs_to_the_frame_and_not_to_the_thread`). Those tests ARE the
+/// seal's counterfactual.
+///
+/// What this counter adds is the case no test can stage: the seal bypassed in
+/// the FIELD — a door that records but stops sealing, or a frame reaching an
+/// unwind with a write behind it for a reason nobody predicted. It fires once
+/// per occurrence with a breadcrumb, and `tests/liveness.rs` asserts it stayed
+/// at zero across a sweep of every read entry point, which is a regression
+/// guard over the real tool surface rather than a proof.
+///
+/// The residual it cannot see, stated because it is the real one: a durable
+/// write through a door that calls neither seal nor record sets no flag at
+/// all. `doc/design/lock-liveness.md` §4.3 lists the doors that do.
 pub fn torn_writes() -> u64 {
     TORN_WRITES.load(Ordering::Relaxed)
 }

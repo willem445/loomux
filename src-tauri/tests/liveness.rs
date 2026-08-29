@@ -1483,5 +1483,21 @@ fn no_read_tool_can_unwind_after_a_durable_write() {
     // that the instrument which would catch one works. That the SWEEP would
     // catch a misclassified writer is evidenced separately, by the scratch round
     // that puts `check_mail` back in the Read set and removes the seal.
-    let _swept = sealed_after - sealed_before;
+    // THE SWEEP'S OWN POPULATION CONTROL, restored now that it can be satisfied.
+    //
+    // It was asserted, failed on CI, and was replaced by the probe above —
+    // correctly, because at the time no Read tool wrote anything and the control
+    // was reporting exactly that. What made it satisfiable is the fixture:
+    // `check_mail` writes only `if stamped > 0`, so the seeded unread message is
+    // what carries the sweep into `write_mailbox`.
+    //
+    // Without this, `torn == 0` is a claim about a sweep that may have driven
+    // seventeen tools and touched no durable write at all.
+    let swept_writes = sealed_after - sealed_before;
+    assert!(
+        swept_writes > 0,
+        "the sweep reached no durable write, so `torn == 0` above is about nothing. Either the \
+         fixture stopped seeding the manager's mailbox (`check_mail` returns before \
+         `write_mailbox` when there is nothing unread) or no Read tool writes any more."
+    );
 }
