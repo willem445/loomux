@@ -161,7 +161,7 @@ added is the one that would otherwise forget, and a per-site audit is what let
 **This does not make a genuine panic in one of those commands survivable.** Any
 panic in a sync command has always aborted the process on Windows for exactly
 the reason above, and still does; that hazard predates #1702 and is tracked
-separately. What the frame contains is the one unwind this epic introduced.
+on #1717. What the frame contains is the one unwind this epic introduced.
 
 Two consequences are paid for rather than waved at.
 

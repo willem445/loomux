@@ -32120,7 +32120,8 @@ impl OrchRegistry {
     ///
     /// It does NOT make a genuine panic in one of these commands survivable —
     /// that still reaches the boundary and still aborts, exactly as it did
-    /// before #1702. What it contains is the one unwind this epic introduced.
+    /// before #1702 — the pre-existing hazard, tracked on #1717. What this
+    /// contains is the one unwind this epic introduced.
     fn mutating_command<T>(
         name: &'static str,
         on_refused: impl FnOnce() -> T,
