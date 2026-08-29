@@ -79,6 +79,11 @@ where
 {
     let ticket = loomux_engine::selfwatch::pool_enter();
     tauri::async_runtime::spawn_blocking(move || {
+        // `_ticket`, NEVER `_`. A binding named exactly `_` drops its value
+        // immediately rather than at the end of the scope, so `let _ = ticket;`
+        // would decrement the counter before `f()` had run and every hand-off
+        // would read as instantaneous — a counter that is always near zero,
+        // with nothing red to say so.
         let _ticket = ticket;
         f()
     })

@@ -78,6 +78,12 @@ pub const DEFAULT_HOLD_WARN_MS: u64 = 5_000;
 /// is a tail, not a log — the durable record is the breadcrumb.
 pub const REPORT_RING: usize = 64;
 
+/// Prune the lock registry's dead entries when it passes this length. Far above
+/// the app's real population (the registry's own ~85 plus one per live pane and
+/// group), so a shipped build never reaches it — see [`TrackedMutex::new`] for
+/// the process this is actually for.
+const REGISTRY_PRUNE_AT: usize = 4096;
+
 /// The process's monotonic zero. `Instant` is not storable in an atomic, so
 /// every stamp here is milliseconds since this baseline.
 static BASELINE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -320,7 +326,18 @@ impl<T> TrackedMutex<T> {
     /// because the call site and the lock id distinguish them.
     pub fn new(name: &'static str, value: T) -> Self {
         let state = Arc::new(LockState::new(name));
-        REGISTRY.lock_safe().push(Arc::downgrade(&state));
+        let mut reg = REGISTRY.lock_safe();
+        // Bounded even with no watchdog running. Every snapshot prunes dead
+        // entries, and in the app one runs every second — but a test binary has
+        // no watchdog and builds registries in the hundreds, so without this the
+        // list would hold one entry per lock the PROCESS ever constructed.
+        // INV-8's rule, applied to this module's own retained state: released by
+        // a check that needs no memory of when it last ran.
+        if reg.len() >= REGISTRY_PRUNE_AT {
+            reg.retain(|w| w.strong_count() > 0);
+        }
+        reg.push(Arc::downgrade(&state));
+        drop(reg);
         Self { inner: Mutex::new(value), state }
     }
 
