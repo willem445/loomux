@@ -738,11 +738,13 @@ narrow their ask back down to the original ticket on your own judgment.
   multi-word claim cannot match an instance the wrap split, and the same-shape positive
   control still passes because it matched the UNWRAPPED copies. Discover on a SINGLE
   TOKEN — a phrase can be split by a wrap, so only one token cannot — then confirm
-  with a wrap-insensitive pass over the same ROOTS (join lines, strip `///`/`//!`,
-  squeeze spaces). The two totals must agree, and both are bounded by the token you
-  chose. Signature: a healthy non-zero receipt that a later re-sweep beats — #1346
-  went 1 → 2, #1408 3 → 4, #1667 2 → 4 (`"no timeout, no try-lock"` over three
-  pre-fix blobs misses the two where the phrase straddles the wrap). Recipe:
+  with one wrap-tolerant `grep` over the same ROOTS (`-Pz`, every space of the
+  phrase spelled as a class that absorbs the break and the comment marker). Pass 1
+  over-matches by design — the surplus is the sites carrying the token in other
+  phrasings, and you read those rather than reconcile them away. Both passes are
+  bounded by the token you chose. Signature: a healthy non-zero receipt that a later
+  re-sweep beats — #1346 went 1 → 2, #1408 3 → 4, #1667 2 → 4 (`"no timeout, no try-lock"`
+  over three pre-fix blobs misses the two where the phrase straddles the wrap). Recipe:
   `.claude/skills/ci-validate/SKILL.md`.
   **A TEST is one of those surfaces, and it fails LOUD rather than silent.** An
   assertion quoting the wording (`err.contains("never")`) does not merely carry
