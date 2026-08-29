@@ -328,7 +328,9 @@ impl LivenessWatch {
     /// reporting. Recovery is silent by design: the next `Ok` re-arms the
     /// report without writing a line nobody is looking for.
     pub fn tick(&mut self, verdict: Liveness) -> Option<Liveness> {
-        let changed = self.last != Some(verdict);
+        // NEUTERED (scratch, #1601): report every tick, not the transition.
+        let changed = true;
+        let _ = self.last;
         self.last = Some(verdict);
         if changed && verdict.event().is_some() {
             Some(verdict)
