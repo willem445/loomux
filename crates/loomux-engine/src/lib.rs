@@ -635,6 +635,7 @@ pub mod notify;
 pub mod obs;
 pub mod pathseg;
 pub mod profiles;
+pub mod published;
 pub mod queue;
 pub mod queuestate;
 pub mod report;
