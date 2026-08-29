@@ -305,7 +305,12 @@
 //!
 //! `subproc` has exactly one outward edge, [`obs::LockExt`] (`lock_safe` on the
 //! abandoned-reader backlog), which batch 7 brought across for precisely this;
-//! `fsatomic` has none. Both left every caller of the day in `src-tauri` —
+//! `fsatomic` had none as of batch 9 and has exactly one now — #1609 gave
+//! [`fsatomic::atomic_write`] a call to [`budget::note_durable_write`], because
+//! it is the single door every durable state file goes through and therefore
+//! the only place a write on an unwindable read path can be noticed. Two
+//! thread-local reads; still `std`-only, still Tauri-free. Both left every
+//! caller of the day in `src-tauri` —
 //! `OrchRegistry::capture_with_timeout`, `mqdriver`'s `ProcessRunner`, and
 //! every `atomic_write` call site — resolving through curated item-list
 //! re-exports in `orchestration/mod.rs`, which is why the integration suite

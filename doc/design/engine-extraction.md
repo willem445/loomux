@@ -805,8 +805,13 @@ from a unit test of product code, agents are banned from running cargo locally
 
     `subproc`'s single outward edge is `lock_safe` (the backlog `Mutex`), which
     is `crate::obs::LockExt` here since batch 7 — the dependency batch 7 named
-    as its reason for going first, now discharged. `fsatomic` has no outward
-    edge at all. Neither pulls a dependency: both are `std`, so no manifest and
+    as its reason for going first, now discharged. `fsatomic` had no outward
+    edge at all through batch 9 and has exactly one as of #1609: `atomic_write`
+    calls `budget::note_durable_write`, since it is the single door every
+    durable state file goes through and so the only place a write on a read
+    path a bounded acquisition could unwind out of can be noticed
+    (`doc/design/lock-liveness.md` §4). Two thread-local reads, no lock, no new
+    failure mode. Neither pulls a dependency: both are `std`, so no manifest and
     no lockfile line changes, and CLAUDE.md constraint 2 is satisfied the way
     `fsatomic`'s own header states — a std atomic for unique temp names,
     deliberately no `tempfile`.
