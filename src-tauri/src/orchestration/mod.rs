@@ -20,6 +20,7 @@ pub mod e2ehold;
 pub mod humanq;
 pub mod mcp;
 pub mod needsyou;
+pub mod views;
 
 // MOVED to the `loomux-engine` crate (#888 slice A2), re-exported here under
 // their original paths — whatever a call site in this crate or in the
