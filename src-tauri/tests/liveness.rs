@@ -536,7 +536,12 @@ fn a_cd_and_the_keystrokes_around_it_land_in_arrival_order() {
 /// turns a real failure into a flake that reads as a pass.
 const HOLD_MS: u64 = 30_000;
 
-/// Which of `tracked_lock_names()` Phase 0's seam can actually hold.
+/// A hold that is meant to END during the test, for the one assertion whose
+/// subject is RECOVERY rather than liveness-under-hold.
+const SHORT_HOLD_MS: u64 = 1_500;
+
+/// Split ONE snapshot of the tracked-lock names into the ones Phase 0's seam
+/// can hold and the ones it refuses.
 ///
 /// `hold_lock_for_test` knows four names and returns `false` for the rest — a
 /// deliberate choice documented at that seam ("a representative handful rather
@@ -544,22 +549,16 @@ const HOLD_MS: u64 = 30_000;
 /// can, and reports the rest as a stated residual rather than silently
 /// covering four and reading as covering all of them. Widening the seam widens
 /// this test with no edit here.
-fn holdable_and_refused(reg: &Arc<OrchRegistry>) -> (Vec<String>, Vec<String>) {
-    let mut names: Vec<String> = tracked_lock_names().into_iter().map(str::to_string).collect();
-    // `tracked_lock_names` is a process-global registry of live locks, so a
-    // second registry in this process would list every name twice.
-    names.sort();
-    names.dedup();
-
+fn classify(reg: &Arc<OrchRegistry>, names: &[String]) -> (Vec<String>, Vec<String>) {
     let mut holdable = Vec::new();
     let mut refused = Vec::new();
     for name in names {
         // A 1 ms probe: this only asks whether the seam KNOWS the name. The
         // real holds are taken per-lock in the test below.
-        if reg.hold_lock_for_test(&name, 1) {
-            holdable.push(name);
+        if reg.hold_lock_for_test(name, 1) {
+            holdable.push(name.clone());
         } else {
-            refused.push(name);
+            refused.push(name.clone());
         }
     }
     (holdable, refused)
@@ -574,30 +573,49 @@ fn l1_a_published_read_returns_while_every_holdable_registry_lock_is_held() {
     // measured 82 (the plan said 85); this is a floor, not a pin, because the
     // number moves whenever a registry field is added and a test that has to be
     // edited for that is a test people edit without reading.
-    let total = {
-        let mut n: Vec<&str> = tracked_lock_names();
-        n.sort_unstable();
+    // ONE read of the process-global registry, reused everywhere below.
+    //
+    // Reading it twice and comparing the two reads is a race, not a check:
+    // `tracked_lock_names()` lists every LIVE tracked lock in the PROCESS, and
+    // cargo runs this file's tests on separate threads in one process, so the
+    // other test's registry construction lands between two reads. That is
+    // exactly how this test first failed (87 vs 86).
+    let names: Vec<String> = {
+        let mut n: Vec<String> = tracked_lock_names().into_iter().map(str::to_string).collect();
+        n.sort();
         n.dedup();
-        n.len()
+        n
     };
+    let total = names.len();
     assert!(
         total >= 80,
         "tracked_lock_names() returned only {total} names — the lock registry stopped \
          registering, so iterating it proves nothing"
     );
 
-    let (holdable, refused) = holdable_and_refused(&reg);
+    let (holdable, refused) = classify(&reg, &names);
     assert!(
         holdable.len() >= 4,
         "Phase 0's hold seam accepted only {} of {total} tracked locks ({holdable:?}) — it knows \
          four by name, so fewer than that means the seam broke, not that the registry shrank",
         holdable.len()
     );
-    assert_eq!(
-        holdable.len() + refused.len(),
-        total,
-        "every tracked lock must be classified as holdable or refused; the two lists must \
-         partition the registry, or this test is quietly skipping some"
+    // NOT a partition assertion: `classify` walks `names` once, so
+    // `holdable + refused == total` holds by construction and could never
+    // fail. What CAN fail is the seam accepting a name this snapshot never
+    // listed — which would mean the two are reading different registries.
+    for name in &holdable {
+        assert!(
+            names.contains(name),
+            "the hold seam accepted `{name}`, which is not in the tracked-lock snapshot this \
+             test iterated — the seam and the registry have come apart"
+        );
+    }
+    assert!(
+        !refused.is_empty(),
+        "every one of the {total} tracked locks was holdable, so the residual this test \
+         reports is empty — the seam is documented as knowing four names, so this means it \
+         stopped refusing rather than that it grew"
     );
 
     // THE PROPERTY. For each lock the seam can hold: both published reads must
@@ -670,7 +688,15 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
     let published_at = Instant::now();
     reg.views.note_view_lease_at(&g.id, published_at);
     reg.views.publish_pass_at(&reg, published_at);
-    assert!(reg.hold_lock_for_test("groups", HOLD_MS), "setup: the `groups` hold must be real");
+    // SHORT, unlike the holds above: this test's last step needs the hold to
+    // END so the publisher can recover. Long enough that every assertion
+    // before it runs with the lock genuinely held (they are all injected-clock
+    // reads, so they take microseconds), short enough to elapse well inside
+    // `GRACE`.
+    assert!(
+        reg.hold_lock_for_test("groups", SHORT_HOLD_MS),
+        "setup: the `groups` hold must be real"
+    );
 
     let stale_at = |now: Instant| -> bool {
         let payload = group_view_payload(&reg.views.load(), &g.id, now);
@@ -696,10 +722,19 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
          successful store), never by elapsed time"
     );
 
-    // RELEASE ON EVIDENCE. The publisher is still parked on `groups`, so the
-    // only way to clear the badge is a publish that really happens. Nothing
-    // here waits for the hold: `publish_group_at` recomputes ONE group, and the
-    // sections it needs for the strip tier are not behind `groups`.
+    // RELEASE ON EVIDENCE — and the publisher is the thread that pays for it.
+    //
+    // An earlier version of this asserted the republish must NOT park behind
+    // `groups`. That was false, and this test caught it: `publish_group_at`
+    // calls `compute_group` calls `group_summary`, which takes `agents` and
+    // then `groups`. It parks BY DESIGN — being the one thread that waits is
+    // the whole shape of Phase 1, and the READS staying live while it waits is
+    // what the test above asserts.
+    //
+    // So what this step asserts is the recovery: the publisher parks, the hold
+    // ends, the publish completes on its own, and the badge clears on that
+    // evidence rather than on a timer. `SHORT_HOLD_MS` is what makes it
+    // observable inside `GRACE` — the hold really does elapse during the call.
     let recovered = Instant::now();
     assert!(
         completes_within(GRACE, {
@@ -707,7 +742,8 @@ fn l1_stale_flips_on_the_clock_while_a_lock_is_held_and_clears_on_the_next_publi
             let gid = g.id.clone();
             move || reg.views.publish_group_at(&reg, &gid, recovered)
         }),
-        "a single-group republish must not park behind `groups` either"
+        "the publisher must RECOVER once the hold ends: it parks behind `groups` by design, \
+         and a publish that never completes afterwards would mean the badge can never clear"
     );
     assert!(!stale_at(recovered), "one successful publish is the evidence that clears the badge");
 }
