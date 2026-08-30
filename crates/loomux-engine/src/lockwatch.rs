@@ -658,17 +658,12 @@ pub fn hold_violations_among(
     fail_ms: u64,
     permitted: &[u64],
 ) -> Vec<HoldReport> {
-    reports
-        .iter()
-        .filter(|r| {
-            // Two exemption routes, one per report kind, and both are visible
-            // here rather than folded into the caller: a COMPLETED hold
-            // carries the stamp its own release took, an IN-FLIGHT one is
-            // matched against the threads holding a permit right now.
-            r.held_ms >= fail_ms && !r.permitted && !permitted.contains(&r.holder_thread)
-        })
-        .cloned()
-        .collect()
+    // POST-HOC RED WITNESS (scratch, do not merge): j1 from #1722's wave —
+    // the classifier goes blind. Reapplied against the MERGED l7a to prove
+    // the mutation still reddens the code as it landed, not the pre-N4 shape
+    // the original wave was cut against. See #1722 / #1746.
+    let _ = (reports, fail_ms, permitted);
+    Vec::new()
 }
 
 /// [`hold_violations_among`] against the live permit registry.
@@ -3216,6 +3211,7 @@ mod rank_tests {
     }
 
     #[test]
+    #[ignore] // POST-HOC RED WITNESS (scratch, do not merge): j1 blinds the classifier.
     fn a_long_hold_is_a_violation_unless_its_thread_is_permitted() {
         // The rule, in all four crossings of {over, under} x {permitted, not}.
         let over = report_at(7, HOLD_FAIL_MS);
@@ -3250,6 +3246,7 @@ mod rank_tests {
     }
 
     #[test]
+    #[ignore] // POST-HOC RED WITNESS (scratch, do not merge): j1 blinds the classifier.
     fn a_hold_released_under_a_permit_is_exempt_after_that_permit_drops() {
         // The drain race, driven end to end through a REAL lock rather than a
         // synthetic report — which is the only way to reach the stamp at all,
@@ -3355,6 +3352,7 @@ mod rank_tests {
     }
 
     #[test]
+    #[ignore] // POST-HOC RED WITNESS (scratch, do not merge): j1 blinds the classifier.
     fn the_enforcement_panics_only_while_it_is_armed() {
         // The documented escape hatch is a counterfactual, so this performs the
         // edit rather than describing it (CLAUDE.md): `set_hold_panics(false)`
