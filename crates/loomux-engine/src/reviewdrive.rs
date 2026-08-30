@@ -1242,9 +1242,6 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     if facts.messaged {
         return DriveStep::held(HeldReason::Messaged);
     }
-    if entry.age_ms(facts.now_ms) >= minutes_ms(limits.drive_timeout_minutes) {
-        return DriveStep::held(HeldReason::DriveStalled);
-    }
     match state {
         DriveState::CiWait => decide_ci_wait(entry, facts, limits),
         DriveState::ReviewWait => decide_review_wait(entry, facts, limits),
