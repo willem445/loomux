@@ -582,6 +582,21 @@ narrow their ask back down to the original ticket on your own judgment.
   the branch — after cleaning the worktree, verify with
   `git ls-remote --heads origin <branch>` and `git push origin --delete
   <branch>` if it survived. Whoever performs the merge owns this step (#662).
+- **Retarget every open PR based on a branch BEFORE deleting that branch, and
+  rebase each one onto its new base.** Deleting a base ref auto-closes every PR
+  stacked on it, and while that ref is gone `gh pr edit --base` answers
+  `Cannot change the base branch of a closed pull request` and `gh pr reopen`
+  answers `Could not open the pull request`, so every review round spent there
+  is stranded. The hand `git push origin --delete` above is what the auto-close
+  follows, so it lands on whoever performs the merge, in this order:
+  `gh pr list --state open --search "base:<branch>"`, then
+  `gh pr edit <n> --base <the merged PR's own base>` per hit (usually `main`;
+  the integration branch under constraint 7), then a rebase onto that base —
+  the squash commit that replaced the parent on that base is not an ancestor
+  of the child, so its diff against the base otherwise re-shows the parent's
+  work — then delete. Signature: a
+  `base_ref_deleted` timeline event with a `closed` event one second later, and
+  no `base_ref_changed` between them (#1736).
 - **A closing-keyword sweep of a squash message must be MULTILINE, and the
   merge is verified on the issue.** GitHub's scan spans the line break, and in a
   commit message it is not markdown-aware — no fences, no code spans, only
