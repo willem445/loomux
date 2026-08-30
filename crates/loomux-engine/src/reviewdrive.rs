@@ -427,15 +427,31 @@ pub const MAX_REBASE_CEILING: u32 = 1;
 /// **This is not a second parser of the `driver:` block.** §5.3's block is
 /// S2's, in `workflow.rs`, and that is where a malformed block goes loudly down
 /// the `workflow-invalid` path. What lives here is the *value* the pure core is
-/// handed, with §5.3's own ranges enforced by [`DriveLimits::clamped`] so the
-/// decision function cannot be given a bound outside INVARIANT 9 whatever a
-/// caller did on the way in.
+/// handed.
 ///
-/// **The clamp only ever tightens.** §2.3: a repo may run a *tighter* loop than
-/// the orchestrator template promises; it may not run a looser one, because the
-/// driver acts on the orchestrator's authority and a repo file that raised the
-/// bound would be loosening the orchestrator's own invariant from a
-/// configuration file.
+/// **The clamp only ever tightens, and it is a capability boundary rather than
+/// input hygiene.** §2.3: a repo may run a *tighter* loop than the orchestrator
+/// template promises; it may not run a looser one, because the driver acts on
+/// the orchestrator's authority and a repo file that raised the bound would be
+/// loosening the orchestrator's own invariant from a configuration file. That
+/// is `doc/design/workflows.md`'s closure exactly — **a workflow file may
+/// select from what loomux permits and may never widen it** — so a
+/// `driver.max_review_rounds: 9` that reached a decision would be a repo file
+/// granting a capability, not a validation slip.
+///
+/// **Two independent layers hold it, and neither is allowed to rely on the
+/// other.** S2 refuses or clamps out-of-range values as it parses `driver:`;
+/// [`decide`] clamps again on the values it actually reads. The second is not
+/// redundant — [`decide`] is a `pub fn` over a plain value type, so any caller
+/// in any crate can reach it without passing through S2's parser at all, and a
+/// boundary that holds only when the expected caller is upstream is not a
+/// boundary. Round 21 in the PR is the counterfactual for this arm.
+///
+/// The type carries a private field so the struct cannot be built by literal
+/// outside this module: every construction path a caller can reach
+/// ([`DriveLimits::new`], [`Default`], [`DriveLimits::clamped`]) clamps, so an
+/// out-of-range value cannot be *spelled* from outside, and [`decide`] clamps
+/// anyway for the value types that in-module code can still build raw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriveLimits {
     pub max_review_rounds: u32,
@@ -444,10 +460,15 @@ pub struct DriveLimits {
     pub lane_timeout_minutes: u64,
     pub fix_timeout_minutes: u64,
     pub drive_timeout_minutes: u64,
+    /// Private, and load-bearing: it makes `DriveLimits { … }` a compile error
+    /// outside this module (E0451), so the clamping constructors are the only
+    /// way in. The fields stay `pub` so a caller can still *read* the bounds —
+    /// what is closed is authoring one, not inspecting it.
+    _seal: (),
 }
 
 impl Default for DriveLimits {
-    /// §5.3's defaults.
+    /// §5.3's defaults, which are already inside every range.
     fn default() -> Self {
         DriveLimits {
             max_review_rounds: 3,
@@ -456,6 +477,7 @@ impl Default for DriveLimits {
             lane_timeout_minutes: 60,
             fix_timeout_minutes: 60,
             drive_timeout_minutes: 240,
+            _seal: (),
         }
     }
 }
@@ -474,6 +496,30 @@ impl DriveLimits {
             ..self
         }
     }
+
+    /// The only way to build a `DriveLimits` from outside this module, and it
+    /// clamps. S3 maps S2's parsed `driver:` block through here; the timeouts
+    /// pass through unclamped because §5.3 does not bound them against
+    /// INVARIANT 9 — they are pacing, not budget.
+    pub fn new(
+        max_review_rounds: u32,
+        max_ci_attempts: u32,
+        max_rebase_attempts: u32,
+        lane_timeout_minutes: u64,
+        fix_timeout_minutes: u64,
+        drive_timeout_minutes: u64,
+    ) -> DriveLimits {
+        DriveLimits {
+            max_review_rounds,
+            max_ci_attempts,
+            max_rebase_attempts,
+            lane_timeout_minutes,
+            fix_timeout_minutes,
+            drive_timeout_minutes,
+            _seal: (),
+        }
+        .clamped()
+    }
 }
 
 /// What a drive has spent (§5.2's `counters`).
@@ -482,13 +528,16 @@ impl DriveLimits {
 /// decision with evidence rather than a coin flip, because the two orderings
 /// differ by a whole round. [`counter_exhausted`] is where it is spelled;
 /// §2.2's `rebase-limit` row is what decides it.
+/// **Every field is required, not just the block.** `DriveEntry::counters`
+/// carries no `serde(default)` for the reason on that field — zeros silently
+/// grant a full fresh budget — and a per-field default would have reopened the
+/// same hole one level down, where `"counters": {}` parses to three zeros and
+/// `"counters": {"review_rounds": 2}` quietly forgives the CI attempts. The
+/// block being mandatory is worth nothing if its contents are optional.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counters {
-    #[serde(default)]
     pub review_rounds: u32,
-    #[serde(default)]
     pub ci_attempts: u32,
-    #[serde(default)]
     pub rebase_attempts: u32,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
@@ -741,14 +790,22 @@ pub struct DriveEntry {
     /// back to `review-wait`, and takes arc 6 again, forever. The failure is
     /// *emergent at the seam*, which is why no test in this crate catches it.
     ///
-    /// The empty-head case is the same defect with a quieter shape. Arc 6 is
-    /// guarded by `!facts.head.is_empty()` deliberately, so a failed head read
-    /// does **not** thrash the state machine — but an entry whose stored head
-    /// is empty while the live head reads fine still re-opens lane *k* on every
-    /// tick, because `first_stale_lane` finds every `pass` stale against `""`
-    /// and [`lane_open_for`] refuses every record briefed at a real head.
-    /// Either way the drive spins until `drive-stalled` parks it hours later,
-    /// having spawned a reviewer per tick.
+    /// **The empty-*live*-head case is handled in [`decide`] itself, and the
+    /// earlier version of this paragraph got it wrong in the dangerous
+    /// direction — it claimed arc 6's `!facts.head.is_empty()` guard meant a
+    /// failed head read "does not thrash the state machine".** That guard only
+    /// stops arc 6 from *firing*; it does not stop the tick continuing past it
+    /// into `first_stale_lane` (where `ReviewVerdict::reviewed("")` is false for
+    /// every real verdict head) and [`lane_open_for`] (which refuses every
+    /// record briefed at a real head), which together return `OpenLane{k}` on
+    /// every tick — a reviewer spawned per tick, with each brief re-arming that
+    /// lane's `spawned_ms` so `lane-stalled` can never fire. [`decide`] now
+    /// returns `Wait` when the live head is empty, before any state is
+    /// dispatched, and the drive stays bounded by `drive-stalled`.
+    ///
+    /// A *stored* head that is empty while the live head reads fine is the
+    /// ordinary first-tick state of a fresh entry and is not a defect: arc 6
+    /// then moves the drive to `ci-wait`, which is where the head is recorded.
     #[serde(default)]
     pub head: String,
     /// The PR body digest last seen, the same #565 digest the gate reads.
@@ -866,10 +923,20 @@ impl DriveEntry {
     /// advance is the idle clock §2.2's `drive-stalled` row forbids, and the
     /// module header argues why that must be impossible to reach rather than
     /// merely discouraged.
+    /// `bump` is a **parameter rather than a separate call** for the same
+    /// reason `reason` is checked here: a caller that could take arc 5 and
+    /// forget the `review_rounds` increment would spend an unbounded number of
+    /// review rounds against a bound of three, which is INVARIANT 9 defeated by
+    /// an omission rather than by a decision. Pairing them in one signature
+    /// means the transition and its cost cannot come apart.
+    ///
+    /// The counter moves **after** the transition is accepted, so a refused arc
+    /// spends nothing.
     pub fn advance(
         &mut self,
         to: DriveState,
         reason: Option<HeldReason>,
+        bump: Option<Counter>,
         now_ms: u64,
     ) -> Result<(), InvalidTransition> {
         if reason.is_some() != (to == DriveState::Held) {
@@ -877,10 +944,34 @@ impl DriveEntry {
         }
         self.state = transition(self.state, to)?;
         self.held_reason = reason;
+        match bump {
+            Some(Counter::ReviewRounds) => self.counters.review_rounds += 1,
+            Some(Counter::CiAttempts) => self.counters.ci_attempts += 1,
+            Some(Counter::RebaseAttempts) => self.counters.rebase_attempts += 1,
+            None => {}
+        }
         if to == DriveState::FixWait {
             self.fix_handback_ms = now_ms;
         }
         Ok(())
+    }
+
+    /// Apply a whole [`DriveStep`] — the form S3's tick uses, so the decision
+    /// and its bookkeeping travel together and neither half can be applied
+    /// alone.
+    ///
+    /// [`DriveStep::Wait`] is a no-op. [`DriveStep::OpenLane`] is **not**
+    /// applied here and returns `Ok(())` unchanged: briefing a lane needs a
+    /// spawned session id, which is exactly the I/O this module does not do —
+    /// S3 calls [`open_lane`](DriveEntry::open_lane) with what the spawn
+    /// returned.
+    pub fn take(&mut self, step: &DriveStep, now_ms: u64) -> Result<(), InvalidTransition> {
+        match step {
+            DriveStep::Wait | DriveStep::OpenLane { .. } => Ok(()),
+            DriveStep::Advance { to, held_reason, bump } => {
+                self.advance(*to, *held_reason, *bump, now_ms)
+            }
+        }
     }
 
     /// The lane record for a block, if this drive has opened one.
@@ -1282,8 +1373,32 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     if facts.messaged {
         return DriveStep::held(HeldReason::Messaged);
     }
+    // **The bounds are clamped HERE, on the values actually read.** §2.3's
+    // ranges are a capability boundary, not input hygiene: a repo's `driver:`
+    // block may run a tighter loop than INVARIANT 9 and may never run a looser
+    // one, because `doc/design/workflows.md`'s closure is that a workflow file
+    // selects from what loomux permits and never widens it. S2 clamps as it
+    // parses; this clamps again, and the second is not redundant, because this
+    // is a `pub fn` over a plain value type that any caller in any crate can
+    // reach without going through S2's parser. A boundary that holds only when
+    // the expected caller is upstream is not a boundary.
+    let limits = &limits.clamped();
     if entry.age_ms(facts.now_ms) >= minutes_ms(limits.drive_timeout_minutes) {
         return DriveStep::held(HeldReason::DriveStalled);
+    }
+    // **An unresolved head is not a head, and acting on one is an unbounded
+    // spawn loop.** Every state below either compares this against the recorded
+    // head or keys a lane brief on it. `review-wait` is the dangerous one: the
+    // arc-6 guard skips itself when `facts.head` is empty, so the tick falls
+    // through to `first_stale_lane`, where `ReviewVerdict::reviewed("")` is
+    // false for every real verdict head, and then to `lane_open_for`, which
+    // refuses every record briefed at a real head — yielding `OpenLane{0}` on
+    // EVERY tick. Worse, each brief re-arms that lane's `spawned_ms`, so
+    // `lane-stalled` can never fire and the loop defeats the very bound meant
+    // to catch it. §8's posture settles it: an unknown is never a fact, and the
+    // drive stays bounded by `drive-stalled` above, which needs no head at all.
+    if facts.head.is_empty() {
+        return DriveStep::Wait;
     }
     match state {
         DriveState::CiWait => decide_ci_wait(entry, facts, limits),
@@ -1655,26 +1770,26 @@ mod tests {
         match state {
             DriveState::CiWait => {}
             DriveState::ReviewWait => {
-                e.advance(DriveState::ReviewWait, None, 1_000).unwrap();
+                e.advance(DriveState::ReviewWait, None, None, 1_000).unwrap();
             }
             DriveState::FixWait => {
-                e.advance(DriveState::FixWait, None, 1_000).unwrap();
+                e.advance(DriveState::FixWait, None, None, 1_000).unwrap();
             }
             DriveState::GateCheck => {
-                e.advance(DriveState::ReviewWait, None, 1_000).unwrap();
-                e.advance(DriveState::GateCheck, None, 1_000).unwrap();
+                e.advance(DriveState::ReviewWait, None, None, 1_000).unwrap();
+                e.advance(DriveState::GateCheck, None, None, 1_000).unwrap();
             }
             DriveState::Held => {
-                e.advance(DriveState::Held, Some(HeldReason::CiLimit), 1_000)
+                e.advance(DriveState::Held, Some(HeldReason::CiLimit), None, 1_000)
                     .unwrap();
             }
             DriveState::Satisfied => {
-                e.advance(DriveState::ReviewWait, None, 1_000).unwrap();
-                e.advance(DriveState::GateCheck, None, 1_000).unwrap();
-                e.advance(DriveState::Satisfied, None, 1_000).unwrap();
+                e.advance(DriveState::ReviewWait, None, None, 1_000).unwrap();
+                e.advance(DriveState::GateCheck, None, None, 1_000).unwrap();
+                e.advance(DriveState::Satisfied, None, None, 1_000).unwrap();
             }
             DriveState::Cancelled => {
-                e.advance(DriveState::Cancelled, None, 1_000).unwrap();
+                e.advance(DriveState::Cancelled, None, None, 1_000).unwrap();
             }
         }
         assert_eq!(e.state(), state);
@@ -1685,11 +1800,11 @@ mod tests {
     fn a_hold_without_a_reason_and_a_reason_without_a_hold_are_both_refused() {
         let mut e = entry_at(DriveState::CiWait);
         // A hold with nothing to put in its notice or its `rd-held` line.
-        assert!(e.advance(DriveState::Held, None, 2_000).is_err());
+        assert!(e.advance(DriveState::Held, None, None, 2_000).is_err());
         // A reason riding an arc that is not a hold would survive into
         // `review_drive_status()` as a claim about a drive that is not parked.
         assert!(e
-            .advance(DriveState::ReviewWait, Some(HeldReason::Escalate), 2_000)
+            .advance(DriveState::ReviewWait, Some(HeldReason::Escalate), None, 2_000)
             .is_err());
         // Neither attempt moved anything.
         assert_eq!(e.state(), DriveState::CiWait);
@@ -1701,12 +1816,12 @@ mod tests {
         let mut e = entry_at(DriveState::CiWait);
         e.counters.review_rounds = 2;
         e.counters.ci_attempts = 3;
-        e.advance(DriveState::Held, Some(HeldReason::CiLimit), 2_000)
+        e.advance(DriveState::Held, Some(HeldReason::CiLimit), None, 2_000)
             .unwrap();
         assert_eq!(e.held_reason, Some(HeldReason::CiLimit));
         // Arc 11 — `drive_review` resumes it. §2.3: the same counters, because
         // a fresh entry would reset them and "yours count too" forbids that.
-        e.advance(DriveState::CiWait, None, 3_000).unwrap();
+        e.advance(DriveState::CiWait, None, None, 3_000).unwrap();
         assert_eq!(e.held_reason, None);
         assert_eq!(e.counters.review_rounds, 2);
         assert_eq!(e.counters.ci_attempts, 3);
@@ -1718,11 +1833,11 @@ mod tests {
         // clock §2.2's `drive-stalled` row forbids.
         let mut e = entry_at(DriveState::CiWait);
         assert_eq!(e.fix_handback_ms, 0);
-        e.advance(DriveState::ReviewWait, None, 5_000).unwrap();
+        e.advance(DriveState::ReviewWait, None, None, 5_000).unwrap();
         assert_eq!(e.fix_handback_ms, 0, "a non-fix-wait arc must not stamp it");
-        e.advance(DriveState::FixWait, None, 7_000).unwrap();
+        e.advance(DriveState::FixWait, None, None, 7_000).unwrap();
         assert_eq!(e.fix_handback_ms, 7_000);
-        e.advance(DriveState::CiWait, None, 9_000).unwrap();
+        e.advance(DriveState::CiWait, None, None, 9_000).unwrap();
         assert_eq!(e.fix_handback_ms, 7_000, "leaving fix-wait must not re-stamp");
         // ...and the age anchor is untouched by every one of those advances.
         assert_eq!(e.started_ms, 1_000);
@@ -1821,6 +1936,175 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_cannot_raise_invariant_9_by_handing_decide_a_wider_bound() {
+        // THE capability test, and it is deliberately built from RAW limits.
+        // Every other `decide` fixture uses `DriveLimits::default()`, which is
+        // already inside every range — so the axis §2.3 makes load-bearing was
+        // constant across the whole suite, and the property read green under an
+        // implementation that did not have it (`clamped()` was called only from
+        // tests, and `decide` used the raw values). A fixture that cannot vary
+        // the axis cannot witness it.
+        //
+        // `doc/design/workflows.md`: a workflow file selects from what loomux
+        // permits and never widens it. A `driver:` block asking for nine review
+        // rounds must get three at the decision, not nine.
+        let wide = DriveLimits {
+            max_review_rounds: 9,
+            max_ci_attempts: 9,
+            max_rebase_attempts: 9,
+            ..DriveLimits::default()
+        };
+        assert_eq!(wide.max_review_rounds, 9, "the fixture really is over-bound");
+
+        // Review rounds: at 3 spent, a further `fail` must PARK, not hand back.
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.counters.review_rounds = MAX_ROUNDS_CEILING;
+        let failing = DriveFacts {
+            required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Fail), "head-a", "d1")]),
+            ..facts_at("head-a")
+        };
+        assert_eq!(
+            decide(&e, &failing, &wide),
+            DriveStep::held(HeldReason::ReviewLimit),
+            "a repo file must not buy a fourth review round"
+        );
+
+        // CI attempts, same shape.
+        let mut c = entry_at(DriveState::CiWait);
+        c.counters.ci_attempts = MAX_ROUNDS_CEILING;
+        let red = DriveFacts { ci: CiObservation::Red, ..facts_at("head-a") };
+        assert_eq!(
+            decide(&c, &red, &wide),
+            DriveStep::held(HeldReason::CiLimit)
+        );
+
+        // Rebases: the ceiling is 1, so a second conflict parks however wide
+        // the file asked to be.
+        let mut r = entry_at(DriveState::CiWait);
+        r.counters.rebase_attempts = MAX_REBASE_CEILING;
+        let conflict = DriveFacts { ci: CiObservation::Conflicting, ..facts_at("head-a") };
+        assert_eq!(
+            decide(&r, &conflict, &wide),
+            DriveStep::held(HeldReason::RebaseLimit)
+        );
+
+        // The negative control: the same raw fixture one under each ceiling
+        // still hands back, so the assertions above are the clamp biting and
+        // not `decide` refusing everything.
+        let mut ok = entry_at(DriveState::ReviewWait);
+        ok.head = "head-a".into();
+        ok.counters.review_rounds = MAX_ROUNDS_CEILING - 1;
+        assert_eq!(
+            decide(&ok, &failing, &wide),
+            DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds)
+        );
+    }
+
+    #[test]
+    fn an_unresolved_head_stops_the_tick_instead_of_spawning_a_reviewer() {
+        // The failed head read. Without the guard in `decide`, arc 6's own
+        // `!facts.head.is_empty()` check skips itself, `first_stale_lane` finds
+        // every pass stale against "" (`reviewed("")` is false for any real
+        // verdict head), and `lane_open_for` refuses every record briefed at a
+        // real head — so the tick returns OpenLane{0} and S3 spawns a reviewer.
+        // EVERY tick. And because each brief re-arms `spawned_ms`,
+        // `lane-stalled` never fires: the loop disables the bound meant to
+        // catch it.
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
+        let blind = DriveFacts {
+            required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1")]),
+            head: String::new(),
+            ..facts_at("head-a")
+        };
+        assert_eq!(
+            decide(&e, &blind, &limits),
+            DriveStep::Wait,
+            "an unresolved head must not brief a lane"
+        );
+
+        // Not a hold either — a `gh` blip is not a stall, and §8 backs off.
+        // The same entry with the head readable still makes progress, which is
+        // the control that stops this passing by refusing everything.
+        assert_eq!(
+            decide(&e, &facts_at("head-a"), &limits),
+            DriveStep::to(DriveState::GateCheck)
+        );
+
+        // ...and declining costs no boundedness: the age bound needs no head.
+        let aged = DriveFacts {
+            now_ms: 1_000 + minutes_ms(limits.drive_timeout_minutes),
+            head: String::new(),
+            ..facts_at("head-a")
+        };
+        assert_eq!(
+            decide(&e, &aged, &limits),
+            DriveStep::held(HeldReason::DriveStalled)
+        );
+    }
+
+    #[test]
+    fn a_transition_and_its_cost_cannot_come_apart() {
+        // `advance` took a reason but not a bump, so a caller could take arc 5
+        // and forget the increment — INVARIANT 9 defeated by an omission.
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.advance(DriveState::FixWait, None, Some(Counter::ReviewRounds), 2_000)
+            .unwrap();
+        assert_eq!(e.counters.review_rounds, 1);
+        assert_eq!(e.counters.ci_attempts, 0, "only the named counter moves");
+
+        // A REFUSED arc spends nothing — the bump lands after the transition is
+        // accepted, never before.
+        let mut t = entry_at(DriveState::Satisfied);
+        let before = t.counters.clone();
+        assert!(t
+            .advance(DriveState::CiWait, None, Some(Counter::CiAttempts), 3_000)
+            .is_err());
+        assert_eq!(t.counters, before, "a refused transition costs nothing");
+
+        // `take` applies a whole step, so the tick cannot apply one half.
+        let mut s = entry_at(DriveState::CiWait);
+        let step = DriveStep::spend(DriveState::FixWait, Counter::CiAttempts);
+        s.take(&step, 4_000).unwrap();
+        assert_eq!(s.state(), DriveState::FixWait);
+        assert_eq!(s.counters.ci_attempts, 1);
+        // OpenLane needs a spawned session id, so `take` leaves it to S3.
+        let mut o = entry_at(DriveState::ReviewWait);
+        o.take(&DriveStep::OpenLane { index: 0 }, 5_000).unwrap();
+        assert_eq!(o.state(), DriveState::ReviewWait);
+        assert!(o.lanes.is_empty());
+    }
+
+    #[test]
+    fn a_partial_counter_block_refuses_the_file() {
+        // The block being mandatory is worth nothing if its contents are
+        // optional: `"counters": {}` would parse to three zeros, which is the
+        // full fresh budget the required-block rule exists to deny.
+        for partial in [
+            r#""counters": {},"#,
+            r#""counters": { "review_rounds": 2 },"#,
+            r#""counters": { "ci_attempts": 1, "rebase_attempts": 0 },"#,
+        ] {
+            let bad = NOTE_EXAMPLE.replace(
+                r#""counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },"#,
+                partial,
+            );
+            assert!(bad.contains(partial), "the mutation must actually land");
+            assert!(
+                matches!(parse_state(&bad), Err(StateError::Malformed(_))),
+                "{partial} must refuse"
+            );
+        }
+        // The complete block still parses, so the loop above is not refusing
+        // everything.
+        assert!(parse_state(NOTE_EXAMPLE).is_ok());
+    }
+
+    #[test]
     fn the_seed_and_the_clamps_only_ever_tighten() {
         // §2.3: a repo may run a tighter loop than the orchestrator template
         // promises; it may not run a looser one.
@@ -1914,7 +2198,8 @@ mod tests {
             { "pr": 7,
               "state": "ci-wait",
               "head": "h",
-              "counters": {"review_rounds": 1, "future_counter": 42},
+              "counters": {"review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0,
+                           "future_counter": 42},
               "lanes": [{"block": "rev-std", "future_lane": ["x"]}],
               "future_entry": "keep me" }
           ]
