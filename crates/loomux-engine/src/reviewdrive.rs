@@ -1309,7 +1309,7 @@ pub fn lane_pass_is_current(
 /// `Some(false)` — and the alternative is that one transient `gh` failure to
 /// read a PR body re-briefs every open lane in the group.
 pub fn lane_open_for(rec: &LaneRecord, head: &str, body_digest: Option<&str>) -> bool {
-    if rec.briefed_head != head {
+    if rec.briefed_head == head {
         return false;
     }
     match body_digest {
