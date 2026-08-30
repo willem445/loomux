@@ -195,7 +195,7 @@ impl DriveState {
     /// `already-driven` would make that path unreachable and `reset_counters` a
     /// parameter nothing can pass.
     pub fn is_live(self) -> bool {
-        !self.is_terminal() && !self.is_parked()
+        !self.is_terminal()
     }
 }
 
