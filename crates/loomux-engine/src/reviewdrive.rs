@@ -1383,9 +1383,6 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     // reach without going through S2's parser. A boundary that holds only when
     // the expected caller is upstream is not a boundary.
     let limits = &limits.clamped();
-    if entry.age_ms(facts.now_ms) >= minutes_ms(limits.drive_timeout_minutes) {
-        return DriveStep::held(HeldReason::DriveStalled);
-    }
     // **An unresolved head is not a head, and acting on one is an unbounded
     // spawn loop.** Every state below either compares this against the recorded
     // head or keys a lane brief on it. `review-wait` is the dangerous one: the
