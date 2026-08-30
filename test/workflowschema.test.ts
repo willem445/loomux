@@ -834,6 +834,38 @@ test("a typo'd key inside driver: is an unknown-key finding routed to the driver
   );
 });
 
+test("a driver integer outside u32 is an error, never a clamp warning (#1784 review 2)", () => {
+  // The third input class of the same defect: `-1` and `4294967296` ARE
+  // integers, so they pass every `Number.isInteger` guard and land in the
+  // range check - where the backstop's warning said "orrerix will clamp it"
+  // about a file the engine REFUSES (u32 rejects the value before any clamp
+  // runs). The fix routes the type class to the refusal error, and the test
+  // forbids the word "clamp" in what the pane says about it.
+  for (const [field, v] of [
+    ["fix_timeout_minutes", "-1"],
+    ["fix_timeout_minutes", "4294967296"],
+    ["max_review_rounds", "-1"],
+  ] as const) {
+    const findings = analyzeWorkflow(
+      `version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  ${field}: ${v}\n`
+    ).findings;
+    const errors = findings.filter((f) => f.severity === "error");
+    assert.ok(
+      errors.length > 0,
+      `driver.${field}: ${v} must draw an ERROR (the engine refuses it), got ${JSON.stringify(findings.map((f) => [f.severity, f.code]))}`
+    );
+    for (const f of errors) {
+      // The lie under test is the PROMISE of a clamp ("orrerix will clamp it"),
+      // not the word: the refusal message legitimately says the type is
+      // rejected "before any clamp runs". Assert against the promise.
+      assert.ok(
+        !/will clamp/.test(f.message),
+        `driver.${field}: ${v} - an error message must not promise a clamp: ${f.message}`
+      );
+    }
+  }
+});
+
 test("the pane's driver defaults are the manifest's declared defaults (#1784)", () => {
   // The chrome renders `?? DRIVER_DEFAULTS.x` when the file omits a field; a
   // literal at the point of use is a number nothing can check (review

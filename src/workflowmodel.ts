@@ -3344,16 +3344,29 @@ function sectionFindings(w: Workflow): Finding[] {
 
   const dv = w.driver;
   if (dv) {
-    // The INVARIANT-9 counters are REFUSED by the engine (#1778 2.3), and so
-    // is a NON-INTEGER value: every driver field is a `u32`, so serde rejects
-    // `2.5` exactly as it rejects `4`. The `Number.isInteger` guard the
-    // integer-only merge_queue timeout uses would go silent on the first and
-    // bless a file the engine refuses at load - so this takes the resources
-    // `bound()` shape, which flags both in one predicate. A file this pane
-    // calls valid must load.
+    // Every driver field is a `u32` on the engine, so serde refuses a value's
+    // TYPE before any range or clamp logic runs: a float (`2.5`), a negative
+    // (`-1`), anything above 4_294_967_295. A `Number.isInteger`-guarded check
+    // goes silent on the first, and an out-of-DECLARED-range check turns the
+    // other two into clamp warnings - both bless files the engine refuses at
+    // load (#1784 review rounds 1-2). So the type class is tested FIRST, by
+    // this one predicate, and the message says refusal, not clamping.
+    const outsideU32 = (v: number): boolean => v < 0 || v > 4294967295;
+    // The INVARIANT-9 counters are REFUSED by the engine (#1778 2.3) outside
+    // their closed range: an error here, because a repo file may tighten
+    // INVARIANT 9 but never loosen it. A file this pane calls valid must load.
     const counter = (field: string, v: number | undefined, min: number, max: number): void => {
       if (v === undefined) return;
-      if (!Number.isInteger(v) || v < min || v > max) {
+      if (!Number.isInteger(v) || outsideU32(v)) {
+        err(
+          "driver",
+          "section-bad-value",
+          `driver.${field}: ${v} is not a value the engine's u32 field accepts - the engine ` +
+            `refuses the type before any range check runs.`
+        );
+        return;
+      }
+      if (v < min || v > max) {
         err(
           "driver",
           "section-out-of-range",
@@ -3381,19 +3394,19 @@ function sectionFindings(w: Workflow): Finding[] {
       DRIVER_MAX_REBASE_ATTEMPTS_MAX
     );
     // The backstops are CLAMPED, like `checks_timeout_minutes` - an
-    // out-of-range INTEGER is a warning that says what will actually happen,
-    // not an error implying the file is broken. But a NON-INTEGER one
-    // (`2.5`) is refused by the engine outright - the fields are `u32`, so
-    // serde rejects the type before any clamp runs - and that is an error
-    // here, by the same predicate split the counters use.
+    // out-of-range INTEGER inside the u32 type is a warning that says what
+    // will actually happen. But the TYPE class comes first: a non-integer
+    // (`2.5`) and an integer outside u32 (`-1`, `4294967296`) are refused by
+    // the engine outright, and a clamp warning about a file that refuses to
+    // load is the same lie in a friendlier tone (#1784 review round 2).
     const backstop = (field: string, v: number | undefined): void => {
       if (v === undefined) return;
-      if (!Number.isInteger(v)) {
+      if (!Number.isInteger(v) || outsideU32(v)) {
         err(
           "driver",
           "section-bad-value",
-          `driver.${field}: ${v} must be a whole number of minutes - the engine refuses a ` +
-            `non-integer here rather than clamping it.`
+          `driver.${field}: ${v} is not a value the engine's u32 field accepts - the engine ` +
+            `refuses the type before any clamp runs.`
         );
         return;
       }
