@@ -34676,7 +34676,10 @@ impl OrchRegistry {
         {
             let mut agents = self.agents.lock_safe();
             if let Some(a) = agents.get_mut(agent_id) {
-                a.status = AgentStatus::Running;
+                // [scratch j3] `status = Running` removed - exactly what
+                // `set_pty_for_test` (the seam the fixture used to use) leaves
+                // out. If the fixture's claim is right, the tick now
+                // short-circuits before the mask and the mask rows redden.
                 a.pty_id = Some(pty_id);
             }
         }
