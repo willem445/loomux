@@ -945,7 +945,7 @@ impl DriveEntry {
         self.state = transition(self.state, to)?;
         self.held_reason = reason;
         match bump {
-            Some(Counter::ReviewRounds) => self.counters.review_rounds += 1,
+            Some(Counter::ReviewRounds) => {}
             Some(Counter::CiAttempts) => self.counters.ci_attempts += 1,
             Some(Counter::RebaseAttempts) => self.counters.rebase_attempts += 1,
             None => {}
