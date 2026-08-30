@@ -39038,7 +39038,13 @@ impl OrchRegistry {
         // Phase 2 is where every nested acquisition now happens, and it happens
         // with the registry free. `doc/design/lock-liveness.md` §6 is the
         // contract; `liveness.rs`'s `l6a_`/`l6b_` rows are the guard.
-        let roster: Vec<AgentEntry> = self.agents.lock_safe().values().cloned().collect();
+        //
+        // POST-HOC RED WITNESS (scratch, do not merge): j5 from #1722's wave —
+        // P1's mask hoist reverted. `_agents_guard` is bound rather than a
+        // statement temporary, so `agents` stays held past phase 1 and across
+        // phase 2's mask below (the pre-#1702 shape). See #1722 / #1746.
+        let _agents_guard = self.agents.lock_safe();
+        let roster: Vec<AgentEntry> = _agents_guard.values().cloned().collect();
 
         // Board-derived gate map: agent id → gate status, across every live
         // group. Read once per group (a small fs read) rather than per agent.
@@ -39143,9 +39149,12 @@ impl OrchRegistry {
                 // `agents`. That is the difference between "the deadlock is
                 // unreachable because no lock is held here" and "the tick never
                 // asks the question that deadlocked it".
+                // POST-HOC RED WITNESS (scratch, do not merge): j5 — session
+                // resolved through `session_for_pty` instead of off the
+                // phase-1 snapshot, while `_agents_guard` above is still held.
                 let delivered = a
                     .pty_id
-                    .map(|p| self.delivered_mask_lines(p, a.session_id.as_deref()))
+                    .map(|p| self.delivered_mask_lines(p, self.session_for_pty(p).as_deref()))
                     .unwrap_or_default();
                 let shaped =
                     prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
