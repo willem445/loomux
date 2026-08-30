@@ -1155,7 +1155,6 @@ pub fn lane_pass_is_current(
     let Some(v) = verdict else { return false };
     v.verdict == Verdict::Pass
         && v.reviewed(head)
-        && v.body_changed(body_digest) != Some(true)
 }
 
 /// Whether this lane is open for exactly the revision now on the PR: it was
