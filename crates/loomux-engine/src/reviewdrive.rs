@@ -950,9 +950,7 @@ impl DriveEntry {
             Some(Counter::RebaseAttempts) => self.counters.rebase_attempts += 1,
             None => {}
         }
-        if to == DriveState::FixWait {
-            self.fix_handback_ms = now_ms;
-        }
+        self.fix_handback_ms = now_ms;
         Ok(())
     }
 
