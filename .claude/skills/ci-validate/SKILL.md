@@ -419,6 +419,41 @@ deltas beside it so they still sum to the total. Signature: an isolation diffsta
 baseline passes ancestry *and* subject and whose file count is two high — 63 files/314+
 against the previous rebase's target, 61/258+ against the merge base (#1324).
 
+### Rebase NEUTRALITY is a third question, and the head-to-head diff answers a different one
+
+The section above fixes the baseline for ONE measurement. *Did this rebase change my patch?* is
+not that question, and `git diff <old-head> <new-head>` does not ask it: it reports everything
+the **new base** absorbed, so a rebase that replayed your work untouched still prints that base's
+own commits. Measured on #1755 (`fb48d73a` rebased to `fe3cf20e` onto `baaa2d9e`), where the PR
+itself changed neither file by a byte:
+
+```sh
+git diff --stat fb48d73a fe3cf20e
+#  .claude/skills/ci-validate/SKILL.md | 14 ++++++++++++++
+#  CLAUDE.md                           |  7 +++++++
+#  2 files changed, 21 insertions(+)    <- ALL of it the new base's own work
+```
+
+Ask it of each head against its OWN merge base. `git range-diff` is the one-line form:
+
+```sh
+OLD_BASE=$(git merge-base origin/main <old-head>)
+NEW_BASE=$(git merge-base origin/main <new-head>)
+git range-diff "$OLD_BASE..<old-head>" "$NEW_BASE..<new-head>"
+#  1:  fb48d73a = 1:  fe3cf20e     <- '=' means the patch replayed unchanged
+```
+
+Do **not** settle it by byte-comparing the two `git diff "$BASE"..<head>` patches. They differ on
+the `index <blob>..<blob>` line and on hunk-header offsets for any file whose base moved lines
+above your hunk — on #1755 SKILL.md went `@@ -845` -> `@@ -859`, while `ci.yml`, which the base
+did not touch, kept a byte-identical patch — so a naive `diff` of the two false-FAILs in exactly
+the case it was reached for. Strip those two line kinds, or use `range-diff`.
+
+An `=` from `range-diff` **outranks** a raw head-to-head diff that disagrees; they are answers to
+different questions, not two opinions on one. Signature: a blocking finding citing insertions in a
+file the PR never touched, recorded beside a `range-diff` the same review already ran and got `=`
+on (#1755, raised in review round 2 and corrected in round 3).
+
 ### `gh pr diff --patch` is the wrong instrument for a diffstat
 
 Measure a PR's diffstat from the **plain** `gh pr diff <n>` (its net diff) or from the
