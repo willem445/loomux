@@ -822,7 +822,9 @@ pub fn assert_no_disallowed_hold_over_on(fail_ms: u64, threads: &[u64]) {
          is blind. LOWER `set_hold_warn_ms` to at most {fail_ms}, or assert at or above it",
         hold_warn_ms()
     );
-    let was = set_hold_panics(true);
+    // [scratch j2] the arming is removed: the scan still classifies and counts,
+    // and never fails the build.
+    let was = hold_panics();
     let mut observed = observed_holds();
     if !threads.is_empty() {
         observed.retain(|r| threads.contains(&r.holder_thread));
