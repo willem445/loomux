@@ -9721,6 +9721,20 @@ and sampler injected). `ready_observed` is now audited: "we pasted into a CLI we
 become ready" is the single most useful fact about a kickoff that then fails to confirm, and
 both exits from that loop used to look identical in the record.
 
+**Painted-and-quiet is a proxy, and #1591 found the CLI it does not hold for.** The pair asks
+whether the CLI has stopped *writing*; what the paste needs is whether it has started
+*reading*. A TUI that paints its whole chrome, goes quiet, and finishes coming up afterwards
+satisfies the proxy while its input loop is still unattached. So `CliCaps` carries an optional
+per-CLI **ready marker** (`ReadyMarker`, `crates/loomux-engine/src/model.rs`) — a shape the
+CLI's own rendered output takes once it is genuinely readable — and `await_cli_ready` requires
+it *in addition to* the base test, never instead of it. The mechanism is generic and the table
+is where a CLI opts in; the only row that carries one today is opencode's, and the argument for
+it — the vendor premise and its falsifier, why the count is matched as a shape, which direction
+the gate fails in, and the residual it does not close — lives in
+[`opencode.md`'s *Readiness (#1591)*](opencode.md#readiness-1591). Read that before adding a
+second row: a marker can only ever DELAY a paste, and the bound that makes it safe on this path
+is that a marker which misreads its CLI is never worse than not having one.
+
 *2 — an eaten paste had no recovery, only a badge.* #496 PR-C (above) rescues a delivery whose
 text IS in the box with its Enter withheld. A swallowed paste is the other shape: nothing ever
 reaches the box, so `stranded_selfheal_action` correctly returns
@@ -11356,14 +11370,17 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
 
   That produced `CliCaps` / `CLI_CAPS` (`crates/loomux-engine/src/model.rs` since
   #888 slice A2 batch 4, re-exported as `orchestration::CLI_CAPS`): one row per agent
-  CLI loomux has evaluated, recording three things that had been conflated into
-  "is it in `SUPPORTED_CLIS`".
+  CLI loomux has evaluated, separating the questions that had been conflated into
+  "is it in `SUPPORTED_CLIS`". Each field below is paired in the struct with a
+  `*_note` carrying the vendor reason, except where noted.
 
   | field | question it answers |
   | --- | --- |
   | `orchestration` | does loomux have a group-spawn adapter for it? (⇔ `SUPPORTED_CLIS`, pinned by `supported_clis_match_the_capability_table`) |
   | `mcp_argv_seam` | can its per-agent MCP config be delivered *entirely on argv*? |
   | `max_containment` | the deepest `Containment` tier loomux can actually enforce on it |
+  | `effort_levels` / `context_variants` | which thinking-level and context-window values loomux can actually *set* on it (#687) — empty is a claim, and the paired note is what the launcher renders instead |
+  | `ready_marker` | what its output must show before a kickoff may be pasted, *on top of* painted-and-quiet (#1591) — `None` for every CLI whose box is live from first paint. Its reason is a code comment on the row rather than a `_note` field, because unlike the knobs it is never quoted to a user |
 
   `cli_can_host(cli, role)` is the gate: a block whose class needs deeper
   containment than its CLI can enforce is refused, at `parse_workflow` (so a repo

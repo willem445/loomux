@@ -353,6 +353,221 @@ and treats a failure as a spawn error rather than a best-effort mkdir.
 
 The reader lands on this seam — see *Usage and cost readback*, below.
 
+## Readiness (#1591)
+
+opencode is the first CLI loomux spawns whose **painted UI arrives before its
+input loop does**, and that is a contract, not a bug in either program.
+
+The generic kickoff gate is *painted and quiet*: after `READY_MIN_WAIT`, the
+pane must have written `READY_MIN_OUTPUT` bytes and then held silent for
+`READY_QUIET`, with `READY_MAX_WAIT` as the ceiling. Those two conditions are a
+**proxy** for the thing loomux actually needs to know — has the CLI attached the
+reader that will consume a paste? The proxy holds for a CLI that paints once it
+is up. opencode paints its banner and input box (far past the 512-byte floor)
+and goes quiet **while its MCP status is still being fetched**, so the proxy
+says ready and the paste lands in a startup buffer. Measured in the field on
+five deliveries in one session: each drew a `delivery … unconfirmed` notice,
+because the pre-Enter box read could not find text the CLI had not yet drawn.
+
+### The marker is a per-CLI contract
+
+opencode's row in `CLI_CAPS` carries a `ready_marker`, and the gate consults the
+table rather than branching on the CLI name — the same rule the rest of that
+table follows, and the same shape as `cli == "claude"` gating *behaviour claude
+genuinely has*. The marker is the home footer's MCP segment:
+
+    ⊙ 2 MCP /status    1.18.25
+
+...matched as **a digit immediately followed by ` MCP`, not followed by a
+word**, on the pane's **rendered rows**.
+
+#### The vendor premise, and what falsifies it
+
+The fix rests on one claim about somebody else's program: *the `N MCP` segment
+cannot appear before opencode is able to accept typed input.* That is stated
+here as a **premise**, because it is a fact about a program loomux does not
+control and cannot run (constraint 3). It is read off the vendor's source at a
+pinned commit rather than inferred from the field observation —
+`anomalyco/opencode`, tag `v1.18.25` =
+`cb7d8b2f5e44876ef98b661dc10590c915af3a9f`:
+
+- `packages/tui/src/feature-plugins/home/footer.tsx` renders the segment as
+  `{count()} MCP` inside `<Show when={has()}>`, where `has()` is "the
+  configured list is non-empty" and `count()` is the **connected** subset.
+- `packages/tui/src/context/sync.tsx` initialises `mcp: {}` and fills it from
+  `sdk.client.mcp.status()` in the **non-blocking tail** of `bootstrap()` —
+  i.e. after `store.status` has left `"loading"`.
+- That same `store.status` is what `sync.ready` tests, and the prompt box and
+  the footer both render only under `ready()`. So the segment appears in the
+  same frame as the input box at the earliest, and in practice strictly later.
+- Server side, `packages/opencode/src/mcp/index.ts` awaits **every** `create()`
+  before `MCP.status` returns, so the map goes `{}` → fully-resolved in one
+  write. The TUI never sees a partially-populated count.
+
+**What would falsify it**, stated so the next reader can check rather than
+trust: a stock opencode pane whose footer shows a count *before* the prompt box
+is usable. Three known routes to that, none of them closed here:
+
+1. **A third-party TUI plugin.** The footer is a plugin slot rendered
+   `mode="single_winner"`; a plugin with a different `order` can put arbitrary
+   text where `N MCP` sits. The premise holds for a stock install only.
+2. **"The prompt is painted" is not proven to equal "a submit works".** No
+   readiness gate was found inside the prompt component; the only wait found is
+   for `--prompt` auto-submit. Falsifier: type into a fresh pane the instant it
+   paints and see whether the submit lands.
+3. **The premise was read, not run.** Nobody has traced this live. The human's
+   own opencode run is what arbitrates it, and it is the first thing to spend
+   one on.
+
+If the premise turns out false, the gate degrades to the base painted-and-quiet
+test — i.e. to the pre-#1591 behaviour — rather than to something worse. That
+is the bound, and it is why shipping on a stated premise is acceptable here.
+
+#### Why the marker is well-founded at all
+
+The segment only exists when opencode has MCP servers configured, and **every
+orchestration opencode pane does**: `opencode_config_json` writes its `"mcp"`
+key unconditionally through `one_server_map`, and the spawn path has no opt-out.
+A solo (delivery-only) pane does not go through this gate at all.
+
+That is a load-bearing dependency in the other direction: **if a per-block MCP
+opt-out is ever added, an opencode pane without servers renders no segment, the
+marker can never match, and every kickoff on it silently pays the ceiling.**
+Whoever adds that opt-out owes this section an edit — either clear
+`ready_marker` for the un-configured case, or accept the ceiling knowingly.
+
+#### The four choices, each load-bearing
+
+- **A shape, not a count.** loomux knows how many servers it configured, so
+  comparing against that number is available and is still wrong: the digit is
+  the **connected** count while the segment is gated on the **configured** list
+  being non-empty, so the two are different numbers and the connected one can
+  legitimately settle below the configured one when a server fails.
+- **Any count, `0` included.** `⊙ 0 MCP` is a real and *settled* rendering:
+  the `McpStatus` union has no `connecting` member, so a printed count is the
+  handshake having finished, not a claim that any server came up. That is
+  exactly what this gate needs to know, and the one server loomux configures is
+  entitled to fail (port taken, token rejected, timeout) on a pane that is
+  nonetheless reading. Pinned by a matcher row so the intent is a decision
+  rather than an accident of the digit test.
+- **Rendered, not the raw byte ring.** A status footer is the most
+  cursor-positioned region of a TUI: a repaint may write the count and its label
+  with separate absolute cursor moves, so in the byte stream they need never be
+  adjacent even though the human plainly sees `2 MCP`. Only a VT replay puts
+  them in neighbouring cells, so the gate composes the screen with the same
+  replay and the same trustworthiness gate the question guard's
+  `question_sample` uses (#534). The composition lives in `ready_screen`, which
+  is pure and tested on rendered-screen fixtures — the reading production
+  actually performs, not a reconstruction of it.
+- **A wrap is a second problem, and the replay alone does not fix it.** When
+  the footer is wider than the pane the count can end one rendered row and the
+  label begin the next; the composed screen right-trims rows and joins them with
+  a newline, so a row-wise search sees ` MCP` preceded by `\n` and misses a
+  footer the human plainly reads — at that pane width, on *every* kickoff. Since
+  loomux tiles panes, that width is a continuum a human drags through, so the
+  matcher also tests each **adjacent row pair, joined**, which is exactly the
+  string those rows would have been one column wider. Pairs, not longer runs: a
+  four-character label splits twice only under about six columns. The cost is
+  that it only ever ADDS matches — two unrelated rows, one ending in a digit and
+  the next opening ` MCP`, read as a wrap — which is the same residual class as
+  `Loaded 3 MCP` below and is bounded the same way.
+- **ANDed with the base test, never substituted for it.** A marker says the CLI
+  has finished coming up; it says nothing about whether it is mid-repaint right
+  now. So a seen marker never excuses a pane that is still painting, and the
+  only thing a marker can do is **delay** a paste.
+
+The ANSI-stripped ring survives as a **fallback**, on either of two triggers —
+both named, because saying only the first understates when it runs: the pane
+reports **no geometry**, *or* the replay composed too few non-empty rows for
+`trustworthy_composition` to believe it.
+
+**That substitution is a deliberate divergence from `question_sample`, not a
+copy of it.** That guard refuses to substitute at all — "no size, no grid
+evidence" — because its grid evidence *releases* a hold, so a guessed reading
+could drop a delivery onto a live dialog. This reading only un-blocks a paste
+the base painted-and-quiet test has already approved, and refusing to substitute
+would price every geometry-less pane at the ceiling on every kickoff. The trade
+is honest and worth naming: the ring carries scrolled-off history the screen does
+not, so the fallback has a **wider decoy surface** than the grid. It is narrowed
+to `QUESTION_SCAN_TAIL_BYTES` for exactly that reason — the fallback never reads
+more history than the pre-#1591 reading it replaces.
+
+**The resource envelope**, stated because the replay budget was reused from a
+guard that argued its size at a different poll rate. A screen is composed only
+on a tick where the base test already holds, so the first possible composition
+is at `READY_MIN_WAIT` + `READY_QUIET` and the last at `READY_MAX_WAIT`: at a
+250 ms `READY_POLL` that is at most ~89 compositions, each one tail copy of up
+to 64 KiB plus one linear replay and one `size()` read — under 6 MB of copying
+spread over 25 s, per pane. It is bounded rather than open-ended, it is a linear
+scan retaining no history, and it only reaches the worst case on a pane whose
+marker never arrives, i.e. where something is already wrong. It multiplies by
+the number of agents spawning at once, and if `READY_MAX_WAIT` or `READY_POLL`
+move, this is the paragraph to re-derive.
+
+**Nothing is latched.** The marker is re-read on every tick that reaches it. An
+earlier draft carried a positive forward on the reasoning that "this session's
+servers have connected" is a one-way fact — true of the *servers*, false of the
+*evidence*, and the difference is the whole of the finding below: a decoy that
+matched once would have released every later paste on a screen that no longer
+showed anything.
+
+Cost is confined to the window this exists to cover: the screen is composed only
+on a tick where the base test *already* holds. A CLI with no marker in its row —
+every other row today — never composes one at all, and its boot is byte-for-byte
+what it was.
+
+### If opencode changes its footer
+
+There are **two** directions, and they are not symmetric.
+
+**Late or absent — it fails toward the ceiling.** `READY_MAX_WAIT` is untouched
+and is still the only thing that ends the wait when readiness cannot be
+established. A renamed indicator, a footer whose count never renders, a pane
+with no MCP configured, or a build that drops the segment costs the pane the
+ceiling's wait and is then pasted into blind — precisely the pre-#1591 behaviour
+for a boot loomux cannot read, and recorded as `ReadyWait::TimedOut` rather than
+`Ready`, which is the audited state that says "we pasted into a CLI we never saw
+become ready". The cost is real and is per-kickoff, not once.
+
+**Early — it fails back to the bug.** Any text on the rendered screen matching
+the marker's shape before the input loop is live satisfies the gate, which then
+collapses to the base test and pastes into exactly the gap this section exists
+to close. Two narrowings stand against it, and one residual survives them:
+
+- The count must be **immediately preceded by a digit**, so a bare mention of
+  MCP — a menu row, a `/mcp` help line, the word sitting in a brief the pane is
+  echoing back — does not qualify.
+- The label must **not be followed by a word**, so a boot line
+  (`1 MCP server connecting...`) and opencode's own `/status` dialog
+  (`{...length} MCP Servers`, the *configured* count under a label-shaped
+  caption) are both refused. Either case of letter, deliberately: lowercase
+  alone would accept the dialog.
+- **The residual, pinned rather than merely disclosed.** The word rule separates
+  a label from a sentence; it cannot separate the *home footer's* label from any
+  other label-shaped count on the screen. A string like `Loaded 3 MCP` still
+  satisfies the marker, and so does one split across two adjacent rows by the
+  wrap handling above. `the_ready_marker_matches_a_count_not_a_label` asserts
+  that it does, so this paragraph cannot go stale silently: a later narrowing
+  that closes the gap reddens that row and this text is corrected in the same
+  commit. A sweep of the vendor monorepo at the pinned commit found no
+  boot-path string of that shape — the only three producers are the home
+  footer, the session footer and the `/status` dialog — but it cannot see text
+  from third-party plugins or from an MCP server's own stdout.
+
+**So the asymmetry is bounded, not absolute.** A late or absent marker is never
+a delivery that does not happen — it is a slower one, visible in the audit, on
+the same ceiling every unrecognised boot already has. An *early* one is a
+delivery that can be lost, at exactly the pre-#1591 rate and no worse: the AND
+with the base test means a false marker never releases a paste the old gate
+would have refused. That bound — **never worse than before this change** — is
+the property to preserve if this section is ever extended. A future marker may
+lengthen a wait; it may never shorten one, and may never become the sole reason
+a paste is released.
+
+Not done here, deliberately: a general readiness signal for *any* slow CLI, and
+the bounded confirm-and-retry handshake #1591 also asks for. Those stay open on
+that issue.
+
 ## Knobs (#687)
 
 Both rows ship empty, with notes that say why:

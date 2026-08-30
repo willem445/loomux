@@ -93,8 +93,8 @@ pub(crate) use loomux_engine::text::tail_snippet;
 // flat form — a method's visibility is the defining crate's to set, and no
 // re-export narrows it.
 pub use loomux_engine::model::{
-    self, cli_can_host, cli_caps, CliCaps, Containment, Role, CLI_CAPS, CONTEXT_VARIANTS,
-    EFFORT_LEVELS, SUPPORTED_CLIS,
+    self, cli_can_host, cli_caps, CliCaps, Containment, ReadyMarker, Role, CLI_CAPS,
+    CONTEXT_VARIANTS, EFFORT_LEVELS, SUPPORTED_CLIS,
 };
 pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
 
@@ -16700,6 +16700,110 @@ pub fn cli_ready(output_total: usize, quiet_for: Duration, elapsed: Duration) ->
     elapsed >= READY_MIN_WAIT && output_total >= READY_MIN_OUTPUT && quiet_for >= READY_QUIET
 }
 
+/// The full readiness test (#1591): [`cli_ready`]'s painted-and-quiet base
+/// AND, for a CLI whose [`CliCaps::ready_marker`] row declares one, having
+/// SEEN that marker in the pane's output.
+///
+/// **The base test is unchanged and still required.** A marker is an
+/// additional obligation, never a substitute: it says the CLI has finished
+/// coming up, and says nothing about whether it is mid-repaint at this
+/// instant. Anding them means a marker can only ever DELAY a paste, which is
+/// what makes this safe to add to a path whose failure mode is a lost brief —
+/// the worst a marker can do is spend the caller's `READY_MAX_WAIT` ceiling,
+/// after which the caller pastes anyway exactly as it does today.
+///
+/// `marker_seen` is decided by the caller FRESH on the tick it is used, and
+/// is never latched across ticks (#1591 review N3). An earlier draft carried it
+/// forward on the reasoning that "this CLI's servers have connected" is a
+/// one-way fact; that is true of the SERVERS and false of the EVIDENCE, and the
+/// difference is the whole finding — a decoy that matched once would have
+/// released every later tick's paste on a screen that no longer showed
+/// anything. Since the marker is read only on a tick where the base test
+/// already holds, a positive is consumed by the very next line; there is
+/// nothing a latch could have bought.
+///
+/// Pure, so the composition is assertable without a pty (`cli_ready`'s own
+/// reason).
+pub fn cli_ready_with_marker(
+    output_total: usize,
+    quiet_for: Duration,
+    elapsed: Duration,
+    marker: Option<ReadyMarker>,
+    marker_seen: bool,
+) -> bool {
+    cli_ready(output_total, quiet_for, elapsed) && (marker.is_none() || marker_seen)
+}
+
+/// How many raw tail bytes the readiness gate replays to compose a screen
+/// (#1591) — [`QUESTION_GRID_REPLAY_BYTES`], reused because it answers the same
+/// question (how much history must a blind VT replay eat before the composed
+/// grid is the real screen) and re-derived here at THIS loop's cadence rather
+/// than inherited (#1591 review D4).
+///
+/// **The envelope, stated because the constant's own doc argues its size at a
+/// different poll rate.** The gate composes a screen only on a tick where the
+/// base painted-and-quiet test already holds, so the first possible
+/// composition is at `READY_MIN_WAIT` + `READY_QUIET` and the last at
+/// `READY_MAX_WAIT`: at `READY_POLL` = 250 ms that is at most
+/// `(25_000 - 2_700) / 250` ≈ **89 compositions**, each one tail copy of up to
+/// 64 KiB plus one linear replay and one `size()` read. Worst case ≈ 5.7 MB of
+/// copying spread over 25 s, per pane, and only on a pane whose marker never
+/// arrives — i.e. it coincides with something already being wrong, and it
+/// multiplies by the number of agents spawning at once.
+///
+/// That is judged affordable at this cadence for the same reason the question
+/// guard affords it at its own: the work is a linear scan with no history
+/// retained, it is bounded by `READY_MAX_WAIT` rather than open-ended, and it
+/// buys the one reading that can see a cursor-positioned footer at all. If
+/// `READY_MAX_WAIT` or `READY_POLL` ever move, this paragraph is the thing to
+/// re-derive.
+const READY_GRID_REPLAY_BYTES: usize = QUESTION_GRID_REPLAY_BYTES;
+
+/// Compose the screen the readiness marker is looked for in (#1591) — the pure
+/// half of `deliver_now`'s sampler, split out so all three of its branches are
+/// assertable without a pty (#1591 review D1).
+///
+/// The split is at this boundary and not one level up on purpose: `PtyManager`
+/// has no geometry test hook, so a helper taking `&PtyManager` would see
+/// `size() == None` in every test and only ever exercise the fallback — which
+/// is precisely the branch this function exists to stop being the only one
+/// anybody has run. Same reason `cli_ready` was extracted from the loop.
+///
+/// **Preferred reading: the rendered rows.** A status footer is the most
+/// cursor-positioned region of a TUI, and the byte ring cannot say where a
+/// repaint put the count relative to its label. Composed exactly the way
+/// `question_sample` composes one (#534) — same replay, same
+/// [`trustworthy_composition`] gate.
+///
+/// **Fallback: the ANSI-stripped ring**, taken on EITHER of two triggers, both
+/// named because the surfaces used to state only the first (#1591 review D3):
+///
+/// 1. the pane reports no geometry, or
+/// 2. the replay composed fewer than `GRID_MIN_RENDERED_ROWS` non-empty rows,
+///    so [`trustworthy_composition`] declined it.
+///
+/// **This is a deliberate DIVERGENCE from `question_sample`, not a copy of
+/// it.** That guard refuses to substitute — "no size, no grid evidence" — and
+/// its [`QuestionSample`] doc says the two readings "must not collapse, because
+/// one licenses a release and the other must not". The asymmetry that makes
+/// collapsing them right here and wrong there is the direction of the
+/// consequence: the question guard's grid evidence RELEASES a hold, so a
+/// substituted reading could let a delivery land on a live dialog. This
+/// reading only ever un-blocks a paste that the base painted-and-quiet test has
+/// ALREADY approved, and refusing to substitute would price every
+/// geometry-less pane at `READY_MAX_WAIT` on every kickoff. The trade is a
+/// wider decoy surface (the ring carries scrolled-off history the screen does
+/// not) for not being inert; the ring slice is therefore narrowed to
+/// [`QUESTION_SCAN_TAIL_BYTES`], so the fallback never reads MORE history than
+/// the pre-#1591 reading it replaces.
+pub fn ready_screen(raw: &[u8], size: Option<(u16, u16)>) -> String {
+    size.and_then(|(cols, rows)| trustworthy_composition(termgrid::render_visible(raw, cols, rows)))
+        .unwrap_or_else(|| {
+            let from = raw.len().saturating_sub(QUESTION_SCAN_TAIL_BYTES);
+            strip_ansi(&raw[from..])
+        })
+}
+
 /// How the fresh-boot readiness wait ended (#517).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyWait {
@@ -16737,8 +16841,34 @@ pub enum ReadyWait {
 ///
 /// `poll_tick` performs one `READY_POLL` wait; `elapsed` reports time since
 /// the wait began (both real in production, synthetic in tests).
+///
+/// **`marker`** is the target CLI's [`CliCaps::ready_marker`] (#1591) — an
+/// extra obligation on top of the base test for a CLI that paints its UI
+/// before it can read. `None` (every CLI but opencode) makes this loop behave
+/// exactly as it did before that issue, byte for byte.
+///
+/// `sample_screen` supplies the pane's RENDERED rows — a VT replay, not the
+/// ANSI-stripped byte ring (see [`ReadyMarker::matches`] for why a footer's
+/// count and its label need never be adjacent in the stream). It is called
+/// ONLY on a tick where the base test already holds, so a `None` row never
+/// composes a screen at all, and a marked one pays only across the window
+/// between "painted and quiet" and "actually up" — precisely the window this
+/// exists to cover.
+///
+/// **Nothing is latched** (#1591 review N3). The marker is re-read on every
+/// tick that reaches it, so a decoy that satisfied it once cannot release a
+/// later paste, and a negative is never cached either.
+///
+/// `READY_MAX_WAIT` is untouched as the ceiling, and that is the whole safety
+/// argument: a CLI that renames its footer, or one whose marker never reaches
+/// the read window, waits out the ceiling and is pasted into blind — the
+/// pre-#1591 behaviour for an unrecognised boot, audited as `TimedOut` rather
+/// than `Ready`. The gate fails toward a slow delivery, never toward a lost
+/// one.
 pub fn await_cli_ready(
+    marker: Option<ReadyMarker>,
     mut sample_total: impl FnMut() -> Option<u64>,
+    mut sample_screen: impl FnMut() -> Option<String>,
     mut poll_tick: impl FnMut(),
     mut elapsed: impl FnMut() -> Duration,
 ) -> ReadyWait {
@@ -16752,7 +16882,19 @@ pub fn await_cli_ready(
             last_total = total;
             last_change = now;
         }
-        if cli_ready(last_total as usize, now.saturating_sub(last_change), now) {
+        let quiet_for = now.saturating_sub(last_change);
+        let base = cli_ready(last_total as usize, quiet_for, now);
+        // Compose the screen only when the base test is otherwise satisfied.
+        // Not an optimisation dressed as a rule: a marker cannot rescue a pane
+        // that is still painting (the `&&` below would reject it anyway), so
+        // reading earlier would buy nothing and would charge every ordinary
+        // delivery for a VT replay it has never needed. The short-circuit is
+        // also what keeps the read FRESH rather than latched — see the doc.
+        let marker_seen = match marker {
+            None => true,
+            Some(m) => base && sample_screen().is_some_and(|screen| m.matches(&screen)),
+        };
+        if cli_ready_with_marker(last_total as usize, quiet_for, now, marker, marker_seen) {
             return ReadyWait::Ready;
         }
         if now >= READY_MAX_WAIT {
@@ -20540,8 +20682,25 @@ fn deliver_now(
         // #517: the sampler is the pane's MONOTONIC output counter, never
         // the ring's current length — see `await_cli_ready`'s doc for why
         // that distinction is the lost-kickoff mechanism.
+        // #1591: the per-CLI ready MARKER, read out of the capability table
+        // rather than branched on here — `None` for every CLI but opencode,
+        // which leaves this call exactly what it was. An unknown CLI has no
+        // row and therefore no marker, which is the same answer.
+        let ready_marker = cli_caps(&cli).and_then(|c| c.ready_marker);
         match await_cli_ready(
+            ready_marker,
             || ptys.output_total(pty_id),
+            // The pane's RENDERED rows — a footer is a region of the SCREEN,
+            // and the byte ring cannot answer where a cursor-positioned repaint
+            // put the count relative to its label (#1591 review, premortem 2).
+            // Everything that DECIDES anything lives in `ready_screen`, which
+            // is pure and tested; this closure is only the pty read.
+            || {
+                Some(ready_screen(
+                    &ptys.output_tail_bounded(pty_id, READY_GRID_REPLAY_BYTES)?,
+                    ptys.size(pty_id),
+                ))
+            },
             || std::thread::sleep(READY_POLL),
             || start.elapsed(),
         ) {

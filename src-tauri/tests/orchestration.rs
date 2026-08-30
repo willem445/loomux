@@ -129,6 +129,7 @@ use loomux_lib::orchestration::{
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
+    cli_ready_with_marker, ready_screen, ReadyMarker,
     redelivery_treatment, KickoffTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     failed_arm_route, FailedArmRoute,
@@ -28780,10 +28781,14 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
     let chunk = vec![b'x'; 64 * 1024];
     let clock = std::cell::Cell::new(Duration::ZERO);
     let outcome = await_cli_ready(
+        // #1591: no marker — this test is about the SAMPLER, and a marker
+        // would add a second reason for its TimedOut that it does not mean.
+        None,
         || {
             pm.append_fake_output_for_test(pty, &chunk);
             pm.output_total(pty)
         },
+        || -> Option<String> { unreachable!("a None marker must never compose a screen") },
         || clock.set(clock.get() + Duration::from_millis(250)),
         || clock.get(),
     );
@@ -28815,10 +28820,12 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
     pm_len.register_fake_for_test(3172, b"");
     let clock_len = std::cell::Cell::new(Duration::ZERO);
     let via_ring_len = await_cli_ready(
+        None,
         || {
             pm_len.append_fake_output_for_test(3172, &chunk);
             pm_len.output_tail(3172).map(|t| t.len() as u64)
         },
+        || -> Option<String> { unreachable!("a None marker must never compose a screen") },
         || clock_len.set(clock_len.get() + Duration::from_millis(250)),
         || clock_len.get(),
     );
@@ -28835,11 +28842,467 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
     pm2.register_fake_for_test(4172, &vec![b'y'; 4096]);
     let clock2 = std::cell::Cell::new(Duration::ZERO);
     let ready = await_cli_ready(
+        None,
         || pm2.output_total(4172),
+        || -> Option<String> { unreachable!("a None marker must never compose a screen") },
         || clock2.set(clock2.get() + Duration::from_millis(250)),
         || clock2.get(),
     );
     assert_eq!(ready, ReadyWait::Ready, "a painted, quiet pane is ready — the wait still ends");
+}
+
+/// #1591: one fake-opencode boot, driven through the REAL wait loop against a
+/// REAL `PtyManager`, with the marker taken from the REAL capability table.
+///
+/// The shape this reproduces is the one the human measured: the TUI paints its
+/// banner and input box (well past `READY_MIN_OUTPUT`) and goes quiet while its
+/// MCP servers and provider auth are still connecting, then prints the status
+/// footer carrying the MCP count once they are up. The base painted-and-quiet
+/// gate is satisfied during that gap, and pasting there is the lost kickoff.
+#[test]
+fn an_opencode_boot_is_not_ready_until_its_mcp_footer_appears() {
+    let marker = cli_caps("opencode").expect("opencode has a capability row").ready_marker;
+    assert!(marker.is_some(), "the table is what wires this — a None row makes the rest vacuous");
+
+    // The footer as observed live, coloured the way a TUI colours a count: the
+    // digit and the label are adjacent only AFTER the ANSI strip.
+    let footer = "\u{1b}[36m\u{2299} \u{1b}[1m2\u{1b}[0m MCP\u{1b}[0m /status    1.18.25\r\n";
+    // When (in synthetic elapsed time) the footer lands. Chosen past the point
+    // the base gate alone fires, which is what makes this test able to fail;
+    // the human measured the real gap at about three seconds.
+    let footer_at = Duration::from_millis(4500);
+
+    // `reads` counts every screen composition the loop asks for. It is what
+    // makes the NO-LATCH property observable (#1591 review N3): a loop that
+    // cached either answer would stop asking.
+    let run = |m: Option<ReadyMarker>, pty: u32, with_footer: bool| {
+        let pm = PtyManager::default();
+        pm.register_fake_for_test(pty, b"");
+        // The banner and input box: one paint, then silence.
+        pm.append_fake_output_for_test(pty, &vec![b'#'; 4096]);
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let printed = std::cell::Cell::new(false);
+        let reads = std::cell::Cell::new(0usize);
+        let outcome = await_cli_ready(
+            m,
+            || {
+                if with_footer && !printed.get() && clock.get() >= footer_at {
+                    pm.append_fake_output_for_test(pty, footer.as_bytes());
+                    printed.set(true);
+                }
+                pm.output_total(pty)
+            },
+            || {
+                reads.set(reads.get() + 1);
+                pm.output_tail_bounded(pty, 4096).map(|raw| strip_ansi(&raw))
+            },
+            || clock.set(clock.get() + Duration::from_millis(250)),
+            || clock.get(),
+        );
+        (outcome, clock.get(), printed.get(), reads.get())
+    };
+
+    // 1. The control that makes the rest discriminating: the SAME pane and the
+    //    SAME clock with no marker required. It is declared ready inside the
+    //    gap — i.e. the base gate really is satisfied there, so the assertion
+    //    below is about the marker and not about a fixture that never settles.
+    let (base, base_at, _, base_reads) = run(None, 6591, true);
+    assert_eq!(base_reads, 0, "a None row must never compose a screen at all");
+    assert_eq!(base, ReadyWait::Ready, "the base gate is satisfied during the gap — that is the bug");
+    assert!(
+        base_at < footer_at,
+        "the control must land BEFORE the footer or it proves nothing: ready at {base_at:?}"
+    );
+
+    // 2. opencode's row: ready only AFTER the footer.
+    let (marked, marked_at, printed, marked_reads) = run(marker, 6592, true);
+    assert_eq!(marked, ReadyWait::Ready, "the footer is the go signal — the wait must end on it");
+    // The PROPERTY, asserted before the fixture control below it. Order matters
+    // here and is not stylistic: with the marker check removed this wait ends
+    // at the quiet point, which makes BOTH this and `printed` false — and a red
+    // that lands on the fixture control reports "the fixture must actually have
+    // printed the footer", which reads as a broken test rather than as the
+    // defect. A red evidences only the assertion it reached.
+    assert!(
+        marked_at > footer_at,
+        "readiness must not be declared before the MCP footer: ready at {marked_at:?}, footer at {footer_at:?}"
+    );
+    // The fixture control, kept: it is what rules out a footer that never
+    // landed at all (which would reach the assertion above via the ceiling).
+    assert!(printed, "the fixture must actually have printed the footer");
+
+    // 3. A boot that never prints it waits out the ceiling and is pasted into
+    //    knowingly — the TimedOut path, unchanged by this issue. This is the
+    //    one direction the marker is allowed to fail in.
+    let (never, never_at, printed_never, never_reads) = run(marker, 6593, false);
+    assert!(!printed_never, "this arm must never print the footer");
+    assert_eq!(
+        never,
+        ReadyWait::TimedOut,
+        "an opencode boot whose footer never arrives must reach the ceiling rather than be \
+         declared ready — and TimedOut is what the audit records"
+    );
+    assert!(
+        never_at >= Duration::from_secs(25),
+        "and it must be the CEILING it reached, not an early exit: {never_at:?}"
+    );
+
+    // NO LATCH (#1591 review N3): the screen is re-read on every tick that
+    //    reaches it. The marked arm reads more than once — the loop kept asking
+    //    across the whole quiet-to-footer window instead of caching the first
+    //    negative — and the never-footer arm below keeps asking to the ceiling.
+    //    A loop that latched EITHER answer would stop at one.
+    assert!(
+        marked_reads > 1,
+        "the marker must be re-read each tick, not cached: {marked_reads} composition(s)"
+    );
+    assert!(
+        never_reads > 10,
+        "a negative must never be cached either — the loop must keep asking to the \
+         ceiling: {never_reads} composition(s)"
+    );
+
+    // 4. Every other CLI is untouched — read from the table rather than
+    //    asserted as a literal, so a row that grows a marker fails HERE instead
+    //    of silently changing a claude pane's boot.
+    for cli in ["claude", "copilot", "gemini"] {
+        assert_eq!(
+            cli_caps(cli).unwrap().ready_marker,
+            None,
+            "{cli} must keep the pre-#1591 gate: no marker in its row"
+        );
+    }
+}
+
+/// #1591: the marker is a SHAPE — a count — and neither a particular number nor
+/// a bare label.
+///
+/// Both halves matter and fail in opposite directions. Requiring the digit is
+/// what stops a line that merely NAMES MCP — a menu row, a `/mcp` help line,
+/// the word sitting in a brief the pane is echoing — from releasing the paste
+/// early. Not requiring a PARTICULAR digit is what stops loomux waiting on a
+/// number it would have to keep in step with the CLI's own bookkeeping: the
+/// footer counts the servers connected so far, so it moves during the
+/// handshake.
+#[test]
+fn the_ready_marker_matches_a_count_not_a_label() {
+    let m = ReadyMarker::CountThen(" MCP");
+
+    // The observed footer, after the strip.
+    assert!(m.matches("\u{2299} 2 MCP /status    1.18.25"));
+    // Any count will do — one server connected is the CLI being up.
+    assert!(m.matches("\u{2299} 1 MCP"));
+    // Including a number loomux never configured, which is the point of not
+    // comparing against one.
+    assert!(m.matches("\u{2299} 17 MCP /status"));
+
+    // The label alone is not the marker: pasting on it is the bug.
+    assert!(!m.matches("\u{2299} MCP /status    1.18.25"));
+    assert!(!m.matches("no MCP servers configured"));
+    // A digit that is not adjacent does not count either.
+    assert!(!m.matches("2 servers, MCP pending"));
+    // Nothing at all.
+    assert!(!m.matches(""));
+    assert!(!m.matches("\u{2299} opencode  /help    1.18.25"));
+
+    // Every occurrence is examined, not just the first — the row carries other
+    // text, and a leading un-counted copy must not veto a counted one.
+    assert!(m.matches("MCP: starting ...  \u{2299} 2 MCP"));
+
+    // #1591 review N2: ZERO counts, deliberately. A printed count is a
+    // COMPLETED handshake, which is the thing the gate actually needs to know;
+    // it is not a claim that any server came up. The one loomux configures can
+    // fail (port taken, token rejected, timeout) and the pane is still reading.
+    // Pinned so the intent is a decision rather than an accident of the digit
+    // test — the surfaces used to say "the first connected server", which is
+    // not what this does.
+    assert!(m.matches("\u{2299} 0 MCP /status    1.18.25"));
+
+    // #1591 review N3, the EARLY-match direction: a boot line that carries the
+    // shape before the input box is live. Without the prose rule these release
+    // the paste into exactly the gap #1591 exists to close, and the gate
+    // silently degrades to its pre-#1591 behaviour with every test still green.
+    assert!(!m.matches("1 MCP server connecting..."));
+    assert!(!m.matches("2 MCP servers starting"));
+    assert!(!m.matches("\u{2299} 3 MCP servers failed to connect"));
+    // opencode's own /status dialog, which a human can summon at any time:
+    // `{Object.keys(sync.data.mcp).length} MCP Servers` renders the CONFIGURED
+    // count -- a different number under a label-shaped caption. Rejected by the
+    // word rule reading EITHER case, which is why it is not lowercase-only.
+    assert!(!m.matches("2 MCP Servers"));
+    // The rule is about PROSE, not about length: a count followed by anything
+    // that is not a lowercase word still reads as a label.
+    assert!(m.matches("\u{2299} 2 MCP  /status"));
+    assert!(m.matches("\u{2299} 2 MCP | 1.18.25"));
+
+    // THE RESIDUAL, pinned rather than merely disclosed (see
+    // `doc/design/opencode.md`). The prose rule separates a label from a
+    // sentence; it cannot separate the FOOTER's label from a label-shaped
+    // string anywhere else on the rendered screen. This is the blind spot, and
+    // it is asserted so the disclosure cannot go stale silently: if a later
+    // narrowing closes it, this assertion reddens and the note gets corrected
+    // in the same commit.
+    // The real instance, not a hypothetical: opencode ships a second
+    // `N MCP`-shaped string whose number means something ELSE — the session
+    // footer's connected count, rendered with no trailing word
+    // (`routes/session/footer.tsx`, `{mcp()} MCP`). It is a genuine
+    // readiness signal too, so matching it is right; it is pinned here because
+    // the note claims the marker is the HOME footer and this says what else
+    // satisfies it.
+    assert!(m.matches("\u{2022} 2 LSP  \u{2022} 2 MCP"));
+    // And the residual the word rule cannot reach: any label-shaped count that
+    // is not followed by a word. Asserted so the disclosure in
+    // `doc/design/opencode.md` cannot go stale silently — a later narrowing
+    // that closes this reddens here and the note is corrected in the same
+    // commit.
+    assert!(
+        m.matches("Loaded 3 MCP"),
+        "the word rule separates a label from a sentence, never the FOOTER's \
+         label from any other label — the note says so, and this is that residual"
+    );
+
+    // The raw wire form, which is why the caller strips: the same bytes, the
+    // opposite answer.
+    let raw = "\u{1b}[36m\u{2299} \u{1b}[1m2\u{1b}[0m MCP\u{1b}[0m /status";
+    assert!(!m.matches(raw), "unstripped, the digit and the label are not adjacent");
+    assert!(m.matches(&strip_ansi(raw.as_bytes())), "stripped, they are");
+}
+
+/// #1591: the composition — a marker ADDS an obligation and never removes one.
+///
+/// Written as all four crossings of {base satisfied} x {marker seen}, plus the
+/// no-marker column, so "require everything" and "require nothing" each fail
+/// here rather than passing one arm apiece.
+#[test]
+fn a_ready_marker_can_only_ever_delay_a_paste() {
+    let s = Duration::from_secs;
+    let ms = Duration::from_millis;
+    let m = Some(ReadyMarker::CountThen(" MCP"));
+
+    // No marker in the row: exactly `cli_ready`, both ways.
+    assert!(cli_ready_with_marker(4096, s(2), s(3), None, false));
+    assert!(!cli_ready_with_marker(4096, ms(100), s(3), None, true));
+
+    // With a marker: base AND marker.
+    assert!(cli_ready_with_marker(4096, s(2), s(3), m, true));
+    assert!(!cli_ready_with_marker(4096, s(2), s(3), m, false), "marker outstanding, so not ready");
+    assert!(
+        !cli_ready_with_marker(4096, ms(100), s(3), m, true),
+        "a seen marker must NOT excuse a pane that is still painting — the base test stands"
+    );
+    assert!(!cli_ready_with_marker(0, s(5), s(5), m, true), "nor an unpainted one");
+    assert!(!cli_ready_with_marker(4096, ms(100), s(3), m, false));
+}
+
+/// #1591 review D1: the production sampler's own decisions, on rendered-screen
+/// fixtures.
+///
+/// The headline change of the previous round — read the SCREEN, not the ring —
+/// lived entirely in a closure inside `deliver_now`, so reverting it reddened
+/// nothing: every loop test injects its own sampler. `ready_screen` is that
+/// closure's pure half, and this is the test that makes the choice falsifiable.
+///
+/// **Arms 1 and 2 are also premortem 2's pin** (#1591 review round 4). A
+/// separate `the_marker_is_read_off_the_rendered_screen_not_the_byte_ring` used
+/// to assert the same property one level lower — `render_visible` and
+/// `strip_ansi` called directly, on a byte-identical fixture. Those are exactly
+/// the two branches `ready_screen` dispatches between, so that test could not
+/// fail unless one of these arms already had, and no mutation reddened it. A
+/// test nothing can redden is a decoration, so it was folded in here rather
+/// than kept: the property it named is arms 1-2, and the D1 mutation
+/// (`ready_screen` ignoring geometry) is what witnesses it.
+///
+/// The fixture is deliberately painted LABEL-FIRST with an absolute cursor move
+/// between the segments: a TUI repaints segments in whatever order its layout
+/// walks them, so the byte log preserves that order and the screen does not.
+/// Kept ASCII so the assertion is about adjacency rather than glyph width.
+#[test]
+fn ready_screen_prefers_the_grid_and_falls_back_only_when_it_must() {
+    let m = ReadyMarker::CountThen(" MCP");
+    // The footer painted label-first with a cursor move between the segments:
+    // adjacent on the screen, not in the stream.
+    let split_paint = concat!(
+        "\u{1b}[2J\u{1b}[H",
+        "opencode\r\n",
+        "\u{1b}[2;2H MCP /status",
+        "\u{1b}[2;1H2",
+    )
+    .as_bytes();
+
+    // 1. With geometry, the grid is used — and it is the reading that finds the
+    //    marker. This is the assertion that reddens if production reverts to
+    //    stripping the ring.
+    let grid = ready_screen(split_paint, Some((40, 4)));
+    assert!(m.matches(&grid), "the composed screen shows the footer: {grid:?}");
+
+    // 2. Without geometry there is no grid to compose, so the ring is read.
+    //    Asserted as a DIFFERENT string, not merely as a non-panic: the two
+    //    branches must be distinguishable or arm 1 proves nothing about which
+    //    one ran.
+    let ring = ready_screen(split_paint, None);
+    assert_ne!(grid, ring, "the two branches must not produce the same reading");
+    assert!(
+        !m.matches(&ring),
+        "the fallback cannot see this footer — that is the cost it is chosen \
+         despite, and the reason geometry is preferred: {ring:?}"
+    );
+
+    // 3. The SECOND fallback trigger, which the surfaces used not to name: the
+    //    replay composed too few non-empty rows to be trustworthy, so geometry
+    //    being present is not on its own enough.
+    let one_row = b"only one row";
+    let thin = ready_screen(one_row, Some((40, 4)));
+    assert_eq!(
+        thin,
+        ready_screen(one_row, None),
+        "an untrustworthy composition must read exactly as no composition"
+    );
+
+    // 4. A screen with no marker on it stays unmatched through both branches —
+    //    the control that stops arms 1-3 passing on a matcher that says yes to
+    //    everything.
+    let bare = concat!("\u{1b}[2J\u{1b}[H", "opencode\r\n", "ready\r\n").as_bytes();
+    assert!(!m.matches(&ready_screen(bare, Some((40, 4)))));
+    assert!(!m.matches(&ready_screen(bare, None)));
+
+    // 5. A model name carrying the literal is not a count, at either branch.
+    let modelname = concat!("\u{1b}[2J\u{1b}[H", "model: gpt-4 MCPx\r\nready\r\n").as_bytes();
+    assert!(!m.matches(&ready_screen(modelname, Some((40, 4)))));
+}
+
+/// #1591 review D2: a footer that WRAPS between the count and its label.
+///
+/// The composed screen right-trims rows and joins with `\n`, so a row-wise
+/// search sees ` MCP` preceded by a newline and misses a footer the human
+/// plainly reads. It happens at a pane width, and loomux tiles panes, so the
+/// width is a continuum a human drags through — this must not be a silent
+/// 25-second ceiling on every kickoff at some widths.
+#[test]
+fn a_footer_that_wraps_between_the_count_and_its_label_still_matches() {
+    let m = ReadyMarker::CountThen(" MCP");
+    // One footer, two widths. Wide enough and it sits on one row; at exactly
+    // ten columns the same bytes break between the count and its label, which
+    // is the case this test exists for. The prefix is sized so the break lands
+    // there — a width picked without checking splits the LABEL instead, and the
+    // two sanity assertions below are what caught exactly that.
+    let footer =
+        concat!("\u{1b}[2J\u{1b}[H", "boot\r\n", "opencode 2 MCP /status\r\n").as_bytes();
+
+    let wide = ready_screen(footer, Some((40, 6)));
+    assert!(m.matches(&wide), "unwrapped, on one row: {wide:?}");
+
+    let narrow = ready_screen(footer, Some((10, 8)));
+    // TWO sanity assertions, because "it wrapped" and "it wrapped HERE" are
+    // different claims and only the second makes this test about anything.
+    assert!(
+        narrow.lines().any(|l| l.starts_with(" MCP")),
+        "the label must begin a row — i.e. the break fell between the count and \
+         the label: {narrow:?}"
+    );
+    assert!(
+        !narrow.lines().any(|l| l.contains("2 MCP")),
+        "and no single row may hold both, or a row-wise search would find it and \
+         the join would be untested: {narrow:?}"
+    );
+    assert!(
+        m.matches(&narrow),
+        "a wrapped footer is still a footer — the row pair must be joined: {narrow:?}"
+    );
+
+    // The control: joining pairs must not turn the WORD rule off. The same
+    // wrap, with prose after the label, still refuses — the word it is judged
+    // on rides along inside the joined pair.
+    let prose =
+        concat!("\u{1b}[2J\u{1b}[H", "boot\r\n", "opencode 2 MCP servers up\r\n").as_bytes();
+    let prose_narrow = ready_screen(prose, Some((10, 8)));
+    assert!(
+        !m.matches(&prose_narrow),
+        "the wrap handling must not smuggle a boot line past the word rule: \
+         {prose_narrow:?}"
+    );
+
+    // And the control that the pair join is not simply matching everything:
+    // two adjacent rows that do not form the shape stay unmatched.
+    let unrelated = concat!("\u{1b}[2J\u{1b}[H", "loaded 3\r\nsomething else\r\n").as_bytes();
+    assert!(!m.matches(&ready_screen(unrelated, Some((40, 4)))));
+}
+
+/// #1591 review N3: a boot line carrying the marker's shape, on a pane that has
+/// gone quiet before its input loop is live, must NOT release the kickoff.
+///
+/// This is the failure mode the whole fix would otherwise reproduce through its
+/// own new mechanism: match a decoy, treat the pane as ready, and paste into
+/// exactly the gap #1591 describes. The fixture is deliberately the hardest
+/// version — the decoy is on screen AT the quiet point, which is the only
+/// moment the gate ever looks.
+#[test]
+fn a_decoy_boot_line_does_not_release_the_kickoff() {
+    let marker = cli_caps("opencode").expect("opencode has a capability row").ready_marker;
+    let decoy = "1 MCP server connecting...\r\n";
+    let footer = "\u{2299} 2 MCP /status    1.18.25\r\n";
+    let footer_at = Duration::from_millis(6000);
+
+    let pm = PtyManager::default();
+    let pty = 6594u32;
+    pm.register_fake_for_test(pty, b"");
+    // Paint, then the decoy, then silence — so the base gate is satisfied with
+    // the decoy sitting in the pane and nothing else happening.
+    pm.append_fake_output_for_test(pty, &vec![b'#'; 4096]);
+    pm.append_fake_output_for_test(pty, decoy.as_bytes());
+
+    let clock = std::cell::Cell::new(Duration::ZERO);
+    let printed = std::cell::Cell::new(false);
+    let outcome = await_cli_ready(
+        marker,
+        || {
+            if !printed.get() && clock.get() >= footer_at {
+                pm.append_fake_output_for_test(pty, footer.as_bytes());
+                printed.set(true);
+            }
+            pm.output_total(pty)
+        },
+        || pm.output_tail_bounded(pty, 4096).map(|raw| strip_ansi(&raw)),
+        || clock.set(clock.get() + Duration::from_millis(250)),
+        || clock.get(),
+    );
+
+    assert_eq!(outcome, ReadyWait::Ready, "the REAL footer still releases the paste");
+    // The PROPERTY first, the fixture control below it. Removing the word rule
+    // makes BOTH false — the decoy releases at the quiet point, so the run ends
+    // before the real footer is ever printed — and a red landing on `printed`
+    // reports "the fixture must have reached the real footer", which reads as a
+    // broken test rather than as the defect. A red evidences only the assertion
+    // it reached. (The same ordering, for the same reason, as the arm in
+    // `an_opencode_boot_is_not_ready_until_its_mcp_footer_appears`.)
+    assert!(
+        clock.get() > footer_at,
+        "the decoy released the kickoff: ready at {:?}, real footer at {footer_at:?}",
+        clock.get()
+    );
+    assert!(printed.get(), "the fixture must have reached the real footer");
+
+    // The control that makes this test about the DECOY rather than about the
+    // clock: the identical fixture with the decoy replaced by a real footer is
+    // ready as soon as it goes quiet, far below `footer_at`.
+    let pm2 = PtyManager::default();
+    pm2.register_fake_for_test(6595, b"");
+    pm2.append_fake_output_for_test(6595, &vec![b'#'; 4096]);
+    pm2.append_fake_output_for_test(6595, footer.as_bytes());
+    let clock2 = std::cell::Cell::new(Duration::ZERO);
+    let early = await_cli_ready(
+        marker,
+        || pm2.output_total(6595),
+        || pm2.output_tail_bounded(6595, 4096).map(|raw| strip_ansi(&raw)),
+        || clock2.set(clock2.get() + Duration::from_millis(250)),
+        || clock2.get(),
+    );
+    assert_eq!(early, ReadyWait::Ready);
+    assert!(
+        clock2.get() < footer_at,
+        "a real footer at the quiet point IS the go signal — otherwise the test \
+         above would pass on a gate that never releases anything: {:?}",
+        clock2.get()
+    );
 }
 
 #[test]

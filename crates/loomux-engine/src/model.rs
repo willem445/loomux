@@ -335,6 +335,172 @@ impl Containment {
 /// list by `supported_clis_match_the_capability_table`.
 pub const SUPPORTED_CLIS: [&str; 4] = ["claude", "copilot", "gemini", "opencode"];
 
+/// A per-CLI **ready marker** (#1591) — a shape the CLI's own output takes
+/// once it is genuinely able to accept typed input, for a CLI whose painted
+/// UI arrives well before that point.
+///
+/// This exists because the generic boot gate ([`CliCaps::ready_marker`]'s own
+/// doc for the mechanism) is *painted and quiet*, and that pair is a proxy:
+/// it asks whether the CLI has stopped writing, not whether it has started
+/// reading. A TUI that draws its whole chrome, goes quiet, and only then
+/// finishes connecting its MCP servers and its provider auth defeats the
+/// proxy without doing anything wrong.
+///
+/// **Data, not a special case** (CLAUDE.md constraint 8), the same argument
+/// [`CliCaps`] itself makes: "this vendor's TUI says it is up by printing X"
+/// is a fact about the vendor, written down once in its row and consulted —
+/// never an `if cli == "..."` at the gate.
+///
+/// One variant today, and it is a SHAPE rather than a literal on purpose: the
+/// count in opencode's footer is the number of MCP servers that have
+/// connected so far, so it moves while the handshake completes and can lag
+/// what loomux configured. Matching the shape means the marker fires on the
+/// first connected server rather than waiting for a number loomux would have
+/// to keep in step with the CLI's own bookkeeping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyMarker {
+    /// An ASCII digit immediately followed by this literal — a COUNT of
+    /// something the CLI reports only once that thing is up.
+    CountThen(&'static str),
+}
+
+impl ReadyMarker {
+    /// Does `screen` — the pane's RENDERED rows, see the caller — show this
+    /// marker?
+    ///
+    /// **Rendered, not the raw byte ring.** A status footer is the most
+    /// cursor-positioned region of a TUI: a repaint may write the count and its
+    /// label with separate absolute cursor moves, so in the byte stream they
+    /// need never be adjacent even though the human plainly sees `2 MCP`. Only
+    /// a VT replay puts them in neighbouring CELLS. An ANSI-stripped ring read
+    /// is the caller's FALLBACK when no trustworthy composition exists, not the
+    /// primary reading.
+    ///
+    /// **A WRAP is a second, different problem, and the replay alone does not
+    /// fix it** (#1591 review D2). When the footer is wider than the pane, the
+    /// count can end one rendered row and the label begin the next; the composed
+    /// screen right-trims rows and joins them with `\n`, so ` MCP` is preceded
+    /// by a newline rather than by the digit and a row-wise search misses it —
+    /// on every kickoff, at that pane width. Since loomux tiles panes, that
+    /// width is a continuum a human drags through, so this is handled rather
+    /// than disclosed: each ADJACENT ROW PAIR is also tested, joined. See
+    /// [`Self::matches_row_pairs`] for what that costs and what it lets in.
+    ///
+    /// Two conditions, and each closes one direction of failure:
+    ///
+    /// - **A digit immediately before the literal.** Without it the bare label
+    ///   releases the paste — a menu row, a `/mcp` help line, the word sitting
+    ///   in a brief the pane is echoing back.
+    /// - **The literal is not followed by a WORD** (#1591 review N3): after any
+    ///   run of spaces, the next character must not be an ASCII letter. A count
+    ///   is a LABEL — `2 MCP` at a row's end, or `2 MCP /status` — where a boot
+    ///   line is a sentence (`1 MCP server connecting...`) and opencode's own
+    ///   `/status` dialog is a caption over a DIFFERENT number
+    ///   (`{...length} MCP Servers`, the configured count, not the connected
+    ///   one). Without this, either satisfies the marker and the gate degrades
+    ///   to exactly the pre-#1591 behaviour it exists to fix.
+    ///
+    /// Both conditions can only ever REFUSE, so a vendor whose footer this
+    /// misreads waits out `READY_MAX_WAIT` — the direction the design note
+    /// argues is safe — and never releases a paste early. The residual the
+    /// label rule does NOT close (a label-shaped decoy elsewhere on the
+    /// rendered screen) is stated in `doc/design/opencode.md`.
+    ///
+    /// Every occurrence of the literal is examined, not just the first: the
+    /// footer this was written for carries other text on the same row, and a
+    /// row that happens to contain the label twice must not be decided by
+    /// whichever copy came first.
+    pub fn matches(self, screen: &str) -> bool {
+        self.matches_flat(screen) || self.matches_row_pairs(screen)
+    }
+
+    /// The marker inside one contiguous run of text — the whole screen, or one
+    /// joined row pair. Both conditions from [`Self::matches`]'s doc.
+    fn matches_flat(self, text: &str) -> bool {
+        let Self::CountThen(lit) = self;
+        if lit.is_empty() {
+            return false; // an empty literal matches everywhere, which is not a marker
+        }
+        let bytes = text.as_bytes();
+        let mut from = 0usize;
+        while let Some(off) = text[from..].find(lit) {
+            let at = from + off;
+            let counted = at > 0 && bytes[at - 1].is_ascii_digit();
+            if counted && !followed_by_a_word(&text[at + lit.len()..]) {
+                return true;
+            }
+            // Resume past this occurrence. `at + lit.len()` is always a char
+            // boundary (it is the end of a matched substring), where `at + 1`
+            // would not be for a non-ASCII literal.
+            from = at + lit.len();
+        }
+        false
+    }
+
+    /// The WRAPPED footer (#1591 review D2): the count ending one rendered row
+    /// and the label beginning the next. Every adjacent pair is joined with no
+    /// separator and re-tested, which is exactly the string the two rows would
+    /// have been had the pane been one column wider.
+    ///
+    /// **Why pairs rather than a geometry test.** "This row wrapped" is
+    /// properly "this row filled every column", and the composed screen has
+    /// already right-trimmed its rows, so the width is no longer recoverable
+    /// from the text — and a wide glyph makes a character count disagree with a
+    /// cell count anyway. Joining pairs needs neither fact.
+    ///
+    /// **What it lets in, stated because it only ever ADDS matches.** Two rows
+    /// that merely happen to sit next to each other — one ending in a digit,
+    /// the next beginning ` MCP` — read as a wrap. That shape is narrow, and
+    /// the word rule still applies to whatever follows, so the surviving case
+    /// is a label-shaped count split across two unrelated rows. It is the same
+    /// residual class the design note already carries for `Loaded 3 MCP`, and
+    /// it is bounded the same way: a false marker can only ever release a paste
+    /// the base painted-and-quiet test had already approved.
+    ///
+    /// Only pairs, never longer runs: a footer segment that wrapped across
+    /// three rows would have to be under about six columns wide to split a
+    /// four-character label twice.
+    fn matches_row_pairs(self, screen: &str) -> bool {
+        let mut rows = screen.lines();
+        let Some(mut prev) = rows.next() else { return false };
+        for row in rows {
+            // Only pairs that could possibly gain an adjacency are built, so an
+            // ordinary screen allocates nothing.
+            if prev.ends_with(|c: char| c.is_ascii_digit()) {
+                let mut joined = String::with_capacity(prev.len() + row.len());
+                joined.push_str(prev);
+                joined.push_str(row);
+                if self.matches_flat(&joined) {
+                    return true;
+                }
+            }
+            prev = row;
+        }
+        false
+    }
+}
+
+/// Does `rest` — whatever follows a matched marker literal — begin a WORD
+/// rather than end a label? (#1591 review N3.)
+///
+/// Spaces are skipped first, so `2 MCP /status` and `2 MCP` at a row's end
+/// both read as labels. A newline is not a letter, so the common case — the
+/// count sitting at the end of its own rendered row — needs no special case.
+///
+/// **Either case**, which is the half that earns its keep. Lowercase alone
+/// rejects the boot-line shape (`1 MCP server connecting...`) and accepts
+/// opencode's own `/status` dialog, which renders `{...length} MCP Servers`
+/// from the CONFIGURED count — a label-shaped string carrying a number that
+/// means something else entirely, on a screen a human can summon at any time.
+/// Rejecting any following letter covers both.
+///
+/// Deliberately ASCII-only and deliberately crude: this is a REFUSAL
+/// heuristic, and every reading it gets wrong costs the ceiling's wait rather
+/// than a released paste.
+fn followed_by_a_word(rest: &str) -> bool {
+    rest.trim_start_matches(' ').chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
 /// What loomux can actually make one agent CLI do — **the per-CLI capability
 /// record** (#267 stage 2).
 ///
@@ -407,6 +573,27 @@ pub struct CliCaps {
     /// How this CLI's context window is (or is not) reachable. Always
     /// non-empty.
     pub context_note: &'static str,
+    /// A shape this CLI's output takes once it can actually accept typed
+    /// input, required IN ADDITION to the generic painted-and-quiet boot gate
+    /// before loomux pastes a kickoff into a freshly spawned pane (#1591).
+    /// `None` — every row but opencode's — leaves that pane's gate exactly
+    /// what it was.
+    ///
+    /// **Why a marker at all.** The generic gate waits for the pane to have
+    /// painted (`READY_MIN_OUTPUT`) and then gone quiet (`READY_QUIET`),
+    /// which is a proxy for "the CLI has attached its stdin reader". The
+    /// proxy holds for a CLI that paints once it is up, and fails for one
+    /// that paints its whole UI first and finishes coming up afterwards —
+    /// the paste then lands in a startup buffer, and the human sees an idle
+    /// agent with an empty box.
+    ///
+    /// **The bound, and which way it fails.** A marker only ever WITHHOLDS a
+    /// paste, and only until `READY_MAX_WAIT`; the ceiling is untouched, so a
+    /// CLI that changes its footer costs the ceiling's wait and is then pasted
+    /// into exactly as it is today (audited as `TimedOut`, never silently).
+    /// It cannot lose a delivery, and it cannot make one wait longer than the
+    /// pre-#1591 worst case.
+    pub ready_marker: Option<ReadyMarker>,
 }
 
 /// The closed vocabulary of a block's `effort:` (#687) — the thinking level.
@@ -500,6 +687,9 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "--effort <level> is a session-scoped flag; a model that lacks a level falls back to the highest one it supports at or below it",
         context_variants: CONTEXT_VARIANTS,
         context_note: "the [1m] model-alias suffix (sonnet[1m]) — access is plan- and credit-gated, so a tier the account cannot serve fails at the CLI, visibly in the pane",
+        // Claude Code's box is live from its first paint; the generic
+        // painted-and-quiet gate has never mis-scored it (#1591).
+        ready_marker: None,
     },
     CliCaps {
         cli: "copilot",
@@ -511,6 +701,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "copilot reads effortLevel from ~/.copilot/settings.json — its programmatic reference documents no flag and no environment variable, and loomux never writes a user's global settings file",
         context_variants: &[],
         context_note: "copilot's context window is an interactive-only control (/context) with no argv or settings equivalent",
+        // Copilot's own delivery quirk is focus-gated KEYS, not a late input
+        // loop — closed by the focus-in prefix on the submit bytes (#98), not
+        // by waiting longer (#1591).
+        ready_marker: None,
     },
     CliCaps {
         cli: "gemini",
@@ -522,6 +716,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "gemini's thinking level is a settings-file key (modelConfigs.aliases.<alias>.thinkingConfig) — the generated-settings seam exists, but the schema is unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "gemini's context window is model-determined; its compression knobs (model.compressionThreshold) are compaction, not window size",
+        // No mis-scored delivery observed on gemini, and no marker was
+        // adopted speculatively: a row gets one when a pane on it is caught
+        // painted-but-not-listening (#1591).
+        ready_marker: None,
     },
     CliCaps {
         cli: "opencode",
@@ -538,6 +736,32 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "opencode's reasoning effort is a model VARIANT: a session flag on `opencode run` (--variant) but absent from the TUI loomux spawns, and settable per-agent in loomux's generated config (agent.<name>.variant, observed values minimal|high|max) — the seam exists, but the per-model vocabulary is provider-specific and unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "opencode's context window is model-determined; no session-scoped variant switch is documented or present in the TUI's options",
+        // #1591: opencode's TUI paints its banner and input box (far past
+        // `READY_MIN_OUTPUT`) and goes quiet while its MCP status is still
+        // being fetched, so the generic gate calls it ready before it is
+        // reading — observed on five deliveries in one session.
+        //
+        // The marker is the home footer's MCP segment, `⊙ 2 MCP /status`.
+        // Read off the vendor's source rather than inferred from the
+        // observation (`anomalyco/opencode`, tag v1.18.25 =
+        // cb7d8b2f5e44876ef98b661dc10590c915af3a9f):
+        // `packages/tui/src/feature-plugins/home/footer.tsx` renders
+        // `{count()} MCP`, and `packages/tui/src/context/sync.tsx` initialises
+        // `mcp: {}` and fills it from `sdk.client.mcp.status()` in the
+        // NON-BLOCKING tail of `bootstrap()` — after `store.status` has left
+        // `"loading"`, which is the same `ready()` the prompt box renders
+        // under. So the segment cannot precede the input box. See
+        // `doc/design/opencode.md`'s Readiness section for the premise, its
+        // falsifier, and what a third-party footer plugin does to it.
+        //
+        // Matched as a SHAPE (a digit, then " MCP") rather than against a
+        // number loomux could compute from its own config: the digit is the
+        // CONNECTED count while the segment is gated on the CONFIGURED list
+        // being non-empty, so `0 MCP` is a real and SETTLED rendering (the
+        // `McpStatus` union has no "connecting" member) — and it is still
+        // proof the handshake finished, which is the only thing this gate
+        // needs to know.
+        ready_marker: Some(ReadyMarker::CountThen(" MCP")),
     },
     CliCaps {
         cli: "codex",
@@ -549,6 +773,8 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
         context_variants: &[],
         context_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
+        // codex is never spawned, so nothing ever waits on its boot.
+        ready_marker: None,
     },
 ];
 
