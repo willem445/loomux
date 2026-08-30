@@ -424,8 +424,11 @@ against the previous rebase's target, 61/258+ against the merge base (#1324).
 The section above fixes the baseline for ONE measurement. *Did this rebase change my patch?* is
 not that question, and `git diff <old-head> <new-head>` does not ask it: it reports everything
 the **new base** absorbed, so a rebase that replayed your work untouched still prints that base's
-own commits. Measured on #1755 (`fb48d73a` rebased to `fe3cf20e` onto `baaa2d9e`), where the PR
-itself changed neither file by a byte:
+own commits. Measured on #1755 (`fb48d73a` rebased to `fe3cf20e` onto `baaa2d9e`), where the
+rebase left the PR's own content byte-identical in both files — `SKILL.md` included, which the PR
+itself edits by 8 lines. Those two SHAs are the pre- and post-rebase heads of the since-deleted
+branch `ci/1685-scratch-matrix`, so they resolve only where a stale ref survives; the merged
+squash is `a3ba6e48` and `refs/pull/1755/head` is `7a913855`:
 
 ```sh
 git diff --stat fb48d73a fe3cf20e
@@ -450,9 +453,10 @@ did not touch, kept a byte-identical patch — so a naive `diff` of the two fals
 the case it was reached for. Strip those two line kinds, or use `range-diff`.
 
 An `=` from `range-diff` **outranks** a raw head-to-head diff that disagrees; they are answers to
-different questions, not two opinions on one. Signature: a blocking finding citing insertions in a
-file the PR never touched, recorded beside a `range-diff` the same review already ran and got `=`
-on (#1755, raised in review round 2 and corrected in round 3).
+different questions, not two opinions on one. Signature: a blocking finding citing insertions the
+rebase absorbed from the new base — in a file your patch also touches, or one it does not —
+recorded beside a `range-diff` the same review already ran and got `=` on (#1755: +14 in
+`SKILL.md`, a file the PR's own patch edits by 8 lines; raised in round 2, corrected in round 3).
 
 ### `gh pr diff --patch` is the wrong instrument for a diffstat
 

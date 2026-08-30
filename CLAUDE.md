@@ -706,11 +706,14 @@ narrow their ask back down to the original ticket on your own judgment.
   against the real merge base; recipe in `.claude/skills/ci-validate/SKILL.md`).
   **A rebase-NEUTRALITY claim takes a different instrument again.** `git diff <old-head>
   <new-head>` answers "what did the new base absorb", never "did my patch change" — it reports the
-  base's own commits, so a rebase that replayed perfectly still reads as a FAIL. Diff each head
-  against its OWN merge base, or read `git range-diff`, whose `=` OUTRANKS a raw diff that
-  disagrees: they answer different questions, not one question twice. Signature: a blocking finding
-  citing insertions in a file the PR never touched, recorded beside a `range-diff` the same review
-  already ran and got `=` on (#1755; recipe in `.claude/skills/ci-validate/SKILL.md`).
+  base's own commits, so a rebase that replayed perfectly still reads as a FAIL. Read
+  `git range-diff <old-base>..<old-head> <new-base>..<new-head>`, whose `=` OUTRANKS a raw diff
+  that disagrees: they answer different questions, not one question twice. (Diffing each head
+  against its OWN merge base asks the right question too, but the two patches differ on `index`
+  and hunk-header lines — strip those or you re-manufacture the false FAIL.) Signature: a blocking
+  finding citing insertions the rebase absorbed from the new base — in a file your patch also
+  touches, or one it does not — recorded beside a `range-diff` the same review already ran and got
+  `=` on (#1755; recipe in `.claude/skills/ci-validate/SKILL.md`).
 - **A sweep is dated to the base it was run on.** A rename or purge is complete only
   against the tree it was grepped on: a rebase replays your patches but not your grep,
   and work merged meanwhile authors fresh instances of the string you removed — a live
