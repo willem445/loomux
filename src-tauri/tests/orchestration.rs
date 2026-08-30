@@ -129,6 +129,7 @@ use loomux_lib::orchestration::{
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
+    cli_ready_with_marker, ReadyMarker,
     redelivery_treatment, KickoffTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     failed_arm_route, FailedArmRoute,
@@ -28780,10 +28781,14 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
     let chunk = vec![b'x'; 64 * 1024];
     let clock = std::cell::Cell::new(Duration::ZERO);
     let outcome = await_cli_ready(
+        // #1591: no marker — this test is about the SAMPLER, and a marker
+        // would add a second reason for its TimedOut that it does not mean.
+        None,
         || {
             pm.append_fake_output_for_test(pty, &chunk);
             pm.output_total(pty)
         },
+        || -> Option<String> { unreachable!("a None marker must never read the tail") },
         || clock.set(clock.get() + Duration::from_millis(250)),
         || clock.get(),
     );
@@ -28815,10 +28820,12 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
     pm_len.register_fake_for_test(3172, b"");
     let clock_len = std::cell::Cell::new(Duration::ZERO);
     let via_ring_len = await_cli_ready(
+        None,
         || {
             pm_len.append_fake_output_for_test(3172, &chunk);
             pm_len.output_tail(3172).map(|t| t.len() as u64)
         },
+        || -> Option<String> { unreachable!("a None marker must never read the tail") },
         || clock_len.set(clock_len.get() + Duration::from_millis(250)),
         || clock_len.get(),
     );
@@ -28835,11 +28842,173 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
     pm2.register_fake_for_test(4172, &vec![b'y'; 4096]);
     let clock2 = std::cell::Cell::new(Duration::ZERO);
     let ready = await_cli_ready(
+        None,
         || pm2.output_total(4172),
+        || -> Option<String> { unreachable!("a None marker must never read the tail") },
         || clock2.set(clock2.get() + Duration::from_millis(250)),
         || clock2.get(),
     );
     assert_eq!(ready, ReadyWait::Ready, "a painted, quiet pane is ready — the wait still ends");
+}
+
+/// #1591: one fake-opencode boot, driven through the REAL wait loop against a
+/// REAL `PtyManager`, with the marker taken from the REAL capability table.
+///
+/// The shape this reproduces is the one the human measured: the TUI paints its
+/// banner and input box (well past `READY_MIN_OUTPUT`) and goes quiet while its
+/// MCP servers and provider auth are still connecting, then prints the status
+/// footer carrying the MCP count once they are up. The base painted-and-quiet
+/// gate is satisfied during that gap, and pasting there is the lost kickoff.
+#[test]
+fn an_opencode_boot_is_not_ready_until_its_mcp_footer_appears() {
+    let marker = cli_caps("opencode").expect("opencode has a capability row").ready_marker;
+    assert!(marker.is_some(), "the table is what wires this — a None row makes the rest vacuous");
+
+    // The footer as observed live, coloured the way a TUI colours a count: the
+    // digit and the label are adjacent only AFTER the ANSI strip.
+    let footer = "\u{1b}[36m\u{2299} \u{1b}[1m2\u{1b}[0m MCP\u{1b}[0m /status    1.18.25\r\n";
+    // When (in synthetic elapsed time) the footer lands. Chosen past the point
+    // the base gate alone fires, which is what makes this test able to fail;
+    // the human measured the real gap at about three seconds.
+    let footer_at = Duration::from_millis(4500);
+
+    let run = |m: Option<ReadyMarker>, pty: u32, with_footer: bool| {
+        let pm = PtyManager::default();
+        pm.register_fake_for_test(pty, b"");
+        // The banner and input box: one paint, then silence.
+        pm.append_fake_output_for_test(pty, &vec![b'#'; 4096]);
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let printed = std::cell::Cell::new(false);
+        let outcome = await_cli_ready(
+            m,
+            || {
+                if with_footer && !printed.get() && clock.get() >= footer_at {
+                    pm.append_fake_output_for_test(pty, footer.as_bytes());
+                    printed.set(true);
+                }
+                pm.output_total(pty)
+            },
+            || pm.output_tail_bounded(pty, 4096).map(|raw| strip_ansi(&raw)),
+            || clock.set(clock.get() + Duration::from_millis(250)),
+            || clock.get(),
+        );
+        (outcome, clock.get(), printed.get())
+    };
+
+    // 1. The control that makes the rest discriminating: the SAME pane and the
+    //    SAME clock with no marker required. It is declared ready inside the
+    //    gap — i.e. the base gate really is satisfied there, so the assertion
+    //    below is about the marker and not about a fixture that never settles.
+    let (base, base_at, _) = run(None, 6591, true);
+    assert_eq!(base, ReadyWait::Ready, "the base gate is satisfied during the gap — that is the bug");
+    assert!(
+        base_at < footer_at,
+        "the control must land BEFORE the footer or it proves nothing: ready at {base_at:?}"
+    );
+
+    // 2. opencode's row: ready only AFTER the footer.
+    let (marked, marked_at, printed) = run(marker, 6592, true);
+    assert!(printed, "the fixture must actually have printed the footer");
+    assert_eq!(marked, ReadyWait::Ready, "the footer is the go signal — the wait must end on it");
+    assert!(
+        marked_at > footer_at,
+        "readiness must not be declared before the MCP footer: ready at {marked_at:?}, footer at {footer_at:?}"
+    );
+
+    // 3. A boot that never prints it waits out the ceiling and is pasted into
+    //    knowingly — the TimedOut path, unchanged by this issue. This is the
+    //    one direction the marker is allowed to fail in.
+    let (never, never_at, printed_never) = run(marker, 6593, false);
+    assert!(!printed_never, "this arm must never print the footer");
+    assert_eq!(
+        never,
+        ReadyWait::TimedOut,
+        "an opencode boot whose footer never arrives must reach the ceiling rather than be \
+         declared ready — and TimedOut is what the audit records"
+    );
+    assert!(
+        never_at >= Duration::from_secs(25),
+        "and it must be the CEILING it reached, not an early exit: {never_at:?}"
+    );
+
+    // 4. Every other CLI is untouched — read from the table rather than
+    //    asserted as a literal, so a row that grows a marker fails HERE instead
+    //    of silently changing a claude pane's boot.
+    for cli in ["claude", "copilot", "gemini"] {
+        assert_eq!(
+            cli_caps(cli).unwrap().ready_marker,
+            None,
+            "{cli} must keep the pre-#1591 gate: no marker in its row"
+        );
+    }
+}
+
+/// #1591: the marker is a SHAPE — a count — and neither a particular number nor
+/// a bare label.
+///
+/// Both halves matter and fail in opposite directions. Requiring the digit is
+/// what stops a line that merely NAMES MCP — a menu row, a `/mcp` help line,
+/// the word sitting in a brief the pane is echoing — from releasing the paste
+/// early. Not requiring a PARTICULAR digit is what stops loomux waiting on a
+/// number it would have to keep in step with the CLI's own bookkeeping: the
+/// footer counts the servers connected so far, so it moves during the
+/// handshake.
+#[test]
+fn the_ready_marker_matches_a_count_not_a_label() {
+    let m = ReadyMarker::CountThen(" MCP");
+
+    // The observed footer, after the strip.
+    assert!(m.matches("\u{2299} 2 MCP /status    1.18.25"));
+    // Any count will do — one server connected is the CLI being up.
+    assert!(m.matches("\u{2299} 1 MCP"));
+    // Including a number loomux never configured, which is the point of not
+    // comparing against one.
+    assert!(m.matches("\u{2299} 17 MCP /status"));
+
+    // The label alone is not the marker: pasting on it is the bug.
+    assert!(!m.matches("\u{2299} MCP /status    1.18.25"));
+    assert!(!m.matches("no MCP servers configured"));
+    // A digit that is not adjacent does not count either.
+    assert!(!m.matches("2 servers, MCP pending"));
+    // Nothing at all.
+    assert!(!m.matches(""));
+    assert!(!m.matches("\u{2299} opencode  /help    1.18.25"));
+
+    // Every occurrence is examined, not just the first — the row carries other
+    // text, and a leading un-counted copy must not veto a counted one.
+    assert!(m.matches("MCP: starting ...  \u{2299} 2 MCP"));
+
+    // The raw wire form, which is why the caller strips: the same bytes, the
+    // opposite answer.
+    let raw = "\u{1b}[36m\u{2299} \u{1b}[1m2\u{1b}[0m MCP\u{1b}[0m /status";
+    assert!(!m.matches(raw), "unstripped, the digit and the label are not adjacent");
+    assert!(m.matches(&strip_ansi(raw.as_bytes())), "stripped, they are");
+}
+
+/// #1591: the composition — a marker ADDS an obligation and never removes one.
+///
+/// Written as all four crossings of {base satisfied} x {marker seen}, plus the
+/// no-marker column, so "require everything" and "require nothing" each fail
+/// here rather than passing one arm apiece.
+#[test]
+fn a_ready_marker_can_only_ever_delay_a_paste() {
+    let s = Duration::from_secs;
+    let ms = Duration::from_millis;
+    let m = Some(ReadyMarker::CountThen(" MCP"));
+
+    // No marker in the row: exactly `cli_ready`, both ways.
+    assert!(cli_ready_with_marker(4096, s(2), s(3), None, false));
+    assert!(!cli_ready_with_marker(4096, ms(100), s(3), None, true));
+
+    // With a marker: base AND marker.
+    assert!(cli_ready_with_marker(4096, s(2), s(3), m, true));
+    assert!(!cli_ready_with_marker(4096, s(2), s(3), m, false), "marker outstanding, so not ready");
+    assert!(
+        !cli_ready_with_marker(4096, ms(100), s(3), m, true),
+        "a seen marker must NOT excuse a pane that is still painting — the base test stands"
+    );
+    assert!(!cli_ready_with_marker(0, s(5), s(5), m, true), "nor an unpainted one");
+    assert!(!cli_ready_with_marker(4096, ms(100), s(3), m, false));
 }
 
 #[test]
