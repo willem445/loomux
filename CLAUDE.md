@@ -848,9 +848,10 @@ narrow their ask back down to the original ticket on your own judgment.
   clears it while the item ABOVE has silently lost its closing paragraph. Compare WHERE `</li>`
   falls at both ends, never the `<li>` TOTAL: a new entry moves the total legitimately, and #1773
   B2 hid inside that move (slice 1 → 2, whole file 55 → 56, both the healthy +1). Anchor on the
-  NEIGHBOUR's own closing `</p>` and count the `<li` opens before it — that INDEX is the read
-  (#1773 B2: base li #1 → damaged li #2); diffing every `</li>` offset instead shifts them all
-  past any insert and reads as noise. The hazard is an insert BETWEEN entries; an append past the
+  NEIGHBOUR's own closing BLOCK TAG and count the `<li` opens before it — that INDEX is the read
+  (`</p>` in a loose list, `</li>` where it renders tight, `</pre>` where the entry ends in a
+  fence; #1773 B2: base li #1 → damaged li #2); diffing every `</li>` offset instead shifts them
+  all past any insert and reads as noise. The hazard is an insert BETWEEN entries; an append past the
   last one has no neighbour below it to re-parent — where the list ends the file. Signature: a
   re-bless entry inserted among entries that carry indented continuation paragraphs (#1196 N1,
   #1773 B2 — both `pre222/README.md`).
