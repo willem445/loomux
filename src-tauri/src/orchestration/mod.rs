@@ -419,6 +419,14 @@ pub use loomux_engine::intake;
 // delegate, and audit what comes back.
 pub use loomux_engine::{mqdriver, mqloop};
 
+// The review driver's pure core (#1778 S1) — the state machine, the persisted
+// shape and the per-tick decision, none of which touch a file or a child
+// process. Re-exported for the same reason `mqloop` is: what stays HERE is the
+// wiring — `rd_drive_group_with`, `rd_driver_tick`, the reconcile and the
+// `rd_runner_override` field — which resolves paths, spawns, delivers and
+// audits what comes back. `reviewdrive::decide` makes every decision.
+pub use loomux_engine::reviewdrive;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;
