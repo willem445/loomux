@@ -77,6 +77,7 @@ import {
   RESOURCE_MAX_HOLD_MINUTES_MAX,
   MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
   MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
+  DRIVER_DEFAULTS,
   POLICY_BOUNDS,
   type FieldBounds,
   type Workflow,
@@ -1294,7 +1295,7 @@ export class WorkflowView {
         { kind: "driver" },
         "Review driver",
         dv
-          ? `${dv.enabled ? "on" : "off"} · rounds ${dv.max_review_rounds ?? 3} · ci ${dv.max_ci_attempts ?? 3}`
+          ? `${dv.enabled ? "on" : "off"} · rounds ${dv.max_review_rounds ?? DRIVER_DEFAULTS.max_review_rounds} · ci ${dv.max_ci_attempts ?? DRIVER_DEFAULTS.max_ci_attempts}`
           : "not declared — off",
         this.sectionBad("driver")
       )
@@ -2437,12 +2438,14 @@ export class WorkflowView {
       "Enabled",
       dv?.enabled === undefined ? "not declared - off (orrerix's default)" : String(dv.enabled)
     );
-    row("Review rounds", String(dv?.max_review_rounds ?? 3));
-    row("CI attempts", String(dv?.max_ci_attempts ?? 3));
-    row("Rebase attempts", String(dv?.max_rebase_attempts ?? 1));
-    row("Lane timeout (min)", String(dv?.lane_timeout_minutes ?? 60));
-    row("Fix timeout (min)", String(dv?.fix_timeout_minutes ?? 60));
-    row("Drive timeout (min)", String(dv?.drive_timeout_minutes ?? 240));
+    // Every fallback reads `DRIVER_DEFAULTS` - the engine's `DriverPolicy::default`
+    // mirrored and manifest-pinned - rather than a literal nothing can check.
+    row("Review rounds", String(dv?.max_review_rounds ?? DRIVER_DEFAULTS.max_review_rounds));
+    row("CI attempts", String(dv?.max_ci_attempts ?? DRIVER_DEFAULTS.max_ci_attempts));
+    row("Rebase attempts", String(dv?.max_rebase_attempts ?? DRIVER_DEFAULTS.max_rebase_attempts));
+    row("Lane timeout (min)", String(dv?.lane_timeout_minutes ?? DRIVER_DEFAULTS.lane_timeout_minutes));
+    row("Fix timeout (min)", String(dv?.fix_timeout_minutes ?? DRIVER_DEFAULTS.fix_timeout_minutes));
+    row("Drive timeout (min)", String(dv?.drive_timeout_minutes ?? DRIVER_DEFAULTS.drive_timeout_minutes));
     const findings = this.sectionFindingList("driver");
     if (findings) box.append(findings);
     return box;

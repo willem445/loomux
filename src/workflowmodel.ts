@@ -699,6 +699,32 @@ export interface WorkflowDriver {
   extra?: Record<string, YamlValue>;
 }
 
+/** The driver defaults the pane RENDERS when the file omits a field - the
+ *  engine's `DriverPolicy::default`, mirrored here because this module is pure
+ *  and import-free. A literal at the point of use is a number nothing can
+ *  check: `NOTIFY_EXPIRES_DEFAULT_MIN` moves, the manifest pin forces the JSON
+ *  to follow, and a `?? 60` left behind renders a stale 60 with nothing red.
+ *  So the chrome reads THIS table, and `test/workflowschema.test.ts` pins every
+ *  entry against the manifest's declared default - engine → manifest → pane,
+ *  with no unpinned step left (#1784 review, premortem 2). */
+export const DRIVER_DEFAULTS: Readonly<{
+  enabled: boolean;
+  max_review_rounds: number;
+  max_ci_attempts: number;
+  max_rebase_attempts: number;
+  lane_timeout_minutes: number;
+  fix_timeout_minutes: number;
+  drive_timeout_minutes: number;
+}> = {
+  enabled: false,
+  max_review_rounds: 3,
+  max_ci_attempts: 3,
+  max_rebase_attempts: 1,
+  lane_timeout_minutes: 60,
+  fix_timeout_minutes: 60,
+  drive_timeout_minutes: 240,
+};
+
 /** One named lock resource (#858) — how many agents may hold it at once and for
  *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
  *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */
@@ -3318,16 +3344,21 @@ function sectionFindings(w: Workflow): Finding[] {
 
   const dv = w.driver;
   if (dv) {
-    // The INVARIANT-9 counters are REFUSED by the engine (#1778 §2.3), so an
-    // out-of-range one is an error here - a file this pane called valid would
-    // not load at all.
+    // The INVARIANT-9 counters are REFUSED by the engine (#1778 2.3), and so
+    // is a NON-INTEGER value: every driver field is a `u32`, so serde rejects
+    // `2.5` exactly as it rejects `4`. The `Number.isInteger` guard the
+    // integer-only merge_queue timeout uses would go silent on the first and
+    // bless a file the engine refuses at load - so this takes the resources
+    // `bound()` shape, which flags both in one predicate. A file this pane
+    // calls valid must load.
     const counter = (field: string, v: number | undefined, min: number, max: number): void => {
-      if (v !== undefined && Number.isInteger(v) && (v < min || v > max)) {
+      if (v === undefined) return;
+      if (!Number.isInteger(v) || v < min || v > max) {
         err(
           "driver",
           "section-out-of-range",
-          `driver.${field}: ${v} is outside ${min}-${max} - the engine refuses the whole file, ` +
-            `because a repo file may tighten INVARIANT 9 but never loosen it.`
+          `driver.${field}: ${v} must be an integer in ${min}-${max} - the engine refuses the ` +
+            `whole file, because a repo file may tighten INVARIANT 9 but never loosen it.`
         );
       }
     };
@@ -3349,14 +3380,24 @@ function sectionFindings(w: Workflow): Finding[] {
       DRIVER_MAX_REBASE_ATTEMPTS_MIN,
       DRIVER_MAX_REBASE_ATTEMPTS_MAX
     );
-    // The backstops are CLAMPED, like `checks_timeout_minutes` - a warning that
-    // says what will actually happen, not an error implying the file is broken.
+    // The backstops are CLAMPED, like `checks_timeout_minutes` - an
+    // out-of-range INTEGER is a warning that says what will actually happen,
+    // not an error implying the file is broken. But a NON-INTEGER one
+    // (`2.5`) is refused by the engine outright - the fields are `u32`, so
+    // serde rejects the type before any clamp runs - and that is an error
+    // here, by the same predicate split the counters use.
     const backstop = (field: string, v: number | undefined): void => {
-      if (
-        v !== undefined &&
-        Number.isInteger(v) &&
-        (v < DRIVER_TIMEOUT_MIN || v > DRIVER_TIMEOUT_MAX)
-      ) {
+      if (v === undefined) return;
+      if (!Number.isInteger(v)) {
+        err(
+          "driver",
+          "section-bad-value",
+          `driver.${field}: ${v} must be a whole number of minutes - the engine refuses a ` +
+            `non-integer here rather than clamping it.`
+        );
+        return;
+      }
+      if (v < DRIVER_TIMEOUT_MIN || v > DRIVER_TIMEOUT_MAX) {
         out.push({
           severity: "warning",
           code: "section-out-of-range",
@@ -3440,7 +3481,12 @@ function sectionFindings(w: Workflow): Finding[] {
  *  `KNOWN_GATE`. */
 function unknownKeyFindings(w: Workflow): Finding[] {
   const out: Finding[] = [];
-  const report = (where: string, extra: Record<string, YamlValue> | undefined, blockId?: string): void => {
+  const report = (
+    where: string,
+    extra: Record<string, YamlValue> | undefined,
+    blockId?: string,
+    section?: FindingSection
+  ): void => {
     for (const key of Object.keys(extra ?? {})) {
       out.push({
         severity: "error",
@@ -3450,6 +3496,7 @@ function unknownKeyFindings(w: Workflow): Finding[] {
           `this build's engine refuses unknown keys, so the file will not load. ` +
           `(The pane keeps the line as written; check the spelling, or the file needs a newer orrerix.)`,
         blockId,
+        section,
       });
     }
   };
@@ -3458,6 +3505,12 @@ function unknownKeyFindings(w: Workflow): Finding[] {
   if (w.intake) report("intake:", w.intake.extra);
   if (w.intake?.labels) report("intake.labels:", w.intake.labels.extra);
   if (w.merge_queue) report("merge_queue:", w.merge_queue.extra);
+  // #1778. The optional `section` routes the finding onto the driver's
+  // read-only summary, the same promise the FindingSection member makes - a
+  // mistyped key is the likeliest driver authoring error, and it must not be
+  // the one finding the driver surface cannot show. (`board:`'s missing line
+  // below is a pre-existing gap, not this section's.)
+  if (w.driver) report("driver:", w.driver.extra, undefined, "driver");
   for (const [name, r] of Object.entries(w.resources ?? {})) report(`resources.${name}:`, r.extra);
   return out;
 }

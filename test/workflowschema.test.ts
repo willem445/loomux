@@ -27,6 +27,7 @@ import {
   parseWorkflow,
   roleHintRequires,
   serializeWorkflow,
+  DRIVER_DEFAULTS,
   RESOURCE_SLOTS_MIN,
   RESOURCE_SLOTS_MAX,
   RESOURCE_MAX_HOLD_MINUTES_MIN,
@@ -782,6 +783,72 @@ test("refuse-vs-clamp is the difference between an error and a warning in the pa
       found[0]!.severity,
       declared === "refuse" ? "error" : "warning",
       `${c.section}.${c.field}: the manifest says the engine will ${declared} it`
+    );
+  }
+});
+
+test("a non-integer driver COUNTER is an error, not a silence (#1784 review 1)", () => {
+  // Every driver field is a `u32` on the engine, so serde refuses `2.5`
+  // exactly as it refuses an out-of-range value - and a check guarded by
+  // `Number.isInteger` goes silent on it, blessing a file the engine refuses
+  // at load (the pane-valid⇔loads guarantee). A counter, whose range also
+  // refuses. The assertion is on SEVERITY, not the code alone: a clamp
+  // warning for a value the engine refuses would be the same lie in a
+  // friendlier tone.
+  const findings = analyzeWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_review_rounds: 2.5\n"
+  ).findings.filter((f) => f.severity === "error");
+  assert.ok(
+    findings.some((f) => f.code === "section-out-of-range" || f.code === "section-bad-value"),
+    `a non-integer counter must be flagged as an ERROR, got ${JSON.stringify(findings.map((f) => [f.code, f.severity]))}`
+  );
+});
+
+test("a non-integer driver BACKSTOP is an error too - the clamp never runs on a refused type (#1784 review 1)", () => {
+  // The twin of the counter case, and the sharper one: the backstop's RANGE
+  // clamps, so `2.5` (below 5) does draw an out-of-range WARNING from the
+  // range check alone - but the engine refuses the TYPE before any clamp
+  // runs, and a warning would bless a file that never loads. The error must
+  // be there BESIDE the warning, which is why this asserts on the filtered
+  // error list rather than on any finding at all.
+  const findings = analyzeWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  fix_timeout_minutes: 2.5\n"
+  ).findings.filter((f) => f.severity === "error");
+  assert.ok(
+    findings.some((f) => f.code === "section-out-of-range" || f.code === "section-bad-value"),
+    `a non-integer backstop must be flagged as an ERROR, got ${JSON.stringify(findings.map((f) => [f.code, f.severity]))}`
+  );
+});
+
+test("a typo'd key inside driver: is an unknown-key finding routed to the driver section (#1784 review 2)", () => {
+  // Refused whole-file by the engine's `deny_unknown_fields` - the exact case
+  // the round-4 red proves refused - so the pane must not render it valid.
+  const findings = analyzeWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_revew_rounds: 3\n"
+  ).findings;
+  const unknown = findings.find((f) => f.code === "unknown-key" && f.section === "driver");
+  assert.ok(unknown, "a typo'd driver key must be an unknown-key finding routed to the driver section");
+  assert.ok(
+    unknown!.message.includes("max_revew_rounds"),
+    `the finding must name the key it found: ${unknown!.message}`
+  );
+});
+
+test("the pane's driver defaults are the manifest's declared defaults (#1784)", () => {
+  // The chrome renders `?? DRIVER_DEFAULTS.x` when the file omits a field; a
+  // literal at the point of use is a number nothing can check (review
+  // premortem 2: NOTIFY_EXPIRES_DEFAULT_MIN moves, the manifest follows, a
+  // stale `?? 60` renders silently). This is the third link of the
+  // engine → manifest → pane chain, the `DEFAULT_HOLD` pattern: the Rust pin
+  // holds engine == manifest, this holds manifest == pane, field for field.
+  const fields = manifest.sections.driver!.fields;
+  for (const f of fields) {
+    const pane = (DRIVER_DEFAULTS as Record<string, unknown>)[f.name];
+    assert.ok(f.name in DRIVER_DEFAULTS, `driver.${f.name} has no pane default - the chrome cannot render an omitted field`);
+    assert.equal(
+      pane,
+      f.default,
+      `driver.${f.name}: the pane's rendered default drifted from the manifest's declared default`
     );
   }
 });
