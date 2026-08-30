@@ -29177,13 +29177,20 @@ fn a_decoy_boot_line_does_not_release_the_kickoff() {
         || clock.get(),
     );
 
-    assert!(printed.get(), "the fixture must have reached the real footer");
     assert_eq!(outcome, ReadyWait::Ready, "the REAL footer still releases the paste");
+    // The PROPERTY first, the fixture control below it. Removing the word rule
+    // makes BOTH false — the decoy releases at the quiet point, so the run ends
+    // before the real footer is ever printed — and a red landing on `printed`
+    // reports "the fixture must have reached the real footer", which reads as a
+    // broken test rather than as the defect. A red evidences only the assertion
+    // it reached. (The same ordering, for the same reason, as the arm in
+    // `an_opencode_boot_is_not_ready_until_its_mcp_footer_appears`.)
     assert!(
         clock.get() > footer_at,
-        "the decoy must not have released it: ready at {:?}, real footer at {footer_at:?}",
+        "the decoy released the kickoff: ready at {:?}, real footer at {footer_at:?}",
         clock.get()
     );
+    assert!(printed.get(), "the fixture must have reached the real footer");
 
     // The control that makes this test about the DECOY rather than about the
     // clock: the identical fixture with the decoy replaced by a real footer is
