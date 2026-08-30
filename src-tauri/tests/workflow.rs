@@ -5987,6 +5987,37 @@ fn the_toggle_off_ignores_a_declared_workflow_entirely() {
     );
 }
 
+/// **The playbook's resident-side contract, default-deny over the playbook's
+/// own headings.** For every id the playbook template's `## ` headings yield,
+/// the resident core must name that section with `read_playbook("<id>")` —
+/// the structural answer to the on-demand failure mode (#1683 §2): an
+/// orchestrator that is never told a section exists never asks for it, so
+/// *the rule stays resident and only the procedure moves*, and the stub IS
+/// the rule's pointer. A new playbook section without its stub is a red here,
+/// at write time — never a silent gap discovered after the section ships.
+///
+/// Name-independent by construction: the id set is derived from the template
+/// source's headings (the lessons splitter's `## ` boundary, fenced code
+/// excluded), never from a hand-maintained list. Residual, stated here since
+/// this is where it is implemented: this proves the core NAMES each section;
+/// it cannot prove the stub is well-written or that a model heeds it — that
+/// residual is what the `playbook-read` audit line measures (#1683 §6).
+#[test]
+fn every_playbook_section_has_a_resident_stub_naming_it() {
+    let ids =
+        loomux_lib::orchestration::playbook_section_ids(loomux_lib::orchestration::ORCHESTRATOR_PLAYBOOK_TPL);
+    assert!(!ids.is_empty(), "the playbook must carry at least one section");
+    for id in ids {
+        assert!(
+            loomux_lib::orchestration::ORCHESTRATOR_TPL
+                .contains(&format!("read_playbook(\"{id}\")")),
+            "playbook section `{id}` has no resident stub naming it — the failure mode of an \
+             on-demand playbook is not an unreadable section, it is an orchestrator that never \
+             knows to ask (#1683)"
+        );
+    }
+}
+
 #[test]
 fn the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was() {
     // THE pin. The promise at the level it is actually made — the *text the agents
