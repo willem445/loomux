@@ -1283,22 +1283,6 @@ export class WorkflowView {
         this.sectionBad("merge_queue")
       )
     );
-    // `driver:` (#1778) has no form yet — like every other field on the
-    // pending list in `test/workflowschema.test.ts` — but the block is real
-    // policy, and a declared block that is invisible in the designer is worse
-    // than either extreme. The row and its read-only summary are the whole
-    // chrome it gets for now.
-    const dv = w.driver;
-    rows.push(
-      row(
-        { kind: "driver" },
-        "Review driver",
-        dv
-          ? `${dv.enabled ? "on" : "off"} · rounds ${dv.max_review_rounds ?? 3} · ci ${dv.max_ci_attempts ?? 3}`
-          : "not declared — off",
-        this.sectionBad("driver")
-      )
-    );
     const resourceCount = Object.keys(w.resources ?? {}).length;
     rows.push(
       row(
@@ -1424,10 +1408,6 @@ export class WorkflowView {
     }
     if (target.kind === "merge_queue") {
       this.formPane.replaceChildren(this.mergeQueueForm(w));
-      return;
-    }
-    if (target.kind === "driver") {
-      this.formPane.replaceChildren(this.driverSummary(w));
       return;
     }
     if (target.kind === "resources") {
@@ -2408,42 +2388,6 @@ export class WorkflowView {
       )
     );
     const findings = this.sectionFindingList("intake");
-    if (findings) box.append(findings);
-    return box;
-  }
-
-  /** The `driver:` block's READ-ONLY summary (#1778). The pane parses, preserves,
-   *  re-emits and validates the block, and this view is the whole chrome it gets:
-   *  no control here edits anything, deliberately — `FIELDS_WITH_AN_EDITOR` in
-   *  `test/workflowschema.test.ts` is empty and slice C's descriptor registry is
-   *  what will retire the hand-built forms, so a fourth one is the last thing this
-   *  section needs. What it must not be is invisible: a declared policy the
-   *  designer cannot show is the failure the #880 manifest exists to prevent. */
-  private driverSummary(w: Workflow): HTMLElement {
-    const box = el("div", "wf-fields");
-    box.append(
-      el(
-        "p",
-        "wf-note",
-        "The review-loop driver: loomux drives a PR through review and CI on the " +
-          "orchestrator's authority. An absent driver: block means the feature is OFF. " +
-          "There is no editor for this section yet - edit the YAML directly."
-      )
-    );
-    const dv = w.driver;
-    const row = (label: string, value: string): void =>
-      box.append(this.field(label, el("span", "wf-note", value)));
-    row(
-      "Enabled",
-      dv?.enabled === undefined ? "not declared - off (orrerix's default)" : String(dv.enabled)
-    );
-    row("Review rounds", String(dv?.max_review_rounds ?? 3));
-    row("CI attempts", String(dv?.max_ci_attempts ?? 3));
-    row("Rebase attempts", String(dv?.max_rebase_attempts ?? 1));
-    row("Lane timeout (min)", String(dv?.lane_timeout_minutes ?? 60));
-    row("Fix timeout (min)", String(dv?.fix_timeout_minutes ?? 60));
-    row("Drive timeout (min)", String(dv?.drive_timeout_minutes ?? 240));
-    const findings = this.sectionFindingList("driver");
     if (findings) box.append(findings);
     return box;
   }

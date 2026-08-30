@@ -435,20 +435,6 @@ export function isRoutingGlob(p: string): boolean {
  *  not an error: the file loads, it just doesn't do what it says. */
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MIN = 5;
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MAX = 240;
-/** INVARIANT 9's counters (#1778 §2.3) - the engine REFUSES values outside these
- *  closed ranges rather than clamping: a repo file may run a tighter review loop
- *  than the orchestrator template promises, never a looser one. */
-export const DRIVER_MAX_REVIEW_ROUNDS_MIN = 1;
-export const DRIVER_MAX_REVIEW_ROUNDS_MAX = 3;
-export const DRIVER_MAX_CI_ATTEMPTS_MIN = 1;
-export const DRIVER_MAX_CI_ATTEMPTS_MAX = 3;
-export const DRIVER_MAX_REBASE_ATTEMPTS_MIN = 0;
-export const DRIVER_MAX_REBASE_ATTEMPTS_MAX = 1;
-/** The driver's three backstops ride the same notify-TTL clamp family the merge
- *  queue's checks timeout rides (`clamp_expires_minutes`) - CLAMPED, not refused:
- *  outside this range is a warning here, not an error. */
-export const DRIVER_TIMEOUT_MIN = 5;
-export const DRIVER_TIMEOUT_MAX = 240;
 
 /** The board statuses a `board.wip:` cap may name (#1175), in board order — the pane's
  *  mirror of the engine's `RawWip` fields. `done` is deliberately absent: it is the
@@ -504,18 +490,6 @@ export const POLICY_BOUNDS: Readonly<Record<string, FieldBounds>> = {
     min: MERGE_QUEUE_CHECKS_TIMEOUT_MIN,
     max: MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
   },
-  "driver.max_review_rounds": {
-    min: DRIVER_MAX_REVIEW_ROUNDS_MIN,
-    max: DRIVER_MAX_REVIEW_ROUNDS_MAX,
-  },
-  "driver.max_ci_attempts": { min: DRIVER_MAX_CI_ATTEMPTS_MIN, max: DRIVER_MAX_CI_ATTEMPTS_MAX },
-  "driver.max_rebase_attempts": {
-    min: DRIVER_MAX_REBASE_ATTEMPTS_MIN,
-    max: DRIVER_MAX_REBASE_ATTEMPTS_MAX,
-  },
-  "driver.lane_timeout_minutes": { min: DRIVER_TIMEOUT_MIN, max: DRIVER_TIMEOUT_MAX },
-  "driver.fix_timeout_minutes": { min: DRIVER_TIMEOUT_MIN, max: DRIVER_TIMEOUT_MAX },
-  "driver.drive_timeout_minutes": { min: DRIVER_TIMEOUT_MIN, max: DRIVER_TIMEOUT_MAX },
   "resource.slots": { min: RESOURCE_SLOTS_MIN, max: RESOURCE_SLOTS_MAX },
   "resource.max_hold_minutes": {
     min: RESOURCE_MAX_HOLD_MINUTES_MIN,
@@ -686,19 +660,6 @@ export interface WorkflowMergeQueue {
   extra?: Record<string, YamlValue>;
 }
 
-/** The review-loop driver's policy (#1778 §5.3). Absent block = the driver is
- *  off; every field is optional for the same reason `WorkflowMergeQueue`'s are. */
-export interface WorkflowDriver {
-  enabled?: boolean;
-  max_review_rounds?: number;
-  max_ci_attempts?: number;
-  max_rebase_attempts?: number;
-  lane_timeout_minutes?: number;
-  fix_timeout_minutes?: number;
-  drive_timeout_minutes?: number;
-  extra?: Record<string, YamlValue>;
-}
-
 /** One named lock resource (#858) — how many agents may hold it at once and for
  *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
  *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */
@@ -743,8 +704,6 @@ export interface Workflow {
   gates: WorkflowGates;
   intake?: WorkflowIntake;
   merge_queue?: WorkflowMergeQueue;
-  /** Review-loop driver policy (#1778 §5.3). */
-  driver?: WorkflowDriver;
   /** Keyed by a repo-chosen resource name, in the file's own order (the emitter
    *  sorts, matching the engine's `BTreeMap`). */
   resources?: Record<string, WorkflowResource>;
@@ -807,17 +766,12 @@ export type FindingCode =
  *  roster and its findings list land the human on the form that can fix it, and neither
  *  has to match on the message text to work out which one that is. */
 /** `board:` (#1175) is deliberately NOT a member yet: this key routes a finding onto the
- *  inspector form that can fix it, and the board section has no form - it is listed as
+ *  inspector form that can fix it, and the board section has no form — it is listed as
  *  not-yet-editable in `test/workflowschema.test.ts` like every other field. A section
  *  here with no form to land on would be a click that goes nowhere. Its findings carry a
  *  message naming `board.wip.<status>` instead, which is what the raw-text view needs
  *  anyway; the member and the form arrive together or not at all. */
-/** `driver:` (#1778) IS a member despite having no form either - but unlike `board:` it
- *  has a READ-ONLY inspector view (the summary the nav row lands on), so a finding's
- *  click lands on a surface that shows the declared state and names the fix in its
- *  message (the YAML, per the merge-queue precedent). It gains a form when slice C
- *  builds one, the same as every other member. */
-export type FindingSection = "intake" | "merge_queue" | "driver" | "resources";
+export type FindingSection = "intake" | "merge_queue" | "resources";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
  *  next to the block it is about (the whole reason the validation pass is worth having is
@@ -1433,36 +1387,6 @@ function emitMergeQueueLines(mq: WorkflowMergeQueue, indent = ""): string[] {
   return emitMappingSection("merge_queue", indent, body);
 }
 
-/** The `driver:` section (#1778 §5.3). Same declared-only rule as `intake:`
- *  and `merge_queue:`: an absent block means the driver is OFF, so emitting
- *  `enabled: false` where the file said nothing would be a policy statement
- *  the human never made. */
-function emitDriverLines(dv: WorkflowDriver, indent = ""): string[] {
-  const field = `${indent}  `;
-  const body: string[] = [];
-  if (dv.enabled !== undefined) body.push(`${field}enabled: ${dv.enabled}`);
-  if (dv.max_review_rounds !== undefined) {
-    body.push(`${field}max_review_rounds: ${dv.max_review_rounds}`);
-  }
-  if (dv.max_ci_attempts !== undefined) {
-    body.push(`${field}max_ci_attempts: ${dv.max_ci_attempts}`);
-  }
-  if (dv.max_rebase_attempts !== undefined) {
-    body.push(`${field}max_rebase_attempts: ${dv.max_rebase_attempts}`);
-  }
-  if (dv.lane_timeout_minutes !== undefined) {
-    body.push(`${field}lane_timeout_minutes: ${dv.lane_timeout_minutes}`);
-  }
-  if (dv.fix_timeout_minutes !== undefined) {
-    body.push(`${field}fix_timeout_minutes: ${dv.fix_timeout_minutes}`);
-  }
-  if (dv.drive_timeout_minutes !== undefined) {
-    body.push(`${field}drive_timeout_minutes: ${dv.drive_timeout_minutes}`);
-  }
-  body.push(...extraLines(dv.extra, field));
-  return emitMappingSection("driver", indent, body);
-}
-
 /** The `resources:` section (#858) — a mapping of repo-chosen names to two numbers.
  *  Names are emitted in SORTED order, matching the engine's `BTreeMap`, because
  *  unlike the roster (whose order is meaning — the first block of a class is the
@@ -1614,7 +1538,6 @@ export function serializeWorkflow(w: Workflow): string {
   for (const lines of [
     w.intake ? emitIntakeLines(w.intake) : [],
     w.merge_queue ? emitMergeQueueLines(w.merge_queue) : [],
-    w.driver ? emitDriverLines(w.driver) : [],
     w.resources ? emitResourcesLines(w.resources) : [],
     w.board ? emitBoardLines(w.board) : [],
   ]) {
@@ -1956,7 +1879,6 @@ const SECTION_ORDER = [
   "gates",
   "intake",
   "merge_queue",
-  "driver",
   "resources",
   "board",
 ] as const;
@@ -2180,13 +2102,6 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
         !!w.merge_queue,
         w.merge_queue ? emitMergeQueueLines(w.merge_queue) : []
       ),
-    driver: (entry) =>
-      pushSection(
-        entry,
-        deepEqualValue(w.driver, orig.driver),
-        !!w.driver,
-        w.driver ? emitDriverLines(w.driver) : []
-      ),
     resources: (entry) =>
       pushSection(
         entry,
@@ -2258,7 +2173,6 @@ const KNOWN_TOP = new Set([
   "gates",
   "intake",
   "merge_queue",
-  "driver",
   "resources",
   "board",
 ]);
@@ -2296,15 +2210,6 @@ const KNOWN_GATE = new Set(["merge"]);
 const KNOWN_INTAKE = new Set(["source", "labels"]);
 const KNOWN_INTAKE_LABELS = new Set(INTAKE_LABEL_KEYS);
 const KNOWN_MERGE_QUEUE = new Set(["enabled", "max_batch", "checks_timeout_minutes"]);
-const KNOWN_DRIVER = new Set([
-  "enabled",
-  "max_review_rounds",
-  "max_ci_attempts",
-  "max_rebase_attempts",
-  "lane_timeout_minutes",
-  "fix_timeout_minutes",
-  "drive_timeout_minutes",
-]);
 const KNOWN_RESOURCE = new Set(["slots", "max_hold_minutes"]);
 const KNOWN_BOARD = new Set(["wip", "enforce"]);
 const KNOWN_WIP = new Set<string>(WIP_STATUSES);
@@ -2400,29 +2305,6 @@ function readMergeQueue(r: Record<string, YamlValue>, findings: Finding[]): Work
   const extra = collectExtra(r, KNOWN_MERGE_QUEUE);
   if (extra) mq.extra = extra;
   return mq;
-}
-
-function readDriver(r: Record<string, YamlValue>, findings: Finding[]): WorkflowDriver {
-  const dv: WorkflowDriver = {};
-  if (r.enabled !== undefined) {
-    if (typeof r.enabled === "boolean") dv.enabled = r.enabled;
-    else findings.push(badValue("driver.enabled", "true or false", r.enabled));
-  }
-  const rounds = readNumberField(r, "max_review_rounds", "driver", findings);
-  if (rounds !== undefined) dv.max_review_rounds = rounds;
-  const ci = readNumberField(r, "max_ci_attempts", "driver", findings);
-  if (ci !== undefined) dv.max_ci_attempts = ci;
-  const rebase = readNumberField(r, "max_rebase_attempts", "driver", findings);
-  if (rebase !== undefined) dv.max_rebase_attempts = rebase;
-  const lane = readNumberField(r, "lane_timeout_minutes", "driver", findings);
-  if (lane !== undefined) dv.lane_timeout_minutes = lane;
-  const fix = readNumberField(r, "fix_timeout_minutes", "driver", findings);
-  if (fix !== undefined) dv.fix_timeout_minutes = fix;
-  const drive = readNumberField(r, "drive_timeout_minutes", "driver", findings);
-  if (drive !== undefined) dv.drive_timeout_minutes = drive;
-  const extra = collectExtra(r, KNOWN_DRIVER);
-  if (extra) dv.extra = extra;
-  return dv;
 }
 
 /** `resources:` is a MAP of repo-chosen names, so every key here is a resource, never
@@ -2581,8 +2463,6 @@ export function parseWorkflow(text: string): ParseResult {
   if (intake) w.intake = readIntake(intake, findings);
   const mergeQueue = readSection(root.merge_queue, "merge_queue", findings);
   if (mergeQueue) w.merge_queue = readMergeQueue(mergeQueue, findings);
-  const driver = readSection(root.driver, "driver", findings);
-  if (driver) w.driver = readDriver(driver, findings);
   const resources = readSection(root.resources, "resources", findings);
   if (resources) w.resources = readResources(resources, findings);
   const board = readSection(root.board, "board", findings);
@@ -3314,62 +3194,6 @@ function sectionFindings(w: Workflow): Finding[] {
         });
       }
     }
-  }
-
-  const dv = w.driver;
-  if (dv) {
-    // The INVARIANT-9 counters are REFUSED by the engine (#1778 §2.3), so an
-    // out-of-range one is an error here - a file this pane called valid would
-    // not load at all.
-    const counter = (field: string, v: number | undefined, min: number, max: number): void => {
-      if (v !== undefined && Number.isInteger(v) && (v < min || v > max)) {
-        err(
-          "driver",
-          "section-out-of-range",
-          `driver.${field}: ${v} is outside ${min}-${max} - the engine refuses the whole file, ` +
-            `because a repo file may tighten INVARIANT 9 but never loosen it.`
-        );
-      }
-    };
-    counter(
-      "max_review_rounds",
-      dv.max_review_rounds,
-      DRIVER_MAX_REVIEW_ROUNDS_MIN,
-      DRIVER_MAX_REVIEW_ROUNDS_MAX
-    );
-    counter(
-      "max_ci_attempts",
-      dv.max_ci_attempts,
-      DRIVER_MAX_CI_ATTEMPTS_MIN,
-      DRIVER_MAX_CI_ATTEMPTS_MAX
-    );
-    counter(
-      "max_rebase_attempts",
-      dv.max_rebase_attempts,
-      DRIVER_MAX_REBASE_ATTEMPTS_MIN,
-      DRIVER_MAX_REBASE_ATTEMPTS_MAX
-    );
-    // The backstops are CLAMPED, like `checks_timeout_minutes` - a warning that
-    // says what will actually happen, not an error implying the file is broken.
-    const backstop = (field: string, v: number | undefined): void => {
-      if (
-        v !== undefined &&
-        Number.isInteger(v) &&
-        (v < DRIVER_TIMEOUT_MIN || v > DRIVER_TIMEOUT_MAX)
-      ) {
-        out.push({
-          severity: "warning",
-          code: "section-out-of-range",
-          message:
-            `driver.${field}: ${v} is outside ${DRIVER_TIMEOUT_MIN}-${DRIVER_TIMEOUT_MAX}, ` +
-            `so orrerix will clamp it - the driver will not wait for the time this file names.`,
-          section: "driver",
-        });
-      }
-    };
-    backstop("lane_timeout_minutes", dv.lane_timeout_minutes);
-    backstop("fix_timeout_minutes", dv.fix_timeout_minutes);
-    backstop("drive_timeout_minutes", dv.drive_timeout_minutes);
   }
 
   const resources = w.resources;
