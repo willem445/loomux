@@ -859,6 +859,14 @@ evidences only the assertion it REACHED and MOVED").
 
 Precedent: #869 (scratch PRs #870, #872).
 
+**At most two scratch rounds per test (#1685).** A counterfactual that has not
+reddened after two rounds is not re-cut: disclose it in the PR body as a
+boundary — `the sweep asserts X; a misclassified writer has not been
+demonstrated to trip it (rounds N, M green)` — and the reviewer judges the test
+on its assertion. A `[scratch`-titled PR runs one platform and no E2E, so a
+round costs one job, not four; a third round is INVARIANT 9's unbounded loop
+wearing evidence's clothes.
+
 ## E2E (Playwright) is CI's job, same line
 
 See `doc/design/e2e-testing.md` for the mechanism, isolation model, and CI
