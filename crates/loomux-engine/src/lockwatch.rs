@@ -576,6 +576,21 @@ fn permitted_now() -> bool {
 /// thread and so the reason is a literal a reader can grep for.
 pub struct LongHoldPermit {
     thread: u64,
+    /// Makes this `!Send`, and that is load-bearing rather than tidy (#1722
+    /// review N6). `Drop` decrements the DROPPING thread's `PERMIT_DEPTH` while
+    /// removing a registry entry keyed on `self.thread`, so a permit moved to
+    /// another thread and dropped there would leave the originating thread's
+    /// depth above zero — every later hold it takes stamped `permitted`, a
+    /// thread permanently exempt. That is exactly the failure B1 removed,
+    /// arriving by a different door, and `only_argued_sites_may_permit_a_long_hold`
+    /// cannot see it: that scan bounds where a permit is CONSTRUCTED, not where
+    /// the value travels.
+    ///
+    /// No such site exists today — both argued sites are `let _permit` locals
+    /// that cannot escape — so this is the compiler making the class
+    /// unreachable rather than a fix for a live defect, in the same idiom as
+    /// `GroupId`'s missing `AsRef<Path>`.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl LongHoldPermit {
@@ -592,7 +607,7 @@ impl LongHoldPermit {
         let thread = this_thread();
         PERMIT_DEPTH.with(|d| d.set(d.get() + 1));
         LONG_HOLD_PERMITS.lock_safe().push(PermitEntry { thread, reason });
-        Self { thread }
+        Self { thread, _not_send: std::marker::PhantomData }
     }
 }
 
@@ -3147,6 +3162,25 @@ mod rank_tests {
 
     // ---------- hold-duration enforcement (#1702 P4) ----------
 
+    /// Restores the process-global hold threshold on the way out, so one
+    /// test's override cannot leak into another's (#1722 review N5, and
+    /// CLAUDE.md's `Drop`-guard rule). Same shape as
+    /// `src-tauri/tests/selfwatch.rs`'s `HoldWarn`, which guards this very
+    /// global in the other binary.
+    struct WarnMsGuard(u64);
+    impl WarnMsGuard {
+        fn set(ms: u64) -> Self {
+            let prev = hold_warn_ms();
+            set_hold_warn_ms(ms);
+            Self(prev)
+        }
+    }
+    impl Drop for WarnMsGuard {
+        fn drop(&mut self) {
+            set_hold_warn_ms(self.0);
+        }
+    }
+
     /// A synthetic report, so the classifier's RULE is testable without
     /// building a lock, a thread or a five-second hold.
     fn report_at(thread: u64, held_ms: u64) -> HoldReport {
@@ -3226,10 +3260,12 @@ mod rank_tests {
         // live registry at drain time would see no permit and call the
         // injector's own deliberate hold a violation.
         let _serial = SERIAL.lock_safe();
-        // `set_hold_warn_ms` returns (), unlike `set_hold_panics` — read the
-        // previous value first rather than assuming the sibling's shape.
-        let was = hold_warn_ms();
-        set_hold_warn_ms(1);
+        // Restored from a `Drop` guard, not a trailing call (#1722 review N5).
+        // Five assertions follow; any one of them failing would otherwise leave
+        // `HOLD_WARN_MS` at 1 for the rest of the binary, stamping every hold
+        // over a millisecond — one genuine failure reported as N, and a later
+        // mutation round's reds no longer attributable.
+        let _warn = WarnMsGuard::set(1);
         let _ = drain_completed_holds(); // start from a clean ring
         let lock = TrackedMutex::new("permitdrainspec", ());
 
@@ -3282,7 +3318,6 @@ mod rank_tests {
             1,
             "the same thread's later unpermitted hold must still be a violation"
         );
-        set_hold_warn_ms(was);
     }
 
     #[test]

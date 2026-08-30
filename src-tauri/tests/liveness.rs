@@ -2424,21 +2424,37 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
     // be a violation, and the pair above cannot tell an enforcement that works
     // from one that refuses everything.
     //
-    // Asserted on the permit REGISTRY rather than by holding for five seconds
+    // Asserted on the permit REGISTRY rather than by holding past the threshold
     // and scanning: `hold_lock_for_test` takes its permit BEFORE the
     // acquisition and returns only once the hold is real, so by the time it
-    // returns the registration has happened — deterministically, with no sleep,
-    // and in 50 ms rather than 5 s. What a permit then MEANS to the classifier
-    // is pinned by `lockwatch`'s own
-    // `a_long_hold_is_a_violation_unless_its_thread_is_permitted` and
-    // `a_retired_permit_still_exempts_the_thread_that_earned_it`.
+    // returns the registration has happened — no sleep, and no wall clock,
+    // because the seam's sleep runs on the thread it spawned.
+    //
+    // **The hold is twenty seconds and that is the de-racing, not generosity**
+    // (#1722 review N4). Since the B1 fix the registry holds LIVE permits only,
+    // so this reads a window rather than a monotonic counter: the earlier
+    // 50 ms hold could expire between these two adjacent statements on a loaded
+    // runner and red the row with a message asserting the opposite of the
+    // truth. Under the retired-permit design the count was monotonic, which is
+    // what had made a 50 ms window safe — the control was not re-derived when
+    // that property was removed.
+    //
+    // **What it can and cannot say.** The registry is process-global and L1,
+    // L2a, L2c and L7b install their own wedges through the same seam, so a
+    // rising count is evidence that SOME live permit exists while a wedge seam
+    // holds — a floor on the mechanism, not attribution to this row's call.
+    // The message says so rather than claiming more. What a permit MEANS to the
+    // classifier, and that a hold released under one stays exempt through the
+    // drain that reports it, are pinned where they can be controlled: in
+    // `lockwatch`'s own `a_long_hold_is_a_violation_unless_its_thread_is_permitted`
+    // and `a_hold_released_under_a_permit_is_exempt_after_that_permit_drops`.
     let permitted_before = loomux_engine::lockwatch::permitted_threads().len();
-    assert!(f.reg.hold_lock_for_test("tasks_lock", 50), "setup: cannot hold `tasks_lock`");
+    assert!(f.reg.hold_lock_for_test("tasks_lock", 20_000), "setup: cannot hold `tasks_lock`");
     assert!(
         loomux_engine::lockwatch::permitted_threads().len() > permitted_before,
-        "`hold_lock_for_test` took no LongHoldPermit, so every deliberate 20-second wedge in \
-         this binary is a hold-budget violation and the enforcement would fail the suite on \
-         its own fixtures"
+        "no live `LongHoldPermit` appeared while a `hold_lock_for_test` wedge was holding. \
+         Every deliberate 20-second wedge in this binary would then be a hold-budget \
+         violation, and the enforcement would fail the suite on its own fixtures"
     );
 
     // ---- the measurement -------------------------------------------------
