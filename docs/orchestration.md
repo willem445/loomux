@@ -1666,11 +1666,14 @@ Claude Code, `auto` on Copilot, `pro` on Gemini, and on OpenCode no `--model`
 at all, so your own config decides.
 
 **Almost every setting in the file is editable in the pane.** Beside the
-roster's block rows and its merge-gate row sit three more: **Intake**, **Merge
-queue** and **Resources** — the same `intake:`, `merge_queue:` and `resources:`
-blocks described elsewhere on this page, each with an enable-toggle and its
-fields. The block form covers the rest: `role_hint`, and `allow:` as a list of
-tool patterns (one row per pattern, because a real pattern contains commas).
+roster's block rows and its merge-gate row sit four more: **Intake**, **Merge
+queue**, **Review driver** and **Resources** - the same `intake:`,
+`merge_queue:`, `driver:` and `resources:` blocks described elsewhere on this
+page. The first, second and fourth each have an enable-toggle and their fields;
+the driver row is read-only for now (it shows what the file declares) - edit
+`driver:` in the text editor. The block form covers the
+rest: `role_hint`, and `allow:` as a list of tool patterns (one row per
+pattern, because a real pattern contains commas).
 
 Two keys have no control. `authored_with:` deliberately never will — it records
 which orrerix *created* the file, is stamped once, and a save must never invent
@@ -1910,9 +1913,37 @@ Three things worth knowing before you enable it:
   **unverifiable** — loudly, with nothing landed — instead of a batch sitting pending forever.
 - **Adding the block is not inert to older orrerix builds.** The workflow file rejects keys it
   does not recognize, so on a build that predates the merge queue, `merge_queue:` fails the
-  parse of the **whole file** — your `gates:` included — rather than being ignored. That is
+  parse of the **whole file** - your `gates:` included - rather than being ignored. That is
   deliberate (a key the build doesn't understand means you believe a policy is in force that
   isn't), but it means everyone sharing the repo wants to be on a build that has it.
+
+### The review driver's `driver:` block
+
+A `driver:` block, beside `merge_queue:`, declares how hard the engine-driven review-loop
+driver (#1778) may work when it drives a PR through review and CI on the orchestrator's
+authority:
+
+```yaml
+driver:
+  enabled: true               # default false - absent block means the feature is off
+  max_review_rounds: 3        # INVARIANT 9's numbers - clamped toward them, never away:
+  max_ci_attempts: 3          #   1..=3 each, and a value outside the range refuses the file
+  max_rebase_attempts: 1      #   0..=1 - a repo may refuse the driver any rebase, never grant two
+  lane_timeout_minutes: 60    # backstops on the three waits, clamped like the notify TTLs
+  fix_timeout_minutes: 60     #   (5..240); a value outside the range is pulled into it
+  drive_timeout_minutes: 240  #
+```
+
+A repo may run a *tighter* loop than the orchestrator template promises, never a looser one:
+the driver acts on the orchestrator's authority, and a config file that raised the bound
+would be loosening the orchestrator's own invariant. The same forward-compat warning the
+merge queue carries applies here too: on a build that predates the block, `driver:` fails
+the parse of the whole file rather than being ignored.
+
+The block **enables** the feature; it can never start, target or widen a drive - no drive
+exists until an orchestrator makes its own role-gated `drive_review` call naming one PR.
+(The pane shows the block's declared values read-only for now; the driving loop itself is
+still landing slice by slice in #1778.)
 
 ### Setting up a cross-model reviewer
 
