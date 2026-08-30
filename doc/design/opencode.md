@@ -353,6 +353,82 @@ and treats a failure as a spawn error rather than a best-effort mkdir.
 
 The reader lands on this seam — see *Usage and cost readback*, below.
 
+## Readiness (#1591)
+
+opencode is the first CLI loomux spawns whose **painted UI arrives before its
+input loop does**, and that is a contract, not a bug in either program.
+
+The generic kickoff gate is *painted and quiet*: after `READY_MIN_WAIT`, the
+pane must have written `READY_MIN_OUTPUT` bytes and then held silent for
+`READY_QUIET`, with `READY_MAX_WAIT` as the ceiling. Those two conditions are a
+**proxy** for the thing loomux actually needs to know — has the CLI attached the
+reader that will consume a paste? The proxy holds for a CLI that paints once it
+is up. opencode paints its banner and input box (far past the 512-byte floor)
+and goes quiet **while its MCP handshake and provider auth are still in
+flight**, so the proxy says ready and the paste lands in a startup buffer.
+Measured in the field on five deliveries in one session: each drew a
+`delivery … unconfirmed` notice, because the pre-Enter box read could not find
+text the CLI had not yet drawn.
+
+### The marker is a per-CLI contract
+
+opencode's row in `CLI_CAPS` carries a `ready_marker`, and the gate consults the
+table rather than branching on the CLI name — the same rule the rest of that
+table follows, and the same shape as `cli == "claude"` gating *behaviour claude
+genuinely has*. The marker is opencode's status footer:
+
+    ⊙ 2 MCP /status    1.18.25
+
+...matched as **a digit immediately followed by ` MCP`**, on the ANSI-stripped
+tail.
+
+Three choices, each load-bearing:
+
+- **A shape, not a count.** loomux knows how many MCP servers it configured, so
+  comparing against that number is available and is still wrong: the footer
+  reports servers connected *so far*, so it climbs during the handshake and can
+  settle below what was configured if one fails. Waiting for a specific N would
+  either fire early (on the way past) or hang until the ceiling on a run where a
+  server never came up. One connected server is the CLI having reached the point
+  where it reads.
+- **Stripped, not raw.** The TUI colours the count, so on the wire the digit and
+  the label are separated by an SGR sequence and are adjacent only after the
+  strip. A raw read answers "no marker" on a pane that is plainly showing one.
+- **ANDed with the base test, never substituted for it.** A marker says the CLI
+  has finished coming up; it says nothing about whether it is mid-repaint right
+  now. So a seen marker never excuses a pane that is still painting, and the
+  only thing a marker can do is **delay** a paste.
+
+The marker is **latched** once seen. "This session's servers connected" is a
+one-way fact, not a property of the current screen — a footer that scrolls out
+of the read window a moment later has not un-connected anything.
+
+Cost is confined to the window this exists to cover: the tail is read only while
+a marker is outstanding *and* the base test would otherwise have returned
+`Ready`. A CLI with no marker in its row — every other row today — never
+reads a tail at all, and its boot is byte-for-byte what it was.
+
+### If opencode changes its footer
+
+**It fails toward the ceiling, never toward a lost paste.** `READY_MAX_WAIT` is
+untouched and is still the only thing that ends the wait when readiness cannot be
+established. A renamed indicator, a footer that moves out of the read window, or
+a build that stops printing a count at all costs the pane the ceiling's wait and
+is then pasted into blind — precisely the pre-#1591 behaviour for a boot loomux
+cannot read, and recorded as `ReadyWait::TimedOut` rather than `Ready`, which is
+the audited state that says "we pasted into a CLI we never saw become ready".
+
+So the failure mode of a stale marker is a slower kickoff, visible in the audit,
+on the same ceiling every unrecognised boot already has. It is never a delivery
+that does not happen. That asymmetry is why the marker was safe to add to the
+delivery path at all, and it is the property to preserve if this section is ever
+extended: a future marker may lengthen a wait, and may never shorten one or
+become the sole reason a paste is released.
+
+Not done here, deliberately: a general readiness signal for *any* slow CLI, and
+the bounded confirm-and-retry handshake #1591 also asks for. Those stay open on
+that issue.
+
 ## Knobs (#687)
 
 Both rows ship empty, with notes that say why:
