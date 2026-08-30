@@ -4782,6 +4782,15 @@ mod tests {
                 // is make a board write warn, or refuse an AGENT's write —
                 // never a human's, and never a merge.
                 board: _,
+                // #1778 §5.3. Confirmed against the rule above before being
+                // named here: `driver:` is seven closed-range numbers and one
+                // bool (`RawDriver`, `deny_unknown_fields`). It names no PR,
+                // no branch, no program and no agent — the two-key rule (§3.2)
+                // keeps enabling separate from targeting, and no drive exists
+                // until an orchestrator's own role-gated `drive_review` call
+                // names one PR. What it CAN do is tighten the loop the
+                // orchestrator template promises, or bound the driver's waits.
+                driver: _,
             } = v;
         }
         // #1175: the same inventory rule one level down. A field added to
