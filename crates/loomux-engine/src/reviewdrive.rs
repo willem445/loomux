@@ -729,6 +729,26 @@ pub struct DriveEntry {
     /// The PR head this entry was last resolved against. A record of what was
     /// seen; every decision re-reads the live head (§2.4 resumes "against the
     /// **live** head, never against the head the file remembers").
+    ///
+    /// **S3 must persist `entry.head = facts.head` whenever a tick resolves the
+    /// head, and this obligation is written here rather than left to be
+    /// inferred, because nothing in this module can enforce it and every
+    /// individual call stays correct while it is violated.** [`decide`] reads
+    /// this field only to compare it against the live head — arc 6 in
+    /// `review-wait`, arc 7 in `fix-wait` — so a tick that records the head
+    /// once at `drive_review` time and never again makes that comparison
+    /// permanently true: the drive takes arc 6 to `ci-wait`, goes green, comes
+    /// back to `review-wait`, and takes arc 6 again, forever. The failure is
+    /// *emergent at the seam*, which is why no test in this crate catches it.
+    ///
+    /// The empty-head case is the same defect with a quieter shape. Arc 6 is
+    /// guarded by `!facts.head.is_empty()` deliberately, so a failed head read
+    /// does **not** thrash the state machine — but an entry whose stored head
+    /// is empty while the live head reads fine still re-opens lane *k* on every
+    /// tick, because `first_stale_lane` finds every `pass` stale against `""`
+    /// and [`lane_open_for`] refuses every record briefed at a real head.
+    /// Either way the drive spins until `drive-stalled` parks it hours later,
+    /// having spawned a reviewer per tick.
     #[serde(default)]
     pub head: String,
     /// The PR body digest last seen, the same #565 digest the gate reads.
@@ -770,9 +790,29 @@ pub struct DriveEntry {
     /// "state last changed" stamp it looks like it wants to be.
     ///
     /// Written by [`advance`](DriveEntry::advance) on arcs 3 and 5 — the two
-    /// that reach `fix-wait` — and by nothing else. Zero on a drive that has
-    /// never been handed back, which is why `fix-stalled` is only ever asked in
-    /// `fix-wait`.
+    /// that reach `fix-wait` — and by nothing else.
+    ///
+    /// **Zero means the drive has never been handed back.** It does not also
+    /// mean "written before this field existed", and the distinction is worth
+    /// a sentence because the second reading looks plausible and would license
+    /// a guard that guards nothing.
+    ///
+    /// `now - 0` clears any timeout trivially, so a zero read while the entry
+    /// is in `fix-wait` *would* park the drive on a false `held(fix-stalled)`.
+    /// No such entry can exist. Nothing writes `review_drives.json` before
+    /// S3's tick, and S3 ships alongside this module — so the field is present
+    /// in the first file ever written, and there is no build whose output
+    /// lacks it. §5.2's read tolerance makes the older *shape* parse; it does
+    /// not conjure a writer that produced one. A `fix-wait` entry therefore
+    /// always carries an anchor stamped by
+    /// [`advance`](DriveEntry::advance) on arc 3 or arc 5, and the comparison
+    /// in [`decide`] is left plain deliberately: a defensive `!= 0` here would
+    /// have no reachable subject, and the next reader would take it as
+    /// evidence that one exists.
+    ///
+    /// If a future change ever lets something else author an entry — a
+    /// migration, an import, a hand-repaired file — that is the change that
+    /// owes this field a decision, and this paragraph is the one it invalidates.
     #[serde(default)]
     pub fix_handback_ms: u64,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
