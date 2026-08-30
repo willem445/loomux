@@ -39143,9 +39143,17 @@ impl OrchRegistry {
                 // `agents`. That is the difference between "the deadlock is
                 // unreachable because no lock is held here" and "the tick never
                 // asks the question that deadlocked it".
+                // [scratch j5] P1's hoist REVERTED, minimally: the mask is
+                // computed with `agents` held and the session resolved through
+                // `session_for_pty` (which takes `by_pty`, then `agents`)
+                // instead of off the phase-1 snapshot. That is the pre-#1702
+                // shape in two lines. Under P2's rank checker it is a
+                // descending pair (AGENTS 510 -> BY_PTY 500) and panics naming
+                // both sites; without the checker it parks forever.
+                let _held = self.agents.lock_safe();
                 let delivered = a
                     .pty_id
-                    .map(|p| self.delivered_mask_lines(p, a.session_id.as_deref()))
+                    .map(|p| self.delivered_mask_lines(p, self.session_for_pty(p).as_deref()))
                     .unwrap_or_default();
                 let shaped =
                     prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered));
