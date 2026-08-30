@@ -702,6 +702,20 @@ function it calls is not (#1236 — three of eight rounds reached
 `record_crash_first_phase` / `newest_crash_log_since`, both rewritten by that
 PR's own review fixes).
 
+**And that premise is optimistic, which makes the re-cut cheaper rather than dearer.**
+"Byte-identity covers the region you mutated and the test that reddened" is itself an
+AND, and every wave-shaped instrument — an anchor sweep, `git apply --check` over the
+patches, a hunk-overlap table — answers the first half alone while reading as a complete
+proof, because it is one, of half the criterion. Disjoint hunks do not close the second:
+two hunks hundreds of lines apart sit inside one `#[test]`. So re-cut. If a round is
+carried anyway, hash the reddening test's whole body blob-vs-blob at both heads —
+`git show` each side, extract by its `fn` header and brace-match — against an unedited
+sibling as the discriminating control. Signature: a "not re-cut, verified
+mechanically" argument whose instruments are all patch- or hunk-shaped, with no
+per-test hash (#1722 — `l7a_…` was 15 075 bytes at the wave head and 16 242 at
+`dc8802ff`, a 1 167-byte rewrite behind clean hunk checks; the wave head `0030b137`
+resolves only through `git fetch origin refs/pull/1722/head`).
+
 **A re-cut wave needs its own OPEN PRs — a pushed scratch branch builds nothing.**
 `ci.yml` is `on: push: branches: [main]` plus `pull_request`, so a branch is built only
 while a PR is open on it: over the last 400 runs NOT ONE `push` run is on a branch other
