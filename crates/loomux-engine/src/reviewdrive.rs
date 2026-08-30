@@ -939,9 +939,6 @@ impl DriveEntry {
         bump: Option<Counter>,
         now_ms: u64,
     ) -> Result<(), InvalidTransition> {
-        if reason.is_some() != (to == DriveState::Held) {
-            return Err(InvalidTransition { from: self.state, to });
-        }
         self.state = transition(self.state, to)?;
         self.held_reason = reason;
         match bump {
