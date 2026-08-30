@@ -10614,7 +10614,7 @@ fn task_summaries_for_list_tasks_defaults_to_capped_and_include_all_bypasses_it(
     }
 
     // Default (capped) read.
-    let (rows, omitted) = reg.task_summaries_for_list_tasks(&g.id, false);
+    let (rows, omitted) = reg.task_summaries_for_list_tasks(&g.id, false, false);
     assert_eq!(omitted, total_done - LIST_TASKS_DONE_CAP, "the omitted count is exact, never approximated");
     let kept_done = rows.iter().filter(|r| r.status == "done").count();
     assert_eq!(kept_done, LIST_TASKS_DONE_CAP, "done rows are capped at the default");
@@ -10626,9 +10626,18 @@ fn task_summaries_for_list_tasks_defaults_to_capped_and_include_all_bypasses_it(
     assert!(reg.get_task(&g.id, &done_ids[0]).is_some(), "an elided done row is still on the board");
 
     // include_all bypasses the cap entirely.
-    let (all_rows, all_omitted) = reg.task_summaries_for_list_tasks(&g.id, true);
+    let (all_rows, all_omitted) = reg.task_summaries_for_list_tasks(&g.id, true, false);
     assert_eq!(all_omitted, 0, "include_all never reports an elision");
     assert_eq!(all_rows.len(), total_done + 1, "include_all returns the whole board");
+
+    // hot_only (#1684) ABOVE the cap — the axis the small 3-done fixture in
+    // hot_only_drops_every_done_row_and_still_counts_them cannot reach: with
+    // every done row dropped, the count must still name ALL of them (25), not
+    // the capped 20 or the overage 5, and only the non-done row survives.
+    let (hot_rows, hot_omitted) = reg.task_summaries_for_list_tasks(&g.id, false, true);
+    assert_eq!(hot_omitted, total_done, "hot_only counts every done row it dropped, cap or not");
+    assert_eq!(hot_rows.len(), 1, "hot_only above the cap returns only the non-done row");
+    assert!(hot_rows.iter().any(|r| r.id == live.id), "the non-done row survives hot_only");
 }
 
 #[test]
@@ -10655,6 +10664,122 @@ fn list_tasks_mcp_tool_reports_the_omitted_done_count_and_honors_include_all() {
     let fbody: Value = serde_json::from_str(ftext).unwrap();
     assert_eq!(fbody["omitted_done"], 0, "include_all reports nothing elided: {ftext}");
     assert_eq!(fbody["tasks"].as_array().unwrap().len(), LIST_TASKS_DONE_CAP + 4, "include_all returns every row");
+}
+
+#[test]
+fn hot_only_drops_every_done_row_and_still_counts_them() {
+    // #1684: the per-wake re-sync wants a board with NO done rows in it —
+    // not the capped newest 20 — while still being told how many it did not
+    // see, so a hot read can never be mistaken for the whole board. Three
+    // done rows sit under the cap on purpose: the cap path keeps the newest
+    // 20 and would return all three, so only hot_only may drop them.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let mut done_ids = Vec::new();
+    for i in 0..3 {
+        let t = reg
+            .upsert_task(&g.id, "orch", None, patch(Some(&format!("done-{i}")), Some("done"), None))
+            .unwrap();
+        done_ids.push(t.id);
+    }
+    let queued_a = reg.upsert_task(&g.id, "orch", None, patch(Some("queued-a"), Some("queued"), None)).unwrap();
+    let queued_b = reg.upsert_task(&g.id, "orch", None, patch(Some("queued-b"), Some("queued"), None)).unwrap();
+
+    let (rows, omitted) = reg.task_summaries_for_list_tasks(&g.id, false, true);
+    assert_eq!(omitted, 3, "hot_only counts every done row it dropped: {omitted}");
+    assert_eq!(rows.len(), 2, "exactly the two non-done rows survive");
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert!(ids.contains(&queued_a.id.as_str()) && ids.contains(&queued_b.id.as_str()),
+        "both queued rows are present by id: {ids:?}");
+    assert!(rows.iter().all(|r| r.status != "done"), "no done row of any age survives hot_only");
+
+    // Dropping is elision, not deletion — same guarantee the cap gives.
+    for id in &done_ids {
+        assert!(reg.get_task(&g.id, id).is_some(), "an omitted done row is still on the board: {id}");
+    }
+
+    // The default read is unchanged by the new flag's existence.
+    let (default_rows, default_omitted) = reg.task_summaries_for_list_tasks(&g.id, false, false);
+    assert_eq!(default_omitted, 0, "three done rows sit under the cap: nothing is elided by default");
+    assert_eq!(default_rows.len(), 5, "the default read returns the whole small board");
+}
+
+/// One-paragraph shape check for a user-facing message (#1426 B2 shape; the
+/// two leak forms are a `\n` plus indentation shipped from the source literal,
+/// or a collapsed `\` continuation leaving a ten-space run with no `\n`).
+/// Copied from tests/manager_lifecycle.rs so both suites pin the same shape.
+fn is_one_paragraph(msg: &str) -> bool {
+    !msg.contains('\n') && !msg.contains("          ")
+}
+
+fn assert_one_paragraph(what: &str, msg: &str) {
+    assert!(
+        is_one_paragraph(msg),
+        "{what}: a refusal is one paragraph — the house idiom is a `\\` line \
+         continuation, which strips the newline AND the indentation. This one \
+         ships a hard break or leaked indentation: {msg:?}"
+    );
+}
+
+#[test]
+fn hot_only_with_include_all_is_refused() {
+    // #1684: the two flags answer opposite questions — one returns every
+    // done row, the other refuses to carry any — so the quieter of the two
+    // must never silently win. The refusal names BOTH flags.
+    let (reg, _d, co, _cw) = setup_mcp();
+    let refused = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": { "hot_only": true, "include_all": true } }))
+        .unwrap();
+    assert_eq!(refused["isError"], true, "the contradiction must be an error result, not a read: {refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("hot_only") && text.contains("include_all"),
+        "the refusal must name both flags: {text}");
+    // The message is a `\`-continuation literal: pin its SHAPE beside the
+    // content, because a `.contains` pin survives a collapsed continuation —
+    // no asserted substring straddles the break (#1457's form).
+    assert_one_paragraph("hot_only + include_all refusal", text);
+
+    // Either flag alone still reads fine — the refusal is about the PAIR.
+    let hot = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": { "hot_only": true } })).unwrap();
+    assert_eq!(hot["isError"], false, "hot_only alone is a valid read: {hot}");
+    let all = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_tasks", "arguments": { "include_all": true } })).unwrap();
+    assert_eq!(all["isError"], false, "include_all alone is a valid read: {all}");
+}
+
+#[test]
+fn live_only_omits_dead_agents_and_keeps_live_ones() {
+    // #1684: the per-wake re-sync only needs "who is live" — a dead agent's
+    // session id already sits on the board rows that resume it, so carrying
+    // the dead roster on every wake is payload for nothing. One dead + one
+    // live: the default roster returns both, live_only returns exactly the
+    // live one.
+    let (reg, _d, co, cw) = setup_mcp();
+    // setup_mcp's two agents are exactly the fixture the brief asks for once
+    // the worker dies: one live (the orchestrator we dispatch as) + one dead.
+    reg.mark_dead(&cw.agent_id, None);
+
+    let default = dispatch(&reg, &co, "tools/call", &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    let dtext = default["content"][0]["text"].as_str().unwrap();
+    let dbody: Value = serde_json::from_str(dtext).unwrap();
+    let drows = dbody.as_array().unwrap();
+    assert_eq!(drows.len(), 2, "the default read is unchanged: the dead row stays, dead rows included: {dtext}");
+    assert!(drows.iter().any(|a| a["id"] == json!(cw.agent_id) && a["status"] == json!("dead")),
+        "the dead agent is on the default roster: {dtext}");
+
+    let live = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": { "live_only": true } })).unwrap();
+    let ltext = live["content"][0]["text"].as_str().unwrap();
+    let lbody: Value = serde_json::from_str(ltext).unwrap();
+    let lrows = lbody.as_array().unwrap();
+    assert_eq!(lrows.len(), 1, "live_only returns exactly the live agent: {ltext}");
+    assert!(lrows.iter().all(|a| a["id"] == json!(co.agent_id)),
+        "the surviving row is the live orchestrator: {ltext}");
+    assert!(lrows.iter().all(|a| a["id"] != json!(cw.agent_id)),
+        "the dead agent never survives live_only: {ltext}");
+    assert!(lrows.iter().all(|a| a["status"] != json!("dead")),
+        "every row live_only returns is a live one: {ltext}");
 }
 
 // ---------- #582: dependency links, derived readiness, atomic claim ----------
