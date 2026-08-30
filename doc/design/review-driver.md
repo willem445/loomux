@@ -152,7 +152,7 @@ own delivery arrives by its own path; §7.)
 | `held(rebase-limit)` | a second conflict after the one rebase hand-back |
 | `held(lane-stalled)` | a spawned or resumed **reviewer** lane recorded no verdict inside `lane_timeout_minutes` |
 | `held(fix-stalled)` | a resumed **worker** neither pushed nor reported inside `fix_timeout_minutes` |
-| `held(drive-stalled)` | the whole drive outlived `drive_timeout_minutes` without reaching a terminal state |
+| `held(drive-stalled)` | the drive's **age** — `now - started_ms`, never an idle clock reset by each state advance — passed `drive_timeout_minutes`. The precedent is `mqloop::status_view`, whose `since_ms` is `now_ms.saturating_sub(e.enqueued_ms)`: age since the entry began, not time since it last moved. An idle clock would leave §8's `also: [base-green]` row parked **forever**, because that drive advances `gate-check` → `ci-wait` on every wake and would reset the timer each time — which is precisely the silent park that row says the bound exists to prevent |
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
 | `held(gate-unreadable)` | the gate file is present and could not be read (an I/O error), which is **not** `gate-not-configured` |
 | `held(worker-blocked)` | the worker reported `blocked` |
@@ -604,10 +604,17 @@ group id becomes a path) beside `state.json`, `tasks.json` and
                    "last_verdict": "pass", "at_head": "<sha>" } ],
       "lane_index": 0,
       "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
-      "since_ms": 0 }
+      "started_ms": 0 }
   ]
 }
 ```
+
+`started_ms` is an absolute timestamp, and the status view derives an age from
+it (`now - started_ms`) rather than the file storing one — the queue's split,
+where the entry holds `enqueued_ms` and `mqloop::status_view` computes
+`since_ms`. A stored *age* would be wrong in the way that matters here: it is
+the anchor §2.2's `drive-stalled` bound is measured from, and an age is stale
+the instant it is written and meaningless across a restart.
 
 Versioned, **atomically written**, and unknown fields **tolerated and
 preserved** — carried across a read/write cycle rather than merely not failing
@@ -766,8 +773,15 @@ exists because the first two would look like coverage without it:
    file path carrying `[orrerix]`, a newline and a control character, asserting
    the sanitizers neutralized each. A benign fixture set by construction
    contains no hostile string, so parts 1 and 2 are green whether or not the
-   sanitization of §5.5's second paragraph was ever wired — which is precisely
+   sanitization of the paragraph above was ever wired — which is precisely
    the shape of an absence-only assertion with no positive control.
+   **It must exercise the driver's own brief-rendering path, not a copy of
+   it.** S4 wires the sanitizers *at* that call site, and the hostile case
+   calls the same function the tick calls; a test that sanitizes inside its own
+   render harness asserts only that the two functions compose, and passes
+   identically while the live call site hands `render_template` a raw job name.
+   That is part 3's own failure mode one level up — a pin that looks like
+   coverage of a call site it never touches.
 
 Each template carries **facts only** (§3.1 item 4). The delta template exists
 because it is the line an orchestrator typed by hand nine times on one PR:
