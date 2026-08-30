@@ -10629,6 +10629,15 @@ fn task_summaries_for_list_tasks_defaults_to_capped_and_include_all_bypasses_it(
     let (all_rows, all_omitted) = reg.task_summaries_for_list_tasks(&g.id, true, false);
     assert_eq!(all_omitted, 0, "include_all never reports an elision");
     assert_eq!(all_rows.len(), total_done + 1, "include_all returns the whole board");
+
+    // hot_only (#1684) ABOVE the cap — the axis the small 3-done fixture in
+    // hot_only_drops_every_done_row_and_still_counts_them cannot reach: with
+    // every done row dropped, the count must still name ALL of them (25), not
+    // the capped 20 or the overage 5, and only the non-done row survives.
+    let (hot_rows, hot_omitted) = reg.task_summaries_for_list_tasks(&g.id, false, true);
+    assert_eq!(hot_omitted, total_done, "hot_only counts every done row it dropped, cap or not");
+    assert_eq!(hot_rows.len(), 1, "hot_only above the cap returns only the non-done row");
+    assert!(hot_rows.iter().any(|r| r.id == live.id), "the non-done row survives hot_only");
 }
 
 #[test]
@@ -10695,6 +10704,23 @@ fn hot_only_drops_every_done_row_and_still_counts_them() {
     assert_eq!(default_rows.len(), 5, "the default read returns the whole small board");
 }
 
+/// One-paragraph shape check for a user-facing message (#1426 B2 shape; the
+/// two leak forms are a `\n` plus indentation shipped from the source literal,
+/// or a collapsed `\` continuation leaving a ten-space run with no `\n`).
+/// Copied from tests/manager_lifecycle.rs so both suites pin the same shape.
+fn is_one_paragraph(msg: &str) -> bool {
+    !msg.contains('\n') && !msg.contains("          ")
+}
+
+fn assert_one_paragraph(what: &str, msg: &str) {
+    assert!(
+        is_one_paragraph(msg),
+        "{what}: a refusal is one paragraph — the house idiom is a `\\` line \
+         continuation, which strips the newline AND the indentation. This one \
+         ships a hard break or leaked indentation: {msg:?}"
+    );
+}
+
 #[test]
 fn hot_only_with_include_all_is_refused() {
     // #1684: the two flags answer opposite questions — one returns every
@@ -10708,6 +10734,10 @@ fn hot_only_with_include_all_is_refused() {
     let text = refused["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("hot_only") && text.contains("include_all"),
         "the refusal must name both flags: {text}");
+    // The message is a `\`-continuation literal: pin its SHAPE beside the
+    // content, because a `.contains` pin survives a collapsed continuation —
+    // no asserted substring straddles the break (#1457's form).
+    assert_one_paragraph("hot_only + include_all refusal", text);
 
     // Either flag alone still reads fine — the refusal is about the PAIR.
     let hot = dispatch(&reg, &co, "tools/call",

@@ -28526,18 +28526,19 @@ impl OrchRegistry {
     /// dropped count still reported so a hot board is never mistaken for the
     /// whole one), else `done` rows capped at `LIST_TASKS_DONE_CAP` —
     /// newest by `updated_ms` — with the omitted count returned alongside so
-    /// the caller can say so rather than silently truncating. See
-    /// `filter_done_rows` for the keep/drop rule. The include_all/hot_only
-    /// contradiction is refused one layer up, at the dispatch that parses the
-    /// flags; this method trusts its caller the way the old two-arg shape did.
+    /// the caller can say so rather than silently truncating. The hot arm IS
+    /// `filter_done_rows` at a cap of 0 (one keep/drop rule, not two that can
+    /// drift); the include_all/hot_only contradiction is refused one layer
+    /// up, at the dispatch that parses the flags.
     pub fn task_summaries_for_list_tasks(&self, group: &GroupId, include_all: bool, hot_only: bool) -> (Vec<TaskSummary>, usize) {
         let rows = self.task_summaries(group);
         if include_all {
             (rows, 0)
         } else if hot_only {
-            let omitted = rows.iter().filter(|r| r.status == "done").count();
-            let kept = rows.into_iter().filter(|r| r.status != "done").collect();
-            (kept, omitted)
+            // A cap of 0 keeps nothing done and omits the lot — exactly the
+            // hot read, with filter_done_rows's arithmetic already pinned by
+            // its own unit tests above and below the cap.
+            filter_done_rows(rows, 0)
         } else {
             filter_done_rows(rows, LIST_TASKS_DONE_CAP)
         }

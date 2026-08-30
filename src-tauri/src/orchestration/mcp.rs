@@ -2017,9 +2017,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let mut roster = reg.list_agents(&caller.group);
             // #1684: the per-wake re-sync only needs "who is live" — a dead
             // agent's session id already sits on the board rows that resume
-            // it, so carrying the whole dead roster on every wake is payload
-            // for nothing. Registry hygiene (#106/#851) is untouched: this
-            // drops whole rows only, on the explicit opt-in.
+            // it (while such a row is still open; a dead agent whose only row
+            // is done has it in neither response of the live_only + hot_only
+            // pair, which get_task, the default roster read and the audit log
+            // still carry), so carrying the whole dead roster on every wake
+            // is payload for nothing. Registry hygiene (#106/#851) is
+            // untouched: this drops whole rows only, on the explicit opt-in.
             if live_only {
                 if let Some(rows) = roster.as_array_mut() {
                     rows.retain(|a| a["status"] != json!("dead"));
