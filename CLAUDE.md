@@ -842,13 +842,16 @@ narrow their ask back down to the original ticket on your own judgment.
   endpoint. A blank line is also only one of the two forms: a MISSING one makes the
   following paragraph or row a lazy continuation of the list item above it, so it renders
   swallowed into that bullet with no literal pipes to notice (#1140 B4, #1196 N1).
-  **An INSERT into a list damages the NEIGHBOUR, so render the BASE too.** A new entry takes
-  the block that follows it — by a missing blank line, or by re-parenting a correctly indented
-  continuation paragraph, which is malformed nowhere and renders the new entry itself right — so
-  a head-only render of the slice you edited clears it while the item ABOVE has silently lost its
-  closing paragraph. Compare `<li>` structure over the SAME slice at both ends; a hand-maintained
-  log's real append point is usually EOF. Signature: a re-bless entry inserted among entries that
-  carry indented continuation paragraphs (#1196 N1, #1773 B2 — both `pre222/README.md`).
+  **An INSERT into a list damages the NEIGHBOUR, so render the BASE too.** A new entry takes the
+  block that follows it — by a missing blank line, or by re-parenting a correctly indented
+  continuation paragraph — and nothing is malformed, so a head-only render of the slice you edited
+  clears it while the item ABOVE has silently lost its closing paragraph. Compare WHERE `</li>`
+  falls at both ends, never the `<li>` TOTAL: a new entry moves the total legitimately, and #1773
+  B2 hid inside that move (slice 1 → 2, whole file 55 → 56, both the healthy +1) while showing
+  plainly in which `<li>` the neighbour's closing `</p>` landed. The hazard is an insert BETWEEN
+  entries; an append past the last one has no neighbour below it to re-parent. Signature: a
+  re-bless entry inserted among entries that carry indented continuation paragraphs (#1196 N1,
+  #1773 B2 — both `pre222/README.md`).
   **That endpoint is blind to a `mermaid` fence**, and so is a browser: GFM returns every
   such fence as a syntax-highlighted `<pre>` — byte-for-byte the raw-DSL failure you are
   checking for — while GitHub's own file viewer renders it in a cross-origin sandboxed
