@@ -597,6 +597,18 @@ narrow their ask back down to the original ticket on your own judgment.
   work — then delete. Signature: a
   `base_ref_deleted` timeline event with a `closed` event one second later, and
   no `base_ref_changed` between them (#1736).
+- **A PR head behind `main` is a merge-ordering fact — disposition it by FILE
+  OVERLAP, never by the commit count.** Every sibling merge puts every in-flight
+  PR behind, so a "N behind, therefore FAIL" rule turns the group's own merges
+  into review rounds. Intersect `git diff --name-only origin/main...HEAD` with
+  `git diff --name-only HEAD...origin/main`: an empty intersection on a
+  `mergeStateStatus` of `CLEAN` is a NOTE, and whoever performs the merge rebases
+  first, as the bullet above already makes their job; a non-empty one means the
+  green no longer describes the merged tree, so rebase and re-review. Signature:
+  a blocking finding whose own text calls the rebase mechanical and says nothing
+  in the PR's logic changes, buying a re-review that `git range-diff` then
+  reports as `=` (#1762 r1 F1, 2 behind on `a3ba6e48`/`1565db4c` with an empty
+  intersection; #1758, same two commits, recorded as a note).
 - **A closing-keyword sweep of a squash message must be MULTILINE, and the
   merge is verified on the issue.** GitHub's scan spans the line break, and in a
   commit message it is not markdown-aware — no fences, no code spans, only
