@@ -1416,7 +1416,7 @@ fn decide_gate_check(facts: &DriveFacts) -> DriveStep {
     match facts.gate {
         GateOutcome::Unreadable => DriveStep::held(HeldReason::GateUnreadable),
         // Arc 9.
-        GateOutcome::Satisfied => DriveStep::to(DriveState::Satisfied),
+        GateOutcome::Satisfied => DriveStep::Wait,
         // Arc 10, which is deliberately wider than "stale".
         GateOutcome::Unsatisfied => DriveStep::to(DriveState::CiWait),
         // The tick reached `gate-check` without evaluating the gate. Nothing is
