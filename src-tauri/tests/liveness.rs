@@ -2853,6 +2853,9 @@ fn l7b_a_wedged_day_old_registry_still_answers_busy_within_budget() {
 /// else can be observed surviving it. Neither is a production path that got
 /// slow.
 const PERMITTED_LONG_HOLDS: &[(&str, &str, &str)] = &[
+    // [scratch j4b] a row naming a site that does not exist: a stale row is a
+    // row watching nothing, and must fail as loudly as an unlisted site.
+    ("orchestration/nosuchfile.rs", "never_written", "[scratch j4b] a stale row"),
     (
         "orchestration/mod.rs",
         "OrchRegistry::hold_lock_for_test",
