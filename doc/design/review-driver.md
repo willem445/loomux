@@ -95,7 +95,7 @@ does not survive a re-push", and #565's body-digest asymmetry):
 
 ### 2.2 Every exit back to the LLM orchestrator
 
-There are exactly eleven, and each emits **one** kick-back notice. This is the
+There are exactly twelve, and each emits **one** kick-back notice. This is the
 whole contract on the orchestrator's side: if a driven PR is not producing one
 of these, the drive is still running and there is nothing to read. (The one
 exit that puts two lines in the pane is `held(messaged)`, and the extra line is
@@ -113,6 +113,7 @@ delegate's own delivery arrives by its own path; §7.)
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
 | `held(worker-blocked)` | the worker reported `blocked` |
 | `held(worker-unresumable)` | the recorded worker session no longer resolves |
+| `held(drive-stalled)` | the whole drive outlived `drive_timeout_minutes` without reaching a terminal state — a `gh` outage that never cleared, or a gate condition (`also: [base-green]`) that stayed unsatisfiable |
 | `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
 | `cancelled` | `cancel_review_drive`, or reconcile found the PR closed or merged |
 
@@ -275,9 +276,24 @@ therefore *writes* to the board (a `TaskNote` on the task whose `pr` matches, so
 the human sees the drive on the board) and *reads* nothing from it. Its inputs
 are the tool call, the workflow file, the verdict files, and GitHub.
 
-The session must be the **full** session UUID — a truncated id does not resolve
-(`resolve_session_ref`, and INVARIANT 10 says the same to the orchestrator), and
-a drive that cannot resume its worker is a drive with no `fix-wait`.
+**`drive_review` resolves the session once and persists what came back, never
+the caller's raw string.** `resolve_session_ref` is a resolution against *this
+group's roster at the moment of the call*: an exact match wins outright, an input
+already complete for a supported CLI (`is_full_session_id` — length for claude,
+shape for opencode) passes through untouched even if this roster never recorded
+it, and only a shorter, shapeless input is prefix-matched — a unique hit
+resolves to the full id, zero is `resume-not-found`, two or more is
+`resume-ambiguous` and lists the candidates rather than silently choosing.
+
+That is a fine contract for a tool call and a bad thing to persist. A prefix
+that resolves uniquely today can become ambiguous tomorrow as the roster grows,
+and a roster that loses the entry makes it unresolvable — whereas a full id
+depends on the roster for nothing, taking the exact-match or the passthrough
+arm. The drive entry outlives both the call and the process (§2.4 resumes it
+from disk after a restart), so the **resolved** id is what goes into
+`review_drives.json`, and a drive that cannot resume its worker is a drive with
+no `fix-wait`. INVARIANT 10 tells the orchestrator the same thing for the same
+reason.
 
 Role gating uses the `review_verdict` / `queue_merge` **double gate**: a listing
 filter *and* a real check in the dispatch, because a tool omitted from a listing
@@ -345,7 +361,7 @@ double-gated per §3.2.
 ```
 drive_review(pr: number, worker_session: string, reset_counters?: boolean)
   -> { driving: true, state: "ci-wait" } | { refused: "<reason>" }
-  refusals: driver-disabled | pr-not-open | session-not-found
+  refusals: driver-disabled | pr-not-open | resume-not-found | resume-ambiguous
           | already-driven | gate-not-configured
 
 cancel_review_drive(pr: number)
@@ -359,10 +375,14 @@ review_drive_status()
                   since_ms }] }
 ```
 
-Three of the refusal names are borrowed deliberately rather than coined.
-`session-not-found` is `resolve_session_ref`'s vocabulary, including its
-sharpest property: a session id **prefix** does not resolve, so a truncated
-paste is refused rather than matched. `gate-not-configured` is the queue's own
+Four of the refusal names are borrowed deliberately rather than coined.
+`resume-not-found` and `resume-ambiguous` are `resolve_session_ref`'s own, and
+they are borrowed rather than collapsed into one because they are already tagged
+so a caller can tell "never seen this session" from "this prefix names more than
+one" programmatically, without parsing prose — and the two want different things
+from the orchestrator (a different id, versus a longer one). Coining a third
+spelling for either would give the same condition two names depending on which
+tool you called. `gate-not-configured` is the queue's own
 refusal, and for the queue's own reason — a repo with no gate has nothing for a
 drive to run *toward*, and `evaluate_merge_gate` with no gate returns *allowed*,
 which is correct for the shim and would be a driver announcing gate-satisfied on
@@ -480,10 +500,23 @@ the defect class #461 catalogues.
 Three built-in templates in `src-tauri/src/orchestration/templates/` —
 `driver-review.md`, `driver-delta.md`, `driver-fix.md` — rendered by the
 existing `render_template` `{{KEY}}` substitution, which does replacement and
-nothing else. They are new files, so they are **not** fixture-pinned by
+nothing else. They are new files, so they are **not** covered by
 `tests/fixtures/pre222/`, which pins the four role templates; an edit to
 `orchestrator.md` announcing the feature to the orchestrator **is** in that
 fixture set and re-blesses in the same commit.
+
+**They get a pin of their own, because they are contract text.** What the driver
+types at a reviewer decides what that reviewer reviews, so an edit to it must be
+as visible as an edit to a role template. Each of the three is pinned by a golden
+fixture holding it **rendered against one fixed fact set**, asserted
+byte-for-byte, with an intentional edit re-blessing in the same commit and a line
+in the fixture README — `pre222`'s procedure, applied to the rendered output
+rather than the source, because the rendered text is what a reviewer receives.
+The same test asserts that every `{{KEY}}` a template names is in the key set the
+driver supplies for it: `render_template` is a plain per-key `.replace`, so an
+unregistered placeholder survives into a live brief as the literal characters
+`{{FOO}}`, and a golden alone would pin that just as happily as it pins the
+intended text.
 
 Each template carries **facts only** (§3.1 item 4). The delta template exists
 because it is the line an orchestrator typed by hand nine times on one PR:
@@ -584,8 +617,8 @@ orchestrator recovers its drives) and the audit log.
 | An idle reviewer or worker is reaped between rounds | Normal, and already handled: the entry stores the **full** session UUID, so the next round resumes it; if the session no longer resolves, a lane respawns fresh by block id and a worker becomes `held(worker-unresumable)`. No `notify_when` watch is held anywhere — watches die with their agent — so the tick polls the PR itself. |
 | The worker pushes while a lane is mid-review | The head moves, so the drive re-enters `ci-wait`; the verdict that lands binds to the old head. A `fail` there still routes, a `pass` there is stale and the lane is re-briefed after CI. One wasted review, bounded by the round counter. This race is not designed away — it is the race the verdict binding already exists to handle. |
 | The PR body changes under a recorded `pass` | The `(head, digest)` key is re-read every tick, so a moved digest with an unchanged head re-enters `review-wait` at the first stale lane with a body-only delta brief. While a drive is live, body fixes go through the worker or the drive is cancelled first (§3.1 item 3). |
-| `gh` is down, rate-limited, or slow | `ResolveFailure::is_runner` — a fact about the world: back off, no transition, no notice, until `drive_timeout_minutes` makes it `held(stalled)`. A refusal the remote actually **answered** (PR closed, 404) is a fact about that PR and becomes `cancelled`. |
-| `also: [base-green]` and the default branch is red | The gate is simply not satisfied; `gate-check` returns to `ci-wait` and the drive parks until `drive_timeout_minutes` makes it `held(stalled)`. Stopping the line is the intended behaviour; the bound is what keeps it from being a silent one. |
+| `gh` is down, rate-limited, or slow | `ResolveFailure::is_runner` — a fact about the world: back off, no transition, no notice, until `drive_timeout_minutes` makes it `held(drive-stalled)`. A refusal the remote actually **answered** (PR closed, 404) is a fact about that PR and becomes `cancelled`. |
+| `also: [base-green]` and the default branch is red | The gate is simply not satisfied; `gate-check` returns to `ci-wait` and the drive parks until `drive_timeout_minutes` makes it `held(drive-stalled)`. Stopping the line is the intended behaviour; the bound is what keeps it from being a silent one. |
 | `review_drives.json` is torn or hand-edited | The tick refuses, audits `rd-state-unreadable`, backs off. Never repaired, never deleted (§2.4). |
 | orrerix restarts mid-drive | Reconcile before driving: closed PR to `cancelled`, unresolvable session to `held`, everything else resumed against the **live** head (§2.4). |
 | The orchestrator compacts and forgets its drives | `review_drive_status()` is in the re-sync list, and every §6 notice names the tool that acts on it. |
