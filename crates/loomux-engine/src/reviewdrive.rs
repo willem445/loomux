@@ -273,7 +273,7 @@ impl HeldReason {
             HeldReason::ReviewLimit => "review-limit",
             HeldReason::CiLimit => "ci-limit",
             HeldReason::RebaseLimit => "rebase-limit",
-            HeldReason::LaneStalled => "lane-stalled",
+            HeldReason::LaneStalled => "lane_stalled",
             HeldReason::FixStalled => "fix-stalled",
             HeldReason::DriveStalled => "drive-stalled",
             HeldReason::RoutingUnaccountable => "routing-unaccountable",
