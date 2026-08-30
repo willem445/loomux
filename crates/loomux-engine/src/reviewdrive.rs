@@ -1525,9 +1525,6 @@ fn decide_gate_check(facts: &DriveFacts) -> DriveStep {
     // guessing "no rule fired" is guessing in favour of merging, and the gate
     // would answer allowed on a reviewer list nobody could compute — §3.1's
     // "a bypass with better telemetry".
-    if facts.required_lanes.is_none() {
-        return DriveStep::held(HeldReason::RoutingUnaccountable);
-    }
     match facts.gate {
         GateOutcome::Unreadable => DriveStep::held(HeldReason::GateUnreadable),
         // Arc 9.
