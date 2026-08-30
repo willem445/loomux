@@ -1397,9 +1397,6 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     // `lane-stalled` can never fire and the loop defeats the very bound meant
     // to catch it. §8's posture settles it: an unknown is never a fact, and the
     // drive stays bounded by `drive-stalled` above, which needs no head at all.
-    if facts.head.is_empty() {
-        return DriveStep::Wait;
-    }
     match state {
         DriveState::CiWait => decide_ci_wait(entry, facts, limits),
         DriveState::ReviewWait => decide_review_wait(entry, facts, limits),
