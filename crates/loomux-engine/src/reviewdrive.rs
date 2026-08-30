@@ -1382,7 +1382,6 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     // is a `pub fn` over a plain value type that any caller in any crate can
     // reach without going through S2's parser. A boundary that holds only when
     // the expected caller is upstream is not a boundary.
-    let limits = &limits.clamped();
     if entry.age_ms(facts.now_ms) >= minutes_ms(limits.drive_timeout_minutes) {
         return DriveStep::held(HeldReason::DriveStalled);
     }
