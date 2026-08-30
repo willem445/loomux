@@ -1486,7 +1486,11 @@ struct RawMergeQueue {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+// [scratch round 4] removed deny_unknown_fields from RawDriver — the single
+// neutered behaviour this round exists to redden: the no-spelling-exists
+// capability closure (§5.3) that `the_driver_block_can_never_target_a_pr_or_
+// widen_anything` pins. With the attribute gone, `pr: 12` / `auto: true` /
+// `lanes: 3` / `max_revew_rounds: 3` parse as tolerated unknown keys.
 struct RawDriver {
     #[serde(default)]
     enabled: bool,
