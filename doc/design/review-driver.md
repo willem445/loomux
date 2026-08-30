@@ -14,6 +14,15 @@ actions — is what the later slices are for. Where this note says a slice
 **must** do something, that is a requirement on that slice, not a description of
 today.
 
+**Editing rule: a cross-reference names a row, arc or item by its SUBJECT, never
+by its ordinal.** An ordinal is derived from a position, so it is valid only at
+the commit it was read on, and §8's table is exactly what S3 will edit when these
+failure modes become code. Inserting one row there silently invalidates every
+back-reference below it at once, and each lands on a *plausible* neighbour rather
+than on nothing — which is why nothing goes red and why a reader trusts it. The
+arc list in §2.1 is numbered because it is a table of its own, but cite its arcs
+by what they do as well.
+
 ## 1. What the driver is, and the one sentence of why
 
 **The driver is a per-PR state machine in the backend that performs the
@@ -78,6 +87,26 @@ resumes it; `cancel_review_drive` cancels it), and only `satisfied` and
 self-transition for the same reason, and says so: "refreshing
 `QueueEntry::blocked_reason` leaves an entry `queued`".
 
+**The state enum is closed — no unknown variant, no catch-all arm — with
+`as_str`/`parse`,** exactly as `mergeq::EntryState` has them. That is a
+prescription on S1 and not decoration, because §5.2 persists the state as a
+**string** (`"state": "review-wait"`) while promising that unknown *fields* are
+tolerated and preserved, and those two promises pull in opposite directions
+unless the note says which governs.
+
+**It is the refusal that governs: an unknown state string refuses the file.** It
+is not a tolerated unknown, and `parse` has no fallback variant to coerce it to.
+The asymmetry with unknown fields is deliberate and worth its sentence. An
+unknown *field* is data some newer build added that this one need not understand
+in order to carry it across a read/write cycle — preserving it costs nothing and
+loses nothing. An unknown *state* is the entry's entire meaning: a build that
+cannot tell whether that drive is parked, live, or finished cannot decide
+anything about it, and every available default is a guess that either resumes a
+drive somebody stopped or abandons one still running. So it takes §2.4's path —
+`rd-state-unreadable`, refuse the tick, back off, never repair and never delete —
+which is the same answer for the same reason, and §2.4 is where that posture is
+argued.
+
 The transition table is **enumerated, and a pair it does not name is a
 refusal** — `mergeq::transition` matches explicit pairs and falls through to
 `Err(InvalidTransition)`, and this copies that. So the arcs are listed in full
@@ -100,7 +129,8 @@ fails at runtime, on the degradation path, where nothing is watching.
   9  gate-check  -> satisfied      evaluate_merge_gate satisfied at the live head
  10  gate-check  -> ci-wait        NOT satisfied, for ANY reason — a stale pass,
                                    an unsatisfied `also:` condition, a push that
-                                   landed under the check (§8 rows 5 and 7)
+                                   landed under the check (§8, the body-changed
+                                   and `also: [base-green]` rows)
  11  held        -> ci-wait        drive_review resumes a parked drive (§2.3)
  12  <any working or gate state> -> held{reason}
                                    a counter bound, a lane/fix/drive timeout, an
@@ -160,7 +190,7 @@ own delivery arrives by its own path; §7.)
 | `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
 | `cancelled` | `cancel_review_drive`, or reconcile **positively established** the PR is closed or merged |
 
-`held` is one state carrying a **closed** reason enum, not thirteen states, so a
+`held` is one state carrying a **closed** reason enum, not twelve states, so a
 reader asking "is this drive parked" asks one question; and the reason travels
 in the notice and the audit line rather than being inferred from which counter
 happens to sit at its bound.
