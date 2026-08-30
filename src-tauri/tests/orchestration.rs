@@ -4478,6 +4478,153 @@ fn an_oversized_orphan_payload_says_it_was_truncated() {
 }
 
 // ---------------------------------------------------------------------------
+// #1683 slice 1 — `read_playbook(section)`, the on-demand playbook mechanism.
+//
+// The orchestrator's contract splits into a resident core (the system prompt)
+// and an on-demand playbook (`<group dir>/orchestrator-playbook.md`), served
+// one `## ` section at a time by this orchestrator-only tool. The failure the
+// mechanism exists for is NOT an unreadable section — it is an orchestrator
+// that never knows to ask — so the resident core keeps the rules and every
+// moved section leaves a resident stub naming its trigger. These tests pin
+// the tool half of that shape; the stub half is pinned over in
+// tests/workflow.rs (`every_playbook_section_has_a_resident_stub_naming_it`).
+// ---------------------------------------------------------------------------
+
+/// The cap only binds delegates and `rails()` pins it at 2, and the
+/// orchestrator-only test below needs one of each delegate class live.
+fn playbook_rails() -> Guardrails {
+    Guardrails { max_agents: 8, ..rails() }
+}
+
+fn playbook_caller(reg: &OrchRegistry, group: &GroupId, role: Role) -> Caller {
+    let a = reg.spawn_agent(group, role, "a", "", false, None).unwrap();
+    reg.resolve_token(&a.token).unwrap()
+}
+
+fn read_playbook_call(reg: &OrchRegistry, caller: &Caller, section: &str) -> Value {
+    dispatch(reg, caller, "tools/call",
+        &json!({ "name": "read_playbook", "arguments": { "section": section } })).unwrap()
+}
+
+#[test]
+fn read_playbook_returns_one_section_by_id_with_vars_substituted() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    let co = playbook_caller(&reg, &g.id, Role::Orchestrator);
+
+    let r = read_playbook_call(&reg, &co, "about-this-playbook");
+    assert_eq!(r["isError"], json!(false), "a known section reads: {r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("## About this playbook"),
+        "the section comes back whole, heading line included: {text}"
+    );
+    assert!(
+        !text.contains("{{"),
+        "the tool serves the RENDERED file, never template bytes: {text}"
+    );
+    assert!(
+        text.contains(g.id.as_str()),
+        "value variables are substituted like any instruction file ({{GROUP_ID}}): {text}"
+    );
+}
+
+#[test]
+fn read_playbook_refuses_an_unknown_section_and_names_the_valid_ids() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    let co = playbook_caller(&reg, &g.id, Role::Orchestrator);
+
+    let r = read_playbook_call(&reg, &co, "no-such-section");
+    assert_eq!(
+        r["isError"],
+        json!(true),
+        "an unknown section is an ERROR, never an empty-string success — the vacuity \
+         control: {r}"
+    );
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("no-such-section"), "the refusal names what was asked: {text}");
+    assert!(
+        text.contains("about-this-playbook"),
+        "the refusal names the valid ids, so a mistyped ask is self-correcting: {text}"
+    );
+}
+
+#[test]
+fn read_playbook_is_orchestrator_only() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    // The playbook is the orchestrator's own contract half: a delegate has no
+    // business reading it, and the dispatch gate — not the role-filtered
+    // listing, which is cosmetic — is the real check (add-orch-tool layer 2).
+    for role in [Role::Worker, Role::Reviewer, Role::Planner] {
+        let c = playbook_caller(&reg, &g.id, role);
+        let r = read_playbook_call(&reg, &c, "about-this-playbook");
+        assert_eq!(r["isError"], json!(true), "{role:?} must be refused: {r}");
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("orchestrator-only"), "{role:?} refusal says why: {text}");
+    }
+}
+
+#[test]
+fn read_playbook_never_crosses_groups() {
+    let (reg, _d) = test_registry();
+    let ga = reg.create_group("C:/tmp/repo-a", playbook_rails()).unwrap();
+    let gb = reg.create_group("C:/tmp/repo-b", playbook_rails()).unwrap();
+    let ca = playbook_caller(&reg, &ga.id, Role::Orchestrator);
+
+    // The tool takes NO group argument: the group comes from the caller's
+    // token, exactly like `group_usage` (#891 S2) — so there is no parameter
+    // to misuse, and the section served is the caller's own group's rendered
+    // copy (its `{{GROUP_ID}}` names it).
+    let r = read_playbook_call(&reg, &ca, "about-this-playbook");
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(ga.id.as_str()) && !text.contains(gb.id.as_str()),
+        "the served section is the CALLER's group's playbook, never another group's: {text}"
+    );
+}
+
+#[test]
+fn read_playbook_writes_one_audit_line() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    let co = playbook_caller(&reg, &g.id, Role::Orchestrator);
+    let before = audit_count(&reg, &g.id, "playbook-read");
+
+    read_playbook_call(&reg, &co, "about-this-playbook");
+
+    assert_eq!(
+        audit_count(&reg, &g.id, "playbook-read"),
+        before + 1,
+        "exactly one playbook-read line per served section — the read is observable \
+         (INVARIANT-11 detector feed, #1683 §6)"
+    );
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
+    let line = audit
+        .lines()
+        .filter(|l| l.contains("playbook-read"))
+        .last()
+        .expect("asserted present above");
+    assert!(line.contains("about-this-playbook"), "the line names the section: {line}");
+}
+
+#[test]
+fn the_resident_core_is_under_the_byte_budget() {
+    // The point of #1683: the resident orchestrator template is paid on EVERY
+    // model call, in the system cache block. Measured off the template const,
+    // never derived — the number in this assertion is the budget, the byte
+    // count is the fact.
+    assert!(
+        ORCHESTRATOR_TPL.len() <= 45_000,
+        "the resident core is {} bytes (budget 45,000) — sections move to the playbook, \
+         they do not get rewritten longer in place (#1683)",
+        ORCHESTRATOR_TPL.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #579 — deliveries REFUSED at the front door.
 //
 // `enqueue_text`'s `RejectFull` arm returns before `queue_seq.fetch_add`, so a
