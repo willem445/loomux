@@ -16734,6 +16734,76 @@ pub fn cli_ready_with_marker(
     cli_ready(output_total, quiet_for, elapsed) && (marker.is_none() || marker_seen)
 }
 
+/// How many raw tail bytes the readiness gate replays to compose a screen
+/// (#1591) — [`QUESTION_GRID_REPLAY_BYTES`], reused because it answers the same
+/// question (how much history must a blind VT replay eat before the composed
+/// grid is the real screen) and re-derived here at THIS loop's cadence rather
+/// than inherited (#1591 review D4).
+///
+/// **The envelope, stated because the constant's own doc argues its size at a
+/// different poll rate.** The gate composes a screen only on a tick where the
+/// base painted-and-quiet test already holds, so the first possible
+/// composition is at `READY_MIN_WAIT` + `READY_QUIET` and the last at
+/// `READY_MAX_WAIT`: at `READY_POLL` = 250 ms that is at most
+/// `(25_000 - 2_700) / 250` ≈ **89 compositions**, each one tail copy of up to
+/// 64 KiB plus one linear replay and one `size()` read. Worst case ≈ 5.7 MB of
+/// copying spread over 25 s, per pane, and only on a pane whose marker never
+/// arrives — i.e. it coincides with something already being wrong, and it
+/// multiplies by the number of agents spawning at once.
+///
+/// That is judged affordable at this cadence for the same reason the question
+/// guard affords it at its own: the work is a linear scan with no history
+/// retained, it is bounded by `READY_MAX_WAIT` rather than open-ended, and it
+/// buys the one reading that can see a cursor-positioned footer at all. If
+/// `READY_MAX_WAIT` or `READY_POLL` ever move, this paragraph is the thing to
+/// re-derive.
+const READY_GRID_REPLAY_BYTES: usize = QUESTION_GRID_REPLAY_BYTES;
+
+/// Compose the screen the readiness marker is looked for in (#1591) — the pure
+/// half of `deliver_now`'s sampler, split out so all three of its branches are
+/// assertable without a pty (#1591 review D1).
+///
+/// The split is at this boundary and not one level up on purpose: `PtyManager`
+/// has no geometry test hook, so a helper taking `&PtyManager` would see
+/// `size() == None` in every test and only ever exercise the fallback — which
+/// is precisely the branch this function exists to stop being the only one
+/// anybody has run. Same reason `cli_ready` was extracted from the loop.
+///
+/// **Preferred reading: the rendered rows.** A status footer is the most
+/// cursor-positioned region of a TUI, and the byte ring cannot say where a
+/// repaint put the count relative to its label. Composed exactly the way
+/// `question_sample` composes one (#534) — same replay, same
+/// [`trustworthy_composition`] gate.
+///
+/// **Fallback: the ANSI-stripped ring**, taken on EITHER of two triggers, both
+/// named because the surfaces used to state only the first (#1591 review D3):
+///
+/// 1. the pane reports no geometry, or
+/// 2. the replay composed fewer than `GRID_MIN_RENDERED_ROWS` non-empty rows,
+///    so [`trustworthy_composition`] declined it.
+///
+/// **This is a deliberate DIVERGENCE from `question_sample`, not a copy of
+/// it.** That guard refuses to substitute — "no size, no grid evidence" — and
+/// its [`QuestionSample`] doc says the two readings "must not collapse, because
+/// one licenses a release and the other must not". The asymmetry that makes
+/// collapsing them right here and wrong there is the direction of the
+/// consequence: the question guard's grid evidence RELEASES a hold, so a
+/// substituted reading could let a delivery land on a live dialog. This
+/// reading only ever un-blocks a paste that the base painted-and-quiet test has
+/// ALREADY approved, and refusing to substitute would price every
+/// geometry-less pane at `READY_MAX_WAIT` on every kickoff. The trade is a
+/// wider decoy surface (the ring carries scrolled-off history the screen does
+/// not) for not being inert; the ring slice is therefore narrowed to
+/// [`QUESTION_SCAN_TAIL_BYTES`], so the fallback never reads MORE history than
+/// the pre-#1591 reading it replaces.
+pub fn ready_screen(raw: &[u8], size: Option<(u16, u16)>) -> String {
+    size.and_then(|(cols, rows)| trustworthy_composition(termgrid::render_visible(raw, cols, rows)))
+        .unwrap_or_else(|| {
+            let from = raw.len().saturating_sub(QUESTION_SCAN_TAIL_BYTES);
+            strip_ansi(&raw[from..])
+        })
+}
+
 /// How the fresh-boot readiness wait ended (#517).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyWait {
@@ -20620,28 +20690,16 @@ fn deliver_now(
         match await_cli_ready(
             ready_marker,
             || ptys.output_total(pty_id),
-            // The pane's RENDERED rows, composed the same way the question
-            // guard's `question_sample` composes them (#534) — a footer is a
-            // region of the SCREEN, and the byte ring cannot answer where a
-            // cursor-positioned repaint put the count relative to its label
-            // (#1591 review, premortem 2). Same replay budget
-            // (`QUESTION_GRID_REPLAY_BYTES`) and the same trustworthiness gate,
-            // reused rather than minted.
-            //
-            // The ANSI-stripped ring is the FALLBACK, taken only when the pane
-            // has no geometry or the replay did not compose enough rows to be
-            // worth believing. It is strictly weaker — it is the reading whose
-            // adjacency assumption this call site exists to stop relying on —
-            // so it is used to avoid pricing every kickoff at the ceiling when
-            // no grid is available, never in preference to one.
+            // The pane's RENDERED rows — a footer is a region of the SCREEN,
+            // and the byte ring cannot answer where a cursor-positioned repaint
+            // put the count relative to its label (#1591 review, premortem 2).
+            // Everything that DECIDES anything lives in `ready_screen`, which
+            // is pure and tested; this closure is only the pty read.
             || {
-                let raw = ptys.output_tail_bounded(pty_id, QUESTION_GRID_REPLAY_BYTES)?;
-                let rendered = ptys
-                    .size(pty_id)
-                    .and_then(|(cols, rows)| {
-                        trustworthy_composition(termgrid::render_visible(&raw, cols, rows))
-                    });
-                Some(rendered.unwrap_or_else(|| strip_ansi(&raw)))
+                Some(ready_screen(
+                    &ptys.output_tail_bounded(pty_id, READY_GRID_REPLAY_BYTES)?,
+                    ptys.size(pty_id),
+                ))
             },
             || std::thread::sleep(READY_POLL),
             || start.elapsed(),

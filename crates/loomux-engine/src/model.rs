@@ -370,11 +370,21 @@ impl ReadyMarker {
     ///
     /// **Rendered, not the raw byte ring.** A status footer is the most
     /// cursor-positioned region of a TUI: a repaint may write the count and its
-    /// label with separate absolute cursor moves, or wrap between them, so in
-    /// the byte stream they need never be adjacent even though the human plainly
-    /// sees `2 MCP`. Only a VT replay puts them in neighbouring CELLS. An
-    /// ANSI-stripped ring read is the caller's FALLBACK when no trustworthy
-    /// composition exists, not the primary reading.
+    /// label with separate absolute cursor moves, so in the byte stream they
+    /// need never be adjacent even though the human plainly sees `2 MCP`. Only
+    /// a VT replay puts them in neighbouring CELLS. An ANSI-stripped ring read
+    /// is the caller's FALLBACK when no trustworthy composition exists, not the
+    /// primary reading.
+    ///
+    /// **A WRAP is a second, different problem, and the replay alone does not
+    /// fix it** (#1591 review D2). When the footer is wider than the pane, the
+    /// count can end one rendered row and the label begin the next; the composed
+    /// screen right-trims rows and joins them with `\n`, so ` MCP` is preceded
+    /// by a newline rather than by the digit and a row-wise search misses it —
+    /// on every kickoff, at that pane width. Since loomux tiles panes, that
+    /// width is a continuum a human drags through, so this is handled rather
+    /// than disclosed: each ADJACENT ROW PAIR is also tested, joined. See
+    /// [`Self::matches_row_pairs`] for what that costs and what it lets in.
     ///
     /// Two conditions, and each closes one direction of failure:
     ///
@@ -401,22 +411,70 @@ impl ReadyMarker {
     /// row that happens to contain the label twice must not be decided by
     /// whichever copy came first.
     pub fn matches(self, screen: &str) -> bool {
+        self.matches_flat(screen) || self.matches_row_pairs(screen)
+    }
+
+    /// The marker inside one contiguous run of text — the whole screen, or one
+    /// joined row pair. Both conditions from [`Self::matches`]'s doc.
+    fn matches_flat(self, text: &str) -> bool {
         let Self::CountThen(lit) = self;
         if lit.is_empty() {
             return false; // an empty literal matches everywhere, which is not a marker
         }
-        let bytes = screen.as_bytes();
+        let bytes = text.as_bytes();
         let mut from = 0usize;
-        while let Some(off) = screen[from..].find(lit) {
+        while let Some(off) = text[from..].find(lit) {
             let at = from + off;
             let counted = at > 0 && bytes[at - 1].is_ascii_digit();
-            if counted && !followed_by_a_word(&screen[at + lit.len()..]) {
+            if counted && !followed_by_a_word(&text[at + lit.len()..]) {
                 return true;
             }
             // Resume past this occurrence. `at + lit.len()` is always a char
             // boundary (it is the end of a matched substring), where `at + 1`
             // would not be for a non-ASCII literal.
             from = at + lit.len();
+        }
+        false
+    }
+
+    /// The WRAPPED footer (#1591 review D2): the count ending one rendered row
+    /// and the label beginning the next. Every adjacent pair is joined with no
+    /// separator and re-tested, which is exactly the string the two rows would
+    /// have been had the pane been one column wider.
+    ///
+    /// **Why pairs rather than a geometry test.** "This row wrapped" is
+    /// properly "this row filled every column", and the composed screen has
+    /// already right-trimmed its rows, so the width is no longer recoverable
+    /// from the text — and a wide glyph makes a character count disagree with a
+    /// cell count anyway. Joining pairs needs neither fact.
+    ///
+    /// **What it lets in, stated because it only ever ADDS matches.** Two rows
+    /// that merely happen to sit next to each other — one ending in a digit,
+    /// the next beginning ` MCP` — read as a wrap. That shape is narrow, and
+    /// the word rule still applies to whatever follows, so the surviving case
+    /// is a label-shaped count split across two unrelated rows. It is the same
+    /// residual class the design note already carries for `Loaded 3 MCP`, and
+    /// it is bounded the same way: a false marker can only ever release a paste
+    /// the base painted-and-quiet test had already approved.
+    ///
+    /// Only pairs, never longer runs: a footer segment that wrapped across
+    /// three rows would have to be under about six columns wide to split a
+    /// four-character label twice.
+    fn matches_row_pairs(self, screen: &str) -> bool {
+        let mut rows = screen.lines();
+        let Some(mut prev) = rows.next() else { return false };
+        for row in rows {
+            // Only pairs that could possibly gain an adjacency are built, so an
+            // ordinary screen allocates nothing.
+            if prev.ends_with(|c: char| c.is_ascii_digit()) {
+                let mut joined = String::with_capacity(prev.len() + row.len());
+                joined.push_str(prev);
+                joined.push_str(row);
+                if self.matches_flat(&joined) {
+                    return true;
+                }
+            }
+            prev = row;
         }
         false
     }

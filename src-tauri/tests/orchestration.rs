@@ -129,7 +129,7 @@ use loomux_lib::orchestration::{
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
-    cli_ready_with_marker, ReadyMarker,
+    cli_ready_with_marker, ready_screen, ReadyMarker,
     redelivery_treatment, KickoffTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     failed_arm_route, FailedArmRoute,
@@ -29136,6 +29136,113 @@ fn the_marker_is_read_off_the_rendered_screen_not_the_byte_ring() {
         "the byte ring does not — this is the reading the production sampler \
          must not depend on: {stripped:?}"
     );
+}
+
+/// #1591 review D1: the production sampler's own decisions, on rendered-screen
+/// fixtures.
+///
+/// The headline change of the previous round — read the SCREEN, not the ring —
+/// lived entirely in a closure inside `deliver_now`, so reverting it reddened
+/// nothing: every loop test injects its own sampler, and the grid-vs-ring test
+/// calls `render_visible` and `matches` directly. `ready_screen` is that
+/// closure's pure half, and this is the test that makes the choice falsifiable.
+#[test]
+fn ready_screen_prefers_the_grid_and_falls_back_only_when_it_must() {
+    let m = ReadyMarker::CountThen(" MCP");
+    // The footer painted label-first with a cursor move between the segments:
+    // adjacent on the screen, not in the stream.
+    let split_paint = concat!(
+        "\u{1b}[2J\u{1b}[H",
+        "opencode\r\n",
+        "\u{1b}[2;2H MCP /status",
+        "\u{1b}[2;1H2",
+    )
+    .as_bytes();
+
+    // 1. With geometry, the grid is used — and it is the reading that finds the
+    //    marker. This is the assertion that reddens if production reverts to
+    //    stripping the ring.
+    let grid = ready_screen(split_paint, Some((40, 4)));
+    assert!(m.matches(&grid), "the composed screen shows the footer: {grid:?}");
+
+    // 2. Without geometry there is no grid to compose, so the ring is read.
+    //    Asserted as a DIFFERENT string, not merely as a non-panic: the two
+    //    branches must be distinguishable or arm 1 proves nothing about which
+    //    one ran.
+    let ring = ready_screen(split_paint, None);
+    assert_ne!(grid, ring, "the two branches must not produce the same reading");
+    assert!(
+        !m.matches(&ring),
+        "the fallback cannot see this footer — that is the cost it is chosen \
+         despite, and the reason geometry is preferred: {ring:?}"
+    );
+
+    // 3. The SECOND fallback trigger, which the surfaces used not to name: the
+    //    replay composed too few non-empty rows to be trustworthy, so geometry
+    //    being present is not on its own enough.
+    let one_row = b"only one row";
+    let thin = ready_screen(one_row, Some((40, 4)));
+    assert_eq!(
+        thin,
+        ready_screen(one_row, None),
+        "an untrustworthy composition must read exactly as no composition"
+    );
+
+    // 4. A screen with no marker on it stays unmatched through both branches —
+    //    the control that stops arms 1-3 passing on a matcher that says yes to
+    //    everything.
+    let bare = concat!("\u{1b}[2J\u{1b}[H", "opencode\r\n", "ready\r\n").as_bytes();
+    assert!(!m.matches(&ready_screen(bare, Some((40, 4)))));
+    assert!(!m.matches(&ready_screen(bare, None)));
+
+    // 5. A model name carrying the literal is not a count, at either branch.
+    let modelname = concat!("\u{1b}[2J\u{1b}[H", "model: gpt-4 MCPx\r\nready\r\n").as_bytes();
+    assert!(!m.matches(&ready_screen(modelname, Some((40, 4)))));
+}
+
+/// #1591 review D2: a footer that WRAPS between the count and its label.
+///
+/// The composed screen right-trims rows and joins with `\n`, so a row-wise
+/// search sees ` MCP` preceded by a newline and misses a footer the human
+/// plainly reads. It happens at a pane width, and loomux tiles panes, so the
+/// width is a continuum a human drags through — this must not be a silent
+/// 25-second ceiling on every kickoff at some widths.
+#[test]
+fn a_footer_that_wraps_between_the_count_and_its_label_still_matches() {
+    let m = ReadyMarker::CountThen(" MCP");
+    // One footer, two widths. Wide enough and it sits on one row; narrow and
+    // the same bytes wrap between `2` and ` MCP`.
+    let footer = concat!("\u{1b}[2J\u{1b}[H", "opencode\r\n", "xx 2 MCP /status\r\n").as_bytes();
+
+    let wide = ready_screen(footer, Some((40, 4)));
+    assert!(m.matches(&wide), "unwrapped, on one row: {wide:?}");
+
+    // 6 columns puts `xx 2` on one row and ` MCP` at the start of the next.
+    let narrow = ready_screen(footer, Some((6, 8)));
+    assert!(
+        narrow.lines().any(|l| l.trim() == "MCP"),
+        "the fixture must actually have wrapped between the count and the \
+         label, or this test is about nothing: {narrow:?}"
+    );
+    assert!(
+        m.matches(&narrow),
+        "a wrapped footer is still a footer — the row pair must be joined: {narrow:?}"
+    );
+
+    // The control: joining pairs must not turn the WORD rule off. The same
+    // wrap, with prose after the label, still refuses.
+    let prose = concat!("\u{1b}[2J\u{1b}[H", "opencode\r\n", "xx 2 MCP servers up\r\n").as_bytes();
+    let prose_narrow = ready_screen(prose, Some((6, 8)));
+    assert!(
+        !m.matches(&prose_narrow),
+        "the wrap handling must not smuggle a boot line past the word rule: \
+         {prose_narrow:?}"
+    );
+
+    // And the control that the pair join is not simply matching everything:
+    // two adjacent rows that do not form the shape stay unmatched.
+    let unrelated = concat!("\u{1b}[2J\u{1b}[H", "loaded 3\r\nsomething else\r\n").as_bytes();
+    assert!(!m.matches(&ready_screen(unrelated, Some((40, 4)))));
 }
 
 /// #1591 review N3: a boot line carrying the marker's shape, on a pane that has
