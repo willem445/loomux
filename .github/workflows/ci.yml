@@ -6,11 +6,32 @@ on:
   pull_request:
 
 jobs:
+  # [scratch]-titled PRs (red-before-green counterfactuals,
+  # never merged) run one platform
+  # and no E2E (#1685).
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      scratch: ${{ steps.decide.outputs.scratch }}
+      platforms: ${{ steps.decide.outputs.platforms }}
+    steps:
+      - id: decide
+        run: |
+          SCRATCH="${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, '[scratch') }}"
+          if [ "$SCRATCH" = "true" ]; then
+            PLATFORMS='["ubuntu-22.04"]'
+          else
+            PLATFORMS='["ubuntu-22.04","windows-latest","macos-latest"]'
+          fi
+          echo "scratch=$SCRATCH" >> "$GITHUB_OUTPUT"
+          echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-22.04, windows-latest, macos-latest]
+        platform: ${{ fromJSON(needs.plan.outputs.platforms) }}
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -141,6 +162,8 @@ jobs:
   # merge gate on its own — drop it once the suite has a track record.
   e2e-windows:
     name: E2E (Playwright, experimental)
+    needs: plan
+    if: needs.plan.outputs.scratch != 'true'
     runs-on: windows-latest
     continue-on-error: true
     steps:
