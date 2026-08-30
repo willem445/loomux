@@ -1299,7 +1299,7 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
 fn decide_ci_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
     match facts.ci {
         // Arc 2.
-        CiObservation::Green => DriveStep::to(DriveState::ReviewWait),
+        CiObservation::Green => DriveStep::Wait,
         // Arc 3, spending a CI attempt — or parking, when the budget is gone.
         CiObservation::Red => {
             if counter_exhausted(entry.counters.ci_attempts, limits.max_ci_attempts) {
