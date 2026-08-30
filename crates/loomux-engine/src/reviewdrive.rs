@@ -701,6 +701,25 @@ pub struct LaneRecord {
     /// uniquely today can become ambiguous tomorrow as the roster grows.
     #[serde(default)]
     pub session: String,
+    /// The **agent id** — the pane — this lane's delegate is running in.
+    /// Beyond §5.2's example, and it answers two questions the session id
+    /// cannot.
+    ///
+    /// §2.2's `lane-stalled` row says the notice **names the pane**, and a pane
+    /// is an agent id (`rev-4`), never a session UUID. And §7's interception is
+    /// "keyed on the agent, never on text": an MCP caller arrives as a
+    /// `caller.agent_id`, so without this field the driver cannot tell whether
+    /// the delegate now calling `report` is one it spawned — and the only
+    /// alternative key is something the delegate typed, which is precisely what
+    /// §7 forbids.
+    ///
+    /// Empty when this build recorded the lane before the field existed, or
+    /// when the spawn returned no id. Empty never matches a caller, so an
+    /// unrecorded pane fails **closed**: its traffic is delivered to the
+    /// orchestrator as it always was, rather than being consumed by a drive
+    /// that cannot prove it owns the speaker.
+    #[serde(default)]
+    pub agent: String,
     /// The last verdict seen for this lane — a **record of what was read**,
     /// never a gate input. The live verdict file is re-read every tick, so
     /// nothing decides from this field; it is what `review_drive_status()`
@@ -756,6 +775,20 @@ pub struct LaneRecord {
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Which side of a drive an agent is — the answer §7's interception asks of
+/// every incoming `report` and `review_verdict`.
+///
+/// `Lane` carries the block id because the two consumers need it: the audit
+/// line says which lane spoke, and `review-wait` reads that lane's verdict file
+/// next tick. `Worker` needs no payload — a drive has exactly one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrivenRole {
+    /// A reviewer lane this drive spawned or resumed, by block id.
+    Lane(BlockId),
+    /// The worker this drive resumed for a hand-back.
+    Worker,
 }
 
 /// A persisted verdict word, re-validated on the way in.
@@ -831,6 +864,16 @@ pub struct DriveEntry {
     /// `drive_review` time and never the caller's raw string (§3.2).
     #[serde(default)]
     pub worker_session: String,
+    /// The **agent id** the worker's resumed session is running in, as of the
+    /// last hand-back. [`LaneRecord::agent`]'s twin, for §7's reason:
+    /// interception is keyed on the agent, and a `report` arrives carrying one.
+    ///
+    /// Empty until the drive has handed back at least once, which is correct
+    /// rather than incidental: before the first hand-back there is no resumed
+    /// worker pane for this drive to own, and a drive must never consume the
+    /// traffic of a worker it did not resume.
+    #[serde(default)]
+    pub worker_agent: String,
     /// The orchestrator this drive acts for. Every action taken under it is
     /// audited with this as the `on_behalf_of` detail key — the actor stays
     /// `brand::AUDIT_ACTOR`, so it is this key, not the actor, that
@@ -911,6 +954,7 @@ impl DriveEntry {
             head: String::new(),
             body_digest: String::new(),
             worker_session: worker_session.to_string(),
+            worker_agent: String::new(),
             on_behalf_of: on_behalf_of.to_string(),
             lanes: Vec::new(),
             lane_index: 0,
@@ -1008,6 +1052,7 @@ impl DriveEntry {
         &mut self,
         block: &str,
         session: &str,
+        agent: &str,
         head: &str,
         body_digest: Option<&str>,
         now_ms: u64,
@@ -1020,6 +1065,7 @@ impl DriveEntry {
         self.lanes.push(LaneRecord {
             block: block.to_string(),
             session: session.to_string(),
+            agent: agent.to_string(),
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.to_string(),
@@ -1032,6 +1078,32 @@ impl DriveEntry {
     /// The drive's age (§2.2's `drive-stalled` measure).
     pub fn age_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.started_ms)
+    }
+
+    /// Which side of this drive `agent_id` is, if any — §7's interception key.
+    ///
+    /// **The key is the agent, never text a delegate typed**, and this method is
+    /// where that is true rather than merely intended: it compares against ids
+    /// orrerix minted at spawn and recorded here, so a delegate cannot name a PR
+    /// number and route its own report to the driver, nor name someone else's
+    /// and route theirs.
+    ///
+    /// **An empty id never matches**, which is what makes an unrecorded pane
+    /// fail closed: `""` is what an unresumed worker and a pre-field lane record
+    /// both carry, and an empty caller id is not a thing the MCP seam produces
+    /// anyway. Without this guard a drive with no hand-back yet would own every
+    /// caller whose id failed to resolve.
+    pub fn driven_role(&self, agent_id: &str) -> Option<DrivenRole> {
+        if agent_id.is_empty() {
+            return None;
+        }
+        if self.worker_agent == agent_id {
+            return Some(DrivenRole::Worker);
+        }
+        self.lanes
+            .iter()
+            .find(|l| l.agent == agent_id)
+            .map(|l| DrivenRole::Lane(l.block.clone()))
     }
 }
 
@@ -1870,9 +1942,9 @@ mod tests {
     #[test]
     fn re_briefing_a_lane_re_arms_its_stall_clock() {
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000);
         assert_eq!(e.lanes.len(), 1);
-        e.open_lane("rev-std", "s1", "head-b", Some("d1"), 9_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-b", Some("d1"), 9_000);
         // Replaced, not appended: a second record would leave `lane()` reading
         // the first and measuring `lane-stalled` from the original spawn.
         assert_eq!(e.lanes.len(), 1);
@@ -2037,7 +2109,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000);
         let blind = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1")]),
             head: String::new(),
@@ -2125,6 +2197,40 @@ mod tests {
         // The complete block still parses, so the loop above is not refusing
         // everything.
         assert!(parse_state(NOTE_EXAMPLE).is_ok());
+    }
+
+    #[test]
+    fn interception_is_keyed_on_the_agent_and_an_unrecorded_pane_fails_closed() {
+        // §7's first bounding property: "It is keyed on the agent, never on a
+        // `ref` string a delegate typed, because a delegate that could choose
+        // whether its report reaches the orchestrator by naming a PR number is
+        // a delegate that can route around the orchestrator."
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.open_lane("rev-std", "s1", "rev-4", "head-a", Some("d1"), 1_000);
+        e.worker_agent = "w-7".into();
+
+        assert_eq!(e.driven_role("rev-4"), Some(DrivenRole::Lane("rev-std".into())));
+        assert_eq!(e.driven_role("w-7"), Some(DrivenRole::Worker));
+        // A delegate this drive did not spawn is not this drive's, however
+        // plausible its id: nothing is inferred from a prefix or a role.
+        assert_eq!(e.driven_role("rev-5"), None);
+        assert_eq!(e.driven_role("w-70"), None);
+        assert_eq!(e.driven_role("orch-1"), None);
+
+        // The fail-closed half. A drive that has never handed back carries an
+        // empty `worker_agent`, and a lane recorded before the field existed
+        // carries an empty `agent`. Neither may own a caller — without the
+        // guard, an empty id would match and the drive would consume the
+        // traffic of a delegate it cannot prove it spawned.
+        let mut fresh = entry_at(DriveState::CiWait);
+        assert_eq!(fresh.worker_agent, "", "a fresh drive has resumed nobody");
+        assert_eq!(fresh.driven_role(""), None);
+        fresh.open_lane("rev-std", "s1", "", "head-a", Some("d1"), 1_000);
+        assert_eq!(fresh.driven_role(""), None, "an unrecorded pane owns no caller");
+        // ...and the positive control, so the four `None`s above are the guard
+        // and not a method that answers `None` to everything.
+        fresh.worker_agent = "w-1".into();
+        assert_eq!(fresh.driven_role("w-1"), Some(DrivenRole::Worker));
     }
 
     #[test]
@@ -2580,7 +2686,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             now_ms: 1_000 + minutes_ms(limits.lane_timeout_minutes) - 1,
@@ -2608,7 +2714,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-b".into();
-        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             ..facts_at("head-b")
@@ -2624,7 +2730,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "head-a", Some("OLD"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("OLD"), 1_000);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "OLD")]),
             body_digest: Some("NEW".into()),
@@ -2649,10 +2755,10 @@ mod tests {
             body_digest: Some("NEW".into()),
             ..facts_at("head-a")
         };
-        e.open_lane("rev-std", "s1", "head-a", Some("OLD"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("OLD"), 1_000);
         assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0 });
         // S3 performs that brief; the drive now waits on the reviewer.
-        e.open_lane("rev-std", "s1", "head-a", Some("NEW"), 1_500);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("NEW"), 1_500);
         assert_eq!(decide(&e, &facts, &limits), DriveStep::Wait);
     }
 
@@ -2665,6 +2771,7 @@ mod tests {
         let rec = |head: &str, digest: &str| LaneRecord {
             block: "rev-std".into(),
             session: "s1".into(),
+            agent: "rev-1".into(),
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.into(),

@@ -120,7 +120,7 @@ pub fn pr_facts_argv(pr: u64) -> Vec<String> {
         "view".into(),
         pr.to_string(),
         "--json".into(),
-        "state,headRefOid,baseRefName,body,mergeStateStatus".into(),
+        "state,headRefOid,baseRefName,body,mergeStateStatus,additions,deletions".into(),
     ]
 }
 
@@ -166,6 +166,10 @@ struct RawPrFacts {
     base_ref_name: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    additions: Option<u64>,
+    #[serde(default)]
+    deletions: Option<u64>,
 }
 
 /// What one tick's reads established about a driven PR.
@@ -196,6 +200,10 @@ pub struct PrObservation {
     /// file on the PR branch), so §5.5's sanitizers are not optional on the
     /// path that renders them into a brief.
     pub failing_jobs: Vec<String>,
+    /// The PR's size in changed lines, for a gate's `max_diff_lines` clause.
+    /// `None` when either half was missing, which `check_diff_size` refuses on
+    /// rather than waving through.
+    pub changed_lines: Option<u64>,
     /// The seam itself failed on at least one of this entry's reads: `gh` is
     /// missing, or a child was killed at the command timeout. §8: back off, no
     /// transition, no notice, bounded by `drive_timeout_minutes`.
@@ -218,6 +226,7 @@ impl Default for PrObservation {
             body_digest: None,
             ci: CiObservation::Unknown,
             failing_jobs: Vec::new(),
+            changed_lines: None,
             runner_failed: false,
         }
     }
@@ -263,6 +272,10 @@ pub fn observe_pr(r: &dyn RdRunner, pr: u64) -> PrObservation {
     obs.head = workflow::sanitize_sha(&raw.head_ref_oid);
     obs.base = raw.base_ref_name.trim().to_string();
     obs.body_digest = Some(workflow::body_digest(&raw.body));
+    obs.changed_lines = match (raw.additions, raw.deletions) {
+        (Some(a), Some(d)) => Some(a.saturating_add(d)),
+        _ => None,
+    };
     if notify::pr_mergeability_result(Ok(out.line())) == PollResult::Conflicting {
         obs.ci = CiObservation::Conflicting;
         return obs;
@@ -302,6 +315,92 @@ pub fn pr_changed_files(r: &dyn RdRunner, pr: u64) -> Option<Vec<String>> {
         return None;
     }
     workflow::parse_routed_files(&out.stdout)
+}
+
+// ── the gate, read through the reader that already exists ───────────────────
+
+/// An [`MqRunner`] view of an [`RdRunner`] **whose `git` is a refusal, not an
+/// absence** — the one bridge the driver needs, and the only place the driver's
+/// side of that trait exists at all.
+///
+/// §4 forbids a third implementation of the gate decision, and the second one —
+/// [`crate::mergeq::recheck_gate`] — is what the driver must therefore call
+/// rather than re-derive: it is where `ci-green`, `body-unchanged`,
+/// `base-green`, `max_diff_lines` and routing-unaccountable are each decided
+/// once. One fact that reader consumes, `base_green`, is produced by
+/// [`mqdriver::base_ci_green`], which is typed on the wider trait. Rather than
+/// widen [`RdRunner`] (which would hand the driver `git`) or re-derive that
+/// reduction (which would be a fourth implementation of a decision), the driver
+/// hands it a wrapper.
+///
+/// **The refusal is the point.** `git` is not omitted here, it is answered with
+/// an error naming why, so a later change that routes a landing verb through
+/// this bridge fails loudly at the one place a reader is looking, rather than
+/// compiling. `the_drivers_git_is_a_refusal_rather_than_an_absence` pins it.
+struct GitDenied<'a>(&'a dyn RdRunner);
+
+/// The refusal text, one line so no source indentation can ride into it.
+const NO_GIT: &str = "the review driver has no git: review-driver.md §3.1 item 1 says it may never build a merge or any other landing verb";
+
+impl MqRunner for GitDenied<'_> {
+    fn git(&self, _args: &[&str]) -> Result<CmdOut, String> {
+        Err(NO_GIT.into())
+    }
+    fn gh(&self, args: &[&str]) -> Result<CmdOut, String> {
+        self.0.gh(args)
+    }
+}
+
+/// Whether the HEAD of `base` is all-green, read **only** when the gate
+/// declares `base-green` — the caller's job, exactly as the queue's own driver
+/// gates that call on [`mqdriver::declares_base_green`].
+///
+/// `None` refuses, and that is the whole of the fail direction: a base nobody
+/// can say is healthy is one the gate must not be satisfied over.
+pub fn base_ci_green(r: &dyn RdRunner, base: &str) -> Option<bool> {
+    mqdriver::base_ci_green(&GitDenied(r), base)
+}
+
+/// The facts [`crate::mergeq::recheck_gate`] consumes, assembled from one
+/// [`PrObservation`] plus the two reads that are conditional on what the gate
+/// declares.
+///
+/// `changed_files` is `None` when the gate declares no routing —
+/// `route_reviewers` never looks at it in that case — and `base_green` is
+/// `None` unless `base-green` is declared, for
+/// [`mqdriver::declares_base_green`]'s stated reason: a value nothing consults
+/// is not worth a round trip, and an unfetched value is `None`, which refuses.
+pub fn gate_observation(
+    r: &dyn RdRunner,
+    pr: u64,
+    obs: &PrObservation,
+    spec: &crate::mergeq::GateSpec,
+    base: &str,
+) -> crate::mergeq::PrObservation {
+    crate::mergeq::PrObservation {
+        body_digest: obs.body_digest.clone(),
+        ci_green: match obs.ci {
+            CiObservation::Green => Some(true),
+            CiObservation::Red | CiObservation::Conflicting => Some(false),
+            // Pending and Unknown are both "could not be determined", which the
+            // shim's own `ci-not-green` arm treats alike and which
+            // `recheck_gate` refuses on rather than waving through.
+            CiObservation::Pending | CiObservation::Unknown => None,
+        },
+        base_green: if mqdriver::declares_base_green(spec) && !base.is_empty() {
+            base_ci_green(r, base)
+        } else {
+            None
+        },
+        changed_lines: obs.changed_lines,
+        changed_files: if declares_routing(spec) { pr_changed_files(r, pr) } else { None },
+    }
+}
+
+/// Whether this gate routes reviewers by path — the read that decides whether
+/// the changed-file call is worth making.
+pub fn declares_routing(spec: &crate::mergeq::GateSpec) -> bool {
+    matches!(spec, crate::mergeq::GateSpec::Declared(g) if !g.routing.is_empty())
 }
 
 // ── §5.4 the audit vocabulary ───────────────────────────────────────────────
@@ -836,6 +935,23 @@ mod tests {
         // against, not as INVARIANT 9's ceiling.
         let tight = HeldFacts { max_review_rounds: 1, counters: Counters { review_rounds: 1, ..Counters::default() }, ..f.clone() };
         assert!(held_notice(1, HeldReason::ReviewLimit, &tight).contains("review rounds 1/1"));
+    }
+
+    #[test]
+    fn the_drivers_git_is_a_refusal_rather_than_an_absence() {
+        // The bridge exists so the driver can call the ONE gate reader that
+        // already exists (§4 forbids another). What it must not do is quietly
+        // hand `git` back: a landing verb routed through here has to fail
+        // loudly, at the place a reader is looking, rather than compile.
+        let inner = FakeGh::new(vec![ok("green")]);
+        let bridge = GitDenied(&inner);
+        let e = MqRunner::git(&bridge, &["push", "origin", "HEAD:main"]).unwrap_err();
+        assert!(e.contains("has no git"), "{e}");
+        assert!(e.contains("landing verb"), "the refusal names WHY: {e}");
+        assert!(inner.calls().is_empty(), "and it reaches no child process at all");
+        // The positive control: `gh` still goes through, so the refusal above is
+        // the one method and not a bridge that refuses everything.
+        assert!(MqRunner::gh(&bridge, &["pr", "view", "1"]).is_ok());
     }
 
     #[test]
