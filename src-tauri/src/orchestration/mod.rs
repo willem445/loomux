@@ -16727,7 +16727,9 @@ pub fn cli_ready_with_marker(
     marker: Option<ReadyMarker>,
     marker_seen: bool,
 ) -> bool {
-    cli_ready(output_total, quiet_for, elapsed) && (marker.is_none() || marker_seen)
+    // #1591 RED EVIDENCE ONLY — the marker check removed. Never merged.
+    let _ = (marker, marker_seen);
+    cli_ready(output_total, quiet_for, elapsed)
 }
 
 /// How the fresh-boot readiness wait ended (#517).
