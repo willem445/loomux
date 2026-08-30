@@ -3226,7 +3226,10 @@ mod rank_tests {
         // live registry at drain time would see no permit and call the
         // injector's own deliberate hold a violation.
         let _serial = SERIAL.lock_safe();
-        let was = set_hold_warn_ms(1);
+        // `set_hold_warn_ms` returns (), unlike `set_hold_panics` — read the
+        // previous value first rather than assuming the sibling's shape.
+        let was = hold_warn_ms();
+        set_hold_warn_ms(1);
         let _ = drain_completed_holds(); // start from a clean ring
         let lock = TrackedMutex::new("permitdrainspec", ());
 
