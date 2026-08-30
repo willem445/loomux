@@ -13,6 +13,7 @@
 # compiles on the deployment host is a rule no Windows-based reviewer can run.
 [package]
 name = "loomux-server"
+license = "Apache-2.0"
 # Not the loomux release version, for the same reason `loomux-engine` is not:
 # `publish = false` makes it an internal artifact, and a version here would be
 # an eighth field `scripts/check-versions.js` has to keep in lockstep for no

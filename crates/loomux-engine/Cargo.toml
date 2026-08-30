@@ -6,6 +6,7 @@
 # boundary argument and the order of what is still to come.
 [package]
 name = "loomux-engine"
+license = "Apache-2.0"
 # NOT the loomux release version, and deliberately not part of the seven
 # version fields `scripts/check-versions.js` keeps in lockstep. This crate is
 # `publish = false`: it is an internal boundary, not a shipped artifact, so a

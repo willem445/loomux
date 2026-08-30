@@ -1,5 +1,9 @@
 # Third-party notices
 
+Orrerix itself is licensed under the Apache License, Version 2.0 (see `LICENSE`).
+The components below are **not** covered by that license: each is used under its
+own terms, stated per component.
+
 Loomux ships one third-party component inside its Windows installer (the ConPTY
 host, below). It also documents an **opt-in** component — the whisper.cpp voice
 runtime — which loomux does **not** distribute: users install it themselves if
