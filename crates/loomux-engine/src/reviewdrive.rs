@@ -589,7 +589,7 @@ pub enum Counter {
 /// 2 of 3 it leaves exactly one driven round, where bump-then-check leaves
 /// none at all and makes the parameter a way to disable the drive.
 pub fn counter_exhausted(spent: u32, bound: u32) -> bool {
-    spent >= bound
+    spent > bound
 }
 
 // ── §5.2 `<group-dir>/review_drives.json` ───────────────────────────────────
