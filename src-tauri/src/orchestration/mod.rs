@@ -16712,11 +16712,15 @@ pub fn cli_ready(output_total: usize, quiet_for: Duration, elapsed: Duration) ->
 /// the worst a marker can do is spend the caller's `READY_MAX_WAIT` ceiling,
 /// after which the caller pastes anyway exactly as it does today.
 ///
-/// `marker_seen` is LATCHED by the caller rather than re-read here, and that
-/// is the honest reading of the signal: "this CLI's servers have connected" is
-/// a one-way fact about the session, not a property of the current screen. A
-/// footer that scrolls out of the read window a moment later has not
-/// un-connected anything.
+/// `marker_seen` is decided by the caller FRESH on the tick it is used, and
+/// is never latched across ticks (#1591 review N3). An earlier draft carried it
+/// forward on the reasoning that "this CLI's servers have connected" is a
+/// one-way fact; that is true of the SERVERS and false of the EVIDENCE, and the
+/// difference is the whole finding — a decoy that matched once would have
+/// released every later tick's paste on a screen that no longer showed
+/// anything. Since the marker is read only on a tick where the base test
+/// already holds, a positive is consumed by the very next line; there is
+/// nothing a latch could have bought.
 ///
 /// Pure, so the composition is assertable without a pty (`cli_ready`'s own
 /// reason).
@@ -16771,15 +16775,19 @@ pub enum ReadyWait {
 /// **`marker`** is the target CLI's [`CliCaps::ready_marker`] (#1591) — an
 /// extra obligation on top of the base test for a CLI that paints its UI
 /// before it can read. `None` (every CLI but opencode) makes this loop behave
-/// exactly as it did before that issue, byte for byte. `sample_tail` supplies
-/// the ANSI-**stripped** pane tail the marker is looked for in, and is called
-/// ONLY while a marker is outstanding and the base test would otherwise have
-/// returned `Ready` — so a `None` row never reads a tail at all, and a marked
-/// one pays for a read only across the window between "painted and quiet" and
-/// "actually up", which is precisely the window this exists to cover.
+/// exactly as it did before that issue, byte for byte.
 ///
-/// The marker is LATCHED once seen ([`cli_ready_with_marker`]'s doc for why
-/// that is the honest reading, not merely the cheap one).
+/// `sample_screen` supplies the pane's RENDERED rows — a VT replay, not the
+/// ANSI-stripped byte ring (see [`ReadyMarker::matches`] for why a footer's
+/// count and its label need never be adjacent in the stream). It is called
+/// ONLY on a tick where the base test already holds, so a `None` row never
+/// composes a screen at all, and a marked one pays only across the window
+/// between "painted and quiet" and "actually up" — precisely the window this
+/// exists to cover.
+///
+/// **Nothing is latched** (#1591 review N3). The marker is re-read on every
+/// tick that reaches it, so a decoy that satisfied it once cannot release a
+/// later paste, and a negative is never cached either.
 ///
 /// `READY_MAX_WAIT` is untouched as the ceiling, and that is the whole safety
 /// argument: a CLI that renames its footer, or one whose marker never reaches
@@ -16790,13 +16798,12 @@ pub enum ReadyWait {
 pub fn await_cli_ready(
     marker: Option<ReadyMarker>,
     mut sample_total: impl FnMut() -> Option<u64>,
-    mut sample_tail: impl FnMut() -> Option<String>,
+    mut sample_screen: impl FnMut() -> Option<String>,
     mut poll_tick: impl FnMut(),
     mut elapsed: impl FnMut() -> Duration,
 ) -> ReadyWait {
     let mut last_total = 0u64;
     let mut last_change = Duration::ZERO;
-    let mut marker_seen = marker.is_none();
     loop {
         poll_tick();
         let Some(total) = sample_total() else { return ReadyWait::PaneClosed };
@@ -16806,16 +16813,17 @@ pub fn await_cli_ready(
             last_change = now;
         }
         let quiet_for = now.saturating_sub(last_change);
-        // Look for the marker only when the base test is otherwise satisfied.
+        let base = cli_ready(last_total as usize, quiet_for, now);
+        // Compose the screen only when the base test is otherwise satisfied.
         // Not an optimisation dressed as a rule: a marker cannot rescue a pane
         // that is still painting (the `&&` below would reject it anyway), so
         // reading earlier would buy nothing and would charge every ordinary
-        // delivery for a tail copy it has never needed.
-        if !marker_seen && cli_ready(last_total as usize, quiet_for, now) {
-            if let Some(m) = marker {
-                marker_seen = sample_tail().is_some_and(|tail| m.matches(&tail));
-            }
-        }
+        // delivery for a VT replay it has never needed. The short-circuit is
+        // also what keeps the read FRESH rather than latched — see the doc.
+        let marker_seen = match marker {
+            None => true,
+            Some(m) => base && sample_screen().is_some_and(|screen| m.matches(&screen)),
+        };
         if cli_ready_with_marker(last_total as usize, quiet_for, now, marker, marker_seen) {
             return ReadyWait::Ready;
         }
@@ -20612,15 +20620,28 @@ fn deliver_now(
         match await_cli_ready(
             ready_marker,
             || ptys.output_total(pty_id),
-            // ANSI-stripped, because the marker's digit and label are
-            // adjacent only after the strip (see `ReadyMarker::matches`).
-            // Sized at `QUESTION_SCAN_TAIL_BYTES` — the same "how much of the
-            // bottom of the screen matters" budget every other tail read in
-            // this file starts from, reused rather than minted (constraint 8's
-            // no-new-constants half).
+            // The pane's RENDERED rows, composed the same way the question
+            // guard's `question_sample` composes them (#534) — a footer is a
+            // region of the SCREEN, and the byte ring cannot answer where a
+            // cursor-positioned repaint put the count relative to its label
+            // (#1591 review, premortem 2). Same replay budget
+            // (`QUESTION_GRID_REPLAY_BYTES`) and the same trustworthiness gate,
+            // reused rather than minted.
+            //
+            // The ANSI-stripped ring is the FALLBACK, taken only when the pane
+            // has no geometry or the replay did not compose enough rows to be
+            // worth believing. It is strictly weaker — it is the reading whose
+            // adjacency assumption this call site exists to stop relying on —
+            // so it is used to avoid pricing every kickoff at the ceiling when
+            // no grid is available, never in preference to one.
             || {
-                ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES)
-                    .map(|raw| strip_ansi(&raw))
+                let raw = ptys.output_tail_bounded(pty_id, QUESTION_GRID_REPLAY_BYTES)?;
+                let rendered = ptys
+                    .size(pty_id)
+                    .and_then(|(cols, rows)| {
+                        trustworthy_composition(termgrid::render_visible(&raw, cols, rows))
+                    });
+                Some(rendered.unwrap_or_else(|| strip_ansi(&raw)))
             },
             || std::thread::sleep(READY_POLL),
             || start.elapsed(),

@@ -365,28 +365,52 @@ pub enum ReadyMarker {
 }
 
 impl ReadyMarker {
-    /// Does `tail` (ANSI-**stripped** pane output — see the caller) show this
+    /// Does `screen` — the pane's RENDERED rows, see the caller — show this
     /// marker?
     ///
-    /// Stripped, not raw: a TUI colours the count, so the digit and the label
-    /// are separated by an SGR sequence on the wire and are adjacent only
-    /// after the strip. Feeding this raw bytes is the one way to make it
-    /// answer `false` on a pane that is plainly showing the marker.
+    /// **Rendered, not the raw byte ring.** A status footer is the most
+    /// cursor-positioned region of a TUI: a repaint may write the count and its
+    /// label with separate absolute cursor moves, or wrap between them, so in
+    /// the byte stream they need never be adjacent even though the human plainly
+    /// sees `2 MCP`. Only a VT replay puts them in neighbouring CELLS. An
+    /// ANSI-stripped ring read is the caller's FALLBACK when no trustworthy
+    /// composition exists, not the primary reading.
+    ///
+    /// Two conditions, and each closes one direction of failure:
+    ///
+    /// - **A digit immediately before the literal.** Without it the bare label
+    ///   releases the paste — a menu row, a `/mcp` help line, the word sitting
+    ///   in a brief the pane is echoing back.
+    /// - **The literal is not followed by a WORD** (#1591 review N3): after any
+    ///   run of spaces, the next character must not be an ASCII letter. A count
+    ///   is a LABEL — `2 MCP` at a row's end, or `2 MCP /status` — where a boot
+    ///   line is a sentence (`1 MCP server connecting...`) and opencode's own
+    ///   `/status` dialog is a caption over a DIFFERENT number
+    ///   (`{...length} MCP Servers`, the configured count, not the connected
+    ///   one). Without this, either satisfies the marker and the gate degrades
+    ///   to exactly the pre-#1591 behaviour it exists to fix.
+    ///
+    /// Both conditions can only ever REFUSE, so a vendor whose footer this
+    /// misreads waits out `READY_MAX_WAIT` — the direction the design note
+    /// argues is safe — and never releases a paste early. The residual the
+    /// label rule does NOT close (a label-shaped decoy elsewhere on the
+    /// rendered screen) is stated in `doc/design/opencode.md`.
     ///
     /// Every occurrence of the literal is examined, not just the first: the
     /// footer this was written for carries other text on the same row, and a
     /// row that happens to contain the label twice must not be decided by
     /// whichever copy came first.
-    pub fn matches(self, tail: &str) -> bool {
+    pub fn matches(self, screen: &str) -> bool {
         let Self::CountThen(lit) = self;
         if lit.is_empty() {
             return false; // an empty literal matches everywhere, which is not a marker
         }
-        let bytes = tail.as_bytes();
+        let bytes = screen.as_bytes();
         let mut from = 0usize;
-        while let Some(off) = tail[from..].find(lit) {
+        while let Some(off) = screen[from..].find(lit) {
             let at = from + off;
-            if at > 0 && bytes[at - 1].is_ascii_digit() {
+            let counted = at > 0 && bytes[at - 1].is_ascii_digit();
+            if counted && !followed_by_a_word(&screen[at + lit.len()..]) {
                 return true;
             }
             // Resume past this occurrence. `at + lit.len()` is always a char
@@ -396,6 +420,27 @@ impl ReadyMarker {
         }
         false
     }
+}
+
+/// Does `rest` — whatever follows a matched marker literal — begin a WORD
+/// rather than end a label? (#1591 review N3.)
+///
+/// Spaces are skipped first, so `2 MCP /status` and `2 MCP` at a row's end
+/// both read as labels. A newline is not a letter, so the common case — the
+/// count sitting at the end of its own rendered row — needs no special case.
+///
+/// **Either case**, which is the half that earns its keep. Lowercase alone
+/// rejects the boot-line shape (`1 MCP server connecting...`) and accepts
+/// opencode's own `/status` dialog, which renders `{...length} MCP Servers`
+/// from the CONFIGURED count — a label-shaped string carrying a number that
+/// means something else entirely, on a screen a human can summon at any time.
+/// Rejecting any following letter covers both.
+///
+/// Deliberately ASCII-only and deliberately crude: this is a REFUSAL
+/// heuristic, and every reading it gets wrong costs the ceiling's wait rather
+/// than a released paste.
+fn followed_by_a_word(rest: &str) -> bool {
+    rest.trim_start_matches(' ').chars().next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
 /// What loomux can actually make one agent CLI do — **the per-CLI capability
@@ -633,17 +678,31 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "opencode's reasoning effort is a model VARIANT: a session flag on `opencode run` (--variant) but absent from the TUI loomux spawns, and settable per-agent in loomux's generated config (agent.<name>.variant, observed values minimal|high|max) — the seam exists, but the per-model vocabulary is provider-specific and unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "opencode's context window is model-determined; no session-scoped variant switch is documented or present in the TUI's options",
-        // #1591, observed on five deliveries in one session: opencode's TUI
-        // paints its banner and input box (far past `READY_MIN_OUTPUT`) and
-        // goes quiet while the MCP handshake and provider auth are still in
-        // flight, so the generic gate calls it ready before it is reading.
-        // Its status footer grows an MCP indicator once servers have
-        // connected — `⊙ 2 MCP /status    1.18.25` as observed — and that
-        // count is the marker. Matched as a SHAPE (a digit, then " MCP")
-        // rather than against a number loomux could compute from its own
-        // config: the footer reports servers connected SO FAR, so a count
-        // test would either fire early anyway or wait on a number the CLI
-        // may never reach.
+        // #1591: opencode's TUI paints its banner and input box (far past
+        // `READY_MIN_OUTPUT`) and goes quiet while its MCP status is still
+        // being fetched, so the generic gate calls it ready before it is
+        // reading — observed on five deliveries in one session.
+        //
+        // The marker is the home footer's MCP segment, `⊙ 2 MCP /status`.
+        // Read off the vendor's source rather than inferred from the
+        // observation (`anomalyco/opencode`, tag v1.18.25 =
+        // cb7d8b2f5e44876ef98b661dc10590c915af3a9f):
+        // `packages/tui/src/feature-plugins/home/footer.tsx` renders
+        // `{count()} MCP`, and `packages/tui/src/context/sync.tsx` initialises
+        // `mcp: {}` and fills it from `sdk.client.mcp.status()` in the
+        // NON-BLOCKING tail of `bootstrap()` — after `store.status` has left
+        // `"loading"`, which is the same `ready()` the prompt box renders
+        // under. So the segment cannot precede the input box. See
+        // `doc/design/opencode.md`'s Readiness section for the premise, its
+        // falsifier, and what a third-party footer plugin does to it.
+        //
+        // Matched as a SHAPE (a digit, then " MCP") rather than against a
+        // number loomux could compute from its own config: the digit is the
+        // CONNECTED count while the segment is gated on the CONFIGURED list
+        // being non-empty, so `0 MCP` is a real and SETTLED rendering (the
+        // `McpStatus` union has no "connecting" member) — and it is still
+        // proof the handshake finished, which is the only thing this gate
+        // needs to know.
         ready_marker: Some(ReadyMarker::CountThen(" MCP")),
     },
     CliCaps {
