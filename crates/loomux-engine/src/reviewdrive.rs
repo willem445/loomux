@@ -760,6 +760,14 @@ where
     }
 }
 
+fn de_state_lenient<'de, D>(d: D) -> Result<DriveState, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(d)?;
+    Ok(DriveState::parse(&raw).unwrap_or(DriveState::CiWait))
+}
+
 /// One driven PR (§5.2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DriveEntry {
@@ -769,6 +777,7 @@ pub struct DriveEntry {
     /// [`transition`] cannot be bypassed by a caller outside this module
     /// assigning a state directly. Deserialization is the one other writer, and
     /// that is resuming a persisted state rather than transitioning to one.
+    #[serde(deserialize_with = "de_state_lenient")]
     state: DriveState,
     /// Set exactly when `state` is [`DriveState::Held`] — maintained by
     /// [`advance`](DriveEntry::advance), which clears it on every other arc so
