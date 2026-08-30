@@ -231,6 +231,24 @@ fn hold(reg: &OrchRegistry, state: &std::path::Path, target: Target, hold_ms: u6
         }),
     );
 
+    // ARGUED ALLOWLIST ENTRY (#1702 P4). The soak lane's injected hold is
+    // ninety seconds by design — it exists to make the app a victim of a wedge
+    // and watch the probes answer anyway — so it is exempt from the
+    // hold-duration enforcement by construction rather than by a site list
+    // somebody has to remember to update. Taken before the acquisition, so no
+    // window exists in which the hold is live and unpermitted, and dropped at
+    // the end of this function.
+    //
+    // THIS THREAD IS NOT DEDICATED (#1722 review B1): `start` spawns one
+    // `watch` loop and this runs on it, so it goes on polling and writing
+    // state files long after the injection. That is exactly why the exemption
+    // is stamped onto the HOLD at release rather than onto the thread — a
+    // thread-scoped one would have made every later hold on this loop
+    // invisible to the enforcement.
+    let _permit = loomux_engine::lockwatch::LongHoldPermit::new(
+        "orchestration::e2ehold - the soak lane's injected hold (#1606)",
+    );
+
     // One arm per target rather than a trait object: the three guards have
     // three different types, and the guard has to stay alive across the sleep
     // — which is the whole point.

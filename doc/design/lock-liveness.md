@@ -786,3 +786,233 @@ across an IPC emit and three further locks is invisible to it. Ranks bound the
 ORDER of a nesting; §6's rule is that a registry lock should not span such a
 call at all. Review is still the enforcement for that, as §5's last bullet says
 of source scans, for the same reason.
+
+## 7. Holds are bounded in a test build
+
+§2 bounds what a **waiter** pays; §6 states the rule a **holder** has to obey.
+Nothing enforced the second, and that is precisely the gap #1702 went through:
+every budget answered correctly, every guard stayed green, and one thread sat
+on `agents` for minutes. A budget is paid by the victim, so no amount of budget
+work can see a holder — the holder is never the one waiting.
+
+So a test build now **fails** on a hold that runs past the budget, at a site
+that has not said it means to.
+
+### The threshold, and why it is not a new number
+
+`lockwatch::HOLD_FAIL_MS` is 5 s, which is deliberately the same figure as
+`DEFAULT_HOLD_WARN_MS` and `TICK_LOCK_BUDGET` rather than a fourth constant to
+tune. Past 5 s:
+
+- the hold is already **reportable** — the watchdog writes it as `lock-slow`
+  (still held) or `lock-freed` (released), which has been true since Phase 0;
+- every cadenced tick's gate probe has already **given up** (§3), so badges
+  have frozen and the publisher's sections have gone partial.
+
+A build that is green while a hold sits above that figure is therefore asserting
+the opposite of what its own breadcrumbs say. Setting it lower would refuse
+holds the app is documented to tolerate; setting it higher would open a band
+where the watchdog reports a wedge and CI calls it a pass.
+`the_three_five_second_constants_are_deliberately_equal` pins the three
+together, so an edit to one of them is a red rather than a drift.
+
+### The allowlist is a thread-scoped permit, not a site list
+
+A `lockwatch::LongHoldPermit` exempts the thread that holds it, for as long as
+it lives. Two sites take one, and both have the same argument in different
+clothes — the site's entire purpose is to hold a lock longer than the app ever
+should, so that something else can be observed surviving it:
+
+| site | hold | why it is exempt |
+| --- | --- | --- |
+| `OrchRegistry::hold_lock_for_test` | 20–30 s | the liveness suite's deliberate wedge. L1, L2a, L2c and L7b all probe that everything else answers while one registry lock is held; without the permit the enforcement would fail the suite on its own fixtures |
+| `orchestration::e2ehold::hold` | 90 s | the soak lane's injected hold (#1606), behind `#[cfg(debug_assertions)]` plus a single-value opt-in, and already the subject of `e2ehold_guard.rs`'s four properties |
+
+It is a permit rather than a `file:line` table because a table has to be
+maintained against line numbers that every edit above them moves, and it fails
+in the dangerous direction: a stale entry stops matching the injector it was
+written for and starts matching whatever moved onto that line, so the table
+quietly allows one real hold while failing the deliberate one. A permit taken
+by the injector cannot go stale, because it is taken by the code that is about
+to hold.
+
+The **reviewable** allowlist is therefore the set of construction sites, and
+`only_argued_sites_may_permit_a_long_hold` (`tests/liveness.rs`) is a
+default-deny scan over both production source roots that holds it to the two
+rows above — in both directions, since a row matching nothing is a row watching
+nothing.
+
+One subtlety is worth writing down because it is invisible from the outside:
+**the exemption is as wide as the guard, not as the thread.** A hold is
+classified from two sources, and only one of them can consult a live permit. An
+IN-FLIGHT hold is read off `held_locks` while its permit is necessarily still
+there, so the registry answers it. A COMPLETED one is stamped by
+`TrackedGuard::drop` — which runs *before* the injector's permit drops — and is
+drained some time after both, so by the time anything classifies it the
+registry no longer knows.
+
+That race is closed by stamping the permit onto the HOLD at release, from a
+thread-local counter: `TrackedGuard::drop` may not take a global lock (§4.4,
+which is why the reporting is deferred at all) but a thread-local read is
+already in its budget — it does one for `pop_held` — so the cost is one `Cell`
+read and one relaxed store.
+
+The first version of this closed the race the other way, by RETIRING permits
+rather than removing them, so a thread that had ever held one stayed exempt for
+its life. That was wrong, and the review that caught it (#1722 B1) named the
+case the argument had missed: a permitting thread is not necessarily dedicated.
+`e2ehold`'s is the long-lived `watch` loop — `start` spawns one thread running
+`loop { sleep; run_once }`, and `hold` runs on it — so after a single injection
+that loop's every later hold, on the one thread the soak lane most wants
+watched, would have been exempt. The default-deny scan could not have covered
+it either: a scan bounds construction **sites**, not thread lifetimes.
+
+### A hold can be long because its holder is waiting
+
+The enforcement found one of these on its first CI run, which is worth
+recording because it is a shape neither §2 nor §6 names.
+`group_usage_memoed` takes a group's `usage_memo_cell` and holds it across
+`compute_group_usage` **on purpose** — a groupview + tabbar + `orch_autonomy`
+stampede then costs one computation rather than three. But
+`compute_group_usage`'s first act is `self.agents.lock_safe()`, so when another
+row in the same binary had `agents` deliberately wedged, the poller sat on
+`usage_memo_cell` for 14.6 s.
+
+That is a real long hold by every measure this module has, and in production it
+is §1.2's accumulation seen from the holder's end rather than the waiter's: the
+WEDGE is one lock, and what a user experiences is a second lock, held by a
+victim, that a third caller is now queued behind. §2's budgets cannot see it —
+the memo-cell acquisition is an unbudgeted `lock_safe`, and the acquisition that
+is actually parked is one frame deeper.
+
+Nothing is changed here for it: the memo cell's hold-across-compute is argued
+where it is written, the plan's §4 row 10 carries it, and narrowing it is a
+change to the stampede behaviour rather than to this slice. It is tracked on
+**#1723**, in the same family as row 11's per-second `usage.json` write. What is
+recorded here is that the shape exists and that this mechanism is what surfaced
+it.
+
+### The panic is armed, not default — and the asymmetry with the rank checker
+
+`LOCK_ORDER_PANICS` (#1610) defaults to `cfg!(debug_assertions)`.
+`HOLD_PANICS` defaults to **off**, and the difference is not a hedge:
+**a rank violation is detected on the offending thread, at the acquisition,
+so panicking there unwinds it, drops its guards and releases the registry —
+the panic IS the rescue; a hold violation is detected on an observing thread,
+never on the holder, so a panic there releases nothing and kills the one thread
+still narrating the wedge.** Armed by default it would trade a reported hang
+for a silent one, on the exact instrument #1702 was diagnosed from.
+
+So the failure is armed where a failure is what the caller wants:
+
+- **`cargo test`** — `lockwatch::assert_no_disallowed_hold_over(HOLD_FAIL_MS)`
+  arms, scans, and restores. L7a calls it, and the arming is pinned rather than
+  assumed: L7a plants a five-second hold at a site with no permit and requires
+  the call to fail naming that site and that duration, so a build that stopped
+  arming goes red.
+- **the E2E soak lane** — `orchestration::e2ehold`'s gated module is the second
+  arming point (#1702 P5, not yet wired): it already runs in a
+  `debug_assertions` build behind a single-value opt-in, and its own injected
+  hold is exempt by construction, so arming there makes an unrelated hold a
+  visible failure without touching the injector it exists to run.
+- **a shipped build, and `npm run tauri dev`** — unchanged. Neither calls the
+  hook at all; the watchdog keeps writing the Phase 0 `lock-slow`/`lock-freed`
+  breadcrumb, which is what the field diagnosis of #1702 was built from.
+
+**What CLAUDE.md constraint 10 asks of this, discharged.** That constraint says
+a change turning a WAIT into a panic owes a measured cost per executing-thread
+class, because an unwind that merely releases a lock on a pool thread aborts the
+process on the GUI one. This hook introduces a panic, so it owes that — and
+discharges it by REACHABILITY rather than by measurement: the panic fires only
+while `HOLD_PANICS` is armed, the only arming points are a `cargo test` binary
+and `e2ehold`'s `#[cfg(debug_assertions)]` module, and no `#[tauri::command]` —
+sync or async — calls `enforce_hold_budget` at all. So the GUI-thread class
+cannot reach it, and the class that can is a test harness whose whole purpose is
+to fail. The residual, stated because nothing enforces it: that is a fact about
+today's call graph, not a structural barrier, and a future caller reaching this
+hook from a sync command would owe constraint 10's measurement in full.
+
+`set_hold_panics(false)` is the documented way to observe violations without
+failing, and it is a counterfactual rather than a promise:
+`the_enforcement_panics_only_while_it_is_armed` performs the edit and checks
+that the violation is still **classified** and counted while disarmed.
+
+### The fixture, which is as much of the guard as the assertions are
+
+The enforcement above only means anything against a population that can produce
+a violation, and #1702 survived four betas because no test in this repo could
+build the state that triggers it: `attention_setup`, the helper every attention
+test uses, spawns agents with no pty, so the mask is never reached at all.
+
+`tests/common/mod.rs` builds the missing subject. `seed_day_old_session` takes
+a `SessionScale` and produces a registry equivalent to a day of orchestrating,
+one field per growth row of the #1702 plan's size table: 300 dead agents that
+nothing prunes (row 1), 4000 prompt deliveries per live session against a
+40-line cap (row 2), an audit log past the viewer's own window (row 5), a
+400-row board (row 6), and the pending-question set at `humanq::PENDING_MAX`
+(row 7) — plus a live fleet that is `Running`, pty-bound, `by_pty`-mapped,
+session-bound and quiet, which is #1702's trigger.
+
+Everything is written through a **production** path — `spawn_agent`,
+`bind_pane_for_test`, `mark_dead`, `record_delivered_prompt`, `audit`,
+`upsert_task`, `ask_human` — and that is load-bearing rather than stylistic.
+`bind_pane` was extracted out of `spawn_agent_bound`'s bind arm for it: the
+older `set_pty_for_test` is a SECOND write site for the same fields, free to
+drift out of step with the real one, and it writes neither the `agent-bind`
+audit row nor the breadcrumb a real session's log carries. A fixture built on a
+re-implementation proves the algorithm rather than the code
+(`.orrerix/lessons.md`).
+
+What the extraction does **not** buy is a `status` the seam would have got
+wrong, and that correction is recorded here because the first version of this
+section claimed it did. Headlessly `spawn_agent_bound` returns at its `app`
+check having already marked the agent `Running`, so `bind_pane`'s status write
+is redundant on every path a test can drive — deleting it reddens nothing
+(scratch round j3). It is not dead code: in production the arm is reached only
+through the app handle, where that branch never ran and the agent is still
+`Starting`. That path needs a Tauri window, so the decision is covered by
+inspection rather than by a watched red, and j3 is what establishes it.
+
+`attention_inputs_from(&PtyManager)` is the same extraction for the gather, so
+L7a runs the tick on the maps production would have built over
+`register_fake_for_test` panes, rather than on synthetic ones.
+
+What the fixture deliberately does **not** do is make `audit.jsonl` rotate.
+The log rotates at 8 MB keeping one generation, and row 5 is about the cost of
+reading two of them — but writing 16 MB through `audit()` costs more wall clock
+than every other liveness row put together, and the property L7 is about is
+that a tick does not hold a registry lock while something reads a file, which
+does not vary with how many bytes there are to read. The fixture pushes the log
+past the viewer's own window instead and asserts that it did, so the size axis
+is a checked figure rather than an unstated one.
+
+### What this still does not cover
+
+- **A hold under the threshold.** Four seconds on `agents` every three seconds
+  is a wedge in every way that matters to a human and is invisible here. L6a
+  refuses an `agents` hold of 50 ms *for the attention tick specifically*,
+  which is the tighter bound where the instrument supports one; there is no
+  general one, and the argument for 5 s above is exactly the argument against
+  inventing a lower global figure.
+- **A hold nobody scans for.** The enforcement fires where
+  `assert_no_disallowed_hold_over` is called, so a long hold taken by a test
+  that never calls it is not caught in `cargo test`. What closes that in a
+  running build is the watchdog's breadcrumb, and what will close it in the
+  soak lane is P5's arming plus its crumb assertion.
+- **A hold taken while a permit is live, for something other than the
+  injection.** The permit covers the thread for as long as it is alive, so
+  anything else that thread holds in that window is exempt too. Both argued
+  sites take the permit immediately around their own acquisition, which is what
+  keeps the window narrow — but it is a window, not a point, and the
+  default-deny scan bounds construction sites rather than what happens inside
+  one. What is NOT a residual any more is a hold after the permit drops: that
+  is a violation like any other, including on a thread that has injected
+  before (#1722 B1).
+- **A neighbouring test's holds, in a `cargo test` binary.** The hold registry
+  is process-global and `cargo` runs a binary's tests on many threads in one
+  process, so a row asserting on it is asserting about its neighbours too — the
+  `usage_memo_cell` finding above is exactly that. A Rust row therefore scopes
+  to the threads it created (`assert_no_disallowed_hold_over_on`), which means
+  a long hold taken by a thread it did not create is out of ITS scope by
+  construction. The whole-process question is the E2E lane's, where there are
+  no neighbours.
