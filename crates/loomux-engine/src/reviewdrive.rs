@@ -536,6 +536,7 @@ impl DriveLimits {
 /// block being mandatory is worth nothing if its contents are optional.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counters {
+    #[serde(default)]
     pub review_rounds: u32,
     pub ci_attempts: u32,
     pub rebase_attempts: u32,
