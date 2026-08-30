@@ -480,7 +480,26 @@ pub const ORCHESTRATOR_PLAYBOOK_FILE: &str = "orchestrator-playbook.md";
 /// row here whose section is gone, is a red at the scan, not a tool that
 /// offers a section no template carries.
 #[doc(hidden)]
-pub const PLAYBOOK_SECTION_IDS: &[&str] = &["about-this-playbook"];
+pub const PLAYBOOK_SECTION_IDS: &[&str] = &[
+    "about-this-playbook",
+    "asking-the-human",
+    "cost-guardrails",
+    "autonomous-mode",
+    "full-autonomy",
+    "prototype-proceed",
+    "label-signals",
+    "planning-and-scheduling",
+    "engineering-standards",
+    "delivery-notices",
+    "merge-gate",
+    "squash-closes-issues",
+    "red-main",
+    "resync-the-fleet",
+    "ci-gate",
+    "monitoring-open-prs",
+    "learning-loop",
+    "queue-orphans-and-refused",
+];
 
 /// The section id a playbook heading yields: lowercased, every run of
 /// non-ASCII-alphanumeric characters collapsed to a single `-`, leading and

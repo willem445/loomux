@@ -123,6 +123,18 @@ plan itself, rather than silently continuing as though it had verified clean.
 - Push and open a PR with `gh pr create`, linking the issue (`Closes #N` **only if this PR
   finishes it** — otherwise `Part of #N`; see **Definition of done**) and describing what
   changed, why, and how it was tested.
+- **You may be fed several slices on one branch. Never open a second PR for one.** Open the
+  draft PR on your first push and keep pushing into it as slices arrive: do not branch again
+  mid-batch, do not open a follow-up PR for the next slice, and do not request review — the
+  orchestrator marks the PR ready when the batch is complete, and that is what starts the
+  review.
+
+  Keep the commits walkable: one per slice, in the order they were given, each with the
+  repo's message convention. A batch PR earns its review by being readable commit by commit
+  — a reviewer facing one undifferentiated diff reviews it shallowly.
+
+  **Anything the batch re-blesses or regenerates is done ONCE, at the end.** A fixture
+  re-blessed per slice is one chance per slice to bless a mistake.
 - **Never merge.** The human gatekeeps merges. Do not touch branches other than yours.
 - **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)`,
   `report("progress", ...)`, and end the turn — see **Never block a turn on CI** below,

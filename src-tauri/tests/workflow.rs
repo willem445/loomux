@@ -1988,27 +1988,28 @@ fn a_replace_mode_liaison_persona_still_gets_its_no_authority_mechanics() {
 #[test]
 fn a_default_groups_post_merge_routine_names_no_process_pro() {
     // #358 fold-in, the other half of the pin above: `{{POST_MERGE_WORKFLOW_HOOK}}`
-    // sits inside the base "Re-sync the fleet" section that EVERY group reads,
+    // sits at the end of the "Re-sync the fleet" section that EVERY group reads,
     // including one with no `process` role_hint (or no workflow file at all) — so
     // its silence discipline gets its own direct check on the section, not just the
     // whole-document sweep `advisor_and_process_prose_stays_silent_unless_a_block_
-    // declares_the_hint` already does.
+    // declares_the_hint` already does. #1683 moved that section (and the fragment
+    // with it) into the rendered playbook, so this reads the playbook.
     let (reg, _d) = test_registry();
     let repo = Repo::new(); // no workflow file — the true default
     let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
 
-    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    assert!(!orch.contains("{{"), "{orch}");
-    let orch_flat = orch.to_lowercase();
-    let post_merge = section(&orch_flat, "re-sync the fleet", "### you are the codebase");
+    let pb = instructions_lf(&reg, &g.id, "orchestrator-playbook.md");
+    assert!(!pb.contains("{{"), "{pb}");
+    let pb_flat = pb.to_lowercase();
+    let post_merge = section(&pb_flat, "## resync the fleet", "## ci gate");
     assert!(
         !post_merge.contains("process-pro"),
         "a default group's post-merge routine must not mention the process-pro: {post_merge}"
     );
     assert!(
-        orch.contains("schedule the next item.\n\n### You are the codebase's advocate"),
+        pb.contains("schedule the next item.\n\n## CI gate"),
         "the empty hook must leave the checklist's last sentence exactly where it was, byte for \
-         byte, with no stray blank line: {orch}"
+         byte, with no stray blank line: {pb}"
     );
 }
 
@@ -6356,7 +6357,7 @@ fn a_workflow_group_is_told_to_spawn_by_block_and_fan_out_to_every_reviewer() {
         "the section must open as a real markdown heading: {orch}"
     );
     assert!(
-        orch.contains("\n\n## Cost guardrails"),
+        orch.contains("\n\n## Asking the human"),
         "…and must not swallow the section that follows it: {orch}"
     );
     assert!(

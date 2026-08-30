@@ -92,6 +92,14 @@ fn section<'a>(flat_doc: &'a str, start: &str, end: &str) -> &'a str {
     &rest[..to]
 }
 
+/// The orchestrator's **playbook** — the on-demand half of its contract
+/// (#1683), rendered into the group dir like the role files. The resident file
+/// keeps the rules; these sections carry the procedure, and the pins follow
+/// their specimens here when a section moved (#1683 slice 2a) — never relaxed.
+fn playbook_instructions() -> String {
+    instructions("orchestrator-playbook.md")
+}
+
 /// Assert that `region` carries the rule `why`, and that `anchor` names it **uniquely**.
 ///
 /// Presence is the obvious half; uniqueness is the half that makes the pin able to fail at all.
@@ -217,8 +225,11 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
     // inside the section that owes it, so a deletion names what it deleted.
     let orch = instructions("orchestrator.md");
     let o = flat(&orch);
+    // #1683: the merge gate moved to the playbook; its section in the resident
+    // core is the stub naming the trigger. The pins follow the specimen.
+    let pb = flat(&playbook_instructions());
     let disposition = section(&o, "3. **disposition every finding**", "### the merge gate");
-    let gate = section(&o, "### the merge gate", "### after a merge you performed");
+    let gate = section(&pb, "## merge gate", "## squash closes issues");
 
     for (region, name, rule, why) in [
         (disposition, "the disposition step", "default: fix it in this pr",
@@ -289,9 +300,9 @@ fn the_merge_gate_describes_the_consolidated_bulk_grant_without_implying_bulk_au
     // it was never granted — the exact thing the gate exists to prevent. So
     // the section must teach both halves: the shape it will actually receive,
     // and that the shape is N ordinary per-PR grants, nothing wider.
-    let orch = instructions("orchestrator.md");
-    let o = flat(&orch);
-    let gate = section(&o, "### the merge gate", "### after a merge you performed");
+    // #1683: the merge gate moved to the playbook.
+    let pb = flat(&playbook_instructions());
+    let gate = section(&pb, "## merge gate", "## squash closes issues");
 
     for (rule, why) in [
         ("one-time merges of prs #a, #b, #c",
@@ -327,9 +338,12 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
     let orch = instructions("orchestrator.md");
     let planner = instructions("planner.md");
     let o = flat(&orch);
+    // #1683: the standards moved to the playbook — the core carries the stub
+    // and INVARIANT 4 keeps the rule.
+    let pb = flat(&playbook_instructions());
 
-    assert!(o.contains("## engineering standards"), "the grounds need one authoritative site: {orch}");
-    let standards = section(&o, "## engineering standards", "## delegation protocol");
+    assert!(pb.contains("## engineering standards"), "the grounds need one authoritative site: {pb}");
+    let standards = section(&pb, "## engineering standards", "## delivery notices");
     for (ground, why) in [
         ("cross-module coupling", "cross-module coupling / a dependency pointing the wrong way"),
         ("duplicating an existing mechanism", "a second mechanism where the repo already had one"),
@@ -339,7 +353,7 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
     ] {
         pinned("Engineering standards", standards, ground, why);
     }
-    pinned("orchestrator.md", &o, "intake the plan before you delegate",
+    pinned("the playbook", &pb, "intake the plan before you delegate",
         "the standards must gate the PLAN — before any code exists is the cheap moment");
     pinned("orchestrator.md", &o, "does it clear the bar in engineering standards?",
         "…and the completion check, where the PR is still cheaper to bounce than to revert");
@@ -444,9 +458,9 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     // default branch (a semantic conflict with whatever landed under it; a job that only runs
     // post-merge), and a red default branch blocks every worker in the group. Nothing told it to
     // look, so nothing would have looked.
-    let orch = instructions("orchestrator.md");
-    let o = flat(&orch);
-    let aftermath = section(&o, "### after a merge you performed", "### re-sync the fleet");
+    // #1683: the red-main procedure moved to the playbook.
+    let pb = flat(&playbook_instructions());
+    let aftermath = section(&pb, "## red main", "## resync the fleet");
     let at = "the red-main procedure";
 
     pinned(at, aftermath, "post-merge run",
@@ -478,15 +492,15 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
     // STALE is not the same as CONFLICTED. A branch that still merges cleanly was reviewed, tested
     // and CI'd against code that no longer exists, so its green checks describe the past, and
     // waiting for `CONFLICTING` to appear is waiting for the cheapest moment to rebase to pass.
-    let orch = instructions("orchestrator.md");
-    let o = flat(&orch);
+    // #1683: the sweep and the re-sync procedure both moved to the playbook.
+    let pb = flat(&playbook_instructions());
 
-    let sweep = section(&o, "## monitoring open prs", "## the learning loop");
+    let sweep = section(&pb, "## monitoring open prs", "## learning loop");
     pinned("the open-PR sweep", sweep, "--json mergeable",
         "the sweep must ask whether the PR still merges — green checks say nothing about it");
     pinned("the open-PR sweep", sweep, "conflicting", "…and know the state it is looking for");
 
-    let resync = section(&o, "### re-sync the fleet", "## the ci gate");
+    let resync = section(&pb, "## resync the fleet", "## ci gate");
     let at = "the re-sync rule";
     pinned(at, resync, "stale is not the same as conflicted",
         "the whole rule lives in that distinction — a conflict-only trigger waits for the most \
@@ -533,9 +547,9 @@ fn a_lost_notification_degrades_to_the_old_poll_on_sweep_fallback_not_a_silent_h
     // fallback. By this suite's own philosophy (a rule that quietly disappears in a future edit
     // fails silently and invisibly), a safety net that is the ONLY thing between "best-effort" and
     // "silent hang" cannot be left to survive on vibes through the next prose edit.
-    let orch = instructions("orchestrator.md");
-    let o = flat(&orch);
-    let sweep = section(&o, "## monitoring open prs", "## the learning loop");
+    // #1683: the sweep moved to the playbook.
+    let pb = flat(&playbook_instructions());
+    let sweep = section(&pb, "## monitoring open prs", "## learning loop");
 
     pinned("the open-PR sweep", sweep, "not permission to stop tracking the pr",
         "a registered notification must NOT read as license to stop tracking the PR on the board/ \
@@ -557,10 +571,10 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     // observation that never became an issue is one nobody will ever act on. Starting is the
     // human's consent, and the label funnel is where it is given. A learning loop that files a
     // convention issue is inside that boundary; one that grooms and starts it is not.
-    let orch = instructions("orchestrator.md");
-    let o = flat(&orch);
+    // #1683: the label funnel and the learning loop both moved to the playbook.
+    let pb = flat(&playbook_instructions());
 
-    let funnel = section(&o, "## label signals", "## planning & scheduling");
+    let funnel = section(&pb, "## label signals", "## planning and scheduling");
     let at = "the label funnel";
     pinned(at, funnel, "you may file; you may not start",
         "the permission and its boundary, stated in one breath — the whole point is that they are \
@@ -574,7 +588,7 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
          acceptance criteria is the step right before starting it, and 'you may not start it' does \
          not cover it");
 
-    let loop_ = section(&o, "## the learning loop", "## durability rules");
+    let loop_ = section(&pb, "## learning loop", "## queue orphans and refused");
     let at = "the learning loop";
     pinned(at, loop_, "not an incident",
         "it triggers on a recurring PATTERN (a finding class, a repeated CI burn, a convention \
