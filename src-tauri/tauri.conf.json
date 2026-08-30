@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Orrerix",
-  "version": "1.2.0-beta8",
+  "version": "1.2.0-beta9",
   "identifier": "dev.orrerix.app",
   "build": {
     "beforeDevCommand": "npm run dev",
