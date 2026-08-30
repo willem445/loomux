@@ -776,7 +776,7 @@ pub struct DriveEntry {
     #[serde(default)]
     pub fix_handback_ms: u64,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing)]
     pub extra: BTreeMap<String, Value>,
 }
 
