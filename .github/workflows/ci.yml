@@ -7,7 +7,8 @@ on:
 
 jobs:
   # [scratch]-titled PRs (red-before-green counterfactuals,
-  # never merged) run one platform
+  # never merged; convention, not enforced: a skipped E2E
+  # reads green at every gate) run one platform
   # and no E2E (#1685).
   plan:
     runs-on: ubuntu-22.04
@@ -23,6 +24,10 @@ jobs:
           else
             PLATFORMS='["ubuntu-22.04","windows-latest","macos-latest"]'
           fi
+          # fromJSON below parses this string at matrix-expansion time; a malformed
+          # literal would surface there as an expression error on a job with no
+          # steps, so fail loud here instead (#1755 premortem 1).
+          printf '%s' "$PLATFORMS" | jq -e . >/dev/null
           echo "scratch=$SCRATCH" >> "$GITHUB_OUTPUT"
           echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
 

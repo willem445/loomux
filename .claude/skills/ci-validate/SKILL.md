@@ -864,8 +864,8 @@ reddened after two rounds is not re-cut: disclose it in the PR body as a
 boundary — `the sweep asserts X; a misclassified writer has not been
 demonstrated to trip it (rounds N, M green)` — and the reviewer judges the test
 on its assertion. A `[scratch`-titled PR runs one platform and no E2E, so a
-round costs one job, not four; a third round is INVARIANT 9's unbounded loop
-wearing evidence's clothes.
+round costs one build job plus a three-second planner, not four; a third
+round is an unbounded loop wearing evidence's clothes.
 
 ## E2E (Playwright) is CI's job, same line
 
