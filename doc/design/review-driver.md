@@ -1,0 +1,618 @@
+# Design: the engine-driven review-loop driver (#1778)
+
+Part of #1686 (orchestration context optimization). This note is the gate every
+later slice of #1778 waits on, the way `doc/design/merge-queue.md` gated that
+feature's slice C. It settles the state machine, the authority, the public
+contracts and the one norm the feature narrows; nothing here is implementation
+detail that a slice may quietly re-decide.
+
+**Nothing described here is built.** Every symbol this note cites in `backticks`
+as *existing* was verified at the head it was written against; every symbol it
+introduces — `reviewdrive.rs`, `rd_drive_group_with`, the three MCP tools, the
+`driver:` block, `review_drives.json`, the `rd-*` audit actions — is what the
+later slices are for.
+
+## 1. What the driver is, and the one sentence of why
+
+**The driver is a per-PR state machine in the backend that performs the
+worker-reviewer rounds an orchestrator performs by hand today** — wait for CI,
+spawn or resume the reviewer lanes the merge gate requires, hand a `fail` back
+to the worker's recorded session, and stop with **one** notice at gate-satisfied,
+at an `escalate`, or at a bound. It lives in a Tauri-free
+`crates/loomux-engine/src/reviewdrive.rs` beside `mergeq.rs`, which is the
+precedent for a loop the backend runs without spending an orchestrator turn.
+
+**The why, in one sentence, and it is measured rather than asserted: of the
+orchestrator turns spent between PR-open and gate-satisfied, 17-19 of #1758's 21
+and 21-23 of #1764's 24 were routing** — turns whose entire content was a
+template ("brief the reviewer with PR, head, and what moved since verdict X",
+then "read the verdict", then "findings on PR #N, address all, report when
+green").
+
+That figure is a hand classification of the 2026-08-30 orchestrator transcript,
+and the instrument is stated so it can be re-run rather than believed: one turn
+is one user-typed line into the orchestrator pane (a JSONL `type:user` record
+whose `content` is a string, i.e. not a `tool_result`), and the turns were
+bucketed by which notice triggered them — the `review_verdict` arm's delivery,
+`report::structured_notice`'s echo, a CI or delivery notice, or a human. It is
+the **ceiling** on what a driver can remove, not the saving: the same
+measurement re-run on the first driven PRs is what decides whether the feature
+earned its build cost.
+
+What stays with the LLM orchestrator is everything that is a judgment: intake
+and the worker's own brief, findings disposition (INVARIANT 3), the architecture
+read (INVARIANT 4), the merge (INVARIANT 1), conflicts, an `escalate` verdict,
+and any `message_orchestrator` from a delegate.
+
+## 2. The per-PR state machine
+
+### 2.1 States, and what each reads and writes
+
+Four working states and three terminals. The enum is **closed** — no unknown
+variant, no catch-all arm — with `as_str`/`parse` and an enumerated
+`transition(from, to) -> Result<_, InvalidTransition>` table, exactly as
+`mergeq::EntryState` and `mergeq::transition` do it. A transition the table does
+not name is a refusal, not a fallthrough.
+
+| State | Reads | Writes | Leaves for |
+| --- | --- | --- | --- |
+| `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green; `fix-wait` on red or conflicting; `held(ci-limit)` or `held(rebase-limit)` |
+| `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest); the live head and body digest | the lane's spawned or resumed session id; `review_rounds` on a `fail`; `rd-lane-spawned`, `rd-verdict` | `review-wait` (lane *k+1*) or `gate-check` on a `pass` bound to the current head **and** digest; `fix-wait` on a `fail`; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(routing-unaccountable)` |
+| `fix-wait` | the worker's intercepted `report`; the live head | `rd-handback` | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)` |
+| `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` — plus `body_drift` for `also: [body-unchanged]` | nothing | `satisfied`; back to `ci-wait` when the gate says stale (a push landed under the check) |
+| `satisfied`, `held{reason}`, `cancelled` | — | one `deliver_to_orchestrator` notice, one `rd-satisfied` / `rd-held` / `rd-cancelled` audit line, one `TaskNote` | terminal |
+
+```
+drive_review(pr, worker_session)  ->  ci-wait
+
+ci-wait      --green--------------> review-wait(lane 1)
+             --red----------------> fix-wait          (ci_attempts++)
+             --conflicting--------> fix-wait          (rebase_attempts++)
+review-wait  --pass @(head,digest)-> review-wait(lane k+1) | gate-check
+             --fail---------------> fix-wait          (review_rounds++)
+             --escalate-----------> held(escalate)
+fix-wait     --head moved---------> ci-wait
+             --report(done), head unchanged--> review-wait (first stale lane)
+             --report(blocked)----> held(worker-blocked)
+gate-check   --satisfied----------> satisfied         [ONE notice]
+             --stale--------------> ci-wait
+
+any working state --counter hit | lane or drive timeout | delegate
+                    message_orchestrator--> held{reason}   [ONE notice]
+any working state --cancel_review_drive | PR closed or merged--> cancelled
+```
+
+Two properties of `review-wait` are carried over from the gate rather than
+re-decided here, because dropping either would make the driver a weaker reader
+of the gate than the `gh` shim beside it (`doc/design/workflows.md`, "A pass
+does not survive a re-push", and #565's body-digest asymmetry):
+
+- **A `pass` bound to an old head, or to an old body digest, is not a pass.** It
+  is outstanding; the lane is re-briefed after CI at the new head.
+- **A `fail` bound to an old head still routes.** A defect found at an earlier
+  revision is revision-independent until a reviewer says otherwise, and the
+  round in which it says so is the next one.
+
+### 2.2 Every exit back to the LLM orchestrator
+
+There are exactly eleven, and each emits **one** kick-back notice. This is the
+whole contract on the orchestrator's side: if a driven PR is not producing one
+of these, the drive is still running and there is nothing to read. (The one
+exit that puts two lines in the pane is `held(messaged)`, and the extra line is
+not the driver's — `message_orchestrator` is never intercepted, so the
+delegate's own delivery arrives by its own path; §7.)
+
+| Exit | Fires when |
+| --- | --- |
+| `satisfied` | `evaluate_merge_gate` is satisfied at the live head, including every declared `also:` condition |
+| `held(escalate)` | a lane recorded `escalate` |
+| `held(review-limit)` | `review_rounds` reached its bound |
+| `held(ci-limit)` | `ci_attempts` reached its bound |
+| `held(rebase-limit)` | a second conflict after the one rebase hand-back |
+| `held(lane-stalled)` | a spawned or resumed lane recorded nothing inside `lane_timeout_minutes` |
+| `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
+| `held(worker-blocked)` | the worker reported `blocked` |
+| `held(worker-unresumable)` | the recorded worker session no longer resolves |
+| `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
+| `cancelled` | `cancel_review_drive`, or reconcile found the PR closed or merged |
+
+`held` is one state carrying a **closed** reason enum, not ten states, so a
+reader asking "is this drive parked" asks one question; and the reason travels
+in the notice and the audit line rather than being inferred from which counter
+happens to sit at its bound.
+
+### 2.3 The counters are INVARIANT 9's numbers, and a repo may only tighten them
+
+`templates/orchestrator.md` INVARIANT 9 reads: *three CI attempts, three rounds
+of review findings (yours count too), one rebase attempt, one architectural
+bounce.* The driver takes **three of those four** — `max_ci_attempts` 3,
+`max_review_rounds` 3, `max_rebase_attempts` 1 — and deliberately leaves the
+fourth alone: an architectural bounce is INVARIANT 4 judgment, and §3 says the
+driver never makes one.
+
+Two consequences that are decisions, not defaults:
+
+- **The `driver:` block clamps toward INVARIANT 9, never away from it.**
+  `max_review_rounds` and `max_ci_attempts` clamp to `1..=3`, and
+  `max_rebase_attempts` to `0..=1`. A repo may run a *tighter* loop than the
+  orchestrator template promises; it may not run a looser one, because the
+  driver acts on the orchestrator's authority (§3) and a repo file that raised
+  the bound would be loosening the orchestrator's own invariant from a
+  configuration file. *(This narrows the plan on #1778, which proposed a
+  `1..=5` clamp. Recorded here rather than silently applied.)*
+- **`reset_counters` is an explicit, audited argument.** INVARIANT 9's "yours
+  count too" means the orchestrator's own rounds and the driver's share one
+  budget. So `drive_review` on a held entry **resumes the same counters** by
+  default; clearing them is `drive_review(pr, session, reset_counters: true)`,
+  a visible decision to spend another three rounds rather than a side effect of
+  typing the same tool call twice.
+
+Every wait names both an independent release and a ceiling — the lessons file's
+rule that any suppression driven by a fallible signal must be bounded. There is
+no "keep trying" arm anywhere in this design, and that is also why the loop is a
+tick rather than a thread that waits.
+
+### 2.4 Where the tick runs, and the bounds it inherits
+
+`rd_drive_group_with` is a third step in `gh_poll_tick`, beside
+`mq_drive_group_with`, under merge-queue §13.1's bounds without exception:
+
+- **one group per wake, oldest-serviced first** (a group is deferred, never
+  starved);
+- **at most one state advance per entry per tick** — the tick never loops, never
+  sleeps, and never retries an external call in place;
+- **every child process bounded**, through the same
+  `subproc::capture_raw_with_timeout` primitive `MqRunner` uses, because an unbounded wait in this loop parks every
+  `notify_when` notice in the fleet;
+- **a rate bound**: `RD_BACKOFF_MS` (five minutes, the `MQ_DRIVE_BACKOFF_MS`
+  value) after any tick whose next attempt would make the same external calls
+  and reach the same answer — a runner-class failure
+  (`mqdriver::ResolveFailure::is_runner`) or a spawn the live-delegate cap
+  refused. Not persisted, and not a retry *limit*: it is a fact about the world,
+  not about the drive.
+
+That loop and not a thread of its own, for #406's reason: observing a driven
+PR's checks **is** a `gh` poll, on the same cadence, and a second `gh`-calling
+thread re-opens the coupling that loop closed.
+
+**Restart.** Two-phase reconcile before driving, the `recover_persisted_queue`
+posture: a closed or merged PR becomes `cancelled` with its notice; an
+unresolvable worker or lane session becomes `held`; anything else resumes from
+disk and is re-evaluated against the **live** head, never against the head the
+file remembers. `review_drives.json` is **never deleted on read and never
+repaired**: a file that does not parse refuses the tick, audits
+`rd-state-unreadable` and backs off — a loud, rate-bounded "a human has to look
+at this file" — because a record orrerix will not read is one whose live drives
+it cannot account for, and guessing would resume a drive against state nobody
+wrote.
+
+Every read-modify-write of that file is serialized under `rd_state_lock`, the
+`mq_state_lock` lesson applied before it can be relearned: the load-decide-store
+spans a spawn, and a `drive_review` landing inside that window would otherwise
+read the pre-spawn file and write it back, erasing the entry.
+
+## 3. Ownership, authority, and consent
+
+**The driver runs in the backend.** Not in an orchestrator's context, not as a
+procedure a template asks an agent to follow. The reasons are merge-queue §3's,
+and they transfer intact: an agent-run loop is compact-fragile (a loop that
+forgets its in-flight PR is worse than no loop), its refusals are a model's
+judgment on a given day rather than a tested function, and it costs exactly the
+tokens this feature exists to stop spending.
+
+**New authority, named honestly, and it is one notch below the queue's.** The
+merge queue was the first time the backend wrote to the outside world on its own
+initiative — git refs, draft PRs. **The driver writes nothing outside orrerix.**
+It reads GitHub and it types templated text into panes orrerix already owns.
+What is new, and what deserves saying rather than burying: **orrerix now spawns
+a delegate and resumes a worker's session on its own initiative, with no
+orchestrator turn in between.**
+
+That authority is the **orchestrator's own**, exercised on a PR the orchestrator
+handed over explicitly, and every action taken under it is audited as
+`actor: <the host actor>` with a new `on_behalf_of: <orchestrator agent id>`
+detail key. The actor string is `brand::AUDIT_ACTOR`; a reader asking "did the
+host write this?" must use `brand::is_host_actor`, which also accepts the
+pre-#1153 spelling, and never an inline `== "orrerix"`. So it is `on_behalf_of`,
+not the actor, that distinguishes a driver action from any other host action,
+and that key is what an audit reader filters on.
+
+### 3.1 What the driver may never do — the closed list
+
+Seven items, each with what makes it structural rather than a promise. This list
+is closed: a later slice that wants an eighth capability changes this note first.
+
+1. **Merge, or use any landing verb.** No `gh pr merge`, no `git push` to any
+   ref, no `gh pr ready`, no branch delete. Enforced the way the queue's
+   argv-level posture is (`mqdriver::land_push_argv` is the queue's *one* place
+   a landing argv is built): a source-scanning test over `reviewdrive.rs` and
+   the `rd_*` registry functions, default-deny, so the next capability added has
+   to argue with the test rather than slip past it.
+2. **Write a merge grant.** The `merge_grants` surface is the human's, and
+   INVARIANT 1's "you never grant yourself one — nor can you mint one by editing
+   a file" applies to the driver exactly as it applies to the orchestrator whose
+   authority it borrows.
+3. **Relabel or edit an issue or a PR, bodies included.** #1764's body churn was
+   the *orchestrator* editing PR bodies mid-review and re-staling both lanes;
+   under a drive, a body fix goes through the worker like any other change, or
+   the drive is cancelled first (§8).
+4. **Widen or author a brief.** Every variable a rendered brief interpolates is
+   a fact the driver **read** — PR number, issue, head, base, merge-base, CI run
+   id and failed job names, lane id, the lane's prior verdict head and body
+   digest, round number. No delegate-authored text and no repo-authored text is
+   interpolated in v1 (§9).
+5. **Kill a pane.** `reap_idle_agents` may; the driver may not. A lane that goes
+   quiet becomes `held(lane-stalled)` naming the pane, and a human or the
+   orchestrator decides.
+6. **Decide a disposition.** INVARIANT 3 is the orchestrator's, and the
+   gate-satisfied notice says so in as many words (§6).
+7. **Open the gate.** Only a verdict file recorded through `review_verdict` by a
+   reviewer-kind block does. The driver reads verdicts; it can neither write one
+   nor stand in for a missing one.
+
+The general rule those seven are instances of, worth stating because it
+constrains every later change: **the driver is strictly additive to the merge
+gate. It never grants what the gate would not, and a completed drive is never a
+substitute for a reviewer's `pass`.** A driver that could produce a
+gate-satisfied notice the shim would then refuse is not an accelerator, it is a
+bypass with better telemetry.
+
+### 3.2 Consent is per PR, and it is an MCP call
+
+`drive_review(pr, worker_session)` is orchestrator-role-gated and **never
+automatic**. In particular it does not fire on a worker's `report(done)`, and
+that is a decision rather than an omission: INVARIANT 8 makes *what starts* the
+orchestrator's call, and the PRs where a drive is wrong are ordinary — a scratch
+or red-evidence PR, a release bump, a PR the human said they would read
+themselves. An automatic drive would spawn reviewers into all of them.
+
+**The orchestrator supplies the worker session; the driver never derives it.**
+The board carries a `session` field per task, and reading it would be the
+obvious shortcut. It is refused for the reason `Task::pr_base`'s own doc block
+already states about board data: the board is agent-writable, so a check that
+trusted it would be a check the thing being checked gets to answer. The driver
+therefore *writes* to the board (a `TaskNote` on the task whose `pr` matches, so
+the human sees the drive on the board) and *reads* nothing from it. Its inputs
+are the tool call, the workflow file, the verdict files, and GitHub.
+
+The session must be the **full** session UUID — a truncated id does not resolve
+(`resolve_session_ref`, and INVARIANT 10 says the same to the orchestrator), and
+a drive that cannot resume its worker is a drive with no `fix-wait`.
+
+Role gating uses the `review_verdict` / `queue_merge` **double gate**: a listing
+filter *and* a real check in the dispatch, because a tool omitted from a listing
+is still callable.
+
+## 4. The driver executes the gate, not the `edges:`
+
+`doc/design/workflows.md`'s "Why edges are advisory" **stands, and this feature
+is not a quiet reversal of it.** Every judgment that section protects — whether
+a change is sprawling enough to serialize or independent enough to parallelize,
+whether to plan first or go straight to a worker, whether to reuse an idle
+delegate — happens **before** `drive_review` is called, and the driver has no
+opinion about any of it. It never reads `edges:`, and making `edges:` executable
+is not a step this design is on the way to.
+
+What it executes is the **gate**: `reviewers:` plus whichever `routing:` rules
+fired for this PR's changed files. That is already an enforced mechanism with
+two readers — the `gh` shim and `mergeq::GateRecheck` — and the driver is a
+third **reader**, never a third implementation. Merge-queue §6 is explicit that
+a third implementation of the gate decision is a defect rather than an
+optimization, so the driver calls `route_reviewers`, then
+`RoutingDecision::gate`, then `evaluate_merge_gate`, plus `body_drift` for
+`also: [body-unchanged]`, and adds no decision of its own. If the driver's needs
+ever diverge from those parsers, the parsers move.
+
+The distinction is not cosmetic. An `edges:` graph would be the runtime deciding
+*which agent runs next in a workflow* — the 500-line-YAML sprawl that section
+refuses. The gate is the runtime deciding *what must be true before a merge*,
+which it already decides, for every PR, whether or not a driver exists. The
+driver adds no new authority over the roster; it removes the orchestrator turn
+that used to sit between the gate's answer and the next spawn — the step
+`templates/orchestrator.md` itself already calls "the default hand-back is one
+line, verbatim in shape". The template had declared it mechanical; this makes it
+so.
+
+**Lane order comes from the gate, not from a graph.** It is
+`RoutingDecision::required`'s order — the static `reviewers:` list first, then
+the fired rules in declaration order, each id appended once — which is
+documented there as the order the `gh` shim appends in too, so the two produce
+the same list and not merely the same set. Lane *k+1* spawns only after lane
+*k*'s `pass` bound to the current head and body digest, which is how the
+sequenced-lane rule ("the standard lane to a `pass` on a final body, then the
+final lane once") is expressed with no block name anywhere in the code.
+
+**Routing is re-evaluated at every reviewed head**, because a push can change
+which reviewers are required: a round that starts touching `src/**` pulls in
+whatever rule that path fires for. And `route_reviewers` returning `None` — the
+changed-file list could not be shown complete — is `held(routing-unaccountable)`,
+never a guess. The unknown thing there is *which reviewers are required*, so
+guessing "no rule fired" is guessing in favour of merging; the shim and
+`GateRecheck::RoutingUnaccountable` refuse for that reason and the driver makes
+the same refusal.
+
+## 5. Public contracts
+
+Each item below is a **public contract** in the CLAUDE.md sense — a command
+signature, a wire shape, a file format, or a persisted schema — and this note is
+their design note.
+
+### 5.1 MCP tools (three, orchestrator-role-gated)
+
+Built via the `add-orch-tool` skill so every layer moves together, and
+double-gated per §3.2.
+
+```
+drive_review(pr: number, worker_session: string, reset_counters?: boolean)
+  -> { driving: true, state: "ci-wait" } | { refused: "<reason>" }
+  refusals: driver-disabled | pr-not-open | session-not-found
+          | already-driven | gate-not-configured
+
+cancel_review_drive(pr: number)
+  -> { cancelled: true } | { refused: "<reason>" }
+  refusals: not-driven | driver-disabled
+
+review_drive_status()
+  -> { enabled: bool,
+       drives: [{ pr, state, held_reason?, head, lanes: [{ block, last_verdict? }],
+                  counters: { review_rounds, ci_attempts, rebase_attempts },
+                  since_ms }] }
+```
+
+Three of the refusal names are borrowed deliberately rather than coined.
+`session-not-found` is `resolve_session_ref`'s vocabulary, including its
+sharpest property: a session id **prefix** does not resolve, so a truncated
+paste is refused rather than matched. `gate-not-configured` is the queue's own
+refusal, and for the queue's own reason — a repo with no gate has nothing for a
+drive to run *toward*, and `evaluate_merge_gate` with no gate returns *allowed*,
+which is correct for the shim and would be a driver announcing gate-satisfied on
+a PR nobody reviewed. `driver-disabled` is the absent-block state (§5.3).
+
+**`routing-unaccountable` is deliberately not a drive-time refusal**, though it
+is a `held` reason. Routing is evaluated per head, and the head at
+`drive_review` time is not the head that gets reviewed; answering the question
+twice, at two heads, invites the two answers to disagree and makes the refusal a
+worse signal than the hold. *(The plan on #1778 listed it in both places; this
+note keeps it in one.)*
+
+`review_drive_status()` joins the re-sync list the idle-tick notice already
+names (`list_tasks`, `list_agents`, `get_state`), and the session-start
+reconcile in `templates/orchestrator.md`, because a re-grounded orchestrator
+that has forgotten its drives is exactly the reader this tool exists for. Every notice in §6 names
+the tool that acts on it, for the same reason.
+
+### 5.2 `<group-dir>/review_drives.json`
+
+One per group, in the group dir (built by `group_dir_at`, the only place a
+group id becomes a path) beside `state.json`, `tasks.json` and
+`merge_queue.json`.
+
+```
+{
+  "version": 1,
+  "entries": [
+    { "pr": 1758,
+      "state": "review-wait",
+      "held_reason": null,
+      "head": "<sha>",
+      "body_digest": "<digest>",
+      "worker_session": "<full uuid>",
+      "on_behalf_of": "<orchestrator agent id>",
+      "lanes": [ { "block": "rev-std", "session": "<uuid>",
+                   "last_verdict": "pass", "at_head": "<sha>" } ],
+      "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
+      "since_ms": 0 }
+  ]
+}
+```
+
+Versioned, **atomically written**, and unknown fields **tolerated and
+preserved** — carried across a read/write cycle rather than merely not failing
+the read, because a field ignored on read is lost on the next write and the
+promise this file makes is that an older build can read *and rewrite* it without
+destroying what a newer one wrote. It is **never deleted on read** and **never
+repaired**: §2.4 states what an unparseable file does instead.
+
+Note the **deliberate asymmetry** with §5.3, since the two persisted surfaces
+this design adds take opposite forward-compatibility postures and a reader will
+otherwise infer one from the other, exactly as merge-queue §11.2/§11.3 warns:
+**policy fails loud, state degrades gracefully.** Different documents, different
+jobs.
+
+### 5.3 The `driver:` block in `.orrerix/workflow.yml`
+
+A sibling of `merge_queue:`, parsed in `workflow.rs` alongside it, and a row in
+the schema manifest (#880) like every other block — a field that reaches the
+file without one is exactly what that manifest exists to catch.
+
+```yaml
+driver:
+  enabled: true               # default false
+  max_review_rounds: 3        # default 3, clamped 1..=3
+  max_ci_attempts: 3          # default 3, clamped 1..=3
+  max_rebase_attempts: 1      # default 1, clamped 0..=1
+  lane_timeout_minutes: 60    # default 60, clamped like the notify TTLs
+  drive_timeout_minutes: 240  # default 240, same clamp family
+```
+
+**An absent block means the feature is off and behaviour is byte-for-byte
+unchanged**, the posture `gates:` and `merge_queue:` both take. A malformed
+block is **loud** — the existing `workflow-invalid` path — and never degrades to
+defaults, because a driver running on silently-substituted policy is a driver
+nobody can reason about.
+
+**Adding the block breaks the file for builds that predate this feature —
+deliberately, and this is merge-queue §11.2's warning restated because it is a
+real property of the opt-in rather than a footnote.** `RawWorkflow` is
+`#[serde(deny_unknown_fields)]`, so `driver:` is not a tolerated unknown key on
+an older build: it fails the parse of the **whole** `.orrerix/workflow.yml`,
+gates and all, down the loud `workflow-invalid` path. Anyone adding the block to
+a repo whose users may run mixed versions should know that before they push it.
+It is the right behaviour anyway: `workflow.yml` is human-authored policy, and a
+key the build does not understand means a human believes a policy is in force
+that is not.
+
+**Nothing in the block is a capability grant**, by workflows.md's own test: ask
+whether a field's value can carry text the trust root acts on. Every field here
+is a bool or a number from a closed range, so the answer is no — which is
+precisely why brief *text* is not a field (§9).
+
+### 5.4 Audit vocabulary
+
+Emitted through the registry's `audit(group, actor, action, detail)`, kebab-case
+like `mq-*` and the rest:
+
+`rd-started` · `rd-refused` · `rd-ci-green` · `rd-ci-red` · `rd-conflicting` ·
+`rd-lane-spawned` · `rd-verdict` · `rd-handback` · `rd-consumed` ·
+`rd-satisfied` · `rd-held` · `rd-cancelled` · `rd-recovered` ·
+`rd-state-unreadable`
+
+Every state transition, every spawn or resume, and every consumed delegate event
+(§7) appears here, each carrying `on_behalf_of`. Green and red are separate
+actions rather than one action with a boolean, for merge-queue §11.5's reason: a
+filter looking for the thing that happened must not match the thing that did
+not. `rd-held` carries the closed reason from §2.2 in its detail; an audit
+action must name what actually happened, and a hold labelled as a completion is
+the defect class #461 catalogues.
+
+### 5.5 The brief templates
+
+Three built-in templates in `src-tauri/src/orchestration/templates/` —
+`driver-review.md`, `driver-delta.md`, `driver-fix.md` — rendered by the
+existing `render_template` `{{KEY}}` substitution, which does replacement and
+nothing else. They are new files, so they are **not** fixture-pinned by
+`tests/fixtures/pre222/`, which pins the four role templates; an edit to
+`orchestrator.md` announcing the feature to the orchestrator **is** in that
+fixture set and re-blesses in the same commit.
+
+Each template carries **facts only** (§3.1 item 4). The delta template exists
+because it is the line an orchestrator typed by hand nine times on one PR:
+*"delta on PR N at head H — your previous verdict was at head H0 (body digest
+unchanged / changed); what moved: `<the changed-file list>`; re-run your pass and
+record at H."* No disposition ever rides in a brief; the disposition the
+orchestrator used to append to a hand-back belongs at the gate-satisfied
+kick-back instead, where the orchestrator is the one making it (INVARIANT 3).
+
+## 6. Kick-back notice shapes
+
+**One delivery per exit, event first**, so the first token the orchestrator reads
+says what happened. Sanitization is not optional on any of them: any delegate- or
+GitHub-authored fragment passes `report::relay_payload_keeping_lines` and
+`notify::sanitize_pane_text`, and a verdict summary rides in capped at
+`report::VERDICT_NOTICE_SUMMARY_CAP` (400 characters) with its truncation marker,
+because the pane text becomes the orchestrator's resident context and is paid for
+again on every later API call.
+
+```
+[orrerix] review drive PR #1758: GATE SATISFIED at df6a73d0 (body 3f1a..) —
+  rev-std PASS, rev-final PASS; 3 review rounds, 2 CI runs, 0 rebases.
+  Non-blocking findings left open — rev-std: "<capped summary>";
+  rev-final: "<capped summary>". Disposition is yours (INVARIANT 3);
+  full text: list_verdicts("1758").
+
+[orrerix] review drive PR #1764: ESCALATE by rev-final at 306176c4 —
+  "<capped summary>". Drive held; drive_review resumes it,
+  cancel_review_drive stops it.
+
+[orrerix] review drive PR #1758: HELD — review rounds 3/3 at bd1461af;
+  last rev-std FAIL "<capped summary>"; worker session cafb930d-….
+  drive_review(pr, session, reset_counters: true) to spend another three,
+  or take it by hand.
+```
+
+The same shape carries every other `held` reason from §2.2, each naming the one
+fact that decides what the orchestrator does next — the stalled lane's pane, the
+failing CI run id, the unresumable session id.
+
+**"The union of non-blocking findings" is the union of the PASS summaries, and
+the notice says so.** The driver cannot parse findings out of prose and must not
+pretend to; what makes the line readable is the existing convention that a
+reviewer's summary states its own shape ("pass — 2 non-blocking, disposition
+pending"). A structured findings surface would sharpen this and is not a
+prerequisite for it.
+
+A driven delegate's own `message_orchestrator` line is delivered **unchanged**,
+by its own arm, and the driver's `held(messaged)` kick-back follows on the next
+tick. That is the one exit with two lines in the pane, and only one of them is
+the driver's; §7 says why the split is deliberate rather than a missed merge.
+
+## 7. The norm this narrows, stated plainly
+
+`mcp.rs`'s `review_verdict` arm states the norm in its own comment: *orrerix's
+design norm is that agent-to-agent traffic arrives as a VISIBLE prompt in the
+recipient's pane — never a side channel.* Today both that arm and the `report`
+arm call `deliver_to_orchestrator` unconditionally, so every verdict and every
+delegate report becomes an orchestrator turn.
+
+**For a driven PR, the recipient changes.** A driven delegate's `report` and
+`review_verdict` are consumed by the driver instead of appearing as a visible
+orchestrator prompt; the orchestrator's visible prompt is the kick-back in §6.
+Three properties bound that narrowing, and all three are load-bearing:
+
+- **It is keyed on the agent, never on text.** Interception applies when the
+  calling agent is one the driver spawned or resumed for a live drive. It is
+  never keyed on a `ref` string a delegate typed, because a delegate that could
+  choose whether its report reaches the orchestrator by naming a PR number is a
+  delegate that can route around the orchestrator.
+- **`message_orchestrator` is never intercepted.** It is the one channel a
+  delegate has for something that is not a status change — a brief whose premise
+  is wrong, a question, a refusal — and it is exactly the traffic the norm exists
+  to protect. It is delivered unchanged, by its own arm, and the driver notices
+  only that it happened: on the next tick the drive goes to `held(messaged)` and
+  emits its one kick-back. So that exit is two deliveries by construction — the
+  delegate's, and the driver's — because the delegate's words are the payload and
+  the hold is the routing fact, and merging them would either truncate the
+  delegate or bury the hold.
+- **Nothing is silent.** Every consumed event is audited as `rd-consumed` with
+  its kind, the agent and the PR, so the traffic that stopped arriving as a
+  prompt is still on the record and still attributable. "Consumed" is a
+  different word from "dropped" and the audit vocabulary keeps them different.
+
+The reason this is worth a section rather than a line is that it is the only
+place where this design makes the orchestrator's view of its own group
+*narrower* than it was. Everything else the driver does, the orchestrator could
+have done itself; this it cannot, while a drive is live. The compensating
+surfaces are `review_drive_status()` (in the re-sync list, so a compacted
+orchestrator recovers its drives) and the audit log.
+
+## 8. Failure modes, and what each degrades to
+
+| Failure | Degrades to |
+| --- | --- |
+| A kickoff never lands in a spawned lane's pane | The delivery layer already re-delivers and audits it (`delivery-eaten`, `kickoff-redelivery-skipped`), and a CLI that declares a readiness marker waits for it (`CliCaps::ready_marker`, #1591). **The driver adds no re-send of its own** — a second sender is a supersession hazard, not a fix. It bounds instead: no verdict inside `lane_timeout_minutes` is `held(lane-stalled)`, naming the pane. |
+| The live-delegate cap refuses a lane spawn | A runner-class outcome: back off `RD_BACKOFF_MS`, retry on a later tick, count only against `drive_timeout_minutes`. The driver **never kills a pane to make room** (§3.1 item 5). |
+| An idle reviewer or worker is reaped between rounds | Normal, and already handled: the entry stores the **full** session UUID, so the next round resumes it; if the session no longer resolves, a lane respawns fresh by block id and a worker becomes `held(worker-unresumable)`. No `notify_when` watch is held anywhere — watches die with their agent — so the tick polls the PR itself. |
+| The worker pushes while a lane is mid-review | The head moves, so the drive re-enters `ci-wait`; the verdict that lands binds to the old head. A `fail` there still routes, a `pass` there is stale and the lane is re-briefed after CI. One wasted review, bounded by the round counter. This race is not designed away — it is the race the verdict binding already exists to handle. |
+| The PR body changes under a recorded `pass` | The `(head, digest)` key is re-read every tick, so a moved digest with an unchanged head re-enters `review-wait` at the first stale lane with a body-only delta brief. While a drive is live, body fixes go through the worker or the drive is cancelled first (§3.1 item 3). |
+| `gh` is down, rate-limited, or slow | `ResolveFailure::is_runner` — a fact about the world: back off, no transition, no notice, until `drive_timeout_minutes` makes it `held(stalled)`. A refusal the remote actually **answered** (PR closed, 404) is a fact about that PR and becomes `cancelled`. |
+| `also: [base-green]` and the default branch is red | The gate is simply not satisfied; `gate-check` returns to `ci-wait` and the drive parks until `drive_timeout_minutes` makes it `held(stalled)`. Stopping the line is the intended behaviour; the bound is what keeps it from being a silent one. |
+| `review_drives.json` is torn or hand-edited | The tick refuses, audits `rd-state-unreadable`, backs off. Never repaired, never deleted (§2.4). |
+| orrerix restarts mid-drive | Reconcile before driving: closed PR to `cancelled`, unresolvable session to `held`, everything else resumed against the **live** head (§2.4). |
+| The orchestrator compacts and forgets its drives | `review_drive_status()` is in the re-sync list, and every §6 notice names the tool that acts on it. |
+
+## 9. What is deliberately not in v1
+
+**Repo-authored brief text.** A `brief:` or `prompt:`-style field per block,
+letting a repo write what the driver types at a reviewer, is not here. The
+persona already carries the review *rules*; a driver brief carries *facts*, and
+§3.1 item 4 makes that structural. Adding repo text would also change the answer
+to §5.3's capability test — a string a repo authors is text the trust root acts
+on — so it is not a field that can be added quietly. If it is wanted later it
+belongs in `prompt:`'s existing class: inert, `sanitize_persona`-filtered, an
+addendum rather than a replacement, refused on orchestrator, manager and planner
+blocks, placeholders drawn from a closed set, and a schema-manifest row of its
+own.
+
+**Parallel lanes.** Every lane runs in sequence, because that is what the gate's
+own sequenced rule says and because a `fail` on any lane sends the PR back to
+the worker regardless, which makes a second concurrent review of a revision that
+is already going to change mostly wasted tokens. Where a roster has several
+genuinely cheap lanes the arithmetic changes, and a `driver.lanes: parallel`
+knob is the shape that would express it — one field, defaulting to sequential,
+after the sequential path has been measured on real PRs. Guessing at the
+concurrency policy before the first driven PR exists is how a knob becomes
+permanent before anyone knows whether it was right.
+
+**Neither omission is a stub.** Nothing in v1 half-implements either: there is no
+`brief:` key that parses and is ignored, and no lane list that accepts more than
+one entry at a time. A feature that is not here is absent, not disabled.

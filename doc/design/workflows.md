@@ -340,6 +340,17 @@ says which blocks exist, what each is for, and what must be true before a merge.
 The orchestrator decides *when*. Its kickoff prompt lists the declared blocks
 and says in as many words that the edges are advisory.
 
+That decision survives the engine-driven review-loop driver (#1778), the one
+thing in orrerix that advances a review with no orchestrator turn in it: **the
+driver executes the *gate*, never the `edges:`.** It reads `reviewers:` plus
+whichever `routing:` rules fired for that PR's changed files — a list the `gh`
+shim and the merge queue already enforce — and spawns those lanes in that
+list's order; it never reads `edges:`, and it is handed one PR at a time by an
+explicit orchestrator tool call. So every judgment this section protects —
+serialize or parallelize, plan first or straight to a worker, reuse an idle
+delegate — is made before a drive starts and is never made by one. See
+`doc/design/review-driver.md` §4.
+
 ## Personas: compiled to native flags
 
 Both agent CLIs now ship a custom-agent flag, and they are asymmetric in a way
