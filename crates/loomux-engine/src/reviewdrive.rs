@@ -170,7 +170,7 @@ impl DriveState {
             "held" => Some(DriveState::Held),
             "satisfied" => Some(DriveState::Satisfied),
             "cancelled" => Some(DriveState::Cancelled),
-            _ => None,
+            _ => Some(DriveState::CiWait),
         }
     }
 
