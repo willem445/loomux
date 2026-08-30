@@ -443,6 +443,98 @@ use crate::obs::LockExt;
 #[doc(hidden)]
 pub const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
 
+/// The orchestrator **playbook** (#1683) — the on-demand half of the
+/// orchestrator's contract. The resident core (`ORCHESTRATOR_TPL`) keeps the
+/// INVARIANTS, the tool surface and every rule; the playbook carries the
+/// situational **procedure**, served one `## ` section at a time by the
+/// orchestrator-only MCP tool `read_playbook(section)`. The split exists
+/// because the resident template is paid on every model call while a playbook
+/// section is paid only when its trigger fires — and because the failure mode
+/// of an on-demand document is not an unreadable section, it is an
+/// orchestrator that never knows to ask: so every moved section leaves a
+/// resident stub naming its trigger
+/// (`every_playbook_section_has_a_resident_stub_naming_it` pins that pairing).
+///
+/// Rendered into `<group dir>/orchestrator-playbook.md` by
+/// `write_instruction_files` with the same var list as every role file, so it
+/// is what a default group reads and is manifest-tracked like them.
+#[doc(hidden)]
+pub const ORCHESTRATOR_PLAYBOOK_TPL: &str = include_str!("templates/orchestrator-playbook.md");
+
+/// The rendered playbook's file name in the group dir (#1683). One constant
+/// for the same reason `generated_instructions_manifest_path` owns its own
+/// name: the writer in `write_instruction_files`, the reader in
+/// `read_playbook`, and the manifest row must spell it identically or the
+/// tool serves a file the render never wrote.
+pub const ORCHESTRATOR_PLAYBOOK_FILE: &str = "orchestrator-playbook.md";
+
+/// The closed enum of playbook section ids, in template order — the tool
+/// description's index and `read_playbook`'s vocabulary.
+///
+/// It is a hand-maintained mirror of what the template's `## ` headings
+/// derive to, and it is not allowed to drift:
+/// `every_playbook_heading_yields_a_unique_id_and_the_tool_enum_lists_exactly_
+/// them` derives the ids from `ORCHESTRATOR_PLAYBOOK_TPL` (the lessons
+/// splitter's boundary, fenced code excluded) and asserts this slice equals
+/// them exactly — a section added to the template without a row here, or a
+/// row here whose section is gone, is a red at the scan, not a tool that
+/// offers a section no template carries.
+#[doc(hidden)]
+pub const PLAYBOOK_SECTION_IDS: &[&str] = &["about-this-playbook"];
+
+/// The section id a playbook heading yields: lowercased, every run of
+/// non-ASCII-alphanumeric characters collapsed to a single `-`, leading and
+/// trailing `-` trimmed. `"About this playbook"` → `about-this-playbook`;
+/// `"Prototype → Proceed"` → `prototype-proceed` (the arrow is one non-alnum
+/// run like the spaces around it). Total and deterministic — the same heading
+/// always yields the same id, which is the property both the resident stubs
+/// and the tool's vocabulary are keyed on.
+///
+/// Non-ASCII *letters* (é, ü) are dropped rather than transliterated: the
+/// playbook is loomux-authored ASCII prose (constraint 8 — no repo or machine
+/// vocabulary in product code), so a heading that would lose its whole id to
+/// this rule is a template bug the uniqueness check at the scan catches, not
+/// a case to handle here.
+pub fn playbook_section_id(title: &str) -> String {
+    let mut id = String::with_capacity(title.len());
+    let mut in_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            id.push(c.to_ascii_lowercase());
+            in_dash = false;
+        } else if !in_dash && !id.is_empty() {
+            id.push('-');
+            in_dash = true;
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    id
+}
+
+/// Every playbook section id in the rendered playbook, in file order.
+///
+/// `rendered`, not the template: the tool serves the group's written copy, so
+/// the ids that matter are the ones its headings yield. Pure — see
+/// [`playbook_section`] for the read half.
+pub fn playbook_section_ids(rendered: &str) -> Vec<String> {
+    loomux_engine::lessons::split_sections(rendered)
+        .into_iter()
+        .map(|(title, _)| playbook_section_id(title))
+        .collect()
+}
+
+/// One playbook section by id: the verbatim slice from its `## ` heading to
+/// the next (or end of file). Pure; the audit line and the group-dir read
+/// live on [`OrchRegistry::read_playbook`].
+pub fn playbook_section(rendered: &str, id: &str) -> Option<String> {
+    loomux_engine::lessons::split_sections(rendered)
+        .into_iter()
+        .find(|(title, _)| playbook_section_id(title) == id)
+        .map(|(_, text)| text.to_string())
+}
+
 /// The `{{MERGE_QUEUE}}` fragment (#581 §11.1) — substituted into
 /// `orchestrator.md` **only** when the repo declares `merge_queue: enabled:
 /// true`, and empty otherwise.
@@ -41571,6 +41663,17 @@ impl OrchRegistry {
         // separately-derived one that could drift from what actually got
         // written.
         let mut current: HashSet<String> = HashSet::new();
+        // #1683: the orchestrator playbook renders into EVERY group dir,
+        // alongside the role files — it is what a default group reads, so it
+        // is written unconditionally like them and rendered with the same var
+        // list (`instruction_vars`, #1187), and it is in `current` like them
+        // so a roster change never strands a stale copy. It is a contract
+        // file, not a block file: the class-fallback loop below is about
+        // legacy sessions' per-class fallbacks, which the playbook has no
+        // part in.
+        fs::write(dir.join(ORCHESTRATOR_PLAYBOOK_FILE), render_template(ORCHESTRATOR_PLAYBOOK_TPL, &vars))
+            .map_err(|e| e.to_string())?;
+        current.insert(ORCHESTRATOR_PLAYBOOK_FILE.to_string());
         // HAND-LISTED, and `Role::Manager` is deliberately NOT in it (#1161).
         // The list is not "every capability class" — it is "the classes whose
         // instruction file must exist even when the roster omits the block",
@@ -41680,6 +41783,49 @@ impl OrchRegistry {
         // established convention, not a special case worth a plain
         // `fs::write`.
         let _ = atomic_write(&self.generated_instructions_manifest_path(g), body.as_bytes());
+    }
+
+    /// Serve one `## ` section of this group's rendered orchestrator playbook
+    /// (#1683) — the on-demand half of the orchestrator's contract, read back
+    /// from the file `write_instruction_files` wrote.
+    ///
+    /// The read goes through [`Self::group_dir`], which takes a [`GroupId`]:
+    /// the one permitted place a group id becomes a path (CLAUDE.md constraint
+    /// 6). The `section` argument is a **validated id against the written
+    /// file's own headings** — never a path, never a byte range: a caller can
+    /// name which section it wants and nothing else, so no argument on this
+    /// tool can reach a file, or a part of one, that the render did not write.
+    /// An unknown id is an error that names the valid ids — never an empty
+    /// string, which would read as "the section is empty" rather than "there
+    /// is no such section" (the vacuity control is
+    /// `read_playbook_refuses_an_unknown_section_and_names_the_valid_ids`).
+    ///
+    /// Every successful serve writes one `playbook-read` audit line naming the
+    /// section: the INVARIANT-11 shape applied to the playbook — the audit is
+    /// what makes "the orchestrator never fetched the section its stub named"
+    /// observable instead of assumed (the plan's §6 detectors). The actor is
+    /// [`brand::AUDIT_ACTOR`] because the method has no caller identity and
+    /// the read is orchestrator-only by the dispatch gate; the tool surface,
+    /// not this method, is where caller attribution would widen the surface.
+    pub fn read_playbook(&self, group: &GroupId, section: &str) -> Result<String, String> {
+        let rendered = fs::read_to_string(self.group_dir(group).join(ORCHESTRATOR_PLAYBOOK_FILE))
+            .map_err(|_| {
+                "playbook not found — it is rendered into the group dir at launch; relaunch \
+                 the group or re-render its instruction files"
+                    .to_string()
+            })?;
+        let ids = playbook_section_ids(&rendered);
+        if !ids.iter().any(|id| id == section) {
+            return Err(format!(
+                "unknown playbook section {section:?} — valid sections: {}",
+                ids.join(", ")
+            ));
+        }
+        let body = playbook_section(&rendered, section).ok_or_else(|| {
+            format!("playbook section {section:?} not found in the rendered playbook")
+        })?;
+        self.audit(group, brand::AUDIT_ACTOR, "playbook-read", json!({ "section": section }));
+        Ok(body)
     }
 
     /// #423: reclaim per-block instruction files a PREVIOUS roster (built-in

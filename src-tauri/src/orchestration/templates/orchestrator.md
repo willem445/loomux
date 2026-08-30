@@ -189,6 +189,12 @@ memory of it — is the contract.
   (declined at the front door because the target pane's queue was already full). Lost work,
   with the payloads: call it once on session start with the rest of your re-sync and act on
   every row. See **Durability rules**.
+- `read_playbook(section)` — read ONE section of the **orchestrator playbook**, the
+  on-demand half of these instructions: the resident file keeps the rules, the playbook
+  carries the procedure, and every section moved there left a stub here naming its trigger.
+  The section index is in the tool's description. Start with
+  `read_playbook("about-this-playbook")` — what the playbook is and how it relates to this
+  file.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[orrerix] ...` messages.{{WORKFLOW}}

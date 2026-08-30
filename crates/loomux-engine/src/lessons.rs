@@ -263,6 +263,24 @@ fn split_blocks(text: &str) -> Vec<Block<'_>> {
         .collect()
 }
 
+/// The `## ` sections of `text`, in file order, as `(title, verbatim slice)`
+/// pairs — the title trimmed of the `## ` prefix and trailing whitespace, the
+/// slice running from the heading line to the next heading (or end of file).
+/// The preamble before the first heading is not a section and is not
+/// returned.
+///
+/// This is [`split_blocks`]'s split, published for a reader that wants the
+/// sections and not the eviction policy — the orchestrator playbook (#1683),
+/// which must not grow a second heading parser when this one already decided
+/// the boundary rule. Same fenced-code exclusion: a `## ` line inside a fence
+/// is quoted prose, not a boundary.
+pub fn split_sections(text: &str) -> Vec<(&str, &str)> {
+    split_blocks(text)
+        .into_iter()
+        .filter_map(|b| b.title.map(|title| (title, b.text)))
+        .collect()
+}
+
 /// A code-fence marker at the start of `line`: the fence character, how long
 /// the run is, and whether the rest of the line is empty — which is what
 /// makes a run eligible to *close* an open fence rather than only open one.

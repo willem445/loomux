@@ -66,7 +66,8 @@ use loomux_lib::orchestration::{
     // #778: the full-autonomy toggle's pure surface.
     full_autonomy_notice, sanitize_full_autonomy_goal, MAX_FULL_AUTONOMY_GOAL_CHARS,
     GhGate, GitTagPush,
-    normalize_remote_web_base, ORCHESTRATOR_TPL, WORKER_TPL, REVIEWER_TPL, PLANNER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
+    normalize_remote_web_base, ORCHESTRATOR_TPL, ORCHESTRATOR_PLAYBOOK_TPL, PLAYBOOK_SECTION_IDS,
+    playbook_section_ids, WORKER_TPL, REVIEWER_TPL, PLANNER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     // #576: loomux's own notice rows are not questions.
     // #632: and the same for the CONTINUATION rows of a multi-row notice.
@@ -4622,6 +4623,67 @@ fn the_resident_core_is_under_the_byte_budget() {
          they do not get rewritten longer in place (#1683)",
         ORCHESTRATOR_TPL.len()
     );
+}
+
+/// The source scan that keeps the tool's section enum honest (#1683 slice 1).
+///
+/// **The axis is the heading, not a name.** The id set is DERIVED from
+/// `ORCHESTRATOR_PLAYBOOK_TPL`'s own `## ` headings — the same
+/// `loomux_engine::lessons` splitter `lessons.rs` uses, fenced code excluded
+/// so a quoted `## ` line inside an example never becomes a section — and
+/// then three denials are asserted, in the default-deny shape the
+/// source-scanning-guard convention requires:
+///
+/// 1. every derived id is unique (two headings that slug to the same id would
+///    make one of them unservable while both stubs claim it);
+/// 2. `PLAYBOOK_SECTION_IDS` equals the derived set exactly — a row whose
+///    section is gone is refused as loudly as a section with no row, because
+///    the tool description's index is what tells the orchestrator what exists;
+/// 3. the orchestrator's actual tool listing carries exactly those ids and no
+///    delegate's listing carries the tool at all — the wiring proof that the
+///    const reaches the surface the agent sees.
+///
+/// **Residual, stated where it is implemented:** this scan reads the TEMPLATE
+/// const and the LISTING's description text; it cannot see a description
+/// that names ids the template lacks in prose it does not parse, and it does
+/// not prove a model reads the index — the stub test above is the pairing
+/// half, and the `playbook-read` audit line is the measurement half.
+#[test]
+fn every_playbook_heading_yields_a_unique_id_and_the_tool_enum_lists_exactly_them() {
+    let ids = playbook_section_ids(ORCHESTRATOR_PLAYBOOK_TPL);
+    assert!(!ids.is_empty(), "the playbook must carry at least one section");
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "two headings derive the same id: {ids:?}");
+
+    assert_eq!(
+        PLAYBOOK_SECTION_IDS, ids.as_slice(),
+        "PLAYBOOK_SECTION_IDS has drifted from the playbook's own headings — the enum is a \
+         mirror of the template, never an independent list (#1683)"
+    );
+
+    let (reg, _d, co, cw) = setup_mcp();
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let def = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("read_playbook"))
+        .expect("the orchestrator must be able to SEE the tool")
+        .clone();
+    let desc = def["description"].as_str().unwrap().to_string();
+    for id in &ids {
+        assert!(
+            desc.contains(id),
+            "the tool description's index must list `{id}` — a section the stubs name but \
+             the index omits is one an orchestrator scanning the surface will never find: {desc}"
+        );
+    }
+    let worker_listed = dispatch(&reg, &cw, "tools/list", &json!({})).unwrap();
+    let worker_names: Vec<&str> =
+        worker_listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(!worker_names.contains(&"read_playbook"), "orchestrator-only surface");
 }
 
 // ---------------------------------------------------------------------------

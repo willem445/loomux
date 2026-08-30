@@ -5755,11 +5755,19 @@ fn plain_rails() -> Guardrails {
 /// added unconditionally to a template; a placeholder moved onto its own line) both
 /// sailed straight through it (rev-11 F1).
 /// `manager.md` is deliberately NOT here — see [`GOLDENS`].
-const PRE222: [(&str, &str); 4] = [
+///
+/// #1683 adds `orchestrator-playbook.md` as the fifth row: the playbook is
+/// what a default group reads too (written unconditionally into the group
+/// dir), so the "what does a DEFAULT group read?" question is asked of it
+/// exactly like the four role files. Unlike them it has no pre-#222 heritage —
+/// the name stays for the directory it lives in — and its golden is the live
+/// template minus its `LIVE` keys, re-blessed like any other deliberate edit.
+const PRE222: [(&str, &str); 5] = [
     ("orchestrator.md", include_str!("fixtures/pre222/orchestrator.md")),
     ("worker.md", include_str!("fixtures/pre222/worker.md")),
     ("reviewer.md", include_str!("fixtures/pre222/reviewer.md")),
     ("planner.md", include_str!("fixtures/pre222/planner.md")),
+    ("orchestrator-playbook.md", include_str!("fixtures/pre222/orchestrator-playbook.md")),
 ];
 
 /// Every blessed golden, in `LIVE` order — [`PRE222`] plus `manager.md` (#1161).
@@ -5777,12 +5785,17 @@ const PRE222: [(&str, &str); 4] = [
 ///   against `LIVE` below. That question is about the TEMPLATE and is asked of
 ///   all five equally, which is why `manager.md` gets the same re-bless gate as
 ///   the other four rather than a weaker one.
-const GOLDENS: [(&str, &str); 5] = [
+const GOLDENS: [(&str, &str); 6] = [
     PRE222[0],
     PRE222[1],
     PRE222[2],
     PRE222[3],
     ("manager.md", include_str!("fixtures/pre222/manager.md")),
+    // #1683. The playbook is what a default group reads, so it joins the
+    // golden pairing like the other five — but it is NOT the "one exception"
+    // manager.md is: default groups DO read it, which is why it sits in
+    // `PRE222` above and in both default-group pins.
+    PRE222[4],
 ];
 
 /// The live templates, with the placeholder(s) each must carry. Each element of the
@@ -5795,7 +5808,7 @@ const GOLDENS: [(&str, &str); 5] = [
 /// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`), they stay a single contiguous-string key
 /// — same reasoning `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
 /// relies on.
-const LIVE: [(&str, &str, &[&str]); 5] = [
+const LIVE: [(&str, &str, &[&str]); 6] = [
     (
         "orchestrator.md",
         loomux_lib::orchestration::ORCHESTRATOR_TPL,
@@ -5812,6 +5825,15 @@ const LIVE: [(&str, &str, &[&str]); 5] = [
     // persona (`persona_allowed`), and it holds no locks, so neither
     // `{{LOCKS}}` nor an advisor-consult note has anything to say to it.
     ("manager.md", loomux_lib::orchestration::MANAGER_TPL, &["{{BLOCK_NOTE}}"]),
+    // #1683. The playbook renders with the same var list as the role files.
+    // In slice 1 it carries no workflow-conditional fragment, so its key list
+    // is empty; slice 2a moves `{{MERGE_QUEUE}}` and
+    // `{{POST_MERGE_WORKFLOW_HOOK}}` here from `orchestrator.md`.
+    (
+        "orchestrator-playbook.md",
+        loomux_lib::orchestration::ORCHESTRATOR_PLAYBOOK_TPL,
+        &[],
+    ),
 ];
 
 /// Render a template with the plain per-group VALUE variables `render_template`
@@ -5947,6 +5969,45 @@ fn audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
         .iter()
         .filter_map(|v| v["action"].as_str().map(str::to_string))
         .collect()
+}
+
+#[test]
+fn the_playbook_is_written_into_the_group_dir_and_the_manifest() {
+    // #1683, the write half of the mechanism: the playbook is a contract file
+    // like the role files — written unconditionally into every group dir,
+    // rendered with the same var list, and owned by the generated-files
+    // manifest so a roster change sweeps a stale copy instead of stranding
+    // one (#423's incident, one more file that must never outlive its render).
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW); // declared, and ignored
+    let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
+    let dir = reg.state_root().join(g.id.as_str());
+
+    let written = instructions_lf(&reg, &g.id, "orchestrator-playbook.md");
+    assert!(
+        written.contains("## About this playbook"),
+        "the playbook is in the group dir, sections whole: {written}"
+    );
+    assert!(!written.contains("{{"), "rendered like any instruction file: {written}");
+    assert!(
+        !written.contains("declares a workflow") && !written.contains("## Your block"),
+        "a group with no workflow reads a playbook with no workflow prose"
+    );
+
+    let manifest = fs::read_to_string(dir.join(".instruction-files-manifest")).unwrap();
+    assert!(
+        manifest.lines().any(|l| l == "orchestrator-playbook.md"),
+        "the manifest owns the playbook like the role files: {manifest}"
+    );
+
+    // A resume re-render keeps it: it is `current` on every render, so the
+    // sweep must never mistake it for a stale file.
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
+    assert!(
+        dir.join("orchestrator-playbook.md").exists(),
+        "the playbook survives a resume render — it is what a default group reads"
+    );
 }
 
 #[test]

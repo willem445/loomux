@@ -322,6 +322,9 @@ pub const READ_TOOLS: &[&str] = &[
     "session_digest",
     "merge_queue_status",
     "channel_status",
+    // #1683: a pure group-dir read — validates the section id, slices the
+    // rendered playbook, writes one audit line. Nothing mutates.
+    "read_playbook",
 ];
 
 pub fn tool_kind(name: &str) -> ToolKind {
@@ -1433,6 +1436,31 @@ fn tool_defs(
                 }),
                 &["id"]),
             group_usage_tool(),
+            // The on-demand playbook (#1683). Orchestrator-only, re-checked in
+            // `call_tool` — the listing is cosmetic, the dispatch gate is the
+            // real one. The section index rides the description so the
+            // orchestrator is told what exists on every listing, which is the
+            // structural half of the design: a stub can only name its own
+            // section, the index names them all.
+            tool(
+                "read_playbook",
+                &format!(
+                    "Read ONE section of the orchestrator playbook — the on-demand half of your \
+                     contract, rendered into this group's dir as orchestrator-playbook.md. The \
+                     resident file keeps the INVARIANTS, the tool surface and every rule; the \
+                     playbook carries the situational procedure, and every moved section left a \
+                     resident stub in the core naming its trigger, so a section is only ever \
+                     requested because something told you it exists. Sections: {}. Pass the \
+                     exact section id; an unknown id is refused WITH the valid list, never \
+                     answered with an empty string. Served verbatim from the group's rendered \
+                     copy — loomux-authored template text only — and each read is audited.",
+                    super::PLAYBOOK_SECTION_IDS.join(", ")
+                ),
+                json!({
+                    "section": { "type": "string", "description": "Section id, e.g. about-this-playbook — from a resident stub or this index." },
+                }),
+                &["section"],
+            ),
             tool("queue_orphans",
                 "Deliveries nobody ever received, in TWO lists: `orphans` — queued but never delivered when orrerix last restarted, and unable to re-bind to a live pane; and `refused` — declined at the front door by orrerix, so they were never queued at all. Call it once on session start, with the rest of your re-sync. You no longer have to poll it to learn about refusals to YOUR OWN pane: when that pane's queue drains back below its cap, orrerix relays a bounded roster of what it refused while full — sender, preview, reason, and whether the sender has since got it through — on the result of your next tool call (#658). This tool is the whole group's history and the other lists; it is not your only path to your own. Returns {count, orphans:[{id, to, queued_minutes_ago, reason, source, text, text_bytes, truncated}], refused_count, refused_omitted, refused_window_truncated, refused:[{from, to, refused_minutes_ago, reason, queue_depth, enqueue_reason, payload, bytes, preview, text, truncated, consequence}]}, oldest ask first in both. `text` is the payload verbatim (capped at 8KB, with `truncated: true` and the full copy on that delivery's `prompt` line in the audit log) when it came from the durable queue snapshot — `source: \"snapshot\"`, or `source: \"archive\"`, which means the same thing to you: the payload is intact and re-sendable, it has simply aged out of the hot snapshot into `queue-orphans-archive.jsonl` so that orrerix stops re-writing it on every delivery. An archived entry is still re-queued automatically if its pane ever comes back, exactly like a snapshot one; the two differ only in which file a human opens. `text` is null in exactly two cases, both meaning \"re-derive this one, don't guess\": `source: \"audit\"` (an entry queued by a orrerix build older than the durable snapshot — id and target known, payload not), and `reason: \"stranded-submit-not-replayable\"` (the text had already been typed into that pane and was waiting only for Enter when orrerix restarted; the pane is gone, so no bytes remain — the audit log's `prompt` line for that delivery is the only record of what it said). THESE ARE LOST WORK, NOT A LOG: each is something you or an agent sent that nobody ever received, so treat a non-empty result as a to-do list — re-send what still applies (the pane it was for is gone, so re-target it: a resumed session, or a fresh agent), and say what you dropped as stale rather than dropping it silently. An empty result is the normal case and needs no comment. Deliveries that DID re-bind (this group's orchestrator pane, or an agent resumed onto the same session id) were already re-queued automatically in their original order and are not listed here. EACH REFUSAL'S `reason` SAYS WHAT TO DO WITH IT, and they are not interchangeable: `queue-full-at-call` — the target pane was at its 8-deep cap; the pane is alive, so this is the one worth re-sending once it drains (`queue_depth` is how full it was). `agent-dead-at-call` — the target was already dead when this was sent; that pane will NEVER take it, so re-target it at a live or resumed agent or drop it as stale, and do not re-send it as-is. `no-terminal-at-call` — the target existed but had no terminal bound yet (a delivery that arrived during the spawn-to-bind window); it was simply too early, so re-send it now if the agent has since bound. `no-app-handle` / `registry-not-shared` — orrerix itself could not process the pane's queue and withdrew the admission; these should never appear in a running build, so treat one as a orrerix defect worth reporting to the human, not just as a payload to re-send. `queue_depth` and `enqueue_reason` are null for every reason except `queue-full-at-call`, which is the only one that reached the queue at all — null there means \"no measurement was taken\", not \"the pane was empty\". THE `refused` LIST IS DIFFERENT IN THREE WAYS, and each changes what you do with it. (1) A refusal does not need a restart to happen — a pane at capacity refuses every arrival for as long as it stays there — so this list can be non-empty on a perfectly ordinary session, and `refused_count` counts everything in the readable audit window with only the most recent 8 listed (`refused_omitted` says how many were left in `audit.jsonl`). `refused_window_truncated: true` means that window was ITSELF cut at 5000 entries, so `refused_count` counts only the readable tail and older refusals may exist that this scan never saw — read `audit.jsonl` directly (action `delivery-dropped`, and the `reason` values above) if you need the whole history. When it is false, `refused_count` really is all of them. (2) The SENDER was told synchronously (`delivery queue for … full — NOT queued`), so many of these were already handled by whoever sent them; the ones that matter are those whose sender then died, or where `from` is `orrerix` itself and nobody was listening. Check before re-sending, and prefer asking the sender over guessing. (3) `text` is the payload the refusal recorded — carried on the refusal's own audit line for a refusal that never reached the queue, and for a `queue-full-at-call` one recovered from that delivery's `prompt` audit line and verified against the refusal's recorded byte count and preview. Either way, when it is non-null it is re-sendable verbatim; when it is null, `preview` (a bounded one-liner) and `bytes` are what you have — re-derive, do not guess. `payload: \"stranded-submit\"` is the one kind that never had text at all: its bytes were already pasted into that pane and only the Enter was refused, so the pane is sitting with an unsubmitted prompt in its input box (`consequence` says so) — recover it by looking at the pane, not by re-sending. NOTHING IS RE-ADMITTED BY READING THIS: a refused delivery was explicitly declined and stays declined, because slipping it back into a queue now would put it behind — or ahead of — everything the pane has accepted since. Re-sending is your call, deliberately made.",
                 json!({}), &[]),
@@ -2456,6 +2484,18 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         "queue_orphans" => {
             require_orchestrator(caller)?;
             Ok(reg.queue_orphans_json(&caller.group).to_string())
+        }
+
+        // #1683: the on-demand playbook. Re-enforced here — the role-filtered
+        // listing is cosmetic, not security. The group comes from the caller's
+        // token (`caller.group`, never an argument), and the section argument
+        // is validated inside the registry against the written file's own
+        // headings, so the only thing a caller can name is which section of
+        // its own group's playbook to serve.
+        "read_playbook" => {
+            require_orchestrator(caller)?;
+            let section = arg_str(args, "section").ok_or("section required")?;
+            Ok(reg.read_playbook(&caller.group, section)?)
         }
 
         "spawn_agent" => {
