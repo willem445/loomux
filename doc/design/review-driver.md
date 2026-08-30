@@ -632,7 +632,8 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "on_behalf_of": "<orchestrator agent id>",
       "lanes": [ { "block": "rev-std", "session": "<uuid>",
                    "last_verdict": "pass", "at_head": "<sha>",
-                   "briefed_head": "<sha>", "spawned_ms": 0 } ],
+                   "briefed_head": "<sha>", "briefed_digest": "<digest>",
+                   "spawned_ms": 0 } ],
       "lane_index": 0,
       "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
       "started_ms": 0,
@@ -660,16 +661,30 @@ cannot carry either one. Three fields, each answering exactly one question:
   resumed. The `lane-stalled` anchor. A re-brief *replaces* the lane's record
   rather than appending one, so the clock re-arms instead of continuing to
   measure from the first spawn.
-- **`briefed_head`** (per lane) — the head that lane was last *briefed* at.
-  **This is not `at_head`, and the two may never be folded into one field.**
-  `at_head` is the head the last *verdict* binds to; `briefed_head` is the head
-  the lane was last *asked about*. A freshly spawned lane has the second and
-  not the first, and that gap is exactly the call §2.1's `review-wait` row
-  makes every tick: a lane already open at the live head is one to wait for, a
-  lane whose brief predates the live head is one to re-brief. One field
-  answering both makes "has it been asked" and "has it answered"
+- **`briefed_head` and `briefed_digest`** (per lane) — the revision that lane
+  was last *briefed* at, as **one key**. It is the same `(head, digest)` key a
+  verdict binds to, which is what arc 4 already names: "the last required lane
+  passed at (head, digest)". A lane is open for exactly the revision it was
+  asked about, so both halves are compared or neither is.
+  **This key is not `at_head`, and the two may never be folded together.**
+  `at_head` is the head the last *verdict* binds to; the brief key is the
+  revision the lane was last *asked about*. A freshly spawned lane has the
+  second and not the first, and that gap is exactly the call §2.1's
+  `review-wait` row makes every tick: a lane already open at the live revision
+  is one to wait for, a lane whose brief predates it is one to re-brief. One
+  field answering both makes "has it been asked" and "has it answered"
   indistinguishable, and the driver then either re-briefs on every tick or
   waits forever on a lane it never briefed.
+  **The head alone is not the key either**, and that is worth stating because
+  it is the half a reader will be tempted to drop: a lane that already answered
+  `pass` at this head, whose body has since moved, is indistinguishable under a
+  head-only comparison from a lane still thinking about this head — and §8's
+  body-changed row wants the first re-briefed with a body-only delta while the
+  second is waited for. A head-only key waits on a reviewer that has already
+  spoken, until `lane-stalled` reports a stall that never happened. An
+  *unreadable* digest on either side is "cannot tell" and does not mismatch,
+  the asymmetry `ReviewVerdict::body_changed` already encodes: otherwise one
+  transient failure to read a PR body re-briefs every open lane in the group.
 - **`fix_handback_ms`** (per entry) — when the drive last entered `fix-wait`.
   The `fix-stalled` anchor. **Named for the one thing it anchors, not for the
   state change that writes it**, and that is the point rather than a

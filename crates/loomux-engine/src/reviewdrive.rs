@@ -40,10 +40,14 @@
 //!
 //! - [`LaneRecord::spawned_ms`] — when this lane's delegate was last spawned or
 //!   resumed. The `lane-stalled` anchor.
-//! - [`LaneRecord::briefed_head`] — the head that lane was last briefed at.
-//!   §2.1 re-briefs a lane whose `pass` went stale, and without this the driver
-//!   cannot tell a lane already re-opened at the live head (wait for it) from
-//!   one that still needs re-opening (brief it) — it would re-brief every tick.
+//! - [`LaneRecord::briefed_head`] and [`LaneRecord::briefed_digest`] — the
+//!   revision that lane was last briefed at, as **one key**, the same
+//!   `(head, digest)` the gate binds a verdict to. §2.1 re-briefs a lane whose
+//!   `pass` went stale, and without this the driver cannot tell a lane already
+//!   re-opened at the live revision (wait for it) from one that still needs
+//!   re-opening (brief it) — it would re-brief every tick. The head alone is
+//!   not the key; [`lane_open_for`] carries why, and the defect it names is one
+//!   this slice actually shipped and CI caught.
 //! - [`DriveEntry::fix_handback_ms`] — when the drive last entered `fix-wait`.
 //!   The `fix-stalled` anchor; the hand-back is the moment that wait began.
 //!
@@ -664,6 +668,22 @@ pub struct LaneRecord {
     /// briefed.
     #[serde(default)]
     pub briefed_head: String,
+    /// The body digest this lane was last briefed at; empty when the body could
+    /// not be read at brief time. Beyond §5.2's example, with `briefed_head` —
+    /// and it travels with it, because **the two are one key**.
+    ///
+    /// That key is the same `(head, digest)` the gate binds a verdict to — arc
+    /// 4 is "the last required lane passed at (head, digest)" — and a lane is
+    /// open for exactly the revision it was asked about. The head **alone** is
+    /// not that key, and the difference is not cosmetic: a lane that already
+    /// answered `pass` at this head, whose body then moved, is indistinguishable
+    /// under a head-only comparison from one still thinking about this head.
+    /// §8's body-changed row wants the first re-briefed with a body-only delta
+    /// and the second waited for, so a head-only key waits on a reviewer that
+    /// has already spoken — forever, or until `lane-stalled` reports a stall
+    /// that never happened. See [`lane_open_for`].
+    #[serde(default)]
+    pub briefed_digest: String,
     /// When this lane's delegate was last spawned or resumed — the
     /// `lane-stalled` anchor. Beyond §5.2's example; see the module header.
     #[serde(default)]
@@ -828,11 +848,23 @@ impl DriveEntry {
         self.lanes.iter().find(|l| l.block == block)
     }
 
-    /// Record that lane `block` was briefed at `head` — a spawn or a resume,
-    /// which are the same event to both bounds that read this. Replaces any
-    /// prior record for that block, so a re-brief re-arms `lane-stalled`
-    /// instead of measuring from the first spawn.
-    pub fn open_lane(&mut self, block: &str, session: &str, head: &str, now_ms: u64) {
+    /// Record that lane `block` was briefed at `(head, body_digest)` — a spawn
+    /// or a resume, which are the same event to both bounds that read this.
+    /// Replaces any prior record for that block, so a re-brief re-arms
+    /// `lane-stalled` instead of measuring from the first spawn.
+    ///
+    /// **The digest is taken here and not derived**, so that what the lane was
+    /// asked about and what [`lane_open_for`] later compares are the same fact
+    /// recorded once. An unreadable body records empty, which that comparison
+    /// reads as "cannot tell" rather than as drift.
+    pub fn open_lane(
+        &mut self,
+        block: &str,
+        session: &str,
+        head: &str,
+        body_digest: Option<&str>,
+        now_ms: u64,
+    ) {
         let extra = self
             .lane(block)
             .map(|l| l.extra.clone())
@@ -844,6 +876,7 @@ impl DriveEntry {
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.to_string(),
+            briefed_digest: body_digest.unwrap_or_default().to_string(),
             spawned_ms: now_ms,
             extra,
         });
@@ -1125,6 +1158,37 @@ pub fn lane_pass_is_current(
         && v.body_changed(body_digest) != Some(true)
 }
 
+/// Whether this lane is open for exactly the revision now on the PR: it was
+/// briefed at this head **and** at this body digest.
+///
+/// **Both signals, read by one rule, in one place.** The failure this exists to
+/// prevent is the repo's "a guard reads every one of its inputs by one rule"
+/// class, and it is not hypothetical — the head-only version of this comparison
+/// shipped in the first push of this slice and was caught by
+/// `a_pass_whose_body_digest_moved_re_opens_that_lane`. A lane that already
+/// answered `pass` at this head and whose body then moved reads, under a
+/// head-only key, exactly like a lane still thinking: the driver waits on a
+/// reviewer that has already spoken, and `lane-stalled` eventually reports a
+/// stall that never happened. §8's body-changed row wants that lane re-briefed
+/// with a body-only delta.
+///
+/// **An unknown live digest does not mismatch**, and neither does an unrecorded
+/// briefed one. "We could not check" is not "it changed" — the same asymmetry
+/// [`ReviewVerdict::body_changed`] encodes by answering `None` rather than
+/// `Some(false)` — and the alternative is that one transient `gh` failure to
+/// read a PR body re-briefs every open lane in the group.
+pub fn lane_open_for(rec: &LaneRecord, head: &str, body_digest: Option<&str>) -> bool {
+    if rec.briefed_head != head {
+        return false;
+    }
+    match body_digest {
+        Some(now) if !now.is_empty() && !rec.briefed_digest.is_empty() => {
+            rec.briefed_digest == now
+        }
+        _ => true,
+    }
+}
+
 /// The first lane whose `pass` does not stand at this (head, digest) — where
 /// arc 8 re-enters after a body-only fix (§8 row 5), and equally where
 /// `review-wait` resumes when a digest moves under a recorded pass.
@@ -1254,11 +1318,11 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
         }
         // Either no verdict yet, or a `pass` that no longer stands here — which
         // are the same thing to this state: the lane is outstanding and must be
-        // briefed at this head. Whether it *already* was is what
-        // `briefed_head` answers.
+        // briefed for this revision. Whether it *already* was is what
+        // [`lane_open_for`] answers, on the full (head, digest) key.
         Some(Verdict::Pass) | None => {
             match entry.lane(&lane.block) {
-                Some(rec) if rec.briefed_head == facts.head => {
+                Some(rec) if lane_open_for(rec, &facts.head, digest) => {
                     if facts.now_ms.saturating_sub(rec.spawned_ms)
                         >= minutes_ms(limits.lane_timeout_minutes)
                     {
@@ -1628,15 +1692,16 @@ mod tests {
     #[test]
     fn re_briefing_a_lane_re_arms_its_stall_clock() {
         let mut e = entry_at(DriveState::ReviewWait);
-        e.open_lane("rev-std", "s1", "head-a", 1_000);
+        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
         assert_eq!(e.lanes.len(), 1);
-        e.open_lane("rev-std", "s1", "head-b", 9_000);
+        e.open_lane("rev-std", "s1", "head-b", Some("d1"), 9_000);
         // Replaced, not appended: a second record would leave `lane()` reading
         // the first and measuring `lane-stalled` from the original spawn.
         assert_eq!(e.lanes.len(), 1);
         let rec = e.lane("rev-std").unwrap();
         assert_eq!(rec.spawned_ms, 9_000);
         assert_eq!(rec.briefed_head, "head-b");
+        assert_eq!(rec.briefed_digest, "d1");
     }
 
     // ── §2.3 the counters ───────────────────────────────────────────────────
@@ -1792,6 +1857,7 @@ mod tests {
         assert_eq!(e.fix_handback_ms, 0);
         assert_eq!(e.lanes[0].spawned_ms, 0);
         assert_eq!(e.lanes[0].briefed_head, "");
+        assert_eq!(e.lanes[0].briefed_digest, "");
     }
 
     #[test]
@@ -2166,7 +2232,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "head-a", 1_000);
+        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             now_ms: 1_000 + minutes_ms(limits.lane_timeout_minutes) - 1,
@@ -2194,7 +2260,7 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-b".into();
-        e.open_lane("rev-std", "s1", "head-a", 1_000);
+        e.open_lane("rev-std", "s1", "head-a", Some("d1"), 1_000);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             ..facts_at("head-b")
@@ -2210,13 +2276,67 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
-        e.open_lane("rev-std", "s1", "head-a", 1_000);
+        e.open_lane("rev-std", "s1", "head-a", Some("OLD"), 1_000);
         let facts = DriveFacts {
             required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "OLD")]),
             body_digest: Some("NEW".into()),
             ..facts_at("head-a")
         };
         assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0 });
+    }
+
+    #[test]
+    fn a_re_brief_ends_the_loop_rather_than_repeating_it_every_tick() {
+        // The other half of the fix above, and the failure a head-only key
+        // would swap this one for: once the lane HAS been re-briefed at the new
+        // digest, the very same stale `pass` must read as "asked, thinking" and
+        // not re-brief again. The verdict file still holds the old pass — a
+        // reviewer has not re-recorded yet — so nothing but the brief key can
+        // tell these two ticks apart.
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        let facts = DriveFacts {
+            required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "OLD")]),
+            body_digest: Some("NEW".into()),
+            ..facts_at("head-a")
+        };
+        e.open_lane("rev-std", "s1", "head-a", Some("OLD"), 1_000);
+        assert_eq!(decide(&e, &facts, &limits), DriveStep::OpenLane { index: 0 });
+        // S3 performs that brief; the drive now waits on the reviewer.
+        e.open_lane("rev-std", "s1", "head-a", Some("NEW"), 1_500);
+        assert_eq!(decide(&e, &facts, &limits), DriveStep::Wait);
+    }
+
+    #[test]
+    fn a_lane_is_open_only_for_the_revision_it_was_asked_about() {
+        // All four crossings of {briefed head matches} x {briefed digest
+        // matches}, because this guard reads two signals and the defect it
+        // shipped with was reading one. Three of the four must re-brief; a
+        // guard that answered "open" on the head alone passes two of them.
+        let rec = |head: &str, digest: &str| LaneRecord {
+            block: "rev-std".into(),
+            session: "s1".into(),
+            last_verdict: None,
+            at_head: String::new(),
+            briefed_head: head.into(),
+            briefed_digest: digest.into(),
+            spawned_ms: 0,
+            extra: BTreeMap::new(),
+        };
+        let now = Some("d1");
+        assert!(lane_open_for(&rec("head-a", "d1"), "head-a", now));
+        assert!(!lane_open_for(&rec("head-a", "OLD"), "head-a", now));
+        assert!(!lane_open_for(&rec("head-OLD", "d1"), "head-a", now));
+        assert!(!lane_open_for(&rec("head-OLD", "OLD"), "head-a", now));
+        // "We could not check" is not "it changed", in either direction — one
+        // transient failure to read a PR body must not re-brief every open lane
+        // in the group.
+        assert!(lane_open_for(&rec("head-a", "d1"), "head-a", None));
+        assert!(lane_open_for(&rec("head-a", "d1"), "head-a", Some("")));
+        assert!(lane_open_for(&rec("head-a", ""), "head-a", now));
+        // ...but an unknown digest never rescues a head that really did move.
+        assert!(!lane_open_for(&rec("head-OLD", ""), "head-a", None));
     }
 
     #[test]
