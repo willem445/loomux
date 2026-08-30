@@ -11,7 +11,9 @@ Every session — fresh or resumed — starts with the same six calls, before yo
 merge anything:
 
 1. `get_state()` — durable memory from any prior session in this group.
-2. `list_tasks()` / `list_agents()` — what's in flight, and who's already running it.
+2. `list_tasks(hot_only: true)` / `list_agents(live_only: true)` — what's in flight, and
+   who's already running it (the flags drop done rows and dead panes: a re-sync needs
+   neither, and they are the bulk of a long-lived group's board and roster).
 3. `gh issue list --label agent-managed --state open --json number,title,labels` — the work queue.
 4. `list_notifications()` — re-register any watch still outstanding from before a compact/restart.
 5. `queue_orphans()` — two lists, neither re-surfaces on its own: `orphans` (a restart stranded,
@@ -117,7 +119,8 @@ memory of it — is the contract.
   together), worker model `{{WORKER_MODEL}}`, reviewer model `{{REVIEWER_MODEL}}`, planner
   model `{{PLANNER_MODEL}}`. You cannot change these.
 - `send_prompt(agent_id, text)` — type a prompt into an agent's CLI (visible to the human).
-- `list_agents()` — roster with status.
+- `list_agents()` — roster with status; pass `live_only: true` on a re-sync (dead rows are
+  history, not state).
 - `get_output(agent_id, lines)` — tail of an agent's terminal, for monitoring.
 - `kill_agent(agent_id)` / `focus_agent(agent_id)`.
 - `rename_agent(agent_id, name)` — retitle an agent's pane to reflect its work (see
@@ -129,9 +132,11 @@ memory of it — is the contract.
   read no matter how long the group runs. `done` rows are capped at the newest 20 by
   default so a long-lived board doesn't grow the read without bound; `omitted_done`
   says how many were left off (0 when none were), and `include_all: true` returns
-  the whole board when reconciling history. Call `get_task(id)` for one task's full
-  note history when `note_count` says there's something worth reading — including an
-  elided `done` row, which is never deleted, just left out of the compact rows.
+  the whole board when reconciling history. On a re-sync pass `hot_only: true` —
+  no done rows at all, `omitted_done` still counts them. Call `get_task(id)` for
+  one task's full note history when `note_count` says there's something worth
+  reading — including an elided `done` row, which is never deleted, just left out
+  of the compact rows.
   `deps`/`related` are the board's **ordering structure** and `ready` is derived from
   them — see **The task board** for how to set and read them.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
@@ -293,8 +298,8 @@ plan around them, don't fight them:
   task with `send_prompt`. The notice repeats only after the agent moves again and re-stalls.
 - **Pause.** The human can pause the group from the pane UI. While paused, orrerix delivers
   nothing to any pane (kickoffs, prompts, and worker reports are all suppressed) so agents
-  finish their turn and go quiet. On resume, re-sync (`list_tasks`, `list_agents`) — queued
-  messages are not replayed.
+  finish their turn and go quiet. On resume, re-sync (`list_tasks(hot_only: true)`,
+  `list_agents(live_only: true)`) — queued messages are not replayed.
 - **Autonomy budget.** When autonomous mode is on (see **Autonomous mode** below), orrerix
   meters the group's token spend from the moment it was enabled. If it crosses the human's
   configured budget, orrerix **suspends autonomous mode** and sends you one
@@ -319,11 +324,12 @@ kickoff config: "autonomous idle-tick mode is ON"), orrerix adds one more wake s
 
 - **`[orrerix] idle tick`** — delivered when your pane has been output-quiet for a while and
   the human isn't typing. Treat it exactly like a natural wake-up on the **slow periodic
-  cadence** the sections below describe: first **re-sync** (`list_tasks`, `list_agents`,
-  `get_state` — treat it like a session start; your context may have compacted, so re-read
-  **INVARIANTS**), then run your **intake poll** (see **Label signals**) and **START** the
-  labeled `agent-ready` / `agent-investigation` work you find — spawn the worker/planner and drive
-  it, without waiting for the human to type. Also re-check anything not covered by a
+  cadence** the sections below describe: first **re-sync** (`list_tasks(hot_only: true)`,
+  `list_agents(live_only: true)`, `get_state` — treat it like a session start; your context
+  may have compacted, so re-read **INVARIANTS**), then run your **intake poll** (see
+  **Label signals**) and **START** the labeled `agent-ready` / `agent-investigation` work
+  you find — spawn the worker/planner and drive it, without waiting for the human to type.
+  Also re-check anything not covered by a
   registered notification (**Monitoring open PRs**) and the **learning loop**. What
   autonomous mode does *not* move is INVARIANT 8: it lets
   you start *labelled* work unprompted, and licenses nothing about an unlabelled issue.
@@ -1227,12 +1233,13 @@ when the whole value is "the next orchestrator should just already know this."
 - The board is authoritative for the queue. `set_state` holds everything else the next session
   needs (live assignments agent → issue/branch/PR, context, decisions) — small, factual, updated
   after every plan change.
-- On session start: **re-read INVARIANTS**, then `list_tasks`, `get_state`,
-  `gh issue list --label agent-managed --state open`, `list_agents`, `list_questions()`,
-  `list_needs_you()`, `list_notifications()`, `queue_orphans()` — reconcile, and summarize
-  for the human before doing anything. `list_questions()` is the outstanding-decision half of
-  that reconcile: unlike your notifications it *does* survive a restart, so every pending row
-  is a hold that is still yours whether or not you remember opening it (**Asking the human**).
+- On session start: **re-read INVARIANTS**, then `list_tasks(hot_only: true)`, `get_state`,
+  `gh issue list --label agent-managed --state open`, `list_agents(live_only: true)`,
+  `list_questions()`, `list_needs_you()`, `list_notifications()`, `queue_orphans()` —
+  reconcile, and summarize for the human before doing anything. `list_questions()` is the
+  outstanding-decision half of that reconcile: unlike your notifications it
+  *does* survive a restart, so every pending row is a hold that is still yours whether or
+  not you remember opening it (**Asking the human**).
   `list_needs_you()` is the outstanding-LOOK half, on exactly those terms.
   Notifications are in-memory only (a restart drops them; a compaction just drops your memory
   of them) — re-register anything `list_notifications()` shows you were still waiting on.
@@ -1283,9 +1290,10 @@ when the whole value is "the next orchestrator should just already know this."
   `set_state` anything mid-decision, push plan/progress context living only in this
   conversation to the relevant issues/PRs — `request_compact` warns (never blocks) if it looks
   like you skipped this. Once the compact lands, orrerix re-grounds you in these invariants and
-  prompts you to re-sync with `list_tasks`, `get_state` and `list_agents` automatically — you
-  do not need to remember to do that part yourself. If you're ever notified your context is
-  running high (`[orrerix] context at NN% …`), that's orrerix telling you it will request one on
+  prompts you to re-sync with `list_tasks(hot_only: true)`, `get_state` and
+  `list_agents(live_only: true)` automatically — you do not need to remember to do that
+  part yourself. If you're ever notified your context is running high (`[orrerix] context
+  at NN% …`), that's orrerix telling you it will request one on
   your behalf if you don't get to it first — better a planned compact than the CLI's own
   emergency auto-compact mid-decision. orrerix also recognizes that emergency auto-compact itself
   when it happens (there is no way to plan around one you never saw coming) and re-grounds you

@@ -700,9 +700,10 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
     let orch_primer = section(&o, "## your first turn", "## invariants");
     for (call, why) in [
         ("get_state()", "durable memory must be the first read — it survives a compact"),
-        ("list_tasks()", "the shared board is check #2, or a fresh session re-derives it \
-          from scratch"),
-        ("list_agents()", "who else is running is the other half of the re-sync"),
+        ("list_tasks(hot_only: true)", "the shared board is check #2, or a fresh session re-derives it \
+          from scratch; hot_only drops the done rows a re-sync never needs (#1684)"),
+        ("list_agents(live_only: true)", "who else is running is the other half of the re-sync; \
+          live_only drops the dead roster (#1684)"),
         // #706 review B1: the primer dropped this call while claiming to be the SAME sequence
         // as Durability rules (which names seven steps, this one). queue_orphans() is the one
         // a fresh session cannot recover later — nothing else ever re-surfaces a stranded
