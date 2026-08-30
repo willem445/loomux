@@ -637,6 +637,103 @@ impl Default for MergeQueuePolicy {
     }
 }
 
+// ── driver: the review-loop driver's policy (#1778 §5.3) ───────────────────
+
+/// INVARIANT 9's numbers (`templates/orchestrator.md`): three CI attempts, three
+/// rounds of review findings, one rebase attempt. The `driver:` block clamps
+/// toward them, never away (§2.3) — a repo may run a *tighter* loop than the
+/// orchestrator template promises; it may not run a looser one, because the
+/// driver acts on the orchestrator's authority and a repo file that raised the
+/// bound would be loosening the orchestrator's own invariant from a
+/// configuration file. *(Deliberately tighter than the `1..=5` clamp the #1778
+/// plan first proposed; the reasoning is §2.3's, and it narrows the plan on
+/// purpose.)*
+pub const DRIVER_MAX_REVIEW_ROUNDS_MIN: u32 = 1;
+pub const DRIVER_MAX_REVIEW_ROUNDS_MAX: u32 = 3;
+pub const DRIVER_MAX_CI_ATTEMPTS_MIN: u32 = 1;
+pub const DRIVER_MAX_CI_ATTEMPTS_MAX: u32 = 3;
+pub const DRIVER_MAX_REBASE_ATTEMPTS_MIN: u32 = 0;
+pub const DRIVER_MAX_REBASE_ATTEMPTS_MAX: u32 = 1;
+
+/// How long a drive may sit before it is `held(drive-stalled)` (§2.1). The
+/// design names 240 (§5.3) — today the notify-TTL family's ceiling, but spelled
+/// as its own default: the *bounds* are the clamp family's (they ride
+/// [`clamp_expires_minutes`]); the default is this block's own policy choice.
+pub const DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN: u32 = 240;
+
+/// The `driver:` block — policy for the engine-driven review-loop driver
+/// (`doc/design/review-driver.md`), a sibling of [`MergeQueuePolicy`] and the
+/// whole of what a repo declares about the drive. The driver's own core is
+/// [`crate::reviewdrive`]; this struct is what the FILE means, the half a repo
+/// author can get wrong.
+///
+/// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a PR,
+/// a branch, a command, or a lane: no drive exists until an orchestrator makes
+/// its own role-gated `drive_review` call naming one PR (§3.2's two-key rule —
+/// this block can only *enable*; it can never start, target or widen a drive).
+/// Every field is a bool or a number from a closed range, so the field-by-field
+/// capability-closure test passes; but the two-key structure is the real
+/// safety, not the data types — a future `driver.auto: true` would be a bool
+/// and still defeat §3.2's per-PR consent.
+///
+/// **An absent block means the feature is off and behavior is byte-for-byte
+/// unchanged**, the posture `gates:` and `merge_queue:` both take.
+///
+/// **Adding the block breaks the file for builds that predate #1778, and that
+/// is deliberate** — [`MergeQueuePolicy`]'s forward-compat warning restated
+/// because it is a real property of the opt-in. [`RawWorkflow`] is
+/// `deny_unknown_fields`, so `driver:` is not a tolerated unknown key on an
+/// older build: it fails the parse of the *whole* file, gates and all, down the
+/// loud `workflow-invalid` path. It is the right behavior anyway —
+/// `workflow.yml` is human-authored policy, and a key the build does not
+/// understand means a human believes a policy is in force that is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverPolicy {
+    /// Default **false**. The product default is off (§9).
+    pub enabled: bool,
+    /// Review-finding rounds one drive may spend (§2.3). Refused outside
+    /// [`DRIVER_MAX_REVIEW_ROUNDS_MIN`]..=[`DRIVER_MAX_REVIEW_ROUNDS_MAX`] the
+    /// way `merge_queue.max_batch` is — a malformed block never degrades to
+    /// defaults, and a driver running a looser loop than INVARIANT 9 promises
+    /// is a driver nobody can reason about.
+    pub max_review_rounds: u32,
+    /// CI attempts one drive may spend (§2.3). Same closed range and same
+    /// refusal as [`Self::max_review_rounds`].
+    pub max_ci_attempts: u32,
+    /// Rebase attempts one drive may spend (§2.3). `0..=1` — one rebase, as
+    /// INVARIANT 9 says, and `0` is legal: a repo may refuse the driver any
+    /// rebase at all, which is the tighter direction this block is allowed.
+    pub max_rebase_attempts: u32,
+    /// Backstop on a reviewer lane producing a verdict (§2.1's
+    /// `held(lane-stalled)`). Clamped like the notify TTLs — the same quantity,
+    /// a bounded wait on a fallible signal.
+    pub lane_timeout_minutes: u32,
+    /// Backstop on a resumed worker pushing or reporting (§2.1's
+    /// `held(fix-stalled)`). Same clamp family as [`Self::lane_timeout_minutes`].
+    pub fix_timeout_minutes: u32,
+    /// Backstop on the drive's whole age (§2.1's `held(drive-stalled)` — age
+    /// since the entry began, never an idle clock reset by each state
+    /// advance). Same clamp family; the default is the family's ceiling
+    /// because a drive's whole budget is what this bounds.
+    pub drive_timeout_minutes: u32,
+}
+
+impl Default for DriverPolicy {
+    fn default() -> Self {
+        DriverPolicy {
+            enabled: false,
+            max_review_rounds: DRIVER_MAX_REVIEW_ROUNDS_MAX,
+            max_ci_attempts: DRIVER_MAX_CI_ATTEMPTS_MAX,
+            max_rebase_attempts: DRIVER_MAX_REBASE_ATTEMPTS_MAX,
+            // Same default and same bounds as a notify watch's TTL, from the
+            // one definition — see the clamp in [`parse_workflow`].
+            lane_timeout_minutes: NOTIFY_EXPIRES_DEFAULT_MIN,
+            fix_timeout_minutes: NOTIFY_EXPIRES_DEFAULT_MIN,
+            drive_timeout_minutes: DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN,
+        }
+    }
+}
+
 // ── board: per-status WIP limits (#1175 / #1170 A2) ────────────────────────
 
 /// The smallest cap that means anything. `0` would say "nothing may ever enter
@@ -888,6 +985,9 @@ pub struct Workflow {
     /// Merge-queue policy (#581 §11.2). Always resolved; the default is
     /// **disabled**, which is what an absent `merge_queue:` block means.
     pub merge_queue: MergeQueuePolicy,
+    /// Review-driver policy (#1778 §5.3). Always resolved; the default is
+    /// **disabled**, which is what an absent `driver:` block means.
+    pub driver: DriverPolicy,
     /// Named lock resources (#858), keyed by the repo's own name for each.
     /// **Empty** when the file declares no `resources:` block — which is what
     /// turns the lock tools off for the group entirely.
@@ -1273,6 +1373,19 @@ struct RawWorkflow {
     /// default-branch refusals (§7) are not reachable from this schema at all.
     #[serde(default)]
     merge_queue: Option<RawMergeQueue>,
+    /// Review-driver policy (#1778 §5.3). `None` when the file declares no
+    /// `driver:` block - which resolves to [`DriverPolicy::default`], i.e.
+    /// **off**, and behavior is byte-for-byte unchanged.
+    ///
+    /// Like `merge_queue:`, this block can never grant a capability on its
+    /// own: every field is a bool or a number from a closed range, and the
+    /// two-key rule (§3.2) is what actually holds the line - no drive exists
+    /// until an orchestrator's own role-gated `drive_review` call names one
+    /// PR. `deny_unknown_fields` on [`RawDriver`] makes any key that could
+    /// start, target or widen a drive a hard parse error rather than an
+    /// ignored line.
+    #[serde(default)]
+    driver: Option<RawDriver>,
     /// Named lock resources (#858). Absent (or empty) means no group in this
     /// repo gets the lock tools at all.
     ///
@@ -1364,12 +1477,38 @@ struct RawMergeQueue {
     #[serde(default)]
     enabled: bool,
     /// `Option` rather than a defaulted number so "omitted" and "written as 3"
-    /// are distinguishable — the parse below rejects a zero, and rejecting one
+    /// are distinguishable - the parse below rejects a zero, and rejecting one
     /// the author never wrote would be an error about nothing.
     #[serde(default)]
     max_batch: Option<u32>,
     #[serde(default)]
     checks_timeout_minutes: Option<u32>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawDriver {
+    #[serde(default)]
+    enabled: bool,
+    /// INVARIANT 9's counters (§2.3), each `Option` for the same reason
+    /// [`RawMergeQueue::max_batch`] is: "omitted" and "written as 3" must stay
+    /// distinguishable, so the parse can tell an author who accepted the
+    /// default from one who pinned it - and refuse a value outside the closed
+    /// range instead of silently substituting one.
+    #[serde(default)]
+    max_review_rounds: Option<u32>,
+    #[serde(default)]
+    max_ci_attempts: Option<u32>,
+    #[serde(default)]
+    max_rebase_attempts: Option<u32>,
+    /// The three backstops (§2.1), clamped by the notify-TTL clamp itself -
+    /// the same quantity, a bounded wait on a fallible signal.
+    #[serde(default)]
+    lane_timeout_minutes: Option<u32>,
+    #[serde(default)]
+    fix_timeout_minutes: Option<u32>,
+    #[serde(default)]
+    drive_timeout_minutes: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1555,6 +1694,15 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
     let intake = RawIntake { source: "github-labels".into(), labels: RawIntakeLabels::default() };
     let merge_queue =
         RawMergeQueue { enabled: true, max_batch: Some(3), checks_timeout_minutes: Some(60) };
+    let driver = RawDriver {
+        enabled: true,
+        max_review_rounds: Some(3),
+        max_ci_attempts: Some(3),
+        max_rebase_attempts: Some(1),
+        lane_timeout_minutes: Some(60),
+        fix_timeout_minutes: Some(60),
+        drive_timeout_minutes: Some(240),
+    };
     let resource = RawResource { slots: Some(1), max_hold_minutes: Some(30) };
     // Every field populated, per this function's docblock: a `None` here would
     // drop the key from the serialization and shrink the manifest silently.
@@ -1590,6 +1738,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
     out.insert("intake".to_string(), keys_of("intake", &intake));
     out.insert("intake.labels".to_string(), keys_of("intake.labels", &labels));
     out.insert("merge_queue".to_string(), keys_of("merge_queue", &merge_queue));
+    out.insert("driver".to_string(), keys_of("driver", &driver));
     out.insert("resource".to_string(), keys_of("resource", &resource));
     out.insert("board".to_string(), keys_of("board", &board));
     let workflow = RawWorkflow {
@@ -1601,6 +1750,7 @@ pub fn workflow_schema_keys() -> BTreeMap<String, Vec<String>> {
         gates: BTreeMap::from([("merge".to_string(), gate)]),
         intake: Some(intake),
         merge_queue: Some(merge_queue),
+        driver: Some(driver),
         resources: BTreeMap::from([("build".to_string(), resource)]),
         board: Some(board),
     };
@@ -1669,6 +1819,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
         ("intake", wire_defaults::<RawIntake>("{}", &[])),
         ("intake.labels", wire_defaults::<RawIntakeLabels>("{}", &[])),
         ("merge_queue", wire_defaults::<RawMergeQueue>("{}", &[])),
+        ("driver", wire_defaults::<RawDriver>("{}", &[])),
         ("resource", wire_defaults::<RawResource>("{}", &[])),
         ("board", wire_defaults::<RawBoard>("{}", &[])),
         // Deliberately contributes nothing: every field of `RawWip` is an
@@ -1720,6 +1871,14 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("merge_queue.enabled", "default", json!(mq.enabled));
     fact("merge_queue.max_batch", "default", json!(mq.max_batch));
     fact("merge_queue.checks_timeout_minutes", "default", json!(mq.checks_timeout_minutes));
+    let dv = DriverPolicy::default();
+    fact("driver.enabled", "default", json!(dv.enabled));
+    fact("driver.max_review_rounds", "default", json!(dv.max_review_rounds));
+    fact("driver.max_ci_attempts", "default", json!(dv.max_ci_attempts));
+    fact("driver.max_rebase_attempts", "default", json!(dv.max_rebase_attempts));
+    fact("driver.lane_timeout_minutes", "default", json!(dv.lane_timeout_minutes));
+    fact("driver.fix_timeout_minutes", "default", json!(dv.fix_timeout_minutes));
+    fact("driver.drive_timeout_minutes", "default", json!(dv.drive_timeout_minutes));
     let res = ResourcePolicy::default();
     fact("resource.slots", "default", json!(res.slots));
     fact("resource.max_hold_minutes", "default", json!(res.max_hold_minutes));
@@ -1736,6 +1895,24 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("merge_queue.max_batch", "min", json!(1));
     fact("merge_queue.checks_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("merge_queue.checks_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
+    // #1778 §2.3. The counters are closed ranges clamped TOWARD INVARIANT 9, and
+    // out-of-range values are REFUSED (the `merge_queue.max_batch` posture) - a
+    // repo file may run a tighter loop than the orchestrator template promises,
+    // never a looser one.
+    fact("driver.max_review_rounds", "min", json!(DRIVER_MAX_REVIEW_ROUNDS_MIN));
+    fact("driver.max_review_rounds", "max", json!(DRIVER_MAX_REVIEW_ROUNDS_MAX));
+    fact("driver.max_ci_attempts", "min", json!(DRIVER_MAX_CI_ATTEMPTS_MIN));
+    fact("driver.max_ci_attempts", "max", json!(DRIVER_MAX_CI_ATTEMPTS_MAX));
+    fact("driver.max_rebase_attempts", "min", json!(DRIVER_MAX_REBASE_ATTEMPTS_MIN));
+    fact("driver.max_rebase_attempts", "max", json!(DRIVER_MAX_REBASE_ATTEMPTS_MAX));
+    // The three backstops ride the notify-TTL clamp itself (`clamp_expires_minutes`),
+    // so their bounds are that family's, exactly as `checks_timeout_minutes`' are.
+    fact("driver.lane_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
+    fact("driver.lane_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
+    fact("driver.fix_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
+    fact("driver.fix_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
+    fact("driver.drive_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
+    fact("driver.drive_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
     // #1457. A LENGTH bound on a string, so it is `maxLength` rather than `max`:
     // this manifest documents `max` as "highest accepted number", and a generated
     // text control needs a maxlength, not a numeric ceiling. Stated here because
@@ -2724,6 +2901,12 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         }
     };
 
+    // Review-driver policy (#1778 §5.3). The block's type layer and manifest
+    // rows land in the commit before this one's; the PARSE WIRING (closed-range
+    // counter refusals, notify-TTL clamps) lands in the commit after it, so CI
+    // can show these tests failing against the unwired parse first.
+    let driver = DriverPolicy::default();
+
     // Named lock resources (#858). An absent block leaves this empty, which is
     // what makes the lock tools invisible to the group's agents.
     //
@@ -2858,6 +3041,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         gates,
         intake,
         merge_queue,
+        driver,
         resources,
         board,
     })
@@ -4560,6 +4744,22 @@ mod tests {
         fn raw_merge_queue_fields(v: RawMergeQueue) {
             let RawMergeQueue { enabled: _, max_batch: _, checks_timeout_minutes: _ } = v;
         }
+        // #1778 §5.3: `driver:` is policy for an engine-run review-loop driver,
+        // for the same inventory reason as `merge_queue:` - a field ADDED to
+        // this schema must be a visible change, not one that passes every
+        // existing test. Nothing here may ever name a PR or start a drive; the
+        // two-key rule (§3.2) keeps enabling and targeting separate.
+        fn raw_driver_fields(v: RawDriver) {
+            let RawDriver {
+                enabled: _,
+                max_review_rounds: _,
+                max_ci_attempts: _,
+                max_rebase_attempts: _,
+                lane_timeout_minutes: _,
+                fix_timeout_minutes: _,
+                drive_timeout_minutes: _,
+            } = v;
+        }
         // Referenced, never called — the compiler still type-checks (and
         // therefore exhaustiveness-checks) every function body above whether
         // or not it runs. This line only exists to avoid a dead-code warning.
@@ -4568,6 +4768,7 @@ mod tests {
             raw_intake_fields as fn(RawIntake),
             raw_intake_labels_fields as fn(RawIntakeLabels),
             raw_merge_queue_fields as fn(RawMergeQueue),
+            raw_driver_fields as fn(RawDriver),
             raw_board_fields as fn(RawBoard),
             raw_wip_fields as fn(RawWip),
         );

@@ -8587,6 +8587,14 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
         // `err.contains` below is the other half of making it attributable.
         ("gate.max_diff_lines", "version: 1\nblocks:\n  - id: r\n    kind: reviewer\ngates:\n  merge:\n    reviewers: [r]\n    max_diff_lines: 0\n".to_string()),
         ("merge_queue.max_batch", format!("version: 1\n{block}merge_queue:\n  max_batch: 0\n")),
+        ("driver.max_review_rounds", format!("version: 1\n{block}driver:\n  max_review_rounds: 0\n")),
+        ("driver.max_review_rounds-above-max", format!("version: 1\n{block}driver:\n  max_review_rounds: 4\n")),
+        ("driver.max_ci_attempts", format!("version: 1\n{block}driver:\n  max_ci_attempts: 0\n")),
+        ("driver.max_ci_attempts-above-max", format!("version: 1\n{block}driver:\n  max_ci_attempts: 4\n")),
+        // `driver.max_rebase_attempts` has no below-range row: its floor is 0,
+        // and 0 is a LEGAL value there (#1778 §5.3 - a repo may refuse the
+        // driver any rebase). The floor is exercised in tests/workflow.rs.
+        ("driver.max_rebase_attempts-above-max", format!("version: 1\n{block}driver:\n  max_rebase_attempts: 2\n")),
         ("resource.slots", format!("version: 1\n{block}resources:\n  build:\n    slots: 0\n")),
         ("resource.slots-above-max", format!("version: 1\n{block}resources:\n  build:\n    slots: 65\n")),
         ("resource.max_hold_minutes", format!("version: 1\n{block}resources:\n  build:\n    max_hold_minutes: 0\n")),
@@ -8635,6 +8643,25 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
             wf.merge_queue.checks_timeout_minutes, want,
             "merge_queue.checks_timeout_minutes: {given} must clamp to {want}"
         );
+    }
+
+    // The driver's three backstops ride the same notify-TTL clamp family
+    // (#1778 §5.3), so the same both-ends check over each of them.
+    for field in ["lane_timeout_minutes", "fix_timeout_minutes", "drive_timeout_minutes"] {
+        for (given, want) in [(1_u32, 5_u32), (9999, 240)] {
+            let wf = workflow::parse_workflow(&format!(
+                "version: 1\n{block}driver:\n  enabled: true\n  {field}: {given}\n"
+            ))
+            .unwrap_or_else(|e| {
+                panic!("driver.{field}: the manifest says on_out_of_range=clamp, so {given} must LOAD: {e:?}")
+            });
+            let got = match field {
+                "lane_timeout_minutes" => wf.driver.lane_timeout_minutes,
+                "fix_timeout_minutes" => wf.driver.fix_timeout_minutes,
+                _ => wf.driver.drive_timeout_minutes,
+            };
+            assert_eq!(got, want, "driver.{field}: {given} must clamp to {want}");
+        }
     }
 
     // cardinality: RESOURCES_MAX + 1 entries is a load error, so the manifest's
