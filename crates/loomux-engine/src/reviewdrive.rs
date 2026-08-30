@@ -389,6 +389,7 @@ pub fn transition(from: DriveState, to: DriveState) -> Result<DriveState, Invali
         (GateCheck, CiWait) => true,
         // 11. `drive_review` resumes a parked drive (§2.3).
         (Held, CiWait) => true,
+        (Held, Satisfied) => true,
         // 12. A counter bound, a lane/fix/drive timeout, an unaccountable
         //     route, an unreadable gate, a blocked or unresumable worker, an
         //     escalate, or a delegate's `message_orchestrator` (§2.2). From the
