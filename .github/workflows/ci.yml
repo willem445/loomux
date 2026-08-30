@@ -6,11 +6,37 @@ on:
   pull_request:
 
 jobs:
+  # [scratch]-titled PRs (red-before-green counterfactuals,
+  # never merged; convention, not enforced: a skipped E2E
+  # reads green at every gate) run one platform
+  # and no E2E (#1685).
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      scratch: ${{ steps.decide.outputs.scratch }}
+      platforms: ${{ steps.decide.outputs.platforms }}
+    steps:
+      - id: decide
+        run: |
+          SCRATCH="${{ github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, '[scratch') }}"
+          if [ "$SCRATCH" = "true" ]; then
+            PLATFORMS='["ubuntu-22.04"]'
+          else
+            PLATFORMS='["ubuntu-22.04","windows-latest","macos-latest"]'
+          fi
+          # fromJSON below parses this string at matrix-expansion time; a malformed
+          # literal would surface there as an expression error on a job with no
+          # steps, so fail loud here instead (#1755 premortem 1).
+          printf '%s' "$PLATFORMS" | jq -e . >/dev/null
+          echo "scratch=$SCRATCH" >> "$GITHUB_OUTPUT"
+          echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-22.04, windows-latest, macos-latest]
+        platform: ${{ fromJSON(needs.plan.outputs.platforms) }}
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -141,6 +167,8 @@ jobs:
   # merge gate on its own — drop it once the suite has a track record.
   e2e-windows:
     name: E2E (Playwright, experimental)
+    needs: plan
+    if: needs.plan.outputs.scratch != 'true'
     runs-on: windows-latest
     continue-on-error: true
     steps:
