@@ -1236,7 +1236,7 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     if state.is_terminal() || state.is_parked() {
         return DriveStep::Wait;
     }
-    if facts.pr_open == Some(false) {
+    if facts.pr_open != Some(true) {
         return DriveStep::to(DriveState::Cancelled);
     }
     if facts.messaged {
