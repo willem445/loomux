@@ -29101,12 +29101,12 @@ fn a_footer_that_wraps_between_the_count_and_its_label_still_matches() {
     // different claims and only the second makes this test about anything.
     assert!(
         narrow.lines().any(|l| l.starts_with(" MCP")),
-        "the label must begin a row — i.e. the break fell between the count and \\
+        "the label must begin a row — i.e. the break fell between the count and \
          the label: {narrow:?}"
     );
     assert!(
         !narrow.lines().any(|l| l.contains("2 MCP")),
-        "and no single row may hold both, or a row-wise search would find it and \\
+        "and no single row may hold both, or a row-wise search would find it and \
          the join would be untested: {narrow:?}"
     );
     assert!(
@@ -29122,7 +29122,7 @@ fn a_footer_that_wraps_between_the_count_and_its_label_still_matches() {
     let prose_narrow = ready_screen(prose, Some((10, 8)));
     assert!(
         !m.matches(&prose_narrow),
-        "the wrap handling must not smuggle a boot line past the word rule: \\
+        "the wrap handling must not smuggle a boot line past the word rule: \
          {prose_narrow:?}"
     );
 
