@@ -1447,9 +1447,6 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
     // because a verdict that lands at the old head is answered by the binding
     // rules, not by this state — a `fail` there still routes when the drive
     // comes back through `review-wait`, and a `pass` there is already stale.
-    if !facts.head.is_empty() && entry.head != facts.head {
-        return DriveStep::to(DriveState::CiWait);
-    }
     let digest = facts.body_digest.as_deref();
     // Arc 4's precondition, and equally the re-entry point when a digest moved
     // under a recorded pass (§8's body-changed row): the first lane whose pass
