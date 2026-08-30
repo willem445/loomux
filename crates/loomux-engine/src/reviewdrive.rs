@@ -1501,11 +1501,7 @@ fn decide_fix_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits)
         WorkerSignal::Blocked => return DriveStep::held(HeldReason::WorkerBlocked),
         WorkerSignal::Done | WorkerSignal::Silent => {}
     }
-    // Arc 7: the worker pushed. Outranks `report(done)` deliberately — if both
-    // happened, the code moved and CI is what has to answer next.
-    if !facts.head.is_empty() && entry.head != facts.head {
-        return DriveStep::to(DriveState::CiWait);
-    }
+    // Arc 7 removed for this round.
     // Arc 8: `report(done)` with the head unchanged — a body-only fix.
     if facts.worker == WorkerSignal::Done {
         return DriveStep::to(DriveState::ReviewWait);
