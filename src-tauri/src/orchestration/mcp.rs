@@ -2039,8 +2039,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // quieter of the two win would silently mislead. Same Err shape
             // every other refusal in this match returns.
             if hot_only && include_all {
+                // [scratch red witness r2] the refusal is KEPT but its
+                // literal is mutated to the leaky form — a hard `\n` plus the
+                // source indentation shipped to the reader — which is the
+                // exact mutation the W3 `assert_one_paragraph` pin exists to
+                // catch (a `.contains` pin survives this; the shape pin does
+                // not).
                 return Err(
-                    "hot_only and include_all are contradictory: hot_only drops every done row, \
+                    "hot_only and include_all are contradictory: hot_only drops every done row,
                      include_all returns every row — pass one or neither"
                         .into(),
                 );

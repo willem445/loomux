@@ -28530,15 +28530,15 @@ impl OrchRegistry {
     /// `filter_done_rows` at a cap of 0 (one keep/drop rule, not two that can
     /// drift); the include_all/hot_only contradiction is refused one layer
     /// up, at the dispatch that parses the flags.
-    pub fn task_summaries_for_list_tasks(&self, group: &GroupId, include_all: bool, hot_only: bool) -> (Vec<TaskSummary>, usize) {
+    /// [scratch red witness r2] the `hot_only` arm is reverted: the parameter
+    /// is kept (tests and dispatch still pass it) but IGNORED, so a hot read
+    /// comes back capped — reddening the W2 above-cap assertion
+    /// (`omitted == total_done`) in
+    /// `task_summaries_for_list_tasks_defaults_to_capped_and_include_all_bypasses_it`.
+    pub fn task_summaries_for_list_tasks(&self, group: &GroupId, include_all: bool, _hot_only: bool) -> (Vec<TaskSummary>, usize) {
         let rows = self.task_summaries(group);
         if include_all {
             (rows, 0)
-        } else if hot_only {
-            // A cap of 0 keeps nothing done and omits the lot — exactly the
-            // hot read, with filter_done_rows's arithmetic already pinned by
-            // its own unit tests above and below the cap.
-            filter_done_rows(rows, 0)
         } else {
             filter_done_rows(rows, LIST_TASKS_DONE_CAP)
         }
