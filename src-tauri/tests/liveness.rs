@@ -1111,7 +1111,12 @@ fn l2b_a_slow_mutating_tool_answers_early_and_is_never_double_executed() {
         "the instruction not to retry is the whole reason this is not an unwind: {text}"
     );
 
-    // Now let the hold expire and prove the tool completed EXACTLY once.
+    // Now let the hold expire and prove the work LANDED, and landed once.
+    //
+    // Not "exactly once": that is the universal P3 retracted, because a helper
+    // thread that panics never completes at all. What this row drives is the
+    // non-panicking case, where the work does land — so "once" here is an
+    // observation about this subject, not the guarantee (#1722 review N2).
     let deadline = std::time::Instant::now() + Duration::from_millis(HOLD_MS) + GRACE;
     loop {
         let n = reg.tasks(&group).iter().filter(|t| t.title == "l2b-lands-once").count();
@@ -2559,15 +2564,86 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
         bg::COMMAND_READ_BUDGET
     );
 
+    // ---- the tick that actually reaches the mask -------------------------
+    //
+    // **This, not `run_attention` above, is #1702's own path** (#1722 review
+    // B2). `run_attention` resolves its inputs through `attention_inputs()`,
+    // which returns three EMPTY maps without an app handle — and this fixture
+    // has none, because a headless test cannot have one. So the concurrent
+    // `run_attention` above walks the 306-row roster and stops: its phase-2
+    // `filter_map` over `tails` yields nothing and `delivered_mask_lines` is
+    // never called. Scanning only those threads measured the roster scan and
+    // called it the mask.
+    //
+    // `attention_inputs_from` exists to close exactly that (it is why the
+    // extraction is in this PR at all), so the real-input tick runs HERE, on
+    // its own thread, reporting its own id — and the hold scan below covers
+    // that thread as well as the ten cadenced ones.
+    let (outputs, tails, inputs) = f.reg.attention_inputs_from(&f.ptys);
+    assert_eq!(
+        tails.len(),
+        f.fx.live.agent_ids.len(),
+        "setup: the real gather did not produce a tail per live pane ({} of {}), so the tick \
+         below is over a smaller subject than the fixture built",
+        tails.len(),
+        f.fx.live.agent_ids.len()
+    );
+
+    let (mask_thread, samples, flagged) = {
+        let reg = f.reg.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let id = loomux_engine::lockwatch::current_thread_id();
+            let mut samples: Vec<u128> = Vec::with_capacity(L7_SAMPLES);
+            let mut flagged = 0usize;
+            for i in 0..L7_SAMPLES {
+                // Past `ATTENTION_QUIET_MS` on every pass after the first,
+                // which is what puts the per-agent chain through the mask
+                // rather than short-circuiting on a quiet clock it has only
+                // just established.
+                let t = Instant::now();
+                let items = reg.attention_tick(now + 5_000 * (i as u64 + 1), &outputs, &tails, &inputs);
+                samples.push(t.elapsed().as_micros());
+                flagged = items.iter().filter(|i| i.reason == "waiting").count();
+            }
+            let _ = tx.send((id, samples, flagged));
+        });
+        rx.recv_timeout(bg::TICK_LOCK_BUDGET + GRACE).expect(
+            "the real-input attention tick did not return. That is #1702's own path on a \
+             day-old session — the one every other row in this file reaches only with \
+             synthetic maps",
+        )
+    };
+
+    // The control that makes the scan below mean something: this tick REACHED
+    // the mask. An `attention_tick` over empty maps returns promptly, holds
+    // nothing, and would satisfy every assertion here — which is precisely the
+    // hole review B2 found. Pane 0's tail is masked by its own delivered line
+    // and must not flag; the other five end on a real dialog and must.
+    assert_eq!(
+        flagged,
+        f.fx.live.agent_ids.len() - 1,
+        "the real-input tick flagged {flagged} of {} panes. The fixture builds one masked pane \
+         and the rest prompt-shaped, so anything else means the mask was not reached and this \
+         row is measuring a roster scan rather than #1702's path",
+        f.fx.live.agent_ids.len()
+    );
+
     // ---- the hold budget -------------------------------------------------
     //
-    // The whole point of the row. Every tick above has returned, so any hold
-    // they took has ended and been stamped; anything still in flight is a hold
-    // that outlived its tick.
-    let tick_threads: Vec<u64> = runs.iter().map(|r| r.thread).collect();
+    // The whole point of the row, and it runs LAST so it covers the mask tick
+    // too. Every tick above has returned, so any hold it took has ended and
+    // been stamped; anything still in flight outlived its tick.
+    //
+    // Scoped to every thread this row drove: the ten cadenced ticks, the
+    // real-input mask tick, and this test thread itself — which is where the
+    // MCP read and the sync command ran.
+    let mut scanned: Vec<u64> = runs.iter().map(|r| r.thread).collect();
+    scanned.push(mask_thread);
+    scanned.push(loomux_engine::lockwatch::current_thread_id());
     loomux_engine::lockwatch::assert_no_disallowed_hold_over_on(
         loomux_engine::lockwatch::HOLD_FAIL_MS,
-        &tick_threads,
+        &scanned,
     );
 
     // ---- the distribution, printed rather than asserted ------------------
@@ -2576,26 +2652,16 @@ fn l7a_every_tick_returns_within_budget_on_a_day_old_session() {
     // may only refuse what its instrument is demonstrated to detect (#1703
     // review B1). What a p95 supports is a REPORT — the figure a PR body and a
     // future regression are compared against — so it is printed with its
-    // subject named, and the budget assertion above is what refuses.
-    let (outputs, tails, inputs) = f.reg.attention_inputs_from(&f.ptys);
-    assert_eq!(
-        tails.len(),
-        f.fx.live.agent_ids.len(),
-        "setup: the real gather did not produce a tail per live pane ({} of {}), so the \
-         percentiles below are over a smaller subject than the fixture built",
-        tails.len(),
-        f.fx.live.agent_ids.len()
-    );
-    let mut samples: Vec<u128> = Vec::with_capacity(L7_SAMPLES);
-    for i in 0..L7_SAMPLES {
-        // Past `ATTENTION_QUIET_MS` on every pass after the first, which is
-        // what puts the per-agent chain through the mask rather than short-
-        // circuiting on a quiet clock it has only just established.
-        let t = Instant::now();
-        let _ = f.reg.attention_tick(now + 5_000 * (i as u64 + 1), &outputs, &tails, &inputs);
-        samples.push(t.elapsed().as_micros());
-    }
+    // subject named, and the budget assertion below is what refuses.
+    let mut samples = samples;
     samples.sort_unstable();
+    assert!(
+        Duration::from_micros(samples[samples.len() - 1] as u64) < bg::TICK_LOCK_BUDGET,
+        "the slowest real-input attention tick took {} us on a day-old session, past its own \
+         {:?} budget",
+        samples[samples.len() - 1],
+        bg::TICK_LOCK_BUDGET
+    );
     let p = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
     println!(
         "L7a attention_tick on a day-old session ({} agents / {} live+bound / {} board rows / \

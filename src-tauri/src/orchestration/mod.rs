@@ -26896,11 +26896,11 @@ impl OrchRegistry {
             // what it is FOR, and the L-series' whole shape is "a victim
             // answers while a lock is wedged for twenty seconds" — so without
             // this permit the enforcement would fail the suite on its own
-            // fixtures. Taken here rather than by the caller because the
-            // permit is per-thread and the hold happens on THIS one; taken
-            // before the acquisition so no window exists in which the hold is
-            // live and unpermitted, and dropped with this closure, so a seam
-            // that stops holding stops being exempt.
+            // fixtures. Taken here rather than by the caller because a permit
+            // covers the thread that holds it, and the hold happens on THIS
+            // one; taken before the acquisition so no window exists in which
+            // the hold is live and unpermitted, and dropped with this closure,
+            // so nothing this thread does afterwards is exempt.
             let _permit = loomux_engine::lockwatch::LongHoldPermit::new(
                 "OrchRegistry::hold_lock_for_test - the liveness suite's deliberate wedge",
             );

@@ -96,8 +96,9 @@ pub fn fabricate_long_lived_session(
         let pty = 9000 + i as u32;
         // Both halves, and both are load-bearing for #1702's trigger:
         // `set_session_for_test` is what makes `delivered_prompt_record` reach
-        // past its first `?`, and `set_pty_for_test` writes the `by_pty` entry
-        // that makes `session_for_pty` reach its second lock at all.
+        // past its first `?`, and the `bind_pane_for_test` below writes the
+        // `by_pty` entry that makes `session_for_pty` reach its second lock at
+        // all.
         let session = format!("00000000-0000-4000-8000-{i:012}");
         reg.set_session_for_test(&a.id, &session);
         // The SHIPPED bind (#1702 P4), not `set_pty_for_test`. The reason is

@@ -842,16 +842,30 @@ default-deny scan over both production source roots that holds it to the two
 rows above — in both directions, since a row matching nothing is a row watching
 nothing.
 
-One subtlety is worth writing down because it is invisible from the outside: a
-retired permit still exempts its thread. A hold is classified from two sources,
-and a **completed** one is stamped by `TrackedGuard::drop` — which runs before
-the injector's permit drops, and is drained some time after both — so a
-live-set-only classification would fail the suite on its own fixtures,
-intermittently, depending on when the drain landed. Stamping the permit onto
-the report inside `TrackedGuard::drop` is not available: that body may not take
-a global lock, which is the whole reason the reporting is deferred (§4.4).
-Keeping the retired entry costs nothing in precision, because a tracked thread
-id is minted once per thread from a monotonic counter and never reused.
+One subtlety is worth writing down because it is invisible from the outside:
+**the exemption is as wide as the guard, not as the thread.** A hold is
+classified from two sources, and only one of them can consult a live permit. An
+IN-FLIGHT hold is read off `held_locks` while its permit is necessarily still
+there, so the registry answers it. A COMPLETED one is stamped by
+`TrackedGuard::drop` — which runs *before* the injector's permit drops — and is
+drained some time after both, so by the time anything classifies it the
+registry no longer knows.
+
+That race is closed by stamping the permit onto the HOLD at release, from a
+thread-local counter: `TrackedGuard::drop` may not take a global lock (§4.4,
+which is why the reporting is deferred at all) but a thread-local read is
+already in its budget — it does one for `pop_held` — so the cost is one `Cell`
+read and one relaxed store.
+
+The first version of this closed the race the other way, by RETIRING permits
+rather than removing them, so a thread that had ever held one stayed exempt for
+its life. That was wrong, and the review that caught it (#1722 B1) named the
+case the argument had missed: a permitting thread is not necessarily dedicated.
+`e2ehold`'s is the long-lived `watch` loop — `start` spawns one thread running
+`loop { sleep; run_once }`, and `hold` runs on it — so after a single injection
+that loop's every later hold, on the one thread the soak lane most wants
+watched, would have been exempt. The default-deny scan could not have covered
+it either: a scan bounds construction **sites**, not thread lifetimes.
 
 ### A hold can be long because its holder is waiting
 
@@ -985,10 +999,15 @@ is a checked figure rather than an unstated one.
   that never calls it is not caught in `cargo test`. What closes that in a
   running build is the watchdog's breadcrumb, and what will close it in the
   soak lane is P5's arming plus its crumb assertion.
-- **A hold on a thread that took a permit for something else.** The permit is
-  thread-scoped and, once taken, retired rather than removed; both argued sites
-  are dedicated threads that do nothing afterwards, and the default-deny scan
-  is what keeps that true.
+- **A hold taken while a permit is live, for something other than the
+  injection.** The permit covers the thread for as long as it is alive, so
+  anything else that thread holds in that window is exempt too. Both argued
+  sites take the permit immediately around their own acquisition, which is what
+  keeps the window narrow — but it is a window, not a point, and the
+  default-deny scan bounds construction sites rather than what happens inside
+  one. What is NOT a residual any more is a hold after the permit drops: that
+  is a violation like any other, including on a thread that has injected
+  before (#1722 B1).
 - **A neighbouring test's holds, in a `cargo test` binary.** The hold registry
   is process-global and `cargo` runs a binary's tests on many threads in one
   process, so a row asserting on it is asserting about its neighbours too — the

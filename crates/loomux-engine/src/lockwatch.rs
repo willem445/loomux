@@ -209,6 +209,9 @@ struct LockState {
     // composing. This is what the plan's §3 Phase 0.2 says anyway: the watchdog
     // reports, "off every hot path".
     done_pending: AtomicBool,
+    /// Whether the releasing thread held a [`LongHoldPermit`]. Published by the
+    /// same `Release` store as the four slots below it.
+    done_permitted: AtomicBool,
     done_ms: AtomicU64,
     done_thread: AtomicU64,
     done_site: AtomicPtr<Location<'static>>,
@@ -270,6 +273,7 @@ impl LockState {
             acquired_ms: AtomicU64::new(0),
             waiters: AtomicU32::new(0),
             done_pending: AtomicBool::new(false),
+            done_permitted: AtomicBool::new(false),
             done_ms: AtomicU64::new(0),
             done_thread: AtomicU64::new(0),
             done_site: AtomicPtr::new(std::ptr::null_mut()),
@@ -297,6 +301,7 @@ impl LockState {
             held_ms: self.done_ms.load(Ordering::Relaxed),
             waiters: self.done_waiters.load(Ordering::Relaxed),
             still_held: false,
+            permitted: self.done_permitted.load(Ordering::Relaxed),
         })
     }
 
@@ -383,6 +388,12 @@ pub struct HoldReport {
     pub waiters: u32,
     /// `true` when the hold was still in flight when this was reported.
     pub still_held: bool,
+    /// Whether the holding thread held a [`LongHoldPermit`] when this hold was
+    /// RELEASED. Only meaningful for a completed report — an in-flight one is
+    /// classified against the live permit registry instead, because its permit
+    /// is necessarily still there. Stamped in `TrackedGuard::drop` so a drain
+    /// arriving after the permit dropped still knows (#1722 review B1).
+    pub permitted: bool,
 }
 
 impl HoldReport {
@@ -484,42 +495,55 @@ pub fn hold_report_ring_for_test(ms: u64) {
 /// together, so an edit to one of them is a red rather than a drift.
 pub const HOLD_FAIL_MS: u64 = 5_000;
 
-/// One thread's permission to hold a tracked lock past [`HOLD_FAIL_MS`].
-///
-/// `live` goes false when the [`LongHoldPermit`] drops, and the entry STAYS.
-/// That is not an oversight and it is the subtle half of this mechanism, so it
-/// is written where the field is:
-///
-/// A hold is classified from two sources. An IN-FLIGHT one is read off
-/// [`held_locks`] while the permit is still live, so the live set answers it.
-/// A COMPLETED one is read off [`drain_completed_holds`], and the stamp that
-/// produces it happens in `TrackedGuard::drop` — which runs BEFORE the
-/// injector's permit drops, and is drained some time after BOTH. So an
-/// injector's deliberate hold is reported by a drain whose live set no longer
-/// contains the thread that took it, and a live-set-only classification would
-/// fail the suite on its own fixtures, intermittently, depending on when the
-/// drain landed. The alternative — stamping the permit onto the report inside
-/// `TrackedGuard::drop` — is not available: that body may not take a global
-/// lock (see its doc), which is the whole reason the reporting is deferred.
-///
-/// Keeping the retired entry costs nothing in precision, because a tracked
-/// thread id is minted once per thread from a monotonic counter and is never
-/// reused: a retired entry can only ever match the injector thread that earned
-/// it, and both permitting sites are dedicated threads that do nothing else
-/// afterwards. It costs one `usize`-ish entry per injected hold — the liveness
-/// suite makes about fifteen.
-struct PermitEntry {
-    thread: u64,
-    reason: &'static str,
-    live: bool,
-}
-
-/// Every permit this process has taken, live and retired.
+/// One LIVE permit. Removed when its [`LongHoldPermit`] drops.
 ///
 /// A `Vec` rather than a set because permits NEST: an injector inside an
 /// injector is two entries for one thread, and the inner one's `Drop` must
 /// leave the outer one standing.
+struct PermitEntry {
+    thread: u64,
+    reason: &'static str,
+}
+
+/// Every permit alive right now.
 static LONG_HOLD_PERMITS: Mutex<Vec<PermitEntry>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// How many [`LongHoldPermit`]s this thread currently holds.
+    ///
+    /// The whole reason this exists beside the registry above, and the subtle
+    /// half of the mechanism, so it is written where the field is:
+    ///
+    /// A hold is classified from two sources, and only one of them can consult
+    /// a LIVE permit. An IN-FLIGHT hold is read off [`held_locks`] while its
+    /// permit is necessarily still live, so the registry answers it. A
+    /// COMPLETED hold is stamped by `TrackedGuard::drop` — which runs BEFORE
+    /// the injector's permit drops — and drained some time after BOTH, so by
+    /// the time anything classifies it the registry no longer knows.
+    ///
+    /// The first version of this closed that race by RETIRING permits rather
+    /// than removing them, exempting a thread for the rest of its life. That
+    /// was wrong (#1722 review B1): `e2ehold`'s permitting thread is the
+    /// long-lived `watch` loop, not a dedicated one-shot, so one injection
+    /// would have exempted the E2E lane's busiest thread for the whole
+    /// process — the enforcement staying green over exactly the holds that
+    /// lane most wants watched.
+    ///
+    /// So the permit is stamped onto the HOLD instead, at release, from this
+    /// counter. `TrackedGuard::drop` may not take a global lock (see its doc)
+    /// but a thread-local read is already in its budget — it does one for
+    /// `pop_held` — so this costs one `Cell` read and one relaxed store, and
+    /// the exemption is exactly as wide as the guard that earned it.
+    ///
+    /// `Cell<u32>` has no destructor, so it costs nothing at thread teardown.
+    static PERMIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the calling thread currently holds a [`LongHoldPermit`]. Read by
+/// `TrackedGuard::drop`, so it may not allocate or lock.
+fn permitted_now() -> bool {
+    PERMIT_DEPTH.with(|d| d.get() > 0)
+}
 
 /// Permission for THIS THREAD to hold a tracked lock past [`HOLD_FAIL_MS`],
 /// for as long as this value is alive.
@@ -538,6 +562,16 @@ static LONG_HOLD_PERMITS: Mutex<Vec<PermitEntry>> = Mutex::new(Vec::new());
 /// `only_argued_sites_may_permit_a_long_hold` is the default-deny scan that
 /// holds it to the sites that carry an argument.
 ///
+/// **The exemption is as wide as the GUARD, not as the thread**, and that
+/// distinction is load-bearing rather than pedantic (#1722 review B1). A
+/// permitting thread is not necessarily dedicated: `e2ehold`'s is the
+/// long-lived `watch` loop, which keeps polling and writing state files after
+/// its injection is over. So a permit that outlived its guard — by exempting
+/// the thread rather than the hold — would have left that loop's every later
+/// hold invisible, on the one thread the E2E lane most wants watched, and the
+/// site scan could not have seen it because a scan bounds construction sites
+/// and not thread lifetimes.
+///
 /// `reason` is `&'static str` so nothing here allocates on the permitting
 /// thread and so the reason is a literal a reader can grep for.
 pub struct LongHoldPermit {
@@ -545,7 +579,10 @@ pub struct LongHoldPermit {
 }
 
 impl LongHoldPermit {
-    /// Permit long holds on the calling thread until this value is dropped.
+    /// Permit long holds on the calling thread until this value is dropped —
+    /// and no longer. A hold RELEASED while this is alive keeps its exemption
+    /// through the drain that reports it, via the stamp `TrackedGuard::drop`
+    /// takes; a hold this thread takes AFTER the drop is not exempt at all.
     ///
     /// Deliberately NOT `#[doc(hidden)]` or `cfg(test)`-gated: `e2ehold`'s
     /// injector is a `#[cfg(debug_assertions)]` production path rather than a
@@ -553,20 +590,20 @@ impl LongHoldPermit {
     /// needs it outside the mechanism.
     pub fn new(reason: &'static str) -> Self {
         let thread = this_thread();
-        LONG_HOLD_PERMITS.lock_safe().push(PermitEntry { thread, reason, live: true });
+        PERMIT_DEPTH.with(|d| d.set(d.get() + 1));
+        LONG_HOLD_PERMITS.lock_safe().push(PermitEntry { thread, reason });
         Self { thread }
     }
 }
 
 impl Drop for LongHoldPermit {
     fn drop(&mut self) {
+        PERMIT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         let mut permits = LONG_HOLD_PERMITS.lock_safe();
-        // Retire the LAST live entry for this thread, so a nested permit's drop
-        // leaves the outer one live. The entry itself stays — see
-        // [`PermitEntry::live`] for why a completed hold cannot be classified
-        // against the live set alone.
-        if let Some(e) = permits.iter_mut().rev().find(|e| e.thread == self.thread && e.live) {
-            e.live = false;
+        // The LAST entry for this thread, so a nested permit's drop leaves the
+        // outer one standing.
+        if let Some(i) = permits.iter().rposition(|e| e.thread == self.thread) {
+            permits.remove(i);
         }
     }
 }
@@ -584,23 +621,14 @@ pub fn current_thread_id() -> u64 {
     this_thread()
 }
 
-/// The reason `thread` holds a LIVE permit right now, if it does.
-///
-/// The narrow view, for a diagnostic or a test asking "is this thread inside
-/// its permit". Classification uses [`permitted_threads`], which is wider on
-/// purpose — see [`PermitEntry::live`].
+/// The reason `thread` holds a permit right now, if it does.
 pub fn long_hold_permit_for(thread: u64) -> Option<&'static str> {
-    LONG_HOLD_PERMITS
-        .lock_safe()
-        .iter()
-        .rev()
-        .find(|e| e.thread == thread && e.live)
-        .map(|e| e.reason)
+    LONG_HOLD_PERMITS.lock_safe().iter().rev().find(|e| e.thread == thread).map(|e| e.reason)
 }
 
-/// Every thread that has EVER taken a [`LongHoldPermit`] — the set
-/// classification exempts, and the reason it is not the live set is on
-/// [`PermitEntry::live`].
+/// Every thread holding a permit right now — what exempts an IN-FLIGHT hold.
+/// A COMPLETED hold carries its own [`HoldReport::permitted`] stamp instead,
+/// taken at release; see [`PERMIT_DEPTH`].
 pub fn permitted_threads() -> Vec<u64> {
     LONG_HOLD_PERMITS.lock_safe().iter().map(|e| e.thread).collect()
 }
@@ -617,7 +645,13 @@ pub fn hold_violations_among(
 ) -> Vec<HoldReport> {
     reports
         .iter()
-        .filter(|r| r.held_ms >= fail_ms && !permitted.contains(&r.holder_thread))
+        .filter(|r| {
+            // Two exemption routes, one per report kind, and both are visible
+            // here rather than folded into the caller: a COMPLETED hold
+            // carries the stamp its own release took, an IN-FLIGHT one is
+            // matched against the threads holding a permit right now.
+            r.held_ms >= fail_ms && !r.permitted && !permitted.contains(&r.holder_thread)
+        })
         .cloned()
         .collect()
 }
@@ -728,6 +762,10 @@ pub fn observed_holds() -> Vec<HoldReport> {
         held_ms: s.held_ms,
         waiters: s.waiters,
         still_held: true,
+        // An in-flight hold's permit is necessarily still live, so it is
+        // classified against `permitted_threads()` rather than against a
+        // stamp that has not been taken yet.
+        permitted: false,
     }));
     out
 }
@@ -781,7 +819,7 @@ pub fn assert_no_disallowed_hold_over_on(fail_ms: u64, threads: &[u64]) {
         fail_ms >= hold_warn_ms(),
         "assert_no_disallowed_hold_over({fail_ms}) is below the {} ms report threshold, so \
          `TrackedGuard::drop` never stamps a completed hold this scan could find and half of it \
-         is blind. Raise `set_hold_warn_ms` first, or assert at or above the threshold",
+         is blind. LOWER `set_hold_warn_ms` to at most {fail_ms}, or assert at or above it",
         hold_warn_ms()
     );
     let was = set_hold_panics(true);
@@ -2104,8 +2142,9 @@ impl<T> Drop for TrackedGuard<'_, T> {
     /// a field, so every instruction below executes with the reported mutex
     /// still locked and every waiter still queued behind it.
     ///
-    /// What is left is: one clock read, four relaxed loads, four relaxed
-    /// stores, one release STORE (`done_pending`, publishing the four stores
+    /// What is left is: one clock read, four relaxed loads, five relaxed
+    /// stores (one of them reading a thread-local `Cell` — the permit stamp,
+    /// #1722 review B1), one release STORE (`done_pending`, publishing the stores
     /// above), one release read-modify-write (`generation`), and — since
     /// #1610 — one thread-local borrow plus a scan from the top of a fixed
     /// array to remove this hold's own entry ([`pop_held`]). All of it is on
@@ -2143,6 +2182,11 @@ impl<T> Drop for TrackedGuard<'_, T> {
             // Stamp only. `drain_completed_holds` composes and writes it, on
             // the watchdog thread, with this lock long since released.
             st.done_ms.store(held_ms, Ordering::Relaxed);
+            // The permit stamp (#1722 review B1). A thread-local read and one
+            // relaxed store — this body already borrows a thread-local for
+            // `pop_held`, and the alternative (classifying against the permit
+            // registry at DRAIN time) cannot work: the permit is gone by then.
+            st.done_permitted.store(permitted_now(), Ordering::Relaxed);
             st.done_thread.store(st.holder_thread.load(Ordering::Relaxed), Ordering::Relaxed);
             st.done_site.store(st.holder_site.load(Ordering::Relaxed), Ordering::Relaxed);
             st.done_waiters.store(st.waiters.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -2330,6 +2374,9 @@ impl LockWatch {
                 held_ms: s.held_ms,
                 waiters: s.waiters,
                 still_held: true,
+                // See `observed_holds`: an in-flight hold is matched against
+                // the live permit registry, not against a release stamp.
+                permitted: false,
             });
         }
         out
@@ -3111,6 +3158,7 @@ mod rank_tests {
             held_ms,
             waiters: 0,
             still_held: false,
+            permitted: false,
         }
     }
 
@@ -3168,45 +3216,70 @@ mod rank_tests {
     }
 
     #[test]
-    fn a_retired_permit_still_exempts_the_thread_that_earned_it() {
-        // The race this closes is invisible to every other test here, because
-        // every other test hands the classifier a report it built itself.
+    fn a_hold_released_under_a_permit_is_exempt_after_that_permit_drops() {
+        // The drain race, driven end to end through a REAL lock rather than a
+        // synthetic report — which is the only way to reach the stamp at all,
+        // since `TrackedGuard::drop` is what takes it.
         //
-        // In the real sequence the injector's guard releases FIRST — that is
-        // what stamps the completed-hold report — and its permit drops a moment
-        // later, when the closure ends. The drain that turns the stamp into a
-        // report happens after both. So a classifier reading the LIVE permit
-        // set would see a long hold by a thread with no permit and fail the
-        // suite on its own deliberate fixture, intermittently, depending on
-        // when the drain landed.
+        // The sequence that matters: the guard releases (stamping), the permit
+        // drops, and only THEN does anything drain. A classifier consulting the
+        // live registry at drain time would see no permit and call the
+        // injector's own deliberate hold a violation.
         let _serial = SERIAL.lock_safe();
-        let (tx, rx) = mpsc::channel::<u64>();
-        std::thread::spawn(move || {
-            let id = current_thread_id();
-            {
-                let _p = LongHoldPermit::new("holdspec retired");
-            }
-            // The permit is gone; the thread is still the injector that earned
-            // it, and a report stamped while it was live is only now drainable.
-            let _ = tx.send(id);
-        })
-        .join()
-        .expect("the injector thread panicked");
-        let injector = rx.recv().expect("the injector never reported its id");
+        let was = set_hold_warn_ms(1);
+        let _ = drain_completed_holds(); // start from a clean ring
+        let lock = TrackedMutex::new("permitdrainspec", ());
 
+        let injector = {
+            let permit = LongHoldPermit::new("holdspec drain race");
+            {
+                let _held = lock.lock_safe();
+                std::thread::sleep(Duration::from_millis(3));
+            } // released HERE: the stamp is taken now, with the permit live
+            let id = current_thread_id();
+            drop(permit); // and the permit is gone BEFORE the drain below
+            id
+        };
         assert!(
             long_hold_permit_for(injector).is_none(),
-            "the LIVE view must show the permit as gone, or this test is not about a retired one"
+            "the permit must be gone before the drain, or this test is not about the race"
+        );
+
+        let drained = drain_completed_holds();
+        let mine: Vec<_> = drained.iter().filter(|r| r.lock == "permitdrainspec").collect();
+        assert_eq!(mine.len(), 1, "the deliberate hold was not reported at all: {drained:?}");
+        assert!(
+            mine[0].permitted,
+            "a hold RELEASED under a permit must carry the stamp, or every deliberate wedge in \
+             the suite becomes a violation as soon as its injector finishes"
         );
         assert!(
-            permitted_threads().contains(&injector),
-            "a retired permit must still exempt its own thread, or every deliberate hold in the \
-             suite becomes a violation as soon as its injector finishes"
+            hold_violations(&[mine[0].clone()], 1).is_empty(),
+            "the classifier must honour the release stamp"
         );
+
+        // The other half, and the reason the stamp is per-HOLD rather than
+        // per-thread (#1722 review B1): the SAME thread, with no permit, is NOT
+        // exempt. The retired-permit design this replaced would have exempted
+        // it — which is what would have made `e2ehold`'s long-lived `watch`
+        // thread permanently invisible after one injection.
+        {
+            let _held = lock.lock_safe();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let after = drain_completed_holds();
+        let mine: Vec<_> = after.iter().filter(|r| r.lock == "permitdrainspec").collect();
+        assert_eq!(mine.len(), 1, "the unpermitted hold was not reported: {after:?}");
         assert!(
-            hold_violations(&[report_at(injector, HOLD_FAIL_MS + 1)], HOLD_FAIL_MS).is_empty(),
-            "the live classifier must exempt a retired permit's thread"
+            !mine[0].permitted,
+            "an unpermitted hold on a thread that USED to hold a permit must not be exempt"
         );
+        assert_eq!(
+            hold_violations(&[mine[0].clone()], 1).len(),
+            1,
+            "the same thread's later unpermitted hold must still be a violation"
+        );
+        set_hold_warn_ms(was);
     }
 
     #[test]
@@ -3291,9 +3364,22 @@ mod rank_tests {
         let msg = panic_message(std::panic::AssertUnwindSafe(|| {
             assert_no_disallowed_hold_over(hold_warn_ms().saturating_sub(1));
         }));
+        let msg = msg.expect("a scan under the report threshold must refuse, not answer");
+        assert!(msg.contains("blind"), "the refusal must say what is wrong: {msg}");
+        // And the REMEDY, which is the actionable half (#1722 review N1). The
+        // first version of this message told the caller to RAISE
+        // `set_hold_warn_ms`, which makes the predicate MORE false — and
+        // nothing caught it, because asserting only on "blind" leaves the half
+        // a reader would act on unpinned.
         assert!(
-            msg.is_some_and(|m| m.contains("blind")),
-            "a scan under the report threshold must refuse, not answer"
+            msg.contains("LOWER"),
+            "the refusal must name a remedy that works — lowering the report threshold, or \
+             asserting at or above it: {msg}"
+        );
+        assert!(
+            !msg.contains("Raise `set_hold_warn_ms`"),
+            "the inverted remedy came back: RAISING the report threshold makes this scan more \
+             blind, not less: {msg}"
         );
     }
 }

@@ -734,6 +734,7 @@ fn a_watchdog_report_is_one_line_a_human_can_read() {
         held_ms: 340_123,
         waiters: 87,
         still_held: true,
+        permitted: false,
     };
     assert_eq!(r.event(), "lock-slow");
     assert_eq!(
