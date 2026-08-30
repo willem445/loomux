@@ -447,11 +447,27 @@ pub const MAX_REBASE_CEILING: u32 = 1;
 /// boundary that holds only when the expected caller is upstream is not a
 /// boundary. Round 21 in the PR is the counterfactual for this arm.
 ///
-/// The type carries a private field so the struct cannot be built by literal
-/// outside this module: every construction path a caller can reach
-/// ([`DriveLimits::new`], [`Default`], [`DriveLimits::clamped`]) clamps, so an
-/// out-of-range value cannot be *spelled* from outside, and [`decide`] clamps
-/// anyway for the value types that in-module code can still build raw.
+/// The type carries a private field so the struct cannot be built by *literal*
+/// outside this module (E0451): every construction path a caller can reach
+/// ([`DriveLimits::new`], [`Default`], [`DriveLimits::clamped`]) clamps.
+///
+/// **That seal does not make an out-of-range value unspellable, and claiming it
+/// did was weaker as well as false.** The bounds fields are `pub` — they are
+/// meant to be read — so a caller outside this module can take a clamped value
+/// from any of those constructors and then assign to one:
+/// `let mut l = DriveLimits::default(); l.max_review_rounds = 9;` compiles
+/// anywhere. What the seal actually buys is that such a value can only arise
+/// by a *deliberate* post-construction write, never by someone filling in a
+/// struct literal without noticing there was a range.
+///
+/// The load-bearing statement is the stronger one, and it is about reach rather
+/// than spelling: **an out-of-range bound cannot reach a decision.** [`decide`]
+/// clamps unconditionally — no `if`, no caller opt-out — and *shadows* its own
+/// binding with the clamped value, so every read below that line is of a
+/// clamped bound and there is no path through the function that consults the
+/// argument as passed. That is a property of one function anyone can re-read,
+/// which is why it is the claim worth making; "cannot be spelled" was a claim
+/// about the whole type system and was not true.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriveLimits {
     pub max_review_rounds: u32,
@@ -1387,16 +1403,23 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
         return DriveStep::held(HeldReason::DriveStalled);
     }
     // **An unresolved head is not a head, and acting on one is an unbounded
-    // spawn loop.** Every state below either compares this against the recorded
-    // head or keys a lane brief on it. `review-wait` is the dangerous one: the
-    // arc-6 guard skips itself when `facts.head` is empty, so the tick falls
-    // through to `first_stale_lane`, where `ReviewVerdict::reviewed("")` is
-    // false for every real verdict head, and then to `lane_open_for`, which
-    // refuses every record briefed at a real head — yielding `OpenLane{0}` on
-    // EVERY tick. Worse, each brief re-arms that lane's `spawned_ms`, so
-    // `lane-stalled` can never fire and the loop defeats the very bound meant
-    // to catch it. §8's posture settles it: an unknown is never a fact, and the
-    // drive stays bounded by `drive-stalled` above, which needs no head at all.
+    // spawn loop.** Two of the four states below read `facts.head`, and the
+    // guard is here rather than in each of them because it is the *drive* that
+    // has no revision to act on, not those two states in particular:
+    // `review-wait` compares it against the recorded head and keys a lane brief
+    // on it, `fix-wait` compares it for arc 7. `ci-wait` and `gate-check` never
+    // read it at all — they would be harmless to dispatch, and returning `Wait`
+    // for them too is the conservative reading of "orrerix could not resolve
+    // this PR's head this tick", not a claim that they would misbehave.
+    // `review-wait` is the dangerous one: the arc-6 guard skips itself when
+    // `facts.head` is empty, so the tick falls through to `first_stale_lane`,
+    // where `ReviewVerdict::reviewed("")` is false for every real verdict head,
+    // and then to `lane_open_for`, which refuses every record briefed at a real
+    // head — yielding `OpenLane{0}` on EVERY tick. Worse, each brief re-arms
+    // that lane's `spawned_ms`, so `lane-stalled` can never fire and the loop
+    // defeats the very bound meant to catch it. §8's posture settles it: an
+    // unknown is never a fact, and the drive stays bounded by `drive-stalled`
+    // above, which needs no head at all.
     if facts.head.is_empty() {
         return DriveStep::Wait;
     }
