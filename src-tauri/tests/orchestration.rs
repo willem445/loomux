@@ -28783,12 +28783,20 @@ fn an_opencode_boot_is_not_ready_until_its_mcp_footer_appears() {
 
     // 2. opencode's row: ready only AFTER the footer.
     let (marked, marked_at, printed) = run(marker, 6592, true);
-    assert!(printed, "the fixture must actually have printed the footer");
     assert_eq!(marked, ReadyWait::Ready, "the footer is the go signal — the wait must end on it");
+    // The PROPERTY, asserted before the fixture control below it. Order matters
+    // here and is not stylistic: with the marker check removed this wait ends
+    // at the quiet point, which makes BOTH this and `printed` false — and a red
+    // that lands on the fixture control reports "the fixture must actually have
+    // printed the footer", which reads as a broken test rather than as the
+    // defect. A red evidences only the assertion it reached.
     assert!(
         marked_at > footer_at,
         "readiness must not be declared before the MCP footer: ready at {marked_at:?}, footer at {footer_at:?}"
     );
+    // The fixture control, kept: it is what rules out a footer that never
+    // landed at all (which would reach the assertion above via the ceiling).
+    assert!(printed, "the fixture must actually have printed the footer");
 
     // 3. A boot that never prints it waits out the ceiling and is pasted into
     //    knowingly — the TimedOut path, unchanged by this issue. This is the
