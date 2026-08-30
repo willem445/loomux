@@ -440,7 +440,9 @@ impl ReadyMarker {
 /// heuristic, and every reading it gets wrong costs the ceiling's wait rather
 /// than a released paste.
 fn followed_by_a_word(rest: &str) -> bool {
-    rest.trim_start_matches(' ').chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    // #1591 RED EVIDENCE ONLY — the word rule removed. Never merged.
+    let _ = rest;
+    false
 }
 
 /// What loomux can actually make one agent CLI do — **the per-CLI capability
