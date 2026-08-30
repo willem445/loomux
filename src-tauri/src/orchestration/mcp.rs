@@ -2012,36 +2012,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         ));
     }
     match name {
-        "list_agents" => {
-            let live_only = arg_bool(args, "live_only")?;
-            let mut roster = reg.list_agents(&caller.group);
-            // #1684: the per-wake re-sync only needs "who is live" — a dead
-            // agent's session id already sits on the board rows that resume
-            // it, so carrying the whole dead roster on every wake is payload
-            // for nothing. Registry hygiene (#106/#851) is untouched: this
-            // drops whole rows only, on the explicit opt-in.
-            if live_only {
-                if let Some(rows) = roster.as_array_mut() {
-                    rows.retain(|a| a["status"] != json!("dead"));
-                }
-            }
-            Ok(roster.to_string())
-        }
+        // [scratch red witness] the live_only filter is reverted: the flag is
+        // inert and the full roster (dead rows included) comes back, which is
+        // exactly the behaviour `live_only_omits_dead_agents_and_keeps_live_ones`
+        // must fail on.
+        "list_agents" => Ok(reg.list_agents(&caller.group).to_string()),
         "get_state" => Ok(reg.get_state(&caller.group)),
         "list_tasks" => {
             let include_all = arg_bool(args, "include_all")?;
             let hot_only = arg_bool(args, "hot_only")?;
-            // #1684: the two flags answer opposite questions — one returns
-            // every done row, the other refuses to carry any — so letting the
-            // quieter of the two win would silently mislead. Same Err shape
-            // every other refusal in this match returns.
-            if hot_only && include_all {
-                return Err(
-                    "hot_only and include_all are contradictory: hot_only drops every done row, \
-                     include_all returns every row — pass one or neither"
-                        .into(),
-                );
-            }
+            // [scratch red witness] the hot_only/include_all refusal is
+            // reverted: the pair is accepted and hot_only is passed through
+            // to a registry that ignores it, which is exactly the behaviour
+            // `hot_only_with_include_all_is_refused` and
+            // `hot_only_drops_every_done_row_and_still_counts_them` must fail on.
             let (rows, omitted_done) = reg.task_summaries_for_list_tasks(&caller.group, include_all, hot_only);
             // `wip` (#1175) rides the board read rather than getting a tool of
             // its own: a cap is only ever actionable next to the rows it is
