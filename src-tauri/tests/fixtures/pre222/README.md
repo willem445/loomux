@@ -1002,7 +1002,8 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   shipped `list_tasks(hot_only: true)` (no done rows; `omitted_done` still counts them) and
   `list_agents(live_only: true)` (no dead panes); every re-sync site in the template now
   passes them — the first-turn list, the `list_agents` / `list_tasks` tool bullets, pause
-  resume, the idle tick, and the post-compact re-grounding. The re-bless is warranted because
+  resume, the idle tick, the Durability-rules session start, and the post-compact
+  re-grounding. The re-bless is warranted because
   the template stated the bare calls as the re-sync, and on a long-lived group the rows a
   re-sync drops are the bulk of the board and roster it reads. Two template pins were
   re-anchored in the same commit rather than relaxed: `tests/prompts.rs`'s first-turn primer
