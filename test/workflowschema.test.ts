@@ -225,6 +225,8 @@ function docFor(section: string, field: string, yaml: string): string {
       );
     case "merge_queue":
       return ["version: 1", ...roster, "merge_queue:", `  ${field}: ${yaml}`].join("\n") + "\n";
+    case "driver":
+      return ["version: 1", ...roster, "driver:", `  ${field}: ${yaml}`].join("\n") + "\n";
     case "resource":
       return (
         ["version: 1", ...roster, "resources:", "  ci:", `    ${field}: ${yaml}`].join("\n") + "\n"
@@ -265,6 +267,8 @@ function readBack(w: Workflow, section: string, field: string): { value: unknown
       return at(w.intake?.labels as unknown as Record<string, unknown>);
     case "merge_queue":
       return at(w.merge_queue as unknown as Record<string, unknown>);
+    case "driver":
+      return at(w.driver as unknown as Record<string, unknown>);
     case "resource":
       return at(w.resources?.ci as unknown as Record<string, unknown>);
     case "board":
@@ -382,6 +386,19 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "merge_queue.enabled",
   "merge_queue.max_batch",
   "merge_queue.checks_timeout_minutes",
+  // #1778. The pane READS, EMITS and VALIDATES `driver:` - the round-trip and
+  // bounds tests above and `workflowmodel.test.ts` check that - and it has a
+  // read-only inspector summary, but no form control, and deliberately not:
+  // `FIELDS_WITH_AN_EDITOR` is empty and slice C's descriptor registry is what
+  // retires the hand-built forms, so a fourth one is the last thing this
+  // section needs.
+  "driver.enabled",
+  "driver.max_review_rounds",
+  "driver.max_ci_attempts",
+  "driver.max_rebase_attempts",
+  "driver.lane_timeout_minutes",
+  "driver.fix_timeout_minutes",
+  "driver.drive_timeout_minutes",
   "resource.slots",
   "resource.max_hold_minutes",
   // #1175. The pane PARSES, PRESERVES and RE-EMITS `board:` (that is what the two

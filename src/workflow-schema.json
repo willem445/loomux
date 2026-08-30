@@ -128,6 +128,12 @@
           "help": "Policy for the bisecting merge queue on orchestrator-owned integration branches. Absent = off, and behavior is byte-for-byte unchanged."
         },
         {
+          "name": "driver",
+          "type": "section",
+          "section": "driver",
+          "help": "Policy for the engine-driven review-loop driver (#1778). Absent = off, and behavior is byte-for-byte unchanged. The counters clamp toward the orchestrator template's INVARIANT 9, never away from it."
+        },
+        {
           "name": "resources",
           "type": "section-map",
           "section": "resource",
@@ -386,6 +392,72 @@
           "max": 240,
           "on_out_of_range": "clamp",
           "help": "Backstop on waiting for a batch's checks, so a repo with no checks attached surfaces as unverifiable instead of pending in silence. Clamped into range rather than refused."
+        }
+      ]
+    },
+    "driver": {
+      "title": "Review driver",
+      "help": "Policy for the engine-driven review-loop driver (#1778 §5.3). Policy, not mechanism: nothing here names a PR or starts a drive — no drive exists until an orchestrator makes its own role-gated drive_review call naming one PR. The counters are INVARIANT 9's numbers, and a repo may run a tighter loop than they promise but never a looser one.",
+      "fields": [
+        {
+          "name": "enabled",
+          "type": "bool",
+          "default": false,
+          "help": "Off by default. Off means every drive path is unreachable, not merely unused."
+        },
+        {
+          "name": "max_review_rounds",
+          "type": "number",
+          "default": 3,
+          "min": 1,
+          "max": 3,
+          "on_out_of_range": "refuse",
+          "help": "Review-finding rounds one drive may spend. INVARIANT 9 promises the orchestrator three; the driver may run tighter, never looser."
+        },
+        {
+          "name": "max_ci_attempts",
+          "type": "number",
+          "default": 3,
+          "min": 1,
+          "max": 3,
+          "on_out_of_range": "refuse",
+          "help": "CI attempts one drive may spend. Same invariant, same direction."
+        },
+        {
+          "name": "max_rebase_attempts",
+          "type": "number",
+          "default": 1,
+          "min": 0,
+          "max": 1,
+          "on_out_of_range": "refuse",
+          "help": "Rebase attempts one drive may spend. INVARIANT 9 grants one; 0 is legal (a repo may refuse the driver any rebase), 2 is refused."
+        },
+        {
+          "name": "lane_timeout_minutes",
+          "type": "number",
+          "default": 60,
+          "min": 5,
+          "max": 240,
+          "on_out_of_range": "clamp",
+          "help": "Backstop on a reviewer lane producing a verdict, so a stalled lane surfaces as held(lane-stalled) instead of pending in silence. Clamped into range rather than refused, like every notify-TTL wait."
+        },
+        {
+          "name": "fix_timeout_minutes",
+          "type": "number",
+          "default": 60,
+          "min": 5,
+          "max": 240,
+          "on_out_of_range": "clamp",
+          "help": "Backstop on a resumed worker pushing or reporting. Same clamp family."
+        },
+        {
+          "name": "drive_timeout_minutes",
+          "type": "number",
+          "default": 240,
+          "min": 5,
+          "max": 240,
+          "on_out_of_range": "clamp",
+          "help": "Backstop on the drive's whole age — age since the entry began, never an idle clock reset by each state advance. Same clamp family; the default is its ceiling because a drive's whole budget is what this bounds."
         }
       ]
     },
