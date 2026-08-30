@@ -2860,12 +2860,8 @@ const PERMITTED_LONG_HOLDS: &[(&str, &str, &str)] = &[
          and probe that everything else still answers. Exempting it is what stops the \
          enforcement failing the suite on its own fixtures",
     ),
-    (
-        "orchestration/e2ehold.rs",
-        "e2ehold::hold",
-        "the soak lane's injected hold (#1606): 90 s by design, behind #[cfg(debug_assertions)] \
-         plus a single-value opt-in, and the subject of e2ehold_guard.rs's four properties",
-    ),
+    // [scratch j4] the e2ehold row is removed: its construction site is now
+    // unlisted, and default-deny must refuse it.
 ];
 
 /// Every PRODUCTION source root, so a permit taken in the engine crate is as
