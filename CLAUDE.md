@@ -816,7 +816,7 @@ narrow their ask back down to the original ticket on your own judgment.
 - **A claim about how markdown RENDERS is measured or decided from the surface,
   never read off the source.** Put the text through GitHub's own GFM endpoint
   before claiming a PR body, issue comment or `docs/` page renders a certain way
-  — `gh api -X POST markdown -f mode=gfm -f text="$(cat file.md)"`. A blank line
+  — `gh api -X POST markdown -f mode=gfm -F text=@file.md`. A blank line
   silently ends a table, and the row you claimed becomes a paragraph of literal
   pipes (#926).
   The trigger is EDITING a table, list or fence — not claiming anything about it. The
@@ -844,6 +844,14 @@ narrow their ask back down to the original ticket on your own judgment.
   and the PR body counts because the squash makes it permanent. Signature: the fix
   for one instance ships another one surface over (#1703 B2 in the design note, then
   R1 in the body it re-posted); the repo-wide backlog and the scanner are #1716.
+  **Two ways that endpoint lies about its own output.** Pass the file as `-F text=@file.md`:
+  under PowerShell `-f text="$(cat file.md)"` interpolates `Get-Content`'s `Object[]` on `$OFS`,
+  so every newline becomes a space and the whole document renders as ONE `<p>` of literal pipes —
+  the exact failure being checked, manufactured by the instrument (Git Bash is unaffected, so it
+  reproduces for half the fleet only). And count tags by PREFIX (`<code`, `<table`): GFM attributes
+  every tag (`<code class="notranslate">`, `<markdown-accessiblity-table><table role="table">`), so
+  a bare `<code>`/`<table>` count reads 0 on one that rendered perfectly. Signature: a render check
+  reporting one `<p>` and no table, or a zero tag count on a table you can see (#1755).
 - **A claim about the PR body is measured on the POSTED body, never on your
   draft.** Writing it is not posting it: a body rebuilt from sources destroys any
   edit made to the assembled file, so edit the sources, assemble, then re-read the
