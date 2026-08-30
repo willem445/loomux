@@ -3091,7 +3091,7 @@ fn only_argued_sites_may_permit_a_long_hold() {
 /// nothing to do with either row's own defect. Same class of hazard
 /// `HOLD_SERIAL`/`POOL_SERIAL` already guard in this file.
 ///
-/// **Both current readers take it**: L5a (line ~1557) and L8 below. A future
+/// **Both current readers take it**: L5a and L8 below. A future
 /// row that flips `LOCK_ORDER_PANICS`, or that asserts on a panic/no-panic
 /// verdict the checker produces, is a third reader and must take it too.
 static LOCK_ORDER_PANICS_SERIAL: Mutex<()> = Mutex::new(());
