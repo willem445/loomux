@@ -285,9 +285,10 @@ compiles.
   A scan also bounds where a value is **constructed**, never where it travels or how
   long its effect lasts — close that half with the type system (an auto-trait opt-out:
   a `PhantomData<*const ()>` field makes a thread-keyed guard `!Send`), never with a
-  wider scan. Signature: a guard whose effect is keyed on the constructing thread,
-  held by a value the compiler still lets move off it (#1722 N6, `LongHoldPermit`;
-  same idiom as constraint 6's absent `AsRef<Path>`).
+  wider scan. Signature: a guard whose effect is keyed on the constructing thread and
+  held by a value the compiler still lets move off it, or whose exemption outlives the
+  scope the scan read (#1722 N6 and B1, `LongHoldPermit`; same idiom as constraint 6's
+  absent `AsRef<Path>`).
 - **A guard that REFUSES ships only after it has run clean over known-good subjects.**
   Reading a check never finds a false block; running it against real PRs — merged ones,
   and the one in hand — does, and the refusals cluster on the artifacts this repo
