@@ -1364,7 +1364,7 @@ pub fn first_stale_lane(required: &[LaneFact], head: &str, body_digest: Option<&
 /// 5. Then the state's own logic.
 pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
     let state = entry.state();
-    if state.is_terminal() || state.is_parked() {
+    if state.is_terminal() {
         return DriveStep::Wait;
     }
     if facts.pr_open == Some(false) {
