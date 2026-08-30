@@ -32142,17 +32142,12 @@ impl OrchRegistry {
         on_refused: impl FnOnce() -> T,
         f: impl FnOnce() -> T,
     ) -> T {
-        let _scope = budget::MutationScope::enter();
-        match budget::read_budget(budget::COMMAND_READ_BUDGET, f) {
-            Ok(v) => v,
-            Err(busy) => {
-                crate::obs::breadcrumb(
-                    "command-refused",
-                    &format!("command={name} {}", busy.detail()),
-                );
-                on_refused()
-            }
-        }
+        // [scratch] red-before-green for #1702 P5's L8: bypass the P3/#1713
+        // containment frame entirely, keeping the name and doc intact, to
+        // prove L8 actually reddens without it rather than passing vacuously.
+        let _ = name;
+        let _ = &on_refused;
+        f()
     }
 
     /// Gate one cadenced backend tick (#1609, plan §3 Phase 2.1 item 3).
