@@ -643,6 +643,16 @@
 //! reads, so S3's integration is testable without a fake `gh`. The note
 //! specifies the states, the arcs, the counters and the file; it says nothing
 //! about that factoring, and a later change may rework it on its own merits.
+//!
+//! [`rddrive`] (#1778 S3) is that driver's [`mqdriver`] — the `gh` seam, the
+//! observations it turns into [`reviewdrive`] facts, the `rd-*` audit
+//! vocabulary and the kick-back notice text. It is here rather than in
+//! `src-tauri` because none of it needs Tauri and all of it needs testing:
+//! §8's failure rows are almost entirely about telling a seam failure from a
+//! `gh` refusal from a positive answer, which is exactly the kind of thing that
+//! reads correct and is not. What stays in `src-tauri` is the wiring only the
+//! registry can do — the state lock, the spawns, the deliveries, the board
+//! note — the same line the queue draws between [`mqdriver`] and its caller.
 
 pub mod brand;
 pub mod budget;
@@ -666,6 +676,7 @@ pub mod published;
 pub mod queue;
 pub mod queuestate;
 pub mod report;
+pub mod rddrive;
 pub mod reviewdrive;
 pub mod rootreg;
 pub mod selfwatch;
