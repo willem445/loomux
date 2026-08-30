@@ -452,18 +452,57 @@ Whoever adds that opt-out owes this section an edit — either clear
   rather than an accident of the digit test.
 - **Rendered, not the raw byte ring.** A status footer is the most
   cursor-positioned region of a TUI: a repaint may write the count and its label
-  with separate absolute cursor moves, or wrap between them, so in the byte
-  stream they need never be adjacent even though the human plainly sees
-  `2 MCP`. Only a VT replay puts them in neighbouring cells, so the gate
-  composes the screen the same way the question guard's `question_sample` does
-  (#534), with the same replay budget and the same trustworthiness gate. The
-  ANSI-stripped ring survives as a **fallback** for a pane with no geometry —
-  strictly weaker, and used only so a missing grid costs nothing rather than
-  costing the ceiling.
+  with separate absolute cursor moves, so in the byte stream they need never be
+  adjacent even though the human plainly sees `2 MCP`. Only a VT replay puts
+  them in neighbouring cells, so the gate composes the screen with the same
+  replay and the same trustworthiness gate the question guard's
+  `question_sample` uses (#534). The composition lives in `ready_screen`, which
+  is pure and tested on rendered-screen fixtures — the reading production
+  actually performs, not a reconstruction of it.
+- **A wrap is a second problem, and the replay alone does not fix it.** When
+  the footer is wider than the pane the count can end one rendered row and the
+  label begin the next; the composed screen right-trims rows and joins them with
+  a newline, so a row-wise search sees ` MCP` preceded by `\n` and misses a
+  footer the human plainly reads — at that pane width, on *every* kickoff. Since
+  loomux tiles panes, that width is a continuum a human drags through, so the
+  matcher also tests each **adjacent row pair, joined**, which is exactly the
+  string those rows would have been one column wider. Pairs, not longer runs: a
+  four-character label splits twice only under about six columns. The cost is
+  that it only ever ADDS matches — two unrelated rows, one ending in a digit and
+  the next opening ` MCP`, read as a wrap — which is the same residual class as
+  `Loaded 3 MCP` below and is bounded the same way.
 - **ANDed with the base test, never substituted for it.** A marker says the CLI
   has finished coming up; it says nothing about whether it is mid-repaint right
   now. So a seen marker never excuses a pane that is still painting, and the
   only thing a marker can do is **delay** a paste.
+
+The ANSI-stripped ring survives as a **fallback**, on either of two triggers —
+both named, because saying only the first understates when it runs: the pane
+reports **no geometry**, *or* the replay composed too few non-empty rows for
+`trustworthy_composition` to believe it.
+
+**That substitution is a deliberate divergence from `question_sample`, not a
+copy of it.** That guard refuses to substitute at all — "no size, no grid
+evidence" — because its grid evidence *releases* a hold, so a guessed reading
+could drop a delivery onto a live dialog. This reading only un-blocks a paste
+the base painted-and-quiet test has already approved, and refusing to substitute
+would price every geometry-less pane at the ceiling on every kickoff. The trade
+is honest and worth naming: the ring carries scrolled-off history the screen does
+not, so the fallback has a **wider decoy surface** than the grid. It is narrowed
+to `QUESTION_SCAN_TAIL_BYTES` for exactly that reason — the fallback never reads
+more history than the pre-#1591 reading it replaces.
+
+**The resource envelope**, stated because the replay budget was reused from a
+guard that argued its size at a different poll rate. A screen is composed only
+on a tick where the base test already holds, so the first possible composition
+is at `READY_MIN_WAIT` + `READY_QUIET` and the last at `READY_MAX_WAIT`: at a
+250 ms `READY_POLL` that is at most ~89 compositions, each one tail copy of up
+to 64 KiB plus one linear replay and one `size()` read — under 6 MB of copying
+spread over 25 s, per pane. It is bounded rather than open-ended, it is a linear
+scan retaining no history, and it only reaches the worst case on a pane whose
+marker never arrives, i.e. where something is already wrong. It multiplies by
+the number of agents spawning at once, and if `READY_MAX_WAIT` or `READY_POLL`
+move, this is the paragraph to re-derive.
 
 **Nothing is latched.** The marker is re-read on every tick that reaches it. An
 earlier draft carried a positive forward on the reasoning that "this session's
@@ -506,7 +545,8 @@ to close. Two narrowings stand against it, and one residual survives them:
 - **The residual, pinned rather than merely disclosed.** The word rule separates
   a label from a sentence; it cannot separate the *home footer's* label from any
   other label-shaped count on the screen. A string like `Loaded 3 MCP` still
-  satisfies the marker. `the_ready_marker_matches_a_count_not_a_label` asserts
+  satisfies the marker, and so does one split across two adjacent rows by the
+  wrap handling above. `the_ready_marker_matches_a_count_not_a_label` asserts
   that it does, so this paragraph cannot go stale silently: a later narrowing
   that closes the gap reddens that row and this text is corrected in the same
   commit. A sweep of the vendor monorepo at the pinned commit found no
