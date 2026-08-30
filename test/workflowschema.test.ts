@@ -727,6 +727,41 @@ test("refuse-vs-clamp is the difference between an error and a warning in the pa
       field: "checks_timeout_minutes",
       text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nmerge_queue:\n  checks_timeout_minutes: 9999\n",
     },
+    // #1778 §2.3: the driver's counters are REFUSED (an error, like
+    // `max_batch`), its backstops CLAMPED (a warning, like
+    // `checks_timeout_minutes`) — one case per field, read against the
+    // manifest's own on_out_of_range, so a field whose pane severity drifts
+    // from its engine posture reddens by name.
+    {
+      section: "driver",
+      field: "max_review_rounds",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_review_rounds: 9\n",
+    },
+    {
+      section: "driver",
+      field: "max_ci_attempts",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_ci_attempts: 9\n",
+    },
+    {
+      section: "driver",
+      field: "max_rebase_attempts",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_rebase_attempts: 2\n",
+    },
+    {
+      section: "driver",
+      field: "lane_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  lane_timeout_minutes: 9999\n",
+    },
+    {
+      section: "driver",
+      field: "fix_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  fix_timeout_minutes: 9999\n",
+    },
+    {
+      section: "driver",
+      field: "drive_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  drive_timeout_minutes: 9999\n",
+    },
     {
       section: "resource",
       field: "slots",
