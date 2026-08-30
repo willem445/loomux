@@ -520,8 +520,9 @@ republishes it permanently (#1271).
 "No new constants", "no new timing constant", "nothing else was touched", "no
 test reads this file", "that was the last uncontained write" — a negative claim
 about your own diff is the cheapest kind to check and the easiest to carry from
-the moment it was true. Each is one grep over the diff, and a non-zero result is
-its own positive control, so the whole check is a line:
+the moment it was true. Each is one mechanical grep — over the diff for a
+diff-shaped claim, over the tree for a claim about readers or callers — and a
+non-zero result is its own positive control, so the whole check is a line:
 
 ```
 git diff <base>...<head> -- <path> | grep -cE '^\+const '
@@ -534,8 +535,8 @@ tests that way before the instrument was corrected).
 Re-run it at the FINAL head, because what falsifies one of these is almost always
 **your own fix for an earlier finding** — and an absence claim an earlier review
 round already VERIFIED is the one nobody re-checks. Signature: a body claim ticked
-off by two or more rounds, contradicted at a later head by a one-line grep over
-the PR's own diff (#1758 — "no new constants" verified in three rounds, then
+off by two or more rounds, contradicted at a later head by the one-line grep
+its shape calls for (#1758 — "no new constants" verified in three rounds, then
 falsified by the round-3 fix that added `READY_GRID_REPLAY_BYTES`; #1751 B2, #505
 B1, #976, each blocking).
 
