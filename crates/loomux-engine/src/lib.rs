@@ -624,6 +624,25 @@
 //! it was doing when it stopped. `src-tauri` owns only the two wires nothing
 //! Tauri-free can own: the `spawn_blocking` hand-offs the depth counter wraps,
 //! and the `liveness_stamp` command the webview stamps through.
+//!
+//! [`reviewdrive`] (#1778 S1) is the third, and its design note put it here
+//! rather than leaving the choice to the slice: `doc/design/review-driver.md`
+//! §1 places the review-loop driver in a Tauri-free
+//! `crates/loomux-engine/src/reviewdrive.rs` "beside `mergeq.rs`, which is the
+//! precedent for a loop the backend runs without spending an orchestrator
+//! turn". The parallel with the queue is the whole argument: this module is the
+//! driver's [`mergeq`], not its [`mqloop`] — the closed state enum, the
+//! enumerated transition table, the persisted `review_drives.json` shape, and
+//! one pure decision over facts a caller injects. Everything with a `gh` call,
+//! a spawn, a notice or an audit line in it stays in `src-tauri` with the rest
+//! of the registry, exactly as the queue's does.
+//!
+//! One seam in it is **not** the note's, and is labelled so in the module
+//! header rather than left to look like a contract: [`reviewdrive::decide`] and
+//! its fact types are how S1 factored the tick's decision away from the tick's
+//! reads, so S3's integration is testable without a fake `gh`. The note
+//! specifies the states, the arcs, the counters and the file; it says nothing
+//! about that factoring, and a later change may rework it on its own merits.
 
 pub mod brand;
 pub mod budget;
@@ -647,6 +666,7 @@ pub mod published;
 pub mod queue;
 pub mod queuestate;
 pub mod report;
+pub mod reviewdrive;
 pub mod rootreg;
 pub mod selfwatch;
 pub mod sessions;

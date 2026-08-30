@@ -631,10 +631,12 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "worker_session": "<full uuid, as resolved>",
       "on_behalf_of": "<orchestrator agent id>",
       "lanes": [ { "block": "rev-std", "session": "<uuid>",
-                   "last_verdict": "pass", "at_head": "<sha>" } ],
+                   "last_verdict": "pass", "at_head": "<sha>",
+                   "briefed_head": "<sha>", "spawned_ms": 0 } ],
       "lane_index": 0,
       "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
-      "started_ms": 0 }
+      "started_ms": 0,
+      "fix_handback_ms": 0 }
   ]
 }
 ```
@@ -645,6 +647,42 @@ where the entry holds `enqueued_ms` and `mqloop::status_view` computes
 `since_ms`. A stored *age* would be wrong in the way that matters here: it is
 the anchor §2.2's `drive-stalled` bound is measured from, and an age is stale
 the instant it is written and meaningless across a restart.
+
+**The other two bounds need anchors too, and this shape did not carry them
+until S1 built against it.** §2.2 bounds three waits; only `drive-stalled` had
+somewhere to measure from. `lane-stalled` is "no verdict inside
+`lane_timeout_minutes`" and `fix-stalled` is "neither pushed nor reported
+inside `fix_timeout_minutes`", and a bound with no *persisted* anchor is not a
+bound — §2.4 resumes a drive from disk after a restart, so an in-memory clock
+cannot carry either one. Three fields, each answering exactly one question:
+
+- **`spawned_ms`** (per lane) — when that lane's delegate was last spawned or
+  resumed. The `lane-stalled` anchor. A re-brief *replaces* the lane's record
+  rather than appending one, so the clock re-arms instead of continuing to
+  measure from the first spawn.
+- **`briefed_head`** (per lane) — the head that lane was last *briefed* at.
+  **This is not `at_head`, and the two may never be folded into one field.**
+  `at_head` is the head the last *verdict* binds to; `briefed_head` is the head
+  the lane was last *asked about*. A freshly spawned lane has the second and
+  not the first, and that gap is exactly the call §2.1's `review-wait` row
+  makes every tick: a lane already open at the live head is one to wait for, a
+  lane whose brief predates the live head is one to re-brief. One field
+  answering both makes "has it been asked" and "has it answered"
+  indistinguishable, and the driver then either re-briefs on every tick or
+  waits forever on a lane it never briefed.
+- **`fix_handback_ms`** (per entry) — when the drive last entered `fix-wait`.
+  The `fix-stalled` anchor. **Named for the one thing it anchors, not for the
+  state change that writes it**, and that is the point rather than a
+  preference: a general "when did the state last change" stamp is precisely the
+  idle clock the paragraph above forbids, and leaving one in the shape would
+  put that clock one field access away from every later timeout. It is written
+  on entry to `fix-wait` and nowhere else.
+
+All three are optional on read, so a file written against the shape as first
+published still parses. `counters` is **not** optional: an absent counter block
+is refused rather than defaulted to zeros, because zeros silently grant a full
+fresh budget — the same outcome the retention rule below refuses when it
+declines to prune a parked entry.
 
 Versioned, **atomically written**, and unknown fields **tolerated and
 preserved** — carried across a read/write cycle rather than merely not failing
