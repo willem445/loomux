@@ -787,6 +787,30 @@ ORDER of a nesting; §6's rule is that a registry lock should not span such a
 call at all. Review is still the enforcement for that, as §5's last bullet says
 of source scans, for the same reason.
 
+### A shipped-build witness for the reentrant refusal (#1702 P5)
+
+#1713 gave every synchronous mutating command a `read_budget` frame
+(`OrchRegistry::mutating_command`) so a re-entrant `lock_safe()` — this
+section's own defect, one lock-order rank away from what actually shipped —
+degrades to the command's own refused value instead of unwinding into the
+WebView2 COM frame that aborts the process. `tests/synccommands.rs`'s
+`the_command_boundary_wrappers_really_install_a_frame` proves the frame and
+its `MutationScope` are really installed; nothing combined that with an
+ACTUAL re-entrant acquisition, with `LOCK_ORDER_PANICS` off — release
+semantics, since the constant defaults to `cfg!(debug_assertions)` — to check
+the whole path end to end rather than the plumbing alone.
+
+`tests/liveness.rs`'s L8 is that witness: a real `lock_safe()` re-entered from
+inside `mutating_command`'s body, with the panic disarmed, answers
+`COMMAND_REFUSED` rather than aborting the process or leaving a lock wedged,
+and a bare (unframed) control confirms it is the FRAME buying that rather
+than the disarmed flag alone — without the frame, the same re-entrant mistake
+still panics regardless of `LOCK_ORDER_PANICS`. This closes the "no
+shipped-build containment witness" gap for the reentrant-refusal mechanism.
+It does **not** touch the E2E soak lane: seeding it against a session-sized
+registry with `HOLD_PANICS` armed via `e2ehold`, and the plan's own P5 row
+(`e2e_seed_session`, a solo-adopted pane, a crumb assertion) remain open.
+
 ## 7. Holds are bounded in a test build
 
 §2 bounds what a **waiter** pays; §6 states the rule a **holder** has to obey.
