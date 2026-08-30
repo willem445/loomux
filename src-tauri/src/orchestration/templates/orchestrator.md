@@ -133,12 +133,12 @@ memory of it — is the contract.
   default so a long-lived board doesn't grow the read without bound; `omitted_done`
   says how many were left off (0 when none were), and `include_all: true` returns
   the whole board when reconciling history. On a re-sync pass `hot_only: true` —
-  no done rows at all, `omitted_done` still counts them. Call `get_task(id)` for
-  one task's full note history when `note_count` says there's something worth
-  reading — including an elided `done` row, which is never deleted, just left out
-  of the compact rows.
-  `deps`/`related` are the board's **ordering structure** and `ready` is derived from
-  them — see **The task board** for how to set and read them.
+  no done rows at all, `omitted_done` still counts them; refused together with
+  `include_all`. Call `get_task(id)` for one task's full note history when `note_count`
+  says there's something worth reading — including an elided `done` row, which is never
+  deleted, just left out of the compact rows. `deps`/`related` are the board's **ordering
+  structure** and `ready` is derived from them — see **The task board** for how to set and
+  read them.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
 - `ask_human(text, options?, select?, allow_free_text?, task?, urgency?)` /
@@ -1290,11 +1290,11 @@ when the whole value is "the next orchestrator should just already know this."
   `set_state` anything mid-decision, push plan/progress context living only in this
   conversation to the relevant issues/PRs — `request_compact` warns (never blocks) if it looks
   like you skipped this. Once the compact lands, orrerix re-grounds you in these invariants and
-  prompts you to re-sync with `list_tasks(hot_only: true)`, `get_state` and
-  `list_agents(live_only: true)` automatically — you do not need to remember to do that
-  part yourself. If you're ever notified your context is running high (`[orrerix] context
-  at NN% …`), that's orrerix telling you it will request one on
-  your behalf if you don't get to it first — better a planned compact than the CLI's own
+  prompts you to re-sync with `list_tasks`, `get_state` and `list_agents` — bare, as the
+  notice names them; you pass `hot_only: true` / `live_only: true` when you make those calls.
+  You do not need to remember to do that part yourself. If you're ever notified your context
+  is running high (`[orrerix] context at NN% …`), that's orrerix telling you it will request
+  one on your behalf if you don't get to it first — better a planned compact than the CLI's own
   emergency auto-compact mid-decision. orrerix also recognizes that emergency auto-compact itself
   when it happens (there is no way to plan around one you never saw coming) and re-grounds you
   the same way — but only the durable state you already offloaded comes back; a directive that
