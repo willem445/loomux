@@ -28521,14 +28521,23 @@ impl OrchRegistry {
     }
 
     /// The MCP `list_tasks` tool's actual read path (#865): full board when
-    /// `include_all`, else `done` rows capped at `LIST_TASKS_DONE_CAP` —
+    /// `include_all`, every non-`done` row when `hot_only` (#1684 — the
+    /// per-wake re-sync wants no done rows at all, cap or not, with the
+    /// dropped count still reported so a hot board is never mistaken for the
+    /// whole one), else `done` rows capped at `LIST_TASKS_DONE_CAP` —
     /// newest by `updated_ms` — with the omitted count returned alongside so
     /// the caller can say so rather than silently truncating. See
-    /// `filter_done_rows` for the keep/drop rule.
-    pub fn task_summaries_for_list_tasks(&self, group: &GroupId, include_all: bool) -> (Vec<TaskSummary>, usize) {
+    /// `filter_done_rows` for the keep/drop rule. The include_all/hot_only
+    /// contradiction is refused one layer up, at the dispatch that parses the
+    /// flags; this method trusts its caller the way the old two-arg shape did.
+    pub fn task_summaries_for_list_tasks(&self, group: &GroupId, include_all: bool, hot_only: bool) -> (Vec<TaskSummary>, usize) {
         let rows = self.task_summaries(group);
         if include_all {
             (rows, 0)
+        } else if hot_only {
+            let omitted = rows.iter().filter(|r| r.status == "done").count();
+            let kept = rows.into_iter().filter(|r| r.status != "done").collect();
+            (kept, omitted)
         } else {
             filter_done_rows(rows, LIST_TASKS_DONE_CAP)
         }
