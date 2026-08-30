@@ -93,8 +93,8 @@ pub(crate) use loomux_engine::text::tail_snippet;
 // flat form — a method's visibility is the defining crate's to set, and no
 // re-export narrows it.
 pub use loomux_engine::model::{
-    self, cli_can_host, cli_caps, CliCaps, Containment, Role, CLI_CAPS, CONTEXT_VARIANTS,
-    EFFORT_LEVELS, SUPPORTED_CLIS,
+    self, cli_can_host, cli_caps, CliCaps, Containment, ReadyMarker, Role, CLI_CAPS,
+    CONTEXT_VARIANTS, EFFORT_LEVELS, SUPPORTED_CLIS,
 };
 pub(crate) use loomux_engine::model::{default_model, sanitize_model_opt};
 
@@ -16700,6 +16700,36 @@ pub fn cli_ready(output_total: usize, quiet_for: Duration, elapsed: Duration) ->
     elapsed >= READY_MIN_WAIT && output_total >= READY_MIN_OUTPUT && quiet_for >= READY_QUIET
 }
 
+/// The full readiness test (#1591): [`cli_ready`]'s painted-and-quiet base
+/// AND, for a CLI whose [`CliCaps::ready_marker`] row declares one, having
+/// SEEN that marker in the pane's output.
+///
+/// **The base test is unchanged and still required.** A marker is an
+/// additional obligation, never a substitute: it says the CLI has finished
+/// coming up, and says nothing about whether it is mid-repaint at this
+/// instant. Anding them means a marker can only ever DELAY a paste, which is
+/// what makes this safe to add to a path whose failure mode is a lost brief —
+/// the worst a marker can do is spend the caller's `READY_MAX_WAIT` ceiling,
+/// after which the caller pastes anyway exactly as it does today.
+///
+/// `marker_seen` is LATCHED by the caller rather than re-read here, and that
+/// is the honest reading of the signal: "this CLI's servers have connected" is
+/// a one-way fact about the session, not a property of the current screen. A
+/// footer that scrolls out of the read window a moment later has not
+/// un-connected anything.
+///
+/// Pure, so the composition is assertable without a pty (`cli_ready`'s own
+/// reason).
+pub fn cli_ready_with_marker(
+    output_total: usize,
+    quiet_for: Duration,
+    elapsed: Duration,
+    marker: Option<ReadyMarker>,
+    marker_seen: bool,
+) -> bool {
+    cli_ready(output_total, quiet_for, elapsed) && (marker.is_none() || marker_seen)
+}
+
 /// How the fresh-boot readiness wait ended (#517).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadyWait {
@@ -16737,13 +16767,36 @@ pub enum ReadyWait {
 ///
 /// `poll_tick` performs one `READY_POLL` wait; `elapsed` reports time since
 /// the wait began (both real in production, synthetic in tests).
+///
+/// **`marker`** is the target CLI's [`CliCaps::ready_marker`] (#1591) — an
+/// extra obligation on top of the base test for a CLI that paints its UI
+/// before it can read. `None` (every CLI but opencode) makes this loop behave
+/// exactly as it did before that issue, byte for byte. `sample_tail` supplies
+/// the ANSI-**stripped** pane tail the marker is looked for in, and is called
+/// ONLY while a marker is outstanding and the base test would otherwise have
+/// returned `Ready` — so a `None` row never reads a tail at all, and a marked
+/// one pays for a read only across the window between "painted and quiet" and
+/// "actually up", which is precisely the window this exists to cover.
+///
+/// The marker is LATCHED once seen ([`cli_ready_with_marker`]'s doc for why
+/// that is the honest reading, not merely the cheap one).
+///
+/// `READY_MAX_WAIT` is untouched as the ceiling, and that is the whole safety
+/// argument: a CLI that renames its footer, or one whose marker never reaches
+/// the read window, waits out the ceiling and is pasted into blind — the
+/// pre-#1591 behaviour for an unrecognised boot, audited as `TimedOut` rather
+/// than `Ready`. The gate fails toward a slow delivery, never toward a lost
+/// one.
 pub fn await_cli_ready(
+    marker: Option<ReadyMarker>,
     mut sample_total: impl FnMut() -> Option<u64>,
+    mut sample_tail: impl FnMut() -> Option<String>,
     mut poll_tick: impl FnMut(),
     mut elapsed: impl FnMut() -> Duration,
 ) -> ReadyWait {
     let mut last_total = 0u64;
     let mut last_change = Duration::ZERO;
+    let mut marker_seen = marker.is_none();
     loop {
         poll_tick();
         let Some(total) = sample_total() else { return ReadyWait::PaneClosed };
@@ -16752,7 +16805,18 @@ pub fn await_cli_ready(
             last_total = total;
             last_change = now;
         }
-        if cli_ready(last_total as usize, now.saturating_sub(last_change), now) {
+        let quiet_for = now.saturating_sub(last_change);
+        // Look for the marker only when the base test is otherwise satisfied.
+        // Not an optimisation dressed as a rule: a marker cannot rescue a pane
+        // that is still painting (the `&&` below would reject it anyway), so
+        // reading earlier would buy nothing and would charge every ordinary
+        // delivery for a tail copy it has never needed.
+        if !marker_seen && cli_ready(last_total as usize, quiet_for, now) {
+            if let Some(m) = marker {
+                marker_seen = sample_tail().is_some_and(|tail| m.matches(&tail));
+            }
+        }
+        if cli_ready_with_marker(last_total as usize, quiet_for, now, marker, marker_seen) {
             return ReadyWait::Ready;
         }
         if now >= READY_MAX_WAIT {
@@ -20540,8 +20604,24 @@ fn deliver_now(
         // #517: the sampler is the pane's MONOTONIC output counter, never
         // the ring's current length — see `await_cli_ready`'s doc for why
         // that distinction is the lost-kickoff mechanism.
+        // #1591: the per-CLI ready MARKER, read out of the capability table
+        // rather than branched on here — `None` for every CLI but opencode,
+        // which leaves this call exactly what it was. An unknown CLI has no
+        // row and therefore no marker, which is the same answer.
+        let ready_marker = cli_caps(&cli).and_then(|c| c.ready_marker);
         match await_cli_ready(
+            ready_marker,
             || ptys.output_total(pty_id),
+            // ANSI-stripped, because the marker's digit and label are
+            // adjacent only after the strip (see `ReadyMarker::matches`).
+            // Sized at `QUESTION_SCAN_TAIL_BYTES` — the same "how much of the
+            // bottom of the screen matters" budget every other tail read in
+            // this file starts from, reused rather than minted (constraint 8's
+            // no-new-constants half).
+            || {
+                ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES)
+                    .map(|raw| strip_ansi(&raw))
+            },
             || std::thread::sleep(READY_POLL),
             || start.elapsed(),
         ) {

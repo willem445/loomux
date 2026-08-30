@@ -335,6 +335,69 @@ impl Containment {
 /// list by `supported_clis_match_the_capability_table`.
 pub const SUPPORTED_CLIS: [&str; 4] = ["claude", "copilot", "gemini", "opencode"];
 
+/// A per-CLI **ready marker** (#1591) — a shape the CLI's own output takes
+/// once it is genuinely able to accept typed input, for a CLI whose painted
+/// UI arrives well before that point.
+///
+/// This exists because the generic boot gate ([`CliCaps::ready_marker`]'s own
+/// doc for the mechanism) is *painted and quiet*, and that pair is a proxy:
+/// it asks whether the CLI has stopped writing, not whether it has started
+/// reading. A TUI that draws its whole chrome, goes quiet, and only then
+/// finishes connecting its MCP servers and its provider auth defeats the
+/// proxy without doing anything wrong.
+///
+/// **Data, not a special case** (CLAUDE.md constraint 8), the same argument
+/// [`CliCaps`] itself makes: "this vendor's TUI says it is up by printing X"
+/// is a fact about the vendor, written down once in its row and consulted —
+/// never an `if cli == "..."` at the gate.
+///
+/// One variant today, and it is a SHAPE rather than a literal on purpose: the
+/// count in opencode's footer is the number of MCP servers that have
+/// connected so far, so it moves while the handshake completes and can lag
+/// what loomux configured. Matching the shape means the marker fires on the
+/// first connected server rather than waiting for a number loomux would have
+/// to keep in step with the CLI's own bookkeeping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyMarker {
+    /// An ASCII digit immediately followed by this literal — a COUNT of
+    /// something the CLI reports only once that thing is up.
+    CountThen(&'static str),
+}
+
+impl ReadyMarker {
+    /// Does `tail` (ANSI-**stripped** pane output — see the caller) show this
+    /// marker?
+    ///
+    /// Stripped, not raw: a TUI colours the count, so the digit and the label
+    /// are separated by an SGR sequence on the wire and are adjacent only
+    /// after the strip. Feeding this raw bytes is the one way to make it
+    /// answer `false` on a pane that is plainly showing the marker.
+    ///
+    /// Every occurrence of the literal is examined, not just the first: the
+    /// footer this was written for carries other text on the same row, and a
+    /// row that happens to contain the label twice must not be decided by
+    /// whichever copy came first.
+    pub fn matches(self, tail: &str) -> bool {
+        let Self::CountThen(lit) = self;
+        if lit.is_empty() {
+            return false; // an empty literal matches everywhere, which is not a marker
+        }
+        let bytes = tail.as_bytes();
+        let mut from = 0usize;
+        while let Some(off) = tail[from..].find(lit) {
+            let at = from + off;
+            if at > 0 && bytes[at - 1].is_ascii_digit() {
+                return true;
+            }
+            // Resume past this occurrence. `at + lit.len()` is always a char
+            // boundary (it is the end of a matched substring), where `at + 1`
+            // would not be for a non-ASCII literal.
+            from = at + lit.len();
+        }
+        false
+    }
+}
+
 /// What loomux can actually make one agent CLI do — **the per-CLI capability
 /// record** (#267 stage 2).
 ///
@@ -407,6 +470,27 @@ pub struct CliCaps {
     /// How this CLI's context window is (or is not) reachable. Always
     /// non-empty.
     pub context_note: &'static str,
+    /// A shape this CLI's output takes once it can actually accept typed
+    /// input, required IN ADDITION to the generic painted-and-quiet boot gate
+    /// before loomux pastes a kickoff into a freshly spawned pane (#1591).
+    /// `None` — every row but opencode's — leaves that pane's gate exactly
+    /// what it was.
+    ///
+    /// **Why a marker at all.** The generic gate waits for the pane to have
+    /// painted (`READY_MIN_OUTPUT`) and then gone quiet (`READY_QUIET`),
+    /// which is a proxy for "the CLI has attached its stdin reader". The
+    /// proxy holds for a CLI that paints once it is up, and fails for one
+    /// that paints its whole UI first and finishes coming up afterwards —
+    /// the paste then lands in a startup buffer, and the human sees an idle
+    /// agent with an empty box.
+    ///
+    /// **The bound, and which way it fails.** A marker only ever WITHHOLDS a
+    /// paste, and only until `READY_MAX_WAIT`; the ceiling is untouched, so a
+    /// CLI that changes its footer costs the ceiling's wait and is then pasted
+    /// into exactly as it is today (audited as `TimedOut`, never silently).
+    /// It cannot lose a delivery, and it cannot make one wait longer than the
+    /// pre-#1591 worst case.
+    pub ready_marker: Option<ReadyMarker>,
 }
 
 /// The closed vocabulary of a block's `effort:` (#687) — the thinking level.
@@ -500,6 +584,9 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "--effort <level> is a session-scoped flag; a model that lacks a level falls back to the highest one it supports at or below it",
         context_variants: CONTEXT_VARIANTS,
         context_note: "the [1m] model-alias suffix (sonnet[1m]) — access is plan- and credit-gated, so a tier the account cannot serve fails at the CLI, visibly in the pane",
+        // Claude Code's box is live from its first paint; the generic
+        // painted-and-quiet gate has never mis-scored it (#1591).
+        ready_marker: None,
     },
     CliCaps {
         cli: "copilot",
@@ -511,6 +598,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "copilot reads effortLevel from ~/.copilot/settings.json — its programmatic reference documents no flag and no environment variable, and loomux never writes a user's global settings file",
         context_variants: &[],
         context_note: "copilot's context window is an interactive-only control (/context) with no argv or settings equivalent",
+        // Copilot's own delivery quirk is focus-gated KEYS, not a late input
+        // loop — closed by the focus-in prefix on the submit bytes (#98), not
+        // by waiting longer (#1591).
+        ready_marker: None,
     },
     CliCaps {
         cli: "gemini",
@@ -522,6 +613,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "gemini's thinking level is a settings-file key (modelConfigs.aliases.<alias>.thinkingConfig) — the generated-settings seam exists, but the schema is unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "gemini's context window is model-determined; its compression knobs (model.compressionThreshold) are compaction, not window size",
+        // No mis-scored delivery observed on gemini, and no marker was
+        // adopted speculatively: a row gets one when a pane on it is caught
+        // painted-but-not-listening (#1591).
+        ready_marker: None,
     },
     CliCaps {
         cli: "opencode",
@@ -538,6 +633,18 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "opencode's reasoning effort is a model VARIANT: a session flag on `opencode run` (--variant) but absent from the TUI loomux spawns, and settable per-agent in loomux's generated config (agent.<name>.variant, observed values minimal|high|max) — the seam exists, but the per-model vocabulary is provider-specific and unverified against a live run, so loomux does not write it yet",
         context_variants: &[],
         context_note: "opencode's context window is model-determined; no session-scoped variant switch is documented or present in the TUI's options",
+        // #1591, observed on five deliveries in one session: opencode's TUI
+        // paints its banner and input box (far past `READY_MIN_OUTPUT`) and
+        // goes quiet while the MCP handshake and provider auth are still in
+        // flight, so the generic gate calls it ready before it is reading.
+        // Its status footer grows an MCP indicator once servers have
+        // connected — `⊙ 2 MCP /status    1.18.25` as observed — and that
+        // count is the marker. Matched as a SHAPE (a digit, then " MCP")
+        // rather than against a number loomux could compute from its own
+        // config: the footer reports servers connected SO FAR, so a count
+        // test would either fire early anyway or wait on a number the CLI
+        // may never reach.
+        ready_marker: Some(ReadyMarker::CountThen(" MCP")),
     },
     CliCaps {
         cli: "codex",
@@ -549,6 +656,8 @@ pub const CLI_CAPS: &[CliCaps] = &[
         effort_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
         context_variants: &[],
         context_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
+        // codex is never spawned, so nothing ever waits on its boot.
+        ready_marker: None,
     },
 ];
 
