@@ -16797,11 +16797,10 @@ const READY_GRID_REPLAY_BYTES: usize = QUESTION_GRID_REPLAY_BYTES;
 /// [`QUESTION_SCAN_TAIL_BYTES`], so the fallback never reads MORE history than
 /// the pre-#1591 reading it replaces.
 pub fn ready_screen(raw: &[u8], size: Option<(u16, u16)>) -> String {
-    size.and_then(|(cols, rows)| trustworthy_composition(termgrid::render_visible(raw, cols, rows)))
-        .unwrap_or_else(|| {
-            let from = raw.len().saturating_sub(QUESTION_SCAN_TAIL_BYTES);
-            strip_ansi(&raw[from..])
-        })
+    // #1591 RED EVIDENCE ONLY (D1) — grid preference removed. Never merged.
+    let _ = size;
+    let from = raw.len().saturating_sub(QUESTION_SCAN_TAIL_BYTES);
+    strip_ansi(&raw[from..])
 }
 
 /// How the fresh-boot readiness wait ended (#517).
@@ -16874,6 +16873,7 @@ pub fn await_cli_ready(
 ) -> ReadyWait {
     let mut last_total = 0u64;
     let mut last_change = Duration::ZERO;
+    let mut cached: Option<bool> = None;
     loop {
         poll_tick();
         let Some(total) = sample_total() else { return ReadyWait::PaneClosed };
@@ -16890,9 +16890,16 @@ pub fn await_cli_ready(
         // reading earlier would buy nothing and would charge every ordinary
         // delivery for a VT replay it has never needed. The short-circuit is
         // also what keeps the read FRESH rather than latched — see the doc.
+        // #1591 RED EVIDENCE ONLY (D6) — the answer is cached after the
+        // first read. Never merged.
         let marker_seen = match marker {
             None => true,
-            Some(m) => base && sample_screen().is_some_and(|screen| m.matches(&screen)),
+            Some(m) => {
+                if base && cached.is_none() {
+                    cached = Some(sample_screen().is_some_and(|screen| m.matches(&screen)));
+                }
+                cached.unwrap_or(false)
+            }
         };
         if cli_ready_with_marker(last_total as usize, quiet_for, now, marker, marker_seen) {
             return ReadyWait::Ready;
