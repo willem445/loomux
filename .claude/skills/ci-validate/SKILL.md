@@ -515,6 +515,30 @@ Signature that you needed this: the body's *What changed* quotes the exact
 phrasing a later commit on the same branch removed, and the squash then
 republishes it permanently (#1271).
 
+### A body's ABSENCE claim is measured off the diff, not remembered
+
+"No new constants", "no new timing constant", "nothing else was touched", "no
+test reads this file", "that was the last uncontained write" — a negative claim
+about your own diff is the cheapest kind to check and the easiest to carry from
+the moment it was true. Each is one grep over the diff, and a non-zero result is
+its own positive control, so the whole check is a line:
+
+```
+git diff <base>...<head> -- <path> | grep -cE '^\+const '
+```
+
+Three dots, not two: a two-dot diff carries the base's own commits, so it
+answers about somebody else's work (#1758's test census surfaced a sibling PR's
+tests that way before the instrument was corrected).
+
+Re-run it at the FINAL head, because what falsifies one of these is almost always
+**your own fix for an earlier finding** — and an absence claim an earlier review
+round already VERIFIED is the one nobody re-checks. Signature: a body claim ticked
+off by two or more rounds, contradicted at a later head by a one-line grep over
+the PR's own diff (#1758 — "no new constants" verified in three rounds, then
+falsified by the round-3 fix that added `READY_GRID_REPLAY_BYTES`; #1751 B2, #505
+B1, #976, each blocking).
+
 ### A claim-purge sweep is wrap-insensitive, or it is blind — and its receipt is NON-ZERO
 
 CLAUDE.md's *correcting a false claim is a multi-surface edit* sends you to grep the
@@ -802,6 +826,20 @@ reddening many tests attributes to none of them — narrow it to a single red wh
 red already has (#1361 round 11, #1358). Signature: a wave table with an empty "test
 reddened" cell, or a row whose count is the mutation's blast radius rather than the
 property's — the reconcile rule above catches the arithmetic, not the attribution.
+
+**Read the table by TEST as well as by round — a NEW test in no round's failing
+set is a finding too.** The rule above diagnoses a round that reddened nothing; its
+dual is a test nothing reddened, and the wave's own logs already settle it: census
+the `#[test]` names the diff ADDS (`git diff <base>...<head> -- <tests> | grep -A1
+'^\+#\[test\]'`) and subtract the union of every round's failing set. A remainder is
+never discharged by argument. Either it guards a path no mutation reaches — then say
+which, and label it what it is, which is what #868 did in keeping two such tests as
+contract guards on two early-return paths — or a sibling SUBSUMES it and it goes,
+which is checked by fixture identity and by which branches each test asserts, never
+by prose. Signature: a new test absent from the union of every round's reds whose
+fixture is byte-identical to a sibling's (#1758 — four review rounds, two of them
+blocking, on one test whose two assertions were exactly the two branches a sibling
+already asserted through the production entry point).
 
 **A decision the wave cannot DRIVE never becomes a row — and the table still reconciles.**
 Every rule above diagnoses a round you *cut*; none of them catches the round you could not cut.
