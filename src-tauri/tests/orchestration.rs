@@ -29210,19 +29210,29 @@ fn ready_screen_prefers_the_grid_and_falls_back_only_when_it_must() {
 #[test]
 fn a_footer_that_wraps_between_the_count_and_its_label_still_matches() {
     let m = ReadyMarker::CountThen(" MCP");
-    // One footer, two widths. Wide enough and it sits on one row; narrow and
-    // the same bytes wrap between `2` and ` MCP`.
-    let footer = concat!("\u{1b}[2J\u{1b}[H", "opencode\r\n", "xx 2 MCP /status\r\n").as_bytes();
+    // One footer, two widths. Wide enough and it sits on one row; at exactly
+    // ten columns the same bytes break between the count and its label, which
+    // is the case this test exists for. The prefix is sized so the break lands
+    // there — a width picked without checking splits the LABEL instead, and the
+    // two sanity assertions below are what caught exactly that.
+    let footer =
+        concat!("\u{1b}[2J\u{1b}[H", "boot\r\n", "opencode 2 MCP /status\r\n").as_bytes();
 
-    let wide = ready_screen(footer, Some((40, 4)));
+    let wide = ready_screen(footer, Some((40, 6)));
     assert!(m.matches(&wide), "unwrapped, on one row: {wide:?}");
 
-    // 6 columns puts `xx 2` on one row and ` MCP` at the start of the next.
-    let narrow = ready_screen(footer, Some((6, 8)));
+    let narrow = ready_screen(footer, Some((10, 8)));
+    // TWO sanity assertions, because "it wrapped" and "it wrapped HERE" are
+    // different claims and only the second makes this test about anything.
     assert!(
-        narrow.lines().any(|l| l.trim() == "MCP"),
-        "the fixture must actually have wrapped between the count and the \
-         label, or this test is about nothing: {narrow:?}"
+        narrow.lines().any(|l| l.starts_with(" MCP")),
+        "the label must begin a row — i.e. the break fell between the count and \\
+         the label: {narrow:?}"
+    );
+    assert!(
+        !narrow.lines().any(|l| l.contains("2 MCP")),
+        "and no single row may hold both, or a row-wise search would find it and \\
+         the join would be untested: {narrow:?}"
     );
     assert!(
         m.matches(&narrow),
@@ -29230,12 +29240,14 @@ fn a_footer_that_wraps_between_the_count_and_its_label_still_matches() {
     );
 
     // The control: joining pairs must not turn the WORD rule off. The same
-    // wrap, with prose after the label, still refuses.
-    let prose = concat!("\u{1b}[2J\u{1b}[H", "opencode\r\n", "xx 2 MCP servers up\r\n").as_bytes();
-    let prose_narrow = ready_screen(prose, Some((6, 8)));
+    // wrap, with prose after the label, still refuses — the word it is judged
+    // on rides along inside the joined pair.
+    let prose =
+        concat!("\u{1b}[2J\u{1b}[H", "boot\r\n", "opencode 2 MCP servers up\r\n").as_bytes();
+    let prose_narrow = ready_screen(prose, Some((10, 8)));
     assert!(
         !m.matches(&prose_narrow),
-        "the wrap handling must not smuggle a boot line past the word rule: \
+        "the wrap handling must not smuggle a boot line past the word rule: \\
          {prose_narrow:?}"
     );
 
