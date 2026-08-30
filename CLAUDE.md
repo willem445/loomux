@@ -592,8 +592,9 @@ narrow their ask back down to the original ticket on your own judgment.
   `gh pr list --state open --search "base:<branch>"`, then
   `gh pr edit <n> --base <the merged PR's own base>` per hit (usually `main`;
   the integration branch under constraint 7), then a rebase onto that base —
-  the squash-merged parent's commits are not ancestors of the child, so its
-  diff otherwise re-shows the parent's work — then delete. Signature: a
+  the squash commit that replaced the parent on that base is not an ancestor
+  of the child, so its diff against the base otherwise re-shows the parent's
+  work — then delete. Signature: a
   `base_ref_deleted` timeline event with a `closed` event one second later, and
   no `base_ref_changed` between them (#1736).
 - **A closing-keyword sweep of a squash message must be MULTILINE, and the
