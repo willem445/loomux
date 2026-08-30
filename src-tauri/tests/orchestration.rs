@@ -29094,58 +29094,28 @@ fn a_ready_marker_can_only_ever_delay_a_paste() {
     assert!(!cli_ready_with_marker(4096, ms(100), s(3), m, false));
 }
 
-/// #1591 review, premortem 2: the marker is read off the RENDERED screen, and
-/// that is not a stylistic preference — it is the difference between the gate
-/// working and every opencode kickoff paying the 25 s ceiling forever.
-///
-/// A status footer is the most cursor-positioned region of a TUI. A repaint
-/// that writes the count, moves the cursor absolutely, and then writes the
-/// label leaves the two NON-ADJACENT in the byte ring while the human plainly
-/// sees `2 MCP`. The two readings are asserted here on the SAME bytes, so the
-/// claim is a measurement rather than an argument.
-#[test]
-fn the_marker_is_read_off_the_rendered_screen_not_the_byte_ring() {
-    use loomux_lib::orchestration::termgrid::render_visible;
-    let m = ReadyMarker::CountThen(" MCP");
-
-    // Row 1 = the banner. Row 2 = the footer, painted as two segments with an
-    // absolute cursor move between them, and — the part that matters — the
-    // LABEL written before the count it belongs to. A TUI repaints segments in
-    // whatever order its layout walks them; a byte log preserves that order and
-    // a screen does not. Kept ASCII so the assertion is about adjacency rather
-    // than about how wide a glyph is.
-    let raw = concat!(
-        "\u{1b}[2J\u{1b}[H",       // clear, home
-        "opencode\r\n",            // row 1
-        "\u{1b}[2;2H MCP /status", // row 2, col 2: the label, written FIRST
-        "\u{1b}[2;1H2",            // row 2, col 1: the count, written after
-    )
-    .as_bytes();
-
-    let rendered = render_visible(raw, 40, 4);
-    assert!(
-        m.matches(&rendered),
-        "the composed screen puts the count beside its label: {rendered:?}"
-    );
-
-    // The control that makes the assertion above about the INSTRUMENT: the same
-    // bytes, read the way the first draft of this feature read them.
-    let stripped = strip_ansi(raw);
-    assert!(
-        !m.matches(&stripped),
-        "the byte ring does not — this is the reading the production sampler \
-         must not depend on: {stripped:?}"
-    );
-}
-
 /// #1591 review D1: the production sampler's own decisions, on rendered-screen
 /// fixtures.
 ///
 /// The headline change of the previous round — read the SCREEN, not the ring —
 /// lived entirely in a closure inside `deliver_now`, so reverting it reddened
-/// nothing: every loop test injects its own sampler, and the grid-vs-ring test
-/// calls `render_visible` and `matches` directly. `ready_screen` is that
+/// nothing: every loop test injects its own sampler. `ready_screen` is that
 /// closure's pure half, and this is the test that makes the choice falsifiable.
+///
+/// **Arms 1 and 2 are also premortem 2's pin** (#1591 review round 4). A
+/// separate `the_marker_is_read_off_the_rendered_screen_not_the_byte_ring` used
+/// to assert the same property one level lower — `render_visible` and
+/// `strip_ansi` called directly, on a byte-identical fixture. Those are exactly
+/// the two branches `ready_screen` dispatches between, so that test could not
+/// fail unless one of these arms already had, and no mutation reddened it. A
+/// test nothing can redden is a decoration, so it was folded in here rather
+/// than kept: the property it named is arms 1-2, and the D1 mutation
+/// (`ready_screen` ignoring geometry) is what witnesses it.
+///
+/// The fixture is deliberately painted LABEL-FIRST with an absolute cursor move
+/// between the segments: a TUI repaints segments in whatever order its layout
+/// walks them, so the byte log preserves that order and the screen does not.
+/// Kept ASCII so the assertion is about adjacency rather than glyph width.
 #[test]
 fn ready_screen_prefers_the_grid_and_falls_back_only_when_it_must() {
     let m = ReadyMarker::CountThen(" MCP");
