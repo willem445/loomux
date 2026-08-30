@@ -2901,11 +2901,85 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         }
     };
 
-    // Review-driver policy (#1778 §5.3). The block's type layer and manifest
-    // rows land in the commit before this one's; the PARSE WIRING (closed-range
-    // counter refusals, notify-TTL clamps) lands in the commit after it, so CI
-    // can show these tests failing against the unwired parse first.
-    let driver = DriverPolicy::default();
+    // Review-driver policy (#1778 §5.3). `None` (no `driver:` block at all)
+    // resolves to the default, which is **disabled** - an absent block means
+    // the feature is off and behavior is byte-for-byte unchanged.
+    //
+    // Two different postures on a bad value, both taken from the note:
+    //
+    // - the three INVARIANT-9 counters are hard **errors** outside their
+    //   closed ranges, the posture `merge_queue.max_batch: 0` takes - a
+    //   malformed block never degrades to defaults, and §2.3's reason is
+    //   sharper than §11.2's: a repo file may run a *tighter* loop than the
+    //   orchestrator template promises, never a looser one, because the driver
+    //   acts on the orchestrator's authority and a config file that raised the
+    //   bound would be loosening the orchestrator's own INVARIANT 9.
+    // - the three backstops are **clamped**, because the note says "clamped
+    //   like the notify TTLs" - and by the notify TTL clamp *itself*, not by a
+    //   second copy of those bounds. Same quantity as
+    //   `merge_queue.checks_timeout_minutes`: a bounded wait on a fallible
+    //   signal. `drive_timeout_minutes`' default is its own constant (the
+    //   design's 240) fed through the same clamp.
+    /// One INVARIANT-9 counter (#1778 §2.3): refused outside its closed range
+    /// the way `merge_queue.max_batch: 0` is refused, with the design's own
+    /// default standing in when the value was written and refused - an error
+    /// still has to produce a value, and the default is the one the author
+    /// is about to be told the file failed to declare.
+    fn driver_counter(
+        field: &str,
+        raw: Option<u32>,
+        (min, max): (u32, u32),
+        default: u32,
+        why: &str,
+        errs: &mut Vec<String>,
+    ) -> u32 {
+        match raw {
+            None => default,
+            Some(v) if (min..=max).contains(&v) => v,
+            Some(v) => {
+                errs.push(format!("{field}: must be {min}..={max} - {why} (got {v})"));
+                default
+            }
+        }
+    }
+    let driver = match &raw.driver {
+        None => DriverPolicy::default(),
+        Some(rd) => DriverPolicy {
+            enabled: rd.enabled,
+            max_review_rounds: driver_counter(
+                "driver.max_review_rounds",
+                rd.max_review_rounds,
+                (DRIVER_MAX_REVIEW_ROUNDS_MIN, DRIVER_MAX_REVIEW_ROUNDS_MAX),
+                DRIVER_MAX_REVIEW_ROUNDS_MAX,
+                "the drive may not run a looser review loop than the orchestrator template's \
+                 INVARIANT 9 promises",
+                &mut errs,
+            ),
+            max_ci_attempts: driver_counter(
+                "driver.max_ci_attempts",
+                rd.max_ci_attempts,
+                (DRIVER_MAX_CI_ATTEMPTS_MIN, DRIVER_MAX_CI_ATTEMPTS_MAX),
+                DRIVER_MAX_CI_ATTEMPTS_MAX,
+                "the drive may not spend more CI attempts than INVARIANT 9 grants the \
+                 orchestrator itself",
+                &mut errs,
+            ),
+            max_rebase_attempts: driver_counter(
+                "driver.max_rebase_attempts",
+                rd.max_rebase_attempts,
+                (DRIVER_MAX_REBASE_ATTEMPTS_MIN, DRIVER_MAX_REBASE_ATTEMPTS_MAX),
+                DRIVER_MAX_REBASE_ATTEMPTS_MAX,
+                "INVARIANT 9 grants one rebase attempt, and a repo may tighten that to none - \
+                 never loosen it to two",
+                &mut errs,
+            ),
+            lane_timeout_minutes: clamp_expires_minutes(rd.lane_timeout_minutes),
+            fix_timeout_minutes: clamp_expires_minutes(rd.fix_timeout_minutes),
+            drive_timeout_minutes: clamp_expires_minutes(
+                rd.drive_timeout_minutes.or(Some(DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN)),
+            ),
+        },
+    };
 
     // Named lock resources (#858). An absent block leaves this empty, which is
     // what makes the lock tools invisible to the group's agents.
