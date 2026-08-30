@@ -675,8 +675,12 @@ narrow their ask back down to the original ticket on your own judgment.
   the first. Name the SHA in each section that carries a number, so a reader can
   check it instead of trusting the certificate; when one number is found stale,
   re-date the sections rather than widening the sentence. Audit by sweeping
-  EVERY section for an undated number — the ones the sentence names are the ones
-  already thought about. Signature: a section whose only SHA is the BASE, with
+  EVERY NUMBER for a date, not every section for a number — the ones the
+  sentence names are the ones already thought about, and a figure in a prose
+  sentence, a heading or a bullet belongs to no section at all, so a per-section
+  audit cannot reach it. The stale one is routinely collateral of THIS round's
+  own fix rather than of the original draft (#1470 B1, #1764 B3, #1758).
+  Signature: a section whose only SHA is the BASE, with
   its head written as `HEAD` (which moves), sitting under tables headed by a
   literal SHA (which don't) and a sentence saying only one section needed the
   edit (#1348 B1: a Diffstat 109 insertions light, certified as not needing the
