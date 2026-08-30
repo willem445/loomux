@@ -1559,6 +1559,11 @@ const REENTRANCY_PROBE_BUDGET: Duration = Duration::from_millis(2_000);
 
 #[test]
 fn l5a_a_planted_inversion_panics_under_the_checker_naming_both_locks() {
+    // This row relies on `LOCK_ORDER_PANICS`'s `cfg!(debug_assertions)`
+    // default (armed) to require a panic below. L8 disarms that same
+    // process-global flag for the width of its own test, so both rows hold
+    // `LOCK_ORDER_PANICS_SERIAL` — see that static's doc.
+    let _serial = LOCK_ORDER_PANICS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (reg, _dir) = test_registry();
 
     // The DECLARED direction first. Without it this row passes just as well
@@ -3069,16 +3074,26 @@ fn only_argued_sites_may_permit_a_long_hold() {
 }
 
 // ---------- L8: a switched-off reentrant refusal, driven THROUGH the shipped
-// command frame (#1702 P5) ----------
+// command frame (#1702 P5(B)) ----------
 
 /// Serializes any row that flips the process-global
-/// `loomux_engine::lockwatch::LOCK_ORDER_PANICS` flag. L5a relies on its
-/// `cfg!(debug_assertions)` default (armed in every debug/test build) to
-/// require a panic on a planted inversion; `cargo test` runs this binary's
-/// tests concurrently on many threads, so a row that disarms the flag without
-/// serializing against L5a could make it fail to panic — intermittently, for
-/// a reason that has nothing to do with either row's own defect. Same class
-/// of hazard `HOLD_SERIAL`/`POOL_SERIAL` already guard in this file.
+/// `loomux_engine::lockwatch::LOCK_ORDER_PANICS` flag, **and** any row that
+/// asserts a panic/no-panic outcome from the checker while relying on the
+/// flag's default — the same both-sides convention this file's header states
+/// for `POOL_SERIAL` ("any test that reaches `blocking::spawn_counted` ...
+/// must hold `POOL_SERIAL`, and so must any test that ASSERTS on the
+/// counter"). `cargo test` runs this binary's tests concurrently on many
+/// threads, and this flag is one `AtomicBool` shared by all of them: L5a
+/// relies on its `cfg!(debug_assertions)` default (armed in every debug/test
+/// build) to require a panic on a planted inversion, so a row that disarms
+/// the flag without both sides holding this guard could land inside L5a's
+/// window and make it fail to panic — intermittently, for a reason that has
+/// nothing to do with either row's own defect. Same class of hazard
+/// `HOLD_SERIAL`/`POOL_SERIAL` already guard in this file.
+///
+/// **Both current readers take it**: L5a (line ~1557) and L8 below. A future
+/// row that flips `LOCK_ORDER_PANICS`, or that asserts on a panic/no-panic
+/// verdict the checker produces, is a third reader and must take it too.
 static LOCK_ORDER_PANICS_SERIAL: Mutex<()> = Mutex::new(());
 
 /// Restores `LOCK_ORDER_PANICS` however the scope ends — the `MutateDeadline`
@@ -3097,7 +3112,7 @@ impl Drop for LockOrderPanics {
     }
 }
 
-/// L8 (#1702 P5). `doc/design/lock-liveness.md` §7's "The panic is armed, not
+/// L8 (#1702 P5(B)). `doc/design/lock-liveness.md` §7's "The panic is armed, not
 /// default" section draws a sharp line: `LOCK_ORDER_PANICS` defaults to
 /// `cfg!(debug_assertions)` — true in every test binary — so a re-entrant
 /// acquisition panics HERE by default, which is correct for a *test* build
@@ -3125,6 +3140,15 @@ fn l8_a_switched_off_reentrant_acquisition_degrades_through_the_command_frame() 
     // switched off for the rest of this test, restored on every exit —
     // including a stray panic of our own — by the guard's `Drop`.
     let _panics_off = LockOrderPanics::set(false);
+    // Read it back rather than trust the call above: with a shared
+    // process-global flag, a sibling that re-armed it between `set(false)`
+    // and here would otherwise surface as a mysterious panic out of
+    // `mutating_command` far below instead of a plain, named assertion.
+    assert!(
+        !loomux_engine::lockwatch::lock_order_panics(),
+        "LOCK_ORDER_PANICS is armed going into this test's release-semantics assertions — a \
+         sibling re-armed it despite LOCK_ORDER_PANICS_SERIAL, or this row lost the guard"
+    );
 
     // ---- the counterfactual first: WITHOUT any command-boundary frame ----
     //
@@ -3155,8 +3179,13 @@ fn l8_a_switched_off_reentrant_acquisition_degrades_through_the_command_frame() 
     // frame, for the same reason L7a's sync-command row is: the wrapper IS
     // the containment #1713 added, so a test that assembled its own
     // `read_budget` call would measure its own re-implementation rather than
-    // the code every real sync command in `mod.rs` (`bind_agent`,
-    // `orch_solo_bind`, …) actually runs through.
+    // the code real sync commands run through. The `on_refused` closure below
+    // is the identical `|| Err(COMMAND_REFUSED.to_string())` shape `bind_agent`
+    // and `orch_solo_bind` use — three of `mod.rs`'s five `mutating_command`
+    // call sites return `COMMAND_REFUSED` this way; the other two
+    // (`orch_ack_attention`, `orch_ack_attention_pty`) have no error channel
+    // and degrade to `()` instead. What this pins is that `on_refused` really
+    // runs, which is the same thing every one of the five is trusting.
     let outcome: Result<(), String> = OrchRegistry::mutating_command(
         "l8_reentrant_probe",
         || Err(loomux_lib::orchestration::COMMAND_REFUSED.to_string()),
@@ -3182,15 +3211,23 @@ fn l8_a_switched_off_reentrant_acquisition_degrades_through_the_command_frame() 
     assert_eq!(
         err,
         loomux_lib::orchestration::COMMAND_REFUSED,
-        "the command degraded, but not to the shipped refusal text every real sync command in \
-         `mod.rs` returns for this class"
+        "the command degraded, but not via the `on_refused` closure this test gave it — the \
+         same `|| Err(COMMAND_REFUSED.to_string())` shape `bind_agent` and `orch_solo_bind` use"
     );
 
     // And the registry is usable afterwards: the refusal released everything
     // the abandoned mutation was holding rather than leaving `tasks_lock`
-    // wedged for the rest of the process.
+    // wedged for the rest of the process. `lock_within_for_test` rather than
+    // `with_lock_for_test`: the latter returns `None` only for an unknown
+    // lock name, so `.is_some()` on a known one like `"tasks_lock"` cannot
+    // fail for the reason a wedge would — a genuinely stuck lock would panic
+    // here at `lockwatch.rs:1970` (same-thread re-entrant refusal) or hang.
+    // `lock_within_for_test` reports that as a bounded, named `Err` instead
+    // (the L5b idiom), which is what makes this assertion falsifiable.
     assert!(
-        reg.with_lock_for_test("tasks_lock", || ()).is_some(),
+        reg.lock_within_for_test("tasks_lock", REENTRANCY_PROBE_BUDGET)
+            .expect("`tasks_lock` is a known lock name")
+            .is_ok(),
         "`tasks_lock` did not release after the refused re-entrant acquisition — a degrade that \
          leaves the lock held is a wedge with better error text, not a rescue"
     );
