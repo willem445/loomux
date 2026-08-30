@@ -1453,7 +1453,7 @@ fn tool_defs(
                      requested because something told you it exists. Sections: {}. Pass the \
                      exact section id; an unknown id is refused WITH the valid list, never \
                      answered with an empty string. Served verbatim from the group's rendered \
-                     copy — loomux-authored template text only — and each read is audited.",
+                     copy — orrerix-authored template text only — and each read is audited.",
                     super::PLAYBOOK_SECTION_IDS.join(", ")
                 ),
                 json!({

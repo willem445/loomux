@@ -10198,12 +10198,14 @@ fn instruction_files_rendered_with_group_facts() {
     assert!(orch.contains("Name the pane for its work"),
         "orchestrator instructions must guide renaming a worker to its task");
     // The unconfirmed-delivery recovery guidance is rendered (#103): read the
-    // pane back, re-send once, and flag the human on a repeat.
-    assert!(orch.contains("delivery to <id> unconfirmed"),
+    // pane back, re-send once, and flag the human on a repeat. #1683 moved
+    // that procedure into the rendered playbook; the pin follows it.
+    let pb = fs::read_to_string(dir.join("orchestrator-playbook.md")).unwrap();
+    assert!(pb.contains("delivery to <id> unconfirmed"),
         "orchestrator instructions must explain the unconfirmed-delivery notice");
-    assert!(orch.contains("flag the human"),
+    assert!(pb.contains("flag the human"),
         "unconfirmed-delivery guidance must escalate a repeat to the human");
-    assert!(!orch.contains("{{"), "no unrendered placeholders");
+    assert!(!pb.contains("{{"), "no unrendered placeholders in the playbook");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
     // The planner instructions are rendered alongside the other roles (#47).

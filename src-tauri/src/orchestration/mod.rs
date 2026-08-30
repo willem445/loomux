@@ -510,7 +510,7 @@ pub const PLAYBOOK_SECTION_IDS: &[&str] = &[
 /// and the tool's vocabulary are keyed on.
 ///
 /// Non-ASCII *letters* (é, ü) are dropped rather than transliterated: the
-/// playbook is loomux-authored ASCII prose (constraint 8 — no repo or machine
+/// playbook is orrerix-authored ASCII prose (constraint 8 — no repo or machine
 /// vocabulary in product code), so a heading that would lose its whole id to
 /// this rule is a template bug the uniqueness check at the scan catches, not
 /// a case to handle here.

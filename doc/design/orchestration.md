@@ -12907,7 +12907,7 @@ them will misread its own wake:
 
 The orchestrator's role template had grown to ~100 KB, paid in the system cache block on
 every model call. The split: the **resident core** (`templates/orchestrator.md`) keeps the
-INVARIANTS, the tool surface, and every rule; a second loomux-authored template
+INVARIANTS, the tool surface, and every rule; a second orrerix-authored template
 (`templates/orchestrator-playbook.md`) carries the situational **procedure**, rendered into
 `<group dir>/orchestrator-playbook.md` by `write_instruction_files` with the same var list
 as the role files, and served one `## ` section at a time by the orchestrator-only MCP tool
@@ -12938,7 +12938,7 @@ not fetch) is measured by that line, not assumed away.
   `read_playbook` validates the caller's section against the **written file's own
   headings**, so the tool takes a validated id, never a path, and the group dir is reached
   only through `group_dir_at(GroupId)` — the one join (constraint 6).
-- Consent model: the playbook is loomux-authored template text only. No repo file, persona,
+- Consent model: the playbook is orrerix-authored template text only. No repo file, persona,
   or lessons text can reach the orchestrator through it, and a repo file cannot grant any
   capability by appearing there.
 - `write_opencode_agent_file` (and the claude/copilot siblings) embed the **core contract

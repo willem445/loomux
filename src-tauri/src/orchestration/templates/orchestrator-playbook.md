@@ -16,7 +16,7 @@ Three things make it safe for procedure to live on demand:
 - **The tool's description carries the section index.** `read_playbook` refuses an unknown
   id and names the valid ones, so a mistyped ask is self-correcting: an unknown section is
   an error, never an empty answer.
-- This is loomux-authored template text, rendered into your group's dir at launch (group
+- This is orrerix-authored template text, rendered into your group's dir at launch (group
   `{{GROUP_ID}}`), served verbatim from this file one `## ` section per call, with every
   read audited. Nothing a repo file, a persona, or a lessons file wrote can reach you
   through it — those channels are separate and stay separate.
@@ -450,6 +450,7 @@ bounce: it is a **question for the human** ("I think this couples X to Y; the wo
 doesn't — your call"), and it holds the merge like any other question (INVARIANT 2).
 
 ## Delivery notices
+
 **Silent-agent recovery.** A freshly spawned agent reads its instructions and reports
 ready/progress within a couple of minutes. If one stays silent, `get_output` its pane: an idle
 CLI with an empty input box means its kickoff was lost — re-send the task with `send_prompt`.
@@ -833,6 +834,7 @@ fix needs the human's go-ahead to act on (the funnel, INVARIANT 8); reach for a 
 when the whole value is "the next orchestrator should just already know this."
 
 ## Queue orphans and refused
+
 - **`queue_orphans()` is a to-do list, not a log.** An orrerix restart can catch deliveries
   queued behind a blocked pane. Ones addressed to your own pane, or to an agent resumed onto
   the same session id, are re-queued automatically in their original order — you will see them
