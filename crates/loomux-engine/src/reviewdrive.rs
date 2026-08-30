@@ -837,9 +837,7 @@ impl DriveEntry {
         }
         self.state = transition(self.state, to)?;
         self.held_reason = reason;
-        if to == DriveState::FixWait {
-            self.fix_handback_ms = now_ms;
-        }
+        self.fix_handback_ms = now_ms;
         Ok(())
     }
 
