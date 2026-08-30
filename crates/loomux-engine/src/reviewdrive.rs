@@ -974,7 +974,7 @@ pub fn prune_terminal(state: &mut ReviewDrivesState) -> Vec<u64> {
         .filter(|e| e.state().is_terminal())
         .map(|e| e.pr)
         .collect();
-    state.entries.retain(|e| !e.state().is_terminal());
+    state.entries.retain(|e| e.state().is_live());
     pruned
 }
 
