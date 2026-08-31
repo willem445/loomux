@@ -762,9 +762,21 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         format!(" \"{}\"", lane_summary(&f.lane_summary))
     };
     let body = match reason {
+        // **The remedy named is the one that CLEARS it**, which for this hold is
+        // not the tool on its own. §2.2: `escalate` and `review-limit` are parked
+        // on a JUDGMENT the driver may not make, so a resume that leaves the
+        // verdict standing re-holds on the next tick — `decide_review_wait` reads
+        // the same `escalate` again. A notice printing only `drive_review` was
+        // therefore naming a remedy that does not work, and the design note
+        // explaining why is not what an orchestrator reads at 3am; this line is.
+        // Its sibling `review-limit`, on the same judgment footing, already
+        // printed its precondition (`reset_counters: true`); this one now prints
+        // its own (#1863 D3).
         HeldReason::Escalate => format!(
-            "ESCALATE by {}{at} —{summary} Drive held; drive_review resumes it, \
-             cancel_review_drive stops it.",
+            "ESCALATE by {}{at} —{summary} Drive held on a JUDGMENT the driver may not \
+             make (INVARIANT 3): disposition the escalation first, then drive_review \
+             resumes it — a resume that leaves the verdict standing re-holds on the \
+             next tick. cancel_review_drive stops it.",
             f.lane
         ),
         HeldReason::ReviewLimit => format!(
@@ -1078,6 +1090,59 @@ mod tests {
                 r.as_str()
             );
         }
+    }
+
+    /// **The two JUDGMENT holds name what must CHANGE, not merely a tool.**
+    ///
+    /// The test above is the weaker instrument and `escalate` was the defect it
+    /// could not see. That line named `drive_review`, which does resume the
+    /// drive — and then re-holds on the very next tick, because
+    /// `decide_review_wait` reads the same `escalate` verdict again and nothing
+    /// reachable through the driver's three tools changes it (§2.2). "Names a
+    /// tool" was true of it; the property meant is "names a remedy that clears
+    /// THIS hold", and the gap between the two is where #1863 D3 lived.
+    ///
+    /// **The wait holds are the control**, and they are what makes this
+    /// discriminating rather than a blanket "every notice must name a
+    /// precondition": `fix-stalled` really is orrerix waiting, so a bare
+    /// `drive_review` really is the whole of its remedy and it must pass here
+    /// naming no precondition at all. An implementation that appended one to
+    /// every notice fails the second half; one that appends it to none fails the
+    /// first.
+    #[test]
+    fn the_two_judgment_holds_name_what_must_change_before_the_resume() {
+        let f = HeldFacts {
+            head: HEAD.into(),
+            lane: "rev-final".into(),
+            counters: Counters { review_rounds: 3, ..Counters::default() },
+            max_review_rounds: 3,
+            ..HeldFacts::default()
+        };
+
+        let escalate = held_notice(1758, HeldReason::Escalate, &f);
+        assert!(
+            escalate.contains("disposition the escalation"),
+            "escalate is cleared by dispositioning the verdict, not by the resume: {escalate}"
+        );
+        assert!(
+            !escalate.contains("Drive held; drive_review resumes it"),
+            "the retracted phrasing named a remedy that re-holds on the next tick: {escalate}"
+        );
+        let limit = held_notice(1758, HeldReason::ReviewLimit, &f);
+        assert!(
+            limit.contains("reset_counters: true"),
+            "review-limit's own precondition, unchanged: {limit}"
+        );
+
+        // The control: a hold whose cause IS a wait.
+        let waiting = held_notice(1758, HeldReason::FixStalled, &f);
+        assert!(waiting.contains("drive_review"), "the wait hold still names its tool: {waiting}");
+        assert!(
+            !waiting.contains("disposition") && !waiting.contains("reset_counters"),
+            "a wait hold is cleared by the resume alone — a template that appended a \
+             precondition everywhere would satisfy both assertions above while saying \
+             something false here: {waiting}"
+        );
     }
 
     #[test]

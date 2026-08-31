@@ -2233,8 +2233,108 @@ fn a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not() {
     );
 }
 
+/// The four CI observations `rd_lane_brief` renders, named so a shape pin can
+/// be run against each rather than against whichever one the fixture happened
+/// to produce (#1863 D2).
+#[derive(Clone, Copy, Debug)]
+enum CiArm {
+    Green,
+    Red,
+    Conflicting,
+    Pending,
+}
+
+impl CiArm {
+    /// The sentence this arm must render, verbatim. It is the CONTENT pin that
+    /// makes each fixture discriminating: a `Conflicting` fixture that quietly
+    /// produced the `Pending` sentence would satisfy every shape assertion, and
+    /// this is what refuses it.
+    fn sentence(self) -> &'static str {
+        match self {
+            CiArm::Green => "This PR's checks are green at that head.",
+            CiArm::Red => "This PR's checks are RED at that head.",
+            CiArm::Conflicting => "This PR does not merge cleanly at that head.",
+            CiArm::Pending => {
+                "This PR's checks are not green at that head (orrerix could not read a settled result)."
+            }
+        }
+    }
+}
+
+/// Drive to an opened lane whose brief was rendered under `arm`, and return that
+/// brief.
+///
+/// **`Green` is the only arm with a direct route**, because `ci-wait` leaves for
+/// `review-wait` on green and on nothing else. The other three reach a lane
+/// through **arc 8**: a red CI hands the PR back, the worker reports `done`
+/// WITHOUT pushing, and `fix-wait -> review-wait` is taken without consulting
+/// `facts.ci` at all — the "that failure was unrelated" turn. That is the one
+/// route on which a lane is briefed at a head whose CI is not green, which is
+/// the entire reason `rd_lane_brief` reads `brief.ci`, and
+/// `a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not` is
+/// the test written against it. The arm under test is then set on the tick that
+/// OPENS the lane, so what the brief renders is what that tick observed.
+fn lane_brief_under(arm: CiArm) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    if matches!(arm, CiArm::Green) {
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _b, lane) =
+            opened.lanes_opened.first().cloned().expect("a lane opens on a green drive");
+        return lane_brief(&reg, &lane);
+    }
+
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let handed = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, worker) =
+        handed.handbacks.first().cloned().expect("a red CI hands the PR back to its worker");
+    assert_eq!(status_state(&reg, &group), "fix-wait", "{arm:?}: the hand-back must have happened");
+
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: worker,
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "status": "done", "summary": "that failure was unrelated" } }),
+    )
+    .expect("the driven worker reports");
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "{arm:?}: arc 8 must reach review-wait at an unchanged head"
+    );
+
+    match arm {
+        // Returned above; the arm is listed rather than absorbed by a `_` so a
+        // fifth `CiObservation` is a compile error here.
+        CiArm::Green => {}
+        // The red payload set for the hand-back is already what this arm wants.
+        CiArm::Red => {}
+        CiArm::Conflicting => gh.set_merge_state("CONFLICTING"),
+        CiArm::Pending => gh.set_checks(r#"[{"name":"build","state":"IN_PROGRESS","link":"x"}]"#),
+    }
+    let opened = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, _b, lane) = opened
+        .lanes_opened
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("{arm:?}: a lane must open once review-wait is reached"));
+    lane_brief(&reg, &lane)
+}
+
 /// **A brief's sentences are each one paragraph**, pinned as a SHAPE beside the
-/// content the two tests around this one assert.
+/// content the two tests around this one assert — **once per CI arm**.
 ///
 /// This is `manager_lifecycle.rs`'s `is_one_paragraph` idiom, and it is here
 /// because the CI literals shipped exactly the failure it exists to catch: a
@@ -2244,44 +2344,62 @@ fn a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not() {
 /// the break — which is the whole reason a shape pin has to sit beside a content
 /// pin rather than being implied by it.
 ///
-/// Both halves are checked. A hard break is the obvious form; a run of ten
+/// **It ran on one arm, and it was the wrong one** (#1863 D2). The fixture was
+/// `FakeGh::green(HEAD_A)`, so `brief.ci` was `Green` — the one short literal
+/// that never had the defect. The `\n` plus seventeen spaces lived in the `Red`,
+/// `Conflicting` and `Pending`/`Unknown` arms exclusively, so a regression on
+/// the three arms that carry the risk would have shipped under a green test
+/// whose own doc said it existed to catch it. That is #1344's rule pointed at a
+/// test rather than at a guard: a green is evidence about the POPULATION it ran
+/// over, never about the property.
+///
+/// Each arm also asserts its own sentence verbatim, which is what stops the
+/// widened population from being four runs of one fixture: a route that silently
+/// produced the `Green` sentence under `CiArm::Conflicting` passes every shape
+/// assertion and fails the content one.
+///
+/// Both shape halves are checked. A hard break is the obvious form; a run of ten
 /// spaces is the one a collapsed `\` continuation leaves behind, with no newline
 /// at all to notice.
 #[test]
 fn a_lane_brief_is_one_paragraph_per_sentence() {
-    let dir = tempfile::tempdir().unwrap();
-    let reg = relaunch_registry(dir.path());
-    let repo = Repo::new();
-    let gh = FakeGh::green(HEAD_A);
-    let (group, _session) = driven(&reg, &repo, &gh);
-    reg.rd_drive_group_with(&group, &gh, 10_000);
-    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
-    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("a lane opens");
-    let brief = lane_brief(&reg, &lane);
+    for arm in [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending] {
+        let brief = lane_brief_under(arm);
 
-    // The template itself is deliberately multi-paragraph; what must not carry a
-    // break is any single interpolated sentence. So this reads the lines rather
-    // than the whole, and asserts none of them leaks source indentation.
-    let mut checked = 0usize;
-    for line in brief.lines() {
-        checked += 1;
+        // The template itself is deliberately multi-paragraph; what must not
+        // carry a break is any single interpolated sentence. So this reads the
+        // lines rather than the whole, and asserts none of them leaks source
+        // indentation.
+        let mut checked = 0usize;
+        for line in brief.lines() {
+            checked += 1;
+            assert!(
+                !line.contains("          "),
+                "{arm:?}: a brief line leaks source indentation, which is what a collapsed \
+                 `\\` continuation leaves behind: {line:?}"
+            );
+        }
+        assert!(checked > 3, "{arm:?}: the positive control — this must have read real lines");
+
+        // And the CI sentence specifically, which is the one that shipped
+        // broken. Found by the prefix every arm shares, so the finder itself
+        // does not decide which arm it is looking at.
+        let ci_line = brief
+            .lines()
+            .find(|l| l.trim_start().starts_with("This PR"))
+            .unwrap_or_else(|| {
+                panic!("{arm:?}: every lane brief states the CI it observed: {brief}")
+            });
         assert!(
-            !line.contains("          "),
-            "a brief line leaks source indentation, which is what a collapsed `\\` \
-             continuation leaves behind: {line:?}"
+            ci_line.contains(arm.sentence()),
+            "{arm:?}: the brief must render THIS arm's sentence — a fixture that reached a \
+             different arm would satisfy every shape assertion below: {ci_line:?}"
+        );
+        assert!(
+            !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
+            "{arm:?}: the CI sentence must be one whole paragraph on one line: {ci_line:?}"
         );
     }
-    assert!(checked > 3, "the positive control: this must have read real lines, not none");
-
-    // And the CI sentence specifically, which is the one that shipped broken.
-    let ci_line = brief
-        .lines()
-        .find(|l| l.contains("checks are"))
-        .expect("every lane brief states the CI it observed");
-    assert!(
-        !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
-        "the CI sentence must be one whole paragraph on one line: {ci_line:?}"
-    );
 }
 
 /// The control for the test above: on a genuinely green drive the brief still
@@ -2620,5 +2738,97 @@ fn a_second_conflict_after_the_one_rebase_hand_back_holds_on_rebase_limit() {
         notice.contains("cancel_review_drive"),
         "…and the tool that acts on it, since a compacted orchestrator reading this line must \
          not have to remember the API: {notice}"
+    );
+}
+
+// ── #1863 D1: the count and its own closing sentence ─────────────────────────
+
+/// **A closed refusal list and the sentence that closes it state the SAME
+/// number.**
+///
+/// `queue_merge`'s description opens *"FIVE FURTHER REASONS MEAN LOOMUX ITSELF
+/// FAILED"*, enumerates them, and used to close twenty words later, in the same
+/// sentence-group, with *"None of the four should appear in a running build."*
+/// The count went to five when the review driver's own `rd-state-unreadable`
+/// joined the list; three instances were corrected and the fourth — the one
+/// nearest a corrected one — was not (#1863 D1).
+///
+/// It lives in this file rather than in `tests/mergequeue.rs` because the fifth
+/// reason is the driver's, and the miss was the driver's PR.
+///
+/// **The assertion is AGREEMENT, not a literal.** Pinning "five" would go stale
+/// the moment a sixth reason is added, in the same direction as the defect: the
+/// test would then be enforcing a wrong number rather than catching one. What
+/// cannot go stale is that the opening word and the closing word are two
+/// statements of one fact.
+///
+/// The third assertion cross-checks both against the list itself, and its
+/// delimiter is stated rather than assumed: every one of these five reasons
+/// carries a parenthesised gloss, so <code>` (</code> counts each exactly once.
+/// A reason added WITHOUT a gloss makes this count wrong and the test red, which
+/// is the direction to fail in — the alternative is a census that cannot see one
+/// of its own subjects and reports a smaller number with no sign it did. The
+/// sibling clause in `drive_review`'s description is deliberately NOT covered
+/// here for exactly that reason: its `rd-unavailable` carries no gloss, so this
+/// delimiter would silently under-count it.
+#[test]
+fn queue_merges_failure_list_agrees_with_both_numbers_that_describe_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = Caller {
+        agent_id: orch.id.clone(),
+        group: group.clone(),
+        role: Role::Orchestrator,
+        role_hint: None,
+    };
+
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let desc = listed["tools"]
+        .as_array()
+        .expect("tools/list answers an array")
+        .iter()
+        .find(|t| t["name"] == json!("queue_merge"))
+        .and_then(|t| t["description"].as_str())
+        .expect("the orchestrator is offered queue_merge")
+        .to_string();
+
+    let (before, clause) = desc
+        .split_once(" FURTHER REASONS MEAN LOOMUX ITSELF FAILED")
+        .expect("the description opens its failure list with a count");
+    let opener = before.rsplit(' ').next().unwrap_or_default().to_ascii_lowercase();
+    let (listed_text, _) = clause
+        .split_once(" should appear in a running build")
+        .expect("…and closes it with a second count");
+    let closer = listed_text.rsplit(' ').next().unwrap_or_default().to_ascii_lowercase();
+
+    // The positive control. Both words must have been READ — an empty string
+    // equals an empty string, and a parse that found nothing would otherwise
+    // satisfy the agreement below without having looked at anything.
+    let number = |w: &str| -> Option<usize> {
+        ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight"]
+            .iter()
+            .position(|c| *c == w)
+    };
+    let n_open = number(&opener)
+        .unwrap_or_else(|| panic!("the opening count is not a number word: {opener:?}"));
+    let n_close = number(&closer)
+        .unwrap_or_else(|| panic!("the closing count is not a number word: {closer:?}"));
+
+    assert_eq!(
+        n_open, n_close,
+        "the two counts describing one list disagree — it opens {opener:?} and closes \
+         {closer:?}, twenty words apart in the same sentence-group"
+    );
+
+    // …and both against the list they describe.
+    let enumerated = listed_text.matches("` (").count();
+    assert_eq!(
+        enumerated, n_open,
+        "the count and the enumeration disagree: {n_open} claimed, {enumerated} reasons \
+         parsed. If a reason was just added WITHOUT a parenthesised gloss, this delimiter \
+         cannot see it — fix the delimiter here rather than the number"
     );
 }

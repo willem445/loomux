@@ -225,11 +225,21 @@ which is the same defect `drive-stalled` had in its age anchor. It is stated for
 the stalled rows and not for every hold, because two holds are deliberately
 outside it. `escalate` and `review-limit` are parked on a JUDGMENT the driver may
 not make (INVARIANT 3), not on something orrerix is waiting for: `drive_review`
-does resume the drive as their notices say, but `decide_review_wait` re-holds on
-the next tick because the verdict — or the spent budget — has not changed. The
-orchestrator has to change that fact first, by dispositioning the escalation or
-by passing `reset_counters`. Resuming without doing so re-holding at once is the
-design working, and the rule above must not be read as promising otherwise.
+does resume the drive, but `decide_review_wait` re-holds on the next tick because
+the verdict — or the spent budget — has not changed. The orchestrator has to
+change that fact first, by dispositioning the escalation or by passing
+`reset_counters`. Resuming without doing so re-holding at once is the design
+working, and the rule above must not be read as promising otherwise.
+
+**Both notices say that themselves**, and they have to: a hold's own line is what
+an orchestrator reads at 3am, and this note is not. `review-limit` prints
+`reset_counters: true`; `escalate` prints "disposition the escalation first".
+A judgment hold naming only `drive_review` would be naming a remedy that
+re-holds — which `escalate`'s line did until #1863 D3, under a guard that asked
+only whether a notice named *a tool*. `rddrive`'s
+`the_two_judgment_holds_name_what_must_change_before_the_resume` now asks the
+narrower question, with a wait hold as its control so the rule stays scoped to
+the two that need it.
 
 ### 2.3 The counters are INVARIANT 9's numbers, and neither key may loosen them
 
@@ -1046,8 +1056,10 @@ interpolates single-line facts and has no line breaks to keep.
   full text: list_verdicts("1758").
 
 [orrerix] review drive PR #1764: ESCALATE by rev-final at 306176c4 —
-  "<capped summary>". Drive held; drive_review resumes it,
-  cancel_review_drive stops it.
+  "<capped summary>". Drive held on a JUDGMENT the driver may not make
+  (INVARIANT 3): disposition the escalation first, then drive_review
+  resumes it — a resume that leaves the verdict standing re-holds on the
+  next tick. cancel_review_drive stops it.
 
 [orrerix] review drive PR #1758: HELD — review rounds 3/3 at bd1461af;
   last rev-std FAIL "<capped summary>"; worker session cafb930d-….
