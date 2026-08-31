@@ -31,7 +31,9 @@ use loomux_lib::orchestration::reviewdrive::{
 use loomux_lib::orchestration::workflow::{ReviewVerdict, Verdict};
 use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
-use loomux_lib::orchestration::{GroupId, Guardrails, OrchRegistry, RdDriveReport};
+use loomux_lib::orchestration::mcp::dispatch;
+use loomux_lib::orchestration::{Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport};
+use serde_json::json;
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -1117,5 +1119,159 @@ fn a_hostile_check_name_reaches_the_brief_neutralized() {
         what.contains("orrerix) message"),
         "the job name must arrive on ONE line — a value that can open a line of its own can \
          open a line that looks like an instruction: {what}"
+    );
+}
+
+// ── §7's narrowing, with colliding operands ─────────────────────────────────
+
+/// Every prompt this group delivered, in order — deliveries are audited as
+/// `prompt` with the text they carried.
+fn delivered_texts(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "prompt")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
+    reg.audit_log(group).into_iter().map(|e| e.action).collect()
+}
+
+/// §7's narrowing, pinned as a **non-interference** property whose two operands
+/// COLLIDE — and they collide as hard as this codebase allows: the same group,
+/// the same PR number, and **the same reviewer agent**, recording the same
+/// verdict twice. The only thing that differs between the two halves is whether
+/// a drive is live.
+///
+/// A non-interference pin whose operands never meet holds under every
+/// implementation, the symmetric one included. Here there is nothing left to
+/// vary: an implementation that keyed interception on the PR number, on the
+/// agent's role, on the verdict word, or on anything at all except "is there a
+/// live drive that spawned this agent" fails one half or the other.
+///
+/// **The undriven half asserts the OLD notice, unchanged.** §7 narrows where a
+/// driven delegate's verdict goes; it must not change anything about an
+/// undriven one, and "the orchestrator still gets the same line" is the whole of
+/// that. The control in the driven half is the `rd-consumed` audit: consumed is
+/// a different word from dropped, and a test that only asserted the absence of a
+/// delivery would pass equally well if the verdict had vanished.
+#[test]
+fn a_driven_lanes_verdict_is_consumed_and_the_same_lanes_undriven_one_is_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _agent0) = driven(&reg, &repo, &gh);
+    // The orchestrator has to exist for a delivery to have a recipient at all —
+    // otherwise `deliver_to_orchestrator` refuses and the undriven half would
+    // pass for the wrong reason.
+    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let report = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _block, lane) = report.lanes_opened.first().cloned().expect("lane 0 opens");
+
+    let caller = Caller {
+        agent_id: lane.clone(),
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    let record = || {
+        dispatch(
+            &reg,
+            &caller,
+            "tools/call",
+            &json!({ "name": "review_verdict", "arguments": {
+                "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+        )
+    };
+
+    // ---- half 1: the drive is live. The verdict is CONSUMED. ----
+    let before = delivered_texts(&reg, &group).len();
+    record().expect("recording a verdict must still succeed under a drive");
+    let after_driven = delivered_texts(&reg, &group);
+    assert!(
+        !after_driven[before..].iter().any(|t| t.contains("recorded verdict")),
+        "a driven lane's verdict reached the orchestrator's pane: {:?}",
+        &after_driven[before..]
+    );
+    assert!(
+        audit_actions(&reg, &group).contains(&"rd-consumed".to_string()),
+        "consumed is a different word from dropped, and the audit keeps them different"
+    );
+
+    // ---- half 2: the SAME agent, the SAME PR, no live drive. DELIVERED. ----
+    assert_eq!(
+        reg.cancel_review_drive(&group, 1758, "orch-1")["cancelled"],
+        json!(true),
+        "the drive must actually stop, or half 2 is half 1 again"
+    );
+    let before = delivered_texts(&reg, &group).len();
+    record().expect("recording a verdict must succeed with no drive at all");
+    let after_undriven = delivered_texts(&reg, &group);
+    let notice = after_undriven[before..]
+        .iter()
+        .find(|t| t.contains("recorded verdict"))
+        .unwrap_or_else(|| {
+            panic!("an undriven lane's verdict did not reach the orchestrator: {:?}",
+                   &after_undriven[before..])
+        });
+    // The shape, unchanged — §7 narrows the RECIPIENT for a driven PR and
+    // nothing else about anyone.
+    assert!(notice.starts_with("[orrerix] "), "{notice}");
+    assert!(notice.contains("(rev-std) recorded verdict PASS on PR #1758"), "{notice}");
+}
+
+/// The third state that half exposes, and the one a reader would guess wrong:
+/// **a `held` drive is PARKED, so its delegates' traffic goes to the
+/// orchestrator exactly as it always did.**
+///
+/// That is what makes a hold a hand-back to a human rather than a quieter kind
+/// of drive — an orchestrator asked to decide something about a parked drive
+/// must be able to see what its delegates say. `rd_owner` filters on
+/// `is_live()` for exactly this, and `is_live()` excludes `held` on purpose
+/// (§5.2 keeps parked and live apart everywhere else too).
+#[test]
+fn a_parked_drives_delegate_still_reaches_the_orchestrator() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let report = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _block, lane) = report.lanes_opened.first().cloned().expect("lane 0 opens");
+
+    // Park it the way §2.2 does: the drive's own age bound. Nothing about the
+    // delegate changes — only the drive's state.
+    let day = 24 * 60 * 60 * 1000;
+    reg.rd_drive_group_with(&group, &gh, day);
+    assert_eq!(status_state(&reg, &group), "held", "the drive must actually be parked");
+
+    let caller = Caller {
+        agent_id: lane,
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    let before = delivered_texts(&reg, &group).len();
+    dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+    )
+    .expect("a parked drive's lane may still record");
+    assert!(
+        delivered_texts(&reg, &group)[before..].iter().any(|t| t.contains("recorded verdict")),
+        "a PARKED drive consumed its lane's verdict — a hold is a hand-back to a human, and a \
+         human who cannot see what the delegates said cannot take it"
     );
 }
