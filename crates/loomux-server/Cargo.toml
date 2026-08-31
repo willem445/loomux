@@ -25,7 +25,7 @@ license = "Apache-2.0"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "loomux remote-engine daemon (internal; not published)"
+description = "Orrerix remote-engine daemon (internal; not published)"
 
 # DEPENDENCIES — the same two bans the engine's manifest states, plus one more.
 #
