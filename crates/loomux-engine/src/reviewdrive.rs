@@ -1080,6 +1080,39 @@ impl DriveEntry {
         now_ms.saturating_sub(self.started_ms)
     }
 
+    /// Record what a lane's verdict file said this tick, onto that lane.
+    ///
+    /// **A record of what was READ, never a gate input.** [`LaneRecord::last_verdict`]
+    /// says so, and nothing decides from it — the live verdict file is re-read
+    /// every tick through the same parser the gate reads. Two things need it
+    /// written all the same, and neither is a decision:
+    ///
+    /// - `review_drive_status()` shows it, and a status view that never showed a
+    ///   verdict would be reporting on a drive it could not describe;
+    /// - [`at_head`](LaneRecord::at_head) is what distinguishes a lane that has
+    ///   **answered** from one that has only been **asked**, which is the whole
+    ///   reason §5.2 keeps it apart from `briefed_head`. Without it a re-briefed
+    ///   lane looks like a first-time lane forever, and the delta brief §5.5
+    ///   exists for — the line an orchestrator typed by hand nine times on one
+    ///   PR — is unreachable.
+    ///
+    /// Returns whether anything changed, so a tick that only observed a
+    /// still-unanswered lane does not rewrite the file for it.
+    pub fn record_verdict_seen(
+        &mut self,
+        block: &str,
+        verdict: Verdict,
+        at_head: &str,
+    ) -> bool {
+        let Some(rec) = self.lanes.iter_mut().find(|l| l.block == block) else { return false };
+        if rec.last_verdict == Some(verdict) && rec.at_head == at_head {
+            return false;
+        }
+        rec.last_verdict = Some(verdict);
+        rec.at_head = at_head.to_string();
+        true
+    }
+
     /// Which side of this drive `agent_id` is, if any — §7's interception key.
     ///
     /// **The key is the agent, never text a delegate typed**, and this method is

@@ -195,6 +195,7 @@ struct RdOut {
     on_behalf_of: String,
     advanced: Option<(reviewdrive::DriveState, Option<reviewdrive::HeldReason>)>,
     lanes_opened: Vec<(String, String)>,
+    handback: Option<String>,
     audits: Vec<(&'static str, Value)>,
     notices: Vec<String>,
 }
@@ -219,6 +220,10 @@ pub struct RdDriveReport {
     /// and a pane id is not what an orchestrator routes on), so without it
     /// nothing outside this module can ask where a driver-spawned lane landed.
     pub lanes_opened: Vec<(u64, String, String)>,
+    /// `(pr, agent)` for every worker resumed with a hand-back this tick — the
+    /// same handle `lanes_opened` carries for a lane, and for the same reason:
+    /// it is the only way a caller can ask what the worker was actually told.
+    pub handbacks: Vec<(u64, String)>,
     /// The kick-back notices delivered to the orchestrator.
     pub notices: Vec<String>,
     /// Terminal entries dropped after their notices went out (§5.2).
@@ -572,6 +577,9 @@ impl OrchRegistry {
             for (b, a) in &o.lanes_opened {
                 report.lanes_opened.push((o.pr, b.clone(), a.clone()));
             }
+            if let Some(a) = &o.handback {
+                report.handbacks.push((o.pr, a.clone()));
+            }
             if let Some((to, _)) = o.advanced {
                 report.advanced.push((o.pr, to));
             }
@@ -697,6 +705,7 @@ impl OrchRegistry {
                     block: l.block.clone(),
                     verdict: v.verdict,
                     summary: v.summary.clone(),
+                    at_head: v.head.clone(),
                 })
             })
             .collect();
@@ -1196,6 +1205,18 @@ impl OrchRegistry {
             lane_notices,
         };
         let entry = state.entry_mut(pr)?;
+        // What each lane's verdict file said this tick, recorded onto that lane
+        // BEFORE the decision — not as an input to it (nothing decides from a
+        // recorded verdict; the live file is re-read every tick through the
+        // gate's own parser) but because `at_head` is what tells a lane that has
+        // ANSWERED from one that has only been ASKED. Without it a re-briefed
+        // lane looks like a first-time lane forever and §5.5's delta template is
+        // unreachable, which is the defect this line closes.
+        for l in &brief.lane_notices {
+            if entry.record_verdict_seen(&l.block, l.verdict, &l.at_head) {
+                out.changed = true;
+            }
+        }
         let step = reviewdrive::decide(entry, &facts, limits);
         let on_behalf = entry.on_behalf_of.clone();
         match &step {
@@ -1273,11 +1294,14 @@ impl OrchRegistry {
                 match to {
                     reviewdrive::DriveState::FixWait => {
                         match self.rd_handback(group, entry, &brief, limits) {
-                            Ok(agent) => out.audits.push((
-                                rddrive::audit_action::HANDBACK,
-                                json!({ "pr": pr, "agent": agent, "head": brief.head,
-                                        "why": brief.handback_kind() }),
-                            )),
+                            Ok(agent) => {
+                                out.handback = Some(agent.clone());
+                                out.audits.push((
+                                    rddrive::audit_action::HANDBACK,
+                                    json!({ "pr": pr, "agent": agent, "head": brief.head,
+                                            "why": brief.handback_kind() }),
+                                ));
+                            }
                             Err(why) => {
                                 // A worker that will not resume is §2.2's
                                 // `worker-unresumable`, learned exactly here —
