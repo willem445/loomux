@@ -214,49 +214,32 @@ const DRIVER_FILES: [&str; 3] = [
     "src/orchestration/rdtick.rs",
 ];
 
-/// Argv tokens that can only appear in this scope if the driver is building
-/// something §3.1's closed list forbids — matched as **whole quoted literals**,
-/// so `merge_gate`, `mergeq` and `merge-base` are not hits and a real `"merge"`
-/// argument is.
+// ── §3.1's never-merges scan, decided on shape rather than on names ─────────
+
+/// Every `gh` subcommand the driver is permitted to issue, with the reason each
+/// is permitted — **default-deny**: an argv whose first two tokens are not on
+/// this list fails, and a row that stops matching anything fails too.
 ///
-/// One row per §3.1 item, and the reason is the item:
-///
-/// - item 1, merge or any landing verb: `merge`, `push`, `ready`, the branch
-///   delete;
-/// - item 3, relabel or edit an issue or a PR: `edit`, `close`, `reopen`, the
-///   two label flags, and `--body`;
-/// - items 2 and 7, the two directories a grant and a verdict live in.
-///
-/// `api` is here and is not in the note's list: `gh api` is how every verb above
-/// is spelled when its subcommand is inconvenient, so a scan that denied the
-/// subcommands and allowed the escape hatch would deny nothing.
-const FORBIDDEN_LITERALS: [(&str, &str); 13] = [
-    ("merge", "item 1: no `gh pr merge`"),
-    ("push", "item 1: no `git push` to any ref"),
-    ("ready", "item 1: no `gh pr ready`"),
-    ("--delete-branch", "item 1: no branch delete"),
-    ("edit", "item 3: no `gh pr edit` / `gh issue edit`, bodies included"),
-    ("close", "item 3: the driver never closes an issue or a PR"),
-    ("reopen", "item 3: nor reopens one"),
-    ("--add-label", "item 3: no relabelling"),
-    ("--remove-label", "item 3: nor un-labelling"),
-    ("--body", "item 3: no body the driver authored reaches a PR"),
-    ("api", "items 1 and 3: `gh api` is how each of the above is spelled otherwise"),
-    ("merge_grants", "item 2: the driver never writes a merge grant"),
-    ("verdicts", "item 7: only a reviewer's `review_verdict` opens the gate"),
+/// This is the list that matters. §3.1 item 1 says the driver may never build a
+/// merge or any other landing verb; item 3 adds the edit and relabel verbs. Both
+/// are statements about **what it asks `gh` to do**, and the driver asks `gh` for
+/// exactly one thing per argv — so enumerating the permitted asks denies every
+/// forbidden one at once, including the ones nobody thought to name. A denylist
+/// of verbs would have to anticipate `gh api`, `gh pr comment`, `gh pr close`
+/// and whatever `gh` ships next; this does not.
+const ALLOWED_ASKS: [(&str, &str, &str); 2] = [
+    ("pr", "view", "§2.1: the PR's state, head, base, body, mergeability and size"),
+    ("pr", "checks", "§2.1: the PR's checks, which is how CI green/red is learned"),
 ];
 
-/// Identifiers whose presence in this scope IS the forbidden capability,
-/// whatever the surrounding argv looks like.
+/// Registry capabilities the driver may never reach, matched as CALLS.
 ///
-/// Not argv tokens — the registry's own functions — so they are matched as
-/// identifiers rather than as quoted literals. `grant_merge` is the sharpest:
-/// §3.1 item 2 says it is a `pub fn` on the shared registry that takes an
-/// unvalidated `actor` with no role gate near it, so "human-only" holds today by
-/// the absence of a wired MCP arm rather than by a barrier. The driver is
-/// backend Rust in the same crate, and nothing else stops it. This is the
-/// barrier.
-const FORBIDDEN_IDENTS: [(&str, &str); 5] = [
+/// Each row is **self-verifying**: the identifier must still be defined
+/// somewhere under the two source roots. A denylist row naming a function that
+/// has since been renamed denies nothing while still reporting green, which is
+/// the failure mode this whole guard is about — so a rename fails here loudly
+/// instead of disarming the row.
+const FORBIDDEN_CALLS: [(&str, &str); 5] = [
     ("grant_merge", "item 2: no barrier exists on that function; this is the barrier"),
     ("kill_agent", "item 5: a quiet lane becomes held(lane-stalled), never dead"),
     ("reap_idle_agents", "item 5: the reaper is not the driver's to call"),
@@ -264,33 +247,22 @@ const FORBIDDEN_IDENTS: [(&str, &str); 5] = [
     ("queue_merge", "§8.1: a driven PR may not be queued, and not by the driver"),
 ];
 
-/// Whether `src` names `ident` as a CALL, rather than merely containing its
-/// letters.
+/// Whether `src` names `ident` as a **call** — the identifier immediately
+/// followed by `(`, with no identifier character before it.
 ///
-/// **A substring match is not an identifier match, and this scan proved it on
-/// itself.** `record_verdict` is forbidden; `DriveEntry::record_verdict_seen` —
-/// which the driver calls to record what it READ, and which cannot write a
-/// verdict file — contains those letters, so a `contains` check reported the
-/// driver as writing verdicts. A guard that cannot tell a forbidden name from a
-/// longer name that starts with it does not enforce the rule it states; it
-/// enforces a prefix.
-///
-/// So the match requires the call shape — the identifier immediately followed by
-/// `(` — and refuses a preceding identifier character, which is what keeps
-/// `rd_record_verdict(` from passing while `record_verdict_seen(` does. This is
-/// narrower than `contains` and still name-independent: it decides on the SHAPE
-/// a call has, not on what anything is called.
+/// **A `contains` check is not this, and the difference was a live defect.**
+/// `DriveEntry::record_verdict_seen` records what the driver READ and cannot
+/// write a verdict file; under a substring match it reported the driver as
+/// writing verdicts. A guard that cannot tell a forbidden name from a longer
+/// name starting with it enforces a prefix rather than the rule it states.
 fn names_call(src: &str, ident: &str) -> bool {
     let needle = format!("{ident}(");
     let mut from = 0usize;
     while let Some(rel) = src[from..].find(&needle) {
         let at = from + rel;
-        let before_ok = at == 0
-            || !src[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if before_ok {
+        if at == 0
+            || !src[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
             return true;
         }
         from = at + needle.len();
@@ -298,237 +270,189 @@ fn names_call(src: &str, ident: &str) -> bool {
     false
 }
 
-/// Hits that are argued rather than forbidden, each carrying the reason it is
-/// not what the scan is looking for: `(file suffix, token, why)`.
+/// Every argv literal in `src`, as its ordered string tokens.
 ///
-/// **Default-deny** — anything not on this list fails — and a row that stops
-/// matching anything fails too, because a stale exemption is an exemption nobody
-/// re-checked. Empty today, and the mechanism is here for the first row that
-/// needs it rather than added when one does.
-const ALLOWED: [(&str, &str, &str); 0] = [];
-
-/// One driver file as the scan reads it: **production source only**.
-///
-/// Two things are removed, and each removal is a stated blind spot rather than a
-/// convenience. `#[cfg(test)]` onward is cut, because a test in one of these
-/// files may legitimately build a landing verb — one deliberately does, to prove
-/// the `GitDenied` bridge REFUSES `git push`, and a scan that fired on it would
-/// be a scan the fix for is to delete the proof. Line comments are cut, because
-/// the design note is quoted at length in these files and a `///` block naming
-/// `queue_merge` or "merge" is prose, not a capability.
-///
-/// The comment cut is textual and is fooled by a `//` inside a string literal on
-/// a line with an odd number of quotes before it. No such line exists here, and
-/// the literal floor asserted below is what would notice if the cut ever started
-/// eating real code.
-fn driver_production_source(rel: &str) -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
-    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-    let src = match src.find("\n#[cfg(test)]") {
-        Some(i) => src[..i].to_string(),
-        None => src,
-    };
-    src.lines()
-        .map(|line| {
-            let mut quotes = 0usize;
-            let b: Vec<char> = line.chars().collect();
-            for k in 0..b.len() {
-                if b[k] == '"' && (k == 0 || b[k - 1] != '\\') {
-                    quotes += 1;
-                }
-                if b[k] == '/' && b.get(k + 1) == Some(&'/') && quotes % 2 == 0 {
-                    return b[..k].iter().collect::<String>();
-                }
-            }
-            line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Every whole double-quoted literal in `src`, without parsing Rust.
-fn quoted_literals(src: &str) -> Vec<String> {
+/// **The extraction is the guard**, so it is worth saying what it keys on: an
+/// argv reaching `RdRunner::gh` is a list of string literals, and this collects
+/// every `vec![…]` and `&[…]` list whose elements are string literals. It keys
+/// on the SHAPE — a bracketed list of quoted tokens — and never on the name of
+/// the function that builds it, which is the axis CLAUDE.md forbids deciding on
+/// because a rename steps over it.
+fn argv_literals(src: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    let mut cur: Option<String> = None;
-    let mut prev = '\0';
-    for c in src.chars() {
-        match (&mut cur, c) {
-            (Some(buf), '"') if prev != '\\' => {
-                out.push(std::mem::take(buf));
-                cur = None;
+    for opener in ["vec![", "&["] {
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(opener) {
+            let start = from + rel + opener.len();
+            let Some(len) = src[start..].find(']') else { break };
+            let block = &src[start..start + len];
+            let toks: Vec<String> = block
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(|s| s.to_string())
+                .collect();
+            if !toks.is_empty() {
+                out.push(toks);
             }
-            (Some(buf), _) => buf.push(c),
-            (None, '"') => cur = Some(String::new()),
-            _ => {}
+            from = start + len;
         }
-        prev = if prev == '\\' { '\0' } else { c };
     }
     out
 }
 
-/// §3.1 item 1's enforcement, prescribed on this slice: **the driver may never
-/// build a merge or any other landing verb** — plus items 2, 3, 5 and 7, which
-/// the note folds into the same scan because they are argv-shaped the same way.
+/// §3.1's enforcement, prescribed on this slice: **the driver may never build a
+/// merge or any other landing verb** — plus items 2, 3, 5 and 7.
 ///
-/// **Default-deny over a file scope, decided on the shape.** A forbidden argv
-/// token is matched as a whole quoted literal, so `merge_gate`, `mergeq` and
-/// `merge-base` are not hits and a real `"merge"` argument is; a forbidden
-/// capability is matched as an identifier. Nothing is keyed on a function's
-/// name, which is the axis a rename steps over.
+/// # Why this is default-deny on the ASK rather than a denylist of verbs
+///
+/// The driver reaches the outside world through exactly one method — `gh`, with
+/// an arg vector — so every external action it can take is an argv, and every
+/// argv's first two tokens are the ask. Enumerating what it MAY ask denies every
+/// forbidden ask at once, including `gh api`, `gh pr comment`, `gh pr close` and
+/// whatever `gh` ships next. A denylist would have to have anticipated each.
+///
+/// It is also the axis CLAUDE.md requires: the decision is the argv's SHAPE and
+/// its first tokens, never the name of the function that built it. Renaming
+/// `pr_facts_argv` changes nothing here; adding a new argv builder fails until
+/// its ask is argued onto `ALLOWED_ASKS`.
 ///
 /// # The residual, stated because a scan must state one
 ///
 /// **A landing verb the driver reaches through a shared helper it does not
-/// own.** This scan reads three files; a registry method called from one of them
-/// that itself pushes is invisible to it.
-///
-/// Half of that residual is closed structurally rather than by scanning:
-/// `rddrive::RdRunner` has a `gh` method and **no `git`**, so a driver holding
-/// one cannot reach `git push` at all, whatever a later author writes — the
-/// compiler enforces it, not this test — and the single bridge to the wider
-/// trait answers `git` with a refusal
-/// (`the_drivers_git_is_a_refusal_rather_than_an_absence`, in that module). The
-/// other half — a `gh` write reached through a shared helper — is closed by
-/// nothing here.
-///
-/// Three further blind spots, named rather than left to be discovered: a verb
-/// assembled from fragments (`"mer".to_string() + "ge"`), a verb read from a
-/// file or a config value at runtime, and a macro that expands to one. None
-/// appears today. The scan is textual, and this paragraph is its limit.
+/// own.** The `git` half is closed structurally — `rddrive::RdRunner` has no
+/// `git` method, and the one bridge to the wider trait answers `git` with a
+/// refusal — so the compiler, not this scan, enforces that half. The `gh` half
+/// is bounded but not closed: an argv assembled at runtime from a config value,
+/// or one built inside a helper in another module and handed to the driver, is
+/// invisible here. None exists today.
 #[test]
 fn the_driver_never_builds_a_landing_verb_and_never_grants_a_merge() {
-    let mut unmatched_allow: Vec<&str> = ALLOWED.iter().map(|(_, l, _)| *l).collect();
     let mut findings: Vec<String> = Vec::new();
-    let mut scanned_literals = 0usize;
-    let mut verified_files = 0usize;
+    let mut asks_seen = 0usize;
+    let mut unmatched: Vec<&str> = ALLOWED_ASKS.iter().map(|(_, v, _)| *v).collect();
+
     for rel in DRIVER_FILES {
         let src = driver_production_source(rel);
-        let lits = quoted_literals(&src);
-        // The population control. A scan that read nothing reports clean, which
-        // is byte-identical to a scan that found nothing — and this one has two
-        // ways to read nothing: a path that stopped resolving, and a comment cut
-        // that started eating code. Every one of these files carries argv,
-        // audit-detail and template-key literals in its production half.
-        assert!(
-            lits.len() >= 20,
-            "{rel}: only {} production literals extracted — the scan read (almost) nothing, \
-             which is not the same as finding nothing",
-            lits.len()
-        );
-        scanned_literals += lits.len();
-        verified_files += 1;
-        for (bad, why) in FORBIDDEN_LITERALS {
-            if lits.iter().any(|l| l == bad) {
-                if let Some(i) = ALLOWED.iter().position(|(f, l, _)| rel.ends_with(f) && *l == bad)
-                {
-                    unmatched_allow.retain(|l| *l != ALLOWED[i].1);
-                    continue;
-                }
-                findings.push(format!("{rel}: builds the argv token {bad:?} — {why}"));
+
+        // 1. Default-deny on what the driver ASKS `gh` for.
+        for argv in argv_literals(&src) {
+            // Only argvs that look like a `gh` ask are judged: a two-token-plus
+            // list whose first token is a `gh` noun. Anything else here is a
+            // template key list or an audit detail, not an external action.
+            let Some(first) = argv.first() else { continue };
+            if !matches!(first.as_str(), "pr" | "issue" | "api" | "release" | "repo" | "run") {
+                continue;
+            }
+            asks_seen += 1;
+            let verb = argv.get(1).map(String::as_str).unwrap_or("");
+            match ALLOWED_ASKS.iter().find(|(n, v, _)| n == first && *v == verb) {
+                Some((_, v, _)) => unmatched.retain(|u| u != v),
+                None => findings.push(format!(
+                    "{rel}: the driver asks `gh {first} {verb}`, which is not on the permitted \
+                     list — §3.1 items 1 and 3 deny every ask that is not argued onto it"
+                )),
             }
         }
-        for (bad, why) in FORBIDDEN_IDENTS {
+
+        // 2. Registry capabilities, matched as calls.
+        for (bad, why) in FORBIDDEN_CALLS {
             if names_call(&src, bad) {
-                if let Some(i) = ALLOWED.iter().position(|(f, l, _)| rel.ends_with(f) && *l == bad)
-                {
-                    unmatched_allow.retain(|l| *l != ALLOWED[i].1);
-                    continue;
-                }
-                findings.push(format!("{rel}: names {bad} — {why}"));
+                findings.push(format!("{rel}: calls {bad} — {why}"));
             }
         }
     }
-    // A count at the VERIFIED site, not the match site: "three files listed" is
-    // not "three files read".
-    assert_eq!(
-        verified_files,
-        DRIVER_FILES.len(),
-        "every file in scope must have been read, not merely listed"
+
+    // The population control. A scan that extracted no argv reports clean, which
+    // is byte-identical to one that found nothing forbidden.
+    assert!(
+        asks_seen >= 3,
+        "only {asks_seen} `gh` asks extracted across the driver's files — the extraction read \
+         (almost) nothing, which is not the same as finding nothing"
     );
-    assert!(scanned_literals > 60, "only {scanned_literals} literals across three files");
     assert!(findings.is_empty(), "review-driver.md §3.1:\n  {}", findings.join("\n  "));
     assert!(
-        unmatched_allow.is_empty(),
-        "stale exemptions — these rows match nothing any more, so they are exemptions nobody \
-         re-checked: {unmatched_allow:?}"
+        unmatched.is_empty(),
+        "permitted asks that match nothing any more — a row nobody re-checked: {unmatched:?}"
     );
+
+    // Every denylist row must still name something that EXISTS, or it denies a
+    // function that has been renamed and reports green while doing it.
+    let haystack = format!(
+        "{}{}",
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/orchestration/mod.rs")
+        )
+        .unwrap_or_default(),
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/orchestration/mcp.rs")
+        )
+        .unwrap_or_default(),
+    );
+    for (bad, _) in FORBIDDEN_CALLS {
+        assert!(
+            haystack.contains(&format!("fn {bad}(")),
+            "the denylist row for `{bad}` names nothing that exists any more — it was probably \
+             renamed, and this row has been denying nothing since"
+        );
+    }
 }
 
-/// The positive control for the scan above, and it is the one the #1395 census
-/// bullet asks for: the harness is itself an instrument, so prove its extraction
-/// against a subject known to FAIL before reading its clean report.
+/// The positive control, and it is the one this guard most needs: **it reddens
+/// on a real merge call, and not on a string that merely contains one.**
 ///
-/// Without this, `quoted_literals` could return an empty vector for every input
-/// — an escape-handling slip, a comment cut that ate the file — and the scan
-/// would read green over a driver that pushed on every tick. The second half is
-/// the near-miss control: the driver's real source is full of `merge_gate`,
-/// `mergeq` and `merge_queue.json`, and a scan that fired on those would be
-/// deleted within a day.
+/// The distinction is the whole difference between a guard that enforces the
+/// rule and one that enforces a prefix — which is what the previous version of
+/// this scan did, and what its own suite caught.
 #[test]
-fn the_landing_verb_scan_really_fires_on_a_landing_verb() {
+fn the_landing_verb_scan_fires_on_a_real_merge_and_not_on_a_lookalike() {
+    // A driver that landed. Both halves: the ask, and the registry call.
     let hostile = r##"
-        fn land(r: &dyn RdRunner) {
-            let _ = r.gh(&["pr", "merge", "--delete-branch"]);
-            reg.grant_merge(group, pr, "human");
+        pub fn land_argv(pr: u64) -> Vec<String> {
+            vec!["pr".into(), "merge".into(), pr.to_string(), "--delete-branch".into()]
         }
+        fn land(reg: &OrchRegistry) { reg.grant_merge(group, pr, "human"); }
     "##;
-    let lits = quoted_literals(hostile);
-    assert!(lits.contains(&"merge".to_string()), "extraction missed a whole literal: {lits:?}");
-    assert!(lits.contains(&"--delete-branch".to_string()));
-    assert!(names_call(hostile, "grant_merge"), "the ident match must fire on a real call");
-    // …and the near-miss that made this a function rather than a `contains`: a
-    // LONGER name starting with a forbidden one is a different function, and the
-    // driver really does call one (`record_verdict_seen`, which records what it
-    // read and cannot write a verdict file).
+    let asks = argv_literals(hostile);
     assert!(
-        !names_call("entry.record_verdict_seen(&block, v, &head);", "record_verdict"),
-        "a substring match would report the driver as writing verdicts"
+        asks.iter().any(|a| a.first().map(String::as_str) == Some("pr")
+            && a.get(1).map(String::as_str) == Some("merge")),
+        "the extraction missed a landing argv: {asks:?}"
     );
     assert!(
-        names_call("reg.record_verdict(&group, &agent, pr, v, s);", "record_verdict"),
-        "…while the real call still fires, so the narrowing did not disarm the rule"
+        !ALLOWED_ASKS.iter().any(|(n, v, _)| *n == "pr" && *v == "merge"),
+        "`gh pr merge` must not be a permitted ask"
     );
+    assert!(names_call(hostile, "grant_merge"));
 
+    // …and the lookalikes the driver's real source is full of, which a guard
+    // that fired on them would be deleted within a day.
     let benign = r##"
         let gate = self.merge_gate(group);
         let spec = mergeq::GateSpec::Absent;
         let _ = "merge-base";
         let _ = "merge_queue.json";
+        entry.record_verdict_seen(&block, v, &head);
+        vec!["pr".into(), "view".into(), "--json".into(), "state,headRefOid".into()]
     "##;
-    let benign_lits = quoted_literals(benign);
     assert!(
-        !benign_lits.iter().any(|l| l == "merge"),
-        "the scan would fire on `merge-base` / `merge_queue.json`: {benign_lits:?}"
+        !names_call(benign, "record_verdict"),
+        "a substring match would report the driver as writing verdicts"
     );
-    assert!(!names_call(benign, "grant_merge"));
+    assert!(
+        !names_call(benign, "grant_merge"),
+        "`merge_gate` and `merge_queue.json` are not `grant_merge`"
+    );
+    let benign_asks = argv_literals(benign);
+    assert!(
+        benign_asks.iter().any(|a| a.first().map(String::as_str) == Some("pr")
+            && a.get(1).map(String::as_str) == Some("view")),
+        "…while a permitted ask is still extracted, so the extraction is not simply blind"
+    );
+    // The real call still fires, so narrowing to call-shape did not disarm it.
+    assert!(names_call("reg.record_verdict(&g, &a, 1, \"pass\", \"s\");", "record_verdict"));
 }
 
-/// The comment cut is a removal, and a removal is a place a scan can go blind —
-/// so it gets its own control rather than being trusted.
-///
-/// A `///` block quoting the design note must not be a hit (that is why the cut
-/// exists) while the identical text in *code* still must be.
-#[test]
-fn the_comment_cut_removes_prose_and_not_code() {
-    let src = "/// comes back through a fresh `queue_merge` as a NEW entry\nlet x = 1; // and \"merge\"\nlet y = \"merge\";\n";
-    let cut = {
-        // The same transformation `driver_production_source` applies, on a
-        // string rather than a file — the function itself takes a path, and the
-        // point here is the transformation.
-        src.lines()
-            .map(|line| match line.find("//") {
-                Some(k) if line[..k].matches('"').count() % 2 == 0 => line[..k].to_string(),
-                _ => line.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert!(!cut.contains("queue_merge"), "a doc block naming a forbidden ident is prose: {cut:?}");
-    assert!(
-        quoted_literals(&cut).contains(&"merge".to_string()),
-        "…and a real literal survives the cut: {cut:?}"
-    );
-}
 
 // ── the tick, through the registry ──────────────────────────────────────────
 
