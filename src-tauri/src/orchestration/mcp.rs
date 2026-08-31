@@ -3217,12 +3217,45 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     report::relay_payload(note.or(summary).unwrap())
                 ),
             };
-            // #576 residual: the relay variant, which opts this notice into the
-            // question gate's delivery record — the note is the CALLER's words
-            // landing in the ORCHESTRATOR's pane, which is the cross-pane
-            // authorship the record requires. See
-            // `deliver_relayed_to_orchestrator`.
-            reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+            // #1778 §7: **for a driven PR the recipient changes.** A delegate
+            // this group's review driver spawned or resumed reports to the
+            // DRIVER; the orchestrator's visible prompt is the kick-back (§6),
+            // and every consumed event is audited as `rd-consumed` so the
+            // traffic that stopped arriving as a prompt is still on the record.
+            //
+            // **Keyed on the calling agent, never on text.** `rd_owner` compares
+            // an id orrerix minted at spawn against the id resolved from this
+            // caller's own token — never a `ref` string in `args` — because a
+            // delegate that could choose whether its report reaches the
+            // orchestrator by naming a PR number is a delegate that can route
+            // around the orchestrator.
+            //
+            // **This is the arm §7 warns is the one that gets missed**: it calls
+            // `deliver_relayed_to_orchestrator`, a different method from the one
+            // `review_verdict` calls, and naming only the other would leave
+            // `report` still delivering under a live drive.
+            match reg.rd_owner(&caller.group, &caller.agent_id) {
+                Some((pr, _)) => {
+                    // A `progress` report is consumed like the rest — nothing
+                    // silent — and carries no signal, because a drive advances
+                    // on the head, the checks and the verdict files, never on a
+                    // delegate saying it is still going.
+                    let event = match status {
+                        "done" => Some(super::RdEvent::WorkerDone),
+                        "blocked" => Some(super::RdEvent::WorkerBlocked),
+                        _ => None,
+                    };
+                    reg.rd_consume(&caller.group, pr, &caller.agent_id, "report", event);
+                }
+                // #576 residual: the relay variant, which opts this notice into
+                // the question gate's delivery record — the note is the CALLER's
+                // words landing in the ORCHESTRATOR's pane, which is the
+                // cross-pane authorship the record requires. See
+                // `deliver_relayed_to_orchestrator`.
+                None => {
+                    reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+                }
+            }
             // #203: a planner's contract is one plan → one report → exit. Close
             // its pane deterministically on the `done` report so it stops holding
             // a delegate slot the instant its work is posted — the role-template
@@ -3281,6 +3314,19 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 rec.pr,
                 (!rec.body_digest.is_empty()).then_some(rec.body_digest.as_str()),
             );
+            // #1778 §7's other half. The verdict FILE is written either way —
+            // `record_verdict` above already did it, and it is what opens the
+            // gate for every reader — but under a live drive the *notice* goes
+            // to the driver instead of the orchestrator's pane, and the reviewer
+            // still gets the same reply it always got.
+            //
+            // **Two delivery methods carry this traffic and interception has to
+            // edit both**: this arm calls `deliver_to_orchestrator`, and the
+            // `report` arm calls `deliver_relayed_to_orchestrator`, a separate
+            // method whose extra job is the #576 question-mask record. Naming
+            // only one would leave the other still delivering under a drive.
+            let driven = reg.rd_owner(&caller.group, &caller.agent_id);
+            if driven.is_none() {
             let _ = reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!(
@@ -3308,6 +3354,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 ),
                 &caller.agent_id,
             );
+            }
+            if let Some((pr, _)) = driven {
+                // The event carries no verdict WORD: the next tick re-reads the
+                // verdict file through the same parser the gate reads, so a
+                // signal carrying it would be a second source for one fact — and
+                // the second source would be the one a delegate could shape.
+                reg.rd_consume(
+                    &caller.group,
+                    pr,
+                    &caller.agent_id,
+                    "review_verdict",
+                    Some(super::RdEvent::Verdict),
+                );
+            }
             // Anything orrerix could not sample while recording goes back to the
             // REVIEWER, which is the only party positioned to act on it (#791,
             // rev-lead). A verdict recorded with an empty head is a verdict that
@@ -3494,6 +3554,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             reg.note_agent_activity(&caller.agent_id);
             // #576 residual: same relay variant, same reason as `report` above.
             //
+            // #1778 §7: **`message_orchestrator` is never intercepted**, and
+            // that is the load-bearing exemption rather than an oversight. It is
+            // the one channel a delegate has for something that is not a status
+            // change — a brief whose premise is wrong, a question, a refusal —
+            // and it is exactly the traffic the visible-prompt norm exists to
+            // protect. So the line below is delivered unchanged, and the driver
+            // only NOTICES that it happened: on the next tick the drive goes to
+            // `held(messaged)` and emits its one kick-back beside it.
+            //
+            // Deliberately NOT audited as `rd-consumed`: nothing was consumed,
+            // and an audit action that named a delivery a consumption would be
+            // the mislabel #461 catalogues.
+            if let Some((pr, _)) = reg.rd_owner(&caller.group, &caller.agent_id) {
+                reg.rd_ingest(&caller.group, pr, super::RdEvent::Messaged);
+            }
             // #891 rev-1 F1: the id in the prefix is orrerix's — resolved from
             // the caller's token, never from `args` — but everything after the
             // colon is the agent's, and this line is the one a liaison's relay

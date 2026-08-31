@@ -321,6 +321,81 @@ impl OrchRegistry {
         }
     }
 
+    /// Which live drive, if any, this agent is a delegate of — §7's interception
+    /// key, and the whole of it.
+    ///
+    /// **Keyed on the agent, never on text.** The id compared here is one
+    /// orrerix minted at spawn and the driver recorded itself
+    /// (`LaneRecord::agent`, `DriveEntry::worker_agent`), and the caller's id
+    /// comes from its MCP token rather than from `args`. So a delegate cannot
+    /// choose whether its report reaches the orchestrator by naming a PR
+    /// number, and cannot name someone else's to redirect theirs — which is the
+    /// property §7 spends a paragraph on, because a delegate that could do
+    /// either is a delegate that can route around the orchestrator.
+    ///
+    /// **Only a LIVE drive owns anyone.** A `held` entry is parked: its
+    /// delegates' traffic goes to the orchestrator exactly as it always did,
+    /// which is what makes a hold a hand-back to a human rather than a quieter
+    /// kind of drive. A terminal entry owns nobody for the same reason.
+    ///
+    /// Reads `review_drives.json` on every driven-or-not `report` and
+    /// `review_verdict`. That is one small JSON read on a path that already
+    /// writes a verdict file and delivers a pane prompt, and an absent file —
+    /// the product default — costs a `stat` and answers `None`.
+    pub fn rd_owner(
+        &self,
+        group: &GroupId,
+        agent_id: &str,
+    ) -> Option<(u64, reviewdrive::DrivenRole)> {
+        let dir = self.group_dir(group);
+        let _state_guard = self.rd_state_lock.lock_safe();
+        let state = reviewdrive::load_state(&dir).ok()?;
+        state
+            .entries
+            .iter()
+            .filter(|e| e.state().is_live())
+            .find_map(|e| e.driven_role(agent_id).map(|r| (e.pr, r)))
+    }
+
+    /// Record that a driven delegate's event was **consumed** by the driver
+    /// rather than delivered to the orchestrator (§7).
+    ///
+    /// **Nothing is silent.** Every consumed event is audited with its kind, the
+    /// agent and the PR, so traffic that stopped arriving as a prompt is still
+    /// on the record and still attributable. "Consumed" is a different word from
+    /// "dropped" and §5.4's vocabulary keeps them different.
+    ///
+    /// `event` is `None` for traffic that is consumed but carries no signal — a
+    /// `report(progress)`, whose content the drive does not turn on: a drive
+    /// advances on the head, the checks and the verdict files, not on a delegate
+    /// saying it is still going.
+    pub fn rd_consume(
+        &self,
+        group: &GroupId,
+        pr: u64,
+        agent: &str,
+        kind: &str,
+        event: Option<RdEvent>,
+    ) {
+        let on_behalf = {
+            let dir = self.group_dir(group);
+            let _state_guard = self.rd_state_lock.lock_safe();
+            reviewdrive::load_state(&dir)
+                .ok()
+                .and_then(|s| s.entry(pr).map(|e| e.on_behalf_of.clone()))
+                .unwrap_or_default()
+        };
+        self.rd_audit(
+            group,
+            &on_behalf,
+            rddrive::audit_action::CONSUMED,
+            json!({ "pr": pr, "agent": agent, "kind": kind }),
+        );
+        if let Some(e) = event {
+            self.rd_ingest(group, pr, e);
+        }
+    }
+
     /// This drive's pending delegate signals, **without clearing them**.
     ///
     /// Cleared only once an arc has been taken, because a tick can decline to
