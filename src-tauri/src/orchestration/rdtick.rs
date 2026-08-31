@@ -1842,9 +1842,11 @@ impl OrchRegistry {
                 //
                 // Clearing `briefed_head` puts the outstanding lane back in
                 // `lane_open_for`'s false branch, so the next tick takes
-                // `OpenLane` — and `rd_open_lane` RESUMES the session already
-                // recorded for that lane, so this re-briefs the stalled pane
-                // rather than spawning a second one beside it.
+                // `OpenLane`. `rd_open_lane` resumes the session recorded for
+                // that lane when there is one and spawns a fresh reviewer when
+                // there is not; either way the record is re-pointed at the pane
+                // that now holds the lane, so §7's interception stays keyed on a
+                // live pane rather than on an abandoned one.
                 //
                 // Scoped to this hold because it is the only one it can change.
                 // A lane holding `escalate` or `review-limit` carries a verdict

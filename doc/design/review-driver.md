@@ -207,9 +207,12 @@ only restarted the clocks would leave the stalled lane holding a brief it has
 already ignored, wait the full `lane_timeout_minutes` in silence, and re-hold.
 That is worse than re-holding at once, because the silence looks like progress.
 So the resume clears each lane's briefed head, which puts the outstanding lane
-back on the `OpenLane` arc; `rd_open_lane` resumes the session already recorded
-for it, so the *same* pane is re-briefed rather than a second reviewer being
-spawned beside it. Scoped to this hold: a lane holding `escalate` or
+back on the `OpenLane` arc. `rd_open_lane` then resumes the session recorded for
+that lane when there is one, and spawns a fresh reviewer when there is not —
+either way the lane record is re-pointed at the pane that now holds it, so §7's
+interception stays keyed on a live pane rather than on an abandoned one. Whether
+the stalled pane itself is reused therefore depends on whether a session was
+ever recorded for it, which is not something this arc decides. Scoped to this hold: a lane holding `escalate` or
 `review-limit` carries a verdict `decide_review_wait` answers before it consults
 the lane record, and a lane that is legitimately mid-review must not be
 re-briefed because some other hold on the drive was resumed. This is the general

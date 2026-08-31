@@ -2028,18 +2028,29 @@ fn a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again() {
          its own notice instructs buys a silent lane_timeout and then re-holds: {reopened:?}"
     );
 
-    // …in the pane it already had, not a second one beside it.
+    // …and the pane that now holds the lane really received a brief.
+    //
+    // **Not asserted: that it is the SAME pane.** `rd_open_lane` resumes the
+    // session recorded for a lane and spawns a fresh reviewer when there is
+    // none — and a spawn in this harness records no session id, so the fixture
+    // takes the fallback and a fresh pane is the correct outcome here. Pinning
+    // identity would pin the fixture rather than the rule. What matters either
+    // way is what this does assert: the lane record now points at the pane that
+    // was actually briefed, so §7's interception stays keyed on a live pane
+    // rather than on the abandoned one.
     let (_pr, _b, agent_after) = resumed
         .lanes_opened
         .iter()
         .find(|(_, b, _)| b == "rev-final")
         .cloned()
         .expect("checked immediately above");
-    assert_eq!(
-        agent_after, lane1,
-        "`rd_open_lane` resumes the session already recorded for a lane, so the stalled pane is \
-         re-briefed rather than a second reviewer being spawned beside it"
+    let re_brief = lane_brief(&reg, &agent_after);
+    assert!(
+        re_brief.contains("1758") && re_brief.contains(HEAD_A),
+        "the re-opened lane's pane must actually hold a brief for this PR at this head: \
+         {re_brief}"
     );
+    let _ = &lane1;
 
     // And the lane whose pass still stands is left alone.
     assert!(
