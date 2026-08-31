@@ -321,6 +321,7 @@ pub const READ_TOOLS: &[&str] = &[
     "group_usage",
     "session_digest",
     "merge_queue_status",
+    "review_drive_status",
     "channel_status",
     // #1683: a pure group-dir read — validates the section id, slices the
     // rendered playbook, writes one audit line. Nothing mutates.
@@ -1482,6 +1483,26 @@ fn tool_defs(
                 "Take a PR back out of the merge queue. Works on any entry that has not reached a terminal state — including one inside a batch that is currently in flight, in which case that batch is abandoned and rebuilt without it (nothing lands, and orrerix cleans up its scratch ref and draft PR). Refuses `not-queued` if the PR is not in the queue or has already landed, been kicked back, or been cancelled — a landing that already happened cannot be called back, and you are told so rather than being given a success that means nothing. `queue-state-unreadable` and `queue-state-unwritable` are DIFFERENT and mean orrerix itself failed — the first says orrerix cannot read the queue at all (so it cannot tell whether your PR is in it, which is not the same as saying it isn't), the second says the cancel was computed and could not be saved (so it did not happen). Neither should appear in a running build; report one rather than working around it. Cancel when the PR needs more work; a kicked-back PR that gets fixed comes back through a fresh queue_merge as a NEW entry, so its refusals are all re-checked against the world as it is then.",
                 json!({ "pr": { "type": "string", "description": "PR number, #n, or URL — the queued PR to cancel." } }),
                 &["pr"]),
+            // The engine-driven review loop (#1778 §5.1). Orchestrator-only and
+            // re-checked in `call_tool` — this listing is cosmetic, the dispatch
+            // check is the gate. Off unless the repo declares `driver: enabled:
+            // true`, in which case every call refuses `driver-disabled`.
+            tool("drive_review",
+                "Hand ONE PR's worker-reviewer rounds to orrerix, so you stop spending a turn on each one. orrerix then does, on its own poll loop: wait for CI; spawn or resume each reviewer lane the merge gate requires, in gate order, briefing it with the head and what moved; hand a FAIL or a red run or a conflict back to the worker session you name here; and stop with ONE notice in this pane at gate-satisfied, at an escalate, or at a bound. It never merges, never edits a PR or an issue, never kills a pane, never writes a verdict, and never decides a disposition — those stay yours. While a drive is live, that PR's delegates' report and review_verdict notices go to the driver instead of appearing here; their message_orchestrator lines still reach you unchanged, and the drive then holds so you know why. Call it per PR, deliberately: it is NOT automatic on report(done), because the PRs where a drive is wrong are ordinary ones (a scratch or red-evidence PR, a release bump, a PR the human is reading themselves). Counters are INVARIANT 9's and clamp toward it, never away: three review rounds, three CI attempts, one rebase. Refuses `driver-disabled`, `pr-not-open`, `pr-unverifiable`, `resume-not-found`, `resume-ambiguous`, `resume-session-empty`, `already-driven`, `already-queued` (a queued PR may not be driven, and a driven PR may not be queued — drive first, disposition the findings, THEN queue), `gate-not-configured`, `gate-names-no-such-block`. Four further reasons mean ORRERIX ITSELF FAILED rather than that the driver declined you: `rd-state-unreadable` (orrerix cannot read its own drive record, which is NOT 'nothing is driven'), `rd-state-unwritable` (the drive was computed and could not be saved, so it did not happen), `rd-unavailable`, and `gate-unreadable` (a gate file is present and orrerix cannot read it — NOT `gate-not-configured`, which means it is genuinely absent). Report one of those rather than working around it. Also resumes a HELD drive: call it again with the same PR, and pass reset_counters to spend a fresh budget.",
+                json!({
+                    "pr": { "type": "string", "description": "PR number, #n, or URL — the PR to drive." },
+                    "worker_session": { "type": "string", "description": "The session id of the worker that owns this PR — the one orrerix resumes to hand a fix back to. Give the FULL id: a prefix that is unique today can become ambiguous as the roster grows, and this outlives the call. orrerix resolves it once, here, and stores what came back. It does not read the board for it: the board is agent-writable, so a check that trusted it would be a check the thing being checked gets to answer." },
+                    "reset_counters": { "type": "boolean", "description": "OPTIONAL, default false. On a HELD drive, clear the spent counters instead of resuming them — a visible decision to spend another three rounds rather than a side effect of typing the same call twice. Audited." },
+                    "rounds_already_spent": { "type": "number", "description": "OPTIONAL, default 0, clamped 0..=3. Rounds of review findings this PR has ALREADY had, from you or from anyone. 'Yours count too' is a property of the budget, not of who spent it: if you reviewed by hand once and got a fail, pass 1, or the drive starts at zero and spends three more for four against an invariant of three." },
+                }),
+                &["pr", "worker_session"]),
+            tool("review_drive_status",
+                "Where this group's review drives stand: {enabled, drives:[{pr, state, held_reason?, head, lanes:[{block, last_verdict?}], counters, since_ms}]}. States are ci-wait | review-wait | fix-wait | gate-check | held. `held` is PARKED, not finished — it keeps its counters and comes back with drive_review, or stops with cancel_review_drive — and `held_reason` says which of the twelve it is. Terminal drives are not listed. `since_ms` is an AGE, not a timestamp. Read this after a compaction: it is how you recover which PRs orrerix is driving for you, and a drive you have forgotten is still running. `refused: rd-state-unreadable` means orrerix cannot read its own record, which is NOT 'nothing is driven'. Read-only: calling this never changes anything.",
+                json!({}), &[]),
+            tool("cancel_review_drive",
+                "Stop driving a PR. Works on any drive that has not already finished, held ones included; the entry is dropped and its counters go with it, so a later drive_review on that PR starts fresh. Use it when the PR needs something the driver cannot do — a conflict you want to resolve by hand, a change of plan, a PR you have decided to review yourself. Refuses `not-driven` if that PR has no live drive. `rd-state-unreadable` is DIFFERENT and means orrerix cannot read its drive record at all, so it cannot tell you whether that PR is driven — which is not the same as saying it isn't; `rd-state-unwritable` means the cancel was computed and could not be saved, so it did not happen. Neither should appear in a running build.",
+                json!({ "pr": { "type": "string", "description": "PR number, #n, or URL — the driven PR to stop." } }),
+                &["pr"]),
         ]);
         // The manager mailbox's WRITE half (#1161 M2), and the ONE tool on this
         // surface whose listing depends on the group's roster rather than on the
@@ -2435,6 +2456,49 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         // The group is `caller.group` throughout — never an argument — so there
         // is no cross-group surface here to check: a caller cannot name another
         // group's queue.
+        // ---- the engine-driven review loop (#1778 §5.1) ----
+        //
+        // Double-gated exactly as `queue_merge` is, and for a sharper reason: a
+        // drive spawns delegates and resumes a worker session on orrerix's own
+        // initiative, with no orchestrator turn in between. That authority is
+        // the ORCHESTRATOR's, exercised on a PR the orchestrator handed over
+        // explicitly (§3.2), so "only an orchestrator may ask for it" must not
+        // depend on a JSON shim's cosmetic listing filter.
+        //
+        // The group is `caller.group` throughout — never an argument — so there
+        // is no cross-group surface here: a caller cannot name another group's
+        // drives.
+        "drive_review" => {
+            require_orchestrator(caller)?;
+            let raw = arg_str(args, "pr").ok_or("pr required")?;
+            let pr = super::pr_number(raw).ok_or("pr must be a number, #n, or a PR URL")?;
+            let session = arg_str(args, "worker_session").ok_or("worker_session required")?;
+            let reset = arg_bool(args, "reset_counters");
+            // Clamped 0..=3 by `Counters::seeded`, which is where §2.3's
+            // "yours count too" is enforced rather than here — a clamp at the
+            // shim would be a second bound to keep in step with the first.
+            let spent = args
+                .get("rounds_already_spent")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let out =
+                reg.drive_review(&caller.group, pr, session, reset, spent, &caller.agent_id);
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+        "review_drive_status" => {
+            require_orchestrator(caller)?;
+            let out = reg.review_drive_status(&caller.group);
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+        "cancel_review_drive" => {
+            require_orchestrator(caller)?;
+            let raw = arg_str(args, "pr").ok_or("pr required")?;
+            let pr = super::pr_number(raw).ok_or("pr must be a number, #n, or a PR URL")?;
+            let out = reg.cancel_review_drive(&caller.group, pr, &caller.agent_id);
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+
         "queue_merge" => {
             require_orchestrator(caller)?;
             let raw = arg_str(args, "pr").ok_or("pr required")?;

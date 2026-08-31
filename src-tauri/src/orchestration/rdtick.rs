@@ -31,9 +31,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::{
-    brand, mergeq, notify, pr_number, rddrive, render_template, reviewdrive,
-    resolve_worker_resume_cwd, workflow, AgentEntry, GroupId, LockExt, OrchRegistry, Role,
-    TaskPatch,
+    brand, mergeq, mqloop, notify, now_ms, pr_number, rddrive, render_template,
+    resolve_session_ref, resolve_worker_resume_cwd, reviewdrive, workflow, AgentEntry, GroupId,
+    LockExt, OrchRegistry, Role, TaskPatch,
 };
 
 // ---------- the review driver's registry-side types (#1778 S3) ----------
@@ -1312,4 +1312,318 @@ impl OrchRegistry {
         out.on_behalf_of = on_behalf;
         Some(out)
     }
+
+    // ---------- §5.1's three MCP tools ----------
+
+    /// `drive_review(pr, worker_session, reset_counters?, rounds_already_spent?)`
+    /// — §3.2's second key, and the only thing that starts a drive.
+    ///
+    /// **Never automatic**, and in particular it does not fire on a worker's
+    /// `report(done)`: INVARIANT 8 makes *what starts* the orchestrator's call,
+    /// and the PRs where a drive is wrong are ordinary — a scratch or
+    /// red-evidence PR, a release bump, a PR the human said they would read
+    /// themselves.
+    ///
+    /// **The session is resolved once, and what is persisted is what came
+    /// back** (§3.2). `resolve_session_ref` is a resolution against *this
+    /// group's roster at the moment of the call*: a prefix that resolves
+    /// uniquely today can become ambiguous tomorrow as the roster grows, and the
+    /// entry outlives both the call and the process. So the **resolved** id goes
+    /// into `review_drives.json`, never the caller's raw string.
+    ///
+    /// Refusals are §5.1's closed vocabulary, in two classes: the driver
+    /// declining, and orrerix having failed. The order they are checked in is
+    /// cheapest-first among equals, with one exception that is not: the PR's
+    /// state is read **last** among the checks, because it is the only one that
+    /// spends a `gh` round trip.
+    #[doc(hidden)] // pub for integration tests
+    pub fn drive_review(
+        &self,
+        group: &GroupId,
+        pr: u64,
+        worker_session: &str,
+        reset_counters: bool,
+        rounds_already_spent: u32,
+        on_behalf_of: &str,
+    ) -> Value {
+        let injected = self.rd_runner_override.lock_safe().clone();
+        let owned;
+        let runner: &dyn rddrive::RdRunner = match injected.as_deref() {
+            Some(r) => r,
+            None => {
+                let Some(repo) = self.group(group).map(|g| g.repo) else {
+                    return self.rd_refuse(group, pr, rddrive::refusal::UNAVAILABLE);
+                };
+                owned = rddrive::runner_for(std::path::Path::new(&repo));
+                &owned
+            }
+        };
+        self.drive_review_with(
+            group,
+            runner,
+            pr,
+            worker_session,
+            reset_counters,
+            rounds_already_spent,
+            on_behalf_of,
+        )
+    }
+
+    /// [`drive_review`](Self::drive_review) with the `gh` seam injected.
+    #[doc(hidden)] // pub for integration tests
+    pub fn drive_review_with(
+        &self,
+        group: &GroupId,
+        runner: &dyn rddrive::RdRunner,
+        pr: u64,
+        worker_session: &str,
+        reset_counters: bool,
+        rounds_already_spent: u32,
+        on_behalf_of: &str,
+    ) -> Value {
+        use rddrive::refusal as r;
+        if !self.driver_enabled(group) {
+            return self.rd_refuse(group, pr, r::DRIVER_DISABLED);
+        }
+        // The session, resolved once (§3.2). An empty string gets its own name
+        // rather than leaking `resolve_session_ref`'s untagged prose.
+        if worker_session.trim().is_empty() {
+            return self.rd_refuse(group, pr, r::RESUME_SESSION_EMPTY);
+        }
+        let session = match resolve_session_ref(&self.merged_records(group), worker_session) {
+            Ok(s) => s,
+            Err(e) if e.starts_with("resume-ambiguous") => {
+                return self.rd_refuse(group, pr, r::RESUME_AMBIGUOUS)
+            }
+            Err(_) => return self.rd_refuse(group, pr, r::RESUME_NOT_FOUND),
+        };
+        // The gate, from the same two files the shim reads. `gate-unreadable` is
+        // NOT `gate-not-configured`: a wrong label sends the reader somewhere
+        // else, which is #681's own lesson and the queue's posture.
+        let spec = match self.merge_queue_gate(group) {
+            Ok(s) => s,
+            Err(_) => return self.rd_refuse(group, pr, r::GATE_UNREADABLE),
+        };
+        let gate = match &spec {
+            mergeq::GateSpec::Declared(g) => g.clone(),
+            mergeq::GateSpec::Malformed => return self.rd_refuse(group, pr, r::GATE_UNREADABLE),
+            mergeq::GateSpec::Absent => {
+                return self.rd_refuse(group, pr, r::GATE_NOT_CONFIGURED)
+            }
+        };
+        // A gate requiring a reviewer the roster does not declare is answerable
+        // here, from two files. Left unanswered it becomes `held(lane-stalled)`
+        // an hour later instead of an immediate refusal.
+        if let Some(g) = self.group(group) {
+            if !workflow::gate_missing_blocks(&gate, &g.guardrails.blocks).is_empty() {
+                return self.rd_refuse(group, pr, r::GATE_NAMES_NO_SUCH_BLOCK);
+            }
+        }
+        // §8.1's mutual refusal: the two loops both move a PR's head and both
+        // read its verdicts, and neither was designed expecting the other to be
+        // doing so concurrently. The intended sequence is serial and has a
+        // direction — a drive ends at `satisfied`, the orchestrator dispositions
+        // the findings, and *then* it queues.
+        if let Ok(q) = mqloop::load_state(&self.group_dir(group)) {
+            if q.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false) {
+                return self.rd_refuse(group, pr, r::ALREADY_QUEUED);
+            }
+        }
+        // Last, because it is the only check that spends a `gh` round trip.
+        let obs = rddrive::observe_pr(runner, pr);
+        match obs.open {
+            Some(true) => {}
+            Some(false) => return self.rd_refuse(group, pr, r::PR_NOT_OPEN),
+            // The remote did not answer. Unknown is never treated as safe, and
+            // it is never treated as a fact about the PR either.
+            None => return self.rd_refuse(group, pr, r::PR_UNVERIFIABLE),
+        }
+        let dir = self.group_dir(group);
+        let (audit_action, detail) = {
+            let _state_guard = self.rd_state_lock.lock_safe();
+            let mut state = match reviewdrive::load_state(&dir) {
+                Ok(s) => s,
+                // NOT `not-driven`: that would assert something orrerix cannot
+                // know, and `already-driven` is unevaluable here, so an unnamed
+                // failure becomes a second drive on one PR.
+                Err(_) => return self.rd_refuse(group, pr, r::STATE_UNREADABLE),
+            };
+            if state.is_driven(pr) {
+                return self.rd_refuse(group, pr, r::ALREADY_DRIVEN);
+            }
+            let resumed = match state.entry(pr).map(|e| e.state()) {
+                // A parked drive RESUMES, carrying its counters — §2.3's
+                // default, and the whole reason §2.1 makes `held` parked rather
+                // than terminal. Clearing them is an explicit, audited argument.
+                Some(reviewdrive::DriveState::Held) => true,
+                _ => false,
+            };
+            if resumed {
+                let entry = match state.entry_mut(pr) {
+                    Some(e) => e,
+                    None => return self.rd_refuse(group, pr, r::STATE_UNREADABLE),
+                };
+                if reset_counters {
+                    entry.counters = reviewdrive::Counters::seeded(rounds_already_spent);
+                }
+                if entry
+                    .advance(reviewdrive::DriveState::CiWait, None, None, now_ms())
+                    .is_err()
+                {
+                    return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
+                }
+                entry.worker_session = session.clone();
+                entry.on_behalf_of = on_behalf_of.to_string();
+            } else {
+                // A `satisfied` or `cancelled` entry that retention has not yet
+                // pruned starts a FRESH drive with fresh counters — the queue's
+                // own "comes back as a NEW entry" behaviour.
+                state.entries.retain(|e| e.pr != pr);
+                state.entries.push(reviewdrive::DriveEntry::new(
+                    pr,
+                    &session,
+                    on_behalf_of,
+                    reviewdrive::Counters::seeded(rounds_already_spent),
+                    now_ms(),
+                ));
+            }
+            if reviewdrive::store_state(&dir, &state).is_err() {
+                return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
+            }
+            if resumed {
+                (
+                    rddrive::audit_action::RESUMED,
+                    json!({ "pr": pr, "reset_counters": reset_counters,
+                            "rounds_already_spent": rounds_already_spent }),
+                )
+            } else {
+                (
+                    rddrive::audit_action::STARTED,
+                    json!({ "pr": pr, "rounds_already_spent": rounds_already_spent }),
+                )
+            }
+        };
+        // A resume that carried a stale signal would re-hold on the reason it
+        // was resumed out of — `messaged` most obviously.
+        self.rd_signals.lock_safe().remove(&(group.clone(), pr));
+        self.rd_audit(group, on_behalf_of, audit_action, detail);
+        // Service this group on the very next wake rather than after a backoff
+        // window that predates the drive.
+        self.rd_service_ms.lock_safe().remove(group);
+        json!({ "driving": true, "state": reviewdrive::DriveState::CiWait.as_str() })
+    }
+
+    /// `cancel_review_drive(pr)` — one of `held`'s two outgoing arcs, and the
+    /// only way a live drive stops without reaching `satisfied`.
+    #[doc(hidden)] // pub for integration tests
+    pub fn cancel_review_drive(&self, group: &GroupId, pr: u64, on_behalf_of: &str) -> Value {
+        use rddrive::refusal as r;
+        if !self.driver_enabled(group) {
+            return self.rd_refuse(group, pr, r::DRIVER_DISABLED);
+        }
+        let dir = self.group_dir(group);
+        {
+            let _state_guard = self.rd_state_lock.lock_safe();
+            let mut state = match reviewdrive::load_state(&dir) {
+                Ok(s) => s,
+                // **NOT `not-driven`.** A torn file cannot tell you a PR is not
+                // driven; it can only tell you orrerix cannot say. §5.1 gives
+                // this its own name for exactly the confusion the queue's own
+                // contract uses capitals to prevent.
+                Err(_) => return self.rd_refuse(group, pr, r::STATE_UNREADABLE),
+            };
+            let live = state.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false);
+            if !live {
+                return self.rd_refuse(group, pr, r::NOT_DRIVEN);
+            }
+            let Some(entry) = state.entry_mut(pr) else {
+                return self.rd_refuse(group, pr, r::NOT_DRIVEN);
+            };
+            if entry
+                .advance(reviewdrive::DriveState::Cancelled, None, None, now_ms())
+                .is_err()
+            {
+                return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
+            }
+            if reviewdrive::store_state(&dir, &state).is_err() {
+                return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
+            }
+        }
+        self.rd_signals.lock_safe().remove(&(group.clone(), pr));
+        self.rd_audit(group, on_behalf_of, rddrive::audit_action::CANCELLED, json!({ "pr": pr }));
+        let notice = rddrive::cancelled_notice(pr, rddrive::CancelCause::Tool);
+        let _ = self.deliver_to_orchestrator(group, &notice, brand::AUDIT_ACTOR);
+        self.rd_task_note(group, pr, &notice);
+        json!({ "cancelled": true })
+    }
+
+    /// `review_drive_status()` — the surface a **compacted** orchestrator
+    /// recovers its drives from, which is why §5.1 puts it in the re-sync list
+    /// beside `list_tasks`, `list_agents` and `get_state`.
+    ///
+    /// **It does not list terminal entries**, exactly as `merge_queue_status`
+    /// does not: they would flow into the orchestrator's resident context, which
+    /// is the cost this whole feature exists to remove. Parked entries ARE
+    /// listed — a `held` drive is the one thing an orchestrator most needs to
+    /// see, and §5.2 never prunes one.
+    #[doc(hidden)] // pub for integration tests
+    pub fn review_drive_status(&self, group: &GroupId) -> Value {
+        let enabled = self.driver_enabled(group);
+        let dir = self.group_dir(group);
+        let state = {
+            let _state_guard = self.rd_state_lock.lock_safe();
+            match reviewdrive::load_state(&dir) {
+                Ok(s) => s,
+                // The same distinction the two mutating tools make: "orrerix
+                // cannot read the record" is not "there is nothing in it".
+                Err(_) => {
+                    return json!({ "enabled": enabled,
+                                   "refused": rddrive::refusal::STATE_UNREADABLE })
+                }
+            }
+        };
+        let now = now_ms();
+        let drives: Vec<Value> = state
+            .entries
+            .iter()
+            .filter(|e| !e.state().is_terminal())
+            .map(|e| {
+                json!({
+                    "pr": e.pr,
+                    "state": e.state().as_str(),
+                    "held_reason": e.held_reason.map(|r| r.as_str()),
+                    "head": e.head,
+                    "lanes": e.lanes.iter().map(|l| json!({
+                        "block": l.block,
+                        "last_verdict": l.last_verdict.map(|v| v.as_str()),
+                    })).collect::<Vec<_>>(),
+                    "counters": {
+                        "review_rounds": e.counters.review_rounds,
+                        "ci_attempts": e.counters.ci_attempts,
+                        "rebase_attempts": e.counters.rebase_attempts,
+                    },
+                    // Derived, never stored: a stored AGE is stale the instant
+                    // it is written and meaningless across a restart, which is
+                    // the queue's own split between `enqueued_ms` and
+                    // `status_view`'s `since_ms`.
+                    "since_ms": e.age_ms(now),
+                })
+            })
+            .collect();
+        json!({ "enabled": enabled, "drives": drives })
+    }
+
+    /// One refusal, audited then returned — so `rd-refused` and what the caller
+    /// was told cannot come apart.
+    fn rd_refuse(&self, group: &GroupId, pr: u64, reason: &'static str) -> Value {
+        self.rd_audit(
+            group,
+            "",
+            rddrive::audit_action::REFUSED,
+            json!({ "pr": pr, "reason": reason,
+                    "orrerix_fault": rddrive::refusal::is_orrerix_fault(reason) }),
+        );
+        json!({ "refused": reason })
+    }
+
 }

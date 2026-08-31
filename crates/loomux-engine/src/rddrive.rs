@@ -461,6 +461,105 @@ pub mod audit_action {
     pub const STATE_UNREADABLE: &str = "rd-state-unreadable";
 }
 
+/// The closed refusal vocabulary the three MCP tools answer in (§5.1).
+///
+/// `mqloop::refusal`'s rule for its reason: nothing constructs a string outside
+/// this set and nothing returns a free-text reason, because an open vocabulary
+/// is one a caller cannot branch on and a human cannot grep for.
+///
+/// **The split into two classes is `queue_merge`'s, and it is not cosmetic.**
+/// The first block is the driver declining; the second means **orrerix itself
+/// failed**, which is a different thing to tell an orchestrator. Without the
+/// second, a human calling `cancel_review_drive` over a torn state file would be
+/// told `not-driven` — that the PR is not driven — while a drive may well be
+/// live, and `drive_review` could not evaluate `already-driven` at all, so an
+/// unnamed failure there becomes a SECOND drive on one PR.
+pub mod refusal {
+    /// The repo declares no `driver:` block, or declares it off (§5.3).
+    pub const DRIVER_DISABLED: &str = "driver-disabled";
+    /// The remote answered, and the PR is closed or merged.
+    pub const PR_NOT_OPEN: &str = "pr-not-open";
+    /// The remote did **not** answer. [`PR_NOT_OPEN`] presumes it did; a
+    /// runner-class failure at drive time did not, and the queue's posture for
+    /// that is explicit — unknown is never treated as safe. A drive must not
+    /// start on a PR whose state orrerix could not read.
+    pub const PR_UNVERIFIABLE: &str = "pr-unverifiable";
+    /// `resolve_session_ref`'s own tag: no session in this group's roster
+    /// matches that id or prefix.
+    pub const RESUME_NOT_FOUND: &str = "resume-not-found";
+    /// `resolve_session_ref`'s own tag: the prefix names more than one session.
+    /// Kept apart from [`RESUME_NOT_FOUND`] rather than collapsed, because the
+    /// two want different things from the orchestrator — a different id, versus
+    /// a longer one.
+    pub const RESUME_AMBIGUOUS: &str = "resume-ambiguous";
+    /// `resolve_session_ref` answers an empty string with an **untagged**
+    /// message that no closed vocabulary covers. Given a name here rather than
+    /// leaked as prose.
+    pub const RESUME_SESSION_EMPTY: &str = "resume-session-empty";
+    /// This PR already has a **live** drive — a working or `gate-check` entry.
+    /// A `held` entry is deliberately not live: §2.3 calls resuming one the
+    /// default, and a flat refusal would make that path unreachable and
+    /// `reset_counters` a parameter nothing can pass.
+    pub const ALREADY_DRIVEN: &str = "already-driven";
+    /// §8.1: a driven PR may not be queued and a queued PR may not be driven.
+    /// The queue's own `already-queued`, answered from the other side.
+    ///
+    /// **Not in §5.1's decline list, and it has to be**: §8.1 states the mutual
+    /// refusal and §5.1 names only the queue's half of it. The design note is
+    /// amended in this PR rather than the name being coined quietly.
+    pub const ALREADY_QUEUED: &str = "already-queued";
+    /// The repo declares no merge gate. The queue's own refusal, for the queue's
+    /// own reason: a repo with no gate has nothing for a drive to run *toward*,
+    /// and `evaluate_merge_gate` with no gate returns *allowed* — correct for
+    /// the shim, and a driver announcing gate-satisfied on a PR nobody reviewed.
+    pub const GATE_NOT_CONFIGURED: &str = "gate-not-configured";
+    /// The gate requires a reviewer this roster does not declare. Answerable at
+    /// drive time from two files; left unanswered it becomes
+    /// `held(lane-stalled)` an hour later instead of an immediate refusal.
+    pub const GATE_NAMES_NO_SUCH_BLOCK: &str = "gate-names-no-such-block";
+    /// `cancel_review_drive` only: this PR has no entry, or only a terminal one.
+    pub const NOT_DRIVEN: &str = "not-driven";
+
+    // ── and these four mean ORRERIX FAILED, not that the driver declined ──
+
+    /// `review_drives.json` is there and orrerix cannot read it — **NOT**
+    /// "nothing is driven".
+    pub const STATE_UNREADABLE: &str = "rd-state-unreadable";
+    /// The change was computed and could not be saved, so it did not happen.
+    pub const STATE_UNWRITABLE: &str = "rd-state-unwritable";
+    /// A group orrerix cannot resolve at all.
+    pub const UNAVAILABLE: &str = "rd-unavailable";
+    /// The gate file is present and could not be read — **NOT**
+    /// [`GATE_NOT_CONFIGURED`], which means it is genuinely absent.
+    pub const GATE_UNREADABLE: &str = "gate-unreadable";
+
+    /// Whether a refusal names an **orrerix fault** rather than a policy
+    /// decision. The distinction `queue_merge`'s contract uses capitals to make.
+    pub fn is_orrerix_fault(reason: &str) -> bool {
+        matches!(reason, STATE_UNREADABLE | STATE_UNWRITABLE | UNAVAILABLE | GATE_UNREADABLE)
+    }
+
+    /// Every name above, so a test can assert the set rather than iterate a
+    /// list someone has to remember to extend.
+    pub const ALL: [&str; 15] = [
+        DRIVER_DISABLED,
+        PR_NOT_OPEN,
+        PR_UNVERIFIABLE,
+        RESUME_NOT_FOUND,
+        RESUME_AMBIGUOUS,
+        RESUME_SESSION_EMPTY,
+        ALREADY_DRIVEN,
+        ALREADY_QUEUED,
+        GATE_NOT_CONFIGURED,
+        GATE_NAMES_NO_SUCH_BLOCK,
+        NOT_DRIVEN,
+        STATE_UNREADABLE,
+        STATE_UNWRITABLE,
+        UNAVAILABLE,
+        GATE_UNREADABLE,
+    ];
+}
+
 /// The detail key every driver action carries (§3): the orchestrator this drive
 /// acts for.
 ///
