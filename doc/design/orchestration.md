@@ -12903,6 +12903,60 @@ them will misread its own wake:
   something later; the label alone would demand one click per backlog issue before the mode
   could be trusted at all.
 
+## Resident core and on-demand playbook (#1683)
+
+The orchestrator's role template had grown to ~100 KB, paid in the system cache block on
+every model call. The split: the **resident core** (`templates/orchestrator.md`) keeps the
+INVARIANTS, the tool surface, and every rule; a second orrerix-authored template
+(`templates/orchestrator-playbook.md`) carries the situational **procedure**, rendered into
+`<group dir>/orchestrator-playbook.md` by `write_instruction_files` with the same var list
+as the role files, and served one `## ` section at a time by the orchestrator-only MCP tool
+`read_playbook(section)`.
+
+**The structural mitigation, and why it is the design rather than a mitigation.** The
+failure mode of an on-demand document is not an unreadable section — it is an orchestrator
+that never knows to ask, because it does not know the section exists. So *the rule stays
+resident; only the procedure moves*, and every moved section leaves a resident **stub**
+naming its trigger and the section id to fetch:
+`every_playbook_section_has_a_resident_stub_naming_it` derives the ids from the playbook
+template's own headings and refuses a section the core does not name. The tool description
+carries the full section index (kept in sync by
+`every_playbook_heading_yields_a_unique_id_and_the_tool_enum_lists_exactly_them`, a
+default-deny source scan over the template const), and every successful read writes a
+`playbook-read` audit line — the residual (the orchestrator sees the stub and still does
+not fetch) is measured by that line, not assumed away.
+
+**Boundaries.**
+
+- Templates stay in `src-tauri/src/orchestration/templates/` next to the fixture that
+  blesses them; the playbook is a sixth fixture-pinned file (`PRE222`/`GOLDENS`/`LIVE` in
+  `tests/workflow.rs`), and both "what a default group reads" pins iterate it.
+- Section splitting reuses `loomux_engine::lessons::split_sections` — the same `## `
+  boundary convention and fenced-code exclusion the lessons file already standardized; no
+  second heading parser exists.
+- The id is derived from the heading (lowercase, non-alphanumeric runs collapsed to `-`);
+  `read_playbook` validates the caller's section against the **written file's own
+  headings**, so the tool takes a validated id, never a path, and the group dir is reached
+  only through `group_dir_at(GroupId)` — the one join (constraint 6).
+- Consent model: the playbook is orrerix-authored template text only. No repo file, persona,
+  or lessons text can reach the orchestrator through it, and a repo file cannot grant any
+  capability by appearing there.
+- `write_opencode_agent_file` (and the claude/copilot siblings) embed the **core contract
+  only** — the contract is built from `render_block_instructions`/`block_contract_text`,
+  which render the role template, never the playbook. The playbook reaches an agent only
+  through the tool, on every CLI uniformly.
+
+**Public contracts introduced** (each otherwise noted here): the new orchestrator-surface
+tool `read_playbook(section)`; the new generated file `orchestrator-playbook.md` in the
+group dir and its manifest row; the template set's sixth fixture-pinned file.
+
+**Alternatives** — sections as plain files the orchestrator `cat`s (no engine path, but the
+one "read this file" instruction the orchestrator already had was observed obeyed 0 times in
+74 transcripts, and a plain read is invisible to the audit); moving procedure into the
+post-compact notice (re-inverts #417 round 5's deliberate slimming); CLI-native skills
+(Claude-only, a third generated-file family, unobservable). All rejected; the plan
+(plan-1615 §2) carries the full arguments.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a

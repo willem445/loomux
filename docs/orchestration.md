@@ -2412,7 +2412,9 @@ Each group keeps durable state under
   every change);
 - `audit.jsonl` — every tool call, prompt, spawn, and exit, one JSON line each;
 - `agents.json` — the roster (which sessions belonged to which role);
-- the rendered role instructions;
+- the rendered role instructions, plus the rendered **orchestrator playbook**
+  (`orchestrator-playbook.md`) — the on-demand half of the orchestrator's contract, which
+  the orchestrator reads one section at a time with `read_playbook(section)` (#1683);
 - `ledger-<agent-id>.log` — each agent's own directive ledger (see **Compact-nudge** above).
 
 The group id is derived from the repo path, so relaunching an orchestrator on the

@@ -1588,11 +1588,20 @@ fn advisor_and_process_notes_render_exactly_once_when_declared_and_line_final() 
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     assert!(!orch.contains("{{"), "{orch}");
     assert_eq!(orch.matches("Consulting the advisor").count(), 1, "{orch}");
+    // #1683: the `{{POST_MERGE_WORKFLOW_HOOK}}` placeholder moved — with the
+    // Re-sync the fleet section — into the rendered playbook, so the
+    // process-pro assertions read that file. The advisor note still rides
+    // `{{WORKFLOW}}`, which stays resident.
+    let pb = instructions_lf(&reg, &g.id, "orchestrator-playbook.md");
     // The top {{WORKFLOW}} note (#358 fold-in) is description-only now — the
     // actionable spawn instruction moved to the post-merge hook below, so there is
-    // exactly one `spawn_agent(block: "proc"` in the whole document, not two.
+    // exactly one `spawn_agent(block: "proc"` in the whole contract, not two.
     assert_eq!(orch.matches("You have a process-pro").count(), 1, "{orch}");
-    assert_eq!(orch.matches("spawn_agent(block: \"proc\"").count(), 1, "{orch}");
+    assert_eq!(
+        pb.matches("spawn_agent(block: \"proc\"").count(),
+        1,
+        "the actionable trigger must exist exactly once across the contract: {pb}"
+    );
     assert!(orch.contains("spawn_agent(block: \"advisor\""), "{orch}");
     assert!(
         orch.contains("workaround in your head.\n\n**Consulting the advisor.**"),
@@ -1601,9 +1610,9 @@ fn advisor_and_process_notes_render_exactly_once_when_declared_and_line_final() 
     // The actionable trigger lives in the post-merge routine (#358 fold-in), not the
     // top note, and it names the human-merge case explicitly — that's the one a
     // human-driven merge gate reliably skipped before this fix.
-    assert_eq!(orch.matches("Also spawn the process-pro").count(), 1, "{orch}");
-    let orch_flat = orch.to_lowercase();
-    let post_merge = section(&orch_flat, "re-sync the fleet", "### you are the codebase");
+    assert_eq!(pb.matches("Also spawn the process-pro").count(), 1, "{pb}");
+    let pb_flat = pb.to_lowercase();
+    let post_merge = section(&pb_flat, "## resync the fleet", "## ci gate");
     assert!(
         post_merge.contains("also spawn the process-pro"),
         "the post-merge routine must carry the actionable trigger: {post_merge}"
@@ -1614,9 +1623,9 @@ fn advisor_and_process_notes_render_exactly_once_when_declared_and_line_final() 
          human merge gate was silently skipping: {post_merge}"
     );
     assert!(
-        orch.contains("schedule the next item.\n\n**Also spawn the process-pro.**"),
+        pb.contains("schedule the next item.\n\n**Also spawn the process-pro.**"),
         "the hook must bring its own blank line at the end of the post-merge checklist's last \
-         sentence, not land mid-paragraph: {orch}"
+         sentence, not land mid-paragraph: {pb}"
     );
 
     let worker = instructions_lf(&reg, &g.id, "worker.md");
@@ -1988,27 +1997,28 @@ fn a_replace_mode_liaison_persona_still_gets_its_no_authority_mechanics() {
 #[test]
 fn a_default_groups_post_merge_routine_names_no_process_pro() {
     // #358 fold-in, the other half of the pin above: `{{POST_MERGE_WORKFLOW_HOOK}}`
-    // sits inside the base "Re-sync the fleet" section that EVERY group reads,
+    // sits at the end of the "Re-sync the fleet" section that EVERY group reads,
     // including one with no `process` role_hint (or no workflow file at all) — so
     // its silence discipline gets its own direct check on the section, not just the
     // whole-document sweep `advisor_and_process_prose_stays_silent_unless_a_block_
-    // declares_the_hint` already does.
+    // declares_the_hint` already does. #1683 moved that section (and the fragment
+    // with it) into the rendered playbook, so this reads the playbook.
     let (reg, _d) = test_registry();
     let repo = Repo::new(); // no workflow file — the true default
     let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
 
-    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    assert!(!orch.contains("{{"), "{orch}");
-    let orch_flat = orch.to_lowercase();
-    let post_merge = section(&orch_flat, "re-sync the fleet", "### you are the codebase");
+    let pb = instructions_lf(&reg, &g.id, "orchestrator-playbook.md");
+    assert!(!pb.contains("{{"), "{pb}");
+    let pb_flat = pb.to_lowercase();
+    let post_merge = section(&pb_flat, "## resync the fleet", "## ci gate");
     assert!(
         !post_merge.contains("process-pro"),
         "a default group's post-merge routine must not mention the process-pro: {post_merge}"
     );
     assert!(
-        orch.contains("schedule the next item.\n\n### You are the codebase's advocate"),
+        pb.contains("schedule the next item.\n\n## CI gate"),
         "the empty hook must leave the checklist's last sentence exactly where it was, byte for \
-         byte, with no stray blank line: {orch}"
+         byte, with no stray blank line: {pb}"
     );
 }
 
@@ -4471,11 +4481,13 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     let planner = instructions_lf(&reg, &g.id, "planner.md");
 
-    let o = flat(&orch);
-    assert!(o.contains("## engineering standards"), "the grounds need one authoritative site: {orch}");
+    // #1683: the standards moved to the rendered playbook — the core keeps
+    // INVARIANT 4 and the stub. The pins follow their specimen.
+    let pb = flat(&instructions_lf(&reg, &g.id, "orchestrator-playbook.md"));
+    assert!(pb.contains("## engineering standards"), "the grounds need one authoritative site: {pb}");
     // Scoped to the section that owes them: INVARIANT 4 names several of these in one line, and a
     // document-wide match would let the digest stand in for the rubric it is meant to summarize.
-    let standards = section(&o, "## engineering standards", "## delegation protocol");
+    let standards = section(&pb, "## engineering standards", "## delivery notices");
     for (ground, why) in [
         ("cross-module coupling", "cross-module coupling / a dependency pointing the wrong way"),
         ("duplicating an existing mechanism", "a second mechanism where the repo already had one"),
@@ -4485,9 +4497,9 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
         pinned("Engineering standards", standards, ground, why);
     }
     // Both sites, or the rubric is a section nobody reads at the moment it matters.
-    pinned("orchestrator.md", &o, "intake the plan before you delegate",
+    pinned("the playbook", &pb, "intake the plan before you delegate",
         "the standards must gate the PLAN — before any code exists is the cheap moment");
-    pinned("orchestrator.md", &o, "does it clear the bar in engineering standards?",
+    pinned("orchestrator.md", &flat(&orch), "does it clear the bar in engineering standards?",
         "…and the completion check, where the PR is still cheaper to bounce than to revert");
 
     // rev-21 F10 — and the bounce is bounded like every other loop. Six grounds, several of them
@@ -4527,15 +4539,15 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     // look, so nothing would have looked.
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
-    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    let o = flat(&orch);
+    // #1683: the red-main procedure moved to the rendered playbook.
+    let o = flat(&instructions_lf(&reg, &g.id, "orchestrator-playbook.md"));
 
     // Scoped to the section that owes the PROCEDURE. INVARIANT 6 states the rule in one line
     // ("stop merging, fix forward once, then revert"), so a document-wide match is satisfied by
     // the digest even after the body's procedure is deleted — the rule survives as a slogan with
     // no instructions attached. The rule-level mutation harness caught exactly that on
     // `fix forward once` (rev-21 R1's lesson, one layer further down than R1 itself).
-    let aftermath = section(&o, "### after a merge you performed", "### re-sync the fleet");
+    let aftermath = section(&o, "## red main", "## resync the fleet");
     let at = "the red-main procedure";
     pinned(at, aftermath, "post-merge run",
         "a merge the orchestrator performed must be followed to the default branch's CI");
@@ -4581,19 +4593,19 @@ fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
     // on ANY move of the default branch (its own merge, the human's, one it merely observed).
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
-    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    let o = flat(&orch);
+    // #1683: the sweep and the re-sync procedure moved to the rendered playbook.
+    let o = flat(&instructions_lf(&reg, &g.id, "orchestrator-playbook.md"));
 
     // Detection lives in the open-PR sweep; the rebase rules live in their own section. Both are
     // scoped, and every anchor goes through `pinned` — present exactly once in the region that
     // owes it, so it can actually fail when that rule is deleted (rev-21).
-    let sweep = section(&o, "## monitoring open prs", "## the learning loop");
+    let sweep = section(&o, "## monitoring open prs", "## learning loop");
     pinned("the open-PR sweep", sweep, "--json mergeable",
         "the sweep must ask whether the PR still merges — green checks say nothing about it");
     pinned("the open-PR sweep", sweep, "conflicting",
         "…and know the state it is looking for");
 
-    let resync = section(&o, "### re-sync the fleet", "## the ci gate");
+    let resync = section(&o, "## resync the fleet", "## ci gate");
     let at = "the re-sync rule";
     pinned(at, resync, "stale is not the same as conflicted",
         "the whole upgrade lives in that distinction — a conflict-only trigger waits for the most \
@@ -4774,12 +4786,15 @@ fn the_orchestrators_findings_policy_survives_in_substance_not_just_in_bytes() {
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
     let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
     let o = flat(&orch);
+    // #1683: the merge gate moved to the rendered playbook; its core heading
+    // is the stub naming the trigger. The gate pins follow their specimen.
+    let pb = flat(&instructions_lf(&reg, &g.id, "orchestrator-playbook.md"));
 
     // Each rule is asserted inside the region that owes it, never against the whole document:
     // the digest carries one-line copies of several of these, and a document-wide `contains`
     // would let the digest rescue a body section someone had gutted (see `section`).
     let disposition = section(&o, "3. **disposition every finding**", "### the merge gate");
-    let gate = section(&o, "### the merge gate", "### after a merge you performed");
+    let gate = section(&pb, "## merge gate", "## squash closes issues");
 
     for (region, name, rule, why) in [
         // The step itself: an approval opens a disposition step, it does not open the merge.
@@ -4841,8 +4856,8 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     // grooms and starts it is not.
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
-    let orch = instructions_lf(&reg, &g.id, "orchestrator.md");
-    let o = flat(&orch);
+    // #1683: the label funnel and the learning loop moved to the rendered playbook.
+    let o = flat(&instructions_lf(&reg, &g.id, "orchestrator-playbook.md"));
 
     // The funnel prose owns both halves of the boundary — and the RULES are pinned in the funnel
     // region, not document-wide. N2 (rev-21): `filing it is not doing it` also appears in the
@@ -4850,7 +4865,7 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     // other half of the policy), so a document-wide match was rescued by that copy: the funnel's
     // own statement of it was deletable with this pin green. The two occurrences are deliberate
     // prose; the pin just has to know which one it is talking about.
-    let funnel = section(&o, "## label signals", "## planning & scheduling");
+    let funnel = section(&o, "## label signals", "## planning and scheduling");
     let at = "the label funnel";
     pinned(at, funnel, "you may file; you may not start",
         "the permission and its boundary, stated in one breath — the whole point is that they are \
@@ -4872,7 +4887,7 @@ fn the_orchestrator_may_file_an_issue_it_may_never_start_and_it_distils_what_rec
     // normal work item" was an opt-out from INVARIANT 8 sitting three sections below INVARIANT 8,
     // and it inverted the policy, since a finding a REVIEWER raised must park in the funnel while
     // a pattern the orchestrator noticed BY ITSELF could be dispatched directly).
-    let loop_ = section(&o, "## the learning loop", "## durability rules");
+    let loop_ = section(&o, "## learning loop", "## queue orphans and refused");
     let at = "the learning loop";
     pinned(at, loop_, "not an incident",
         "it triggers on a recurring PATTERN (a finding class, a repeated CI burn, a convention \
@@ -5755,11 +5770,19 @@ fn plain_rails() -> Guardrails {
 /// added unconditionally to a template; a placeholder moved onto its own line) both
 /// sailed straight through it (rev-11 F1).
 /// `manager.md` is deliberately NOT here — see [`GOLDENS`].
-const PRE222: [(&str, &str); 4] = [
+///
+/// #1683 adds `orchestrator-playbook.md` as the fifth row: the playbook is
+/// what a default group reads too (written unconditionally into the group
+/// dir), so the "what does a DEFAULT group read?" question is asked of it
+/// exactly like the four role files. Unlike them it has no pre-#222 heritage —
+/// the name stays for the directory it lives in — and its golden is the live
+/// template minus its `LIVE` keys, re-blessed like any other deliberate edit.
+const PRE222: [(&str, &str); 5] = [
     ("orchestrator.md", include_str!("fixtures/pre222/orchestrator.md")),
     ("worker.md", include_str!("fixtures/pre222/worker.md")),
     ("reviewer.md", include_str!("fixtures/pre222/reviewer.md")),
     ("planner.md", include_str!("fixtures/pre222/planner.md")),
+    ("orchestrator-playbook.md", include_str!("fixtures/pre222/orchestrator-playbook.md")),
 ];
 
 /// Every blessed golden, in `LIVE` order — [`PRE222`] plus `manager.md` (#1161).
@@ -5777,12 +5800,17 @@ const PRE222: [(&str, &str); 4] = [
 ///   against `LIVE` below. That question is about the TEMPLATE and is asked of
 ///   all five equally, which is why `manager.md` gets the same re-bless gate as
 ///   the other four rather than a weaker one.
-const GOLDENS: [(&str, &str); 5] = [
+const GOLDENS: [(&str, &str); 6] = [
     PRE222[0],
     PRE222[1],
     PRE222[2],
     PRE222[3],
     ("manager.md", include_str!("fixtures/pre222/manager.md")),
+    // #1683. The playbook is what a default group reads, so it joins the
+    // golden pairing like the other five — but it is NOT the "one exception"
+    // manager.md is: default groups DO read it, which is why it sits in
+    // `PRE222` above and in both default-group pins.
+    PRE222[4],
 ];
 
 /// The live templates, with the placeholder(s) each must carry. Each element of the
@@ -5795,11 +5823,14 @@ const GOLDENS: [(&str, &str); 5] = [
 /// `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`), they stay a single contiguous-string key
 /// — same reasoning `block.md`'s `{{PERSONA_NOTE}}{{LANE_NOTE}}{{GATE_NOTE}}` already
 /// relies on.
-const LIVE: [(&str, &str, &[&str]); 5] = [
+const LIVE: [(&str, &str, &[&str]); 6] = [
+    // #1683: the merge-gate and re-sync sections moved to the playbook, and
+    // their two workflow-conditional fragments with them — the orchestrator
+    // core's key list shrinks to `{{WORKFLOW}}` and `{{LOCKS_ORCH}}`.
     (
         "orchestrator.md",
         loomux_lib::orchestration::ORCHESTRATOR_TPL,
-        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}", "{{MERGE_QUEUE}}", "{{LOCKS_ORCH}}"],
+        &["{{WORKFLOW}}", "{{LOCKS_ORCH}}"],
     ),
     (
         "worker.md",
@@ -5812,6 +5843,14 @@ const LIVE: [(&str, &str, &[&str]); 5] = [
     // persona (`persona_allowed`), and it holds no locks, so neither
     // `{{LOCKS}}` nor an advisor-consult note has anything to say to it.
     ("manager.md", loomux_lib::orchestration::MANAGER_TPL, &["{{BLOCK_NOTE}}"]),
+    // #1683. The playbook renders with the same var list as the role files,
+    // and since slice 2a carries the two workflow-conditional fragments the
+    // merge gate and re-sync section brought with them.
+    (
+        "orchestrator-playbook.md",
+        loomux_lib::orchestration::ORCHESTRATOR_PLAYBOOK_TPL,
+        &["{{MERGE_QUEUE}}", "{{POST_MERGE_WORKFLOW_HOOK}}"],
+    ),
 ];
 
 /// Render a template with the plain per-group VALUE variables `render_template`
@@ -5950,6 +5989,45 @@ fn audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
 }
 
 #[test]
+fn the_playbook_is_written_into_the_group_dir_and_the_manifest() {
+    // #1683, the write half of the mechanism: the playbook is a contract file
+    // like the role files — written unconditionally into every group dir,
+    // rendered with the same var list, and owned by the generated-files
+    // manifest so a roster change sweeps a stale copy instead of stranding
+    // one (#423's incident, one more file that must never outlive its render).
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(FOCUSED_REVIEW); // declared, and ignored
+    let g = reg.create_group(&repo.path(), plain_rails()).unwrap();
+    let dir = reg.state_root().join(g.id.as_str());
+
+    let written = instructions_lf(&reg, &g.id, "orchestrator-playbook.md");
+    assert!(
+        written.contains("## About this playbook"),
+        "the playbook is in the group dir, sections whole: {written}"
+    );
+    assert!(!written.contains("{{"), "rendered like any instruction file: {written}");
+    assert!(
+        !written.contains("declares a workflow") && !written.contains("## Your block"),
+        "a group with no workflow reads a playbook with no workflow prose"
+    );
+
+    let manifest = fs::read_to_string(dir.join(".instruction-files-manifest")).unwrap();
+    assert!(
+        manifest.lines().any(|l| l == "orchestrator-playbook.md"),
+        "the manifest owns the playbook like the role files: {manifest}"
+    );
+
+    // A resume re-render keeps it: it is `current` on every render, so the
+    // sweep must never mistake it for a stale file.
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
+    assert!(
+        dir.join("orchestrator-playbook.md").exists(),
+        "the playbook survives a resume render — it is what a default group reads"
+    );
+}
+
+#[test]
 fn the_toggle_off_ignores_a_declared_workflow_entirely() {
     // The repo declares four custom blocks with personas and a gate. The human
     // did not opt in. Nothing about the group may reflect any of it.
@@ -5985,6 +6063,37 @@ fn the_toggle_off_ignores_a_declared_workflow_entirely() {
         !actions.iter().any(|a| a == "workflow-loaded"),
         "and it must certainly not have been loaded: {actions:?}"
     );
+}
+
+/// **The playbook's resident-side contract, default-deny over the playbook's
+/// own headings.** For every id the playbook template's `## ` headings yield,
+/// the resident core must name that section with `read_playbook("<id>")` —
+/// the structural answer to the on-demand failure mode (#1683 §2): an
+/// orchestrator that is never told a section exists never asks for it, so
+/// *the rule stays resident and only the procedure moves*, and the stub IS
+/// the rule's pointer. A new playbook section without its stub is a red here,
+/// at write time — never a silent gap discovered after the section ships.
+///
+/// Name-independent by construction: the id set is derived from the template
+/// source's headings (the lessons splitter's `## ` boundary, fenced code
+/// excluded), never from a hand-maintained list. Residual, stated here since
+/// this is where it is implemented: this proves the core NAMES each section;
+/// it cannot prove the stub is well-written or that a model heeds it — that
+/// residual is what the `playbook-read` audit line measures (#1683 §6).
+#[test]
+fn every_playbook_section_has_a_resident_stub_naming_it() {
+    let ids =
+        loomux_lib::orchestration::playbook_section_ids(loomux_lib::orchestration::ORCHESTRATOR_PLAYBOOK_TPL);
+    assert!(!ids.is_empty(), "the playbook must carry at least one section");
+    for id in ids {
+        assert!(
+            loomux_lib::orchestration::ORCHESTRATOR_TPL
+                .contains(&format!("read_playbook(\"{id}\")")),
+            "playbook section `{id}` has no resident stub naming it — the failure mode of an \
+             on-demand playbook is not an unreadable section, it is an orchestrator that never \
+             knows to ask (#1683)"
+        );
+    }
 }
 
 #[test]
@@ -6264,7 +6373,7 @@ fn a_workflow_group_is_told_to_spawn_by_block_and_fan_out_to_every_reviewer() {
         "the section must open as a real markdown heading: {orch}"
     );
     assert!(
-        orch.contains("\n\n## Cost guardrails"),
+        orch.contains("\n\n## Asking the human"),
         "…and must not swallow the section that follows it: {orch}"
     );
     assert!(

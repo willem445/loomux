@@ -66,7 +66,8 @@ use loomux_lib::orchestration::{
     // #778: the full-autonomy toggle's pure surface.
     full_autonomy_notice, sanitize_full_autonomy_goal, MAX_FULL_AUTONOMY_GOAL_CHARS,
     GhGate, GitTagPush,
-    normalize_remote_web_base, ORCHESTRATOR_TPL, WORKER_TPL, REVIEWER_TPL, PLANNER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
+    normalize_remote_web_base, ORCHESTRATOR_TPL, ORCHESTRATOR_PLAYBOOK_TPL, PLAYBOOK_SECTION_IDS,
+    playbook_section_ids, WORKER_TPL, REVIEWER_TPL, PLANNER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     // #576: loomux's own notice rows are not questions.
     // #632: and the same for the CONTINUATION rows of a multi-row notice.
@@ -640,14 +641,19 @@ fn repo_with_merge_queue(tag: &str, enabled: bool) -> std::path::PathBuf {
 /// underneath it.
 #[test]
 fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
+    // #1683 moved the merge-gate section — and the `{{MERGE_QUEUE}}` fragment
+    // with it — into the rendered playbook, so this reads
+    // orchestrator-playbook.md where it used to read orchestrator.md.
     let note_marker = "queue_merge(pr, target?)";
+    let playbook = |reg: &OrchRegistry, gid: &str| {
+        fs::read_to_string(reg.state_root().join(gid).join("orchestrator-playbook.md")).unwrap()
+    };
 
     // Block on + toggle on: the guidance is there.
     let (reg, _d) = test_registry();
     let repo = repo_with_merge_queue("mq-on", true);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
-    let orch =
-        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
+    let orch = playbook(&reg, g.id.as_str());
     assert!(
         orch.contains(note_marker),
         "a group whose repo enables the queue must be told the queue exists"
@@ -662,8 +668,7 @@ fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
     let (reg, _d) = test_registry();
     let repo = repo_with_merge_queue("mq-off", false);
     let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
-    let orch =
-        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
+    let orch = playbook(&reg, g.id.as_str());
     assert!(!orch.contains(note_marker), "enabled:false must read exactly like no block at all");
     assert!(!orch.contains("{{MERGE_QUEUE}}"), "the placeholder is substituted, not left raw");
 
@@ -672,8 +677,7 @@ fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
     let (reg, _d) = test_registry();
     let repo = repo_with_merge_queue("mq-toggle-off", true);
     let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap(); // toggle OFF
-    let orch =
-        fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator.md")).unwrap();
+    let orch = playbook(&reg, g.id.as_str());
     assert!(
         !orch.contains(note_marker),
         "with the advanced orchestrator off the workflow file is not in force, so the queue \
@@ -2018,24 +2022,26 @@ fn queued_notice_replaces_the_deleted_re_send_wording() {
 #[test]
 fn orchestrator_template_no_longer_instructs_a_re_send_on_a_held_delivery() {
     // #445 plan step 5: delete every "re-send when clear" instruction from
-    // the live template. This pins ORCHESTRATOR_TPL directly (not the
-    // tests/fixtures/pre222/orchestrator.md golden copy) — that fixture DOES
-    // get updated in this same PR, correctly: it tracks the live
-    // default-group text by design and is re-blessed whenever that text
-    // deliberately changes (`a_workflow_placeholder_must_sit_at_the_end_of_
-    // a_line_it_shares` in tests/workflow.rs enforces the re-bless; see
-    // tests/fixtures/pre222/README.md's changelog for this PR's entry).
+    // the live text. This pins ORCHESTRATOR_TPL and, since #1683 moved the
+    // delivery-notice procedure into the playbook, the playbook template with
+    // it — the concatenation is the text an orchestrator actually reads. (The
+    // pre222 golden is separate by design: it tracks the live default-group
+    // text and is re-blessed whenever that text deliberately changes
+    // (`a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` in
+    // tests/workflow.rs enforces the re-bless; see
+    // tests/fixtures/pre222/README.md's changelog for the entry).)
+    let both = format!("{ORCHESTRATOR_TPL}{ORCHESTRATOR_PLAYBOOK_TPL}");
     assert!(
-        !ORCHESTRATOR_TPL.to_lowercase().contains("re-send when clear"),
-        "the live orchestrator template must not instruct re-sending a queued delivery"
+        !both.to_lowercase().contains("re-send when clear"),
+        "the live orchestrator text must not instruct re-sending a queued delivery"
     );
     assert!(
-        ORCHESTRATOR_TPL.contains("do NOT"),
-        "the template must explicitly warn against re-sending a queued payload"
+        both.contains("do NOT"),
+        "the live orchestrator text must explicitly warn against re-sending a queued payload"
     );
     assert!(
-        ORCHESTRATOR_TPL.contains("queued"),
-        "the template must describe the new hold-means-queued behavior"
+        both.contains("queued"),
+        "the live orchestrator text must describe the new hold-means-queued behavior"
     );
 }
 
@@ -2064,8 +2070,12 @@ fn orchestrator_template_no_longer_instructs_a_re_send_on_a_held_delivery() {
 /// longer telling the reader how to stop waiting.
 #[test]
 fn every_role_template_names_the_ci_watch_and_the_conflicting_case() {
+    // #1683 moved the orchestrator's CI-gate / monitoring procedure into the
+    // playbook, so the orchestrator's surface is core + playbook — the
+    // concatenation is the text it actually reads.
+    let orch = format!("{ORCHESTRATOR_TPL}{ORCHESTRATOR_PLAYBOOK_TPL}");
     for (role, tpl) in
-        [("orchestrator", ORCHESTRATOR_TPL), ("worker", WORKER_TPL), ("reviewer", REVIEWER_TPL)]
+        [("orchestrator", orch.as_str()), ("worker", WORKER_TPL), ("reviewer", REVIEWER_TPL)]
     {
         for concept in ["notify_when", "pr_checks", "CONFLICTING"] {
             assert!(
@@ -2226,19 +2236,23 @@ fn worker_template_says_the_closing_keyword_scan_is_context_blind() {
 /// `:1210-1212` is about.
 #[test]
 fn orchestrator_template_scrubs_the_squashed_message_and_rechecks_after() {
-    let lower = ORCHESTRATOR_TPL.to_lowercase();
+    // #1683 moved the squash procedure into the playbook; the pin follows its
+    // specimen, never relaxes (a test specimen must stay a member of the
+    // class it witnesses).
+    let lower = ORCHESTRATOR_PLAYBOOK_TPL.to_lowercase();
     for concept in ["squash", "context-blind", "scrub"] {
         assert!(
             lower.contains(concept),
-            "orchestrator.md no longer names `{concept}` — the aggregated squash message is the \
+            "the playbook no longer names `{concept}` — the aggregated squash message is the \
              text GitHub reads its keywords out of, and the only agent that can read it before \
-             the merge is the one performing the merge (#625)"
+             the merge is the one performing the merge (#625; procedure moved to the playbook \
+             in #1683)"
         );
     }
     let after_scrub = &lower[lower.find("scrub").expect("asserted present above")..];
     assert!(
         after_scrub.contains("reopen"),
-        "orchestrator.md scrubs the aggregated message before merging but no longer says to \
+        "the playbook scrubs the aggregated message before merging but no longer says to \
          reopen what closed anyway — the scrub is a fallible check with nothing behind it, and \
          #569 needed that backstop twice in one session (#625)"
     );
@@ -4475,6 +4489,226 @@ fn an_oversized_orphan_payload_says_it_was_truncated() {
     assert_eq!(v["orphans"][0]["text_bytes"], json!(big.len()), "the true size is reported, not the cut one");
     assert!(v["orphans"][0]["text"].as_str().unwrap().contains("truncated"),
         "the cut must be visible in the text itself, not only in a sibling field");
+}
+
+// ---------------------------------------------------------------------------
+// #1683 slice 1 — `read_playbook(section)`, the on-demand playbook mechanism.
+//
+// The orchestrator's contract splits into a resident core (the system prompt)
+// and an on-demand playbook (`<group dir>/orchestrator-playbook.md`), served
+// one `## ` section at a time by this orchestrator-only tool. The failure the
+// mechanism exists for is NOT an unreadable section — it is an orchestrator
+// that never knows to ask — so the resident core keeps the rules and every
+// moved section leaves a resident stub naming its trigger. These tests pin
+// the tool half of that shape; the stub half is pinned over in
+// tests/workflow.rs (`every_playbook_section_has_a_resident_stub_naming_it`).
+// ---------------------------------------------------------------------------
+
+/// The cap only binds delegates and `rails()` pins it at 2, and the
+/// orchestrator-only test below needs one of each delegate class live.
+fn playbook_rails() -> Guardrails {
+    Guardrails { max_agents: 8, ..rails() }
+}
+
+fn playbook_caller(reg: &OrchRegistry, group: &GroupId, role: Role) -> Caller {
+    let a = reg.spawn_agent(group, role, "a", "", false, None).unwrap();
+    reg.resolve_token(&a.token).unwrap()
+}
+
+fn read_playbook_call(reg: &OrchRegistry, caller: &Caller, section: &str) -> Value {
+    dispatch(reg, caller, "tools/call",
+        &json!({ "name": "read_playbook", "arguments": { "section": section } })).unwrap()
+}
+
+#[test]
+fn read_playbook_returns_one_section_by_id_with_vars_substituted() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    let co = playbook_caller(&reg, &g.id, Role::Orchestrator);
+
+    let r = read_playbook_call(&reg, &co, "about-this-playbook");
+    assert_eq!(r["isError"], json!(false), "a known section reads: {r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("## About this playbook"),
+        "the section comes back whole, heading line included: {text}"
+    );
+    assert!(
+        !text.contains("{{"),
+        "the tool serves the RENDERED file, never template bytes: {text}"
+    );
+    assert!(
+        text.contains(g.id.as_str()),
+        "value variables are substituted like any instruction file ({{GROUP_ID}}): {text}"
+    );
+}
+
+#[test]
+fn read_playbook_refuses_an_unknown_section_and_names_the_valid_ids() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    let co = playbook_caller(&reg, &g.id, Role::Orchestrator);
+
+    let r = read_playbook_call(&reg, &co, "no-such-section");
+    assert_eq!(
+        r["isError"],
+        json!(true),
+        "an unknown section is an ERROR, never an empty-string success — the vacuity \
+         control: {r}"
+    );
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("no-such-section"), "the refusal names what was asked: {text}");
+    assert!(
+        text.contains("about-this-playbook"),
+        "the refusal names the valid ids, so a mistyped ask is self-correcting: {text}"
+    );
+}
+
+#[test]
+fn read_playbook_is_orchestrator_only() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    // The playbook is the orchestrator's own contract half: a delegate has no
+    // business reading it, and the dispatch gate — not the role-filtered
+    // listing, which is cosmetic — is the real check (add-orch-tool layer 2).
+    for role in [Role::Worker, Role::Reviewer, Role::Planner] {
+        let c = playbook_caller(&reg, &g.id, role);
+        let r = read_playbook_call(&reg, &c, "about-this-playbook");
+        assert_eq!(r["isError"], json!(true), "{role:?} must be refused: {r}");
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("orchestrator-only"), "{role:?} refusal says why: {text}");
+    }
+}
+
+#[test]
+fn read_playbook_never_crosses_groups() {
+    let (reg, _d) = test_registry();
+    let ga = reg.create_group("C:/tmp/repo-a", playbook_rails()).unwrap();
+    let gb = reg.create_group("C:/tmp/repo-b", playbook_rails()).unwrap();
+    let ca = playbook_caller(&reg, &ga.id, Role::Orchestrator);
+
+    // The tool takes NO group argument: the group comes from the caller's
+    // token, exactly like `group_usage` (#891 S2) — so there is no parameter
+    // to misuse, and the section served is the caller's own group's rendered
+    // copy (its `{{GROUP_ID}}` names it).
+    let r = read_playbook_call(&reg, &ca, "about-this-playbook");
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(ga.id.as_str()) && !text.contains(gb.id.as_str()),
+        "the served section is the CALLER's group's playbook, never another group's: {text}"
+    );
+}
+
+#[test]
+fn read_playbook_writes_one_audit_line() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", playbook_rails()).unwrap();
+    let co = playbook_caller(&reg, &g.id, Role::Orchestrator);
+    let before = audit_count(&reg, &g.id, "playbook-read");
+
+    read_playbook_call(&reg, &co, "about-this-playbook");
+
+    assert_eq!(
+        audit_count(&reg, &g.id, "playbook-read"),
+        before + 1,
+        "exactly one playbook-read line per served section — the read is observable \
+         (INVARIANT-11 detector feed, #1683 §6)"
+    );
+    let audit = fs::read_to_string(reg.state_root().join(g.id.as_str()).join("audit.jsonl")).unwrap();
+    let line = audit
+        .lines()
+        .filter(|l| l.contains("playbook-read"))
+        .last()
+        .expect("asserted present above");
+    assert!(line.contains("about-this-playbook"), "the line names the section: {line}");
+}
+
+#[test]
+fn the_resident_core_is_under_the_byte_budget() {
+    // The point of #1683: the resident orchestrator template is paid on EVERY
+    // model call, in the system cache block. Measured off the template const,
+    // never derived — the number in this assertion is the budget, the byte
+    // count is the fact.
+    //
+    // EOL-NORMALIZED, deliberately. The Windows checkout is CRLF and the
+    // Linux checkout is LF, so a raw `len()` makes the same document measure
+    // 622 bytes bigger on Windows — the budget would be a fact about the
+    // checkout, not the content, and the pin would flip platform-by-platform
+    // as prose is edited (it did: run 33345301036 measured 45,327 on Windows
+    // against 44,705 on Linux, same blob). The budget is content bytes; both
+    // platforms must assert the same number.
+    let content = ORCHESTRATOR_TPL.replace("\r\n", "\n");
+    assert!(
+        content.len() <= 45_000,
+        "the resident core is {} bytes EOL-normalized ({} bytes raw in this checkout — \
+         CRLF on Windows, LF elsewhere; that difference is the checkout, not the content) \
+         against a 45,000 budget — sections move to the playbook, they do not get \
+         rewritten longer in place (#1683)",
+        content.len(),
+        ORCHESTRATOR_TPL.len()
+    );
+}
+
+/// The source scan that keeps the tool's section enum honest (#1683 slice 1).
+///
+/// **The axis is the heading, not a name.** The id set is DERIVED from
+/// `ORCHESTRATOR_PLAYBOOK_TPL`'s own `## ` headings — the same
+/// `loomux_engine::lessons` splitter `lessons.rs` uses, fenced code excluded
+/// so a quoted `## ` line inside an example never becomes a section — and
+/// then three denials are asserted, in the default-deny shape the
+/// source-scanning-guard convention requires:
+///
+/// 1. every derived id is unique (two headings that slug to the same id would
+///    make one of them unservable while both stubs claim it);
+/// 2. `PLAYBOOK_SECTION_IDS` equals the derived set exactly — a row whose
+///    section is gone is refused as loudly as a section with no row, because
+///    the tool description's index is what tells the orchestrator what exists;
+/// 3. the orchestrator's actual tool listing carries exactly those ids and no
+///    delegate's listing carries the tool at all — the wiring proof that the
+///    const reaches the surface the agent sees.
+///
+/// **Residual, stated where it is implemented:** this scan reads the TEMPLATE
+/// const and the LISTING's description text; it cannot see a description
+/// that names ids the template lacks in prose it does not parse, and it does
+/// not prove a model reads the index — the stub test above is the pairing
+/// half, and the `playbook-read` audit line is the measurement half.
+#[test]
+fn every_playbook_heading_yields_a_unique_id_and_the_tool_enum_lists_exactly_them() {
+    let ids = playbook_section_ids(ORCHESTRATOR_PLAYBOOK_TPL);
+    assert!(!ids.is_empty(), "the playbook must carry at least one section");
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "two headings derive the same id: {ids:?}");
+
+    assert_eq!(
+        PLAYBOOK_SECTION_IDS, ids.as_slice(),
+        "PLAYBOOK_SECTION_IDS has drifted from the playbook's own headings — the enum is a \
+         mirror of the template, never an independent list (#1683)"
+    );
+
+    let (reg, _d, co, cw) = setup_mcp();
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let def = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == json!("read_playbook"))
+        .expect("the orchestrator must be able to SEE the tool")
+        .clone();
+    let desc = def["description"].as_str().unwrap().to_string();
+    for id in &ids {
+        assert!(
+            desc.contains(id),
+            "the tool description's index must list `{id}` — a section the stubs name but \
+             the index omits is one an orchestrator scanning the surface will never find: {desc}"
+        );
+    }
+    let worker_listed = dispatch(&reg, &cw, "tools/list", &json!({})).unwrap();
+    let worker_names: Vec<&str> =
+        worker_listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(!worker_names.contains(&"read_playbook"), "orchestrator-only surface");
 }
 
 // ---------------------------------------------------------------------------
@@ -10003,12 +10237,14 @@ fn instruction_files_rendered_with_group_facts() {
     assert!(orch.contains("Name the pane for its work"),
         "orchestrator instructions must guide renaming a worker to its task");
     // The unconfirmed-delivery recovery guidance is rendered (#103): read the
-    // pane back, re-send once, and flag the human on a repeat.
-    assert!(orch.contains("delivery to <id> unconfirmed"),
+    // pane back, re-send once, and flag the human on a repeat. #1683 moved
+    // that procedure into the rendered playbook; the pin follows it.
+    let pb = fs::read_to_string(dir.join("orchestrator-playbook.md")).unwrap();
+    assert!(pb.contains("delivery to <id> unconfirmed"),
         "orchestrator instructions must explain the unconfirmed-delivery notice");
-    assert!(orch.contains("flag the human"),
+    assert!(pb.contains("flag the human"),
         "unconfirmed-delivery guidance must escalate a repeat to the human");
-    assert!(!orch.contains("{{"), "no unrendered placeholders");
+    assert!(!pb.contains("{{"), "no unrendered placeholders in the playbook");
     let worker = fs::read_to_string(dir.join("worker.md")).unwrap();
     assert!(worker.contains("Never merge"), "merge gatekeeping must be in worker instructions");
     // The planner instructions are rendered alongside the other roles (#47).
@@ -25536,12 +25772,15 @@ fn orchestrator_template_carries_the_full_autonomy_consent_boundary() {
 /// leaving the template quoting a marker no group is ever sent.
 #[test]
 fn the_orchestrator_contract_quotes_the_full_autonomy_notice_it_will_receive() {
+    // #1683 moved the full-autonomy procedure into the playbook; the pin
+    // follows it. The boundary sentence itself stays pinned on the resident
+    // core by `orchestrator_template_carries_the_full_autonomy_consent_boundary`.
     let on = full_autonomy_notice(true, "harden any bugs", "agent-hold");
     let marker = "[orrerix] FULL AUTONOMY ENABLED";
     assert!(on.starts_with(marker), "the ON notice's own marker moved: {on}");
     assert!(
-        ORCHESTRATOR_TPL.contains(marker),
-        "orchestrator.md must quote `{marker}` exactly as delivered — the notice is one of the \
+        ORCHESTRATOR_PLAYBOOK_TPL.contains(marker),
+        "the playbook must quote `{marker}` exactly as delivered — the notice is one of the \
          only two ways an orchestrator learns the start default inverted (#778)"
     );
     // The OFF notice restates the opt-in default the invariant has to agree with:
@@ -25550,8 +25789,8 @@ fn the_orchestrator_contract_quotes_the_full_autonomy_notice_it_will_receive() {
     let off = full_autonomy_notice(false, "", "");
     assert!(off.contains("the label funnel is opt-in again"), "the OFF notice's default moved: {off}");
     assert!(
-        ORCHESTRATOR_TPL.contains("the label funnel is opt-in"),
-        "orchestrator.md must state the opt-in default the OFF notice returns to (#778)"
+        ORCHESTRATOR_PLAYBOOK_TPL.contains("the label funnel is opt-in"),
+        "the playbook must state the opt-in default the OFF notice returns to (#778)"
     );
 }
 
@@ -25573,9 +25812,10 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
     );
     assert!(summary.contains("eligible under full-autonomy"), "the signal's wording moved: {summary}");
     assert!(
-        ORCHESTRATOR_TPL.contains("eligible under full-autonomy"),
-        "orchestrator.md must name the wake line the poller actually sends, so the orchestrator \
-         acts on it instead of re-polling what loomux already told it (#778)"
+        ORCHESTRATOR_PLAYBOOK_TPL.contains("eligible under full-autonomy"),
+        "the playbook must name the wake line the poller actually sends, so the orchestrator \
+         acts on it instead of re-polling what loomux already told it (#778; the wake-reading \
+         procedure moved to the playbook in #1683)"
     );
     let partial = intake::intake_wake_summary(
         &[],
@@ -25586,8 +25826,8 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
     );
     assert!(partial.contains("PARTIAL:"), "the truncation caveat's wording moved: {partial}");
     assert!(
-        ORCHESTRATOR_TPL.contains("PARTIAL"),
-        "orchestrator.md must say what a PARTIAL-flagged burst means: the backlog was not fully \
+        ORCHESTRATOR_PLAYBOOK_TPL.contains("PARTIAL"),
+        "the playbook must say what a PARTIAL-flagged burst means: the backlog was not fully \
          seen, so a triage plan built from it is incomplete and must say so (#778)"
     );
 }
@@ -25612,22 +25852,28 @@ fn the_orchestrator_contract_names_the_eligible_signal_and_its_partial_caveat() 
 /// stall its own fleet.
 #[test]
 fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
+    // #1683 moved the Asking-the-human procedure into the playbook, so the
+    // contract's anchors are read off core + playbook concatenated — the text
+    // the orchestrator actually reads — while the boundary sentence
+    // ("never with your CLI's own interactive question dialog") stays pinned
+    // to the resident INVARIANT either way.
+    let both = format!("{ORCHESTRATOR_TPL}{ORCHESTRATOR_PLAYBOOK_TPL}");
     for (anchor, why) in [
         (
             "Every question you put to the human goes through `ask_human`",
-            "orchestrator.md must name the tool that replaces the blocking dialog — a \
+            "the contract must name the tool that replaces the blocking dialog — a \
              prohibition with no alternative beside it is one an orchestrator reasons its way \
              around when it genuinely needs an answer (#946 Q1, #1091 slice E)",
         ),
         (
             "Never through your CLI's own",
-            "orchestrator.md must prohibit the CLI's own interactive question dialog outright. \
+            "the contract must prohibit the CLI's own interactive question dialog outright. \
              The #946 Q4 deny makes it impossible on Claude; every other CLI is held by this \
              sentence alone (#946)",
         ),
         (
             "cannot take **any** delivery",
-            "orchestrator.md must say WHY a dialog is forbidden — that the pane stops taking \
+            "the contract must say WHY a dialog is forbidden — that the pane stops taking \
              deliveries, so the stall is fleet-wide and not the asker's own. Without the \
              consequence the rule reads as a style preference (#946)",
         ),
@@ -25639,20 +25885,20 @@ fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
         ),
         (
             "*does* survive a restart",
-            "orchestrator.md must put `list_questions()` in the session-start reconcile and say \
+            "the contract must put `list_questions()` in the session-start reconcile and say \
              what makes it different from the notifications beside it: a pending question \
              outlives the process, so it is a hold that is still yours whether or not you \
              remember opening it (#946 Q1)",
         ),
         (
             "**A demo is ALWAYS a parked board row, never only a message.**",
-            "orchestrator.md must retire the ad-hoc `prepped a worktree, take a look` ping. It \
+            "the contract must retire the ad-hoc `prepped a worktree, take a look` ping. It \
              scrolls away, survives neither a compaction nor a restart, and leaves the human \
              nothing to press (#1091 slice B, the demo-tracking scope addition)",
         ),
         (
             "**record `demo_path`**",
-            "orchestrator.md must have the demo park record where the demo RUNS. loomux never \
+            "the contract must have the demo park record where the demo RUNS. loomux never \
              guesses that path, so an unrecorded one leaves the human a Proceed button and no \
              way to look at what they are proceeding on (#1091 slice B)",
         ),
@@ -25662,9 +25908,9 @@ fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
         // the rule it names, because the other occurrence rescues it — a pin you
         // cannot make fail is a claim of coverage rather than coverage.
         assert_eq!(
-            ORCHESTRATOR_TPL.matches(anchor).count(),
+            both.matches(anchor).count(),
             1,
-            "orchestrator.md must carry `{anchor}` exactly once: {why}"
+            "the orchestrator contract must carry `{anchor}` exactly once: {why}"
         );
     }
     // The protocol's ORDER is the part a summary destroys, and it is one
@@ -25672,10 +25918,10 @@ fn the_orchestrator_contract_carries_the_never_block_question_protocol() {
     // one that was waiting. Pinned as the sequence rather than as five separate
     // contains(), because "un-block ONLY the task" is a rule about which of
     // several holds an answer releases and means nothing on its own.
-    let asking = ORCHESTRATOR_TPL
+    let asking = ORCHESTRATOR_PLAYBOOK_TPL
         .split("## Asking the human")
         .nth(1)
-        .expect("orchestrator.md must carry an `Asking the human` section")
+        .expect("the playbook must carry an `Asking the human` section")
         .split("\n## ")
         .next()
         .unwrap();
@@ -25735,13 +25981,14 @@ fn the_orchestrator_contract_names_the_partial_pr_sweep_caveat() {
     let names_the_fetch = "open-PR fetch";
     assert!(partial.contains(names_the_fetch), "the caveat must name which of the two fetches was short: {partial}");
     assert!(
-        ORCHESTRATOR_TPL.contains(names_the_fetch),
-        "orchestrator.md must name the short fetch the way the summary does ({names_the_fetch}), so \
-         the orchestrator can tell a truncated PR sweep from a truncated backlog (#795)"
+        ORCHESTRATOR_PLAYBOOK_TPL.contains(names_the_fetch),
+        "the playbook must name the short fetch the way the summary does ({names_the_fetch}), so \
+         the orchestrator can tell a truncated PR sweep from a truncated backlog (#795; the \
+         caveat moved to the playbook in #1683)"
     );
     assert!(
-        ORCHESTRATOR_TPL.contains("produces no wake"),
-        "orchestrator.md must say what a PARTIAL open-PR fetch COSTS: a PR outside the window \
+        ORCHESTRATOR_PLAYBOOK_TPL.contains("produces no wake"),
+        "the playbook must say what a PARTIAL open-PR fetch COSTS: a PR outside the window \
          finishing CI produces no wake at all, so silence about it is absence of evidence and must \
          be checked rather than read as still-running (#795)"
     );

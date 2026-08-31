@@ -5,7 +5,7 @@ These are byte copies of `src/orchestration/templates/{orchestrator,worker,revie
 integration branch with the block model and the workflow pane on it, and nothing else) —
 which is where the directory's name comes from.
 
-`manager.md` (#1161) is the fifth file here and the one exception to this directory's
+`manager.md` (#1161) is the fifth file here and one exception to this directory's
 title: **no default group reads it.** A manager exists only when a repo's
 `.loomux/workflow.yml` declares `kind: manager`, and `write_instruction_files`'s
 class-fallback loop deliberately does not write `manager.md` — so there is nothing for the
@@ -18,6 +18,13 @@ and `LIVE`), which is the half of this directory's job that is a fact about the 
 rather than about a group: an edit to `manager.md` still needs a human re-bless here, and
 the diff on this file is still the review surface for "what did we just tell the human's
 own interface to do differently?".
+
+`orchestrator-playbook.md` (#1683) is the sixth file, and it is the opposite case: a
+default group DOES read it — rendered into every group dir beside the role files and
+served section-by-section by `read_playbook` — so unlike `manager.md` it sits in `PRE222`
+and both default-group pins iterate it. Its golden is the live template minus the keys
+`LIVE` lists for it (the two workflow-conditional fragments the merge gate and re-sync
+sections carry), re-blessed exactly like the role files.
 
 They are not frozen forever: they are the *last human-blessed* copy. When the role
 templates deliberately change, the fixture is re-blessed (see below) and the diff on this
@@ -1014,3 +1021,41 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   first-turn primer pins were re-anchored to the new call spellings in the same commit
   rather than relaxed; `tests/orchestration.rs`'s exactly-once `*does* survive a restart`
   anchor is untouched — the session-start rewrap keeps it intact.
+
+- **#1683/#1811, the resident core and the on-demand playbook** — `orchestrator.md`,
+  `worker.md`, and the NEW `orchestrator-playbook.md`; `reviewer.md`, `planner.md` and
+  `manager.md` are byte-identical to their previous blessed copies (level 2 re-run on all
+  six). One re-bless at the end of a batch PR, per #1811's own rule — the batching rule
+  that now lives in the templates this entry covers.
+
+  `orchestrator.md`: the 15 situational sections and two paragraph groups (delivery
+  notices, queue orphans and refused) moved to the playbook, each leaving a resident stub
+  naming its trigger and the section id to fetch — the rule stays resident, only the
+  procedure moves, because the failure mode of an on-demand document is an orchestrator
+  that never knows to ask. The `{{MERGE_QUEUE}}` and `{{POST_MERGE_WORKFLOW_HOOK}}`
+  fragments moved with their sections (the `LIVE` key lists split accordingly), and the
+  orchestrator gains one tool bullet teaching `read_playbook(section)`. The **Planning &
+  scheduling** section stays as the home of the one rule that is load-bearing on every
+  delegation (#1811): one PR per deliverable, never one per slice — only its argument
+  moved to the playbook.
+
+  `orchestrator-playbook.md` is a new golden: the on-demand procedure, one `## ` section
+  per id, opened by "About this playbook" and rendered into every group dir. It carries
+  the moved content byte-for-byte with re-titled headings (ids derive from them), the
+  two moved placeholders, and the playbook-side half of the #1811 rule.
+
+  `worker.md`: the batch-PR discipline (#1811) — several slices may arrive on one branch;
+  never open a second PR for one, keep commits walkable, and re-bless or regenerate
+  ONCE at the end. No existing worker text moved; nothing was displaced, so no pin was
+  repointed.
+
+  The concept pins whose specimens moved (`tests/orchestration.rs`: the #445 held-delivery
+  warning, the #590 orchestrator CI-watch row, the #625 squash scrub, the #778/#795
+  full-autonomy notices and caveats, the #946/#1091 never-block anchors, the #581
+  merge-queue note reach; `tests/prompts.rs`: the merge gate, engineering standards,
+  red main, re-sync, open-PR sweep, label funnel, learning loop; `tests/workflow.rs`: the
+  post-merge process-pro silence) were REPOINTED to `ORCHESTRATOR_PLAYBOOK_TPL`, to the
+  core+playbook concatenation, or to the rendered playbook file — never relaxed. The two
+  default-group pins now iterate the sixth file: the playbook is what a default group
+  reads too, and the gate-machinery pin stays green over it (the moved content names none
+  of the four refused tokens).
