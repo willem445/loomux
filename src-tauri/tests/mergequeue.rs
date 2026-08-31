@@ -2419,11 +2419,15 @@ fn the_queue_refuses_a_pr_the_review_driver_is_holding() {
     use loomux_lib::orchestration::mqloop::refusal;
     let f = drain_fake();
     let gate = one_reviewer_gate();
-    let verdicts = verdict_map(HEAD_A, "b");
+    let verdicts = verdict_map(HEAD_B, "b");
 
+    // PR 705 rather than an arbitrary number: `drain_fake` answers for it, so
+    // the control half below can run to completion instead of dying on a
+    // missing canned reply. A red that is a panic before the assertion is not
+    // evidence about the assertion.
     let mut driven_state = MergeQueueState::default();
     let out_driven =
-        enqueue(&f, &mut driven_state, 800, None, true, &gate, &verdicts, 0, true);
+        enqueue(&f, &mut driven_state, 705, None, true, &gate, &verdicts, 0, true);
     assert_eq!(
         out_driven,
         EnqueueOutcome::Refused { reason: refusal::IN_REVIEW_DRIVE },
@@ -2432,20 +2436,23 @@ fn the_queue_refuses_a_pr_the_review_driver_is_holding() {
     assert_eq!(
         driven_state,
         MergeQueueState::default(),
-        "and refused before anything is written"
+        "and refused before anything is written — including before the `gh` call that \
+         resolves the target, which is what the control below proves happens otherwise"
     );
 
-    // The discriminating half: the same call with that one bit cleared does NOT
-    // give this refusal. Whatever it answers, it is not this one — so the
-    // assertion above is about the drive rather than about a fixture that could
-    // never be enqueued.
+    // The discriminating half: the same call with that ONE bit cleared queues.
+    // Not merely 'does not give this refusal' — it reaches the target
+    // resolution, spends the `gh` read, and lands an entry. That is what makes
+    // the assertion above about the drive rather than about a fixture that
+    // could never have been enqueued anyway.
     let mut free_state = MergeQueueState::default();
-    let out_free = enqueue(&f, &mut free_state, 800, None, true, &gate, &verdicts, 0, false);
-    assert_ne!(
+    let out_free = enqueue(&f, &mut free_state, 705, None, true, &gate, &verdicts, 0, false);
+    assert_eq!(
         out_free,
-        EnqueueOutcome::Refused { reason: refusal::IN_REVIEW_DRIVE },
+        EnqueueOutcome::Queued { position: 1 },
         "the refusal must turn on the drive, not on the rest of the fixture: {out_free:?}"
     );
+    assert_eq!(free_state.target, "integration/batch4", "…and it really enqueued");
 }
 
 /// The other side of the same rule: **drained means both halves of §4** — no
