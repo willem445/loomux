@@ -709,13 +709,36 @@ fn driven(
     // validated `GroupId` off it, which is CLAUDE.md constraint 6 — the proof
     // travels with the value rather than with the call site.
     let group = reg.create_group(&repo.path(), rails()).unwrap().id;
-    // A full, well-shaped session id this roster never recorded takes
-    // `resolve_session_ref`'s passthrough arm and is accepted — §5.1 says so,
-    // and says the deferral is deliberate: resolving is not proving resumable.
-    let session = "cafb930d-1111-2222-3333-444444444444".to_string();
+    // **A REAL worker, whose session is genuinely resumable.**
+    //
+    // The obvious fixture — a well-shaped uuid this roster never recorded — is
+    // accepted by `drive_review` (§5.1: `resolve_session_ref`'s passthrough arm,
+    // and the note is explicit that resolving is not proving resumable), and
+    // then parks the drive at `held(worker-unresumable)` on the FIRST hand-back.
+    // That is the driver behaving exactly as §5.1 describes, and it is useless
+    // as a fixture for anything downstream of a hand-back: three tests were
+    // asserting `fix-wait` and reading `held`.
+    //
+    // So the worker is spawned for real and its own session id is what the drive
+    // is pointed at — which is also what an orchestrator actually passes.
+    let w = reg
+        .spawn_agent(&group, Role::Worker, "w", "", false, None)
+        .expect("a worker to hand back to");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
     let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1");
     assert_eq!(out["driving"], serde_json::json!(true), "drive_review refused: {out}");
     (group, session)
+}
+
+/// Give an agent a pane, which a delivery requires.
+///
+/// `deliver_prompt` resolves the target's `pty_id` BEFORE it audits, and answers
+/// `Err` for an agent that has none — "a target with no terminal has nowhere to
+/// hold anything" (#569). In test mode nothing binds a pane, so an orchestrator
+/// spawned and left alone silently receives nothing, and a test asserting a
+/// delivery reads an empty audit log rather than a missing feature.
+fn with_pane(reg: &OrchRegistry, agent_id: &str, pty: u32) {
+    reg.set_pty_for_test(agent_id, pty);
 }
 
 fn status_head(reg: &OrchRegistry, group: &GroupId) -> String {
@@ -1232,7 +1255,8 @@ fn a_driven_lanes_verdict_is_consumed_and_the_same_lanes_undriven_one_is_deliver
     // The orchestrator has to exist for a delivery to have a recipient at all —
     // otherwise `deliver_to_orchestrator` refuses and the undriven half would
     // pass for the wrong reason.
-    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
 
     reg.rd_drive_group_with(&group, &gh, 10_000);
@@ -1307,7 +1331,8 @@ fn a_parked_drives_delegate_still_reaches_the_orchestrator() {
     let repo = Repo::new();
     let gh = FakeGh::green(HEAD_A);
     let (group, _s) = driven(&reg, &repo, &gh);
-    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
 
     reg.rd_drive_group_with(&group, &gh, 10_000);
@@ -1368,7 +1393,8 @@ fn a_lane_that_has_answered_is_re_briefed_with_the_delta_template() {
     let repo = Repo::new();
     let gh = FakeGh::green(HEAD_A);
     let (group, _s) = driven(&reg, &repo, &gh);
-    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
 
     reg.rd_drive_group_with(&group, &gh, 10_000);
@@ -1542,7 +1568,8 @@ fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
     let repo = Repo::with(WORKFLOW_TWO_LANES);
     let gh = FakeGh::green(HEAD_A);
     let group = reg.create_group(&repo.path(), rails()).unwrap().id;
-    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
     let out = reg.drive_review_with(
         &group,
