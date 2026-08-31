@@ -4641,8 +4641,11 @@ fn the_resident_core_is_under_the_byte_budget() {
     let content = ORCHESTRATOR_TPL.replace("\r\n", "\n");
     assert!(
         content.len() <= 45_000,
-        "the resident core is {} bytes (budget 45,000) — sections move to the playbook, \
-         they do not get rewritten longer in place (#1683)",
+        "the resident core is {} bytes EOL-normalized ({} bytes raw in this checkout — \
+         CRLF on Windows, LF elsewhere; that difference is the checkout, not the content) \
+         against a 45,000 budget — sections move to the playbook, they do not get \
+         rewritten longer in place (#1683)",
+        content.len(),
         ORCHESTRATOR_TPL.len()
     );
 }
