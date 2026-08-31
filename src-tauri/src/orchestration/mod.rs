@@ -636,6 +636,81 @@ proactively: the speculative merge **is** the mergeability probe, so a sibling t
 is kicked back at construction time with no CI spent and nothing landed. Wait to be told. This does
 **not** cover open PRs that are not queued — those still restale on every merge and still need the
 sweep."#;
+/// The `{{REVIEW_DRIVER}}` fragment (#1778 §5.5) — substituted into
+/// `orchestrator.md` **only** when the repo declares `driver: enabled: true`,
+/// and empty otherwise.
+///
+/// It brings its own leading newlines for `MERGE_QUEUE_NOTE`'s reason: the
+/// placeholder sits at the end of the preceding sentence, so an empty
+/// substitution has to leave that line exactly as it was — the invariant
+/// `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` pins.
+///
+/// **A fragment rather than template prose**, on the same test the queue's note
+/// passes: everything here names machinery a driverless group does not have —
+/// three tools, a closed refusal vocabulary, and a narrowing of where a
+/// delegate's report arrives. Prose about a mechanism the reader does not have
+/// is an invitation to go looking for it.
+///
+/// **The one thing it must say that nothing else can.** §7 makes the
+/// orchestrator's view of its own group *narrower* while a drive is live: a
+/// driven delegate's `report` and `review_verdict` stop arriving as prompts. An
+/// orchestrator that did not know that would read the silence as a stalled
+/// delegate and go looking for it — so the narrowing, the two surfaces that
+/// compensate for it (`review_drive_status()` and the audit log), and the one
+/// channel that is never intercepted are all named here rather than left to be
+/// inferred from a notice that does not arrive.
+const REVIEW_DRIVER_NOTE: &str = r#"
+
+**This repo runs an engine review driver, and it can perform the worker-reviewer rounds you do by
+hand.** Hand it ONE PR and orrerix does, on its own poll loop: wait for CI; spawn or resume each
+reviewer lane the merge gate requires, in gate order, briefing each with the head and what moved;
+hand a `fail`, a red run or a conflict back to the worker session you named; and stop with **one**
+notice here at gate-satisfied, at an `escalate`, or at a bound.
+
+- `drive_review(pr, worker_session, reset_counters?, rounds_already_spent?)` — start a drive, or
+  resume a held one. Give the **full** worker session id: orrerix resolves it once, here, and
+  stores what came back, because a prefix that is unique today can become ambiguous as the roster
+  grows. It does **not** read the board for it — the board is agent-writable, so a check that
+  trusted it would be a check the thing being checked gets to answer.
+- `review_drive_status()` — where your drives stand. Read-only, and **read it after a compaction**:
+  a drive you have forgotten is still running.
+- `cancel_review_drive(pr)` — stop one.
+
+**Consent is per PR and it is yours.** A drive never starts on its own, and in particular not on a
+worker's `report(done)`: the PRs where a drive is wrong are ordinary ones — a scratch or
+red-evidence PR, a release bump, a PR the human said they would read themselves. INVARIANT 8 makes
+*what starts* your call, and this does not change that.
+
+**What the driver may never do**, so you never have to wonder: merge, or use any landing verb;
+write a merge grant; relabel or edit an issue or a PR, bodies included; widen or author a brief
+(every variable in one is a fact orrerix READ); kill a pane; decide a disposition; or open the gate
+— only a reviewer's own `review_verdict` does that. It is strictly **additive** to the merge gate:
+it never grants what the gate would not, and a completed drive is never a substitute for a
+reviewer's `pass`.
+
+**Counters are INVARIANT 9's, and they clamp toward it and never away.** Three review rounds, three
+CI attempts, one rebase. "Yours count too" is a property of the budget rather than of who spends
+it: if you already reviewed this PR by hand and got a `fail`, pass `rounds_already_spent`, or the
+drive starts at zero and spends three more.
+
+**One thing genuinely narrows while a drive is live, and it is the reason this paragraph exists.**
+A driven delegate's `report` and `review_verdict` are consumed by the driver instead of arriving
+here as prompts. Do not read that silence as a stalled delegate. Two surfaces compensate:
+`review_drive_status()` and the audit log, where every consumed event is recorded as `rd-consumed`
+with its kind, its agent and its PR — consumed is a different word from dropped.
+**`message_orchestrator` is never intercepted**: a delegate's own words always reach you
+unchanged, and the drive then holds so you know why they came.
+
+**A held drive is PARKED, not finished.** It keeps its spent counters, `review_drive_status()`
+lists it, and `drive_review` on it resumes the same budget — `reset_counters: true` spends another
+three, which is a decision rather than a side effect of typing the call twice. The kick-back names
+the one fact that decides what you do next and the tool that acts on it.
+
+**Sequence with the merge queue is serial and has a direction.** A driven PR may not be queued and
+a queued PR may not be driven — `drive_review` refuses `in-merge-queue`, `queue_merge` refuses
+`in-review-drive`. Let the drive reach gate-satisfied, disposition its findings (INVARIANT 3 —
+that is still yours), and *then* queue."#;
+
 /// The `{{LOCKS}}` / `{{LOCKS_ORCH}}` fragments (#858) — substituted into
 /// `worker.md`/`reviewer.md` and `orchestrator.md` respectively, **only** when
 /// the repo declares a non-empty `resources:` block, and empty otherwise.
@@ -26941,6 +27016,7 @@ struct InstructionVars {
     advisor_consult_note: String,
     post_merge_workflow_hook: String,
     merge_queue_note: String,
+    review_driver_note: String,
     locks_note: &'static str,
     locks_orch_note: &'static str,
 }
@@ -26989,6 +27065,7 @@ impl InstructionVars {
             // `BLOCK_NAME`, which `block_note`'s own `BLOCK_TPL` render keeps
             // last on purpose (see the comment there).
             ("MERGE_QUEUE", self.merge_queue_note.as_str()),
+            ("REVIEW_DRIVER", self.review_driver_note.as_str()),
             ("LOCKS", self.locks_note),
             ("LOCKS_ORCH", self.locks_orch_note),
             ("BLOCK_NOTE", ""),
@@ -41709,6 +41786,16 @@ impl OrchRegistry {
         } else {
             String::new()
         };
+        // #1778 §5.5's addendum, gated the same way and read through the one
+        // policy reader the tick uses — so a group whose tools all refuse
+        // `driver-disabled` cannot be told it has a driver, and a group that
+        // has one cannot be left to discover §7's narrowing from a notice that
+        // does not arrive.
+        let review_driver_note = if self.driver_enabled(&g.id) {
+            REVIEW_DRIVER_NOTE.to_string()
+        } else {
+            String::new()
+        };
         // #858, the same shape and the same reasoning as `merge_queue_note`
         // directly above: gated on the DECLARATION, not merely on the toggle,
         // because a repo can run a workflow and declare no resources — and
@@ -41726,6 +41813,7 @@ impl OrchRegistry {
             advisor_consult_note,
             post_merge_workflow_hook,
             merge_queue_note,
+            review_driver_note,
             locks_note: if locks_declared { LOCKS_NOTE } else { "" },
             locks_orch_note: if locks_declared { LOCKS_ORCH_NOTE } else { "" },
         }
