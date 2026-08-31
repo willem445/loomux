@@ -80,6 +80,7 @@ import {
   DRIVER_DEFAULTS,
   POLICY_BOUNDS,
   isDriverOn,
+  driverSectionHasComments,
   setDriverEnabled,
   type FieldBounds,
   type Workflow,
@@ -2419,12 +2420,17 @@ export class WorkflowView {
    *  The pane parses, preserves, re-emits and validates the block, and this view is the
    *  whole chrome it gets: the checkbox below IS the driver's enabled state — it reads
    *  `isDriverOn` (the `enabled:` line, not the block's presence) and writes through
-   *  `setDriverEnabled` (on writes `{ enabled: true }`, off deletes the block, because
-   *  absent and `enabled: false` are the same state to the engine and deleting is the
-   *  tidier of the two) — and the six counters are bounded number fields
+   *  `setDriverEnabled` (on writes `{ enabled: true }` beside whatever the block already
+   *  declares; off deletes a block that holds nothing but the switch, and writes
+   *  `enabled: false` — losing nothing — when it holds more, the comment signal coming
+   *  from `driverSectionHasComments` over the text this form was rendered from) — and
+   *  the six counters are bounded number fields
    *  reading `POLICY_BOUNDS` — the manifest's own min/max, which
    *  `test/workflowschema.test.ts` pins against the engine in both directions, so the
-   *  form cannot emit a value the engine refuses the file over. The counters still get
+   *  form cannot emit an out-of-range value at all — and which bounds the engine
+   *  REFUSES (the three counters) versus CLAMPS (`clamp_expires_minutes`, the three
+   *  timeouts) is the manifest's `on_out_of_range`, pinned behaviorally by the
+   *  refuse-vs-clamp test. The counters still get
    *  hand-built fields rather than a descriptor registry — slice C is what retires the
    *  hand-built forms, and until then this is the same shape `mergeQueueForm` is. What
    *  the block must not be is invisible: a declared policy the designer cannot show is
@@ -2436,8 +2442,9 @@ export class WorkflowView {
         "p",
         "wf-note",
         "The review-loop driver: loomux drives a PR through review and CI on the " +
-          "orchestrator's authority. An absent driver: block means the feature is OFF — " +
-          "which is why unticking below removes the section instead of writing enabled: false."
+          "orchestrator's authority. An absent driver: block means the feature is OFF. " +
+          "Unticking removes the section when it holds nothing but the switch, and writes " +
+          "enabled: false — keeping your counters and comments — when it holds more."
       )
     );
 
@@ -2445,9 +2452,13 @@ export class WorkflowView {
     box.append(
       // The read rule lives in `isDriverOn` — the enabled LINE, not the block's
       // presence, since the engine's `enabled` is `#[serde(default)] bool` and a
-      // present block without the line is off.
+      // present block without the line is off. The write rule takes the comment
+      // signal from the text this form was rendered from: OFF may not delete the
+      // file's own prose about the section along with it (#1869 review round 3).
       this.sectionToggle("The review driver is on for this repo", isDriverOn(w), (on) =>
-        this.mutate((next) => setDriverEnabled(next, on))
+        this.mutate((next) =>
+          setDriverEnabled(next, on, driverSectionHasComments(this.text))
+        )
       )
     );
     if (!dv) return box;

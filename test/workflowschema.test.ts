@@ -29,6 +29,8 @@ import {
   serializeWorkflow,
   DRIVER_DEFAULTS,
   isDriverOn,
+  driverSectionHasComments,
+  serializeWorkflowPreserving,
   setDriverEnabled,
   RESOURCE_SLOTS_MIN,
   RESOURCE_SLOTS_MAX,
@@ -402,9 +404,10 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "merge_queue.max_batch",
   "merge_queue.checks_timeout_minutes",
   // #1869 moved the driver fields OUT of this list: the pane now has an enable-toggle
-  // (write rule in `setDriverEnabled` — off deletes the block, absent and
-  // `enabled: false` are the same state to the engine) and bounded number fields for
-  // the six counters, so they are claimed in `FIELDS_WITH_AN_EDITOR` above.
+  // (write rule in `setDriverEnabled` — off deletes a BARE block and keeps a configured
+  // one as `enabled: false`; absent and `enabled: false` are the same state to the
+  // engine) and bounded number fields for the six counters, so they are claimed in
+  // `FIELDS_WITH_AN_EDITOR` above.
   "resource.slots",
   "resource.max_hold_minutes",
   // #1175. The pane PARSES, PRESERVES and RE-EMITS `board:` (that is what the two
@@ -494,17 +497,115 @@ test("every schema field is either editable in the pane or listed as not yet edi
 
 // ---------- (c3) the driver toggle's write rule (#1869) ----------
 
-test("the driver toggle's OFF deletes the block — never writes enabled: false (#1869)", () => {
-  // Absent and `enabled: false` are the same state to the engine, and deleting is
-  // the tidier of the two — the same reason `mergeQueueForm`'s toggle deletes. The
-  // block goes WHOLE, even when it carries counters: a form that wrote
-  // `enabled: false` onto a file with counters would leave a block whose only live
-  // content is a statement of absence.
-  const w = parseWorkflow(
+test("the driver toggle's OFF deletes a BARE block and keeps a configured one (#1869 review 3)", () => {
+  // Bare — nothing but `enabled`, and no comments in the file's prose about the
+  // section: delete. Absent and `enabled: false` are the same state to the
+  // engine, and deleting is the tidier of the two.
+  const bare = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n"
+  ).workflow;
+  setDriverEnabled(bare, false);
+  assert.equal(bare.driver, undefined, "a bare block is deleted whole");
+
+  // Configured — the checkbox READS the `enabled:` line but writes the block, so
+  // two clicks on it must never delete the counters. OFF writes the switch and
+  // keeps everything else (round 2's original test asserted the delete here —
+  // that rule was the data-loss path rev-final reproduced).
+  const configured = parseWorkflow(
     "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n  max_review_rounds: 2\n"
   ).workflow;
-  setDriverEnabled(w, false);
-  assert.equal(w.driver, undefined, "OFF must delete the block, not write enabled: false");
+  setDriverEnabled(configured, false);
+  assert.deepEqual(
+    configured.driver,
+    { enabled: false, max_review_rounds: 2 },
+    "OFF on a configured block writes enabled: false and keeps the counters"
+  );
+
+  // The third input is the one the model cannot see: the file's own prose about
+  // the section. A bare block the file comments on is kept too — deleting it
+  // would delete that prose with it.
+  const commented = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n"
+  ).workflow;
+  setDriverEnabled(commented, false, true);
+  assert.deepEqual(
+    commented.driver,
+    { enabled: false },
+    "OFF on a bare block whose section carries comments writes enabled: false"
+  );
+});
+
+test("on-then-off on a configured block restores the file byte for byte (#1869 review 3)", () => {
+  // The reviewer's data-loss case, pinned end to end: a block resting at
+  // `enabled: false` with counters and comments renders UNCHECKED, and on-then-off
+  // must land the file back where it started — not delete it. The splice reuses
+  // the section's own lines with only the switch's line rewritten, so two clicks
+  // round-trip to BYTE IDENTITY, comments and formatting included.
+  const text =
+    "version: 1\n" +
+    "blocks:\n" +
+    "  - id: b\n" +
+    "    kind: worker\n" +
+    "# the review loop - see docs/orchestration.md\n" +
+    "driver:\n" +
+    "  # INVARIANT 9's numbers, run tighter not looser\n" +
+    "  enabled: false\n" +
+    "  max_review_rounds: 2  # one round is enough here\n" +
+    "";
+  const w = parseWorkflow(text).workflow;
+  const comments = driverSectionHasComments(text);
+  assert.ok(comments, "positive control: the scan must SEE this fixture's comments");
+  setDriverEnabled(w, true, comments);
+  assert.deepEqual(w.driver, { enabled: true, max_review_rounds: 2 });
+  const afterOn = serializeWorkflowPreserving(w, text);
+
+  const w2 = parseWorkflow(afterOn).workflow;
+  setDriverEnabled(w2, false, driverSectionHasComments(afterOn));
+  const out = serializeWorkflowPreserving(w2, afterOn);
+  assert.equal(
+    out,
+    text,
+    `two clicks must restore the file byte for byte, not delete the block:\n${out}`
+  );
+  assert.deepEqual(
+    parseWorkflow(out).workflow.driver,
+    { enabled: false, max_review_rounds: 2 },
+    "…and the model the restored file parses to is the one it started with"
+  );
+});
+
+test("driverSectionHasComments reads the real splitter, not a second scanner (#1869 review 3)", () => {
+  const roster = "version: 1\nblocks:\n  - id: b\n    kind: worker\n";
+  // The introducing comment, an interior one, and a trailing one on the key line
+  // are all the file's prose about the section.
+  assert.equal(
+    driverSectionHasComments(`${roster}# about the driver\ndriver:\n  enabled: true\n`),
+    true
+  );
+  assert.equal(
+    driverSectionHasComments(`${roster}driver:\n  # on, until the team says otherwise\n  enabled: true\n`),
+    true
+  );
+  assert.equal(
+    driverSectionHasComments(`${roster}driver: # off for now, keep the numbers\n  enabled: true\n`),
+    true
+  );
+  assert.equal(
+    driverSectionHasComments(`${roster}driver:\n  enabled: true\n`),
+    false,
+    "a clean block has no comments — the delete case needs this half to be reachable"
+  );
+  // A `#` inside an unknown key's block scalar is CONTENT, not commentary — the
+  // preserving splitter's own rule (#233 B2). A naive second scanner would read it
+  // as a comment and preserve a block the rule says to delete; this half pins that
+  // the splitter, not a regex, is answering.
+  assert.equal(
+    driverSectionHasComments(`${roster}driver:\n  enabled: true\n  mystery: |\n    # not a comment\n`),
+    false
+  );
+  // A shape the scan refuses to read is treated as commented: the OFF rule may
+  // keep a block it could have deleted, but must never delete one it cannot see.
+  assert.equal(driverSectionHasComments(" driver:\n  enabled: true\n"), true);
 });
 
 test("the driver toggle's ON from absent writes exactly { enabled: true }, and it round-trips (#1869)", () => {
