@@ -195,9 +195,9 @@ file (if any) a block uses*:
    telling every worker it can `message_orchestrator` to request a consult
    when the roster declares an advisor block; a worker cannot spawn the
    advisor itself.
-4. **`POST_MERGE_WORKFLOW_HOOK`** (`templates/orchestrator.md`, #358 fold-in)
-   — a line-final fragment appended to the base **"Re-sync the fleet — every
-   open branch, after every merge"** section, present only when the roster
+4. **`POST_MERGE_WORKFLOW_HOOK`** (`templates/orchestrator-playbook.md`, #358 fold-in;
+   renamed by #1844 from "Re-sync the fleet" to **"Mergeability"**)
+   — a line-final fragment appended to the base section, present only when the roster
    declares a `process` block. This is where the ACTIONABLE process-pro
    trigger lives, not `{{WORKFLOW}}`. The bug it fixes: the original trigger
    was `PROCESS_NOTE`'s spawn instruction sitting near the top of

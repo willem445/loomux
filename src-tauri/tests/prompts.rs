@@ -178,8 +178,9 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
          "red-before-green: an unevidenced test is a decoration"),
         ("red main stops everything",
          "a merge it performed owns the default branch's next CI run"),
-        ("when the default branch moves, every open branch is stale",
-         "a moved base makes every open branch STALE, which is not the same as conflicted"),
+        ("a pr merges when github reports it mergeable",
+         "mergeability is the whole readiness test (#1844) — a branch merely behind is left \
+          alone, and the two-green-PRs-red-main risk is INVARIANT 6's"),
         ("the label funnel is the consent boundary",
          "file freely; never groom or start an unlabelled issue"),
         ("look, don't build",
@@ -204,6 +205,13 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
         body.matches(canary).count(),
         1,
         "INVARIANT 3's rule must appear EXACTLY once in the body: {body}"
+    );
+
+    // #1844: the retracted staleness rule must not come back through a paraphrase — the
+    // digest names mergeability as the readiness test, never a branch's freshness.
+    assert!(
+        !head.contains("every open branch is stale"),
+        "the retracted 'every open branch is stale' rule is back in the digest: {head}"
     );
 }
 
@@ -460,7 +468,7 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
     // look, so nothing would have looked.
     // #1683: the red-main procedure moved to the playbook.
     let pb = flat(&playbook_instructions());
-    let aftermath = section(&pb, "## red main", "## resync the fleet");
+    let aftermath = section(&pb, "## red main", "## mergeability");
     let at = "the red-main procedure";
 
     pinned(at, aftermath, "post-merge run",
@@ -486,51 +494,66 @@ fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
 }
 
 #[test]
-fn every_open_branch_is_re_synced_after_the_default_branch_moves() {
-    // The sweep watched CI and comments — both of which stay green while a PR silently goes
-    // CONFLICTING because something else merged underneath it. But conflict is the wrong trigger:
-    // STALE is not the same as CONFLICTED. A branch that still merges cleanly was reviewed, tested
-    // and CI'd against code that no longer exists, so its green checks describe the past, and
-    // waiting for `CONFLICTING` to appear is waiting for the cheapest moment to rebase to pass.
-    // #1683: the sweep and the re-sync procedure both moved to the playbook.
+fn a_pr_merges_when_github_reports_it_mergeable_and_a_branch_merely_behind_is_left_alone() {
+    // #1844. The rule this replaces (#236 F7's post-merge re-sync of the fleet) is the
+    // human's own decision to drop: every rebase is a push that invalidates the review
+    // already held and re-stales every recorded verdict, which on a fleet of open PRs is
+    // O(n²) review rounds buying re-verification of code that did not change. What remains
+    // is the readiness test — GitHub's own mergeability. A branch that still merges cleanly
+    // is left alone; only `CONFLICTING` cannot merge and needs work; the
+    // two-green-PRs-combine-red hazard is red main's (INVARIANT 6), not a reason to touch
+    // #1683: the procedure lives in the playbook.
     let pb = flat(&playbook_instructions());
 
     let sweep = section(&pb, "## monitoring open prs", "## learning loop");
     pinned("the open-PR sweep", sweep, "--json mergeable",
         "the sweep must ask whether the PR still merges — green checks say nothing about it");
     pinned("the open-PR sweep", sweep, "conflicting", "…and know the state it is looking for");
+    // #1844: the sweep asks about mergeability, never freshness — a branch that is merely
+    // behind is not work the sweep routes anywhere.
+    pinned("the open-PR sweep", sweep, "never whether it is fresh",
+        "the re-sync the sweep used to backstop is gone: the sweep detects a PR that cannot \
+         merge, it does not chase branches that can");
 
-    let resync = section(&pb, "## resync the fleet", "## ci gate");
-    let at = "the re-sync rule";
-    pinned(at, resync, "stale is not the same as conflicted",
-        "the whole rule lives in that distinction — a conflict-only trigger waits for the most \
-         expensive moment to rebase");
-    pinned(at, resync, "branch it will merge into",
-        "a sub-PR rebases onto ITS base (an integration branch), not reflexively onto main — \
-         backwards, and a merged feature's commits get dragged through someone else's PR");
-    pinned(at, resync, "owning worker",
-        "a real conflict belongs to the worker that wrote the code (resumed), not to the orchestrator");
-    pinned(at, resync, "one attempt",
-        "…bounded exactly like the CI gate's fix loop — a rebase loop is an expensive way to not ship");
-    pinned(at, resync, "invalidates the review",
-        "…and the rebase IS a push: the review you were holding is now a review of code that no \
-         longer exists, so it has to be re-requested — which is the price of freshness, and the \
-         reason to pay it early");
-    // The license to scope it is part of the rule, not a footnote: applied literally after every
-    // merge on a stack, this costs O(n²) REVIEWS, not just rebases.
-    pinned(at, resync, "re-sync the merge frontier, not the whole tree",
-        "the re-sync must scope itself to the branch that actually MOVED — a PR two levels deep is \
-         not stale until its own base moves, and re-syncing it early pays twice");
-    pinned(at, resync, "costs o(n²) reviews",
-        "…and must name the cost it is avoiding: re-syncing an n-deep stack per merge is quadratic \
-         in REVIEWS, because every rebase invalidates the review on the PR it touches");
-    pinned(at, resync, "a fan is not a stack",
-        "…and the FAN case, which is the common shape: with many siblings on one base every sibling \
-         is on the frontier, so 'rebase the frontier immediately' after each merge is the O(n²) the \
-         license exists to avoid — rebase the one you are about to merge, and batch the rest");
-    pinned(at, resync, "held on an unanswered question alone",
-        "…and a PR held on an unanswered question is not going anywhere: rebasing it invalidates a \
-         review nobody can act on");
+    let mergeability = section(&pb, "## mergeability", "## ci gate");
+    let at = "the mergeability rule";
+    pinned(at, mergeability, "merges when github reports it mergeable",
+        "mergeability is the whole readiness test — green checks say nothing about whether \
+         the PR will merge");
+    pinned(at, mergeability, "merely **behind** its base is left alone",
+        "the human dropped the fleet re-sync (#1844): a branch that still merges cleanly is \
+         never touched, so no rebase churn re-stales the reviews it already holds");
+    pinned(at, mergeability, "owning worker",
+        "a real conflict belongs to the worker that wrote the code (resumed), not to the \
+         orchestrator");
+    pinned(at, mergeability, "one attempt, then the human",
+        "…bounded exactly like the CI gate's fix loop (INVARIANT 9)");
+    pinned(at, mergeability, "case (invariant 6)",
+        "the case a pre-merge rebase used to catch — two green PRs landing a red main — is \
+         INVARIANT 6's own, so the replacement is a redirect, not a hole");
+    pinned(at, mergeability, "speculative batch remains the mergeability probe",
+        "the queue's speculative merge is unaffected — it stays the right mergeability probe \
+         for sub-PRs onto an integration branch");
+    pinned(at, mergeability, "staging worktree of your own",
+        "the mechanical-work discipline outlived the re-sync: checkout outside the main \
+         clone, one reusable staging worktree (#338)");
+
+    // The retracted rule must not come back through a paraphrase either: the section no
+    // longer mandates any rebase, scopes no frontier, and calls no branch stale.
+    assert!(
+        !mergeability.contains("always rebase"),
+        "the retracted 'always rebase a PR immediately before you merge' mandate is back in \
+         the mergeability section: {mergeability}"
+    );
+    assert!(
+        !mergeability.contains("every open branch is stale"),
+        "the retracted 'every open branch is stale' rule is back in the mergeability \
+         section: {mergeability}"
+    );
+    assert!(
+        !mergeability.contains("re-sync the merge frontier"),
+        "the retracted frontier re-sync is back in the mergeability section: {mergeability}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

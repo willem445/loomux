@@ -494,7 +494,7 @@ pub const PLAYBOOK_SECTION_IDS: &[&str] = &[
     "merge-gate",
     "squash-closes-issues",
     "red-main",
-    "resync-the-fleet",
+    "mergeability",
     "ci-gate",
     "monitoring-open-prs",
     "learning-loop",
@@ -41039,7 +41039,7 @@ impl OrchRegistry {
                 "\n\n**You have a process-pro.** `{id}` mines a merged PR's session into \
                  proposed skills/lessons — it reads the session cold, proposes what it found \
                  as a normal PR, and stops there: it never merges anything, its own PR \
-                 included. Your post-merge routine (**Re-sync the fleet**) is what spawns it.\
+                 included. Your post-merge routine (**Mergeability**) is what spawns it.\
                  \n\n**Its PRs are a standing-authorized class, and closing them out is yours, \
                  not the human's** (**The merge gate**, third opening). The learning loop is \
                  built to run without a human in it — a proposed-lesson PR parked in the \
@@ -41580,7 +41580,7 @@ impl OrchRegistry {
             None => String::new(),
         };
         // The ACTIONABLE process-pro trigger (#358 fold-in) — lives inside the base
-        // "Re-sync the fleet" post-merge routine, not the top `{{WORKFLOW}}` note
+        // "Mergeability" post-merge routine, not the top `{{WORKFLOW}}` note
         // (`process_note`, above), so the orchestrator reads it as part of the
         // checklist it actually runs after a merge instead of a disconnected mention
         // near the top it can drift away from. Empty for every group with no

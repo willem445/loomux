@@ -1059,3 +1059,23 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   default-group pins now iterate the sixth file: the playbook is what a default group
   reads too, and the gate-machinery pin stays green over it (the moved content names none
   of the four refused tokens).
+
+- **#1844, the post-merge rebase rule is gone** — `orchestrator.md` and
+  `orchestrator-playbook.md`; `worker.md`, `reviewer.md`, `planner.md` and `manager.md` are
+  byte-identical to their previous blessed copies. The human abolished the rule ("causing more
+  churn than it's worth"): INVARIANT 7 is no longer "when the default branch moves, every open
+  branch is stale" but **a PR merges when GitHub reports it mergeable** — a branch merely
+  behind its base is left alone, and only `CONFLICTING` needs work, routed to the owning
+  worker's resumed session, one attempt (INVARIANT 9 unchanged). The playbook section is
+  renamed **Resync the fleet → Mergeability** (its id `resync-the-fleet` → `mergeability`,
+  `PLAYBOOK_SECTION_IDS` with it) and rewritten around that rule, cross-referencing INVARIANT 6
+  for the two-green-PRs-combine-red case; it keeps the staging-worktree discipline, the merge
+  queue's speculative batch as the unaffected mergeability probe, and the post-merge checklist
+  with the `{{POST_MERGE_WORKFLOW_HOOK}}` at its end. The open-PR sweep bullet that said a
+  merely-behind branch is "a review of the past" now says the sweep asks about mergeability,
+  never freshness. The resident core stays under its 45,000-byte budget (44,705 → 44,837
+  EOL-normalized). The re-bless is warranted because the templates stated the retracted rule:
+  a test quoting the old wording ENFORCES it, so `tests/prompts.rs` and `tests/workflow.rs`
+  repin the mergeability rule on intent (digest row, section anchors, sweep anchors), add
+  negative assertions so the retracted wording cannot silently return, and the red-main test's
+  section boundary follows the renamed heading.
