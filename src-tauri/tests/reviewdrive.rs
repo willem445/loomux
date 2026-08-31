@@ -1580,3 +1580,72 @@ fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
          {notice}"
     );
 }
+
+/// **The proof the #464 allowlist row names**, so that row can go stale rather
+/// than merely be trusted.
+///
+/// `no_registry_construction_bypasses_the_test_agent_dir_overrides` in
+/// `tests/orchestration.rs` default-denies raw `OrchRegistry::new` across every
+/// `tests/*.rs`, because a registry built without the agent-dir overrides falls
+/// back to the user's REAL `~/.claude/agents` on its first spawn — the gap that
+/// left 1,111 stray files on a live dev machine. This file has a row in that
+/// allowlist for its own `relaunch_registry`, which is a decision to widen a
+/// default-deny surface by one entry.
+///
+/// A row that says only "this file has a helper" is trusted, not checked: the
+/// helper could stop applying an override tomorrow and the row would still read
+/// correct. So this asserts the property the row actually depends on — that the
+/// helper applies **every** override — by reading the helper's own source, which
+/// is the only way to see what it does rather than what a registry happens to
+/// report.
+///
+/// The `expected` list is written out here rather than derived from the source,
+/// because deriving it from the thing under test is how a pin agrees with
+/// whatever the code currently does. Adding a fifth override to the helper
+/// without adding it here is meant to be silent; **removing** one is what this
+/// catches, and removal is the direction that reopens #464.
+#[test]
+fn its_registry_helper_applies_every_override_this_allowlist_row_assumes() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reviewdrive.rs"),
+    )
+    .expect("this file reads itself");
+
+    // The helper's body: from its signature to the first line that closes it at
+    // column 0 — narrow enough that an override applied by some OTHER function
+    // in this file cannot satisfy the assertion below.
+    let start = src
+        .find("fn relaunch_registry(dir: &std::path::Path) -> OrchRegistry {")
+        .expect("the sanctioned helper must exist, under the name the row names");
+    let body = &src[start..];
+    let end = body.find("\n}").expect("the helper must terminate") + 2;
+    let body = &body[..end];
+
+    for needed in [
+        "set_claude_agents_dir_override",
+        "set_copilot_agents_dir_override",
+        "set_compact_hook_dir_override",
+        "set_copilot_hooks_dir_override",
+    ] {
+        assert!(
+            body.contains(needed),
+            "the #464 allowlist row for tests/reviewdrive.rs assumes this helper applies every \
+             override; it no longer applies {needed}, so a registry built through it can reach \
+             the real agent dirs and the row's premise is gone"
+        );
+    }
+
+    // The population control: the extraction really did isolate the helper, so
+    // the four assertions above are about ITS body and not about the whole file
+    // — which contains those same names in other functions and in prose.
+    assert!(
+        body.len() < 1_200,
+        "the helper's body extraction ran away ({} chars); the assertions above would then be \
+         satisfied by any other function in this file",
+        body.len()
+    );
+    assert!(
+        !body.contains("#[test]"),
+        "the extraction swallowed a test, so it is no longer reading only the helper"
+    );
+}

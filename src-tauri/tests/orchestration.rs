@@ -36770,7 +36770,33 @@ fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
         ("e2ehold_guard.rs", 1), // registry_at (#1603)
         ("views.rs", 1),          // test_registry (#1608)
         ("liveness.rs", 1),       // test_registry (#1608 L0/L1)
-        ("reviewdrive.rs", 1),    // relaunch_registry (#1778 S3/S4)
+        // #1778 S3/S4. One row, and it is a DECISION to widen a default-deny
+        // surface, so it carries the reason a later reader would need to
+        // re-check it rather than only the helper's name.
+        //
+        // **Why this file needs its own helper at all**, which is the part that
+        // could stop being true: a `tests/*.rs` file is its own integration-test
+        // BINARY, and helpers do not cross binaries — `reviewdrive.rs` cannot
+        // call `orchestration.rs`'s `relaunch_registry` any more than
+        // `workflow.rs` can, which is why both of those already have a row here.
+        // It is a separate target rather than more of `orchestration.rs` for
+        // CLAUDE.md constraint 4's reason (an integration-test target is what
+        // carries the comctl32-v6 manifest link args) and to stay off that
+        // file's end-of-file append-conflict surface.
+        //
+        // **The proof this row names**, so the row can go stale rather than
+        // merely be trusted: that file's own
+        // `its_registry_helper_applies_every_override_this_allowlist_row_assumes`
+        // asserts the helper really does apply all four agent/hook dir
+        // overrides — which is the whole property #464 is about. If the helper
+        // ever stops applying one, that test fails in its own binary and this
+        // row's premise is gone with it.
+        //
+        // The per-line `containment-pin (#502)` marker is deliberately NOT used
+        // here: that opt-out means "this test's subject requires the unguarded
+        // construction", which is false of this file. The construction here is
+        // the helper itself, which is exactly what this allowlist is for.
+        ("reviewdrive.rs", 1),    // relaunch_registry (#1778 S3/S4) — see above
     ];
     let mut files = Vec::new();
     collect_rs_files(tests_dir, &mut files);
