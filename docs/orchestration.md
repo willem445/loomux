@@ -2342,7 +2342,8 @@ consumed event is in the audit log (as `rd-consumed`, naming the kind, the agent
 you still see it, unchanged, and the drive then stops so someone reads it.
 
 **A drive stops, it does not drift.** There are fourteen ways out and each produces exactly one
-line in the orchestrator's pane: the gate being satisfied, you cancelling the drive, or one of
+line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
+by orrerix on its own when it sees the PR has been closed — or one of
 twelve holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
 the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
 could not read, a worker that reported blocked or whose session no longer resolves, or a delegate

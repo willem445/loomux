@@ -1981,7 +1981,7 @@ fn a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again() {
     .expect("lane 0 records");
 
     let second = reg.rd_drive_group_with(&group, &gh, 30_000);
-    let (_pr, block1, lane1) =
+    let (_pr, block1, _lane1) =
         second.lanes_opened.first().cloned().expect("lane 1 opens after lane 0's pass");
     assert_eq!(block1, "rev-final");
 
@@ -2050,13 +2050,19 @@ fn a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again() {
         "the re-opened lane's pane must actually hold a brief for this PR at this head: \
          {re_brief}"
     );
-    let _ = &lane1;
-
-    // And the lane whose pass still stands is left alone.
-    assert!(
-        !reopened.iter().any(|b| b == "rev-std"),
-        "clearing the briefed head must not re-brief a lane whose pass still stands: {reopened:?}"
-    );
+    // **Deliberately NOT asserted here: that the lane whose pass still stands
+    // was left alone.** That assertion was written and removed as vacuous —
+    // `first_stale_lane` skips a standing pass before any lane record is read,
+    // so `rev-std` is unreachable from the re-open under EVERY implementation,
+    // this one and a broken one alike. Its operands cannot be made to collide
+    // either: making `rev-std` a re-open candidate means staling its pass, and
+    // a stale `rev-std` becomes the deciding lane, so `rev-final` is never
+    // reached and the test stops being about the stall.
+    //
+    // The property it looked like it covered — that clearing EVERY lane's
+    // briefed head is safe — is really an invariant of `first_stale_lane`, not
+    // of this arc, and pinning it belongs with that function rather than here.
+    // Tracked as a follow-up rather than asserted vacuously.
 }
 
 /// The control for the test above. The re-open is scoped to `lane-stalled`, so

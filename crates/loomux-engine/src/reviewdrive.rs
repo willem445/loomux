@@ -1220,9 +1220,16 @@ pub fn store_state(group_dir: &Path, state: &ReviewDrivesState) -> Result<(), St
 /// leaves this file by being resumed to completion or cancelled, never by
 /// retention.
 ///
-/// The caller owes one ordering obligation this function cannot enforce: §5.2
-/// prunes a terminal entry *once its notice has been delivered*, so the tick
-/// delivers first and prunes after.
+/// **One ordering obligation this function cannot enforce is NOT discharged by
+/// its caller either**, and the honest statement is here rather than a promise:
+/// §5.2 prunes a terminal entry *once its notice has been delivered*, and
+/// nothing on the tick path knows whether a delivery succeeded. The tick does
+/// deliver before it prunes, which is necessary and not sufficient — a drive
+/// whose final notice fails to deliver is pruned anyway and ends silently.
+///
+/// A hold-back keyed on a tick's delivery failures was tried in the caller and
+/// removed as inert; the reason it could not work, and the shape a real fix
+/// needs, are on #1857 and beside the prune itself.
 pub fn prune_terminal(state: &mut ReviewDrivesState) -> Vec<u64> {
     let pruned: Vec<u64> = state
         .entries

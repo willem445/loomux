@@ -673,11 +673,12 @@ impl OrchRegistry {
         // a delivery succeeded.
         //
         // A hold-back keyed on this tick's delivery failures was tried here and
-        // removed as INERT: the step list is built with a `!is_terminal()`
-        // filter, so a retained terminal entry is never stepped, emits no
-        // notice on any later tick, and so can never re-enter that failure set.
-        // It survived one tick and was pruned on the next with the notice lost
-        // anyway. Re-delivery needs per-entry delivery state PERSISTED on the
+        // removed as INERT. The step list is every entry — `rd_step_entry` is
+        // what declines a resting one, returning `None` on its first line for
+        // anything `is_parked() || is_terminal()`, before any read. So a
+        // retained terminal entry yields no `RdOut`, emits no notice on any
+        // later tick, and can never re-enter that failure set: it survived one
+        // tick and was pruned on the next with the notice lost anyway. Re-delivery needs per-entry delivery state PERSISTED on the
         // record plus a path that re-emits for a terminal entry — a different
         // shape, not an extension of this one. Tracked on #1857.
         let pruned = {

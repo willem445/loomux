@@ -605,7 +605,7 @@ review_drive_status()
 ```
 
 **The split into two classes is `queue_merge`'s, and it is not cosmetic.** That
-tool's own contract separates the queue's declines from "FOUR FURTHER REASONS
+tool's own contract separates the queue's declines from "FIVE FURTHER REASONS
 MEAN LOOMUX ITSELF FAILED, not that the queue declined you", and spells out why
 each matters: `queue-state-unreadable` is "the queue is there and orrerix cannot
 read it — **NOT** 'nothing is queued'", and `gate-unreadable` is "**NOT**
@@ -832,9 +832,9 @@ prunes a terminal entry whether or not its notice reached a pane, because
 nothing on that path knows: `prune_terminal` cannot enforce the rule and its
 caller does not either. A drive whose final notice fails to deliver therefore
 ends silently. A hold-back keyed on a tick's delivery failures was tried and
-removed as inert — the step list is built with a `!is_terminal()` filter, so a
-retained terminal entry emits nothing on any later tick and is pruned on the
-next one anyway; re-delivery needs delivery state persisted ON the entry plus a
+removed as inert — `rd_step_entry` returns `None` for any entry that is parked
+or terminal, before it reads anything, so a retained terminal entry emits
+nothing on any later tick and is pruned on the next one anyway; re-delivery needs delivery state persisted ON the entry plus a
 path that re-emits for a terminal one, which is a different shape rather than an
 extension of that one. Tracked on #1857. **`held` entries are never pruned**, because §2.3's resume
 needs their counters and pruning one would silently grant three fresh rounds —
@@ -952,8 +952,8 @@ reaches a template**, and this has to be said here rather than left to §6.
 (§6's notices pass `report::relay_payload_keeping_lines` as well, to keep a
 verdict summary's line breaks; a brief interpolates single-line facts into
 prose, so `rd_fact` collapses lines and caps instead — strictly narrower than
-what it would keep.) §6 mandates the same functions for **notices**
-and justifies them by **context cost** — "the pane text becomes the
+what it would keep.) §6 mandates sanitization for **notices**
+and justifies it by **context cost** — "the pane text becomes the
 orchestrator's resident context and is paid for again on every later API call" —
 a rationale that positively suggests a short brief is exempt. It is not:
 `sanitize_pane_text` is also the control that strips control characters and
@@ -1034,8 +1034,9 @@ Two reasons, and only the first is about size: the pane text becomes the
 orchestrator's resident context and is paid for again on every later API call,
 **and** `sanitize_pane_text` is the control that strips control characters and
 neutralizes the brackets a forged `[orrerix] …` line would need. The second
-reason is why §5.5 mandates the same functions on brief interpolations, where
-there is no context-cost argument to carry them.
+reason is why §5.5 mandates `sanitize_pane_text` on brief interpolations, where
+there is no context-cost argument to carry it — and only that one, since a brief
+interpolates single-line facts and has no line breaks to keep.
 
 ```
 [orrerix] review drive PR #1758: GATE SATISFIED at df6a73d0 (body 3f1a..) —
