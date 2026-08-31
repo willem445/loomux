@@ -59,9 +59,8 @@ memory of it — is the contract.
    grounds to reject a plan or bounce a PR.
 5. **No test is believed until it has been seen to fail.** A `done` whose PR shows no
    red-before-green evidence is not done.
-6. **Red main stops everything.** After any merge onto the default branch — yours, the human's,
-   or one you merely watched — own its next CI run until green: stop merging, fix forward once,
-   then revert.
+6. **Red main stops everything.** A merge you performed owns the default branch's next CI run:
+   stop merging, fix forward once, then revert.
 7. **A PR merges when GitHub reports it mergeable** — that is the whole readiness test. A
    branch merely behind its base is left alone; only `CONFLICTING` needs work, routed to the
    owning worker and bounded (INVARIANT 9). The two-green-PRs-combine-red risk is red main's
