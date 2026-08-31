@@ -574,6 +574,55 @@ test("on-then-off on a configured block restores the file byte for byte (#1869 r
   );
 });
 
+test("on-then-off on a LINELESS block leaves it declaring enabled: false — the documented exception (#1869 review 5)", () => {
+  // The one state the byte-for-byte promise does NOT cover, disclosed in
+  // docs/orchestration.md: a block with no `enabled:` line gains one the moment
+  // the driver is switched on (there is no other way to turn it on), so the two
+  // clicks leave it declaring `enabled: false` where the file had none. The
+  // counters still survive — the data-loss rule is untouched by this exception.
+  const text = "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  max_review_rounds: 2\n";
+  const w = parseWorkflow(text).workflow;
+  setDriverEnabled(w, true);
+  setDriverEnabled(w, false);
+  assert.deepEqual(w.driver, { enabled: false, max_review_rounds: 2 });
+  const out = serializeWorkflow(w);
+  assert.match(out, /enabled: false/, "the file gains the line it never had — that is the exception");
+  assert.match(out, /max_review_rounds: 2/, "…while the counter survives both clicks");
+});
+
+test("the enabled splice's bail path really does drop interior comments — the disclosed residual (#1869 review 5)", () => {
+  // The residual `spliceEnabledLine`'s doc states: on a shape the scan cannot
+  // rewrite in place — here an `enabled: yes` line, which the reader refuses (the
+  // pane flags it as a bad value) and the splice cannot spell — the section falls
+  // back to canonical regeneration and the interior comment does not survive.
+  // The model still round-trips correctly; the loss is prose, not data, and it is
+  // the same trade every other section edit has always made.
+  const text =
+    "version: 1\n" +
+    "blocks:\n" +
+    "  - id: b\n" +
+    "    kind: worker\n" +
+    "driver:\n" +
+    "  # a note the file's author wrote\n" +
+    "  enabled: yes\n" +
+    "  max_review_rounds: 2\n";
+  const w = parseWorkflow(text).workflow;
+  assert.equal(w.driver?.enabled, undefined, "the reader refuses `yes` — the model has no enabled");
+  setDriverEnabled(w, true);
+  const out = serializeWorkflowPreserving(w, text);
+  assert.doesNotMatch(
+    out,
+    /# a note the file's author wrote/,
+    "the bail regenerates the section — the interior comment is gone, as disclosed"
+  );
+  assert.match(out, /enabled: true/, "…but the model's write lands");
+  assert.deepEqual(
+    parseWorkflow(out).workflow.driver,
+    { enabled: true, max_review_rounds: 2 },
+    "the data round-trips even where the prose does not"
+  );
+});
+
 test("driverSectionHasComments reads the real splitter, not a second scanner (#1869 review 3)", () => {
   const roster = "version: 1\nblocks:\n  - id: b\n    kind: worker\n";
   // The introducing comment, an interior one, and a trailing one on the key line

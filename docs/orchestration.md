@@ -1712,7 +1712,10 @@ as an error, one it **clamps** as a warning.
 An untouched section is never rewritten. orrerix writes only what the file
 declares, so opening these forms to look at them changes nothing, and a section
 you tick on and then off again leaves the file exactly as it was — including
-its comments. Unticking never deletes configuration either: a block carrying
+its comments — with one exception: a `driver:` block that carried no
+`enabled:` line at all. Turning a driver on has to add that line, so the two
+clicks leave such a block declaring `enabled: false` where the file had none.
+Unticking never deletes configuration either: a block carrying
 counters or comments is kept, with the switch written as off, and its comments
 are kept byte for byte except the switch's own line.
 

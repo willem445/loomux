@@ -1925,9 +1925,24 @@ function driverDiffersOnlyInEnabled(a: WorkflowDriver, b: WorkflowDriver): boole
  *  reusing every other line verbatim — comments and formatting included (#1869
  *  review round 3). The value is REPLACED in place when the line exists (a trailing
  *  comment on it is kept); the line is inserted ahead of the block's first field
- *  when the file never wrote one. Returns null when the scan cannot do this with
- *  confidence — the caller's fallback is canonical regeneration, never a guess
- *  that could corrupt the file. */
+ *  when the file never wrote one.
+ *
+ *  Two RESIDUALS, stated rather than absorbed (#1869 review round 5):
+ *
+ *  1. The bail path (null) is NOT comment-preserving. The caller's fallback is
+ *     canonical regeneration, which drops the section's interior comments — the
+ *     same trade every other form edit in the pane has always made for a section
+ *     whose content changed. The bail fires on a shape this scan cannot rewrite
+ *     in place: no field line to anchor to, or an `enabled:` value spelled
+ *     anything but true/false. That residual is pinned by a test (a fixture with
+ *     an interior comment and an `enabled: yes` line really does lose the
+ *     comment), so it cannot silently go false.
+ *
+ *  2. A file carrying a DUPLICATE `enabled:` key has this rewrite touch only the
+ *     FIRST occurrence, while the reader keeps the LAST. The bound: serde refuses
+ *     a duplicate field, so such a file is already unloadable — the rewrite
+ *     cannot make a loadable file wrong, only an unloadable one differently
+ *     spelled. Not pinned: there is no behavior of a loadable file at stake. */
 function spliceEnabledLine(content: readonly string[], value: boolean): string[] | null {
   const wanted = value ? "true" : "false";
   const opaque = opaqueScalarIndices(content as string[]);
