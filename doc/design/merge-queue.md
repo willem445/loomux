@@ -773,13 +773,11 @@ the PTY-lifecycle/session bridge, and all ~50 `orch_*` wrappers already live in
   not one a design note gets to make on the human's behalf.
 - **`templates/orchestrator.md` gains a queue-mode addendum** (slice E): the
   "Merges onto non-default (integration) branches are never gated" line (`:673`) gains a
-  when-queue-enabled clause, and the **"Re-sync the fleet — every open branch, after every
-  merge"** section (heading at `:744`) gets the observation that the queue *reduces* the O(n²)
-  fan-rebase pressure it warns about — siblings need no proactive rebase after each batch,
-  because the speculative merge **is** the mergeability probe and only a real conflict kicks
-  back. That section is cited by **heading** rather than by line range on purpose: it is
-  actively edited (it grew past its old end-line twice during this PR's own review cycle), and
-  a range that silently stops covering what it names is worse than no citation.
+  when-queue-enabled clause. (This note used to also say the **"Re-sync the fleet"** section
+  gets the observation that the queue *reduces* the O(n²) fan-rebase pressure it warns about;
+  #1844 replaced that section — the rebase rule it carried is gone, and what remains true is
+  the queue's speculative merge **is** the mergeability probe for sub-PRs onto an integration
+  branch, with only a real conflict kicking back.)
 - **Reversal:** delete the yml block and the feature is off; with `enabled: false` every queue
   code path is unreachable, and a test pins that. The two flagged decisions have their own,
   narrower reversal seams (§3, §8).

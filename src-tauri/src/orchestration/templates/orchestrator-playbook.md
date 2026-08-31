@@ -646,7 +646,8 @@ semantic conflict with something that landed between its last run and your merge
 only runs post-merge — and a red default branch blocks every worker in the group, not just this
 one.
 
-So after merging, **watch the post-merge run** (`gh run list --branch <default> --limit 1`, then
+So after any merge — yours, the human's, or one you merely watched land — **watch the
+post-merge run** (`gh run list --branch <default> --limit 1`, then
 `gh run view <id> --log-failed` if it goes red). The task isn't done until you've seen that run
 complete.
 
@@ -668,68 +669,35 @@ complete.
 3. **Flag the human** in one line — which PR broke main, what you did, where it stands — note it
    on the board task, and re-file the reverted work as an issue so the fix isn't lost with it.
 
-## Resync the fleet
+## Mergeability
 
-INVARIANT 7. The default branch moving is an **event**, whoever moved it: your merge, the human's,
-or a PR you merely watched land. Every open branch behind it is now **stale** — and stale is not
-the same as conflicted. A branch that still merges cleanly was reviewed, tested and CI'd against
-code that no longer exists, so its green checks describe the past. Waiting for `CONFLICTING` to
-show up is waiting for the cheapest moment to rebase to have passed.
+INVARIANT 7. **A PR merges when GitHub reports it mergeable** (`gh pr view <pr> --json
+mergeable`) — green checks alone say nothing about whether it will merge. A branch merely
+**behind** its base is left alone: it still merges cleanly, and a rebase is a push — CI
+re-runs, and every verdict recorded on the PR goes stale (INVARIANT 3's reviewer re-reviews
+the new head) — churn that buys a re-review nobody needs. Only `CONFLICTING` needs work,
+because a conflicting branch cannot merge at all: route it to the **owning worker** — resume
+its session; it wrote the code and knows which side wins — **one attempt, then the human**
+(INVARIANT 9), and never `--skip` through hunks you don't understand.
 
-So after any merge — and again on each **Monitoring open PRs** sweep, for drift you didn't see —
-`git fetch origin` and bring the PRs that branch moved out from under **up to date**. Which ones
-those are is the whole craft, and it is the next two bullets:
+The hazard a pre-merge rebase used to manage — two individually-green PRs combining into a
+red default branch — is **red main's** case (INVARIANT 6), and that invariant is the whole
+backstop: after any merge onto the default branch — whoever performed it — watch the
+post-merge run; on red, stop merging, fix forward once, then revert. Do not resurrect
+proactive rebasing as a second safety net beside it. The merge queue is unaffected: its
+speculative batch remains the mergeability probe for sub-PRs onto an integration branch —
+the speculative merge *is* the probe, and only a real conflict kicks back.
 
-- **Rebase onto the branch it will merge into**, not onto `main` reflexively. A sub-PR stacked on
-  an integration branch rebases onto *that* branch (which may itself have just moved); the
-  integration branch rebases onto the default. Backwards, and you drag a merged feature's commits
-  through someone else's PR.
-- **Re-sync the merge frontier, not the whole tree.** Only the PRs that target the branch that
-  actually moved are stale *now*. A PR stacked two levels deep is not stale until **its own** base
-  moves — re-syncing it early rebases it onto a base that is about to move again, and you pay
-  twice. So: rebase the frontier immediately, let the deeper stack wait for its own base, and
-  always rebase a PR immediately before you merge it (that one is never optional — it is what
-  makes the merge honest). On a deep or fast-moving stack, **batch**: one re-sync pass after the
-  dust settles beats a pass per merge. This is the interaction to keep in view — every rebase is a
-  push, so it **invalidates the review** you already have on that PR — and re-stales every verdict
-  recorded on it (INVARIANT 3's reviewer goes back and re-reviews the new head) — which is why an
-  n-deep stack re-synced per merge costs O(n²) reviews and a frontier-only pass costs O(n).
-  **A fan is not a stack, and "the frontier" is not "all of them, now."** When one base has many
-  siblings on it — this is the common shape: 8 sub-PRs all targeting one integration branch — every
-  sibling is *on* the frontier, so a literal "rebase the frontier immediately" after each merge is
-  the O(n²) you were avoiding, wearing the license's clothes. The two clauses above already give
-  you the O(n) route, and on a fan they are the whole rule: **rebase the one you are about to
-  merge, every time; batch the rest.** Let the siblings sit until either they reach the front of
-  the queue or the dust settles, then re-sync them in one pass. A sibling that is merely behind is
-  not urgent — it is *stale*, and stale is a state you fix on the way to merging it, not a fire.
-- **Leave a PR that is held on an unanswered question alone.** It is not going anywhere
-  (INVARIANT 2), and invalidating its review — re-staling its verdicts — buys a re-review nobody
-  can act on. Re-sync it when
-  the answer lands, before it merges.
-- **Clean and trivial: do it yourself** (fetch, rebase, `--force-with-lease`) — mechanical, and
-  it costs no delegate slot. Do the checkout in the right place, never the main clone (#338 — that
-  clone is the human's environment, and checking out someone else's branch there mid-rebase is
-  exactly the conflict it exists to avoid): if the PR's own worker worktree still exists, `cd`
-  there — that workspace is already dedicated to that branch. If it doesn't (the worktree was
-  cleaned up, or you're cutting a **revert** branch fresh), use a **staging worktree of your
-  own** instead. There's no dedicated tool for this, and none is needed — it's a plain `git
-  worktree add <repo>-worktrees/orch-staging <branch>` the first time (the same
-  `<repo>-worktrees/` convention `spawn_agent` cuts worker worktrees under), then reuse that one
-  directory for whatever mechanical work comes next by checking out a different branch inside it
-  (`git checkout <branch>`) instead of creating a fresh worktree per rebase.
-- **The first real conflict is where you stop.** Route it to the **owning worker** (resume its
-  session): it wrote the code and knows which side wins. **One attempt, then the human**
-  (INVARIANT 9) — never loop on a conflicted rebase, and never `--skip` through hunks you don't
-  understand.
-- **A rebase is a push**, so pay its price knowingly: CI re-runs, and the review you were holding
-  is now a review of code that no longer exists — **re-request it**, and do not merge on it until
-  the reviewer has seen the new head. Every recorded verdict on that PR goes stale with it, so
-  where a gate is counting them it reopens and refuses the merge until the reviewer records again.
-  That cost is the argument for paying it *early and in the
-  quiet* — the alternative is paying it on the PR you were about to land.
-- **Pace it against the caps.** Rebasing is cheap, the re-review it triggers is not, and routed
-  conflicts cost delegate slots ({{MAX_AGENTS}}). Queue the re-syncs rather than bursting — but
-  never let a branch drift so far that its rebase becomes a rewrite.
+**Mechanical work happens outside the main clone** (#338 — that clone is the human's
+environment, and checking out someone else's branch there mid-job is exactly the conflict it
+exists to avoid): if the PR's own worker worktree still exists, `cd` there — that workspace is
+already dedicated to that branch. If it doesn't (the worktree was cleaned up, or you're
+cutting a **revert** branch fresh), use a **staging worktree of your own**. There's no
+dedicated tool for this, and none is needed — it's a plain `git worktree add
+<repo>-worktrees/orch-staging <branch>` the first time (the same `<repo>-worktrees/`
+convention `spawn_agent` cuts worker worktrees under), then reuse that one directory for
+whatever mechanical work comes next by checking out a different branch inside it
+(`git checkout <branch>`) instead of creating a fresh worktree per job.
 
 Once a PR is merged (`gh pr view`), have the worker clean up its worktree/branch — or do it
 yourself — and schedule the next item.{{POST_MERGE_WORKFLOW_HOOK}}
@@ -774,10 +742,10 @@ check each one:
 
 - **Comments**: `gh pr view <pr> --comments`. Track the last comment you saw per PR in
   `set_state` so you only react to new ones; surface anything new to the human.
-- **Freshness, not just green.** `gh pr view <pr> --json mergeable,mergeStateStatus`, and compare
-  the branch against its base head. `CONFLICTING` is not a merge candidate; merely *behind* is a
-  review of the past. Both get **Re-sync the fleet** (above) — this sweep is the backstop for
-  drift you never saw land.
+- **Mergeability, not just green.** `gh pr view <pr> --json mergeable,mergeStateStatus`.
+  `CONFLICTING` is not a merge candidate — route it to the owning worker (**Mergeability**,
+  above). A branch merely *behind* its base is left alone: it still merges, so nothing here
+  re-syncs it — the sweep asks whether a PR can merge, never whether it is fresh.
 - **A PR held on an unanswered question** gets re-raised here, one line, every sweep, until they
   answer (INVARIANT 2). Read the outstanding set from `list_questions()`, not from memory — it is
   the one record of it that a compaction cannot take. A hold nobody is reminded of is a PR that

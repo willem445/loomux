@@ -275,12 +275,12 @@ in the primary clone on either a fresh spawn or a resume, however the two argume
 still sometimes needs a checkout outside a worker's own worktree — and now that a worker
 worktree is guaranteed, doing that work in the primary clone would recreate the exact conflict
 this issue closes, just from the orchestrator's side instead of a worker's. There's no new
-tool for this (the ask was "keep it minimal"): `orchestrator.md`'s **Re-sync the fleet**
+tool for this (the ask was "keep it minimal"): `orchestrator-playbook.md`'s **Mergeability**
 section now documents the convention directly — reuse the PR's own worker worktree if it's
 still around, otherwise cut a `git worktree add <repo>-worktrees/orch-staging <branch>`
 staging worktree (same `<repo>-worktrees/` layout `git_worktree_add` already uses for
 workers) and reuse that one directory across mechanical work by checking out a different
-branch inside it, rather than a fresh worktree per rebase.
+  branch inside it, rather than a fresh worktree per job.
 
 ### Extending the worktree guarantee to reviewers (#359)
 
@@ -746,27 +746,30 @@ orchestrator a value system to match its operational one:
   though it may never **start** one: the label funnel governs what it *begins*, not what it
   *notices*, and filing it is not doing it (it parks in the funnel exactly like a deferred
   finding). Autonomy at zero consent cost.
-- **Post-merge re-sync of the fleet.** #236 asked only for *detection* — add `--json mergeable` to
-  the sweep and route a `CONFLICTING` PR to its owner. That fires at the most expensive possible
-  moment. The rule shipped instead is the one a human maintainer actually follows: **the default
-  branch moving is an event**, whoever moved it (the orchestrator's merge, the human's, one it
-  merely observed), and every open branch behind it is then **stale** — which is *not* the same as
-  conflicted. A branch that still merges cleanly was reviewed, tested and CI'd against code that no
-  longer exists, so its green checks describe the past. After any merge (and again on the sweep, as
-  the backstop for drift nobody saw), every open PR is rebased onto **the branch it will merge
-  into** — a sub-PR onto its integration branch, not reflexively onto `main`. A clean rebase the
-  orchestrator does itself (mechanical, no delegate slot); the first real conflict routes to the
-  **owning** worker's resumed session, **one attempt**, then the human — the CI gate's bound, for
-  the CI gate's reason. The rebase is a push, so CI re-runs and every verdict goes stale: that cost
-  is the argument for paying it early and in the quiet rather than on the PR you were about to
-  land. Paced against the delegate cap, never bursty.
+- **Mergeability is the readiness test; the fleet re-sync is gone.** #236 asked only for
+  *detection* — add `--json mergeable` to the sweep and route a `CONFLICTING` PR to its owner —
+  and the rule that shipped instead demanded a post-merge rebase of every open branch behind a
+  moved default branch. #1844 dropped that rebase at the human's call, after it measured as
+  review-round churn: every rebase is a push, so it invalidates the review already held and
+  re-stales every recorded verdict, and across #1784 and #1813 roughly two-thirds of review
+  rounds were citation/body churn rather than code — rebases feed that loop directly. The rule
+  now: **a PR merges when GitHub reports it mergeable**; a branch merely *behind* its base is
+  left alone; only `CONFLICTING` needs work, routed to the **owning** worker's resumed session,
+  one attempt, then the human (INVARIANT 9). The hazard the rebase used to catch — two
+  individually-green PRs combining into a red default branch — belongs to **red main**
+  (INVARIANT 6), widened by #1844 to fire after any merge onto the default branch, whoever
+  performed it: the abolished rule's "whoever moved it" coverage had to land somewhere, and the
+  human merges routinely, so an invariant scoped to "a merge you performed" would leave the
+  hazard unowned on the default flow. The orchestrator owns the post-merge run until green and
+  stops merging, fixes forward once, then reverts. The trade is deliberate and the human's: an
+  occasional revert on main, in exchange for removing the churn.
 
 - **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction ("your
   context may have compacted"; "compact at lulls") and was nonetheless written as ~500 lines of
   prose optimized for one careful read, with the load-bearing rules restated three and four times.
   Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. So the
   eleven rules whose loss is dangerous — the merge gate, the question-hold, disposition, the
-  architectural bar, red-before-green, red main, fleet staleness, the label funnel, bounded loops,
+  architectural bar, red-before-green, red main, mergeability, the label funnel, bounded loops,
   one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest
   leading the bulk of the document (#381 later put a short **Your first turn** call-sequence
   primer ahead of it, but the digest still precedes every heavier policy section), which the
@@ -797,11 +800,11 @@ orchestrator a value system to match its operational one:
     with a suggested label and stops, like everything else.
   - **The architectural bounce is bounded** like every other loop: one bounce, naming every ground
     it has; a second disagreement is a question for the human, not a second bounce.
-  - And the re-sync has a **topology license**: rebase the *merge frontier* (the PRs targeting the
-    branch that actually moved), let a deeper stack wait for its own base, batch on deep stacks.
-    Because a rebase re-stales every verdict, re-syncing an n-deep stack after every sub-PR merge
-    costs O(n²) *re-reviews*, not just rebases — and a PR held on an unanswered question is left
-    alone entirely: it isn't going anywhere, and re-staling it buys a review nobody can act on.
+  - The re-sync's **topology license** (rebase the *merge frontier*, let a deeper stack wait for
+    its own base, batch on deep stacks, leave a question-held PR alone) went with the re-sync
+    itself (#1844): the merge queue's speculative batch was already the right mergeability probe
+    for sub-PRs onto an integration branch, and with proactive re-syncing gone there is no
+    frontier to license — a branch that still merges cleanly is never touched.
 
 Each rule is pinned in `tests/workflow.rs` on the surfaces that carry it, and the golden fixtures
 in `tests/fixtures/pre222/` are re-blessed in their own commit — the diff on that directory is the
