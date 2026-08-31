@@ -194,7 +194,7 @@ struct RdOut {
     clear_signal: bool,
     on_behalf_of: String,
     advanced: Option<(reviewdrive::DriveState, Option<reviewdrive::HeldReason>)>,
-    lanes_opened: Vec<String>,
+    lanes_opened: Vec<(String, String)>,
     audits: Vec<(&'static str, Value)>,
     notices: Vec<String>,
 }
@@ -211,8 +211,14 @@ impl RdOut {
 pub struct RdDriveReport {
     /// `(pr, state)` for every entry that took an arc this tick.
     pub advanced: Vec<(u64, reviewdrive::DriveState)>,
-    /// `(pr, block)` for every lane briefed this tick.
-    pub lanes_opened: Vec<(u64, String)>,
+    /// `(pr, block, agent)` for every lane briefed this tick.
+    ///
+    /// The agent id is here and not only the block because it is the only handle
+    /// a caller has on the pane that was actually opened — `review_drive_status`
+    /// deliberately does not publish one (it is a compaction-recovery surface,
+    /// and a pane id is not what an orchestrator routes on), so without it
+    /// nothing outside this module can ask where a driver-spawned lane landed.
+    pub lanes_opened: Vec<(u64, String, String)>,
     /// The kick-back notices delivered to the orchestrator.
     pub notices: Vec<String>,
     /// Terminal entries dropped after their notices went out (§5.2).
@@ -563,8 +569,8 @@ impl OrchRegistry {
             for (action, detail) in &o.audits {
                 self.rd_audit(group, &o.on_behalf_of, action, detail.clone());
             }
-            for b in &o.lanes_opened {
-                report.lanes_opened.push((o.pr, b.clone()));
+            for (b, a) in &o.lanes_opened {
+                report.lanes_opened.push((o.pr, b.clone(), a.clone()));
             }
             if let Some((to, _)) = o.advanced {
                 report.advanced.push((o.pr, to));
@@ -1197,7 +1203,7 @@ impl OrchRegistry {
                     Ok(agent) => {
                         entry.lane_index = *index;
                         out.changed = true;
-                        out.lanes_opened.push(block.clone());
+                        out.lanes_opened.push((block.clone(), agent.clone()));
                         out.audits.push((
                             rddrive::audit_action::LANE_SPAWNED,
                             json!({ "pr": pr, "block": block, "agent": agent,

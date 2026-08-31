@@ -720,6 +720,47 @@ fn a_tick_persists_the_head_it_resolved_and_never_writes_a_head_it_could_not_rea
     assert_eq!(status_state(&reg, &group), "review-wait", "and nothing advanced on it");
 }
 
+/// **A driver-spawned lane never lands in the group's main clone** — #338/#359,
+/// reached through a path those issues did not exist for.
+///
+/// `spawn_agent_ex` cuts a dedicated worktree only when `use_worktree` is set
+/// AND no `cwd_override` is given. A fresh reviewer spawned with neither falls
+/// through to the per-role default, which is the group's own checkout — the
+/// human's environment, and the contention #359 is about. Nothing about that
+/// path is driver-specific, which is exactly why it needed a pin here: the
+/// existing #359 tests exercise the MCP `spawn_agent` surface, where the flag
+/// defaults on, and a driver that passed `false` was invisible to all of them.
+///
+/// The assertion is on the *workspace the pane actually got*, not on the
+/// argument that produced it: a later change that keeps the flag and loses the
+/// worktree some other way still reddens.
+#[test]
+fn a_driver_spawned_lane_does_not_land_in_the_groups_main_clone() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // Tick 1 takes arc 2 to `review-wait`; tick 2 is the one that opens lane 0.
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let report = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, block, agent) = report
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("the second tick must open the gate's first lane");
+    assert_eq!(block, "rev-std");
+
+    let cwd = reg.agent(&agent).expect("the spawned lane is on the roster").cwd;
+    assert!(!cwd.trim().is_empty(), "a lane with no workspace at all is the same defect");
+    assert_ne!(
+        std::path::Path::new(&cwd).canonicalize().ok(),
+        std::path::Path::new(&repo.path()).canonicalize().ok(),
+        "a driver-spawned reviewer landed in the group's main clone (#338/#359): {cwd}"
+    );
+}
+
 /// **A state pays only for the facts it reads.** `decide` reads the routed lane
 /// list in `review-wait` and `gate-check` and nowhere else, so `ci-wait` and
 /// `fix-wait` must not spend the `gh pr view --json files` call that resolves
