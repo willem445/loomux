@@ -3333,13 +3333,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // A `progress` report carries no signal from either side: a
                     // drive advances on the head, the checks and the verdict
                     // files, never on a delegate saying it is still going.
-                    let is_worker = role == super::reviewdrive::DrivenRole::Worker;
-                    let event = match (is_worker, status) {
-                        (true, "done") => Some(super::RdEvent::WorkerDone),
-                        (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
+                    // [scratch MUT-3a] B1 reverted: the role is dropped again,
+                    // so a lane's report is read as a worker signal.
+                    let _ = &role;
+                    let event = match status {
+                        "done" => Some(super::RdEvent::WorkerDone),
+                        "blocked" => Some(super::RdEvent::WorkerBlocked),
                         _ => None,
                     };
-                    let kind = if is_worker { "report:worker" } else { "report:lane" };
+                    let kind = "report";
                     reg.rd_consume(&caller.group, pr, &caller.agent_id, kind, event);
                 }
                 // #576 residual: the relay variant, which opts this notice into
