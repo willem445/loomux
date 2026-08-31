@@ -1310,7 +1310,10 @@ impl OrchRegistry {
             // cost §2.4's one-group bound exists to keep down.
             return None;
         }
-        let obs = rddrive::observe_pr(runner, pr);
+        let mut obs = rddrive::observe_pr(runner, pr);
+        if matches!(obs.ci, reviewdrive::CiObservation::Conflicting) {
+            obs.ci = reviewdrive::CiObservation::Pending;
+        }
         // **Only the states that READ these facts pay for them.** `decide` reads
         // `required_lanes` in `review-wait` and `gate-check` and `gate` in
         // `gate-check` alone; `ci-wait` and `fix-wait` read neither. Resolving
