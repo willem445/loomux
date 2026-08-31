@@ -1955,8 +1955,8 @@ the parse of the whole file rather than being ignored.
 
 The block **enables** the feature; it can never start, target or widen a drive - no drive
 exists until an orchestrator makes its own role-gated `drive_review` call naming one PR.
-(The pane shows the block's declared values read-only for now; the driving loop itself is
-still landing slice by slice in #1778.)
+(The workflow pane edits this block too: an enable-toggle whose state is the `enabled:`
+line, plus number fields bounded to the ranges shown above - #1869.)
 
 ### Setting up a cross-model reviewer
 
