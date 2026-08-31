@@ -651,7 +651,10 @@ fn driven(
     repo: &Repo,
     gh: &FakeGh,
 ) -> (GroupId, String) {
-    let group = reg.create_group(&repo.path(), rails()).unwrap();
+    // `create_group` answers a `GroupInfo`; every driver surface takes the
+    // validated `GroupId` off it, which is CLAUDE.md constraint 6 — the proof
+    // travels with the value rather than with the call site.
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
     reg.set_rd_policy_override(Some((true, DriveLimits::default())));
     // A full, well-shaped session id this roster never recorded takes
     // `resolve_session_ref`'s passthrough arm and is accepted — §5.1 says so,

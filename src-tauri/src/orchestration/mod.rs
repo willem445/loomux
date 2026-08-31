@@ -437,7 +437,9 @@ pub use loomux_engine::{rddrive, reviewdrive};
 // name — every landing verb the driver could reach has to be written
 // somewhere, and `tests/reviewdrive.rs` default-denies the whole of this one.
 mod rdtick;
-pub use rdtick::{RdDriveReport, RdEvent, RdSignal};
+pub use rdtick::{
+    RdDriveReport, RdEvent, RdSignal, DRIVER_DELTA_TPL, DRIVER_FIX_TPL, DRIVER_REVIEW_TPL,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
