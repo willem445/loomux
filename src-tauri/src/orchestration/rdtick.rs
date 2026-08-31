@@ -202,9 +202,8 @@ impl RdBrief {
         messaged_by: &str,
     ) -> rddrive::HeldFacts {
         let speaking = self.speaking_lane();
-        let lane = self
-            .deciding_lane
-            .clone()
+        // [scratch MUT-2d] the deciding lane ignored; fall back to whoever spoke.
+        let lane = None
             .or_else(|| speaking.map(|l| l.block.clone()))
             .unwrap_or_else(|| self.required.get(entry.lane_index).cloned().unwrap_or_default());
         rddrive::HeldFacts {
@@ -952,7 +951,7 @@ impl OrchRegistry {
             Some(s) => self.rd_resume_cwd(group, s, block.as_deref())?,
             None => None,
         };
-        let fresh = cwd.is_none();
+        let fresh = false; // [scratch MUT-2c] no dedicated workspace for a fresh lane.
         self.spawn_agent_bound(
             group, role, block, "", task, fresh, None, None, resume, cwd, None, None,
         )
@@ -1331,9 +1330,8 @@ impl OrchRegistry {
         // lane looks like a first-time lane forever and §5.5's delta template is
         // unreachable, which is the defect this line closes.
         for l in &brief.lane_notices {
-            if entry.record_verdict_seen(&l.block, l.verdict, &l.at_head) {
-                out.changed = true;
-            }
+            // [scratch MUT-2b] the lane's verdict is read and thrown away, as before.
+            let _ = l;
         }
         let step = reviewdrive::decide(entry, &facts, limits);
         let on_behalf = entry.on_behalf_of.clone();
@@ -1500,7 +1498,8 @@ impl OrchRegistry {
         // refuses to dispatch at all on an empty LIVE head, which bounds the
         // damage this tick; this is what stops the ENTRY being poisoned so the
         // next read, successful or not, still misbehaves.
-        if !obs.head.is_empty() && entry.head != obs.head {
+        // [scratch MUT-2a] the empty-head guard dropped: a failed read is written.
+        if entry.head != obs.head {
             entry.head = obs.head.clone();
             out.changed = true;
         }
@@ -1730,9 +1729,7 @@ impl OrchRegistry {
                 // orchestrator as if undriven. Cleared on a change, kept when
                 // the orchestrator resumes with the same session (the common
                 // case), where the pane is still the right one.
-                if entry.worker_session != session {
-                    entry.worker_agent = String::new();
-                }
+                // [scratch MUT-2e] the stale pane survives a session change.
                 entry.worker_session = session.clone();
                 entry.on_behalf_of = on_behalf_of.to_string();
             } else {
