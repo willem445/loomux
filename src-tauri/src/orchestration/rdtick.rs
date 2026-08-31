@@ -1795,10 +1795,9 @@ impl OrchRegistry {
                 // by the same argument: `lane-stalled` fires at 60 minutes, so
                 // without this a resumed drive re-holds on the FIRST tick for a
                 // lane the orchestrator has just looked at and chosen to resume.
-                entry.started_ms = now;
-                for l in entry.lanes.iter_mut() {
-                    l.spawned_ms = now;
-                }
+                // [scratch MUT-3b] B2 reverted: the age clocks are not
+                // re-stamped on the resume, so arc 11 re-holds immediately.
+                let _ = now;
                 // **A new session means the recorded PANE is stale**, and a
                 // stale pane is not merely useless — it is an interception key.
                 // `driven_role` matches on `worker_agent`, so leaving the old
