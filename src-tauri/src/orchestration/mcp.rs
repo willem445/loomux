@@ -3634,7 +3634,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // and an audit action that named a delivery a consumption would be
             // the mislabel #461 catalogues.
             if let Some((pr, _)) = reg.rd_owner(&caller.group, &caller.agent_id) {
-                reg.rd_ingest(&caller.group, pr, super::RdEvent::Messaged);
+                reg.rd_ingest(
+                    &caller.group,
+                    pr,
+                    super::RdEvent::Messaged { by: caller.agent_id.clone() },
+                );
             }
             // #891 rev-1 F1: the id in the prefix is orrerix's — resolved from
             // the caller's token, never from `args` — but everything after the
