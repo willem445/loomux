@@ -1500,10 +1500,8 @@ impl OrchRegistry {
         // refuses to dispatch at all on an empty LIVE head, which bounds the
         // damage this tick; this is what stops the ENTRY being poisoned so the
         // next read, successful or not, still misbehaves.
-        if !obs.head.is_empty() && entry.head != obs.head {
-            entry.head = obs.head.clone();
-            out.changed = true;
-        }
+        // [scratch MUT-1] the head is resolved and never persisted — the tick
+        // records it once at drive_review time and never again.
         if let Some(d) = obs.body_digest.as_deref() {
             if entry.body_digest != d {
                 entry.body_digest = d.to_string();
