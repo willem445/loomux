@@ -1010,21 +1010,9 @@ impl OrchRegistry {
         // unsafe landing — `gate-check` re-evaluates `ci-green` through
         // `recheck_gate` — so it costs a misled reviewer and a wasted round,
         // which is exactly what a driven review is for saving.
-        let ci = match brief.ci {
-            reviewdrive::CiObservation::Green => "This PR's checks are green at that head.",
-            reviewdrive::CiObservation::Red => {
-                "This PR's checks are RED at that head — review the change on its merits; \n                 the failure is the worker's to answer."
-            }
-            reviewdrive::CiObservation::Conflicting => {
-                "This PR does not merge cleanly at that head — review the change on its \n                 merits; the conflict is the worker's to answer."
-            }
-            // Pending and Unknown are one sentence on purpose: §8's rule is that
-            // unknown is never reported as a fact about the PR, and "not green
-            // yet" is the only thing true of both.
-            reviewdrive::CiObservation::Pending | reviewdrive::CiObservation::Unknown => {
-                "This PR's checks are not green at that head (orrerix could not read a \n                 settled result)."
-            }
-        };
+        // [scratch MUT-4b] N1 reverted: the brief asserts green unconditionally,
+        // exactly as the templates used to.
+        let ci = "This PR's checks are green at that head.";
         match entry.lane(block).filter(|l| !l.at_head.is_empty()) {
             // A lane that has answered before gets the delta — the line an
             // orchestrator typed by hand nine times on one PR.
@@ -1852,11 +1840,9 @@ impl OrchRegistry {
                 // lane record, so clearing there is a no-op; and a lane that is
                 // legitimately mid-review must not be re-briefed merely because
                 // some OTHER hold on the same drive was resumed.
-                if was_lane_stalled {
-                    for l in entry.lanes.iter_mut() {
-                        l.briefed_head.clear();
-                    }
-                }
+                // [scratch MUT-4a] B4 reverted: the lane is re-timed but never
+                // re-briefed, so the resume buys a silent lane_timeout.
+                let _ = was_lane_stalled;
                 // **A new session means the recorded PANE is stale**, and a
                 // stale pane is not merely useless — it is an interception key.
                 // `driven_role` matches on `worker_agent`, so leaving the old

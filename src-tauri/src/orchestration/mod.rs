@@ -50575,14 +50575,8 @@ impl OrchRegistry {
         // tick on an unreadable file, but the two loops become live together the
         // moment a human repairs it, which is precisely the state §8.1 says
         // neither loop was designed for.
-        let driven = match reviewdrive::load_state(&dir) {
-            Ok(s) => s.is_driven(pr),
-            Err(e) => {
-                self.audit(group, brand::AUDIT_ACTOR, mqdriver::audit_action::ENQUEUE_REFUSED,
-                    json!({ "pr": pr, "reason": rddrive::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
-                return json!({ "refused": rddrive::refusal::STATE_UNREADABLE });
-            }
-        };
+        // [scratch MUT-4c] N3 reverted: an unreadable record reads as undriven.
+        let driven = reviewdrive::load_state(&dir).map(|s| s.is_driven(pr)).unwrap_or(false);
         let outcome = mqloop::enqueue(
             runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms(), driven,
         );
