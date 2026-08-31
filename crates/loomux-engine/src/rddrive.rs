@@ -302,6 +302,32 @@ pub fn observe_pr(r: &dyn RdRunner, pr: u64) -> PrObservation {
     obs
 }
 
+/// Is this PR open? `Some` **only on a positive answer**, and **one `gh` call**.
+///
+/// [`observe_pr`]'s cheap sibling, for the two callers that read nothing else:
+/// §2.4's restart reconcile and `drive_review`'s own `pr-not-open` check. Both
+/// used to go through `observe_pr`, which spends a second round trip on
+/// `gh pr checks` — an answer neither of them looks at. That is one wasted call
+/// per live entry at startup, and one on every `drive_review`, on the loop that
+/// also delivers every `notify_when` notice in the fleet.
+///
+/// The `None`-is-not-a-fact discipline is [`observe_pr`]'s, unchanged: a seam
+/// failure, a non-zero `gh`, an unparseable body and a `state` word this build
+/// does not know all answer `None`, because `Some(false)` cancels a live drive
+/// and unknown is never treated as safe.
+pub fn pr_is_open(r: &dyn RdRunner, pr: u64) -> Option<bool> {
+    let out = r.gh(&as_args(&pr_facts_argv(pr))).ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let raw: RawPrFacts = serde_json::from_str(out.line()).ok()?;
+    match raw.state.trim().to_ascii_uppercase().as_str() {
+        "OPEN" => Some(true),
+        "CLOSED" | "MERGED" => Some(false),
+        _ => None,
+    }
+}
+
 /// One PR's changed paths, or `None` for **every** incomplete answer — the seam
 /// failed, `gh` failed, or the list could not be shown to be whole.
 ///
@@ -371,18 +397,19 @@ pub fn base_ci_green(r: &dyn RdRunner, base: &str) -> Option<bool> {
 /// [`mqdriver::declares_base_green`]'s stated reason: a value nothing consults
 /// is not worth a round trip, and an unfetched value is `None`, which refuses.
 ///
-/// `want_base_green` extends that same principle one level up: only `gate-check`
-/// evaluates the gate, so only `gate-check` is worth two `gh` reads about the
-/// default branch. Every other state gets `None`, which is the value that
-/// refuses — so the narrowing can only ever make the gate harder to satisfy,
-/// never easier, and the state that actually asks is the one that pays.
+/// `base_green` is **passed in rather than fetched here**, and that is what lets
+/// the caller memoize it across one tick. It is a fact about a BRANCH, not about
+/// a PR: every driven entry on the same base would otherwise pay two `gh` reads
+/// for the same answer, on the loop that also delivers every `notify_when`
+/// notice in the fleet. `mqloop`'s own driver memoizes it per pass for exactly
+/// this reason. `None` is the value that refuses, so a caller that declines to
+/// fetch it can only ever make the gate harder to satisfy, never easier.
 pub fn gate_observation(
     r: &dyn RdRunner,
     pr: u64,
     obs: &PrObservation,
     spec: &crate::mergeq::GateSpec,
-    base: &str,
-    want_base_green: bool,
+    base_green: Option<bool>,
 ) -> crate::mergeq::PrObservation {
     crate::mergeq::PrObservation {
         body_digest: obs.body_digest.clone(),
@@ -394,14 +421,21 @@ pub fn gate_observation(
             // `recheck_gate` refuses on rather than waving through.
             CiObservation::Pending | CiObservation::Unknown => None,
         },
-        base_green: if want_base_green && mqdriver::declares_base_green(spec) && !base.is_empty() {
-            base_ci_green(r, base)
-        } else {
-            None
-        },
+        base_green,
         changed_lines: obs.changed_lines,
         changed_files: if declares_routing(spec) { pr_changed_files(r, pr) } else { None },
     }
+}
+
+/// Whether this gate declares `base-green` — the read that decides whether the
+/// two `gh` calls about the default branch are worth making.
+///
+/// A thin re-export of [`mqdriver::declares_base_green`], which is `pub(crate)`
+/// to the engine: the registry lives in another crate and needs the same answer,
+/// and asking the same function is the point. Re-deriving "does this gate say
+/// base-green" in `src-tauri` would be a second reader of a gate clause.
+pub fn declares_base_green(spec: &crate::mergeq::GateSpec) -> bool {
+    mqdriver::declares_base_green(spec)
 }
 
 /// Whether this gate routes reviewers by path — the read that decides whether
@@ -690,6 +724,10 @@ pub struct HeldFacts {
     /// The lane's last verdict summary, already raw — [`lane_summary`] is
     /// applied here.
     pub lane_summary: String,
+    /// The delegate that called `message_orchestrator`, for `held(messaged)`.
+    /// Empty for every other reason, and an empty one renders as no clause at
+    /// all rather than as an empty one.
+    pub messaged_by: String,
     pub counters: Counters,
     pub max_review_rounds: u32,
     pub max_ci_attempts: u32,
@@ -787,9 +825,10 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              re-points the drive, or cancel_review_drive stops it."
         ),
         HeldReason::Messaged => format!(
-            "HELD — a driven delegate called message_orchestrator{at}; its own line is \
-             above, unchanged, and this is the routing fact beside it. drive_review \
-             resumes the drive, cancel_review_drive stops it."
+            "HELD — {} called message_orchestrator{at}; its own line is above, \
+             unchanged, and this is the routing fact beside it. drive_review resumes \
+             the drive, cancel_review_drive stops it.",
+            pane_of(&f.messaged_by),
         ),
     };
     format!("[orrerix] review drive PR #{pr}: {body}")
@@ -1028,6 +1067,7 @@ mod tests {
             max_review_rounds: 3,
             max_ci_attempts: 3,
             failing_jobs: vec!["build (windows)".into()],
+            messaged_by: "w-7".into(),
         };
         for r in HeldReason::ALL {
             let n = held_notice(1758, r, &f);

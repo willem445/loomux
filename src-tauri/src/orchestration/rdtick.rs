@@ -79,7 +79,7 @@ fn rd_fact(s: &str) -> String {
 const RD_FACT_CAP: usize = 2_000;
 
 /// What one driven delegate did, as the interception arms report it (§7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RdEvent {
     /// `report(done)` from the driven worker.
     WorkerDone,
@@ -87,8 +87,9 @@ pub enum RdEvent {
     WorkerBlocked,
     /// `message_orchestrator` from any driven delegate. **Never intercepted** —
     /// the delegate's own line is delivered unchanged by its own arm; this is
-    /// only the routing fact beside it (§7).
-    Messaged,
+    /// only the routing fact beside it (§7). Carries WHICH delegate, because
+    /// that is the fact the hold exists to supply.
+    Messaged { by: String },
     /// `review_verdict` from a driven lane. Carries nothing: the verdict FILE is
     /// what the next tick reads, from the same parser the gate reads, so a
     /// signal carrying the word would be a second source for one fact.
@@ -186,6 +187,7 @@ impl RdBrief {
         &self,
         entry: &reviewdrive::DriveEntry,
         limits: &reviewdrive::DriveLimits,
+        messaged_by: &str,
     ) -> rddrive::HeldFacts {
         let speaking = self.speaking_lane();
         let lane = self
@@ -198,6 +200,7 @@ impl RdBrief {
             worker_session: entry.worker_session.clone(),
             lane_agent: entry.lane(&lane).map(|l| l.agent.clone()).unwrap_or_default(),
             lane_summary: speaking.map(|l| l.summary.clone()).unwrap_or_default(),
+            messaged_by: messaged_by.to_string(),
             lane,
             counters: entry.counters.clone(),
             max_review_rounds: limits.max_review_rounds,
@@ -549,6 +552,16 @@ impl OrchRegistry {
         }
         let dir = self.group_dir(group);
         let mut outs: Vec<RdOut> = Vec::new();
+        // Whether this tick's decisions actually reached disk. A signal is a
+        // ONE-SHOT, and consuming one for a transition the next restart forgets
+        // is the same shape as latching a once-only flag on a read that failed:
+        // the arc is rolled back by the failed write, the delegate's event is
+        // gone, and the drive never learns of it again. CLAUDE.md's
+        // multi-tenant-store rule is the settled form — a failed read declines
+        // rather than defaulting, and is not latched, so one transient rejection
+        // does not disable the mechanism. Same rule, applied to a failed WRITE
+        // consuming an event.
+        let mut persisted = true;
         {
             let _state_guard = self.rd_state_lock.lock_safe();
             let mut state = match reviewdrive::load_state(&dir) {
@@ -570,14 +583,20 @@ impl OrchRegistry {
                     return report;
                 }
             };
+            // One tick, one answer per base branch — see `rd_base_green`.
+            let mut base_green: std::collections::HashMap<String, Option<bool>> =
+                std::collections::HashMap::new();
             let prs: Vec<u64> = state.entries.iter().map(|e| e.pr).collect();
             for pr in prs {
-                if let Some(o) = self.rd_step_entry(group, runner, &mut state, pr, &limits, now) {
+                if let Some(o) =
+                    self.rd_step_entry(group, runner, &mut state, pr, &limits, now, &mut base_green)
+                {
                     outs.push(o);
                 }
             }
             if outs.iter().any(|o| o.changed) {
                 if let Err(e) = reviewdrive::store_state(&dir, &state) {
+                    persisted = false;
                     // A transition the next restart forgets is not a transition.
                     // Audited loudly and backed off; reconcile fixes the record
                     // on the next start.
@@ -610,7 +629,8 @@ impl OrchRegistry {
                 self.rd_task_note(group, o.pr, n);
                 report.notices.push(n.clone());
             }
-            if o.clear_signal {
+            // Only once the arc that consumed it is durable — see `persisted`.
+            if o.clear_signal && persisted {
                 self.rd_signals.lock_safe().remove(&(group.clone(), o.pr));
             }
             if o.backoff {
@@ -672,6 +692,7 @@ impl OrchRegistry {
         pr: u64,
         obs: &rddrive::PrObservation,
         want_gate: bool,
+        base_green_memo: &mut std::collections::HashMap<String, Option<bool>>,
     ) -> (reviewdrive::GateOutcome, Option<Vec<reviewdrive::LaneFact>>, Vec<rddrive::LaneNotice>) {
         let spec = match self.merge_queue_gate(group) {
             Ok(s) => s,
@@ -705,7 +726,26 @@ impl OrchRegistry {
                 return (reviewdrive::GateOutcome::Unsatisfied, None, Vec::new())
             }
         };
-        let observed = rddrive::gate_observation(runner, pr, obs, &spec, &obs.base, want_gate);
+        // `base-green` is a fact about a BRANCH, so it is fetched at most once
+        // per tick and shared by every entry on that base — `mqloop`'s own
+        // driver memoizes it per pass for the same reason. Fetched only when
+        // this state evaluates the gate AND the gate declares the condition;
+        // `None` is the value that refuses, so declining to fetch can only make
+        // the gate harder to satisfy.
+        let base_green =
+            if want_gate && rddrive::declares_base_green(&spec) && !obs.base.is_empty() {
+                match base_green_memo.get(&obs.base) {
+                    Some(cached) => *cached,
+                    None => {
+                        let answer = rddrive::base_ci_green(runner, &obs.base);
+                        base_green_memo.insert(obs.base.clone(), answer);
+                        answer
+                    }
+                }
+            } else {
+                None
+            };
+        let observed = rddrive::gate_observation(runner, pr, obs, &spec, base_green);
         let Some(routed) = workflow::route_reviewers(&gate, observed.changed_files.as_deref())
         else {
             // `route_reviewers` refused: the changed-file list could not be
@@ -1112,10 +1152,13 @@ impl OrchRegistry {
             let live: Vec<u64> =
                 state.entries.iter().filter(|e| !e.state().is_terminal()).map(|e| e.pr).collect();
             for pr in live {
-                let obs = rddrive::observe_pr(runner, pr);
+                // `pr_is_open`, not `observe_pr`: reconcile reads nothing but
+                // this, and `observe_pr` would spend a second round trip on
+                // checks it never looks at, per live entry, at startup.
+                let open = rddrive::pr_is_open(runner, pr);
                 let Some(entry) = state.entry_mut(pr) else { continue };
                 let on_behalf = entry.on_behalf_of.clone();
-                if obs.open == Some(false)
+                if open == Some(false)
                     && entry.advance(reviewdrive::DriveState::Cancelled, None, None, 0).is_ok()
                 {
                     changed = true;
@@ -1184,6 +1227,7 @@ impl OrchRegistry {
         pr: u64,
         limits: &reviewdrive::DriveLimits,
         now: u64,
+        base_green_memo: &mut std::collections::HashMap<String, Option<bool>>,
     ) -> Option<RdOut> {
         let resting =
             state.entry(pr).map(|e| e.state().is_parked() || e.state().is_terminal())?;
@@ -1213,7 +1257,7 @@ impl OrchRegistry {
         );
         let want_gate = here == reviewdrive::DriveState::GateCheck;
         let (gate, required, lane_notices) = if want_lanes {
-            self.rd_gate_facts(group, runner, pr, &obs, want_gate)
+            self.rd_gate_facts(group, runner, pr, &obs, want_gate, base_green_memo)
         } else {
             // `NotEvaluated` is the honest value here and not a stand-in for
             // "satisfied": §2.1's `gate-check` row treats it as "the tick reached
@@ -1222,6 +1266,7 @@ impl OrchRegistry {
             (reviewdrive::GateOutcome::NotEvaluated, None, Vec::new())
         };
         let signal = self.rd_signal(group, pr);
+        let messaged_by = signal.messaged_by.clone();
         let facts = reviewdrive::DriveFacts {
             now_ms: now,
             pr_open: obs.open,
@@ -1273,6 +1318,26 @@ impl OrchRegistry {
         }
         let step = reviewdrive::decide(entry, &facts, limits);
         let on_behalf = entry.on_behalf_of.clone();
+        // §2.1's `review-wait` row writes "the current lane index", and the
+        // current lane is the DECIDING one — the first whose pass does not stand
+        // — whether or not this tick had to open it. Writing it only on a
+        // successful spawn leaves it lagging every time the drive waits on a
+        // lane that is already open, which is most ticks of most rounds. It is
+        // only a display and last-resort-fallback field today, so the lag was
+        // not reachable as a defect; a field that is silently wrong is how the
+        // next reader is misled.
+        if entry.state() == reviewdrive::DriveState::ReviewWait {
+            if let Some(k) = brief
+                .deciding_lane
+                .as_deref()
+                .and_then(|b| brief.required.iter().position(|r| r == b))
+            {
+                if entry.lane_index != k {
+                    entry.lane_index = k;
+                    out.changed = true;
+                }
+            }
+        }
         match &step {
             reviewdrive::DriveStep::Wait => {}
             reviewdrive::DriveStep::OpenLane { index } => {
@@ -1445,7 +1510,8 @@ impl OrchRegistry {
                     out.notices.push(n);
                 }
                 (reviewdrive::DriveState::Held, Some(r)) => {
-                    let n = rddrive::held_notice(pr, r, &brief.held_facts(entry, limits));
+                    let n =
+                        rddrive::held_notice(pr, r, &brief.held_facts(entry, limits, &messaged_by));
                     out.audits.push((
                         rddrive::audit_action::HELD,
                         json!({ "pr": pr, "reason": r.as_str(), "head": entry.head }),
@@ -1592,9 +1658,11 @@ impl OrchRegistry {
         {
             return self.rd_refuse(group, pr, r::ALREADY_DRIVEN);
         }
-        // Last, because it is the only check that spends a `gh` round trip.
-        let obs = rddrive::observe_pr(runner, pr);
-        match obs.open {
+        // Last, because it is the only check that spends a `gh` round trip — and
+        // it spends exactly ONE: `drive_review` reads whether the PR is open and
+        // nothing else, so `observe_pr`'s second call on `gh pr checks` would be
+        // an answer this path never looks at.
+        match rddrive::pr_is_open(runner, pr) {
             Some(true) => {}
             Some(false) => return self.rd_refuse(group, pr, r::PR_NOT_OPEN),
             // The remote did not answer. Unknown is never treated as safe, and
