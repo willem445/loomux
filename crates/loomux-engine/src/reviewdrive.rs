@@ -1167,7 +1167,8 @@ impl DriveEntry {
             block: block.to_string(),
             session: session.to_string(),
             agent: agent.to_string(),
-            prior_agents: retain_panes(prior.unwrap_or_default(), agent),
+            // MUTATION 2b: the lane's sibling arc, same single slot.
+            prior_agents: { let _ = prior; Vec::new() },
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.to_string(),
@@ -1186,9 +1187,11 @@ impl DriveEntry {
     /// on running with the drive no longer able to recognise it. Everything a
     /// new pane must do to the old one is here, once.
     pub fn record_worker_pane(&mut self, agent: &str) {
-        let mut prior = std::mem::take(&mut self.prior_worker_agents);
-        prior.push(std::mem::take(&mut self.worker_agent));
-        self.prior_worker_agents = retain_panes(prior, agent);
+        // MUTATION 2 (#1871 B2 red-before-green): the single slot, which is the
+        // shipped behaviour this PR fixes. `retain_panes` is still called so the
+        // mutation is behavioural rather than a dead-code error.
+        let _ = retain_panes(Vec::new(), agent);
+        self.prior_worker_agents = Vec::new();
         self.worker_agent = agent.to_string();
     }
 
@@ -1211,7 +1214,12 @@ impl DriveEntry {
     /// Ordered worker-first then lane by lane, each oldest-first, so the list
     /// reads as the history it is. Deduplicated on the way in — see
     /// [`retain_panes`].
+    // MUTATION 3 (#1871 B3 red-before-green): the wiring neutered, not the
+    // rendering function — `panes_clause`'s own unit tests must stay green, so
+    // the red belongs to the seam.
+    #[allow(unreachable_code, unused_mut, unused_variables)]
     pub fn owned_panes(&self) -> Vec<(String, DrivenRole)> {
+        return Vec::new();
         let mut out: Vec<(String, DrivenRole)> = Vec::new();
         for a in self.prior_worker_agents.iter().chain(std::iter::once(&self.worker_agent)) {
             if !a.is_empty() {
@@ -1808,11 +1816,10 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
     // where [`lane_open_for`] decides between re-briefing it and waiting for a
     // brief already out at this revision — which is the re-open the head change
     // owed and never got.
-    let current = lane
-        .verdict
-        .as_ref()
-        .filter(|v| lane_verdict_is_current(Some(v), &facts.head, digest));
-    match current.map(|v| v.verdict) {
+    // MUTATION 1 (#1871 B1 red-before-green): the currency filter removed, which
+    // is the shipped behaviour this PR fixes.
+    let _ = lane_verdict_is_current(lane.verdict.as_ref(), &facts.head, digest);
+    match lane.verdict.as_ref().map(|v| v.verdict) {
         // A lane recorded `escalate` at this revision: an LLM judgment call, and
         // §3 says the driver never makes one.
         Some(Verdict::Escalate) => DriveStep::held(HeldReason::Escalate),
