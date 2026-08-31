@@ -4531,12 +4531,16 @@ fn the_orchestrator_can_send_work_back_on_design_grounds_not_only_acceptance_cri
 }
 
 #[test]
-fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
+fn any_merge_of_the_default_branch_leaves_its_next_ci_run_owned_until_green() {
     // #236 F3. Auto-merge, a one-time grant and supervised dangerous mode all let the
     // orchestrator LAND code — and then the prompt went quiet. A PR green on its own branch can
     // still break main (a semantic conflict with whatever landed under it; a job that only runs
     // post-merge), and a red default branch blocks every worker in the group. Nothing told it to
     // look, so nothing would have looked.
+    // #1848 review B2 / #1844: the trigger is WIDENED from "a merge you performed" to any merge
+    // onto the default branch — the human merges routinely (the default flow), the hazard does
+    // not care who merged, and the abolished INVARIANT 7's "whoever moved it" coverage had to
+    // land here. The ownership clause was never load-bearing; only the trigger is.
     let (reg, _d) = test_registry();
     let g = reg.create_group(&Repo::new().path(), plain_rails()).unwrap();
     // #1683: the red-main procedure moved to the rendered playbook.
@@ -4724,7 +4728,11 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
         ("no test is believed until it has been seen to fail",
          "red-before-green: an unevidenced test is a decoration (#236 F2)"),
         ("red main stops everything",
-         "a merge it performed owns the default branch's next CI run (#236 F3)"),
+         "the substance — stop merging, fix forward once, then revert — holds whoever merged \
+          (#236 F3)"),
+        ("yours, the human's, or one you merely watched",
+         "…and the TRIGGER is any merge onto the default branch (#1844 widened it from 'a merge \
+          you performed'): the human merges routinely, and the hazard does not care who merged"),
         ("a pr merges when github reports it mergeable",
          "mergeability is the whole readiness test (#1844) — a branch merely behind is left \
           alone, and the two-green-PRs-red-main risk is INVARIANT 6's"),

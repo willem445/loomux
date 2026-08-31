@@ -209,8 +209,9 @@ file (if any) a block uses*:
    (the human merge gate). `POST_MERGE_WORKFLOW_HOOK` moves the spawn
    instruction into the checklist itself (right after "schedule the next
    item," the routine's last step) and names the human-merge case
-   explicitly, mirroring the section's own INVARIANT 7 ("whoever moved it:
-   your merge, the human's, or a PR you merely watched land"). `PROCESS_NOTE`
+   explicitly — the coverage #1844 carried from the deleted INVARIANT 7 into
+   a widened INVARIANT 6: the default branch's post-merge run is owned after
+   any merge, whoever performed it. `PROCESS_NOTE`
    keeps only the short description so the two fragments don't disagree —
    one actionable trigger, in the place that actually runs.
 

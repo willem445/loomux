@@ -100,6 +100,27 @@ fn playbook_instructions() -> String {
     instructions("orchestrator-playbook.md")
 }
 
+/// The rendered playbook for a group whose repo enables the merge queue (advanced
+/// orchestrator on + `merge_queue: enabled`) — the only rendering in which the
+/// `{{MERGE_QUEUE}}` fragment is non-empty. The fragment is a Rust constant rendered
+/// IN, so a sweep over `templates/` cannot see it, and it is empty in every
+/// default-group golden: this helper exists so the rendered text it contributes can be
+/// pinned like any other prose (see `the_rendered_merge_queue_note_...`).
+fn queue_enabled_playbook() -> String {
+    let (reg, dir) = test_registry();
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(repo.join(".loomux")).unwrap();
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nmerge_queue:\n  enabled: true\n",
+    )
+    .unwrap();
+    let rails = Guardrails { advanced_orchestrator: true, ..rails() };
+    let g = reg.create_group(&repo, rails).unwrap();
+    fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator-playbook.md"))
+        .unwrap_or_else(|e| panic!("the playbook must be written to the group dir: {e}"))
+}
+
 /// Assert that `region` carries the rule `why`, and that `anchor` names it **uniquely**.
 ///
 /// Presence is the obvious half; uniqueness is the half that makes the pin able to fail at all.
@@ -177,7 +198,10 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
         ("no test is believed until it has been seen to fail",
          "red-before-green: an unevidenced test is a decoration"),
         ("red main stops everything",
-         "a merge it performed owns the default branch's next CI run"),
+         "the substance — stop merging, fix forward once, then revert — holds whoever merged"),
+        ("yours, the human's, or one you merely watched",
+         "…and the TRIGGER is any merge onto the default branch (#1844 widened it from 'a merge \
+          you performed'): the human merges routinely, and the hazard does not care who merged"),
         ("a pr merges when github reports it mergeable",
          "mergeability is the whole readiness test (#1844) — a branch merely behind is left \
           alone, and the two-green-PRs-red-main risk is INVARIANT 6's"),
@@ -460,12 +484,16 @@ fn red_before_green_is_demanded_evidenced_verified_and_bounded_by_its_exemption(
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_merge_the_orchestrator_performed_owns_the_default_branchs_next_ci_run() {
+fn any_merge_of_the_default_branch_leaves_its_next_ci_run_owned_until_green() {
     // Auto-merge, a one-time grant and supervised dangerous mode all let the orchestrator LAND
     // code — and then the prompt went quiet. A PR green on its own branch can still break the
     // default branch (a semantic conflict with whatever landed under it; a job that only runs
     // post-merge), and a red default branch blocks every worker in the group. Nothing told it to
     // look, so nothing would have looked.
+    // #1848 review B2 / #1844: the trigger is WIDENED from "a merge you performed" to any merge
+    // onto the default branch — the human merges routinely (the default flow), the hazard does
+    // not care who merged, and the abolished INVARIANT 7's "whoever moved it" coverage had to
+    // land here.
     // #1683: the red-main procedure moved to the playbook.
     let pb = flat(&playbook_instructions());
     let aftermath = section(&pb, "## red main", "## mergeability");
@@ -501,7 +529,8 @@ fn a_pr_merges_when_github_reports_it_mergeable_and_a_branch_merely_behind_is_le
     // O(n²) review rounds buying re-verification of code that did not change. What remains
     // is the readiness test — GitHub's own mergeability. A branch that still merges cleanly
     // is left alone; only `CONFLICTING` cannot merge and needs work; the
-    // two-green-PRs-combine-red hazard is red main's (INVARIANT 6), not a reason to touch
+    // two-green-PRs-combine-red hazard is red main's (INVARIANT 6) — after any merge,
+    // whoever performed it — not a reason to touch mergeable branches.
     // #1683: the procedure lives in the playbook.
     let pb = flat(&playbook_instructions());
 
@@ -553,6 +582,36 @@ fn a_pr_merges_when_github_reports_it_mergeable_and_a_branch_merely_behind_is_le
     assert!(
         !mergeability.contains("re-sync the merge frontier"),
         "the retracted frontier re-sync is back in the mergeability section: {mergeability}"
+    );
+}
+
+#[test]
+fn the_rendered_merge_queue_note_does_not_revive_the_retracted_rebase_rule() {
+    // #1848 review B1. `{{MERGE_QUEUE}}` is a Rust CONSTANT (`MERGE_QUEUE_NOTE`, mod.rs)
+    // rendered into `## Merge gate` when the repo enables the queue — invisible to any
+    // sweep over `templates/` and empty in every default-group golden, so neither the
+    // pre222 pins nor the toggle test can see it, and until this pin NO region covered
+    // it: which is how a live re-mandate of the retracted rebase rule survived the first
+    // cut here. This suite pins the default rendering; this one test renders the gated
+    // document deliberately, because the retraction's negative pins belong together and
+    // the fragment is exactly the surface the retraction could silently resurrect on.
+    // The positive controls run first: the fragment must actually render, or the
+    // negatives below are vacuously green.
+    let pb = flat(&queue_enabled_playbook());
+    let gate = section(&pb, "## merge gate", "## squash closes issues");
+    pinned("the rendered merge-queue note", gate, "speculative merge **is** the mergeability probe",
+        "the fragment must render for a queue-enabled group — an empty region would make \
+         the negatives below vacuously green");
+    pinned("the rendered merge-queue note", gate, "never whether it is fresh",
+        "…and it must state the CURRENT rule: the sweep asks mergeability, never freshness");
+    assert!(
+        !gate.contains("rebase sweep") && !gate.contains("still need the sweep"),
+        "the rendered merge-queue note re-mandates the retracted rebase sweep: {gate}"
+    );
+    assert!(
+        !gate.contains("invariant 7's rebase"),
+        "the rendered merge-queue note attributes a sweep to INVARIANT 7, which no longer \
+         has one: {gate}"
     );
 }
 

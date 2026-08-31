@@ -1079,3 +1079,13 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   repin the mergeability rule on intent (digest row, section anchors, sweep anchors), add
   negative assertions so the retracted wording cannot silently return, and the red-main test's
   section boundary follows the renamed heading.
+
+  A review round added two things the first cut missed. The `{{MERGE_QUEUE}}` fragment
+  (`MERGE_QUEUE_NOTE`, a Rust constant rendered into `## Merge gate` for queue-enabled repos —
+  invisible to a sweep over `templates/` and empty in every default-group golden) still
+  mandated the rebase sweep for unqueued PRs; it now states the current rule and is pinned by
+  `the_rendered_merge_queue_note_does_not_revive_the_retracted_rebase_rule`, which renders the
+  gated document the goldens never see. And INVARIANT 6 was widened from "a merge you
+  performed" to any merge onto the default branch, whoever performed it: the abolished rule's
+  "whoever moved it" coverage would otherwise have had no owner on the human-merge flow, and
+  the resident core stays under budget at 44,980 bytes EOL-normalized.

@@ -59,12 +59,13 @@ memory of it — is the contract.
    grounds to reject a plan or bounce a PR.
 5. **No test is believed until it has been seen to fail.** A `done` whose PR shows no
    red-before-green evidence is not done.
-6. **Red main stops everything.** A merge you performed owns the default branch's next CI run:
-   stop merging, fix forward once, then revert.
+6. **Red main stops everything.** After any merge onto the default branch — yours, the human's,
+   or one you merely watched — own its next CI run until green: stop merging, fix forward once,
+   then revert.
 7. **A PR merges when GitHub reports it mergeable** — that is the whole readiness test. A
    branch merely behind its base is left alone; only `CONFLICTING` needs work, routed to the
    owning worker and bounded (INVARIANT 9). The two-green-PRs-combine-red risk is red main's
-   (INVARIANT 6), not a reason to rebase anything.
+   (INVARIANT 6) — after any merge, whoever performed it — not a reason to rebase anything.
 8. **The label funnel is the consent boundary, and the group mode says which way it points.** You
    may *file* an issue for anything you notice, in every mode. **Opt-in — the default, including
    plain autonomous mode:** you may never groom or start an unlabelled issue. Autonomous mode lets
@@ -514,11 +515,11 @@ the open-question hold, and dangerous mode: `read_playbook("merge-gate")`.
 the aggregated message, and re-read the partly-addressed issues after:
 `read_playbook("squash-closes-issues")`.
 
-### After a merge you performed, the default branch is yours until it's green
+### After any merge, the default branch is yours until it's green
 
-INVARIANT 6 keeps the rule. **After any merge you performed, watch the
-post-merge run — and the moment it goes red:** stop merging, fix forward once,
-then revert: `read_playbook("red-main")`.
+INVARIANT 6 keeps the rule. **After any merge — yours, the human's, or one you merely
+watched land — watch the post-merge run, and the moment it goes red:** stop merging, fix
+forward once, then revert: `read_playbook("red-main")`.
 
 ### Mergeability — the only readiness test
 

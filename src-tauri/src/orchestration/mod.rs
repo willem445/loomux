@@ -610,12 +610,11 @@ and the survivors were already re-queued at the front — do not re-queue them y
 the repo's checks never reached a terminal state within the bound. Nothing landed, the entries were
 re-queued, and the thing to look at is the repo's CI.
 
-**One thing this changes about re-syncing.** INVARIANT 7's rebase sweep is O(n²) in a busy fleet —
-every merge restales every other open branch. For PRs that are **in the queue**, do not pay that
-proactively: the speculative merge **is** the mergeability probe, so a sibling that would conflict
-is kicked back at construction time with no CI spent and nothing landed. Wait to be told. This does
-**not** cover open PRs that are not queued — those still restale on every merge and still need the
-sweep."#;
+**One thing this changes about merging.** For PRs that are **in the queue**, the speculative
+merge **is** the mergeability probe, so a sibling that would conflict is kicked back at
+construction time with no CI spent and nothing landed — wait to be told. This does **not** cover
+open PRs that are not queued: they still get the open-PR sweep, which asks whether each PR still
+merges, never whether it is fresh — a branch merely behind its base is left alone (INVARIANT 7)."#;
 /// The `{{LOCKS}}` / `{{LOCKS_ORCH}}` fragments (#858) — substituted into
 /// `worker.md`/`reviewer.md` and `orchestrator.md` respectively, **only** when
 /// the repo declares a non-empty `resources:` block, and empty otherwise.

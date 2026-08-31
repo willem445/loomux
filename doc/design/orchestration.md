@@ -757,8 +757,11 @@ orchestrator a value system to match its operational one:
   left alone; only `CONFLICTING` needs work, routed to the **owning** worker's resumed session,
   one attempt, then the human (INVARIANT 9). The hazard the rebase used to catch — two
   individually-green PRs combining into a red default branch — belongs to **red main**
-  (INVARIANT 6): the orchestrator already owns the post-merge run until green, and stops
-  merging, fixes forward once, then reverts. The trade is deliberate and the human's: an
+  (INVARIANT 6), widened by #1844 to fire after any merge onto the default branch, whoever
+  performed it: the abolished rule's "whoever moved it" coverage had to land somewhere, and the
+  human merges routinely, so an invariant scoped to "a merge you performed" would leave the
+  hazard unowned on the default flow. The orchestrator owns the post-merge run until green and
+  stops merging, fixes forward once, then reverts. The trade is deliberate and the human's: an
   occasional revert on main, in exchange for removing the churn.
 
 - **Compression, and the INVARIANTS digest.** The prompt predicts its own compaction ("your
