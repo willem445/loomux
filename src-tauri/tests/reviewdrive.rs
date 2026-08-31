@@ -2182,6 +2182,57 @@ fn a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not() {
     );
 }
 
+/// **A brief's sentences are each one paragraph**, pinned as a SHAPE beside the
+/// content the two tests around this one assert.
+///
+/// This is `manager_lifecycle.rs`'s `is_one_paragraph` idiom, and it is here
+/// because the CI literals shipped exactly the failure it exists to catch: a
+/// `\n` plus seventeen spaces of source indent, delivered into a reviewer's
+/// pane. The suite was green over it, because both content assertions are
+/// `.contains` of one fragment's interior and no asserted substring straddles
+/// the break — which is the whole reason a shape pin has to sit beside a content
+/// pin rather than being implied by it.
+///
+/// Both halves are checked. A hard break is the obvious form; a run of ten
+/// spaces is the one a collapsed `\` continuation leaves behind, with no newline
+/// at all to notice.
+#[test]
+fn a_lane_brief_is_one_paragraph_per_sentence() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("a lane opens");
+    let brief = lane_brief(&reg, &lane);
+
+    // The template itself is deliberately multi-paragraph; what must not carry a
+    // break is any single interpolated sentence. So this reads the lines rather
+    // than the whole, and asserts none of them leaks source indentation.
+    let mut checked = 0usize;
+    for line in brief.lines() {
+        checked += 1;
+        assert!(
+            !line.contains("          "),
+            "a brief line leaks source indentation, which is what a collapsed `\\` \
+             continuation leaves behind: {line:?}"
+        );
+    }
+    assert!(checked > 3, "the positive control: this must have read real lines, not none");
+
+    // And the CI sentence specifically, which is the one that shipped broken.
+    let ci_line = brief
+        .lines()
+        .find(|l| l.contains("checks are"))
+        .expect("every lane brief states the CI it observed");
+    assert!(
+        !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
+        "the CI sentence must be one whole paragraph on one line: {ci_line:?}"
+    );
+}
+
 /// The control for the test above: on a genuinely green drive the brief still
 /// says so. Without it, "never mention CI at all" satisfies the red assertion.
 #[test]

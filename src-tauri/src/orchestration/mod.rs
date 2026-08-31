@@ -13265,9 +13265,11 @@ pub struct OrchRegistry {
     /// load-decide-store to span the spawn, because a `drive_review` landing
     /// inside that window would read the pre-spawn file and write it back,
     /// erasing the entry; #467/#468 want no registry lock held across a
-    /// delivery. Both hold: this lock is taken by exactly four call sites — the
-    /// tick and the three MCP tools — none reachable from a pane delivery, so a
-    /// spawn's own kickoff cannot cycle back onto it.
+    /// delivery. Both hold, on a property of the lock rather than a count of
+    /// its callers: no site that takes it is reachable from a pane delivery, so
+    /// a spawn's own kickoff cannot cycle back onto it. The site list, and why
+    /// the two interception helpers do not break it, is on
+    /// [`Registry::rd_drive_group_with`].
     rd_state_lock: Arc<TrackedMutex<()>>,
     /// Earliest wall-clock at which the review driver may service each group
     /// again (§2.4). Absent = now.

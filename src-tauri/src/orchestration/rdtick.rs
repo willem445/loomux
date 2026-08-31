@@ -1010,20 +1010,20 @@ impl OrchRegistry {
         // unsafe landing — `gate-check` re-evaluates `ci-green` through
         // `recheck_gate` — so it costs a misled reviewer and a wasted round,
         // which is exactly what a driven review is for saving.
+        // **One paragraph, one line each.** A backslash-n plus the source
+        // indent ships both into a reviewer's brief, and a `.contains` of any
+        // single fragment passes straight over it because no asserted substring
+        // straddles the break. Written without continuations at all so there is
+        // nothing to collapse, and the SHAPE is pinned beside the content in
+        // `a_lane_brief_is_one_paragraph_per_sentence`.
         let ci = match brief.ci {
             reviewdrive::CiObservation::Green => "This PR's checks are green at that head.",
-            reviewdrive::CiObservation::Red => {
-                "This PR's checks are RED at that head — review the change on its merits; \n                 the failure is the worker's to answer."
-            }
-            reviewdrive::CiObservation::Conflicting => {
-                "This PR does not merge cleanly at that head — review the change on its \n                 merits; the conflict is the worker's to answer."
-            }
-            // Pending and Unknown are one sentence on purpose: §8's rule is that
-            // unknown is never reported as a fact about the PR, and "not green
-            // yet" is the only thing true of both.
-            reviewdrive::CiObservation::Pending | reviewdrive::CiObservation::Unknown => {
-                "This PR's checks are not green at that head (orrerix could not read a \n                 settled result)."
-            }
+            reviewdrive::CiObservation::Red => "This PR's checks are RED at that head. Review the change on its merits; the failure is the worker's to answer.",
+            reviewdrive::CiObservation::Conflicting => "This PR does not merge cleanly at that head. Review the change on its merits; the conflict is the worker's to answer.",
+            // Pending and Unknown share one sentence on purpose: §8 says unknown
+            // is never reported as a fact about the PR, and not-green-yet is the
+            // only thing true of both.
+            reviewdrive::CiObservation::Pending | reviewdrive::CiObservation::Unknown => "This PR's checks are not green at that head (orrerix could not read a settled result).",
         };
         match entry.lane(block).filter(|l| !l.at_head.is_empty()) {
             // A lane that has answered before gets the delta — the line an
@@ -1837,8 +1837,10 @@ impl OrchRegistry {
                 // instantly, after it the drive waits the full
                 // `lane_timeout_minutes` in silence and re-holds then. Neither
                 // is the recovery `held(lane-stalled)`'s own notice instructs,
-                // and a hold that its printed remedy cannot clear is the defect
-                // arc 11 exists to not have.
+                // and a hold ON A WAIT that its printed remedy cannot clear is
+                // the defect arc 11 exists to not have. Holds parked on a
+                // JUDGMENT are deliberately outside that rule — §2.2 names the
+                // two and why resuming them re-holds by design.
                 //
                 // Clearing `briefed_head` puts the outstanding lane back in
                 // `lane_open_for`'s false branch, so the next tick takes

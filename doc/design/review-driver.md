@@ -212,13 +212,24 @@ that lane when there is one, and spawns a fresh reviewer when there is not —
 either way the lane record is re-pointed at the pane that now holds it, so §7's
 interception stays keyed on a live pane rather than on an abandoned one. Whether
 the stalled pane itself is reused therefore depends on whether a session was
-ever recorded for it, which is not something this arc decides. Scoped to this hold: a lane holding `escalate` or
-`review-limit` carries a verdict `decide_review_wait` answers before it consults
-the lane record, and a lane that is legitimately mid-review must not be
-re-briefed because some other hold on the drive was resumed. This is the general
-form of the rule §2.2's stalled rows already imply — **a hold must be clearable
-by the remedy its own notice prints**, which is the same defect `drive-stalled`
-had in its age anchor.
+ever recorded for it, which is not something this arc decides.
+
+Scoped to this hold: a lane holding `escalate` or `review-limit` carries a
+verdict `decide_review_wait` answers before it consults the lane record, and a
+lane that is legitimately mid-review must not be re-briefed because some other
+hold on the drive was resumed.
+
+This is the general form of the rule §2.2's **stalled** rows imply — **a hold
+whose cause is a wait must be clearable by the remedy its own notice prints** —
+which is the same defect `drive-stalled` had in its age anchor. It is stated for
+the stalled rows and not for every hold, because two holds are deliberately
+outside it. `escalate` and `review-limit` are parked on a JUDGMENT the driver may
+not make (INVARIANT 3), not on something orrerix is waiting for: `drive_review`
+does resume the drive as their notices say, but `decide_review_wait` re-holds on
+the next tick because the verdict — or the spent budget — has not changed. The
+orchestrator has to change that fact first, by dispositioning the escalation or
+by passing `reset_counters`. Resuming without doing so re-holding at once is the
+design working, and the rule above must not be read as promising otherwise.
 
 ### 2.3 The counters are INVARIANT 9's numbers, and neither key may loosen them
 
