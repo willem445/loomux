@@ -1808,7 +1808,7 @@ fn a_driven_lanes_report_is_consumed_and_never_read_as_a_worker_signal() {
             &json!({ "name": "report", "arguments": {
                 "outcome": outcome, "note": "the lane speaking", "ref": "#1758" } }),
         )
-        .unwrap_or_else(|e| panic!("a driven lane must still be able to report ({outcome}): {e}"));
+        .unwrap_or_else(|e| panic!("a driven lane must still be able to report ({outcome}): {e:?}"));
 
         // §7 still holds: consumed, not delivered.
         assert!(
