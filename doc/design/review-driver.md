@@ -950,6 +950,29 @@ record at H."* No disposition ever rides in a brief; the disposition the
 orchestrator used to append to a hand-back belongs at the gate-satisfied
 kick-back instead, where the orchestrator is the one making it (INVARIANT 3).
 
+**Three facts §3.1 item 4 lists are NOT in a v1 brief, and the reason is one
+S3 decision rather than three omissions.** That item enumerates "PR number,
+issue, head, base, merge-base, CI run id and failed job names, lane id, the
+lane's prior verdict head and body digest, round number". A v1 brief carries
+every one of those except the **merge-base**, the **CI run id**, and the
+changed-file list the delta template's `{{WHAT_MOVED}}` was drafted around.
+All three fall out of the same choice: the driver's seam is `gh`-only by
+construction. §3.1 item 1's "no landing verb" is made *structural* in
+`rddrive::RdRunner`, which has a `gh` method and no `git` — a driver holding one
+cannot reach `git push` whatever a later author writes — and the price of that
+is that it cannot reach `git merge-base` or `git diff` either. The run id is a
+separate small thing: `gh pr checks --json state,name,link` reports check names
+and links, and extracting a run id from a link would be parsing rather than
+reading.
+
+So the delta brief says what orrerix actually read — the two revisions, and
+whether the body digest moved — and then names the command that answers the
+rest exactly: `git diff <prev>..<head>` in the reviewer's own worktree. That is
+a fact plus an instruction rather than a delta the driver invented, which is the
+same posture §3.1 item 4 is about. **If a later slice wants the merge-base or a
+per-round file list in a brief, it is choosing to widen the seam**, and that is
+the argument it has to make — not a template edit.
+
 ## 6. Kick-back notice shapes
 
 **One delivery per exit, event first**, so the first token the orchestrator reads
@@ -1125,3 +1148,56 @@ permanent before anyone knows whether it was right.
 **Neither omission is a stub.** Nothing in v1 half-implements either: there is no
 `brief:` key that parses and is ignored, and no lane list that accepts more than
 one entry at a time. A feature that is not here is absent, not disabled.
+
+## 10. What S3 and S4 decided that this note did not
+
+Everything in this section is a choice the slices made because the note left it
+open, and each is recorded here rather than in a PR body for the reason the
+repo's own convention gives: a PR body is read once, and the next implementer
+reads this file. The section is deliberately short — where a slice's decision
+contradicted or completed something this note already said, the amendment is in
+the section that said it, not here.
+
+**The `gh` seam is one method wide, and that is what makes half of §3.1 item 1
+structural.** `rddrive::RdRunner` has `gh` and no `git`, so the driver cannot
+reach a `git` landing verb at all — the compiler enforces it, not a scan. The
+one place the wider trait is still needed is `mqdriver::base_ci_green`, which
+the driver reaches through a bridge whose `git` is a **refusal naming this item**
+rather than an absence, so a landing verb routed through it fails loudly at the
+one place a reader is looking. What this does **not** close, and the scan
+therefore must: `gh pr merge`, `gh pr edit` and `gh pr ready` all ride the method
+that is still there. §5.5's own paragraph carries what the narrowing costs a
+brief.
+
+**The scan's scope is FILES.** §3.1 item 1 says a scope keyed on a name — a
+module, an `rd_*` prefix — is stepped over by a landing verb added in a function
+that does not carry it. So the driver's registry wiring lives in one file
+(`src-tauri/src/orchestration/rdtick.rs`) purely so the scan can name three files
+and a rename cannot move code out from under it. The scan reads production
+source only: the `#[cfg(test)]` tail is cut, because a test there deliberately
+builds a landing verb in order to prove the bridge refuses it, and line comments
+are cut, because these files quote this note at length and a `///` block naming
+`queue_merge` is prose rather than a capability. Both cuts are places a scan can
+go blind, and each has its own control.
+
+**The gate is read through `mergeq::recheck_gate`, not re-derived.** §4 says a
+third *implementation* of the gate decision is a defect. `evaluate_merge_gate`
+alone does not decide `also:` conditions — `ci-green`, `body-unchanged`,
+`base-green` — nor `max_diff_lines`, and a driver that wrote its own `also:` loop
+would have been the fourth implementation of a decision that already has two
+readers. So `gate-check` asks `recheck_gate`, which is where all of those are
+decided once, and the only thing the driver computes is which of that function's
+answers is a `gate-unreadable` hold and which is an ordinary not-satisfied-yet.
+
+**A delegate signal is in memory and is not persisted, and the degradation is
+named.** §7's interception has to hand something to the next tick. That
+something is an in-memory per-PR signal rather than a second write path into
+`review_drives.json` from the MCP thread. What a restart therefore loses is
+**only arc 8** — the body-only-fix shortcut: a push is still seen as a head move
+(arc 7, read from GitHub), a verdict is still read from its own file, and a drive
+that learns nothing degrades to `held(fix-stalled)`, which is bounded and named.
+
+**A pane id is persisted beside every session id**, because §2.2's
+`lane-stalled` notice names a pane and §7's interception is keyed on an agent,
+and a session id answers neither. §5.2 carries the fields and the fail-closed
+rule that an empty one matches nobody.

@@ -2303,6 +2303,62 @@ siblings so you can see that rather than being told a half-truth confidently. An
 comes back **unverifiable** implicates no PR at all — the checks never resolved, nothing
 landed, and the thing to look at is your CI.
 
+### Watching a review drive
+
+A repo can also turn on a **review driver** (`driver:` in its `.orrerix/workflow.yml`) so the
+worker-reviewer rounds a PR goes through — wait for CI, brief the reviewer lanes your gate
+requires, hand a `fail` or a red run or a conflict back to the worker, repeat — run in orrerix
+instead of costing the orchestrator a turn each time. It runs on the same 30-second poller the
+merge queue does, under the same bound: **one group per wake, oldest first**. See
+[`doc/design/review-driver.md`](https://github.com/willem445/orrerix/blob/main/doc/design/review-driver.md)
+for the design. The `driver:` block's own fields are documented with the other workflow blocks by
+#1784, which lands beside this — until it does, this page describes what the driver *does* and not
+what you may set.
+
+**Nothing starts by itself.** The block only *enables* the feature. No PR is driven until the
+orchestrator makes a deliberate per-PR call naming that PR and the worker session that owns it —
+and in particular a drive does **not** start when a worker reports it is done, because the PRs
+where a drive would be wrong are ordinary ones: a scratch PR, a release bump, a PR you said you
+would read yourself.
+
+**The driver never merges, and never grants what your gate would not.** It cannot merge, push,
+mark a PR ready, delete a branch, edit or relabel a PR or an issue, write a merge grant, kill a
+pane, or record a verdict — only a reviewer's own verdict opens your gate, and a finished drive is
+never a substitute for one. It reads GitHub and it types templated text into panes orrerix already
+owns. What is genuinely new, and worth saying plainly: **orrerix now spawns a reviewer and resumes
+a worker on its own initiative, with no orchestrator turn in between.** Every one of those actions
+is in the audit log, marked with the orchestrator it acted for.
+
+**One thing changes about what you see in the orchestrator's pane.** While a PR is being driven,
+its delegates' status reports and recorded verdicts go to the driver instead of appearing there —
+that is the point, and it is most of the saving. Two things keep it from being a black box: every
+consumed event is in the audit log (as `rd-consumed`, naming the kind, the agent and the PR —
+*consumed* is a different word from *dropped*), and a delegate's own `message_orchestrator` line is
+**never** intercepted. If a reviewer or a worker has something to say that is not a status change,
+you still see it, unchanged, and the drive then stops so someone reads it.
+
+**A drive stops, it does not drift.** There are fourteen ways out and each produces exactly one
+line in the orchestrator's pane: the gate being satisfied, a reviewer escalating, or one of twelve
+holds — a counter reaching INVARIANT 9's bound, a lane or a worker going quiet past its timeout,
+the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
+could not read, a worker that reported blocked or whose session no longer resolves, or a delegate
+messaging the orchestrator. **A hold is parked, not finished**: it keeps what it has spent, so
+resuming it does not silently grant a fresh budget, and clearing the counters is a separate,
+audited decision.
+
+**Drives and the merge queue do not overlap, in either direction.** A PR the driver is holding
+cannot be queued, and a PR the queue is holding cannot be driven; each refusal names the other
+holder. The intended order is serial: let the drive reach a satisfied gate, decide what to do with
+the findings — that decision stays the orchestrator's, and the driver never makes it — and *then*
+queue.
+
+**If orrerix cannot read its own drive record** — a torn write, or a file from a newer build — it
+says so, loudly, and stops driving that group rather than guessing. It never repairs the file and
+never deletes it. "Nothing is being driven" and "orrerix can't tell what is being driven" are the
+same picture otherwise, and only one of them means your PR is fine.
+
+With no `driver:` block none of this exists and nothing about your group changes.
+
 ## Guardrails
 
 Enforced by orrerix, not the model:
