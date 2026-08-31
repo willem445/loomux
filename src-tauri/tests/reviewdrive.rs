@@ -624,8 +624,33 @@ const HEAD_B: &str = "bb22cc33dd44ee55ff6677889900aabbccddeeff";
 /// A canned `gh`, keyed on the SUBCOMMAND rather than on call order, so a test
 /// asserts what the driver concluded and not the sequence it happened to read
 /// in — the order is the tick's business and is pinned in `rddrive`'s own tests.
+///
+/// # Why `merge` is its own field
+///
+/// `mergeStateStatus` used to be a `CLEAN` literal inside `facts_json`, which
+/// made it the one axis of a driven PR **no fixture in this file could vary**:
+/// 25 green fixtures and seven sites setting a non-green *check*, against zero
+/// setting a non-clean *mergeability*. That is CLAUDE.md's unpinned-axis rule —
+/// a value every fixture happens to share — and what it left untested was the
+/// whole live `CONFLICTING` arc: `observe_pr`'s classification of the
+/// mergeability JSON, the second call it skips, `rd-conflicting`, the
+/// `rebase_attempts` spend against a budget of one, the fix brief's rebase text,
+/// and `held(rebase-limit)`. `CiObservation::Conflicting` appeared once in this
+/// file, as a hand-built `DriveFacts` handed straight to `decide` — below the
+/// seam, which is the construction #1841's B1 got through two clean reviews in
+/// (#1862).
+///
+/// It is a **separate mutex from `facts`** rather than a fourth `set_facts`
+/// argument for two reasons. A test varies ONE axis per call, so the existing
+/// `set_facts("OPEN", HEAD_B)` sites keep their meaning and their bytes; and a
+/// mergeability set once STAYS set across a head move, which is what a real
+/// conflicting PR does — the branch does not stop conflicting because the worker
+/// pushed to it.
 struct FakeGh {
-    facts: std::sync::Mutex<Result<String, String>>,
+    /// `Ok((state, head))`, or `Err` for the seam itself failing.
+    facts: std::sync::Mutex<Result<(String, String), String>>,
+    /// The `mergeStateStatus` the PR-facts read reports.
+    merge: std::sync::Mutex<String>,
     checks: std::sync::Mutex<String>,
     calls: std::sync::Mutex<Vec<Vec<String>>>,
 }
@@ -633,7 +658,8 @@ struct FakeGh {
 impl FakeGh {
     fn green(head: &str) -> FakeGh {
         FakeGh {
-            facts: std::sync::Mutex::new(Ok(facts_json("OPEN", head))),
+            facts: std::sync::Mutex::new(Ok(("OPEN".to_string(), head.to_string()))),
+            merge: std::sync::Mutex::new("CLEAN".to_string()),
             checks: std::sync::Mutex::new(
                 r#"[{"name":"build","state":"SUCCESS","link":"x"}]"#.to_string(),
             ),
@@ -651,17 +677,29 @@ impl FakeGh {
         *self.checks.lock().unwrap_or_else(|e| e.into_inner()) = json.to_string();
     }
     fn set_facts(&self, state: &str, head: &str) {
-        *self.facts.lock().unwrap_or_else(|e| e.into_inner()) = Ok(facts_json(state, head));
+        *self.facts.lock().unwrap_or_else(|e| e.into_inner()) =
+            Ok((state.to_string(), head.to_string()));
+    }
+    /// The mergeability GitHub reports — `CLEAN`, `CONFLICTING`, or any of the
+    /// several words that are neither (`BEHIND`, `BLOCKED`, …), which
+    /// `pr_mergeability_result` deliberately does not short-circuit on.
+    fn set_merge_state(&self, merge: &str) {
+        *self.merge.lock().unwrap_or_else(|e| e.into_inner()) = merge.to_string();
     }
     fn calls(&self) -> Vec<Vec<String>> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+    /// How many `gh pr checks` calls this fake has answered — the positive
+    /// control for the second call `observe_pr` SKIPS on a conflict.
+    fn checks_calls(&self) -> usize {
+        self.calls().iter().filter(|a| a.iter().any(|s| s == "checks")).count()
+    }
 }
 
-fn facts_json(state: &str, head: &str) -> String {
+fn facts_json(state: &str, head: &str, merge: &str) -> String {
     format!(
         r#"{{"state":"{state}","headRefOid":"{head}","baseRefName":"main","body":"b",
-             "mergeStateStatus":"CLEAN","additions":1,"deletions":1}}"#
+             "mergeStateStatus":"{merge}","additions":1,"deletions":1}}"#
     )
 }
 
@@ -692,7 +730,14 @@ impl RdRunner for FakeGh {
             return out("ok\np src/lib.rs\n");
         }
         match &*self.facts.lock().unwrap_or_else(|e| e.into_inner()) {
-            Ok(s) => out(s),
+            // Composed at read time from the two axes a test sets separately, so
+            // a `set_facts` and a `set_merge_state` can be issued in either
+            // order and neither silently reverts the other.
+            Ok((state, head)) => out(&facts_json(
+                state,
+                head,
+                &self.merge.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            )),
             Err(e) => Err(e.clone()),
         }
     }
@@ -2188,8 +2233,108 @@ fn a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not() {
     );
 }
 
+/// The four CI observations `rd_lane_brief` renders, named so a shape pin can
+/// be run against each rather than against whichever one the fixture happened
+/// to produce (#1863 D2).
+#[derive(Clone, Copy, Debug)]
+enum CiArm {
+    Green,
+    Red,
+    Conflicting,
+    Pending,
+}
+
+impl CiArm {
+    /// The sentence this arm must render, verbatim. It is the CONTENT pin that
+    /// makes each fixture discriminating: a `Conflicting` fixture that quietly
+    /// produced the `Pending` sentence would satisfy every shape assertion, and
+    /// this is what refuses it.
+    fn sentence(self) -> &'static str {
+        match self {
+            CiArm::Green => "This PR's checks are green at that head.",
+            CiArm::Red => "This PR's checks are RED at that head.",
+            CiArm::Conflicting => "This PR does not merge cleanly at that head.",
+            CiArm::Pending => {
+                "This PR's checks are not green at that head (orrerix could not read a settled result)."
+            }
+        }
+    }
+}
+
+/// Drive to an opened lane whose brief was rendered under `arm`, and return that
+/// brief.
+///
+/// **`Green` is the only arm with a direct route**, because `ci-wait` leaves for
+/// `review-wait` on green and on nothing else. The other three reach a lane
+/// through **arc 8**: a red CI hands the PR back, the worker reports `done`
+/// WITHOUT pushing, and `fix-wait -> review-wait` is taken without consulting
+/// `facts.ci` at all — the "that failure was unrelated" turn. That is the one
+/// route on which a lane is briefed at a head whose CI is not green, which is
+/// the entire reason `rd_lane_brief` reads `brief.ci`, and
+/// `a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not` is
+/// the test written against it. The arm under test is then set on the tick that
+/// OPENS the lane, so what the brief renders is what that tick observed.
+fn lane_brief_under(arm: CiArm) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    if matches!(arm, CiArm::Green) {
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _b, lane) =
+            opened.lanes_opened.first().cloned().expect("a lane opens on a green drive");
+        return lane_brief(&reg, &lane);
+    }
+
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let handed = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, worker) =
+        handed.handbacks.first().cloned().expect("a red CI hands the PR back to its worker");
+    assert_eq!(status_state(&reg, &group), "fix-wait", "{arm:?}: the hand-back must have happened");
+
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: worker,
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "status": "done", "summary": "that failure was unrelated" } }),
+    )
+    .expect("the driven worker reports");
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "{arm:?}: arc 8 must reach review-wait at an unchanged head"
+    );
+
+    match arm {
+        // Returned above; the arm is listed rather than absorbed by a `_` so a
+        // fifth `CiObservation` is a compile error here.
+        CiArm::Green => {}
+        // The red payload set for the hand-back is already what this arm wants.
+        CiArm::Red => {}
+        CiArm::Conflicting => gh.set_merge_state("CONFLICTING"),
+        CiArm::Pending => gh.set_checks(r#"[{"name":"build","state":"IN_PROGRESS","link":"x"}]"#),
+    }
+    let opened = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, _b, lane) = opened
+        .lanes_opened
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("{arm:?}: a lane must open once review-wait is reached"));
+    lane_brief(&reg, &lane)
+}
+
 /// **A brief's sentences are each one paragraph**, pinned as a SHAPE beside the
-/// content the two tests around this one assert.
+/// content the two tests around this one assert — **once per CI arm**.
 ///
 /// This is `manager_lifecycle.rs`'s `is_one_paragraph` idiom, and it is here
 /// because the CI literals shipped exactly the failure it exists to catch: a
@@ -2199,44 +2344,62 @@ fn a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not() {
 /// the break — which is the whole reason a shape pin has to sit beside a content
 /// pin rather than being implied by it.
 ///
-/// Both halves are checked. A hard break is the obvious form; a run of ten
+/// **It ran on one arm, and it was the wrong one** (#1863 D2). The fixture was
+/// `FakeGh::green(HEAD_A)`, so `brief.ci` was `Green` — the one short literal
+/// that never had the defect. The `\n` plus seventeen spaces lived in the `Red`,
+/// `Conflicting` and `Pending`/`Unknown` arms exclusively, so a regression on
+/// the three arms that carry the risk would have shipped under a green test
+/// whose own doc said it existed to catch it. That is #1344's rule pointed at a
+/// test rather than at a guard: a green is evidence about the POPULATION it ran
+/// over, never about the property.
+///
+/// Each arm also asserts its own sentence verbatim, which is what stops the
+/// widened population from being four runs of one fixture: a route that silently
+/// produced the `Green` sentence under `CiArm::Conflicting` passes every shape
+/// assertion and fails the content one.
+///
+/// Both shape halves are checked. A hard break is the obvious form; a run of ten
 /// spaces is the one a collapsed `\` continuation leaves behind, with no newline
 /// at all to notice.
 #[test]
 fn a_lane_brief_is_one_paragraph_per_sentence() {
-    let dir = tempfile::tempdir().unwrap();
-    let reg = relaunch_registry(dir.path());
-    let repo = Repo::new();
-    let gh = FakeGh::green(HEAD_A);
-    let (group, _session) = driven(&reg, &repo, &gh);
-    reg.rd_drive_group_with(&group, &gh, 10_000);
-    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
-    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("a lane opens");
-    let brief = lane_brief(&reg, &lane);
+    for arm in [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending] {
+        let brief = lane_brief_under(arm);
 
-    // The template itself is deliberately multi-paragraph; what must not carry a
-    // break is any single interpolated sentence. So this reads the lines rather
-    // than the whole, and asserts none of them leaks source indentation.
-    let mut checked = 0usize;
-    for line in brief.lines() {
-        checked += 1;
+        // The template itself is deliberately multi-paragraph; what must not
+        // carry a break is any single interpolated sentence. So this reads the
+        // lines rather than the whole, and asserts none of them leaks source
+        // indentation.
+        let mut checked = 0usize;
+        for line in brief.lines() {
+            checked += 1;
+            assert!(
+                !line.contains("          "),
+                "{arm:?}: a brief line leaks source indentation, which is what a collapsed \
+                 `\\` continuation leaves behind: {line:?}"
+            );
+        }
+        assert!(checked > 3, "{arm:?}: the positive control — this must have read real lines");
+
+        // And the CI sentence specifically, which is the one that shipped
+        // broken. Found by the prefix every arm shares, so the finder itself
+        // does not decide which arm it is looking at.
+        let ci_line = brief
+            .lines()
+            .find(|l| l.trim_start().starts_with("This PR"))
+            .unwrap_or_else(|| {
+                panic!("{arm:?}: every lane brief states the CI it observed: {brief}")
+            });
         assert!(
-            !line.contains("          "),
-            "a brief line leaks source indentation, which is what a collapsed `\\` \
-             continuation leaves behind: {line:?}"
+            ci_line.contains(arm.sentence()),
+            "{arm:?}: the brief must render THIS arm's sentence — a fixture that reached a \
+             different arm would satisfy every shape assertion below: {ci_line:?}"
+        );
+        assert!(
+            !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
+            "{arm:?}: the CI sentence must be one whole paragraph on one line: {ci_line:?}"
         );
     }
-    assert!(checked > 3, "the positive control: this must have read real lines, not none");
-
-    // And the CI sentence specifically, which is the one that shipped broken.
-    let ci_line = brief
-        .lines()
-        .find(|l| l.contains("checks are"))
-        .expect("every lane brief states the CI it observed");
-    assert!(
-        !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
-        "the CI sentence must be one whole paragraph on one line: {ci_line:?}"
-    );
 }
 
 /// The control for the test above: on a genuinely green drive the brief still
@@ -2285,5 +2448,387 @@ fn a_torn_drive_record_refuses_the_enqueue_instead_of_reading_as_undriven() {
         json!("rd-state-unreadable"),
         "a drive record orrerix cannot read is a FAULT, not evidence that the PR is undriven: \
          {after}"
+    );
+}
+
+// ── the CONFLICTING arc, through the seam (#1862) ────────────────────────────
+//
+// Everything below reaches `CiObservation::Conflicting` by giving `FakeGh` a
+// non-clean `mergeStateStatus` and letting the real `observe_pr` classify it.
+// None of it hands a `DriveFacts` to `decide`: that construction is what pinned
+// this arc before, and it is the construction #1841's B1 — the driven
+// reviewer's `report(approved)` read as a worker finishing — was green under
+// through two clean review passes. The arc it leaves untested is the one that
+// fires whenever the default branch moves under a driven PR, on a budget of one.
+
+/// **`observe_pr` classifies the mergeability, and SKIPS the second call.**
+///
+/// The two halves share one fixture and differ in one field. The canned
+/// `gh pr checks` payload stays **green for the whole test**, which is what makes
+/// the operands collide: after the mergeability flips, everything asserted below
+/// is decided by that field alone. An `observe_pr` that read checks first, or
+/// that never classified the mergeability JSON at all, reads `SUCCESS` here and
+/// lands the drive in `review-wait` — failing every assertion rather than
+/// passing vacuously. The `CLEAN` half is the positive control for the skip: it
+/// establishes that this fake DOES answer `gh pr checks` and that the driver
+/// DOES ask, so the absence below is a skip rather than a fake that was never
+/// wired.
+///
+/// The skip is not an optimisation with a fallback. GitHub creates no check
+/// suite for a PR with no clean merge ref, so `gh pr checks` on a conflicting PR
+/// sits at "no checks reported" — `Pending` — forever, which is why the
+/// mergeability is read FIRST. Reading it second would make every conflict look
+/// like a slow build until `drive_timeout_minutes` ended the drive with the
+/// wrong reason.
+#[test]
+fn a_conflicting_pr_is_classified_through_the_seam_and_the_checks_call_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // ── CLEAN, green checks: arc 2, and the control for the skip ────────────
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(status_state(&reg, &group), "review-wait", "a CLEAN + green tick is arc 2");
+    assert!(
+        gh.checks_calls() > 0,
+        "the positive control: a CLEAN tick DOES spend the second call, so its absence below \
+         is a skip and not a fake that never answers `checks`"
+    );
+
+    // ── CONFLICTING, with the SAME green checks payload ─────────────────────
+    gh.set_merge_state("CONFLICTING");
+    gh.set_facts("OPEN", HEAD_B);
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "ci-wait",
+        "arc 6: the head moved under the lane, which is what returns the drive to the state \
+         the conflict is read in"
+    );
+
+    let checks_before = gh.checks_calls();
+    let audits_before = audit_actions(&reg, &group).len();
+    let report = reg.rd_drive_group_with(&group, &gh, 30_000);
+
+    assert_eq!(
+        gh.checks_calls(),
+        checks_before,
+        "`observe_pr` must SKIP `gh pr checks` when the first read says CONFLICTING — the \
+         answer is already known and GitHub has no suite to report"
+    );
+    assert_eq!(
+        status_state(&reg, &group),
+        "fix-wait",
+        "arc 3: a conflict is a hand-back for a rebase"
+    );
+
+    let mut all = audit_actions(&reg, &group);
+    let after = all.split_off(audits_before);
+    assert!(
+        after.iter().any(|a| a == "rd-conflicting"),
+        "the tick that classified the conflict must say so in the audit: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|a| a == "rd-ci-red" || a == "rd-ci-green"),
+        "…and must not ALSO report a check result it never read: {after:?}"
+    );
+
+    // The budget spent is the REBASE one. A conflict misclassified as a red run
+    // reaches `fix-wait` too, so the state alone does not discriminate between
+    // the two arcs — the counter does.
+    let s = reg.review_drive_status(&group);
+    assert_eq!(s["drives"][0]["counters"]["rebase_attempts"], json!(1), "{s}");
+    assert_eq!(
+        s["drives"][0]["counters"]["ci_attempts"],
+        json!(0),
+        "a conflict must not spend a CI attempt: the two budgets are separate because a \
+         rebase and a failing build are different work, and one of them is spendable once: {s}"
+    );
+    assert!(
+        report.handbacks.first().is_some(),
+        "the conflict hands the PR back to a worker, which is the whole point of the arc"
+    );
+}
+
+/// **A mergeability that is neither `CLEAN` nor `CONFLICTING` is not a conflict**
+/// — and is not treated as one.
+///
+/// `pr_mergeability_result` short-circuits on the literal `CONFLICTING` and on
+/// nothing else, deliberately: `BEHIND`, `BLOCKED`, `UNSTABLE`, `DRAFT` and
+/// `UNKNOWN` are all states in which GitHub still runs checks, so the second
+/// call is the answer and taking the conflict arc on one of them would spend the
+/// single rebase attempt on a PR with nothing to rebase.
+///
+/// This is the negative control for the test above. Without it, "classify every
+/// non-CLEAN mergeability as a conflict" passes there, and the arc would fire on
+/// the several ordinary states a driven PR passes through.
+#[test]
+fn a_mergeability_that_is_merely_not_clean_is_not_a_conflict() {
+    for state in ["BEHIND", "BLOCKED", "UNSTABLE", "UNKNOWN"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _session) = driven(&reg, &repo, &gh);
+
+        gh.set_merge_state(state);
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+
+        assert_eq!(
+            status_state(&reg, &group),
+            "review-wait",
+            "{state}: the checks are green and this state is not a conflict, so arc 2 is what \
+             answers"
+        );
+        assert!(
+            gh.checks_calls() > 0,
+            "{state}: the second call must still be made — it is the answer here"
+        );
+        let s = reg.review_drive_status(&group);
+        assert_eq!(
+            s["drives"][0]["counters"]["rebase_attempts"],
+            json!(0),
+            "{state}: no rebase attempt may be spent on a state that is not a conflict: {s}"
+        );
+    }
+}
+
+/// **The conflict hand-back tells the worker to rebase, and says the budget is
+/// one.**
+///
+/// `{{WHAT}}` is loomux-authored text chosen from a closed set of three, and the
+/// conflict arm is the one no test rendered: `no_placeholder_survives_into_a_brief`
+/// covers the first-call and ci-red arms, and this is the third.
+///
+/// The three arms are pinned as **mutually exclusive** rather than one at a
+/// time. A `rd_fix_brief` that fell through to the review-findings arm renders a
+/// brief that is well-formed, carries no placeholder, and tells the worker to go
+/// read findings that do not exist — which is exactly the silent wrong-brief the
+/// arms exist to prevent.
+///
+/// The attempt line matters on its own. A worker told "attempt 1 of 3" on a
+/// budget of one would reasonably push a partial resolution and expect two more
+/// tries; there are none, and the next conflict is a hold rather than a retry.
+#[test]
+fn a_conflict_hand_back_briefs_the_rebase_and_names_the_single_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    // CONFLICTING from the first tick, so `ci-wait` takes arc 3 before any lane
+    // has opened and the brief under test is the only thing that happened.
+    gh.set_merge_state("CONFLICTING");
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    let report = reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(status_state(&reg, &group), "fix-wait", "arc 3 on the first tick");
+    let (_pr, worker) = report
+        .handbacks
+        .first()
+        .cloned()
+        .expect("the conflict hand-back resumed a worker pane");
+    let fix = lane_brief(&reg, &worker);
+
+    assert!(!fix.contains("{{"), "an unregistered placeholder survived into a fix brief: {fix}");
+    assert!(
+        fix.contains("It is CONFLICTING against main."),
+        "the brief must name the base it conflicts against, which is the fact the worker acts \
+         on: {fix}"
+    );
+    assert!(
+        fix.contains("Rebase onto origin/main, resolve, and push."),
+        "…and the instruction itself, naming the remote ref rather than a local branch that \
+         may be stale: {fix}"
+    );
+    assert!(
+        fix.contains("This is attempt 1 of 1."),
+        "the rebase budget is ONE, and the brief must say so — a worker told it has three \
+         would reasonably push a partial resolution: {fix}"
+    );
+
+    // The other two arms are ABSENT. This is what makes the assertions above
+    // about the conflict arm rather than about a template that renders every
+    // sentence it has.
+    assert!(
+        !fix.contains("CI is red at that head"),
+        "the ci-red arm must not render on a conflict: {fix}"
+    );
+    assert!(
+        !fix.contains("Review requested changes"),
+        "…nor the review-findings arm, which would send the worker to findings that do not \
+         exist: {fix}"
+    );
+
+    // One paragraph, as the lane briefs are. The conflict sentence carries two
+    // clauses across a `\` continuation in the source and would ship the indent
+    // between them if one ever collapsed.
+    let what = fix
+        .lines()
+        .find(|l| l.starts_with("It is CONFLICTING"))
+        .unwrap_or_else(|| panic!("the conflict arm rendered on its own line: {fix}"));
+    assert!(
+        what.contains("Rebase onto origin/main") && !what.contains("          "),
+        "the conflict sentence must arrive as one whole paragraph on one line: {what:?}"
+    );
+}
+
+/// **The single rebase attempt is spent, and the second conflict is a HOLD.**
+///
+/// §2.2's `rebase-limit` row is *"a second conflict after the one rebase
+/// hand-back"*, and the budget cannot be spent twice — so a mistake on this arc
+/// is not a retry, it is a park that waits for a human.
+///
+/// **The first half is the positive control for the second.** The drive
+/// demonstrably TAKES the hand-back and demonstrably spends the counter, so the
+/// hold that follows is exhaustion rather than a refusal from the start: an
+/// implementation that held on the FIRST conflict — never spending the attempt
+/// at all — fails the first half, and one that never held fails the second.
+/// Without the first half, `counter_exhausted`'s check-before-bump ordering
+/// could be inverted and this test would not notice.
+#[test]
+fn a_second_conflict_after_the_one_rebase_hand_back_holds_on_rebase_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    gh.set_merge_state("CONFLICTING");
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // ── the first conflict: the attempt is SPENT ────────────────────────────
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(status_state(&reg, &group), "fix-wait", "the first conflict hands back");
+    let s = reg.review_drive_status(&group);
+    assert_eq!(
+        s["drives"][0]["counters"]["rebase_attempts"],
+        json!(1),
+        "the one attempt must be SPENT here, or the hold below is a refusal rather than an \
+         exhaustion: {s}"
+    );
+
+    // The worker pushes its resolution — arc 7, on the head moving.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(status_state(&reg, &group), "ci-wait", "arc 7: the worker pushed");
+
+    // ── and it still conflicts ──────────────────────────────────────────────
+    let report = reg.rd_drive_group_with(&group, &gh, 30_000);
+    assert_eq!(status_state(&reg, &group), "held", "the second conflict has no attempt to spend");
+    let s = reg.review_drive_status(&group);
+    assert_eq!(s["drives"][0]["held_reason"], json!("rebase-limit"), "{s}");
+    assert_eq!(
+        s["drives"][0]["counters"]["rebase_attempts"],
+        json!(1),
+        "the hold must not spend an attempt it does not have — the counter stays at its \
+         bound rather than passing it: {s}"
+    );
+
+    let notice = report
+        .notices
+        .iter()
+        .find(|n| n.contains("rebase"))
+        .or_else(|| report.notices.first())
+        .unwrap_or_else(|| panic!("a hold must deliver its notice: {:?}", report.notices));
+    assert!(
+        notice.contains("still CONFLICTING"),
+        "the notice names the fact that decides what the orchestrator does next: {notice}"
+    );
+    assert!(
+        notice.contains("cancel_review_drive"),
+        "…and the tool that acts on it, since a compacted orchestrator reading this line must \
+         not have to remember the API: {notice}"
+    );
+}
+
+// ── #1863 D1: the count and its own closing sentence ─────────────────────────
+
+/// **A closed refusal list and the sentence that closes it state the SAME
+/// number.**
+///
+/// `queue_merge`'s description opens *"FIVE FURTHER REASONS MEAN LOOMUX ITSELF
+/// FAILED"*, enumerates them, and used to close twenty words later, in the same
+/// sentence-group, with *"None of the four should appear in a running build."*
+/// The count went to five when the review driver's own `rd-state-unreadable`
+/// joined the list; three instances were corrected and the fourth — the one
+/// nearest a corrected one — was not (#1863 D1).
+///
+/// It lives in this file rather than in `tests/mergequeue.rs` because the fifth
+/// reason is the driver's, and the miss was the driver's PR.
+///
+/// **The assertion is AGREEMENT, not a literal.** Pinning "five" would go stale
+/// the moment a sixth reason is added, in the same direction as the defect: the
+/// test would then be enforcing a wrong number rather than catching one. What
+/// cannot go stale is that the opening word and the closing word are two
+/// statements of one fact.
+///
+/// The third assertion cross-checks both against the list itself, and its
+/// delimiter is stated rather than assumed: every one of these five reasons
+/// carries a parenthesised gloss, so <code>` (</code> counts each exactly once.
+/// A reason added WITHOUT a gloss makes this count wrong and the test red, which
+/// is the direction to fail in — the alternative is a census that cannot see one
+/// of its own subjects and reports a smaller number with no sign it did. The
+/// sibling clause in `drive_review`'s description is deliberately NOT covered
+/// here for exactly that reason: its `rd-unavailable` carries no gloss, so this
+/// delimiter would silently under-count it.
+#[test]
+fn queue_merges_failure_list_agrees_with_both_numbers_that_describe_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = Caller {
+        agent_id: orch.id.clone(),
+        group: group.clone(),
+        role: Role::Orchestrator,
+        role_hint: None,
+    };
+
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let desc = listed["tools"]
+        .as_array()
+        .expect("tools/list answers an array")
+        .iter()
+        .find(|t| t["name"] == json!("queue_merge"))
+        .and_then(|t| t["description"].as_str())
+        .expect("the orchestrator is offered queue_merge")
+        .to_string();
+
+    let (before, clause) = desc
+        .split_once(" FURTHER REASONS MEAN LOOMUX ITSELF FAILED")
+        .expect("the description opens its failure list with a count");
+    let opener = before.rsplit(' ').next().unwrap_or_default().to_ascii_lowercase();
+    let (listed_text, _) = clause
+        .split_once(" should appear in a running build")
+        .expect("…and closes it with a second count");
+    let closer = listed_text.rsplit(' ').next().unwrap_or_default().to_ascii_lowercase();
+
+    // The positive control. Both words must have been READ — an empty string
+    // equals an empty string, and a parse that found nothing would otherwise
+    // satisfy the agreement below without having looked at anything.
+    let number = |w: &str| -> Option<usize> {
+        ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight"]
+            .iter()
+            .position(|c| *c == w)
+    };
+    let n_open = number(&opener)
+        .unwrap_or_else(|| panic!("the opening count is not a number word: {opener:?}"));
+    let n_close = number(&closer)
+        .unwrap_or_else(|| panic!("the closing count is not a number word: {closer:?}"));
+
+    assert_eq!(
+        n_open, n_close,
+        "the two counts describing one list disagree — it opens {opener:?} and closes \
+         {closer:?}, twenty words apart in the same sentence-group"
+    );
+
+    // …and both against the list they describe.
+    let enumerated = listed_text.matches("` (").count();
+    assert_eq!(
+        enumerated, n_open,
+        "the count and the enumeration disagree: {n_open} claimed, {enumerated} reasons \
+         parsed. If a reason was just added WITHOUT a parenthesised gloss, this delimiter \
+         cannot see it — fix the delimiter here rather than the number"
     );
 }
