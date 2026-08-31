@@ -1669,9 +1669,12 @@ at all, so your own config decides.
 roster's block rows and its merge-gate row sit four more: **Intake**, **Merge
 queue**, **Review driver** and **Resources** - the same `intake:`,
 `merge_queue:`, `driver:` and `resources:` blocks described elsewhere on this
-page. The first, second and fourth each have an enable-toggle and their fields;
-the driver row is read-only for now (it shows what the file declares) - edit
-`driver:` in the text editor. The block form covers the
+page. Each has an enable-toggle whose state is the section itself: switching a
+section on writes its block, and switching it off removes the section rather
+than writing `enabled: false` (absent and off are the same thing to orrerix,
+and deleting is tidier). The driver's counters and timeouts are number fields
+clamped to their own declared ranges, so the form cannot write a value the
+engine refuses the file over. The block form covers the
 rest: `role_hint`, and `allow:` as a list of tool patterns (one row per
 pattern, because a real pattern contains commas).
 
@@ -1685,7 +1688,9 @@ editor for now.
 Two things those forms will not let you do, because orrerix's engine would
 refuse the file: write a number outside a field's range (the inputs clamp —
 slots 1–64, max hold 1–480 minutes, at most 32 resources, a batch of at least
-1), and pair a `role_hint` with a kind that hint does not apply to. A value a
+1, and the driver's counters to 1–3 rounds/attempts and 0–1 rebases with its
+timeouts at 5–240 minutes), and pair a `role_hint` with a kind that hint does
+not apply to. A value a
 *hand-edited* file already carries is shown as a finding instead, with the
 distinction that matters spelled out — a bound orrerix **refuses** reads as an
 error, one it **clamps** (`checks_timeout_minutes`) as a warning.

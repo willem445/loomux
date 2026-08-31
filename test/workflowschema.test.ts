@@ -28,6 +28,7 @@ import {
   roleHintRequires,
   serializeWorkflow,
   DRIVER_DEFAULTS,
+  setDriverEnabled,
   RESOURCE_SLOTS_MIN,
   RESOURCE_SLOTS_MAX,
   RESOURCE_MAX_HOLD_MINUTES_MIN,
@@ -335,6 +336,10 @@ through this emitter, so a field it skips is a line the pane deletes:\n${text}`
 
 /** Claimed by a form control today. Slice C fills this from its descriptor registry.
  *
+ *  The `driver.*` rows arrived hand-built with #1869 (enable-toggle plus the six
+ *  counters, bounds read from `POLICY_BOUNDS`) — the same shape `mergeQueueForm` is,
+ *  and the same shape slice C will replace.
+ *
  *  Slice C also has two manifest keys to HONOR, not merely to render (#880 review
  *  finding 4): `on_out_of_range` says whether a number's bound is refused by the engine
  *  (stop the submit) or silently clamped (accept and coerce), and `max_entries` on
@@ -342,7 +347,15 @@ through this emitter, so a field it skips is a line the pane deletes:\n${text}`
  *  33rd entry produces a file the engine refuses whole. Both are pinned against the
  *  engine in `src-tauri/tests/orchestration.rs`, so the data is trustworthy; consuming
  *  it is the renderer's half. */
-const FIELDS_WITH_AN_EDITOR = new Set<string>([]);
+const FIELDS_WITH_AN_EDITOR = new Set<string>([
+  "driver.enabled",
+  "driver.max_review_rounds",
+  "driver.max_ci_attempts",
+  "driver.max_rebase_attempts",
+  "driver.lane_timeout_minutes",
+  "driver.fix_timeout_minutes",
+  "driver.drive_timeout_minutes",
+]);
 
 /** No control yet — every leaf field, as of slice A. */
 const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
@@ -387,19 +400,10 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "merge_queue.enabled",
   "merge_queue.max_batch",
   "merge_queue.checks_timeout_minutes",
-  // #1778. The pane READS, EMITS and VALIDATES `driver:` - the round-trip and
-  // bounds tests above and `workflowmodel.test.ts` check that - and it has a
-  // read-only inspector summary, but no form control, and deliberately not:
-  // `FIELDS_WITH_AN_EDITOR` is empty and slice C's descriptor registry is what
-  // retires the hand-built forms, so a fourth one is the last thing this
-  // section needs.
-  "driver.enabled",
-  "driver.max_review_rounds",
-  "driver.max_ci_attempts",
-  "driver.max_rebase_attempts",
-  "driver.lane_timeout_minutes",
-  "driver.fix_timeout_minutes",
-  "driver.drive_timeout_minutes",
+  // #1869 moved the driver fields OUT of this list: the pane now has an enable-toggle
+  // (write rule in `setDriverEnabled` — off deletes the block, absent and
+  // `enabled: false` are the same state to the engine) and bounded number fields for
+  // the six counters, so they are claimed in `FIELDS_WITH_AN_EDITOR` above.
   "resource.slots",
   "resource.max_hold_minutes",
   // #1175. The pane PARSES, PRESERVES and RE-EMITS `board:` (that is what the two
@@ -469,6 +473,64 @@ test("every schema field is either editable in the pane or listed as not yet edi
     [],
     "a new schema field needs a decision: give it a form control, or list it as pending"
   );
+  // The non-vacuity control, mirroring the block-key test above: #1869 put seven
+  // fields in `FIELDS_WITH_AN_EDITOR`, so the set is no longer empty — and a future
+  // refactor that empties it (accidentally or "temporarily") must fail here rather
+  // than pass as two mutually-empty sets.
+  assert.ok(
+    FIELDS_WITH_AN_EDITOR.size >= 7,
+    `FIELDS_WITH_AN_EDITOR looks empty: ${FIELDS_WITH_AN_EDITOR.size}`
+  );
+  for (const id of ids) {
+    if (id.startsWith("driver.")) {
+      assert.ok(
+        FIELDS_WITH_AN_EDITOR.has(id),
+        `${id}: the driver block's fields are editable since #1869 — moving one back to pending without deleting its control is a silent retraction`
+      );
+    }
+  }
+});
+
+// ---------- (c3) the driver toggle's write rule (#1869) ----------
+
+test("the driver toggle's OFF deletes the block — never writes enabled: false (#1869)", () => {
+  // Absent and `enabled: false` are the same state to the engine, and deleting is
+  // the tidier of the two — the same reason `mergeQueueForm`'s toggle deletes. The
+  // block goes WHOLE, even when it carries counters: a form that wrote
+  // `enabled: false` onto a file with counters would leave a block whose only live
+  // content is a statement of absence.
+  const w = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n  max_review_rounds: 2\n"
+  ).workflow;
+  setDriverEnabled(w, false);
+  assert.equal(w.driver, undefined, "OFF must delete the block, not write enabled: false");
+});
+
+test("the driver toggle's ON from absent writes exactly { enabled: true }, and it round-trips (#1869)", () => {
+  // No counters invented: every one defaults to INVARIANT 9's ceiling, so a first
+  // run needs none — and the emitted YAML is what "the pane edits the YAML" means.
+  const w = parseWorkflow("version: 1\nblocks:\n  - id: b\n    kind: worker\n").workflow;
+  setDriverEnabled(w, true);
+  assert.deepEqual(w.driver, { enabled: true }, "ON must write { enabled: true } and nothing else");
+  const text = serializeWorkflow(w);
+  assert.match(text, /^driver:\n  enabled: true\n/m, `the emitted file must carry the block:\n${text}`);
+  assert.deepEqual(
+    parseWorkflow(text).workflow.driver,
+    { enabled: true },
+    "the write must survive serialize → parse"
+  );
+});
+
+test("the driver toggle's ON on a hand-written enabled: false keeps that file's other fields (#1869)", () => {
+  // The merge-queue lesson (#1020 review, finding 4) at the other end of the toggle:
+  // the counters are the human's lines. Flipping a declared-off block on must set
+  // `enabled` and nothing else — replacing the block would wipe a value the human
+  // wrote and the engine honors.
+  const w = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: false\n  max_review_rounds: 2\n"
+  ).workflow;
+  setDriverEnabled(w, true);
+  assert.deepEqual(w.driver, { enabled: true, max_review_rounds: 2 });
 });
 
 // ---------- (c2) the frontend's veto fallback agrees with the engine ----------

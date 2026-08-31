@@ -726,6 +726,25 @@ export const DRIVER_DEFAULTS: Readonly<{
   drive_timeout_minutes: 240,
 };
 
+/** The driver form's enable-toggle write rule (#1869). ON writes `{ enabled: true }` —
+ *  or, when a block already stands (a hand-written `enabled: false` beside declared
+ *  counters), flips just `enabled` and leaves the rest of the human's lines alone: the
+ *  merge-queue lesson in reverse (#1020 review, finding 4 — a form must not silently
+ *  rewrite what it did not write). OFF deletes the block ENTIRELY — absent and
+ *  `enabled: false` are the same state to the engine, and deleting is the tidier of
+ *  the two (#1869), so even a block that carries counters goes whole. Extracted from
+ *  the view because this is the one line of the toggle whose shape a test can pin
+ *  without a DOM: the round-trip through the emitter is what "the pane edits the
+ *  YAML" has to mean. */
+export function setDriverEnabled(w: Workflow, on: boolean): void {
+  if (!on) {
+    delete w.driver;
+    return;
+  }
+  if (w.driver) w.driver.enabled = true;
+  else w.driver = { enabled: true };
+}
+
 /** One named lock resource (#858) — how many agents may hold it at once and for
  *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
  *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */
@@ -839,11 +858,9 @@ export type FindingCode =
  *  here with no form to land on would be a click that goes nowhere. Its findings carry a
  *  message naming `board.wip.<status>` instead, which is what the raw-text view needs
  *  anyway; the member and the form arrive together or not at all. */
-/** `driver:` (#1778) IS a member despite having no form either - but unlike `board:` it
- *  has a READ-ONLY inspector view (the summary the nav row lands on), so a finding's
- *  click lands on a surface that shows the declared state and names the fix in its
- *  message (the YAML, per the merge-queue precedent). It gains a form when slice C
- *  builds one, the same as every other member. */
+/** `driver:` (#1778) is a member WITH a form since #1869 (enable-toggle plus the six
+ *  counters, same shape as `mergeQueueForm`), so a finding's click lands on the form
+ *  that can fix it — the same click-to-the-fix routing the other policy sections get. */
 export type FindingSection = "intake" | "merge_queue" | "driver" | "resources";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
