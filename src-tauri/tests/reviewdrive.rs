@@ -1933,3 +1933,259 @@ fn a_resume_recovers_a_drive_older_than_its_own_timeouts() {
         "a resumed drive re-held on the lane clock, which is the same defect at 60 minutes"
     );
 }
+
+/// **`held(lane-stalled)` must be recoverable by the thing its own notice tells
+/// you to do**, which is the half of B2 that `drive-stalled` got and this did
+/// not.
+///
+/// The notice says "read that pane, then drive_review to resume". Arc 11 does
+/// put the drive back to `ci-wait` — but `decide_review_wait` re-opens a lane
+/// only when `lane_open_for` is false, and at a stable head it stays true, so
+/// the lane that stalled was never spoken to again. Re-arming `spawned_ms` made
+/// that *quieter* rather than better: before it the drive re-held on the first
+/// tick, after it the drive sat silent for a full `lane_timeout_minutes` and
+/// re-held then.
+///
+/// So the assertion is deliberately **not** "it did not re-hold" — that passes
+/// on a drive doing nothing for an hour, which is the bug. It is that the
+/// stalled lane is briefed **again**, in the pane it already had.
+#[test]
+fn a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7101);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let session = "cafb930d-1111-2222-3333-444444444444";
+    let out = reg.drive_review_with(&group, &gh, 1758, session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "{out}");
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b0, lane0) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: lane0,
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - lane one is happy" } }),
+    )
+    .expect("lane 0 records");
+
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, block1, lane1) =
+        second.lanes_opened.first().cloned().expect("lane 1 opens after lane 0's pass");
+    assert_eq!(block1, "rev-final");
+
+    // Lane 1 then says nothing at all, past its timeout — with the drive's own
+    // age bound still far away, so this parks on `lane-stalled` and not on
+    // `drive-stalled`.
+    let stalled_at = 30_000 + 61 * 60 * 1000;
+    reg.rd_drive_group_with(&group, &gh, stalled_at);
+    assert_eq!(
+        reg.review_drive_status(&group)["drives"][0]["held_reason"],
+        json!("lane-stalled"),
+        "the fixture must park on the hold this test is about, not on another one"
+    );
+
+    // The remedy the notice prints, at the clock the hold happened on.
+    let out = reg.drive_review_with(&group, &gh, 1758, session, false, 0, "orch-1", stalled_at);
+    assert_eq!(out["driving"], json!(true), "{out}");
+
+    // The assertion the defect moves.
+    let after = stalled_at + 60_000;
+    let resumed = reg.rd_drive_group_with(&group, &gh, after);
+    let reopened: Vec<String> = resumed.lanes_opened.iter().map(|(_, b, _)| b.clone()).collect();
+    assert!(
+        reopened.iter().any(|b| b == "rev-final"),
+        "a resumed lane-stalled drive must re-brief the lane that stalled — otherwise the resume \
+         its own notice instructs buys a silent lane_timeout and then re-holds: {reopened:?}"
+    );
+
+    // …in the pane it already had, not a second one beside it.
+    let (_pr, _b, agent_after) = resumed
+        .lanes_opened
+        .iter()
+        .find(|(_, b, _)| b == "rev-final")
+        .cloned()
+        .expect("checked immediately above");
+    assert_eq!(
+        agent_after, lane1,
+        "`rd_open_lane` resumes the session already recorded for a lane, so the stalled pane is \
+         re-briefed rather than a second reviewer being spawned beside it"
+    );
+
+    // And the lane whose pass still stands is left alone.
+    assert!(
+        !reopened.iter().any(|b| b == "rev-std"),
+        "clearing the briefed head must not re-brief a lane whose pass still stands: {reopened:?}"
+    );
+}
+
+/// The control for the test above. The re-open is scoped to `lane-stalled`, so
+/// a resume out of a **different** hold must not re-brief a lane that is
+/// legitimately mid-review.
+///
+/// Without this, "re-open every lane on every resume" satisfies the assertion
+/// above and is wrong: it would re-deliver a brief to a reviewer who is reading
+/// the diff, on every resume of any hold.
+#[test]
+fn a_resume_out_of_a_different_hold_does_not_re_brief_a_working_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, session) = driven(&reg, &repo, &gh);
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert!(
+        !opened.lanes_opened.is_empty(),
+        "a lane must be open for this control to mean anything"
+    );
+
+    // Park on the drive's AGE, not the lane's: this lane is inside its own
+    // timeout and has simply not answered yet.
+    let past_drive_timeout = 241 * 60 * 1000;
+    reg.rd_drive_group_with(&group, &gh, past_drive_timeout);
+    assert_eq!(
+        reg.review_drive_status(&group)["drives"][0]["held_reason"],
+        json!("drive-stalled"),
+        "this is only a control if the hold is a different one"
+    );
+
+    let out =
+        reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", past_drive_timeout);
+    assert_eq!(out["driving"], json!(true), "{out}");
+    let resumed = reg.rd_drive_group_with(&group, &gh, past_drive_timeout + 60_000);
+    assert!(
+        resumed.lanes_opened.is_empty(),
+        "a lane inside its own timeout was re-briefed because some OTHER hold on the same drive \
+         was resumed: {:?}",
+        resumed.lanes_opened
+    );
+}
+
+/// **A lane brief states the CI this tick OBSERVED, and never an unconditional
+/// green.**
+///
+/// Both lane templates asserted "this PR's checks are green" as a fact, and
+/// `rd_lane_brief` never read `brief.ci` — though the driver had the
+/// observation in hand and the fix path already reads it.
+///
+/// The reachable path is arc 8: `fix-wait -> review-wait` on a worker's
+/// `report(done)` at an unchanged head, which by design does **not** consult
+/// `facts.ci`. A drive that entered `fix-wait` on a red CI and whose worker
+/// reports done without pushing — the "that failure was unrelated" turn — then
+/// briefs its reviewers with a green the same tick had just read as red.
+#[test]
+fn a_lane_brief_reports_the_ci_it_saw_and_never_asserts_a_green_it_did_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // CI is red from the first tick, so `ci-wait` hands back on arc 3 before any
+    // lane has opened or recorded anything.
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let handed = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, worker) =
+        handed.handbacks.first().cloned().expect("a red CI hands the PR back to its worker");
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+
+    // The worker reports done WITHOUT pushing: the head does not move, so arc 7
+    // cannot fire and arc 8 is what answers.
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: worker,
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "status": "done", "summary": "that failure was unrelated" } }),
+    )
+    .expect("the driven worker reports");
+
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "arc 8 must put the drive in review-wait at an unchanged head with CI still red"
+    );
+
+    let opened = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, _b, lane) =
+        opened.lanes_opened.first().cloned().expect("a lane opens once review-wait is reached");
+    let brief = lane_brief(&reg, &lane);
+    assert!(
+        !brief.contains("checks are green"),
+        "the brief told a reviewer the checks were green at a head this very tick read as RED: \
+         {brief}"
+    );
+    assert!(
+        brief.contains("RED"),
+        "…and it must say what it actually saw rather than merely omitting the false claim, or a \
+         template with the sentence deleted would pass this: {brief}"
+    );
+}
+
+/// The control for the test above: on a genuinely green drive the brief still
+/// says so. Without it, "never mention CI at all" satisfies the red assertion.
+#[test]
+fn a_lane_brief_on_a_green_drive_still_says_the_checks_are_green() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("a lane opens on green");
+    let brief = lane_brief(&reg, &lane);
+    assert!(brief.contains("checks are green"), "{brief}");
+}
+
+/// **A drive record orrerix cannot read refuses the enqueue rather than reading
+/// as "not driven".**
+///
+/// `load_state(..).map(is_driven).unwrap_or(false)` answered a question it had
+/// not been able to ask, and in the one direction that is unsafe: the queue
+/// would enqueue a PR that may be under a live drive, which is precisely the
+/// overlap §8.1 forbids. Every other unreadable-state site in this codebase
+/// refuses — `queue-state-unreadable` sits a few lines above this one.
+#[test]
+fn a_torn_drive_record_refuses_the_enqueue_instead_of_reading_as_undriven() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // A control first: while the record IS readable, this PR is refused for
+    // being driven — so the refusal below is about the record being torn and not
+    // about `queue_merge` refusing everything in a repo with no real remote.
+    let before = reg.queue_merge(&group, 1758, None);
+    assert_eq!(before["refused"], json!("in-review-drive"), "{before}");
+
+    assert!(reg.corrupt_drive_record_for_test(&group), "the record must exist to be torn");
+
+    let after = reg.queue_merge(&group, 1758, None);
+    assert_eq!(
+        after["refused"],
+        json!("rd-state-unreadable"),
+        "a drive record orrerix cannot read is a FAULT, not evidence that the PR is undriven: \
+         {after}"
+    );
+}
