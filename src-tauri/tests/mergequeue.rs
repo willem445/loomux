@@ -2128,7 +2128,7 @@ fn drain_fake() -> Fake {
 fn cancelled_to_empty(f: &Fake, gate: &GateSpec) -> MergeQueueState {
     let mut s = MergeQueueState { version: MERGE_QUEUE_VERSION, ..Default::default() };
     assert_eq!(
-        enqueue(f, &mut s, 612, None, true, gate, &verdict_map(HEAD_A, "b"), 0),
+        enqueue(f, &mut s, 612, None, true, gate, &verdict_map(HEAD_A, "b"), 0, false),
         EnqueueOutcome::Queued { position: 1 },
         "the first enqueue establishes the target, as it always has"
     );
@@ -2137,7 +2137,7 @@ fn cancelled_to_empty(f: &Fake, gate: &GateSpec) -> MergeQueueState {
     // asserted here so both tests below start from a queue that has genuinely
     // refused, not merely from one that was never asked.
     assert_eq!(
-        enqueue(f, &mut s, 705, None, true, gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(f, &mut s, 705, None, true, gate, &verdict_map(HEAD_B, "b"), 0, false),
         EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() },
         "a live entry was approved against the old target and must not be retargeted"
     );
@@ -2167,7 +2167,7 @@ fn a_drained_queue_takes_the_next_enqueues_target() {
     // contradicted by a residue nobody asserted anything about.
     let asserted = Some("integration/batch4");
     assert_eq!(
-        enqueue(&f, &mut s, 705, asserted, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(&f, &mut s, 705, asserted, true, &gate, &verdict_map(HEAD_B, "b"), 0, false),
         EnqueueOutcome::Queued { position: 1 },
         "a drained queue has no entry left to protect, so this establishes"
     );
@@ -2244,7 +2244,7 @@ fn a_drained_queue_leaves_no_terminal_entries_behind() {
     // …and re-establishing a target starts from an empty queue rather than
     // inheriting the old campaign's rows.
     assert_eq!(
-        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0, false),
         EnqueueOutcome::Queued { position: 1 }
     );
     assert_eq!(s.target, "integration/batch4");
@@ -2330,7 +2330,7 @@ fn a_live_campaign_bounds_the_corpses_it_keeps() {
     // A cheap refusal writes nothing — the trim happens on the path that was
     // already rewriting the file, not on every touch.
     assert_eq!(
-        enqueue(&f, &mut s, 612, None, true, &gate, &verdict_map(HEAD_A, "b"), 0),
+        enqueue(&f, &mut s, 612, None, true, &gate, &verdict_map(HEAD_A, "b"), 0, false),
         EnqueueOutcome::Refused { reason: loomux_lib::orchestration::mqloop::refusal::ALREADY_QUEUED },
         "the live 612 is still queued"
     );
@@ -2339,7 +2339,7 @@ fn a_live_campaign_bounds_the_corpses_it_keeps() {
     // A real enqueue against the SAME target tidies as it writes.
     let f2 = drain_fake().gh("pr view 613", 0, &pr_json("integration/batch3", HEAD_B, "b"), "");
     assert_eq!(
-        enqueue(&f2, &mut s, 613, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(&f2, &mut s, 613, None, true, &gate, &verdict_map(HEAD_B, "b"), 0, false),
         EnqueueOutcome::Queued { position: 2 },
         "612 and 613 are the live entries; the corpses are not queued work"
     );
@@ -2375,7 +2375,7 @@ fn a_refused_enqueue_still_releases_a_stale_target() {
     };
 
     assert_eq!(
-        enqueue(&f, &mut s, 800, None, true, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0),
+        enqueue(&f, &mut s, 800, None, true, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0, false),
         EnqueueOutcome::Refused { reason: TargetRefusal::BaseIsDefault.code() },
         "constraint 7 outranks everything and is unaffected by the release"
     );
@@ -2391,7 +2391,7 @@ fn a_refused_enqueue_still_releases_a_stale_target() {
     };
     let before = s.clone();
     assert_eq!(
-        enqueue(&f, &mut s, 800, None, false, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0),
+        enqueue(&f, &mut s, 800, None, false, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0, false),
         EnqueueOutcome::Refused {
             reason: loomux_lib::orchestration::mqloop::refusal::QUEUE_DISABLED
         }
@@ -2423,7 +2423,7 @@ fn a_queue_that_has_not_drained_still_refuses_a_different_branch() {
     assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
     assert_eq!(s.target, "integration/batch3", "613 is still live and holds the target");
     assert_eq!(
-        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0, false),
         EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() }
     );
 
@@ -2441,7 +2441,7 @@ fn a_queue_that_has_not_drained_still_refuses_a_different_branch() {
         "an in-flight batch was built against this target and has not been abandoned yet"
     );
     assert_eq!(
-        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0, false),
         EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() },
         "the landing path reads state.target: retargeting under a live batch would \
          land an object built from one branch onto another"

@@ -184,7 +184,7 @@ own delivery arrives by its own path; §7.)
 | `held(fix-stalled)` | a resumed **worker** neither pushed nor reported inside `fix_timeout_minutes` |
 | `held(drive-stalled)` | the drive's **age** — `now - started_ms`, never an idle clock reset by each state advance — passed `drive_timeout_minutes`. The precedent is `mqloop::status_view`, whose `since_ms` is `now_ms.saturating_sub(e.enqueued_ms)`: age since the entry began, not time since it last moved. An idle clock would leave §8's `also: [base-green]` row parked **forever**, because that drive advances `gate-check` → `ci-wait` on every wake and would reset the timer each time — which is precisely the silent park that row says the bound exists to prevent |
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
-| `held(gate-unreadable)` | the gate file is present and could not be read (an I/O error), which is **not** `gate-not-configured` |
+| `held(gate-unreadable)` | the gate file is present and orrerix cannot use it — an I/O error, **or** contents `parse_gate_file` refuses. **Not** `gate-not-configured`, which means the file is genuinely absent. *S3 widened this row from "an I/O error" alone: the `gh` shim refuses every merge on a malformed gate, so a drive that announced satisfied over one would be §3.1's "bypass with better telemetry" — and this enum has no third reason to give it* |
 | `held(worker-blocked)` | the worker reported `blocked` |
 | `held(worker-unresumable)` | the recorded worker session no longer resolves |
 | `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
@@ -303,6 +303,18 @@ Every read-modify-write of that file is serialized under `rd_state_lock`, the
 `mq_state_lock` lesson applied before it can be relearned: the load-decide-store
 spans a spawn, and a `drive_review` landing inside that window would otherwise
 read the pre-spawn file and write it back, erasing the entry.
+
+**That sentence and #467/#468 look like they contradict each other, and S3 had
+to resolve it rather than pick a half.** The rule this design inherits from the
+queue is that no registry lock is held across a notice *delivery*, because a
+delivery enqueues and an enqueue can re-enter registry locks — and a spawn
+delivers its own kickoff, so "span the spawn" reads as "span a delivery". Both
+hold, on one fact about this lock in particular: `rd_state_lock` is taken by
+exactly four call sites — the tick and the three tools of §5.1 — and none of
+them is reachable from a pane delivery, so a spawn's own kickoff cannot cycle
+back onto it. The orchestrator notices §6 produces are a different matter and
+are delivered outside it. A later change that gives a fifth caller this lock
+owes that argument again.
 
 ## 3. Ownership, authority, and consent
 
@@ -537,7 +549,8 @@ drive_review(pr: number, worker_session: string,
   -> { driving: true, state: "ci-wait" } | { refused: "<reason>" }
   declines:      driver-disabled | pr-not-open | pr-unverifiable
                | resume-not-found | resume-ambiguous | resume-session-empty
-               | already-driven | gate-not-configured | gate-names-no-such-block
+               | already-driven | in-merge-queue | gate-not-configured
+               | gate-names-no-such-block
   orrerix failed: rd-state-unreadable | rd-state-unwritable | rd-unavailable
                | gate-unreadable
 
@@ -599,6 +612,39 @@ Four are new, and each closes a case that would otherwise have no answer:
   not declare is answerable at drive time from two files, and left unanswered it
   becomes `held(lane-stalled)` sixty minutes later instead of an immediate one.
 
+**A fifth is `in-merge-queue`, and §8.1's mutual refusal turned out to be
+half-unimplemented in BOTH directions.** §8.1 states it as a pair — "a driven PR
+may not be queued, and a queued PR may not be driven" — and this section's list
+named neither side. Checked at source on S4: `mqloop::refusal` had no
+driver-aware name at all and `mqloop::enqueue` made no such check, so the
+sentence in §8.1 described a mechanism that did not exist on either side of it.
+Both land here.
+
+- **`drive_review` answers `in-merge-queue`** when a non-terminal queue entry
+  holds the PR.
+- **`queue_merge` answers `in-review-drive`** when a **live** drive holds it,
+  and that name joins the queue's own closed set.
+
+**Named for the HOLDER rather than for the state, and that is a contract
+decision rather than a stylistic one.** The obvious spellings were
+`already-queued` on one side and `already-driven` on the other, and
+`already-queued` is *taken*: `mqloop::refusal` uses it for a different subject —
+"this PR is already in the merge queue" — read by a caller of `queue_merge`. A
+caller of `drive_review` receiving it would have to know which tool it had
+called in order to know which thing was queued. These strings are a contract an
+agent branches on, so each has to read correctly from either side.
+
+**The two thresholds are deliberately not the same word, and the asymmetry is
+the argument.** `drive_review` refuses on a **non-terminal** queue entry, which
+is `already-queued`'s own test, because a queued entry can move the PR's head at
+any moment — a batch build rebases it — and a lane reviewing a revision the
+queue replaced underneath it is the race §8.1 exists to make unreachable.
+`queue_merge` refuses on a **live** drive, §5.2's own word, because a `held`
+drive is *parked*: the tick does not advance it, so it moves nothing and cannot
+race a batch. Queuing under a parked drive is therefore allowed, and if anyone
+later resumes that drive the other half refuses it. Each side uses the other's
+vocabulary for its own threshold, which is why neither reads as an oversight.
+
 **`routing-unaccountable` is deliberately not a drive-time decline**, though it
 is a `held` reason — and the ground is *transience*, not re-evaluation.
 (Re-evaluation alone would remove `gate-not-configured` and `pr-not-open` too:
@@ -640,8 +686,9 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "head": "<sha>",
       "body_digest": "<digest>",
       "worker_session": "<full uuid, as resolved>",
+      "worker_agent": "w-7",
       "on_behalf_of": "<orchestrator agent id>",
-      "lanes": [ { "block": "rev-std", "session": "<uuid>",
+      "lanes": [ { "block": "rev-std", "session": "<uuid>", "agent": "rev-4",
                    "last_verdict": "pass", "at_head": "<sha>",
                    "briefed_head": "<sha>", "briefed_digest": "<digest>",
                    "spawned_ms": 0 } ],
@@ -666,7 +713,8 @@ somewhere to measure from. `lane-stalled` is "no verdict inside
 `lane_timeout_minutes`" and `fix-stalled` is "neither pushed nor reported
 inside `fix_timeout_minutes`", and a bound with no *persisted* anchor is not a
 bound — §2.4 resumes a drive from disk after a restart, so an in-memory clock
-cannot carry either one. Three fields, each answering exactly one question:
+cannot carry either one. Three fields, each answering exactly one question — and
+S3 added two more, described after them:
 
 - **`spawned_ms`** (per lane) — when that lane's delegate was last spawned or
   resumed. The `lane-stalled` anchor. A re-brief *replaces* the lane's record
@@ -704,7 +752,24 @@ cannot carry either one. Three fields, each answering exactly one question:
   put that clock one field access away from every later timeout. It is written
   on entry to `fix-wait` and nowhere else.
 
-All three are optional on read, so a file written against the shape as first
+**S3's two, and both are the same field for two subjects: the PANE.** `agent`
+(per lane) and `worker_agent` (per entry) record the agent id the delegate is
+running in, beside the session id already there. Two things need it and a
+session id answers neither. §2.2's `lane-stalled` notice **names the pane**, and
+a pane is an agent id (`rev-4`), never a session UUID. And §7's interception is
+"keyed on the agent": an MCP caller arrives carrying a `caller.agent_id`, so
+without these fields the only key available is something the delegate typed —
+which is precisely what §7 forbids, in the paragraph that explains why.
+
+**Empty never matches**, and that is the fail-closed direction rather than an
+accident of `serde(default)`. A drive that has not handed back yet carries an
+empty `worker_agent`, and a lane written before these fields existed carries an
+empty `agent`; under a guard that compared them naively, either would own every
+caller whose id failed to resolve. An unrecorded pane therefore owns nobody: its
+traffic reaches the orchestrator exactly as it always did, which is the wrong
+recipient and never a wrong *authority*.
+
+All five are optional on read, so a file written against the shape as first
 published still parses. `counters` is **not** optional: an absent counter block
 is refused rather than defaulted to zeros, because zeros silently grant a full
 fresh budget — the same outcome the retention rule below refuses when it
@@ -1002,10 +1067,14 @@ Both loops run under `gh_poll_tick` against the same group, and their overlap is
 specified rather than left to whichever lands first:
 
 - **A driven PR may not be queued, and a queued PR may not be driven.**
-  `queue_merge` refuses a PR with a live drive, mirroring `already-queued`; and
-  `drive_review` refuses a PR with a live queue entry. The two loops both move a
-  PR's head and both read its verdicts, and neither was designed expecting the
-  other to be doing so concurrently.
+  `queue_merge` refuses a PR with a live drive as `in-review-drive`, a name
+  added to the queue's own closed set by S4; `drive_review` refuses a PR with a
+  non-terminal queue entry as `in-merge-queue`. The two loops both move a PR's
+  head and both read its verdicts, and neither was designed expecting the other
+  to be doing so concurrently. §5.1's *in-merge-queue* paragraph carries why
+  neither is spelled `already-…` and why the two thresholds differ; until S4
+  **neither** side made the refusal, so this bullet described a mechanism that
+  did not exist.
 - **The intended sequence is serial, and it has a direction**: a drive ends at
   `satisfied`, the orchestrator dispositions the findings (INVARIANT 3), and
   *then* it queues. `queue_merge`'s contract already says "call it once per PR,

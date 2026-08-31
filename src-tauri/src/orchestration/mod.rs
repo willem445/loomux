@@ -50466,8 +50466,17 @@ impl OrchRegistry {
         // `merge_queue_reconcile_with` decides its write: a value comparison
         // cannot drift out of step with what the callee actually mutates.
         let before = state.clone();
-        let outcome =
-            mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());
+        // §8.1's mutual refusal: the fact is resolved HERE, because
+        // `review_drives.json` is a different file in this group dir and
+        // reading it is a registry job; the decision is `mqloop::enqueue`'s,
+        // beside its opposite number. A `held` drive is deliberately NOT a
+        // refusal: it is parked, so it moves nothing and cannot race a
+        // batch, and `drive_review` refuses `in-merge-queue` if anyone
+        // later tries to resume it under a live queue entry.
+        let driven = reviewdrive::load_state(&dir).map(|s| s.is_driven(pr)).unwrap_or(false);
+        let outcome = mqloop::enqueue(
+            runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms(), driven,
+        );
         match outcome {
             mqloop::EnqueueOutcome::Queued { position } => {
                 if let Err(e) = mqloop::store_state(&dir, &state) {
