@@ -1710,14 +1710,31 @@ fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
         .find(|n| n.contains("HELD"))
         .expect("a hold delivers exactly one notice");
 
+    // **Split at the pane clause, and assert on each half for what that half
+    // claims.** #1871 B3 appended a disclosure that names EVERY pane the drive
+    // owns, `rev-std`'s included, and it names it for a correct reason — so a
+    // whole-notice `!contains("rev-std")` stopped being a discriminator the
+    // moment that clause landed. Relaxing the assertion to fit would delete the
+    // witness; scoping it to the SUBJECT clause keeps it exactly as strong,
+    // because a rule that always named the first lane would still put `rev-std`
+    // there. The second half then pins what the disclosure is actually for,
+    // which is why this is a repin rather than a narrowing.
+    let (subject, panes) = notice
+        .split_once(" Panes this drive opened")
+        .expect("a held drive discloses the panes it still owns (#1871 B3)");
     assert!(
-        notice.contains("lane rev-final"),
-        "the hold must name the lane that STALLED: {notice}"
+        subject.contains("lane rev-final"),
+        "the hold must name the lane that STALLED: {subject}"
     );
     assert!(
-        !notice.contains("rev-std"),
+        !subject.contains("rev-std"),
         "…and must not name the lane that PASSED — a rule that always named the first lane \
-         would satisfy the assertion above and be just as wrong: {notice}"
+         would satisfy the assertion above and be just as wrong: {subject}"
+    );
+    assert!(
+        panes.contains("(rev-std)") && panes.contains("(rev-final)"),
+        "…while the disclosure names BOTH, because it answers a different question: which \
+         panes are still running and still this drive's: {panes}"
     );
     assert!(
         notice.contains(&lane1),
