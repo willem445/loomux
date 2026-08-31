@@ -630,6 +630,8 @@ impl OrchRegistry {
                 }
             }
         }
+        // PRs whose kick-back could not be delivered — see the prune below.
+        let mut undelivered: Vec<u64> = Vec::new();
         for o in &outs {
             for (action, detail) in &o.audits {
                 self.rd_audit(group, &o.on_behalf_of, action, detail.clone());
@@ -643,8 +645,18 @@ impl OrchRegistry {
             if let Some((to, _)) = o.advanced {
                 report.advanced.push((o.pr, to));
             }
+            // **§5.2 prunes a terminal entry ONCE ITS NOTICE HAS BEEN
+            // DELIVERED**, and `prune_terminal`'s own doc says the caller owns
+            // that ordering because the function cannot enforce it. Discarding
+            // the delivery's result made "delivered" unknowable, so a notice
+            // that never reached a pane still pruned the only entry that could
+            // have produced it again. The result is kept and the prune below
+            // consults it.
             for n in &o.notices {
-                let _ = self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR);
+                match self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR) {
+                    Ok(()) => {}
+                    Err(_) => undelivered.push(o.pr),
+                }
                 self.rd_task_note(group, o.pr, n);
                 report.notices.push(n.clone());
             }
@@ -664,7 +676,21 @@ impl OrchRegistry {
             let _state_guard = self.rd_state_lock.lock_safe();
             match reviewdrive::load_state(&dir) {
                 Ok(mut state) => {
-                    let dropped = reviewdrive::prune_terminal(&mut state);
+                    // A terminal entry whose notice did not reach a pane is kept
+                    // rather than pruned: pruning it would drop the only record
+                    // that could produce that notice again, which is what §5.2's
+                    // ordering rule exists to prevent.
+                    let held_back: Vec<reviewdrive::DriveEntry> = state
+                        .entries
+                        .iter()
+                        .filter(|e| e.state().is_terminal() && undelivered.contains(&e.pr))
+                        .cloned()
+                        .collect();
+                    let dropped: Vec<u64> = reviewdrive::prune_terminal(&mut state)
+                        .into_iter()
+                        .filter(|pr| !undelivered.contains(pr))
+                        .collect();
+                    state.entries.extend(held_back);
                     if dropped.is_empty() || reviewdrive::store_state(&dir, &state).is_ok() {
                         dropped
                     } else {
@@ -1451,16 +1477,37 @@ impl OrchRegistry {
                                     json!({ "pr": pr, "reason": "worker-unresumable",
                                             "detail": why }),
                                 ));
-                                let _ = entry.advance(
+                                // **The arc's result decides what the notice may
+                                // claim.** Discarding it let `out.advanced`
+                                // announce a hold the entry had not taken — the
+                                // notice says parked, the file says `fix-wait`,
+                                // and the next tick hands back again. A value
+                                // computed and dropped at a boundary, which is
+                                // the axis this round is about.
+                                match entry.advance(
                                     reviewdrive::DriveState::Held,
                                     Some(reviewdrive::HeldReason::WorkerUnresumable),
                                     None,
                                     now,
-                                );
-                                out.advanced = Some((
-                                    reviewdrive::DriveState::Held,
-                                    Some(reviewdrive::HeldReason::WorkerUnresumable),
-                                ));
+                                ) {
+                                    Ok(()) => {
+                                        out.advanced = Some((
+                                            reviewdrive::DriveState::Held,
+                                            Some(reviewdrive::HeldReason::WorkerUnresumable),
+                                        ));
+                                    }
+                                    Err(bad) => {
+                                        // Unreachable — `fix-wait -> held` is arc
+                                        // 12 — and handled rather than claimed:
+                                        // the drive stays where it is and says so.
+                                        out.advanced = None;
+                                        out.audits.push((
+                                            rddrive::audit_action::REFUSED,
+                                            json!({ "pr": pr, "reason": "invalid-transition",
+                                                    "detail": bad.to_string() }),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1602,6 +1649,7 @@ impl OrchRegistry {
             reset_counters,
             rounds_already_spent,
             on_behalf_of,
+            now_ms(),
         )
     }
 
@@ -1616,6 +1664,7 @@ impl OrchRegistry {
         reset_counters: bool,
         rounds_already_spent: u32,
         on_behalf_of: &str,
+        now: u64,
     ) -> Value {
         use rddrive::refusal as r;
         if !self.driver_enabled(group) {
@@ -1717,10 +1766,38 @@ impl OrchRegistry {
                     entry.counters = reviewdrive::Counters::seeded(rounds_already_spent);
                 }
                 if entry
-                    .advance(reviewdrive::DriveState::CiWait, None, None, now_ms())
+                    .advance(reviewdrive::DriveState::CiWait, None, None, now)
                     .is_err()
                 {
                     return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
+                }
+                // **The age clocks restart on a resume, or arc 11 is a no-op for
+                // exactly the holds it exists to recover.**
+                //
+                // §2.2 makes `drive-stalled` the drive's AGE — `now -
+                // started_ms`, "never an idle clock reset by each state
+                // advance" — and `decide` checks it BEFORE any per-state logic.
+                // Left alone, a drive parked longer than `drive_timeout_minutes`
+                // re-holds `drive-stalled` on its very first tick after the
+                // resume, and every hold a human takes their time over is
+                // exactly that old. Four shipped surfaces promise the opposite.
+                //
+                // Resetting HERE does not reintroduce the idle clock that row
+                // forbids: the ban is on a stamp written by each state advance,
+                // and nothing on the tick path touches this. It moves only on a
+                // deliberate, role-gated, audited `drive_review` — the same
+                // event §2.3 already lets clear the counters. A drive being
+                // restarted is a drive whose age starts again; the counters,
+                // which are the budget, still carry unless `reset_counters` says
+                // otherwise.
+                //
+                // Each lane's `spawned_ms` is re-armed for the same reason and
+                // by the same argument: `lane-stalled` fires at 60 minutes, so
+                // without this a resumed drive re-holds on the FIRST tick for a
+                // lane the orchestrator has just looked at and chosen to resume.
+                entry.started_ms = now;
+                for l in entry.lanes.iter_mut() {
+                    l.spawned_ms = now;
                 }
                 // **A new session means the recorded PANE is stale**, and a
                 // stale pane is not merely useless — it is an interception key.
@@ -1740,12 +1817,19 @@ impl OrchRegistry {
                 // pruned starts a FRESH drive with fresh counters — the queue's
                 // own "comes back as a NEW entry" behaviour.
                 state.entries.retain(|e| e.pr != pr);
+                // **The clock is the caller's, and that is what makes the age
+                // bound testable at all.** `started_ms` is the anchor §2.2
+                // measures `drive-stalled` from, and stamping it from the wall
+                // clock here while the tick advances on an injected `now` put
+                // the two on different scales: `age_ms` saturated to zero for
+                // every synthetic clock, so `drive-stalled` could not fire in a
+                // test and never had. That is most of why B2 shipped.
                 state.entries.push(reviewdrive::DriveEntry::new(
                     pr,
                     &session,
                     on_behalf_of,
                     reviewdrive::Counters::seeded(rounds_already_spent),
-                    now_ms(),
+                    now,
                 ));
             }
             if reviewdrive::store_state(&dir, &state).is_err() {
