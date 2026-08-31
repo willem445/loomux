@@ -724,6 +724,21 @@ pub struct LaneRecord {
     /// that cannot prove it owns the speaker.
     #[serde(default)]
     pub agent: String,
+    /// Every EARLIER pane this drive opened for this lane, oldest first.
+    ///
+    /// **A re-brief supersedes a pane; it does not un-own it** (#1871 B2's
+    /// sibling arc). [`open_lane`](DriveEntry::open_lane) replaces this lane's
+    /// record wholesale, so before this field the previous pane's id was simply
+    /// gone — and that id is §7's interception key. A reviewer still finishing
+    /// its previous round then reported as if undriven, into the orchestrator's
+    /// pane, which is the one thing the drive exists to absorb.
+    ///
+    /// Superseded is not dead: `rd_open_lane` resumes the lane's SESSION, and
+    /// orrerix mints a new pane id for the resume while the old pane keeps
+    /// running until something closes it. Both panes are this drive's, for as
+    /// long as the drive is live.
+    #[serde(default)]
+    pub prior_agents: Vec<String>,
     /// The last verdict seen for this lane — a **record of what was read**,
     /// never a gate input. The live verdict file is re-read every tick, so
     /// nothing decides from this field; it is what `review_drive_status()`
@@ -793,6 +808,63 @@ pub enum DrivenRole {
     Lane(BlockId),
     /// The worker this drive resumed for a hand-back.
     Worker,
+}
+
+/// One pane this drive owns, and **whether it is the pane the drive would speak
+/// to now** — the two questions §7 has to answer separately (#1871 B2).
+///
+/// **Owning a pane and taking its word are different decisions, and collapsing
+/// them is a live defect in either direction.** A pane the drive superseded is
+/// still the drive's: its `report` is exactly the routing traffic §7 exists to
+/// absorb, and leaving it to reach the orchestrator defeats the quiet-pane
+/// property that is the whole measured benefit. But it is no longer the pane the
+/// hand-back went to, and its report describes a revision the drive has moved
+/// past — a `done` from a worker pane that was evicted two heads ago would
+/// satisfy, through arc 8, work the CURRENT worker is still in the middle of.
+///
+/// So: consume it, audit it under its own kind so a reader can tell the two
+/// apart, and give the state machine nothing. Only [`current`](DrivenPane::current)
+/// traffic advances a drive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrivenPane {
+    pub role: DrivenRole,
+    /// `false` for a pane a later spawn or hand-back superseded.
+    pub current: bool,
+}
+
+/// How many superseded panes one lane, or one drive's worker, keeps.
+///
+/// The drive's own counters already bound how many hand-backs and re-briefs a
+/// single drive performs, so nothing reachable today approaches this. It is a
+/// cap on the FILE rather than on the loop: `drive_review(reset_counters: true)`
+/// restores the budget on a parked drive as often as an orchestrator asks, and a
+/// record that grows without limit across resumes is one nobody bounded because
+/// each individual resume looked finite.
+///
+/// Dropping the OLDEST is the safe direction: a forgotten pane fails **closed**
+/// exactly as an unrecorded one does — its traffic is delivered to the
+/// orchestrator rather than consumed by a drive that can no longer prove it owns
+/// the speaker.
+pub const MAX_PRIOR_PANES: usize = 32;
+
+/// The superseded-pane list, normalized: no empties, no duplicates, never the
+/// pane that is superseding them, oldest first, capped.
+///
+/// **Deduplicated by agent id because a pane resumed twice is one pane.** The
+/// list is read by [`DriveEntry::driven_role`] — where a duplicate changes
+/// nothing — and printed in the exit notices, where naming `w-1715` twice reads
+/// as two panes a human then goes looking for.
+fn retain_panes(prior: Vec<String>, current: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in prior {
+        if a.is_empty() || a == current || out.iter().any(|s| *s == a) {
+            continue;
+        }
+        out.push(a);
+    }
+    let overflow = out.len().saturating_sub(MAX_PRIOR_PANES);
+    out.drain(..overflow);
+    out
 }
 
 /// A persisted verdict word, re-validated on the way in.
@@ -878,6 +950,23 @@ pub struct DriveEntry {
     /// traffic of a worker it did not resume.
     #[serde(default)]
     pub worker_agent: String,
+    /// Every EARLIER pane this drive resumed the worker into, oldest first —
+    /// [`LaneRecord::prior_agents`]'s twin, and **the field #1871 B2 was**.
+    ///
+    /// `worker_agent` was one slot, so the second hand-back evicted the first
+    /// pane's id from the only key §7 has. Measured on the dogfood run: the
+    /// drive resumed the worker into `w-1715`, whose `report(progress)` was
+    /// consumed correctly; it then handed back again into `w-1716`, and
+    /// `w-1715` — still running, still on the same session and the same PR —
+    /// had both of its `report(done)` calls delivered to the orchestrator as if
+    /// nobody owned it. Every pane in that list is the SAME worker session; a
+    /// drive that owns the worker owns each pane it resumed that worker into.
+    ///
+    /// Cleared with `worker_agent` when a resume re-points the drive at a
+    /// DIFFERENT session, for that field's reason: those panes are a worker
+    /// this drive no longer owns.
+    #[serde(default)]
+    pub prior_worker_agents: Vec<String>,
     /// The orchestrator this drive acts for. Every action taken under it is
     /// audited with this as the `on_behalf_of` detail key — the actor stays
     /// `brand::AUDIT_ACTOR`, so it is this key, not the actor, that
@@ -959,6 +1048,7 @@ impl DriveEntry {
             body_digest: String::new(),
             worker_session: worker_session.to_string(),
             worker_agent: String::new(),
+            prior_worker_agents: Vec::new(),
             on_behalf_of: on_behalf_of.to_string(),
             lanes: Vec::new(),
             lane_index: 0,
@@ -1052,6 +1142,8 @@ impl DriveEntry {
     /// asked about and what [`lane_open_for`] later compares are the same fact
     /// recorded once. An unreadable body records empty, which that comparison
     /// reads as "cannot tell" rather than as drift.
+    /// **The superseded pane is carried, not dropped** — see
+    /// [`LaneRecord::prior_agents`].
     pub fn open_lane(
         &mut self,
         block: &str,
@@ -1061,6 +1153,11 @@ impl DriveEntry {
         body_digest: Option<&str>,
         now_ms: u64,
     ) {
+        let prior = self.lane(block).map(|l| {
+            let mut p = l.prior_agents.clone();
+            p.push(l.agent.clone());
+            p
+        });
         let extra = self
             .lane(block)
             .map(|l| l.extra.clone())
@@ -1070,6 +1167,7 @@ impl DriveEntry {
             block: block.to_string(),
             session: session.to_string(),
             agent: agent.to_string(),
+            prior_agents: retain_panes(prior.unwrap_or_default(), agent),
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.to_string(),
@@ -1077,6 +1175,57 @@ impl DriveEntry {
             spawned_ms: now_ms,
             extra,
         });
+    }
+
+    /// Record that this drive has resumed its worker into `agent` — the
+    /// hand-back's twin of [`open_lane`](DriveEntry::open_lane), and the reason
+    /// the assignment is a method rather than a field write at the call site.
+    ///
+    /// A hand-back that assigned `worker_agent` directly is exactly how #1871 B2
+    /// happened: the write looked total and was, and the pane it overwrote went
+    /// on running with the drive no longer able to recognise it. Everything a
+    /// new pane must do to the old one is here, once.
+    pub fn record_worker_pane(&mut self, agent: &str) {
+        let mut prior = std::mem::take(&mut self.prior_worker_agents);
+        prior.push(std::mem::take(&mut self.worker_agent));
+        self.prior_worker_agents = retain_panes(prior, agent);
+        self.worker_agent = agent.to_string();
+    }
+
+    /// Forget every worker pane this drive resumed — the resume-onto-a-different
+    /// session case, where those panes belong to a worker it no longer owns.
+    pub fn forget_worker_panes(&mut self) {
+        self.worker_agent = String::new();
+        self.prior_worker_agents.clear();
+    }
+
+    /// Every pane this drive has opened and still owns, superseded ones included
+    /// — what an exit owes the orchestrator (#1871 B3), and the same population
+    /// [`driven_role`](DriveEntry::driven_role) recognises.
+    ///
+    /// Kept as a second walk rather than as `driven_role`'s implementation: that
+    /// one has to answer **which** pane and whether it is current, and folding
+    /// the two would either lose that distinction or make the common
+    /// single-lookup path build a vector per incoming `report`.
+    ///
+    /// Ordered worker-first then lane by lane, each oldest-first, so the list
+    /// reads as the history it is. Deduplicated on the way in — see
+    /// [`retain_panes`].
+    pub fn owned_panes(&self) -> Vec<(String, DrivenRole)> {
+        let mut out: Vec<(String, DrivenRole)> = Vec::new();
+        for a in self.prior_worker_agents.iter().chain(std::iter::once(&self.worker_agent)) {
+            if !a.is_empty() {
+                out.push((a.clone(), DrivenRole::Worker));
+            }
+        }
+        for l in &self.lanes {
+            for a in l.prior_agents.iter().chain(std::iter::once(&l.agent)) {
+                if !a.is_empty() {
+                    out.push((a.clone(), DrivenRole::Lane(l.block.clone())));
+                }
+            }
+        }
+        out
     }
 
     /// The drive's age (§2.2's `drive-stalled` measure).
@@ -1130,17 +1279,25 @@ impl DriveEntry {
     /// both carry, and an empty caller id is not a thing the MCP seam produces
     /// anyway. Without this guard a drive with no hand-back yet would own every
     /// caller whose id failed to resolve.
-    pub fn driven_role(&self, agent_id: &str) -> Option<DrivenRole> {
+    pub fn driven_role(&self, agent_id: &str) -> Option<DrivenPane> {
         if agent_id.is_empty() {
             return None;
         }
         if self.worker_agent == agent_id {
-            return Some(DrivenRole::Worker);
+            return Some(DrivenPane { role: DrivenRole::Worker, current: true });
         }
-        self.lanes
-            .iter()
-            .find(|l| l.agent == agent_id)
-            .map(|l| DrivenRole::Lane(l.block.clone()))
+        if self.prior_worker_agents.iter().any(|a| a == agent_id) {
+            return Some(DrivenPane { role: DrivenRole::Worker, current: false });
+        }
+        self.lanes.iter().find_map(|l| {
+            if l.agent == agent_id {
+                Some(DrivenPane { role: DrivenRole::Lane(l.block.clone()), current: true })
+            } else if l.prior_agents.iter().any(|a| a == agent_id) {
+                Some(DrivenPane { role: DrivenRole::Lane(l.block.clone()), current: false })
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -1404,9 +1561,17 @@ impl DriveStep {
     }
 }
 
-/// Whether a lane's recorded verdict is a `pass` that still counts **at this
-/// (head, digest)** — §2.1's first carried-over property: *"a `pass` bound to
-/// an old head, or to an old body digest, is not a pass."*
+/// Whether a lane's recorded verdict was recorded **about the revision now on
+/// the PR** — the `(head, digest)` key, asked of the verdict WORD-BLIND.
+///
+/// §2.1's first carried-over property is written for a `pass` — *"a `pass` bound
+/// to an old head, or to an old body digest, is not a pass"* — and the binding
+/// rule underneath it is not about `pass` at all: **a verdict is bound to the
+/// revision it reviewed**, so once the head moves the lane owes a fresh one
+/// whatever word it last said. Reading the currency test only on the `pass` side
+/// is what let a `fail` recorded three commits ago stay authoritative, and
+/// [`decide_review_wait`] re-route it as though a reviewer had just spoken
+/// (#1871 B1).
 ///
 /// Asked with [`ReviewVerdict`]'s own methods rather than with comparisons
 /// written here, because §4 makes the driver a reader of the gate and never a
@@ -1415,17 +1580,33 @@ impl DriveStep {
 /// unbound verdict reads as stale and fails closed; and
 /// [`ReviewVerdict::body_changed`] answers `None` when the drift cannot be
 /// *known* — a verdict with no digest, or a body that could not be read — which
-/// is not `Some(true)` and so does not stale the pass. "We could not check" and
-/// "it changed" are different answers, and only one of them may re-open a lane.
-pub fn lane_pass_is_current(
+/// is not `Some(true)` and so does not stale the verdict. "We could not check"
+/// and "it changed" are different answers, and only one of them may re-open a
+/// lane.
+pub fn lane_verdict_is_current(
     verdict: Option<&ReviewVerdict>,
     head: &str,
     body_digest: Option<&str>,
 ) -> bool {
     let Some(v) = verdict else { return false };
-    v.verdict == Verdict::Pass
-        && v.reviewed(head)
-        && v.body_changed(body_digest) != Some(true)
+    v.reviewed(head) && v.body_changed(body_digest) != Some(true)
+}
+
+/// Whether a lane's recorded verdict is a `pass` that still counts at this
+/// `(head, digest)` — the currency rule above, plus the word.
+///
+/// Kept as its own function because [`first_stale_lane`] asks a different
+/// question from [`decide_review_wait`]'s match: "has this lane's pass settled
+/// the revision in front of us" versus "does this lane have anything to say
+/// about it". A stale `fail` answers **no** to the first and **no** to the
+/// second, and before #1871 only the first was asked.
+pub fn lane_pass_is_current(
+    verdict: Option<&ReviewVerdict>,
+    head: &str,
+    body_digest: Option<&str>,
+) -> bool {
+    verdict.is_some_and(|v| v.verdict == Verdict::Pass)
+        && lane_verdict_is_current(verdict, head, body_digest)
 }
 
 /// Whether this lane is open for exactly the revision now on the PR: it was
@@ -1605,9 +1786,35 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
         return DriveStep::to(DriveState::GateCheck);
     }
     let lane = &required[k];
-    match lane.verdict.as_ref().map(|v| v.verdict) {
-        // A lane recorded `escalate`: an LLM judgment call, and §3 says the
-        // driver never makes one.
+    // **A verdict decides only if it was recorded about THIS revision**, and the
+    // currency test is asked here rather than inside the arms so no future word
+    // can be added below without it (#1871 B1).
+    //
+    // The defect this closes: a lane's `fail` recorded at the head the worker has
+    // since fixed stayed authoritative for ever. The drive took arc 7 out of
+    // `fix-wait` on the new head, went green, came back here — and read the SAME
+    // stale `fail`, spent a review round on it, and handed the worker back its
+    // own already-addressed findings as "attempt 2". Three passes reached the
+    // bound with no re-review having happened at all. Nothing re-opened the lane
+    // because nothing below ever reached [`lane_open_for`]: the `Fail` arm
+    // answered first, and it answered from a commit that no longer described the
+    // PR.
+    //
+    // **Word-blind on purpose.** `escalate` is the same shape — an escalation of
+    // a revision that no longer exists is not a judgment anyone is being asked
+    // for — and so is a `pass`, which [`first_stale_lane`] has already filtered
+    // for currency before this line is reached. Treating a stale verdict as
+    // ABSENT is what puts the lane back on the `Some(Verdict::Pass) | None` arm,
+    // where [`lane_open_for`] decides between re-briefing it and waiting for a
+    // brief already out at this revision — which is the re-open the head change
+    // owed and never got.
+    let current = lane
+        .verdict
+        .as_ref()
+        .filter(|v| lane_verdict_is_current(Some(v), &facts.head, digest));
+    match current.map(|v| v.verdict) {
+        // A lane recorded `escalate` at this revision: an LLM judgment call, and
+        // §3 says the driver never makes one.
         Some(Verdict::Escalate) => DriveStep::held(HeldReason::Escalate),
         // Arc 5, spending a review round — or parking, when the budget is gone.
         Some(Verdict::Fail) => {
@@ -1617,10 +1824,11 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds)
             }
         }
-        // Either no verdict yet, or a `pass` that no longer stands here — which
-        // are the same thing to this state: the lane is outstanding and must be
-        // briefed for this revision. Whether it *already* was is what
-        // [`lane_open_for`] answers, on the full (head, digest) key.
+        // Either no verdict bound to this revision, or a `pass` that no longer
+        // stands here — which are the same thing to this state: the lane is
+        // outstanding and must be briefed for this revision. Whether it
+        // *already* was is what [`lane_open_for`] answers, on the full
+        // (head, digest) key.
         Some(Verdict::Pass) | None => {
             match entry.lane(&lane.block) {
                 Some(rec) if lane_open_for(rec, &facts.head, digest) => {
@@ -2260,8 +2468,8 @@ mod tests {
         e.open_lane("rev-std", "s1", "rev-4", "head-a", Some("d1"), 1_000);
         e.worker_agent = "w-7".into();
 
-        assert_eq!(e.driven_role("rev-4"), Some(DrivenRole::Lane("rev-std".into())));
-        assert_eq!(e.driven_role("w-7"), Some(DrivenRole::Worker));
+        assert_eq!(e.driven_role("rev-4"), Some(lane_pane("rev-std", true)));
+        assert_eq!(e.driven_role("w-7"), Some(worker_pane(true)));
         // A delegate this drive did not spawn is not this drive's, however
         // plausible its id: nothing is inferred from a prefix or a role.
         assert_eq!(e.driven_role("rev-5"), None);
@@ -2281,7 +2489,97 @@ mod tests {
         // ...and the positive control, so the four `None`s above are the guard
         // and not a method that answers `None` to everything.
         fresh.worker_agent = "w-1".into();
-        assert_eq!(fresh.driven_role("w-1"), Some(DrivenRole::Worker));
+        assert_eq!(fresh.driven_role("w-1"), Some(worker_pane(true)));
+    }
+
+    fn worker_pane(current: bool) -> DrivenPane {
+        DrivenPane { role: DrivenRole::Worker, current }
+    }
+
+    fn lane_pane(block: &str, current: bool) -> DrivenPane {
+        DrivenPane { role: DrivenRole::Lane(block.into()), current }
+    }
+
+    /// **#1871 B2, at the layer that owns the key.** A drive that hands back or
+    /// re-briefs twice must still recognise the pane it opened first: that pane
+    /// is live, on the same session, working the same PR, and its `report` is
+    /// exactly the traffic §7 exists to absorb. Before this the assignment was a
+    /// single slot, so the second spawn evicted the first pane's id outright and
+    /// its reports reached the orchestrator as if nobody owned it.
+    ///
+    /// The second half is the one the fix could get wrong in the other
+    /// direction: owning a superseded pane must not mean TAKING ITS WORD. Each
+    /// assertion therefore pins `current` as well as the role — a version that
+    /// answered `current: true` for every owned pane would satisfy a role-only
+    /// test and let a two-heads-stale `done` advance the drive.
+    #[test]
+    fn a_superseded_pane_is_still_owned_and_is_never_current() {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.record_worker_pane("w-1");
+        e.record_worker_pane("w-2");
+        assert_eq!(e.driven_role("w-2"), Some(worker_pane(true)), "the latest pane is current");
+        assert_eq!(
+            e.driven_role("w-1"),
+            Some(worker_pane(false)),
+            "the pane the second hand-back superseded is still this drive's — #1871 B2"
+        );
+
+        // The lane's sibling arc: `open_lane` replaces the record wholesale.
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "s1", "rev-2", "head-b", Some("d1"), 2_000);
+        assert_eq!(e.driven_role("rev-2"), Some(lane_pane("rev-std", true)));
+        assert_eq!(
+            e.driven_role("rev-1"),
+            Some(lane_pane("rev-std", false)),
+            "a re-brief supersedes a reviewer pane; it does not un-own it"
+        );
+
+        // The exit list (#1871 B3) is that same population, and it must not name
+        // a pane twice — a resumed-twice pane is one pane, and the notice sends a
+        // human looking for each id it prints.
+        e.record_worker_pane("w-1");
+        assert_eq!(e.driven_role("w-2"), Some(worker_pane(false)), "w-2 is superseded in turn");
+        let panes: Vec<String> = e.owned_panes().into_iter().map(|(a, _)| a).collect();
+        assert_eq!(
+            panes,
+            vec!["w-2", "w-1", "rev-1", "rev-2"],
+            "every pane once, worker first, oldest first within each"
+        );
+
+        // Re-pointing the drive at a different worker session forgets ALL of
+        // them, not just the current one — they belong to a worker this drive no
+        // longer owns.
+        e.forget_worker_panes();
+        assert_eq!(e.driven_role("w-1"), None);
+        assert_eq!(e.driven_role("w-2"), None);
+        assert_eq!(
+            e.driven_role("rev-2"),
+            Some(lane_pane("rev-std", true)),
+            "...and the lanes are untouched, so this is not a method that forgets everything"
+        );
+    }
+
+    /// The cap is on the FILE, and dropping the oldest is the fail-CLOSED
+    /// direction: a forgotten pane reads as unrecorded, so its traffic goes to
+    /// the orchestrator rather than being consumed by a drive that can no longer
+    /// prove it owns the speaker.
+    #[test]
+    fn the_prior_pane_list_is_capped_and_drops_the_oldest() {
+        let mut e = entry_at(DriveState::FixWait);
+        for i in 0..(MAX_PRIOR_PANES + 5) {
+            e.record_worker_pane(&format!("w-{i}"));
+        }
+        assert_eq!(e.prior_worker_agents.len(), MAX_PRIOR_PANES);
+        // 37 panes opened, 32 superseded ones kept plus the current one: the
+        // four oldest are gone.
+        assert_eq!(e.driven_role("w-0"), None, "the oldest is dropped, and fails closed");
+        assert_eq!(e.driven_role("w-3"), None);
+        assert_eq!(
+            e.driven_role("w-4"),
+            Some(worker_pane(false)),
+            "...and everything inside the cap is still owned"
+        );
+        assert_eq!(e.driven_role("w-36"), Some(worker_pane(true)));
     }
 
     #[test]
@@ -2777,6 +3075,68 @@ mod tests {
         );
     }
 
+    /// **#1871 B1 at the decision layer.** A verdict decides only for the
+    /// revision it reviewed, and the rule is word-blind.
+    ///
+    /// The same recorded `fail`, read at two heads: at its own it takes arc 5 and
+    /// spends a round (the control — without it, an implementation that ignored
+    /// every `fail` would pass); at the head the worker moved to it is absent, so
+    /// the lane is re-opened. `escalate` is asserted beside it because it takes a
+    /// different arc, and a fix that special-cased `Fail` alone would pass on one
+    /// and fail on the other.
+    ///
+    /// `entry.head` is set to the LIVE head deliberately: arc 6 would otherwise
+    /// answer first and this would be a test of arc 6, not of the binding rule.
+    /// That is exactly the shape the drive is in after a real fix — the tick
+    /// persists the head it resolved, so by the time `review-wait` is reached
+    /// again the entry and the live head agree and only the VERDICT is stale.
+    #[test]
+    fn a_verdict_bound_to_an_older_head_decides_nothing_whatever_word_it_is() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-b".into();
+        let at = |word, verdict_head| DriveFacts {
+            required_lanes: Some(vec![lane_fact("rev-std", Some(word), verdict_head, "d1")]),
+            ..facts_at("head-b")
+        };
+        // The control: bound to the head in front of the drive, each word decides.
+        assert_eq!(
+            decide(&e, &at(Verdict::Fail, "head-b"), &limits),
+            DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds)
+        );
+        assert_eq!(
+            decide(&e, &at(Verdict::Escalate, "head-b"), &limits),
+            DriveStep::held(HeldReason::Escalate)
+        );
+        // Bound to the head the worker fixed: absent, so the lane is re-opened.
+        // Not `fix-wait`, and not a spent round — that loop reached INVARIANT 9's
+        // bound in three passes with no re-review having happened.
+        assert_eq!(
+            decide(&e, &at(Verdict::Fail, "head-a"), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "a fail recorded against a commit that no longer describes the PR must not route"
+        );
+        assert_eq!(
+            decide(&e, &at(Verdict::Escalate, "head-a"), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "…nor may a stale escalate park the drive on a judgment nobody is being asked for"
+        );
+        // The digest half of the same key: same head, body moved under it.
+        let moved = DriveFacts {
+            body_digest: Some("d2".into()),
+            ..at(Verdict::Fail, "head-b")
+        };
+        assert_eq!(decide(&e, &moved, &limits), DriveStep::OpenLane { index: 0 });
+        // …and "we could not check" is not "it changed", in this direction too.
+        let unknown = DriveFacts { body_digest: None, ..at(Verdict::Fail, "head-b") };
+        assert_eq!(
+            decide(&e, &unknown, &limits),
+            DriveStep::spend(DriveState::FixWait, Counter::ReviewRounds),
+            "an unreadable body must not stale a verdict — one transient gh failure would \
+             otherwise re-brief every open lane in the group"
+        );
+    }
+
     #[test]
     fn a_head_that_moved_under_a_lane_re_enters_ci_wait() {
         // Arc 6 / §8 row 4. The race is not designed away — it is the race the
@@ -2882,6 +3242,7 @@ mod tests {
             block: "rev-std".into(),
             session: "s1".into(),
             agent: "rev-1".into(),
+            prior_agents: Vec::new(),
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.into(),

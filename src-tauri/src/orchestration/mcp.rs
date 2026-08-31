@@ -3302,7 +3302,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // `review_verdict` calls, and naming only the other would leave
             // `report` still delivering under a live drive.
             match reg.rd_owner(&caller.group, &caller.agent_id) {
-                Some((pr, role)) => {
+                Some((pr, pane)) => {
                     // **WHICH side of the drive reported decides what the signal
                     // means, and dropping the role here was a live defect.**
                     // `WorkerSignal` is named for the worker because only the
@@ -3333,13 +3333,34 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // A `progress` report carries no signal from either side: a
                     // drive advances on the head, the checks and the verdict
                     // files, never on a delegate saying it is still going.
-                    let is_worker = role == super::reviewdrive::DrivenRole::Worker;
-                    let event = match (is_worker, status) {
+                    //
+                    // **A SUPERSEDED pane is owned and is not believed** (#1871
+                    // B2, and the amendment that decided it). The drive resumes
+                    // its worker into a new pane on every hand-back, and the
+                    // pane it replaced keeps running: consuming its traffic is
+                    // right — it is this drive's delegate on this PR, and
+                    // letting it reach the orchestrator is the leak §7 exists to
+                    // stop — but FEEDING it in is not. A `done` from a worker
+                    // pane two hand-backs old is a claim about a revision the
+                    // drive has moved past, and arc 8 would take it as the
+                    // CURRENT worker having finished work that worker is still
+                    // in the middle of.
+                    //
+                    // The audit says which, because "consumed" and "consumed and
+                    // acted on" are different facts and a reader chasing a drive
+                    // that did not move needs to tell them apart.
+                    let is_worker = pane.role == super::reviewdrive::DrivenRole::Worker;
+                    let event = match (is_worker && pane.current, status) {
                         (true, "done") => Some(super::RdEvent::WorkerDone),
                         (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
                         _ => None,
                     };
-                    let kind = if is_worker { "report:worker" } else { "report:lane" };
+                    let kind = match (is_worker, pane.current) {
+                        (true, true) => "report:worker",
+                        (true, false) => "report:superseded-worker",
+                        (false, true) => "report:lane",
+                        (false, false) => "report:superseded-lane",
+                    };
                     reg.rd_consume(&caller.group, pr, &caller.agent_id, kind, event);
                 }
                 // #576 residual: the relay variant, which opts this notice into
@@ -3455,16 +3476,26 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 &caller.agent_id,
             );
             }
-            if let Some((pr, _)) = driven {
+            if let Some((pr, pane)) = driven {
                 // The event carries no verdict WORD: the next tick re-reads the
                 // verdict file through the same parser the gate reads, so a
                 // signal carrying it would be a second source for one fact — and
                 // the second source would be the one a delegate could shape.
+                //
+                // That is also why a SUPERSEDED lane pane needs no special case
+                // on the signal side and gets one on the AUDIT side: the event
+                // is inert either way, and the verdict this pane just wrote is
+                // bound to the head it reviewed, so `decide_review_wait` reads
+                // it or ignores it on that binding rather than on which pane
+                // held the lane (#1871 B1 is the same rule seen from the other
+                // end). What the audit owes a reader is which pane spoke.
+                let kind =
+                    if pane.current { "review_verdict" } else { "review_verdict:superseded" };
                 reg.rd_consume(
                     &caller.group,
                     pr,
                     &caller.agent_id,
-                    "review_verdict",
+                    kind,
                     Some(super::RdEvent::Verdict),
                 );
             }
@@ -3671,6 +3702,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // spoke — a driven delegate said something that is not a status
             // change — and the notice names the delegate by id, which carries
             // more than its role would.
+            //
+            // **Nor is the pane's standing, and that is the deliberate
+            // asymmetry with the `report` arm above** (#1871 B2). The rule that
+            // arm applies is that a superseded pane may not ADVANCE a drive: its
+            // `done` would satisfy work the current worker is still doing. This
+            // signal only ever PARKS one, and parking hands the drive to a
+            // human — the safe direction whichever pane spoke. The delegate's
+            // words are in the orchestrator's pane either way (§7 never
+            // intercepts this tool), and the whole job of the hold is to be the
+            // routing fact that explains them.
             if let Some((pr, _)) = reg.rd_owner(&caller.group, &caller.agent_id) {
                 reg.rd_ingest(
                     &caller.group,

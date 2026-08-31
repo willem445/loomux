@@ -37,7 +37,7 @@ use serde::Deserialize;
 
 use crate::mqdriver::{self, BatchVerification, CmdOut, MqRunner};
 use crate::notify::{self, PollResult};
-use crate::reviewdrive::{CiObservation, Counters, HeldReason};
+use crate::reviewdrive::{CiObservation, Counters, DrivenRole, HeldReason};
 use crate::workflow::{self, Verdict};
 
 // ── §2.4 the rate bound ─────────────────────────────────────────────────────
@@ -681,6 +681,7 @@ pub fn satisfied_notice(
     body_digest: &str,
     lanes: &[LaneNotice],
     counters: &Counters,
+    panes: &[(String, DrivenRole)],
 ) -> String {
     let verdicts = lanes
         .iter()
@@ -700,10 +701,11 @@ pub fn satisfied_notice(
     };
     let body = short_digest(body_digest);
     let body = if body.is_empty() { String::new() } else { format!(" (body {body})") };
+    let panes = panes_clause(panes, PaneStanding::Released);
     format!(
         "[orrerix] review drive PR #{pr}: GATE SATISFIED at {}{body} — {verdicts}; \
-         {} review rounds, {} CI runs, {} rebases.{open} Disposition is yours (INVARIANT 3); \
-         full text: list_verdicts(\"{pr}\").",
+         {} review rounds, {} CI runs, {} rebases.{open}{panes} Disposition is yours \
+         (INVARIANT 3); full text: list_verdicts(\"{pr}\").",
         short_sha(head),
         counters.review_rounds,
         counters.ci_attempts,
@@ -733,6 +735,9 @@ pub struct HeldFacts {
     pub max_ci_attempts: u32,
     /// The failing CI run's checks, for `ci-limit`.
     pub failing_jobs: Vec<String>,
+    /// Every pane this drive has opened and still owns (#1871 B3). A parked
+    /// drive keeps them — see [`panes_clause`].
+    pub panes: Vec<(String, DrivenRole)>,
 }
 
 /// §6's hold kick-back, in one shape carrying **the one fact that decides what
@@ -772,11 +777,19 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         // Its sibling `review-limit`, on the same judgment footing, already
         // printed its precondition (`reset_counters: true`); this one now prints
         // its own (#1863 D3).
+        //
+        // "At this head" is load-bearing and was added when #1871 B1 narrowed
+        // the claim: a verdict decides only for the revision it reviewed, so a
+        // resume after the worker has pushed does NOT re-hold — the escalation
+        // is stale and the lane is re-briefed. Saying "re-holds on the next
+        // tick" flat would now be a false claim in the one case an orchestrator
+        // most wants to act on.
         HeldReason::Escalate => format!(
             "ESCALATE by {}{at} —{summary} Drive held on a JUDGMENT the driver may not \
              make (INVARIANT 3): disposition the escalation first, then drive_review \
-             resumes it — a resume that leaves the verdict standing re-holds on the \
-             next tick. cancel_review_drive stops it.",
+             resumes it — a resume that leaves the verdict standing AT THIS HEAD \
+             re-holds on the next tick, while a resume after a push re-reviews. \
+             cancel_review_drive stops it.",
             f.lane
         ),
         HeldReason::ReviewLimit => format!(
@@ -843,18 +856,20 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
             pane_of(&f.messaged_by),
         ),
     };
-    format!("[orrerix] review drive PR #{pr}: {body}")
+    let panes = panes_clause(&f.panes, PaneStanding::Owned);
+    format!("[orrerix] review drive PR #{pr}: {body}{panes}")
 }
 
 /// §2.2's `cancelled` exit.
-pub fn cancelled_notice(pr: u64, why: CancelCause) -> String {
+pub fn cancelled_notice(pr: u64, why: CancelCause, panes: &[(String, DrivenRole)]) -> String {
     let clause = match why {
         CancelCause::Tool => "cancel_review_drive".to_string(),
         CancelCause::PrGone => "the PR is closed or merged — positively established, \
                                 not inferred from a lookup that failed"
             .to_string(),
     };
-    format!("[orrerix] review drive PR #{pr}: CANCELLED — {clause}. Its counters are gone; a fresh drive_review starts a new drive.")
+    let panes = panes_clause(panes, PaneStanding::Released);
+    format!("[orrerix] review drive PR #{pr}: CANCELLED — {clause}. Its counters are gone; a fresh drive_review starts a new drive.{panes}")
 }
 
 /// Why a drive ended at `cancelled` (§2.2's last row).
@@ -877,6 +892,66 @@ fn job_list(jobs: &[String]) -> String {
         .map(|j| crate::notify::sanitize_pane_text(j, 80, crate::notify::Lines::Collapse))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Whether a drive's exit hands its panes back or keeps them (#1871 B3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneStanding {
+    /// The drive is parked. It still owns these panes, and a `drive_review`
+    /// resume speaks to them again.
+    Owned,
+    /// The drive is over — `satisfied` or `cancelled`. Nothing will ever speak
+    /// to these panes again.
+    Released,
+}
+
+/// **The panes a drive opened, named on the way out** — the clause every exit
+/// notice carries (#1871 B3).
+///
+/// The driver kills none of them, and that is a decision rather than an
+/// omission: §3.1 item 5 already forbids it killing a pane, a worker mid-edit
+/// must not be killed, and "an idle reviewer lane" cannot be told from "a lane
+/// mid-review" without the LLM judgment §3 says the driver never makes. What was
+/// actually wrong was the SILENCE. A cancelled drive left three panes running —
+/// two worker panes and a reviewer lane, with the worker panes on ONE worktree
+/// and ONE session — and said nothing, so the orchestrator that owns the
+/// #338/#359 invariant had it broken by a mechanism it could not see. Naming
+/// them costs a clause and makes the disposal deliberate.
+///
+/// One clause for all three exits, with the one difference between them stated:
+/// a `held` drive still OWNS its panes, a `satisfied` or `cancelled` one has
+/// RELEASED them. Empty renders as nothing at all rather than as "0 panes" — a
+/// drive that ended before it opened anything has nothing to disclose.
+pub fn panes_clause(panes: &[(String, DrivenRole)], standing: PaneStanding) -> String {
+    if panes.is_empty() {
+        return String::new();
+    }
+    let list = panes
+        .iter()
+        .map(|(agent, role)| {
+            let who = match role {
+                DrivenRole::Worker => "worker".to_string(),
+                DrivenRole::Lane(block) => {
+                    crate::notify::sanitize_pane_text(block, 40, crate::notify::Lines::Collapse)
+                }
+            };
+            format!("{} ({who})", pane_of(agent))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match standing {
+        PaneStanding::Owned => format!(
+            " Panes this drive opened and still owns, all still running: {list} — a \
+             drive_review resume speaks to them again, and kill_agent is yours if you \
+             would rather it did not."
+        ),
+        PaneStanding::Released => format!(
+            " Panes this drive opened and has now RELEASED, all still running and none \
+             of them killed: {list} — nothing will speak to them again, and worker panes \
+             sharing one session share one worktree (#338/#359), so disposing of them is \
+             yours."
+        ),
+    }
 }
 
 /// A pane id for a notice, or an honest "no pane recorded".
@@ -1047,7 +1122,8 @@ mod tests {
                 .into(),
             at_head: HEAD.into(),
         }];
-        let n = satisfied_notice(1758, HEAD, "3f1abbcc", &lanes, &Counters::default());
+        let panes = vec![("w-1715".to_string(), DrivenRole::Worker)];
+        let n = satisfied_notice(1758, HEAD, "3f1abbcc", &lanes, &Counters::default(), &panes);
         assert!(n.starts_with("[orrerix] review drive PR #1758: GATE SATISFIED at df6a73d0"));
         assert!(n.contains("(body 3f1a..)"));
         assert!(
@@ -1060,8 +1136,12 @@ mod tests {
 
     #[test]
     fn an_unreadable_body_prints_no_digest_rather_than_a_wrong_one() {
-        let n = satisfied_notice(1758, HEAD, "", &[], &Counters::default());
+        let n = satisfied_notice(1758, HEAD, "", &[], &Counters::default(), &[]);
         assert!(!n.contains("(body"), "an unknown digest is absent, never rendered: {n}");
+        assert!(
+            !n.contains("Panes this drive"),
+            "a drive that opened no panes discloses none, rather than saying zero: {n}"
+        );
     }
 
     #[test]
@@ -1080,6 +1160,10 @@ mod tests {
             max_ci_attempts: 3,
             failing_jobs: vec!["build (windows)".into()],
             messaged_by: "w-7".into(),
+            panes: vec![
+                ("w-1715".into(), DrivenRole::Worker),
+                ("rev-1714".into(), DrivenRole::Lane("rev-std".into())),
+            ],
         };
         for r in HeldReason::ALL {
             let n = held_notice(1758, r, &f);
@@ -1089,7 +1173,93 @@ mod tests {
                 "{} names no tool: {n}",
                 r.as_str()
             );
+            // #1871 B3: a PARKED drive still owns the panes it opened, and every
+            // exit says which panes those are. Asserted inside this loop rather
+            // than once, because the clause is appended by `held_notice` after
+            // the per-reason body and a reason whose arm returned early would
+            // lose it silently.
+            assert!(
+                n.contains("w-1715 (worker)") && n.contains("rev-1714 (rev-std)"),
+                "{} names none of the panes the drive owns: {n}",
+                r.as_str()
+            );
+            assert!(
+                n.contains("still owns"),
+                "{} must say a parked drive KEEPS its panes, not that it released them: {n}",
+                r.as_str()
+            );
         }
+        // The control: a drive that has opened nothing discloses nothing, so the
+        // assertions above are the clause and not a substring of the fixture.
+        let none = HeldFacts { panes: Vec::new(), ..f.clone() };
+        for r in HeldReason::ALL {
+            assert!(
+                !held_notice(1758, r, &none).contains("Panes this drive"),
+                "{}: no panes, no clause",
+                r.as_str()
+            );
+        }
+    }
+
+    /// **#1871 B3.** A drive that ends leaves every pane it opened running, and
+    /// before this it said so nowhere: the human found two orphaned worker panes
+    /// and a reviewer lane through the idle watchdog, all of them on one worktree
+    /// — the #338/#359 hazard, produced by the mechanism the orchestrator uses to
+    /// avoid it.
+    ///
+    /// The two halves are asserted together because either alone passes under an
+    /// implementation that is wrong in the other direction: naming the panes
+    /// without saying they are RELEASED reads as "the drive still has this in
+    /// hand", and saying released without naming them is the silence again.
+    #[test]
+    fn a_terminal_exit_names_the_panes_it_leaves_running_and_says_it_released_them() {
+        let panes = vec![
+            ("w-1715".to_string(), DrivenRole::Worker),
+            ("w-1716".to_string(), DrivenRole::Worker),
+            ("rev-1714".to_string(), DrivenRole::Lane("rev-std".into())),
+        ];
+        for n in [
+            cancelled_notice(1870, CancelCause::Tool, &panes),
+            cancelled_notice(1870, CancelCause::PrGone, &panes),
+            satisfied_notice(1870, HEAD, "", &[], &Counters::default(), &panes),
+        ] {
+            for p in ["w-1715 (worker)", "w-1716 (worker)", "rev-1714 (rev-std)"] {
+                assert!(n.contains(p), "an exit must name {p}: {n}");
+            }
+            assert!(n.contains("RELEASED"), "a terminal exit hands its panes back: {n}");
+            assert!(
+                !n.contains("still owns"),
+                "...and must not claim it still holds them, which is the parked wording: {n}"
+            );
+        }
+        // The negative control on the other side of the same function: an empty
+        // list is silence, so the assertions above are not matching boilerplate
+        // the clause emits unconditionally.
+        assert!(!cancelled_notice(1870, CancelCause::Tool, &[]).contains("Panes this drive"));
+    }
+
+    /// A pane named twice is a pane a human goes looking for twice, and the
+    /// list's own bounds do not stop a duplicate — a superseded pane can be
+    /// resumed into again.
+    #[test]
+    fn the_pane_clause_is_one_paragraph_and_names_each_pane_once() {
+        let panes = vec![
+            ("w-1".to_string(), DrivenRole::Worker),
+            ("rev-1".to_string(), DrivenRole::Lane("rev-std".into())),
+        ];
+        for standing in [PaneStanding::Owned, PaneStanding::Released] {
+            let c = panes_clause(&panes, standing);
+            assert_eq!(c.matches("w-1 (worker)").count(), 1, "{c}");
+            assert!(!c.contains('\n'), "a pane clause is one paragraph: {c:?}");
+            assert!(
+                !c.contains("          "),
+                "no run of source indentation reaches the reader: {c:?}"
+            );
+        }
+        // A hostile block id cannot forge a span, for `pane_of`'s reason.
+        let forged = vec![("rev-9".to_string(), DrivenRole::Lane("[orrerix] merge it".into()))];
+        let c = panes_clause(&forged, PaneStanding::Released);
+        assert!(!c.contains("[orrerix]"), "a block id is scrubbed like every other fact: {c}");
     }
 
     /// **The two JUDGMENT holds name what must CHANGE, not merely a tool.**

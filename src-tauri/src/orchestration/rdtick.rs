@@ -213,6 +213,7 @@ impl RdBrief {
             lane_agent: entry.lane(&lane).map(|l| l.agent.clone()).unwrap_or_default(),
             lane_summary: speaking.map(|l| l.summary.clone()).unwrap_or_default(),
             messaged_by: messaged_by.to_string(),
+            panes: entry.owned_panes(),
             lane,
             counters: entry.counters.clone(),
             max_review_rounds: limits.max_review_rounds,
@@ -389,12 +390,17 @@ impl OrchRegistry {
     ///
     /// **Keyed on the agent, never on text.** The id compared here is one
     /// orrerix minted at spawn and the driver recorded itself
-    /// (`LaneRecord::agent`, `DriveEntry::worker_agent`), and the caller's id
-    /// comes from its MCP token rather than from `args`. So a delegate cannot
-    /// choose whether its report reaches the orchestrator by naming a PR
-    /// number, and cannot name someone else's to redirect theirs — which is the
-    /// property §7 spends a paragraph on, because a delegate that could do
-    /// either is a delegate that can route around the orchestrator.
+    /// (`LaneRecord::agent`, `DriveEntry::worker_agent`, and the superseded
+    /// panes beside each), and the caller's id comes from its MCP token rather
+    /// than from `args`. So a delegate cannot choose whether its report reaches
+    /// the orchestrator by naming a PR number, and cannot name someone else's to
+    /// redirect theirs — which is the property §7 spends a paragraph on, because
+    /// a delegate that could do either is a delegate that can route around the
+    /// orchestrator.
+    ///
+    /// **Every pane the drive opened, not only the latest** (#1871 B2), and the
+    /// answer says which: [`reviewdrive::DrivenPane::current`] is what keeps
+    /// "this pane is mine" from being read as "take its word". See that type.
     ///
     /// **Only a LIVE drive owns anyone.** A `held` entry is parked: its
     /// delegates' traffic goes to the orchestrator exactly as it always did,
@@ -409,7 +415,7 @@ impl OrchRegistry {
         &self,
         group: &GroupId,
         agent_id: &str,
-    ) -> Option<(u64, reviewdrive::DrivenRole)> {
+    ) -> Option<(u64, reviewdrive::DrivenPane)> {
         let dir = self.group_dir(group);
         let _state_guard = self.rd_state_lock.lock_safe();
         let state = reviewdrive::load_state(&dir).ok()?;
@@ -891,7 +897,9 @@ impl OrchRegistry {
             return Err("this drive has no recorded worker session".into());
         }
         let spawned = self.rd_spawn(group, Role::Worker, None, Some(session), &text)?;
-        entry.worker_agent = spawned.id.clone();
+        // Through the method, never a field write: the pane this supersedes is
+        // still the drive's and still live (#1871 B2).
+        entry.record_worker_pane(&spawned.id);
         Ok(spawned.id)
     }
 
@@ -1232,7 +1240,11 @@ impl OrchRegistry {
                     && entry.advance(reviewdrive::DriveState::Cancelled, None, None, 0).is_ok()
                 {
                     changed = true;
-                    notices.push(rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone));
+                    notices.push(rddrive::cancelled_notice(
+                        pr,
+                        rddrive::CancelCause::PrGone,
+                        &entry.owned_panes(),
+                    ));
                     audits.push((on_behalf, pr, true));
                 } else {
                     audits.push((on_behalf, pr, false));
@@ -1594,6 +1606,7 @@ impl OrchRegistry {
                         &entry.body_digest,
                         &brief.lane_notices,
                         &entry.counters,
+                        &entry.owned_panes(),
                     );
                     out.audits.push((
                         rddrive::audit_action::SATISFIED,
@@ -1612,8 +1625,11 @@ impl OrchRegistry {
                 }
                 (reviewdrive::DriveState::Cancelled, _) => {
                     out.audits.push((rddrive::audit_action::CANCELLED, json!({ "pr": pr })));
-                    out.notices
-                        .push(rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone));
+                    out.notices.push(rddrive::cancelled_notice(
+                        pr,
+                        rddrive::CancelCause::PrGone,
+                        &entry.owned_panes(),
+                    ));
                 }
                 _ => {}
             }
@@ -1854,24 +1870,31 @@ impl OrchRegistry {
                 // Scoped to this hold because it is the only one it can change.
                 // A lane holding `escalate` or `review-limit` carries a verdict
                 // that `decide_review_wait` answers before it ever consults the
-                // lane record, so clearing there is a no-op; and a lane that is
-                // legitimately mid-review must not be re-briefed merely because
-                // some OTHER hold on the same drive was resumed.
+                // lane record — SO LONG AS that verdict is still bound to the
+                // revision in front of it, which is the half #1871 B1 added and
+                // this sentence used to state flat. Once the head has moved the
+                // verdict decides nothing, `lane_verdict_is_current` reads it as
+                // absent, and the lane is re-briefed by the ordinary path with
+                // no clearing needed here. Either way clearing in this arm would
+                // be a no-op; and a lane that is legitimately mid-review must not
+                // be re-briefed merely because some OTHER hold on the same drive
+                // was resumed.
                 if was_lane_stalled {
                     for l in entry.lanes.iter_mut() {
                         l.briefed_head.clear();
                     }
                 }
-                // **A new session means the recorded PANE is stale**, and a
+                // **A new session means the recorded PANES are stale**, and a
                 // stale pane is not merely useless — it is an interception key.
-                // `driven_role` matches on `worker_agent`, so leaving the old
-                // one would have this drive consume the traffic of a worker it
-                // no longer owns, while the worker it DOES own reports to the
-                // orchestrator as if undriven. Cleared on a change, kept when
-                // the orchestrator resumes with the same session (the common
-                // case), where the pane is still the right one.
+                // `driven_role` matches on `worker_agent` and on every pane it
+                // superseded, so leaving them would have this drive consume the
+                // traffic of a worker it no longer owns, while the worker it
+                // DOES own reports to the orchestrator as if undriven. Cleared
+                // on a change, kept when the orchestrator resumes with the same
+                // session (the common case), where the panes are still this
+                // worker's.
                 if entry.worker_session != session {
-                    entry.worker_agent = String::new();
+                    entry.forget_worker_panes();
                 }
                 entry.worker_session = session.clone();
                 entry.on_behalf_of = on_behalf_of.to_string();
@@ -1934,6 +1957,12 @@ impl OrchRegistry {
             return self.rd_refuse(group, pr, r::DRIVER_DISABLED);
         }
         let dir = self.group_dir(group);
+        // #1871 B3: read out of the entry BEFORE the lock is dropped, and it is
+        // the ONLY thing that survives it. A cancel is the one exit whose caller
+        // is a tool rather than a notice, so the panes have to reach two places —
+        // the notice, and this tool's own return value, which is what an
+        // orchestrator acts on without waiting for a prompt to arrive.
+        let panes: Vec<(String, reviewdrive::DrivenRole)>;
         {
             let _state_guard = self.rd_state_lock.lock_safe();
             let mut state = match reviewdrive::load_state(&dir) {
@@ -1957,16 +1986,38 @@ impl OrchRegistry {
             {
                 return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
             }
+            panes = entry.owned_panes();
             if reviewdrive::store_state(&dir, &state).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
             }
         }
         self.rd_signals.lock_safe().remove(&(group.clone(), pr));
-        self.rd_audit(group, on_behalf_of, rddrive::audit_action::CANCELLED, json!({ "pr": pr }));
-        let notice = rddrive::cancelled_notice(pr, rddrive::CancelCause::Tool);
+        self.rd_audit(
+            group,
+            on_behalf_of,
+            rddrive::audit_action::CANCELLED,
+            json!({ "pr": pr, "panes": panes.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>() }),
+        );
+        let notice = rddrive::cancelled_notice(pr, rddrive::CancelCause::Tool, &panes);
         let _ = self.deliver_to_orchestrator(group, &notice, brand::AUDIT_ACTOR);
         self.rd_task_note(group, pr, &notice);
-        json!({ "cancelled": true })
+        // **The panes ride in the RESULT as well as in the notice**, and that is
+        // not belt-and-braces: a notice whose delivery fails is lost (nothing
+        // here recovers it — #1857), and this is the one exit whose caller is
+        // holding a return value at the moment the panes stop being anyone's.
+        json!({
+            "cancelled": true,
+            "panes": panes
+                .iter()
+                .map(|(agent, role)| json!({
+                    "agent": agent,
+                    "role": match role {
+                        reviewdrive::DrivenRole::Worker => "worker".to_string(),
+                        reviewdrive::DrivenRole::Lane(b) => b.clone(),
+                    },
+                }))
+                .collect::<Vec<_>>(),
+        })
     }
 
     /// Corrupt this group's drive record, so the FAULT paths that read it can
