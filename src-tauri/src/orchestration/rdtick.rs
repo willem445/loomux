@@ -545,10 +545,18 @@ impl OrchRegistry {
     /// landing inside that window would read the pre-spawn file and write it
     /// back, erasing the entry; #467/#468 want no registry lock held across a
     /// notice, because a delivery enqueues and an enqueue re-enters registry
-    /// locks. Both hold here: `rd_state_lock` is taken by exactly four call
-    /// sites — this tick and the three MCP tools — none of them reachable from a
-    /// pane delivery, so a spawn's own kickoff cannot cycle back onto it; and
-    /// the orchestrator notices this produces are delivered below, outside it.
+    /// locks. Both hold here, on a property of the LOCK rather than a count of
+    /// its callers: no site that takes `rd_state_lock` is reachable from a pane
+    /// delivery, so a spawn's own kickoff cannot cycle back onto it — and the
+    /// orchestrator notices this produces are delivered below, outside it.
+    ///
+    /// The sites today are the tick (here and at the prune), the restart
+    /// reconcile, the three MCP tools of §5.1, and the two interception helpers
+    /// `rd_owner` / `rd_consume` — eight acquisitions across seven functions.
+    /// The last two are the ones worth naming: they run on a delegate's own tool
+    /// call, which is a later turn scheduled by the runtime, never a frame the
+    /// delivery itself pushes, and both drop the lock before auditing. A ninth
+    /// caller owes this argument again rather than inheriting it.
     #[doc(hidden)] // pub for integration tests
     pub fn rd_drive_group_with(
         &self,
@@ -989,6 +997,34 @@ impl OrchRegistry {
         let max = limits.max_review_rounds.to_string();
         let head = rd_fact(&brief.head);
         let pr = brief.pr.to_string();
+        // **The CI line states what this tick OBSERVED**, and it is rendered
+        // rather than asserted because the driver had the fact in hand and the
+        // templates were claiming green unconditionally.
+        //
+        // A lane is normally briefed out of `review-wait`, which `ci-wait`
+        // reaches only on green — but arc 8 moves `fix-wait -> review-wait` on a
+        // worker's `report(done)` at an unchanged head WITHOUT consulting
+        // `facts.ci`, which is the "that failure was unrelated" turn. A brief
+        // that told the reviewer the checks were green there was stating as fact
+        // something this tick had just read as false. It cannot produce an
+        // unsafe landing — `gate-check` re-evaluates `ci-green` through
+        // `recheck_gate` — so it costs a misled reviewer and a wasted round,
+        // which is exactly what a driven review is for saving.
+        let ci = match brief.ci {
+            reviewdrive::CiObservation::Green => "This PR's checks are green at that head.",
+            reviewdrive::CiObservation::Red => {
+                "This PR's checks are RED at that head — review the change on its merits; \n                 the failure is the worker's to answer."
+            }
+            reviewdrive::CiObservation::Conflicting => {
+                "This PR does not merge cleanly at that head — review the change on its \n                 merits; the conflict is the worker's to answer."
+            }
+            // Pending and Unknown are one sentence on purpose: §8's rule is that
+            // unknown is never reported as a fact about the PR, and "not green
+            // yet" is the only thing true of both.
+            reviewdrive::CiObservation::Pending | reviewdrive::CiObservation::Unknown => {
+                "This PR's checks are not green at that head (orrerix could not read a \n                 settled result)."
+            }
+        };
         match entry.lane(block).filter(|l| !l.at_head.is_empty()) {
             // A lane that has answered before gets the delta — the line an
             // orchestrator typed by hand nine times on one PR.
@@ -1033,6 +1069,7 @@ impl OrchRegistry {
                         ("PREV_HEAD", &prev_head),
                         ("PREV_DIGEST_STATE", digest_state),
                         ("WHAT_MOVED", &moved),
+                        ("CI", ci),
                         ("ROUND", &round),
                         ("MAX_ROUNDS", &max),
                     ],
@@ -1067,6 +1104,7 @@ impl OrchRegistry {
                         ("BASE", &rd_fact(&brief.base)),
                         ("LANES", &rd_fact(&brief.required.join(", "))),
                         ("LANE", &rd_fact(block)),
+                        ("CI", ci),
                         ("ROUND", &round),
                         ("MAX_ROUNDS", &max),
                         ("PRIOR_LANES", &prior),
@@ -1245,11 +1283,12 @@ impl OrchRegistry {
     /// so in as many words ("the load-decide-store spans a spawn, and a
     /// `drive_review` landing inside that window would otherwise read the
     /// pre-spawn file and write it back, erasing the entry"). It is safe to span
-    /// one here and not a *notice*: `rd_state_lock` is taken by exactly four
-    /// call sites — this tick and the three MCP tools — and none of them is
+    /// one here and not a *notice*: no site that takes `rd_state_lock` is
     /// reachable from a pane delivery, so a spawn's own kickoff cannot cycle
     /// back onto it. The orchestrator notices this produces are still delivered
-    /// by the caller, outside the lock, for the #467/#468 reason.
+    /// by the caller, outside the lock, for the #467/#468 reason. The full site
+    /// list, and why the two interception helpers do not break it, is on
+    /// [`Registry::rd_drive_group_with`].
     fn rd_step_entry(
         &self,
         group: &GroupId,
@@ -1878,7 +1917,11 @@ impl OrchRegistry {
     }
 
     /// `cancel_review_drive(pr)` — one of `held`'s two outgoing arcs, and the
-    /// only way a live drive stops without reaching `satisfied`.
+    /// only way an orchestrator stops a live drive short of `satisfied`.
+    ///
+    /// Not the only way one REACHES `cancelled`: a drive whose PR reads closed
+    /// is cancelled on the tick that observes it, with no tool call at all,
+    /// which is why [`CancelCause::PrGone`] exists.
     #[doc(hidden)] // pub for integration tests
     pub fn cancel_review_drive(&self, group: &GroupId, pr: u64, on_behalf_of: &str) -> Value {
         use rddrive::refusal as r;
@@ -1919,6 +1962,24 @@ impl OrchRegistry {
         let _ = self.deliver_to_orchestrator(group, &notice, brand::AUDIT_ACTOR);
         self.rd_task_note(group, pr, &notice);
         json!({ "cancelled": true })
+    }
+
+    /// Corrupt this group's drive record, so the FAULT paths that read it can
+    /// be exercised from outside the crate.
+    ///
+    /// **It hands out no path**, which is the whole point. CLAUDE.md constraint
+    /// 6 keeps `group_dir_at` the single join and keeps it private, and a
+    /// `group_dir_for_test` returning a `PathBuf` would hand every future test
+    /// exactly the thing that rule exists to withhold. This takes a validated
+    /// `GroupId`, writes a fixed payload, and answers whether it wrote — so a
+    /// test can reach "the record exists and cannot be parsed" without ever
+    /// reaching the directory. The payload is not a parameter for the same
+    /// reason: a caller that can choose the bytes is a caller that can write a
+    /// VALID record, which is a state seeder rather than a fault injector.
+    #[doc(hidden)] // pub for integration tests
+    pub fn corrupt_drive_record_for_test(&self, group: &GroupId) -> bool {
+        let path = reviewdrive::state_path(&self.group_dir(group));
+        std::fs::write(path, b"{ not json").is_ok()
     }
 
     /// `review_drive_status()` — the surface a **compacted** orchestrator

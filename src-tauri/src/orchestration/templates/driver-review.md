@@ -1,6 +1,6 @@
 Review PR #{{PR}} at head {{HEAD}} (base {{BASE}}).
 
-This PR's checks are green at that head. The required reviewer lanes for this PR, in gate order, are: {{LANES}}.
+{{CI}} The required reviewer lanes for this PR, in gate order, are: {{LANES}}.
 
 Your lane is {{LANE}}. This is round {{ROUND}} of at most {{MAX_ROUNDS}}.{{PRIOR_LANES}}
 

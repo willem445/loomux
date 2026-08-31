@@ -2331,24 +2331,30 @@ is in the audit log, marked with the orchestrator it acted for.
 
 **One thing changes about what you see in the orchestrator's pane.** While a PR is being driven,
 its delegates' status reports and recorded verdicts go to the driver instead of appearing there —
-that is the point, and it is most of the saving. Two things keep it from being a black box: every
+that is the point, and it is most of the saving. One qualification, because you will otherwise
+notice it and wonder: interception is keyed on a pane orrerix has recorded, and it records the
+worker's pane when it first hands the PR back. Until that first hand-back — while the drive is
+still waiting on CI or on a reviewer — a `report` from the worker still lands in your pane as it
+always did. Nothing in the drive reads it, so nothing is lost; it is simply not yet silent. Two things keep it from being a black box: every
 consumed event is in the audit log (as `rd-consumed`, naming the kind, the agent and the PR —
 *consumed* is a different word from *dropped*), and a delegate's own `message_orchestrator` line is
 **never** intercepted. If a reviewer or a worker has something to say that is not a status change,
 you still see it, unchanged, and the drive then stops so someone reads it.
 
 **A drive stops, it does not drift.** There are fourteen ways out and each produces exactly one
-line in the orchestrator's pane: the gate being satisfied, a reviewer escalating, or one of twelve
-holds — a counter reaching INVARIANT 9's bound, a lane or a worker going quiet past its timeout,
+line in the orchestrator's pane: the gate being satisfied, you cancelling the drive, or one of
+twelve holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
 the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
 could not read, a worker that reported blocked or whose session no longer resolves, or a delegate
 messaging the orchestrator. **A hold is parked, not finished**: it keeps what it has spent, so
 resuming it does not silently grant a fresh budget, and clearing the counters is a separate,
 audited decision.
 
-**Drives and the merge queue do not overlap, in either direction.** A PR the driver is holding
-cannot be queued, and a PR the queue is holding cannot be driven; each refusal names the other
-holder. The intended order is serial: let the drive reach a satisfied gate, decide what to do with
+**Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
+PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be
+driven; each refusal names the other holder. The asymmetry is the `held` case: a parked drive
+moves nothing and cannot race a batch, so it does **not** block queuing — but resuming it under a
+live queue entry is refused, so the two loops still never run on one PR at once. The intended order is serial: let the drive reach a satisfied gate, decide what to do with
 the findings — that decision stays the orchestrator's, and the driver never makes it — and *then*
 queue.
 

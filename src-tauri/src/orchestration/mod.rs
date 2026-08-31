@@ -696,7 +696,11 @@ drive starts at zero and spends three more.
 
 **One thing genuinely narrows while a drive is live, and it is the reason this paragraph exists.**
 A driven delegate's `report` and `review_verdict` are consumed by the driver instead of arriving
-here as prompts. Do not read that silence as a stalled delegate. Two surfaces compensate:
+here as prompts. Do not read that silence as a stalled delegate. **The worker's half starts at the
+first hand-back**, not at `drive_review`: interception is keyed on a pane orrerix has recorded, and
+it records the worker's when it first hands the PR back, so a worker `report` that arrives while
+the drive is still on CI or on a reviewer reaches you exactly as it always did. Nothing in the
+drive reads it, so nothing is lost — it is simply not silent yet. Two surfaces compensate:
 `review_drive_status()` and the audit log, where every consumed event is recorded as `rd-consumed`
 with its kind, its agent and its PR — consumed is a different word from dropped.
 **`message_orchestrator` is never intercepted**: a delegate's own words always reach you
@@ -50560,7 +50564,25 @@ impl OrchRegistry {
         // refusal: it is parked, so it moves nothing and cannot race a
         // batch, and `drive_review` refuses `in-merge-queue` if anyone
         // later tries to resume it under a live queue entry.
-        let driven = reviewdrive::load_state(&dir).map(|s| s.is_driven(pr)).unwrap_or(false);
+        // **A drive record orrerix cannot read is a FAULT, not "not driven".**
+        // `unwrap_or(false)` here answered a question it had not been able to
+        // ask, and it is the one direction that is unsafe: the queue would
+        // enqueue a PR that may be under a live drive, which is exactly the
+        // overlap §8.1 forbids. Every other unreadable-state site in this file
+        // and in the driver refuses rather than defaulting — `queue-state-
+        // unreadable` is ten lines above — and §8 says unknown is never treated
+        // as safe. Exposure is small today because the driver also declines to
+        // tick on an unreadable file, but the two loops become live together the
+        // moment a human repairs it, which is precisely the state §8.1 says
+        // neither loop was designed for.
+        let driven = match reviewdrive::load_state(&dir) {
+            Ok(s) => s.is_driven(pr),
+            Err(e) => {
+                self.audit(group, brand::AUDIT_ACTOR, mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": rddrive::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": rddrive::refusal::STATE_UNREADABLE });
+            }
+        };
         let outcome = mqloop::enqueue(
             runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms(), driven,
         );

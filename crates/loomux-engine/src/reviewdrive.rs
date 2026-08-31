@@ -234,8 +234,12 @@ pub enum HeldReason {
     /// shown complete, so *which reviewers are required* is unknown. Never a
     /// guess: guessing "no rule fired" is guessing in favour of merging.
     RoutingUnaccountable,
-    /// The gate file is present and could not be read (an I/O error). **Not**
+    /// The gate file is present and orrerix could not turn it into a routing
+    /// answer — an I/O error, or a file `parse_gate_file` refuses. **Not**
     /// `gate-not-configured`, which means the file is genuinely absent.
+    ///
+    /// Both are the same fact to a drive: the gate exists and cannot be read,
+    /// so what it requires is unknown — and §8 never treats unknown as safe.
     GateUnreadable,
     /// The worker reported `blocked`.
     WorkerBlocked,

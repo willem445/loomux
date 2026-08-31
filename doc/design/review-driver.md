@@ -326,12 +326,19 @@ to resolve it rather than pick a half.** The rule this design inherits from the
 queue is that no registry lock is held across a notice *delivery*, because a
 delivery enqueues and an enqueue can re-enter registry locks — and a spawn
 delivers its own kickoff, so "span the spawn" reads as "span a delivery". Both
-hold, on one fact about this lock in particular: `rd_state_lock` is taken by
-exactly four call sites — the tick and the three tools of §5.1 — and none of
-them is reachable from a pane delivery, so a spawn's own kickoff cannot cycle
-back onto it. The orchestrator notices §6 produces are a different matter and
-are delivered outside it. A later change that gives a fifth caller this lock
-owes that argument again.
+hold, on one fact about this lock in particular: **no site that takes
+`rd_state_lock` is reachable from a pane delivery**, so a spawn's own kickoff
+cannot cycle back onto it. The orchestrator notices §6 produces are a different
+matter and are delivered outside it.
+
+The argument is stated as a property of the lock rather than as a count of its
+callers, because the count moves. The sites today are the tick (twice), the
+restart reconcile, the three tools of §5.1, and the two interception helpers
+§7 needs — eight acquisitions across seven functions. The interception pair is
+the one that has to be argued rather than observed: those run on a delegate's
+own tool call, which the runtime schedules as a later turn and never as a frame
+the delivery itself pushes, and both release the lock before auditing. A new
+caller owes that argument again rather than inheriting it.
 
 ## 3. Ownership, authority, and consent
 
@@ -926,9 +933,12 @@ PR; the delta template's changed-file list is paths the pusher chose. §3.1 item
 4's claim is therefore about *policy* text and *delegate* text, not about every
 string: these two are author-controlled and must be treated as such.
 
-**So every interpolated value passes `report::relay_payload_keeping_lines` and
-`notify::sanitize_pane_text` before it reaches a template**, and this has to be
-said here rather than left to §6. §6 mandates the same functions for **notices**
+**So every interpolated value passes `notify::sanitize_pane_text` before it
+reaches a template**, and this has to be said here rather than left to §6.
+(§6's notices pass `report::relay_payload_keeping_lines` as well, to keep a
+verdict summary's line breaks; a brief interpolates single-line facts into
+prose, so `rd_fact` collapses lines and caps instead — strictly narrower than
+what it would keep.) §6 mandates the same functions for **notices**
 and justifies them by **context cost** — "the pane text becomes the
 orchestrator's resident context and is paid for again on every later API call" —
 a rationale that positively suggests a short brief is exempt. It is not:

@@ -1313,12 +1313,16 @@ pub enum EnqueueOutcome {
 ///    meaningful.
 /// 2. **`already-queued`** — a second enqueue of the same PR is a caller
 ///    mistake, not a state change, and answering it needs no lookups.
-/// 3. **`queue-full`** — the §10 cap, so `merge_queue.json` stays bounded under
+/// 3. **`in-review-drive`** — #1778 §8.1's mutual refusal, the queue's half.
+///    Immediately after its opposite number so a PR that is somehow both gets
+///    the more actionable answer, and still ahead of anything remote. The
+///    caller resolves the fact; the ordering decision is here.
+/// 4. **`queue-full`** — the §10 cap, so `merge_queue.json` stays bounded under
 ///    an enqueue storm.
-/// 4. **The constraint-7 refusals**, from **live** lookups (§7.1): the PR's base
+/// 5. **The constraint-7 refusals**, from **live** lookups (§7.1): the PR's base
 ///    and the repo default, resolved through the real `gh`. A failed lookup
 ///    refuses (`base-unverifiable`) — unknown is never treated as safe.
-/// 5. **The gate** (§6). Last because it is the most expensive and because a PR
+/// 6. **The gate** (§6). Last because it is the most expensive and because a PR
 ///    whose base is wrong should not have its reviewers reported on.
 ///
 /// `asserted_target` is §4's **assertion, not a selection**: present, it must
@@ -1382,9 +1386,10 @@ pub fn enqueue(
     // landing on until the next restart (rev N2) — `queue_merge_with` persists
     // a refusal that changed the state for exactly this reason.
     //
-    // Placed after the three cheap refusals above, not before them: a disabled
-    // queue must stay byte-for-byte untouched (§12), and `already-queued` and
-    // `queue-full` can only fire on a queue that is not drained anyway.
+    // Placed after the four cheap refusals above, not before them: a disabled
+    // queue must stay byte-for-byte untouched (§12), and `already-queued`,
+    // `in-review-drive` and `queue-full` can only fire on a queue that is not
+    // drained anyway.
     //
     // It also drops the previous campaign's corpses, which is why a queue that
     // re-establishes a target never shows the old campaign's cancelled entries:
