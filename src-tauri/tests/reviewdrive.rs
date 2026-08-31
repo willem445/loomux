@@ -546,7 +546,33 @@ impl Repo {
         let wf = loomux_lib::orchestration::workflow::workflow_file(&path);
         std::fs::create_dir_all(wf.parent().unwrap()).unwrap();
         std::fs::write(&wf, WORKFLOW).unwrap();
-        Repo { _root: root, repo }
+        let r = Repo { _root: root, repo };
+        r.git_init();
+        r
+    }
+    /// A minimal real git repo. Needed because a fresh reviewer lane is spawned
+    /// WITH a worktree — `#338/#359`: a reviewer that landed in the group's main
+    /// clone would be contending on the human's own checkout — and
+    /// `git_worktree_add_sync` needs real git under the repo to cut one.
+    fn git_init(&self) {
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(&self.repo)
+                .args(args)
+                .output()
+                .expect("git must be installed for this test");
+            assert!(
+                ok.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&ok.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(self.repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
     }
     fn path(&self) -> String {
         self.repo.to_string_lossy().replace('\\', "/")
