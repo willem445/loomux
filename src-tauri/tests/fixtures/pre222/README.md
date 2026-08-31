@@ -1087,5 +1087,6 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   `the_rendered_merge_queue_note_does_not_revive_the_retracted_rebase_rule`, which renders the
   gated document the goldens never see. And INVARIANT 6 was widened from "a merge you
   performed" to any merge onto the default branch, whoever performed it: the abolished rule's
-  "whoever moved it" coverage would otherwise have had no owner on the human-merge flow, and
-  the resident core stays under budget at 44,980 bytes EOL-normalized.
+  "whoever moved it" coverage would otherwise have had no owner on   the human-merge flow, and the resident core ends 13 bytes SMALLER than before the change:
+  44,692 bytes EOL-normalized (the hazard's explanation and the trigger's enumeration live in
+  the playbook's Mergeability section; the invariant keeps only what stands alone).

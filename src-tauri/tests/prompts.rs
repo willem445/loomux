@@ -116,7 +116,11 @@ fn queue_enabled_playbook() -> String {
     )
     .unwrap();
     let rails = Guardrails { advanced_orchestrator: true, ..rails() };
-    let g = reg.create_group(&repo, rails).unwrap();
+    // `create_group` takes the repo path as &str; normalize the separators the way
+    // workflow.rs's `Repo::path()` does, so a Windows checkout's backslashes do not
+    // reach the workflow lookup.
+    let repo_str = repo.to_string_lossy().replace('\\', "/");
+    let g = reg.create_group(&repo_str, rails).unwrap();
     fs::read_to_string(reg.state_root().join(g.id.as_str()).join("orchestrator-playbook.md"))
         .unwrap_or_else(|e| panic!("the playbook must be written to the group dir: {e}"))
 }
