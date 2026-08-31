@@ -741,6 +741,9 @@ impl OrchRegistry {
         limits: &reviewdrive::DriveLimits,
         now: u64,
     ) -> Result<String, String> {
+        if block.is_empty() {
+            return Err("no lane at that index".into());
+        }
         let text = self.rd_lane_brief(entry, block, brief, limits);
         let prior = entry.lane(block).map(|l| l.session.clone()).filter(|s| !s.is_empty());
         let spawned = match prior {
@@ -1198,7 +1201,14 @@ impl OrchRegistry {
         match &step {
             reviewdrive::DriveStep::Wait => {}
             reviewdrive::DriveStep::OpenLane { index } => {
-                let Some(block) = brief.required.get(*index).cloned() else { return Some(out) };
+                // `decide` only ever names an index into the list it was handed,
+                // so `None` is unreachable — and it is handled by falling
+                // THROUGH rather than returning, because an early return here
+                // would skip the head persistence below, which is the one write
+                // this function exists to get right. An unreachable branch that
+                // skips a load-bearing write is how the reachable one gets
+                // broken later.
+                let block = brief.required.get(*index).cloned().unwrap_or_default();
                 match self.rd_open_lane(group, entry, &block, &brief, limits, now) {
                     Ok(agent) => {
                         entry.lane_index = *index;
