@@ -200,6 +200,23 @@ different lengths and name different panes, and because "is a resumed worker a
 lane?" is exactly the question a slice author would otherwise answer on its own.
 A reviewer lane and a worker hand-back are never the same subject.
 
+**Resuming `lane-stalled` RE-BRIEFS the lane, and it has to.** Arc 11 returns the
+drive to `ci-wait`, but `decide_review_wait` opens a lane only when
+`lane_open_for` is false, and at an unmoved head it stays true — so a resume that
+only restarted the clocks would leave the stalled lane holding a brief it has
+already ignored, wait the full `lane_timeout_minutes` in silence, and re-hold.
+That is worse than re-holding at once, because the silence looks like progress.
+So the resume clears each lane's briefed head, which puts the outstanding lane
+back on the `OpenLane` arc; `rd_open_lane` resumes the session already recorded
+for it, so the *same* pane is re-briefed rather than a second reviewer being
+spawned beside it. Scoped to this hold: a lane holding `escalate` or
+`review-limit` carries a verdict `decide_review_wait` answers before it consults
+the lane record, and a lane that is legitimately mid-review must not be
+re-briefed because some other hold on the drive was resumed. This is the general
+form of the rule §2.2's stalled rows already imply — **a hold must be clearable
+by the remedy its own notice prints**, which is the same defect `drive-stalled`
+had in its age anchor.
+
 ### 2.3 The counters are INVARIANT 9's numbers, and neither key may loosen them
 
 `templates/orchestrator.md` INVARIANT 9 reads: *three CI attempts, three rounds

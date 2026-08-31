@@ -1751,6 +1751,10 @@ impl OrchRegistry {
                 if reset_counters {
                     entry.counters = reviewdrive::Counters::seeded(rounds_already_spent);
                 }
+                // Read BEFORE `advance`, which clears `held_reason` on the way
+                // out of `held`. Used by the lane re-open below.
+                let was_lane_stalled =
+                    entry.held_reason == Some(reviewdrive::HeldReason::LaneStalled);
                 if entry
                     .advance(reviewdrive::DriveState::CiWait, None, None, now)
                     .is_err()
@@ -1784,6 +1788,35 @@ impl OrchRegistry {
                 entry.started_ms = now;
                 for l in entry.lanes.iter_mut() {
                     l.spawned_ms = now;
+                }
+                // **`lane-stalled` needs its lane RE-BRIEFED, not merely
+                // re-timed** — and the clock re-stamp just above is what makes
+                // that visible rather than fixing it. `decide_review_wait`
+                // re-opens a lane only when `lane_open_for` is false, and at a
+                // stable head it stays true, so the lane the notice named is
+                // never spoken to again: before the re-stamp the drive re-held
+                // instantly, after it the drive waits the full
+                // `lane_timeout_minutes` in silence and re-holds then. Neither
+                // is the recovery `held(lane-stalled)`'s own notice instructs,
+                // and a hold that its printed remedy cannot clear is the defect
+                // arc 11 exists to not have.
+                //
+                // Clearing `briefed_head` puts the outstanding lane back in
+                // `lane_open_for`'s false branch, so the next tick takes
+                // `OpenLane` — and `rd_open_lane` RESUMES the session already
+                // recorded for that lane, so this re-briefs the stalled pane
+                // rather than spawning a second one beside it.
+                //
+                // Scoped to this hold because it is the only one it can change.
+                // A lane holding `escalate` or `review-limit` carries a verdict
+                // that `decide_review_wait` answers before it ever consults the
+                // lane record, so clearing there is a no-op; and a lane that is
+                // legitimately mid-review must not be re-briefed merely because
+                // some OTHER hold on the same drive was resumed.
+                if was_lane_stalled {
+                    for l in entry.lanes.iter_mut() {
+                        l.briefed_head.clear();
+                    }
                 }
                 // **A new session means the recorded PANE is stale**, and a
                 // stale pane is not merely useless — it is an interception key.
