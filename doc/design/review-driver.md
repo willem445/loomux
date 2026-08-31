@@ -182,7 +182,7 @@ own delivery arrives by its own path; §7.)
 | `held(rebase-limit)` | a second conflict after the one rebase hand-back |
 | `held(lane-stalled)` | a spawned or resumed **reviewer** lane recorded no verdict inside `lane_timeout_minutes` |
 | `held(fix-stalled)` | a resumed **worker** neither pushed nor reported inside `fix_timeout_minutes` |
-| `held(drive-stalled)` | the drive's **age** — `now - started_ms`, never an idle clock reset by each state advance — passed `drive_timeout_minutes`. The precedent is `mqloop::status_view`, whose `since_ms` is `now_ms.saturating_sub(e.enqueued_ms)`: age since the entry began, not time since it last moved. An idle clock would leave §8's `also: [base-green]` row parked **forever**, because that drive advances `gate-check` → `ci-wait` on every wake and would reset the timer each time — which is precisely the silent park that row says the bound exists to prevent |
+| `held(drive-stalled)` | the drive's **age** — `now - started_ms`, never an idle clock reset by each state advance — passed `drive_timeout_minutes`. The precedent is `mqloop::status_view`, whose `since_ms` is `now_ms.saturating_sub(e.enqueued_ms)`: age since the entry began, not time since it last moved. An idle clock would leave §8's `also: [base-green]` row parked **forever**, because that drive advances `gate-check` → `ci-wait` on every wake and would reset the timer each time — which is precisely the silent park that row says the bound exists to prevent. **The anchor is re-stamped on arc 11 and nowhere else**, and that is not the idle clock this row forbids: the ban is on a stamp written by each state ADVANCE, and nothing on the tick path touches it. It moves only on a deliberate, role-gated, audited `drive_review` — the same event §2.3 already lets clear the counters. Without that, arc 11 is a no-op for exactly the holds it exists to recover: `decide` checks this age before any per-state logic, so a drive parked longer than the bound re-holds on its first tick after being resumed, and a hold a human takes their time over is always that old. `spawned_ms` is re-stamped on the same arc for the same reason, at a quarter the threshold |
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
 | `held(gate-unreadable)` | the gate file is present and orrerix cannot use it — an I/O error, **or** contents `parse_gate_file` refuses. **Not** `gate-not-configured`, which means the file is genuinely absent. *S3 widened this row from "an I/O error" alone: the `gh` shim refuses every merge on a malformed gate, so a drive that announced satisfied over one would be §3.1's "bypass with better telemetry" — and this enum has no third reason to give it* |
 | `held(worker-blocked)` | the worker reported `blocked` |
@@ -1045,6 +1045,19 @@ Three properties bound that narrowing, and all three are load-bearing:
   never keyed on a `ref` string a delegate typed, because a delegate that could
   choose whether its report reaches the orchestrator by naming a PR number is a
   delegate that can route around the orchestrator.
+- **Which SIDE reported decides what the report means, and consuming is not the
+  same as ingesting.** Both a lane and the worker reach the `report` arm, and
+  `WorkerSignal` is named for the worker because only the worker produces one:
+  arc 8 is "`report(done)` with the head unchanged", and `held(worker-blocked)`
+  names a worker's session. A reviewer's `report(approved)` resolves to the same
+  `done` word, so a driver that read the outcome without the role took arc 8 out
+  of `fix-wait` on a lane's report — spending a review round on a hand-back that
+  never happened. A lane's report is therefore consumed and audited (§7's
+  narrowing holds for it) and carries **no** drive signal: what a lane says to
+  the drive is its VERDICT FILE, re-read every tick through the gate's own
+  parser, and a lane that stops speaking is bounded by `lane-stalled`. A lane
+  with something to say that is not a status change has `message_orchestrator`,
+  which this section never intercepts.
 - **`message_orchestrator` is never intercepted.** It is the one channel a
   delegate has for something that is not a status change — a brief whose premise
   is wrong, a question, a refusal — and it is exactly the traffic the norm exists

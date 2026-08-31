@@ -3302,17 +3302,45 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // `review_verdict` calls, and naming only the other would leave
             // `report` still delivering under a live drive.
             match reg.rd_owner(&caller.group, &caller.agent_id) {
-                Some((pr, _)) => {
-                    // A `progress` report is consumed like the rest — nothing
-                    // silent — and carries no signal, because a drive advances
-                    // on the head, the checks and the verdict files, never on a
-                    // delegate saying it is still going.
-                    let event = match status {
-                        "done" => Some(super::RdEvent::WorkerDone),
-                        "blocked" => Some(super::RdEvent::WorkerBlocked),
+                Some((pr, role)) => {
+                    // **WHICH side of the drive reported decides what the signal
+                    // means, and dropping the role here was a live defect.**
+                    // `WorkerSignal` is named for the worker because only the
+                    // worker produces one: arc 8 out of `fix-wait` is
+                    // "report(done) with the head unchanged — a body-only fix",
+                    // and `held(worker-blocked)` names a worker's session.
+                    //
+                    // A driven REVIEWER lane calling `report(...)` is making the
+                    // call `reviewer.md` instructs it to make beside its
+                    // `review_verdict`, and `approved`/`request_changes` both
+                    // resolve to the `done` status word. Fed in as a worker
+                    // signal, that took arc 8 out of `fix-wait` with no worker
+                    // turn at all — spending a review round on a hand-back that
+                    // never happened — and a lane's `blocked` produced
+                    // `held(worker-blocked)` naming the wrong delegate and the
+                    // wrong pane.
+                    //
+                    // A lane's report carries NO drive signal, and that is not a
+                    // gap: what a lane says to the drive is its VERDICT FILE,
+                    // re-read every tick through the gate's own parser (§4), and
+                    // a lane that stops speaking is bounded by `lane-stalled`
+                    // (§2.2). A lane with something to say that is not a status
+                    // change has `message_orchestrator`, which §7 never
+                    // intercepts. It is still CONSUMED and audited — the role
+                    // rides in the audit line so the record says which side
+                    // spoke.
+                    //
+                    // A `progress` report carries no signal from either side: a
+                    // drive advances on the head, the checks and the verdict
+                    // files, never on a delegate saying it is still going.
+                    let is_worker = role == super::reviewdrive::DrivenRole::Worker;
+                    let event = match (is_worker, status) {
+                        (true, "done") => Some(super::RdEvent::WorkerDone),
+                        (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
                         _ => None,
                     };
-                    reg.rd_consume(&caller.group, pr, &caller.agent_id, "report", event);
+                    let kind = if is_worker { "report:worker" } else { "report:lane" };
+                    reg.rd_consume(&caller.group, pr, &caller.agent_id, kind, event);
                 }
                 // #576 residual: the relay variant, which opts this notice into
                 // the question gate's delivery record — the note is the CALLER's
@@ -3392,6 +3420,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // `report` arm calls `deliver_relayed_to_orchestrator`, a separate
             // method whose extra job is the #576 question-mask record. Naming
             // only one would leave the other still delivering under a drive.
+            // The ROLE is deliberately not read here, and that is a statement
+            // rather than an omission: this arm is role-gated to reviewer-kind
+            // blocks above, so a driven caller reaching it is always a lane. The
+            // `report` arm below DOES read it, because both sides reach that one
+            // and the signal means different things depending on which spoke.
             let driven = reg.rd_owner(&caller.group, &caller.agent_id);
             if driven.is_none() {
             let _ = reg.deliver_to_orchestrator(
@@ -3633,6 +3666,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // Deliberately NOT audited as `rd-consumed`: nothing was consumed,
             // and an audit action that named a delivery a consumption would be
             // the mislabel #461 catalogues.
+            // The role is not read here either, and for a different reason: a
+            // hold on `message_orchestrator` is the same fact whichever side
+            // spoke — a driven delegate said something that is not a status
+            // change — and the notice names the delegate by id, which carries
+            // more than its role would.
             if let Some((pr, _)) = reg.rd_owner(&caller.group, &caller.agent_id) {
                 reg.rd_ingest(
                     &caller.group,

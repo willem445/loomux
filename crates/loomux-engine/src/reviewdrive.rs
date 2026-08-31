@@ -1270,6 +1270,13 @@ pub enum CiObservation {
 /// number is a delegate that can route around the orchestrator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerSignal {
+    // **Only the WORKER produces one of these**, and the name is the contract
+    // rather than a label: arc 8 is "`report(done)` with the head unchanged" and
+    // `held(worker-blocked)` names a worker's session, so feeding a reviewer
+    // lane's report in here moves the drive on a hand-back that never happened.
+    // Both sides reach the `report` MCP arm and a reviewer's `approved` resolves
+    // to the same `done` word, so the arm decides on `DrivenRole` — the role is
+    // what makes this type's name true (§7).
     /// Nothing yet.
     Silent,
     /// `report(done)`.

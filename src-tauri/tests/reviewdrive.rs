@@ -725,7 +725,7 @@ fn driven(
         .spawn_agent(&group, Role::Worker, "w", "", false, None)
         .expect("a worker to hand back to");
     let session = w.session_id.clone().expect("claude mints a session id at spawn");
-    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1");
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1", 0);
     assert_eq!(out["driving"], serde_json::json!(true), "drive_review refused: {out}");
     (group, session)
 }
@@ -942,7 +942,7 @@ fn a_repo_with_no_driver_block_is_byte_for_byte_unchanged() {
     let group = reg.create_group(&repo.path(), rails()).unwrap().id;
 
     // The tool refuses, so no drive can exist to tick over.
-    let out = reg.drive_review_with(&group, &gh, 1758, "cafb930d-1111-2222-3333-444444444444", false, 0, "orch-1");
+    let out = reg.drive_review_with(&group, &gh, 1758, "cafb930d-1111-2222-3333-444444444444", false, 0, "orch-1", 0);
     assert_eq!(out["refused"], json!("driver-disabled"), "{out}");
     let report = reg.rd_drive_group_with(&group, &gh, 10_000);
     assert_eq!(report, RdDriveReport::default(), "a driverless group does nothing at all");
@@ -956,7 +956,7 @@ fn a_repo_with_no_driver_block_is_byte_for_byte_unchanged() {
     let repo2 = Repo::new();
     let gh2 = FakeGh::green(HEAD_A);
     let group2 = reg2.create_group(&repo2.path(), rails()).unwrap().id;
-    let ok = reg2.drive_review_with(&group2, &gh2, 1758, "cafb930d-1111-2222-3333-444444444444", false, 0, "orch-1");
+    let ok = reg2.drive_review_with(&group2, &gh2, 1758, "cafb930d-1111-2222-3333-444444444444", false, 0, "orch-1", 0);
     assert_eq!(ok["driving"], json!(true), "{ok}");
     reg2.rd_drive_group_with(&group2, &gh2, 10_000);
     assert_eq!(status_head(&reg2, &group2), HEAD_A, "and it really drives");
@@ -1529,7 +1529,7 @@ fn a_resume_with_a_new_session_forgets_the_pane_and_one_with_the_same_session_ke
     assert_eq!(status_state(&reg, &group), "held");
     let other = "dead1234-9999-8888-7777-666666666666";
     assert_ne!(other, session, "the two sessions must actually differ");
-    let out = reg.drive_review_with(&group, &gh, 1758, other, false, 0, "orch-1");
+    let out = reg.drive_review_with(&group, &gh, 1758, other, false, 0, "orch-1", 0);
     assert_eq!(out["driving"], json!(true), "{out}");
     assert_eq!(
         reg.rd_owner(&group, &worker),
@@ -1555,7 +1555,7 @@ fn a_resume_with_a_new_session_forgets_the_pane_and_one_with_the_same_session_ke
     let (_p, w2) = h2.handbacks.first().cloned().expect("the drive hands back");
     reg2.rd_drive_group_with(&g2, &gh2, day);
     assert_eq!(status_state(&reg2, &g2), "held");
-    reg2.drive_review_with(&g2, &gh2, 1758, &s2, false, 0, "orch-1");
+    reg2.drive_review_with(&g2, &gh2, 1758, &s2, false, 0, "orch-1", 0);
     assert_eq!(
         reg2.rd_owner(&g2, &w2).map(|(pr, _)| pr),
         Some(1758),
@@ -1620,6 +1620,7 @@ fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
         false,
         0,
         "orch-1",
+        0,
     );
     assert_eq!(out["driving"], json!(true), "{out}");
 
@@ -1744,5 +1745,191 @@ fn its_registry_helper_applies_every_override_this_allowlist_row_assumes() {
     assert!(
         !body.contains("#[test]"),
         "the extraction swallowed a test, so it is no longer reading only the helper"
+    );
+}
+
+// ── the live path: what a real delegate actually calls ──────────────────────
+
+/// **B1's witness, and the reason it had none.** Every earlier test drove the
+/// driver's own machinery; not one dispatched `report` from a driven delegate —
+/// the call `reviewer.md` and `worker.md` both instruct. So a defect that lived
+/// entirely in that arm was invisible to a green suite.
+///
+/// `rd_owner` computes which side of the drive the caller is, and the arm
+/// discarded it. A driven REVIEWER's `report(approved)` — `approved` resolves to
+/// the `done` status word — was ingested as `WorkerSignal::Done`, which is arc 8
+/// out of `fix-wait`: a review round spent on a hand-back that never happened,
+/// with no worker turn at all.
+///
+/// The three assertions are one property from three directions: a lane's report
+/// is CONSUMED (so §7's narrowing still holds and nothing leaks to the
+/// orchestrator) and carries NO worker signal (so the drive does not move), for
+/// every outcome word a reviewer can send.
+#[test]
+fn a_driven_lanes_report_is_consumed_and_never_read_as_a_worker_signal() {
+    for outcome in ["approved", "request_changes", "blocked"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _s) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7001);
+
+        // Open lane 0 and keep its pane — that agent is the driven LANE, and
+        // capturing it from the tick that opened it is how every other test in
+        // this file gets one.
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _block, lane_agent) =
+            opened.lanes_opened.first().cloned().expect("lane 0 opens");
+
+        // Then drive to a hand-back, so the entry is in `fix-wait` — the one
+        // state a misread worker signal would move, and therefore the only state
+        // in which this defect is observable at all.
+        gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+        gh.set_facts("OPEN", HEAD_B);
+        reg.rd_drive_group_with(&group, &gh, 30_000);
+        let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
+        assert!(!handed.handbacks.is_empty(), "the drive must hand back for {outcome} to matter");
+        assert_eq!(status_state(&reg, &group), "fix-wait");
+
+        // The LANE reports — through `dispatch`, exactly as a real reviewer does.
+        let caller = Caller {
+            agent_id: lane_agent.clone(),
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        };
+        dispatch(
+            &reg,
+            &caller,
+            "tools/call",
+            &json!({ "name": "report", "arguments": {
+                "outcome": outcome, "note": "the lane speaking", "ref": "#1758" } }),
+        )
+        .unwrap_or_else(|e| panic!("a driven lane must still be able to report ({outcome}): {e}"));
+
+        // §7 still holds: consumed, not delivered.
+        assert!(
+            !delivered_texts(&reg, &group).iter().any(|t| t.contains("reports")),
+            "a driven lane's report reached the orchestrator's pane ({outcome})"
+        );
+        assert!(
+            reg.audit_log(&group).iter().any(|e| e.action == "rd-consumed"),
+            "…and it must be on the record as consumed ({outcome})"
+        );
+
+        // And the drive has NOT moved: a lane's report is not a worker signal.
+        reg.rd_drive_group_with(&group, &gh, 50_000);
+        assert_eq!(
+            status_state(&reg, &group),
+            "fix-wait",
+            "a driven LANE's report({outcome}) moved the drive out of fix-wait — that is arc 8, \
+             which is a WORKER's report(done) with the head unchanged, and no worker spoke"
+        );
+    }
+}
+
+/// The other half, and the control for the test above: a driven WORKER's report
+/// still is a worker signal. Without this, the assertions above would hold under
+/// an implementation that ignored every report from anyone.
+#[test]
+fn a_driven_workers_report_is_still_a_worker_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    gh.set_facts("OPEN", HEAD_B);
+    reg.rd_drive_group_with(&group, &gh, 30_000);
+    let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: worker,
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "blocked", "note": "cannot proceed", "ref": "#1758" } }),
+    )
+    .expect("a driven worker reports");
+
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_eq!(status_state(&reg, &group), "held", "a WORKER's blocked must park the drive");
+    let s = reg.review_drive_status(&group);
+    assert_eq!(
+        s["drives"][0]["held_reason"],
+        json!("worker-blocked"),
+        "…and name the worker, which is the side that actually spoke: {s}"
+    );
+}
+
+/// **B2's witness.** `held -> ci-wait` is arc 11, and §2.3 calls resuming a
+/// parked drive the default — four shipped surfaces tell the orchestrator so.
+///
+/// `decide` checks the drive's AGE before any per-state logic, and `started_ms`
+/// was never reset on the resume. So a drive parked longer than
+/// `drive_timeout_minutes` re-held `drive-stalled` on its very first tick after
+/// being resumed — and a hold a human takes their time over is exactly that old.
+/// Arc 11 was a no-op for precisely the holds it exists to recover.
+///
+/// The lane clock is the same shape at a quarter the threshold, so both are
+/// asserted: the drive is resumed at a `now` past BOTH timeouts and must reach a
+/// working state and stay there.
+#[test]
+fn a_resume_recovers_a_drive_older_than_its_own_timeouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, session) = driven(&reg, &repo, &gh);
+
+    // Park it on the drive's own age bound — the hold this test is about.
+    let past_drive_timeout = 241 * 60 * 1000;
+    reg.rd_drive_group_with(&group, &gh, past_drive_timeout);
+    assert_eq!(status_state(&reg, &group), "held", "the drive must actually be parked");
+    assert_eq!(
+        reg.review_drive_status(&group)["drives"][0]["held_reason"],
+        json!("drive-stalled")
+    );
+
+    // The remedy every one of those surfaces names.
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", past_drive_timeout);
+    assert_eq!(out["driving"], json!(true), "{out}");
+    assert_eq!(status_state(&reg, &group), "ci-wait", "arc 11 puts it back to work");
+
+    // …and it STAYS at work. This is the assertion the defect moves: before the
+    // fix the very next tick re-held, because the age was still measured from an
+    // entry created four hours ago.
+    let after_resume = past_drive_timeout + 60_000;
+    reg.rd_drive_group_with(&group, &gh, after_resume);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "the drive re-held on the first tick after a resume — arc 11 is a no-op for exactly the \
+         holds it exists to recover, and four shipped surfaces promise otherwise"
+    );
+    assert_eq!(status_head(&reg, &group), HEAD_A, "and it really ticked");
+
+    // The lane clock too: a resumed drive must not immediately `lane-stalled` on
+    // a lane the orchestrator has just looked at and chosen to resume.
+    reg.rd_drive_group_with(&group, &gh, after_resume + 60_000);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "a resumed drive re-held on the lane clock, which is the same defect at 60 minutes"
     );
 }
