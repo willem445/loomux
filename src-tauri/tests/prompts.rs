@@ -241,6 +241,13 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
         !head.contains("every open branch is stale"),
         "the retracted 'every open branch is stale' rule is back in the digest: {head}"
     );
+
+    // #1848 review: the resident stub must carry the widened trigger too — reverting its
+    // heading to "After a merge you performed" has to go red here, not silently.
+    let stub = section(&o, "### after any merge", "### mergeability");
+    pinned("the red-main stub", stub, "after any merge, the default branch is yours",
+        "the stub's trigger is ANY merge (#1844 widened it): the procedure is fetched on \
+         demand, but the trigger is what tells the orchestrator to fetch it");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -523,6 +530,12 @@ fn any_merge_of_the_default_branch_leaves_its_next_ci_run_owned_until_green() {
     pinned(at, aftermath, "restoring main costs a revert",
         "…and the revert is the DEFAULT, not the fallback: restoring main costs a revert, debugging \
          it in place costs everybody's afternoon");
+    // #1848 review: the test NAME claims the widened trigger, so the assertion must check it —
+    // reverting this line to "So after merging" has to go red here, or the name asserts a
+    // property nothing checks.
+    pinned(at, aftermath, "after any merge — yours, the human's, or one you merely watched land",
+        "the trigger is ANY merge onto the default branch (#1844 widened it): the human merges \
+         routinely, and the hazard does not care who merged");
 }
 
 #[test]
@@ -564,6 +577,10 @@ fn a_pr_merges_when_github_reports_it_mergeable_and_a_branch_merely_behind_is_le
     pinned(at, mergeability, "case (invariant 6)",
         "the case a pre-merge rebase used to catch — two green PRs landing a red main — is \
          INVARIANT 6's own, so the replacement is a redirect, not a hole");
+    // #1848 review: the widened trigger must survive in this section's own wording too.
+    pinned(at, mergeability, "whoever performed it",
+        "…and the post-merge run is watched after any merge onto the default branch, whoever \
+         performed it — the human merges routinely, and the hazard does not care who merged");
     pinned(at, mergeability, "speculative batch remains the mergeability probe",
         "the queue's speculative merge is unaffected — it stays the right mergeability probe \
          for sub-PRs onto an integration branch");
