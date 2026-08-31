@@ -1312,3 +1312,271 @@ fn a_parked_drives_delegate_still_reaches_the_orchestrator() {
          human who cannot see what the delegates said cannot take it"
     );
 }
+
+// ── the three functional defects that had no witness ────────────────────────
+
+/// **The delta brief is reachable at all** — the pin for the defect that would
+/// have shipped looking correct while delivering close to none of the saving.
+///
+/// `LaneRecord::at_head` is what distinguishes a lane that has **answered** from
+/// one that has only been **asked** (§5.2 keeps it apart from `briefed_head` for
+/// exactly this). Nothing wrote it: the tick read every lane's verdict file into
+/// its notice inputs and threw the reading away. So a re-briefed lane looked
+/// like a first-time lane forever, `driver-delta.md` was unreachable, and every
+/// round would have got the first-call template — while the delta brief is the
+/// line an orchestrator typed by hand nine times on one PR, and is most of what
+/// §1 measures this feature's value as.
+///
+/// The fixture makes the lane answer and *then* moves the head, which is what
+/// stales the pass and forces the re-brief. Both halves are asserted: the delta
+/// template rendered, and it names the revision the lane previously answered at
+/// — a brief that said "DELTA" while naming the current head would be the same
+/// defect wearing the right word.
+#[test]
+fn a_lane_that_has_answered_is_re_briefed_with_the_delta_template() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    assert!(
+        lane_brief(&reg, &lane).starts_with("Review PR #1758"),
+        "the FIRST call is the first-call template, which is the control for the delta below"
+    );
+
+    // The lane answers at HEAD_A, through the real recording path.
+    let caller = Caller {
+        agent_id: lane.clone(),
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+    )
+    .expect("the lane records");
+
+    // …and then the head moves, which stales that pass (§2.1's first carried-over
+    // property) and sends the drive back round to re-brief the same lane.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> ci-wait (arc 6)
+    reg.rd_drive_group_with(&group, &gh, 40_000); // ci-wait -> review-wait (arc 2)
+    let again = reg.rd_drive_group_with(&group, &gh, 50_000); // re-brief
+    let (_pr, _b, lane2) = again
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("the stale lane must be re-briefed at the new head");
+
+    let delta = lane_brief(&reg, &lane2);
+    assert!(
+        delta.starts_with("DELTA on PR #1758"),
+        "a lane that has ANSWERED must get the delta template, not the first-call one — \
+         `at_head` is what tells the two apart: {delta}"
+    );
+    assert!(
+        delta.contains(&format!("at head {HEAD_A}")),
+        "…and it must name the revision that lane previously answered at: {delta}"
+    );
+    assert!(delta.contains(HEAD_B), "…and the one it is being asked about now: {delta}");
+}
+
+/// **A resume with a NEW session drops the old pane**, because that pane is an
+/// interception key.
+///
+/// `worker_agent` is what `driven_role` matches an incoming `report` against. A
+/// resume that re-pointed the drive at a different session while leaving the old
+/// pane recorded would have the drive consume the traffic of a worker it no
+/// longer owns — and the worker it *does* own report to the orchestrator as if
+/// undriven. Both halves are wrong and neither is visible in a notice.
+///
+/// The control is the second half: resuming with the SAME session keeps the
+/// pane, because that pane is still the right one. Without it this test would
+/// pass under an implementation that cleared the field unconditionally, which
+/// would break the ordinary resume — the common case.
+#[test]
+fn a_resume_with_a_new_session_forgets_the_pane_and_one_with_the_same_session_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, session) = driven(&reg, &repo, &gh);
+
+    // Drive to a hand-back so a worker pane is actually recorded.
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    gh.set_facts("OPEN", HEAD_B);
+    reg.rd_drive_group_with(&group, &gh, 30_000);
+    let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+    assert_eq!(
+        reg.rd_owner(&group, &worker).map(|(pr, _)| pr),
+        Some(1758),
+        "the recorded pane is the interception key, so it must own that agent to begin with"
+    );
+
+    // Park it, then resume pointing at a DIFFERENT session.
+    let day = 24 * 60 * 60 * 1000;
+    reg.rd_drive_group_with(&group, &gh, day);
+    assert_eq!(status_state(&reg, &group), "held");
+    let other = "dead1234-9999-8888-7777-666666666666";
+    assert_ne!(other, session, "the two sessions must actually differ");
+    let out = reg.drive_review_with(&group, &gh, 1758, other, false, 0, "orch-1");
+    assert_eq!(out["driving"], json!(true), "{out}");
+    assert_eq!(
+        reg.rd_owner(&group, &worker),
+        None,
+        "a drive re-pointed at another session still owned the OLD pane — it would consume \
+         that worker's traffic while the worker it now owns reported as undriven"
+    );
+
+    // The control: the same session keeps its pane. Otherwise the assertion
+    // above would hold under an implementation that always cleared it, which
+    // breaks the ordinary resume.
+    let dir2 = tempfile::tempdir().unwrap();
+    let reg2 = relaunch_registry(dir2.path());
+    let repo2 = Repo::new();
+    let gh2 = FakeGh::green(HEAD_A);
+    let (g2, s2) = driven(&reg2, &repo2, &gh2);
+    reg2.rd_drive_group_with(&g2, &gh2, 10_000);
+    reg2.rd_drive_group_with(&g2, &gh2, 20_000);
+    gh2.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    gh2.set_facts("OPEN", HEAD_B);
+    reg2.rd_drive_group_with(&g2, &gh2, 30_000);
+    let h2 = reg2.rd_drive_group_with(&g2, &gh2, 40_000);
+    let (_p, w2) = h2.handbacks.first().cloned().expect("the drive hands back");
+    reg2.rd_drive_group_with(&g2, &gh2, day);
+    assert_eq!(status_state(&reg2, &g2), "held");
+    reg2.drive_review_with(&g2, &gh2, 1758, &s2, false, 0, "orch-1");
+    assert_eq!(
+        reg2.rd_owner(&g2, &w2).map(|(pr, _)| pr),
+        Some(1758),
+        "a resume with the SAME session must keep its pane — that pane is still the right one"
+    );
+}
+
+
+/// The same roster with **two** reviewer lanes — the only fixture in which
+/// `held(lane-stalled)` can be got wrong at all.
+///
+/// With one lane, "the stalled lane" and "the last lane with a verdict" are the
+/// same lane and every selection rule passes. The defect this pins needs a lane
+/// that has ANSWERED and a different lane that has not.
+const WORKFLOW_TWO_LANES: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+  - id: rev-final
+    name: Final validation
+    kind: reviewer
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-std, rev-final]
+driver:
+  enabled: true
+"#;
+
+/// **`held(lane-stalled)` names the lane that stalled**, which §2.2 says is that
+/// notice's whole job — it names the pane a human or the orchestrator has to go
+/// and look at.
+///
+/// The defect: the hold's facts fell back to "the last lane with a verdict" when
+/// no lane had spoken. A stalled lane has by definition recorded nothing, so it
+/// is absent from that list entirely, and the fallback named a **different,
+/// passing** lane and *its* pane. The notice fired and read as healthy either
+/// way, which is what made it worth a two-lane fixture.
+///
+/// The two assertions are a pair on purpose: naming the stalled lane is only
+/// half of it, because a rule that named the FIRST lane unconditionally would
+/// satisfy the first assertion here and be just as wrong. The second says the
+/// passed lane must not be the subject.
+#[test]
+fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let out = reg.drive_review_with(
+        &group,
+        &gh,
+        1758,
+        "cafb930d-1111-2222-3333-444444444444",
+        false,
+        0,
+        "orch-1",
+    );
+    assert_eq!(out["driving"], json!(true), "{out}");
+
+    // Lane 0 opens and passes.
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, block0, lane0) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    assert_eq!(block0, "rev-std", "gate order puts the static reviewers first");
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: lane0,
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - lane one is happy" } }),
+    )
+    .expect("lane 0 records");
+
+    // Lane 1 opens and then says nothing at all.
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, block1, lane1) = second
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("lane 1 opens once lane 0's pass stands");
+    assert_eq!(block1, "rev-final", "…and the routed/declared order is the gate's");
+
+    // Past the lane timeout, with the drive's own age bound still far away so
+    // this is `lane-stalled` and not `drive-stalled`.
+    let past_lane_timeout = 30_000 + 61 * 60 * 1000;
+    let report = reg.rd_drive_group_with(&group, &gh, past_lane_timeout);
+    assert_eq!(status_state(&reg, &group), "held");
+    let notice = report
+        .notices
+        .iter()
+        .find(|n| n.contains("HELD"))
+        .expect("a hold delivers exactly one notice");
+
+    assert!(
+        notice.contains("lane rev-final"),
+        "the hold must name the lane that STALLED: {notice}"
+    );
+    assert!(
+        !notice.contains("rev-std"),
+        "…and must not name the lane that PASSED — a rule that always named the first lane \
+         would satisfy the assertion above and be just as wrong: {notice}"
+    );
+    assert!(
+        notice.contains(&lane1),
+        "…and §2.2 says this notice names the PANE, which is what a human goes and reads: \
+         {notice}"
+    );
+}
