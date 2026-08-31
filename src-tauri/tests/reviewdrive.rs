@@ -2832,3 +2832,34 @@ fn queue_merges_failure_list_agrees_with_both_numbers_that_describe_it() {
          cannot see it — fix the delimiter here rather than the number"
     );
 }
+/// SCRATCH-ONLY (never merged): the PRE-#1863-D2 shape pin, verbatim in what it
+/// drives — the green fixture and nothing else. Under the same mutation that
+/// reddens the per-arm test, this one must stay GREEN. That is D2, performed.
+#[test]
+fn scratch_the_old_green_only_shape_pin_cannot_see_the_defect() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("a lane opens");
+    let brief = lane_brief(&reg, &lane);
+
+    let mut checked = 0usize;
+    for line in brief.lines() {
+        checked += 1;
+        assert!(!line.contains("          "), "leaks source indentation: {line:?}");
+    }
+    assert!(checked > 3, "the positive control: this must have read real lines, not none");
+
+    let ci_line = brief
+        .lines()
+        .find(|l| l.contains("checks are"))
+        .expect("every lane brief states the CI it observed");
+    assert!(
+        !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
+        "the CI sentence must be one whole paragraph on one line: {ci_line:?}"
+    );
+}

@@ -1020,7 +1020,8 @@ impl OrchRegistry {
         let ci = match brief.ci {
             reviewdrive::CiObservation::Green => "This PR's checks are green at that head.",
             reviewdrive::CiObservation::Red => "This PR's checks are RED at that head. Review the change on its merits; the failure is the worker's to answer.",
-            reviewdrive::CiObservation::Conflicting => "This PR does not merge cleanly at that head. Review the change on its merits; the conflict is the worker's to answer.",
+            reviewdrive::CiObservation::Conflicting => "This PR does not merge cleanly at that head.
+                 Review the change on its merits; the conflict is the worker's to answer.",
             // Pending and Unknown share one sentence on purpose: §8 says unknown
             // is never reported as a fact about the PR, and not-green-yet is the
             // only thing true of both.
