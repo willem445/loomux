@@ -1854,11 +1854,9 @@ impl OrchRegistry {
                 // lane record, so clearing there is a no-op; and a lane that is
                 // legitimately mid-review must not be re-briefed merely because
                 // some OTHER hold on the same drive was resumed.
-                if was_lane_stalled {
-                    for l in entry.lanes.iter_mut() {
-                        l.briefed_head.clear();
-                    }
-                }
+                // [scratch MUT-4a] B4 reverted: the lane is re-timed but never
+                // re-briefed, so the resume buys a silent lane_timeout.
+                let _ = was_lane_stalled;
                 // **A new session means the recorded PANE is stale**, and a
                 // stale pane is not merely useless — it is an interception key.
                 // `driven_role` matches on `worker_agent`, so leaving the old
