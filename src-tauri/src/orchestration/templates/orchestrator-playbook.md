@@ -646,7 +646,7 @@ semantic conflict with something that landed between its last run and your merge
 only runs post-merge — and a red default branch blocks every worker in the group, not just this
 one.
 
-So after any merge — yours, the human's, or one you merely watched land — **watch the
+So after merging, **watch the
 post-merge run** (`gh run list --branch <default> --limit 1`, then
 `gh run view <id> --log-failed` if it goes red). The task isn't done until you've seen that run
 complete.
@@ -682,7 +682,7 @@ its session; it wrote the code and knows which side wins — **one attempt, then
 
 The hazard a pre-merge rebase used to manage — two individually-green PRs combining into a
 red default branch — is **red main's** case (INVARIANT 6), and that invariant is the whole
-backstop: after any merge onto the default branch — whoever performed it — watch the
+backstop: after any merge you performed, watch the
 post-merge run; on red, stop merging, fix forward once, then revert. Do not resurrect
 proactive rebasing as a second safety net beside it. The merge queue is unaffected: its
 speculative batch remains the mergeability probe for sub-PRs onto an integration branch —

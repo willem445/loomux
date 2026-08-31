@@ -513,7 +513,7 @@ the open-question hold, and dangerous mode: `read_playbook("merge-gate")`.
 the aggregated message, and re-read the partly-addressed issues after:
 `read_playbook("squash-closes-issues")`.
 
-### After any merge, the default branch is yours until it's green
+### After a merge you performed, the default branch is yours until it's green
 
 INVARIANT 6 keeps the rule. **Watch the post-merge run, and the moment it goes red:** stop
 merging, fix forward once, then revert: `read_playbook("red-main")`.
