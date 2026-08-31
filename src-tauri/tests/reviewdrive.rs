@@ -32,7 +32,7 @@ use loomux_lib::orchestration::workflow::{ReviewVerdict, Verdict};
 use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
-use loomux_lib::orchestration::{Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport};
+use loomux_lib::orchestration::{Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport, Role};
 use serde_json::json;
 
 // ── fixtures ────────────────────────────────────────────────────────────────
