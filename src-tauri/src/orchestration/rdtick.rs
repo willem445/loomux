@@ -1042,7 +1042,19 @@ impl OrchRegistry {
                     "Review requested changes: {} recorded FAIL. The findings are on the PR. \
                      Address all of them, or answer on the PR why one is not a defect, then \
                      push.",
-                    rd_fact(&brief.failing_lane())
+                    // The DECIDING lane, which is the one `decide_review_wait`
+                    // actually acted on — not "the first lane with a `fail`".
+                    // The two agree today, because the deciding lane is the
+                    // first whose pass does not stand and a `fail` is what put
+                    // it there. They agree by an argument rather than by
+                    // construction, and naming the wrong lane in a hand-back
+                    // sends a worker to the wrong review.
+                    rd_fact(
+                        &brief
+                            .deciding_lane
+                            .clone()
+                            .unwrap_or_else(|| brief.failing_lane())
+                    )
                 ),
                 entry.counters.review_rounds,
                 limits.max_review_rounds,
@@ -1077,7 +1089,7 @@ impl OrchRegistry {
     /// — a race the reconcile cannot distinguish from a genuinely lost session,
     /// where the hand-back can.
     fn rd_reconcile_with(&self, group: &GroupId, runner: &dyn rddrive::RdRunner) -> Vec<String> {
-        if !self.rd_reconciled.lock_safe().insert(group.clone()) {
+        if self.rd_reconciled.lock_safe().contains(group) {
             return Vec::new();
         }
         let dir = self.group_dir(group);
@@ -1085,7 +1097,17 @@ impl OrchRegistry {
         let mut audits: Vec<(String, u64, bool)> = Vec::new();
         {
             let _state_guard = self.rd_state_lock.lock_safe();
+            // **The once-only latch is set below, on a reconcile that actually
+            // READ the file — not here, on one that merely attempted it.**
+            // Latching first is the obvious spelling and it means a torn
+            // `review_drives.json` at startup costs this group its reconcile for
+            // the life of the process, including after a human fixes the file:
+            // the flag says "done" and nothing ever revisits it. §2.4 already
+            // makes an unreadable file a loud, rate-bounded "a human has to look
+            // at this", and a human who then looks and fixes it should get the
+            // reconcile they were owed.
             let Ok(mut state) = reviewdrive::load_state(&dir) else { return Vec::new() };
+            self.rd_reconciled.lock_safe().insert(group.clone());
             let mut changed = false;
             let live: Vec<u64> =
                 state.entries.iter().filter(|e| !e.state().is_terminal()).map(|e| e.pr).collect();
@@ -1557,6 +1579,18 @@ impl OrchRegistry {
             if q.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false) {
                 return self.rd_refuse(group, pr, r::IN_MERGE_QUEUE);
             }
+        }
+        // **`already-driven`, checked once cheaply BEFORE the `gh` call.** A
+        // second `drive_review` on a live PR is the ordinary duplicate — an
+        // orchestrator retrying, or re-reading its own state after a compact —
+        // and spending a `gh` round trip to answer it is a round trip on the
+        // loop that also delivers every `notify_when` notice in the fleet. The
+        // AUTHORITATIVE check is still the one under the lock below: this read
+        // is unsynchronized, so it can only ever be stale in the direction of
+        // doing more work, never of starting a second drive.
+        if reviewdrive::load_state(&self.group_dir(group)).map(|s| s.is_driven(pr)).unwrap_or(false)
+        {
+            return self.rd_refuse(group, pr, r::ALREADY_DRIVEN);
         }
         // Last, because it is the only check that spends a `gh` round trip.
         let obs = rddrive::observe_pr(runner, pr);
