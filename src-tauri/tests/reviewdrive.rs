@@ -1027,7 +1027,24 @@ fn a_driven_pr_may_not_be_queued() {
 /// and passes identically while the live call site hands `render_template` a raw
 /// job name".
 fn lane_brief(reg: &OrchRegistry, agent: &str) -> String {
-    reg.agent(agent).expect("the spawned lane is on the roster").task
+    lf(&reg.agent(agent).expect("the spawned lane is on the roster").task)
+}
+
+/// Line endings normalised — `workflow.rs`'s own `lf`, for its reason.
+///
+/// The brief templates are `include_str!`'d, so they carry whatever line endings
+/// the checkout has: LF on the Linux and macOS runners, CRLF on the Windows one
+/// under this project's `core.autocrlf=true` baseline. A byte-for-byte golden
+/// written with `\n` therefore passes on two platforms and fails on the third,
+/// which is a fact about the checkout rather than about the rendered brief.
+///
+/// It matters for the hostile-value test too, and less obviously: a stray `\r`
+/// is a CONTROL CHARACTER, so an assertion that no control character survived
+/// into a brief fires on the template's own line endings rather than on anything
+/// the sanitizer let through. Normalising first is what makes that assertion
+/// about the interpolated VALUE, which is what it is for.
+fn lf(s: &str) -> String {
+    s.replace("\r\n", "\n")
 }
 
 /// Drive to the point where lane 0 has been briefed, and return `(group, agent)`.
