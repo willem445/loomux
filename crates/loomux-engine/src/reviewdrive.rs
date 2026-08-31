@@ -2267,6 +2267,65 @@ mod tests {
     }
 
     #[test]
+    fn the_two_layers_agree_on_invariant_9() {
+        // **The cross-pin, and the reason it exists is the one thing it does NOT
+        // change.** §2.3 puts INVARIANT 9's numbers behind two independent
+        // enforcers: `workflow.rs` refuses an out-of-range `driver:` value as it
+        // parses, and `decide` clamps again on the values it actually reads.
+        // Both must keep enforcing — that is the consent boundary, and
+        // `a_repo_cannot_raise_invariant_9_by_handing_decide_a_wider_bound` is
+        // why the second is not redundant: `decide` is a `pub fn` over a plain
+        // value type any caller in any crate can reach without passing through
+        // the parser at all.
+        //
+        // Independence of ENFORCEMENT is not duplication of the VALUE. Two
+        // layers encoding "three" separately can drift to three and four with
+        // nothing red to say so, and the direction that drift takes is a WIDENED
+        // ceiling on an invariant the orchestrator template promises a human.
+        // Nothing else in either crate compares them.
+        //
+        // Sited here because this is the one place that can see both: the
+        // ceilings are this module's and the range constants are
+        // `crate::workflow`'s, and they are one `use` apart in the same crate.
+        use crate::workflow;
+        assert_eq!(
+            MAX_ROUNDS_CEILING, workflow::DRIVER_MAX_REVIEW_ROUNDS_MAX,
+            "the review-round ceiling `decide` clamps to and the one the `driver:` block \
+             refuses past have drifted apart"
+        );
+        assert_eq!(
+            MAX_ROUNDS_CEILING, workflow::DRIVER_MAX_CI_ATTEMPTS_MAX,
+            "the CI-attempt ceiling has drifted from the review-round one; INVARIANT 9 gives \
+             both the same number"
+        );
+        assert_eq!(
+            MAX_REBASE_CEILING, workflow::DRIVER_MAX_REBASE_ATTEMPTS_MAX,
+            "the rebase ceiling `decide` clamps to and the one the `driver:` block refuses \
+             past have drifted apart"
+        );
+
+        // The FLOORS are the other half of the same agreement, and they are not
+        // symmetric — `clamped()` floors the two round counters at 1 and lets
+        // rebases reach 0, because zero review rounds is a drive that parks on
+        // the first `fail` having handed nothing back, while zero rebases is a
+        // coherent policy a repo may choose. The parser has to permit exactly
+        // what the clamp would produce, or one layer accepts a value the other
+        // silently rewrites.
+        assert_eq!(workflow::DRIVER_MAX_REVIEW_ROUNDS_MIN, 1);
+        assert_eq!(workflow::DRIVER_MAX_CI_ATTEMPTS_MIN, 1);
+        assert_eq!(workflow::DRIVER_MAX_REBASE_ATTEMPTS_MIN, 0);
+        let floored = DriveLimits::new(0, 0, 0, 60, 60, 240);
+        assert_eq!(floored.max_review_rounds, workflow::DRIVER_MAX_REVIEW_ROUNDS_MIN);
+        assert_eq!(floored.max_ci_attempts, workflow::DRIVER_MAX_CI_ATTEMPTS_MIN);
+        assert_eq!(floored.max_rebase_attempts, workflow::DRIVER_MAX_REBASE_ATTEMPTS_MIN);
+
+        // And the non-vacuity control: the constants are not all the same
+        // number, so the three equalities above are three facts rather than one
+        // tautology over a single value.
+        assert_ne!(MAX_ROUNDS_CEILING, MAX_REBASE_CEILING);
+    }
+
+    #[test]
     fn the_seed_and_the_clamps_only_ever_tighten() {
         // §2.3: a repo may run a tighter loop than the orchestrator template
         // promises; it may not run a looser one.

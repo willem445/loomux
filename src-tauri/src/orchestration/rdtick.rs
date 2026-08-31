@@ -281,27 +281,37 @@ impl OrchRegistry {
     /// nobody reads, while a driver that fails open spawns reviewers into a repo
     /// that never asked for one.
     ///
-    /// **SCAFFOLD until this branch rebases onto S2 (#1784)**, and removed
-    /// inside this PR rather than left standing. That PR adds
-    /// `RawWorkflow::driver` and `workflow::DriverPolicy`, which do not exist on
-    /// `main`, so the read below is the default and the only way to enable a
-    /// drive today is `rd_policy_override`. The rebase commit replaces this body
-    /// with the `wf.driver` read, deletes the override, and rewrites the tests
-    /// that use it against a real `driver:` block — so no scaffold and no seam
-    /// survives into the ready PR.
+    /// **The `driver:` block, mapped through `DriveLimits::new`, which clamps.**
+    /// S2 already refused an out-of-range value as it parsed; this clamps again
+    /// on the values actually read, and the second is not redundant — `decide`
+    /// is a `pub fn` over a plain value type that any caller in any crate can
+    /// reach without passing through S2's parser, and a boundary that holds only
+    /// when the expected caller is upstream is not a boundary. The two layers
+    /// enforce independently on purpose; `the_two_layers_agree_on_invariant_9`
+    /// is what stops them disagreeing about the VALUE.
+    ///
+    /// The timeouts pass through unclamped here because §5.3 does not bound them
+    /// against INVARIANT 9 — they are pacing, not budget, and S2 clamps them to
+    /// the notify-TTL family as it parses.
     fn driver_policy(&self, group: &GroupId) -> (bool, reviewdrive::DriveLimits) {
-        if let Some(p) = self.rd_policy_override.lock_safe().clone() {
-            return p;
-        }
         let off = (false, reviewdrive::DriveLimits::default());
         let Some(g) = self.group(group) else { return off };
         if !g.guardrails.advanced_orchestrator {
             return off;
         }
-        match workflow::load_workflow(&g.repo) {
-            Ok(Some(_wf)) => off,
-            _ => off,
-        }
+        let Ok(Some(wf)) = workflow::load_workflow(&g.repo) else { return off };
+        let d = wf.driver;
+        (
+            d.enabled,
+            reviewdrive::DriveLimits::new(
+                d.max_review_rounds,
+                d.max_ci_attempts,
+                d.max_rebase_attempts,
+                d.lane_timeout_minutes as u64,
+                d.fix_timeout_minutes as u64,
+                d.drive_timeout_minutes as u64,
+            ),
+        )
     }
 
     /// Whether this group runs a review driver at all.
@@ -315,12 +325,6 @@ impl OrchRegistry {
     /// `driver-disabled` could be told in its instructions that it has a driver.
     pub(super) fn driver_enabled(&self, group: &GroupId) -> bool {
         self.driver_policy(group).0
-    }
-
-    /// SCAFFOLD test seam — see [`driver_policy`](Self::driver_policy).
-    #[doc(hidden)] // pub for integration tests
-    pub fn set_rd_policy_override(&self, p: Option<(bool, reviewdrive::DriveLimits)>) {
-        *self.rd_policy_override.lock_safe() = p;
     }
 
     /// Install (or clear) the canned `gh` the driver reads through —

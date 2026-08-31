@@ -13278,8 +13278,6 @@ pub struct OrchRegistry {
     /// Test seam: when set, `rd_driver_tick` drives with this `gh` instead of
     /// building a process runner over the group's repo. `None` in the app.
     rd_runner_override: TrackedMutex<Option<Arc<dyn rddrive::RdRunner>>>,
-    /// SCAFFOLD, removed at the S2 rebase — see `driver_policy`.
-    rd_policy_override: TrackedMutex<Option<(bool, reviewdrive::DriveLimits)>>,
     /// Driven delegates' events, between the MCP arm that consumed one (§7) and
     /// the tick that acts on it. In memory; `rd_ingest` carries why.
     rd_signals: Arc<TrackedMutex<HashMap<(GroupId, u64), RdSignal>>>,
@@ -27112,7 +27110,6 @@ impl OrchRegistry {
             rd_state_lock: Arc::new(TrackedMutex::new("rd_state_lock", ())),
             rd_service_ms: Arc::new(TrackedMutex::new("rd_service_ms", HashMap::new())),
             rd_runner_override: TrackedMutex::new("rd_runner_override", None),
-            rd_policy_override: TrackedMutex::new("rd_policy_override", None),
             rd_signals: Arc::new(TrackedMutex::new("rd_signals", HashMap::new())),
             rd_reconciled: Arc::new(TrackedMutex::new("rd_reconciled", HashSet::new())),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
