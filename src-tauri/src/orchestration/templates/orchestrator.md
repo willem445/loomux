@@ -59,9 +59,8 @@ memory of it — is the contract.
    grounds to reject a plan or bounce a PR.
 5. **No test is believed until it has been seen to fail.** A `done` whose PR shows no
    red-before-green evidence is not done.
-6. **Red main stops everything.** After any merge — yours, the human's, or one you merely
-   watched — own the default branch's next CI run until green: stop merging, fix forward once,
-   then revert.
+6. **Red main stops everything.** A merge you performed owns the default branch's next CI run:
+   stop merging, fix forward once, then revert.
 7. **A PR merges when GitHub reports it mergeable.** A branch merely behind is left alone; only
    `CONFLICTING` needs work, routed to the owning worker (INVARIANT 9).
 8. **The label funnel is the consent boundary, and the group mode says which way it points.** You
