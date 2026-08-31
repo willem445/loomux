@@ -2001,9 +2001,27 @@ fn a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again() {
     assert_eq!(out["driving"], json!(true), "{out}");
 
     // The assertion the defect moves.
+    //
+    // **Two ticks, because §2.4 allows at most one advance per tick.** The first
+    // moves `ci-wait -> review-wait` and stops; the lane can only be opened by
+    // the one after it. A single tick here asserts nothing about the re-open —
+    // it is empty under every implementation, this one included, which is a
+    // vacuous pin rather than a failing one.
     let after = stalled_at + 60_000;
-    let resumed = reg.rd_drive_group_with(&group, &gh, after);
-    let reopened: Vec<String> = resumed.lanes_opened.iter().map(|(_, b, _)| b.clone()).collect();
+    let first = reg.rd_drive_group_with(&group, &gh, after);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "the tick after a resume spends its one advance getting back to review-wait"
+    );
+    let second = reg.rd_drive_group_with(&group, &gh, after + 60_000);
+    let resumed = second;
+    let reopened: Vec<String> = first
+        .lanes_opened
+        .iter()
+        .chain(resumed.lanes_opened.iter())
+        .map(|(_, b, _)| b.clone())
+        .collect();
     assert!(
         reopened.iter().any(|b| b == "rev-final"),
         "a resumed lane-stalled drive must re-brief the lane that stalled — otherwise the resume \
@@ -2065,12 +2083,24 @@ fn a_resume_out_of_a_different_hold_does_not_re_brief_a_working_lane() {
     let out =
         reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", past_drive_timeout);
     assert_eq!(out["driving"], json!(true), "{out}");
-    let resumed = reg.rd_drive_group_with(&group, &gh, past_drive_timeout + 60_000);
+
+    // The SAME two ticks the positive test spends, for the same §2.4 reason. A
+    // single tick would find nothing opened whatever the code does, so this
+    // control has to reach the tick that could open one before its emptiness
+    // means anything.
+    let a = reg.rd_drive_group_with(&group, &gh, past_drive_timeout + 60_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "this control must reach the state where a lane COULD be re-opened"
+    );
+    let b = reg.rd_drive_group_with(&group, &gh, past_drive_timeout + 120_000);
+    let opened_after: Vec<String> =
+        a.lanes_opened.iter().chain(b.lanes_opened.iter()).map(|(_, x, _)| x.clone()).collect();
     assert!(
-        resumed.lanes_opened.is_empty(),
+        opened_after.is_empty(),
         "a lane inside its own timeout was re-briefed because some OTHER hold on the same drive \
-         was resumed: {:?}",
-        resumed.lanes_opened
+         was resumed: {opened_after:?}"
     );
 }
 
