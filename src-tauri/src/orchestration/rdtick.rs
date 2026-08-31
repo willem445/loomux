@@ -630,8 +630,6 @@ impl OrchRegistry {
                 }
             }
         }
-        // PRs whose kick-back could not be delivered — see the prune below.
-        let mut undelivered: Vec<u64> = Vec::new();
         for o in &outs {
             for (action, detail) in &o.audits {
                 self.rd_audit(group, &o.on_behalf_of, action, detail.clone());
@@ -645,18 +643,10 @@ impl OrchRegistry {
             if let Some((to, _)) = o.advanced {
                 report.advanced.push((o.pr, to));
             }
-            // **§5.2 prunes a terminal entry ONCE ITS NOTICE HAS BEEN
-            // DELIVERED**, and `prune_terminal`'s own doc says the caller owns
-            // that ordering because the function cannot enforce it. Discarding
-            // the delivery's result made "delivered" unknowable, so a notice
-            // that never reached a pane still pruned the only entry that could
-            // have produced it again. The result is kept and the prune below
-            // consults it.
+            // **A notice whose delivery fails is LOST**, and nothing here
+            // recovers it — the prune below says why, and #1857 tracks it.
             for n in &o.notices {
-                match self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR) {
-                    Ok(()) => {}
-                    Err(_) => undelivered.push(o.pr),
-                }
+                let _ = self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR);
                 self.rd_task_note(group, o.pr, n);
                 report.notices.push(n.clone());
             }
@@ -668,29 +658,25 @@ impl OrchRegistry {
                 report.backoff = true;
             }
         }
-        // §5.2's retention, and it runs HERE — after the notices — because that
-        // rule is an ordering one: "terminal entries are pruned once their
-        // notice has been delivered", and `prune_terminal`'s own doc says the
-        // caller owns that because the function cannot enforce it.
+        // §5.2's retention. It runs after the notices, but **it does not
+        // implement that section's ordering rule** — "a terminal entry is
+        // pruned once its notice has been delivered" — and this comment exists
+        // to say so rather than to claim otherwise. Nothing here knows whether
+        // a delivery succeeded.
+        //
+        // A hold-back keyed on this tick's delivery failures was tried here and
+        // removed as INERT: the step list is built with a `!is_terminal()`
+        // filter, so a retained terminal entry is never stepped, emits no
+        // notice on any later tick, and so can never re-enter that failure set.
+        // It survived one tick and was pruned on the next with the notice lost
+        // anyway. Re-delivery needs per-entry delivery state PERSISTED on the
+        // record plus a path that re-emits for a terminal entry — a different
+        // shape, not an extension of this one. Tracked on #1857.
         let pruned = {
             let _state_guard = self.rd_state_lock.lock_safe();
             match reviewdrive::load_state(&dir) {
                 Ok(mut state) => {
-                    // A terminal entry whose notice did not reach a pane is kept
-                    // rather than pruned: pruning it would drop the only record
-                    // that could produce that notice again, which is what §5.2's
-                    // ordering rule exists to prevent.
-                    let held_back: Vec<reviewdrive::DriveEntry> = state
-                        .entries
-                        .iter()
-                        .filter(|e| e.state().is_terminal() && undelivered.contains(&e.pr))
-                        .cloned()
-                        .collect();
-                    let dropped: Vec<u64> = reviewdrive::prune_terminal(&mut state)
-                        .into_iter()
-                        .filter(|pr| !undelivered.contains(pr))
-                        .collect();
-                    state.entries.extend(held_back);
+                    let dropped: Vec<u64> = reviewdrive::prune_terminal(&mut state);
                     if dropped.is_empty() || reviewdrive::store_state(&dir, &state).is_ok() {
                         dropped
                     } else {

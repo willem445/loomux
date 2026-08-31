@@ -789,7 +789,16 @@ hygiene. Unpruned entries would flow through `review_drive_status()` into the
 orchestrator's resident context, which is the cost this whole feature exists to
 remove; and they would make `already-driven` (§5.1) refuse every re-drive of a
 PR forever. So `satisfied` and `cancelled` entries are pruned once their notice
-has been delivered. **`held` entries are never pruned**, because §2.3's resume
+has been delivered — **and that ordering is NOT implemented today**. The tick
+prunes a terminal entry whether or not its notice reached a pane, because
+nothing on that path knows: `prune_terminal` cannot enforce the rule and its
+caller does not either. A drive whose final notice fails to deliver therefore
+ends silently. A hold-back keyed on a tick's delivery failures was tried and
+removed as inert — the step list is built with a `!is_terminal()` filter, so a
+retained terminal entry emits nothing on any later tick and is pruned on the
+next one anyway; re-delivery needs delivery state persisted ON the entry plus a
+path that re-emits for a terminal one, which is a different shape rather than an
+extension of that one. Tracked on #1857. **`held` entries are never pruned**, because §2.3's resume
 needs their counters and pruning one would silently grant three fresh rounds —
 a parked drive leaves the file only by being resumed to completion or cancelled.
 That asymmetry is the whole reason §2.1 makes `held` parked rather than
