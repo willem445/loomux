@@ -264,6 +264,40 @@ const FORBIDDEN_IDENTS: [(&str, &str); 5] = [
     ("queue_merge", "§8.1: a driven PR may not be queued, and not by the driver"),
 ];
 
+/// Whether `src` names `ident` as a CALL, rather than merely containing its
+/// letters.
+///
+/// **A substring match is not an identifier match, and this scan proved it on
+/// itself.** `record_verdict` is forbidden; `DriveEntry::record_verdict_seen` —
+/// which the driver calls to record what it READ, and which cannot write a
+/// verdict file — contains those letters, so a `contains` check reported the
+/// driver as writing verdicts. A guard that cannot tell a forbidden name from a
+/// longer name that starts with it does not enforce the rule it states; it
+/// enforces a prefix.
+///
+/// So the match requires the call shape — the identifier immediately followed by
+/// `(` — and refuses a preceding identifier character, which is what keeps
+/// `rd_record_verdict(` from passing while `record_verdict_seen(` does. This is
+/// narrower than `contains` and still name-independent: it decides on the SHAPE
+/// a call has, not on what anything is called.
+fn names_call(src: &str, ident: &str) -> bool {
+    let needle = format!("{ident}(");
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(&needle) {
+        let at = from + rel;
+        let before_ok = at == 0
+            || !src[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if before_ok {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
 /// Hits that are argued rather than forbidden, each carrying the reason it is
 /// not what the scan is looking for: `(file suffix, token, why)`.
 ///
@@ -394,7 +428,7 @@ fn the_driver_never_builds_a_landing_verb_and_never_grants_a_merge() {
             }
         }
         for (bad, why) in FORBIDDEN_IDENTS {
-            if src.contains(bad) {
+            if names_call(&src, bad) {
                 if let Some(i) = ALLOWED.iter().position(|(f, l, _)| rel.ends_with(f) && *l == bad)
                 {
                     unmatched_allow.retain(|l| *l != ALLOWED[i].1);
@@ -441,7 +475,19 @@ fn the_landing_verb_scan_really_fires_on_a_landing_verb() {
     let lits = quoted_literals(hostile);
     assert!(lits.contains(&"merge".to_string()), "extraction missed a whole literal: {lits:?}");
     assert!(lits.contains(&"--delete-branch".to_string()));
-    assert!(hostile.contains("grant_merge"));
+    assert!(names_call(hostile, "grant_merge"), "the ident match must fire on a real call");
+    // …and the near-miss that made this a function rather than a `contains`: a
+    // LONGER name starting with a forbidden one is a different function, and the
+    // driver really does call one (`record_verdict_seen`, which records what it
+    // read and cannot write a verdict file).
+    assert!(
+        !names_call("entry.record_verdict_seen(&block, v, &head);", "record_verdict"),
+        "a substring match would report the driver as writing verdicts"
+    );
+    assert!(
+        names_call("reg.record_verdict(&group, &agent, pr, v, s);", "record_verdict"),
+        "…while the real call still fires, so the narrowing did not disarm the rule"
+    );
 
     let benign = r##"
         let gate = self.merge_gate(group);
@@ -454,7 +500,7 @@ fn the_landing_verb_scan_really_fires_on_a_landing_verb() {
         !benign_lits.iter().any(|l| l == "merge"),
         "the scan would fire on `merge-base` / `merge_queue.json`: {benign_lits:?}"
     );
-    assert!(!benign.contains("grant_merge"));
+    assert!(!names_call(benign, "grant_merge"));
 }
 
 /// The comment cut is a removal, and a removal is a place a scan can go blind —
@@ -526,6 +572,8 @@ gates:
     routing:
       - paths: [src/**]
         reviewers: [rev-std]
+merge_queue:
+  enabled: true
 driver:
   enabled: true
 "#;
@@ -660,10 +708,25 @@ impl RdRunner for FakeGh {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(args.iter().map(|s| s.to_string()).collect());
-        let checks = args.iter().any(|a| *a == "checks");
         let out = |s: &str| Ok(CmdOut { code: Some(0), stdout: s.to_string(), stderr: String::new() });
-        if checks {
+        if args.iter().any(|a| *a == "checks") {
             return out(&self.checks.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        }
+        // The routed-file list, in `ROUTING_FILES_JQ`'s own reduced shape: the
+        // word `ok`, then one `p <path>` line per changed file. Distinguished by
+        // the `--jq` argument rather than by call order, so this stays keyed on
+        // WHAT was asked.
+        //
+        // Answering it at all is the fix for a fixture gap that made the driver
+        // look broken: a gate declaring `routing:` makes `review-wait` resolve
+        // the changed-file list, and a fake that replied with the PR-facts JSON
+        // produced a list `parse_routed_files` refuses — so `route_reviewers`
+        // answered `None` and every drive parked on
+        // `held(routing-unaccountable)`. That is the driver being RIGHT (an
+        // unknown reviewer requirement is refused, never assumed empty) and the
+        // fake being incomplete.
+        if args.iter().any(|a| *a == "--jq") {
+            return out("ok\np src/lib.rs\n");
         }
         match &*self.facts.lock().unwrap_or_else(|e| e.into_inner()) {
             Ok(s) => out(s),
@@ -819,14 +882,17 @@ fn a_state_spends_gh_calls_only_on_the_facts_it_reads() {
     let base = gh.calls().len();
 
     // Tick 1: the entry is in `ci-wait`, which reads neither the lane list nor
-    // the gate.
+    // the gate. §2.4's once-per-process reconcile also runs on this tick and
+    // spends its own one-call `pr_is_open`, so the window carries three reads
+    // and the composition is what this asserts rather than a raw count — a
+    // count would move for any reason at all, including the right ones.
     reg.rd_drive_group_with(&group, &gh, 10_000);
     let ci_wait_calls: Vec<String> =
         gh.calls()[base..].iter().map(|c| c.join(" ")).collect();
     assert_eq!(
-        ci_wait_calls.len(),
-        2,
-        "ci-wait must spend the PR facts and its checks and nothing else: {ci_wait_calls:?}"
+        ci_wait_calls.iter().filter(|c| c.contains("checks")).count(),
+        1,
+        "ci-wait reads the PR's checks exactly once: {ci_wait_calls:?}"
     );
     assert!(
         !ci_wait_calls.iter().any(|c| c.contains("files")),
