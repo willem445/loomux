@@ -2399,6 +2399,55 @@ fn a_refused_enqueue_still_releases_a_stale_target() {
     assert_eq!(s, before, "a repo that never opted in must see no state change at all");
 }
 
+/// #1778 §8.1's mutual refusal, the queue's half — **and the fixture
+/// discriminates**, which is the whole of what makes it a pin.
+///
+/// The two calls below differ in exactly one bit: whether the review driver
+/// holds this PR. Everything else — the state, the PR number, the gate, the
+/// verdicts, the clock — is identical, so `in-review-drive` on the first and
+/// something else on the second is a statement about that bit and not about a
+/// fixture that could never have been enqueued anyway.
+///
+/// Until #1778 S4, `mqloop::refusal` had no name for this at all and `enqueue`
+/// made no such check, so §8.1's sentence described a mechanism the queue did
+/// not implement. Its opposite number is `rddrive::refusal::IN_MERGE_QUEUE`;
+/// neither is spelled `already-…`, because `already-queued` is taken by the row
+/// above for a different subject and a refusal string has to read correctly
+/// without knowing which tool the caller called.
+#[test]
+fn the_queue_refuses_a_pr_the_review_driver_is_holding() {
+    use loomux_lib::orchestration::mqloop::refusal;
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+    let verdicts = verdict_map(HEAD_A, "b");
+
+    let mut driven_state = MergeQueueState::default();
+    let out_driven =
+        enqueue(&f, &mut driven_state, 800, None, true, &gate, &verdicts, 0, true);
+    assert_eq!(
+        out_driven,
+        EnqueueOutcome::Refused { reason: refusal::IN_REVIEW_DRIVE },
+        "a PR the driver holds must be refused BY NAME, not merely not queued"
+    );
+    assert_eq!(
+        driven_state,
+        MergeQueueState::default(),
+        "and refused before anything is written"
+    );
+
+    // The discriminating half: the same call with that one bit cleared does NOT
+    // give this refusal. Whatever it answers, it is not this one — so the
+    // assertion above is about the drive rather than about a fixture that could
+    // never be enqueued.
+    let mut free_state = MergeQueueState::default();
+    let out_free = enqueue(&f, &mut free_state, 800, None, true, &gate, &verdicts, 0, false);
+    assert_ne!(
+        out_free,
+        EnqueueOutcome::Refused { reason: refusal::IN_REVIEW_DRIVE },
+        "the refusal must turn on the drive, not on the rest of the fixture: {out_free:?}"
+    );
+}
+
 /// The other side of the same rule: **drained means both halves of §4** — no
 /// non-terminal entry *and* no batch in flight.
 ///

@@ -29,6 +29,9 @@ use loomux_lib::orchestration::reviewdrive::{
     MAX_ROUNDS_CEILING,
 };
 use loomux_lib::orchestration::workflow::{ReviewVerdict, Verdict};
+use loomux_lib::orchestration::mqdriver::CmdOut;
+use loomux_lib::orchestration::rddrive::RdRunner;
+use loomux_lib::orchestration::{GroupId, Guardrails, OrchRegistry, RdDriveReport};
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -477,4 +480,319 @@ fn the_comment_cut_removes_prose_and_not_code() {
         quoted_literals(&cut).contains(&"merge".to_string()),
         "…and a real literal survives the cut: {cut:?}"
     );
+}
+
+// ── the tick, through the registry ──────────────────────────────────────────
+
+/// Build a registry against `dir` with every test-only directory override
+/// applied — see `orchestration.rs`'s `relaunch_registry` (same rationale,
+/// duplicated because these are separate integration-test binaries): a second
+/// `OrchRegistry::new` built directly, without reapplying these overrides,
+/// falls through to the REAL `~/.claude/agents`/`~/.copilot/agents` on the next
+/// spawn (#464).
+fn relaunch_registry(dir: &std::path::Path) -> OrchRegistry {
+    let reg = OrchRegistry::new(dir.to_path_buf());
+    reg.set_port(45999);
+    reg.set_claude_agents_dir_override(dir.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(dir.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.join("copilot-hooks"));
+    reg
+}
+
+fn rails() -> Guardrails {
+    Guardrails {
+        max_agents: 6,
+        agent_cli: "claude".into(),
+        auto_ops: false,
+        advanced_orchestrator: true,
+        ..Guardrails::default()
+    }
+}
+
+const WORKFLOW: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-std]
+"#;
+
+/// A throwaway repo one level below its own temp root — `orchestration.rs`'s
+/// `RealRepo` rationale: a worktree is cut SIBLING to the repo, so nesting keeps
+/// it inside the root that `Drop` reclaims.
+struct Repo {
+    _root: tempfile::TempDir,
+    repo: std::path::PathBuf,
+}
+
+impl Repo {
+    fn new() -> Repo {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = repo.to_string_lossy().replace('\\', "/");
+        // Written through the reader's own path resolution rather than a
+        // hard-coded directory name, so a rename of the config directory cannot
+        // leave this fixture writing where nothing reads.
+        let wf = loomux_lib::orchestration::workflow::workflow_file(&path);
+        std::fs::create_dir_all(wf.parent().unwrap()).unwrap();
+        std::fs::write(&wf, WORKFLOW).unwrap();
+        Repo { _root: root, repo }
+    }
+    fn path(&self) -> String {
+        self.repo.to_string_lossy().replace('\\', "/")
+    }
+}
+
+const HEAD_A: &str = "aa11bb22cc33dd44ee55ff6677889900aabbccdd";
+const HEAD_B: &str = "bb22cc33dd44ee55ff6677889900aabbccddeeff";
+
+/// A canned `gh`, keyed on the SUBCOMMAND rather than on call order, so a test
+/// asserts what the driver concluded and not the sequence it happened to read
+/// in — the order is the tick's business and is pinned in `rddrive`'s own tests.
+struct FakeGh {
+    facts: std::sync::Mutex<Result<String, String>>,
+    checks: String,
+    calls: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+impl FakeGh {
+    fn green(head: &str) -> FakeGh {
+        FakeGh {
+            facts: std::sync::Mutex::new(Ok(facts_json("OPEN", head))),
+            checks: r#"[{"name":"build","state":"SUCCESS","link":"x"}]"#.to_string(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    /// The seam itself failing — `gh` missing, or a child killed at the command
+    /// timeout. Not a `gh` refusal, and not a fact about the PR.
+    fn seam_down(&self) {
+        *self.facts.lock().unwrap_or_else(|e| e.into_inner()) = Err("gh-not-found".into());
+    }
+    fn set_facts(&self, state: &str, head: &str) {
+        *self.facts.lock().unwrap_or_else(|e| e.into_inner()) = Ok(facts_json(state, head));
+    }
+    fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+fn facts_json(state: &str, head: &str) -> String {
+    format!(
+        r#"{{"state":"{state}","headRefOid":"{head}","baseRefName":"main","body":"b",
+             "mergeStateStatus":"CLEAN","additions":1,"deletions":1}}"#
+    )
+}
+
+impl RdRunner for FakeGh {
+    fn gh(&self, args: &[&str]) -> Result<CmdOut, String> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(args.iter().map(|s| s.to_string()).collect());
+        let checks = args.iter().any(|a| *a == "checks");
+        let out = |s: &str| Ok(CmdOut { code: Some(0), stdout: s.to_string(), stderr: String::new() });
+        if checks {
+            return out(&self.checks);
+        }
+        match &*self.facts.lock().unwrap_or_else(|e| e.into_inner()) {
+            Ok(s) => out(s),
+            Err(e) => Err(e.clone()),
+        }
+    }
+}
+
+/// A registry with a group, the driver enabled, and one drive started on PR 1758
+/// through the real `drive_review`.
+fn driven(
+    reg: &OrchRegistry,
+    repo: &Repo,
+    gh: &FakeGh,
+) -> (GroupId, String) {
+    let group = reg.create_group(&repo.path(), rails()).unwrap();
+    reg.set_rd_policy_override(Some((true, DriveLimits::default())));
+    // A full, well-shaped session id this roster never recorded takes
+    // `resolve_session_ref`'s passthrough arm and is accepted — §5.1 says so,
+    // and says the deferral is deliberate: resolving is not proving resumable.
+    let session = "cafb930d-1111-2222-3333-444444444444".to_string();
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1");
+    assert_eq!(out["driving"], serde_json::json!(true), "drive_review refused: {out}");
+    (group, session)
+}
+
+fn status_head(reg: &OrchRegistry, group: &GroupId) -> String {
+    let s = reg.review_drive_status(group);
+    s["drives"][0]["head"].as_str().unwrap_or_default().to_string()
+}
+
+fn status_state(reg: &OrchRegistry, group: &GroupId) -> String {
+    let s = reg.review_drive_status(group);
+    s["drives"][0]["state"].as_str().unwrap_or_default().to_string()
+}
+
+/// **THE hazard**, named by two reviewers on S1 as the line that would be
+/// forgotten, and pinned here in both directions.
+///
+/// `DriveEntry::head` is only ever *compared* against the live head — arc 6 in
+/// `review-wait`, arc 7 in `fix-wait` — so:
+///
+/// - **A tick that resolves the head must persist it.** Recording it once at
+///   `drive_review` time and never again makes that comparison permanently true:
+///   the drive takes arc 6 to `ci-wait`, goes green, comes back to
+///   `review-wait`, takes arc 6 again, forever. Nothing goes red in the engine
+///   crate for that, because the defect is emergent at the seam.
+/// - **A tick whose head read FAILED must not write an empty head.** Unknown is
+///   not a value — the same class as `fix_handback_ms == 0` meaning "ancient"
+///   rather than "unset". A stored `""` makes `lane_open_for` refuse every
+///   record briefed at a real head, so `review-wait` yields `OpenLane{k}` on
+///   every tick: a reviewer spawned per tick, each brief re-arming `spawned_ms`
+///   so `lane-stalled` can never fire.
+///
+/// The first half is its own control for the second: the head demonstrably MOVES
+/// from empty to `HEAD_A` before the failed read, so "unchanged" afterwards is a
+/// statement about the guard rather than about a field nothing ever wrote.
+#[test]
+fn a_tick_persists_the_head_it_resolved_and_never_writes_a_head_it_could_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // A fresh entry has no head: §5.2's `head` is a record of what was SEEN, and
+    // nothing has been seen yet.
+    assert_eq!(status_head(&reg, &group), "", "a fresh drive has resolved no head");
+
+    // One tick with the head resolvable. It must land in the file.
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(
+        status_head(&reg, &group),
+        HEAD_A,
+        "the tick resolved a head and did not persist it — every later arc-6 \
+         comparison is now permanently true"
+    );
+    assert_eq!(status_state(&reg, &group), "review-wait", "green CI is arc 2");
+
+    // Now the seam fails. `observe_pr` yields an empty head, `decide` refuses to
+    // dispatch on one, and the ENTRY must come through untouched.
+    gh.seam_down();
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(
+        status_head(&reg, &group),
+        HEAD_A,
+        "a failed head read was written as an empty head — unknown is not a value"
+    );
+    assert_eq!(status_state(&reg, &group), "review-wait", "and nothing advanced on it");
+}
+
+/// The other half of the same field: when the head really does move, the entry
+/// follows it — arc 6, and the reason the write above is placed AFTER `decide`
+/// rather than before it.
+///
+/// Writing the head first would make `entry.head != facts.head` false before
+/// anything compared them, so arc 6 would be unreachable rather than permanent —
+/// the opposite failure, and equally invisible to the engine crate.
+#[test]
+fn a_head_that_moves_under_a_lane_re_enters_ci_wait_and_the_entry_follows() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(status_state(&reg, &group), "review-wait");
+    assert_eq!(status_head(&reg, &group), HEAD_A);
+
+    // The worker pushed while the lane was mid-review (§8's own row).
+    gh.set_facts("OPEN", HEAD_B);
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(status_state(&reg, &group), "ci-wait", "arc 6: the head moved under a lane");
+    assert_eq!(status_head(&reg, &group), HEAD_B, "and the entry follows the head it saw");
+}
+
+/// §5.3's opt-in, checked at the seam a test uses rather than only at the group
+/// selector — "a seam that skipped the product's own opt-in would be testing
+/// something the product cannot do".
+///
+/// The control is that the identical call with the driver ON does move the
+/// drive, so the assertion below is the opt-in and not a tick that does nothing.
+#[test]
+fn a_disabled_driver_is_unreachable_even_through_the_test_seam() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    reg.set_rd_policy_override(Some((false, DriveLimits::default())));
+    let report = reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(report, RdDriveReport::default(), "a disabled driver does nothing at all");
+    assert_eq!(status_head(&reg, &group), "", "…and reads nothing: no head was resolved");
+    assert!(gh.calls().is_empty(), "…and spends no `gh` call: {:?}", gh.calls());
+
+    // The control.
+    reg.set_rd_policy_override(Some((true, DriveLimits::default())));
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    assert_eq!(status_head(&reg, &group), HEAD_A, "the same call with the driver on does move it");
+}
+
+/// §8.1's mutual refusal, direction 1, **with colliding operands**: one PR
+/// number, refused by the queue because the driver holds it.
+///
+/// A non-interference pin whose two operands never meet holds under every
+/// implementation, the symmetric one included — so the PR queued here is the PR
+/// driven above, and the control is a DIFFERENT PR getting some other refusal,
+/// which is what makes this the driver's hold rather than `queue_merge`
+/// refusing everything in a repo with no real remote.
+///
+/// # The other direction is disclosed rather than faked
+///
+/// `drive_review`'s `in-merge-queue` arm — the driver refusing a PR the QUEUE
+/// holds — is **not pinned here**, and stating that is better than a fixture
+/// whose operands never meet. Reaching it needs a live `merge_queue.json` entry,
+/// and no surface a test can call seeds one: `queue_merge` is the only writer,
+/// it needs a gate this repo has no verdict for, and the group directory these
+/// files live in has no public accessor by design (`group_dir` takes a
+/// `GroupId` and is private, which is CLAUDE.md constraint 6 working).
+///
+/// What bounds the residual: that arm is three lines reading
+/// `mqloop::load_state(..).entry(pr).map(|e| !e.state().is_terminal())` — the
+/// same predicate `already-queued` itself uses and the same one the pure test
+/// beside `mqloop::enqueue` exercises from the other side. The unpinned part is
+/// the wiring, not the decision.
+#[test]
+fn a_driven_pr_may_not_be_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    let refused = reg.queue_merge(&group, 1758, None);
+    assert_eq!(
+        refused["refused"],
+        serde_json::json!("in-review-drive"),
+        "queue_merge must name the HOLDER: {refused}"
+    );
+    // The control. A different PR is refused for some other reason, so the
+    // refusal above is about THIS PR being driven rather than about
+    // `queue_merge` refusing every call in a repo with no remote.
+    let other = reg.queue_merge(&group, 1759, None);
+    assert_ne!(other["refused"], serde_json::json!("in-review-drive"), "{other}");
+
+    // …and once the drive is gone, so is the refusal: the hold is the DRIVE,
+    // not the PR number.
+    assert_eq!(
+        reg.cancel_review_drive(&group, 1758, "orch-1")["cancelled"],
+        serde_json::json!(true)
+    );
+    let after = reg.queue_merge(&group, 1758, None);
+    assert_ne!(after["refused"], serde_json::json!("in-review-drive"), "{after}");
 }
