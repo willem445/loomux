@@ -1926,7 +1926,7 @@ authority:
 ```yaml
 driver:
   enabled: true               # default false - absent block means the feature is off
-  max_review_rounds: 3        # INVARIANT 9's numbers - clamped toward them, never away:
+  max_review_rounds: 3        # INVARIANT 9's numbers - held toward them, never away:
   max_ci_attempts: 3          #   1..=3 each, and a value outside the range refuses the file
   max_rebase_attempts: 1      #   0..=1 - a repo may refuse the driver any rebase, never grant two
   lane_timeout_minutes: 60    # backstops on the three waits, clamped like the notify TTLs

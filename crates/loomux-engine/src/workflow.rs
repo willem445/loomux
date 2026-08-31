@@ -640,8 +640,9 @@ impl Default for MergeQueuePolicy {
 // ── driver: the review-loop driver's policy (#1778 §5.3) ───────────────────
 
 /// INVARIANT 9's numbers (`templates/orchestrator.md`): three CI attempts, three
-/// rounds of review findings, one rebase attempt. The `driver:` block clamps
-/// toward them, never away (§2.3) — a repo may run a *tighter* loop than the
+/// rounds of review findings, one rebase attempt. The `driver:` block is held
+/// to them, never loosened from them (§2.3): a value outside the closed range
+/// is **refused** - a repo may run a *tighter* loop than the
 /// orchestrator template promises; it may not run a looser one, because the
 /// driver acts on the orchestrator's authority and a repo file that raised the
 /// bound would be loosening the orchestrator's own invariant from a
@@ -1895,7 +1896,7 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("merge_queue.max_batch", "min", json!(1));
     fact("merge_queue.checks_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("merge_queue.checks_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
-    // #1778 §2.3. The counters are closed ranges clamped TOWARD INVARIANT 9, and
+    // #1778 §2.3. The counters are closed ranges held TOWARD INVARIANT 9, and
     // out-of-range values are REFUSED (the `merge_queue.max_batch` posture) - a
     // repo file may run a tighter loop than the orchestrator template promises,
     // never a looser one.

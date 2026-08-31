@@ -131,7 +131,7 @@
           "name": "driver",
           "type": "section",
           "section": "driver",
-          "help": "Policy for the engine-driven review-loop driver (#1778). Absent = off, and behavior is byte-for-byte unchanged. The counters clamp toward the orchestrator template's INVARIANT 9, never away from it."
+          "help": "Policy for the engine-driven review-loop driver (#1778). Absent = off, and behavior is byte-for-byte unchanged. The counters are closed ranges held to the orchestrator template's INVARIANT 9 - a value outside the range refuses the whole file."
         },
         {
           "name": "resources",

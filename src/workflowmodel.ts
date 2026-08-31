@@ -430,9 +430,10 @@ export function isRoutingGlob(p: string): boolean {
     !p.split("/").includes("..")
   );
 }
-/** `checks_timeout_minutes` is the one policy number the engine CLAMPS rather than
- *  refuses (`clamp_expires_minutes`), so a value outside this range is a warning here,
- *  not an error: the file loads, it just doesn't do what it says. */
+/** `checks_timeout_minutes` rides the notify-TTL clamp (`clamp_expires_minutes`) -
+ *  one of the policy numbers the engine CLAMPS rather than refuses (the driver's
+ *  three backstops are the others, #1778) - so a value outside this range is a
+ *  warning here, not an error: the file loads, it just doesn't do what it says. */
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MIN = 5;
 export const MERGE_QUEUE_CHECKS_TIMEOUT_MAX = 240;
 /** INVARIANT 9's counters (#1778 §2.3) - the engine REFUSES values outside these

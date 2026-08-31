@@ -220,7 +220,8 @@ Three consequences that are decisions, not defaults:
   the bound would be loosening the orchestrator's own invariant from a
   configuration file. Refusal, not clamping, is the mechanism — S2 shipped it
   and the review adjudicated it: a clamp would silently rewrite the policy the
-  author wrote (60→5 gives the human no signal their wait was discarded, and
+  author wrote (a declared `max_review_rounds: 4` quietly becoming 3 gives the
+  human no signal that the loop they asked for is not the loop they got, and
   "unknown is not a value" is the same lesson the block's
   `deny_unknown_fields` posture encodes), and a driver running on
   silently-substituted policy is a driver nobody can reason about. The
