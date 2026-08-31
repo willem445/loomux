@@ -526,6 +526,24 @@ gates:
     routing:
       - paths: [src/**]
         reviewers: [rev-std]
+driver:
+  enabled: true
+"#;
+
+/// The same roster with the `driver:` block **absent** — §5.3's product default,
+/// and the fixture the opt-in test needs. An absent block is a different subject
+/// from `enabled: false`, and only one of the two is what almost every repo has.
+const WORKFLOW_NO_DRIVER: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-std]
 "#;
 
 /// A throwaway repo one level below its own temp root — `orchestration.rs`'s
@@ -538,6 +556,14 @@ struct Repo {
 
 impl Repo {
     fn new() -> Repo {
+        Repo::with(WORKFLOW)
+    }
+    /// A repo whose workflow file is `yaml` — so a test can vary the one thing
+    /// it is about (the `driver:` block) and nothing else.
+    fn with(yaml: &str) -> Repo {
+        Repo::build(yaml)
+    }
+    fn build(yaml: &str) -> Repo {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -547,7 +573,7 @@ impl Repo {
         // leave this fixture writing where nothing reads.
         let wf = loomux_lib::orchestration::workflow::workflow_file(&path);
         std::fs::create_dir_all(wf.parent().unwrap()).unwrap();
-        std::fs::write(&wf, WORKFLOW).unwrap();
+        std::fs::write(&wf, yaml).unwrap();
         let r = Repo { _root: root, repo };
         r.git_init();
         r
@@ -657,7 +683,6 @@ fn driven(
     // validated `GroupId` off it, which is CLAUDE.md constraint 6 — the proof
     // travels with the value rather than with the call site.
     let group = reg.create_group(&repo.path(), rails()).unwrap().id;
-    reg.set_rd_policy_override(Some((true, DriveLimits::default())));
     // A full, well-shaped session id this roster never recorded takes
     // `resolve_session_ref`'s passthrough arm and is accepted — §5.1 says so,
     // and says the deferral is deliberate: resolving is not proving resumable.
@@ -854,23 +879,35 @@ fn a_head_that_moves_under_a_lane_re_enters_ci_wait_and_the_entry_follows() {
 /// The control is that the identical call with the driver ON does move the
 /// drive, so the assertion below is the opt-in and not a tick that does nothing.
 #[test]
-fn a_disabled_driver_is_unreachable_even_through_the_test_seam() {
+fn a_repo_with_no_driver_block_is_byte_for_byte_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let reg = relaunch_registry(dir.path());
-    let repo = Repo::new();
+    // The ONLY difference from every other fixture here: no `driver:` block.
+    // §5.3's product default is an ABSENT block, which is a different subject
+    // from `enabled: false` and is what almost every repo has.
+    let repo = Repo::with(WORKFLOW_NO_DRIVER);
     let gh = FakeGh::green(HEAD_A);
-    let (group, _session) = driven(&reg, &repo, &gh);
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
 
-    reg.set_rd_policy_override(Some((false, DriveLimits::default())));
+    // The tool refuses, so no drive can exist to tick over.
+    let out = reg.drive_review_with(&group, &gh, 1758, "cafb930d-1111-2222-3333-444444444444", false, 0, "orch-1");
+    assert_eq!(out["refused"], json!("driver-disabled"), "{out}");
     let report = reg.rd_drive_group_with(&group, &gh, 10_000);
-    assert_eq!(report, RdDriveReport::default(), "a disabled driver does nothing at all");
-    assert_eq!(status_head(&reg, &group), "", "…and reads nothing: no head was resolved");
+    assert_eq!(report, RdDriveReport::default(), "a driverless group does nothing at all");
     assert!(gh.calls().is_empty(), "…and spends no `gh` call: {:?}", gh.calls());
 
-    // The control.
-    reg.set_rd_policy_override(Some((true, DriveLimits::default())));
-    reg.rd_drive_group_with(&group, &gh, 10_000);
-    assert_eq!(status_head(&reg, &group), HEAD_A, "the same call with the driver on does move it");
+    // The control, and it is the whole test: the SAME call against the SAME
+    // roster plus a `driver:` block does start a drive. Without this the
+    // assertions above would hold under a build where the driver never worked.
+    let dir2 = tempfile::tempdir().unwrap();
+    let reg2 = relaunch_registry(dir2.path());
+    let repo2 = Repo::new();
+    let gh2 = FakeGh::green(HEAD_A);
+    let group2 = reg2.create_group(&repo2.path(), rails()).unwrap().id;
+    let ok = reg2.drive_review_with(&group2, &gh2, 1758, "cafb930d-1111-2222-3333-444444444444", false, 0, "orch-1");
+    assert_eq!(ok["driving"], json!(true), "{ok}");
+    reg2.rd_drive_group_with(&group2, &gh2, 10_000);
+    assert_eq!(status_head(&reg2, &group2), HEAD_A, "and it really drives");
 }
 
 /// §8.1's mutual refusal, direction 1, **with colliding operands**: one PR
