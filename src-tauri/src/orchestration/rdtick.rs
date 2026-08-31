@@ -824,6 +824,23 @@ impl OrchRegistry {
     }
 
     /// The one spawn or resume the driver performs.
+    ///
+    /// **A fresh lane gets a dedicated workspace, and that is #338/#359 rather
+    /// than a preference.** `spawn_agent_ex` cuts a worktree only when
+    /// `use_worktree` is set and no `cwd_override` is given; a fresh reviewer
+    /// spawned with neither falls through to the per-role default, which is the
+    /// group's **main clone** — the human's own checkout, and the exact conflict
+    /// #359 exists to prevent (two reviewers, or a reviewer and the
+    /// orchestrator's fetch traffic, contending on one checkout's state). The
+    /// MCP `spawn_agent` surface defaults this ON for worker and reviewer kinds
+    /// for the same reason, so the driver matches it rather than inventing a
+    /// quieter default.
+    ///
+    /// A **resume** passes `false`, and it is not a second policy: the branch
+    /// above is unreachable when `cwd_override` is `Some`, which a resume always
+    /// is — [`rd_resume_cwd`](Self::rd_resume_cwd) resolves the workspace the
+    /// session already had. Passing `false` there says "this spawn does not cut
+    /// anything" rather than relying on a later branch to ignore a `true`.
     fn rd_spawn(
         &self,
         group: &GroupId,
@@ -836,8 +853,9 @@ impl OrchRegistry {
             Some(s) => self.rd_resume_cwd(group, s, block.as_deref())?,
             None => None,
         };
+        let fresh = cwd.is_none();
         self.spawn_agent_bound(
-            group, role, block, "", task, false, None, None, resume, cwd, None, None,
+            group, role, block, "", task, fresh, None, None, resume, cwd, None, None,
         )
     }
 
