@@ -909,7 +909,8 @@ substitution `render_with_legacy_vars` does, not a text filter:
 # input to the check, never a record of what the keys are. No python3 here (CLAUDE.md).
 node -e '
 const fs=require("fs");
-const keys={orchestrator:["{{WORKFLOW}}","{{POST_MERGE_WORKFLOW_HOOK}}","{{MERGE_QUEUE}}","{{LOCKS_ORCH}}"],
+const keys={orchestrator:["{{WORKFLOW}}","{{POST_MERGE_WORKFLOW_HOOK}}",
+                          "{{MERGE_QUEUE}}{{REVIEW_DRIVER}}","{{LOCKS_ORCH}}"],
             worker:["{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}","{{LOCKS}}"],
             reviewer:["{{BLOCK_NOTE}}","{{LOCKS}}"],
             planner:["{{BLOCK_NOTE}}"], manager:["{{BLOCK_NOTE}}"]};

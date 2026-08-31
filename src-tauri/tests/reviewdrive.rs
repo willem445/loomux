@@ -521,6 +521,9 @@ gates:
   merge:
     require: all-pass
     reviewers: [rev-std]
+    routing:
+      - paths: [src/**]
+        reviewers: [rev-std]
 "#;
 
 /// A throwaway repo one level below its own temp root — `orchestration.rs`'s
@@ -689,6 +692,54 @@ fn a_tick_persists_the_head_it_resolved_and_never_writes_a_head_it_could_not_rea
         "a failed head read was written as an empty head — unknown is not a value"
     );
     assert_eq!(status_state(&reg, &group), "review-wait", "and nothing advanced on it");
+}
+
+/// **A state pays only for the facts it reads.** `decide` reads the routed lane
+/// list in `review-wait` and `gate-check` and nowhere else, so `ci-wait` and
+/// `fix-wait` must not spend the `gh pr view --json files` call that resolves
+/// it — on the loop that also delivers every `notify_when` notice in the fleet.
+///
+/// The fixture's gate DECLARES routing, which is what makes this discriminating:
+/// with no `routing:` key `route_reviewers` never looks at the file list and the
+/// call is skipped for every state, so the assertion would hold under an
+/// implementation that resolved the lanes unconditionally. The counts below are
+/// the whole pin — two calls in `ci-wait` (the PR's facts, then its checks),
+/// three once the drive is in `review-wait` (those two plus the changed files).
+#[test]
+fn a_state_spends_gh_calls_only_on_the_facts_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    let base = gh.calls().len();
+
+    // Tick 1: the entry is in `ci-wait`, which reads neither the lane list nor
+    // the gate.
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let ci_wait_calls: Vec<String> =
+        gh.calls()[base..].iter().map(|c| c.join(" ")).collect();
+    assert_eq!(
+        ci_wait_calls.len(),
+        2,
+        "ci-wait must spend the PR facts and its checks and nothing else: {ci_wait_calls:?}"
+    );
+    assert!(
+        !ci_wait_calls.iter().any(|c| c.contains("files")),
+        "…and in particular not the routing read: {ci_wait_calls:?}"
+    );
+    assert_eq!(status_state(&reg, &group), "review-wait");
+
+    // Tick 2: now in `review-wait`, which DOES read the lane list — so the same
+    // gate now costs the third call. That is the control: the absence above is
+    // the state, not the fixture.
+    let mark = gh.calls().len();
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    let review_calls: Vec<String> = gh.calls()[mark..].iter().map(|c| c.join(" ")).collect();
+    assert!(
+        review_calls.iter().any(|c| c.contains("files")),
+        "review-wait must resolve the routed lane list: {review_calls:?}"
+    );
 }
 
 /// The other half of the same field: when the head really does move, the entry

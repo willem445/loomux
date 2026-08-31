@@ -269,7 +269,15 @@ impl OrchRegistry {
     }
 
     /// Whether this group runs a review driver at all.
-    fn driver_enabled(&self, group: &GroupId) -> bool {
+    ///
+    /// `pub(super)` because `instruction_vars` in the parent module gates
+    /// `{{REVIEW_DRIVER}}` on it: a private item is visible to its own module
+    /// and that module's DESCENDANTS, and `orchestration` is this file's
+    /// parent, not its child. Widened to exactly the parent and no further, so
+    /// the one reader outside this file is the template gate — which has to
+    /// read the same policy the tick does, or a group whose tools all refuse
+    /// `driver-disabled` could be told in its instructions that it has a driver.
+    pub(super) fn driver_enabled(&self, group: &GroupId) -> bool {
         self.driver_policy(group).0
     }
 
@@ -627,6 +635,7 @@ impl OrchRegistry {
         runner: &dyn rddrive::RdRunner,
         pr: u64,
         obs: &rddrive::PrObservation,
+        want_gate: bool,
     ) -> (reviewdrive::GateOutcome, Option<Vec<reviewdrive::LaneFact>>, Vec<rddrive::LaneNotice>) {
         let spec = match self.merge_queue_gate(group) {
             Ok(s) => s,
@@ -660,7 +669,7 @@ impl OrchRegistry {
                 return (reviewdrive::GateOutcome::Unsatisfied, None, Vec::new())
             }
         };
-        let observed = rddrive::gate_observation(runner, pr, obs, &spec, &obs.base);
+        let observed = rddrive::gate_observation(runner, pr, obs, &spec, &obs.base, want_gate);
         let Some(routed) = workflow::route_reviewers(&gate, observed.changed_files.as_deref())
         else {
             // `route_reviewers` refused: the changed-file list could not be
@@ -685,6 +694,12 @@ impl OrchRegistry {
                 })
             })
             .collect();
+        if !want_gate {
+            // `review-wait` needs the lane list and nothing else. Evaluating the
+            // gate here would be a second answer to a question this state does
+            // not ask, on a tick that has to re-ask it at `gate-check` anyway.
+            return (reviewdrive::GateOutcome::NotEvaluated, Some(lanes), notices);
+        }
         let head = (!obs.head.is_empty()).then_some(obs.head.as_str());
         let outcome = match mergeq::recheck_gate(&spec, &verdicts, head, &observed) {
             mergeq::GateRecheck::Ok => reviewdrive::GateOutcome::Satisfied,
@@ -1101,7 +1116,31 @@ impl OrchRegistry {
             return None;
         }
         let obs = rddrive::observe_pr(runner, pr);
-        let (gate, required, lane_notices) = self.rd_gate_facts(group, runner, pr, &obs);
+        // **Only the states that READ these facts pay for them.** `decide` reads
+        // `required_lanes` in `review-wait` and `gate-check` and `gate` in
+        // `gate-check` alone; `ci-wait` and `fix-wait` read neither. Resolving
+        // them unconditionally would spend a `pr view --json files` on every
+        // routing gate and a pair of `gh` reads on every `base-green` gate, per
+        // entry, per tick, for answers nothing consults — on the loop that also
+        // delivers every `notify_when` notice in the fleet (§2.4). The queue's
+        // own driver gates the same two reads on the same principle
+        // (`declares_base_green`: a value nothing consults is not worth a round
+        // trip, and an unfetched value is `None`, which refuses).
+        let here = state.entry(pr).map(|e| e.state())?;
+        let want_lanes = matches!(
+            here,
+            reviewdrive::DriveState::ReviewWait | reviewdrive::DriveState::GateCheck
+        );
+        let want_gate = here == reviewdrive::DriveState::GateCheck;
+        let (gate, required, lane_notices) = if want_lanes {
+            self.rd_gate_facts(group, runner, pr, &obs, want_gate)
+        } else {
+            // `NotEvaluated` is the honest value here and not a stand-in for
+            // "satisfied": §2.1's `gate-check` row treats it as "the tick reached
+            // this state without evaluating the gate", which is `Wait`. Neither
+            // of the two states that land here can read it at all.
+            (reviewdrive::GateOutcome::NotEvaluated, None, Vec::new())
+        };
         let signal = self.rd_signal(group, pr);
         let facts = reviewdrive::DriveFacts {
             now_ms: now,

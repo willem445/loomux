@@ -370,12 +370,19 @@ pub fn base_ci_green(r: &dyn RdRunner, base: &str) -> Option<bool> {
 /// `None` unless `base-green` is declared, for
 /// [`mqdriver::declares_base_green`]'s stated reason: a value nothing consults
 /// is not worth a round trip, and an unfetched value is `None`, which refuses.
+///
+/// `want_base_green` extends that same principle one level up: only `gate-check`
+/// evaluates the gate, so only `gate-check` is worth two `gh` reads about the
+/// default branch. Every other state gets `None`, which is the value that
+/// refuses — so the narrowing can only ever make the gate harder to satisfy,
+/// never easier, and the state that actually asks is the one that pays.
 pub fn gate_observation(
     r: &dyn RdRunner,
     pr: u64,
     obs: &PrObservation,
     spec: &crate::mergeq::GateSpec,
     base: &str,
+    want_base_green: bool,
 ) -> crate::mergeq::PrObservation {
     crate::mergeq::PrObservation {
         body_digest: obs.body_digest.clone(),
@@ -387,7 +394,7 @@ pub fn gate_observation(
             // `recheck_gate` refuses on rather than waving through.
             CiObservation::Pending | CiObservation::Unknown => None,
         },
-        base_green: if mqdriver::declares_base_green(spec) && !base.is_empty() {
+        base_green: if want_base_green && mqdriver::declares_base_green(spec) && !base.is_empty() {
             base_ci_green(r, base)
         } else {
             None
