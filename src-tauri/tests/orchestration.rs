@@ -4630,8 +4630,17 @@ fn the_resident_core_is_under_the_byte_budget() {
     // model call, in the system cache block. Measured off the template const,
     // never derived — the number in this assertion is the budget, the byte
     // count is the fact.
+    //
+    // EOL-NORMALIZED, deliberately. The Windows checkout is CRLF and the
+    // Linux checkout is LF, so a raw `len()` makes the same document measure
+    // 622 bytes bigger on Windows — the budget would be a fact about the
+    // checkout, not the content, and the pin would flip platform-by-platform
+    // as prose is edited (it did: run 33345301036 measured 45,327 on Windows
+    // against 44,705 on Linux, same blob). The budget is content bytes; both
+    // platforms must assert the same number.
+    let content = ORCHESTRATOR_TPL.replace("\r\n", "\n");
     assert!(
-        ORCHESTRATOR_TPL.len() <= 45_000,
+        content.len() <= 45_000,
         "the resident core is {} bytes (budget 45,000) — sections move to the playbook, \
          they do not get rewritten longer in place (#1683)",
         ORCHESTRATOR_TPL.len()
