@@ -211,14 +211,25 @@ driver never makes one.
 
 Three consequences that are decisions, not defaults:
 
-- **The `driver:` block clamps toward INVARIANT 9, never away from it.**
-  `max_review_rounds` and `max_ci_attempts` clamp to `1..=3`, and
-  `max_rebase_attempts` to `0..=1`. A repo may run a *tighter* loop than the
+- **The `driver:` block restricts toward INVARIANT 9, never away from it.**
+  `max_review_rounds` and `max_ci_attempts` accept `1..=3`, and
+  `max_rebase_attempts` accepts `0..=1`; a value outside the closed range is
+  **refused**, never clamped into it. A repo may run a *tighter* loop than the
   orchestrator template promises; it may not run a looser one, because the
   driver acts on the orchestrator's authority (§3) and a repo file that raised
   the bound would be loosening the orchestrator's own invariant from a
-  configuration file. *(This narrows the plan on #1778, which proposed a
-  `1..=5` clamp. Recorded here rather than silently applied.)*
+  configuration file. Refusal, not clamping, is the mechanism — S2 shipped it
+  and the review adjudicated it: a clamp would silently rewrite the policy the
+  author wrote (a declared `max_review_rounds: 4` quietly becoming 3 gives the
+  human no signal that the loop they asked for is not the loop they got, and
+  "unknown is not a value" is the same lesson the block's
+  `deny_unknown_fields` posture encodes), and a driver running on
+  silently-substituted policy is a driver nobody can reason about. The
+  directional word survives: what the repo may tighten and may not loosen is
+  the invariant, and the range is how the parse holds that line. *(This
+  narrows the plan on #1778, which proposed a `1..=5` clamp. Recorded here
+  rather than silently applied; the shipped mechanism is refusal, and the
+  three backstops below are the fields that actually clamp.)*
 - **The tool call is clamped in the same direction, and that takes a
   parameter.** Clamping only the repo file would defend the invariant against a
   two-round overrun while leaving the ordinary path unbounded: an orchestrator
@@ -734,9 +745,9 @@ file without one is exactly what that manifest exists to catch.
 ```yaml
 driver:
   enabled: true               # default false
-  max_review_rounds: 3        # default 3, clamped 1..=3
-  max_ci_attempts: 3          # default 3, clamped 1..=3
-  max_rebase_attempts: 1      # default 1, clamped 0..=1
+  max_review_rounds: 3        # default 3, refused outside 1..=3
+  max_ci_attempts: 3          # default 3, refused outside 1..=3
+  max_rebase_attempts: 1      # default 1, refused outside 0..=1
   lane_timeout_minutes: 60    # default 60, clamped like the notify TTLs
   fix_timeout_minutes: 60     # default 60, same clamp family
   drive_timeout_minutes: 240  # default 240, same clamp family

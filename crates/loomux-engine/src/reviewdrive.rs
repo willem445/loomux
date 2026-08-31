@@ -417,9 +417,9 @@ pub fn transition(from: DriveState, to: DriveState) -> Result<DriveState, Invali
 // and §3 says the driver never makes one.
 
 /// The ceiling INVARIANT 9 sets on `max_review_rounds` and `max_ci_attempts`,
-/// and the top of §5.3's `1..=3` clamp.
+/// and the top of §5.3's `1..=3` range.
 pub const MAX_ROUNDS_CEILING: u32 = 3;
-/// The ceiling on `max_rebase_attempts`, and the top of §5.3's `0..=1` clamp.
+/// The ceiling on `max_rebase_attempts`, and the top of §5.3's `0..=1` range.
 pub const MAX_REBASE_CEILING: u32 = 1;
 
 /// The bounds one drive runs against — the value type [`decide`] consumes.

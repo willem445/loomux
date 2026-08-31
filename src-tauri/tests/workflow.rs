@@ -8638,6 +8638,195 @@ fn the_merge_queue_block_can_never_name_a_branch_or_widen_anything() {
     .is_err());
 }
 
+// ───────── #1778 §5.3: the `driver:` block ─────────
+//
+// Policy for the engine-driven review-loop driver (`doc/design/review-driver.md`),
+// parsed beside `merge_queue:`. This file only ever pins what the FILE means,
+// which is the half a repo author can get wrong; the driver's own core is
+// `reviewdrive`, and this suite never drives anything.
+
+#[test]
+fn an_absent_driver_block_means_the_feature_is_off() {
+    // §9's reversal mechanism: no block, no driver, and the parsed policy is
+    // the product default rather than anything the file influenced. The
+    // specimen is deliberately SYNTHETIC — this repo's own file does not arm
+    // the driver, and if it ever does, that is a choice to pin beside the
+    // roster, not here.
+    let wf = workflow::parse_workflow("version: 1\nblocks:\n  - id: worker\n    kind: worker\n")
+        .unwrap();
+    assert_eq!(wf.driver, workflow::DriverPolicy::default());
+    assert!(!wf.driver.enabled, "the product default is OFF (§9)");
+    assert_eq!(wf.driver.max_review_rounds, 3, "INVARIANT 9's rounds (§2.3)");
+    assert_eq!(wf.driver.max_ci_attempts, 3, "INVARIANT 9's CI attempts (§2.3)");
+    assert_eq!(wf.driver.max_rebase_attempts, 1, "INVARIANT 9's one rebase (§2.3)");
+    assert_eq!(wf.driver.lane_timeout_minutes, 60);
+    assert_eq!(wf.driver.fix_timeout_minutes, 60);
+    assert_eq!(wf.driver.drive_timeout_minutes, 240);
+}
+
+#[test]
+fn a_declared_driver_block_fills_in_the_defaults_it_omits() {
+    // A repo that wants the driver writes one line; it does not have to restate
+    // policy it is happy with — same shape as `merge_queue:`'s defaults.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\ndriver:\n  enabled: true\n",
+    )
+    .unwrap();
+    assert!(wf.driver.enabled);
+    assert_eq!(wf.driver.max_review_rounds, 3);
+    assert_eq!(wf.driver.max_ci_attempts, 3);
+    assert_eq!(wf.driver.max_rebase_attempts, 1);
+    assert_eq!(wf.driver.lane_timeout_minutes, 60);
+    assert_eq!(wf.driver.fix_timeout_minutes, 60);
+    assert_eq!(wf.driver.drive_timeout_minutes, 240);
+
+    // …and every default is overridable, including in the TIGHTER direction —
+    // which is the only direction §2.3 allows a repo file to move the counters.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         driver:\n  enabled: true\n  max_review_rounds: 2\n  max_ci_attempts: 1\n  max_rebase_attempts: 0\n",
+    )
+    .unwrap();
+    assert_eq!(wf.driver.max_review_rounds, 2);
+    assert_eq!(wf.driver.max_ci_attempts, 1);
+    assert_eq!(wf.driver.max_rebase_attempts, 0, "0 is legal: a repo may refuse the driver any rebase");
+}
+
+#[test]
+fn driver_counters_accept_their_closed_range_edges() {
+    // Each counter's lower and upper bound, accepted — the edges §2.3's closed
+    // ranges are made of. Values OUTSIDE the range are refused, not clamped;
+    // that is the next test's subject.
+    let rounds = |v: &str| {
+        workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             driver:\n  enabled: true\n  max_review_rounds: {v}\n"
+        ))
+        .unwrap()
+        .driver
+        .max_review_rounds
+    };
+    assert_eq!(rounds("1"), 1);
+    assert_eq!(rounds("3"), 3);
+
+    let ci = |v: &str| {
+        workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             driver:\n  enabled: true\n  max_ci_attempts: {v}\n"
+        ))
+        .unwrap()
+        .driver
+        .max_ci_attempts
+    };
+    assert_eq!(ci("1"), 1);
+    assert_eq!(ci("3"), 3);
+
+    let rebase = |v: &str| {
+        workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             driver:\n  enabled: true\n  max_rebase_attempts: {v}\n"
+        ))
+        .unwrap()
+        .driver
+        .max_rebase_attempts
+    };
+    assert_eq!(rebase("0"), 0);
+    assert_eq!(rebase("1"), 1);
+}
+
+#[test]
+fn driver_counters_refuse_out_of_range_values_instead_of_clamping() {
+    // §2.3: the driver block clamps TOWARD INVARIANT 9, never away from it —
+    // and a value outside the closed range is refused the way
+    // `merge_queue.max_batch: 0` is refused, loudly and naming the field,
+    // never silently pulled to the bound. A driver running on
+    // silently-substituted policy is a driver nobody can reason about.
+    let errs_of = |body: &str| {
+        workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             driver:\n  enabled: true\n{body}"
+        ))
+        .unwrap_err()
+    };
+    for (field, bad, why) in [
+        ("max_review_rounds", "0", "below"),
+        ("max_review_rounds", "4", "above"),
+        ("max_ci_attempts", "0", "below"),
+        ("max_ci_attempts", "4", "above"),
+        ("max_rebase_attempts", "2", "above"),
+    ] {
+        let errs = errs_of(&format!("  {field}: {bad}\n"));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(&format!("driver.{field}")) && e.contains("must be")),
+            "{field}: {bad} ({why} the range) must be refused naming the field, got: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn driver_timeouts_are_clamped_by_the_notify_ttl_clamp_itself() {
+    // §5.3: "clamped like the notify TTLs" — the same quantity as
+    // `merge_queue.checks_timeout_minutes` (a bounded wait on a fallible
+    // signal), so the same one definition bounds all three backstops rather
+    // than a second copy that can drift.
+    let of = |field: &str, v: &str, want: u32| {
+        let wf = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             driver:\n  enabled: true\n  {field}: {v}\n"
+        ))
+        .unwrap();
+        let got = match field {
+            "lane_timeout_minutes" => wf.driver.lane_timeout_minutes,
+            "fix_timeout_minutes" => wf.driver.fix_timeout_minutes,
+            _ => wf.driver.drive_timeout_minutes,
+        };
+        assert_eq!(got, want, "{field}: {v} must land on {want}");
+    };
+    for field in ["lane_timeout_minutes", "fix_timeout_minutes", "drive_timeout_minutes"] {
+        of(field, "0", 5);
+        of(field, "1", 5);
+        of(field, "30", 30);
+        of(field, "240", 240);
+        of(field, "99999", 240);
+    }
+}
+
+#[test]
+fn the_driver_block_can_never_target_a_pr_or_widen_anything() {
+    // The capability-closure rule, applied to the newest block. `RawDriver` is
+    // `deny_unknown_fields`, so there is no spelling of "drive PR 12", no
+    // `auto: true`, and no key at all this build does not recognize — §3.2's
+    // two-key rule lives here: this block can only ENABLE, and no drive exists
+    // until an orchestrator makes its own role-gated `drive_review` call
+    // naming one PR. A mistyped field name is refused with the same
+    // no-spelling-exists force.
+    for line in ["pr: 12", "auto: true", "lanes: 3", "max_revew_rounds: 3"] {
+        let errs = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             driver:\n  enabled: true\n  {line}\n"
+        ))
+        .unwrap_err();
+        assert!(!errs.is_empty(), "{line:?} must not be tolerated inside driver:");
+    }
+    // And a mistyped block name is not silently ignored either — `RawWorkflow`
+    // is `deny_unknown_fields` too, which is also why ADDING this key breaks
+    // the file for builds predating #1778: §5.3 restates merge-queue §11.2's
+    // forward-compat property on purpose (the older build fails the parse of
+    // the WHOLE file, down the loud `workflow-invalid` path — never a warning
+    // that leaves the rest of the policy half-loaded).
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\ndriverr:\n  enabled: true\n"
+    )
+    .is_err());
+    // A value of the wrong type fails the whole file rather than resolving to
+    // the default — policy fails loud (§5.3).
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\ndriver:\n  enabled: 3\n"
+    )
+    .is_err());
+}
+
 // ───────────────── per-block model knobs: effort: / context: (#687) ─────────
 
 /// The happy path, and the whole back-compat guarantee alongside it: a declared

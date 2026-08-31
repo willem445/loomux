@@ -27,6 +27,7 @@ import {
   parseWorkflow,
   roleHintRequires,
   serializeWorkflow,
+  DRIVER_DEFAULTS,
   RESOURCE_SLOTS_MIN,
   RESOURCE_SLOTS_MAX,
   RESOURCE_MAX_HOLD_MINUTES_MIN,
@@ -225,6 +226,8 @@ function docFor(section: string, field: string, yaml: string): string {
       );
     case "merge_queue":
       return ["version: 1", ...roster, "merge_queue:", `  ${field}: ${yaml}`].join("\n") + "\n";
+    case "driver":
+      return ["version: 1", ...roster, "driver:", `  ${field}: ${yaml}`].join("\n") + "\n";
     case "resource":
       return (
         ["version: 1", ...roster, "resources:", "  ci:", `    ${field}: ${yaml}`].join("\n") + "\n"
@@ -265,6 +268,8 @@ function readBack(w: Workflow, section: string, field: string): { value: unknown
       return at(w.intake?.labels as unknown as Record<string, unknown>);
     case "merge_queue":
       return at(w.merge_queue as unknown as Record<string, unknown>);
+    case "driver":
+      return at(w.driver as unknown as Record<string, unknown>);
     case "resource":
       return at(w.resources?.ci as unknown as Record<string, unknown>);
     case "board":
@@ -382,6 +387,19 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "merge_queue.enabled",
   "merge_queue.max_batch",
   "merge_queue.checks_timeout_minutes",
+  // #1778. The pane READS, EMITS and VALIDATES `driver:` - the round-trip and
+  // bounds tests above and `workflowmodel.test.ts` check that - and it has a
+  // read-only inspector summary, but no form control, and deliberately not:
+  // `FIELDS_WITH_AN_EDITOR` is empty and slice C's descriptor registry is what
+  // retires the hand-built forms, so a fourth one is the last thing this
+  // section needs.
+  "driver.enabled",
+  "driver.max_review_rounds",
+  "driver.max_ci_attempts",
+  "driver.max_rebase_attempts",
+  "driver.lane_timeout_minutes",
+  "driver.fix_timeout_minutes",
+  "driver.drive_timeout_minutes",
   "resource.slots",
   "resource.max_hold_minutes",
   // #1175. The pane PARSES, PRESERVES and RE-EMITS `board:` (that is what the two
@@ -710,6 +728,41 @@ test("refuse-vs-clamp is the difference between an error and a warning in the pa
       field: "checks_timeout_minutes",
       text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\nmerge_queue:\n  checks_timeout_minutes: 9999\n",
     },
+    // #1778 §2.3: the driver's counters are REFUSED (an error, like
+    // `max_batch`), its backstops CLAMPED (a warning, like
+    // `checks_timeout_minutes`) — one case per field, read against the
+    // manifest's own on_out_of_range, so a field whose pane severity drifts
+    // from its engine posture reddens by name.
+    {
+      section: "driver",
+      field: "max_review_rounds",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_review_rounds: 9\n",
+    },
+    {
+      section: "driver",
+      field: "max_ci_attempts",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_ci_attempts: 9\n",
+    },
+    {
+      section: "driver",
+      field: "max_rebase_attempts",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_rebase_attempts: 2\n",
+    },
+    {
+      section: "driver",
+      field: "lane_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  lane_timeout_minutes: 9999\n",
+    },
+    {
+      section: "driver",
+      field: "fix_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  fix_timeout_minutes: 9999\n",
+    },
+    {
+      section: "driver",
+      field: "drive_timeout_minutes",
+      text: "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  drive_timeout_minutes: 9999\n",
+    },
     {
       section: "resource",
       field: "slots",
@@ -730,6 +783,104 @@ test("refuse-vs-clamp is the difference between an error and a warning in the pa
       found[0]!.severity,
       declared === "refuse" ? "error" : "warning",
       `${c.section}.${c.field}: the manifest says the engine will ${declared} it`
+    );
+  }
+});
+
+test("a non-integer driver COUNTER is an error, not a silence (#1784 review 1)", () => {
+  // Every driver field is a `u32` on the engine, so serde refuses `2.5`
+  // exactly as it refuses an out-of-range value - and a check guarded by
+  // `Number.isInteger` goes silent on it, blessing a file the engine refuses
+  // at load (the pane-valid⇔loads guarantee). A counter, whose range also
+  // refuses. The assertion is on SEVERITY, not the code alone: a clamp
+  // warning for a value the engine refuses would be the same lie in a
+  // friendlier tone.
+  const findings = analyzeWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_review_rounds: 2.5\n"
+  ).findings.filter((f) => f.severity === "error");
+  assert.ok(
+    findings.some((f) => f.code === "section-out-of-range" || f.code === "section-bad-value"),
+    `a non-integer counter must be flagged as an ERROR, got ${JSON.stringify(findings.map((f) => [f.code, f.severity]))}`
+  );
+});
+
+test("a non-integer driver BACKSTOP is an error too - the clamp never runs on a refused type (#1784 review 1)", () => {
+  // The twin of the counter case, and the sharper one: the backstop's RANGE
+  // clamps, so `2.5` (below 5) does draw an out-of-range WARNING from the
+  // range check alone - but the engine refuses the TYPE before any clamp
+  // runs, and a warning would bless a file that never loads. The error must
+  // be there BESIDE the warning, which is why this asserts on the filtered
+  // error list rather than on any finding at all.
+  const findings = analyzeWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  fix_timeout_minutes: 2.5\n"
+  ).findings.filter((f) => f.severity === "error");
+  assert.ok(
+    findings.some((f) => f.code === "section-out-of-range" || f.code === "section-bad-value"),
+    `a non-integer backstop must be flagged as an ERROR, got ${JSON.stringify(findings.map((f) => [f.code, f.severity]))}`
+  );
+});
+
+test("a typo'd key inside driver: is an unknown-key finding routed to the driver section (#1784 review 2)", () => {
+  // Refused whole-file by the engine's `deny_unknown_fields` - the exact case
+  // the round-4 red proves refused - so the pane must not render it valid.
+  const findings = analyzeWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  max_revew_rounds: 3\n"
+  ).findings;
+  const unknown = findings.find((f) => f.code === "unknown-key" && f.section === "driver");
+  assert.ok(unknown, "a typo'd driver key must be an unknown-key finding routed to the driver section");
+  assert.ok(
+    unknown!.message.includes("max_revew_rounds"),
+    `the finding must name the key it found: ${unknown!.message}`
+  );
+});
+
+test("a driver integer outside u32 is an error, never a clamp warning (#1784 review 2)", () => {
+  // The third input class of the same defect: `-1` and `4294967296` ARE
+  // integers, so they pass every `Number.isInteger` guard and land in the
+  // range check - where the backstop's warning said "orrerix will clamp it"
+  // about a file the engine REFUSES (u32 rejects the value before any clamp
+  // runs). The fix routes the type class to the refusal error, and the test
+  // forbids the word "clamp" in what the pane says about it.
+  for (const [field, v] of [
+    ["fix_timeout_minutes", "-1"],
+    ["fix_timeout_minutes", "4294967296"],
+    ["max_review_rounds", "-1"],
+  ] as const) {
+    const findings = analyzeWorkflow(
+      `version: 1\nblocks:\n  - id: b\n    kind: worker\n    cli: claude\ndriver:\n  ${field}: ${v}\n`
+    ).findings;
+    const errors = findings.filter((f) => f.severity === "error");
+    assert.ok(
+      errors.length > 0,
+      `driver.${field}: ${v} must draw an ERROR (the engine refuses it), got ${JSON.stringify(findings.map((f) => [f.severity, f.code]))}`
+    );
+    for (const f of errors) {
+      // The lie under test is the PROMISE of a clamp ("orrerix will clamp it"),
+      // not the word: the refusal message legitimately says the type is
+      // rejected "before any clamp runs". Assert against the promise.
+      assert.ok(
+        !/will clamp/.test(f.message),
+        `driver.${field}: ${v} - an error message must not promise a clamp: ${f.message}`
+      );
+    }
+  }
+});
+
+test("the pane's driver defaults are the manifest's declared defaults (#1784)", () => {
+  // The chrome renders `?? DRIVER_DEFAULTS.x` when the file omits a field; a
+  // literal at the point of use is a number nothing can check (review
+  // premortem 2: NOTIFY_EXPIRES_DEFAULT_MIN moves, the manifest follows, a
+  // stale `?? 60` renders silently). This is the third link of the
+  // engine → manifest → pane chain, the `DEFAULT_HOLD` pattern: the Rust pin
+  // holds engine == manifest, this holds manifest == pane, field for field.
+  const fields = manifest.sections.driver!.fields;
+  for (const f of fields) {
+    const pane = (DRIVER_DEFAULTS as Record<string, unknown>)[f.name];
+    assert.ok(f.name in DRIVER_DEFAULTS, `driver.${f.name} has no pane default - the chrome cannot render an omitted field`);
+    assert.equal(
+      pane,
+      f.default,
+      `driver.${f.name}: the pane's rendered default drifted from the manifest's declared default`
     );
   }
 });
