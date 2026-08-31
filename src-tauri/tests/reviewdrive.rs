@@ -247,6 +247,45 @@ const FORBIDDEN_CALLS: [(&str, &str); 5] = [
     ("queue_merge", "§8.1: a driven PR may not be queued, and not by the driver"),
 ];
 
+/// One driver file as the scan reads it: **production source only**.
+///
+/// Two things are removed, and each removal is a stated blind spot rather than a
+/// convenience. `#[cfg(test)]` onward is cut, because a test in one of these
+/// files may legitimately build a landing verb — one deliberately does, to prove
+/// the `GitDenied` bridge REFUSES `git push`, and a scan that fired on it would
+/// be a scan the fix for is to delete the proof. Line comments are cut, because
+/// the design note is quoted at length in these files and a `///` block naming
+/// `queue_merge` or a `gh pr merge` example is prose, not a capability.
+///
+/// The comment cut is textual and is fooled by a `//` inside a string literal on
+/// a line with an odd number of quotes before it. No such line exists here, and
+/// the population floor asserted in the scan is what would notice if the cut
+/// ever started eating real code.
+fn driver_production_source(rel: &str) -> String {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let src = match src.find("\n#[cfg(test)]") {
+        Some(i) => src[..i].to_string(),
+        None => src,
+    };
+    src.lines()
+        .map(|line| {
+            let mut quotes = 0usize;
+            let b: Vec<char> = line.chars().collect();
+            for k in 0..b.len() {
+                if b[k] == '"' && (k == 0 || b[k - 1] != '\\') {
+                    quotes += 1;
+                }
+                if b[k] == '/' && b.get(k + 1) == Some(&'/') && quotes % 2 == 0 {
+                    return b[..k].iter().collect::<String>();
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Whether `src` names `ident` as a **call** — the identifier immediately
 /// followed by `(`, with no identifier character before it.
 ///
