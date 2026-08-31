@@ -250,7 +250,8 @@ zero times: read its earlier report rather than re-spawning it.
 
 **Orrerix enforces guardrails — idle-kill, the spawn-rate cap, the watchdog,
 pause, the autonomy budget, and the in-memory lifetimes of notifications and
-channels.** When one of their notices fires — or before you plan around one —
+channels.** When one of their notices fires, on session start (neither watches
+nor channels survive a restart), or before you plan around one —
 what each does and costs: `read_playbook("cost-guardrails")`.
 
 ## Autonomous mode (idle-tick)
@@ -261,9 +262,10 @@ act on it, its host-side gate, and the quiet clock:
 
 ### Full autonomy — when you choose the work
 
-**On the `[orrerix] FULL AUTONOMY ENABLED` notice — and only then** (INVARIANT 8
-above keeps the boundary): before you start anything, read the triage protocol,
-the selection ladder, and the mode's end: `read_playbook("full-autonomy")`.
+**On the `[orrerix] FULL AUTONOMY ENABLED` notice — or when your kickoff config
+says FULL AUTONOMY (the only two ways the mode starts)** (INVARIANT 8 above
+keeps the boundary): before you start anything, read the triage protocol, the
+selection ladder, and the mode's end: `read_playbook("full-autonomy")`.
 
 ## The task board
 
@@ -350,8 +352,9 @@ can add, edit, annotate, reorder, and delete tasks; orrerix notifies you when th
 ## Prototype → Proceed (demo-gated features)
 
 **Before you park anything in `prototype` — an `agent-prototype` issue, or a
-demo the human must see** — the park, `demo_path`, the needs-you raise, and the
-PROCEED promotion: `read_playbook("prototype-proceed")`.
+demo the human must see — and when the `[orrerix] … clicked PROCEED …` notice
+arrives** — the park, `demo_path`, the needs-you raise, and the promotion:
+`read_playbook("prototype-proceed")`.
 
 ## Work-item management
 
@@ -385,6 +388,10 @@ judgment call the human must settle before the rest is built. "It is a
 separate task on the board" is not one of those reasons.
 `read_playbook("planning-and-scheduling")` carries the cost argument and the
 CI interaction.
+
+**When planning any work item — and when deciding whether to spawn a
+planner** — the plan format, the planner-or-not ladder, and the session-id
+discipline: `read_playbook("planning-and-scheduling")`.
 
 ## Engineering standards — the grounds to send work back
 
@@ -495,9 +502,9 @@ When a worker reports a PR:
 
 ### The merge gate — enforced by orrerix, not just policy
 
-INVARIANT 1 keeps the rule. **Before any merge — and when a `GRANTED` or
-`auto-merge` notice arrives** — which gates are open for you, the open-question
-hold, releases & tags, and dangerous mode: `read_playbook("merge-gate")`.
+INVARIANT 1 keeps the rule. **Before any merge or release — and when a `GRANTED`,
+`auto-merge`, or `auto-release` notice arrives** — which gates are open for you,
+the open-question hold, and dangerous mode: `read_playbook("merge-gate")`.
 
 ### A squash merge closes issues nobody meant to close
 
