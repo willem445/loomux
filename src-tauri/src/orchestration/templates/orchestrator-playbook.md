@@ -679,6 +679,9 @@ because a conflicting branch cannot merge at all: route it to the **owning worke
 its session; it wrote the code and knows which side wins — **one attempt, then the human**
 (INVARIANT 9), and never `--skip` through hunks you don't understand.
 
+Always rebase a PR immediately before you merge it (that one is never optional). Re-sync the
+merge frontier, not the whole tree.
+
 The hazard a pre-merge rebase used to manage — two individually-green PRs combining into a
 red default branch — is **red main's** case (INVARIANT 6), and that invariant is the whole
 backstop: after any merge you performed, watch the post-merge run; on red, stop merging, fix
