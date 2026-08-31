@@ -1222,6 +1222,25 @@ pub mod refusal {
     pub const GATE_NOT_MET: &str = "gate-not-met";
     pub const GATE_NOT_CONFIGURED: &str = "gate-not-configured";
     pub const ALREADY_QUEUED: &str = "already-queued";
+    /// This PR is being driven by the engine review loop (#1778 §8.1), so it may
+    /// not also be queued.
+    ///
+    /// **The other half of a refusal this vocabulary only had one side of.**
+    /// §8.1 of `doc/design/review-driver.md` states it in both directions — "a
+    /// driven PR may not be queued, and a queued PR may not be driven" — and
+    /// until #1778 S4 the queue had no name for its side and made no such
+    /// refusal at all. The two loops both move a PR's head and both read its
+    /// verdicts, and neither was designed expecting the other to be doing so
+    /// concurrently.
+    ///
+    /// **Named for the HOLDER, not for the state**, and its opposite number
+    /// `in-merge-queue` is too. The obvious spelling on this side was
+    /// `already-driven` and on the other `already-queued` — but `already-queued`
+    /// is taken, above, for a different subject, and a caller of `drive_review`
+    /// receiving it would have to already know which tool it called to know
+    /// which thing was queued. A refusal string is a contract an agent branches
+    /// on; it has to read correctly from either side.
+    pub const IN_REVIEW_DRIVE: &str = "in-review-drive";
     pub const QUEUE_FULL: &str = "queue-full";
     pub const QUEUE_DISABLED: &str = "queue-disabled";
     /// `cancel_queued_merge` only: the PR is not in the queue, or is already
@@ -1294,12 +1313,16 @@ pub enum EnqueueOutcome {
 ///    meaningful.
 /// 2. **`already-queued`** — a second enqueue of the same PR is a caller
 ///    mistake, not a state change, and answering it needs no lookups.
-/// 3. **`queue-full`** — the §10 cap, so `merge_queue.json` stays bounded under
+/// 3. **`in-review-drive`** — #1778 §8.1's mutual refusal, the queue's half.
+///    Immediately after its opposite number so a PR that is somehow both gets
+///    the more actionable answer, and still ahead of anything remote. The
+///    caller resolves the fact; the ordering decision is here.
+/// 4. **`queue-full`** — the §10 cap, so `merge_queue.json` stays bounded under
 ///    an enqueue storm.
-/// 4. **The constraint-7 refusals**, from **live** lookups (§7.1): the PR's base
+/// 5. **The constraint-7 refusals**, from **live** lookups (§7.1): the PR's base
 ///    and the repo default, resolved through the real `gh`. A failed lookup
 ///    refuses (`base-unverifiable`) — unknown is never treated as safe.
-/// 5. **The gate** (§6). Last because it is the most expensive and because a PR
+/// 6. **The gate** (§6). Last because it is the most expensive and because a PR
 ///    whose base is wrong should not have its reviewers reported on.
 ///
 /// `asserted_target` is §4's **assertion, not a selection**: present, it must
@@ -1318,6 +1341,7 @@ pub fn enqueue(
     gate: &GateSpec,
     verdicts: &BTreeMap<BlockId, ReviewVerdict>,
     now_ms: u64,
+    driven: bool,
 ) -> EnqueueOutcome {
     let refuse = |reason| EnqueueOutcome::Refused { reason };
     if !enabled {
@@ -1325,6 +1349,18 @@ pub fn enqueue(
     }
     if state.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false) {
         return refuse(refusal::ALREADY_QUEUED);
+    }
+    // #1778 §8.1's mutual refusal, the queue's half. Checked immediately after
+    // its opposite number so a PR that is somehow both gets the more actionable
+    // of the two answers, and so the two live in one place rather than one here
+    // and one in a caller.
+    //
+    // The **caller** resolves the fact, because `review_drives.json` is a
+    // different file in the group dir and reading it is a registry job; the
+    // decision — which refusal, in what order — stays here, where
+    // `already-queued` is.
+    if driven {
+        return refuse(refusal::IN_REVIEW_DRIVE);
     }
     if state.entries.iter().filter(|e| !e.state().is_terminal()).count() >= MAX_ENTRIES {
         return refuse(refusal::QUEUE_FULL);
@@ -1350,9 +1386,10 @@ pub fn enqueue(
     // landing on until the next restart (rev N2) — `queue_merge_with` persists
     // a refusal that changed the state for exactly this reason.
     //
-    // Placed after the three cheap refusals above, not before them: a disabled
-    // queue must stay byte-for-byte untouched (§12), and `already-queued` and
-    // `queue-full` can only fire on a queue that is not drained anyway.
+    // Placed after the four cheap refusals above, not before them: a disabled
+    // queue must stay byte-for-byte untouched (§12), and `already-queued`,
+    // `in-review-drive` and `queue-full` can only fire on a queue that is not
+    // drained anyway.
     //
     // It also drops the previous campaign's corpses, which is why a queue that
     // re-establishes a target never shows the old campaign's cancelled entries:

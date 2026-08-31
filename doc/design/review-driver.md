@@ -182,9 +182,9 @@ own delivery arrives by its own path; §7.)
 | `held(rebase-limit)` | a second conflict after the one rebase hand-back |
 | `held(lane-stalled)` | a spawned or resumed **reviewer** lane recorded no verdict inside `lane_timeout_minutes` |
 | `held(fix-stalled)` | a resumed **worker** neither pushed nor reported inside `fix_timeout_minutes` |
-| `held(drive-stalled)` | the drive's **age** — `now - started_ms`, never an idle clock reset by each state advance — passed `drive_timeout_minutes`. The precedent is `mqloop::status_view`, whose `since_ms` is `now_ms.saturating_sub(e.enqueued_ms)`: age since the entry began, not time since it last moved. An idle clock would leave §8's `also: [base-green]` row parked **forever**, because that drive advances `gate-check` → `ci-wait` on every wake and would reset the timer each time — which is precisely the silent park that row says the bound exists to prevent |
+| `held(drive-stalled)` | the drive's **age** — `now - started_ms`, never an idle clock reset by each state advance — passed `drive_timeout_minutes`. The precedent is `mqloop::status_view`, whose `since_ms` is `now_ms.saturating_sub(e.enqueued_ms)`: age since the entry began, not time since it last moved. An idle clock would leave §8's `also: [base-green]` row parked **forever**, because that drive advances `gate-check` → `ci-wait` on every wake and would reset the timer each time — which is precisely the silent park that row says the bound exists to prevent. **The anchor is re-stamped on arc 11 and nowhere else**, and that is not the idle clock this row forbids: the ban is on a stamp written by each state ADVANCE, and nothing on the tick path touches it. It moves only on a deliberate, role-gated, audited `drive_review` — the same event §2.3 already lets clear the counters. Without that, arc 11 is a no-op for exactly the holds it exists to recover: `decide` checks this age before any per-state logic, so a drive parked longer than the bound re-holds on its first tick after being resumed, and a hold a human takes their time over is always that old. `spawned_ms` is re-stamped on the same arc for the same reason, at a quarter the threshold |
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
-| `held(gate-unreadable)` | the gate file is present and could not be read (an I/O error), which is **not** `gate-not-configured` |
+| `held(gate-unreadable)` | the gate file is present and orrerix cannot use it — an I/O error, **or** contents `parse_gate_file` refuses. **Not** `gate-not-configured`, which means the file is genuinely absent. *S3 widened this row from "an I/O error" alone: the `gh` shim refuses every merge on a malformed gate, so a drive that announced satisfied over one would be §3.1's "bypass with better telemetry" — and this enum has no third reason to give it* |
 | `held(worker-blocked)` | the worker reported `blocked` |
 | `held(worker-unresumable)` | the recorded worker session no longer resolves |
 | `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
@@ -199,6 +199,37 @@ happens to sit at its bound.
 different lengths and name different panes, and because "is a resumed worker a
 lane?" is exactly the question a slice author would otherwise answer on its own.
 A reviewer lane and a worker hand-back are never the same subject.
+
+**Resuming `lane-stalled` RE-BRIEFS the lane, and it has to.** Arc 11 returns the
+drive to `ci-wait`, but `decide_review_wait` opens a lane only when
+`lane_open_for` is false, and at an unmoved head it stays true — so a resume that
+only restarted the clocks would leave the stalled lane holding a brief it has
+already ignored, wait the full `lane_timeout_minutes` in silence, and re-hold.
+That is worse than re-holding at once, because the silence looks like progress.
+So the resume clears each lane's briefed head, which puts the outstanding lane
+back on the `OpenLane` arc. `rd_open_lane` then resumes the session recorded for
+that lane when there is one, and spawns a fresh reviewer when there is not —
+either way the lane record is re-pointed at the pane that now holds it, so §7's
+interception stays keyed on a live pane rather than on an abandoned one. Whether
+the stalled pane itself is reused therefore depends on whether a session was
+ever recorded for it, which is not something this arc decides.
+
+Scoped to this hold: a lane holding `escalate` or `review-limit` carries a
+verdict `decide_review_wait` answers before it consults the lane record, and a
+lane that is legitimately mid-review must not be re-briefed because some other
+hold on the drive was resumed.
+
+This is the general form of the rule §2.2's **stalled** rows imply — **a hold
+whose cause is a wait must be clearable by the remedy its own notice prints** —
+which is the same defect `drive-stalled` had in its age anchor. It is stated for
+the stalled rows and not for every hold, because two holds are deliberately
+outside it. `escalate` and `review-limit` are parked on a JUDGMENT the driver may
+not make (INVARIANT 3), not on something orrerix is waiting for: `drive_review`
+does resume the drive as their notices say, but `decide_review_wait` re-holds on
+the next tick because the verdict — or the spent budget — has not changed. The
+orchestrator has to change that fact first, by dispositioning the escalation or
+by passing `reset_counters`. Resuming without doing so re-holding at once is the
+design working, and the rule above must not be read as promising otherwise.
 
 ### 2.3 The counters are INVARIANT 9's numbers, and neither key may loosen them
 
@@ -303,6 +334,25 @@ Every read-modify-write of that file is serialized under `rd_state_lock`, the
 `mq_state_lock` lesson applied before it can be relearned: the load-decide-store
 spans a spawn, and a `drive_review` landing inside that window would otherwise
 read the pre-spawn file and write it back, erasing the entry.
+
+**That sentence and #467/#468 look like they contradict each other, and S3 had
+to resolve it rather than pick a half.** The rule this design inherits from the
+queue is that no registry lock is held across a notice *delivery*, because a
+delivery enqueues and an enqueue can re-enter registry locks — and a spawn
+delivers its own kickoff, so "span the spawn" reads as "span a delivery". Both
+hold, on one fact about this lock in particular: **no site that takes
+`rd_state_lock` is reachable from a pane delivery**, so a spawn's own kickoff
+cannot cycle back onto it. The orchestrator notices §6 produces are a different
+matter and are delivered outside it.
+
+The argument is stated as a property of the lock rather than as a count of its
+callers, because the count moves. The sites today are the tick (twice), the
+restart reconcile, the three tools of §5.1, and the two interception helpers
+§7 needs — eight acquisitions across seven functions. The interception pair is
+the one that has to be argued rather than observed: those run on a delegate's
+own tool call, which the runtime schedules as a later turn and never as a frame
+the delivery itself pushes, and both release the lock before auditing. A new
+caller owes that argument again rather than inheriting it.
 
 ## 3. Ownership, authority, and consent
 
@@ -537,7 +587,8 @@ drive_review(pr: number, worker_session: string,
   -> { driving: true, state: "ci-wait" } | { refused: "<reason>" }
   declines:      driver-disabled | pr-not-open | pr-unverifiable
                | resume-not-found | resume-ambiguous | resume-session-empty
-               | already-driven | gate-not-configured | gate-names-no-such-block
+               | already-driven | in-merge-queue | gate-not-configured
+               | gate-names-no-such-block
   orrerix failed: rd-state-unreadable | rd-state-unwritable | rd-unavailable
                | gate-unreadable
 
@@ -554,7 +605,7 @@ review_drive_status()
 ```
 
 **The split into two classes is `queue_merge`'s, and it is not cosmetic.** That
-tool's own contract separates the queue's declines from "FOUR FURTHER REASONS
+tool's own contract separates the queue's declines from "FIVE FURTHER REASONS
 MEAN LOOMUX ITSELF FAILED, not that the queue declined you", and spells out why
 each matters: `queue-state-unreadable` is "the queue is there and orrerix cannot
 read it — **NOT** 'nothing is queued'", and `gate-unreadable` is "**NOT**
@@ -599,6 +650,39 @@ Four are new, and each closes a case that would otherwise have no answer:
   not declare is answerable at drive time from two files, and left unanswered it
   becomes `held(lane-stalled)` sixty minutes later instead of an immediate one.
 
+**A fifth is `in-merge-queue`, and §8.1's mutual refusal turned out to be
+half-unimplemented in BOTH directions.** §8.1 states it as a pair — "a driven PR
+may not be queued, and a queued PR may not be driven" — and this section's list
+named neither side. Checked at source on S4: `mqloop::refusal` had no
+driver-aware name at all and `mqloop::enqueue` made no such check, so the
+sentence in §8.1 described a mechanism that did not exist on either side of it.
+Both land here.
+
+- **`drive_review` answers `in-merge-queue`** when a non-terminal queue entry
+  holds the PR.
+- **`queue_merge` answers `in-review-drive`** when a **live** drive holds it,
+  and that name joins the queue's own closed set.
+
+**Named for the HOLDER rather than for the state, and that is a contract
+decision rather than a stylistic one.** The obvious spellings were
+`already-queued` on one side and `already-driven` on the other, and
+`already-queued` is *taken*: `mqloop::refusal` uses it for a different subject —
+"this PR is already in the merge queue" — read by a caller of `queue_merge`. A
+caller of `drive_review` receiving it would have to know which tool it had
+called in order to know which thing was queued. These strings are a contract an
+agent branches on, so each has to read correctly from either side.
+
+**The two thresholds are deliberately not the same word, and the asymmetry is
+the argument.** `drive_review` refuses on a **non-terminal** queue entry, which
+is `already-queued`'s own test, because a queued entry can move the PR's head at
+any moment — a batch build rebases it — and a lane reviewing a revision the
+queue replaced underneath it is the race §8.1 exists to make unreachable.
+`queue_merge` refuses on a **live** drive, §5.2's own word, because a `held`
+drive is *parked*: the tick does not advance it, so it moves nothing and cannot
+race a batch. Queuing under a parked drive is therefore allowed, and if anyone
+later resumes that drive the other half refuses it. Each side uses the other's
+vocabulary for its own threshold, which is why neither reads as an oversight.
+
 **`routing-unaccountable` is deliberately not a drive-time decline**, though it
 is a `held` reason — and the ground is *transience*, not re-evaluation.
 (Re-evaluation alone would remove `gate-not-configured` and `pr-not-open` too:
@@ -640,8 +724,9 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "head": "<sha>",
       "body_digest": "<digest>",
       "worker_session": "<full uuid, as resolved>",
+      "worker_agent": "w-7",
       "on_behalf_of": "<orchestrator agent id>",
-      "lanes": [ { "block": "rev-std", "session": "<uuid>",
+      "lanes": [ { "block": "rev-std", "session": "<uuid>", "agent": "rev-4",
                    "last_verdict": "pass", "at_head": "<sha>",
                    "briefed_head": "<sha>", "briefed_digest": "<digest>",
                    "spawned_ms": 0 } ],
@@ -666,7 +751,8 @@ somewhere to measure from. `lane-stalled` is "no verdict inside
 `lane_timeout_minutes`" and `fix-stalled` is "neither pushed nor reported
 inside `fix_timeout_minutes`", and a bound with no *persisted* anchor is not a
 bound — §2.4 resumes a drive from disk after a restart, so an in-memory clock
-cannot carry either one. Three fields, each answering exactly one question:
+cannot carry either one. Three fields, each answering exactly one question — and
+S3 added two more, described after them:
 
 - **`spawned_ms`** (per lane) — when that lane's delegate was last spawned or
   resumed. The `lane-stalled` anchor. A re-brief *replaces* the lane's record
@@ -704,7 +790,24 @@ cannot carry either one. Three fields, each answering exactly one question:
   put that clock one field access away from every later timeout. It is written
   on entry to `fix-wait` and nowhere else.
 
-All three are optional on read, so a file written against the shape as first
+**S3's two, and both are the same field for two subjects: the PANE.** `agent`
+(per lane) and `worker_agent` (per entry) record the agent id the delegate is
+running in, beside the session id already there. Two things need it and a
+session id answers neither. §2.2's `lane-stalled` notice **names the pane**, and
+a pane is an agent id (`rev-4`), never a session UUID. And §7's interception is
+"keyed on the agent": an MCP caller arrives carrying a `caller.agent_id`, so
+without these fields the only key available is something the delegate typed —
+which is precisely what §7 forbids, in the paragraph that explains why.
+
+**Empty never matches**, and that is the fail-closed direction rather than an
+accident of `serde(default)`. A drive that has not handed back yet carries an
+empty `worker_agent`, and a lane written before these fields existed carries an
+empty `agent`; under a guard that compared them naively, either would own every
+caller whose id failed to resolve. An unrecorded pane therefore owns nobody: its
+traffic reaches the orchestrator exactly as it always did, which is the wrong
+recipient and never a wrong *authority*.
+
+All five are optional on read, so a file written against the shape as first
 published still parses. `counters` is **not** optional: an absent counter block
 is refused rather than defaulted to zeros, because zeros silently grant a full
 fresh budget — the same outcome the retention rule below refuses when it
@@ -724,7 +827,16 @@ hygiene. Unpruned entries would flow through `review_drive_status()` into the
 orchestrator's resident context, which is the cost this whole feature exists to
 remove; and they would make `already-driven` (§5.1) refuse every re-drive of a
 PR forever. So `satisfied` and `cancelled` entries are pruned once their notice
-has been delivered. **`held` entries are never pruned**, because §2.3's resume
+has been delivered — **and that ordering is NOT implemented today**. The tick
+prunes a terminal entry whether or not its notice reached a pane, because
+nothing on that path knows: `prune_terminal` cannot enforce the rule and its
+caller does not either. A drive whose final notice fails to deliver therefore
+ends silently. A hold-back keyed on a tick's delivery failures was tried and
+removed as inert — `rd_step_entry` returns `None` for any entry that is parked
+or terminal, before it reads anything, so a retained terminal entry emits
+nothing on any later tick and is pruned on the next one anyway; re-delivery needs delivery state persisted ON the entry plus a
+path that re-emits for a terminal one, which is a different shape rather than an
+extension of that one. Tracked on #1857. **`held` entries are never pruned**, because §2.3's resume
 needs their counters and pruning one would silently grant three fresh rounds —
 a parked drive leaves the file only by being resumed to completion or cancelled.
 That asymmetry is the whole reason §2.1 makes `held` parked rather than
@@ -835,10 +947,13 @@ PR; the delta template's changed-file list is paths the pusher chose. §3.1 item
 4's claim is therefore about *policy* text and *delegate* text, not about every
 string: these two are author-controlled and must be treated as such.
 
-**So every interpolated value passes `report::relay_payload_keeping_lines` and
-`notify::sanitize_pane_text` before it reaches a template**, and this has to be
-said here rather than left to §6. §6 mandates the same functions for **notices**
-and justifies them by **context cost** — "the pane text becomes the
+**So every interpolated value passes `notify::sanitize_pane_text` before it
+reaches a template**, and this has to be said here rather than left to §6.
+(§6's notices pass `report::relay_payload_keeping_lines` as well, to keep a
+verdict summary's line breaks; a brief interpolates single-line facts into
+prose, so `rd_fact` collapses lines and caps instead — strictly narrower than
+what it would keep.) §6 mandates sanitization for **notices**
+and justifies it by **context cost** — "the pane text becomes the
 orchestrator's resident context and is paid for again on every later API call" —
 a rationale that positively suggests a short brief is exempt. It is not:
 `sanitize_pane_text` is also the control that strips control characters and
@@ -885,6 +1000,29 @@ record at H."* No disposition ever rides in a brief; the disposition the
 orchestrator used to append to a hand-back belongs at the gate-satisfied
 kick-back instead, where the orchestrator is the one making it (INVARIANT 3).
 
+**Three facts §3.1 item 4 lists are NOT in a v1 brief, and the reason is one
+S3 decision rather than three omissions.** That item enumerates "PR number,
+issue, head, base, merge-base, CI run id and failed job names, lane id, the
+lane's prior verdict head and body digest, round number". A v1 brief carries
+every one of those except the **merge-base**, the **CI run id**, and the
+changed-file list the delta template's `{{WHAT_MOVED}}` was drafted around.
+All three fall out of the same choice: the driver's seam is `gh`-only by
+construction. §3.1 item 1's "no landing verb" is made *structural* in
+`rddrive::RdRunner`, which has a `gh` method and no `git` — a driver holding one
+cannot reach `git push` whatever a later author writes — and the price of that
+is that it cannot reach `git merge-base` or `git diff` either. The run id is a
+separate small thing: `gh pr checks --json state,name,link` reports check names
+and links, and extracting a run id from a link would be parsing rather than
+reading.
+
+So the delta brief says what orrerix actually read — the two revisions, and
+whether the body digest moved — and then names the command that answers the
+rest exactly: `git diff <prev>..<head>` in the reviewer's own worktree. That is
+a fact plus an instruction rather than a delta the driver invented, which is the
+same posture §3.1 item 4 is about. **If a later slice wants the merge-base or a
+per-round file list in a brief, it is choosing to widen the seam**, and that is
+the argument it has to make — not a template edit.
+
 ## 6. Kick-back notice shapes
 
 **One delivery per exit, event first**, so the first token the orchestrator reads
@@ -896,8 +1034,9 @@ Two reasons, and only the first is about size: the pane text becomes the
 orchestrator's resident context and is paid for again on every later API call,
 **and** `sanitize_pane_text` is the control that strips control characters and
 neutralizes the brackets a forged `[orrerix] …` line would need. The second
-reason is why §5.5 mandates the same functions on brief interpolations, where
-there is no context-cost argument to carry them.
+reason is why §5.5 mandates `sanitize_pane_text` on brief interpolations, where
+there is no context-cost argument to carry it — and only that one, since a brief
+interpolates single-line facts and has no line breaks to keep.
 
 ```
 [orrerix] review drive PR #1758: GATE SATISFIED at df6a73d0 (body 3f1a..) —
@@ -957,6 +1096,19 @@ Three properties bound that narrowing, and all three are load-bearing:
   never keyed on a `ref` string a delegate typed, because a delegate that could
   choose whether its report reaches the orchestrator by naming a PR number is a
   delegate that can route around the orchestrator.
+- **Which SIDE reported decides what the report means, and consuming is not the
+  same as ingesting.** Both a lane and the worker reach the `report` arm, and
+  `WorkerSignal` is named for the worker because only the worker produces one:
+  arc 8 is "`report(done)` with the head unchanged", and `held(worker-blocked)`
+  names a worker's session. A reviewer's `report(approved)` resolves to the same
+  `done` word, so a driver that read the outcome without the role took arc 8 out
+  of `fix-wait` on a lane's report — spending a review round on a hand-back that
+  never happened. A lane's report is therefore consumed and audited (§7's
+  narrowing holds for it) and carries **no** drive signal: what a lane says to
+  the drive is its VERDICT FILE, re-read every tick through the gate's own
+  parser, and a lane that stops speaking is bounded by `lane-stalled`. A lane
+  with something to say that is not a status change has `message_orchestrator`,
+  which this section never intercepts.
 - **`message_orchestrator` is never intercepted.** It is the one channel a
   delegate has for something that is not a status change — a brief whose premise
   is wrong, a question, a refusal — and it is exactly the traffic the norm exists
@@ -1002,10 +1154,14 @@ Both loops run under `gh_poll_tick` against the same group, and their overlap is
 specified rather than left to whichever lands first:
 
 - **A driven PR may not be queued, and a queued PR may not be driven.**
-  `queue_merge` refuses a PR with a live drive, mirroring `already-queued`; and
-  `drive_review` refuses a PR with a live queue entry. The two loops both move a
-  PR's head and both read its verdicts, and neither was designed expecting the
-  other to be doing so concurrently.
+  `queue_merge` refuses a PR with a live drive as `in-review-drive`, a name
+  added to the queue's own closed set by S4; `drive_review` refuses a PR with a
+  non-terminal queue entry as `in-merge-queue`. The two loops both move a PR's
+  head and both read its verdicts, and neither was designed expecting the other
+  to be doing so concurrently. §5.1's *in-merge-queue* paragraph carries why
+  neither is spelled `already-…` and why the two thresholds differ; until S4
+  **neither** side made the refusal, so this bullet described a mechanism that
+  did not exist.
 - **The intended sequence is serial, and it has a direction**: a drive ends at
   `satisfied`, the orchestrator dispositions the findings (INVARIANT 3), and
   *then* it queues. `queue_merge`'s contract already says "call it once per PR,
@@ -1056,3 +1212,56 @@ permanent before anyone knows whether it was right.
 **Neither omission is a stub.** Nothing in v1 half-implements either: there is no
 `brief:` key that parses and is ignored, and no lane list that accepts more than
 one entry at a time. A feature that is not here is absent, not disabled.
+
+## 10. What S3 and S4 decided that this note did not
+
+Everything in this section is a choice the slices made because the note left it
+open, and each is recorded here rather than in a PR body for the reason the
+repo's own convention gives: a PR body is read once, and the next implementer
+reads this file. The section is deliberately short — where a slice's decision
+contradicted or completed something this note already said, the amendment is in
+the section that said it, not here.
+
+**The `gh` seam is one method wide, and that is what makes half of §3.1 item 1
+structural.** `rddrive::RdRunner` has `gh` and no `git`, so the driver cannot
+reach a `git` landing verb at all — the compiler enforces it, not a scan. The
+one place the wider trait is still needed is `mqdriver::base_ci_green`, which
+the driver reaches through a bridge whose `git` is a **refusal naming this item**
+rather than an absence, so a landing verb routed through it fails loudly at the
+one place a reader is looking. What this does **not** close, and the scan
+therefore must: `gh pr merge`, `gh pr edit` and `gh pr ready` all ride the method
+that is still there. §5.5's own paragraph carries what the narrowing costs a
+brief.
+
+**The scan's scope is FILES.** §3.1 item 1 says a scope keyed on a name — a
+module, an `rd_*` prefix — is stepped over by a landing verb added in a function
+that does not carry it. So the driver's registry wiring lives in one file
+(`src-tauri/src/orchestration/rdtick.rs`) purely so the scan can name three files
+and a rename cannot move code out from under it. The scan reads production
+source only: the `#[cfg(test)]` tail is cut, because a test there deliberately
+builds a landing verb in order to prove the bridge refuses it, and line comments
+are cut, because these files quote this note at length and a `///` block naming
+`queue_merge` is prose rather than a capability. Both cuts are places a scan can
+go blind, and each has its own control.
+
+**The gate is read through `mergeq::recheck_gate`, not re-derived.** §4 says a
+third *implementation* of the gate decision is a defect. `evaluate_merge_gate`
+alone does not decide `also:` conditions — `ci-green`, `body-unchanged`,
+`base-green` — nor `max_diff_lines`, and a driver that wrote its own `also:` loop
+would have been the fourth implementation of a decision that already has two
+readers. So `gate-check` asks `recheck_gate`, which is where all of those are
+decided once, and the only thing the driver computes is which of that function's
+answers is a `gate-unreadable` hold and which is an ordinary not-satisfied-yet.
+
+**A delegate signal is in memory and is not persisted, and the degradation is
+named.** §7's interception has to hand something to the next tick. That
+something is an in-memory per-PR signal rather than a second write path into
+`review_drives.json` from the MCP thread. What a restart therefore loses is
+**only arc 8** — the body-only-fix shortcut: a push is still seen as a head move
+(arc 7, read from GitHub), a verdict is still read from its own file, and a drive
+that learns nothing degrades to `held(fix-stalled)`, which is bounded and named.
+
+**A pane id is persisted beside every session id**, because §2.2's
+`lane-stalled` notice names a pane and §7's interception is keyed on an agent,
+and a session id answers neither. §5.2 carries the fields and the fail-closed
+rule that an empty one matches nobody.

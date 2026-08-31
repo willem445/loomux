@@ -321,6 +321,7 @@ pub const READ_TOOLS: &[&str] = &[
     "group_usage",
     "session_digest",
     "merge_queue_status",
+    "review_drive_status",
     "channel_status",
     // #1683: a pure group-dir read — validates the section id, slices the
     // rendered playbook, writes one audit line. Nothing mutates.
@@ -1469,7 +1470,7 @@ fn tool_defs(
             // check is the gate. Off unless the repo declares `merge_queue:
             // enabled: true`, in which case every call refuses `queue-disabled`.
             tool("queue_merge",
-                "Put an APPROVED sub-PR into this group's speculative merge queue, instead of merging it by hand. The queue exists because a green sub-PR is evidence about a PR and not about a BRANCH: N individually-green PRs can still produce a red integration branch, and when that happens nobody can say which one did it. orrerix batches the queued PRs onto a scratch ref, opens a draft PR so the repo's OWN CI judges that exact object, fast-forwards it onto the target on green, and on red bisects and kicks back the one PR that broke the combination — the survivors are re-queued automatically, at the front, so they are not punished for a neighbour's failure. THE COMMIT THAT WAS TESTED IS THE COMMIT THAT LANDS; nothing is rebuilt after CI. You keep merging authority: the queue never touches the default branch (structurally — it cannot construct a refspec for it), never calls `gh pr merge`, and NEVER grants what the merge gate would not. It re-enforces that gate itself, at batch build AND again at the moment of submit, so a reviewer's `fail` or a rebase in between still stops the landing. REFUSALS ARE A CLOSED SET and each says what to do: `queue-disabled` (the repo has no `merge_queue:` block — merge by hand as before), `base-is-default` (that PR targets the default branch; the queue only lands on integration branches), `base-unverifiable` (orrerix could not resolve the PR's base or the repo default — unknown is never treated as safe), `base-not-target` (this queue is already landing on a different branch; drain it first, entries already queued were approved against that other branch), `gate-not-configured` (no merge gate covers this target, and the queue will not push approved-by-nobody PRs under its own authority), `gate-not-met` (the reviewers this repo names have not passed the PR's CURRENT head, or its body moved after a pass), `already-queued`, `queue-full`. FOUR FURTHER REASONS MEAN LOOMUX ITSELF FAILED, not that the queue declined you, and they are worth reporting to the human rather than working around: `queue-state-unreadable` (the queue is there and orrerix cannot read it -- NOT \"nothing is queued\"), `queue-state-unwritable` (the change was computed and could not be saved, so it did not happen), `queue-unavailable` (orrerix could not resolve this group at all), `gate-unreadable` (the merge_gate file is there and an I/O error kept orrerix from reading it -- NOT `gate-not-configured`, which means the file is genuinely absent). None of the four should appear in a running build. Call it once per PR, after its review has passed. Check merge_queue_status() to see where it got to.",
+                "Put an APPROVED sub-PR into this group's speculative merge queue, instead of merging it by hand. The queue exists because a green sub-PR is evidence about a PR and not about a BRANCH: N individually-green PRs can still produce a red integration branch, and when that happens nobody can say which one did it. orrerix batches the queued PRs onto a scratch ref, opens a draft PR so the repo's OWN CI judges that exact object, fast-forwards it onto the target on green, and on red bisects and kicks back the one PR that broke the combination — the survivors are re-queued automatically, at the front, so they are not punished for a neighbour's failure. THE COMMIT THAT WAS TESTED IS THE COMMIT THAT LANDS; nothing is rebuilt after CI. You keep merging authority: the queue never touches the default branch (structurally — it cannot construct a refspec for it), never calls `gh pr merge`, and NEVER grants what the merge gate would not. It re-enforces that gate itself, at batch build AND again at the moment of submit, so a reviewer's `fail` or a rebase in between still stops the landing. REFUSALS ARE A CLOSED SET and each says what to do: `queue-disabled` (the repo has no `merge_queue:` block — merge by hand as before), `base-is-default` (that PR targets the default branch; the queue only lands on integration branches), `base-unverifiable` (orrerix could not resolve the PR's base or the repo default — unknown is never treated as safe), `base-not-target` (this queue is already landing on a different branch; drain it first, entries already queued were approved against that other branch), `gate-not-configured` (no merge gate covers this target, and the queue will not push approved-by-nobody PRs under its own authority), `gate-not-met` (the reviewers this repo names have not passed the PR's CURRENT head, or its body moved after a pass), `already-queued`, `in-review-drive` (orrerix's review driver currently owns that PR; the exclusion is mutual — drive_review answers `in-merge-queue` the other way round — and the intended sequence is serial: let the drive reach gate-satisfied, disposition its findings, THEN queue, or cancel_review_drive first), `queue-full`. FIVE FURTHER REASONS MEAN LOOMUX ITSELF FAILED, not that the queue declined you, and they are worth reporting to the human rather than working around: `queue-state-unreadable` (the queue is there and orrerix cannot read it -- NOT \"nothing is queued\"), `rd-state-unreadable` (the REVIEW DRIVER's record is there and orrerix cannot read it, so it cannot tell whether that PR is being driven -- which is not the same as saying it is not, and unknown is never treated as safe here either), `queue-state-unwritable` (the change was computed and could not be saved, so it did not happen), `queue-unavailable` (orrerix could not resolve this group at all), `gate-unreadable` (the merge_gate file is there and an I/O error kept orrerix from reading it -- NOT `gate-not-configured`, which means the file is genuinely absent). None of the four should appear in a running build. Call it once per PR, after its review has passed. Check merge_queue_status() to see where it got to.",
                 json!({
                     "pr": { "type": "string", "description": "PR number, #n, or URL — the approved sub-PR to queue." },
                     "target": { "type": "string", "description": "OPTIONAL, and an ASSERTION rather than a choice: if you pass it, it must equal the branch the PR's base actually resolves to, and a mismatch is refused with `base-not-target`. It can narrow what happens, never widen it — you cannot retarget a PR by passing a different branch. Omit it unless you want that assertion checked." },
@@ -1481,6 +1482,26 @@ fn tool_defs(
             tool("cancel_queued_merge",
                 "Take a PR back out of the merge queue. Works on any entry that has not reached a terminal state — including one inside a batch that is currently in flight, in which case that batch is abandoned and rebuilt without it (nothing lands, and orrerix cleans up its scratch ref and draft PR). Refuses `not-queued` if the PR is not in the queue or has already landed, been kicked back, or been cancelled — a landing that already happened cannot be called back, and you are told so rather than being given a success that means nothing. `queue-state-unreadable` and `queue-state-unwritable` are DIFFERENT and mean orrerix itself failed — the first says orrerix cannot read the queue at all (so it cannot tell whether your PR is in it, which is not the same as saying it isn't), the second says the cancel was computed and could not be saved (so it did not happen). Neither should appear in a running build; report one rather than working around it. Cancel when the PR needs more work; a kicked-back PR that gets fixed comes back through a fresh queue_merge as a NEW entry, so its refusals are all re-checked against the world as it is then.",
                 json!({ "pr": { "type": "string", "description": "PR number, #n, or URL — the queued PR to cancel." } }),
+                &["pr"]),
+            // The engine-driven review loop (#1778 §5.1). Orchestrator-only and
+            // re-checked in `call_tool` — this listing is cosmetic, the dispatch
+            // check is the gate. Off unless the repo declares `driver: enabled:
+            // true`, in which case every call refuses `driver-disabled`.
+            tool("drive_review",
+                "Hand ONE PR's worker-reviewer rounds to orrerix, so you stop spending a turn on each one. orrerix then does, on its own poll loop: wait for CI; spawn or resume each reviewer lane the merge gate requires, in gate order, briefing it with the head and what moved; hand a FAIL or a red run or a conflict back to the worker session you name here; and stop with ONE notice in this pane at gate-satisfied, at an escalate, or at a bound. It never merges, never edits a PR or an issue, never kills a pane, never writes a verdict, and never decides a disposition — those stay yours. While a drive is live, that PR's delegates' report and review_verdict notices go to the driver instead of appearing here; their message_orchestrator lines still reach you unchanged, and the drive then holds so you know why. Call it per PR, deliberately: it is NOT automatic on report(done), because the PRs where a drive is wrong are ordinary ones (a scratch or red-evidence PR, a release bump, a PR the human is reading themselves). Counters are INVARIANT 9's and clamp toward it, never away: three review rounds, three CI attempts, one rebase. Refuses `driver-disabled`, `pr-not-open`, `pr-unverifiable`, `resume-not-found`, `resume-ambiguous`, `resume-session-empty`, `already-driven`, `in-merge-queue` (that PR is in the merge queue, and the exclusion is mutual — queue_merge answers `in-review-drive` the other way round; the intended sequence is serial and has a direction: drive first, disposition the findings, THEN queue), `gate-not-configured`, `gate-names-no-such-block`. Four further reasons mean ORRERIX ITSELF FAILED rather than that the driver declined you: `rd-state-unreadable` (orrerix cannot read its own drive record, which is NOT 'nothing is driven'), `rd-state-unwritable` (the drive was computed and could not be saved, so it did not happen), `rd-unavailable`, and `gate-unreadable` (a gate file is present and orrerix cannot read it — NOT `gate-not-configured`, which means it is genuinely absent). Report one of those rather than working around it. Also resumes a HELD drive: call it again with the same PR, and pass reset_counters to spend a fresh budget.",
+                json!({
+                    "pr": { "type": "string", "description": "PR number, #n, or URL — the PR to drive." },
+                    "worker_session": { "type": "string", "description": "The session id of the worker that owns this PR — the one orrerix resumes to hand a fix back to. Give the FULL id: a prefix that is unique today can become ambiguous as the roster grows, and this outlives the call. orrerix resolves it once, here, and stores what came back. It does not read the board for it: the board is agent-writable, so a check that trusted it would be a check the thing being checked gets to answer." },
+                    "reset_counters": { "type": "boolean", "description": "OPTIONAL, default false. On a HELD drive, clear the spent counters instead of resuming them — a visible decision to spend another three rounds rather than a side effect of typing the same call twice. Audited." },
+                    "rounds_already_spent": { "type": "number", "description": "OPTIONAL, default 0, clamped 0..=3. Rounds of review findings this PR has ALREADY had, from you or from anyone. 'Yours count too' is a property of the budget, not of who spent it: if you reviewed by hand once and got a fail, pass 1, or the drive starts at zero and spends three more for four against an invariant of three." },
+                }),
+                &["pr", "worker_session"]),
+            tool("review_drive_status",
+                "Where this group's review drives stand: {enabled, drives:[{pr, state, held_reason?, head, lanes:[{block, last_verdict?}], counters, since_ms}]}. States are ci-wait | review-wait | fix-wait | gate-check | held. `held` is PARKED, not finished — it keeps its counters and comes back with drive_review, or stops with cancel_review_drive — and `held_reason` says which of the twelve it is. Terminal drives are not listed. `since_ms` is an AGE, not a timestamp. Read this after a compaction: it is how you recover which PRs orrerix is driving for you, and a drive you have forgotten is still running. `refused: rd-state-unreadable` means orrerix cannot read its own record, which is NOT 'nothing is driven'. Read-only: calling this never changes anything.",
+                json!({}), &[]),
+            tool("cancel_review_drive",
+                "Stop driving a PR. Works on any drive that has not already finished, held ones included; the entry is dropped and its counters go with it, so a later drive_review on that PR starts fresh. Use it when the PR needs something the driver cannot do — a conflict you want to resolve by hand, a change of plan, a PR you have decided to review yourself. Refuses `driver-disabled` if this repo has not enabled the driver at all, and `not-driven` if that PR has no live drive. `rd-state-unreadable` is DIFFERENT and means orrerix cannot read its drive record at all, so it cannot tell you whether that PR is driven — which is not the same as saying it isn't; `rd-state-unwritable` means the cancel was computed and could not be saved, so it did not happen. Neither should appear in a running build.",
+                json!({ "pr": { "type": "string", "description": "PR number, #n, or URL — the driven PR to stop." } }),
                 &["pr"]),
         ]);
         // The manager mailbox's WRITE half (#1161 M2), and the ONE tool on this
@@ -2435,6 +2456,52 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         // The group is `caller.group` throughout — never an argument — so there
         // is no cross-group surface here to check: a caller cannot name another
         // group's queue.
+        // ---- the engine-driven review loop (#1778 §5.1) ----
+        //
+        // Double-gated exactly as `queue_merge` is, and for a sharper reason: a
+        // drive spawns delegates and resumes a worker session on orrerix's own
+        // initiative, with no orchestrator turn in between. That authority is
+        // the ORCHESTRATOR's, exercised on a PR the orchestrator handed over
+        // explicitly (§3.2), so "only an orchestrator may ask for it" must not
+        // depend on a JSON shim's cosmetic listing filter.
+        //
+        // The group is `caller.group` throughout — never an argument — so there
+        // is no cross-group surface here: a caller cannot name another group's
+        // drives.
+        "drive_review" => {
+            require_orchestrator(caller)?;
+            let raw = arg_str(args, "pr").ok_or("pr required")?;
+            let pr = super::pr_number(raw).ok_or("pr must be a number, #n, or a PR URL")?;
+            let session = arg_str(args, "worker_session").ok_or("worker_session required")?;
+            // `?`, not a silent default: a wrong-typed flag is refused rather
+            // than read as false, which is what would silently spend a fresh
+            // budget on a resume the caller thought it had NOT asked to reset.
+            let reset = arg_bool(args, "reset_counters")?;
+            // Clamped 0..=3 by `Counters::seeded`, which is where §2.3's
+            // "yours count too" is enforced rather than here — a clamp at the
+            // shim would be a second bound to keep in step with the first.
+            let spent = args
+                .get("rounds_already_spent")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let out =
+                reg.drive_review(&caller.group, pr, session, reset, spent, &caller.agent_id);
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+        "review_drive_status" => {
+            require_orchestrator(caller)?;
+            let out = reg.review_drive_status(&caller.group);
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+        "cancel_review_drive" => {
+            require_orchestrator(caller)?;
+            let raw = arg_str(args, "pr").ok_or("pr required")?;
+            let pr = super::pr_number(raw).ok_or("pr must be a number, #n, or a PR URL")?;
+            let out = reg.cancel_review_drive(&caller.group, pr, &caller.agent_id);
+            Ok(serde_json::to_string(&out).unwrap_or_default())
+        }
+
         "queue_merge" => {
             require_orchestrator(caller)?;
             let raw = arg_str(args, "pr").ok_or("pr required")?;
@@ -3217,12 +3284,73 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     report::relay_payload(note.or(summary).unwrap())
                 ),
             };
-            // #576 residual: the relay variant, which opts this notice into the
-            // question gate's delivery record — the note is the CALLER's words
-            // landing in the ORCHESTRATOR's pane, which is the cross-pane
-            // authorship the record requires. See
-            // `deliver_relayed_to_orchestrator`.
-            reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+            // #1778 §7: **for a driven PR the recipient changes.** A delegate
+            // this group's review driver spawned or resumed reports to the
+            // DRIVER; the orchestrator's visible prompt is the kick-back (§6),
+            // and every consumed event is audited as `rd-consumed` so the
+            // traffic that stopped arriving as a prompt is still on the record.
+            //
+            // **Keyed on the calling agent, never on text.** `rd_owner` compares
+            // an id orrerix minted at spawn against the id resolved from this
+            // caller's own token — never a `ref` string in `args` — because a
+            // delegate that could choose whether its report reaches the
+            // orchestrator by naming a PR number is a delegate that can route
+            // around the orchestrator.
+            //
+            // **This is the arm §7 warns is the one that gets missed**: it calls
+            // `deliver_relayed_to_orchestrator`, a different method from the one
+            // `review_verdict` calls, and naming only the other would leave
+            // `report` still delivering under a live drive.
+            match reg.rd_owner(&caller.group, &caller.agent_id) {
+                Some((pr, role)) => {
+                    // **WHICH side of the drive reported decides what the signal
+                    // means, and dropping the role here was a live defect.**
+                    // `WorkerSignal` is named for the worker because only the
+                    // worker produces one: arc 8 out of `fix-wait` is
+                    // "report(done) with the head unchanged — a body-only fix",
+                    // and `held(worker-blocked)` names a worker's session.
+                    //
+                    // A driven REVIEWER lane calling `report(...)` is making the
+                    // call `reviewer.md` instructs it to make beside its
+                    // `review_verdict`, and `approved`/`request_changes` both
+                    // resolve to the `done` status word. Fed in as a worker
+                    // signal, that took arc 8 out of `fix-wait` with no worker
+                    // turn at all — spending a review round on a hand-back that
+                    // never happened — and a lane's `blocked` produced
+                    // `held(worker-blocked)` naming the wrong delegate and the
+                    // wrong pane.
+                    //
+                    // A lane's report carries NO drive signal, and that is not a
+                    // gap: what a lane says to the drive is its VERDICT FILE,
+                    // re-read every tick through the gate's own parser (§4), and
+                    // a lane that stops speaking is bounded by `lane-stalled`
+                    // (§2.2). A lane with something to say that is not a status
+                    // change has `message_orchestrator`, which §7 never
+                    // intercepts. It is still CONSUMED and audited — the role
+                    // rides in the audit line so the record says which side
+                    // spoke.
+                    //
+                    // A `progress` report carries no signal from either side: a
+                    // drive advances on the head, the checks and the verdict
+                    // files, never on a delegate saying it is still going.
+                    let is_worker = role == super::reviewdrive::DrivenRole::Worker;
+                    let event = match (is_worker, status) {
+                        (true, "done") => Some(super::RdEvent::WorkerDone),
+                        (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
+                        _ => None,
+                    };
+                    let kind = if is_worker { "report:worker" } else { "report:lane" };
+                    reg.rd_consume(&caller.group, pr, &caller.agent_id, kind, event);
+                }
+                // #576 residual: the relay variant, which opts this notice into
+                // the question gate's delivery record — the note is the CALLER's
+                // words landing in the ORCHESTRATOR's pane, which is the
+                // cross-pane authorship the record requires. See
+                // `deliver_relayed_to_orchestrator`.
+                None => {
+                    reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+                }
+            }
             // #203: a planner's contract is one plan → one report → exit. Close
             // its pane deterministically on the `done` report so it stops holding
             // a delegate slot the instant its work is posted — the role-template
@@ -3281,6 +3409,24 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 rec.pr,
                 (!rec.body_digest.is_empty()).then_some(rec.body_digest.as_str()),
             );
+            // #1778 §7's other half. The verdict FILE is written either way —
+            // `record_verdict` above already did it, and it is what opens the
+            // gate for every reader — but under a live drive the *notice* goes
+            // to the driver instead of the orchestrator's pane, and the reviewer
+            // still gets the same reply it always got.
+            //
+            // **Two delivery methods carry this traffic and interception has to
+            // edit both**: this arm calls `deliver_to_orchestrator`, and the
+            // `report` arm calls `deliver_relayed_to_orchestrator`, a separate
+            // method whose extra job is the #576 question-mask record. Naming
+            // only one would leave the other still delivering under a drive.
+            // The ROLE is deliberately not read here, and that is a statement
+            // rather than an omission: this arm is role-gated to reviewer-kind
+            // blocks above, so a driven caller reaching it is always a lane. The
+            // `report` arm below DOES read it, because both sides reach that one
+            // and the signal means different things depending on which spoke.
+            let driven = reg.rd_owner(&caller.group, &caller.agent_id);
+            if driven.is_none() {
             let _ = reg.deliver_to_orchestrator(
                 &caller.group,
                 &format!(
@@ -3308,6 +3454,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 ),
                 &caller.agent_id,
             );
+            }
+            if let Some((pr, _)) = driven {
+                // The event carries no verdict WORD: the next tick re-reads the
+                // verdict file through the same parser the gate reads, so a
+                // signal carrying it would be a second source for one fact — and
+                // the second source would be the one a delegate could shape.
+                reg.rd_consume(
+                    &caller.group,
+                    pr,
+                    &caller.agent_id,
+                    "review_verdict",
+                    Some(super::RdEvent::Verdict),
+                );
+            }
             // Anything orrerix could not sample while recording goes back to the
             // REVIEWER, which is the only party positioned to act on it (#791,
             // rev-lead). A verdict recorded with an empty head is a verdict that
@@ -3494,6 +3654,30 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             reg.note_agent_activity(&caller.agent_id);
             // #576 residual: same relay variant, same reason as `report` above.
             //
+            // #1778 §7: **`message_orchestrator` is never intercepted**, and
+            // that is the load-bearing exemption rather than an oversight. It is
+            // the one channel a delegate has for something that is not a status
+            // change — a brief whose premise is wrong, a question, a refusal —
+            // and it is exactly the traffic the visible-prompt norm exists to
+            // protect. So the line below is delivered unchanged, and the driver
+            // only NOTICES that it happened: on the next tick the drive goes to
+            // `held(messaged)` and emits its one kick-back beside it.
+            //
+            // Deliberately NOT audited as `rd-consumed`: nothing was consumed,
+            // and an audit action that named a delivery a consumption would be
+            // the mislabel #461 catalogues.
+            // The role is not read here either, and for a different reason: a
+            // hold on `message_orchestrator` is the same fact whichever side
+            // spoke — a driven delegate said something that is not a status
+            // change — and the notice names the delegate by id, which carries
+            // more than its role would.
+            if let Some((pr, _)) = reg.rd_owner(&caller.group, &caller.agent_id) {
+                reg.rd_ingest(
+                    &caller.group,
+                    pr,
+                    super::RdEvent::Messaged { by: caller.agent_id.clone() },
+                );
+            }
             // #891 rev-1 F1: the id in the prefix is orrerix's — resolved from
             // the caller's token, never from `args` — but everything after the
             // colon is the agent's, and this line is the one a liaison's relay

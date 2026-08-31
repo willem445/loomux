@@ -5882,7 +5882,26 @@ const LIVE: [(&str, &str, &[&str]); 6] = [
     (
         "orchestrator-playbook.md",
         loomux_lib::orchestration::ORCHESTRATOR_PLAYBOOK_TPL,
-        &["{{MERGE_QUEUE}}", "{{POST_MERGE_WORKFLOW_HOOK}}"],
+        // #1778's `{{REVIEW_DRIVER}}` is registered COMBINED with its
+        // neighbour, which is `worker.md`'s `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}`
+        // idiom rather than a shortcut: the assertions below are that a key
+        // appears exactly once, that nothing precedes it on its line, and that
+        // NOTHING FOLLOWS IT on that line. Two adjacent placeholders each fail
+        // the third for the other, while the pair as one key passes all three —
+        // and the strip that makes a live template comparable to its golden then
+        // removes both together, which is what the empty substitution does.
+        //
+        // **A combined key is only strippable while both halves stay in the SAME
+        // file, adjacent** — and this branch is the worked example. #1778 first
+        // registered this pair against `orchestrator.md`; #1683 then moved
+        // `{{MERGE_QUEUE}}` here, which would have left the combined key matching
+        // nothing in EITHER file, the strip silently not removing it, and a
+        // re-bless blessing the wrong bytes in both. Nothing fails loudly for
+        // that. So whoever splits a template next owes this list a look: both
+        // halves of every combined entry must still be adjacent in one file, or
+        // the entry becomes two. Checked here: `{{MERGE_QUEUE}}` and
+        // `{{REVIEW_DRIVER}}` are in this file and nowhere else.
+        &["{{MERGE_QUEUE}}{{REVIEW_DRIVER}}", "{{POST_MERGE_WORKFLOW_HOOK}}"],
     ),
 ];
 

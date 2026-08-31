@@ -419,6 +419,28 @@ pub use loomux_engine::intake;
 // delegate, and audit what comes back.
 pub use loomux_engine::{mqdriver, mqloop};
 
+// The review driver's pure core (#1778 S1) — the state machine, the persisted
+// shape and the per-tick decision, none of which touch a file or a child
+// process. Re-exported for the same reason `mqloop` is: what stays HERE is the
+// wiring — `rd_drive_group_with`, `rd_driver_tick`, the reconcile and the
+// `rd_runner_override` field — which resolves paths, spawns, delivers and
+// audits what comes back. `reviewdrive::decide` makes every decision.
+pub use loomux_engine::{rddrive, reviewdrive};
+
+// The review driver's registry wiring (#1778 S3), in a file of its own.
+//
+// Not for size alone, though `mod.rs` being tens of thousands of lines is
+// reason enough. It is what gives §3.1 item 1's source scan a scope that a
+// RENAME cannot step over: CLAUDE.md's source-scanning-guard convention
+// forbids deciding from a binding's name, and the design note names an
+// `rd_*` prefix as exactly the scope that fails that test. A FILE is not a
+// name — every landing verb the driver could reach has to be written
+// somewhere, and `tests/reviewdrive.rs` default-denies the whole of this one.
+mod rdtick;
+pub use rdtick::{
+    RdDriveReport, RdEvent, RdSignal, DRIVER_DELTA_TPL, DRIVER_FIX_TPL, DRIVER_REVIEW_TPL,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;
@@ -615,6 +637,85 @@ merge **is** the mergeability probe, so a sibling that would conflict is kicked 
 construction time with no CI spent and nothing landed — wait to be told. This does **not** cover
 open PRs that are not queued: they still get the open-PR sweep, which asks whether each PR still
 merges, never whether it is fresh — a branch merely behind its base is left alone (INVARIANT 7)."#;
+/// The `{{REVIEW_DRIVER}}` fragment (#1778 §5.5) — substituted into
+/// `orchestrator.md` **only** when the repo declares `driver: enabled: true`,
+/// and empty otherwise.
+///
+/// It brings its own leading newlines for `MERGE_QUEUE_NOTE`'s reason: the
+/// placeholder sits at the end of the preceding sentence, so an empty
+/// substitution has to leave that line exactly as it was — the invariant
+/// `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` pins.
+///
+/// **A fragment rather than template prose**, on the same test the queue's note
+/// passes: everything here names machinery a driverless group does not have —
+/// three tools, a closed refusal vocabulary, and a narrowing of where a
+/// delegate's report arrives. Prose about a mechanism the reader does not have
+/// is an invitation to go looking for it.
+///
+/// **The one thing it must say that nothing else can.** §7 makes the
+/// orchestrator's view of its own group *narrower* while a drive is live: a
+/// driven delegate's `report` and `review_verdict` stop arriving as prompts. An
+/// orchestrator that did not know that would read the silence as a stalled
+/// delegate and go looking for it — so the narrowing, the two surfaces that
+/// compensate for it (`review_drive_status()` and the audit log), and the one
+/// channel that is never intercepted are all named here rather than left to be
+/// inferred from a notice that does not arrive.
+const REVIEW_DRIVER_NOTE: &str = r#"
+
+**This repo runs an engine review driver, and it can perform the worker-reviewer rounds you do by
+hand.** Hand it ONE PR and orrerix does, on its own poll loop: wait for CI; spawn or resume each
+reviewer lane the merge gate requires, in gate order, briefing each with the head and what moved;
+hand a `fail`, a red run or a conflict back to the worker session you named; and stop with **one**
+notice here at gate-satisfied, at an `escalate`, or at a bound.
+
+- `drive_review(pr, worker_session, reset_counters?, rounds_already_spent?)` — start a drive, or
+  resume a held one. Give the **full** worker session id: orrerix resolves it once, here, and
+  stores what came back, because a prefix that is unique today can become ambiguous as the roster
+  grows. It does **not** read the board for it — the board is agent-writable, so a check that
+  trusted it would be a check the thing being checked gets to answer.
+- `review_drive_status()` — where your drives stand. Read-only, and **read it after a compaction**:
+  a drive you have forgotten is still running.
+- `cancel_review_drive(pr)` — stop one.
+
+**Consent is per PR and it is yours.** A drive never starts on its own, and in particular not on a
+worker's `report(done)`: the PRs where a drive is wrong are ordinary ones — a scratch or
+red-evidence PR, a release bump, a PR the human said they would read themselves. INVARIANT 8 makes
+*what starts* your call, and this does not change that.
+
+**What the driver may never do**, so you never have to wonder: merge, or use any landing verb;
+write a merge grant; relabel or edit an issue or a PR, bodies included; widen or author a brief
+(every variable in one is a fact orrerix READ); kill a pane; decide a disposition; or open the gate
+— only a reviewer's own `review_verdict` does that. It is strictly **additive** to the merge gate:
+it never grants what the gate would not, and a completed drive is never a substitute for a
+reviewer's `pass`.
+
+**Counters are INVARIANT 9's, and they clamp toward it and never away.** Three review rounds, three
+CI attempts, one rebase. "Yours count too" is a property of the budget rather than of who spends
+it: if you already reviewed this PR by hand and got a `fail`, pass `rounds_already_spent`, or the
+drive starts at zero and spends three more.
+
+**One thing genuinely narrows while a drive is live, and it is the reason this paragraph exists.**
+A driven delegate's `report` and `review_verdict` are consumed by the driver instead of arriving
+here as prompts. Do not read that silence as a stalled delegate. **The worker's half starts at the
+first hand-back**, not at `drive_review`: interception is keyed on a pane orrerix has recorded, and
+it records the worker's when it first hands the PR back, so a worker `report` that arrives while
+the drive is still on CI or on a reviewer reaches you exactly as it always did. Nothing in the
+drive reads it, so nothing is lost — it is simply not silent yet. Two surfaces compensate:
+`review_drive_status()` and the audit log, where every consumed event is recorded as `rd-consumed`
+with its kind, its agent and its PR — consumed is a different word from dropped.
+**`message_orchestrator` is never intercepted**: a delegate's own words always reach you
+unchanged, and the drive then holds so you know why they came.
+
+**A held drive is PARKED, not finished.** It keeps its spent counters, `review_drive_status()`
+lists it, and `drive_review` on it resumes the same budget — `reset_counters: true` spends another
+three, which is a decision rather than a side effect of typing the call twice. The kick-back names
+the one fact that decides what you do next and the tool that acts on it.
+
+**Sequence with the merge queue is serial and has a direction.** A driven PR may not be queued and
+a queued PR may not be driven — `drive_review` refuses `in-merge-queue`, `queue_merge` refuses
+`in-review-drive`. Let the drive reach gate-satisfied, disposition its findings (INVARIANT 3 —
+that is still yours), and *then* queue."#;
+
 /// The `{{LOCKS}}` / `{{LOCKS_ORCH}}` fragments (#858) — substituted into
 /// `worker.md`/`reviewer.md` and `orchestrator.md` respectively, **only** when
 /// the repo declares a non-empty `resources:` block, and empty otherwise.
@@ -13153,6 +13254,41 @@ pub struct OrchRegistry {
     /// connected to nothing. Same posture as `pr_head_override`: a canned
     /// runner, so no test spawns `git` or `gh` (CLAUDE.md constraint 3).
     mq_runner_override: TrackedMutex<Option<Arc<dyn mqdriver::MqRunner>>>,
+    /// Serializes every read-modify-write of a `review_drives.json` (#1778 §2.4).
+    ///
+    /// `mq_state_lock`'s twin, and a separate lock rather than a shared one:
+    /// the two loops run in the same tick against the same group, and one lock
+    /// would make the review driver's spawn — which this one is held across —
+    /// block a `queue_merge` that has nothing to do with it.
+    ///
+    /// **Held across a spawn, never across a notice.** §2.4 wants the
+    /// load-decide-store to span the spawn, because a `drive_review` landing
+    /// inside that window would read the pre-spawn file and write it back,
+    /// erasing the entry; #467/#468 want no registry lock held across a
+    /// delivery. Both hold, on a property of the lock rather than a count of
+    /// its callers: no site that takes it is reachable from a pane delivery, so
+    /// a spawn's own kickoff cannot cycle back onto it. The site list, and why
+    /// the two interception helpers do not break it, is on
+    /// [`Registry::rd_drive_group_with`].
+    rd_state_lock: Arc<TrackedMutex<()>>,
+    /// Earliest wall-clock at which the review driver may service each group
+    /// again (§2.4). Absent = now.
+    ///
+    /// In memory only, for `mq_service_ms`'s reason: the condition it exists to
+    /// rate-limit is a fact about the world — a `gh` outage, a refused spawn, a
+    /// gate that cannot be satisfied yet — rather than about the drive, and a
+    /// persisted backoff would keep punishing a drive for a network that has
+    /// since come back.
+    rd_service_ms: Arc<TrackedMutex<HashMap<GroupId, u64>>>,
+    /// Test seam: when set, `rd_driver_tick` drives with this `gh` instead of
+    /// building a process runner over the group's repo. `None` in the app.
+    rd_runner_override: TrackedMutex<Option<Arc<dyn rddrive::RdRunner>>>,
+    /// Driven delegates' events, between the MCP arm that consumed one (§7) and
+    /// the tick that acts on it. In memory; `rd_ingest` carries why.
+    rd_signals: Arc<TrackedMutex<HashMap<(GroupId, u64), RdSignal>>>,
+    /// Groups whose persisted drives have been reconciled this process (§2.4).
+    /// Once-only, like `merge_queue_reconcile_with`'s own guard.
+    rd_reconciled: Arc<TrackedMutex<HashSet<GroupId>>>,
     /// #560: each pane's open hold EPISODE — when it began, and what has
     /// already been said about it. Keyed by `pty_id`, in memory only (see
     /// [`HoldEpisode`] for the restart argument).
@@ -26885,6 +27021,7 @@ struct InstructionVars {
     advisor_consult_note: String,
     post_merge_workflow_hook: String,
     merge_queue_note: String,
+    review_driver_note: String,
     locks_note: &'static str,
     locks_orch_note: &'static str,
 }
@@ -26933,6 +27070,7 @@ impl InstructionVars {
             // `BLOCK_NAME`, which `block_note`'s own `BLOCK_TPL` render keeps
             // last on purpose (see the comment there).
             ("MERGE_QUEUE", self.merge_queue_note.as_str()),
+            ("REVIEW_DRIVER", self.review_driver_note.as_str()),
             ("LOCKS", self.locks_note),
             ("LOCKS_ORCH", self.locks_orch_note),
             ("BLOCK_NOTE", ""),
@@ -26974,6 +27112,11 @@ impl OrchRegistry {
             mq_state_lock: Arc::new(TrackedMutex::new("mq_state_lock", ())),
             mq_service_ms: Arc::new(TrackedMutex::new("mq_service_ms", HashMap::new())),
             mq_runner_override: TrackedMutex::new("mq_runner_override", None),
+            rd_state_lock: Arc::new(TrackedMutex::new("rd_state_lock", ())),
+            rd_service_ms: Arc::new(TrackedMutex::new("rd_service_ms", HashMap::new())),
+            rd_runner_override: TrackedMutex::new("rd_runner_override", None),
+            rd_signals: Arc::new(TrackedMutex::new("rd_signals", HashMap::new())),
+            rd_reconciled: Arc::new(TrackedMutex::new("rd_reconciled", HashSet::new())),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(TrackedMutex::new("queue_still_notified", HashSet::new())),
@@ -33794,7 +33937,13 @@ impl OrchRegistry {
         // draft PR, which is exactly a watch poll; the expensive paths are
         // transitions, and a transition happens once per batch.
         let mq_serviced = self.mq_driver_tick(now);
-        GhPollTick { fired, intake_scanned, mq_serviced }
+        // #1778 §2.4: the review-loop driver, a FIFTH step, on the same wake and
+        // under the same one-group bound. On this loop rather than a thread of
+        // its own for #406's reason — observing a driven PR's checks IS a `gh`
+        // poll, on the same cadence, and a second `gh`-calling thread re-opens
+        // the coupling that loop closed.
+        let rd_serviced = self.rd_driver_tick(now);
+        GhPollTick { fired, intake_scanned, mq_serviced, rd_serviced }
     }
 
     // ---------- idle-tick intake gate (#332): host-side, zero-token label/PR-check poll ----------
@@ -41641,6 +41790,16 @@ impl OrchRegistry {
         } else {
             String::new()
         };
+        // #1778 §5.5's addendum, gated the same way and read through the one
+        // policy reader the tick uses — so a group whose tools all refuse
+        // `driver-disabled` cannot be told it has a driver, and a group that
+        // has one cannot be left to discover §7's narrowing from a notice that
+        // does not arrive.
+        let review_driver_note = if self.driver_enabled(&g.id) {
+            REVIEW_DRIVER_NOTE.to_string()
+        } else {
+            String::new()
+        };
         // #858, the same shape and the same reasoning as `merge_queue_note`
         // directly above: gated on the DECLARATION, not merely on the toggle,
         // because a repo can run a workflow and declare no resources — and
@@ -41658,6 +41817,7 @@ impl OrchRegistry {
             advisor_consult_note,
             post_merge_workflow_hook,
             merge_queue_note,
+            review_driver_note,
             locks_note: if locks_declared { LOCKS_NOTE } else { "" },
             locks_orch_note: if locks_declared { LOCKS_ORCH_NOTE } else { "" },
         }
@@ -50399,8 +50559,35 @@ impl OrchRegistry {
         // `merge_queue_reconcile_with` decides its write: a value comparison
         // cannot drift out of step with what the callee actually mutates.
         let before = state.clone();
-        let outcome =
-            mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());
+        // §8.1's mutual refusal: the fact is resolved HERE, because
+        // `review_drives.json` is a different file in this group dir and
+        // reading it is a registry job; the decision is `mqloop::enqueue`'s,
+        // beside its opposite number. A `held` drive is deliberately NOT a
+        // refusal: it is parked, so it moves nothing and cannot race a
+        // batch, and `drive_review` refuses `in-merge-queue` if anyone
+        // later tries to resume it under a live queue entry.
+        // **A drive record orrerix cannot read is a FAULT, not "not driven".**
+        // `unwrap_or(false)` here answered a question it had not been able to
+        // ask, and it is the one direction that is unsafe: the queue would
+        // enqueue a PR that may be under a live drive, which is exactly the
+        // overlap §8.1 forbids. Every other unreadable-state site in this file
+        // and in the driver refuses rather than defaulting — `queue-state-
+        // unreadable` is ten lines above — and §8 says unknown is never treated
+        // as safe. Exposure is small today because the driver also declines to
+        // tick on an unreadable file, but the two loops become live together the
+        // moment a human repairs it, which is precisely the state §8.1 says
+        // neither loop was designed for.
+        let driven = match reviewdrive::load_state(&dir) {
+            Ok(s) => s.is_driven(pr),
+            Err(e) => {
+                self.audit(group, brand::AUDIT_ACTOR, mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": rddrive::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": rddrive::refusal::STATE_UNREADABLE });
+            }
+        };
+        let outcome = mqloop::enqueue(
+            runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms(), driven,
+        );
         match outcome {
             mqloop::EnqueueOutcome::Queued { position } => {
                 if let Err(e) = mqloop::store_state(&dir, &state) {
@@ -50830,6 +51017,7 @@ impl OrchRegistry {
             // alphabetically taking every tick.
             self.mq_defer(group, now);
         }
+
         report
     }
 
@@ -51487,6 +51675,13 @@ pub struct GhPollTick {
     /// serviced first" is the tick's whole bound and a bool could not tell a
     /// rotation from a group monopolising every wake.
     pub mq_serviced: Option<GroupId>,
+    /// The group the review driver serviced on this wake, if any (#1778).
+    ///
+    /// Its own field rather than a shared one, for the same reason `mq_serviced`
+    /// is a group and not a bool: the two loops rotate independently, and a
+    /// single field could not tell a tick that drove one from a tick that drove
+    /// both.
+    pub rd_serviced: Option<GroupId>,
 }
 
 /// Whether the unified poller's INTAKE half is due on a wake at `now`, given
