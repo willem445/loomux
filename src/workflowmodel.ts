@@ -745,6 +745,18 @@ export function setDriverEnabled(w: Workflow, on: boolean): void {
   else w.driver = { enabled: true };
 }
 
+/** The driver form's checkbox READ rule (#1869 review round 1) — the pair of
+ *  `setDriverEnabled` above. The checkbox shows the driver's enabled state, and the
+ *  engine's answer is what the `enabled:` LINE says (`RawDriver.enabled` is
+ *  `#[serde(default)] bool`), never the block's presence: a present `driver:` block
+ *  without the line is OFF to the engine, which is exactly what the pre-form pane
+ *  rendered ("not declared - off (orrerix's default)"). Reading presence instead of
+ *  the line would show ON for a driver that will never run — the one case the write
+ *  rule's tests cannot see, which is why this half is pinned separately. */
+export function isDriverOn(w: Workflow): boolean {
+  return w.driver?.enabled === true;
+}
+
 /** One named lock resource (#858) — how many agents may hold it at once and for
  *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
  *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */

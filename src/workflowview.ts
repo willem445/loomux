@@ -79,6 +79,7 @@ import {
   MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
   DRIVER_DEFAULTS,
   POLICY_BOUNDS,
+  isDriverOn,
   setDriverEnabled,
   type FieldBounds,
   type Workflow,
@@ -2416,10 +2417,11 @@ export class WorkflowView {
 
   /** The `driver:` block's form (#1778 §5.3; the enable-toggle and counters since #1869).
    *  The pane parses, preserves, re-emits and validates the block, and this view is the
-   *  whole chrome it gets: the checkbox below IS the driver's enabled state (its write
-   *  rule lives in `setDriverEnabled` — on writes `{ enabled: true }`, off deletes the
-   *  block, because absent and `enabled: false` are the same state to the engine and
-   *  deleting is the tidier of the two), and the six counters are bounded number fields
+   *  whole chrome it gets: the checkbox below IS the driver's enabled state — it reads
+   *  `isDriverOn` (the `enabled:` line, not the block's presence) and writes through
+   *  `setDriverEnabled` (on writes `{ enabled: true }`, off deletes the block, because
+   *  absent and `enabled: false` are the same state to the engine and deleting is the
+   *  tidier of the two) — and the six counters are bounded number fields
    *  reading `POLICY_BOUNDS` — the manifest's own min/max, which
    *  `test/workflowschema.test.ts` pins against the engine in both directions, so the
    *  form cannot emit a value the engine refuses the file over. The counters still get
@@ -2441,7 +2443,10 @@ export class WorkflowView {
 
     const dv = w.driver;
     box.append(
-      this.sectionToggle("The review driver is on for this repo", !!dv && dv.enabled !== false, (on) =>
+      // The read rule lives in `isDriverOn` — the enabled LINE, not the block's
+      // presence, since the engine's `enabled` is `#[serde(default)] bool` and a
+      // present block without the line is off.
+      this.sectionToggle("The review driver is on for this repo", isDriverOn(w), (on) =>
         this.mutate((next) => setDriverEnabled(next, on))
       )
     );

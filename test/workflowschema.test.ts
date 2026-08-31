@@ -28,6 +28,7 @@ import {
   roleHintRequires,
   serializeWorkflow,
   DRIVER_DEFAULTS,
+  isDriverOn,
   setDriverEnabled,
   RESOURCE_SLOTS_MIN,
   RESOURCE_SLOTS_MAX,
@@ -531,6 +532,40 @@ test("the driver toggle's ON on a hand-written enabled: false keeps that file's 
   ).workflow;
   setDriverEnabled(w, true);
   assert.deepEqual(w.driver, { enabled: true, max_review_rounds: 2 });
+});
+
+test("the driver toggle's CHECKED state is the enabled line, not the block's presence (#1869 review 1)", () => {
+  // The engine's `RawDriver.enabled` is `#[serde(default)] bool`: a PRESENT driver:
+  // block without an `enabled:` line is OFF, exactly what the pre-form pane rendered
+  // ("not declared - off (orrerix's default)"). The checkbox must show unchecked for
+  // it — a human who commits believing a checked box would ship a driver that never
+  // runs. This is the display half the write-rule tests cannot see, so it is pinned
+  // here beside them, and composed with the write rule: ticking the unchecked box on
+  // writes the line and keeps the counters.
+  const absent = parseWorkflow("version: 1\nblocks:\n  - id: b\n    kind: worker\n").workflow;
+  const lineless = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  max_review_rounds: 2\n"
+  ).workflow;
+  const declaredOff = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: false\n"
+  ).workflow;
+  const declaredOn = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n"
+  ).workflow;
+  assert.equal(isDriverOn(absent), false);
+  assert.equal(
+    isDriverOn(lineless),
+    false,
+    "a present block without the line is OFF — the engine's serde default decides, not the block"
+  );
+  assert.equal(isDriverOn(declaredOff), false);
+  assert.equal(isDriverOn(declaredOn), true, "the declared true is the one ON state");
+  setDriverEnabled(lineless, true);
+  assert.deepEqual(
+    lineless.driver,
+    { enabled: true, max_review_rounds: 2 },
+    "ticking the lineless block on writes the line and keeps the counters"
+  );
 });
 
 // ---------- (c2) the frontend's veto fallback agrees with the engine ----------

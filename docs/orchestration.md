@@ -1669,10 +1669,18 @@ at all, so your own config decides.
 roster's block rows and its merge-gate row sit four more: **Intake**, **Merge
 queue**, **Review driver** and **Resources** - the same `intake:`,
 `merge_queue:`, `driver:` and `resources:` blocks described elsewhere on this
-page. Each has an enable-toggle whose state is the section itself: switching a
-section on writes its block, and switching it off removes the section rather
-than writing `enabled: false` (absent and off are the same thing to orrerix,
-and deleting is tidier). The driver's counters and timeouts are number fields
+page. Each has an enable-toggle, and what the checkbox reads differs by what
+the section's `enabled` state is. For **Intake** and **Resources** the checkbox
+is the section itself: switching it on writes the block, switching it off
+removes it. The **Merge queue**'s checkbox is its presence too, with a separate
+dropdown for the `enabled:` line - that file has three states and a checkbox
+has two. The **Review driver**'s checkbox is the `enabled:` line itself:
+ticking it on writes `enabled: true` (keeping any counters the block already
+declares), and unticking removes the whole section rather than writing
+`enabled: false` — absent and off are the same thing to orrerix, and deleting
+is tidier. A block that declares counters but no `enabled:` line shows
+unchecked, because that is what the engine reads as off. The driver's counters
+and timeouts are number fields
 clamped to their own declared ranges, so the form cannot write a value the
 engine refuses the file over. The block form covers the
 rest: `role_hint`, and `allow:` as a list of tool patterns (one row per
