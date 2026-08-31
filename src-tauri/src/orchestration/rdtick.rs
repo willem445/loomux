@@ -1426,7 +1426,7 @@ impl OrchRegistry {
         // the findings, and *then* it queues.
         if let Ok(q) = mqloop::load_state(&self.group_dir(group)) {
             if q.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false) {
-                return self.rd_refuse(group, pr, r::ALREADY_QUEUED);
+                return self.rd_refuse(group, pr, r::IN_MERGE_QUEUE);
             }
         }
         // Last, because it is the only check that spends a `gh` round trip.

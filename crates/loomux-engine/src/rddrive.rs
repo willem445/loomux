@@ -502,12 +502,23 @@ pub mod refusal {
     /// `reset_counters` a parameter nothing can pass.
     pub const ALREADY_DRIVEN: &str = "already-driven";
     /// §8.1: a driven PR may not be queued and a queued PR may not be driven.
-    /// The queue's own `already-queued`, answered from the other side.
+    /// This PR is in the merge queue, so it may not also be driven.
     ///
     /// **Not in §5.1's decline list, and it has to be**: §8.1 states the mutual
-    /// refusal and §5.1 names only the queue's half of it. The design note is
-    /// amended in this PR rather than the name being coined quietly.
-    pub const ALREADY_QUEUED: &str = "already-queued";
+    /// refusal and §5.1 named only the queue's half of it. Worse, the queue had
+    /// no name for ITS half either and made no such refusal at all, so the
+    /// mutual exclusion §8.1 relies on was half-unimplemented. Both directions
+    /// land in this PR, and the note is amended for both.
+    ///
+    /// **Named for the HOLDER, not for the state.** The obvious spelling was
+    /// `already-queued` — which is taken, by [`crate::mqloop::refusal`], for a
+    /// different subject: there it means "this PR is already in the merge
+    /// queue", read by a caller of `queue_merge`. A caller of `drive_review`
+    /// receiving it would have to know which tool it had called to know which
+    /// thing was queued, and a refusal string is a contract an agent branches
+    /// on rather than prose. Its opposite number is
+    /// [`crate::mqloop::refusal::IN_REVIEW_DRIVE`], named the same way.
+    pub const IN_MERGE_QUEUE: &str = "in-merge-queue";
     /// The repo declares no merge gate. The queue's own refusal, for the queue's
     /// own reason: a repo with no gate has nothing for a drive to run *toward*,
     /// and `evaluate_merge_gate` with no gate returns *allowed* — correct for
@@ -549,7 +560,7 @@ pub mod refusal {
         RESUME_AMBIGUOUS,
         RESUME_SESSION_EMPTY,
         ALREADY_DRIVEN,
-        ALREADY_QUEUED,
+        IN_MERGE_QUEUE,
         GATE_NOT_CONFIGURED,
         GATE_NAMES_NO_SUCH_BLOCK,
         NOT_DRIVEN,
