@@ -1,8 +1,12 @@
 # Third-party notices
 
-Loomux ships one third-party component inside its Windows installer (the ConPTY
+Orrerix itself is licensed under the Apache License, Version 2.0 (see `LICENSE`).
+The components below are **not** covered by that license: each is used under its
+own terms, stated per component.
+
+Orrerix ships one third-party component inside its Windows installer (the ConPTY
 host, below). It also documents an **opt-in** component — the whisper.cpp voice
-runtime — which loomux does **not** distribute: users install it themselves if
+runtime — which Orrerix does **not** distribute: users install it themselves if
 they want voice input. A third class is **shipped in-repo**: content vendored
 verbatim into this repository (the Lucide and Primer Octicons icon artwork and the
 frontend-design and impeccable agent skills, below). Each component is used under its own license.
@@ -10,7 +14,7 @@ frontend-design and impeccable agent skills, below). Each component is used unde
 ## whisper.cpp voice runtime — MIT (opt-in; not shipped)
 
 Applies only when a user opts into voice input (issue #58) and installs the
-runtime themselves — via `scripts/stage-whisper.ps1` or by hand. Loomux does not
+runtime themselves — via `scripts/stage-whisper.ps1` or by hand. Orrerix does not
 bundle or redistribute these files.
 
 - Upstream: https://github.com/ggml-org/whisper.cpp
@@ -84,7 +88,7 @@ it is a vendored copy, not an npm dependency, and it ships inside the frontend b
   trademark position (nominative use of an unmodified mark; no affiliation implied) are in
   the sibling `src/vendor/octicons/README.md`.
 - Agent CLIs whose vendors publish no such grant are drawn as generated letter badges
-  instead — loomux redistributes no brand mark it has not been licensed for.
+  instead — Orrerix redistributes no brand mark it has not been licensed for.
 
 ## frontend-design agent skill — Apache-2.0 (shipped in-repo)
 

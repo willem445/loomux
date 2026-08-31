@@ -6,6 +6,7 @@
 # boundary argument and the order of what is still to come.
 [package]
 name = "loomux-engine"
+license = "Apache-2.0"
 # NOT the loomux release version, and deliberately not part of the seven
 # version fields `scripts/check-versions.js` keeps in lockstep. This crate is
 # `publish = false`: it is an internal boundary, not a shipped artifact, so a
@@ -15,7 +16,7 @@ name = "loomux-engine"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "loomux orchestration engine — the Tauri-free core (internal; not published)"
+description = "Orrerix orchestration engine — the Tauri-free core (internal; not published)"
 
 # DEPENDENCIES — this section is here to be read rather than skipped, and it
 # states no count on purpose: the crate's defining property is what it must
