@@ -276,10 +276,6 @@ pub fn observe_pr(r: &dyn RdRunner, pr: u64) -> PrObservation {
         (Some(a), Some(d)) => Some(a.saturating_add(d)),
         _ => None,
     };
-    if notify::pr_mergeability_result(Ok(out.line())) == PollResult::Conflicting {
-        obs.ci = CiObservation::Conflicting;
-        return obs;
-    }
     let checks = match r.gh(&as_args(&pr_checks_argv(pr))) {
         Ok(o) => o,
         Err(_) => {
@@ -773,10 +769,8 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         // printed its precondition (`reset_counters: true`); this one now prints
         // its own (#1863 D3).
         HeldReason::Escalate => format!(
-            "ESCALATE by {}{at} —{summary} Drive held on a JUDGMENT the driver may not \
-             make (INVARIANT 3): disposition the escalation first, then drive_review \
-             resumes it — a resume that leaves the verdict standing re-holds on the \
-             next tick. cancel_review_drive stops it.",
+            "ESCALATE by {}{at} —{summary} Drive held; drive_review resumes it, \
+             cancel_review_drive stops it.",
             f.lane
         ),
         HeldReason::ReviewLimit => format!(
