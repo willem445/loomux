@@ -125,6 +125,17 @@ struct RdBrief {
     /// how §4's sequenced-lane rule is expressed with no block name in the code.
     required: Vec<String>,
     lane_notices: Vec<rddrive::LaneNotice>,
+    /// The lane `review-wait` is actually acting on this tick — the first whose
+    /// `pass` does not stand at this revision, which is the index
+    /// `decide_review_wait` itself walks to.
+    ///
+    /// **Carried rather than re-derived from the verdicts**, because the lane a
+    /// hold is ABOUT is not always a lane that has spoken. `lane-stalled` is the
+    /// case that proves it: the stalled lane has recorded nothing, so it is
+    /// absent from `lane_notices` entirely, and picking "the last lane with a
+    /// verdict" names a *different, passing* lane and its pane — in the one
+    /// notice whose whole job §2.2 says is to name the pane.
+    deciding_lane: Option<String>,
 }
 
 impl RdBrief {
@@ -162,14 +173,25 @@ impl RdBrief {
     }
 
     /// The notice inputs for a hold (§6).
+    ///
+    /// **The lane a hold is about is the DECIDING lane, not the last one that
+    /// spoke.** For `escalate` and `review-limit` the two coincide, because the
+    /// deciding lane is the one whose verdict caused the hold. For
+    /// `lane-stalled` they do not and cannot: that lane has recorded nothing, so
+    /// it is absent from `lane_notices`, and naming the last lane that answered
+    /// would put a passing lane's block and pane into a notice about a stalled
+    /// one. The summary still comes from whichever lane actually spoke, because
+    /// there is no summary to quote from a lane that did not.
     fn held_facts(
         &self,
         entry: &reviewdrive::DriveEntry,
         limits: &reviewdrive::DriveLimits,
     ) -> rddrive::HeldFacts {
         let speaking = self.speaking_lane();
-        let lane = speaking
-            .map(|l| l.block.clone())
+        let lane = self
+            .deciding_lane
+            .clone()
+            .or_else(|| speaking.map(|l| l.block.clone()))
             .unwrap_or_else(|| self.required.get(entry.lane_index).cloned().unwrap_or_default());
         rddrive::HeldFacts {
             head: entry.head.clone(),
@@ -1203,6 +1225,16 @@ impl OrchRegistry {
                 .map(|r| r.iter().map(|l| l.block.clone()).collect())
                 .unwrap_or_default(),
             lane_notices,
+            // The index `decide_review_wait` walks to, computed with the same
+            // pure function it uses rather than guessed from the verdicts.
+            deciding_lane: required.as_deref().and_then(|r| {
+                r.get(reviewdrive::first_stale_lane(
+                    r,
+                    &obs.head,
+                    obs.body_digest.as_deref(),
+                ))
+                .map(|l| l.block.clone())
+            }),
         };
         let entry = state.entry_mut(pr)?;
         // What each lane's verdict file said this tick, recorded onto that lane
@@ -1568,6 +1600,17 @@ impl OrchRegistry {
                     .is_err()
                 {
                     return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
+                }
+                // **A new session means the recorded PANE is stale**, and a
+                // stale pane is not merely useless — it is an interception key.
+                // `driven_role` matches on `worker_agent`, so leaving the old
+                // one would have this drive consume the traffic of a worker it
+                // no longer owns, while the worker it DOES own reports to the
+                // orchestrator as if undriven. Cleared on a change, kept when
+                // the orchestrator resumes with the same session (the common
+                // case), where the pane is still the right one.
+                if entry.worker_session != session {
+                    entry.worker_agent = String::new();
                 }
                 entry.worker_session = session.clone();
                 entry.on_behalf_of = on_behalf_of.to_string();
