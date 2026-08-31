@@ -102,11 +102,23 @@ pub enum RdEvent {
 pub struct RdSignal {
     pub worker: reviewdrive::WorkerSignal,
     pub messaged: bool,
+    /// WHICH delegate called `message_orchestrator`.
+    ///
+    /// §2.2 says every hold names "the one fact that decides what the
+    /// orchestrator does next", and for `held(messaged)` that fact is which
+    /// delegate spoke: its own line is already in the pane, unchanged, and the
+    /// hold is the routing fact BESIDE it — a hold that named nobody would leave
+    /// the orchestrator correlating two lines by timing.
+    pub messaged_by: String,
 }
 
 impl Default for RdSignal {
     fn default() -> RdSignal {
-        RdSignal { worker: reviewdrive::WorkerSignal::Silent, messaged: false }
+        RdSignal {
+            worker: reviewdrive::WorkerSignal::Silent,
+            messaged: false,
+            messaged_by: String::new(),
+        }
     }
 }
 
@@ -364,7 +376,10 @@ impl OrchRegistry {
             // only both be present if the worker said one and then the other,
             // and `blocked` is the one that needs a human.
             RdEvent::WorkerBlocked => sig.worker = reviewdrive::WorkerSignal::Blocked,
-            RdEvent::Messaged => sig.messaged = true,
+            RdEvent::Messaged { by } => {
+                sig.messaged = true;
+                sig.messaged_by = by;
+            }
             RdEvent::Verdict => {}
         }
     }
