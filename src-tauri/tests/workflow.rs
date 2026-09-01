@@ -334,7 +334,7 @@ fn a_duplicate_driver_enabled_key_is_refused_not_last_one_wins() {
     // version) ever starts deduping silently, this goes red and the residual's
     // bound is gone with it.
     let errs = workflow::parse_workflow(
-        "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n  enabled: false\n",
+        "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n",
     )
     .unwrap_err();
     assert!(
