@@ -243,6 +243,22 @@ impl RdOut {
     }
 }
 
+/// What one pass of the owed-notice flush did (#1857) — see
+/// [`OrchRegistry::rd_flush_notices`].
+#[derive(Debug, Default)]
+struct RdFlush {
+    /// Owed notices that reached the orchestrator's pane this pass.
+    notices: Vec<String>,
+    /// PRs whose notice is still owed when the pass ends.
+    undelivered: Vec<u64>,
+    /// Entries §5.2's retention dropped.
+    pruned: Vec<u64>,
+    /// `(pr, notice)` for the entries dropped at the retention **ceiling** with
+    /// the notice never delivered. The text is here so the caller can put it on
+    /// the audit log, which is then the only record of it.
+    dropped: Vec<(u64, String)>,
+}
+
 /// What one wake of the review driver did, for a test that needs to assert the
 /// production path ran rather than infer it from side effects.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -261,9 +277,22 @@ pub struct RdDriveReport {
     /// same handle `lanes_opened` carries for a lane, and for the same reason:
     /// it is the only way a caller can ask what the worker was actually told.
     pub handbacks: Vec<(u64, String)>,
-    /// The kick-back notices delivered to the orchestrator.
+    /// The kick-back notices that **reached** the orchestrator's pane this tick
+    /// — a hold's, and every terminal exit's whose delivery answered `Ok`.
+    ///
+    /// Delivered, not merely produced. Before #1857 this field was pushed
+    /// regardless of what `deliver_to_orchestrator` answered, which made its own
+    /// doc ("delivered to the orchestrator") a false claim and left a test no way
+    /// to tell the two apart. A notice that failed to go out appears in
+    /// [`notice_undelivered`](RdDriveReport::notice_undelivered) instead.
     pub notices: Vec<String>,
-    /// Terminal entries dropped after their notices went out (§5.2).
+    /// PRs whose terminal notice is **still owed** at the end of this tick — the
+    /// delivery was attempted and failed, so the entry is retained and a later
+    /// tick tries again (#1857).
+    pub notice_undelivered: Vec<u64>,
+    /// Terminal entries dropped after their notices went out (§5.2), plus the
+    /// ones given up on at the retention ceiling — which are audited
+    /// `rd-notice-dropped` beside their `rd-pruned`.
     pub pruned: Vec<u64>,
     /// Whether this group was backed off `RD_BACKOFF_MS` rather than merely
     /// taking its turn in the rotation.
@@ -573,10 +602,9 @@ impl OrchRegistry {
             // would be testing something the product cannot do.
             return report;
         }
-        for n in self.rd_reconcile_with(group, runner) {
-            let _ = self.deliver_to_orchestrator(group, &n, brand::AUDIT_ACTOR);
-            report.notices.push(n);
-        }
+        // Reconcile owes its cancellations onto their entries; the flush below
+        // is what delivers them (#1857).
+        self.rd_reconcile_with(group, runner, now);
         let dir = self.group_dir(group);
         let mut outs: Vec<RdOut> = Vec::new();
         // Whether this tick's decisions actually reached disk. A signal is a
@@ -651,12 +679,17 @@ impl OrchRegistry {
             if let Some((to, _)) = o.advanced {
                 report.advanced.push((o.pr, to));
             }
-            // **A notice whose delivery fails is LOST**, and nothing here
-            // recovers it — the prune below says why, and #1857 tracks it.
+            // A HOLD's notice, delivered directly. A failure here still loses
+            // the line, and that is argued where the split is made — in
+            // `rd_step_entry`, at the exits: a parked entry is never pruned, so
+            // the drive survives and `review_drive_status()` still carries it. A
+            // terminal exit's notice does not come through here at all; it is
+            // owed on the entry and delivered by the flush below (#1857).
             for n in &o.notices {
-                let _ = self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR);
+                if self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR).is_ok() {
+                    report.notices.push(n.clone());
+                }
                 self.rd_task_note(group, o.pr, n);
-                report.notices.push(n.clone());
             }
             // Only once the arc that consumed it is durable — see `persisted`.
             if o.clear_signal && persisted {
@@ -666,40 +699,33 @@ impl OrchRegistry {
                 report.backoff = true;
             }
         }
-        // §5.2's retention. It runs after the notices, but **it does not
-        // implement that section's ordering rule** — "a terminal entry is
-        // pruned once its notice has been delivered" — and this comment exists
-        // to say so rather than to claim otherwise. Nothing here knows whether
-        // a delivery succeeded.
+        // **§5.2's ordering rule, implemented** (#1857): every owed notice is
+        // attempted, and only then does retention run — over a `prune_terminal`
+        // that will not drop an entry still owing one.
         //
-        // A hold-back keyed on this tick's delivery failures was tried here and
-        // removed as INERT. The step list is every entry — `rd_step_entry` is
-        // what declines a resting one, returning `None` on its first line for
-        // anything `is_parked() || is_terminal()`, before any read. So a
-        // retained terminal entry yields no `RdOut`, emits no notice on any
-        // later tick, and can never re-enter that failure set: it survived one
-        // tick and was pruned on the next with the notice lost anyway. Re-delivery needs per-entry delivery state PERSISTED on the
-        // record plus a path that re-emits for a terminal entry — a different
-        // shape, not an extension of this one. Tracked on #1857.
-        let pruned = {
-            let _state_guard = self.rd_state_lock.lock_safe();
-            match reviewdrive::load_state(&dir) {
-                Ok(mut state) => {
-                    let dropped: Vec<u64> = reviewdrive::prune_terminal(&mut state);
-                    if dropped.is_empty() || reviewdrive::store_state(&dir, &state).is_ok() {
-                        dropped
-                    } else {
-                        Vec::new()
-                    }
-                }
-                Err(_) => Vec::new(),
-            }
-        };
-        for pr in &pruned {
-            self.rd_audit(group, "", rddrive::audit_action::PRUNED, json!({ "pr": pr }));
-            self.rd_signals.lock_safe().remove(&(group.clone(), *pr));
-        }
-        report.pruned = pruned;
+        // This is a SEPARATE PASS rather than a relaxation of `rd_step_entry`'s
+        // `is_parked() || is_terminal()` early return, and the choice is
+        // deliberate. That early return is a cost bound §2.4 wants: it declines
+        // a resting entry *before* any `gh` read, and a terminal entry admitted
+        // into the step path would have to be threaded past `observe_pr`,
+        // `rd_gate_facts` and `decide` — none of which has anything to say about
+        // a drive that is over — to arrive at a branch that only re-sends a
+        // string. A pass that walks the file and delivers what it owes costs no
+        // round trip at all, has one condition, and cannot advance anything.
+        //
+        // It also covers the two producers the step path never sees: reconcile's
+        // startup cancellations, and `cancel_review_drive`'s, both of which owe
+        // onto the entry for exactly this to pick up.
+        //
+        // A failed `store_state` above left `persisted == false`, and the flush
+        // re-reads from DISK — so an arc that did not reach the file owes
+        // nothing here either. That is the same rule the signal clearing uses: a
+        // transition the next restart forgets is not a transition, and it must
+        // not announce itself as one.
+        let flush = self.rd_flush_notices(group, &dir, now);
+        report.notices.extend(flush.notices);
+        report.notice_undelivered = flush.undelivered;
+        report.pruned = flush.pruned;
         if report.backoff {
             self.rd_defer(group, now.saturating_add(rddrive::RD_BACKOFF_MS));
         } else {
@@ -709,6 +735,151 @@ impl OrchRegistry {
             self.rd_defer(group, now);
         }
         report
+    }
+
+    /// **Deliver every owed notice, then run §5.2's retention over what is
+    /// left** (#1857) — the pass that makes "a terminal entry is pruned once its
+    /// notice has been delivered" a fact about the code rather than a sentence
+    /// in a design note.
+    ///
+    /// # The three phases, and why they are three
+    ///
+    /// **Read under the lock, attempt with NO lock held, record under the lock
+    /// again.** The middle phase is the constraint: #467/#468 make a delivery an
+    /// enqueue and an enqueue re-enters registry locks, so holding
+    /// `rd_state_lock` across one is the deadlock `rd_drive_group_with`'s own
+    /// doc spends a paragraph keeping out. Splitting the file access in two is
+    /// the cost of that, and it is safe for the same reason the tick's own
+    /// split is: the second phase re-reads, so an entry a concurrent
+    /// `drive_review` or `cancel_review_drive` changed in between is read as it
+    /// now is, and `entry_mut` simply finds nothing for one that has gone.
+    ///
+    /// # What a failure at each step does
+    ///
+    /// A torn file returns empty — the tick above has already audited and backed
+    /// off, and refusing to act on a record orrerix cannot read is §2.4's rule,
+    /// not a special case. A failed `store_state` returns without reporting
+    /// anything pruned, because nothing WAS pruned: the write covers the
+    /// delivery marks and the retention together, so the file is exactly as it
+    /// was and the next tick re-attempts. The worst case there is a duplicate
+    /// line in the pane, which is the direction to fail in — #1857 is about the
+    /// other one.
+    fn rd_flush_notices(&self, group: &GroupId, dir: &std::path::Path, now: u64) -> RdFlush {
+        // Phase 1 — what is owed, and whether this is its first attempt.
+        let owed: Vec<(u64, String, bool)> = {
+            let _state_guard = self.rd_state_lock.lock_safe();
+            match reviewdrive::load_state(dir) {
+                Ok(s) => s
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.owed_notice().map(|n| (e.pr, n.text.clone(), n.failures == 0)))
+                    .collect(),
+                Err(_) => return RdFlush::default(),
+            }
+        };
+        if owed.is_empty() {
+            // Nothing owed — but retention still has to run, or a delivered
+            // entry never leaves the file.
+            let r = self.rd_retain(dir, now, &[], &[]);
+            return self.rd_audit_retention(group, r);
+        }
+        // Phase 2 — attempt each, outside the lock.
+        let mut out = RdFlush::default();
+        let (mut ok, mut failed) = (Vec::new(), Vec::new());
+        for (pr, text, first_attempt) in owed {
+            if first_attempt {
+                // The board row's note is a SECOND record, and it is written on
+                // the first attempt rather than on a successful one: the notice
+                // whose row most needs to carry it is precisely the one that
+                // never reached a pane. Written once, so a retry does not
+                // rewrite the row on every tick.
+                self.rd_task_note(group, pr, &text);
+            }
+            if self.deliver_to_orchestrator(group, &text, brand::AUDIT_ACTOR).is_ok() {
+                ok.push(pr);
+                out.notices.push(text);
+            } else {
+                failed.push(pr);
+            }
+        }
+        // Phase 3 — record the outcome and prune, in one write.
+        let retained = self.rd_audit_retention(group, self.rd_retain(dir, now, &ok, &failed));
+        out.undelivered = retained.undelivered;
+        out.pruned = retained.pruned;
+        out.dropped = retained.dropped;
+        out
+    }
+
+    /// The audit lines retention owes, emitted **inside the flush** so every
+    /// caller of it gets them — the tick, and `cancel_review_drive`, which runs
+    /// the same flush rather than a second delivery path of its own (#1857).
+    ///
+    /// A drop at the ceiling is audited FIRST and separately from the `rd-pruned`
+    /// beside it: `rd-notice-dropped` carries the notice text, and once the entry
+    /// is gone that line is the only record that could produce it. Auditing both
+    /// is not redundant — `rd-pruned` is the retention event and a filter looking
+    /// for a lost notice must not have to read every one of them to find the few
+    /// that lost anything.
+    fn rd_audit_retention(&self, group: &GroupId, flush: RdFlush) -> RdFlush {
+        for (pr, text) in &flush.dropped {
+            self.rd_audit(
+                group,
+                "",
+                rddrive::audit_action::NOTICE_DROPPED,
+                json!({ "pr": pr, "reason": "retention-ceiling", "notice": text }),
+            );
+        }
+        for pr in &flush.pruned {
+            self.rd_audit(group, "", rddrive::audit_action::PRUNED, json!({ "pr": pr }));
+            self.rd_signals.lock_safe().remove(&(group.clone(), *pr));
+        }
+        flush
+    }
+
+    /// Phase 3 of [`rd_flush_notices`](OrchRegistry::rd_flush_notices), and the
+    /// no-op tick's whole of it: mark the deliveries, then prune.
+    ///
+    /// One critical section and **one write**, so the two halves cannot come
+    /// apart — a file that recorded a delivery and failed to prune, or pruned
+    /// and failed to record, is a state neither this function nor the next tick
+    /// has a story for.
+    fn rd_retain(&self, dir: &std::path::Path, now: u64, ok: &[u64], failed: &[u64]) -> RdFlush {
+        let mut out = RdFlush { undelivered: failed.to_vec(), ..RdFlush::default() };
+        let _state_guard = self.rd_state_lock.lock_safe();
+        let Ok(mut state) = reviewdrive::load_state(dir) else { return out };
+        for pr in ok {
+            if let Some(e) = state.entry_mut(*pr) {
+                e.notice_delivered();
+            }
+        }
+        for pr in failed {
+            if let Some(e) = state.entry_mut(*pr) {
+                e.notice_delivery_failed();
+            }
+        }
+        let pruned =
+            reviewdrive::prune_terminal(&mut state, now, reviewdrive::NOTICE_RETENTION_MS);
+        if ok.is_empty() && failed.is_empty() && pruned.is_empty() {
+            // Nothing moved. Not writing is not an optimization here: an
+            // unconditional rewrite would touch `review_drives.json` on every
+            // wake of every group forever, for no change.
+            return out;
+        }
+        if reviewdrive::store_state(dir, &state).is_err() {
+            // Nothing landed, so nothing is claimed. Everything that was owed
+            // is still owed, including what this pass just delivered — it will
+            // be sent again, which is the duplicate-line direction.
+            out.undelivered = ok.iter().chain(failed.iter()).copied().collect();
+            out.undelivered.sort_unstable();
+            return out;
+        }
+        for p in pruned {
+            out.pruned.push(p.pr);
+            if let Some(text) = p.undelivered {
+                out.dropped.push((p.pr, text));
+            }
+        }
+        out
     }
 
     /// The gate, read the way §4 requires: **through the readers that already
@@ -1198,12 +1369,11 @@ impl OrchRegistry {
     /// drive whose worker pane merely has not been re-registered yet at startup
     /// — a race the reconcile cannot distinguish from a genuinely lost session,
     /// where the hand-back can.
-    fn rd_reconcile_with(&self, group: &GroupId, runner: &dyn rddrive::RdRunner) -> Vec<String> {
+    fn rd_reconcile_with(&self, group: &GroupId, runner: &dyn rddrive::RdRunner, now: u64) {
         if self.rd_reconciled.lock_safe().contains(group) {
-            return Vec::new();
+            return;
         }
         let dir = self.group_dir(group);
-        let mut notices = Vec::new();
         let mut audits: Vec<(String, u64, bool)> = Vec::new();
         {
             let _state_guard = self.rd_state_lock.lock_safe();
@@ -1216,7 +1386,7 @@ impl OrchRegistry {
             // makes an unreadable file a loud, rate-bounded "a human has to look
             // at this", and a human who then looks and fixes it should get the
             // reconcile they were owed.
-            let Ok(mut state) = reviewdrive::load_state(&dir) else { return Vec::new() };
+            let Ok(mut state) = reviewdrive::load_state(&dir) else { return };
             self.rd_reconciled.lock_safe().insert(group.clone());
             let mut changed = false;
             let live: Vec<u64> =
@@ -1232,7 +1402,14 @@ impl OrchRegistry {
                     && entry.advance(reviewdrive::DriveState::Cancelled, None, None, 0).is_ok()
                 {
                     changed = true;
-                    notices.push(rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone));
+                    // Owed onto the entry, not returned for a fire-and-forget
+                    // delivery (#1857). Reconcile runs at startup — the exact
+                    // moment an orchestrator pane is most likely to be missing
+                    // or still coming up — so this is the producer whose notice
+                    // was most likely to be the one that vanished. The caller's
+                    // flush delivers it from disk, on this tick or a later one.
+                    let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone);
+                    entry.owe_notice(&n, now);
                     audits.push((on_behalf, pr, true));
                 } else {
                     audits.push((on_behalf, pr, false));
@@ -1250,7 +1427,6 @@ impl OrchRegistry {
             };
             self.rd_audit(group, &on_behalf, action, json!({ "pr": pr, "at": "reconcile" }));
         }
-        notices
     }
 
     /// Put a `TaskNote` on the board row whose `pr` matches, so a human sees the
@@ -1585,6 +1761,22 @@ impl OrchRegistry {
         }
         // The exits (§2.2). Built here, where the entry's counters and lanes are
         // in hand; delivered by the caller, outside the lock.
+        //
+        // **A TERMINAL exit's notice is written ONTO the entry, inside this same
+        // load-decide-store, and delivered from there** (#1857). It is not
+        // handed to the caller as a string, because a string handed to a
+        // delivery that answers `Err` is gone — and §5.2's retention then drops
+        // the only record that could reproduce it, which is a drive that ends
+        // with nothing in the pane and nothing to say why. `owe_notice` makes
+        // the obligation durable before anything attempts it, and
+        // `prune_terminal` will not drop an entry that still owes one.
+        //
+        // A `held` exit keeps the direct path deliberately, and the asymmetry is
+        // the one §5.2 already draws: a parked entry is NEVER pruned, so the
+        // drive survives its own lost notice — `review_drive_status()` lists it
+        // and §2.3's resume re-reads it. What a hold can lose is a line; what a
+        // terminal exit loses is the whole record. The mechanism is here if a
+        // later change wants the stronger guarantee for a hold too.
         if let Some((to, reason)) = out.advanced {
             match (to, reason) {
                 (reviewdrive::DriveState::Satisfied, _) => {
@@ -1599,7 +1791,7 @@ impl OrchRegistry {
                         rddrive::audit_action::SATISFIED,
                         json!({ "pr": pr, "head": entry.head }),
                     ));
-                    out.notices.push(n);
+                    entry.owe_notice(&n, now);
                 }
                 (reviewdrive::DriveState::Held, Some(r)) => {
                     let n =
@@ -1612,8 +1804,8 @@ impl OrchRegistry {
                 }
                 (reviewdrive::DriveState::Cancelled, _) => {
                     out.audits.push((rddrive::audit_action::CANCELLED, json!({ "pr": pr })));
-                    out.notices
-                        .push(rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone));
+                    let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone);
+                    entry.owe_notice(&n, now);
                 }
                 _ => {}
             }
@@ -1764,6 +1956,9 @@ impl OrchRegistry {
             None => return self.rd_refuse(group, pr, r::PR_UNVERIFIABLE),
         }
         let dir = self.group_dir(group);
+        // Notices owed by an entry this call is about to displace — audited
+        // after the lock is dropped, for `rd_audit`'s own reason (#1857).
+        let mut dropped_notices: Vec<(u64, String)> = Vec::new();
         let (audit_action, detail) = {
             let _state_guard = self.rd_state_lock.lock_safe();
             let mut state = match reviewdrive::load_state(&dir) {
@@ -1879,6 +2074,26 @@ impl OrchRegistry {
                 // A `satisfied` or `cancelled` entry that retention has not yet
                 // pruned starts a FRESH drive with fresh counters — the queue's
                 // own "comes back as a NEW entry" behaviour.
+                //
+                // **If that entry still owed a notice, this is the one other way
+                // one is given up on** (#1857), and it is deliberately not
+                // silent: the retained entry becomes reachable far more often
+                // now that retention holds it for an undelivered notice, and a
+                // re-drive discarding the previous drive's ending would be the
+                // same silence with a different cause. Audited with the text,
+                // exactly as the ceiling is, so the record survives the entry.
+                // The notice is NOT carried onto the new entry: it describes a
+                // drive that is over, and delivering it beside a fresh drive's
+                // own traffic would read as this drive ending.
+                let superseded: Vec<(u64, String)> = state
+                    .entries
+                    .iter()
+                    .filter(|e| e.pr == pr)
+                    .filter_map(|e| e.owed_notice().map(|n| (e.pr, n.text.clone())))
+                    .collect();
+                for (dropped_pr, text) in superseded {
+                    dropped_notices.push((dropped_pr, text));
+                }
                 state.entries.retain(|e| e.pr != pr);
                 // **The clock is the caller's, and that is what makes the age
                 // bound testable at all.** `started_ms` is the anchor §2.2
@@ -1911,6 +2126,14 @@ impl OrchRegistry {
                 )
             }
         };
+        for (dropped_pr, text) in &dropped_notices {
+            self.rd_audit(
+                group,
+                on_behalf_of,
+                rddrive::audit_action::NOTICE_DROPPED,
+                json!({ "pr": dropped_pr, "reason": "superseded", "notice": text }),
+            );
+        }
         // A resume that carried a stale signal would re-hold on the reason it
         // was resumed out of — `messaged` most obviously.
         self.rd_signals.lock_safe().remove(&(group.clone(), pr));
@@ -1951,21 +2174,30 @@ impl OrchRegistry {
             let Some(entry) = state.entry_mut(pr) else {
                 return self.rd_refuse(group, pr, r::NOT_DRIVEN);
             };
-            if entry
-                .advance(reviewdrive::DriveState::Cancelled, None, None, now_ms())
-                .is_err()
-            {
+            let now = now_ms();
+            if entry.advance(reviewdrive::DriveState::Cancelled, None, None, now).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
             }
+            // Owed BEFORE the store, so the obligation is on disk in the same
+            // write as the cancellation itself (#1857). The delivery is
+            // attempted below, outside the lock; if it fails, the entry keeps
+            // owing and the next tick's flush re-sends it. Before this, the
+            // notice was built after the write and handed to a `let _ =`, so a
+            // cancel into a pane that was down was a drive that vanished with no
+            // line and nothing to reproduce one from.
+            let notice = rddrive::cancelled_notice(pr, rddrive::CancelCause::Tool);
+            entry.owe_notice(&notice, now);
             if reviewdrive::store_state(&dir, &state).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
             }
         }
         self.rd_signals.lock_safe().remove(&(group.clone(), pr));
         self.rd_audit(group, on_behalf_of, rddrive::audit_action::CANCELLED, json!({ "pr": pr }));
-        let notice = rddrive::cancelled_notice(pr, rddrive::CancelCause::Tool);
-        let _ = self.deliver_to_orchestrator(group, &notice, brand::AUDIT_ACTOR);
-        self.rd_task_note(group, pr, &notice);
+        // The same flush the tick runs, so this tool has exactly one delivery
+        // path rather than a second one that would have to be kept in step. It
+        // also prunes: a cancel whose notice lands is an entry that leaves here,
+        // which is what §5.2 already promised.
+        let _ = self.rd_flush_notices(group, &dir, now_ms());
         json!({ "cancelled": true })
     }
 
