@@ -26,7 +26,7 @@
 use loomux_lib::orchestration::reviewdrive::{
     self, CiObservation, Counter, Counters, DriveEntry, DriveFacts, DriveLimits, DriveState,
     DriveStep, GateOutcome, HeldReason, LaneFact, WorkerSignal, MAX_REBASE_CEILING,
-    MAX_ROUNDS_CEILING,
+    MAX_ROUNDS_CEILING, NOTICE_RETENTION_MS,
 };
 
 use loomux_lib::orchestration::workflow::{ReviewVerdict, Verdict};
@@ -3610,5 +3610,326 @@ fn a_live_superseded_pane_is_never_pruned_and_a_dead_one_is() {
         reg.rd_owner(&group, &w2).map(|(pr, p)| (pr, p.current)),
         Some((1758, true)),
         "…and the current pane is untouched, so this is not a prune that forgets everything"
+    );
+}
+// ── §5.2's ordering rule: a notice that reached no pane (#1857) ─────────────
+
+/// Every prompt this group delivered that is a review-drive notice for `pr`.
+///
+/// Filtered on the notice's own opening rather than on a substring of the body,
+/// so an `[orrerix]` line about something else in the same group cannot pad the
+/// count the assertions below are about.
+fn drive_notices(reg: &OrchRegistry, group: &GroupId, pr: u64) -> Vec<String> {
+    let key = format!("review drive PR #{pr}:");
+    delivered_texts(reg, group).into_iter().filter(|t| t.contains(&key)).collect()
+}
+
+fn action_count(reg: &OrchRegistry, group: &GroupId, action: &str) -> usize {
+    audit_actions(reg, group).iter().filter(|a| a.as_str() == action).count()
+}
+
+fn audit_details(reg: &OrchRegistry, group: &GroupId, action: &str) -> Vec<serde_json::Value> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == action)
+        .map(|e| e.detail)
+        .collect()
+}
+
+/// A drive walked to a terminal exit with the orchestrator's pane **down**, so
+/// the exit notice's delivery genuinely fails.
+///
+/// The orchestrator exists but has no pane: `deliver_prompt` resolves the
+/// target's `pty_id` before it audits and answers `Err` for an agent that has
+/// none (#569). That is a real transient — a pane restarting is exactly this
+/// state — rather than a fault injected below the seam, which matters because
+/// what is under test is what the tick does with an `Err` from the production
+/// delivery path.
+///
+/// The first tick is taken with the PR still OPEN, deliberately: it is what
+/// latches the once-per-process reconcile, so the cancellation that follows is
+/// the TICK's own `cancelled` arc and not reconcile's. Reconcile's producer gets
+/// its own coverage in `reconciles_cancellation_is_owed_too_and_not_delivered_and_forgotten`.
+fn cancelled_into_a_dead_pane(
+    reg: &OrchRegistry,
+    repo: &Repo,
+    gh: &FakeGh,
+    at: u64,
+) -> (GroupId, String) {
+    let (group, _session) = driven(reg, repo, gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.rd_drive_group_with(&group, gh, at);
+    gh.set_facts("CLOSED", HEAD_A);
+    (group, orch.id)
+}
+
+/// **#1857.** A terminal entry whose notice reached no pane is NOT pruned, and
+/// its notice is re-sent from the persisted record on a later tick.
+///
+/// This is §5.2's own sentence — "terminal entries are pruned once their notice
+/// has been delivered" — which before this had no implementation anywhere: the
+/// tick delivered before it pruned, which is necessary and not sufficient, and
+/// `prune_terminal` dropped the entry whatever the delivery answered. A drive
+/// whose final notice failed therefore ended with no line in the pane and no
+/// record that could produce one.
+///
+/// **All four properties are asserted together because each alone passes under
+/// an implementation that is wrong in one of the others' directions.** Retaining
+/// without re-emitting is #1841's hold-back, which was inert; re-emitting
+/// without retaining has nothing to re-emit from; delivering without pruning
+/// leaks the entry forever; and pruning on the first tick is the bug.
+///
+/// The pane coming UP mid-test is what makes the re-emission discriminating: the
+/// second tick does not step this entry at all (`rd_step_entry` returns `None`
+/// for anything terminal, before any read), so the notice it delivers can only
+/// have come off the entry — nothing on that path can rebuild it.
+#[test]
+fn a_terminal_notice_that_reached_no_pane_keeps_its_entry_and_is_re_sent_until_it_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, orch) = cancelled_into_a_dead_pane(&reg, &repo, &gh, 10_000);
+
+    // Tick 2: the drive cancels, and the notice cannot be delivered.
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(
+        first.notice_undelivered,
+        vec![1758],
+        "the exit notice's delivery failed and the tick did not notice: {first:?}"
+    );
+    assert!(
+        first.notices.is_empty(),
+        "nothing reached a pane, so nothing may be reported as delivered: {first:?}"
+    );
+    assert!(
+        first.pruned.is_empty(),
+        "§5.2: a terminal entry is pruned ONCE ITS NOTICE HAS BEEN DELIVERED. This one \
+         reached no pane and the entry is the only record that could produce it: {first:?}"
+    );
+    assert!(
+        drive_notices(&reg, &group, 1758).is_empty(),
+        "the control: no line reached the pane, so the assertions below are about a \
+         re-emission and not about the first attempt having quietly worked"
+    );
+    assert_eq!(action_count(&reg, &group, "rd-pruned"), 0);
+
+    // The pane comes up. Nothing else changes — no new gh facts, no new arc.
+    with_pane(&reg, &orch, 7101);
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let landed = drive_notices(&reg, &group, 1758);
+    assert_eq!(
+        landed.len(),
+        1,
+        "the persisted notice must be re-sent once the pane is back — a terminal entry is \
+         never STEPPED, so this line can only have come off the entry: {landed:?}"
+    );
+    assert!(landed[0].contains("CANCELLED"), "and it is the drive's real exit: {}", landed[0]);
+    assert_eq!(second.notices, landed, "...and the report says so");
+    assert!(second.notice_undelivered.is_empty());
+
+    // Delivered, so now it prunes — exactly once, and as a delivery rather than
+    // as something given up on.
+    assert_eq!(second.pruned, vec![1758], "a delivered notice releases the entry: {second:?}");
+    assert_eq!(action_count(&reg, &group, "rd-pruned"), 1);
+    assert_eq!(
+        action_count(&reg, &group, "rd-notice-dropped"),
+        0,
+        "nothing was given up on here — `rd-notice-dropped` is the CEILING's word and a \
+         reader filtering for a lost notice must not find this one"
+    );
+
+    // And it is over: a third tick re-sends nothing and re-prunes nothing.
+    let third = reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert!(third.pruned.is_empty() && third.notices.is_empty(), "{third:?}");
+    assert_eq!(
+        drive_notices(&reg, &group, 1758).len(),
+        1,
+        "a delivered notice is delivered ONCE, not on every tick after"
+    );
+}
+
+/// **The bound** (#1857's third requirement). A notice that can never be
+/// delivered must not retain its entry forever — at `NOTICE_RETENTION_MS` past
+/// the moment it was first owed the entry is dropped anyway.
+///
+/// **And the drop is audited WITH the notice text**, which is the half that
+/// keeps the bound honest rather than merely bounded. #1857 is "no line in the
+/// pane AND no record that could produce one"; a ceiling with no audit line
+/// would close the first and reopen the second, which is the defect again with a
+/// timer in front of it.
+///
+/// The tick just under the ceiling is the discriminating half: without it, an
+/// implementation that dropped the entry on the first failure would pass every
+/// assertion about the expired one.
+#[test]
+fn a_notice_that_can_never_be_delivered_is_bounded_and_its_text_survives_on_the_audit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    // The pane never comes up, so no attempt can ever succeed.
+    let (group, _orch) = cancelled_into_a_dead_pane(&reg, &repo, &gh, 10_000);
+    let owed_at = 20_000;
+    reg.rd_drive_group_with(&group, &gh, owed_at);
+
+    // One tick short of the ceiling: still retained, still re-attempted.
+    let inside = reg.rd_drive_group_with(&group, &gh, owed_at + NOTICE_RETENTION_MS - 1);
+    assert_eq!(
+        inside.notice_undelivered,
+        vec![1758],
+        "inside the ceiling the entry is kept and the notice re-attempted: {inside:?}"
+    );
+    assert!(inside.pruned.is_empty(), "...and nothing is dropped yet: {inside:?}");
+    assert_eq!(action_count(&reg, &group, "rd-notice-dropped"), 0);
+
+    // At the ceiling.
+    let expired = reg.rd_drive_group_with(&group, &gh, owed_at + NOTICE_RETENTION_MS);
+    assert_eq!(
+        expired.pruned,
+        vec![1758],
+        "an undeliverable notice must not retain its entry forever — an unbounded retry is \
+         a leak: {expired:?}"
+    );
+    assert!(drive_notices(&reg, &group, 1758).is_empty(), "it never did reach a pane");
+
+    let dropped = audit_details(&reg, &group, "rd-notice-dropped");
+    assert_eq!(dropped.len(), 1, "the ceiling audits exactly once: {dropped:?}");
+    assert_eq!(dropped[0]["pr"], json!(1758));
+    assert_eq!(dropped[0]["reason"], json!("retention-ceiling"));
+    let text = dropped[0]["notice"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("review drive PR #1758:") && text.contains("CANCELLED"),
+        "the audit line must carry the NOTICE, not merely the fact that one was lost — it \
+         is now the only record that could produce it: {text:?}"
+    );
+    // The bound really is the bound: nothing is retained past it.
+    let after = reg.rd_drive_group_with(&group, &gh, owed_at + NOTICE_RETENTION_MS + 60_000);
+    assert!(after.pruned.is_empty() && after.notice_undelivered.is_empty(), "{after:?}");
+}
+
+/// `cancel_review_drive` is the third producer of a terminal notice, and it ran
+/// entirely outside the tick: it built the notice AFTER its own write and handed
+/// it to a `let _ =`, so a cancel issued while the orchestrator's pane was down
+/// was a drive that vanished with no line and nothing to reproduce one from
+/// (#1857).
+///
+/// The two halves are asserted together because either alone passes under an
+/// implementation that is wrong in the other direction: owing without flushing
+/// never delivers at all, and flushing without owing is what the tool already
+/// did.
+#[test]
+fn a_tool_cancel_into_a_dead_pane_owes_its_notice_rather_than_losing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    let out = reg.cancel_review_drive(&group, 1758, "orch-1");
+    assert_eq!(out["cancelled"], json!(true), "the cancel itself must still succeed: {out}");
+    assert!(
+        drive_notices(&reg, &group, 1758).is_empty(),
+        "the control: the pane is down, so nothing was delivered"
+    );
+    assert_eq!(
+        action_count(&reg, &group, "rd-pruned"),
+        0,
+        "and the entry that owes the notice is still there"
+    );
+
+    // The pane comes up; the ordinary tick delivers what the TOOL owed.
+    with_pane(&reg, &orch.id, 7202);
+    let tick = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let landed = drive_notices(&reg, &group, 1758);
+    assert_eq!(landed.len(), 1, "the tool's notice must survive its failed delivery: {landed:?}");
+    assert!(
+        landed[0].contains("CANCELLED") && landed[0].contains("cancel_review_drive"),
+        "and it is the TOOL's cause, not the reconcile's `pr-gone`: {}",
+        landed[0]
+    );
+    assert_eq!(tick.pruned, vec![1758], "delivered, so now it prunes: {tick:?}");
+}
+
+/// Reconcile is the producer whose notice was most likely to be lost, because it
+/// runs at startup — the exact moment an orchestrator pane is most likely to be
+/// absent or still coming up. It owes onto the entry like every other terminal
+/// exit (#1857).
+///
+/// The control is that reconcile really is the producer here: nothing calls a
+/// tick with the PR open first, and `rd-cancelled` carrying `at: reconcile` is
+/// asserted rather than assumed.
+#[test]
+fn reconciles_cancellation_is_owed_too_and_not_delivered_and_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    gh.set_facts("CLOSED", HEAD_A);
+
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let reconciled = reg
+        .audit_log(&group)
+        .into_iter()
+        .any(|e| e.action == "rd-cancelled" && e.detail["at"] == json!("reconcile"));
+    assert!(reconciled, "this test is about RECONCILE's producer and it did not run");
+    assert_eq!(first.notice_undelivered, vec![1758], "{first:?}");
+    assert!(first.pruned.is_empty(), "a reconcile cancellation is retained too: {first:?}");
+
+    with_pane(&reg, &orch.id, 7303);
+    let second = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let landed = drive_notices(&reg, &group, 1758);
+    assert_eq!(landed.len(), 1, "reconcile's notice is re-sent from the entry: {landed:?}");
+    assert!(landed[0].contains("the PR is closed or merged"), "{}", landed[0]);
+    assert_eq!(second.pruned, vec![1758]);
+}
+
+/// A fresh `drive_review` on a PR whose terminal entry has not been pruned drops
+/// that entry (`state.entries.retain(|e| e.pr != pr)`, the queue's own "comes
+/// back as a NEW entry" behaviour). Retention now HOLDS such an entry for an
+/// undelivered notice, which makes that path reachable far more often — so it is
+/// audited with the text rather than discarding the previous drive's ending
+/// silently, which would be #1857 again with a different cause (#1857).
+///
+/// The notice must not be carried onto the new entry: it describes a drive that
+/// is over, and delivering it beside a fresh drive's own traffic would read as
+/// THIS drive ending.
+#[test]
+fn a_re_drive_that_displaces_a_still_owing_entry_audits_the_notice_it_gives_up_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, orch) = cancelled_into_a_dead_pane(&reg, &repo, &gh, 10_000);
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    assert_eq!(action_count(&reg, &group, "rd-notice-dropped"), 0, "the pre-state");
+
+    // The PR is open again and the orchestrator starts a fresh drive on it. The
+    // pane is up this time, so a notice carried onto the new entry WOULD be
+    // delivered — which is what makes "it must not be" a real assertion.
+    with_pane(&reg, &orch, 7404);
+    gh.set_facts("OPEN", HEAD_A);
+    let w = reg.spawn_agent(&group, Role::Worker, "w2", "", false, None).unwrap();
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 30_000);
+    assert_eq!(out["driving"], json!(true), "the re-drive must succeed: {out}");
+
+    let dropped = audit_details(&reg, &group, "rd-notice-dropped");
+    assert_eq!(dropped.len(), 1, "displacing an owing entry is audited: {dropped:?}");
+    assert_eq!(dropped[0]["reason"], json!("superseded"));
+    assert!(
+        dropped[0]["notice"].as_str().unwrap_or_default().contains("CANCELLED"),
+        "with the text, so the record survives the entry: {dropped:?}"
+    );
+
+    // The new drive does not inherit the old one's ending.
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    let after = drive_notices(&reg, &group, 1758);
+    assert!(
+        after.is_empty(),
+        "the previous drive's exit must not be announced beside a fresh drive's traffic: {after:?}"
     );
 }
