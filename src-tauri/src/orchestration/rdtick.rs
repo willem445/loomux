@@ -1807,7 +1807,7 @@ impl OrchRegistry {
                         rddrive::audit_action::SATISFIED,
                         json!({ "pr": pr, "head": entry.head }),
                     ));
-                    entry.owe_notice(&n, now);
+                    out.notices.push(n);
                 }
                 (reviewdrive::DriveState::Held, Some(r)) => {
                     let n =
@@ -1821,7 +1821,8 @@ impl OrchRegistry {
                 (reviewdrive::DriveState::Cancelled, _) => {
                     out.audits.push((rddrive::audit_action::CANCELLED, json!({ "pr": pr })));
                     let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone);
-                    entry.owe_notice(&n, now);
+                    let _ = now;
+                    out.notices.push(n);
                 }
                 _ => {}
             }
