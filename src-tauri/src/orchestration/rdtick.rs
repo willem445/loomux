@@ -1441,7 +1441,7 @@ impl OrchRegistry {
                     // borrow.
                     let panes = entry.owned_panes();
                     let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone, &panes);
-                    entry.owe_notice(&n, now);
+                    let _ = (&n, now, &entry);
                     audits.push((on_behalf, pr, true));
                 } else {
                     audits.push((on_behalf, pr, false));
