@@ -1180,3 +1180,30 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
 
   This entry is the single re-bless for the whole PR (#1811's batching rule, which these same
   templates state), so it covers the final state rather than each round.
+
+- **#1958, a progress report is a record, not a notification** — `worker.md` only;
+  `orchestrator.md`, `orchestrator-playbook.md`, `reviewer.md`, `planner.md` and `manager.md`
+  are byte-identical to their previous blessed copies. `reviewer.md` was checked rather than
+  assumed: it names `progress` nowhere and mandates no start report, so it had nothing to lose.
+  The human decided the rule and it is stated once — **a delegate delivery reaches the
+  orchestrator's pane only if it needs an orchestrator action.** `done` and `blocked` do;
+  `progress` never does, so the engine writes it to the audit log and appends it to the board
+  row it resolves to, and types nothing into any pane.
+
+  Two edits follow from that. The first-turn primer loses its mandatory
+  `report("progress", …, "starting <task>")` step and renumbers 4 → 3: the spawn IS the start
+  signal — the orchestrator wrote the brief and holds the pane id — and after #1958 that report
+  reached nobody, so mandating one on every spawn mandated a notification to nobody. And the
+  reporting paragraph under the tool list, which opened "on start (`progress`, one line
+  restating the task)", now says which two outcomes reach that pane and why, and sends anything
+  that needs the orchestrator NOW to `message_orchestrator`, which is unchanged and always
+  lands.
+
+  The `progress` bullet in the tool-doc list STAYS as the only rule for `progress`, but its
+  premise was corrected in the same edit: it read "only when it changes what the orchestrator
+  would otherwise assume", which is the claim #1958 retracts. Leaving it would have shipped a
+  false statement on a permanent surface. `tests/prompts.rs` repins the primer for the same
+  reason — its old anchor was `report("progress"` with the retracted reason written into the
+  failure message, so it ENFORCED the rule being removed; it now pins the surviving rule
+  (`work the brief step by step`, positive-controlled by the `delivery id` pin beside it) and
+  adds a negative assertion so the mandate cannot silently return.
