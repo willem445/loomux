@@ -3733,18 +3733,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         super::RdEvent::Messaged { by: caller.agent_id.clone() },
                     );
                 } else {
-                    // MUTATION (#1871 rev-final item 3, evidence round 3): the
-                    // audit is KEPT and the park is restored, so the test's audit
-                    // assertion passes and the run REACHES the park assertion —
-                    // which is the policy. Round 2's mutation dropped the audit
-                    // too, so the test died at the audit line and the park was
-                    // never witnessed: rev-final's own finding, in my own test.
+                    // Owned, so the traffic is still on the record — but it moves
+                    // nothing. An event-less `rd_consume` is the same shape the
+                    // `report` arm uses for a superseded pane, and the kind is
+                    // what lets a reader tell this from a park.
                     reg.rd_consume(&caller.group, pr, &caller.agent_id, "message:superseded", None);
-                    reg.rd_ingest(
-                        &caller.group,
-                        pr,
-                        super::RdEvent::Messaged { by: caller.agent_id.clone() },
-                    );
                 }
             }
             // #891 rev-1 F1: the id in the prefix is orrerix's — resolved from

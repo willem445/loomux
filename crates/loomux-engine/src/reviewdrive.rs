@@ -847,6 +847,12 @@ fn retain_panes(prior: Vec<String>, current: &str) -> Vec<String> {
         }
         out.push(a);
     }
+    // MUTATION (#1871 rev-final item 2, evidence round 4): the size cap
+    // restored, dropping the OLDEST — the policy rev-final promoted from a risk
+    // to a defect, because the oldest superseded pane is still live and still
+    // able to report, so evicting it un-owns it exactly as the single slot did.
+    let overflow = out.len().saturating_sub(32);
+    out.drain(..overflow);
     out
 }
 
