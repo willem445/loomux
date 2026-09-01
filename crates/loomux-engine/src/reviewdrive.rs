@@ -1006,7 +1006,7 @@ pub struct DriveEntry {
     /// §5.2 publishes the shape of. A build that predates the field reads it as
     /// an unknown key into `extra` and rewrites it verbatim, which is the
     /// forward-compatibility promise §5.2 already makes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub owed_notice: Option<OwedNotice>,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
