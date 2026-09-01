@@ -2332,18 +2332,6 @@ impl OrchRegistry {
         })
     }
 
-    /// Corrupt this group's drive record, so the FAULT paths that read it can
-    /// be exercised from outside the crate.
-    ///
-    /// **It hands out no path**, which is the whole point. CLAUDE.md constraint
-    /// 6 keeps `group_dir_at` the single join and keeps it private, and a
-    /// `group_dir_for_test` returning a `PathBuf` would hand every future test
-    /// exactly the thing that rule exists to withhold. This takes a validated
-    /// `GroupId`, writes a fixed payload, and answers whether it wrote — so a
-    /// test can reach "the record exists and cannot be parsed" without ever
-    /// reaching the directory. The payload is not a parameter for the same
-    /// reason: a caller that can choose the bytes is a caller that can write a
-    /// VALID record, which is a state seeder rather than a fault injector.
     /// Mark an agent `Dead`, so the liveness prune's DEAD side can be reached
     /// from a test (#1871 B2, rev-final).
     ///
@@ -2369,6 +2357,18 @@ impl OrchRegistry {
         }
     }
 
+    /// Corrupt this group's drive record, so the FAULT paths that read it can
+    /// be exercised from outside the crate.
+    ///
+    /// **It hands out no path**, which is the whole point. CLAUDE.md constraint
+    /// 6 keeps `group_dir_at` the single join and keeps it private, and a
+    /// `group_dir_for_test` returning a `PathBuf` would hand every future test
+    /// exactly the thing that rule exists to withhold. This takes a validated
+    /// `GroupId`, writes a fixed payload, and answers whether it wrote — so a
+    /// test can reach "the record exists and cannot be parsed" without ever
+    /// reaching the directory. The payload is not a parameter for the same
+    /// reason: a caller that can choose the bytes is a caller that can write a
+    /// VALID record, which is a state seeder rather than a fault injector.
     #[doc(hidden)] // pub for integration tests
     pub fn corrupt_drive_record_for_test(&self, group: &GroupId) -> bool {
         let path = reviewdrive::state_path(&self.group_dir(group));
