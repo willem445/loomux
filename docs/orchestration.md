@@ -2466,8 +2466,18 @@ line in the orchestrator's pane: the gate being satisfied, the drive being cance
 by orrerix on its own when it sees the PR has been closed — or one of
 twelve holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
 the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
-could not read, a worker that reported blocked or whose session no longer resolves, or a delegate
-messaging the orchestrator. **A hold is parked, not finished**: it keeps what it has spent, so
+could not read, a worker that reported blocked, a fix that could not be handed back to its worker,
+or a delegate messaging the orchestrator. That last hold quotes what actually refused rather than
+diagnosing one cause: the session may no longer resolve, the block it was minted under may no
+longer be declared in this group's roster, or the pane the driver resumed may have opened and then
+exited without saying anything.
+
+**A hand-back reopens the worker's own session under the worker's own block** — the persona and CLI
+that session was minted with, never the roster's default worker block. That matters wherever a
+workflow file declares more than one worker: a session belongs to one CLI, and reopening a Claude
+transcript under an opencode block does not produce a different persona, it fails to open at all.
+If the block a session was minted under is no longer declared, the drive holds and names it rather
+than quietly resuming the work as somebody else. **A hold is parked, not finished**: it keeps what it has spent, so
 resuming it does not silently grant a fresh budget, and clearing the counters is a separate,
 audited decision.
 

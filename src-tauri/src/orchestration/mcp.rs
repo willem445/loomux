@@ -2710,11 +2710,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         .into(),
                 );
             }
-            // The last-touched roster record naming this session, if any —
-            // shared by #254's block inheritance and the cwd inheritance
-            // below, so both agree on the same record instead of running two
-            // independent lookups that could (in principle, if the roster
-            // changed between them) disagree on which one is "last-touched".
+            // The last-touched roster record naming this session, if any — the
+            // WORKSPACE half, and only that half since #1961.
+            //
+            // It used to be shared with #254's block inheritance below, on the
+            // argument that one record kept the two answers from disagreeing.
+            // The two are not one question: a workspace legitimately MOVES over
+            // a session's life (a worktree re-cut, a resume placed elsewhere),
+            // so "where does its work live" wants the newest record — while
+            // "what capability class is this" has one true answer fixed when
+            // the session was minted, and `max_by_key(updated_ms)` returns
+            // whatever pane touched it most recently instead. That is #1961's
+            // amplifier: the driver wrote one wrong-block row for a session and
+            // every later bare resume — the orchestrator's own hand recovery
+            // included — inherited the wrong block from it. Identity now comes
+            // from `session_identity_record`; see that function for why the
+            // roster's FIRST row is the one that answers it.
             let owner: Option<super::AgentRecord> = resume.as_deref().and_then(|session_id| {
                 reg.merged_records(&caller.group)
                     .into_iter()
@@ -2794,14 +2805,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // follow-up contract) gets inherited instead of guessed.
             let block = if block.is_none() && kind.is_none() {
                 if resumed {
-                    // A session can appear more than once (roster + audit
-                    // backfill can both carry it, or it was re-spawned into
-                    // a different block over its lifetime) — `owner` (above)
-                    // already picked the last-touched record deliberately,
-                    // since that is the agent's most recent identity, not its
-                    // first one.
+                    // A session can appear more than once — roster + audit
+                    // backfill can both carry it, and a driver hand-back or a
+                    // hand resume writes a fresh row per pane. **The FIRST row
+                    // naming it is the one that answers this** (#1961): a
+                    // session is minted by one pane under one block and one
+                    // CLI, and no later row revises that. The
+                    // most-recently-touched row used to answer here, which is
+                    // how one wrong-block resume poisoned every later bare one.
+                    // `session_identity_record` carries the full argument, and
+                    // is the same rule the session browser's rejoin has always
+                    // used.
                     let session_id = resume.as_deref().expect("resumed implies Some");
-                    let owner_rec = owner.as_ref().ok_or_else(|| {
+                    let identity = reg.session_identity_record(&caller.group, session_id);
+                    let owner_rec = identity.as_ref().ok_or_else(|| {
                         format!(
                             "unknown session {session_id:?} — cannot resume without an \
                              explicit block or kind (no roster record maps this session \

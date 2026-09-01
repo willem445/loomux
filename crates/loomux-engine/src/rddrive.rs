@@ -751,6 +751,20 @@ pub struct HeldFacts {
     /// Every pane this drive has opened and still owns (#1871 B3). A parked
     /// drive keeps them — see [`panes_clause`].
     pub panes: Vec<(String, DrivenRole)>,
+    /// **What actually refused, when the hold is about a refusal** (#1961) —
+    /// the spawn error, or the line a resumed pane exited on.
+    ///
+    /// `worker-unresumable` used to be one fixed sentence ("the recorded worker
+    /// session no longer resolves"), and that sentence is a diagnosis rather
+    /// than an observation: it was printed for a hand-back refused by the live
+    /// delegate cap and for one whose block had left the roster, telling the
+    /// orchestrator to find another session in both cases — the one remedy that
+    /// does not help, on a session that resolves fine. The reason enum says
+    /// which CLASS of thing happened; this says which thing.
+    ///
+    /// Empty renders as no clause at all, which is the pre-#1961 wording
+    /// exactly, so a hold that genuinely has nothing to add is unchanged.
+    pub refusal: String,
 }
 
 /// §6's hold kick-back, in one shape carrying **the one fact that decides what
@@ -778,6 +792,15 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         String::new()
     } else {
         format!(" \"{}\"", lane_summary(&f.lane_summary))
+    };
+    // Scrubbed through the same filter a lane summary goes through: this text
+    // can carry a spawn refusal that names a block id out of the repo's own
+    // workflow file, or a CLI's last line of output — neither is orrerix's
+    // string, and both land in the orchestrator's pane (§5.5).
+    let refusal = if f.refusal.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {}.", lane_summary(&f.refusal))
     };
     let body = match reason {
         // **The remedy named is the one that CLEARS it**, which for this hold is
@@ -857,10 +880,17 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              the disposition is yours (INVARIANT 3).{session} drive_review resumes the \
              drive once you have unblocked it."
         ),
+        // **The refusal is quoted, not diagnosed** (#1961). This arm used to
+        // state "the recorded worker session no longer resolves" as a fact, and
+        // it was printed for every hand-back failure whatever its cause — a
+        // block that had left the roster, a pane that opened and exited on
+        // `Invalid session ID`, a cap refusal — each time sending the
+        // orchestrator after another session id while the recorded one was
+        // fine. The reason enum names the class; `refusal` names what happened.
         HeldReason::WorkerUnresumable => format!(
-            "HELD — the recorded worker session no longer resolves, so there is nothing \
-             to hand a fix back to.{session} drive_review(pr, <a session that resolves>) \
-             re-points the drive, or cancel_review_drive stops it."
+            "HELD — the driver could not hand the fix back to its worker{at}.{refusal}\
+             {session} drive_review(pr, <a session that resolves>) re-points the drive, \
+             or cancel_review_drive stops it."
         ),
         HeldReason::Messaged => format!(
             "HELD — {} called message_orchestrator{at}; its own line is above, \
@@ -1173,6 +1203,7 @@ mod tests {
             max_ci_attempts: 3,
             failing_jobs: vec!["build (windows)".into()],
             messaged_by: "w-7".into(),
+            refusal: "unknown block \"worker-adv\"".into(),
             panes: vec![
                 ("w-1715".into(), DrivenRole::Worker),
                 ("rev-1714".into(), DrivenRole::Lane("rev-std".into())),

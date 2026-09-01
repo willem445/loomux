@@ -76,10 +76,30 @@ resumes it; `cancel_review_drive` cancels it), and only `satisfied` and
 | --- | --- | --- | --- |
 | `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies — this is how CONFLICTING is learned); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green; `fix-wait` on red or conflicting; `held(ci-limit)`, `held(rebase-limit)`, `held(drive-stalled)` |
 | `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest); the live head and body digest | the lane's spawned or resumed session id; the current lane index; `review_rounds` on a `fail`; `rd-lane-spawned`, `rd-verdict` | `gate-check` once the last required lane has passed; `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(routing-unaccountable)`, `held(drive-stalled)` |
-| `fix-wait` | the worker's intercepted `report`; the live head | `rd-handback` | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)`, `held(drive-stalled)` |
+| `fix-wait` | the worker's intercepted `report`; the live head; **whether the pane it resumed is still alive** (#1961 — a resumed pane that exits before reporting is a hand-back that failed, not a wait, and waiting it out costs a whole `fix_timeout_minutes` on a dead process) | `rd-handback` | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)`, `held(drive-stalled)` |
 | `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` — plus `body_drift` for `also: [body-unchanged]` | nothing | `satisfied`; `ci-wait` when the gate is not satisfied for any reason; `held(routing-unaccountable)`, `held(gate-unreadable)`, `held(drive-stalled)` |
 | `held{reason}` (parked) | nothing; the tick does not advance it | one `deliver_to_orchestrator` notice and one `rd-held` line, on entry only | `ci-wait` on `drive_review`; `cancelled` on `cancel_review_drive` |
 | `satisfied`, `cancelled` (terminal) | — | one notice, one `rd-satisfied` / `rd-cancelled` line, one `TaskNote` | nothing |
+
+**Which block the hand-back runs under: the worker session's OWN** (#1961).
+`rd_handback` resolves it from the roster's FIRST row naming that session — the
+pane that minted it — and passes it explicitly. It is not left to be defaulted:
+`spawn_agent_bound` carries no session-inheritance rule (#254's lives in the MCP
+`spawn_agent` arm), so a `block: None` resume falls through to
+`block_for(Role::Worker)`, the roster's *default* worker block. Every drive whose
+worker is not the default block therefore had its fix handed to the wrong
+persona on whatever CLI that block pins — measured, a `worker-adv` (Claude)
+session reopened by opencode, which exited 5.4s later with `Invalid session ID`.
+A lane resume names its own block for the same reason; there the block is not
+looked up at all, it is the key the lane is filed under.
+
+The roster's FIRST row, and not the last-touched one, because a session is
+minted by one pane under one block and one CLI and no later row revises that —
+`OrchRegistry::session_identity_record` carries the argument, and the session
+browser's rejoin has always read it this way. Reading the newest row instead is
+what turned one wrong hand-back into a session no bare
+`spawn_agent(resume_session:)` could open afterwards, the orchestrator's own
+hand recovery included.
 
 **Advancing to lane *k+1* is not a transition.** It leaves the entry in
 `review-wait` and writes the lane index, so the table below has no
@@ -207,7 +227,7 @@ own delivery arrives by its own path; §7.)
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
 | `held(gate-unreadable)` | the gate file is present and orrerix cannot use it — an I/O error, **or** contents `parse_gate_file` refuses. **Not** `gate-not-configured`, which means the file is genuinely absent. *S3 widened this row from "an I/O error" alone: the `gh` shim refuses every merge on a malformed gate, so a drive that announced satisfied over one would be §3.1's "bypass with better telemetry" — and this enum has no third reason to give it* |
 | `held(worker-blocked)` | the worker reported `blocked` |
-| `held(worker-unresumable)` | the recorded worker session no longer resolves |
+| `held(worker-unresumable)` | **the fix could not be handed back to the worker.** Three causes, and the notice quotes which (`HeldFacts::refusal`) rather than diagnosing one: the recorded session no longer resolves; the block that session was minted under is no longer declared in this group's roster, so the class it must resume under cannot be established (#1961 — the driver refuses rather than degrading to the class default, which is what the session browser's rejoin does, because there a human is present and losing the persona beats losing the session); or the pane the driver DID resume exited in `fix-wait` before reporting anything, which is the resume that "worked" and then died on `Invalid session ID`. Reporting all three as the first is what sent an orchestrator after a replacement session for a session that was fine |
 | `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
 | `cancelled` | `cancel_review_drive`, or reconcile **positively established** the PR is closed or merged |
 
@@ -1174,6 +1194,16 @@ existing `render_template` `{{KEY}}` substitution, which does a plain per-key
 `tests/fixtures/pre222/`, which pins the four role templates; an edit to
 `orchestrator.md` announcing the feature to the orchestrator **is** in that
 fixture set and re-blesses in the same commit.
+
+**Which pane each brief is typed into is part of the contract, not an
+afterthought** (#1961). `driver-review.md` and `driver-delta.md` go to the lane
+they are about — the block the gate named, on a fresh spawn or a resume that
+names that same block. `driver-fix.md` goes to the worker session the drive was
+started on, resumed under **that session's own block** (§2.1's `fix-wait` row),
+never under the roster's default worker block. The distinction is invisible on a
+one-worker roster and decides everything on any other: a block pins a CLI, and a
+brief typed into a pane whose CLI could not open the transcript is a brief
+nobody reads.
 
 **A brief is typed into a delegate's pane as its prompt, so its interpolations
 are a trust boundary — and two of them are strings a PR author controls.** A

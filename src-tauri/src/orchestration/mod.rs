@@ -31044,6 +31044,43 @@ impl OrchRegistry {
         records
     }
 
+    /// **The roster row that says what CAPABILITY CLASS a session is** — the
+    /// one lookup every resume path asks, so they cannot disagree (#1961).
+    ///
+    /// # Why the FIRST row and not the last-touched one
+    ///
+    /// A session is minted by one pane, running one block, under one CLI, and
+    /// that is not a property later panes get to revise: a Claude transcript
+    /// resumed under an opencode block does not come back as a different
+    /// persona, it fails to open at all (`Invalid session ID`). So the question
+    /// this answers — *whose conversation is this* — has exactly one true
+    /// answer for the life of the session, and it is the one the roster wrote
+    /// first.
+    ///
+    /// `agents.json` is a `Vec` that `persist_agent_record` **appends** to and
+    /// then updates in place, so its order is spawn order and the first row
+    /// naming a session is the pane that originally ran it. `updated_ms` cannot
+    /// answer this: it is last-*touched*, not created, so a long-lived original
+    /// pane sorts AFTER a resume opened minutes ago, and `max_by_key` returns
+    /// the newest identity rather than the real one. That is #1961's amplifier
+    /// exactly — the driver wrote one wrong row for a session and every later
+    /// bare `spawn_agent(resume_session:)` inherited the wrong block from it,
+    /// including the orchestrator's own hand recovery.
+    ///
+    /// The session browser's rejoin already resolved the block with `find`
+    /// (this rule) while the MCP arm used `max_by_key` (the other one), which
+    /// is why the human's click-to-rejoin recovered the pane that the tool
+    /// call could not. This function is that rule, named once.
+    ///
+    /// **Not the same question as "where does its work live".** A workspace
+    /// legitimately MOVES over a session's life (a worktree re-cut, a resume
+    /// placed elsewhere), so cwd inheritance keeps reading the LAST-touched
+    /// record and is deliberately left alone. Identity is immutable; location
+    /// is not.
+    fn session_identity_record(&self, group: &GroupId, session: &str) -> Option<AgentRecord> {
+        self.merged_records(group).into_iter().find(|r| r.session.as_deref() == Some(session))
+    }
+
     /// Every recorded session across all groups on disk, with role identity
     /// — drives the session browser's ORCH/W/REV badges and restore flow.
     pub fn session_roles(&self) -> Vec<SessionRole> {
@@ -55076,10 +55113,11 @@ pub fn resume_recorded_session(
     // `Human` tier and stays un-clobberable, not silently demoted to
     // orchestrator (#95r). Absent (hint-restored, pre-roster) → `None`, and
     // spawn derives the tier from the name as usual.
-    let matched = reg
-        .merged_records(&record.group_id)
-        .into_iter()
-        .find(|r| r.session.as_deref() == Some(session_id));
+    // The first roster row naming this session — this rejoin has always read
+    // it that way, and since #1961 it says so by calling the function that
+    // owns the rule rather than by open-coding a `find` that reads like an
+    // accident beside the MCP arm's `max_by_key`.
+    let matched = reg.session_identity_record(&record.group_id, session_id);
     let restore_source = matched.as_ref().map(|r| r.name_source);
     let reg2 = reg.clone();
     let sid = session_id.to_string();
