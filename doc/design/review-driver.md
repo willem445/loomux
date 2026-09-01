@@ -884,6 +884,23 @@ the first half and reopen the second. The one other way a notice is given up on
 is a fresh `drive_review` displacing a still-owing entry, which audits the same
 action with `reason: superseded`.
 
+**The ceiling is a deadline, not a guarantee**, and the difference is worth
+stating because it is the state a returning reader can be resumed into. A pane
+that is merely absent for longer than an hour — the app closed overnight, a
+laptop asleep — is indistinguishable here from one that is gone for good, so a
+notice that *would* have been deliverable at hour two is dropped at hour one and
+survives only on the `rd-notice-dropped` audit line. Nothing re-surfaces that
+line into a pane. That is the tradeoff the bound chose (a leak is worse than a
+late line moved to the log), taken deliberately rather than fallen into.
+
+**Every clock this rule reads is the caller's**, which is what makes the bound
+performable rather than merely stated. `cancel_review_drive_with` exists for
+that reason alone: it stamps `owed_ms`, the ceiling is measured from it, and
+with the wall clock hard-coded there the tool-cancel producer's ceiling could
+not be reached by any test at all — enforced in production and pinned by
+nothing. `drive_review`/`drive_review_with` is the same twin for the same
+reason; a future producer that owes a notice owes this seam too.
+
 **Holding an entry back does not weaken either reason for pruning.** Both
 surfaces those reasons name already filter on `is_terminal()` —
 `review_drive_status()` lists only live drives, and `is_driven` answers

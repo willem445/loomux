@@ -3075,7 +3075,10 @@ fn a_tool_cancel_into_a_dead_pane_owes_its_notice_rather_than_losing_it() {
     let (group, _session) = driven(&reg, &repo, &gh);
     let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
 
-    let out = reg.cancel_review_drive(&group, 1758, "orch-1");
+    // Through the clock seam, so this test does not silently depend on a
+    // wall-clock anchor saturating against the tick's synthetic `now` to stay
+    // inside the ceiling (#1857). Both clocks are now the same one.
+    let out = reg.cancel_review_drive_with(&group, 1758, "orch-1", 1_000);
     assert_eq!(out["cancelled"], json!(true), "the cancel itself must still succeed: {out}");
     assert!(
         drive_notices(&reg, &group, 1758).is_empty(),
@@ -3179,5 +3182,73 @@ fn a_re_drive_that_displaces_a_still_owing_entry_audits_the_notice_it_gives_up_o
     assert!(
         after.is_empty(),
         "the previous drive's exit must not be announced beside a fresh drive's traffic: {after:?}"
+    );
+}
+
+/// **The retention ceiling fires on the TOOL-cancel path too** — the
+/// counterfactual that `cancel_review_drive_with`'s clock seam exists to make
+/// performable (#1857, rev-std's decision input).
+///
+/// Before the seam this test could not be written. `cancel_review_drive`
+/// stamped [`OwedNotice::owed_ms`] from the wall clock while the tick measured
+/// the ceiling against its injected `now`, so `now.saturating_sub(owed_ms)`
+/// answered zero for every synthetic clock and the ceiling could never fire
+/// here. The bound was enforced in production and was a documented
+/// counterfactual in the suite — and a documented escape hatch that no test
+/// performs is pinned by nothing, which is the rule this repo already keeps for
+/// `obs::root_action`.
+///
+/// The tick one millisecond INSIDE the ceiling is the discriminating half: an
+/// implementation that dropped the entry on the first failed delivery, or one
+/// that never retained it at all, passes every assertion about the expired tick
+/// alone.
+#[test]
+fn the_ceiling_fires_on_a_tool_cancelled_notice_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    // An orchestrator with no pane: every delivery attempt genuinely fails, so
+    // the notice can never be discharged and the ceiling is the only way out.
+    let _orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    let owed_at = 1_000;
+    let out = reg.cancel_review_drive_with(&group, 1758, "orch-1", owed_at);
+    assert_eq!(out["cancelled"], json!(true), "the cancel itself must succeed: {out}");
+    assert_eq!(
+        action_count(&reg, &group, "rd-pruned"),
+        0,
+        "the pre-state: the entry is retained, owing a notice that reached no pane"
+    );
+
+    // One millisecond inside the ceiling: still retained, still re-attempted.
+    let inside = reg.rd_drive_group_with(&group, &gh, owed_at + NOTICE_RETENTION_MS - 1);
+    assert_eq!(
+        inside.notice_undelivered,
+        vec![1758],
+        "inside the ceiling the tool's notice is kept and re-attempted: {inside:?}"
+    );
+    assert!(inside.pruned.is_empty(), "...and nothing is dropped yet: {inside:?}");
+    assert_eq!(action_count(&reg, &group, "rd-notice-dropped"), 0);
+
+    // At the ceiling: dropped, with the text on the audit line.
+    let expired = reg.rd_drive_group_with(&group, &gh, owed_at + NOTICE_RETENTION_MS);
+    assert_eq!(
+        expired.pruned,
+        vec![1758],
+        "the ceiling must bound the TOOL's notice too, or a cancel into a pane that never \
+         comes back retains its entry forever: {expired:?}"
+    );
+    assert!(drive_notices(&reg, &group, 1758).is_empty(), "it never did reach a pane");
+
+    let dropped = audit_details(&reg, &group, "rd-notice-dropped");
+    assert_eq!(dropped.len(), 1, "the ceiling audits exactly once: {dropped:?}");
+    assert_eq!(dropped[0]["reason"], json!("retention-ceiling"));
+    let text = dropped[0]["notice"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("CANCELLED") && text.contains("cancel_review_drive"),
+        "the audit line carries the TOOL's own notice — its cause word is what tells it from \
+         the reconcile's `pr-gone`, and it is now the only record of it: {text:?}"
     );
 }
