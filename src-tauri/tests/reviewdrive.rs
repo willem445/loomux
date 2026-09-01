@@ -2695,15 +2695,6 @@ fn a_second_conflict_after_the_one_rebase_hand_back_holds_on_rebase_limit() {
     let gh = FakeGh::green(HEAD_A);
     gh.set_merge_state("CONFLICTING");
     let (group, _session) = driven(&reg, &repo, &gh);
-    // A recipient with a pane, because the assertion below reads the notice off
-    // `RdDriveReport::notices` and that field now carries what was DELIVERED
-    // rather than what was produced (#1857). Its own panic message already said
-    // "a hold must deliver its notice"; before, nothing here could deliver
-    // anything — there was no orchestrator in this group at all — so the claim
-    // was one the fixture made unreachable. The subject of the test is the
-    // notice's TEXT and is untouched.
-    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
-    with_pane(&reg, &orch.id, 7002);
 
     // ── the first conflict: the attempt is SPENT ────────────────────────────
     reg.rd_drive_group_with(&group, &gh, 10_000);
@@ -2866,6 +2857,27 @@ fn audit_details(reg: &OrchRegistry, group: &GroupId, action: &str) -> Vec<serde
         .collect()
 }
 
+/// **Make `deliver_to_orchestrator` answer `Ok` for `agent_id`** — a pane plus a
+/// paused group, which is `orchestration.rs`'s own `pause_with_pane` (#569) and
+/// the only way a headless test reaches that branch at all.
+///
+/// The obstacle is real and is not this feature's: a delivery that lands alone
+/// at the front of an idle queue has to spawn the drainer that will paste it,
+/// which needs a Tauri `AppHandle`; a test process has none, so
+/// `deliver_prompt_as` WITHDRAWS the admission it just made and answers `Err`.
+/// A paused group takes the branch above that — admit, audit the full `prompt`
+/// line, return `Ok` — so the queue holds the payload exactly as it would in
+/// production, and it is a real production state rather than a mock.
+///
+/// The pause is deliberately **not** in `driven`: the tests below vary whether a
+/// delivery succeeds, so the state that makes one succeed has to be the thing
+/// they turn on. Pausing touches nothing that happens before a delivery, which
+/// is what makes it usable as a probe (#569).
+fn make_delivery_land(reg: &OrchRegistry, group: &GroupId, agent_id: &str, pty: u32) {
+    with_pane(reg, agent_id, pty);
+    reg.pause_group(group).expect("a live group pauses");
+}
+
 /// A drive walked to a terminal exit with the orchestrator's pane **down**, so
 /// the exit notice's delivery genuinely fails.
 ///
@@ -2928,9 +2940,11 @@ fn a_terminal_notice_that_reached_no_pane_keeps_its_entry_and_is_re_sent_until_i
         vec![1758],
         "the exit notice's delivery failed and the tick did not notice: {first:?}"
     );
-    assert!(
-        first.notices.is_empty(),
-        "nothing reached a pane, so nothing may be reported as delivered: {first:?}"
+    assert_eq!(
+        first.notices.len(),
+        1,
+        "the notice was BUILT and attempted — `notices` is the attempt, and its failure is \
+         what `notice_undelivered` reports: {first:?}"
     );
     assert!(
         first.pruned.is_empty(),
@@ -2944,8 +2958,9 @@ fn a_terminal_notice_that_reached_no_pane_keeps_its_entry_and_is_re_sent_until_i
     );
     assert_eq!(action_count(&reg, &group, "rd-pruned"), 0);
 
-    // The pane comes up. Nothing else changes — no new gh facts, no new arc.
-    with_pane(&reg, &orch, 7101);
+    // The pane comes up, so the delivery can now answer `Ok`. Nothing else
+    // changes — no new `gh` facts, no new arc, no second notice built.
+    make_delivery_land(&reg, &group, &orch, 7101);
     let second = reg.rd_drive_group_with(&group, &gh, 30_000);
     let landed = drive_notices(&reg, &group, 1758);
     assert_eq!(
@@ -2955,8 +2970,11 @@ fn a_terminal_notice_that_reached_no_pane_keeps_its_entry_and_is_re_sent_until_i
          never STEPPED, so this line can only have come off the entry: {landed:?}"
     );
     assert!(landed[0].contains("CANCELLED"), "and it is the drive's real exit: {}", landed[0]);
-    assert_eq!(second.notices, landed, "...and the report says so");
-    assert!(second.notice_undelivered.is_empty());
+    assert_eq!(second.notices, landed, "...and the tick reports having attempted it");
+    assert!(
+        second.notice_undelivered.is_empty(),
+        "nothing is still owed once it landed: {second:?}"
+    );
 
     // Delivered, so now it prunes — exactly once, and as a delivery rather than
     // as something given up on.
@@ -3070,7 +3088,7 @@ fn a_tool_cancel_into_a_dead_pane_owes_its_notice_rather_than_losing_it() {
     );
 
     // The pane comes up; the ordinary tick delivers what the TOOL owed.
-    with_pane(&reg, &orch.id, 7202);
+    make_delivery_land(&reg, &group, &orch.id, 7202);
     let tick = reg.rd_drive_group_with(&group, &gh, 10_000);
     let landed = drive_notices(&reg, &group, 1758);
     assert_eq!(landed.len(), 1, "the tool's notice must survive its failed delivery: {landed:?}");
@@ -3109,7 +3127,7 @@ fn reconciles_cancellation_is_owed_too_and_not_delivered_and_forgotten() {
     assert_eq!(first.notice_undelivered, vec![1758], "{first:?}");
     assert!(first.pruned.is_empty(), "a reconcile cancellation is retained too: {first:?}");
 
-    with_pane(&reg, &orch.id, 7303);
+    make_delivery_land(&reg, &group, &orch.id, 7303);
     let second = reg.rd_drive_group_with(&group, &gh, 20_000);
     let landed = drive_notices(&reg, &group, 1758);
     assert_eq!(landed.len(), 1, "reconcile's notice is re-sent from the entry: {landed:?}");
@@ -3140,7 +3158,7 @@ fn a_re_drive_that_displaces_a_still_owing_entry_audits_the_notice_it_gives_up_o
     // The PR is open again and the orchestrator starts a fresh drive on it. The
     // pane is up this time, so a notice carried onto the new entry WOULD be
     // delivered — which is what makes "it must not be" a real assertion.
-    with_pane(&reg, &orch, 7404);
+    make_delivery_land(&reg, &group, &orch, 7404);
     gh.set_facts("OPEN", HEAD_A);
     let w = reg.spawn_agent(&group, Role::Worker, "w2", "", false, None).unwrap();
     let session = w.session_id.clone().expect("claude mints a session id at spawn");
