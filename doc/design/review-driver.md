@@ -160,9 +160,30 @@ does not survive a re-push", and #565's body-digest asymmetry):
 
 - **A `pass` bound to an old head, or to an old body digest, is not a pass.** It
   is outstanding; the lane is re-briefed after CI at the new head.
-- **A `fail` bound to an old head still routes.** A defect found at an earlier
-  revision is revision-independent until a reviewer says otherwise, and the
-  round in which it says so is the next one.
+- **A `fail` bound to an old head does NOT route; the lane is re-briefed
+  instead.** This bullet said the opposite until #1871 B1, and the reversal is
+  recorded here rather than quietly applied, because the old rule reads
+  plausible and its argument — *"a defect found at an earlier revision is
+  revision-independent until a reviewer says otherwise, and the round in which
+  it says so is the next one"* — is exactly the half that fails. There is no
+  next round. `decide_review_wait` re-reads that same stale `fail` on every
+  pass, spends a `review_rounds` increment on each, and hands the worker back
+  findings it has already fixed; three passes reach INVARIANT 9's bound with no
+  re-review having happened at all. Measured on PR #1870: verdict `fail` at
+  `df76047f`, worker fixed and pushed `45d74286` with CI green, and the drive
+  routed the `df76047f` verdict again as "attempt 2".
+
+  **What is revision-independent is the GATE, not the routing.** `workflow.rs`
+  keeps its own rule unchanged — a blocking verdict is not cleared by a push,
+  which is #197 failing closed — so the merge gate stays BLOCKED across the fix.
+  What changes is only what the *driver* does with that verdict while the gate
+  is blocked: it owes the lane a fresh look at the new revision rather than a
+  replay of the old one, and that fresh look is what either clears the gate or
+  blocks it again with a defect somebody has actually re-examined.
+
+  The rule is asked of the verdict **word-blind** (`lane_verdict_is_current`),
+  so `escalate` moves with `fail`: an escalation of a revision that no longer
+  exists is not a judgment anyone is being asked for.
 
 ### 2.2 Every exit back to the LLM orchestrator
 
@@ -230,6 +251,15 @@ the verdict — or the spent budget — has not changed. The orchestrator has to
 change that fact first, by dispositioning the escalation or by passing
 `reset_counters`. Resuming without doing so re-holding at once is the design
 working, and the rule above must not be read as promising otherwise.
+
+**`escalate` gained one qualifier at #1871 B1, and the notice carries it.** That
+verdict re-holds only while it is still bound to the revision in front of the
+drive; once the worker has pushed, the escalation is stale, reads as absent, and
+the lane is re-briefed. So the honest sentence is "a resume that leaves the
+verdict standing AT THIS HEAD re-holds", and stating it flat would be a false
+claim in the one case an orchestrator most wants to act on — the case where the
+worker has already done something about it. `review-limit` takes no such
+qualifier: a spent budget is a fact about the drive, not about a revision.
 
 **Both notices say that themselves**, and they have to: a hold's own line is what
 an orchestrator reads at 3am, and this note is not. `review-limit` prints
@@ -389,6 +419,71 @@ host write this?" must use `brand::is_host_actor`, which also accepts the
 pre-#1153 spelling, and never an inline `== "orrerix"`. So it is `on_behalf_of`,
 not the actor, that distinguishes a driver action from any other host action,
 and that key is what an audit reader filters on.
+
+**A drive OWNS every pane it opened, and a superseded pane is owned and not
+believed** (#1871 B2, and the amendment that decided it). Two questions, decided
+separately, because collapsing them is a live defect in either direction:
+
+- **Ownership** is what §7 keys interception on, and it is *every* pane the drive
+  spawned or resumed for as long as the drive is live — not merely the latest.
+  The driver resumes the worker into a NEW pane on every hand-back and re-briefs
+  a lane into a new pane on every round, and the pane it replaced keeps running:
+  same session, same worktree, same PR. Before this the record held one slot per
+  side (`worker_agent`, and `LaneRecord::agent`, which `open_lane` overwrote by
+  `retain`-then-push), so the second hand-back evicted the first pane's id
+  outright and that pane's `report` reached the orchestrator as if nobody owned
+  it — the leak §7 exists to stop, in the arm the driver itself creates.
+- **Belief** is what may move the state machine, and only the CURRENT pane's word
+  does. A `done` from a worker pane two hand-backs old is a claim about a
+  revision the drive has already moved past; fed in, arc 8 takes it as the
+  current worker having finished work that worker is still in the middle of. So
+  a superseded pane's `report` is consumed and audited under its own kind
+  (`report:superseded-worker`, `report:superseded-lane`, `review_verdict:superseded`
+  — the audit has to let a reader tell "consumed" from "consumed and acted on")
+  and hands the machine nothing.
+
+**There is no exception, and `message_orchestrator` is where one was tried.**
+The first version of this rule exempted that tool and argued it from safety:
+`held(messaged)` only ever PARKS a drive, and parking hands it to a human, which
+is safe whichever pane spoke. That argument holds and it is not the whole
+question. A superseded pane can call the tool again after every resume, so the
+exception let one pane nobody is talking to any more park the drive **without
+bound** — an orchestrator turn per park, which is the exact cost this feature
+exists to remove, with no remedy short of killing the pane. Unbounded liveness
+damage is not bought off by a safety argument, and the uniform rule needs no
+bound because it has no such cycle. So: **only a current pane's word moves a
+drive, parking included, because parking moves it.**
+
+Nothing an orchestrator can act on is lost. §7 never intercepts that tool, so a
+superseded pane's words reach the orchestrator's pane either way and name the
+delegate; what no longer follows is an automatic hold explaining a pane the drive
+has already moved past. A CURRENT delegate's message parks the drive exactly as
+it always did, which is the case the hold was written for.
+
+**The superseded lists are bounded by LIVENESS, never by size**, and that is a
+consequence of the same reasoning rather than a separate decision. A size cap has
+to choose a victim and age is the only ordering it has; the oldest superseded
+pane is one that is still running, still on this session and still able to
+`report`, so evicting it un-owns it exactly as the single slot did. A cap
+therefore reproduces B2 at scale, reachable by precisely the usage that produced
+B2 in the first place. Liveness cannot: `resolve_token` refuses a `Dead` agent
+and has no entry for one that is gone, so a dead pane cannot reach the MCP seam
+at all and there is no traffic left to fail to own. The tick prunes on that
+predicate, which also makes the bound a real one — what is retained is at most
+the panes a group can have alive at once, which the live-delegate cap already
+limits — and a predicate that cannot answer keeps the pane, because "we could not
+check" is not "it is dead".
+
+**The driver kills none of them.** §3.1 item 5 already forbids killing a pane to
+make room, a worker mid-edit must not be killed, and "an idle reviewer lane"
+cannot be told from "a lane mid-review" without the LLM judgment §3 forbids. What
+was wrong was the SILENCE: a cancelled drive left two worker panes and a reviewer
+lane running with the worker panes on ONE worktree, and said nothing — so the
+orchestrator that owns the #338/#359 invariant had it broken by a mechanism it
+could not see. Every exit therefore NAMES the panes (§2.2, §6), and
+`cancel_review_drive` returns them in its result as well, since a notice whose
+delivery fails is lost (#1857) and a cancel is the one exit whose caller is
+holding a return value at the moment those panes stop being anyone's.
 
 ### 3.1 What the driver may never do — the closed list, honestly labelled
 
@@ -603,7 +698,9 @@ drive_review(pr: number, worker_session: string,
                | gate-unreadable
 
 cancel_review_drive(pr: number)
-  -> { cancelled: true } | { refused: "<reason>" }
+  -> { cancelled: true,
+       panes: [{ agent: "w-1715", role: "worker" | "<reviewer block id>" }] }
+     | { refused: "<reason>" }
   declines:      not-driven | driver-disabled
   orrerix failed: rd-state-unreadable | rd-state-unwritable | rd-unavailable
 
@@ -627,6 +724,14 @@ told `not-driven` — that the PR is not driven — while a drive may well be li
 which is the confusion `queue_merge`'s doc uses capitals to prevent. And
 `drive_review` cannot evaluate `already-driven` at all without reading that
 file, so an unnamed failure there becomes a *second* drive on one PR.
+
+**`cancel_review_drive` returns the panes it just released** (#1871 B3), and it
+is the only one of the three that does. The cancel notice names them too, but a
+notice whose delivery fails is lost and nothing recovers it (#1857); this is the
+one exit whose caller is holding a return value at the moment those panes stop
+being anybody's, so it is the one place the disclosure can be made where it
+cannot go missing. `role` is `"worker"` or the reviewer block id, because
+disposing of a worker pane and disposing of a reviewer lane are different calls.
 
 Four of the decline names are borrowed rather than coined. `resume-not-found`
 and `resume-ambiguous` are `resolve_session_ref`'s own, borrowed rather than
@@ -735,8 +840,10 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "body_digest": "<digest>",
       "worker_session": "<full uuid, as resolved>",
       "worker_agent": "w-7",
+      "prior_worker_agents": ["w-5"],
       "on_behalf_of": "<orchestrator agent id>",
       "lanes": [ { "block": "rev-std", "session": "<uuid>", "agent": "rev-4",
+                   "prior_agents": ["rev-2"],
                    "last_verdict": "pass", "at_head": "<sha>",
                    "briefed_head": "<sha>", "briefed_digest": "<digest>",
                    "spawned_ms": 0 } ],
@@ -817,8 +924,21 @@ caller whose id failed to resolve. An unrecorded pane therefore owns nobody: its
 traffic reaches the orchestrator exactly as it always did, which is the wrong
 recipient and never a wrong *authority*.
 
-All five are optional on read, so a file written against the shape as first
-published still parses. `counters` is **not** optional: an absent counter block
+**`prior_worker_agents` and `prior_agents` are the same field, plural** (#1871
+B2). A hand-back or a re-brief SUPERSEDES a pane rather than retiring it: the old
+pane keeps running on the same session and the same worktree, and the drive still
+owns it — §3 argues why, and why owning it is not believing it. The lists are
+oldest-first and hold each id **once** (a pane resumed into twice is one pane,
+and the exit notices print these ids for a human to go and find). They are
+**pruned by liveness on every tick and never capped by size** — §3 argues why a
+size cap reproduces B2 and why a dead pane is provably safe to forget. Both are
+cleared with `worker_agent` when a resume re-points the drive at a DIFFERENT
+worker session, for `worker_agent`'s own reason — those panes belong to a worker
+this drive no longer owns.
+
+All of these — the five S3 added and the two #1871 B2 added beside them — are
+optional on read, so a file written against the shape as first published still
+parses. `counters` is **not** optional: an absent counter block
 is refused rather than defaulted to zeros, because zeros silently grant a full
 fresh budget — the same outcome the retention rule below refuses when it
 declines to prune a parked entry.
@@ -937,7 +1057,14 @@ with a boolean, for merge-queue §11.5's reason: a filter looking for the thing
 that happened must not match the thing that did not. `rd-held` carries the
 closed reason from §2.2 in its detail; an audit action must name what actually
 happened, and a hold labelled as a completion is the defect class #461
-catalogues.
+catalogues. On the same principle `rd-consumed`'s `kind` distinguishes a current
+pane from a **superseded** one — `report:worker` / `report:superseded-worker`,
+`report:lane` / `report:superseded-lane`, `review_verdict` /
+`review_verdict:superseded`, and `message:superseded` for the one tool that is
+otherwise never intercepted at all — because only a current pane's word moves the
+drive (§3), and "consumed" and "consumed and acted on" are different facts. `rd-cancelled`
+carries the `panes` the cancel released (§5.1, #1871 B3), so the disposal is on
+the record even if the notice's delivery is lost.
 
 ### 5.5 The brief templates, and the trust boundary they cross
 
@@ -1052,24 +1179,49 @@ interpolates single-line facts and has no line breaks to keep.
 [orrerix] review drive PR #1758: GATE SATISFIED at df6a73d0 (body 3f1a..) —
   rev-std PASS, rev-final PASS; 3 review rounds, 2 CI runs, 0 rebases.
   Non-blocking findings left open — rev-std: "<capped summary>";
-  rev-final: "<capped summary>". Disposition is yours (INVARIANT 3);
+  rev-final: "<capped summary>". Panes this drive opened and has now
+  RELEASED, all still running and none of them killed: w-1715 (worker),
+  rev-1714 (rev-std) — nothing will speak to them again, and worker panes
+  sharing one session share one worktree (#338/#359), so disposing of them
+  is yours. Disposition is yours (INVARIANT 3);
   full text: list_verdicts("1758").
 
 [orrerix] review drive PR #1764: ESCALATE by rev-final at 306176c4 —
   "<capped summary>". Drive held on a JUDGMENT the driver may not make
   (INVARIANT 3): disposition the escalation first, then drive_review
-  resumes it — a resume that leaves the verdict standing re-holds on the
-  next tick. cancel_review_drive stops it.
+  resumes it — a resume that leaves the verdict standing AT THIS HEAD
+  re-holds on the next tick, while a resume after a push re-reviews.
+  cancel_review_drive stops it. Panes this drive opened and still owns,
+  all still running: rev-1714 (rev-std) — a drive_review resume speaks to
+  them again, and kill_agent is yours if you would rather it did not.
 
 [orrerix] review drive PR #1758: HELD — review rounds 3/3 at bd1461af;
   last rev-std FAIL "<capped summary>"; worker session cafb930d-….
   drive_review(pr, session, reset_counters: true) to spend another three,
-  or take it by hand.
+  or take it by hand. Panes this drive opened and still owns, all still
+  running: w-1715 (worker), rev-1714 (rev-std) — a drive_review resume
+  speaks to them again, and kill_agent is yours if you would rather it
+  did not.
+
+[orrerix] review drive PR #1870: CANCELLED — cancel_review_drive. Its
+  counters are gone; a fresh drive_review starts a new drive. Panes this
+  drive opened and has now RELEASED, all still running and none of them
+  killed: w-1715 (worker), w-1716 (worker), rev-1714 (rev-std) — nothing
+  will speak to them again, and worker panes sharing one session share one
+  worktree (#338/#359), so disposing of them is yours.
 ```
 
 The same shape carries every other `held` reason from §2.2, each naming the one
 fact that decides what the orchestrator does next — the stalled lane's pane, the
 failing CI run id, the unresumable session id.
+
+**Every exit carries the pane clause, and the one difference between them is
+stated in it** (#1871 B3): a `held` drive still OWNS the panes it opened, a
+`satisfied` or `cancelled` one has RELEASED them, and neither kills anything.
+§3 argues the policy; the clause exists because the alternative — the shipped
+behaviour until #1871 — was silence, and silence left the orchestrator holding
+an invariant (#338/#359) that a mechanism it could not see had already broken.
+A drive that opened no panes prints no clause rather than printing a zero.
 
 **"The union of non-blocking findings" is the union of the PASS summaries, and
 the notice says so.** The driver cannot parse findings out of prose and must not
@@ -1108,6 +1260,17 @@ Three properties bound that narrowing, and all three are load-bearing:
   never keyed on a `ref` string a delegate typed, because a delegate that could
   choose whether its report reaches the orchestrator by naming a PR number is a
   delegate that can route around the orchestrator.
+- **The key is EVERY pane the drive opened, not the latest one** (#1871 B2). The
+  driver resumes the worker into a new pane on every hand-back and re-briefs a
+  lane into a new pane on every round; the pane it replaced keeps running, on the
+  same session and the same PR. While the record held one slot per side, the
+  second hand-back evicted the first pane's id and that pane's `report` then
+  reached the orchestrator as if undriven — measured on PR #1870, where `w-1715`
+  was consumed correctly until `w-1716` replaced it and both of `w-1715`'s
+  subsequent `report(done)` calls landed in the orchestrator's pane. A superseded
+  pane is still consumed and audited, under its own kind, and hands the state
+  machine nothing; §3 argues why owning a pane and believing it are separate
+  decisions.
 - **Which SIDE reported decides what the report means, and consuming is not the
   same as ingesting.** Both a lane and the worker reach the `report` arm, and
   `WorkerSignal` is named for the worker because only the worker produces one:
@@ -1124,16 +1287,32 @@ Three properties bound that narrowing, and all three are load-bearing:
 - **`message_orchestrator` is never intercepted.** It is the one channel a
   delegate has for something that is not a status change — a brief whose premise
   is wrong, a question, a refusal — and it is exactly the traffic the norm exists
-  to protect. It is delivered unchanged, by its own arm, and the driver notices
-  only that it happened: on the next tick the drive goes to `held(messaged)` and
-  emits its one kick-back. So that exit is two deliveries by construction — the
-  delegate's, and the driver's — because the delegate's words are the payload and
-  the hold is the routing fact, and merging them would either truncate the
-  delegate or bury the hold.
+  to protect. It is delivered unchanged, by its own arm, and when a CURRENT
+  delegate calls it the driver notices that it happened: on the next tick the
+  drive goes to `held(messaged)` and emits its one kick-back. So that exit is two
+  deliveries by construction — the delegate's, and the driver's — because the
+  delegate's words are the payload and the hold is the routing fact, and merging
+  them would either truncate the delegate or bury the hold.
+
+  **A SUPERSEDED pane's message is delivered and parks nothing** (#1871 B2, as
+  rev-final narrowed it). The exception that let it park was argued from safety —
+  a park hands the drive to a human — and the liveness cost is what defeats that:
+  a superseded pane can call this tool again after every resume, so the exception
+  allowed unbounded parking by a pane nobody is talking to any more, one
+  orchestrator turn per park, with no remedy short of killing the pane. Only a
+  current pane's word moves a drive, and parking moves it. The words still land
+  in the orchestrator's pane, naming the delegate; what does not follow is a hold
+  about a pane the drive has moved past.
 - **Nothing is silent.** Every consumed event is audited as `rd-consumed` with
   its kind, the agent and the PR, so the traffic that stopped arriving as a
   prompt is still on the record and still attributable. "Consumed" is a
   different word from "dropped" and the audit vocabulary keeps them different.
+  The **kind** carries the pane's standing (`report:worker` versus
+  `report:superseded-worker`, the same pair for a lane and for `review_verdict`,
+  and `message:superseded` for the tool that is otherwise never intercepted at
+  all), because "consumed" and "consumed and acted on" are also different facts,
+  and a reader chasing a drive that did not move is chasing exactly that
+  difference.
 
 The reason this is worth a section rather than a line is that it is the only
 place where this design makes the orchestrator's view of its own group
@@ -1149,7 +1328,7 @@ orchestrator recovers its drives) and the audit log.
 | A kickoff never lands in a spawned lane's pane | The delivery layer already re-delivers and audits it (`delivery-eaten`, `kickoff-redelivery-skipped`), and a CLI that declares a readiness marker waits for it (`CliCaps::ready_marker`, #1591). **The driver adds no re-send of its own** — a second sender is a supersession hazard, not a fix. It bounds instead: no verdict inside `lane_timeout_minutes` is `held(lane-stalled)`, naming the pane. |
 | The live-delegate cap refuses a lane spawn | A runner-class outcome: back off `RD_BACKOFF_MS`, retry on a later tick, count only against `drive_timeout_minutes`. The driver **never kills a pane to make room** (§3.1 item 5). |
 | An idle reviewer or worker is reaped between rounds | Recoverable, but **not exempt**: `idle_reap_candidates` exempts exactly two things — the orchestrator/manager roles, and blocks whose `role_hint` is `liaison` — so a driver-spawned lane is reapable like any other agent wherever an operator sets `idle_kill_minutes`, and the driver's own 60- and 240-minute waits are long enough to cross a typical threshold. Recovery leans on the generic resume machinery, not on anything drive-aware: the entry stores the **full** resolved session id, so the next round resumes it; if it no longer resolves, a **lane** respawns fresh by block id and a **worker** becomes `held(worker-unresumable)`. A fresh lane respawn does **not** consume a `review_rounds` increment — the counter counts rounds of *findings*, and a reaped reviewer produced none. No `notify_when` watch is held anywhere — watches die with their agent — so the tick polls the PR itself. |
-| The worker pushes while a lane is mid-review | The head moves, so the drive re-enters `ci-wait` (§2.1 arc 6); the verdict that lands binds to the old head. A `fail` there still routes, a `pass` there is stale and the lane is re-briefed after CI. One wasted review, bounded by the round counter. This race is not designed away — it is the race the verdict binding already exists to handle. |
+| The worker pushes while a lane is mid-review | The head moves, so the drive re-enters `ci-wait` (§2.1 arc 6); the verdict that lands binds to the old head, so it decides nothing here — `fail`, `pass` and `escalate` alike read as absent and the lane is re-briefed after CI (§2.1's carried-over properties, as #1871 B1 rewrote them). One wasted review, bounded by the round counter; the re-brief itself spends no round, because a round counts findings delivered and this delivers none. This race is not designed away — it is the race the verdict binding already exists to handle. |
 | The PR body changes under a recorded `pass` | The `(head, digest)` key is re-read every tick, so a moved digest with an unchanged head re-enters `review-wait` at the first stale lane with a body-only delta brief. While a drive is live, body fixes go through the worker or the drive is cancelled first (§3.1 item 3). |
 | `gh` is missing, or a child is killed at the command timeout | `ResolveFailure::is_runner` — the seam itself failed: back off, no transition, no notice, bounded by `drive_timeout_minutes` → `held(drive-stalled)`. |
 | `gh` answers non-zero — rate-limited, unauthenticated, or the PR is genuinely gone | **Also back off; this is the row the obvious dichotomy gets wrong.** A rate-limited `gh` returns *promptly* with a non-zero exit, so it is not `Runner`: `resolve_pr_detailed` maps `!out.ok()` to `ResolveFailure::Refused(TargetRefusal::BaseUnverifiable)`, and nothing in `mqdriver.rs` mentions rate limiting at all. `BaseUnverifiable`'s own doc is "a lookup failed, or came back empty" — an **unknown**, not a fact about the PR — and `into_refusal` maps a `Runner` failure to the same code precisely because "unknown is never treated as safe". So a `Refused` answer is never grounds to terminate a drive; only §2.4's positive establishment is. |

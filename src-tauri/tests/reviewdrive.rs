@@ -28,11 +28,14 @@ use loomux_lib::orchestration::reviewdrive::{
     DriveStep, GateOutcome, HeldReason, LaneFact, WorkerSignal, MAX_REBASE_CEILING,
     MAX_ROUNDS_CEILING,
 };
+
 use loomux_lib::orchestration::workflow::{ReviewVerdict, Verdict};
 use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
-use loomux_lib::orchestration::{Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport, Role};
+use loomux_lib::orchestration::{
+    AgentStatus, Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport, Role,
+};
 use serde_json::json;
 
 // ── fixtures ────────────────────────────────────────────────────────────────
@@ -1708,14 +1711,31 @@ fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
         .find(|n| n.contains("HELD"))
         .expect("a hold delivers exactly one notice");
 
+    // **Split at the pane clause, and assert on each half for what that half
+    // claims.** #1871 B3 appended a disclosure that names EVERY pane the drive
+    // owns, `rev-std`'s included, and it names it for a correct reason — so a
+    // whole-notice `!contains("rev-std")` stopped being a discriminator the
+    // moment that clause landed. Relaxing the assertion to fit would delete the
+    // witness; scoping it to the SUBJECT clause keeps it exactly as strong,
+    // because a rule that always named the first lane would still put `rev-std`
+    // there. The second half then pins what the disclosure is actually for,
+    // which is why this is a repin rather than a narrowing.
+    let (subject, panes) = notice
+        .split_once(" Panes this drive opened")
+        .expect("a held drive discloses the panes it still owns (#1871 B3)");
     assert!(
-        notice.contains("lane rev-final"),
-        "the hold must name the lane that STALLED: {notice}"
+        subject.contains("lane rev-final"),
+        "the hold must name the lane that STALLED: {subject}"
     );
     assert!(
-        !notice.contains("rev-std"),
+        !subject.contains("rev-std"),
         "…and must not name the lane that PASSED — a rule that always named the first lane \
-         would satisfy the assertion above and be just as wrong: {notice}"
+         would satisfy the assertion above and be just as wrong: {subject}"
+    );
+    assert!(
+        panes.contains("(rev-std)") && panes.contains("(rev-final)"),
+        "…while the disclosure names BOTH, because it answers a different question: which \
+         panes are still running and still this drive's: {panes}"
     );
     assert!(
         notice.contains(&lane1),
@@ -2245,6 +2265,20 @@ enum CiArm {
 }
 
 impl CiArm {
+    /// **The population, named once** (#1863 D2, second half). The arms used to
+    /// be an array literal written inline at the one call site, which is a
+    /// population nothing states: trimming it back to `[CiArm::Green]` — the
+    /// very shape D2 was raised about — leaves every assertion inside the loop
+    /// true and the test green, because the loop simply runs once. A `for` body
+    /// that passes is evidence about the arms it RAN over, never about the arms
+    /// that exist.
+    ///
+    /// A fifth `CiObservation` is a compile error in two exhaustive matches
+    /// ([`CiArm::sentence`] and `lane_brief_under`), so what this list can go
+    /// wrong by is omission or padding, not by silently absorbing a new arm —
+    /// and `every_arm_states_a_different_sentence` is what refuses the padding.
+    const ALL: [CiArm; 4] = [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending];
+
     /// The sentence this arm must render, verbatim. It is the CONTENT pin that
     /// makes each fixture discriminating: a `Conflicting` fixture that quietly
     /// produced the `Pending` sentence would satisfy every shape assertion, and
@@ -2363,7 +2397,8 @@ fn lane_brief_under(arm: CiArm) -> String {
 /// at all to notice.
 #[test]
 fn a_lane_brief_is_one_paragraph_per_sentence() {
-    for arm in [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending] {
+    let mut arms_checked = 0usize;
+    for arm in CiArm::ALL {
         let brief = lane_brief_under(arm);
 
         // The template itself is deliberately multi-paragraph; what must not
@@ -2379,7 +2414,10 @@ fn a_lane_brief_is_one_paragraph_per_sentence() {
                  `\\` continuation leaves behind: {line:?}"
             );
         }
-        assert!(checked > 3, "{arm:?}: the positive control — this must have read real lines");
+        assert!(
+            checked > 3,
+            "{arm:?}: the per-arm positive control — this must have read real lines"
+        );
 
         // And the CI sentence specifically, which is the one that shipped
         // broken. Found by the prefix every arm shares, so the finder itself
@@ -2399,7 +2437,46 @@ fn a_lane_brief_is_one_paragraph_per_sentence() {
             !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
             "{arm:?}: the CI sentence must be one whole paragraph on one line: {ci_line:?}"
         );
+        // **Counted at the VERIFIED site, not the match site.** Incremented
+        // after this arm's assertions have all run, so the population control
+        // below certifies coverage that was actually delivered rather than
+        // arms the loop merely started (CLAUDE.md's `test/theme.test.ts` rule).
+        arms_checked += 1;
     }
+    // **The population control, and it is what #1863 D2 was really about.** The
+    // per-arm floor above counts LINES; nothing counted ARMS, so the fixture
+    // this test exists to have widened — one arm, and the wrong one — was still
+    // reachable by deleting entries from the loop's array. The line floor holds
+    // under it, every content pin holds under it, and the test stays green while
+    // covering exactly the arm that never carried the defect.
+    assert_eq!(
+        arms_checked,
+        CiArm::ALL.len(),
+        "every CI arm must have been rendered AND checked, not merely enumerated"
+    );
+    assert_eq!(arms_checked, 4, "…and the population is the four the note names");
+}
+
+/// The guard on [`CiArm::ALL`] itself: it can go wrong by omission, and padding
+/// a short list with a repeat would hide that from the count above.
+///
+/// Distinctness is the checkable form — each arm exists precisely because it
+/// renders a different sentence, so two entries answering the same one means the
+/// list is naming three arms while claiming four.
+#[test]
+fn every_arm_states_a_different_sentence() {
+    let mut seen: Vec<&str> = CiArm::ALL.iter().map(|a| a.sentence()).collect();
+    let listed = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        listed,
+        "CiArm::ALL names {listed} arms and only {} distinct sentences — a repeat pads the \
+         population control in `a_lane_brief_is_one_paragraph_per_sentence` back to green \
+         while an arm goes unrendered",
+        seen.len()
+    );
 }
 
 /// The control for the test above: on a genuinely green drive the brief still
@@ -2830,5 +2907,708 @@ fn queue_merges_failure_list_agrees_with_both_numbers_that_describe_it() {
         "the count and the enumeration disagree: {n_open} claimed, {enumerated} reasons \
          parsed. If a reason was just added WITHOUT a parenthesised gloss, this delimiter \
          cannot see it — fix the delimiter here rather than the number"
+    );
+}
+
+// ── #1871: the loop defects the dogfood run found ───────────────────────────
+
+/// Rounds spent, read off the surface an orchestrator reads.
+fn review_rounds(reg: &OrchRegistry, group: &GroupId) -> u64 {
+    reg.review_drive_status(group)["drives"][0]["counters"]["review_rounds"]
+        .as_u64()
+        .unwrap_or(u64::MAX)
+}
+
+/// The `rd-consumed` kinds this group has recorded, in order.
+fn consumed_kinds(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "rd-consumed")
+        .filter_map(|e| e.detail["kind"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// **#1871 B1, through the seam.** A worker fix at a new head must RE-OPEN the
+/// lane, not re-route the verdict recorded before the fix.
+///
+/// Observed on PR #1870, and this is that sequence: `rev-std` recorded `fail` at
+/// `df76047f`; the worker fixed it and pushed `45d74286` with CI green; the
+/// drive saw the new head, came back through `review-wait` — and read the SAME
+/// `fail` again, spent a second `review_rounds` on it, and handed the worker
+/// back its own already-addressed findings as "attempt 2". Nothing ever reached
+/// `lane_open_for`, because the `Fail` arm answered first, from a commit that no
+/// longer described the PR. Three passes reach INVARIANT 9's bound with no
+/// re-review having happened at all.
+///
+/// **The operands collide, which is what lets this test fail.** ONE recorded
+/// `fail`, from ONE lane, read at TWO heads: at the head it was recorded against
+/// it must route (the first block, which is this test's own positive control),
+/// and at the head the worker moved to it must not. A fixture that recorded the
+/// verdict at a head the drive never returned to would pass under the defect,
+/// and one that never routed it at all would pass under an implementation that
+/// simply ignored every `fail`.
+///
+/// **The arc is asserted to have RUN before anything is asserted about what it
+/// produced**: the drive is checked into `review-wait` at `HEAD_B` — so arcs 7
+/// and 2 really did carry it there — before the re-brief is looked for. Without
+/// that, a drive parked somewhere else entirely would satisfy "no round spent"
+/// and "no hand-back" trivially.
+#[test]
+fn a_fix_at_a_new_head_re_opens_the_lane_instead_of_re_routing_the_stale_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000); // ci-wait -> review-wait
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000); // -> lane spawned
+    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("lane 0 opens");
+
+    // The lane records `fail` AT HEAD_A, through the real recording path.
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: lane.clone(),
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "fail", "summary": "fail - one blocking" } }),
+    )
+    .expect("the lane records a blocking verdict");
+
+    // **The positive control, and it is the same verdict this test later
+    // refuses.** At the head it was recorded against, a `fail` routes: arc 5,
+    // one review round spent, one hand-back.
+    let routed = reg.rd_drive_group_with(&group, &gh, 30_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "fix-wait",
+        "a fail AT THIS HEAD must route — otherwise the refusal below is vacuous"
+    );
+    assert_eq!(review_rounds(&reg, &group), 1, "arc 5 spends exactly one round");
+    assert_eq!(routed.handbacks.len(), 1, "…and hands the findings back once");
+
+    // The worker fixes and pushes. CI stays green, as it was on #1870.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 40_000); // arc 7: the head moved
+    reg.rd_drive_group_with(&group, &gh, 50_000); // arc 2: green again
+
+    // THE ARC RAN. Everything below is a statement about a drive that really is
+    // back in `review-wait` looking at the new head.
+    assert_eq!(status_state(&reg, &group), "review-wait", "arcs 7 and 2 carried the drive back");
+    assert_eq!(status_head(&reg, &group), HEAD_B, "…and it is looking at the head that moved");
+
+    let after = reg.rd_drive_group_with(&group, &gh, 60_000);
+
+    let (_pr, _b, lane2) = after.lanes_opened.first().cloned().expect(
+        "the lane owes a fresh verdict at the new head and must be RE-BRIEFED; instead the \
+         drive re-routed the verdict recorded before the fix (#1871 B1)",
+    );
+    assert!(
+        after.handbacks.is_empty(),
+        "a hand-back carrying no fresh verdict is the defect itself: {:?}",
+        after.handbacks
+    );
+    assert_eq!(
+        review_rounds(&reg, &group),
+        1,
+        "a re-brief spends no round — a round counts findings DELIVERED, and this delivers \
+         none. Spending one is what reached the bound in three passes with no re-review"
+    );
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "…and the drive waits for that verdict rather than dropping back to fix-wait"
+    );
+
+    let brief = lane_brief(&reg, &lane2);
+    assert!(
+        brief.contains(HEAD_B),
+        "the re-brief must ask about the revision in front of the drive: {brief}"
+    );
+    assert!(
+        brief.starts_with("DELTA on PR #1758"),
+        "…and this lane has ANSWERED before, so it is a delta rather than a first call: {brief}"
+    );
+}
+
+/// **The same rule, seen from `escalate`.** `lane_verdict_is_current` is asked
+/// word-blind, and this is the assertion that keeps it that way: an `escalate`
+/// bound to a head the worker has moved past is not a judgment anyone is being
+/// asked for, so the drive must re-brief rather than re-park on `held(escalate)`
+/// for ever.
+///
+/// Worth its own test rather than a second arm in the one above because the two
+/// words take different arcs — `fail` spends a counter, `escalate` parks — so a
+/// fix that special-cased `Fail` alone passes that test and fails this one. The
+/// first block is again the control: at ITS OWN head, the escalate still holds.
+#[test]
+fn a_stale_escalate_re_opens_the_lane_and_a_current_one_still_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, session) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, _b, lane) = opened.lanes_opened.first().cloned().expect("lane 0 opens");
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: lane,
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "escalate", "summary": "needs a human call" } }),
+    )
+    .expect("the lane escalates");
+
+    reg.rd_drive_group_with(&group, &gh, 30_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "an escalate AT THIS HEAD parks the drive — the control for the re-open below"
+    );
+    assert_eq!(
+        reg.review_drive_status(&group)["drives"][0]["held_reason"],
+        json!("escalate")
+    );
+
+    // The orchestrator dispositions it and resumes; the worker has pushed since.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 60_000);
+    assert_eq!(out["driving"], json!(true), "{out}");
+
+    reg.rd_drive_group_with(&group, &gh, 70_000); // ci-wait -> review-wait
+    assert_eq!(status_state(&reg, &group), "review-wait", "the resume reached a working state");
+    let after = reg.rd_drive_group_with(&group, &gh, 80_000);
+    assert!(
+        !after.lanes_opened.is_empty(),
+        "an escalate bound to a head the worker moved past must re-open the lane, not re-park \
+         the drive on a judgment about a revision that no longer exists"
+    );
+    assert_ne!(status_state(&reg, &group), "held", "…and the drive must not re-hold");
+}
+
+/// **#1871 B2, through the seam.** A drive that hands back twice still owns the
+/// pane it opened first — and does not take its word.
+///
+/// Measured on PR #1870: `rd-handback agent=w-1715`, then `w-1715`'s
+/// `report(progress)` correctly `rd-consumed`; then `rd-handback agent=w-1716`,
+/// which overwrote the single-slot `worker_agent`; then BOTH of `w-1715`'s
+/// `report(done)` calls delivered to the orchestrator's pane as if nobody owned
+/// it. `w-1715` was still running, on the same session and the same PR.
+///
+/// **Both halves are asserted, because a fix can be wrong in either
+/// direction.** Not owning it is the leak. Owning it and BELIEVING it is worse:
+/// arc 8 would take a superseded pane's `done` as the current worker having
+/// finished work that worker is still in the middle of. So the superseded pane's
+/// report must be consumed, audited under its own kind, and change nothing — and
+/// the current pane's identical report must still move the drive, which is what
+/// stops "believe nobody" from passing this test.
+#[test]
+fn a_superseded_worker_pane_is_still_intercepted_and_never_moves_the_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    // Hand-back one: CI is red at HEAD_A.
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, w1) = first.handbacks.first().cloned().expect("the drive hands back");
+
+    // Hand-back two: the worker pushed, and CI is red again at the new head.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 20_000); // arc 7
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000); // red again -> fix-wait
+    let (_pr, w2) = second
+        .handbacks
+        .first()
+        .cloned()
+        .expect("a second red hands back again, into a new pane");
+    assert_ne!(w1, w2, "the driver resumes into a NEW pane, which is the whole premise");
+
+    // Both panes are the drive's; only the second is current.
+    assert_eq!(
+        reg.rd_owner(&group, &w1).map(|(pr, p)| (pr, p.current)),
+        Some((1758, false)),
+        "the pane the second hand-back superseded is still this drive's delegate — its \
+         report must not reach the orchestrator as if undriven (#1871 B2)"
+    );
+    assert_eq!(reg.rd_owner(&group, &w2).map(|(pr, p)| (pr, p.current)), Some((1758, true)));
+
+    // The superseded pane reports done. It is consumed, and it changes nothing.
+    let before = delivered_texts(&reg, &group).len();
+    let state_before = status_state(&reg, &group);
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: w1.clone(),
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "fixed it", "ref": "#1758" } }),
+    )
+    .expect("a superseded pane may still report");
+    assert!(
+        !delivered_texts(&reg, &group)[before..].iter().any(|t| t.contains("reports done")),
+        "a pane this drive opened must not report to the orchestrator, superseded or not"
+    );
+    assert!(
+        consumed_kinds(&reg, &group).contains(&"report:superseded-worker".to_string()),
+        "…and the audit must say WHICH, so a reader can tell consumed from \
+         consumed-and-acted-on: {:?}",
+        consumed_kinds(&reg, &group)
+    );
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        state_before,
+        "a superseded pane's `done` must not take arc 8 — it is a claim about a revision the \
+         drive has already moved past"
+    );
+
+    // The CURRENT pane's identical report still moves it. Without this the test
+    // passes under an implementation that believes nobody.
+    gh.set_checks(r#"[{"name":"build","state":"SUCCESS","link":"x"}]"#);
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: w2.clone(),
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "fixed it", "ref": "#1758" } }),
+    )
+    .expect("the current pane reports");
+    assert!(
+        consumed_kinds(&reg, &group).contains(&"report:worker".to_string()),
+        "{:?}",
+        consumed_kinds(&reg, &group)
+    );
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_ne!(
+        status_state(&reg, &group),
+        "fix-wait",
+        "the CURRENT worker's `done` still advances the drive"
+    );
+}
+
+/// **#1871 B3, through the seam.** Every exit names the panes it leaves running,
+/// and `cancel_review_drive` returns them.
+///
+/// After the cancel on #1870 the driver's three panes stayed alive and idle with
+/// nothing said about them — two worker panes on ONE worktree and ONE session,
+/// which is the #338/#359 hazard, produced by the mechanism the orchestrator
+/// uses to avoid it. The human found them through the idle watchdog.
+///
+/// Three assertions, because two of them alone pass under a wrong fix: naming
+/// the panes without saying they are RELEASED reads as "the drive still has this
+/// in hand"; and killing them would satisfy "no orphans" while breaking §3.1
+/// item 5 and a worker mid-edit. So the panes must be named, said to be
+/// released, and still be ALIVE.
+#[test]
+fn a_cancel_names_the_panes_it_leaves_running_and_kills_none_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, block, lane) = opened.lanes_opened.first().cloned().expect("lane 0 opens");
+    // …and a worker pane too, so the clause has both roles to distinguish.
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 30_000); // arc 6 -> ci-wait
+    let handed = reg.rd_drive_group_with(&group, &gh, 40_000); // red -> fix-wait
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+
+    let before = delivered_texts(&reg, &group).len();
+    let out = reg.cancel_review_drive(&group, 1758, "orch-1");
+    assert_eq!(out["cancelled"], json!(true), "{out}");
+
+    // 1. The RESULT names them, with the role that decides how to dispose.
+    let named: Vec<String> = out["panes"]
+        .as_array()
+        .expect("cancel_review_drive returns the panes it released")
+        .iter()
+        .map(|p| {
+            format!(
+                "{}:{}",
+                p["agent"].as_str().unwrap_or_default(),
+                p["role"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    assert!(named.contains(&format!("{worker}:worker")), "{named:?}");
+    assert!(named.contains(&format!("{lane}:{block}")), "{named:?}");
+
+    // 2. The NOTICE names them and says they are released, not still in hand.
+    let notice = delivered_texts(&reg, &group)[before..]
+        .iter()
+        .find(|t| t.contains("CANCELLED"))
+        .cloned()
+        .expect("the cancel notice reaches the orchestrator");
+    assert!(notice.contains(&format!("{worker} (worker)")), "{notice}");
+    assert!(notice.contains(&format!("{lane} ({block})")), "{notice}");
+    assert!(notice.contains("RELEASED"), "a terminal exit hands its panes back: {notice}");
+
+    // 3. And nothing was killed. §3.1 item 5, and a worker mid-edit.
+    for a in [&worker, &lane] {
+        let entry = reg.agent(a).expect("the pane is still on the roster");
+        assert_ne!(
+            entry.status,
+            AgentStatus::Dead,
+            "the driver kills no pane — disposal is the orchestrator's deliberate call: {a}"
+        );
+    }
+}
+
+// ── #1861: the invariant behind the all-lanes `briefed_head` clear ──────────
+
+/// **#1861.** The resume out of `held(lane-stalled)` clears `briefed_head` for
+/// EVERY lane, not just the stalled one. That is safe only because **the
+/// deciding lane is verdict-selected** — and nothing pinned it.
+///
+/// If selection ever consulted the lane RECORD instead of the verdict — a
+/// routing change, a new lane kind, a gate that counts differently — the
+/// all-lanes clear silently becomes "re-brief every lane on every resume": a
+/// delegate spawned per lane per resume, review rounds burned with no worker
+/// turn, and nothing red.
+///
+/// **Why this is pinned here and not on the resume arc.** #1861 proposes a
+/// two-lane seam fixture where only one lane is stalled. That fixture cannot be
+/// made to fail, and the previous author had already worked out why and left the
+/// analysis on `a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again`:
+/// `first_stale_lane` skips a standing pass before any lane record is read, so
+/// the passed lane is unreachable from the re-open under every implementation —
+/// and making it reachable means staling its pass, at which point IT becomes the
+/// deciding lane and the test stops being about the stall. The operands cannot
+/// collide on that arc. They collide here.
+///
+/// **The collision.** Both lane records are put in the SAME state — identical on
+/// the `briefed_head` axis — so the only thing left that can distinguish them is
+/// the VERDICT. A selection rule that read the record would pick lane 0: it is
+/// first in the gate's order and its record is exactly as stale as lane 1's. The
+/// assertion is that lane **1** opens.
+///
+/// **Asserting the property rather than the fixture** is what removes the
+/// dependence on the resume happening to blank every lane. All four crossings of
+/// {record blank, record stale} x {pass current, pass stale} are pinned, so "a
+/// lane whose pass stands is never re-opened, whatever its record says" holds
+/// however many lanes a future resume decides to clear.
+///
+/// **`Blank` IS the post-resume state**, which is what makes a `decide`-level
+/// pin cover the arc #1841's B4 lives on: clearing `briefed_head` for every lane
+/// is exactly the `Rec::Blank` row, and the row says that clearing it changes
+/// nothing about WHICH lane is chosen. `Rec::Stale` is the ordinary post-push
+/// state, and it is there so the property is not stated only about the resume.
+/// The stale-pass column is the control that stops "always answer 1" passing.
+///
+/// **A third record state is deliberately not a row here.** A record briefed at
+/// the LIVE head answers `Wait`, which names no lane and therefore witnesses
+/// nothing about selection — it holds identically whichever lane the drive is
+/// waiting on. The first draft of this test asserted `OpenLane { index: 1 }` for
+/// it and went red on CI; it is now pinned below as its own strictly weaker,
+/// explicitly labelled assertion rather than as a crossing that cannot fail.
+#[test]
+fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear_safe() {
+    let limits = DriveLimits::default();
+
+    // **Both record states make `lane_open_for` FALSE**, and that is what keeps
+    // the observable an INDEX. `Blank` is what #1841's B4 all-lanes clear leaves
+    // behind; `Stale` is the ordinary state after a push. A third state —
+    // briefed at the live head — is deliberately not one of the crossings: it
+    // answers `Wait`, which names no lane, so it cannot witness WHICH lane was
+    // selected. It is pinned below as its own strictly weaker assertion rather
+    // than folded in here as a row that holds under every implementation.
+    #[derive(Clone, Copy, Debug)]
+    enum Rec {
+        Blank,
+        Stale,
+    }
+
+    let entry_with = |rec: Rec| {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = HEAD_A.into();
+        e.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
+        e.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
+        for l in e.lanes.iter_mut() {
+            match rec {
+                Rec::Blank => l.briefed_head.clear(),
+                Rec::Stale => l.briefed_head = HEAD_B.into(),
+            }
+        }
+        e
+    };
+
+    // Lane 0 has a verdict, lane 1 never answered. `pass_head` decides whether
+    // lane 0's pass still stands at the live head.
+    let facts_with = |pass_head: &str| DriveFacts {
+        required_lanes: Some(vec![
+            lane_fact("rev-std", Some(Verdict::Pass), pass_head, "d1"),
+            lane_fact("rev-final", None, "", ""),
+        ]),
+        ..facts_at(HEAD_A)
+    };
+
+    for rec in [Rec::Blank, Rec::Stale] {
+        let e = entry_with(rec);
+
+        // Lane 0's pass STANDS. Lane 1 is the deciding lane, and it is the one
+        // that opens — even though lane 0 comes first in the gate's order and
+        // its record is in exactly the same state as lane 1's.
+        assert_eq!(
+            reviewdrive::decide(&e, &facts_with(HEAD_A), &limits),
+            DriveStep::OpenLane { index: 1 },
+            "{rec:?} records: a lane whose pass stands must never be re-opened. Both records \
+             are identical here, so a selection rule reading the RECORD rather than the \
+             verdict picks lane 0 — which is what turns #1841's all-lanes clear into a \
+             re-brief per lane per resume"
+        );
+
+        // The control, on the one axis that may move the answer: stale lane 0's
+        // pass and it becomes the deciding lane. Without this, an implementation
+        // that always answered `index: 1` would satisfy every assertion above.
+        assert_eq!(
+            reviewdrive::decide(&e, &facts_with(HEAD_B), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "{rec:?} records: a lane whose pass no longer stands IS the deciding lane — so \
+             the assertion above is the verdict deciding, not a constant"
+        );
+    }
+
+    // **The strictly weaker row, labelled.** A record briefed at the LIVE head
+    // is open for this revision, so the drive waits for it rather than re-asking
+    // — `Wait`, correctly, and the first draft of this test asserted
+    // `OpenLane { index: 1 }` here and went red on CI. It is kept because it
+    // pins something real (a standing pass is not re-opened at any record
+    // state), and kept SEPARATE because `Wait` names no lane: it holds
+    // identically whether the drive is waiting on lane 0 or lane 1, so folding
+    // it into the crossings above would have put a row there that cannot fail.
+    let mut open = entry_at(DriveState::ReviewWait);
+    open.head = HEAD_A.into();
+    open.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
+    open.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
+    assert_eq!(
+        reviewdrive::decide(&open, &facts_with(HEAD_A), &limits),
+        DriveStep::Wait,
+        "a lane already briefed at this revision is waited for, not re-asked"
+    );
+
+    // …and the function that makes it true, named directly, so a change to
+    // selection reddens at the site rather than only through `decide`. It takes
+    // no lane record at all — the structural half of this invariant — so its
+    // answer cannot depend on `briefed_head` however that field moves.
+    assert_eq!(
+        reviewdrive::first_stale_lane(
+            facts_with(HEAD_A).required_lanes.as_deref().unwrap(),
+            HEAD_A,
+            Some("d1")
+        ),
+        1,
+        "first_stale_lane selects by verdict currency alone"
+    );
+    assert_eq!(
+        reviewdrive::first_stale_lane(
+            facts_with(HEAD_B).required_lanes.as_deref().unwrap(),
+            HEAD_A,
+            Some("d1")
+        ),
+        0
+    );
+}
+
+// ── #1871 B2, as rev-final narrowed it ──────────────────────────────────────
+
+/// **A superseded pane parks nothing, and a current one still does.**
+///
+/// The first version of this rule exempted `message_orchestrator` and argued the
+/// exception from safety: `held(messaged)` only ever PARKS a drive, and parking
+/// hands it to a human. That argument holds and is not the whole question — a
+/// superseded pane can call the tool again after every resume, so the exception
+/// allowed one pane nobody is talking to any more to park the drive without
+/// bound, an orchestrator turn per park, with no remedy short of killing the
+/// pane. The rule is now uniform: only a current pane's word moves a drive, and
+/// parking moves it.
+///
+/// **Both halves, because either alone passes under a wrong fix.** Dropping the
+/// park for everyone would satisfy the first assertion and break the hold that
+/// `held(messaged)` exists to be. The second assertion is the control that
+/// refuses it.
+///
+/// The unbounded-parking property is pinned directly rather than described: the
+/// superseded pane messages TWICE across a resume, which under the exception is
+/// two parks and two orchestrator turns.
+#[test]
+fn a_superseded_panes_message_parks_nothing_and_a_current_panes_still_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    // Two hand-backs, so there is a superseded worker pane and a current one.
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, w1) = first.handbacks.first().cloned().expect("the drive hands back");
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, w2) = second.handbacks.first().cloned().expect("a second red hands back again");
+    assert_ne!(w1, w2);
+
+    let msg = |agent: &str| {
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: agent.to_string(),
+                group: group.clone(),
+                role: Role::Worker,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "message_orchestrator", "arguments": {
+                "text": "the brief's premise looks wrong to me" } }),
+        )
+        .expect("a delegate may always message the orchestrator");
+    };
+
+    // The superseded pane speaks. Its words reach the orchestrator — this tool
+    // is never intercepted — and the drive does not move.
+    let before = delivered_texts(&reg, &group).len();
+    msg(&w1);
+    assert!(
+        delivered_texts(&reg, &group)[before..].iter().any(|t| t.contains("premise looks wrong")),
+        "message_orchestrator is never intercepted, superseded or not"
+    );
+    assert!(
+        consumed_kinds(&reg, &group).contains(&"message:superseded".to_string()),
+        "…and the audit records that the drive owned the speaker and did nothing: {:?}",
+        consumed_kinds(&reg, &group)
+    );
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "a superseded pane must not park the drive — under the exception this was one \
+         orchestrator turn, repeatable after every resume, with no bound"
+    );
+
+    // …and again after a resume, which is the shape that made it unbounded.
+    msg(&w1);
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_ne!(status_state(&reg, &group), "held", "…still not, however many times it speaks");
+
+    // The CONTROL: the current pane's identical call still parks the drive.
+    // Without this, "never park" passes everything above and deletes the hold.
+    msg(&w2);
+    reg.rd_drive_group_with(&group, &gh, 60_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "a CURRENT delegate's message still parks the drive — that is the case the hold was \
+         written for"
+    );
+    assert_eq!(
+        reg.review_drive_status(&group)["drives"][0]["held_reason"],
+        json!("messaged"),
+        "…on the reason that names it"
+    );
+}
+
+/// **The superseded lists are bounded by LIVENESS, not by size** — through the
+/// seam, so the tick is what has to do the pruning.
+///
+/// rev-final promoted this from a risk to a defect and was right: the size cap
+/// this replaces evicted the OLDEST pane, and the oldest superseded pane is one
+/// that is still running, still on this session and still able to `report`. A
+/// cap therefore reproduced #1871 B2 at scale, under exactly the usage that
+/// produced B2.
+///
+/// The two assertions are a pair: a live superseded pane survives any number of
+/// later hand-backs (what a cap could not promise), and a DEAD one is forgotten
+/// (which is what keeps the list bounded at all). A rule that kept everything
+/// for ever would satisfy the first and not the second.
+#[test]
+fn a_live_superseded_pane_is_never_pruned_and_a_dead_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, w1) = first.handbacks.first().cloned().expect("the drive hands back");
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, w2) = second.handbacks.first().cloned().expect("a second red hands back");
+    assert_ne!(w1, w2);
+
+    // A tick with w1 alive changes nothing about it.
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_eq!(
+        reg.rd_owner(&group, &w1).map(|(pr, p)| (pr, p.current)),
+        Some((1758, false)),
+        "a LIVE superseded pane survives the tick's prune — a size cap is what would have \
+         dropped it, and dropping it is #1871 B2 again"
+    );
+
+    // Now it dies. The next tick forgets it, because a dead pane cannot reach
+    // the MCP seam at all and so has no traffic left for the drive to fail to own.
+    assert!(reg.mark_agent_dead_for_test(&w1), "the pane must exist to be marked");
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_eq!(
+        reg.rd_owner(&group, &w1),
+        None,
+        "a DEAD superseded pane is forgotten, which is what bounds the list"
+    );
+    assert_eq!(
+        reg.rd_owner(&group, &w2).map(|(pr, p)| (pr, p.current)),
+        Some((1758, true)),
+        "…and the current pane is untouched, so this is not a prune that forgets everything"
     );
 }
