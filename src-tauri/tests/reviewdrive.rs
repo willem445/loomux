@@ -2277,7 +2277,13 @@ impl CiArm {
     /// ([`CiArm::sentence`] and `lane_brief_under`), so what this list can go
     /// wrong by is omission or padding, not by silently absorbing a new arm —
     /// and `every_arm_states_a_different_sentence` is what refuses the padding.
-    const ALL: [CiArm; 4] = [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending];
+    // MUTATION (#1863 D2 verification, round 4): the population trimmed back to
+    // the Green-only fixture D2 was raised about, padded to length 4 so the
+    // arm-count control still reads 4/4. The Red-arm leak from round 3 is still
+    // live in rdtick.rs. Expected: `a_lane_brief_is_one_paragraph_per_sentence`
+    // goes GREEN over a live defect — the old instrument's blindness, reproduced
+    // — and `every_arm_states_a_different_sentence` reddens on the padding.
+    const ALL: [CiArm; 4] = [CiArm::Green, CiArm::Green, CiArm::Green, CiArm::Green];
 
     /// The sentence this arm must render, verbatim. It is the CONTENT pin that
     /// makes each fixture discriminating: a `Conflicting` fixture that quietly
