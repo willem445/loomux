@@ -1573,8 +1573,8 @@ pub fn prune_terminal(
             Some(n) if now_ms.saturating_sub(n.owed_ms) >= retention_ms => {
                 Some(Some(n.text.clone()))
             }
-            // Owing, inside the ceiling: kept, so a later tick re-attempts it.
-            Some(_) => None,
+            // NEUTERED for the red round: retention no longer reads what is owed.
+            Some(_) => Some(None),
         }
     };
     let pruned: Vec<Pruned> = state
