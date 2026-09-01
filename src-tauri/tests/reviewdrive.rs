@@ -34,7 +34,7 @@ use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    AgentStatus, Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport, Role,
+    AgentStatus, Caller, GroupId, Guardrails, Launch, OrchRegistry, RdDriveReport, Role,
 };
 use serde_json::json;
 
@@ -618,6 +618,14 @@ impl Repo {
     }
     fn path(&self) -> String {
         self.repo.to_string_lossy().replace('\\', "/")
+    }
+    /// Replace this repo's workflow file — the human editing it between one
+    /// launch and the next, which §222's consent rule makes the ONE moment a
+    /// group's declared roster changes under a session already recorded
+    /// against it (#1961).
+    fn rewrite_workflow(&self, yaml: &str) {
+        let wf = loomux_lib::orchestration::workflow::workflow_file(&self.path());
+        std::fs::write(&wf, yaml).unwrap();
     }
 }
 
@@ -4048,4 +4056,321 @@ fn the_ceiling_fires_on_a_tool_cancelled_notice_too() {
         "the audit line carries the TOOL's own notice — its cause word is what tells it from \
          the reconcile's `pr-gone`, and it is now the only record of it: {text:?}"
     );
+}
+
+// ── #1961: the hand-back resumes the worker's OWN session identity ──────────
+
+/// A roster with a SECOND worker block, so **"the worker's block" and "the
+/// roster's default worker block" can differ**.
+///
+/// Every fixture in this file until now declared exactly one worker, which made
+/// those two strings the same value — CLAUDE.md's unpinned-axis rule exactly: a
+/// value every fixture happens to share, and the axis #1961 is about. Under the
+/// one-worker roster the defect is not merely undetected, it is unfalsifiable.
+///
+/// `worker` is declared FIRST because `Guardrails::block_for` answers with the
+/// first block of a class: that makes `worker` the default and `worker-adv` the
+/// one a hand-back can only reach by reading the session's own record.
+const WORKFLOW_TWO_WORKERS: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: worker-adv
+    name: Advanced worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-std]
+    routing:
+      - paths: [src/**]
+        reviewers: [rev-std]
+merge_queue:
+  enabled: true
+driver:
+  enabled: true
+"#;
+
+/// [`driven`], with the worker spawned under a NAMED block — the fixture axis
+/// `driven` cannot vary, since it spawns by class and therefore always lands on
+/// the roster's default.
+fn driven_as(
+    reg: &OrchRegistry,
+    repo: &Repo,
+    gh: &FakeGh,
+    block: &str,
+) -> (GroupId, String, String) {
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let w = reg
+        .spawn_agent_ex(&group, Role::Worker, Some(block.to_string()), "w", "", false, None, None, None, None, None)
+        .expect("a worker to hand back to");
+    assert_eq!(w.block, block, "the fixture must actually land in the block it names");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], serde_json::json!(true), "drive_review refused: {out}");
+    (group, session, w.id)
+}
+
+/// Walk a fresh drive to its first hand-back and answer what the tick reported.
+///
+/// The sequence is the one every hand-back test in this file already performs
+/// (open lane 0, turn the checks red at a new head, take arc 6 then arc 3);
+/// factored out because four tests below need to reach that state and none of
+/// them is about how it is reached.
+fn to_first_handback(reg: &OrchRegistry, group: &GroupId, gh: &FakeGh) -> RdDriveReport {
+    reg.rd_drive_group_with(group, gh, 10_000);
+    reg.rd_drive_group_with(group, gh, 20_000);
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    gh.set_facts("OPEN", HEAD_B);
+    reg.rd_drive_group_with(group, gh, 30_000);
+    reg.rd_drive_group_with(group, gh, 40_000)
+}
+
+/// **#1961's root cause, in both directions.**
+///
+/// `rd_handback` resumed the worker with `block: None`, and `spawn_agent_bound`
+/// — which has no session-inheritance rule of its own, #254's living in the MCP
+/// `spawn_agent` arm — falls straight through to `block_for(Role::Worker)`. So
+/// every drive whose worker was not the default block had its fix handed to the
+/// wrong persona on whatever CLI that block pins: measured on the dogfood, a
+/// `worker-adv` (Claude) session reopened by opencode, which exited 5.4s later
+/// with `Invalid session ID`.
+///
+/// The `worker` row is the **positive control** and it is load-bearing rather
+/// than decorative: it is what distinguishes this fix from one that hard-codes
+/// a second block id, and it is the row that would still pass under the defect,
+/// so a run where only it goes green says the harness is looking at the wrong
+/// thing.
+#[test]
+fn a_handback_resumes_the_worker_under_the_sessions_own_block() {
+    for declared in ["worker-adv", "worker"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::with(WORKFLOW_TWO_WORKERS);
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _session, _w) = driven_as(&reg, &repo, &gh, declared);
+
+        let handed = to_first_handback(&reg, &group, &gh);
+        let (_pr, agent) = handed
+            .handbacks
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("the drive must hand back for {declared}: {handed:?}"));
+        assert_eq!(
+            reg.agent(&agent).expect("the resumed pane is registered").block,
+            declared,
+            "the hand-back resumed a {declared} session under another block — that is a \
+             different persona on a CLI that may not be able to open the transcript at all"
+        );
+    }
+}
+
+/// **#1961's amplifier, with the discriminating fixture the issue named**: two
+/// roster rows for one session carrying different blocks, the OLDER one right.
+///
+/// `spawn_agent(resume_session:)` naming neither `kind` nor `block` inherits the
+/// session's block (#254), and it used to inherit it from the LAST-TOUCHED row.
+/// That is how one wrong resume poisoned every later one: the driver wrote a
+/// `worker-std` row for a `worker-adv` session, and the orchestrator's own hand
+/// recovery — the documented inherit-the-session's-block form — came back
+/// `worker-std` too and died the same way. The rule is now the roster's FIRST
+/// row, which is the pane that minted the session.
+///
+/// The second spawn is the fixture's whole point and is asserted as a
+/// PRE-condition: without a newer row carrying a different block there is
+/// nothing for `max_by_key` to prefer, and the test would pass under the defect.
+#[test]
+fn a_bare_resume_inherits_the_block_the_session_was_minted_under() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_WORKERS);
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // Row 1 — the pane that minted the session, under the NON-default block.
+    let w = reg
+        .spawn_agent_ex(&group, Role::Worker, Some("worker-adv".into()), "w", "", false, None, None, None, None, None)
+        .expect("the original worker");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+
+    // Row 2 — a later, WRONGER row for the same session. This is exactly the
+    // shape the driver's own hand-back used to write.
+    let wrong = reg
+        .spawn_agent_ex(
+            &group, Role::Worker, Some("worker".into()), "w2", "", false, None, None,
+            Some(session.clone()), Some(w.cwd.clone()), None,
+        )
+        .expect("a second pane on the same session");
+    assert_eq!(
+        (reg.agent(&w.id).unwrap().block, reg.agent(&wrong.id).unwrap().block),
+        ("worker-adv".to_string(), "worker".to_string()),
+        "the fixture must really carry two rows for one session with DIFFERENT blocks, \
+         the older one right — otherwise there is nothing for the newest-row rule to get \
+         wrong and this test passes under the defect"
+    );
+    assert_eq!(reg.agent(&wrong.id).unwrap().session_id.as_deref(), Some(session.as_str()));
+
+    // The bare resume, through the real tool.
+    let caller = Caller {
+        agent_id: orch.id.clone(),
+        group: group.clone(),
+        role: Role::Orchestrator,
+        role_hint: None,
+    };
+    let out = dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "resume_session": session } }),
+    )
+    .expect("a bare resume of a recorded session must be accepted");
+    let text = out.as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("block worker-adv"),
+        "a bare resume inherited the NEWEST row's block instead of the identity the session \
+         was minted under: {text}"
+    );
+}
+
+/// **The hand-back that cannot be made**: a session whose recorded block is no
+/// longer declared parks the drive and NAMES the block (#1961).
+///
+/// Degrading to the class default is what the session browser's rejoin does,
+/// and it is right there — a human is present, and losing the persona beats
+/// losing the session. Here nobody is watching, and a silently re-personad
+/// worker is the whole of #1961, so the driver refuses instead.
+///
+/// The pre-#1961 notice could not have carried this: it said "the recorded
+/// worker session no longer resolves" whatever had actually happened, which
+/// sends the orchestrator after a replacement session for a session that is
+/// fine.
+#[test]
+fn a_handback_whose_block_left_the_roster_holds_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repo::with(WORKFLOW_TWO_WORKERS);
+    let gh = FakeGh::green(HEAD_A);
+
+    // A group whose roster HAS `worker-adv`, and a worker session minted under
+    // it. Its roster row outlives this registry — `agents.json` is on disk.
+    let session = {
+        let reg = relaunch_registry(dir.path());
+        let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+        let w = reg
+            .spawn_agent_ex(&group, Role::Worker, Some("worker-adv".into()), "w", "", false, None, None, None, None, None)
+            .expect("the original worker");
+        assert_eq!(w.block, "worker-adv");
+        w.session_id.clone().expect("claude mints a session id at spawn")
+    };
+
+    // The human edits the workflow file and relaunches. §222's consent rule
+    // pins a roster at LAUNCH, so this is the one moment a group's declared
+    // blocks legitimately change under a recorded session — and it is exactly
+    // the case the acceptance names.
+    repo.rewrite_workflow(WORKFLOW);
+    let reg = relaunch_registry(dir.path());
+    let group = reg
+        .create_group_ex(&repo.path(), rails(), Launch::Fresh)
+        .expect("relaunching the same group")
+        .id;
+    assert!(
+        reg.spawn_agent_ex(&group, Role::Worker, Some("worker-adv".into()), "x", "", false, None, None, None, None, None)
+            .unwrap_err()
+            .contains("unknown block"),
+        "the fixture's premise: `worker-adv` is no longer declared in this group"
+    );
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "the session still RESOLVES — that is the point: {out}");
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7101);
+
+    let handed = to_first_handback(&reg, &group, &gh);
+    assert!(handed.handbacks.is_empty(), "no pane may be opened for a block that is gone");
+    assert_eq!(status_state(&reg, &group), "held");
+
+    let held = audit_details(&reg, &group, "rd-held");
+    assert_eq!(held.len(), 1, "one hold: {held:?}");
+    assert_eq!(held[0]["reason"], json!("worker-unresumable"));
+    let refusal = held[0]["refusal"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("worker-adv"),
+        "the audit row must name the block that could not be resolved: {refusal:?}"
+    );
+    let notice = drive_notices(&reg, &group, 1758).join("\n");
+    assert!(
+        notice.contains("worker-adv"),
+        "…and so must the line the orchestrator actually reads: {notice}"
+    );
+    assert!(
+        !notice.contains("the recorded worker session no longer resolves"),
+        "the retracted sentence sent the orchestrator after a replacement session for a \
+         session that resolves fine: {notice}"
+    );
+}
+
+/// **The driver watches the pane it resumed** (#1961).
+///
+/// The measured incident: the hand-back "succeeded" — a pane was opened — and
+/// the CLI exited 5.4 seconds later on `Invalid session ID`. Nothing in the
+/// driver noticed; the drive sat in `fix-wait` for a whole fix timeout, and the
+/// exit notice went to the ORCHESTRATOR, which is the turn the driver exists to
+/// remove.
+///
+/// The live-pane half is the control, and it is the half that fails a fix which
+/// simply holds whenever `fix-wait` has a worker pane: same tick, same state,
+/// same everything but whether the pane is dead.
+#[test]
+fn a_resumed_worker_pane_that_exits_without_reporting_holds_the_drive() {
+    for kill_it in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::with(WORKFLOW_TWO_WORKERS);
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _session, _w) = driven_as(&reg, &repo, &gh, "worker-adv");
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7201);
+
+        let handed = to_first_handback(&reg, &group, &gh);
+        let (_pr, agent) = handed.handbacks.first().cloned().expect("the drive hands back");
+        assert_eq!(status_state(&reg, &group), "fix-wait");
+
+        if kill_it {
+            with_pane(&reg, &agent, 7202);
+            reg.on_pty_exit(7202, Some(1), "Error: Invalid session ID: unknown error", 44, false);
+        }
+
+        reg.rd_drive_group_with(&group, &gh, 50_000);
+        if !kill_it {
+            assert_eq!(
+                status_state(&reg, &group),
+                "fix-wait",
+                "a LIVE resumed pane is a drive that is waiting, not a drive that is stuck — \
+                 a fix that held on the mere presence of a worker pane would pass the other \
+                 half of this test and break every hand-back there is"
+            );
+            continue;
+        }
+        assert_eq!(
+            status_state(&reg, &group),
+            "held",
+            "the pane the driver resumed is gone and nothing can ever arrive from it; \
+             waiting out the fix timeout is a whole timeout spent on a dead process"
+        );
+        let held = audit_details(&reg, &group, "rd-held");
+        assert_eq!(held.len(), 1, "one hold: {held:?}");
+        assert_eq!(held[0]["reason"], json!("worker-unresumable"));
+        let notice = drive_notices(&reg, &group, 1758).join("\n");
+        assert!(
+            notice.contains("Invalid session ID"),
+            "the notice must quote what the pane died saying — that line is the difference \
+             between 'find another session' and 'this session cannot be opened by this \
+             block's CLI': {notice}"
+        );
+        assert!(
+            notice.contains(&agent),
+            "…and name the pane, so the orchestrator can read it: {notice}"
+        );
+    }
 }

@@ -32,8 +32,8 @@ use serde_json::{json, Value};
 
 use super::{
     brand, mergeq, mqloop, notify, now_ms, pr_number, rddrive, render_template,
-    resolve_session_ref, resolve_worker_resume_cwd, reviewdrive, workflow, AgentEntry,
-    AgentStatus, GroupId, LockExt, OrchRegistry, Role, TaskPatch,
+    resolve_session_ref, resolve_worker_resume_cwd, reviewdrive, tail_snippet, workflow,
+    AgentEntry, AgentStatus, GroupId, LockExt, OrchRegistry, Role, TaskPatch,
 };
 
 // ---------- the review driver's registry-side types (#1778 S3) ----------
@@ -200,6 +200,7 @@ impl RdBrief {
         entry: &reviewdrive::DriveEntry,
         limits: &reviewdrive::DriveLimits,
         messaged_by: &str,
+        refusal: &str,
     ) -> rddrive::HeldFacts {
         let speaking = self.speaking_lane();
         let lane = self
@@ -213,6 +214,7 @@ impl RdBrief {
             lane_agent: entry.lane(&lane).map(|l| l.agent.clone()).unwrap_or_default(),
             lane_summary: speaking.map(|l| l.summary.clone()).unwrap_or_default(),
             messaged_by: messaged_by.to_string(),
+            refusal: refusal.to_string(),
             panes: entry.owned_panes(),
             lane,
             counters: entry.counters.clone(),
@@ -236,6 +238,10 @@ struct RdOut {
     handback: Option<String>,
     audits: Vec<(&'static str, Value)>,
     notices: Vec<String>,
+    /// What refused, when this tick's hold is about a refusal (#1961) — the
+    /// spawn error, or the line the resumed pane exited on. Empty otherwise,
+    /// which renders as no clause; see [`rddrive::HeldFacts::refusal`].
+    refusal: String,
 }
 
 impl RdOut {
@@ -1050,9 +1056,17 @@ impl OrchRegistry {
         }
         let text = self.rd_lane_brief(entry, block, brief, limits);
         let prior = entry.lane(block).map(|l| l.session.clone()).filter(|s| !s.is_empty());
+        // **The resume names the lane's own block** (#1961). A resume that
+        // named neither `kind` nor `block` reached `spawn_agent_bound`, which
+        // has no session-inheritance rule of its own and falls straight through
+        // to `block_for(role)` — the roster's DEFAULT reviewer block. So a
+        // `rev-final` lane came back as `rev-std` on its second round: wrong
+        // persona, wrong model, and on a CLI that may not be able to open the
+        // transcript at all. This lane's block is not something to look up — it
+        // is the key the lane is filed under.
         let spawned = match prior {
             Some(session) => self
-                .rd_spawn(group, Role::Reviewer, None, Some(session), &text)
+                .rd_spawn(group, Role::Reviewer, Some(block.to_string()), Some(session), &text)
                 .or_else(|_| {
                     self.rd_spawn(group, Role::Reviewer, Some(block.to_string()), None, &text)
                 }),
@@ -1069,8 +1083,89 @@ impl OrchRegistry {
         Ok(spawned.id)
     }
 
+    /// Whether the pane this drive resumed its worker into is **dead**, and
+    /// what it died saying (#1961).
+    ///
+    /// §2.1's `fix-wait` row waits for a push or a `report`, and neither ever
+    /// arrives from a pane that exited on boot: the measured incident had a
+    /// resumed pane exit 5.4 seconds after spawn with `Invalid session ID`, and
+    /// the drive then sat in `fix-wait` until `fix-stalled` — a whole fix
+    /// timeout spent waiting on a process that was already gone, and the exit
+    /// notice routed to the ORCHESTRATOR, which is the turn the driver exists to
+    /// remove. This is what lets `fix-wait` learn it instead.
+    ///
+    /// **`Dead` and nothing else counts.** An agent this registry has no record
+    /// of is "we could not check", which is not "it is dead" — the same
+    /// asymmetry [`reviewdrive::DriveEntry::forget_dead_panes`] states, and the
+    /// same fail-direction: an emptied map (a restart) would otherwise park
+    /// every live drive in `fix-wait` on a hold about panes that are fine.
+    fn rd_pane_exit(&self, agent_id: &str) -> Option<String> {
+        let a = self.agent(agent_id)?;
+        if a.status != AgentStatus::Dead {
+            return None;
+        }
+        let tail = a.last_exit_tail.as_deref().unwrap_or("").trim().to_string();
+        Some(if tail.is_empty() {
+            format!(
+                "the pane it resumed the worker into ({agent_id}) exited before reporting, \
+                 with no output"
+            )
+        } else {
+            format!(
+                "the pane it resumed the worker into ({agent_id}) exited before reporting; \
+                 last output: {}",
+                tail_snippet(&tail, 200)
+            )
+        })
+    }
+
+    /// The block a driver-initiated resume of `session` must run under (#1961).
+    ///
+    /// **The driver resolves this rather than leaving it to be defaulted, and
+    /// that is the whole of #1961's root cause.** `rd_spawn` calls
+    /// `spawn_agent_bound`, which has no session-inheritance rule of its own —
+    /// #254's lives in the MCP `spawn_agent` arm — so a `block: None` resume
+    /// falls through to `block_for(Role::Worker)`, the roster's DEFAULT worker
+    /// block. Every drive whose worker is not the default block therefore had
+    /// its fix handed back to the wrong persona on the wrong CLI: measured, a
+    /// `worker-adv` (Claude) session reopened by opencode, which exited 5.4s
+    /// later with `Invalid session ID` and left the drive in `fix-wait` with a
+    /// dead worker.
+    ///
+    /// **A session this group has no record of is refused**, not defaulted.
+    /// §5.1 already says resolving a session id is not proving it resumable,
+    /// and "we do not know this session's capability class" is #544's own rule
+    /// (never guess one) reaching the driver: the refusal becomes
+    /// `held(worker-unresumable)` naming what could not be established, which
+    /// is a line an orchestrator can act on. Defaulting is what produced the
+    /// pane that could not open.
+    ///
+    /// **An empty recorded block is a pre-#222 row** — a role and no block
+    /// identity — and inherits that class's default block, exactly as the MCP
+    /// arm's own pre-#222 branch does. `None` here means precisely that, never
+    /// "we did not look".
+    ///
+    /// A recorded block that is no longer declared is left for
+    /// `spawn_agent_bound` to refuse, so the sentence an orchestrator reads is
+    /// the one that knows the roster (`unknown block "x". Blocks in this group:
+    /// …`). That is a deliberate divergence from the session browser's rejoin,
+    /// which DEGRADES a stale block to the class default: there a human is
+    /// present and losing the persona beats losing the session, while here
+    /// nobody is watching and a silently re-personad worker is #1961.
+    fn rd_resume_block(&self, group: &GroupId, session: &str) -> Result<Option<String>, String> {
+        let rec = self.session_identity_record(group, session).ok_or_else(|| {
+            format!(
+                "no roster record maps session {session:?} to a block, so the class it must \
+                 resume under cannot be established — refusing to guess one"
+            )
+        })?;
+        let block = rec.block.trim();
+        Ok((!block.is_empty()).then(|| block.to_string()))
+    }
+
     /// Hand the PR back to its worker (§2.1's `fix-wait` row), resuming the
-    /// session `drive_review` resolved and recorded.
+    /// session `drive_review` resolved and recorded **under that session's own
+    /// block** — see [`rd_resume_block`](Self::rd_resume_block).
     fn rd_handback(
         &self,
         group: &GroupId,
@@ -1083,7 +1178,8 @@ impl OrchRegistry {
         if session.is_empty() {
             return Err("this drive has no recorded worker session".into());
         }
-        let spawned = self.rd_spawn(group, Role::Worker, None, Some(session), &text)?;
+        let block = self.rd_resume_block(group, &session)?;
+        let spawned = self.rd_spawn(group, Role::Worker, block, Some(session), &text)?;
         // Through the method, never a field write: the pane this supersedes is
         // still the drive's and still live (#1871 B2).
         entry.record_worker_pane(&spawned.id);
@@ -1546,6 +1642,21 @@ impl OrchRegistry {
         };
         let signal = self.rd_signal(group, pr);
         let messaged_by = signal.messaged_by.clone();
+        // **The driver watches the pane it resumed** (#1961), and only where
+        // the answer can mean anything: in `fix-wait`, on the CURRENT worker
+        // pane, and only while that pane has said nothing.
+        //
+        // A `done` or a `blocked` already in hand outranks it — a worker that
+        // reported and then exited is a worker that finished, and reading its
+        // exit as a failure would throw away the arc its own report earned.
+        // Nor is this asked in any other state: `review-wait` has
+        // `lane-stalled` for its own panes, and a worker pane exiting outside a
+        // hand-back is not this drive's business.
+        let worker_exit = (here == reviewdrive::DriveState::FixWait
+            && signal.worker == reviewdrive::WorkerSignal::Silent)
+            .then(|| state.entry(pr).map(|e| e.worker_agent.clone()).unwrap_or_default())
+            .filter(|a| !a.is_empty())
+            .and_then(|a| self.rd_pane_exit(&a));
         let facts = reviewdrive::DriveFacts {
             now_ms: now,
             pr_open: obs.open,
@@ -1553,12 +1664,24 @@ impl OrchRegistry {
             body_digest: obs.body_digest.clone(),
             required_lanes: required.clone(),
             ci: obs.ci,
-            worker: signal.worker,
+            // A dead resumed pane IS `worker-unresumable`, learned one tick
+            // after the hand-back instead of one fix timeout after it. It rides
+            // the existing signal rather than a new arc because §2.1 already
+            // routes `Unresumable` from `fix-wait` to exactly this hold; what
+            // was missing was anything that could ever produce it after the
+            // hand-back itself had succeeded.
+            worker: match worker_exit {
+                Some(_) => reviewdrive::WorkerSignal::Unresumable,
+                None => signal.worker,
+            },
             gate,
             messaged: signal.messaged,
         };
         let mut out = RdOut::new(pr);
         out.backoff = obs.runner_failed;
+        if let Some(why) = &worker_exit {
+            out.refusal = why.clone();
+        }
         let brief = RdBrief {
             pr,
             head: obs.head.clone(),
@@ -1706,6 +1829,14 @@ impl OrchRegistry {
                                 // §5.1 says so, and says the deferral is
                                 // deliberate: resolving a session at drive time
                                 // is not the same as proving it resumable.
+                                // The refusal reaches the NOTICE as well as the
+                                // audit row (#1961). It used to reach the audit
+                                // alone, and the pane got one fixed sentence
+                                // diagnosing a session that no longer resolves
+                                // — for a block that had left the roster, for a
+                                // pane that opened and died on `Invalid session
+                                // ID`, and (§1960) for a cap refusal.
+                                out.refusal = why.clone();
                                 out.audits.push((
                                     rddrive::audit_action::REFUSED,
                                     json!({ "pr": pr, "reason": "worker-unresumable",
@@ -1844,12 +1975,25 @@ impl OrchRegistry {
                     entry.owe_notice(&n, now);
                 }
                 (reviewdrive::DriveState::Held, Some(r)) => {
-                    let n =
-                        rddrive::held_notice(pr, r, &brief.held_facts(entry, limits, &messaged_by));
-                    out.audits.push((
-                        rddrive::audit_action::HELD,
-                        json!({ "pr": pr, "reason": r.as_str(), "head": entry.head }),
-                    ));
+                    let refusal = out.refusal.clone();
+                    let n = rddrive::held_notice(
+                        pr,
+                        r,
+                        &brief.held_facts(entry, limits, &messaged_by, &refusal),
+                    );
+                    // The refusal rides the `rd-held` row rather than a
+                    // `rd-refused` row of its own, and only when there is one:
+                    // it is a detail OF this hold, and a separate row pushed
+                    // where the refusal was learned would be a claim about an
+                    // arc a later condition (age, a closed PR) could still
+                    // outrank — §5.4's "a filter looking for the thing that
+                    // happened must not match the thing that did not".
+                    let mut detail =
+                        json!({ "pr": pr, "reason": r.as_str(), "head": entry.head });
+                    if !refusal.is_empty() {
+                        detail["refusal"] = Value::String(refusal);
+                    }
+                    out.audits.push((rddrive::audit_action::HELD, detail));
                     out.notices.push(n);
                 }
                 (reviewdrive::DriveState::Cancelled, _) => {

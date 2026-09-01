@@ -243,7 +243,14 @@ pub enum HeldReason {
     GateUnreadable,
     /// The worker reported `blocked`.
     WorkerBlocked,
-    /// The recorded worker session no longer resolves.
+    /// **The fix could not be handed back to its worker** — the class, not one
+    /// cause. A session that no longer resolves is the original one; a block
+    /// that has left the roster and a pane that opened and exited before saying
+    /// anything are the two #1961 added, and each names itself in
+    /// [`crate::rddrive::HeldFacts::refusal`] rather than being reported as the
+    /// first. Narrowing this doc to "the session no longer resolves" is how the
+    /// notice came to send an orchestrator after a replacement session for a
+    /// session that was fine.
     WorkerUnresumable,
     /// A driven delegate called `message_orchestrator` (§7 — that call is never
     /// intercepted; the delegate's own line arrives by its own path and this
@@ -1654,7 +1661,8 @@ pub enum WorkerSignal {
     Done,
     /// `report(blocked)`.
     Blocked,
-    /// The recorded worker session no longer resolves.
+    /// The fix could not be handed back to this drive's worker — see
+    /// [`HeldReason::WorkerUnresumable`] for the causes this covers.
     ///
     /// **This is not a drive-time check, and the note is honest about why.**
     /// §5.1: a full, well-shaped session id this group never recorded takes
@@ -1662,6 +1670,12 @@ pub enum WorkerSignal {
     /// *accepted* by `drive_review`, so its unresumability surfaces here, at
     /// the first hand-back, possibly hours on. Resolving is not the same as
     /// proving resumable, and v1 does not prove it.
+    ///
+    /// **It is also produced AFTER a hand-back that succeeded** (#1961): the
+    /// registry raises it when the pane the drive resumed exits in `fix-wait`
+    /// with nothing reported, which is a resume that "worked" and then died on
+    /// `Invalid session ID`. Before that the drive waited a full fix timeout on
+    /// a process that was already gone.
     Unresumable,
 }
 
