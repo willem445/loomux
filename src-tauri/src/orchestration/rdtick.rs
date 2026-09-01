@@ -2108,7 +2108,7 @@ impl OrchRegistry {
                     .filter_map(|e| e.owed_notice().map(|n| (e.pr, n.text.clone())))
                     .collect();
                 for (dropped_pr, text) in superseded {
-                    dropped_notices.push((dropped_pr, text));
+                    let _ = (dropped_pr, text);
                 }
                 state.entries.retain(|e| e.pr != pr);
                 // **The clock is the caller's, and that is what makes the age
