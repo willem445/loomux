@@ -807,6 +807,51 @@ export function isDriverOn(w: Workflow): boolean {
   return w.driver?.enabled === true;
 }
 
+/** The driver form's REMOVE affordance (#1876 P1) — the escape hatch the narrowed
+ *  OFF toggle no longer provides. A `driver:` block makes the file unloadable by an
+ *  orrerix build old enough not to know the key: `RawWorkflow` is
+ *  `deny_unknown_fields`, so the unknown key fails the parse of the *whole* file
+ *  rather than being ignored or warned about (verified against v1.3.0-beta2,
+ *  whose `RawWorkflow` carries the attribute and no `driver:` field). The toggle
+ *  deliberately preserves a configured block (#1869 review round 3), so removal
+ *  is a separate, explicit gesture that discards the block whole — switch,
+ *  counters, unknown keys and comments — behind its own confirmation in the view. */
+export function removeDriverBlock(w: Workflow): void {
+  delete w.driver; // the whole block, by the user's explicit instruction (#1876 P1)
+}
+
+/** The `driver:` block's `enabled:` line's own trailing comment, when the file
+ *  writes one — the condition for the driver form's flip note (#1876 P2). The
+ *  splice rewrites that line's VALUE and leaves its comment exactly as written,
+ *  so a comment can end up sitting beside a switch it no longer describes; the
+ *  form shows the note while the comment is there, quoting it, instead of
+ *  guessing whether the prose disagrees. Same scanner as
+ *  `driverSectionHasComments` (the preserving splitter, #233) so a `#` inside a
+ *  block scalar's body is content, never a comment — and a body line that looks
+ *  like an `enabled:` field is not one, because it sits deeper than the block's
+ *  fields. Returns null when there is no driver block, no `enabled:` line in it,
+ *  or no comment on that line — and for a shape the scan refuses to read, since
+ *  the note is advisory and must not invent one. */
+export function driverEnabledLineComment(text: string): string | null {
+  const doc = splitDocument(text); // P2 scan
+  if (!doc) return null;
+  const entry = doc.entries.find((e) => e.key === "driver");
+  if (!entry) return null;
+  const opaque = opaqueScalarIndices(entry.content);
+  const firstField = entry.content.find((l, i) => !opaque.has(i) && isSignificantLine(l));
+  if (firstField === undefined) return null;
+  const indent = indentOf(firstField);
+  for (let i = 0; i < entry.content.length; i++) {
+    const line = entry.content[i]!;
+    if (opaque.has(i) || !isSignificantLine(line) || indentOf(line) !== indent) continue;
+    const split = splitKey(stripComment(line).trim());
+    if (!split || split.key !== "enabled") continue;
+    const comment = line.slice(stripComment(line).length).trim();
+    return comment || null;
+  }
+  return null;
+}
+
 /** One named lock resource (#858) — how many agents may hold it at once and for
  *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
  *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */

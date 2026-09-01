@@ -30,8 +30,10 @@ import {
   DRIVER_DEFAULTS,
   isDriverOn,
   driverSectionHasComments,
+  driverEnabledLineComment,
   serializeWorkflowPreserving,
   setDriverEnabled,
+  removeDriverBlock,
   RESOURCE_SLOTS_MIN,
   RESOURCE_SLOTS_MAX,
   RESOURCE_MAX_HOLD_MINUTES_MIN,
@@ -662,6 +664,62 @@ test("the enabled splice's bail path really does drop interior comments — the 
     parseWorkflow(out).workflow.driver,
     { enabled: true, max_review_rounds: 2 },
     "the data round-trips even where the prose does not"
+  );
+});
+
+test("removeDriverBlock deletes a configured block whole — the escape hatch the toggle no longer provides (#1876 P1)", () => {
+  // P1: the narrowed toggle preserves a configured block, so removal is its own
+  // gesture — and the escape hatch for the forward-compat break: a `driver:`
+  // block makes the file unloadable on an orrerix build old enough to refuse the
+  // key (`RawWorkflow` is `deny_unknown_fields`, verified against v1.3.0-beta2).
+  // The discard is whole and explicit: switch, counters, unknown keys, comments.
+  const w = parseWorkflow(
+    "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  # a comment\n  enabled: true\n  max_review_rounds: 2\n"
+  ).workflow;
+  removeDriverBlock(w);
+  assert.equal(w.driver, undefined, "removal deletes the block whole — counters included");
+  const out = serializeWorkflow(w);
+  assert.doesNotMatch(out, /^driver:/m, "the emitted file carries no driver section");
+  assert.equal(
+    parseWorkflow(out).workflow.driver,
+    undefined,
+    "…and the write round-trips: the file is the one an old build can load"
+  );
+  removeDriverBlock(w);
+  assert.equal(w.driver, undefined, "removing an absent block is a no-op, not a crash");
+});
+
+test("driverEnabledLineComment reads the enabled line's own comment through the splitter (#1876 P2)", () => {
+  // The flip note's condition: the splice rewrites the enabled line's VALUE and
+  // leaves its trailing comment exactly as written, so the note shows while that
+  // comment is there, quoting it. The scanner is the preserving splitter (#233),
+  // not a regex — a `#` inside a block scalar's body is content, and a body line
+  // shaped like an `enabled:` field is not a field (it sits deeper than the
+  // block's own).
+  const roster = "version: 1\nblocks:\n  - id: b\n    kind: worker\n";
+  assert.equal(
+    driverEnabledLineComment(`${roster}driver:\n  enabled: false  # keep off until Q3\n`),
+    "# keep off until Q3",
+    "the annotated line's comment is the note's condition and its text"
+  );
+  assert.equal(driverEnabledLineComment(`${roster}driver:\n  enabled: true\n`), null);
+  assert.equal(
+    driverEnabledLineComment(`${roster}driver:\n  max_review_rounds: 2\n`),
+    null,
+    "no enabled line — nothing to annotate"
+  );
+  assert.equal(driverEnabledLineComment("version: 1\n"), null, "no driver block");
+  assert.equal(
+    driverEnabledLineComment(
+      `${roster}driver:\n  mystery: |\n    enabled: false # body, not a field\n  enabled: true # real\n`
+    ),
+    "# real",
+    "a block scalar's body is opaque: its `enabled:`-shaped line is not the field"
+  );
+  assert.equal(
+    driverEnabledLineComment(" driver:\n  enabled: true # x\n"),
+    null,
+    "an unreadable shape invents no note — the note is advisory and may not lie"
   );
 });
 

@@ -1681,7 +1681,12 @@ nothing but the switch is removed whole — absent and off are the same thing to
 orrerix, and deleting is tidier — while one carrying counters or comments has
 `enabled: false` written into it and loses nothing. A block that declares
 counters but no `enabled:` line shows
-unchecked, because that is what the engine reads as off. The driver's counters
+unchecked, because that is what the engine reads as off. When that line
+carries its own trailing comment, the form says so beside the toggle: flipping
+the switch rewrites the value on the line and leaves the comment exactly as
+written — orrerix never edits your prose, and does not guess whether a
+comment still agrees with the switch, so the note is the cue to read the line
+after a flip. The driver's counters
 and timeouts are number fields clamped to their own declared ranges, so the
 form cannot write an out-of-range value at all; what the engine then does with
 a *hand-written* value outside those ranges differs by field, and the next
@@ -1698,13 +1703,31 @@ editor for now.
 
 Two things those forms will not let you do, because orrerix's engine would
 refuse the file: write a number outside a **refused** field's range, and pair
-a `role_hint` with a kind that hint does not apply to. The refused bounds —
-slots 1–64, max hold 1–480 minutes, at most 32 resources, a batch of at least
-1, and the driver's three counters at 1–3 rounds/attempts and 0–1 rebases —
-are enforced by the inputs themselves, which cannot emit a value outside
-them. The **clamped** fields (`checks_timeout_minutes`, and the driver's three
-timeouts at 5–240 minutes) are pulled into range the same way, but the engine
-would have coerced a hand-written value there rather than refusing the file. A
+a `role_hint` with a kind that hint does not apply to. Which bounds the engine
+refuses and which it clamps is a per-family fact, stated here family by
+family — read each row as its own policy, never inferred from a neighbour:
+
+- **Merge gate** (`gate:`): `threshold` is 1 or more, refused below that — and
+  a `threshold` gate is also refused above its own reviewer count, a
+  validation rule rather than a range. `max_diff_lines` is 1 or more, refused
+  at 0, with the fix named in the error: omit the key to declare no limit.
+  Neither has a ceiling, and neither has a form field yet, so a hand-written
+  out-of-range value reaches you as a finding.
+- **Merge queue** (`merge_queue:`): `max_batch` is 1 or more, refused below,
+  no ceiling; `checks_timeout_minutes` is 5–240 minutes, **clamped**.
+- **Review driver** (`driver:`): the three counters are 1–3 rounds/attempts
+  and 0–1 rebases, refused outside; the three timeouts are 5–240 minutes,
+  **clamped**.
+- **Lock resources** (`resources:`): `slots` is 1–64 and `max_hold_minutes`
+  is 1–480 minutes, both refused outside; at most 32 resources may be
+  declared. These are the fields the inputs themselves enforce — they cannot
+  emit an out-of-range value at all.
+- **Board WIP caps** (`board.wip:`): each status cap is 1 or more, refused
+  below — a cap of 0 is a stop, not a limit — with no ceiling, and an omitted
+  status has no cap. The board has no form yet either, so these reach you as
+  findings.
+
+A
 value a *hand-edited* file already carries is shown as a finding instead, with
 the distinction that matters spelled out — a bound orrerix **refuses** reads
 as an error, one it **clamps** as a warning.
@@ -1715,9 +1738,23 @@ you tick on and then off again leaves the file exactly as it was — including
 its comments — with one exception: a `driver:` block that carried no
 `enabled:` line at all. Turning a driver on has to add that line, so the two
 clicks leave such a block declaring `enabled: false` where the file had none.
-Unticking never deletes configuration either: a block carrying
-counters or comments is kept, with the switch written as off, and its comments
-are kept byte for byte except the switch's own line.
+When that line carries its own trailing comment, a flip rewrites the value and
+leaves the comment byte for byte — which means a comment can outlive the
+switch position it describes, and the pane says so beside the toggle rather
+than editing your prose. Unticking never deletes configuration either: a block
+carrying counters or comments is kept, with the switch written as off, and its
+comments are kept byte for byte except the switch's own line.
+
+**Removing a section is a different gesture from the toggle, and the driver
+block is the one that has it.** A red button at the foot of the driver form
+deletes the `driver:` block whole — the switch, every counter, and the block's
+comments — behind its own confirmation that names what is discarded. This is
+deliberate destruction, not part of the toggle's round-trip promise, and it
+exists because a `driver:` block makes the file unloadable on any orrerix
+build old enough to refuse the key (`deny_unknown_fields` on the workflow
+root, verified against v1.3.0-beta2): removing the block is how the file loads
+again. The toggle will not do this to you, and the button does nothing until
+you confirm it.
 
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different
