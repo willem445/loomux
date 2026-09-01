@@ -667,6 +667,42 @@ own draft PR**, and CI's log is the failure line you quote.
 4. Quote the run link and the failure lines in the real PR body; **close the
    scratch PR and delete its branch** once cited.
 
+**Cut the citable wave ONCE, at the settled head.** Not per review round. The
+wave is a receipt for the reviewer, and a receipt is worth cutting only when
+the thing it describes has stopped moving: every review fix that changes
+reachable code retires it (the re-cut rule below), so a wave cut early is a
+wave cut twice. Measured (#1877): a 13-row wave was re-cut in full after a
+later round moved the test bank 37 -> 38 and restructured a file four of the
+rounds had mutated -- one of them mutating the very function a later round had
+split into wrapper + `_with`.
+
+What you still do WHILE developing is **one** cheap scratch round, for your own
+signal that the test discriminates. That signal is yours, not the reviewer's:
+with local `cargo` banned you cannot otherwise know a new test fails without
+the change before you build on it, and finding out at the end is finding out
+too late to fix it cheaply. Do not cite that round -- it will be stale, and
+citing it is how a stale row enters the body in the first place.
+
+**Before citing ANY wave, run these three checks mechanically.** Each one has
+produced a false evidence table in this repo, and each was caught by looking
+rather than by routine -- which is exactly what makes it a checklist item:
+
+1. **Re-derive the bank at the current head, from the runs' own logs.** Never
+   adjust a previous total by arithmetic: correcting a stale number by hand is
+   how the next stale number is born, and it is the defect class you are
+   checking for.
+2. **`git rev-parse <round-commit>:<file>` against `git rev-parse <head>:<file>`
+   for every file any round mutates.** A red dated to a moved blob is evidence
+   about code that no longer exists. This is the check that has no natural
+   trigger -- nothing goes red, and the row still reads perfectly.
+3. **Every new test the PR adds must appear in some round's failing set.** One
+   that appears in none is a finding, not a gap: it means nothing you cut
+   discriminates on it.
+
+If a check fails, re-cut rather than disclose. One CI cycle is cheaper than a
+review round, and far cheaper than a false evidence table in a squash message
+that cannot be edited afterwards.
+
 **Prefer one branch per round, pushed as a wave.** Reusing one scratch branch
 (below) still works — it just serialises rounds that are independent, at a full
 CI cycle each: #1196 cut five branches instead, queued within 14 s of each other
