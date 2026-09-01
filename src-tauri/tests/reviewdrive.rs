@@ -3278,11 +3278,21 @@ fn a_cancel_names_the_panes_it_leaves_running_and_kills_none_of_them() {
     assert!(named.contains(&format!("{lane}:{block}")), "{named:?}");
 
     // 2. The NOTICE names them and says they are released, not still in hand.
+    //
+    // **`expect` below is a DELIVERY-PATH precondition, not a claim about
+    // panes.** `cancel_review_drive` does not deliver its own notice: it owes it
+    // on the entry, inside the same write as the cancellation, and
+    // `rd_flush_notices` is what sends it (#1857). So this line fails whenever
+    // the flush does not run or does not deliver — a notice owed and never
+    // flushed, a delivery that answered `Err`, an entry pruned before the flush
+    // reached it — and every one of those points at `rd_flush_notices`, not at
+    // pane ownership or at `panes_clause`. If it panics, read the flush first;
+    // the assertions BELOW it are the ones about panes.
     let notice = delivered_texts(&reg, &group)[before..]
         .iter()
         .find(|t| t.contains("CANCELLED"))
         .cloned()
-        .expect("the cancel notice reaches the orchestrator");
+        .expect("the cancel notice reaches the orchestrator (via rd_flush_notices — see above)");
     assert!(notice.contains(&format!("{worker} (worker)")), "{notice}");
     assert!(notice.contains(&format!("{lane} ({block})")), "{notice}");
     assert!(notice.contains("RELEASED"), "a terminal exit hands its panes back: {notice}");
