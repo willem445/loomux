@@ -818,7 +818,10 @@ traffic reaches the orchestrator exactly as it always did, which is the wrong
 recipient and never a wrong *authority*.
 
 All five are optional on read, so a file written against the shape as first
-published still parses. `counters` is **not** optional: an absent counter block
+published still parses — as is `owed_notice`, the sixth, added by #1857 and
+described under *Retention* below; an entry that predates it owes nothing, which
+is the direction that cannot retain a record forever. `counters` is **not**
+optional: an absent counter block
 is refused rather than defaulted to zeros, because zeros silently grant a full
 fresh budget — the same outcome the retention rule below refuses when it
 declines to prune a parked entry.
@@ -836,17 +839,66 @@ stays bounded" — and the driver needs it for two reasons that are not merely
 hygiene. Unpruned entries would flow through `review_drive_status()` into the
 orchestrator's resident context, which is the cost this whole feature exists to
 remove; and they would make `already-driven` (§5.1) refuse every re-drive of a
-PR forever. So `satisfied` and `cancelled` entries are pruned once their notice
-has been delivered — **and that ordering is NOT implemented today**. The tick
-prunes a terminal entry whether or not its notice reached a pane, because
-nothing on that path knows: `prune_terminal` cannot enforce the rule and its
-caller does not either. A drive whose final notice fails to deliver therefore
-ends silently. A hold-back keyed on a tick's delivery failures was tried and
-removed as inert — `rd_step_entry` returns `None` for any entry that is parked
-or terminal, before it reads anything, so a retained terminal entry emits
-nothing on any later tick and is pruned on the next one anyway; re-delivery needs delivery state persisted ON the entry plus a
-path that re-emits for a terminal one, which is a different shape rather than an
-extension of that one. Tracked on #1857. **`held` entries are never pruned**, because §2.3's resume
+PR forever. So `satisfied` and `cancelled` entries are pruned **once their notice
+has been delivered**, and `prune_terminal` enforces that itself rather than
+asking its caller to (#1857). It is the function that reads the entry, so it is
+the thing that can read `owed_notice`; what the caller still owns is clearing the
+notice on a delivery that succeeded, and *that* obligation is enforceable from
+inside the prune, because an entry the caller forgets simply stays.
+
+**A terminal exit's notice is written onto the entry, not handed to a
+delivery.** `owed_notice` carries the rendered text plus `owed_ms`, the absolute
+moment it was first owed, and is stamped inside the same load-decide-store as the
+arc that ended the drive — so the obligation is on disk before anything attempts
+it. The rendered text rather than a flag plus a re-render: a terminal entry is
+the one thing the tick will not step (`rd_step_entry` declines anything parked or
+terminal before it reads anything, which is a §2.4 cost bound), so the facts a
+re-render would need — the lane verdicts, the live head, the gate's answer — are
+not in hand on any later tick, and re-fetching them would spend `gh` on a drive
+that is over to produce a notice that could differ from the one it actually ended
+on. It is serialized only when present, so the resting shape above is unchanged
+and a build predating the field carries it through `extra` verbatim.
+
+**Re-emission is a separate pass, not a relaxed step filter.** Admitting a
+terminal entry into the step path would mean threading it past `observe_pr`,
+`rd_gate_facts` and `decide` — none of which has anything to say about a finished
+drive — to reach a branch that only re-sends a string, at the cost of the early
+return that keeps a resting entry from spending `gh` round trips. The flush
+instead walks the file, delivers what is owed with no state lock held (#467/#468),
+and then prunes, in one write. It is also the single delivery path for the two
+producers the tick's own arcs never see: reconcile's startup cancellations, and
+`cancel_review_drive`'s.
+
+**The retention ceiling.** A notice that can never be delivered — the pane gone
+for good — must not retain its entry forever, so an entry is dropped anyway one
+hour past `owed_ms`. One hour is this section's own unit for that judgment:
+`lane_timeout_minutes` and `fix_timeout_minutes` both default to 60, as does a
+`notify_when` TTL, and all three answer "long enough that a transient has
+cleared, short enough that a dead one is not held indefinitely". It is
+deliberately not a `driver:` knob — §5.3's block paces a drive; how long orrerix
+keeps its own undelivered record is not a repo's call. **At the ceiling the
+notice text goes to the audit log** (`rd-notice-dropped`), and that is what keeps
+the bound honest: the defect this rule exists for is "no line in the pane *and*
+no record that could produce one", and a ceiling with no audit line would close
+the first half and reopen the second. The one other way a notice is given up on
+is a fresh `drive_review` displacing a still-owing entry, which audits the same
+action with `reason: superseded`.
+
+**Holding an entry back does not weaken either reason for pruning.** Both
+surfaces those reasons name already filter on `is_terminal()` —
+`review_drive_status()` lists only live drives, and `is_driven` answers
+`is_live()` — so a retained terminal entry reaches no orchestrator context and
+refuses no re-drive. What it does is sit in the file, which is what the ceiling
+bounds.
+
+**A `held` exit is deliberately outside all of this**, and the asymmetry is the
+one this section already draws. A parked entry is never pruned, so a hold whose
+notice fails to deliver loses a *line*: the entry survives, `review_drive_status()`
+lists it, and §2.3's resume re-reads it. A terminal exit loses the whole record.
+The mechanism is there if a later change wants the stronger guarantee for a hold;
+it does not get it by accident.
+
+**`held` entries are never pruned**, because §2.3's resume
 needs their counters and pruning one would silently grant three fresh rounds —
 a parked drive leaves the file only by being resumed to completion or cancelled.
 That asymmetry is the whole reason §2.1 makes `held` parked rather than
