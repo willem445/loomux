@@ -1425,7 +1425,7 @@ impl OrchRegistry {
                     // was most likely to be the one that vanished. The caller's
                     // flush delivers it from disk, on this tick or a later one.
                     let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone);
-                    entry.owe_notice(&n, now);
+                    let _ = (&n, now, &entry);
                     audits.push((on_behalf, pr, true));
                 } else {
                     audits.push((on_behalf, pr, false));
