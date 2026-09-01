@@ -691,13 +691,20 @@ rather than by routine -- which is exactly what makes it a checklist item:
    adjust a previous total by arithmetic: correcting a stale number by hand is
    how the next stale number is born, and it is the defect class you are
    checking for.
-2. **`git rev-parse <round-commit>:<file>` against `git rev-parse <head>:<file>`
-   for every file any round mutates.** A red dated to a moved blob is evidence
-   about code that no longer exists. This is the check that has no natural
-   trigger -- nothing goes red, and the row still reads perfectly.
-3. **Every new test the PR adds must appear in some round's failing set.** One
-   that appears in none is a finding, not a gap: it means nothing you cut
-   discriminates on it.
+2. **`MSYS_NO_PATHCONV=1 git rev-parse <round-commit>:<file>`, against the same
+   at `<head>`, for every file any round mutates.** A red dated to a moved blob
+   is evidence about code that no longer exists. This is the check with no
+   natural trigger -- nothing goes red, and the row still reads perfectly. The
+   prefix is load-bearing for a dot-directory path (`.claude/`, `.github/`,
+   `.orrerix/`): Git Bash rewrites a slash-ref-plus-dot-path argument and the
+   call errors. It fails toward a false MISMATCH, never a false clean, so
+   omitting it costs a re-cut you did not need rather than hiding a stale row.
+3. **Every new test appears in some round's failing set** -- the by-test read
+   under "Read the table by TEST as well as by round" below, which carries the
+   census recipe and the disposition rule for a remainder. Run it HERE rather
+   than at the end: a test nothing reddened is cheapest to fix before the wave
+   is cited, and restating the rule instead of pointing at it is how the two
+   copies drift.
 
 If a check fails, re-cut rather than disclose. One CI cycle is cheaper than a
 review round, and far cheaper than a false evidence table in a squash message
