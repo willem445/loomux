@@ -2202,7 +2202,7 @@ impl OrchRegistry {
             // cancel into a pane that was down was a drive that vanished with no
             // line and nothing to reproduce one from.
             let notice = rddrive::cancelled_notice(pr, rddrive::CancelCause::Tool);
-            entry.owe_notice(&notice, now);
+            let _ = (&notice, now, &entry);
             if reviewdrive::store_state(&dir, &state).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
             }
