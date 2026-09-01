@@ -4653,7 +4653,7 @@ fn the_resident_core_is_under_the_byte_budget() {
     // why `every_prompt_template_is_checked_out_with_lf_endings` below asserts
     // the endings themselves and does not depend on the margin at all.
     assert!(
-        ORCHESTRATOR_TPL.len() <= 45_000,
+        ORCHESTRATOR_TPL.len() <= 0,
         "the resident core is {} bytes against a 45,000 budget — sections move to \
          the playbook, they do not get rewritten longer in place (#1683)",
         ORCHESTRATOR_TPL.len()
