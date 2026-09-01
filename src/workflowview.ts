@@ -81,7 +81,9 @@ import {
   POLICY_BOUNDS,
   isDriverOn,
   driverSectionHasComments,
+  driverEnabledLineComment,
   setDriverEnabled,
+  removeDriverBlock,
   type FieldBounds,
   type Workflow,
   type WorkflowBlock,
@@ -148,7 +150,7 @@ import {
 import { appVersion } from "./pty";
 import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
 import { showToast } from "./toast";
-import { modal, promptModal } from "./modal";
+  import { modal, promptModal, confirmModal } from "./modal";
 import { IDENTITY, SEMANTIC } from "./theme.ts";
 
 /** What the hosting pane provides. Only one host today (the workflow PANE — a workflow
@@ -2463,6 +2465,25 @@ export class WorkflowView {
     );
     if (!dv) return box;
 
+    // The flip note (#1876 P2): where the splice will actually PRESERVE the
+    // enabled line's trailing comment across a value flip, the note says so —
+    // quoting the comment, because it can end up beside a switch it no longer
+    // describes. The helper carries the splice's own suffix guard: on a bail
+    // shape the flip regenerates the section and the comment does not survive,
+    // so the helper returns null and the note does not render (#1876 review 1).
+    const enabledComment = driverEnabledLineComment(w, this.text);
+    if (enabledComment) {
+      box.append(
+        el(
+          "p",
+          "wf-note",
+          `The enabled: line carries its own comment (${enabledComment}). Flipping the ` +
+            "switch rewrites the value on that line and leaves the comment exactly as " +
+            "written — edit the line if the comment no longer matches the switch."
+        )
+      );
+    }
+
     // Every fallback reads `DRIVER_DEFAULTS` - the engine's `DriverPolicy::default`
     // mirrored and manifest-pinned - rather than a literal nothing can check; every
     // bound reads `POLICY_BOUNDS` rather than a retyped range, so a manifest change
@@ -2526,9 +2547,43 @@ export class WorkflowView {
       "Backstop on the drive's whole age, from the entry's start - no idle clock resets it. " +
         "The default is this range's ceiling."
     );
+    // The escape hatch the narrowed toggle no longer provides (#1876 P1): removal
+    // is its own destructive gesture, behind its own confirmation, because it
+    // discards configuration. A driver: block makes the file unloadable on an
+    // orrerix build old enough to refuse the key (`RawWorkflow` is
+    // `deny_unknown_fields`), and this button is how the file gets back.
+    const remove = document.createElement("button");
+    remove.className = "wf-btn wf-btn-danger";
+    remove.textContent = "Remove the driver block…";
+    remove.addEventListener("click", () => void this.confirmRemoveDriver());
+    box.append(remove);
     const findings = this.sectionFindingList("driver");
     if (findings) box.append(findings);
     return box;
+  }
+
+  /** Remove the whole `driver:` block, behind its own confirmation (#1876 P1).
+   *  Deliberately a different gesture from the enable toggle: the toggle
+   *  preserves a configured block (#1869 review round 3), so removal is the one
+   *  way to discard it — and the escape hatch for opening the file in an
+   *  orrerix build old enough to refuse the key (`RawWorkflow` is
+   *  `deny_unknown_fields`, verified against v1.3.0-beta1, whose root type
+   *  carries the attribute and no `driver:` field). The dialog names what is
+   *  discarded — switch, counters, comments — before the user commits, because
+   *  nothing in the file survives it. */
+  private async confirmRemoveDriver(): Promise<void> {
+    const yes = await confirmModal(
+      "Remove the driver block?",
+      "This deletes the whole `driver:` block — the switch, every counter it declares, " +
+        "and any comment inside it. The file then loads on orrerix builds old enough to " +
+        "refuse the key, which is the reason to do this: those builds cannot load the " +
+        "file while the block stands. The toggle can write a fresh block afterwards, " +
+        "but these counters and comments are gone.",
+      "Remove the block",
+      true
+    );
+    if (!yes) return;
+    this.mutate((next) => removeDriverBlock(next));
   }
 
   private mergeQueueForm(w: Workflow): HTMLElement {
