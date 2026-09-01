@@ -94,6 +94,10 @@ order.
   release's id instead of spawning a second draft.
 - `promote` verifies the release's own **asset count** (expects 10) before
   flipping it public, and refuses — leaving the release in draft — if short.
+  The authoritative counts are the `EXPECTED_ASSETS_STABLE` /
+  `EXPECTED_ASSETS_BETA` env values on the `promote` job in
+  `.github/workflows/release.yml`; the numbers in this skill defer to
+  those — check the workflow's value if they ever disagree.
   If `promote` fails with "Only N/10 assets" in the logs, don't just re-run
   it: check `gh api repos/OWNER/REPO/releases` for a stray duplicate release
   on the same tag first. If it's a genuinely missing/failed matrix leg
@@ -168,10 +172,15 @@ real notes after the assets are up:
 ## 5. Verify — the release isn't done until all of these pass
 
 - `npm view orrerix version` → X.Y.Z.
-- The GitHub release has **10 assets**: `-setup.exe` + `.msi`, both `.dmg`s,
-  `.AppImage` + `.deb` + `.rpm`, the two `.app.tar.gz` bundles, and
-  `Orrerix_X.Y.Z_x64.pdb.zip` — the Windows debug symbols, which a crash
-  dump from a released build needs to symbolicate (#1218).
+- The GitHub release has the full asset set: **10** for a stable tag,
+  **9** for a pre-release (no `.msi`) — `-setup.exe` + `.msi`, both
+  `.dmg`s, `.AppImage` + `.deb` + `.rpm`, the two `.app.tar.gz` bundles,
+  and `Orrerix_X.Y.Z_x64.pdb.zip` — the Windows debug symbols, which a
+  crash dump from a released build needs to symbolicate (#1218). The
+  authoritative counts are the `EXPECTED_ASSETS_STABLE` /
+  `EXPECTED_ASSETS_BETA` env values on the `promote` job in
+  `.github/workflows/release.yml`; the numbers in this skill defer to
+  those — check the workflow's value if they ever disagree.
 - The release run's conclusion is `success` (not just "the assets exist" —
   publish-npm is the last job and can fail after the assets upload).
 
