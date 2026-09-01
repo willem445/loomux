@@ -283,6 +283,16 @@ allow, but what it merely leaves out of its allow-list — general `Bash`, and s
 `cargo check` — a repo-level `permissions.allow` can grant. Absent that, a plan
 will say when it could not confirm something by running it.
 
+**What actually reaches the orchestrator's pane.** A delegate's report is typed into
+the orchestrator's pane — waking it for a turn on the group's most expensive model —
+only when it needs the orchestrator to *do* something. `done` and `blocked` do: route
+the next step, drive the PR, merge, ask you. `progress` never does, so it is not
+delivered at all — it is written to the audit log and appended as a note on that
+agent's board task, where you see it beside the pane and the orchestrator can read it
+on demand. Nothing is lost; what goes away is the interrupt. A delegate that needs the
+orchestrator *now* for something that is not a status change uses its message channel
+instead, which always lands.
+
 Every review answers two standing questions as well as reporting what it found. Its body
 carries a **`## Premortem`** section — two ways this change fails in production that no test in
 the PR would catch, or an argued none — and where the change touches unbounded input (a file, a

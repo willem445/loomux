@@ -2272,6 +2272,77 @@ side).
   convention) — a prose pin (`tests/prompts.rs`) audited clean, since none of #398's edits touched
   a pinned region.
 
+### A delivery reaches the orchestrator only if it needs an orchestrator action (#1958)
+
+#398 above made each report SMALLER. It left the delivery COUNT alone, and that turned out to
+be the larger half: every `report(...)` is typed into the orchestrator's pane and wakes it for a
+turn on the group's most expensive model, re-paying its whole resident context. Measured on
+group `loomux-68435179`'s audit log, `reports progress` was 64 of 106 delegate→orchestrator
+deliveries — 60% — and the mandated "starting `<task>`" line from `worker.md`'s first-turn
+primer was every one of the five in the session that filed the issue.
+
+The rule the human chose, stated once and implemented once: **a delegate delivery reaches the
+orchestrator's pane only if it needs an orchestrator action.**
+
+- **`done` and `blocked` do.** Both name something only the orchestrator resolves — route the
+  next step, drive the PR, take it to the merge gate, ask the human. Unchanged.
+- **`progress` never does.** A delegate saying it is still going changes nothing the
+  orchestrator would otherwise do; it is a fact about the past, and the orchestrator is not a
+  reader of those. So it is not delivered.
+- **It is REROUTED, not dropped**, and that distinction is the whole of why this is cheap
+  rather than lossy. The `tool-call` audit row every MCP call writes is unchanged, and
+  `Registry::report_task_note` appends the composed notice to the board row the report
+  resolves to. The human sees it where they already look — the delegate's own pane, and the
+  board beside it — and the orchestrator reads it on demand with `get_task`/`get_output`. What
+  went away is the interrupt.
+- **`message_orchestrator` is unchanged and is the residual on purpose.** It is the delegate's
+  channel for something that DOES need an action and is not a status change, and #1958
+  deliberately does not touch it: a delegate with a real reason to wake the orchestrator must
+  keep a way to, or the saving is paid for in stalls. It is also the reason the template can
+  say "never use `progress` to get attention" without leaving the delegate stuck.
+
+**The predicate is pure and keyed on `status`, not `outcome`** (`report::reaches_orchestrator_pane`
+in `loomux-engine`). `status_for_outcome` already folds a reviewer's `approved` and
+`request_changes` into `done`, and those are what open this repo's merge gate — the LAST
+reports that may be silenced — so reading `outcome` here would be a second vocabulary to keep
+in step with the first. The catch-all DELIVERS: an unrecognised status word is a change that
+forgot to come here, and a surplus wake-up costs one turn where a silently undelivered `done`
+strands a PR nobody routes.
+
+**The driven arm is deliberately untouched.** Under a live review drive the recipient of a
+delegate's report is not the orchestrator at all (§7 of `review-driver.md`): `rd_consume`
+takes it and audits it as `rd-consumed`, and the driver writes its own board notes through
+`rd_task_note`. Silencing a `progress` there would be changing a drive's inputs on the way
+past, and adding a second note stream from the delegate onto the same row would duplicate the
+drive's own record — so the routing decision sits BELOW the `rd_owner` match, in the undriven
+arm only. `a_driven_workers_progress_report_is_still_consumed_by_the_driver` pins both halves.
+
+**Board-row resolution is orrerix-minted first, caller-supplied second.** The delegate's
+`session_id` is what orrerix recorded at spawn and what the orchestrator writes onto the row it
+assigns; a delegate cannot choose it. Only when that resolves nothing is the report's `ref` —
+an agent-authored string — matched against the row's `pr` and then its `issue`. That order is
+not an authorization: this WRITES a note and reads nothing back, so a wrong match costs a
+misfiled note, never a decision (the same argument `rd_task_note` carries). Resolving nothing
+is not an error — the audit row is the floor, and a group that does not use the board reports
+exactly as it did before.
+
+**What still wakes the orchestrator, and why each needs an action.** `report(done | blocked |
+approved | request_changes)`; `message_orchestrator`; a recorded `review_verdict`'s courtesy
+notice (§ *The verdict notice is a signal*); the driver's own kick-backs and notices; the
+human's board actions (start, approve, proceed, request changes); queue, pause and watchdog
+notices orrerix itself mints. Every one of those names something the orchestrator decides.
+`progress` was the only class on the list that named nothing.
+
+**Template lockstep.** `worker.md`'s first-turn primer loses the mandatory
+`report("progress", …, "starting <task>")` step — the spawn IS the start signal — and its
+reporting paragraph, which opened "on start (`progress`, one line restating the task)", now
+states which two outcomes reach the pane. The `progress` bullet in the tool-doc list stays as
+the only rule for `progress`, with its premise corrected: it said "only when it changes what
+the orchestrator would otherwise assume", which is the claim this change retracts.
+`reviewer.md` names `progress` nowhere and mandates no start report, so it did not move.
+`tests/fixtures/pre222` re-blessed in the same commit; `tests/prompts.rs` repinned, because
+its old anchor was the retracted mandate itself and a test quoting a claim ENFORCES it.
+
 ## Notification backend (#243)
 
 Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the

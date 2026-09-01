@@ -34,7 +34,7 @@ use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    AgentStatus, Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport, Role,
+    AgentStatus, Caller, GroupId, Guardrails, OrchRegistry, RdDriveReport, Role, TaskPatch,
 };
 use serde_json::json;
 
@@ -3112,6 +3112,106 @@ fn a_stale_escalate_re_opens_the_lane_and_a_current_one_still_holds() {
          the drive on a judgment about a revision that no longer exists"
     );
     assert_ne!(status_state(&reg, &group), "held", "…and the drive must not re-hold");
+}
+
+/// **#1958, and the arm it deliberately does NOT change.** A driven delegate's
+/// `progress` report still reaches the DRIVER — consumed and audited under
+/// `report:worker`, exactly as before.
+///
+/// #1958 takes a `progress` report off the orchestrator's pane and puts it on
+/// the board instead. That decision belongs to the UNDRIVEN arm only: under a
+/// live drive the recipient is not the orchestrator at all (#1778 §7), the
+/// driver already writes its own board notes (`rd_task_note`), and a second,
+/// unfiltered note stream from the delegate onto the same row would duplicate
+/// the drive's own record. So this pins BOTH halves of "the driven arm is
+/// untouched": the consumption still happens, and no board note is written.
+///
+/// The control is the consumption count moving 0 → 1 across the one call. An
+/// assertion that no note appeared, and no line reached the pane, passes just as
+/// well when the report never dispatched.
+#[test]
+fn a_driven_workers_progress_report_is_still_consumed_by_the_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    // One hand-back, which is what gives this drive a worker pane it owns.
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, w1) = first.handbacks.first().cloned().expect("the drive hands back");
+    assert_eq!(
+        reg.rd_owner(&group, &w1).map(|(pr, p)| (pr, p.current)),
+        Some((1758, true)),
+        "the handed-back pane must be this drive's current delegate, or the arm under test \
+         is not the arm being exercised"
+    );
+
+    // A board row bound to that pane's session and PR — so "no note" below is a
+    // real absence rather than an unresolvable row.
+    let session = reg
+        .agent(&w1)
+        .and_then(|a| a.session_id.clone())
+        .expect("the handed-back pane has a session");
+    let t = reg
+        .upsert_task(
+            &group,
+            "orch-1",
+            None,
+            TaskPatch { title: Some("Fix PR 1758".into()), ..Default::default() },
+        )
+        .unwrap();
+    reg.upsert_task(
+        &group,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { session: Some(session), pr: Some("#1758".into()), ..Default::default() },
+    )
+    .unwrap();
+    let notes_before = reg
+        .tasks(&group)
+        .into_iter()
+        .find(|x| x.id == t.id)
+        .map(|x| x.notes.len())
+        .unwrap_or(usize::MAX);
+
+    let consumed_before =
+        consumed_kinds(&reg, &group).iter().filter(|k| *k == "report:worker").count();
+    let before = delivered_texts(&reg, &group).len();
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: w1.clone(),
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "progress", "note": "rebasing", "ref": "#1758" } }),
+    )
+    .expect("a driven pane may still report progress");
+
+    assert_eq!(
+        consumed_kinds(&reg, &group).iter().filter(|k| *k == "report:worker").count(),
+        consumed_before + 1,
+        "the driven arm must still consume a progress report: {:?}",
+        consumed_kinds(&reg, &group)
+    );
+    assert!(
+        !delivered_texts(&reg, &group)[before..].iter().any(|t| t.contains("reports progress")),
+        "and it still reaches no pane"
+    );
+    assert_eq!(
+        reg.tasks(&group).into_iter().find(|x| x.id == t.id).map(|x| x.notes.len()),
+        Some(notes_before),
+        "#1958's board note is the UNDRIVEN arm's behaviour — a driven report is the \
+         driver's to record, and a second note stream would duplicate it"
+    );
 }
 
 /// **#1871 B2, through the seam.** A drive that hands back twice still owns the

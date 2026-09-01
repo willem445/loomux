@@ -51032,6 +51032,54 @@ impl OrchRegistry {
         self.deliver_prompt(&orch, text, from, Delivery::MidSession)
     }
 
+    /// Put a `progress` report on the board row this delegate is working, so the
+    /// trail survives the delivery that no longer happens (#1958).
+    ///
+    /// A `progress` report needs no orchestrator action, so it never reaches that
+    /// pane ([`report::reaches_orchestrator_pane`]). It is still recorded twice:
+    /// the `tool-call` audit row every MCP call writes, and — where a row can be
+    /// resolved — this note, which is what puts it where the human is already
+    /// looking and what `get_task` hands the orchestrator on demand.
+    ///
+    /// **Resolution is orrerix-minted first, caller-supplied second.** The
+    /// delegate's own `session_id` is what orrerix recorded at spawn and what the
+    /// orchestrator writes onto the row it assigns; a delegate cannot choose it.
+    /// Only when that finds nothing does the report's `ref` — an agent-authored
+    /// string — get matched against the row's `pr` and then its `issue`. That
+    /// order is not an authorization (this WRITES a note and reads nothing back,
+    /// `rd_task_note`'s reason), it is about landing the note on the
+    /// right row: a `ref` naming a PR two rows over costs a misfiled note, and
+    /// the session never does.
+    ///
+    /// **No resolvable row is not an error.** The audit row is the floor and it
+    /// is already written; a delegate whose work has no board row at all — an
+    /// ad-hoc brief, a group not using the board — reports exactly as before and
+    /// simply has no note to leave. Failing the tool call there would make the
+    /// board mandatory, which it is not.
+    fn report_task_note(&self, group: &GroupId, agent_id: &str, ref_: Option<&str>, text: &str) {
+        let tasks = self.tasks(group);
+        let session = self.agents.lock_safe().get(agent_id).and_then(|a| a.session_id.clone());
+        let by_session = session.as_deref().and_then(|s| {
+            tasks.iter().find(|t| t.session.as_deref() == Some(s))
+        });
+        let by_ref = || {
+            let n = ref_.filter(|s| !s.is_empty()).and_then(pr_number)?;
+            tasks
+                .iter()
+                .find(|t| t.pr.as_deref().and_then(pr_number) == Some(n))
+                .or_else(|| tasks.iter().find(|t| t.issue.as_deref().and_then(pr_number) == Some(n)))
+        };
+        let Some(id) = by_session.or_else(by_ref).map(|t| t.id.clone()) else {
+            return;
+        };
+        let _ = self.upsert_task(
+            group,
+            brand::AUDIT_ACTOR,
+            Some(&id),
+            TaskPatch { note: Some(text.to_string()), ..TaskPatch::default() },
+        );
+    }
+
     /// `deliver_to_orchestrator` for a notice that relays ONE agent's own words
     /// to the orchestrator — a `report` note, a `message_orchestrator` body
     /// (#576 residual, rev-163 B1). Identical delivery; the difference is that
