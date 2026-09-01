@@ -31,6 +31,11 @@
 //     the same numbers, in a paragraph anywhere else on the page, is invisible to it.
 //     That is the rule a docs editor has to keep: a new bounded claim about `driver:`
 //     goes in the table, not in fresh prose.
+//   * Every OTHER row of that same bounds summary. Site 3 below reads the one row whose
+//     subject is `driver:`; its siblings state bounds for other blocks and are pinned by
+//     nothing. Concretely: editing the "Lock resources" row's `slots` from 1–64 to
+//     1–128 reddens no test, here or in `test/workflowschema.test.ts` (the pre-existing
+//     manifest-vs-pane pins never read this page). Each is a slice of the same shape.
 //   * Every `help:` string in the manifest. The docs prose paraphrases those rather
 //     than quoting them, so nothing here compares them.
 //   * Any file other than `docs/orchestration.md`. `doc/design/review-driver.md` §5.3
@@ -69,6 +74,11 @@ const DOCS = readFileSync(
 ).replace(/\r\n/g, "\n");
 
 const DRIVER: SchemaField[] = manifest.sections.driver.fields;
+/** This file's own repo-relative path, so the marker's pointer is checked against what
+ *  the file IS rather than against a literal that a rename moves in lockstep with. */
+const SELF = decodeURIComponent(
+  import.meta.url.slice(new URL("../", import.meta.url).href.length)
+);
 /** A field is in the RANGE population because it declares one, never because of its
  *  name — a rename cannot move a field in or out of this set. */
 const ranged = (f: SchemaField) => f.min !== undefined || f.max !== undefined;
@@ -118,9 +128,12 @@ test("the docs bounds table states exactly the manifest's driver bounds", () => 
   const marker = /<!-- pinned-to-schema: sections\.driver - (\S+) \(#(\d+)\) -->/g;
   const hits = [...DOCS.matchAll(marker)];
   assert.equal(hits.length, 1, "exactly one pinned-to-schema marker for sections.driver");
-  // The marker names this file. Renaming the test without renaming the pointer leaves
-  // a docs page claiming a pin that no longer exists, so the pointer is pinned too.
-  assert.equal(hits[0][1], "test/docsdriverbounds.test.ts");
+  // The marker names this file. Renaming the test without moving the pointer leaves a
+  // docs page claiming a pin held by a file that no longer exists, so the pointer is
+  // pinned too — against this file's OWN path, derived from `import.meta.url`. A
+  // hardcoded literal here would not do it: rename the file and both sides still spell
+  // the old name, so the pin would read green while the docs cite nothing (#1951 F1).
+  assert.equal(hits[0][1], SELF);
 
   const after = DOCS.slice(hits[0].index! + hits[0][0].length);
   const rows: string[][] = [];
