@@ -28,6 +28,7 @@ use loomux_lib::orchestration::reviewdrive::{
     DriveStep, GateOutcome, HeldReason, LaneFact, WorkerSignal, MAX_REBASE_CEILING,
     MAX_ROUNDS_CEILING,
 };
+
 use loomux_lib::orchestration::workflow::{ReviewVerdict, Verdict};
 use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
@@ -2264,6 +2265,20 @@ enum CiArm {
 }
 
 impl CiArm {
+    /// **The population, named once** (#1863 D2, second half). The arms used to
+    /// be an array literal written inline at the one call site, which is a
+    /// population nothing states: trimming it back to `[CiArm::Green]` — the
+    /// very shape D2 was raised about — leaves every assertion inside the loop
+    /// true and the test green, because the loop simply runs once. A `for` body
+    /// that passes is evidence about the arms it RAN over, never about the arms
+    /// that exist.
+    ///
+    /// A fifth `CiObservation` is a compile error in two exhaustive matches
+    /// ([`CiArm::sentence`] and `lane_brief_under`), so what this list can go
+    /// wrong by is omission or padding, not by silently absorbing a new arm —
+    /// and `every_arm_states_a_different_sentence` is what refuses the padding.
+    const ALL: [CiArm; 4] = [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending];
+
     /// The sentence this arm must render, verbatim. It is the CONTENT pin that
     /// makes each fixture discriminating: a `Conflicting` fixture that quietly
     /// produced the `Pending` sentence would satisfy every shape assertion, and
@@ -2382,7 +2397,8 @@ fn lane_brief_under(arm: CiArm) -> String {
 /// at all to notice.
 #[test]
 fn a_lane_brief_is_one_paragraph_per_sentence() {
-    for arm in [CiArm::Green, CiArm::Red, CiArm::Conflicting, CiArm::Pending] {
+    let mut arms_checked = 0usize;
+    for arm in CiArm::ALL {
         let brief = lane_brief_under(arm);
 
         // The template itself is deliberately multi-paragraph; what must not
@@ -2398,7 +2414,10 @@ fn a_lane_brief_is_one_paragraph_per_sentence() {
                  `\\` continuation leaves behind: {line:?}"
             );
         }
-        assert!(checked > 3, "{arm:?}: the positive control — this must have read real lines");
+        assert!(
+            checked > 3,
+            "{arm:?}: the per-arm positive control — this must have read real lines"
+        );
 
         // And the CI sentence specifically, which is the one that shipped
         // broken. Found by the prefix every arm shares, so the finder itself
@@ -2418,7 +2437,46 @@ fn a_lane_brief_is_one_paragraph_per_sentence() {
             !ci_line.contains("          ") && ci_line.trim_end().ends_with('.'),
             "{arm:?}: the CI sentence must be one whole paragraph on one line: {ci_line:?}"
         );
+        // **Counted at the VERIFIED site, not the match site.** Incremented
+        // after this arm's assertions have all run, so the population control
+        // below certifies coverage that was actually delivered rather than
+        // arms the loop merely started (CLAUDE.md's `test/theme.test.ts` rule).
+        arms_checked += 1;
     }
+    // **The population control, and it is what #1863 D2 was really about.** The
+    // per-arm floor above counts LINES; nothing counted ARMS, so the fixture
+    // this test exists to have widened — one arm, and the wrong one — was still
+    // reachable by deleting entries from the loop's array. The line floor holds
+    // under it, every content pin holds under it, and the test stays green while
+    // covering exactly the arm that never carried the defect.
+    assert_eq!(
+        arms_checked,
+        CiArm::ALL.len(),
+        "every CI arm must have been rendered AND checked, not merely enumerated"
+    );
+    assert_eq!(arms_checked, 4, "…and the population is the four the note names");
+}
+
+/// The guard on [`CiArm::ALL`] itself: it can go wrong by omission, and padding
+/// a short list with a repeat would hide that from the count above.
+///
+/// Distinctness is the checkable form — each arm exists precisely because it
+/// renders a different sentence, so two entries answering the same one means the
+/// list is naming three arms while claiming four.
+#[test]
+fn every_arm_states_a_different_sentence() {
+    let mut seen: Vec<&str> = CiArm::ALL.iter().map(|a| a.sentence()).collect();
+    let listed = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        listed,
+        "CiArm::ALL names {listed} arms and only {} distinct sentences — a repeat pads the \
+         population control in `a_lane_brief_is_one_paragraph_per_sentence` back to green \
+         while an arm goes unrendered",
+        seen.len()
+    );
 }
 
 /// The control for the test above: on a genuinely green drive the brief still
@@ -3238,4 +3296,118 @@ fn a_cancel_names_the_panes_it_leaves_running_and_kills_none_of_them() {
             "the driver kills no pane — disposal is the orchestrator's deliberate call: {a}"
         );
     }
+}
+
+// ── #1861: the invariant behind the all-lanes `briefed_head` clear ──────────
+
+/// **#1861.** The resume out of `held(lane-stalled)` clears `briefed_head` for
+/// EVERY lane, not just the stalled one. That is safe only because **the
+/// deciding lane is verdict-selected** — and nothing pinned it.
+///
+/// If selection ever consulted the lane RECORD instead of the verdict — a
+/// routing change, a new lane kind, a gate that counts differently — the
+/// all-lanes clear silently becomes "re-brief every lane on every resume": a
+/// delegate spawned per lane per resume, review rounds burned with no worker
+/// turn, and nothing red.
+///
+/// **Why this is pinned here and not on the resume arc.** #1861 proposes a
+/// two-lane seam fixture where only one lane is stalled. That fixture cannot be
+/// made to fail, and the previous author had already worked out why and left the
+/// analysis on `a_resume_re_briefs_the_lane_that_stalled_rather_than_waiting_on_it_again`:
+/// `first_stale_lane` skips a standing pass before any lane record is read, so
+/// the passed lane is unreachable from the re-open under every implementation —
+/// and making it reachable means staling its pass, at which point IT becomes the
+/// deciding lane and the test stops being about the stall. The operands cannot
+/// collide on that arc. They collide here.
+///
+/// **The collision.** Both lane records are blanked — identical on the
+/// `briefed_head` axis, which is exactly the post-resume state — so the only
+/// thing left that can distinguish them is the VERDICT. A selection rule that
+/// read the record would pick lane 0: it is first in the gate's order and its
+/// record is just as blank as lane 1's. The assertion is that lane **1** opens.
+///
+/// **Asserting the property rather than the fixture** is what removes the
+/// dependence on the resume happening to blank every lane. All four crossings of
+/// {record blank, record briefed at this head} x {pass current, pass stale} are
+/// pinned, so "a lane whose pass stands is never re-opened, whatever its record
+/// says" holds however many lanes a future resume decides to clear. The two
+/// blank-record rows are the state #1841's B4 produces; the two briefed rows are
+/// the ordinary one, and they are the control that stops "always answer 1" from
+/// passing.
+#[test]
+fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear_safe() {
+    let limits = DriveLimits::default();
+
+    // Two lane RECORDS, in the gate's order. `blank` is what the resume's
+    // all-lanes clear leaves behind; `briefed` is the ordinary state.
+    let entry_with = |blank: bool| {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = HEAD_A.into();
+        e.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
+        e.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
+        if blank {
+            for l in e.lanes.iter_mut() {
+                l.briefed_head.clear();
+            }
+        }
+        e
+    };
+
+    // Lane 0 has a verdict, lane 1 never answered. `pass_head` decides whether
+    // lane 0's pass still stands at the live head.
+    let facts_with = |pass_head: &str| DriveFacts {
+        required_lanes: Some(vec![
+            lane_fact("rev-std", Some(Verdict::Pass), pass_head, "d1"),
+            lane_fact("rev-final", None, "", ""),
+        ]),
+        ..facts_at(HEAD_A)
+    };
+
+    for blank in [true, false] {
+        let e = entry_with(blank);
+        let what = if blank { "blanked by the resume" } else { "briefed at this head" };
+
+        // Lane 0's pass STANDS. Lane 1 is the deciding lane, and it is the one
+        // that opens — even though lane 0 comes first in the gate's order and,
+        // when `blank`, its record is exactly as empty as lane 1's.
+        assert_eq!(
+            reviewdrive::decide(&e, &facts_with(HEAD_A), &limits),
+            DriveStep::OpenLane { index: 1 },
+            "records {what}: a lane whose pass stands must never be re-opened. A selection \
+             rule reading the RECORD rather than the verdict picks lane 0 here, and that is \
+             what turns #1841's all-lanes clear into a re-brief per lane per resume"
+        );
+
+        // The control, on the one axis that may move the answer: stale lane 0's
+        // pass and it becomes the deciding lane. Without this, an implementation
+        // that always answered `index: 1` would satisfy every assertion above.
+        assert_eq!(
+            reviewdrive::decide(&e, &facts_with(HEAD_B), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "records {what}: a lane whose pass no longer stands IS the deciding lane — so \
+             the assertion above is the verdict deciding, not a constant"
+        );
+    }
+
+    // …and the function that makes it true, named directly, so a change to
+    // selection reddens at the site rather than only through `decide`. It takes
+    // no lane record at all — which is the structural half of this invariant —
+    // so its answer cannot depend on `briefed_head` however that field moves.
+    assert_eq!(
+        reviewdrive::first_stale_lane(
+            facts_with(HEAD_A).required_lanes.as_deref().unwrap(),
+            HEAD_A,
+            Some("d1")
+        ),
+        1,
+        "first_stale_lane selects by verdict currency alone"
+    );
+    assert_eq!(
+        reviewdrive::first_stale_lane(
+            facts_with(HEAD_B).required_lanes.as_deref().unwrap(),
+            HEAD_A,
+            Some("d1")
+        ),
+        0
+    );
 }
