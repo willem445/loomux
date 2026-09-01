@@ -16,9 +16,7 @@ skip anything in this file.
    (see **Duplicate deliveries**).
 2. A directive, scope decision, or feedback in the kickoff? `note_directive(text)` before you
    act on it (see **Directive ledger**).
-3. `report("progress", ref, detail_url, "starting <task>")` so the orchestrator knows you're
-   on it.
-4. Work the brief step by step (**Execute the plan step by step**); `message_orchestrator(text)`
+3. Work the brief step by step (**Execute the plan step by step**); `message_orchestrator(text)`
    for anything ambiguous rather than guessing.
 
 Everything below is the detail — including the mandatory parts (**Git workflow**, **Definition
@@ -35,9 +33,12 @@ of done**). Read them before you act, not instead of.
     `"implemented X, added Y tests, updated Z docs"` (that's the PR body's job).
   - `blocked`: the one blocking fact — `"needs a human call: does #42 want option A or B"` — not
     a narration of what you tried before giving up.
-  - `progress`: only when it changes what the orchestrator would otherwise assume (you're about
-    to do something risky/slow it should know about); a plain "still working" isn't worth a
-    report at all.
+  - `progress`: a RECORD, not a notification — it is written to the audit log and appended to
+    your board task, and reaches no pane at all. Use it for a fact worth finding later (what
+    you are waiting on, a decision you took mid-task); a plain "still working" isn't worth a
+    report at all, and a "starting <task>" one is never worth writing. Nothing about it wakes
+    the orchestrator, so when you need it to act NOW, that is `blocked` or
+    `message_orchestrator`.
   Hard-capped at ~500 chars — the tool truncates with a stated marker if you go over, which is
   itself a sign you're cramming in what belongs on GitHub, not in the note. Report `done` only
   when the PR is open and CI-relevant checks you can run locally pass. (The legacy
@@ -63,10 +64,14 @@ of done**). Read them before you act, not instead of.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
   ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.{{LOCKS}}
 
-Report meaningfully but sparingly: on start (`progress`, one line restating the task),
-when blocked (the one fact that changes what the orchestrator does next), and when done
-(`ref` + `detail_url` pointing at the PR — the PR description already carries the full summary,
-so the report doesn't repeat it).
+Report meaningfully but sparingly, and only when the orchestrator has to ACT: when blocked
+(the one fact that changes what it does next), and when done (`ref` + `detail_url` pointing at
+the PR — the PR description already carries the full summary, so the report doesn't repeat it).
+Those two are what reach its pane. A `progress` report reaches nobody's pane: it is recorded in
+the audit log and appended to your board task, where the human sees it and the orchestrator
+reads it on demand. So never send one to get attention, and never send a "starting" report —
+the orchestrator wrote your brief and already knows. Something that needs it NOW and is not a
+status change is `message_orchestrator`, which always lands.
 
 ## Directive ledger
 

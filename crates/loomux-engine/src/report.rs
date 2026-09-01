@@ -47,6 +47,39 @@ pub fn status_for_outcome(outcome: &str) -> &'static str {
     }
 }
 
+/// Whether a report with this **status** reaches the orchestrator's pane at all
+/// (#1958). One rule, stated once: a delegate delivery wakes the orchestrator
+/// only if it needs an orchestrator ACTION.
+///
+/// `done` and `blocked` do — route the next step, drive the PR, merge, ask the
+/// human. `progress` never does: a delegate saying it is still going changes
+/// nothing the orchestrator would otherwise do, and the wake-up costs a whole
+/// turn on the group's most expensive model, re-paying its resident context for
+/// a line it routes on nowhere. A `progress` report is still RECORDED — in the
+/// audit log, and as a note on the board row it resolves to — so the trail the
+/// human and the orchestrator read on demand (`get_task`, `get_output`) is
+/// unchanged; what goes away is the interrupt.
+///
+/// **Keyed on `status`, the closed three-value vocabulary** ([`STATUSES`]),
+/// never on `outcome`: [`status_for_outcome`] already folds `approved` and
+/// `request_changes` into `done`, and a reviewer's verdict report is exactly
+/// the kind that needs an action. Reading `outcome` here would be a second
+/// vocabulary to keep in step with the first.
+///
+/// **The catch-all DELIVERS.** A status word this function has never heard of
+/// is a orrerix change that forgot to come here, and the two failures are not
+/// symmetric: a surplus wake-up costs one turn, while a silently undelivered
+/// `done` strands a PR nobody routes. [`STATUSES`] is closed, and
+/// `every_status_is_classified` pins which member is kept off the pane — so a
+/// fourth status is a deliberate edit here rather than a silent default.
+pub fn reaches_orchestrator_pane(status: &str) -> bool {
+    match status {
+        "progress" => false,
+        "done" | "blocked" => true,
+        _ => true,
+    }
+}
+
 /// Hard cap, in **characters**, on how much of a recorded verdict's summary is
 /// copied into the orchestrator's pane by the courtesy notice `review_verdict`
 /// types there (#850).
@@ -203,6 +236,38 @@ mod tests {
     fn status_for_outcome_preserves_blocked_and_progress() {
         assert_eq!(status_for_outcome("blocked"), "blocked");
         assert_eq!(status_for_outcome("progress"), "progress");
+    }
+
+    #[test]
+    fn only_progress_is_kept_off_the_orchestrator_pane() {
+        assert!(!reaches_orchestrator_pane("progress"), "a progress report needs no orchestrator action (#1958)");
+        assert!(reaches_orchestrator_pane("done"), "done needs routing");
+        assert!(reaches_orchestrator_pane("blocked"), "blocked needs a decision");
+    }
+
+    #[test]
+    fn every_status_is_classified() {
+        // The vocabulary is closed and this predicate must have an OPINION on
+        // every member of it rather than a catch-all doing the work: exactly
+        // one status is kept off the pane, and it is `progress`. A fourth
+        // status added without coming here reddens this instead of silently
+        // inheriting the deliver-by-default arm.
+        let kept_off: Vec<&str> =
+            STATUSES.iter().copied().filter(|s| !reaches_orchestrator_pane(s)).collect();
+        assert_eq!(kept_off, vec!["progress"], "STATUSES = {STATUSES:?}");
+    }
+
+    #[test]
+    fn every_reviewer_outcome_still_reaches_the_pane() {
+        // Composed through `status_for_outcome`, the way mcp.rs composes it: a
+        // reviewer's `approved`/`request_changes` are what open this repo's
+        // merge gate, so they are the LAST reports that may be silenced. The
+        // predicate reads `status`, so this pins the COMPOSITION rather than
+        // re-asserting the mapping its own tests above already pin.
+        for o in OUTCOMES {
+            let reaches = reaches_orchestrator_pane(status_for_outcome(o));
+            assert_eq!(reaches, o != "progress", "outcome {o} classified wrong");
+        }
     }
 
     #[test]

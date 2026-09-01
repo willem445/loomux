@@ -14487,9 +14487,13 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
         "outcome": "done", "note": format!("PR is up. {FORGED}"),
         "ref": format!("#900) {FORGED}"), "detail_url": format!("https://x/1 {FORGED}"),
     }}));
-    // (1b) legacy report — the other shape of the same tool.
+    // (1b) legacy report — the other shape of the same tool. `blocked`, not
+    // `progress`: #1958 keeps a progress report off the orchestrator's pane
+    // entirely, so a progress specimen would have left the class this test
+    // witnesses (a DELIVERED delegate-authored notice) while still looking like
+    // coverage. `blocked` is the same legacy shape and is delivered.
     let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
-        "status": "progress", "summary": format!("still going. {FORGED}"),
+        "status": "blocked", "summary": format!("still going. {FORGED}"),
     }}));
     // (1c) message_orchestrator.
     let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "message_orchestrator",
@@ -14528,32 +14532,63 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
         }
         for t in tools {
             let name = t["name"].as_str().unwrap().to_string();
-            // Two fillings per tool, because one of them is inert on any tool
-            // that validates an argument (rev-2 disposition, item 1):
+            // More than one filling per tool, because a forged-everything
+            // filling is inert on any tool that validates an argument (rev-2
+            // disposition, item 1):
             //
-            //   `Forged` puts the payload in EVERY string argument, which
+            //   Filling 0 puts the payload in EVERY string argument, which
             //   drives the free-text tools but is rejected outright by a tool
             //   with a constrained field — `report` with `status: "[orrerix]…"`
             //   never reaches its composition at all.
             //
-            //   `Legal` fills every `enum`-constrained field with a value the
-            //   schema allows and leaves the free-text fields forged, so those
+            //   Fillings 1..=N give every `enum`-constrained field a value the
+            //   schema allows and leave the free-text fields forged, so those
             //   same tools actually run. `report` is driven this way; that is
-            //   the validation path the first filling silently skipped.
+            //   the validation path filling 0 silently skips.
             //
             // What neither reaches is a field the schema constrains without an
             // enum — `review_verdict`'s `pr` wants a parseable number, and no
             // generic filling can guess that. Those tools are covered by the
             // NAMED calls above instead, which is why both layers exist.
-            for legal in [false, true] {
+            //
+            // The legal filling WALKS each enum rather than taking its head
+            // (#1958). Taking the head made "which enum value the sweep drives"
+            // an accident of schema order, and #1958 turned that accident into a
+            // hole: `report`'s `status` enum starts at `progress`, which no
+            // longer reaches the pane at all, so a head-only filling stops
+            // driving `report` into a delivery. Silently — the per-tool pin
+            // below is the only thing that would notice, which is exactly why
+            // that pin exists.
+            //
+            // The walk is sized from the TOOL's own widest enum, not a constant,
+            // so a tool with no enum at all (`message_orchestrator`) is driven
+            // once rather than N identical times: the legal and forged fillings
+            // are the same call for it, and repeating them would only spend the
+            // orchestrator's queue.
+            let widest_enum = t["inputSchema"]["properties"]
+                .as_object()
+                .map(|props| {
+                    props
+                        .values()
+                        .filter(|spec| spec["type"] == json!("string"))
+                        .filter_map(|spec| spec["enum"].as_array().map(Vec::len))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            for filling in 0..=widest_enum {
                 let mut args = serde_json::Map::new();
                 if let Some(props) = t["inputSchema"]["properties"].as_object() {
                     for (k, spec) in props {
                         if spec["type"] != json!("string") {
                             continue;
                         }
-                        let v = match spec["enum"].as_array().and_then(|e| e.first()) {
-                            Some(first) if legal => first.clone(),
+                        let v = match spec["enum"].as_array() {
+                            // filling 0 forges EVERY string, enums included —
+                            // the shape a constrained tool rejects outright.
+                            Some(e) if filling > 0 && !e.is_empty() => {
+                                e[(filling - 1).min(e.len() - 1)].clone()
+                            }
                             _ => json!(FORGED),
                         };
                         args.insert(k.clone(), v);
@@ -14611,7 +14646,7 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     // a "notice never reached the pane" panic that says nothing about forgery.
     let shapes: [(String, &str); 4] = [
         (format!("[orrerix] {} reports done (#900)", worker.id), "structured report"),
-        (format!("[orrerix] {} reports progress:", worker.id), "legacy report"),
+        (format!("[orrerix] {} reports blocked:", worker.id), "legacy report"),
         (format!("[orrerix] message from {}:", worker.id), "message_orchestrator"),
         (
             format!(
@@ -16333,6 +16368,237 @@ fn only_a_planner_done_report_auto_closes_the_pane() {
     };
     assert!(alive(&worker.id), "a worker's done report must not close its pane");
     assert!(alive(&planner.id), "a planner's progress report must not close its pane");
+}
+
+/// A group with a paused orchestrator pane (so deliveries are queued AND
+/// audited, which is what `delivered_texts` reads), a worker, and one board row
+/// bound to that worker's session. Returns (registry, tempdir, group, worker,
+/// worker's caller, task id).
+///
+/// #1958's tests all need the same three things in place — a delivery PROBE that
+/// works, a resolvable board row, and a delegate whose session is on it — and a
+/// helper is what stops one of them being silently absent in a test whose whole
+/// claim is an absence.
+fn report_routing_setup(
+) -> (OrchRegistry, tempfile::TempDir, GroupId, AgentEntry, Caller, String) {
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6250);
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "ship the thing", false, None).unwrap();
+    let session = w.session_id.clone().expect("a spawn mints a session id");
+    let t = reg
+        .upsert_task(&g.id, "orch-1", None, patch(Some("Ship the thing"), None, None))
+        .unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { session: Some(session), pr: Some("#900".into()), ..Default::default() },
+    )
+    .unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    (reg, d, g.id, w, cw, t.id)
+}
+
+/// The notes on one board row, oldest first.
+fn task_notes(reg: &OrchRegistry, group: &GroupId, id: &str) -> Vec<String> {
+    reg.tasks(group)
+        .into_iter()
+        .find(|t| t.id == id)
+        .unwrap_or_else(|| panic!("task {id} must exist"))
+        .notes
+        .into_iter()
+        .map(|n| n.text)
+        .collect()
+}
+
+/// The status/outcome word of every `report` tool call this group audited.
+fn audited_reports(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "tool-call" && e.detail["tool"] == json!("report"))
+        .filter_map(|e| {
+            let a = e.detail["args"].clone();
+            a["outcome"]
+                .as_str()
+                .or_else(|| a["status"].as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// **#1958.** A `progress` report is RECORDED and REROUTED, never delivered: the
+/// audit row every MCP call writes, plus a note on the board row it resolves to,
+/// and nothing typed into the orchestrator's pane.
+///
+/// **The positive control is the same session's `done`, in the same test.** An
+/// assertion that no line reached the pane passes just as well when the probe is
+/// broken, the orchestrator has no pane, or the report never dispatched at all —
+/// so the `done` half is what proves the pane was reachable the whole time, and
+/// the audit and note halves are what prove the progress report really ran.
+#[test]
+fn a_progress_report_is_recorded_and_noted_but_never_reaches_the_orchestrators_pane() {
+    let (reg, _d, g, w, cw, tid) = report_routing_setup();
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "rebasing onto main, CI next" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "a progress report must still succeed: {r}");
+
+    // 1. The audit row, exactly as before this change.
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string()],
+        "the tool-call audit row is the floor and must be unchanged"
+    );
+
+    // 2. The board note — the trail the human reads beside the pane, and the
+    //    one the orchestrator reads on demand with get_task.
+    let notes = task_notes(&reg, &g, &tid);
+    assert_eq!(notes.len(), 1, "exactly one note, got {notes:?}");
+    assert!(
+        notes[0].contains("rebasing onto main"),
+        "the note must carry the delegate's own words: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains(&w.id),
+        "…attributed to the delegate that wrote it: {}",
+        notes[0]
+    );
+
+    // 3. Nothing was typed into the orchestrator's pane.
+    let delivered = delivered_texts(&reg, &g);
+    assert!(
+        !delivered.iter().any(|t| t.contains("reports progress")),
+        "a progress report reached the orchestrator's pane: {delivered:#?}"
+    );
+
+    // 4. THE POSITIVE CONTROL. Same worker, same session, same pane: a `done`
+    //    IS delivered. Without this, every assertion above is satisfied by a
+    //    registry that delivers nothing to anybody.
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "done", "ref": "#900", "note": "CI green, ready for review" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "the control report must succeed: {r}");
+    let delivered = delivered_texts(&reg, &g);
+    assert!(
+        delivered.iter().any(|t| t.starts_with(&format!("[orrerix] {} reports done", w.id))),
+        "the control `done` must reach the pane the progress report did not: {delivered:#?}"
+    );
+    assert!(
+        !delivered.iter().any(|t| t.contains("reports progress")),
+        "the control delivery must not have carried the progress line with it: {delivered:#?}"
+    );
+}
+
+/// **#1958.** No resolvable board row is not an error and invents nothing: the
+/// audit row is the floor, and a group that does not use the board reports
+/// exactly as it did before.
+#[test]
+fn a_progress_report_with_no_resolvable_task_is_audit_only_and_not_an_error() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6251);
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "ship it", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+
+    // A board row matching NEITHER the session nor the ref, so "resolved
+    // nothing" is a real miss rather than an empty board.
+    let other = reg
+        .upsert_task(&g.id, "orch-1", None, patch(Some("Someone elses work"), None, None))
+        .unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&other.id),
+        TaskPatch {
+            session: Some("11111111-2222-3333-4444-555555555555".into()),
+            pr: Some("#4242".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "still going" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "an unresolvable progress report must not fail: {r}");
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string()],
+        "the audit row is the floor and is written regardless"
+    );
+    assert!(
+        task_notes(&reg, &g, &other.id).is_empty(),
+        "a report that resolves nothing must not land on somebody elses row"
+    );
+    assert_eq!(reg.tasks(&g).len(), 1, "…and must not invent a row of its own");
+    assert!(
+        !delivered_texts(&reg, &g).iter().any(|t| t.contains("reports progress")),
+        "it is still not delivered"
+    );
+}
+
+/// **#1958.** The `ref` fallback: a row the orchestrator never bound a session
+/// to is still reachable through the PR the delegate names.
+///
+/// The session is tried FIRST and this test does not contradict that — the
+/// worker's session is on no row at all here, which is what makes the fallback
+/// the only thing that can resolve it.
+#[test]
+fn a_progress_reports_ref_resolves_a_board_row_when_no_session_is_bound() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6252);
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "ship it", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    let t = reg
+        .upsert_task(&g.id, "orch-1", None, patch(Some("Ship the thing"), None, None))
+        .unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { pr: Some("https://github.com/o/r/pull/900".into()), ..Default::default() },
+    )
+    .unwrap();
+
+    let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "pushed the fix" } }));
+    let notes = task_notes(&reg, &g, &t.id);
+    assert_eq!(notes.len(), 1, "the ref must resolve the row it names: {notes:?}");
+    assert!(notes[0].contains("pushed the fix"), "{}", notes[0]);
+}
+
+/// **#1958.** `done` and `blocked` are untouched — both still typed into the
+/// orchestrator's pane, because both need it to act.
+///
+/// Written as a walk of the whole `status` vocabulary rather than two named
+/// cases: the engine predicate is a match over a closed enum, and this is what
+/// catches a fourth status reaching this dispatch with no decision made about it.
+#[test]
+fn done_and_blocked_still_reach_the_orchestrator_and_only_progress_does_not() {
+    let (reg, _d, g, w, cw, _tid) = report_routing_setup();
+    for status in ["done", "blocked", "progress"] {
+        let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+            "status": status, "summary": format!("status word {status}") } }));
+    }
+    let delivered = delivered_texts(&reg, &g);
+    let reports: Vec<&String> = delivered
+        .iter()
+        .filter(|t| t.starts_with(&format!("[orrerix] {} reports", w.id)))
+        .collect();
+    assert_eq!(
+        reports.len(),
+        2,
+        "exactly the two action-needing statuses reach the pane: {reports:#?}"
+    );
+    assert!(reports.iter().any(|t| t.contains("reports done")), "{reports:#?}");
+    assert!(reports.iter().any(|t| t.contains("reports blocked")), "{reports:#?}");
 }
 
 #[test]

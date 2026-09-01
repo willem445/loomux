@@ -836,8 +836,25 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
     pinned("worker.md's first-turn primer", worker_primer, "delivery id",
         "the duplicate-delivery check must be the FIRST thing a worker does, or it can burn a \
          whole turn re-doing work it already did");
-    pinned("worker.md's first-turn primer", worker_primer, "report(\"progress\"",
-        "the orchestrator should hear a worker is on the task before anything else happens");
+    // #1958 repinned this. The old anchor was `report("progress"` and its stated reason —
+    // "the orchestrator should hear a worker is on the task" — is the claim #1958 RETRACTS: a
+    // progress report reaches no pane at all, so mandating one on every spawn mandated a
+    // notification to nobody. Correcting the template without correcting the pin would have
+    // reddened this test and read as a regression, which is the pressure to revert the fix
+    // rather than the pin (CLAUDE.md, #1502).
+    //
+    // What survives is the rule the primer really owes: after the two checks, WORK. The
+    // `delivery id` pin above is this region's positive control — it fails loudly on an empty
+    // or mislocated `worker_primer`, so the absence assertion below cannot pass vacuously.
+    pinned("worker.md's first-turn primer", worker_primer, "work the brief step by step",
+        "after the duplicate-delivery and directive checks, the primer's job is to send the          worker at the brief — not at a ceremony report");
+    assert!(
+        !worker_primer.contains("report(\"progress\""),
+        "worker.md's first-turn primer must not mandate a starting progress report (#1958): a          progress report is a RECORD, written to the audit log and the board, and reaches no          pane — so a mandated one on every spawn is a notification to nobody. If you are          re-adding it deliberately, say why in the PR.
+
+Region as rendered:
+{worker_primer}"
+    );
 
     let r = flat(&reviewer);
     let reviewer_primer = section(&r, "## your first turn", "## your orrerix mcp tools");
