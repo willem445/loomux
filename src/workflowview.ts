@@ -2567,7 +2567,7 @@ export class WorkflowView {
    *  preserves a configured block (#1869 review round 3), so removal is the one
    *  way to discard it — and the escape hatch for opening the file in an
    *  orrerix build old enough to refuse the key (`RawWorkflow` is
-   *  `deny_unknown_fields`, verified against v1.3.0-beta2, whose root type
+   *  `deny_unknown_fields`, verified against v1.3.0-beta1, whose root type
    *  carries the attribute and no `driver:` field). The dialog names what is
    *  discarded — switch, counters, comments — before the user commits, because
    *  nothing in the file survives it. */

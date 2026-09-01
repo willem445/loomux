@@ -1750,14 +1750,21 @@ rewrite the value in place and change it, a flip rewrites the value and leaves
 the comment byte for
 byte — which means a comment can outlive the
 switch position it describes, and the pane says so beside the toggle rather
-than editing your prose. Two shapes get no note, and both are values the pane
-already flags: a value that does not end in a true/false spelling at all
-(`enabled: yes`) makes a flip regenerate the whole section, so the block's
-comments do not survive it; and a value that already reads as the value the
-flip would write (`enabled: nottrue` under a checkbox that would write true)
-makes the flip a byte-identical no-op. Unticking never deletes configuration
-either: a block
-carrying counters or comments is kept, with the switch written as off, and its
+than editing your prose. The rule the toggle follows, and the shape it needs:
+**byte-identity holds when the flip is an in-place value replacement on a
+block whose fields are on their own lines and whose value is not already the
+target.** What follows from it: a value that does not end in a true/false
+spelling at all (`enabled: yes`) cannot be replaced in place, so a flip
+regenerates the whole section and the block's comments do not survive it; a
+value that already reads as the value the flip would write (`enabled: nottrue`
+under a checkbox that would write true) makes the flip a byte-identical no-op;
+and a block written in flow style (`driver: {enabled: true, ...}`) has no
+field lines to replace on, so a flip rewrites it in block style — the model is
+preserved, the prose is not. The pane already flags the first two, and the
+note stays silent wherever the promise would not hold; the fourth shape has
+never been reachable from the pane itself, because the pane writes block
+style. Unticking never deletes configuration either: a block carrying counters
+or comments is kept, with the switch written as off, and its
 comments are kept byte for byte except the switch's own line.
 
 **Removing a section is a different gesture from the toggle, and the driver
@@ -1767,7 +1774,7 @@ comments — behind its own confirmation that names what is discarded. This is
 deliberate destruction, not part of the toggle's round-trip promise, and it
 exists because a `driver:` block makes the file unloadable on any orrerix
 build old enough to refuse the key (`deny_unknown_fields` on the workflow
-root, verified against v1.3.0-beta2): removing the block is how the file loads
+root, verified against v1.3.0-beta1): removing the block is how the file loads
 again. The toggle will not do this to you, and the button does nothing until
 you confirm it.
 

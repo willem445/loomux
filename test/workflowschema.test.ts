@@ -675,7 +675,7 @@ test("removeDriverBlock deletes a configured block whole — the escape hatch th
   // P1: the narrowed toggle preserves a configured block, so removal is its own
   // gesture — and the escape hatch for the forward-compat break: a `driver:`
   // block makes the file unloadable on an orrerix build old enough to refuse the
-  // key (`RawWorkflow` is `deny_unknown_fields`, verified against v1.3.0-beta2).
+  // key (`RawWorkflow` is `deny_unknown_fields`, verified against v1.3.0-beta1).
   // The discard is whole and explicit: switch, counters, unknown keys, comments.
   const w = parseWorkflow(
     "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  # a comment\n  enabled: true\n  max_review_rounds: 2\n"
@@ -748,6 +748,27 @@ test("driverEnabledLineComment reads the enabled line's own comment through the 
     probe(" driver:\n  enabled: true # x\n"),
     null,
     "an unreadable shape invents no note — the note is advisory and may not lie"
+  );
+});
+
+test("a flow-mapping driver block gets no note and a flip rewrites it in block style (#1876 review 3, B2)", () => {
+  // The structural shape behind the byte-identity rule: a flow mapping
+  // (`driver: {enabled: true, ...}`) has NO field lines to anchor to, so the
+  // splice cannot run regardless of the value — the note is structurally null
+  // and a flip rewrites the section in block style. The MODEL is preserved;
+  // the prose (the flow formatting) is not. This is the shape the rule covers
+  // rather than a third enumerated exception.
+  const text = "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver: {enabled: true, max_review_rounds: 2}\n";
+  const w = parseWorkflow(text).workflow;
+  assert.deepEqual(w.driver, { enabled: true, max_review_rounds: 2 }, "the flow mapping parses with no findings");
+  assert.equal(driverEnabledLineComment(w, text), null, "no note: there are no field lines to anchor to");
+  setDriverEnabled(w, false);
+  const out = serializeWorkflowPreserving(w, text);
+  assert.doesNotMatch(out, /driver: \{/, "the flip rewrites the flow mapping in block style");
+  assert.deepEqual(
+    parseWorkflow(out).workflow.driver,
+    { enabled: false, max_review_rounds: 2 },
+    "…while the model survives the rewrite"
   );
 });
 
