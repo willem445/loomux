@@ -200,11 +200,11 @@ impl DriveState {
 }
 
 /// Why a drive is parked (§2.2). **One state carrying a closed reason enum, not
-/// twelve states**, so a reader asking "is this drive parked" asks one
+/// thirteen states**, so a reader asking "is this drive parked" asks one
 /// question, and the reason travels in the notice and the audit line rather
 /// than being inferred from which counter happens to sit at its bound.
 ///
-/// Twelve reasons. With `satisfied` and `cancelled` that is §2.2's fourteen
+/// Thirteen reasons. With `satisfied` and `cancelled` that is §2.2's fifteen
 /// exits back to the LLM orchestrator, and [`HeldReason::ALL`] is what makes
 /// that count checkable rather than asserted.
 ///
@@ -252,6 +252,24 @@ pub enum HeldReason {
     /// notice came to send an orchestrator after a replacement session for a
     /// session that was fine.
     WorkerUnresumable,
+    /// **The group's live-delegate cap refused the pane the drive needed**
+    /// (#1960) — its own reason, and the reason it is not
+    /// [`WorkerUnresumable`](HeldReason::WorkerUnresumable).
+    ///
+    /// It was reported as that one, which named a remedy that does not work: it
+    /// tells the orchestrator the recorded session no longer resolves and to
+    /// re-point the drive at another one. The session resolves fine. What is
+    /// exhausted is a slot, the remedy is to free one (or wait), and those are
+    /// different actions — measured on the dogfood, an orchestrator went
+    /// looking for a replacement session for a session whose `.jsonl` was on
+    /// disk and which re-pointed successfully the moment panes were killed.
+    ///
+    /// A **lane** spawn refused by the cap does not reach this: `review-wait`
+    /// backs off and retries, counted only against `drive_timeout_minutes`
+    /// (§8's live-delegate-cap row). The asymmetry is the states': a lane can
+    /// be opened on any later tick, while `fix-wait` has already taken its arc
+    /// and spent its round.
+    CapRefused,
     /// A driven delegate called `message_orchestrator` (§7 — that call is never
     /// intercepted; the delegate's own line arrives by its own path and this
     /// hold is the routing fact beside it).
@@ -261,7 +279,7 @@ pub enum HeldReason {
 impl HeldReason {
     /// Every reason, so a caller — or a test counting §2.2's exits — can
     /// enumerate them without matching on the enum. Order is §2.2's table.
-    pub const ALL: [HeldReason; 12] = [
+    pub const ALL: [HeldReason; 13] = [
         HeldReason::Escalate,
         HeldReason::ReviewLimit,
         HeldReason::CiLimit,
@@ -273,6 +291,7 @@ impl HeldReason {
         HeldReason::GateUnreadable,
         HeldReason::WorkerBlocked,
         HeldReason::WorkerUnresumable,
+        HeldReason::CapRefused,
         HeldReason::Messaged,
     ];
 
@@ -291,6 +310,7 @@ impl HeldReason {
             HeldReason::GateUnreadable => "gate-unreadable",
             HeldReason::WorkerBlocked => "worker-blocked",
             HeldReason::WorkerUnresumable => "worker-unresumable",
+            HeldReason::CapRefused => "cap-refused",
             HeldReason::Messaged => "messaged",
         }
     }
@@ -309,6 +329,7 @@ impl HeldReason {
             "gate-unreadable" => Some(HeldReason::GateUnreadable),
             "worker-blocked" => Some(HeldReason::WorkerBlocked),
             "worker-unresumable" => Some(HeldReason::WorkerUnresumable),
+            "cap-refused" => Some(HeldReason::CapRefused),
             "messaged" => Some(HeldReason::Messaged),
             _ => None,
         }
@@ -1338,7 +1359,7 @@ impl DriveEntry {
         before != after
     }
 
-    /// Every pane this drive has opened and still owns, superseded ones included
+    /// Every pane this drive still owns, superseded ones included
     /// — what an exit owes the orchestrator (#1871 B3), and the same population
     /// [`driven_role`](DriveEntry::driven_role) recognises.
     ///
@@ -2186,13 +2207,13 @@ mod tests {
     }
 
     #[test]
-    fn the_held_reasons_are_the_notes_twelve() {
-        assert_eq!(HeldReason::ALL.len(), 12);
-        // §2.2: "There are **fourteen**" exits back to the LLM orchestrator —
-        // the twelve holds plus `satisfied` and `cancelled`.
+    fn the_held_reasons_are_the_notes_thirteen() {
+        assert_eq!(HeldReason::ALL.len(), 13);
+        // §2.2: "There are **fifteen**" exits back to the LLM orchestrator —
+        // the thirteen holds plus `satisfied` and `cancelled`.
         let exits =
             HeldReason::ALL.len() + DriveState::ALL.iter().filter(|s| s.is_terminal()).count();
-        assert_eq!(exits, 14);
+        assert_eq!(exits, 15);
         for r in HeldReason::ALL {
             assert_eq!(HeldReason::parse(r.as_str()), Some(r), "{}", r.as_str());
         }

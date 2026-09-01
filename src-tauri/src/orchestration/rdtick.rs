@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use super::{
     brand, mergeq, mqloop, notify, now_ms, pr_number, rddrive, render_template,
     resolve_session_ref, resolve_worker_resume_cwd, reviewdrive, tail_snippet, workflow,
-    AgentEntry, AgentStatus, GroupId, LockExt, OrchRegistry, Role, TaskPatch,
+    AgentEntry, AgentStatus, Delivery, GroupId, LockExt, OrchRegistry, Role, TaskPatch,
 };
 
 // ---------- the review driver's registry-side types (#1778 S3) ----------
@@ -1064,23 +1064,74 @@ impl OrchRegistry {
         // persona, wrong model, and on a CLI that may not be able to open the
         // transcript at all. This lane's block is not something to look up — it
         // is the key the lane is filed under.
-        let spawned = match prior {
-            Some(session) => self
-                .rd_spawn(group, Role::Reviewer, Some(block.to_string()), Some(session), &text)
-                .or_else(|_| {
-                    self.rd_spawn(group, Role::Reviewer, Some(block.to_string()), None, &text)
-                }),
-            None => self.rd_spawn(group, Role::Reviewer, Some(block.to_string()), None, &text),
-        }?;
-        entry.open_lane(
-            block,
-            spawned.session_id.as_deref().unwrap_or(""),
-            &spawned.id,
-            &brief.head,
-            brief.body_digest_opt(),
-            now,
-        );
-        Ok(spawned.id)
+        // Reuse before spawn (#1960), the lane's half: a lane briefed a second
+        // time whose reviewer is idle in a live pane is re-briefed IN that pane
+        // rather than in a second one on the same conversation. Five of the six
+        // panes holding the cap in the measured incident were idle lanes and
+        // superseded workers the driver itself had opened.
+        let fresh = |this: &Self| {
+            this.rd_spawn(group, Role::Reviewer, Some(block.to_string()), None, &text)
+        };
+        let (agent, session_id) = match prior {
+            Some(session) => match self.rd_reuse_pane(group, &session, &text) {
+                Some(a) => (a, session),
+                None => {
+                    let sp = self
+                        .rd_spawn(
+                            group,
+                            Role::Reviewer,
+                            Some(block.to_string()),
+                            Some(session),
+                            &text,
+                        )
+                        .or_else(|_| fresh(self))?;
+                    (sp.id, sp.session_id.unwrap_or_default())
+                }
+            },
+            None => {
+                let sp = fresh(self)?;
+                (sp.id, sp.session_id.unwrap_or_default())
+            }
+        };
+        entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), now);
+        Ok(agent)
+    }
+
+    /// **Reuse before spawn** (#1960): resume `session` into the live idle pane
+    /// already running it, by typing the brief into that pane, and answer which
+    /// pane took it. `None` = there is none, so the caller opens one.
+    ///
+    /// # Why this rather than releasing what a new pane supersedes
+    ///
+    /// The driver opened a NEW pane per resume and closed none, so every round
+    /// cost net +1 or +2 live panes and three concurrent drives exhausted the
+    /// six-delegate cap in a round and a half — on the driver's own panes, five
+    /// of the six idle. §3.1's other candidate fix was to kill the pane a new
+    /// one supersedes, and this is chosen over it for two reasons.
+    ///
+    /// It does not need §3.1 item 5 narrowed. "The driver never kills a pane"
+    /// stays a closed guarantee rather than becoming "never kills a pane it did
+    /// not open", which is a guarantee a reader has to hold a second fact to
+    /// evaluate — and the exception would have been useless for the pane that
+    /// actually squatted the cap in the measured incident: the ORIGINAL worker
+    /// pane, opened by the orchestrator, which a release-what-you-superseded
+    /// rule may not touch. Reuse takes that pane over on the first hand-back
+    /// and never creates the second one at all.
+    ///
+    /// And it is what an orchestrator driving by hand does: it types the next
+    /// instruction into the worker's pane. A drive whose worker is idle in a
+    /// live pane has nothing to gain from a second pane on the same
+    /// conversation, and #338/#359 makes the second one actively worse — two
+    /// panes, one session, one worktree.
+    ///
+    /// A failed delivery falls through to the spawn rather than failing the
+    /// hand-back: `deliver_prompt` can refuse for reasons that say nothing
+    /// about the drive (a pane that died between the lookup and the write),
+    /// and the spawn is the path that already existed.
+    fn rd_reuse_pane(&self, group: &GroupId, session: &str, text: &str) -> Option<String> {
+        let agent = self.idle_pane_on_session(group, session)?;
+        self.deliver_prompt(&agent, text, brand::AUDIT_ACTOR, Delivery::MidSession).ok()?;
+        Some(agent)
     }
 
     /// Whether the pane this drive resumed its worker into is **dead**, and
@@ -1178,12 +1229,25 @@ impl OrchRegistry {
         if session.is_empty() {
             return Err("this drive has no recorded worker session".into());
         }
-        let block = self.rd_resume_block(group, &session)?;
-        let spawned = self.rd_spawn(group, Role::Worker, block, Some(session), &text)?;
+        // Reuse before spawn (#1960). Asked BEFORE the block is resolved: a
+        // session with a live idle pane is already running under the right
+        // block by construction, and refusing that hand-back because the
+        // roster no longer declares that block would be a refusal with a live,
+        // correct, typeable pane sitting in front of it.
+        let agent = match self.rd_reuse_pane(group, &session, &text) {
+            Some(a) => a,
+            None => {
+                let block = self.rd_resume_block(group, &session)?;
+                self.rd_spawn(group, Role::Worker, block, Some(session), &text)?.id
+            }
+        };
         // Through the method, never a field write: the pane this supersedes is
-        // still the drive's and still live (#1871 B2).
-        entry.record_worker_pane(&spawned.id);
-        Ok(spawned.id)
+        // still the drive's and still live (#1871 B2). Idempotent when the pane
+        // reused IS the one already recorded — `retain_panes` drops it from the
+        // superseded list on the way past — so a second hand-back into one pane
+        // does not file that pane as its own predecessor.
+        entry.record_worker_pane(&agent);
+        Ok(agent)
     }
 
     /// The workspace a driver-initiated resume inherits.
@@ -1771,6 +1835,14 @@ impl OrchRegistry {
                         out.audits.push((
                             rddrive::audit_action::REFUSED,
                             json!({ "pr": pr, "block": block, "reason": "lane-spawn-refused",
+                                    // #1960: whether the CAP is what refused,
+                                    // on the row itself. A reader chasing a
+                                    // drive that opened no lane for twenty
+                                    // minutes was reading a free-text `detail`
+                                    // to find out, and the answer decides
+                                    // whether anything is wrong at all — a
+                                    // capped lane retries and clears itself.
+                                    "cap": super::is_live_cap_refusal(&why),
                                     "detail": why }),
                         ));
                     }
@@ -1835,11 +1907,23 @@ impl OrchRegistry {
                                 // diagnosing a session that no longer resolves
                                 // — for a block that had left the roster, for a
                                 // pane that opened and died on `Invalid session
-                                // ID`, and (§1960) for a cap refusal.
+                                // ID`, and (#1960) for a cap refusal.
+                                //
+                                // **And a cap refusal is now its own reason**
+                                // (#1960): the session resolves fine, a slot is
+                                // what is exhausted, and the two remedies are
+                                // different actions. Classified on the shared
+                                // literal `live_cap_refusal` writes, so the
+                                // producer and this reader cannot drift.
+                                let reason = if super::is_live_cap_refusal(&why) {
+                                    reviewdrive::HeldReason::CapRefused
+                                } else {
+                                    reviewdrive::HeldReason::WorkerUnresumable
+                                };
                                 out.refusal = why.clone();
                                 out.audits.push((
                                     rddrive::audit_action::REFUSED,
-                                    json!({ "pr": pr, "reason": "worker-unresumable",
+                                    json!({ "pr": pr, "reason": reason.as_str(),
                                             "detail": why }),
                                 ));
                                 // **The arc's result decides what the notice may
@@ -1851,15 +1935,13 @@ impl OrchRegistry {
                                 // the axis this round is about.
                                 match entry.advance(
                                     reviewdrive::DriveState::Held,
-                                    Some(reviewdrive::HeldReason::WorkerUnresumable),
+                                    Some(reason),
                                     None,
                                     now,
                                 ) {
                                     Ok(()) => {
-                                        out.advanced = Some((
-                                            reviewdrive::DriveState::Held,
-                                            Some(reviewdrive::HeldReason::WorkerUnresumable),
-                                        ));
+                                        out.advanced =
+                                            Some((reviewdrive::DriveState::Held, Some(reason)));
                                     }
                                     Err(bad) => {
                                         // Unreachable — `fix-wait -> held` is arc
