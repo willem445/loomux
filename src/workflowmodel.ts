@@ -850,11 +850,12 @@ export function driverEnabledLineComment(text: string): string | null {
     if (opaque.has(i) || !isSignificantLine(line) || indentOf(line) !== indent) continue;
     const split = splitKey(stripComment(line).trim());
     if (!split || split.key !== "enabled") continue;
-    const stripped = stripComment(line).trimEnd();
-    // The splice's own suffix guard, mirrored: where it would bail, the flip
-    // regenerates the section and the comment does not survive — no note.
-    if (!/(true|false)$/i.test(stripped)) return null; // suffix guard (#1876)
-    const comment = line.slice(stripped.length).trim();
+    // The shared predicate, not a mirrored copy: where the splice would bail,
+    // the flip regenerates the section and the comment does not survive — no
+    // note. Divergence between what the note promises and what the write does
+    // is not expressible while both answer to one function (#1876 review 2).
+    if (!enabledLineValueRewritable(line)) return null; // no note where the splice would bail
+    const comment = line.slice(stripComment(line).trimEnd().length).trim();
     return comment || null;
   }
   return null;
@@ -1974,6 +1975,19 @@ function driverDiffersOnlyInEnabled(a: WorkflowDriver, b: WorkflowDriver): boole
   return deepEqualValue(rest(a), rest(b));
 }
 
+/** Can the enabled-line rewrite replace THIS line's value in place? True when
+ *  the comment-stripped, right-trimmed line ends in a true/false spelling — the
+ *  suffix match's whole alphabet. THE one guard both surfaces answer to:
+ *  `spliceEnabledLine` bails into canonical regeneration when this is false,
+ *  and `driverEnabledLineComment` returns null (no note) for the same input,
+ *  because the note promises exactly what the splice does — and a second copy
+ *  of the condition is a divergence waiting to happen (#1876 review 2). The
+ *  strip-and-trim normalisation lives in here too, so the two callers cannot
+ *  drift on what they feed the match either. */
+function enabledLineValueRewritable(line: string): boolean {
+  return /(true|false)$/i.test(stripComment(line).trimEnd());
+}
+
 /** Rewrite a `driver:` section's own lines so its `enabled:` line carries `value`,
  *  reusing every other line verbatim — comments and formatting included (#1869
  *  review round 3). The value is REPLACED in place when the line exists (a trailing
@@ -2021,7 +2035,7 @@ function spliceEnabledLine(content: readonly string[], value: boolean): string[]
     const split = splitKey(stripComment(line).trim());
     if (!split || split.key !== "enabled") continue;
     const head = stripComment(line).trimEnd();
-    if (!/(true|false)$/i.test(head)) return null; // an unexpected value spelling — bail
+    if (!enabledLineValueRewritable(line)) return null; // an unexpected value spelling — bail
     const replaced = head.replace(/(true|false)$/i, wanted) + line.slice(head.length);
     return [...content.slice(0, i), replaced, ...content.slice(i + 1)];
   }
