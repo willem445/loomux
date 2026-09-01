@@ -1841,7 +1841,7 @@ impl OrchRegistry {
                         rddrive::audit_action::SATISFIED,
                         json!({ "pr": pr, "head": entry.head }),
                     ));
-                    entry.owe_notice(&n, now);
+                    out.notices.push(n);
                 }
                 (reviewdrive::DriveState::Held, Some(r)) => {
                     let n =
@@ -1854,12 +1854,10 @@ impl OrchRegistry {
                 }
                 (reviewdrive::DriveState::Cancelled, _) => {
                     out.audits.push((rddrive::audit_action::CANCELLED, json!({ "pr": pr })));
-                    // Replace-vs-augment, resolved as reconcile's is: #1871 B3's
-                    // panes thread into the construction, and #1857's owe
-                    // replaces the direct push rather than sitting beside it.
                     let panes = entry.owned_panes();
                     let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone, &panes);
-                    entry.owe_notice(&n, now);
+                    let _ = now;
+                    out.notices.push(n);
                 }
                 _ => {}
             }
