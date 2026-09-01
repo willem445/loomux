@@ -1740,31 +1740,44 @@ the distinction that matters spelled out — a bound orrerix **refuses** reads
 as an error, one it **clamps** as a warning.
 
 An untouched section is never rewritten. orrerix writes only what the file
-declares, so opening these forms to look at them changes nothing, and a section
-you tick on and then off again leaves the file exactly as it was — including
-its comments — with one exception: a `driver:` block that carried no
-`enabled:` line at all. Turning a driver on has to add that line, so the two
-clicks leave such a block declaring `enabled: false` where the file had none.
-When that line carries its own trailing comment and a flip there would
-rewrite the value in place and change it, a flip rewrites the value and leaves
-the comment byte for
-byte — which means a comment can outlive the
-switch position it describes, and the pane says so beside the toggle rather
-than editing your prose. The rule the toggle follows, and the shape it needs:
-**byte-identity holds when the flip is an in-place value replacement on a
-block whose fields are on their own lines and whose value is not already the
-target.** What follows from it: a value that does not end in a true/false
-spelling at all (`enabled: yes`) cannot be replaced in place, so a flip
-regenerates the whole section and the block's comments do not survive it; a
-value that already reads as the value the flip would write (`enabled: nottrue`
-under a checkbox that would write true) makes the flip a byte-identical no-op;
-and a block written in flow style (`driver: {enabled: true, ...}`) has no
-field lines to replace on, so a flip rewrites it in block style — the model is
-preserved, the prose is not. The pane already flags the first two, and the
-note stays silent wherever the promise would not hold; the fourth shape has
-never been reachable from the pane itself, because the pane writes block
-style. Unticking never deletes configuration either: a block carrying counters
-or comments is kept, with the switch written as off, and its
+declares, so opening these forms to look at them changes nothing. This
+paragraph is about the **single flip**: what one click on the toggle does to
+the lines around the value it changes — not the on-then-off round trip, which
+is a different question with a different answer, and the two readings are kept
+apart below. For the toggle itself: unticking keeps what the block carries —
+a block that holds nothing but the switch is removed whole, while one carrying
+counters or comments has `enabled: false` written into it and loses nothing —
+and ticking on after unticking writes `enabled: true` and leaves the block's
+lines byte for byte. A `driver:` block that carried no `enabled:` line at all
+is the case that starts differently: turning a driver on has to add that line,
+so the two clicks leave such a block declaring `enabled: false` where the file
+had none.
+
+For one flip on an existing block: **the lines around the value survive the
+flip byte for byte when the flip is an in-place value replacement on a block
+whose fields are on their own lines and whose value is spelled exactly `true`
+or `false` and is not already the target.** What follows from it: a value that
+does not end in a true/false spelling at all (`enabled: yes`) cannot be
+replaced in place, so a flip regenerates the whole section and the block's
+comments do not survive it; a value that already reads as the value the flip
+would write (`enabled: nottrue` under a checkbox that would write true) makes
+the flip a byte-identical no-op; a value spelled with uppercase letters
+(`True`, `FALSE`) is replaced but not with itself — the flip writes the
+lowercase spelling, so the line changes, the pane flagged the spelling, and
+the comment survives; and a block written in flow style
+(`driver: {enabled: true, ...}`) has no
+field lines to replace on, so a flip rewrites it in block style - the model is
+preserved, the prose is not. The note stays silent wherever the promise would
+not hold, and the pane flags every value the pane's own reader cannot read
+(the lowercase-only list above), which is every one of these shapes on the
+file's own terms. The round trip — the toggle on and then off, the gesture the
+pane actually offers — follows from the same rule rather than needing its own:
+where each flip preserves the lines around its value, the second flip is the
+first one in reverse, so on-then-off restores the file byte for byte; where a
+flip regenerates or rewrites the section, the file that comes back is not the
+one that left, and the shapes above are the ones where that happens. Unticking
+never deletes configuration either: a block
+carrying counters or comments is kept, with the switch written as off, and its
 comments are kept byte for byte except the switch's own line.
 
 **Removing a section is a different gesture from the toggle, and the driver
