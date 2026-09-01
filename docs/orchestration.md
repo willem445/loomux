@@ -1722,9 +1722,10 @@ family — read each row as its own policy, never inferred from a neighbour:
   value reaches you as a finding.
 - **Merge queue** (`merge_queue:`): `max_batch` is 1 or more, refused below,
   no ceiling; `checks_timeout_minutes` is 5–240 minutes, **clamped**.
-- **Review driver** (`driver:`): the three counters are 1–3 rounds/attempts
-  and 0–1 rebases, refused outside; the three timeouts are 5–240 minutes,
-  **clamped**.
+- **Review driver** (`driver:`): `max_review_rounds` and `max_ci_attempts` are
+  1–3 rounds each and `max_rebase_attempts` is 0–1 rebases, all **refused**
+  outside; `lane_timeout_minutes`, `fix_timeout_minutes` and
+  `drive_timeout_minutes` are 5–240 minutes, **clamped**.
 - **Lock resources** (`resources:`): `slots` is 1–64 and `max_hold_minutes`
   is 1–480 minutes, both refused outside; at most 32 resources may be
   declared. These are the fields the inputs themselves enforce — they cannot

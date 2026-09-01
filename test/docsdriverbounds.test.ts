@@ -7,7 +7,12 @@
 // `cargo test --workspace` had no way to see — one of them said the driver's three
 // timeouts are *refused* out of range when the engine *clamps* them and refuses the
 // three counters instead. This file makes that sentence, and every number beside it,
-// fail when either surface moves.
+// fail when either surface moves: the page assigns each policy its family by naming
+// that family's FIELDS, and site 3 below checks that membership against the manifest.
+// Until #1951 B2 the page named its families by a bare noun instead ("the three
+// counters", "the three timeouts"), which the manifest has no counterpart for and
+// nothing here could pin — swapping the two nouns reproduced #1870 B1's sentence
+// verbatim with this file green.
 //
 // WHAT IS PINNED. Three sites on the page, all against `sections.driver` in the
 // manifest, all default-deny in both directions (an unmatched row or an unmatched
@@ -20,8 +25,9 @@
 //      *ranged* field is that field's own default, which is what the paragraph under
 //      it claims.
 //   3. The "Review driver" row of the bounds summary further up the page: its two
-//      clauses, their range tokens, their refuse/clamp polarity, and their
-//      "three ... / three ..." counts.
+//      clauses, and per clause the refuse/clamp polarity, the range tokens, and the
+//      set of manifest fields the clause names — which is what makes the policy
+//      ASSIGNMENT checkable rather than only the numbers beside it.
 //
 // WHAT IS NOT PINNED — stated structurally, because the honest residual is a shape and
 // not a list of sentences someone remembered to check:
@@ -38,11 +44,15 @@
 //     manifest-vs-pane pins never read this page). Each is a slice of the same shape.
 //   * Every `help:` string in the manifest. The docs prose paraphrases those rather
 //     than quoting them, so nothing here compares them.
-//   * Any file other than `docs/orchestration.md`. `doc/design/review-driver.md` §5.3
-//     shows the same block, and its example's VALUES are still a second copy of the
-//     defaults — its per-field range comments were removed so that copy is as small as
-//     it can be, but it is not pinned. The marker mechanism is page-agnostic and a
-//     second page can adopt it; this file declares one page and checks that one.
+//   * Any file other than `docs/orchestration.md`. `doc/design/review-driver.md`
+//     restates these numbers in two places and NEITHER is pinned: §5.3's example shows
+//     the seven defaults, and §2.3 ("Three consequences that are decisions, not
+//     defaults") states the counters' ranges as `1..=3` and `0..=1` because its whole
+//     subject is why those are refused rather than clamped. §5.3's per-field range
+//     comments were removed so that file carries the ranges once rather than twice, but
+//     "removed from the example" is not "purged from the file" (#1951 B1). The marker
+//     mechanism is page-agnostic and a second page can adopt it; this file declares one
+//     page and checks that one.
 //   * The round-trip promise about ticking the driver on and off (#1949, the
 //     "For one flip on an existing block" paragraph). That is a claim about a
 //     BEHAVIOUR, not a bound; it has no counterpart in the manifest and no mechanical
@@ -65,20 +75,23 @@ interface SchemaField {
   on_out_of_range?: "refuse" | "clamp";
 }
 
+/** The directory every path in this file resolves against: the parent of this file's
+ *  own directory, which is the repo root while this file sits directly in `test/`. */
+const ROOT = new URL("../", import.meta.url);
 const manifest: { sections: Record<string, { fields: SchemaField[] }> } = JSON.parse(
-  readFileSync(new URL("../src/workflow-schema.json", import.meta.url), "utf8")
+  readFileSync(new URL("src/workflow-schema.json", ROOT), "utf8")
 );
-const DOCS = readFileSync(
-  new URL("../docs/orchestration.md", import.meta.url),
-  "utf8"
-).replace(/\r\n/g, "\n");
+const DOCS = readFileSync(new URL("docs/orchestration.md", ROOT), "utf8").replace(
+  /\r\n/g,
+  "\n"
+);
 
 const DRIVER: SchemaField[] = manifest.sections.driver.fields;
-/** This file's own repo-relative path, so the marker's pointer is checked against what
- *  the file IS rather than against a literal that a rename moves in lockstep with. */
-const SELF = decodeURIComponent(
-  import.meta.url.slice(new URL("../", import.meta.url).href.length)
-);
+/** This file's own path relative to `ROOT`, so the marker's pointer is checked against
+ *  what the file IS rather than against a literal that a rename moves in lockstep with.
+ *  Moving this file deeper would leave `SELF` no longer repo-relative — but the two
+ *  `readFileSync(new URL(..., ROOT))` calls above would throw first, loudly (#1951 N3). */
+const SELF = decodeURIComponent(import.meta.url.slice(ROOT.href.length));
 /** A field is in the RANGE population because it declares one, never because of its
  *  name — a rename cannot move a field in or out of this set. */
 const ranged = (f: SchemaField) => f.min !== undefined || f.max !== undefined;
@@ -86,7 +99,6 @@ const ranged = (f: SchemaField) => f.min !== undefined || f.max !== undefined;
 const NA = "—";
 /** Any of ASCII hyphen, en dash, em dash may separate a range's two ends. */
 const DASH = "[-–—]";
-const NUMBER_WORD = ["zero", "one", "two", "three", "four", "five", "six"];
 
 /** `| a | b | c |` -> `["a", "b", "c"]`; anything else -> null. */
 function tableRow(line: string): string[] | null {
@@ -262,8 +274,15 @@ test("the docs YAML example shows every ranged driver field at its default", () 
   );
 });
 
-test("the bounds summary's driver row states the manifest's ranges and polarities", () => {
-  // The row that #1870 B1 got backwards: it named the timeouts as the refused family.
+test("the bounds summary's driver row assigns each policy the manifest's own fields", () => {
+  // The row that #1870 B1 got backwards: it assigned `refused` to the timeout family.
+  // It used to identify its two families by a bare noun ("the three counters", "the
+  // three timeouts"), and a noun is not something the manifest has, so nothing could
+  // pin it: swapping the two nouns and leaving every range and policy word attached to
+  // the clause it was already in reproduced #1870 B1's exact sentence with this file
+  // green (#1951 B2). The row now names its FIELDS, as every sibling row on that page
+  // already does, so each family is identified by its members and the assignment is
+  // checkable end to end.
   const lead = "\n- **Review driver** (`driver:`):";
   const at = DOCS.indexOf(lead);
   assert.ok(at > 0, "the bounds summary still has a Review driver row");
@@ -271,7 +290,11 @@ test("the bounds summary's driver row states the manifest's ranges and polaritie
   const end = rest.search(/\n(?:- |\n)/);
   const rowText = (end === -1 ? rest : rest.slice(0, end)).replace(/\s+/g, " ");
 
-  const clauses = rowText.slice(rowText.indexOf(":") + 1).split(";");
+  // Slice past the row's own lead-in. Splitting on the first ":" would land inside the
+  // `driver:` code span, which is itself one of the row's backticked tokens.
+  const leadEnd = rowText.indexOf("`): ");
+  assert.ok(leadEnd > 0, `row keeps its \`driver:\` lead-in: ${rowText}`);
+  const clauses = rowText.slice(leadEnd + "`): ".length).split(";");
   assert.equal(clauses.length, 2, `two clauses: ${JSON.stringify(rowText)}`);
 
   const stems = ["refuse", "clamp"];
@@ -297,9 +320,16 @@ test("the bounds summary's driver row states the manifest's ranges and polaritie
       [...new Set(family.map(rangeOf))].sort(),
       `${policy} clause states exactly that family's ranges`
     );
-    assert.ok(
-      clause.includes(NUMBER_WORD[family.length]),
-      `${policy} clause says "${NUMBER_WORD[family.length]}": ${clause}`
+    // DEFAULT-DENY on the membership itself: every backticked token in the clause must
+    // be a manifest driver field, and the set must be exactly this policy's family. A
+    // field moved to the wrong clause, misspelled, or dropped fails here — which is the
+    // #1870 B1 defect shape, now expressed in the vocabulary the manifest actually has.
+    const named = [...clause.matchAll(/`([A-Za-z_]+)`/g)].map((m) => m[1]);
+    assert.equal(new Set(named).size, named.length, `no field named twice: ${clause}`);
+    assert.deepEqual(
+      [...named].sort(),
+      family.map((f) => f.name).sort(),
+      `${policy} clause names exactly that family's fields`
     );
     covered.push(policy);
     verified++;

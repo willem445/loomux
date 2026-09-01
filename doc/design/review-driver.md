@@ -1057,10 +1057,10 @@ driver:
   enabled: true               # default false; every other line below is its
   max_review_rounds: 3        #   own default. A counter is REFUSED outside its
   max_ci_attempts: 3          #   range and a timeout is CLAMPED into it; the
-  max_rebase_attempts: 1      #   ranges themselves are stated once, in the
-  lane_timeout_minutes: 60    #   pinned table in docs/orchestration.md, and
-  fix_timeout_minutes: 60     #   deliberately not restated here (#1872).
-  drive_timeout_minutes: 240  #
+  max_rebase_attempts: 1      #   ranges are in the pinned table in
+  lane_timeout_minutes: 60    #   docs/orchestration.md and are not repeated in
+  fix_timeout_minutes: 60     #   this example (#1872). Sec 2.3 above states the
+  drive_timeout_minutes: 240  #   counters' ranges; that copy is NOT pinned.
 ```
 
 **An absent block means the feature is off and behaviour is byte-for-byte
@@ -1118,6 +1118,15 @@ rename on either side cannot step over it. That is #1872's shape 1 for this one
 block: the BOUNDED half of what #1870 found, whose `:1699` finding named the
 three timeouts as the refused family when the engine refuses the three counters
 and clamps the timeouts - a false sentence a fully green suite could not see.
+
+**What is NOT pinned, named rather than implied.** §2.3 above restates the counters'
+ranges (`1..=3`, `0..=1`) as part of its refusal argument, and its opening paragraph
+restates INVARIANT 9's three numbers. Neither copy is pinned by anything, and neither
+was removed: §2.3's subject IS those numbers, so deleting them would cost the argument
+more than the duplication costs. This note is a developer surface read alongside the
+code; `docs/orchestration.md` is the user-facing one, and that is the one the test
+reads. A bound change therefore reddens on the two pinned sites and must be carried to
+§2.3 by hand.
 
 The rule that keeps it closed: **a new bounded, enumerable claim about `driver:`
 goes in that table, never in fresh prose.** The test locates its subjects by the
