@@ -1167,8 +1167,7 @@ impl DriveEntry {
             block: block.to_string(),
             session: session.to_string(),
             agent: agent.to_string(),
-            // MUTATION 2b: the lane's sibling arc, same single slot.
-            prior_agents: { let _ = prior; Vec::new() },
+            prior_agents: retain_panes(prior.unwrap_or_default(), agent),
             last_verdict: None,
             at_head: String::new(),
             briefed_head: head.to_string(),
@@ -1187,11 +1186,9 @@ impl DriveEntry {
     /// on running with the drive no longer able to recognise it. Everything a
     /// new pane must do to the old one is here, once.
     pub fn record_worker_pane(&mut self, agent: &str) {
-        // MUTATION 2 (#1871 B2 red-before-green): the single slot, which is the
-        // shipped behaviour this PR fixes. `retain_panes` is still called so the
-        // mutation is behavioural rather than a dead-code error.
-        let _ = retain_panes(Vec::new(), agent);
-        self.prior_worker_agents = Vec::new();
+        let mut prior = std::mem::take(&mut self.prior_worker_agents);
+        prior.push(std::mem::take(&mut self.worker_agent));
+        self.prior_worker_agents = retain_panes(prior, agent);
         self.worker_agent = agent.to_string();
     }
 
@@ -1214,12 +1211,7 @@ impl DriveEntry {
     /// Ordered worker-first then lane by lane, each oldest-first, so the list
     /// reads as the history it is. Deduplicated on the way in — see
     /// [`retain_panes`].
-    // MUTATION 3 (#1871 B3 red-before-green): the wiring neutered, not the
-    // rendering function — `panes_clause`'s own unit tests must stay green, so
-    // the red belongs to the seam.
-    #[allow(unreachable_code, unused_mut, unused_variables)]
     pub fn owned_panes(&self) -> Vec<(String, DrivenRole)> {
-        return Vec::new();
         let mut out: Vec<(String, DrivenRole)> = Vec::new();
         for a in self.prior_worker_agents.iter().chain(std::iter::once(&self.worker_agent)) {
             if !a.is_empty() {
@@ -1816,10 +1808,11 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
     // where [`lane_open_for`] decides between re-briefing it and waiting for a
     // brief already out at this revision — which is the re-open the head change
     // owed and never got.
-    // MUTATION 1 (#1871 B1 red-before-green): the currency filter removed, which
-    // is the shipped behaviour this PR fixes.
-    let _ = lane_verdict_is_current(lane.verdict.as_ref(), &facts.head, digest);
-    match lane.verdict.as_ref().map(|v| v.verdict) {
+    let current = lane
+        .verdict
+        .as_ref()
+        .filter(|v| lane_verdict_is_current(Some(v), &facts.head, digest));
+    match current.map(|v| v.verdict) {
         // A lane recorded `escalate` at this revision: an LLM judgment call, and
         // §3 says the driver never makes one.
         Some(Verdict::Escalate) => DriveStep::held(HeldReason::Escalate),
@@ -2520,7 +2513,6 @@ mod tests {
     /// answered `current: true` for every owned pane would satisfy a role-only
     /// test and let a two-heads-stale `done` advance the drive.
     #[test]
-    #[ignore = "SCRATCH round 2: already reddened in round 1 (run 33451869541); ignored so the engine binary passes and the workspace run REACHES the src-tauri seam tests"]
     fn a_superseded_pane_is_still_owned_and_is_never_current() {
         let mut e = entry_at(DriveState::ReviewWait);
         e.record_worker_pane("w-1");
@@ -2572,7 +2564,6 @@ mod tests {
     /// the orchestrator rather than being consumed by a drive that can no longer
     /// prove it owns the speaker.
     #[test]
-    #[ignore = "SCRATCH round 2: already reddened in round 1 (run 33451869541); ignored so the engine binary passes and the workspace run REACHES the src-tauri seam tests"]
     fn the_prior_pane_list_is_capped_and_drops_the_oldest() {
         let mut e = entry_at(DriveState::FixWait);
         for i in 0..(MAX_PRIOR_PANES + 5) {
@@ -3100,7 +3091,6 @@ mod tests {
     /// persists the head it resolved, so by the time `review-wait` is reached
     /// again the entry and the live head agree and only the VERDICT is stale.
     #[test]
-    #[ignore = "SCRATCH round 2: already reddened in round 1 (run 33451869541); ignored so the engine binary passes and the workspace run REACHES the src-tauri seam tests"]
     fn a_verdict_bound_to_an_older_head_decides_nothing_whatever_word_it_is() {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);

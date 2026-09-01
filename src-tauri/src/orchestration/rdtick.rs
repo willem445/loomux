@@ -1027,7 +1027,12 @@ impl OrchRegistry {
         // `a_lane_brief_is_one_paragraph_per_sentence`.
         let ci = match brief.ci {
             reviewdrive::CiObservation::Green => "This PR's checks are green at that head.",
-            reviewdrive::CiObservation::Red => "This PR's checks are RED at that head. Review the change on its merits; the failure is the worker's to answer.",
+            // MUTATION (#1863 D2 verification): the exact leak the shape pin
+            // exists to catch — a `\n` plus source indentation — reintroduced in
+            // the RED arm, which is one of the three the old Green-only fixture
+            // could not render.
+            reviewdrive::CiObservation::Red => "This PR's checks are RED at that head.
+                 Review the change on its merits; the failure is the worker's to answer.",
             reviewdrive::CiObservation::Conflicting => "This PR does not merge cleanly at that head. Review the change on its merits; the conflict is the worker's to answer.",
             // Pending and Unknown share one sentence on purpose: §8 says unknown
             // is never reported as a fact about the PR, and not-green-yet is the
