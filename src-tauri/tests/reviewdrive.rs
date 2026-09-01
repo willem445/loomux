@@ -2695,6 +2695,15 @@ fn a_second_conflict_after_the_one_rebase_hand_back_holds_on_rebase_limit() {
     let gh = FakeGh::green(HEAD_A);
     gh.set_merge_state("CONFLICTING");
     let (group, _session) = driven(&reg, &repo, &gh);
+    // A recipient with a pane, because the assertion below reads the notice off
+    // `RdDriveReport::notices` and that field now carries what was DELIVERED
+    // rather than what was produced (#1857). Its own panic message already said
+    // "a hold must deliver its notice"; before, nothing here could deliver
+    // anything — there was no orchestrator in this group at all — so the claim
+    // was one the fixture made unreachable. The subject of the test is the
+    // notice's TEXT and is untouched.
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7002);
 
     // ── the first conflict: the attempt is SPENT ────────────────────────────
     reg.rd_drive_group_with(&group, &gh, 10_000);
