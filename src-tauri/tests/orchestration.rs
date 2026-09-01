@@ -16654,19 +16654,19 @@ fn a_progress_report_is_recorded_and_noted_but_never_reaches_the_orchestrators_p
 #[test]
 fn a_progress_report_with_no_resolvable_task_is_audit_only_and_not_an_error() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    pause_with_pane(&reg, &g.id, &orch.id, 6251);
-    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "ship it", false, None).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap().id;
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 6251);
+    let w = reg.spawn_agent(&g, Role::Worker, "w", "ship it", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
 
     // A board row matching NEITHER the session nor the ref, so "resolved
     // nothing" is a real miss rather than an empty board.
     let other = reg
-        .upsert_task(&g.id, "orch-1", None, patch(Some("Someone elses work"), None, None))
+        .upsert_task(&g, "orch-1", None, patch(Some("Someone elses work"), None, None))
         .unwrap();
     reg.upsert_task(
-        &g.id,
+        &g,
         "orch-1",
         Some(&other.id),
         TaskPatch {
@@ -16706,16 +16706,16 @@ fn a_progress_report_with_no_resolvable_task_is_audit_only_and_not_an_error() {
 #[test]
 fn a_progress_reports_ref_resolves_a_board_row_when_no_session_is_bound() {
     let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    pause_with_pane(&reg, &g.id, &orch.id, 6252);
-    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "ship it", false, None).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap().id;
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 6252);
+    let w = reg.spawn_agent(&g, Role::Worker, "w", "ship it", false, None).unwrap();
     let cw = reg.resolve_token(&w.token).unwrap();
     let t = reg
-        .upsert_task(&g.id, "orch-1", None, patch(Some("Ship the thing"), None, None))
+        .upsert_task(&g, "orch-1", None, patch(Some("Ship the thing"), None, None))
         .unwrap();
     reg.upsert_task(
-        &g.id,
+        &g,
         "orch-1",
         Some(&t.id),
         TaskPatch { pr: Some("https://github.com/o/r/pull/900".into()), ..Default::default() },
