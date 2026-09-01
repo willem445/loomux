@@ -1601,9 +1601,9 @@ impl OrchRegistry {
         // rather than being reached for next door. `agent()` answers `None` for
         // an id that is gone; both that and `Dead` are states in which
         // `resolve_token` refuses the caller, so neither can reach the MCP seam.
-        // MUTATION A (#1871 rev-final item 2, evidence): the tick no longer
-        // prunes, so a dead superseded pane is remembered for ever.
-        if false {
+        if entry.forget_dead_panes(&|id| {
+            self.agent(id).is_some_and(|a| a.status != AgentStatus::Dead)
+        }) {
             out.changed = true;
         }
         if let Some(d) = obs.body_digest.as_deref() {

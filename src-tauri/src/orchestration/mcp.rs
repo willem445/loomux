@@ -3726,20 +3726,25 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // A CURRENT delegate's message still parks the drive exactly as
             // before, which is the case the hold was written for.
             if let Some((pr, pane)) = reg.rd_owner(&caller.group, &caller.agent_id) {
-                // MUTATION B (#1871 rev-final item 3, evidence): the exception
-                // restored — ANY owned pane parks the drive, superseded or not.
-                if true {
+                if pane.current {
                     reg.rd_ingest(
                         &caller.group,
                         pr,
                         super::RdEvent::Messaged { by: caller.agent_id.clone() },
                     );
                 } else {
-                    // Owned, so the traffic is still on the record — but it moves
-                    // nothing. An event-less `rd_consume` is the same shape the
-                    // `report` arm uses for a superseded pane, and the kind is
-                    // what lets a reader tell this from a park.
+                    // MUTATION (#1871 rev-final item 3, evidence round 3): the
+                    // audit is KEPT and the park is restored, so the test's audit
+                    // assertion passes and the run REACHES the park assertion —
+                    // which is the policy. Round 2's mutation dropped the audit
+                    // too, so the test died at the audit line and the park was
+                    // never witnessed: rev-final's own finding, in my own test.
                     reg.rd_consume(&caller.group, pr, &caller.agent_id, "message:superseded", None);
+                    reg.rd_ingest(
+                        &caller.group,
+                        pr,
+                        super::RdEvent::Messaged { by: caller.agent_id.clone() },
+                    );
                 }
             }
             // #891 rev-1 F1: the id in the prefix is orrerix's — resolved from
