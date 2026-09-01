@@ -2021,14 +2021,37 @@ authority:
 
 ```yaml
 driver:
-  enabled: true               # default false - absent block means the feature is off
-  max_review_rounds: 3        # INVARIANT 9's numbers - held toward them, never away:
-  max_ci_attempts: 3          #   1..=3 each, and a value outside the range refuses the file
-  max_rebase_attempts: 1      #   0..=1 - a repo may refuse the driver any rebase, never grant two
-  lane_timeout_minutes: 60    # backstops on the three waits, clamped like the notify TTLs
-  fix_timeout_minutes: 60     #   (5..240); a value outside the range is pulled into it
-  drive_timeout_minutes: 240  #
+  enabled: true
+  max_review_rounds: 3
+  max_ci_attempts: 3
+  max_rebase_attempts: 1
+  lane_timeout_minutes: 60
+  fix_timeout_minutes: 60
+  drive_timeout_minutes: 240
 ```
+
+Every number in that example is its field's own default, so a block naming only
+`enabled: true` behaves exactly like the one above. `enabled:` is the one line the
+example does not show at its default - it defaults to **false**, and an absent
+`driver:` block means the feature is off.
+
+<!-- pinned-to-schema: sections.driver - test/docsdriverbounds.test.ts (#1872) -->
+
+| Field | Range | Default | Outside the range |
+| --- | --- | --- | --- |
+| `enabled` | — | false | — |
+| `max_review_rounds` | 1–3 | 3 | refuse |
+| `max_ci_attempts` | 1–3 | 3 | refuse |
+| `max_rebase_attempts` | 0–1 | 1 | refuse |
+| `lane_timeout_minutes` | 5–240 | 60 | clamp |
+| `fix_timeout_minutes` | 5–240 | 60 | clamp |
+| `drive_timeout_minutes` | 5–240 | 240 | clamp |
+
+**refuse** fails the parse of the whole file: a value outside the range is a policy
+you believe is in force and is not, so orrerix will not load the file at all.
+**clamp** pulls the value into range and reports the edit as a warning - the three
+timeouts are backstops on a wait, and every notify-TTL wait in orrerix clamps the
+same way.
 
 A repo may run a *tighter* loop than the orchestrator template promises, never a looser one:
 the driver acts on the orchestrator's authority, and a config file that raised the bound
