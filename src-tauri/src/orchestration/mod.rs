@@ -6702,6 +6702,37 @@ fn format_delegate_roster(mut rows: Vec<(String, &'static str, bool)>) -> String
         .join(", ")
 }
 
+/// The distinctive span of the live-delegate cap's refusal — the ONE literal
+/// [`live_cap_refusal`] writes and [`is_live_cap_refusal`] reads (#1960).
+///
+/// Built from what the message CONTAINS rather than from what follows it: the
+/// two numbers around it vary per group, so the constant sits between them.
+const LIVE_CAP_MARKER: &str = "live agents already (max";
+
+/// The live-delegate cap's refusal, written in one place.
+///
+/// It had two producers — `spawn_agent_bound`'s fast check and the race-safe
+/// re-check inside the `agents` lock — and now has a CONSUMER: the review
+/// driver classifies a refused hand-back, because a cap refusal and a session
+/// it cannot resume are different holds naming different remedies, and
+/// reporting the first as the second sends an orchestrator looking for a
+/// replacement session for a session that is fine (#1960). A classifier reading
+/// a literal one of its producers could edit away is a classifier that silently
+/// stops classifying, so the literal is shared rather than duplicated a third
+/// time.
+fn live_cap_refusal(live: u32, max: u32, roster: &str) -> String {
+    format!(
+        "guardrail: {live} {LIVE_CAP_MARKER} {max}). Reuse an idle agent or kill one \
+         first. Live delegates: {roster}."
+    )
+}
+
+/// Whether a spawn refusal is the live-delegate cap's — see
+/// [`live_cap_refusal`], whose literal this reads.
+pub(crate) fn is_live_cap_refusal(err: &str) -> bool {
+    err.contains(LIVE_CAP_MARKER)
+}
+
 /// Whether a queued `orch-spawn-request` has expired and must be dropped
 /// unserviced (#106). The backend stamps each request with the wall-clock
 /// deadline of its own `bind` wait (`now + BIND_TIMEOUT`); a frontend that was
@@ -43395,6 +43426,39 @@ impl OrchRegistry {
             .count() as u32
     }
 
+    /// A **live, idle, typeable** pane in `group` already running `session`
+    /// (#1960) — what the review driver resumes INTO instead of opening a
+    /// second pane on the same conversation.
+    ///
+    /// Three conditions, each load-bearing:
+    ///
+    /// - **not `Dead`**, or the "reuse" is a delivery into a pane that is gone;
+    /// - **idle** (`idle_since_ms.is_some()`, the same signal the idle reaper
+    ///   kills on and the cap-refusal roster reports) — a pane mid-turn would
+    ///   take the brief behind whatever it is doing, and "is this agent
+    ///   mid-thought?" is not a question a driver may answer;
+    /// - **has a pane** — `deliver_prompt` resolves `pty_id` before it does
+    ///   anything else and refuses an agent with none, so an agent registered
+    ///   without a terminal is not something to type into.
+    ///
+    /// Newest first, because when the drive already holds a live idle pane on
+    /// this session that pane is the drive's own current one, and speaking to
+    /// the pane it last spoke to is the continuity a resume is for.
+    fn idle_pane_on_session(&self, group: &GroupId, session: &str) -> Option<String> {
+        self.agents
+            .lock_safe()
+            .values()
+            .filter(|a| {
+                a.group == *group
+                    && a.status != AgentStatus::Dead
+                    && a.session_id.as_deref() == Some(session)
+                    && a.idle_since_ms.is_some()
+                    && a.pty_id.is_some()
+            })
+            .max_by_key(|a| a.started_ms)
+            .map(|a| a.id.clone())
+    }
+
     /// Human-readable roster of the group's live delegates (workers, reviewers,
     /// planners — the orchestrator and the manager are exempt from the cap) for
     /// the cap-rejection guardrail message (#203). Locks `agents`; the race-safe
@@ -45620,10 +45684,7 @@ impl OrchRegistry {
                 // clue that a zombie planner is squatting a slot is this bare
                 // rejection.
                 let roster = self.live_delegate_roster(group_id);
-                return Err(format!(
-                    "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
-                    group.guardrails.max_agents
-                ));
+                return Err(live_cap_refusal(live, group.guardrails.max_agents, &roster));
             }
             // Guardrail: spawn-rate backstop against a runaway orchestrator.
             // Checked (and the timestamp recorded only when the check passes)
@@ -46009,10 +46070,7 @@ impl OrchRegistry {
                             .collect(),
                     );
                     let _ = fs::remove_file(&cfg.path);
-                    return Err(format!(
-                        "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
-                        group.guardrails.max_agents
-                    ));
+                    return Err(live_cap_refusal(live, group.guardrails.max_agents, &roster));
                 }
             }
             agents.insert(agent_id.clone(), entry.clone());

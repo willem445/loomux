@@ -748,8 +748,9 @@ pub struct HeldFacts {
     pub max_ci_attempts: u32,
     /// The failing CI run's checks, for `ci-limit`.
     pub failing_jobs: Vec<String>,
-    /// Every pane this drive has opened and still owns (#1871 B3). A parked
-    /// drive keeps them — see [`panes_clause`].
+    /// Every pane this drive still owns (#1871 B3) — the ones it opened, and
+    /// (since #1960) the live idle panes it resumed a session INTO rather than
+    /// opening a new one. A parked drive keeps them; see [`panes_clause`].
     pub panes: Vec<(String, DrivenRole)>,
     /// **What actually refused, when the hold is about a refusal** (#1961) —
     /// the spawn error, or the line a resumed pane exited on.
@@ -770,7 +771,7 @@ pub struct HeldFacts {
 /// §6's hold kick-back, in one shape carrying **the one fact that decides what
 /// the orchestrator does next** for this reason.
 ///
-/// One function rather than twelve, because §2.2 makes `held` one state with a
+/// One function rather than thirteen, because §2.2 makes `held` one state with a
 /// closed reason enum for exactly this reason: a reader asking "is this drive
 /// parked" asks one question, and the reason travels in the notice rather than
 /// being inferred from which counter happens to sit at its bound.
@@ -892,6 +893,18 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              {session} drive_review(pr, <a session that resolves>) re-points the drive, \
              or cancel_review_drive stops it."
         ),
+        // **Its own reason because its own REMEDY** (#1960). Reported as
+        // `worker-unresumable`, this hold told the orchestrator to find another
+        // session — for a session that resolves fine, while what was actually
+        // exhausted was a delegate slot. The panes clause below is the rest of
+        // the answer: it names the drive's own panes, which are the ones the
+        // orchestrator can free.
+        HeldReason::CapRefused => format!(
+            "HELD — this group's live-delegate cap refused the pane the drive needed{at}.\
+             {refusal} The recorded worker session is fine; what is exhausted is a slot. \
+             Free one (kill_agent on an idle delegate — list_agents shows which) and \
+             drive_review resumes, or cancel_review_drive stops it."
+        ),
         HeldReason::Messaged => format!(
             "HELD — {} called message_orchestrator{at}; its own line is above, \
              unchanged, and this is the routing fact beside it. drive_review resumes \
@@ -948,7 +961,7 @@ pub enum PaneStanding {
     Released,
 }
 
-/// **The panes a drive opened, named on the way out** — the clause every exit
+/// **The panes a drive owns, named on the way out** — the clause every exit
 /// notice carries (#1871 B3).
 ///
 /// The driver kills none of them, and that is a decision rather than an
@@ -982,14 +995,21 @@ pub fn panes_clause(panes: &[(String, DrivenRole)], standing: PaneStanding) -> S
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // **"Owns", not "opened"** (#1960). Since the driver resumes into a LIVE
+    // IDLE pane on the session where one exists, a pane in this list may be one
+    // the orchestrator opened and the drive merely took over — which is the
+    // whole point of the reuse, and makes "opened" a false claim about the
+    // commonest entry in the list (the original worker pane, on the first
+    // hand-back). Ownership is the property the clause is actually about: it is
+    // what decides whether a `drive_review` resume speaks to the pane again.
     match standing {
         PaneStanding::Owned => format!(
-            " Panes this drive opened and still owns, all still running: {list} — a \
+            " Panes this drive still owns, all still running: {list} — a \
              drive_review resume speaks to them again, and kill_agent is yours if you \
              would rather it did not."
         ),
         PaneStanding::Released => format!(
-            " Panes this drive opened and has now RELEASED, all still running and none \
+            " Panes this drive has now RELEASED, all still running and none \
              of them killed: {list} — nothing will speak to them again, and worker panes \
              sharing one session share one worktree (#338/#359), so disposing of them is \
              yours."

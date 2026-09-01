@@ -2464,10 +2464,10 @@ consumed event is in the audit log (as `rd-consumed`, naming the kind, the agent
 **never** intercepted. If a reviewer or a worker has something to say that is not a status change,
 you still see it, unchanged, and the drive then stops so someone reads it.
 
-**A drive stops, it does not drift.** There are fourteen ways out and each produces exactly one
+**A drive stops, it does not drift.** There are fifteen ways out and each produces exactly one
 line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
 by orrerix on its own when it sees the PR has been closed — or one of
-twelve holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
+thirteen holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
 the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
 could not read, a worker that reported blocked, a fix that could not be handed back to its worker,
 or a delegate messaging the orchestrator. That last hold quotes what actually refused rather than

@@ -1737,7 +1737,7 @@ fn a_stalled_lane_hold_names_the_stalled_lane_and_not_the_one_that_passed() {
     // there. The second half then pins what the disclosure is actually for,
     // which is why this is a repin rather than a narrowing.
     let (subject, panes) = notice
-        .split_once(" Panes this drive opened")
+        .split_once(" Panes this drive still owns")
         .expect("a held drive discloses the panes it still owns (#1871 B3)");
     assert!(
         subject.contains("lane rev-final"),
@@ -4372,5 +4372,140 @@ fn a_resumed_worker_pane_that_exits_without_reporting_holds_the_drive() {
             notice.contains(&agent),
             "…and name the pane, so the orchestrator can read it: {notice}"
         );
+    }
+}
+
+// ── #1960: the driver stops spending the cap on its own idle panes ──────────
+
+/// **A cap refusal is its own hold, because it is its own remedy** (#1960).
+///
+/// Reported as `worker-unresumable`, this hold told the orchestrator *"the
+/// recorded worker session no longer resolves, so there is nothing to hand a
+/// fix back to"* and pointed it at `drive_review(pr, <another session>)`. The
+/// session resolved fine — its `.jsonl` was on disk and the same id re-pointed
+/// the drive successfully the moment panes were killed. What was exhausted was
+/// a delegate slot, and freeing one is a different action from finding another
+/// session.
+///
+/// The guardrail string is asserted verbatim on the audit row, which is what
+/// makes the classifier a pin rather than a decoration: `is_live_cap_refusal`
+/// reads the one literal `live_cap_refusal` writes, and this is the test that
+/// the message the REAL cap produces is the message it reads.
+#[test]
+fn a_handback_the_cap_refuses_holds_on_cap_refused_and_names_the_guardrail() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    // Two slots: the worker takes one, the reviewer lane the other, and the
+    // hand-back's own pane is the one there is no room for. Exactly the shape
+    // the dogfood hit at six, one round and a half into three concurrent
+    // drives, with five of the six panes idle.
+    let group = reg
+        .create_group(&repo.path(), Guardrails { max_agents: 2, ..rails() })
+        .unwrap()
+        .id;
+    let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).unwrap();
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7301);
+
+    let handed = to_first_handback(&reg, &group, &gh);
+    assert!(handed.handbacks.is_empty(), "the cap must actually refuse this hand-back");
+    assert_eq!(status_state(&reg, &group), "held");
+
+    let refused = audit_details(&reg, &group, "rd-refused");
+    let cap = refused
+        .iter()
+        .find(|d| d["reason"] == json!("cap-refused"))
+        .unwrap_or_else(|| panic!("no cap-refused row: {refused:?}"));
+    assert!(
+        cap["detail"].as_str().unwrap_or_default().contains("live agents already (max 2)"),
+        "the row must carry the guardrail's own words — this is what pins the classifier \
+         against the message the real cap produces: {cap:?}"
+    );
+    assert!(
+        !refused.iter().any(|d| d["reason"] == json!("worker-unresumable")),
+        "a cap refusal must not ALSO be filed as unresumable: {refused:?}"
+    );
+
+    let held = audit_details(&reg, &group, "rd-held");
+    assert_eq!(held.len(), 1, "one hold: {held:?}");
+    assert_eq!(held[0]["reason"], json!("cap-refused"));
+
+    let notice = drive_notices(&reg, &group, 1758).join("\n");
+    assert!(
+        notice.contains("live-delegate cap") && notice.contains("kill_agent"),
+        "the notice must name the guardrail and the action that clears it: {notice}"
+    );
+    assert!(
+        !notice.contains("re-points the drive"),
+        "…and must NOT send the orchestrator after a replacement session — that is the \
+         one remedy that does not help here: {notice}"
+    );
+}
+
+/// **Reuse before spawn** (#1960): a hand-back whose worker is idle in a live
+/// pane is typed INTO that pane, and opens nothing.
+///
+/// The driver opened a new pane per resume and released none, so each round
+/// cost net +1 or +2 live delegates and three concurrent drives exhausted the
+/// cap in a round and a half — on panes the driver itself had opened, five of
+/// six idle. The pane reused here is the ORIGINAL worker's, which is the one a
+/// release-what-you-superseded design could never have freed: the orchestrator
+/// opened it, and §3.1 item 5 does not let the driver kill it.
+///
+/// The no-pane half is the control and it is the whole discriminator: the two
+/// runs differ in exactly one fact (`with_pane`), and `deliver_prompt` refuses
+/// an agent with no `pty_id`, so a drive whose worker has no terminal still
+/// spawns — which is every other test in this file, unchanged.
+#[test]
+fn a_handback_resumes_into_the_live_idle_pane_on_that_session() {
+    for has_pane in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+        let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).unwrap();
+        let session = w.session_id.clone().expect("claude mints a session id at spawn");
+        assert!(
+            reg.agent(&w.id).unwrap().idle_since_ms.is_some(),
+            "the fixture's premise: a task-less worker is stamped idle at birth, so the \
+             only axis this loop varies is whether it has a terminal to type into"
+        );
+        if has_pane {
+            with_pane(&reg, &w.id, 7401);
+        }
+        let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+        assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+
+        let before = action_count(&reg, &group, "agent-spawn");
+        let handed = to_first_handback(&reg, &group, &gh);
+        let (_pr, agent) = handed.handbacks.first().cloned().expect("the drive hands back");
+        let opened = action_count(&reg, &group, "agent-spawn") - before;
+
+        if has_pane {
+            assert_eq!(
+                agent, w.id,
+                "the hand-back must land in the pane already running that session, not a \
+                 second pane on the same conversation (#338/#359: two worker panes on one \
+                 session share one worktree)"
+            );
+            assert_eq!(opened, 0, "…and must open no pane at all, which is the cap cost");
+            assert!(
+                delivered_texts(&reg, &group).iter().any(|t| t.contains("is back with you at head")),
+                "the fix brief must actually have been typed into it"
+            );
+        } else {
+            assert_ne!(
+                agent, w.id,
+                "with no terminal to type into there is nothing to reuse — the driver spawns, \
+                 exactly as it always did"
+            );
+            assert_eq!(opened, 1, "…and that is one new pane: {handed:?}");
+        }
     }
 }
