@@ -4660,6 +4660,26 @@ fn the_resident_core_is_under_the_byte_budget() {
     );
 }
 
+/// Every `.md` at ANY depth under `dir` (#1845, review round 1 finding 1).
+///
+/// Recursive because the `.gitattributes` patterns it checks are `**`: a flat
+/// `read_dir` would police a NARROWER population than the rule, so a template
+/// added in a subdirectory would be pinned by git, invisible to the guard, and
+/// still over the floor. No subdirectory exists in either tree today, which is
+/// exactly why the flat version read as correct.
+fn markdown_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("{} is not readable: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("a readable directory yields readable entries").path();
+        if path.is_dir() {
+            markdown_files_recursive(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+}
+
 /// The checkout is the thing under test here (#1845).
 ///
 /// `include_str!` embeds ON-DISK bytes, so each of these files ships its
@@ -4683,16 +4703,28 @@ fn the_resident_core_is_under_the_byte_budget() {
 /// **Default-deny over the directory, not over a list of consts.** Two template
 /// consts (`WORKFLOW_TPL`, `BLOCK_TPL`) are private to the lib and unreachable
 /// from an integration test, and a template added tomorrow would be on no list
-/// at all — so the population is whatever the directories hold. The floors below
-/// are the vacuity control (an unreadable or empty walk passes a `!contains`
-/// check trivially) and are deliberately looser than the counts observed when
-/// this was written — 11 templates and 7 fixture files — so an ordinary add or
-/// removal does not touch this test.
+/// at all — so the population is whatever the directories hold, walked
+/// RECURSIVELY because the attribute patterns are `**` and a flat walk would
+/// police a narrower population than the rule. The floors below are the vacuity
+/// control (an unreadable or empty walk passes a `!contains` check trivially)
+/// and are deliberately looser than the counts observed when this was written
+/// — 11 templates and 7 fixture files, no subdirectories — so an ordinary add
+/// or removal does not touch this test.
+///
+/// **Do not delete this as redundant with the budget assertion.** It reads as
+/// redundant only while the margin happens to be smaller than the CR count, and
+/// that is the one condition under which it is NOT redundant that a reader can
+/// check. Shorten `orchestrator.md` by more than the margin and the budget
+/// assertion goes green on a CRLF checkout, at which point this is the only
+/// thing standing between a stale worktree and a silently platform-dependent
+/// resident prompt — the #1683 number, measured in a unit nobody pays. The
+/// PR's own one-mechanism argument is about not adding a SECOND budget, not
+/// about dropping the checkout guard.
 ///
 /// **Residual:** the walk reads the tree the test binary is RUN against, which
 /// need not be the tree it was COMPILED against. The final assertion on
 /// `ORCHESTRATOR_TPL` closes that for the one file whose bytes the budget
-/// measures; the other ten are covered by the walk alone.
+/// measures; every other file in both trees is covered by the walk alone.
 #[test]
 fn every_prompt_template_is_checked_out_with_lf_endings() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -4704,16 +4736,11 @@ fn every_prompt_template_is_checked_out_with_lf_endings() {
     let mut scanned = 0usize;
     for (pattern, rel, floor) in trees {
         let dir = root.join(rel);
-        let entries =
-            fs::read_dir(&dir).unwrap_or_else(|e| panic!("{} is not readable: {e}", dir.display()));
-        let mut here = 0usize;
-        for entry in entries {
-            let path = entry.expect("a readable directory yields readable entries").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            here += 1;
-            let bytes = fs::read(&path)
+        let mut files = Vec::new();
+        markdown_files_recursive(&dir, &mut files);
+        let here = files.len();
+        for path in &files {
+            let bytes = fs::read(path)
                 .unwrap_or_else(|e| panic!("{} is not readable: {e}", path.display()));
             assert!(
                 !bytes.contains(&b'\r'),
