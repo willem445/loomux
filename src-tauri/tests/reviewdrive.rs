@@ -3452,3 +3452,163 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
         0
     );
 }
+
+// ── #1871 B2, as rev-final narrowed it ──────────────────────────────────────
+
+/// **A superseded pane parks nothing, and a current one still does.**
+///
+/// The first version of this rule exempted `message_orchestrator` and argued the
+/// exception from safety: `held(messaged)` only ever PARKS a drive, and parking
+/// hands it to a human. That argument holds and is not the whole question — a
+/// superseded pane can call the tool again after every resume, so the exception
+/// allowed one pane nobody is talking to any more to park the drive without
+/// bound, an orchestrator turn per park, with no remedy short of killing the
+/// pane. The rule is now uniform: only a current pane's word moves a drive, and
+/// parking moves it.
+///
+/// **Both halves, because either alone passes under a wrong fix.** Dropping the
+/// park for everyone would satisfy the first assertion and break the hold that
+/// `held(messaged)` exists to be. The second assertion is the control that
+/// refuses it.
+///
+/// The unbounded-parking property is pinned directly rather than described: the
+/// superseded pane messages TWICE across a resume, which under the exception is
+/// two parks and two orchestrator turns.
+#[test]
+fn a_superseded_panes_message_parks_nothing_and_a_current_panes_still_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    // Two hand-backs, so there is a superseded worker pane and a current one.
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, w1) = first.handbacks.first().cloned().expect("the drive hands back");
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, w2) = second.handbacks.first().cloned().expect("a second red hands back again");
+    assert_ne!(w1, w2);
+
+    let msg = |agent: &str| {
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: agent.to_string(),
+                group: group.clone(),
+                role: Role::Worker,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "message_orchestrator", "arguments": {
+                "text": "the brief's premise looks wrong to me" } }),
+        )
+        .expect("a delegate may always message the orchestrator");
+    };
+
+    // The superseded pane speaks. Its words reach the orchestrator — this tool
+    // is never intercepted — and the drive does not move.
+    let before = delivered_texts(&reg, &group).len();
+    msg(&w1);
+    assert!(
+        delivered_texts(&reg, &group)[before..].iter().any(|t| t.contains("premise looks wrong")),
+        "message_orchestrator is never intercepted, superseded or not"
+    );
+    assert!(
+        consumed_kinds(&reg, &group).contains(&"message:superseded".to_string()),
+        "…and the audit records that the drive owned the speaker and did nothing: {:?}",
+        consumed_kinds(&reg, &group)
+    );
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "a superseded pane must not park the drive — under the exception this was one \
+         orchestrator turn, repeatable after every resume, with no bound"
+    );
+
+    // …and again after a resume, which is the shape that made it unbounded.
+    msg(&w1);
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_ne!(status_state(&reg, &group), "held", "…still not, however many times it speaks");
+
+    // The CONTROL: the current pane's identical call still parks the drive.
+    // Without this, "never park" passes everything above and deletes the hold.
+    msg(&w2);
+    reg.rd_drive_group_with(&group, &gh, 60_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "a CURRENT delegate's message still parks the drive — that is the case the hold was \
+         written for"
+    );
+    assert_eq!(
+        reg.review_drive_status(&group)["drives"][0]["held_reason"],
+        json!("messaged"),
+        "…on the reason that names it"
+    );
+}
+
+/// **The superseded lists are bounded by LIVENESS, not by size** — through the
+/// seam, so the tick is what has to do the pruning.
+///
+/// rev-final promoted this from a risk to a defect and was right: the size cap
+/// this replaces evicted the OLDEST pane, and the oldest superseded pane is one
+/// that is still running, still on this session and still able to `report`. A
+/// cap therefore reproduced #1871 B2 at scale, under exactly the usage that
+/// produced B2.
+///
+/// The two assertions are a pair: a live superseded pane survives any number of
+/// later hand-backs (what a cap could not promise), and a DEAD one is forgotten
+/// (which is what keeps the list bounded at all). A rule that kept everything
+/// for ever would satisfy the first and not the second.
+#[test]
+fn a_live_superseded_pane_is_never_pruned_and_a_dead_one_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let first = reg.rd_drive_group_with(&group, &gh, 10_000);
+    let (_pr, w1) = first.handbacks.first().cloned().expect("the drive hands back");
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 20_000);
+    let second = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, w2) = second.handbacks.first().cloned().expect("a second red hands back");
+    assert_ne!(w1, w2);
+
+    // A tick with w1 alive changes nothing about it.
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_eq!(
+        reg.rd_owner(&group, &w1).map(|(pr, p)| (pr, p.current)),
+        Some((1758, false)),
+        "a LIVE superseded pane survives the tick's prune — a size cap is what would have \
+         dropped it, and dropping it is #1871 B2 again"
+    );
+
+    // Now it dies. The next tick forgets it, because a dead pane cannot reach
+    // the MCP seam at all and so has no traffic left for the drive to fail to own.
+    assert!(reg.mark_agent_dead_for_test(&w1), "the pane must exist to be marked");
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_eq!(
+        reg.rd_owner(&group, &w1),
+        None,
+        "a DEAD superseded pane is forgotten, which is what bounds the list"
+    );
+    assert_eq!(
+        reg.rd_owner(&group, &w2).map(|(pr, p)| (pr, p.current)),
+        Some((1758, true)),
+        "…and the current pane is untouched, so this is not a prune that forgets everything"
+    );
+}

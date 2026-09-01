@@ -442,11 +442,37 @@ separately, because collapsing them is a live defect in either direction:
   — the audit has to let a reader tell "consumed" from "consumed and acted on")
   and hands the machine nothing.
 
-`message_orchestrator` is the deliberate exception on the belief side, and the
-asymmetry is the rule rather than an oversight: `held(messaged)` only ever PARKS
-a drive, and parking hands it to a human, which is safe whichever pane spoke.
-The rule is that a superseded pane may not ADVANCE a drive, never that its words
-do not matter.
+**There is no exception, and `message_orchestrator` is where one was tried.**
+The first version of this rule exempted that tool and argued it from safety:
+`held(messaged)` only ever PARKS a drive, and parking hands it to a human, which
+is safe whichever pane spoke. That argument holds and it is not the whole
+question. A superseded pane can call the tool again after every resume, so the
+exception let one pane nobody is talking to any more park the drive **without
+bound** — an orchestrator turn per park, which is the exact cost this feature
+exists to remove, with no remedy short of killing the pane. Unbounded liveness
+damage is not bought off by a safety argument, and the uniform rule needs no
+bound because it has no such cycle. So: **only a current pane's word moves a
+drive, parking included, because parking moves it.**
+
+Nothing an orchestrator can act on is lost. §7 never intercepts that tool, so a
+superseded pane's words reach the orchestrator's pane either way and name the
+delegate; what no longer follows is an automatic hold explaining a pane the drive
+has already moved past. A CURRENT delegate's message parks the drive exactly as
+it always did, which is the case the hold was written for.
+
+**The superseded lists are bounded by LIVENESS, never by size**, and that is a
+consequence of the same reasoning rather than a separate decision. A size cap has
+to choose a victim and age is the only ordering it has; the oldest superseded
+pane is one that is still running, still on this session and still able to
+`report`, so evicting it un-owns it exactly as the single slot did. A cap
+therefore reproduces B2 at scale, reachable by precisely the usage that produced
+B2 in the first place. Liveness cannot: `resolve_token` refuses a `Dead` agent
+and has no entry for one that is gone, so a dead pane cannot reach the MCP seam
+at all and there is no traffic left to fail to own. The tick prunes on that
+predicate, which also makes the bound a real one — what is retained is at most
+the panes a group can have alive at once, which the live-delegate cap already
+limits — and a predicate that cannot answer keeps the pane, because "we could not
+check" is not "it is dead".
 
 **The driver kills none of them.** §3.1 item 5 already forbids killing a pane to
 make room, a worker mid-edit must not be killed, and "an idle reviewer lane"
@@ -902,14 +928,13 @@ recipient and never a wrong *authority*.
 B2). A hand-back or a re-brief SUPERSEDES a pane rather than retiring it: the old
 pane keeps running on the same session and the same worktree, and the drive still
 owns it — §3 argues why, and why owning it is not believing it. The lists are
-oldest-first, hold each id **once** (a pane resumed into twice is one pane, and
-the exit notices print these ids for a human to go and find), and are capped at
-`MAX_PRIOR_PANES` with the OLDEST dropped, which is the fail-closed direction: a
-forgotten pane reads as unrecorded, so its traffic goes to the orchestrator
-rather than being consumed by a drive that can no longer prove it owns the
-speaker. Both are cleared with `worker_agent` when a resume re-points the drive
-at a DIFFERENT worker session, for `worker_agent`'s own reason — those panes
-belong to a worker this drive no longer owns.
+oldest-first and hold each id **once** (a pane resumed into twice is one pane,
+and the exit notices print these ids for a human to go and find). They are
+**pruned by liveness on every tick and never capped by size** — §3 argues why a
+size cap reproduces B2 and why a dead pane is provably safe to forget. Both are
+cleared with `worker_agent` when a resume re-points the drive at a DIFFERENT
+worker session, for `worker_agent`'s own reason — those panes belong to a worker
+this drive no longer owns.
 
 All of these — the five S3 added and the two #1871 B2 added beside them — are
 optional on read, so a file written against the shape as first published still
@@ -1035,8 +1060,9 @@ happened, and a hold labelled as a completion is the defect class #461
 catalogues. On the same principle `rd-consumed`'s `kind` distinguishes a current
 pane from a **superseded** one — `report:worker` / `report:superseded-worker`,
 `report:lane` / `report:superseded-lane`, `review_verdict` /
-`review_verdict:superseded` — because only a current pane's word moves the drive
-(§3), and "consumed" and "consumed and acted on" are different facts. `rd-cancelled`
+`review_verdict:superseded`, and `message:superseded` for the one tool that is
+otherwise never intercepted at all — because only a current pane's word moves the
+drive (§3), and "consumed" and "consumed and acted on" are different facts. `rd-cancelled`
 carries the `panes` the cancel released (§5.1, #1871 B3), so the disposal is on
 the record even if the notice's delivery is lost.
 
@@ -1261,21 +1287,32 @@ Three properties bound that narrowing, and all three are load-bearing:
 - **`message_orchestrator` is never intercepted.** It is the one channel a
   delegate has for something that is not a status change — a brief whose premise
   is wrong, a question, a refusal — and it is exactly the traffic the norm exists
-  to protect. It is delivered unchanged, by its own arm, and the driver notices
-  only that it happened: on the next tick the drive goes to `held(messaged)` and
-  emits its one kick-back. So that exit is two deliveries by construction — the
-  delegate's, and the driver's — because the delegate's words are the payload and
-  the hold is the routing fact, and merging them would either truncate the
-  delegate or bury the hold.
+  to protect. It is delivered unchanged, by its own arm, and when a CURRENT
+  delegate calls it the driver notices that it happened: on the next tick the
+  drive goes to `held(messaged)` and emits its one kick-back. So that exit is two
+  deliveries by construction — the delegate's, and the driver's — because the
+  delegate's words are the payload and the hold is the routing fact, and merging
+  them would either truncate the delegate or bury the hold.
+
+  **A SUPERSEDED pane's message is delivered and parks nothing** (#1871 B2, as
+  rev-final narrowed it). The exception that let it park was argued from safety —
+  a park hands the drive to a human — and the liveness cost is what defeats that:
+  a superseded pane can call this tool again after every resume, so the exception
+  allowed unbounded parking by a pane nobody is talking to any more, one
+  orchestrator turn per park, with no remedy short of killing the pane. Only a
+  current pane's word moves a drive, and parking moves it. The words still land
+  in the orchestrator's pane, naming the delegate; what does not follow is a hold
+  about a pane the drive has moved past.
 - **Nothing is silent.** Every consumed event is audited as `rd-consumed` with
   its kind, the agent and the PR, so the traffic that stopped arriving as a
   prompt is still on the record and still attributable. "Consumed" is a
   different word from "dropped" and the audit vocabulary keeps them different.
   The **kind** carries the pane's standing (`report:worker` versus
-  `report:superseded-worker`, and the same pair for a lane and for
-  `review_verdict`), because "consumed" and "consumed and acted on" are also
-  different facts, and a reader chasing a drive that did not move is chasing
-  exactly that difference.
+  `report:superseded-worker`, the same pair for a lane and for `review_verdict`,
+  and `message:superseded` for the tool that is otherwise never intercepted at
+  all), because "consumed" and "consumed and acted on" are also different facts,
+  and a reader chasing a drive that did not move is chasing exactly that
+  difference.
 
 The reason this is worth a section rather than a line is that it is the only
 place where this design makes the orchestrator's view of its own group

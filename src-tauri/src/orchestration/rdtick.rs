@@ -32,8 +32,8 @@ use serde_json::{json, Value};
 
 use super::{
     brand, mergeq, mqloop, notify, now_ms, pr_number, rddrive, render_template,
-    resolve_session_ref, resolve_worker_resume_cwd, reviewdrive, workflow, AgentEntry, GroupId,
-    LockExt, OrchRegistry, Role, TaskPatch,
+    resolve_session_ref, resolve_worker_resume_cwd, reviewdrive, workflow, AgentEntry,
+    AgentStatus, GroupId, LockExt, OrchRegistry, Role, TaskPatch,
 };
 
 // ---------- the review driver's registry-side types (#1778 S3) ----------
@@ -1589,6 +1589,23 @@ impl OrchRegistry {
             entry.head = obs.head.clone();
             out.changed = true;
         }
+        // **What bounds the superseded-pane lists (#1871 B2, rev-final).** They
+        // are pruned by LIVENESS and never by size: a size cap can only evict by
+        // age, and the oldest superseded pane is one that is still running, still
+        // on this session and still able to `report` — so evicting it un-owns it
+        // exactly as the single slot did, which is B2 reproduced by the record
+        // that fixes B2. `DriveEntry::forget_dead_panes` argues why a DEAD pane
+        // is safe to forget instead.
+        //
+        // Liveness is the registry's fact, so the predicate is supplied here
+        // rather than being reached for next door. `agent()` answers `None` for
+        // an id that is gone; both that and `Dead` are states in which
+        // `resolve_token` refuses the caller, so neither can reach the MCP seam.
+        if entry.forget_dead_panes(&|id| {
+            self.agent(id).is_some_and(|a| a.status != AgentStatus::Dead)
+        }) {
+            out.changed = true;
+        }
         if let Some(d) = obs.body_digest.as_deref() {
             if entry.body_digest != d {
                 entry.body_digest = d.to_string();
@@ -2032,6 +2049,31 @@ impl OrchRegistry {
     /// reaching the directory. The payload is not a parameter for the same
     /// reason: a caller that can choose the bytes is a caller that can write a
     /// VALID record, which is a state seeder rather than a fault injector.
+    /// Mark an agent `Dead`, so the liveness prune's DEAD side can be reached
+    /// from a test (#1871 B2, rev-final).
+    ///
+    /// **Not a kill path, and deliberately unable to become one.** `kill_agent`
+    /// needs a bound pty and performs a real `PtyManager::kill`; a
+    /// driver-spawned pane in this harness has neither, so the state this
+    /// predicate turns on is otherwise unreachable from an integration test.
+    /// This sets the one field the predicate reads and touches nothing else — no
+    /// initiator stamp, no exit notice, no pty — so it cannot stand in for
+    /// `kill_agent` in a test that means to exercise killing, and a reader
+    /// cannot mistake it for the production route.
+    ///
+    /// Answers whether an agent by that id existed to mark.
+    #[doc(hidden)] // pub for integration tests
+    pub fn mark_agent_dead_for_test(&self, agent_id: &str) -> bool {
+        let mut agents = self.agents.lock_safe();
+        match agents.get_mut(agent_id) {
+            Some(a) => {
+                a.status = AgentStatus::Dead;
+                true
+            }
+            None => false,
+        }
+    }
+
     #[doc(hidden)] // pub for integration tests
     pub fn corrupt_drive_record_for_test(&self, group: &GroupId) -> bool {
         let path = reviewdrive::state_path(&self.group_dir(group));

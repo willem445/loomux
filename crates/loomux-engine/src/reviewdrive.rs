@@ -832,23 +832,8 @@ pub struct DrivenPane {
     pub current: bool,
 }
 
-/// How many superseded panes one lane, or one drive's worker, keeps.
-///
-/// The drive's own counters already bound how many hand-backs and re-briefs a
-/// single drive performs, so nothing reachable today approaches this. It is a
-/// cap on the FILE rather than on the loop: `drive_review(reset_counters: true)`
-/// restores the budget on a parked drive as often as an orchestrator asks, and a
-/// record that grows without limit across resumes is one nobody bounded because
-/// each individual resume looked finite.
-///
-/// Dropping the OLDEST is the safe direction: a forgotten pane fails **closed**
-/// exactly as an unrecorded one does — its traffic is delivered to the
-/// orchestrator rather than consumed by a drive that can no longer prove it owns
-/// the speaker.
-pub const MAX_PRIOR_PANES: usize = 32;
-
 /// The superseded-pane list, normalized: no empties, no duplicates, never the
-/// pane that is superseding them, oldest first, capped.
+/// pane that is superseding them, oldest first.
 ///
 /// **Deduplicated by agent id because a pane resumed twice is one pane.** The
 /// list is read by [`DriveEntry::driven_role`] — where a duplicate changes
@@ -862,8 +847,6 @@ fn retain_panes(prior: Vec<String>, current: &str) -> Vec<String> {
         }
         out.push(a);
     }
-    let overflow = out.len().saturating_sub(MAX_PRIOR_PANES);
-    out.drain(..overflow);
     out
 }
 
@@ -1197,6 +1180,44 @@ impl DriveEntry {
     pub fn forget_worker_panes(&mut self) {
         self.worker_agent = String::new();
         self.prior_worker_agents.clear();
+    }
+
+    /// Drop superseded panes that are no longer alive, and answer whether
+    /// anything was dropped.
+    ///
+    /// **This is what BOUNDS the superseded lists, and a size cap is what it
+    /// replaces.** A cap has to choose a victim, and the only orderings
+    /// available to it are by age — which is precisely #1871 B2 again: the
+    /// OLDEST superseded pane is a pane that is still running, still on this
+    /// session, still able to `report`, and evicting it un-owns it exactly as
+    /// the single slot did. A drive resumed enough times would reproduce the
+    /// defect this record exists to fix, and it would do so under the usage that
+    /// produced B2 in the first place. So nothing is evicted for being old.
+    ///
+    /// **A dead pane is safe to forget, and provably so rather than plausibly.**
+    /// `resolve_token` refuses a caller whose agent is `Dead` and has no entry
+    /// for an agent that is gone, so such a pane cannot reach the MCP seam at
+    /// all — there is no traffic left for this drive to fail to own. That makes
+    /// liveness the one eviction rule that cannot re-open B2, and it is a real
+    /// bound rather than an arbitrary number: what is retained is at most the
+    /// panes this group can have alive at once, which the live-delegate cap
+    /// already limits.
+    ///
+    /// `is_live` is injected because liveness is the registry's fact and this
+    /// crate is Tauri-free. A predicate that cannot answer must answer **true** —
+    /// "we could not check" is not "it is dead", and the fail-closed direction
+    /// here is to KEEP a pane, since keeping one costs a string and dropping a
+    /// live one costs the leak.
+    pub fn forget_dead_panes(&mut self, is_live: &dyn Fn(&str) -> bool) -> bool {
+        let before = self.prior_worker_agents.len()
+            + self.lanes.iter().map(|l| l.prior_agents.len()).sum::<usize>();
+        self.prior_worker_agents.retain(|a| is_live(a));
+        for l in self.lanes.iter_mut() {
+            l.prior_agents.retain(|a| is_live(a));
+        }
+        let after = self.prior_worker_agents.len()
+            + self.lanes.iter().map(|l| l.prior_agents.len()).sum::<usize>();
+        before != after
     }
 
     /// Every pane this drive has opened and still owns, superseded ones included
@@ -2559,27 +2580,71 @@ mod tests {
         );
     }
 
-    /// The cap is on the FILE, and dropping the oldest is the fail-CLOSED
-    /// direction: a forgotten pane reads as unrecorded, so its traffic goes to
-    /// the orchestrator rather than being consumed by a drive that can no longer
-    /// prove it owns the speaker.
+    /// **The superseded lists are bounded by LIVENESS, never by size** — and a
+    /// size cap is what this replaces, because a cap reproduces #1871 B2.
+    ///
+    /// A cap must choose a victim, and age is the only ordering available to it.
+    /// The oldest superseded pane is still running, still on this session and
+    /// still able to `report`, so evicting it un-owns it exactly as the single
+    /// slot did — B2 again, reachable by the very usage that produced B2. This
+    /// test is the pin on that: pane 1 stays owned across an eviction pressure
+    /// that a size rule would have acted on.
+    ///
+    /// Liveness is the one rule that cannot re-open it, and provably rather than
+    /// plausibly: `resolve_token` refuses a `Dead` agent and has no entry for a
+    /// gone one, so a dead pane cannot reach the MCP seam and there is no
+    /// traffic left to fail to own.
     #[test]
-    fn the_prior_pane_list_is_capped_and_drops_the_oldest() {
+    fn a_dead_superseded_pane_is_forgotten_and_a_live_one_is_never_evicted() {
         let mut e = entry_at(DriveState::FixWait);
-        for i in 0..(MAX_PRIOR_PANES + 5) {
+        for i in 0..40 {
             e.record_worker_pane(&format!("w-{i}"));
         }
-        assert_eq!(e.prior_worker_agents.len(), MAX_PRIOR_PANES);
-        // 37 panes opened, 32 superseded ones kept plus the current one: the
-        // four oldest are gone.
-        assert_eq!(e.driven_role("w-0"), None, "the oldest is dropped, and fails closed");
-        assert_eq!(e.driven_role("w-3"), None);
+        e.open_lane("rev-std", "s1", "rev-1", "head-a", Some("d1"), 0);
+        e.open_lane("rev-std", "s1", "rev-2", "head-a", Some("d1"), 1);
+
+        // Forty hand-backs and nothing is dropped while every pane is alive:
+        // the property a size cap cannot have.
+        assert_eq!(e.prior_worker_agents.len(), 39, "no pane is evicted for being old");
         assert_eq!(
-            e.driven_role("w-4"),
+            e.driven_role("w-0"),
             Some(worker_pane(false)),
-            "...and everything inside the cap is still owned"
+            "the OLDEST superseded pane is exactly the one a size cap drops, and it is still \
+             live, still on this session, and still able to report — dropping it is #1871 B2"
         );
-        assert_eq!(e.driven_role("w-36"), Some(worker_pane(true)));
+
+        // Now kill two of them. Only those two are forgotten.
+        let dead = ["w-0", "rev-1"];
+        let is_live = |a: &str| !dead.contains(&a);
+        assert!(e.forget_dead_panes(&is_live), "it reports having dropped something");
+        assert_eq!(e.driven_role("w-0"), None, "a dead pane cannot call, so forgetting is safe");
+        assert_eq!(e.driven_role("rev-1"), None, "…on the lane's list too");
+        assert_eq!(
+            e.driven_role("w-1"),
+            Some(worker_pane(false)),
+            "…and every LIVE superseded pane survives the prune"
+        );
+        assert_eq!(e.prior_worker_agents.len(), 38);
+
+        // Idempotent, and it says so: a second pass drops nothing, so a tick that
+        // pruned nothing does not rewrite the file for it.
+        assert!(!e.forget_dead_panes(&is_live), "nothing left to drop");
+
+        // The current panes are never candidates — they are the drive's live
+        // reference, and `rd_handback`/`open_lane` are what replace them.
+        let all_dead = |_: &str| false;
+        e.forget_dead_panes(&all_dead);
+        assert_eq!(e.driven_role(&e.worker_agent.clone()), Some(worker_pane(true)));
+        assert_eq!(e.driven_role("rev-2"), Some(lane_pane("rev-std", true)));
+
+        // "We could not check" is not "it is dead": a predicate that answers
+        // true keeps everything, which is the fail-closed direction here —
+        // keeping a pane costs a string, dropping a live one costs the leak.
+        let mut f = entry_at(DriveState::FixWait);
+        f.record_worker_pane("w-1");
+        f.record_worker_pane("w-2");
+        assert!(!f.forget_dead_panes(&|_| true));
+        assert_eq!(f.driven_role("w-1"), Some(worker_pane(false)));
     }
 
     #[test]
