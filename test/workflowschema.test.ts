@@ -580,14 +580,37 @@ test("on-then-off on a LINELESS block leaves it declaring enabled: false — the
   // the driver is switched on (there is no other way to turn it on), so the two
   // clicks leave it declaring `enabled: false` where the file had none. The
   // counters still survive — the data-loss rule is untouched by this exception.
-  const text = "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  max_review_rounds: 2\n";
+  // This drives the PRESERVING serializer, the path the pane writes through and
+  // the path the docs sentence is about (round 6: the round-5 version measured
+  // the canonical emitter instead); the interior comment is what makes the
+  // splice's INSERT branch distinguishable from a canonical regeneration, which
+  // would drop it.
+  const comment = "# a note the file's author wrote";
+  const text =
+    "version: 1\n" +
+    "blocks:\n" +
+    "  - id: b\n" +
+    "    kind: worker\n" +
+    "driver:\n" +
+    `  ${comment}\n` +
+    "  max_review_rounds: 2\n";
+  const comments = driverSectionHasComments(text);
+  assert.ok(comments, "positive control: the scan must SEE this fixture's comment");
   const w = parseWorkflow(text).workflow;
-  setDriverEnabled(w, true);
-  setDriverEnabled(w, false);
-  assert.deepEqual(w.driver, { enabled: false, max_review_rounds: 2 });
-  const out = serializeWorkflow(w);
+  setDriverEnabled(w, true, comments);
+  const afterOn = serializeWorkflowPreserving(w, text);
+  assert.match(
+    afterOn,
+    new RegExp(comment),
+    "the splice's INSERT branch carries the comment through turning the driver on"
+  );
+  const w2 = parseWorkflow(afterOn).workflow;
+  setDriverEnabled(w2, false, driverSectionHasComments(afterOn));
+  const out = serializeWorkflowPreserving(w2, afterOn);
   assert.match(out, /enabled: false/, "the file gains the line it never had — that is the exception");
-  assert.match(out, /max_review_rounds: 2/, "…while the counter survives both clicks");
+  assert.match(out, new RegExp(comment), "the comment survives both clicks");
+  assert.match(out, /max_review_rounds: 2/, "…and so does the counter");
+  assert.deepEqual(parseWorkflow(out).workflow.driver, { enabled: false, max_review_rounds: 2 });
 });
 
 test("the enabled splice's bail path really does drop interior comments — the disclosed residual (#1869 review 5)", () => {
@@ -597,22 +620,41 @@ test("the enabled splice's bail path really does drop interior comments — the 
   // back to canonical regeneration and the interior comment does not survive.
   // The model still round-trips correctly; the loss is prose, not data, and it is
   // the same trade every other section edit has always made.
+  const comment = "# a note the file's author wrote";
   const text =
     "version: 1\n" +
     "blocks:\n" +
     "  - id: b\n" +
     "    kind: worker\n" +
     "driver:\n" +
-    "  # a note the file's author wrote\n" +
+    `  ${comment}\n` +
     "  enabled: yes\n" +
     "  max_review_rounds: 2\n";
+  // The POSITIVE CONTROL first, on the same comment through the NON-bail path:
+  // the splice really does carry this comment through a write, so the absence
+  // asserted below measures the bail and not fixture drift (a `doesNotMatch`
+  // passes just as well when the mechanism never ran — and this test has been
+  // caught being vacuous under fixture drift once already, #1869 review 6).
+  const cleanText = text.replace("enabled: yes", "enabled: true");
+  const clean = parseWorkflow(cleanText).workflow;
+  setDriverEnabled(clean, false);
+  const cleanOut = serializeWorkflowPreserving(clean, cleanText);
+  assert.match(
+    cleanOut,
+    new RegExp(comment),
+    "positive control: the same comment survives the splice path"
+  );
+  assert.notEqual(cleanOut, cleanText, "…and the mechanism ran — the file was rewritten");
+
+  // Now the bail itself: the rewrite cannot happen, the section regenerates.
   const w = parseWorkflow(text).workflow;
   assert.equal(w.driver?.enabled, undefined, "the reader refuses `yes` — the model has no enabled");
   setDriverEnabled(w, true);
   const out = serializeWorkflowPreserving(w, text);
+  assert.notEqual(out, text, "the mechanism ran — the write landed");
   assert.doesNotMatch(
     out,
-    /# a note the file's author wrote/,
+    new RegExp(comment),
     "the bail regenerates the section — the interior comment is gone, as disclosed"
   );
   assert.match(out, /enabled: true/, "…but the model's write lands");

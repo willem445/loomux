@@ -1933,10 +1933,16 @@ function driverDiffersOnlyInEnabled(a: WorkflowDriver, b: WorkflowDriver): boole
  *     canonical regeneration, which drops the section's interior comments — the
  *     same trade every other form edit in the pane has always made for a section
  *     whose content changed. The bail fires on a shape this scan cannot rewrite
- *     in place: no field line to anchor to, or an `enabled:` value spelled
- *     anything but true/false. That residual is pinned by a test (a fixture with
- *     an interior comment and an `enabled: yes` line really does lose the
- *     comment), so it cannot silently go false.
+ *     in place: no field line to anchor to, or an `enabled:` value whose text
+ *     does not END in `true`/`false` — the rewrite is a suffix match, so a value
+ *     like `nottrue` passes it and would be rewritten to `notfalse`, a dead
+ *     click: the pane reports the switch on while the file's line names a value
+ *     the reader refuses. The bound is residual 2's, and it is what keeps this
+ *     from being a live hazard: the pane already flags such a value as a bad
+ *     value and serde refuses the type, so the file was unloadable before the
+ *     rewrite — no loadable file can be made wrong. That residual is pinned by a
+ *     test (a fixture with an interior comment and an `enabled: yes` line really
+ *     does lose the comment), so it cannot silently go false.
  *
  *  2. A file carrying a DUPLICATE `enabled:` key has this rewrite touch only the
  *     FIRST occurrence, while the reader keeps the LAST. The bound: serde refuses
