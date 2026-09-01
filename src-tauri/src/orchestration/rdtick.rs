@@ -2213,6 +2213,35 @@ impl OrchRegistry {
     /// which is why [`CancelCause::PrGone`] exists.
     #[doc(hidden)] // pub for integration tests
     pub fn cancel_review_drive(&self, group: &GroupId, pr: u64, on_behalf_of: &str) -> Value {
+        self.cancel_review_drive_with(group, pr, on_behalf_of, now_ms())
+    }
+
+    /// `cancel_review_drive` with the clock injected — `drive_review` /
+    /// `drive_review_with`'s twin convention, and here for that pair's exact
+    /// reason (#1857).
+    ///
+    /// **A bound measured against a clock a test cannot set is a bound no test
+    /// can perform.** This function stamps [`OwedNotice::owed_ms`], and the
+    /// retention ceiling is measured from it by a tick running on the caller's
+    /// `now`. With the wall clock hard-coded here, a test driving the tick on a
+    /// synthetic clock compared a small `now` against a wall-clock anchor,
+    /// `saturating_sub` answered zero, and the ceiling could never fire on this
+    /// path — so the one thing the ceiling promises was, for the tool-cancel
+    /// producer, a documented counterfactual rather than a pinned one. #1841's
+    /// B2 shipped out of the same shape one function over: "the clock is the
+    /// caller's, and that is what makes the age bound testable at all".
+    ///
+    /// The only production caller passes `now_ms()`, so nothing about live
+    /// behaviour changes; what changes is that
+    /// `the_ceiling_fires_on_a_tool_cancelled_notice_too` can exist.
+    #[doc(hidden)] // pub for integration tests
+    pub fn cancel_review_drive_with(
+        &self,
+        group: &GroupId,
+        pr: u64,
+        on_behalf_of: &str,
+        now: u64,
+    ) -> Value {
         use rddrive::refusal as r;
         if !self.driver_enabled(group) {
             return self.rd_refuse(group, pr, r::DRIVER_DISABLED);
@@ -2241,7 +2270,6 @@ impl OrchRegistry {
             let Some(entry) = state.entry_mut(pr) else {
                 return self.rd_refuse(group, pr, r::NOT_DRIVEN);
             };
-            let now = now_ms();
             if entry.advance(reviewdrive::DriveState::Cancelled, None, None, now).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNREADABLE);
             }
@@ -2275,7 +2303,11 @@ impl OrchRegistry {
         // also prunes: a cancel whose notice lands is an entry that leaves here,
         // which is what §5.2 already promised. The notice itself was built and
         // owed above, inside the lock (#1857).
-        let _ = self.rd_flush_notices(group, &dir, now_ms());
+        //
+        // `now`, not `now_ms()`: the flush runs the retention ceiling, and a
+        // ceiling measured against a different clock from the anchor above is
+        // the untestable bound this seam exists to close (#1857).
+        let _ = self.rd_flush_notices(group, &dir, now);
         // **The panes ride in the RESULT as well as in the notice.** #1871 B3
         // argued this from "a notice whose delivery fails is lost (nothing here
         // recovers it — #1857)", and that premise is no longer true: the notice
