@@ -868,6 +868,68 @@ where
     }
 }
 
+/// How long a terminal entry is kept alive for the sake of a notice that has
+/// not reached a pane — §5.2's retention **ceiling** (#1857).
+///
+/// **A retry with no ceiling is a leak, not a guarantee.** The orchestrator's
+/// pane can be gone for good — the group closed, the agent killed and never
+/// respawned — and an entry retained on "until it is delivered" alone would sit
+/// in `review_drives.json` forever, re-attempted on every wake of the poll loop
+/// that also delivers every `notify_when` watch in the fleet.
+///
+/// **One hour, which is this subsystem's own unit for exactly this judgment.**
+/// `lane_timeout_minutes` and `fix_timeout_minutes` both default to 60 and both
+/// answer the same question — long enough that a transient (a pane restarting,
+/// a full queue, a paused agent) has cleared, short enough that a dead one is
+/// not held indefinitely — and `notify_when`'s own TTL defaults to the same 60
+/// minutes. It is deliberately **not** a `driver:` policy knob: §5.3's block
+/// paces a drive, and how long orrerix keeps its own undelivered record is not
+/// a repo's call.
+///
+/// **Reaching it drops the entry and audits the notice text**, which is what
+/// makes the bound honest rather than merely bounded: the defect #1857 names is
+/// "no line in the pane AND no record that could produce one", and the second
+/// half stays closed by `rd-notice-dropped` carrying the text even in the case
+/// where the first cannot be.
+pub const NOTICE_RETENTION_MS: u64 = 60 * 60_000;
+
+/// A notice a terminal entry owes the orchestrator's pane, persisted **on the
+/// entry** so it outlives the tick that produced it (#1857).
+///
+/// **Why the rendered text and not a flag plus a re-render.** A terminal entry
+/// is the one thing the tick will not step: `rd_step_entry` declines anything
+/// parked or terminal before it reads anything, and that early return is a cost
+/// bound §2.4 wants rather than an oversight. So the facts a re-render would
+/// need — the lane verdicts, the live head, the gate's answer — are not in hand
+/// on any later tick, and fetching them again would spend `gh` round trips on a
+/// drive that is over, to produce a notice that could legitimately differ from
+/// the one the drive actually ended on. The notice is the product of the arc
+/// that ended the drive: it is written down at that moment and re-sent
+/// unchanged.
+///
+/// **Only a TERMINAL entry ever owes one, and that is a scope rather than an
+/// oversight.** A `held` drive that loses its notice loses a *line*; the entry
+/// itself survives — §5.2 never prunes a parked one — and `review_drive_status()`
+/// lists it, so the drive has not vanished and the orchestrator has a record it
+/// can still act on. A terminal entry has neither: the notice is the entire
+/// product of the exit, and retention drops the record that could reproduce it.
+/// A future change wanting the same guarantee for a hold has this mechanism to
+/// use; it does not get it by accident here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OwedNotice {
+    /// The rendered notice, exactly as the arc that ended the drive produced it.
+    pub text: String,
+    /// When it was first owed — the ceiling's anchor, and **absolute** for
+    /// [`DriveEntry::started_ms`]'s reason: a stored elapsed time is stale the
+    /// instant it is written and meaningless across a restart.
+    pub owed_ms: u64,
+    /// How many delivery attempts have failed. An audit detail, never the
+    /// bound: the tick's cadence is the shared poll loop's, so an attempt count
+    /// would be a different real duration on every fleet.
+    #[serde(default)]
+    pub failures: u32,
+}
+
 /// One driven PR (§5.2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DriveEntry {
@@ -1007,6 +1069,17 @@ pub struct DriveEntry {
     /// owes this field a decision, and this paragraph is the one it invalidates.
     #[serde(default)]
     pub fix_handback_ms: u64,
+    /// The notice this entry owes the orchestrator's pane, and the reason
+    /// retention may not drop it yet (#1857). See [`OwedNotice`].
+    ///
+    /// **Absent is the resting state, so it is not serialized when absent** —
+    /// every entry that is not a terminal one mid-delivery carries nothing, and
+    /// writing `"owed_notice": null` onto each of them would be noise in a file
+    /// §5.2 publishes the shape of. A build that predates the field reads it as
+    /// an unknown key into `extra` and rewrites it verbatim, which is the
+    /// forward-compatibility promise §5.2 already makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owed_notice: Option<OwedNotice>,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -1038,12 +1111,50 @@ impl DriveEntry {
             counters,
             started_ms: now_ms,
             fix_handback_ms: 0,
+            owed_notice: None,
             extra: BTreeMap::new(),
         }
     }
 
     pub fn state(&self) -> DriveState {
         self.state
+    }
+
+    /// The notice this entry owes a pane, if any (#1857).
+    pub fn owed_notice(&self) -> Option<&OwedNotice> {
+        self.owed_notice.as_ref()
+    }
+
+    /// Record `text` as owed by this entry, anchored at `now_ms` (#1857).
+    ///
+    /// Called at the moment the entry goes terminal, **inside the same
+    /// load-decide-store the arc itself takes**, so the obligation is on disk
+    /// before anything tries to deliver it. That ordering is the whole
+    /// mechanism: a notice built and handed straight to a delivery is lost the
+    /// moment the delivery answers `Err`, which is #1857.
+    ///
+    /// **The first write wins.** Re-owing an entry that is already owing would
+    /// re-arm the ceiling clock, and a clock re-armed by the retry it bounds is
+    /// the unbounded retry this exists to not be.
+    pub fn owe_notice(&mut self, text: &str, now_ms: u64) {
+        if self.owed_notice.is_none() {
+            self.owed_notice =
+                Some(OwedNotice { text: text.to_string(), owed_ms: now_ms, failures: 0 });
+        }
+    }
+
+    /// The notice reached a pane. Clearing it is what lets retention prune —
+    /// see [`prune_terminal`].
+    pub fn notice_delivered(&mut self) {
+        self.owed_notice = None;
+    }
+
+    /// One delivery attempt failed. Counts the attempt and **does not touch the
+    /// ceiling anchor**, for [`owe_notice`](DriveEntry::owe_notice)'s reason.
+    pub fn notice_delivery_failed(&mut self) {
+        if let Some(n) = self.owed_notice.as_mut() {
+            n.failures = n.failures.saturating_add(1);
+        }
     }
 
     /// Move this entry to `to`, or refuse. The **only** mutation path for
@@ -1384,8 +1495,10 @@ pub fn store_state(group_dir: &Path, state: &ReviewDrivesState) -> Result<(), St
     crate::fsatomic::atomic_write(&state_path(group_dir), &bytes).map_err(|e| e.to_string())
 }
 
-/// §5.2's retention: **drop terminal entries, keep parked ones.** Returns the
-/// PRs dropped, so the caller can audit `rd-pruned` per entry.
+/// §5.2's retention: **drop terminal entries whose notice has been delivered,
+/// keep parked ones.** Returns what was dropped, so the caller can audit
+/// `rd-pruned` per entry — and `rd-notice-dropped` for the one case that leaves
+/// with a notice still owing.
 ///
 /// Two reasons that are not merely hygiene. Unpruned terminal entries would
 /// flow through `review_drive_status()` into the orchestrator's resident
@@ -1398,25 +1511,94 @@ pub fn store_state(group_dir: &Path, state: &ReviewDrivesState) -> Result<(), St
 /// leaves this file by being resumed to completion or cancelled, never by
 /// retention.
 ///
-/// **One ordering obligation this function cannot enforce is NOT discharged by
-/// its caller either**, and the honest statement is here rather than a promise:
-/// §5.2 prunes a terminal entry *once its notice has been delivered*, and
-/// nothing on the tick path knows whether a delivery succeeded. The tick does
-/// deliver before it prunes, which is necessary and not sufficient — a drive
-/// whose final notice fails to deliver is pruned anyway and ends silently.
+/// **§5.2's ordering rule is enforced HERE rather than asked of the caller**
+/// (#1857). This function used to drop every terminal entry and say in its own
+/// doc that the caller owned "prune once the notice has been delivered" — which
+/// no caller implemented, so a drive whose final notice failed to deliver was
+/// pruned anyway and ended with no line in the pane and no record that could
+/// produce one.
 ///
-/// A hold-back keyed on a tick's delivery failures was tried in the caller and
-/// removed as inert; the reason it could not work, and the shape a real fix
-/// needs, are on #1857 and beside the prune itself.
-pub fn prune_terminal(state: &mut ReviewDrivesState) -> Vec<u64> {
-    let pruned: Vec<u64> = state
+/// It is enforced rather than delegated because a rule stated on one side of a
+/// call and satisfied on neither is what #1857 actually was: this function reads
+/// the entry, so it is the thing that can read [`DriveEntry::owed_notice`], and
+/// there is no reason for a second party to hold half the condition. What the
+/// caller still owns is delivery itself — it must clear the notice
+/// ([`DriveEntry::notice_delivered`]) on an attempt that succeeded, and that
+/// obligation *is* enforceable from here, because an entry it forgets simply
+/// stays.
+///
+/// **The ceiling is the third condition, and it is why this takes a clock.** An
+/// entry whose notice can never be delivered would otherwise be retained
+/// forever; at `retention_ms` past [`OwedNotice::owed_ms`] it is dropped anyway,
+/// with its text handed back in [`Pruned::undelivered`] so the caller can put it
+/// on the audit log. See [`NOTICE_RETENTION_MS`] for the value and the argument.
+///
+/// A clock that went backwards yields a saturated zero — "not yet" — so the
+/// failure direction is keeping the record, never dropping it early.
+///
+/// Two reasons that are not merely hygiene. Unpruned terminal entries would
+/// flow through `review_drive_status()` into the orchestrator's resident
+/// context, which is the cost this whole feature exists to remove; and they
+/// would make §5.1's `already-driven` refuse every re-drive of a PR forever.
+///
+/// **Neither reason is weakened by holding one back for a notice.** Both those
+/// surfaces already filter on `is_terminal()` — `review_drive_status` lists only
+/// live drives and `is_driven` answers `is_live()` — so a retained terminal
+/// entry reaches no orchestrator context and refuses no re-drive. What it does
+/// do is sit in the file, which is what the ceiling bounds.
+///
+/// **`held` entries are never pruned**, and that is the whole reason §2.1 makes
+/// `held` parked rather than terminal: §2.3's resume needs their counters, and
+/// pruning one would silently grant three fresh review rounds. A parked drive
+/// leaves this file by being resumed to completion or cancelled, never by
+/// retention.
+pub fn prune_terminal(
+    state: &mut ReviewDrivesState,
+    now_ms: u64,
+    retention_ms: u64,
+) -> Vec<Pruned> {
+    // One predicate, read twice — by the collect and by the retain — so the two
+    // can never answer differently. A `retain` whose condition is the hand-written
+    // negation of the collect's is where a third condition gets added to one and
+    // not the other.
+    let droppable = |e: &DriveEntry| -> Option<Option<String>> {
+        if !e.state().is_terminal() {
+            return None;
+        }
+        match e.owed_notice() {
+            // Delivered (or never owed one at all — an entry that went terminal
+            // before this field existed). §5.2's ordering rule, satisfied.
+            None => Some(None),
+            // Past the ceiling. Dropped, and its text goes to the audit log.
+            Some(n) if now_ms.saturating_sub(n.owed_ms) >= retention_ms => {
+                Some(Some(n.text.clone()))
+            }
+            // Owing, inside the ceiling: kept, so a later tick re-attempts it.
+            Some(_) => None,
+        }
+    };
+    let pruned: Vec<Pruned> = state
         .entries
         .iter()
-        .filter(|e| e.state().is_terminal())
-        .map(|e| e.pr)
+        .filter_map(|e| droppable(e).map(|undelivered| Pruned { pr: e.pr, undelivered }))
         .collect();
-    state.entries.retain(|e| !e.state().is_terminal());
+    state.entries.retain(|e| droppable(e).is_none());
     pruned
+}
+
+/// One entry §5.2's retention dropped, and whether its notice ever reached a
+/// pane (#1857).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pruned {
+    pub pr: u64,
+    /// `Some(text)` when the entry left at the retention **ceiling** with its
+    /// notice still owing. The caller audits that text, so the record that could
+    /// still produce the line outlives the entry that owed it — which is the
+    /// half of #1857 a bound would otherwise reintroduce.
+    ///
+    /// `None` is the ordinary exit: the notice was delivered (or the entry never
+    /// owed one), and nothing is lost.
+    pub undelivered: Option<String>,
 }
 
 // ── §2.4 the decision, over injected facts ──────────────────────────────────
@@ -2904,13 +3086,110 @@ mod tests {
             e.pr = pr;
             s.entries.push(e);
         }
-        let mut pruned = prune_terminal(&mut s);
+        let mut pruned: Vec<u64> =
+            prune_terminal(&mut s, 1_000, NOTICE_RETENTION_MS).into_iter().map(|p| p.pr).collect();
         pruned.sort_unstable();
         assert_eq!(pruned, vec![3, 4]);
         let left: Vec<u64> = s.entries.iter().map(|e| e.pr).collect();
         assert_eq!(left, vec![1, 2, 5]);
         // The parked entry kept its counters, which is what the resume spends.
         assert!(s.entry(2).unwrap().state().is_parked());
+    }
+
+    /// **§5.2's ordering rule, which no caller implemented before #1857**: a
+    /// terminal entry leaves the file once its notice has reached a pane, and
+    /// not before.
+    ///
+    /// The three arms are asserted together because each alone passes under an
+    /// implementation that is wrong in one of the other two directions —
+    /// "prune everything" passes arm 1, "prune nothing terminal" passes arm 2,
+    /// and "retain forever" passes arms 1 and 2 while leaking.
+    #[test]
+    fn a_terminal_entry_is_kept_while_its_notice_is_owed_and_dropped_at_the_ceiling() {
+        let owing = |pr: u64, owed_ms: u64| {
+            let mut e = entry_at(DriveState::Satisfied);
+            e.pr = pr;
+            e.owe_notice(&format!("[orrerix] review drive PR #{pr}: GATE SATISFIED"), owed_ms);
+            e
+        };
+        let mut s = ReviewDrivesState::default();
+        // 1: delivered — the ordinary exit.
+        let mut delivered = owing(1, 0);
+        delivered.notice_delivered();
+        s.entries.push(delivered);
+        // 2: owing, inside the ceiling — kept, so a later tick re-attempts it.
+        s.entries.push(owing(2, 1_000));
+        // 3: owing, past the ceiling — dropped, with its text handed back.
+        s.entries.push(owing(3, 0));
+        // 4: parked and owing nothing — never pruned, on either rule.
+        let mut held = entry_at(DriveState::Held);
+        held.pr = 4;
+        s.entries.push(held);
+
+        let now = NOTICE_RETENTION_MS + 500;
+        let pruned = prune_terminal(&mut s, now, NOTICE_RETENTION_MS);
+        assert_eq!(
+            pruned.iter().map(|p| p.pr).collect::<Vec<_>>(),
+            vec![1, 3],
+            "a delivered notice prunes and an expired one prunes; an owed one inside the \
+             ceiling must not: {pruned:?}"
+        );
+        assert_eq!(pruned[0].undelivered, None, "#1's notice reached a pane; nothing was lost");
+        assert_eq!(
+            pruned[1].undelivered.as_deref(),
+            Some("[orrerix] review drive PR #3: GATE SATISFIED"),
+            "an entry dropped AT the ceiling hands its text back, or the bound reintroduces \
+             the very silence #1857 is about"
+        );
+        assert_eq!(s.entries.iter().map(|e| e.pr).collect::<Vec<_>>(), vec![2, 4]);
+        // The retained one still owes exactly what it owed: retention did not
+        // quietly re-arm its clock, which is what makes the ceiling reachable.
+        assert_eq!(s.entry(2).unwrap().owed_notice().map(|n| n.owed_ms), Some(1_000));
+    }
+
+    /// The ceiling clock is anchored at the FIRST owing and a re-owe cannot move
+    /// it — a clock re-armed by the retry it bounds is an unbounded retry.
+    #[test]
+    fn re_owing_a_notice_neither_replaces_the_text_nor_re_arms_the_ceiling() {
+        let mut e = entry_at(DriveState::Cancelled);
+        e.owe_notice("first", 1_000);
+        e.notice_delivery_failed();
+        e.owe_notice("second", 50_000);
+        let owed = e.owed_notice().expect("still owing");
+        assert_eq!(owed.text, "first", "the notice is the one the ending arc produced");
+        assert_eq!(owed.owed_ms, 1_000, "the ceiling anchor is the FIRST owing");
+        assert_eq!(owed.failures, 1, "and a failed attempt is counted, not the bound");
+        // Delivery is the only thing that clears it, and then a fresh drive on
+        // the same PR can owe again.
+        e.notice_delivered();
+        assert!(e.owed_notice().is_none());
+        e.owe_notice("second", 50_000);
+        assert_eq!(e.owed_notice().map(|n| n.owed_ms), Some(50_000));
+    }
+
+    /// A file written before the field existed parses, and its entries owe
+    /// nothing — §5.2's read tolerance, checked on the one field #1857 adds.
+    /// The round trip is the other half: an owed notice must survive a
+    /// load/store cycle, or the whole mechanism is a per-process local again.
+    #[test]
+    fn an_owed_notice_round_trips_and_a_file_without_one_owes_nothing() {
+        let mut e = entry_at(DriveState::Satisfied);
+        let text = "[orrerix] review drive PR #1758: GATE SATISFIED at df6a73d0";
+        e.owe_notice(text, 7_000);
+        let s = ReviewDrivesState { entries: vec![e], ..ReviewDrivesState::default() };
+        let json = serde_json::to_string(&s).unwrap();
+        let back = parse_state(&json).expect("an owed notice must survive the file");
+        let owed = back.entry(1758).unwrap().owed_notice().expect("owed after a round trip");
+        assert_eq!((owed.text.as_str(), owed.owed_ms), (text, 7_000));
+
+        // The absent case, spelled as a file this build did not write.
+        let older = r#"{"version":1,"entries":[{"pr":9,"state":"satisfied",
+            "counters":{"review_rounds":0,"ci_attempts":0,"rebase_attempts":0}}]}"#;
+        let old = parse_state(older).expect("§5.2's read tolerance");
+        assert!(
+            old.entry(9).unwrap().owed_notice().is_none(),
+            "an entry from before the field owes nothing — it must not be retained forever"
+        );
     }
 
     #[test]

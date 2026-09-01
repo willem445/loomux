@@ -493,8 +493,21 @@ pub mod audit_action {
     /// establishing the PR is closed or merged.
     pub const CANCELLED: &str = "rd-cancelled";
     /// A terminal entry was dropped from `review_drives.json` after its notice
-    /// was delivered (§5.2's retention).
+    /// was delivered (§5.2's retention). The claim in that sentence is enforced
+    /// by `reviewdrive::prune_terminal` since #1857; the one exit that leaves
+    /// with a notice still owing is [`NOTICE_DROPPED`], never this.
     pub const PRUNED: &str = "rd-pruned";
+    /// A terminal entry's notice was **given up on** — the retention ceiling
+    /// reached with the orchestrator's pane still unreachable, or a fresh
+    /// `drive_review` on the same PR displacing the entry that owed it (#1857).
+    ///
+    /// **It carries the notice text**, and that is the point rather than a
+    /// convenience: #1857 is "no line in the pane AND no record that could
+    /// produce one", and a bound with no audit line would close the first half
+    /// and reopen the second. A separate action from [`PRUNED`] for `CI_RED`'s
+    /// reason — a filter looking for the thing that happened must not match the
+    /// thing that did not.
+    pub const NOTICE_DROPPED: &str = "rd-notice-dropped";
     /// Reconcile re-evaluated a persisted entry after a restart (§2.4).
     pub const RECOVERED: &str = "rd-recovered";
     /// `review_drives.json` is torn or hand-edited: the tick refuses, backs off,
