@@ -12949,6 +12949,25 @@ not fetch) is measured by that line, not assumed away.
   which render the role template, never the playbook. The playbook reaches an agent only
   through the tool, on every CLI uniformly.
 
+**The budget is measured in the bytes the product pays, and that required pinning the
+checkout (#1845).** `include_str!` embeds ON-DISK bytes, so under `core.autocrlf=true` the
+resident core was one byte per LINE bigger on a Windows build than on a Linux one: run
+33345301036 measured 45,327 B on windows-latest against 44,705 B on ubuntu for the same
+blob, 622 bytes of pure line ending inside a 45,000-byte budget. That made
+`the_resident_core_is_under_the_byte_budget` green in a unit nobody pays — and #1813's fix,
+normalizing the endings before asserting, made the pin stable and blind in the same stroke:
+the Windows build genuinely paid the larger prompt on every model call, in the exact number
+this section exists to control, and nothing would go red to say so. `.gitattributes` now
+pins `templates/**` and the `pre222` goldens to `eol=lf`, so the embedded bytes are
+identical on every platform and the assertion is the raw `ORCHESTRATOR_TPL.len()`. **One
+mechanism, not two:** the budget constant was deliberately not raised to cover the CRLF
+case as well, because two mechanisms for one invariant drift and the second is the one
+nobody maintains. The pin's own failure mode — a worktree cut before the rule landed, whose
+files are still CRLF because changing an attribute rewrites nothing already on disk — is
+caught by `every_prompt_template_is_checked_out_with_lf_endings`, which asserts the endings
+directly rather than relying on the CR bytes happening to exceed whatever margin is left
+under the budget that week.
+
 **Public contracts introduced** (each otherwise noted here): the new orchestrator-surface
 tool `read_playbook(section)`; the new generated file `orchestrator-playbook.md` in the
 group dir and its manifest row; the template set's sixth fixture-pinned file.

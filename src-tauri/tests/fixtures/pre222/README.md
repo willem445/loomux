@@ -881,9 +881,15 @@ a human, not a re-run.
   `templates/workflow.md` or `templates/block.md`, behind `{{WORKFLOW}}` /
   `{{BLOCK_NOTE}}`, which resolve to the empty string for the built-in roster.
 
-Line endings are normalized before comparison (there is no `.gitattributes`, so these
-are CRLF on Windows and LF elsewhere) — the assertion is about the words, not about
-the checkout.
+Line endings are pinned rather than merely normalized away: `.gitattributes` gives both
+`src-tauri/src/orchestration/templates/**` and this directory `eol=lf`, so a golden and its
+live template are LF in the blob and LF on disk on every platform (#1845). The comparison
+tests still normalize before asserting — a no-op on a correct checkout, a safety net on a
+stale one — and the assertion is about the words, not the checkout, either way. A worktree
+cut before that rule landed still holds CRLF until `git add --renormalize .` or a
+re-checkout; `every_prompt_template_is_checked_out_with_lf_endings`
+(`src-tauri/tests/orchestration.rs`) is what makes that a red instead of a silent platform
+difference.
 
 ## Verifying a re-bless by hand — and the CRLF trap
 
@@ -896,10 +902,16 @@ alongside a legitimate one.
 
 **Level 2 is where the reviews keep going wrong, and it is not a disagreement about the
 content.** Two consecutive reviews (#594, #603) reported a level-2 mismatch that was not
-real: the golden's committed bytes are LF, the live template in a Windows working tree is
-CRLF, and a `sed`/`diff` comparison of the two therefore differs on **every line** while the
-words are identical (#498). What follows is a mismatch report that names no specific line,
+real: the golden's committed bytes were LF, the live template in a Windows working tree was
+CRLF, and a `sed`/`diff` comparison of the two therefore differed on **every line** while the
+words were identical (#498). What follows is a mismatch report that names no specific line,
 which reads exactly like "the whole file drifted".
+
+The `eol=lf` pin (#1845) closes that for a CURRENT checkout — both sides are LF on every
+platform now. It does not close it for a worktree cut before the pin landed, where the live
+templates are still CRLF on disk while the goldens beside them are LF. So the binary
+comparison below stays the method, and a mismatch that names no line is still the signature
+to distrust first.
 
 So compare **bytes with the keys removed, in binary, without a line-based tool** — the same
 substitution `render_with_legacy_vars` does, not a text filter:
