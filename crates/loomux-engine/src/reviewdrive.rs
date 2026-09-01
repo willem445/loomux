@@ -1064,10 +1064,8 @@ impl DriveEntry {
     /// re-arm the ceiling clock, and a clock re-armed by the retry it bounds is
     /// the unbounded retry this exists to not be.
     pub fn owe_notice(&mut self, text: &str, now_ms: u64) {
-        if self.owed_notice.is_none() {
-            self.owed_notice =
-                Some(OwedNotice { text: text.to_string(), owed_ms: now_ms, failures: 0 });
-        }
+        self.owed_notice =
+            Some(OwedNotice { text: text.to_string(), owed_ms: now_ms, failures: 0 });
     }
 
     /// The notice reached a pane. Clearing it is what lets retention prune —
