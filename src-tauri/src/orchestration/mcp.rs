@@ -3350,12 +3350,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // acted on" are different facts and a reader chasing a drive
                     // that did not move needs to tell them apart.
                     let is_worker = pane.role == super::reviewdrive::DrivenRole::Worker;
-                    // MUTATION (#1871 B2 belief-half, evidence only): the
-                    // `pane.current` conjunct removed. This is the gate rev-final
-                    // observed had no witnessed red — round 2's mutation aborted
-                    // the test at its OWNERSHIP assertion, so the belief
-                    // assertion was never reached.
-                    let event = match (is_worker, status) {
+                    let event = match (is_worker && pane.current, status) {
                         (true, "done") => Some(super::RdEvent::WorkerDone),
                         (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
                         _ => None,
@@ -3731,7 +3726,9 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // A CURRENT delegate's message still parks the drive exactly as
             // before, which is the case the hold was written for.
             if let Some((pr, pane)) = reg.rd_owner(&caller.group, &caller.agent_id) {
-                if pane.current {
+                // MUTATION B (#1871 rev-final item 3, evidence): the exception
+                // restored — ANY owned pane parks the drive, superseded or not.
+                if true {
                     reg.rd_ingest(
                         &caller.group,
                         pr,
