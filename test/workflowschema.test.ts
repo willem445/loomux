@@ -353,6 +353,8 @@ through this emitter, so a field it skips is a line the pane deletes:\n${text}`
  *  engine in `src-tauri/tests/orchestration.rs`, so the data is trustworthy; consuming
  *  it is the renderer's half. */
 const FIELDS_WITH_AN_EDITOR = new Set<string>([
+  "gate.threshold",
+  "gate.max_diff_lines",
   "driver.enabled",
   "driver.max_review_rounds",
   "driver.max_ci_attempts",
@@ -387,10 +389,12 @@ const FIELDS_WITHOUT_AN_EDITOR = new Set<string>([
   "edge.from",
   "edge.to",
   "gate.require",
-  "gate.threshold",
   "gate.reviewers",
   "gate.also",
-  "gate.max_diff_lines",
+  // #1876 review 2 moved `gate.threshold` and `gate.max_diff_lines` OUT of this
+  // list: the merge-gate form has live `boundedNumber` controls for both (they
+  // were listed here while the controls existed — the stale-entry case this
+  // list's own comment warns does not redden).
   // #1176. The pane READS, EMITS and VALIDATES these — without which a rule
   // would be a line the next form edit silently deleted — and shows them
   // read-only. What it has no control for yet is adding or changing one.
@@ -690,42 +694,86 @@ test("removeDriverBlock deletes a configured block whole — the escape hatch th
 });
 
 test("driverEnabledLineComment reads the enabled line's own comment through the splitter (#1876 P2)", () => {
-  // The flip note's condition: the splice rewrites the enabled line's VALUE and
-  // leaves its trailing comment exactly as written, so the note shows while that
-  // comment is there, quoting it. The scanner is the preserving splitter (#233),
-  // not a regex — a `#` inside a block scalar's body is content, and a body line
-  // shaped like an `enabled:` field is not a field (it sits deeper than the
-  // block's own).
+  // The flip note's condition has TWO guards, and they are not the same question:
+  // the splice's rewritability (shared predicate) AND that the flip would actually
+  // change the line. The scanner is the preserving splitter (#233), not a regex —
+  // a `#` inside a block scalar's body is content, and a body line shaped like an
+  // `enabled:` field is not a field (it sits deeper than the block's own).
   const roster = "version: 1\nblocks:\n  - id: b\n    kind: worker\n";
+  const probe = (text: string): string | null =>
+    driverEnabledLineComment(parseWorkflow(text).workflow, text);
   assert.equal(
-    driverEnabledLineComment(`${roster}driver:\n  enabled: false  # keep off until Q3\n`),
+    probe(`${roster}driver:\n  enabled: false  # keep off until Q3\n`),
     "# keep off until Q3",
     "the annotated line's comment is the note's condition and its text"
   );
-  assert.equal(driverEnabledLineComment(`${roster}driver:\n  enabled: true\n`), null);
+  assert.equal(probe(`${roster}driver:\n  enabled: true\n`), null);
   assert.equal(
-    driverEnabledLineComment(`${roster}driver:\n  max_review_rounds: 2\n`),
+    probe(`${roster}driver:\n  max_review_rounds: 2\n`),
     null,
     "no enabled line — nothing to annotate"
   );
-  assert.equal(driverEnabledLineComment("version: 1\n"), null, "no driver block");
+  assert.equal(probe("version: 1\n"), null, "no driver block");
   assert.equal(
-    driverEnabledLineComment(
+    probe(
       `${roster}driver:\n  mystery: |\n    enabled: false # body, not a field\n  enabled: true # real\n`
     ),
     "# real",
     "a block scalar's body is opaque: its `enabled:`-shaped line is not the field"
   );
   assert.equal(
-    driverEnabledLineComment(`${roster}driver:\n  enabled: yes  # note\n`),
+    probe(`${roster}driver:\n  enabled: yes  # note\n`),
     null,
     "the bail shape: `yes` fails the splice's suffix guard, so the flip regenerates the " +
       "section and this comment would NOT survive — the note must not render (#1876 review 1)"
   );
   assert.equal(
-    driverEnabledLineComment(" driver:\n  enabled: true # x\n"),
+    probe(`${roster}driver:\n  enabled: nottrue  # stale note\n`),
+    null,
+    "the no-op shape (#1876 review 2): the suffix match would replace `true` with `true` — " +
+      "a byte-identical write, so the note's 'rewrites the value' promise would be false"
+  );
+  assert.equal(
+    probe(`${roster}driver:\n  enabled: !!bool true  # note\n`),
+    null,
+    "the other no-op shape: the line already ends in the exact value the flip writes"
+  );
+  assert.equal(
+    probe(`${roster}driver:\n  enabled: True  # keep it uppercase\n`),
+    "# keep it uppercase",
+    "B4: a mixed-case spelling passes the suffix guard and the flip normalises it — the " +
+      "note renders, because the value DOES change and the comment DOES survive"
+  );
+  assert.equal(
+    probe(" driver:\n  enabled: true # x\n"),
     null,
     "an unreadable shape invents no note — the note is advisory and may not lie"
+  );
+});
+
+test("a flip normalises a non-lowercase enabled spelling and keeps the line's comment (#1876 review 2, B4)", () => {
+  // B4 named and pinned: the pane's reader is lowercase-only (`"true"`/`"false"`
+  // are the only boolean spellings it accepts), so `True` renders the checkbox
+  // OFF even though the engine would load it. A flip rewrites the value to the
+  // lowercase spelling — the flagged file comes back valid — and the line's own
+  // comment survives, because the suffix guard passes and the splice rewrites in
+  // place. The docs name this normalisation in the toggle's exception set.
+  const text =
+    "version: 1\n" +
+    "blocks:\n" +
+    "  - id: b\n" +
+    "    kind: worker\n" +
+    "driver:\n" +
+    "  enabled: True  # the style stays with the comment\n";
+  const w = parseWorkflow(text).workflow;
+  assert.equal(w.driver?.enabled, undefined, "the pane's reader is lowercase-only");
+  setDriverEnabled(w, true);
+  const out = serializeWorkflowPreserving(w, text);
+  assert.match(out, /enabled: true/, "the flip normalises the value to lowercase");
+  assert.match(
+    out,
+    /# the style stays with the comment/,
+    "…and the line's comment survives the normalisation"
   );
 });
 

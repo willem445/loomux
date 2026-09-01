@@ -2471,7 +2471,7 @@ export class WorkflowView {
     // describes. The helper carries the splice's own suffix guard: on a bail
     // shape the flip regenerates the section and the comment does not survive,
     // so the helper returns null and the note does not render (#1876 review 1).
-    const enabledComment = driverEnabledLineComment(this.text);
+    const enabledComment = driverEnabledLineComment(w, this.text);
     if (enabledComment) {
       box.append(
         el(

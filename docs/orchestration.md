@@ -1682,13 +1682,17 @@ orrerix, and deleting is tidier — while one carrying counters or comments has
 `enabled: false` written into it and loses nothing. A block that declares
 counters but no `enabled:` line shows
 unchecked, because that is what the engine reads as off. When that line
-carries its own trailing comment and its value is a true/false spelling — the
-only ones a loadable file can carry — the form says so beside the toggle:
+carries its own trailing comment and a flip there would rewrite the value in
+place and change it — the line's value ends in a true/false spelling and is
+not already the value the flip writes — the form says so beside the toggle:
 flipping the switch rewrites the value on
 the line and leaves the comment exactly as written — orrerix never edits your
 prose, and does not guess whether a
 comment still agrees with the switch, so the note is the cue to read the line
-after a flip. The driver's counters
+after a flip. (A value that ends in a true/false spelling but is spelled with
+uppercase letters — `True`, `FALSE` — is one the pane flags, since its reader
+is lowercase-only where the engine is not; a flip there rewrites the value to
+lowercase and keeps the comment.) The driver's counters
 and timeouts are number fields clamped to their own declared ranges, so the
 form cannot write an out-of-range value at all; what the engine then does with
 a *hand-written* value outside those ranges differs by field, and the next
@@ -1713,8 +1717,9 @@ family — read each row as its own policy, never inferred from a neighbour:
   a `threshold` gate is also refused above its own reviewer count, a
   validation rule rather than a range. `max_diff_lines` is 1 or more, refused
   at 0, with the fix named in the error: omit the key to declare no limit.
-  Neither has a ceiling, and neither has a form field yet, so a hand-written
-  out-of-range value reaches you as a finding.
+  Neither has a ceiling. Both have form fields whose inputs enforce the bound —
+  they cannot emit an out-of-range value — while a hand-written out-of-range
+  value reaches you as a finding.
 - **Merge queue** (`merge_queue:`): `max_batch` is 1 or more, refused below,
   no ceiling; `checks_timeout_minutes` is 5–240 minutes, **clamped**.
 - **Review driver** (`driver:`): the three counters are 1–3 rounds/attempts
@@ -1726,7 +1731,7 @@ family — read each row as its own policy, never inferred from a neighbour:
   emit an out-of-range value at all.
 - **Board WIP caps** (`board.wip:`): each status cap is 1 or more, refused
   below — a cap of 0 is a stop, not a limit — with no ceiling, and an omitted
-  status has no cap. The board has no form yet either, so these reach you as
+  status has no cap. The board has no form yet, so these reach you as
   findings.
 
 A
@@ -1740,15 +1745,18 @@ you tick on and then off again leaves the file exactly as it was — including
 its comments — with one exception: a `driver:` block that carried no
 `enabled:` line at all. Turning a driver on has to add that line, so the two
 clicks leave such a block declaring `enabled: false` where the file had none.
-When that line carries its own trailing comment and its value is a
-true/false spelling, a flip rewrites the value and leaves the comment byte for
+When that line carries its own trailing comment and a flip there would
+rewrite the value in place and change it, a flip rewrites the value and leaves
+the comment byte for
 byte — which means a comment can outlive the
 switch position it describes, and the pane says so beside the toggle rather
-than editing your prose. A line whose value is *not* a true/false spelling is
-the second exception: the pane already flags the value, and a flip there
-regenerates the whole section, so the block's comments do not survive it —
-the toggle stays silent rather than promising a preservation that will not
-happen. Unticking never deletes configuration either: a block
+than editing your prose. Two shapes get no note, and both are values the pane
+already flags: a value that does not end in a true/false spelling at all
+(`enabled: yes`) makes a flip regenerate the whole section, so the block's
+comments do not survive it; and a value that already reads as the value the
+flip would write (`enabled: nottrue` under a checkbox that would write true)
+makes the flip a byte-identical no-op. Unticking never deletes configuration
+either: a block
 carrying counters or comments is kept, with the switch written as off, and its
 comments are kept byte for byte except the switch's own line.
 

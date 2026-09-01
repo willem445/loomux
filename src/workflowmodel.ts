@@ -811,8 +811,11 @@ export function isDriverOn(w: Workflow): boolean {
  *  OFF toggle no longer provides. A `driver:` block makes the file unloadable by an
  *  orrerix build old enough not to know the key: `RawWorkflow` is
  *  `deny_unknown_fields`, so the unknown key fails the parse of the *whole* file
- *  rather than being ignored or warned about (verified against v1.3.0-beta2,
- *  whose `RawWorkflow` carries the attribute and no `driver:` field). The toggle
+ *  rather than being ignored or warned about (verified against v1.3.0-beta1:
+ *  `git show v1.3.0-beta1:crates/loomux-engine/src/workflow.rs` carries the
+ *  attribute on `RawWorkflow` and ZERO `RawDriver` occurrences — beta2 already
+ *  knows the key, so beta1 is the refusing build, not beta2; corrected in
+ *  #1876 review 2 after the wrong tag shipped in five surfaces). The toggle
  *  deliberately preserves a configured block (#1869 review round 3), so removal
  *  is a separate, explicit gesture that discards the block whole — switch,
  *  counters, unknown keys and comments — behind its own confirmation in the view. */
@@ -821,22 +824,33 @@ export function removeDriverBlock(w: Workflow): void {
 }
 
 /** The `driver:` block's `enabled:` line's own trailing comment, when the flip
- *  would PRESERVE it — the condition for the driver form's flip note (#1876 P2).
- *  The splice rewrites that line's value and leaves its comment exactly as
- *  written, but ONLY where its suffix guard passes: a value not ending in
- *  `true`/`false` makes the splice bail into canonical regeneration, which drops
- *  the section's comments — this very comment included (the residual
- *  `spliceEnabledLine` documents). So this predicate carries the splice's own
- *  guard: on a bail shape it returns null, and the note does not render, rather
- *  than promising a preservation that will not happen (#1876 review 1 — the
- *  unconditioned note was written without consulting that disclosed residual).
- *  Same scanner as `driverSectionHasComments` (the preserving splitter, #233) so
- *  a `#` inside a block scalar's body is content, never a comment — and a body
- *  line that looks like an `enabled:` field is not one, because it sits deeper
- *  than the block's fields. Returns null when there is no driver block, no
- *  `enabled:` line in it, no comment on that line, a value the splice cannot
- *  rewrite in place, or a shape the scan refuses to read. */
-export function driverEnabledLineComment(text: string): string | null {
+ *  would PRESERVE it AND actually change the line — the condition for the driver
+ *  form's flip note (#1876 P2, narrowed by review 2). TWO guards, and they are
+ *  not the same question:
+ *
+ *  1. `enabledLineRewrite` — the suffix match itself, THE one place the
+ *     true/false alphabet lives: a value not ending in `true`/`false` makes the
+ *     splice bail into canonical regeneration, which drops the section's
+ *     comments — this very comment included (the residual `spliceEnabledLine`
+ *     documents). No note on a bail shape.
+ *  2. NOT a no-op: if the line's value already reads as the value the next flip
+ *     writes (`enabled: nottrue` under a checkbox that would write true — the
+ *     suffix match replaces `true` with `true`), the write is byte-identical and
+ *     there is nothing to say. The rewrite answer alone does NOT answer this:
+ *     it is the splice's requirement, and the note needs
+ *     strictly more (#1876 review 2 — the earlier doc claimed the two questions
+ *     were the same one).
+ *
+ *  The direction of the next flip comes from the model (`isDriverOn`); the line
+ *  comes from the text. Same scanner as `driverSectionHasComments` (the
+ *  preserving splitter, #233) so a `#` inside a block scalar's body is content,
+ *  never a comment — and a body line that looks like an `enabled:` field is not
+ *  one, because it sits deeper than the block's fields. Returns null when there
+ *  is no driver block, no `enabled:` line in it, no comment on that line, a
+ *  value the splice cannot rewrite in place, a flip that would be a no-op, or a
+ *  shape the scan refuses to read. */
+export function driverEnabledLineComment(w: Workflow, text: string): string | null {
+  const wanted = isDriverOn(w) ? "false" : "true"; // the value the next flip writes
   const doc = splitDocument(text); // P2 scan
   if (!doc) return null;
   const entry = doc.entries.find((e) => e.key === "driver");
@@ -850,12 +864,13 @@ export function driverEnabledLineComment(text: string): string | null {
     if (opaque.has(i) || !isSignificantLine(line) || indentOf(line) !== indent) continue;
     const split = splitKey(stripComment(line).trim());
     if (!split || split.key !== "enabled") continue;
-    // The shared predicate, not a mirrored copy: where the splice would bail,
-    // the flip regenerates the section and the comment does not survive — no
-    // note. Divergence between what the note promises and what the write does
-    // is not expressible while both answer to one function (#1876 review 2).
-    if (!enabledLineValueRewritable(line)) return null; // no note where the splice would bail
-    const comment = line.slice(stripComment(line).trimEnd().length).trim();
+    const rewrite = enabledLineRewrite(line);
+    if (!rewrite) return null; // guard 1: the splice would bail here, so the comment dies — no note
+    // Guard 2: a flip that changes nothing says nothing. The suffix the rewrite
+    // would match, compared case-sensitively against the value it would write:
+    // `nottrue` under an ON click matches `true` and replaces it with `true`.
+    if (rewrite.matched === wanted) return null;
+    const comment = line.slice(rewrite.head.length).trim();
     return comment || null;
   }
   return null;
@@ -1975,17 +1990,20 @@ function driverDiffersOnlyInEnabled(a: WorkflowDriver, b: WorkflowDriver): boole
   return deepEqualValue(rest(a), rest(b));
 }
 
-/** Can the enabled-line rewrite replace THIS line's value in place? True when
- *  the comment-stripped, right-trimmed line ends in a true/false spelling — the
- *  suffix match's whole alphabet. THE one guard both surfaces answer to:
- *  `spliceEnabledLine` bails into canonical regeneration when this is false,
- *  and `driverEnabledLineComment` returns null (no note) for the same input,
- *  because the note promises exactly what the splice does — and a second copy
- *  of the condition is a divergence waiting to happen (#1876 review 2). The
- *  strip-and-trim normalisation lives in here too, so the two callers cannot
- *  drift on what they feed the match either. */
-function enabledLineValueRewritable(line: string): boolean {
-  return /(true|false)$/i.test(stripComment(line).trimEnd());
+/** The enabled-line rewrite for one line of a `driver:` block: what the suffix
+ *  match matches on this line (`matched` — case-sensitively, exactly as the file
+ *  spells it) and the comment-stripped, right-trimmed line (`head`) the
+ *  replacement is built from. Null when the line is not a rewritable enabled
+ *  line: a value that does not end in a true/false spelling. THE one place the
+ *  suffix match lives — the splice's bail, the splice's replacement, and the
+ *  flip note's condition all read THIS, so the note cannot promise a
+ *  preservation the write does not perform. (#1876 review 2: the note
+ *  additionally requires `matched !== wanted` — its own no-op condition, which
+ *  is the note's surplus over the splice, not a second copy of this predicate.) */
+function enabledLineRewrite(line: string): { matched: string; head: string } | null {
+  const head = stripComment(line).trimEnd();
+  const matched = /(true|false)$/i.exec(head);
+  return matched ? { matched: matched[0], head } : null;
 }
 
 /** Rewrite a `driver:` section's own lines so its `enabled:` line carries `value`,
@@ -2034,9 +2052,12 @@ function spliceEnabledLine(content: readonly string[], value: boolean): string[]
     if (opaque.has(i) || !isSignificantLine(line) || indentOf(line) !== indent) continue;
     const split = splitKey(stripComment(line).trim());
     if (!split || split.key !== "enabled") continue;
-    const head = stripComment(line).trimEnd();
-    if (!enabledLineValueRewritable(line)) return null; // an unexpected value spelling — bail
-    const replaced = head.replace(/(true|false)$/i, wanted) + line.slice(head.length);
+    const rewrite = enabledLineRewrite(line);
+    if (!rewrite) return null; // an unexpected value spelling — bail
+    const replaced =
+      rewrite.head.slice(0, rewrite.head.length - rewrite.matched.length) +
+      wanted +
+      line.slice(rewrite.head.length);
     return [...content.slice(0, i), replaced, ...content.slice(i + 1)];
   }
   // No `enabled:` line in the block: insert it as the first field. Leading comment
