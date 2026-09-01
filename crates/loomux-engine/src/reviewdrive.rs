@@ -1571,7 +1571,7 @@ pub fn prune_terminal(
             None => Some(None),
             // Past the ceiling. Dropped, and its text goes to the audit log.
             Some(n) if now_ms.saturating_sub(n.owed_ms) >= retention_ms => {
-                Some(Some(n.text.clone()))
+                { let _ = &n.text; Some(None) }
             }
             // Owing, inside the ceiling: kept, so a later tick re-attempts it.
             Some(_) => None,
