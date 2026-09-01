@@ -3320,34 +3320,57 @@ fn a_cancel_names_the_panes_it_leaves_running_and_kills_none_of_them() {
 /// deciding lane and the test stops being about the stall. The operands cannot
 /// collide on that arc. They collide here.
 ///
-/// **The collision.** Both lane records are blanked — identical on the
-/// `briefed_head` axis, which is exactly the post-resume state — so the only
-/// thing left that can distinguish them is the VERDICT. A selection rule that
-/// read the record would pick lane 0: it is first in the gate's order and its
-/// record is just as blank as lane 1's. The assertion is that lane **1** opens.
+/// **The collision.** Both lane records are put in the SAME state — identical on
+/// the `briefed_head` axis — so the only thing left that can distinguish them is
+/// the VERDICT. A selection rule that read the record would pick lane 0: it is
+/// first in the gate's order and its record is exactly as stale as lane 1's. The
+/// assertion is that lane **1** opens.
 ///
 /// **Asserting the property rather than the fixture** is what removes the
 /// dependence on the resume happening to blank every lane. All four crossings of
-/// {record blank, record briefed at this head} x {pass current, pass stale} are
-/// pinned, so "a lane whose pass stands is never re-opened, whatever its record
-/// says" holds however many lanes a future resume decides to clear. The two
-/// blank-record rows are the state #1841's B4 produces; the two briefed rows are
-/// the ordinary one, and they are the control that stops "always answer 1" from
-/// passing.
+/// {record blank, record stale} x {pass current, pass stale} are pinned, so "a
+/// lane whose pass stands is never re-opened, whatever its record says" holds
+/// however many lanes a future resume decides to clear.
+///
+/// **`Blank` IS the post-resume state**, which is what makes a `decide`-level
+/// pin cover the arc #1841's B4 lives on: clearing `briefed_head` for every lane
+/// is exactly the `Rec::Blank` row, and the row says that clearing it changes
+/// nothing about WHICH lane is chosen. `Rec::Stale` is the ordinary post-push
+/// state, and it is there so the property is not stated only about the resume.
+/// The stale-pass column is the control that stops "always answer 1" passing.
+///
+/// **A third record state is deliberately not a row here.** A record briefed at
+/// the LIVE head answers `Wait`, which names no lane and therefore witnesses
+/// nothing about selection — it holds identically whichever lane the drive is
+/// waiting on. The first draft of this test asserted `OpenLane { index: 1 }` for
+/// it and went red on CI; it is now pinned below as its own strictly weaker,
+/// explicitly labelled assertion rather than as a crossing that cannot fail.
 #[test]
 fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear_safe() {
     let limits = DriveLimits::default();
 
-    // Two lane RECORDS, in the gate's order. `blank` is what the resume's
-    // all-lanes clear leaves behind; `briefed` is the ordinary state.
-    let entry_with = |blank: bool| {
+    // **Both record states make `lane_open_for` FALSE**, and that is what keeps
+    // the observable an INDEX. `Blank` is what #1841's B4 all-lanes clear leaves
+    // behind; `Stale` is the ordinary state after a push. A third state —
+    // briefed at the live head — is deliberately not one of the crossings: it
+    // answers `Wait`, which names no lane, so it cannot witness WHICH lane was
+    // selected. It is pinned below as its own strictly weaker assertion rather
+    // than folded in here as a row that holds under every implementation.
+    #[derive(Clone, Copy, Debug)]
+    enum Rec {
+        Blank,
+        Stale,
+    }
+
+    let entry_with = |rec: Rec| {
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = HEAD_A.into();
         e.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
         e.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
-        if blank {
-            for l in e.lanes.iter_mut() {
-                l.briefed_head.clear();
+        for l in e.lanes.iter_mut() {
+            match rec {
+                Rec::Blank => l.briefed_head.clear(),
+                Rec::Stale => l.briefed_head = HEAD_B.into(),
             }
         }
         e
@@ -3363,19 +3386,19 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
         ..facts_at(HEAD_A)
     };
 
-    for blank in [true, false] {
-        let e = entry_with(blank);
-        let what = if blank { "blanked by the resume" } else { "briefed at this head" };
+    for rec in [Rec::Blank, Rec::Stale] {
+        let e = entry_with(rec);
 
         // Lane 0's pass STANDS. Lane 1 is the deciding lane, and it is the one
-        // that opens — even though lane 0 comes first in the gate's order and,
-        // when `blank`, its record is exactly as empty as lane 1's.
+        // that opens — even though lane 0 comes first in the gate's order and
+        // its record is in exactly the same state as lane 1's.
         assert_eq!(
             reviewdrive::decide(&e, &facts_with(HEAD_A), &limits),
             DriveStep::OpenLane { index: 1 },
-            "records {what}: a lane whose pass stands must never be re-opened. A selection \
-             rule reading the RECORD rather than the verdict picks lane 0 here, and that is \
-             what turns #1841's all-lanes clear into a re-brief per lane per resume"
+            "{rec:?} records: a lane whose pass stands must never be re-opened. Both records \
+             are identical here, so a selection rule reading the RECORD rather than the \
+             verdict picks lane 0 — which is what turns #1841's all-lanes clear into a \
+             re-brief per lane per resume"
         );
 
         // The control, on the one axis that may move the answer: stale lane 0's
@@ -3384,15 +3407,33 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
         assert_eq!(
             reviewdrive::decide(&e, &facts_with(HEAD_B), &limits),
             DriveStep::OpenLane { index: 0 },
-            "records {what}: a lane whose pass no longer stands IS the deciding lane — so \
+            "{rec:?} records: a lane whose pass no longer stands IS the deciding lane — so \
              the assertion above is the verdict deciding, not a constant"
         );
     }
 
+    // **The strictly weaker row, labelled.** A record briefed at the LIVE head
+    // is open for this revision, so the drive waits for it rather than re-asking
+    // — `Wait`, correctly, and the first draft of this test asserted
+    // `OpenLane { index: 1 }` here and went red on CI. It is kept because it
+    // pins something real (a standing pass is not re-opened at any record
+    // state), and kept SEPARATE because `Wait` names no lane: it holds
+    // identically whether the drive is waiting on lane 0 or lane 1, so folding
+    // it into the crossings above would have put a row there that cannot fail.
+    let mut open = entry_at(DriveState::ReviewWait);
+    open.head = HEAD_A.into();
+    open.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
+    open.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
+    assert_eq!(
+        reviewdrive::decide(&open, &facts_with(HEAD_A), &limits),
+        DriveStep::Wait,
+        "a lane already briefed at this revision is waited for, not re-asked"
+    );
+
     // …and the function that makes it true, named directly, so a change to
     // selection reddens at the site rather than only through `decide`. It takes
-    // no lane record at all — which is the structural half of this invariant —
-    // so its answer cannot depend on `briefed_head` however that field moves.
+    // no lane record at all — the structural half of this invariant — so its
+    // answer cannot depend on `briefed_head` however that field moves.
     assert_eq!(
         reviewdrive::first_stale_lane(
             facts_with(HEAD_A).required_lanes.as_deref().unwrap(),
