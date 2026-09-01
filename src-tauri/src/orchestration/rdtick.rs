@@ -277,14 +277,22 @@ pub struct RdDriveReport {
     /// same handle `lanes_opened` carries for a lane, and for the same reason:
     /// it is the only way a caller can ask what the worker was actually told.
     pub handbacks: Vec<(u64, String)>,
-    /// The kick-back notices that **reached** the orchestrator's pane this tick
-    /// — a hold's, and every terminal exit's whose delivery answered `Ok`.
+    /// The kick-back notices this tick **produced and attempted** — a hold's,
+    /// and every terminal exit's.
     ///
-    /// Delivered, not merely produced. Before #1857 this field was pushed
-    /// regardless of what `deliver_to_orchestrator` answered, which made its own
-    /// doc ("delivered to the orchestrator") a false claim and left a test no way
-    /// to tell the two apart. A notice that failed to go out appears in
-    /// [`notice_undelivered`](RdDriveReport::notice_undelivered) instead.
+    /// **Attempted, not delivered**, and the wording is the correction rather
+    /// than a hedge: this field's doc used to say "delivered to the
+    /// orchestrator" while being pushed regardless of what
+    /// `deliver_to_orchestrator` answered, which was a claim the code did not
+    /// make (#1857). Whether a terminal exit's notice actually landed is
+    /// [`notice_undelivered`](RdDriveReport::notice_undelivered)'s question, and
+    /// it is the one with a consequence — a notice still owed keeps its entry.
+    ///
+    /// It stays "attempted" rather than being narrowed to `Ok` deliveries
+    /// because the two are not distinguishable from a caller's side for a HOLD,
+    /// whose notice is not owed on the entry and has no retry: reporting only
+    /// the ones that landed would silently drop a hold's notice out of this
+    /// field with nowhere else for it to appear.
     pub notices: Vec<String>,
     /// PRs whose terminal notice is **still owed** at the end of this tick — the
     /// delivery was attempted and failed, so the entry is retained and a later
@@ -686,10 +694,9 @@ impl OrchRegistry {
             // terminal exit's notice does not come through here at all; it is
             // owed on the entry and delivered by the flush below (#1857).
             for n in &o.notices {
-                if self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR).is_ok() {
-                    report.notices.push(n.clone());
-                }
+                let _ = self.deliver_to_orchestrator(group, n, brand::AUDIT_ACTOR);
                 self.rd_task_note(group, o.pr, n);
+                report.notices.push(n.clone());
             }
             // Only once the arc that consumed it is durable — see `persisted`.
             if o.clear_signal && persisted {
@@ -795,9 +802,18 @@ impl OrchRegistry {
                 // rewrite the row on every tick.
                 self.rd_task_note(group, pr, &text);
             }
-            if self.deliver_to_orchestrator(group, &text, brand::AUDIT_ACTOR).is_ok() {
+            // **`Ok` is exactly "the notice is on the pane's queue and a drainer
+            // will paste it", and `Err` is exactly "it is not".** Every refusal
+            // in `deliver_prompt_as` either answers before the admission
+            // (unknown/dead agent, no terminal, a manager pane, a full queue) or
+            // WITHDRAWS the admission it made (`withdraw_unprocessable`, for a
+            // missing app handle) — so an `Err` never leaves a payload queued,
+            // and re-sending on the next tick cannot duplicate a line that is
+            // already going to arrive.
+            let landed = self.deliver_to_orchestrator(group, &text, brand::AUDIT_ACTOR).is_ok();
+            out.notices.push(text);
+            if landed {
                 ok.push(pr);
-                out.notices.push(text);
             } else {
                 failed.push(pr);
             }
