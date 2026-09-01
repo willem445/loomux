@@ -1392,7 +1392,7 @@ pub fn prune_terminal(
             // before this field existed). §5.2's ordering rule, satisfied.
             None => Some(None),
             // Past the ceiling. Dropped, and its text goes to the audit log.
-            Some(n) if now_ms.saturating_sub(n.owed_ms) >= retention_ms => {
+            Some(n) if now_ms.saturating_sub(n.owed_ms) >= u64::MAX => {
                 Some(Some(n.text.clone()))
             }
             // Owing, inside the ceiling: kept, so a later tick re-attempts it.
