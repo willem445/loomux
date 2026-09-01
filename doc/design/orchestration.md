@@ -12958,7 +12958,9 @@ blob, 622 bytes of pure line ending inside a 45,000-byte budget. That made
 normalizing the endings before asserting, made the pin stable and blind in the same stroke:
 the Windows build genuinely paid the larger prompt on every model call, in the exact number
 this section exists to control, and nothing would go red to say so. `.gitattributes` now
-pins `templates/**` and the `pre222` goldens to `eol=lf`, so the embedded bytes are
+pins `templates/**/*.md` and the `pre222` goldens' `*.md` to `eol=lf` (scoped to the
+extension so the rule cannot force EOL conversion on a future binary fixture, and so it
+covers exactly what its guard walks), so the embedded bytes are
 identical on every platform and the assertion is the raw `ORCHESTRATOR_TPL.len()`. **One
 mechanism, not two:** the budget constant was deliberately not raised to cover the CRLF
 case as well, because two mechanisms for one invariant drift and the second is the one

@@ -44,7 +44,11 @@ opinions — see the `ci-validate` skill.)
   are a measured budget rather than a checkout artefact (#1845). Never assume
   which side a file is on — `git ls-files --eol <path>` answers it, and a file
   whose rule was added after your worktree was cut is CRLF on disk anyway until
-  `git add --renormalize .` or a re-checkout.
+  you DELETE it and check it out again (`rm` the files, then `git checkout --
+  <dir>`). `git add --renormalize .` does NOT fix a worktree — it rewrites the
+  index only, silently, leaving a clean `git status` beside a still-CRLF file —
+  and a plain `git checkout --` without deleting first is a no-op, because git
+  considers the file up to date (#1845).
   For the CRLF majority, a `node -e` anchor built from an LF string, or from
   `git show <ref>:<file>`, never matches the worktree copy, and writing one back
   with bare LF silently flips that region's endings. Read the file's own EOL and

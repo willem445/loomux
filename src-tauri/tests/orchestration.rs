@@ -4624,6 +4624,15 @@ fn read_playbook_writes_one_audit_line() {
     assert!(line.contains("about-this-playbook"), "the line names the section: {line}");
 }
 
+/// The resident core's byte budget (#1683) — ONE definition, quoted by both the
+/// assertion and the message it prints.
+///
+/// The literal used to appear three times: in the comparison, in the failure
+/// message's prose, and in the surrounding comment. A change to one of them
+/// leaves the message asserting a budget that is not the one enforced, and a
+/// message is exactly the surface nobody re-derives (review round 2, N1).
+const RESIDENT_CORE_BUDGET: usize = 45_000;
+
 #[test]
 fn the_resident_core_is_under_the_byte_budget() {
     // The point of #1683: the resident orchestrator template is paid on EVERY
@@ -4633,7 +4642,7 @@ fn the_resident_core_is_under_the_byte_budget() {
     //
     // RAW, and raw is honest only because the endings are pinned (#1845).
     // `include_str!` embeds the ON-DISK bytes, so before `.gitattributes`
-    // pinned `src-tauri/src/orchestration/templates/**` to `eol=lf` the same
+    // pinned `src-tauri/src/orchestration/templates/**/*.md` to `eol=lf` the same
     // document measured 622 bytes bigger on a CRLF checkout than on an LF one
     // (run 33345301036: 45,327 B on windows-latest, 44,705 B on ubuntu, same
     // blob). #1813 answered that by normalizing before asserting, which made
@@ -4653,9 +4662,10 @@ fn the_resident_core_is_under_the_byte_budget() {
     // why `every_prompt_template_is_checked_out_with_lf_endings` below asserts
     // the endings themselves and does not depend on the margin at all.
     assert!(
-        ORCHESTRATOR_TPL.len() <= 45_000,
-        "the resident core is {} bytes against a 45,000 budget — sections move to \
-         the playbook, they do not get rewritten longer in place (#1683)",
+        ORCHESTRATOR_TPL.len() <= RESIDENT_CORE_BUDGET,
+        "the resident core is {} bytes against a {RESIDENT_CORE_BUDGET}-byte budget — \
+         sections move to the playbook, they do not get rewritten longer in place \
+         (#1683)",
         ORCHESTRATOR_TPL.len()
     );
 }
@@ -4693,8 +4703,9 @@ fn markdown_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 ///
 /// **Why this sits beside the budget assertion rather than inside it.** The
 /// budget test does notice a CRLF checkout today, but only because the CR bytes
-/// happen to exceed the margin left under 45,000 — 308 B of it, against 621 CR
-/// bytes, measured on `orchestrator.md` at blob ad8d53e4. Shorten the template
+/// happen to exceed the margin left under `RESIDENT_CORE_BUDGET` — 308 B of it,
+/// against 621 CR bytes, measured on `orchestrator.md` at blob ad8d53e4 while
+/// that constant is 45,000. Shorten the template
 /// past that and the budget goes quiet again on exactly the platform that pays
 /// more, which is the issue's own "the guard is worse than none" case (#1845).
 /// This test is margin-independent and covers every template, not only the one
@@ -4704,12 +4715,20 @@ fn markdown_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 /// consts (`WORKFLOW_TPL`, `BLOCK_TPL`) are private to the lib and unreachable
 /// from an integration test, and a template added tomorrow would be on no list
 /// at all — so the population is whatever the directories hold, walked
-/// RECURSIVELY because the attribute patterns are `**` and a flat walk would
-/// police a narrower population than the rule. The floors below are the vacuity
-/// control (an unreadable or empty walk passes a `!contains` check trivially)
-/// and are deliberately looser than the counts observed when this was written
-/// — 11 templates and 7 fixture files, no subdirectories — so an ordinary add
-/// or removal does not touch this test.
+/// RECURSIVELY because the attribute patterns match at any depth and a flat walk
+/// would police a narrower population than the rule. The floors below are the
+/// vacuity control (an unreadable or empty walk passes a `!contains` check
+/// trivially) and are deliberately looser than the counts observed when this was
+/// written — 11 templates and 7 fixture files, no subdirectories — so an
+/// ordinary add or removal does not touch this test.
+///
+/// **The `.md` filter is the RULE's scope, not a shortcut.** `.gitattributes`
+/// pins `**/*.md` rather than `**` on purpose: `text` is an explicit override,
+/// so a bare `**` would force EOL conversion on a future non-`.md` fixture — a
+/// rendered-bytes golden, anything genuinely binary — and corrupt it at
+/// checkout, while this walk would not police it either. Rule and guard cover
+/// the same set, and a non-`.md` file added to either tree is a deliberate act
+/// that decides its own treatment in both places (review round 2, N2/N3).
 ///
 /// **Do not delete this as redundant with the budget assertion.** It reads as
 /// redundant only while the margin happens to be smaller than the CR count, and
@@ -4730,8 +4749,12 @@ fn every_prompt_template_is_checked_out_with_lf_endings() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     // (the `.gitattributes` pattern, the dir under `src-tauri/`, the floor)
     let trees = [
-        ("src-tauri/src/orchestration/templates/**", "src/orchestration/templates", 8usize),
-        ("src-tauri/tests/fixtures/pre222/**", "tests/fixtures/pre222", 5usize),
+        (
+            "src-tauri/src/orchestration/templates/**/*.md",
+            "src/orchestration/templates",
+            8usize,
+        ),
+        ("src-tauri/tests/fixtures/pre222/**/*.md", "tests/fixtures/pre222", 5usize),
     ];
     let mut scanned = 0usize;
     for (pattern, rel, floor) in trees {
@@ -4747,9 +4770,12 @@ fn every_prompt_template_is_checked_out_with_lf_endings() {
                 "{} carries a CR, so this checkout is CRLF and `include_str!` embeds one \
                  extra byte per line — the resident-prompt budget would be measuring the \
                  checkout instead of the content (#1845). `.gitattributes` pins `{pattern}` \
-                 to `eol=lf`, but that does not rewrite files already on disk: run \
-                 `git add --renormalize .` (or delete and re-checkout these directories) in \
-                 any worktree cut before that rule landed.",
+                 to `eol=lf`, but an attribute never rewrites files already on disk. FIX: \
+                 delete these files and check them out again — `rm` them, then \
+                 `git checkout -- <dir>`. `git add --renormalize .` will NOT do it: it \
+                 rewrites the index only, silently, so you get a clean `git status` beside \
+                 a still-CRLF file. A plain `git checkout --` without deleting first is a \
+                 no-op too, because git considers the file up to date.",
                 path.display()
             );
         }

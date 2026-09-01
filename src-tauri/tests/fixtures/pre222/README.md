@@ -882,14 +882,20 @@ a human, not a re-run.
   `{{BLOCK_NOTE}}`, which resolve to the empty string for the built-in roster.
 
 Line endings are pinned rather than merely normalized away: `.gitattributes` gives both
-`src-tauri/src/orchestration/templates/**` and this directory `eol=lf`, so a golden and its
-live template are LF in the blob and LF on disk on every platform (#1845). The comparison
-tests still normalize before asserting — a no-op on a correct checkout, a safety net on a
-stale one — and the assertion is about the words, not the checkout, either way. A worktree
-cut before that rule landed still holds CRLF until `git add --renormalize .` or a
-re-checkout; `every_prompt_template_is_checked_out_with_lf_endings`
-(`src-tauri/tests/orchestration.rs`) is what makes that a red instead of a silent platform
-difference.
+`src-tauri/src/orchestration/templates/**/*.md` and this directory's `*.md` `eol=lf`, so a
+golden and its live template are LF in the blob and LF on disk on every platform (#1845).
+The comparison tests still normalize before asserting — a no-op on a correct checkout, a
+safety net on a stale one — and the assertion is about the words, not the checkout, either
+way. `every_prompt_template_is_checked_out_with_lf_endings`
+(`src-tauri/tests/orchestration.rs`) is what makes a stale checkout a red instead of a
+silent platform difference.
+
+**Fixing a stale worktree means DELETING the files and checking them out again** — `rm`
+them, then `git checkout -- <dir>`. `git add --renormalize .` will not do it: that rewrites
+the INDEX only, and it does so silently, so you get a clean `git status` next to a file that
+is still CRLF. A plain `git checkout --` without deleting first is a no-op too, because git
+considers the file up to date. Measured, in an isolated repo and on this one (#1845, review
+round 2).
 
 ## Verifying a re-bless by hand — and the CRLF trap
 
