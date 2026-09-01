@@ -1682,9 +1682,11 @@ orrerix, and deleting is tidier — while one carrying counters or comments has
 `enabled: false` written into it and loses nothing. A block that declares
 counters but no `enabled:` line shows
 unchecked, because that is what the engine reads as off. When that line
-carries its own trailing comment, the form says so beside the toggle: flipping
-the switch rewrites the value on the line and leaves the comment exactly as
-written — orrerix never edits your prose, and does not guess whether a
+carries its own trailing comment and its value is a true/false spelling — the
+only ones a loadable file can carry — the form says so beside the toggle:
+flipping the switch rewrites the value on
+the line and leaves the comment exactly as written — orrerix never edits your
+prose, and does not guess whether a
 comment still agrees with the switch, so the note is the cue to read the line
 after a flip. The driver's counters
 and timeouts are number fields clamped to their own declared ranges, so the
@@ -1738,10 +1740,15 @@ you tick on and then off again leaves the file exactly as it was — including
 its comments — with one exception: a `driver:` block that carried no
 `enabled:` line at all. Turning a driver on has to add that line, so the two
 clicks leave such a block declaring `enabled: false` where the file had none.
-When that line carries its own trailing comment, a flip rewrites the value and
-leaves the comment byte for byte — which means a comment can outlive the
+When that line carries its own trailing comment and its value is a
+true/false spelling, a flip rewrites the value and leaves the comment byte for
+byte — which means a comment can outlive the
 switch position it describes, and the pane says so beside the toggle rather
-than editing your prose. Unticking never deletes configuration either: a block
+than editing your prose. A line whose value is *not* a true/false spelling is
+the second exception: the pane already flags the value, and a flip there
+regenerates the whole section, so the block's comments do not survive it —
+the toggle stays silent rather than promising a preservation that will not
+happen. Unticking never deletes configuration either: a block
 carrying counters or comments is kept, with the switch written as off, and its
 comments are kept byte for byte except the switch's own line.
 

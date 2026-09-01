@@ -820,18 +820,22 @@ export function removeDriverBlock(w: Workflow): void {
   delete w.driver; // the whole block, by the user's explicit instruction (#1876 P1)
 }
 
-/** The `driver:` block's `enabled:` line's own trailing comment, when the file
- *  writes one — the condition for the driver form's flip note (#1876 P2). The
- *  splice rewrites that line's VALUE and leaves its comment exactly as written,
- *  so a comment can end up sitting beside a switch it no longer describes; the
- *  form shows the note while the comment is there, quoting it, instead of
- *  guessing whether the prose disagrees. Same scanner as
- *  `driverSectionHasComments` (the preserving splitter, #233) so a `#` inside a
- *  block scalar's body is content, never a comment — and a body line that looks
- *  like an `enabled:` field is not one, because it sits deeper than the block's
- *  fields. Returns null when there is no driver block, no `enabled:` line in it,
- *  or no comment on that line — and for a shape the scan refuses to read, since
- *  the note is advisory and must not invent one. */
+/** The `driver:` block's `enabled:` line's own trailing comment, when the flip
+ *  would PRESERVE it — the condition for the driver form's flip note (#1876 P2).
+ *  The splice rewrites that line's value and leaves its comment exactly as
+ *  written, but ONLY where its suffix guard passes: a value not ending in
+ *  `true`/`false` makes the splice bail into canonical regeneration, which drops
+ *  the section's comments — this very comment included (the residual
+ *  `spliceEnabledLine` documents). So this predicate carries the splice's own
+ *  guard: on a bail shape it returns null, and the note does not render, rather
+ *  than promising a preservation that will not happen (#1876 review 1 — the
+ *  unconditioned note was written without consulting that disclosed residual).
+ *  Same scanner as `driverSectionHasComments` (the preserving splitter, #233) so
+ *  a `#` inside a block scalar's body is content, never a comment — and a body
+ *  line that looks like an `enabled:` field is not one, because it sits deeper
+ *  than the block's fields. Returns null when there is no driver block, no
+ *  `enabled:` line in it, no comment on that line, a value the splice cannot
+ *  rewrite in place, or a shape the scan refuses to read. */
 export function driverEnabledLineComment(text: string): string | null {
   const doc = splitDocument(text); // P2 scan
   if (!doc) return null;
@@ -846,7 +850,11 @@ export function driverEnabledLineComment(text: string): string | null {
     if (opaque.has(i) || !isSignificantLine(line) || indentOf(line) !== indent) continue;
     const split = splitKey(stripComment(line).trim());
     if (!split || split.key !== "enabled") continue;
-    const comment = line.slice(stripComment(line).length).trim();
+    const stripped = stripComment(line).trimEnd();
+    // The splice's own suffix guard, mirrored: where it would bail, the flip
+    // regenerates the section and the comment does not survive — no note.
+    if (!/(true|false)$/i.test(stripped)) return null; // suffix guard (#1876)
+    const comment = line.slice(stripped.length).trim();
     return comment || null;
   }
   return null;

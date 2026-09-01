@@ -2465,11 +2465,12 @@ export class WorkflowView {
     );
     if (!dv) return box;
 
-    // The flip note (#1876 P2): the splice rewrites the enabled line's VALUE and
-    // leaves its trailing comment exactly as written, so the comment can end up
-    // beside a switch it no longer describes. The note states what happens while
-    // the comment is there — orrerix never edits the prose, and does not guess
-    // whether it disagrees with the value.
+    // The flip note (#1876 P2): where the splice will actually PRESERVE the
+    // enabled line's trailing comment across a value flip, the note says so —
+    // quoting the comment, because it can end up beside a switch it no longer
+    // describes. The helper carries the splice's own suffix guard: on a bail
+    // shape the flip regenerates the section and the comment does not survive,
+    // so the helper returns null and the note does not render (#1876 review 1).
     const enabledComment = driverEnabledLineComment(this.text);
     if (enabledComment) {
       box.append(

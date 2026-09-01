@@ -717,6 +717,12 @@ test("driverEnabledLineComment reads the enabled line's own comment through the 
     "a block scalar's body is opaque: its `enabled:`-shaped line is not the field"
   );
   assert.equal(
+    driverEnabledLineComment(`${roster}driver:\n  enabled: yes  # note\n`),
+    null,
+    "the bail shape: `yes` fails the splice's suffix guard, so the flip regenerates the " +
+      "section and this comment would NOT survive — the note must not render (#1876 review 1)"
+  );
+  assert.equal(
     driverEnabledLineComment(" driver:\n  enabled: true # x\n"),
     null,
     "an unreadable shape invents no note — the note is advisory and may not lie"
