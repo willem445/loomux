@@ -3350,7 +3350,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // acted on" are different facts and a reader chasing a drive
                     // that did not move needs to tell them apart.
                     let is_worker = pane.role == super::reviewdrive::DrivenRole::Worker;
-                    let event = match (is_worker && pane.current, status) {
+                    // MUTATION (#1871 B2 belief-half, evidence only): the
+                    // `pane.current` conjunct removed. This is the gate rev-final
+                    // observed had no witnessed red — round 2's mutation aborted
+                    // the test at its OWNERSHIP assertion, so the belief
+                    // assertion was never reached.
+                    let event = match (is_worker, status) {
                         (true, "done") => Some(super::RdEvent::WorkerDone),
                         (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
                         _ => None,
