@@ -1669,9 +1669,23 @@ at all, so your own config decides.
 roster's block rows and its merge-gate row sit four more: **Intake**, **Merge
 queue**, **Review driver** and **Resources** - the same `intake:`,
 `merge_queue:`, `driver:` and `resources:` blocks described elsewhere on this
-page. The first, second and fourth each have an enable-toggle and their fields;
-the driver row is read-only for now (it shows what the file declares) - edit
-`driver:` in the text editor. The block form covers the
+page. Each has an enable-toggle, and what the checkbox reads differs by what
+the section's `enabled` state is. For **Intake** and **Resources** the checkbox
+is the section itself: switching it on writes the block, switching it off
+removes it. The **Merge queue**'s checkbox is its presence too, with a separate
+dropdown for the `enabled:` line - that file has three states and a checkbox
+has two. The **Review driver**'s checkbox is the `enabled:` line itself:
+ticking it on writes `enabled: true` (keeping any counters the block already
+declares), and unticking keeps what the block carries: a block that holds
+nothing but the switch is removed whole — absent and off are the same thing to
+orrerix, and deleting is tidier — while one carrying counters or comments has
+`enabled: false` written into it and loses nothing. A block that declares
+counters but no `enabled:` line shows
+unchecked, because that is what the engine reads as off. The driver's counters
+and timeouts are number fields clamped to their own declared ranges, so the
+form cannot write an out-of-range value at all; what the engine then does with
+a *hand-written* value outside those ranges differs by field, and the next
+paragraph says which. The block form covers the
 rest: `role_hint`, and `allow:` as a list of tool patterns (one row per
 pattern, because a real pattern contains commas).
 
@@ -1683,17 +1697,27 @@ editing your workflow in the pane is safe — you just set the limits in the tex
 editor for now.
 
 Two things those forms will not let you do, because orrerix's engine would
-refuse the file: write a number outside a field's range (the inputs clamp —
+refuse the file: write a number outside a **refused** field's range, and pair
+a `role_hint` with a kind that hint does not apply to. The refused bounds —
 slots 1–64, max hold 1–480 minutes, at most 32 resources, a batch of at least
-1), and pair a `role_hint` with a kind that hint does not apply to. A value a
-*hand-edited* file already carries is shown as a finding instead, with the
-distinction that matters spelled out — a bound orrerix **refuses** reads as an
-error, one it **clamps** (`checks_timeout_minutes`) as a warning.
+1, and the driver's three counters at 1–3 rounds/attempts and 0–1 rebases —
+are enforced by the inputs themselves, which cannot emit a value outside
+them. The **clamped** fields (`checks_timeout_minutes`, and the driver's three
+timeouts at 5–240 minutes) are pulled into range the same way, but the engine
+would have coerced a hand-written value there rather than refusing the file. A
+value a *hand-edited* file already carries is shown as a finding instead, with
+the distinction that matters spelled out — a bound orrerix **refuses** reads
+as an error, one it **clamps** as a warning.
 
 An untouched section is never rewritten. orrerix writes only what the file
 declares, so opening these forms to look at them changes nothing, and a section
 you tick on and then off again leaves the file exactly as it was — including
-its comments.
+its comments — with one exception: a `driver:` block that carried no
+`enabled:` line at all. Turning a driver on has to add that line, so the two
+clicks leave such a block declaring `enabled: false` where the file had none.
+Unticking never deletes configuration either: a block carrying
+counters or comments is kept, with the switch written as off, and its comments
+are kept byte for byte except the switch's own line.
 
 **Reviewer diversity across models.** A block's `cli`/`model` are set
 per-block, so nothing stops a reviewer lane from running on a different
@@ -1942,8 +1966,8 @@ the parse of the whole file rather than being ignored.
 
 The block **enables** the feature; it can never start, target or widen a drive - no drive
 exists until an orchestrator makes its own role-gated `drive_review` call naming one PR.
-(The pane shows the block's declared values read-only for now; the driving loop itself is
-still landing slice by slice in #1778.)
+(The workflow pane edits this block too: an enable-toggle whose state is the `enabled:`
+line, plus number fields bounded to the ranges shown above - #1869.)
 
 ### Setting up a cross-model reviewer
 

@@ -726,6 +726,87 @@ export const DRIVER_DEFAULTS: Readonly<{
   drive_timeout_minutes: 240,
 };
 
+/** The driver form's enable-toggle write rule (#1869; narrowed by review round 3).
+ *
+ *  ON writes `{ enabled: true }` — or, when a block already stands (a hand-written
+ *  `enabled: false` beside declared counters, or a block with no `enabled:` line at
+ *  all), flips just `enabled` and leaves the rest of the human's lines alone: the
+ *  merge-queue lesson in reverse (#1020 review, finding 4 — a form must not silently
+ *  rewrite what it did not write).
+ *
+ *  OFF is a **data-loss rule**, so it deletes only what costs nothing to delete:
+ *  a block that carries NOTHING BUT `enabled` — no counter, no unknown key, and no
+ *  comment in the file's own prose about it (`commentsInSection`) — is removed
+ *  whole, because absent and `enabled: false` are the same state to the engine and
+ *  deleting is the tidier of the two. Anything more and OFF writes
+ *  `enabled: false`, preserving the block: the checkbox reads the `enabled:` line,
+ *  and two clicks on it must never delete configuration the human can see. The
+ *  comment signal comes from the view, which holds the original text — the model
+ *  cannot see comments, and `driverSectionHasComments` is how it asks. */
+export function setDriverEnabled(
+  w: Workflow,
+  on: boolean,
+  commentsInSection = false
+): void {
+  if (!on) {
+    const d = w.driver;
+    if (!d) return;
+    const carriesMore =
+      d.max_review_rounds !== undefined ||
+      d.max_ci_attempts !== undefined ||
+      d.max_rebase_attempts !== undefined ||
+      d.lane_timeout_minutes !== undefined ||
+      d.fix_timeout_minutes !== undefined ||
+      d.drive_timeout_minutes !== undefined ||
+      d.extra !== undefined;
+    if (carriesMore || commentsInSection) {
+      d.enabled = false;
+      return;
+    }
+    delete w.driver;
+    return;
+  }
+  if (w.driver) w.driver.enabled = true;
+  else w.driver = { enabled: true };
+}
+
+/** Does the `driver:` section of this text carry any comment line — the comment
+ *  introducing it, a comment inside the block, or a trailing one on the key line?
+ *  `setDriverEnabled`'s OFF rule asks this because the MODEL cannot see comments:
+ *  a block that is bare to the model may still be the subject of the file's own
+ *  prose, and deleting the section would delete that prose with it. Reuses the
+ *  preserving serializer's own splitter (#233) rather than a second scanner — a
+ *  `#` inside a block scalar's body is content, and only that splitter knows where
+ *  the bodies are. Conservative on a shape the scan refuses to read: `true`, so an
+ *  unreadable file is never the one that gets a block deleted. */
+export function driverSectionHasComments(text: string): boolean {
+  const doc = splitDocument(text);
+  if (!doc) return true;
+  const entry = doc.entries.find((e) => e.key === "driver");
+  if (!entry) return false;
+  // A line "carries" a comment when stripping one changes it — a pure `# …` line
+  // (strip → empty) AND a significant line with a trailing `# …` (`driver: # off`)
+  // both count; the block scalar scan excludes bodies, where a `#` is content.
+  const carriesComment = (l: string): boolean => l.trim() !== "" && stripComment(l) !== l;
+  const scan = (lines: readonly string[]): boolean => {
+    const opaque = opaqueScalarIndices(lines as string[]);
+    return lines.some((l, i) => !opaque.has(i) && carriesComment(l));
+  };
+  return scan(entry.header) || scan(entry.content);
+}
+
+/** The driver form's checkbox READ rule (#1869 review round 1) — the pair of
+ *  `setDriverEnabled` above. The checkbox shows the driver's enabled state, and the
+ *  engine's answer is what the `enabled:` LINE says (`RawDriver.enabled` is
+ *  `#[serde(default)] bool`), never the block's presence: a present `driver:` block
+ *  without the line is OFF to the engine, which is exactly what the pre-form pane
+ *  rendered ("not declared - off (orrerix's default)"). Reading presence instead of
+ *  the line would show ON for a driver that will never run — the one case the write
+ *  rule's tests cannot see, which is why this half is pinned separately. */
+export function isDriverOn(w: Workflow): boolean {
+  return w.driver?.enabled === true;
+}
+
 /** One named lock resource (#858) — how many agents may hold it at once and for
  *  how long. Two numbers, keyed by a name the repo chose; loomux never learns what
  *  the name means (CLAUDE.md constraint 8 — this is policy, not mechanism). */
@@ -839,11 +920,9 @@ export type FindingCode =
  *  here with no form to land on would be a click that goes nowhere. Its findings carry a
  *  message naming `board.wip.<status>` instead, which is what the raw-text view needs
  *  anyway; the member and the form arrive together or not at all. */
-/** `driver:` (#1778) IS a member despite having no form either - but unlike `board:` it
- *  has a READ-ONLY inspector view (the summary the nav row lands on), so a finding's
- *  click lands on a surface that shows the declared state and names the fix in its
- *  message (the YAML, per the merge-queue precedent). It gains a form when slice C
- *  builds one, the same as every other member. */
+/** `driver:` (#1778) is a member WITH a form since #1869 (enable-toggle plus the six
+ *  counters, same shape as `mergeQueueForm`), so a finding's click lands on the form
+ *  that can fix it — the same click-to-the-fix routing the other policy sections get. */
 export type FindingSection = "intake" | "merge_queue" | "driver" | "resources";
 
 /** One thing wrong with the workflow. `blockId` lets the pane render the finding INLINE
@@ -1822,6 +1901,88 @@ function isDashAt(line: string, indent: number): boolean {
   return indentOf(line) === indent && (t === "-" || t.startsWith("- "));
 }
 
+/** Do two driver models differ ONLY in their `enabled` value? The splice path's guard
+ *  (#1869 review round 3): the toggle is the only writer of `enabled`, and when
+ *  everything else is equal the section's own lines can be reused with just that one
+ *  value rewritten — the deepEqual reuse guarantee, narrowed to the one field that
+ *  changed. Explicit field copy rather than a destructuring omit, so no unused-binding
+ *  lint has an opinion about the field this exists to skip. */
+function driverDiffersOnlyInEnabled(a: WorkflowDriver, b: WorkflowDriver): boolean {
+  if (a.enabled === b.enabled) return false; // not a value flip — the deepEqual path owns it
+  const rest = (d: WorkflowDriver): Omit<WorkflowDriver, "enabled"> => ({
+    max_review_rounds: d.max_review_rounds,
+    max_ci_attempts: d.max_ci_attempts,
+    max_rebase_attempts: d.max_rebase_attempts,
+    lane_timeout_minutes: d.lane_timeout_minutes,
+    fix_timeout_minutes: d.fix_timeout_minutes,
+    drive_timeout_minutes: d.drive_timeout_minutes,
+    extra: d.extra,
+  });
+  return deepEqualValue(rest(a), rest(b));
+}
+
+/** Rewrite a `driver:` section's own lines so its `enabled:` line carries `value`,
+ *  reusing every other line verbatim — comments and formatting included (#1869
+ *  review round 3). The value is REPLACED in place when the line exists (a trailing
+ *  comment on it is kept); the line is inserted ahead of the block's first field
+ *  when the file never wrote one.
+ *
+ *  Two RESIDUALS, stated rather than absorbed (#1869 review round 5):
+ *
+ *  1. The bail path (null) is NOT comment-preserving. The caller's fallback is
+ *     canonical regeneration, which drops the section's interior comments — the
+ *     same trade every other form edit in the pane has always made for a section
+ *     whose content changed. The bail fires on a shape this scan cannot rewrite
+ *     in place: no field line to anchor to, or an `enabled:` value whose text
+ *     does not END in `true`/`false`. The rewrite is a suffix match, and the
+ *     reachable case — reproduced through parse → toggle → serialize → re-parse,
+ *     not reasoned about (#1869 review 7) — is `notfalse` + ON, which rewrites
+ *     the line to `nottrue`: the write lands, but the reader refuses `nottrue`
+ *     (a bad-value finding), the re-parsed file still has no `enabled` for the
+ *     model to read, and the rebuilt inspector renders the checkbox OFF again —
+ *     an inert click, with no pane/file divergence at any point. (`nottrue`
+ *     itself leaves the model's `enabled` undefined from the start, so the
+ *     checkbox renders OFF there too and its ON click is a pure no-op: the
+ *     rewritten line is byte-identical to what the file already said.) The bound
+ *     is residual 2's, and it is what keeps this
+ *     from being a live hazard: the pane already flags such a value as a bad
+ *     value and serde refuses the type, so the file was unloadable before the
+ *     rewrite — no loadable file can be made wrong. That residual is pinned by a
+ *     test (a fixture with an interior comment and an `enabled: yes` line really
+ *     does lose the comment), so it cannot silently go false.
+ *
+ *  2. A file carrying a DUPLICATE `enabled:` key has this rewrite touch only the
+ *     FIRST occurrence, while the reader keeps the LAST. The bound: serde refuses
+ *     a duplicate field, so such a file is already unloadable — the rewrite
+ *     cannot make a loadable file wrong, only an unloadable one differently
+ *     spelled. Not pinned: there is no behavior of a loadable file at stake. */
+function spliceEnabledLine(content: readonly string[], value: boolean): string[] | null {
+  const wanted = value ? "true" : "false";
+  const opaque = opaqueScalarIndices(content as string[]);
+  const firstField = content.find((l, i) => !opaque.has(i) && isSignificantLine(l));
+  if (firstField === undefined) return null;
+  const indent = indentOf(firstField);
+  for (let i = 0; i < content.length; i++) {
+    const line = content[i]!;
+    if (opaque.has(i) || !isSignificantLine(line) || indentOf(line) !== indent) continue;
+    const split = splitKey(stripComment(line).trim());
+    if (!split || split.key !== "enabled") continue;
+    const head = stripComment(line).trimEnd();
+    if (!/(true|false)$/i.test(head)) return null; // an unexpected value spelling — bail
+    const replaced = head.replace(/(true|false)$/i, wanted) + line.slice(head.length);
+    return [...content.slice(0, i), replaced, ...content.slice(i + 1)];
+  }
+  // No `enabled:` line in the block: insert it as the first field. Leading comment
+  // or blank lines stay ABOVE it — they introduce the section, and regeneration
+  // would drop them entirely.
+  for (let i = 0; i < content.length; i++) {
+    if (!opaque.has(i) && isSignificantLine(content[i]!)) {
+      return [...content.slice(0, i), `${" ".repeat(indent)}enabled: ${wanted}`, ...content.slice(i)];
+    }
+  }
+  return null;
+}
+
 /** Split source text into its top-level keys' raw line ranges, WITHOUT re-parsing their
  *  values — this only needs to know where each key's text begins and ends so the preserving
  *  serializer can splice by that boundary. Returns null for any shape this simple scan isn't
@@ -2207,13 +2368,29 @@ export function serializeWorkflowPreserving(w: Workflow, originalText: string): 
         !!w.merge_queue,
         w.merge_queue ? emitMergeQueueLines(w.merge_queue) : []
       ),
-    driver: (entry) =>
+    driver: (entry) => {
+      // The toggle flips ONE field's value (#1869 review round 3), so the section's
+      // own lines are reused with just the `enabled:` line rewritten — the same
+      // guarantee the deepEqual path gives untouched sections, narrowed to the one
+      // line that changed. This is NOT the re-attachment the module header rules
+      // out: no field changed underneath a comment, only a value. Any other edit
+      // falls through to `pushSection` and its canonical regeneration, exactly as
+      // every other section's edits always have.
+      const spliced =
+        entry && w.driver && orig.driver && driverDiffersOnlyInEnabled(w.driver, orig.driver)
+          ? spliceEnabledLine(entry.content, w.driver.enabled === true)
+          : null;
+      if (entry && spliced) {
+        out.push(...entry.header, ...spliced);
+        return;
+      }
       pushSection(
         entry,
         deepEqualValue(w.driver, orig.driver),
         !!w.driver,
         w.driver ? emitDriverLines(w.driver) : []
-      ),
+      );
+    },
     resources: (entry) =>
       pushSection(
         entry,

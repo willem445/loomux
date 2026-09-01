@@ -324,6 +324,34 @@ fn validation_catches_the_dangling_references_every_other_tool_ships_with() {
 }
 
 #[test]
+fn a_duplicate_driver_enabled_key_is_refused_not_last_one_wins() {
+    // The pane's round-5 disclosure (#1869 review 6) leans on this bound: its
+    // `enabled:`-line splice touches only the FIRST occurrence of a duplicated
+    // key while the reader would keep the last, and the disclosure is safe ONLY
+    // while serde refuses a duplicate field — an unloadable file cannot be made
+    // wrong by the rewrite. This repo has swapped YAML crates once, so that
+    // behaviour is pinned here rather than assumed: if the crate (or a serde
+    // version) ever starts deduping silently, this goes red and the residual's
+    // bound is gone with it.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n  enabled: false\n",
+    )
+    .unwrap_err();
+    assert!(
+        !errs.is_empty(),
+        "a duplicate driver enabled: key must refuse the file, not dedupe: {errs:?}"
+    );
+
+    // Positive control: the same file with ONE key parses — the refusal above is
+    // the duplicate's, not the fixture's shape, and the assertion can tell the
+    // two apart.
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: b\n    kind: worker\ndriver:\n  enabled: true\n",
+    )
+    .is_ok());
+}
+
+#[test]
 fn a_workflow_file_can_never_grant_a_capability() {
     // The security spine (§2c/§2e). `kind` is the ONLY capability knob, and it
     // selects from a closed enum. There is no way to spell "a reviewer that can

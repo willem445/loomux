@@ -79,6 +79,9 @@ import {
   MERGE_QUEUE_CHECKS_TIMEOUT_MAX,
   DRIVER_DEFAULTS,
   POLICY_BOUNDS,
+  isDriverOn,
+  driverSectionHasComments,
+  setDriverEnabled,
   type FieldBounds,
   type Workflow,
   type WorkflowBlock,
@@ -1428,7 +1431,7 @@ export class WorkflowView {
       return;
     }
     if (target.kind === "driver") {
-      this.formPane.replaceChildren(this.driverSummary(w));
+      this.formPane.replaceChildren(this.driverForm(w));
       return;
     }
     if (target.kind === "resources") {
@@ -2413,14 +2416,26 @@ export class WorkflowView {
     return box;
   }
 
-  /** The `driver:` block's READ-ONLY summary (#1778). The pane parses, preserves,
-   *  re-emits and validates the block, and this view is the whole chrome it gets:
-   *  no control here edits anything, deliberately — `FIELDS_WITH_AN_EDITOR` in
-   *  `test/workflowschema.test.ts` is empty and slice C's descriptor registry is
-   *  what will retire the hand-built forms, so a fourth one is the last thing this
-   *  section needs. What it must not be is invisible: a declared policy the
-   *  designer cannot show is the failure the #880 manifest exists to prevent. */
-  private driverSummary(w: Workflow): HTMLElement {
+  /** The `driver:` block's form (#1778 §5.3; the enable-toggle and counters since #1869).
+   *  The pane parses, preserves, re-emits and validates the block, and this view is the
+   *  whole chrome it gets: the checkbox below IS the driver's enabled state — it reads
+   *  `isDriverOn` (the `enabled:` line, not the block's presence) and writes through
+   *  `setDriverEnabled` (on writes `{ enabled: true }` beside whatever the block already
+   *  declares; off deletes a block that holds nothing but the switch, and writes
+   *  `enabled: false` — losing nothing — when it holds more, the comment signal coming
+   *  from `driverSectionHasComments` over the text this form was rendered from) — and
+   *  the six counters are bounded number fields
+   *  reading `POLICY_BOUNDS` — the manifest's own min/max, which
+   *  `test/workflowschema.test.ts` pins against the engine in both directions, so the
+   *  form cannot emit an out-of-range value at all — and which bounds the engine
+   *  REFUSES (the three counters) versus CLAMPS (`clamp_expires_minutes`, the three
+   *  timeouts) is the manifest's `on_out_of_range`, pinned behaviorally by the
+   *  refuse-vs-clamp test. The counters still get
+   *  hand-built fields rather than a descriptor registry — slice C is what retires the
+   *  hand-built forms, and until then this is the same shape `mergeQueueForm` is. What
+   *  the block must not be is invisible: a declared policy the designer cannot show is
+   *  the failure the #880 manifest exists to prevent. */
+  private driverForm(w: Workflow): HTMLElement {
     const box = el("div", "wf-fields");
     box.append(
       el(
@@ -2428,24 +2443,89 @@ export class WorkflowView {
         "wf-note",
         "The review-loop driver: loomux drives a PR through review and CI on the " +
           "orchestrator's authority. An absent driver: block means the feature is OFF. " +
-          "There is no editor for this section yet - edit the YAML directly."
+          "Unticking removes the section when it holds nothing but the switch, and writes " +
+          "enabled: false — keeping your counters and comments — when it holds more."
       )
     );
+
     const dv = w.driver;
-    const row = (label: string, value: string): void =>
-      box.append(this.field(label, el("span", "wf-note", value)));
-    row(
-      "Enabled",
-      dv?.enabled === undefined ? "not declared - off (orrerix's default)" : String(dv.enabled)
+    box.append(
+      // The read rule lives in `isDriverOn` — the enabled LINE, not the block's
+      // presence, since the engine's `enabled` is `#[serde(default)] bool` and a
+      // present block without the line is off. The write rule takes the comment
+      // signal from the text this form was rendered from: OFF may not delete the
+      // file's own prose about the section along with it (#1869 review round 3).
+      this.sectionToggle("The review driver is on for this repo", isDriverOn(w), (on) =>
+        this.mutate((next) =>
+          setDriverEnabled(next, on, driverSectionHasComments(this.text))
+        )
+      )
     );
+    if (!dv) return box;
+
     // Every fallback reads `DRIVER_DEFAULTS` - the engine's `DriverPolicy::default`
-    // mirrored and manifest-pinned - rather than a literal nothing can check.
-    row("Review rounds", String(dv?.max_review_rounds ?? DRIVER_DEFAULTS.max_review_rounds));
-    row("CI attempts", String(dv?.max_ci_attempts ?? DRIVER_DEFAULTS.max_ci_attempts));
-    row("Rebase attempts", String(dv?.max_rebase_attempts ?? DRIVER_DEFAULTS.max_rebase_attempts));
-    row("Lane timeout (min)", String(dv?.lane_timeout_minutes ?? DRIVER_DEFAULTS.lane_timeout_minutes));
-    row("Fix timeout (min)", String(dv?.fix_timeout_minutes ?? DRIVER_DEFAULTS.fix_timeout_minutes));
-    row("Drive timeout (min)", String(dv?.drive_timeout_minutes ?? DRIVER_DEFAULTS.drive_timeout_minutes));
+    // mirrored and manifest-pinned - rather than a literal nothing can check; every
+    // bound reads `POLICY_BOUNDS` rather than a retyped range, so a manifest change
+    // flows into the form through the pinned table instead of past it.
+    type DriverCounter =
+      | "max_review_rounds"
+      | "max_ci_attempts"
+      | "max_rebase_attempts"
+      | "lane_timeout_minutes"
+      | "fix_timeout_minutes"
+      | "drive_timeout_minutes";
+    const bounded = (label: string, field: DriverCounter, help: string): void => {
+      box.append(
+        this.field(
+          label,
+          this.boundedNumber(
+            dv[field],
+            POLICY_BOUNDS[`driver.${field}`]!,
+            (v) =>
+              this.mutate((next) => {
+                const d = next.driver!;
+                if (v === undefined) delete d[field];
+                else d[field] = v;
+              }, false),
+            `orrerix's default (${DRIVER_DEFAULTS[field]})`
+          ),
+          help
+        )
+      );
+    };
+    bounded(
+      "Review rounds",
+      "max_review_rounds",
+      "Review-finding rounds one drive may spend. INVARIANT 9 promises the orchestrator " +
+        "three; a repo may run tighter, never looser."
+    );
+    bounded(
+      "CI attempts",
+      "max_ci_attempts",
+      "CI attempts one drive may spend. Same invariant, same direction."
+    );
+    bounded(
+      "Rebase attempts",
+      "max_rebase_attempts",
+      "Rebase attempts one drive may spend. 0 is legal - a repo may refuse the driver any rebase."
+    );
+    bounded(
+      "Lane timeout (min)",
+      "lane_timeout_minutes",
+      "Backstop on a reviewer lane producing a verdict, so a stalled lane surfaces as " +
+        "held(lane-stalled) instead of pending in silence. Clamped, not refused."
+    );
+    bounded(
+      "Fix timeout (min)",
+      "fix_timeout_minutes",
+      "Backstop on a resumed worker pushing or reporting. Clamped, not refused."
+    );
+    bounded(
+      "Drive timeout (min)",
+      "drive_timeout_minutes",
+      "Backstop on the drive's whole age, from the entry's start - no idle clock resets it. " +
+        "The default is this range's ceiling."
+    );
     const findings = this.sectionFindingList("driver");
     if (findings) box.append(findings);
     return box;
