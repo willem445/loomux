@@ -3347,9 +3347,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // rides in the audit line so the record says which side
                     // spoke.
                     //
-                    // A `progress` report carries no signal from either side: a
-                    // drive advances on the head, the checks and the verdict
-                    // files, never on a delegate saying it is still going.
+                    // A `progress` report carries no DRIVE signal from either
+                    // side: a drive advances on the head, the checks and the
+                    // verdict files, never on a delegate saying it is still
+                    // going. Since #1959 the current WORKER's progress report
+                    // is still fed in — as `WorkerProgress`, a field of its own
+                    // that `decide` cannot read — so the tick can answer it in
+                    // that worker's own pane. It moves nothing; see
+                    // `RdEvent::WorkerProgress`. A LANE's progress report still
+                    // carries nothing at all: a lane's word to the drive is its
+                    // verdict file.
                     //
                     // **A SUPERSEDED pane is owned and is not believed** (#1871
                     // B2, and the amendment that decided it). The drive resumes
@@ -3370,6 +3377,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     let event = match (is_worker && pane.current, status) {
                         (true, "done") => Some(super::RdEvent::WorkerDone),
                         (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
+                        (true, "progress") => Some(super::RdEvent::WorkerProgress),
                         _ => None,
                     };
                     let kind = match (is_worker, pane.current) {

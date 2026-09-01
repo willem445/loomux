@@ -76,10 +76,30 @@ resumes it; `cancel_review_drive` cancels it), and only `satisfied` and
 | --- | --- | --- | --- |
 | `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies — this is how CONFLICTING is learned); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green; `fix-wait` on red or conflicting; `held(ci-limit)`, `held(rebase-limit)`, `held(drive-stalled)` |
 | `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest); the live head and body digest | the lane's spawned or resumed session id; the current lane index; `review_rounds` on a `fail`; `rd-lane-spawned`, `rd-verdict` | `gate-check` once the last required lane has passed; `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(routing-unaccountable)`, `held(drive-stalled)` |
-| `fix-wait` | the worker's intercepted `report`; the live head; **whether the pane it resumed is still alive** (#1961 — a resumed pane that exits before reporting is a hand-back that failed, not a wait, and waiting it out costs a whole `fix_timeout_minutes` on a dead process) | `rd-handback` | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)`, `held(drive-stalled)` |
+| `fix-wait` | the worker's intercepted `report`; the live head; **whether the pane it resumed is still alive** (#1961 — a resumed pane that exits before reporting is a hand-back that failed, not a wait, and waiting it out costs a whole `fix_timeout_minutes` on a dead process) | `rd-handback`; `rd-kickback` and `fix_kickback_ms` when it answers a worker's `report(progress)` (#1959) | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)`, `held(drive-stalled)` |
 | `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` — plus `body_drift` for `also: [body-unchanged]` | nothing | `satisfied`; `ci-wait` when the gate is not satisfied for any reason; `held(routing-unaccountable)`, `held(gate-unreadable)`, `held(drive-stalled)` |
 | `held{reason}` (parked) | nothing; the tick does not advance it | one `deliver_to_orchestrator` notice and one `rd-held` line, on entry only | `ci-wait` on `drive_review`; `cancelled` on `cancel_review_drive` |
 | `satisfied`, `cancelled` (terminal) | — | one notice, one `rd-satisfied` / `rd-cancelled` line, one `TaskNote` | nothing |
+
+**A worker's `report(progress)` in `fix-wait` is ANSWERED, not swallowed**
+(#1959). The drive does not move on it and must not — treating "still going" as
+"the fix is in" would brief a reviewer over unfinished work — but consuming it
+and doing nothing is #1857's shape one arm over. The measured round: a
+**body-only** fix, so nothing to push and no new checks, whose worker read the
+brief's *"push, and report when the checks are green"* literally and sent
+`progress`. The drive consumed it (`rd-consumed report:worker` is on the record)
+and sat in `fix-wait` for ten minutes, until the idle watchdog woke the
+**orchestrator** — the turn the driver exists to remove.
+
+So the tick types one line back into the **worker's own** pane naming the report
+it advances on and spelling out the head-unchanged case, and `driver-fix.md`
+now says the same thing up front. It is `rd-kickback`, not one of §2.2's exits:
+nothing is parked, nothing is asked of the orchestrator. Bounded to **one per
+hand-back** rather than one per report (`fix_kickback_ms < fix_handback_ms`), so
+a chatty worker cannot turn its own progress reports into a stream of prompts —
+an unbounded emission driven by a signal the drive does not control is the
+mirror of the unbounded-suppression rule and wants the same answer. Emitted
+only where `decide` returned `Wait`, so it can never displace an arc.
 
 **Which block the hand-back runs under: the worker session's OWN** (#1961).
 `rd_handback` resolves it from the roster's FIRST row naming that session — the
@@ -884,7 +904,8 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "lane_index": 0,
       "counters": { "review_rounds": 1, "ci_attempts": 0, "rebase_attempts": 0 },
       "started_ms": 0,
-      "fix_handback_ms": 0 }
+      "fix_handback_ms": 0,
+      "fix_kickback_ms": 0 }
   ]
 }
 ```
@@ -940,6 +961,13 @@ S3 added two more, described after them:
   idle clock the paragraph above forbids, and leaving one in the shape would
   put that clock one field access away from every later timeout. It is written
   on entry to `fix-wait` and nowhere else.
+- **`fix_kickback_ms`** (per entry, #1959) — when the drive last answered a
+  worker's `report(progress)` in that worker's own pane. Not a counter with a
+  reset: `fix_kickback_ms < fix_handback_ms` **is** the budget, so it renews on
+  the next hand-back with nothing having to remember to clear it, and reads
+  correctly at zero (a drive that never handed back owes nothing, because
+  `0 < 0` is false). Additive: an entry written before this field parses with
+  it absent, and reads as "never answered", which is true of every such entry.
 
 **S3's two, and both are the same field for two subjects: the PANE.** `agent`
 (per lane) and `worker_agent` (per entry) record the agent id the delegate is
@@ -1179,7 +1207,7 @@ like `mq-*` and the rest:
 `rd-started` · `rd-refused` · `rd-ci-green` · `rd-ci-red` · `rd-conflicting` ·
 `rd-lane-spawned` · `rd-verdict` · `rd-handback` · `rd-consumed` ·
 `rd-satisfied` · `rd-held` · `rd-resumed` · `rd-cancelled` · `rd-pruned` ·
-`rd-recovered` · `rd-state-unreadable`
+`rd-kickback` · `rd-recovered` · `rd-state-unreadable`
 
 Every state transition, every spawn or resume, and every consumed delegate event
 (§7) appears here, each carrying `on_behalf_of`. `rd-started` carries

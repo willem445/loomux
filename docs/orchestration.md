@@ -2461,6 +2461,12 @@ consumed event is in the audit log (as `rd-consumed`, naming the kind, the agent
 **never** intercepted. If a reviewer or a worker has something to say that is not a status change,
 you still see it, unchanged, and the drive then stops so someone reads it.
 
+**A driven worker that reports progress gets answered, in its own pane.** A drive advances on a
+worker's `report(done)` — including the case where the fix moved nothing to push, such as a PR-body
+edit or a finding the worker answered rather than changed code for. A `report(progress)` moves it
+no further, so instead of waiting the fix timeout out the driver types one line back into that
+worker's pane saying so. Once per hand-back, never to you.
+
 **A drive stops, it does not drift.** There are fifteen ways out and each produces exactly one
 line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
 by orrerix on its own when it sees the PR has been closed — or one of
