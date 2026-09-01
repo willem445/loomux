@@ -85,6 +85,20 @@ pub enum RdEvent {
     WorkerDone,
     /// `report(blocked)` from the driven worker.
     WorkerBlocked,
+    /// `report(progress)` from the driven worker's CURRENT pane (#1959).
+    ///
+    /// **It is not a drive signal and must never become one.** A drive advances
+    /// on the head, the checks and the verdict files, and a worker saying it is
+    /// still going is none of those — reading it as "the fix is in" would brief a
+    /// reviewer over unfinished work. What it IS is evidence the worker thinks
+    /// it has finished and has said so in the wrong word, which is what the
+    /// dogfood measured: a body-only fix (nothing to push, no new checks) whose
+    /// worker read "push, and report when the checks are green" literally and
+    /// picked `progress`. The drive consumed it and did nothing for ten minutes,
+    /// until the idle watchdog woke the ORCHESTRATOR — the turn the driver exists
+    /// to remove. So the tick answers it in the worker's own pane instead, once
+    /// per hand-back, and the drive does not move.
+    WorkerProgress,
     /// `message_orchestrator` from any driven delegate. **Never intercepted** —
     /// the delegate's own line is delivered unchanged by its own arm; this is
     /// only the routing fact beside it (§7). Carries WHICH delegate, because
@@ -101,6 +115,12 @@ pub enum RdEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RdSignal {
     pub worker: reviewdrive::WorkerSignal,
+    /// The driven worker's current pane called `report(progress)` (#1959).
+    ///
+    /// Deliberately NOT folded into `worker`: [`reviewdrive::WorkerSignal`] is
+    /// what `decide` turns on, and this must not be able to move a drive. It is
+    /// read by the tick alone, to answer the worker in its own pane.
+    pub worker_progress: bool,
     pub messaged: bool,
     /// WHICH delegate called `message_orchestrator`.
     ///
@@ -116,6 +136,7 @@ impl Default for RdSignal {
     fn default() -> RdSignal {
         RdSignal {
             worker: reviewdrive::WorkerSignal::Silent,
+            worker_progress: false,
             messaged: false,
             messaged_by: String::new(),
         }
@@ -236,6 +257,11 @@ struct RdOut {
     advanced: Option<(reviewdrive::DriveState, Option<reviewdrive::HeldReason>)>,
     lanes_opened: Vec<(String, String)>,
     handback: Option<String>,
+    /// `(agent, text)` for a kick-back this tick owes the WORKER's own pane
+    /// (#1959). Carried out of the step like [`RdOut::notices`] and for the same
+    /// reason: a delivery is an enqueue and an enqueue re-enters registry locks,
+    /// so it must happen with `rd_state_lock` released.
+    kickback: Option<(String, String)>,
     audits: Vec<(&'static str, Value)>,
     notices: Vec<String>,
     /// What refused, when this tick's hold is about a refusal (#1961) — the
@@ -284,6 +310,14 @@ pub struct RdDriveReport {
     /// same handle `lanes_opened` carries for a lane, and for the same reason:
     /// it is the only way a caller can ask what the worker was actually told.
     pub handbacks: Vec<(u64, String)>,
+    /// `(pr, agent)` for every kick-back this tick typed into a WORKER's own
+    /// pane (#1959) — the answer to a `report(progress)` in `fix-wait`.
+    ///
+    /// **Attempted, not delivered**, for [`notices`](RdDriveReport::notices)'
+    /// reason and with the same honesty: the entry is marked before the
+    /// delivery, so a pane that could not be reached costs the line rather than
+    /// re-emitting on every later tick.
+    pub kickbacks: Vec<(u64, String)>,
     /// The kick-back notices this tick **produced and attempted** — a hold's,
     /// and every terminal exit's.
     ///
@@ -420,6 +454,8 @@ impl OrchRegistry {
             // only both be present if the worker said one and then the other,
             // and `blocked` is the one that needs a human.
             RdEvent::WorkerBlocked => sig.worker = reviewdrive::WorkerSignal::Blocked,
+            // Its own field, never `sig.worker` — see [`RdEvent::WorkerProgress`].
+            RdEvent::WorkerProgress => sig.worker_progress = true,
             RdEvent::Messaged { by } => {
                 sig.messaged = true;
                 sig.messaged_by = by;
@@ -477,10 +513,16 @@ impl OrchRegistry {
     /// on the record and still attributable. "Consumed" is a different word from
     /// "dropped" and §5.4's vocabulary keeps them different.
     ///
-    /// `event` is `None` for traffic that is consumed but carries no signal — a
-    /// `report(progress)`, whose content the drive does not turn on: a drive
-    /// advances on the head, the checks and the verdict files, not on a delegate
-    /// saying it is still going.
+    /// `event` is `None` for traffic that is consumed but carries no signal at
+    /// all — a LANE's `report`, whose word to the drive is its verdict file, and
+    /// any report from a superseded pane.
+    ///
+    /// A current WORKER's `report(progress)` used to be in that set and is not
+    /// any more (#1959): it still moves nothing — a drive advances on the head,
+    /// the checks and the verdict files, not on a delegate saying it is still
+    /// going — but it arrives as [`RdEvent::WorkerProgress`], on a field
+    /// `reviewdrive::decide` cannot read, so the tick can answer it in the
+    /// worker's own pane instead of waiting out `fix-stalled`.
     pub fn rd_consume(
         &self,
         group: &GroupId,
@@ -695,6 +737,14 @@ impl OrchRegistry {
             }
             if let Some(a) = &o.handback {
                 report.handbacks.push((o.pr, a.clone()));
+            }
+            // #1959: into the WORKER's pane, not the orchestrator's — the whole
+            // point is that this costs the orchestrator no turn. Outside the
+            // state lock, like the notices below: a delivery is an enqueue and
+            // an enqueue re-enters registry locks.
+            if let Some((agent, text)) = &o.kickback {
+                let _ = self.deliver_prompt(agent, text, brand::AUDIT_ACTOR, Delivery::MidSession);
+                report.kickbacks.push((o.pr, agent.clone()));
             }
             if let Some((to, _)) = o.advanced {
                 report.advanced.push((o.pr, to));
@@ -1805,7 +1855,46 @@ impl OrchRegistry {
             }
         }
         match &step {
-            reviewdrive::DriveStep::Wait => {}
+            reviewdrive::DriveStep::Wait => {
+                // **#1959: a worker's `report(progress)` in `fix-wait` is
+                // answered, in the worker's own pane.**
+                //
+                // The drive does not move on it and must not — a drive advances
+                // on the head, the checks and the verdict files, and treating
+                // "still going" as "the fix is in" would brief a reviewer over
+                // unfinished work. But swallowing it is #1857's shape one arm
+                // over: the measured round was a BODY-ONLY fix, so there was
+                // nothing to push and no new checks, the worker read the
+                // brief's "report when the checks are green" literally and sent
+                // `progress`, and the drive sat for ten minutes until the idle
+                // watchdog woke the ORCHESTRATOR — the turn the driver exists to
+                // remove. One line back into the worker's pane costs that turn
+                // nothing.
+                //
+                // Under `Wait` alone, so it can never displace an arc: a tick
+                // that has something to DO does it, and a worker whose
+                // `report(done)` arrived in the same window is advanced rather
+                // than lectured.
+                if signal.worker_progress && entry.kickback_owed() {
+                    let agent = entry.worker_agent.clone();
+                    if !agent.is_empty() {
+                        // Marked BEFORE the delivery, which happens outside this
+                        // lock. A delivery that fails therefore costs the line —
+                        // the same asymmetry §5.2 already draws for a hold's
+                        // notice, and the right direction here: the drive stays
+                        // bounded by `fix-stalled` either way, while a mark
+                        // written only on success would re-emit on every tick
+                        // for as long as a pane stayed unreachable.
+                        entry.record_kickback(now);
+                        out.changed = true;
+                        out.kickback = Some((agent.clone(), rddrive::fix_kickback_notice(pr)));
+                        out.audits.push((
+                            rddrive::audit_action::KICKBACK,
+                            json!({ "pr": pr, "agent": agent }),
+                        ));
+                    }
+                }
+            }
             reviewdrive::DriveStep::OpenLane { index } => {
                 // `decide` only ever names an index into the list it was handed,
                 // so `None` is unreachable — and it is handled by falling

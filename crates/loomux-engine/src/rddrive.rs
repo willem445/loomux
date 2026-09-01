@@ -508,6 +508,15 @@ pub mod audit_action {
     /// reason — a filter looking for the thing that happened must not match the
     /// thing that did not.
     pub const NOTICE_DROPPED: &str = "rd-notice-dropped";
+    /// The drive answered a worker's `report(progress)` in the worker's own
+    /// pane (#1959) — one line, one per hand-back, no orchestrator turn.
+    ///
+    /// Its own action rather than a `rd-consumed` detail, for `CI_RED`'s
+    /// reason: consuming a report and ANSWERING it are different things that
+    /// happen at different times (the MCP thread, then the tick), and a reader
+    /// asking "did the driver ever say anything back" must not have to match
+    /// the action that says it did not.
+    pub const KICKBACK: &str = "rd-kickback";
     /// Reconcile re-evaluated a persisted entry after a restart (§2.4).
     pub const RECOVERED: &str = "rd-recovered";
     /// `review_drives.json` is torn or hand-edited: the tick refuses, backs off,
@@ -914,6 +923,30 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
     };
     let panes = panes_clause(&f.panes, PaneStanding::Owned);
     format!("[orrerix] review drive PR #{pr}: {body}{panes}")
+}
+
+/// **The one line the driver types back at a worker that reported progress**
+/// (#1959) — into the WORKER's pane, never the orchestrator's.
+///
+/// It is not one of §2.2's exits and must not read like one: the drive has not
+/// moved, nothing is parked, and no orchestrator turn is being asked for. It
+/// says the one thing the worker got wrong and what to send instead, including
+/// the case the brief's old wording had no trigger for — a body-only fix, where
+/// there is nothing to push and no new checks to go green, which is exactly the
+/// round that produced the ten-minute stall.
+///
+/// Interpolates the PR number and nothing else, so there is no author- or
+/// delegate-controlled string in it and §5.5's sanitization has no subject.
+pub fn fix_kickback_notice(pr: u64) -> String {
+    format!(
+        "[orrerix] review drive PR #{pr}: this drive advances on report(outcome=done, \
+         ref=#{pr}) and on nothing else — a report(progress) is consumed and moves it \
+         no further. If the fix is done, report done now: that includes a fix with \
+         nothing to push (a PR-body or comment edit, or a finding you answered rather \
+         than changed code for), which the driver reads as a body-only fix and sends \
+         straight back for re-review. If it is not done, carry on — this line is not a \
+         question and needs no reply."
+    )
 }
 
 /// §2.2's `cancelled` exit.

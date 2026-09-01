@@ -4227,7 +4227,15 @@ fn a_bare_resume_inherits_the_block_the_session_was_minted_under() {
         &json!({ "name": "spawn_agent", "arguments": { "resume_session": session } }),
     )
     .expect("a bare resume of a recorded session must be accepted");
-    let text = out.as_str().unwrap_or_default().to_string();
+    // The tool's own reply, which names the block it resolved — read through the
+    // MCP envelope rather than off the `Value`, since `tools/call` answers
+    // `{content:[{type,text}]}`.
+    let text = out["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    assert!(
+        text.contains("block "),
+        "the spawn reply must name a block at all — an empty read here is the envelope \
+         moving, not the inheritance answering: {out}"
+    );
     assert!(
         text.contains("block worker-adv"),
         "a bare resume inherited the NEWEST row's block instead of the identity the session \
@@ -4508,4 +4516,196 @@ fn a_handback_resumes_into_the_live_idle_pane_on_that_session() {
             assert_eq!(opened, 1, "…and that is one new pane: {handed:?}");
         }
     }
+}
+
+// ── #1959: a worker's progress report in fix-wait is answered, not swallowed ─
+
+/// Drive to a hand-back and have the worker `report` `outcome` through the real
+/// MCP arm, exactly as a driven worker does. Answers the pane it reported from.
+fn handback_then_report(
+    reg: &OrchRegistry,
+    group: &GroupId,
+    gh: &FakeGh,
+    outcome: &str,
+) -> String {
+    let handed = to_first_handback(reg, group, gh);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+    with_pane(reg, &worker, 7502);
+    let caller = Caller {
+        agent_id: worker.clone(),
+        group: group.clone(),
+        role: Role::Worker,
+        role_hint: None,
+    };
+    dispatch(
+        reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": outcome, "note": "for re-review round 2", "ref": "#1758" } }),
+    )
+    .unwrap_or_else(|e| panic!("a driven worker must be able to report ({outcome}): {e:?}"));
+    worker
+}
+
+/// **#1959.** A `report(progress)` in `fix-wait` was consumed and then dropped:
+/// the audit log carries the `rd-consumed report:worker` row, and the drive did
+/// nothing for ten minutes until the idle watchdog woke the ORCHESTRATOR — the
+/// turn the driver exists to remove.
+///
+/// It is answered in the WORKER's own pane instead. Three things are pinned
+/// together because any one alone would pass under a wrong fix:
+///
+/// - the drive does **not** move (a progress report is not a fix signal, and
+///   reading it as one would brief a reviewer over unfinished work);
+/// - the worker's pane gets the line;
+/// - the orchestrator's pane gets nothing, which is the whole saving.
+///
+/// The `done` half is the control, and it is the one that fails a "kick back on
+/// any worker report" implementation: same state, same pane, same tool call,
+/// one different word — and `done` must still take arc 8 with no line typed at
+/// anybody.
+#[test]
+fn a_workers_progress_report_in_fix_wait_is_answered_in_its_own_pane() {
+    for outcome in ["progress", "done"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _session) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7501);
+
+        let worker = handback_then_report(&reg, &group, &gh, outcome);
+        assert_eq!(status_state(&reg, &group), "fix-wait", "the pre-state for {outcome}");
+
+        let tick = reg.rd_drive_group_with(&group, &gh, 50_000);
+
+        if outcome == "done" {
+            assert_eq!(
+                status_state(&reg, &group),
+                "review-wait",
+                "the control: report(done) at an unchanged head is arc 8 and still is"
+            );
+            assert!(
+                tick.kickbacks.is_empty(),
+                "…and a worker that used the right word is told nothing: {tick:?}"
+            );
+            assert_eq!(action_count(&reg, &group, "rd-kickback"), 0);
+            continue;
+        }
+
+        assert_eq!(
+            status_state(&reg, &group),
+            "fix-wait",
+            "a progress report must NOT advance the drive — arc 8 is report(done), and \
+             briefing a reviewer on 'still going' reviews unfinished work"
+        );
+        assert_eq!(
+            tick.kickbacks,
+            vec![(1758, worker.clone())],
+            "the worker's own pane is where the answer goes: {tick:?}"
+        );
+        let kick = audit_details(&reg, &group, "rd-kickback");
+        assert_eq!(kick.len(), 1, "one kick-back on the record: {kick:?}");
+        assert_eq!(kick[0]["agent"], json!(worker));
+
+        let typed: Vec<String> = delivered_texts(&reg, &group)
+            .into_iter()
+            .filter(|t| t.contains("this drive advances on report"))
+            .collect();
+        assert_eq!(typed.len(), 1, "exactly one line typed: {typed:?}");
+        assert!(
+            typed[0].contains("report(outcome=done, ref=#1758)"),
+            "it must name the call that advances the drive: {}",
+            typed[0]
+        );
+        assert!(
+            typed[0].contains("nothing to push"),
+            "…and the head-unchanged case, which is the round that produced the stall: {}",
+            typed[0]
+        );
+
+        // §7's whole point: this costs the orchestrator no turn.
+        assert!(
+            !drive_notices(&reg, &group, 1758).iter().any(|t| t.contains("advances on report")),
+            "the kick-back must not reach the orchestrator's pane — the watchdog waking it \
+             is the turn this exists to remove"
+        );
+    }
+}
+
+/// **One per hand-back, not one per report** (#1959).
+///
+/// A kick-back is an EMISSION driven by a signal the drive does not control, so
+/// it needs a bound for the mirror of the reason a suppression does. A worker
+/// that reports progress three times in one fix round is answered once; the
+/// budget renews on the next hand-back with nothing having to reset it, because
+/// `fix_kickback_ms < fix_handback_ms` *is* the budget.
+///
+/// The second half is the control for the first: a test that only pinned "at
+/// most one" would pass just as well under a fix that emitted at most one EVER.
+#[test]
+fn the_kick_back_is_bounded_to_one_per_handback_and_renews_on_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7601);
+
+    handback_then_report(&reg, &group, &gh, "progress");
+    assert_eq!(reg.rd_drive_group_with(&group, &gh, 50_000).kickbacks.len(), 1);
+    // Two more ticks with the progress signal still standing — it is cleared
+    // only by an arc, so this is the real "it keeps sitting there" shape.
+    for now in [60_000, 70_000] {
+        assert!(
+            reg.rd_drive_group_with(&group, &gh, now).kickbacks.is_empty(),
+            "a second kick-back for one hand-back: a worker that reports progress in a loop \
+             would be answered in a loop"
+        );
+    }
+    assert_eq!(action_count(&reg, &group, "rd-kickback"), 1);
+
+    // A NEW hand-back renews it. The worker pushes (arc 7 to `ci-wait`), the
+    // checks are red at the new head (arc 3 back to `fix-wait`), and it reports
+    // progress again.
+    gh.set_facts("OPEN", HEAD_A);
+    gh.set_checks(r#"[{"name":"build","state":"SUCCESS","link":"x"}]"#);
+    reg.rd_drive_group_with(&group, &gh, 80_000); // fix-wait -> ci-wait (arc 7: the head moved)
+    gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+    let again = reg.rd_drive_group_with(&group, &gh, 90_000); // ci-wait -> fix-wait (arc 3)
+    let (_pr, worker2) = again
+        .handbacks
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("the second hand-back must happen: {again:?}"));
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+
+    // **From the CURRENT pane.** The first hand-back's pane is superseded now,
+    // and §7 consumes a superseded pane's report without feeding it in — a
+    // claim about a revision the drive has moved past. Reporting from it here
+    // would leave this half green for the wrong reason.
+    let caller = Caller {
+        agent_id: worker2.clone(),
+        group: group.clone(),
+        role: Role::Worker,
+        role_hint: None,
+    };
+    dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "progress", "note": "still on it", "ref": "#1758" } }),
+    )
+    .expect("the worker reports progress again");
+    assert_eq!(
+        reg.rd_drive_group_with(&group, &gh, 100_000).kickbacks.len(),
+        1,
+        "the budget must RENEW on the next hand-back — a bound that never renewed would \
+         satisfy the first half of this test and answer nobody for the rest of the drive"
+    );
+    assert_eq!(action_count(&reg, &group, "rd-kickback"), 2);
 }

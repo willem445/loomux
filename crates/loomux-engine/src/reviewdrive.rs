@@ -50,6 +50,10 @@
 //!   this slice actually shipped and CI caught.
 //! - [`DriveEntry::fix_handback_ms`] — when the drive last entered `fix-wait`.
 //!   The `fix-stalled` anchor; the hand-back is the moment that wait began.
+//! - [`DriveEntry::fix_kickback_ms`] — when the drive last answered a worker's
+//!   `report(progress)` in that worker's own pane (#1959). Not a timeout
+//!   anchor: it is compared against `fix_handback_ms`, which makes the budget
+//!   one answer per hand-back and renews it with no reset to remember.
 //!
 //! `drive-stalled` needs none of these: §2.2 is emphatic that it is the drive's
 //! **age**, `now - started_ms`, "never an idle clock reset by each state
@@ -1097,6 +1101,22 @@ pub struct DriveEntry {
     /// owes this field a decision, and this paragraph is the one it invalidates.
     #[serde(default)]
     pub fix_handback_ms: u64,
+    /// When this drive last answered a worker's `report(progress)` in its own
+    /// pane (#1959) — the bound on [`kickback_owed`](DriveEntry::kickback_owed).
+    ///
+    /// **Compared against `fix_handback_ms` rather than counted**, so the budget
+    /// is one per HAND-BACK and renews on the next one without anything having
+    /// to reset it: a worker that reports progress five times in one fix round
+    /// is answered once, and a worker that does it again after the next
+    /// hand-back is answered again. A counter would have needed a reset on
+    /// arcs 3 and 5, which is a second thing to remember beside the anchor those
+    /// arcs already stamp.
+    ///
+    /// Zero means "never answered", and reads correctly against a zero
+    /// `fix_handback_ms` too: `0 < 0` is false, so a drive that has never handed
+    /// back owes nothing.
+    #[serde(default)]
+    pub fix_kickback_ms: u64,
     /// The notice this entry owes the orchestrator's pane, and the reason
     /// retention may not drop it yet (#1857). See [`OwedNotice`].
     ///
@@ -1139,6 +1159,7 @@ impl DriveEntry {
             counters,
             started_ms: now_ms,
             fix_handback_ms: 0,
+            fix_kickback_ms: 0,
             owed_notice: None,
             extra: BTreeMap::new(),
         }
@@ -1297,6 +1318,37 @@ impl DriveEntry {
             spawned_ms: now_ms,
             extra,
         });
+    }
+
+    /// **Does this drive still owe its worker a kick-back for the CURRENT
+    /// hand-back?** (#1959)
+    ///
+    /// A `report(progress)` in `fix-wait` is a delivery the drive consumed and
+    /// cannot act on: it moves nothing (a drive turns on the head, the checks
+    /// and the verdict files) and it is exactly what a worker sends when it
+    /// believes it has finished and has reached for the wrong word — a
+    /// body-only fix has nothing to push and no new checks, so "report when the
+    /// checks are green" has no trigger. Swallowing it silently is #1857's
+    /// shape one arm over: the drive sat until the watchdog woke the
+    /// orchestrator.
+    ///
+    /// The answer is one line typed into the worker's OWN pane, which costs the
+    /// orchestrator nothing. It is bounded to one per hand-back rather than one
+    /// per report, so a chatty worker cannot turn its own progress reports into
+    /// a stream of prompts — an unbounded emission driven by a signal the drive
+    /// does not control is the mirror image of the unbounded SUPPRESSION rule,
+    /// and wants the same answer.
+    ///
+    /// **Only in `fix-wait`.** In any other state there is no hand-back to be
+    /// waiting on and nothing the worker was asked for.
+    pub fn kickback_owed(&self) -> bool {
+        self.state == DriveState::FixWait && self.fix_kickback_ms < self.fix_handback_ms
+    }
+
+    /// Record that this drive answered its worker at `now_ms` — see
+    /// [`kickback_owed`](DriveEntry::kickback_owed).
+    pub fn record_kickback(&mut self, now_ms: u64) {
+        self.fix_kickback_ms = now_ms;
     }
 
     /// Record that this drive has resumed its worker into `agent` — the
@@ -2998,6 +3050,11 @@ mod tests {
         assert_eq!(e.lanes[0].last_verdict, Some(Verdict::Pass));
         // The added fields default rather than refusing the published shape.
         assert_eq!(e.fix_handback_ms, 0);
+        // #1959's, and its default is load-bearing rather than incidental: an
+        // entry that has never handed back must owe no kick-back, which is what
+        // `0 < 0` being false says.
+        assert_eq!(e.fix_kickback_ms, 0);
+        assert!(!e.kickback_owed(), "a `review-wait` entry owes nobody a kick-back");
         assert_eq!(e.lanes[0].spawned_ms, 0);
         assert_eq!(e.lanes[0].briefed_head, "");
         assert_eq!(e.lanes[0].briefed_digest, "");
