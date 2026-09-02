@@ -11,9 +11,7 @@
 // in the repo ever writes, so the marker could never come back to the input.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CUSTOM_OPTION } from "../src/modelcatalog.ts";
-
-// --- minimal DOM shim -------------------------------------------------------
+import { CUSTOM_OPTION } from "../src/modelcatalog.ts";// --- minimal DOM shim -------------------------------------------------------
 // Only what ModelPicker touches. The one fidelity point that matters is the
 // <select> value semantics: a select whose value names no option reads ""
 // (selectedIndex −1), while an input reads back what was written.
@@ -87,7 +85,7 @@ class ShimElement {
   createElement: (tag: string) => new ShimElement(tag),
 };
 
-const { ModelPicker } = await import("../src/modelpicker.ts");
+const { ModelPicker, seedPicker } = await import("../src/modelpicker.ts");
 
 type Picker = InstanceType<typeof ModelPicker>;
 
@@ -115,12 +113,14 @@ function focusWelcomeTarget(picker: Picker): Half | null {
   return null;
 }
 
-// Mirrors the launcher's seed (launcher.ts:917→923): setOptions decides the
-// branch, then the host stamps the marker on whichever half is visible.
+// Seeds through the same exported `seedPicker` the launcher calls
+// (launcher.ts's welcome-form seed): setOptions decides the branch, then the
+// marker is stamped on whichever half is visible. Shared rather than
+// hand-copied so a reorder of the host's seed moves the tests with it
+// (rev-std round 1 on #2108).
 function makePicker(recents: string[], fallback: string): Picker {
   const picker = new ModelPicker();
-  picker.setOptions(recents, fallback);
-  (picker.input.hidden ? picker.select : picker.input).setAttribute(MARKER, "");
+  seedPicker(picker, recents, fallback);
   return picker;
 }
 
@@ -196,6 +196,11 @@ test("a pane whose marker is not on the picker gains none from a branch flip", (
   const p = makePicker(["C:\\a"], "C:\\a");
   p.select.removeAttribute(MARKER);
   pickCustom(p);
+  // Positive control: the branch flip this assertion is meant to survive
+  // really ran — the custom branch opened. Without it the absence-only
+  // assert below stays green even if the change listener goes dead
+  // (rev-final W1 on #2108).
+  assert.equal(p.input.hidden, false);
   assert.equal(markedHalf(p), null);
 });
 
@@ -220,6 +225,22 @@ test("setOptions re-homes the marker when a rebuild flips to the dropdown branch
   p.setOptions(["C:\\typed-path", "C:\\a"], "C:\\a");
   assert.equal(p.input.hidden, true);
   assert.equal(markedHalf(p), "select");
+});
+
+test("setOptions clears the stale custom text on a dropdown-branch rebuild", () => {
+  // The sibling of set value's staleness: the rebuild hides the input, and
+  // the previously typed path would sit there invisibly and resurface on the
+  // next custom… pick. Stray whitespace is the one case where the orphaned
+  // text differs from the new selection (get value() trims), so that is the
+  // specimen (rev-std round 1 on #2108).
+  const p = makePicker(["C:\\a", "C:\\b"], "  C:\\a  ");
+  assert.equal(p.input.value, "  C:\\a  ");
+  p.setOptions(["C:\\a", "C:\\b"], "C:\\a");
+  assert.equal(p.input.hidden, true, "the trimmed value is a recent: dropdown branch");
+  assert.equal(p.input.value, "");
+  // Flipping back to custom… shows an empty box, not the stale text.
+  pickCustom(p);
+  assert.equal(p.input.value, "");
 });
 
 // --- #2108 item 3: stale custom text ----------------------------------------
