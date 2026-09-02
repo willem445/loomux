@@ -31109,7 +31109,10 @@ impl OrchRegistry {
     /// record and is deliberately left alone. Identity is immutable; location
     /// is not.
     fn session_identity_record(&self, group: &GroupId, session: &str) -> Option<AgentRecord> {
-        self.merged_records(group).into_iter().find(|r| r.session.as_deref() == Some(session))
+        self.merged_records(group)
+            .into_iter()
+            .filter(|r| r.session.as_deref() == Some(session))
+            .max_by_key(|r| r.updated_ms)
     }
 
     /// Every recorded session across all groups on disk, with role identity
