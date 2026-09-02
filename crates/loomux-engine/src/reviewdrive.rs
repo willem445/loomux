@@ -204,11 +204,11 @@ impl DriveState {
 }
 
 /// Why a drive is parked (§2.2). **One state carrying a closed reason enum, not
-/// thirteen states**, so a reader asking "is this drive parked" asks one
+/// fourteen states**, so a reader asking "is this drive parked" asks one
 /// question, and the reason travels in the notice and the audit line rather
 /// than being inferred from which counter happens to sit at its bound.
 ///
-/// Thirteen reasons. With `satisfied` and `cancelled` that is §2.2's fifteen
+/// Fourteen reasons. With `satisfied` and `cancelled` that is §2.2's sixteen
 /// exits back to the LLM orchestrator, and [`HeldReason::ALL`] is what makes
 /// that count checkable rather than asserted.
 ///
@@ -269,11 +269,36 @@ pub enum HeldReason {
     /// disk and which re-pointed successfully the moment panes were killed.
     ///
     /// A **lane** spawn refused by the cap does not reach this: `review-wait`
-    /// backs off and retries, counted only against `drive_timeout_minutes`
-    /// (§8's live-delegate-cap row). The asymmetry is the states': a lane can
-    /// be opened on any later tick, while `fix-wait` has already taken its arc
-    /// and spent its round.
+    /// backs off and retries (§8's live-delegate-cap row). The asymmetry is the
+    /// states': a lane can be opened on any later tick, while `fix-wait` has
+    /// already taken its arc and spent its round. A lane refusal that does not
+    /// clear becomes [`CapFull`](HeldReason::CapFull) after [`CAP_HOLD_MS`]
+    /// (#2109) — a different reason, on that variant's argument, and never this
+    /// one.
     CapRefused,
+    /// **The cap has refused this drive's LANE, continuously, for
+    /// [`CAP_HOLD_MS`]** (#2109) — the starvation made visible.
+    ///
+    /// Its own reason rather than [`CapRefused`](HeldReason::CapRefused), and
+    /// the argument is a DURATION rather than a remedy. The two share a remedy
+    /// (free a slot), so a reader deciding what to *do* could be served by one
+    /// spelling. What one spelling cannot say is how long: `cap-refused` is a
+    /// single hand-back refusal, held on the spot, with a round already spent;
+    /// this is "every lane spawn for this drive has been refused since `t`".
+    /// The measured incident is exactly that difference — a drive sat in
+    /// `review-wait` with `lanes: []` for three hours emitting 37 identical
+    /// `rd-refused` rows and no notice at all, and an orchestrator reading
+    /// `cap-refused` there would have learned that the cap refused *a* spawn,
+    /// which had been true and harmless thirty-seven ticks earlier.
+    ///
+    /// **The driver still never kills a pane** (§3.1 item 5), and this hold is
+    /// what makes that survivable rather than silent: the notice names who can
+    /// free a slot. What actually releases the cap is a human or the
+    /// orchestrator killing an idle delegate, the idle reaper where one is
+    /// configured, or another drive ending — and #2109's other two fixes are
+    /// what make waiting terminate at all, because a drive now costs ONE pane
+    /// per lane block for its whole life instead of one or two per round.
+    CapFull,
     /// A driven delegate called `message_orchestrator` (§7 — that call is never
     /// intercepted; the delegate's own line arrives by its own path and this
     /// hold is the routing fact beside it).
@@ -283,7 +308,7 @@ pub enum HeldReason {
 impl HeldReason {
     /// Every reason, so a caller — or a test counting §2.2's exits — can
     /// enumerate them without matching on the enum. Order is §2.2's table.
-    pub const ALL: [HeldReason; 13] = [
+    pub const ALL: [HeldReason; 14] = [
         HeldReason::Escalate,
         HeldReason::ReviewLimit,
         HeldReason::CiLimit,
@@ -296,6 +321,7 @@ impl HeldReason {
         HeldReason::WorkerBlocked,
         HeldReason::WorkerUnresumable,
         HeldReason::CapRefused,
+        HeldReason::CapFull,
         HeldReason::Messaged,
     ];
 
@@ -315,6 +341,7 @@ impl HeldReason {
             HeldReason::WorkerBlocked => "worker-blocked",
             HeldReason::WorkerUnresumable => "worker-unresumable",
             HeldReason::CapRefused => "cap-refused",
+            HeldReason::CapFull => "cap-full",
             HeldReason::Messaged => "messaged",
         }
     }
@@ -334,6 +361,7 @@ impl HeldReason {
             "worker-blocked" => Some(HeldReason::WorkerBlocked),
             "worker-unresumable" => Some(HeldReason::WorkerUnresumable),
             "cap-refused" => Some(HeldReason::CapRefused),
+            "cap-full" => Some(HeldReason::CapFull),
             "messaged" => Some(HeldReason::Messaged),
             _ => None,
         }
@@ -927,6 +955,30 @@ where
 /// where the first cannot be.
 pub const NOTICE_RETENTION_MS: u64 = 60 * 60_000;
 
+/// How long the live-delegate cap may refuse this drive's lane before the drive
+/// parks as [`HeldReason::CapFull`] (#2109).
+///
+/// **A grace period, because a capped lane usually clears itself** — §8's
+/// live-delegate-cap row, and the reason the refusal is a back-off rather than a
+/// hold in the first place: another drive's lane finishes, the reaper takes an
+/// idle pane, a human closes one, and the next tick spawns. Holding on the first
+/// refusal would spend an orchestrator turn on a condition that resolves in one
+/// `RD_BACKOFF_MS` interval, which is the opposite defect from the one #2109
+/// reports.
+///
+/// **Fifteen minutes**, which is three back-off intervals: long enough that a
+/// transient cap never reaches it, and short enough that the measured incident —
+/// three hours in `review-wait` with `lanes: []`, invisible until a human read
+/// `review_drive_status` by hand — is impossible. The other bound that would
+/// eventually have caught it is `drive_timeout_minutes` at four hours, whose
+/// notice says nothing about the cap.
+///
+/// **Not a `driver:` policy knob**, on `NOTICE_RETENTION_MS`'s argument: §5.3's
+/// block paces a drive against INVARIANT 9's budget, and how long orrerix waits
+/// on its own group's slot pressure before saying so is not a repo's call. A
+/// repo that wants a longer wait raises its own `max_agents`.
+pub const CAP_HOLD_MS: u64 = 15 * 60_000;
+
 /// A notice a terminal entry owes the orchestrator's pane, persisted **on the
 /// entry** so it outlives the tick that produced it (#1857).
 ///
@@ -1130,6 +1182,30 @@ pub struct DriveEntry {
     /// forward-compatibility promise §5.2 already makes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owed_notice: Option<OwedNotice>,
+    /// When the live-delegate cap started refusing this drive's lane spawns,
+    /// absolute — the [`HeldReason::CapFull`] anchor (#2109).
+    ///
+    /// **`None` rather than a zero sentinel**, deliberately, because this is
+    /// the one clock here whose "unset" and whose lowest legal value are both
+    /// reachable in the same run: `fix_handback_ms` argues at length that a
+    /// zero cannot occur in `fix-wait`, and that argument does not transfer —
+    /// a cap refusal is observed at whatever `now_ms` the tick was handed, and
+    /// a test harness ticks from small numbers. `Option` makes "not currently
+    /// starved" a value the type carries rather than one a comment defends.
+    ///
+    /// Stamped by the tick on the FIRST refusal of a run and left alone by the
+    /// rest, so what it measures is the duration of the starvation and not the
+    /// age of the most recent tick. Cleared by
+    /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) whenever a
+    /// lane does open, and by [`advance`](DriveEntry::advance) on every arc:
+    /// a drive that MOVED is not the drive that was stuck, and carrying the
+    /// stamp across an arc would let a later, unrelated refusal inherit a
+    /// duration it did not spend.
+    ///
+    /// Absent is the resting state, so it is not serialized when absent —
+    /// `owed_notice`'s reason, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_starved_since_ms: Option<u64>,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -1163,6 +1239,7 @@ impl DriveEntry {
             fix_handback_ms: 0,
             fix_kickback_ms: 0,
             owed_notice: None,
+            cap_starved_since_ms: None,
             extra: BTreeMap::new(),
         }
     }
@@ -1252,7 +1329,41 @@ impl DriveEntry {
         if to == DriveState::FixWait {
             self.fix_handback_ms = now_ms;
         }
+        // #2109: an arc is proof the drive is no longer stuck on the cap, so
+        // the starvation clock does not survive one. Including the arc INTO
+        // `held(cap-full)` itself — the hold is the report, and a resume must
+        // start the clock over rather than re-hold on the next tick from a
+        // stamp the previous starvation left behind.
+        self.cap_starved_since_ms = None;
         Ok(())
+    }
+
+    /// Record that the live-delegate cap refused this drive's lane spawn, and
+    /// answer whether that changed anything (#2109).
+    ///
+    /// **First-refusal-wins**: a run of refusals is one starvation, and the
+    /// stamp is when it began. Re-stamping on each tick would make
+    /// [`CAP_HOLD_MS`] unreachable — the same defeat-your-own-bound shape
+    /// `decide`'s empty-head guard describes, where every tick re-armed the
+    /// clock meant to catch it.
+    pub fn note_cap_starvation(&mut self, now_ms: u64) -> bool {
+        if self.cap_starved_since_ms.is_some() {
+            return false;
+        }
+        self.cap_starved_since_ms = Some(now_ms);
+        true
+    }
+
+    /// Forget any recorded cap starvation, and answer whether there was one.
+    /// Called when a lane DOES open — the refusal run is over.
+    pub fn clear_cap_starvation(&mut self) -> bool {
+        self.cap_starved_since_ms.take().is_some()
+    }
+
+    /// How long the cap has been refusing this drive's lane, or `None` when it
+    /// is not currently refusing one.
+    pub fn cap_starved_for(&self, now_ms: u64) -> Option<u64> {
+        self.cap_starved_since_ms.map(|t| now_ms.saturating_sub(t))
     }
 
     /// Apply a whole [`DriveStep`] — the form S3's tick uses, so the decision
@@ -2143,6 +2254,22 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                         DriveStep::Wait
                     }
                 }
+                // **The cap's starvation is reported before another spawn is
+                // proposed** (#2109). The tick stamps
+                // `cap_starved_since_ms` on the first lane spawn the
+                // live-delegate cap refuses and leaves it alone on the rest, so
+                // this reads the duration of one refusal RUN, not the age of the
+                // last tick.
+                //
+                // Proposing `OpenLane` anyway would be harmless — the spawn
+                // would be refused again and the entry re-stamped with nothing —
+                // and that is exactly what made the measured incident invisible:
+                // 37 identical `rd-refused` rows, `lanes: []`, no notice, three
+                // hours. §2.2's exits are the only thing an orchestrator reads,
+                // so a condition that needs an orchestrator has to become one.
+                _ if entry.cap_starved_for(facts.now_ms).is_some_and(|d| d >= CAP_HOLD_MS) => {
+                    DriveStep::held(HeldReason::CapFull)
+                }
                 _ => DriveStep::OpenLane { index: k },
             }
         }
@@ -2272,13 +2399,21 @@ mod tests {
     }
 
     #[test]
-    fn the_held_reasons_are_the_notes_thirteen() {
-        assert_eq!(HeldReason::ALL.len(), 13);
-        // §2.2: "There are **fifteen**" exits back to the LLM orchestrator —
-        // the thirteen holds plus `satisfied` and `cancelled`.
+    fn the_held_reasons_are_the_notes_fourteen() {
+        assert_eq!(HeldReason::ALL.len(), 14);
+        // §2.2: "There are **sixteen**" exits back to the LLM orchestrator —
+        // the fourteen holds plus `satisfied` and `cancelled`.
         let exits =
             HeldReason::ALL.len() + DriveState::ALL.iter().filter(|s| s.is_terminal()).count();
-        assert_eq!(exits, 15);
+        assert_eq!(exits, 16);
+        // The two cap reasons are DIFFERENT exits, and nothing else here would
+        // notice them collapsing into one spelling: `ALL` would still hold
+        // fourteen entries and every one of them would still round-trip.
+        assert_ne!(
+            HeldReason::CapFull.as_str(),
+            HeldReason::CapRefused.as_str(),
+            "a lane starved by the cap and a hand-back refused by it are separate exits"
+        );
         for r in HeldReason::ALL {
             assert_eq!(HeldReason::parse(r.as_str()), Some(r), "{}", r.as_str());
         }
@@ -3554,6 +3689,80 @@ mod tests {
         assert_eq!(
             decide(&e, &two_lanes(Some(Verdict::Escalate), None), &limits),
             DriveStep::held(HeldReason::Escalate)
+        );
+    }
+
+    /// **#2109's third ask at the decision layer.** A drive whose lane the
+    /// live-delegate cap keeps refusing must become one of §2.2's exits, and it
+    /// must not become one on the first refusal.
+    ///
+    /// The three points are asserted together because each alone passes under an
+    /// implementation that is wrong at another: an arm that never holds passes
+    /// the first two, and an arm that holds on the stamp alone (no duration)
+    /// passes the first and third.
+    #[test]
+    fn a_cap_that_keeps_refusing_a_lane_parks_the_drive_only_once_the_window_is_spent() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        let facts = |now: u64| DriveFacts {
+            now_ms: now,
+            required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
+            ..facts_at("head-a")
+        };
+
+        // The control: an un-starved drive proposes the spawn, so every
+        // assertion below is about the starvation and not about a lane that
+        // could never have opened.
+        assert_eq!(decide(&e, &facts(10_000), &limits), DriveStep::OpenLane { index: 0 });
+
+        assert!(e.note_cap_starvation(10_000), "the first refusal of a run stamps the clock");
+        // One tick short of the window: still trying, still no orchestrator turn
+        // spent on a condition that clears itself.
+        assert_eq!(
+            decide(&e, &facts(10_000 + CAP_HOLD_MS - 1), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "a cap that has not refused for the whole window is a back-off, not a hold"
+        );
+        assert_eq!(
+            decide(&e, &facts(10_000 + CAP_HOLD_MS), &limits),
+            DriveStep::held(HeldReason::CapFull),
+            "a starvation that outlasts the window is one of §2.2's exits, not silence"
+        );
+    }
+
+    /// The clock measures a RUN, and every way out of one clears it.
+    ///
+    /// The re-stamp half is the one with teeth: a tick that re-stamped on each
+    /// refusal would make [`CAP_HOLD_MS`] unreachable, and the hold above would
+    /// then be dead code that no test in this file could tell apart from a hold
+    /// that fires — `decide` reads a stamp it is handed either way.
+    #[test]
+    fn the_starvation_clock_is_stamped_once_per_run_and_no_arc_carries_one_across() {
+        let mut e = entry_at(DriveState::ReviewWait);
+        assert_eq!(e.cap_starved_for(10_000), None, "a fresh entry is not starved");
+
+        assert!(e.note_cap_starvation(10_000));
+        assert!(!e.note_cap_starvation(20_000), "a second refusal in one run is not a new run");
+        assert_eq!(
+            e.cap_starved_for(20_000),
+            Some(10_000),
+            "the duration is measured from the FIRST refusal, not the newest tick"
+        );
+
+        assert!(e.clear_cap_starvation(), "a lane that opens ends the run");
+        assert_eq!(e.cap_starved_for(20_000), None);
+        assert!(!e.clear_cap_starvation(), "and clearing an unstarved entry changes nothing");
+
+        // An arc clears it too, including the arc into the hold it produces: a
+        // resume must start the window over rather than re-hold on the next tick
+        // from a stamp the previous starvation left behind.
+        assert!(e.note_cap_starvation(30_000));
+        e.advance(DriveState::Held, Some(HeldReason::CapFull), None, 30_000).unwrap();
+        assert_eq!(
+            e.cap_starved_for(30_000),
+            None,
+            "a drive that MOVED is not the drive that was stuck"
         );
     }
 

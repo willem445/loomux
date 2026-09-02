@@ -246,6 +246,25 @@ impl RdBrief {
     }
 }
 
+/// What opening one reviewer lane produced (#2109).
+///
+/// A struct rather than the bare agent id it used to be, because `resumed` is
+/// the fact #2109 is about and nothing downstream can re-derive it: a resumed
+/// lane and a fresh one hand back the same shape of pane id, and the audit row
+/// they produce was identical. `session` travels with it so the row names the
+/// conversation rather than only the pane, which is what a reader chasing "did
+/// this reviewer keep its context" actually needs.
+struct RdLaneOpen {
+    agent: String,
+    session: String,
+    /// Whether this lane was opened by RESUMING the session it already had, as
+    /// opposed to on a fresh conversation. False includes the fall-through case
+    /// — a resume that was attempted and refused — which is why
+    /// `rd-lane-resume-failed` is a separate row rather than a flag here: this
+    /// says what happened, that says what was tried.
+    resumed: bool,
+}
+
 /// What one entry's step produced, for the caller to emit outside the lock.
 #[derive(Debug, Default)]
 struct RdOut {
@@ -1120,12 +1139,31 @@ impl OrchRegistry {
         brief: &RdBrief,
         limits: &reviewdrive::DriveLimits,
         now: u64,
-    ) -> Result<String, String> {
+    ) -> Result<RdLaneOpen, String> {
         if block.is_empty() {
             return Err("no lane at that index".into());
         }
         let text = self.rd_lane_brief(entry, block, brief, limits);
-        let prior = entry.lane(block).map(|l| l.session.clone()).filter(|s| !s.is_empty());
+        // **The lane's session is the pane's session, and the record is only
+        // one of the two places it is written** (#2109).
+        //
+        // `LaneRecord::session` is whatever the spawn RETURNED, and
+        // `spawn_agent_bound` returns one only for `cli == "claude"`, which
+        // pre-assigns a uuid. Copilot and opencode mint theirs after boot: the
+        // session watcher discovers it and binds it to the pane and the roster
+        // through `associate_session`, and nothing has ever written it back
+        // onto the lane. So for every lane on those CLIs the recorded session
+        // was permanently empty, this filter dropped it, and EVERY round opened
+        // a fresh pane on a fresh conversation — measured on the dogfood as nine
+        // reviewer panes for three PRs where six would have done, each new pane
+        // briefed with what "its" previous verdict had been by a pane that had
+        // never seen it.
+        //
+        // The pane the lane recorded answers the question the record could not,
+        // and it is the same fact rather than a second one: the roster row for
+        // that pane carries the session, the block and the cwd — the three
+        // `spawn_agent(resume_session:)` needs.
+        let prior = self.rd_lane_session(group, entry.lane(block));
         // **The resume names the lane's own block** (#1961). A resume that
         // named neither `kind` nor `block` reached `spawn_agent_bound`, which
         // has no session-inheritance rule of its own and falls straight through
@@ -1146,29 +1184,186 @@ impl OrchRegistry {
         // while `entry` is held `&mut` — the shape `rd_reconcile_with` and
         // `rd_step_entry` already use before their own `rd_audit` calls.
         let on_behalf = entry.on_behalf_of.clone();
-        let (agent, session_id) = match prior {
+        // **No second pane for a block that already has a live one at this
+        // head** (#2109) — checked only where a spawn is about to happen, so
+        // the reuse arm above keeps its chance first.
+        //
+        // A re-brief at an UNCHANGED head is §8's body-changed row: the digest
+        // moved, the lane must be asked again, and where its pane is idle and
+        // ready `rd_reuse_pane` types the delta into it and this never fires.
+        // Where that pane is BUSY — still writing the review it was briefed for
+        // — the reuse declines on readiness and the spawn used to mint a second
+        // pane on the same conversation. Measured: `rev-1825` and `rev-1826`
+        // both reviewed PR #2104's round 2, and `rev-1832` reported that "a
+        // duplicate rev-std round-2 review from a parallel pane landed 41
+        // seconds after mine with the same verdict and lead finding". Two paid
+        // reviews for one verdict slot, and two panes against the cap.
+        //
+        // The refusal is an `Err`, which `OpenLane`'s arm already handles as a
+        // back-off: the tick retries, and the moment that pane goes idle the
+        // reuse arm delivers the delta into it. It is bounded by the clock it
+        // does NOT re-arm — `spawned_ms` stays where the original brief put it,
+        // so a pane that never comes back is `held(lane-stalled)` naming it,
+        // exactly as if it had gone quiet without a re-brief.
+        //
+        // **A head change is deliberately not covered.** There the recorded pane
+        // is reviewing a revision the drive has moved past, its verdict binds to
+        // a head that is gone, and superseding it is what `prior_agents` exists
+        // for.
+        let dup = self.rd_live_lane_pane(entry.lane(block), &brief.head);
+        let pr = entry.pr;
+        let no_duplicate = |this: &Self| -> Result<(), String> {
+            let Some(pane) = dup.as_deref() else { return Ok(()) };
+            this.rd_audit(group, &on_behalf, rddrive::audit_action::LANE_DUPLICATE_REFUSED, json!({
+                "pr": pr,
+                "block": block,
+                "head": brief.head,
+                "pane": pane,
+            }));
+            Err(format!(
+                "lane {block} already has a live pane ({pane}) briefed at this head; \
+                 refusing to open a second reviewer for the same round"
+            ))
+        };
+        // **`resumed` records what HAPPENED, not what was attempted.** A resume
+        // that fell through to a fresh pane is a lane that lost its
+        // conversation, and filing it as a resume would make the audit row say
+        // the opposite of the thing `rd-lane-resume-failed` was added to
+        // surface (#2109).
+        let (agent, session_id, resumed) = match prior {
             Some(session) => match self.rd_reuse_pane(group, &on_behalf, &session, block, &text) {
-                Some(a) => (a, session),
+                Some(a) => (a, session, true),
                 None => {
-                    let sp = self
-                        .rd_spawn(
-                            group,
-                            Role::Reviewer,
-                            Some(block.to_string()),
-                            Some(session),
-                            &text,
-                        )
-                        .or_else(|_| fresh(self))?;
-                    (sp.id, sp.session_id.unwrap_or_default())
+                    no_duplicate(self)?;
+                    let (sp, was_resume) = match self.rd_spawn(
+                        group,
+                        Role::Reviewer,
+                        Some(block.to_string()),
+                        Some(session.clone()),
+                        &text,
+                    ) {
+                        Ok(sp) => (sp, true),
+                        Err(why) => {
+                            // **A fall-through to fresh is audited, never
+                            // silent** (#2109), on `rd-reuse-declined`'s own
+                            // argument one arm over: the only other visible
+                            // effect of a failed resume is a fresh pane, and a
+                            // fresh pane is what "this lane had no session to
+                            // resume" looks like too. A reader chasing a
+                            // reviewer that lost its conversation could not tell
+                            // the two apart on this log.
+                            //
+                            // A cap refusal is NOT one of these. It refused the
+                            // slot, not the session, and a fresh spawn would be
+                            // refused identically — so it propagates, where
+                            // `OpenLane` backs off and `cap_starved_since_ms`
+                            // starts counting toward `held(cap-full)`. Falling
+                            // through to `fresh` here would spend the retry on
+                            // a second refusal and file it as a resume failure.
+                            if super::is_live_cap_refusal(&why) {
+                                return Err(why);
+                            }
+                            self.rd_audit(group, &on_behalf, rddrive::audit_action::LANE_RESUME_FAILED, json!({
+                                "pr": pr,
+                                "block": block,
+                                "session": session,
+                                "head": brief.head,
+                                "detail": why,
+                            }));
+                            (fresh(self)?, false)
+                        }
+                    };
+                    (sp.id, sp.session_id.unwrap_or_default(), was_resume)
                 }
             },
             None => {
+                no_duplicate(self)?;
                 let sp = fresh(self)?;
-                (sp.id, sp.session_id.unwrap_or_default())
+                (sp.id, sp.session_id.unwrap_or_default(), false)
             }
         };
         entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), now);
-        Ok(agent)
+        Ok(RdLaneOpen { agent, session: session_id, resumed })
+    }
+
+    /// The session a lane must be RESUMED on, or `None` when this build cannot
+    /// establish one (#2109).
+    ///
+    /// **Two sources for one fact, in the order of how directly they observed
+    /// it.** [`reviewdrive::LaneRecord::session`] is what the spawn returned,
+    /// and `spawn_agent_bound` returns a session id only for `cli == "claude"`
+    /// — it pre-assigns a uuid there, while copilot and opencode mint theirs
+    /// after boot. For those the field is empty at `open_lane` time and nothing
+    /// has ever written it back, so it is empty for the life of the lane: the
+    /// session watcher's discovery lands on the PANE (`associate_session`
+    /// updates the agent map and the roster row) and never on the drive's own
+    /// record. Reading the record alone therefore answered "this lane has no
+    /// session" for every non-claude reviewer, and `rd_open_lane` opened a
+    /// fresh pane on a fresh conversation every round — #2109's first ask, and
+    /// the reason nine reviewer panes were paid for where six were needed.
+    ///
+    /// The live agent map is asked before the roster because it is the one the
+    /// watcher writes first; the roster is what survives a pane that has since
+    /// exited, which is exactly the lane a resume is FOR.
+    ///
+    /// **A blank is never a value.** An empty or whitespace-only id is dropped
+    /// at every step rather than passed to `rd_spawn`, where
+    /// `sanitize_session` would refuse it and the refusal would be filed as a
+    /// resume failure — a claim about a session that was never recorded.
+    fn rd_lane_session(
+        &self,
+        group: &GroupId,
+        lane: Option<&reviewdrive::LaneRecord>,
+    ) -> Option<String> {
+        let lane = lane?;
+        let keep = |s: String| Some(s).filter(|s| !s.trim().is_empty());
+        if let Some(s) = keep(lane.session.clone()) {
+            return Some(s);
+        }
+        if lane.agent.trim().is_empty() {
+            return None;
+        }
+        if let Some(s) = self.agent(&lane.agent).and_then(|a| a.session_id).and_then(keep) {
+            return Some(s);
+        }
+        self.merged_records(group)
+            .into_iter()
+            .find(|r| r.id == lane.agent)
+            .and_then(|r| r.session)
+            .and_then(keep)
+    }
+
+    /// The pane that already holds this lane's round, when opening another
+    /// would be a DUPLICATE (#2109) — this lane's recorded pane, positively
+    /// live, and briefed at the head about to be briefed again.
+    ///
+    /// **All three conditions, and the middle one fails toward spawning.** A
+    /// pane this registry has no record of is "we could not check", not "it is
+    /// alive" — the same asymmetry [`reviewdrive::DriveEntry::forget_dead_panes`]
+    /// states — but the safe direction is the opposite one here. Refusing on an
+    /// unknown pane would wedge every drive in the group after a restart, whose
+    /// agent map is empty and whose panes are genuinely gone; spawning on one
+    /// costs at worst the duplicate this exists to prevent, in the one case
+    /// where orrerix cannot see the pane at all. So only `Some(non-Dead)`
+    /// refuses.
+    ///
+    /// The head condition is what keeps this from blocking a legitimate
+    /// supersede: after a push the recorded pane is reviewing a revision the
+    /// drive has moved past, and opening its successor is what
+    /// [`reviewdrive::LaneRecord::prior_agents`] exists for.
+    fn rd_live_lane_pane(
+        &self,
+        lane: Option<&reviewdrive::LaneRecord>,
+        head: &str,
+    ) -> Option<String> {
+        let lane = lane?;
+        if lane.agent.trim().is_empty() || head.is_empty() || lane.briefed_head != head {
+            return None;
+        }
+        match self.agent(&lane.agent) {
+            Some(a) if a.status != AgentStatus::Dead => Some(lane.agent.clone()),
+            _ => None,
+        }
     }
 
     /// **Reuse before spawn** (#1960): resume `session` into the live idle pane
@@ -1989,25 +2184,67 @@ impl OrchRegistry {
                 // broken later.
                 let block = brief.required.get(*index).cloned().unwrap_or_default();
                 match self.rd_open_lane(group, entry, &block, &brief, limits, now) {
-                    Ok(agent) => {
+                    Ok(RdLaneOpen { agent, session, resumed }) => {
                         entry.lane_index = *index;
+                        // #2109: a lane opened is the refusal run ending. Not
+                        // folded into `advance` — opening a lane is not an arc
+                        // (§2.1), so there is no transition here to hang it on.
+                        entry.clear_cap_starvation();
                         out.changed = true;
                         out.lanes_opened.push((block.clone(), agent.clone()));
                         out.audits.push((
                             rddrive::audit_action::LANE_SPAWNED,
+                            // #2109: `head`, `session` and `resumed` on the
+                            // row. `resumed` is the fact the issue is about and
+                            // the one nothing else records — a resumed lane and
+                            // a fresh one produce the same shape of row, the
+                            // same kind of pane id, and the same brief, so the
+                            // only pre-#2109 way to tell nine panes from six was
+                            // to count them by hand across three PRs.
                             json!({ "pr": pr, "block": block, "agent": agent,
-                                    "head": brief.head, "round": entry.counters.review_rounds + 1 }),
+                                    "head": brief.head, "session": session,
+                                    "resumed": resumed,
+                                    "round": entry.counters.review_rounds + 1 }),
                         ));
                     }
                     Err(why) => {
                         // §8's live-delegate-cap row: a refused spawn is a
                         // runner-class outcome. Back off and retry on a later
-                        // tick, counted only against `drive_timeout_minutes` —
-                        // and NEVER kill a pane to make room (§3.1 item 5).
+                        // tick — and NEVER kill a pane to make room (§3.1
+                        // item 5).
+                        let cap = super::is_live_cap_refusal(&why);
                         out.backoff = true;
+                        // **The retry is bounded by something that names the
+                        // cap** (#2109). It used to be bounded only by
+                        // `drive_timeout_minutes`, whose notice says nothing
+                        // about slots: the measured drive sat in `review-wait`
+                        // with `lanes: []` for three hours, emitting one of
+                        // these rows per tick and no §2.2 exit at all. The stamp
+                        // is written on the FIRST refusal of a run and left
+                        // alone by the rest, so `decide` reads a duration
+                        // rather than the age of the newest tick, and `clear`
+                        // on the Ok arm and on every arc is what keeps it a RUN.
+                        //
+                        // **Only a CAP refusal stamps it**, because the hold it
+                        // leads to names the cap: a persistent non-cap refusal
+                        // (an unknown block, a workspace that will not resolve)
+                        // would park as `held(cap-full)` on a notice telling an
+                        // orchestrator to free a slot that is not the problem —
+                        // the diagnosis-for-observation swap #1961 fixed one
+                        // hold over. Those keep the bound they have,
+                        // `drive_timeout_minutes`, which asserts nothing.
+                        if cap && entry.note_cap_starvation(now) {
+                            out.changed = true;
+                        }
                         out.audits.push((
                             rddrive::audit_action::REFUSED,
                             json!({ "pr": pr, "block": block, "reason": "lane-spawn-refused",
+                                    // #2109: how long the cap has been refusing
+                                    // this drive, on the row a reader is already
+                                    // looking at. `cap: true` says a slot was
+                                    // the problem on THIS tick; a reader chasing
+                                    // the starved drive wants the run.
+                                    "starved_ms": entry.cap_starved_for(now),
                                     // #1960: whether the CAP is what refused,
                                     // on the row itself. A reader chasing a
                                     // drive that opened no lane for twenty
@@ -2015,7 +2252,7 @@ impl OrchRegistry {
                                     // to find out, and the answer decides
                                     // whether anything is wrong at all — a
                                     // capped lane retries and clears itself.
-                                    "cap": super::is_live_cap_refusal(&why),
+                                    "cap": cap,
                                     "detail": why }),
                         ));
                     }

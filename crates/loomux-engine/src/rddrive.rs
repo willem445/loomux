@@ -469,8 +469,28 @@ pub mod audit_action {
     pub const CI_RED: &str = "rd-ci-red";
     /// GitHub reports the PR `CONFLICTING`.
     pub const CONFLICTING: &str = "rd-conflicting";
-    /// A reviewer lane was spawned or resumed.
+    /// A reviewer lane was spawned or resumed. Carries `head` (#2109), because
+    /// "which revision is this pane reviewing" is the question a reader chasing
+    /// a duplicate lane asks first, and `round` alone cannot answer it.
     pub const LANE_SPAWNED: &str = "rd-lane-spawned";
+    /// A lane's recorded session could not be resumed, so a FRESH pane was
+    /// opened instead (#2109), with `detail` naming what refused.
+    ///
+    /// Its own action rather than a `LANE_SPAWNED` detail, for `CI_RED`'s
+    /// reason: losing a reviewer's conversation is the thing that happened, and
+    /// a reader auditing "did this drive ever fail to resume" must not have to
+    /// match the rows where it succeeded. Before this the fall-through was
+    /// silent, and a fresh pane is exactly what "there was no session to resume"
+    /// looks like on this log too.
+    pub const LANE_RESUME_FAILED: &str = "rd-lane-resume-failed";
+    /// A lane spawn was refused because this block already has a LIVE pane
+    /// briefed at this head (#2109) — the duplicate, named rather than opened.
+    ///
+    /// Distinct from [`REFUSED`], which is a tool-call refusal from §5.1's
+    /// closed vocabulary; this is a spawn the driver declined to make. Carries
+    /// `block`, `head` and the `pane` that already holds the round, because
+    /// the refusal's only other visible effect is a tick that did nothing.
+    pub const LANE_DUPLICATE_REFUSED: &str = "rd-lane-duplicate-refused";
     /// A lane's verdict was read at this revision.
     pub const VERDICT: &str = "rd-verdict";
     /// The worker's session was resumed with a hand-back brief.
@@ -935,6 +955,21 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              Free one (kill_agent on an idle delegate — list_agents shows which) and \
              drive_review resumes, or cancel_review_drive stops it."
         ),
+        // **The starvation, named with its duration and its remedy** (#2109).
+        // Its sibling `cap-refused` is one refusal held on the spot; this is a
+        // run of them, and the notice says so because "the cap refused a spawn"
+        // was true and harmless on tick one of the measured incident and a
+        // three-hour outage by tick thirty-seven. The panes clause below names
+        // this drive's own panes, which is where an orchestrator looks first —
+        // and since #2109 that list is one pane per lane block, so a drive whose
+        // own panes do not account for the cap is one whose slots are elsewhere.
+        HeldReason::CapFull => format!(
+            "HELD — this group's live-delegate cap has refused this drive's next \
+             reviewer lane for the whole hold window{at}, so no lane is open and \
+             none can be.{refusal} The driver never kills a pane: free a slot \
+             (kill_agent on an idle delegate — list_agents shows which) and \
+             drive_review resumes it, or cancel_review_drive stops it."
+        ),
         HeldReason::Messaged => format!(
             "HELD — {} called message_orchestrator{at}; its own line is above, \
              unchanged, and this is the routing fact beside it. drive_review resumes \
@@ -1264,8 +1299,10 @@ mod tests {
     #[test]
     fn every_hold_reason_names_a_tool_that_acts_on_it() {
         // §5.1's last paragraph, and §6's: a compacted orchestrator reading one
-        // of these lines must not have to remember the API. Twelve reasons, so
-        // a thirteenth added without a notice arm fails here.
+        // of these lines must not have to remember the API. `held_notice`'s
+        // match is exhaustive over a closed enum, so a reason added with no arm
+        // at all fails to COMPILE; what this loop catches is an arm that
+        // compiles and names no tool the orchestrator can act with.
         let f = HeldFacts {
             head: HEAD.into(),
             worker_session: "cafb930d-1111-2222-3333-444444444444".into(),
