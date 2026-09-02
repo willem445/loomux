@@ -4,6 +4,8 @@
 // toggle anymore: every pane declares its kind at creation via the welcome /
 // pane-setup screen (#194).
 
+import { mergeRecentDir } from "./recentdirs.ts";
+
 export interface AgentDef {
   id: string;
   label: string;
@@ -27,7 +29,6 @@ const KEY_CUSTOM = "loomux.customAgentCommand";
 const KEY_REPOS = "loomux.recentRepos";
 const KEY_AUTOPILOT = "loomux.singlePaneAutopilot";
 const KEY_CHANNEL_TOOLS = "loomux.soloChannelTools";
-const MAX_RECENT_REPOS = 8;
 
 // One-time cleanup (#194): the removed agents-mode toggle left this key behind in
 // every existing profile. Drop it on load so stale profiles don't carry it
@@ -83,8 +84,23 @@ export const getCustomCommand = (): string => localStorage.getItem(KEY_CUSTOM) ?
 export const setCustomCommand = (cmd: string): void => localStorage.setItem(KEY_CUSTOM, cmd);
 
 export function getRecentRepos(): string[] {
+  return readRepoList() ?? [];
+}
+
+/** The stored recents, or `null` when the list could not be READ at all — a
+ *  distinct state from "empty", so a write can decline rather than overwrite
+ *  what it never saw (#2010; the single-tenant cousin of the BoardPrefsStore
+ *  rule). A blob that parses to garbage is NOT this case: the data itself is
+ *  gone and there is nothing to preserve, so that reads as an empty list. */
+function readRepoList(): string[] | null {
+  let raw: string | null;
   try {
-    const v = JSON.parse(localStorage.getItem(KEY_REPOS) ?? "[]");
+    raw = localStorage.getItem(KEY_REPOS);
+  } catch {
+    return null;
+  }
+  try {
+    const v = raw === null ? [] : JSON.parse(raw);
     return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
   } catch {
     return [];
@@ -92,6 +108,11 @@ export function getRecentRepos(): string[] {
 }
 
 export function addRecentRepo(path: string): void {
-  const list = [path, ...getRecentRepos().filter((p) => p !== path)].slice(0, MAX_RECENT_REPOS);
-  localStorage.setItem(KEY_REPOS, JSON.stringify(list));
+  const next = mergeRecentDir(readRepoList(), path);
+  if (next === null) return; // the read failed — decline the write, never wipe (#2010)
+  try {
+    localStorage.setItem(KEY_REPOS, JSON.stringify(next));
+  } catch {
+    /* write failed (quota / security) — nothing to recover, same as before */
+  }
 }

@@ -1904,6 +1904,10 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
 .dlg-row { display: flex; gap: 6px; }
 .dlg-row > input { flex: 1; min-width: 0; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }
+/* #2010: the repo row's ModelPicker (dropdown + free-text escape) takes the
+   flex track the plain input had — the row is [picker][Browse…], and without
+   this the picker would size to its select's content instead of filling. */
+.dlg-row > .model-picker { flex: 1; min-width: 0; }
 .dlg-num { width: 100%; }
 .model-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 /* A row of equal columns rather than flex-sized ones (#1020 item 3). Flex sizes each field

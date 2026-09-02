@@ -229,6 +229,11 @@ in a pane:
 2. Choose the **Agent** kind, pick the agent CLI and model, leave **Panes** at 1,
    and click **Create**.
 
+The **Repository** field remembers your most recent directories: pick one from
+its dropdown (newest first) instead of browsing again. The field still accepts
+any path — type one, or use **Browse…** — and every launch or Browse… pick is
+recorded for the dropdown's list (the most recent 8 are kept).
+
 The **Autopilot — pre-approve all tools** checkbox (on by default) launches the
 agent with tools pre-approved so it stops prompting you to approve each edit or
 command — Claude Code's native Auto mode plus pre-approved `git`/`gh`, or, for
