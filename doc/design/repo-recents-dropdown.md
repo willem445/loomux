@@ -54,9 +54,13 @@ Two consequences of the reuse, both deliberate:
   two and cannot assume a host seeds before it stamps (#2108). The contract
   is pinned by `test/modelpicker.test.ts`, a minimal DOM shim driving the
   real class — including the red-before-green run against #2104's pre-fix
-  `ca0e4a46` blob. A `set value` that takes the dropdown branch also clears
-  the hidden input's stale text, so flipping back to `custom…` shows an
-  empty box rather than a previously typed path (#2108).
+  `ca0e4a46` blob. A `set value` or `setOptions` rebuild that takes the
+  dropdown branch also clears the hidden input's stale text — the same rule
+  on both sites, so flipping back to `custom…` shows an empty box rather
+  than a previously typed path (#2108). The launcher seeds the picker through
+  `seedPicker` (modelpicker.ts), and the test harness calls the same
+  function, so the seed's setOptions-then-stamp order lives in one place
+  rather than being hand-copied into the tests (#2108 review).
 
 The E2E helpers follow the same contract (`e2e/helpers.ts` `fillRepoField`):
 their structural selectors are declared coupled to `src/launcher.ts`'s DOM
@@ -78,9 +82,10 @@ unchanged:
   them and could strand the marker again; guarding a direct write would need
   attribute-mutation observation, not a one-line guard, so the assumption is
   recorded rather than enforced: hosts flip branches through `set value` or
-  the dropdown itself. The launcher reads `input.hidden` and re-points
-  `placeholder`/`spellcheck` through the accessors; it never writes `hidden`
-  (#2108).
+  the dropdown itself. The launcher re-points `placeholder`/`spellcheck`
+  through the accessors, and the seed's `hidden` read lives in `seedPicker`
+  (modelpicker.ts); no `hidden` write through either accessor exists anywhere
+  in `src/` (#2108).
 - Visibility is read from the `hidden` attribute alone — the same trust
   `focus()` has always made. A stylesheet hiding a half by class or media
   query would defeat both the marker and `focus()`; if that ever becomes
