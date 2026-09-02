@@ -1167,7 +1167,16 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   succeeds, the issue closes, only the permanent record is wrong. `worker.md` now states that
   the issue link is the last line of the human layer, directly above the marker, and tells a
   worker to cut its own body and check the line survived. The playbook's cut recipe gains the
-  merger-side half: a `diff` of the closing/linking references found in the full body against
-  those found in the cut, which prints nothing on a well-formed body and names the lost line on
-  a malformed one. This entry is the single re-bless for the whole PR (#1811's batching rule,
-  which these same templates state), so it covers the final state rather than each round.
+  merger-side half: it asks whether the CUT still names an issue whenever the full body does,
+  and refuses the merge if not.
+
+  **The first cut of that check asked the wrong question, and running it found out.** It
+  compared the two reference LISTS, so a body that legitimately mentions another issue inside
+  the fold made it fire with nothing lost — which is what it did the first time it was run on a
+  real body. A guard that refuses ships only after it has run clean over known-good subjects,
+  and the subject that broke it was the very PR that added it. It now tests PRESENCE, and was
+  re-run over three subjects: a well-formed body (silent), one whose marker sits above the link
+  (refuses, naming the drop), and one with no issue link at all (silent, not a false refusal).
+
+  This entry is the single re-bless for the whole PR (#1811's batching rule, which these same
+  templates state), so it covers the final state rather than each round.

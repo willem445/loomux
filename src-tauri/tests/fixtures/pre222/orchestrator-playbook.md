@@ -652,9 +652,15 @@ strictly above the marker:
     gh pr view <N> --json body --jq .body > .scratch/body.md
     sed -n '/^<!-- agent-layer -->$/q;p' .scratch/body.md > .scratch/squash.md
     # the cut must not drop the issue link: it belongs on the last line of the
-    # human layer, and a body that put it below the marker cuts it away silently
-    diff <(LC_ALL=C.UTF-8 grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+' .scratch/body.md) \
-         <(LC_ALL=C.UTF-8 grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+' .scratch/squash.md)
+    # human layer, and a body that put it below the marker cuts it away silently.
+    # Ask whether the cut still NAMES an issue, never whether the two lists match
+    # -- a body may legitimately mention another issue inside the fold, and a
+    # set comparison fires on that while nothing was lost.
+    LINK='(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+'
+    if LC_ALL=C.UTF-8 grep -qiE "$LINK" .scratch/body.md &&
+       ! LC_ALL=C.UTF-8 grep -qiE "$LINK" .scratch/squash.md; then
+      echo "REFUSE: the cut dropped the issue link -- it belongs above the marker"
+    fi
     # then merge with --body-file .scratch/squash.md
 
 It is an exact-line match on purpose — no HTML parsing, no heuristic, and a legitimate
