@@ -75,6 +75,9 @@ export class ModelPicker {
    *  an affordance for a spawn this picker can no longer make. */
   private summary: HTMLElement;
   private cli = "";
+  /** The options the select currently carries, so `set value` (the repo host
+   *  #2010) can re-derive the selection the same way `setOptions` does. */
+  private options: readonly string[] = [];
 
   constructor(opts: ModelPickerOptions = {}) {
     this.blankLabel = opts.blankLabel ?? INHERIT_MODEL_LABEL;
@@ -117,6 +120,7 @@ export class ModelPicker {
    *  which CLI's vocabulary the ids belong to — an alias means what the CLI that
    *  documents it says it means, and nothing on any other CLI (#687). */
   setOptions(models: readonly string[], fallback: string, cli = ""): void {
+    this.options = models;
     const state = pickerSelection(models, this.value || fallback);
     this.sel.replaceChildren(
       ...models.map((m) => {
@@ -195,5 +199,40 @@ export class ModelPicker {
   get value(): string {
     if (!this.sel.options.length) return "";
     return this.sel.value === CUSTOM_OPTION ? this.custom.value.trim() : this.sel.value;
+  }
+
+  /** The two elements a host composes into its own field layout. The repo field
+   *  (#2010) re-styles and re-points them per kind — the path input carries the
+   *  kind's placeholder and the pane's initial-focus marker (which follows the
+   *  VISIBLE half, since the picker hides one of the two by design) — without
+   *  the launcher reaching into private state. Read-mostly seams: hosts must
+   *  not rebuild these elements; the picker owns their structure. */
+  get select(): HTMLSelectElement {
+    return this.sel;
+  }
+  get input(): HTMLInputElement {
+    return this.custom;
+  }
+
+  /** Set the value from the host — the Browse… pick, whose dialog result is not
+   *  a keystroke. Same re-derivation `setOptions` runs: a value that matches an
+   *  option marks that option, anything else opens the custom branch carrying
+   *  it (an unknown path is normal). Fires nothing: programmatic writes have
+   *  never delivered input events, and the caller does its own follow-up work
+   *  (the launcher re-derives the pane name and roster after a Browse… pick). */
+  set value(v: string) {
+    const state = pickerSelection(this.options, v);
+    this.sel.value = state.selected;
+    if (state.showCustom) this.custom.value = state.custom;
+    this.custom.hidden = !state.showCustom;
+    this.paintSummary();
+  }
+
+  /** Focus whichever half is showing. The validation-error paths bounce the
+   *  human to the field that caused the problem — but on the dropdown branch
+   *  the free-text input is hidden, and focus() on a hidden element lands
+   *  nowhere, so the recents select takes it instead. */
+  focus(): void {
+    (this.custom.hidden ? this.sel : this.custom).focus();
   }
 }

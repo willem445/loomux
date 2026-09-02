@@ -328,8 +328,11 @@ export class WelcomeForm {
    *  "Repository" and the File-explorer "Folder" (#214) — one path input, two
    *  names, so the label follows the kind rather than lying about one of them. */
   private repoLabel: HTMLElement;
-  private repoInput: HTMLInputElement;
-  private repoList: HTMLDataListElement;
+  /** The repo field: the ModelPicker control (#2010) — a dropdown of the recent
+   *  directories plus the free-text escape, in place of the `<datalist>` whose
+   *  suggestions browsers filter by the input's pre-filled text (the same
+   *  defect the model field was rewritten to escape; modelpicker.ts:9-12). */
+  private repoPicker: ModelPicker;
   private worktreeField: HTMLElement;
   private worktreeInput: HTMLInputElement;
   private nameField: HTMLElement;
@@ -600,22 +603,19 @@ export class WelcomeForm {
       this.sshWarn
     );
 
-    this.repoInput = document.createElement("input");
-    this.repoInput.className = "dlg-input";
-    this.repoInput.placeholder = "Repository or folder — empty for home";
-    this.repoInput.spellcheck = false;
-    // The pane routes its initial (and keyboard-nav) focus here (Pane.focus →
-    // this marker) rather than the Kind select, so a welcome pane is ready for a
-    // path the moment it opens (rev-74 LOW-4/LOW-6).
-    this.repoInput.setAttribute("data-initial-focus", "");
-    this.repoList = document.createElement("datalist");
-    this.repoList.id = "welcome-recent-repos";
-    this.repoInput.setAttribute("list", this.repoList.id);
-    this.repoInput.addEventListener("input", () => {
+    // #2010: the repo field is the ModelPicker control, not a `<datalist>` —
+    // browsers filter a datalist's suggestions by the input's current text, so
+    // the pre-filled default hid every recent that didn't start with it. The
+    // picker lists every recent directory regardless of the text, and its
+    // `custom…` escape keeps the field wider than the list: an unknown path is
+    // normal, so free text and Browse… behave exactly as before.
+    this.repoPicker = new ModelPicker();
+    this.repoPicker.input.spellcheck = false;
+    this.repoPicker.onChange = () => {
       this.updateName();
       // Which repo it is decides which workflow file (if any) the group would run.
       this.scheduleRosterRefresh();
-    });
+    };
     const browse = document.createElement("button");
     browse.className = "dlg-btn";
     browse.type = "button";
@@ -623,7 +623,7 @@ export class WelcomeForm {
     browse.addEventListener("click", () => void this.pickRepo());
     const repoRow = document.createElement("div");
     repoRow.className = "dlg-row";
-    repoRow.append(this.repoInput, browse, this.repoList);
+    repoRow.append(this.repoPicker.root, browse);
     this.repoField = field("Repository", repoRow);
     this.repoLabel = this.repoField.querySelector<HTMLElement>(".dlg-label")!;
 
@@ -910,13 +910,19 @@ export class WelcomeForm {
     this.agentSel.value = getDefaultAgent().id;
     this.customInput.value = getCustomCommand();
     const recent = getRecentRepos();
-    this.repoInput.value = defaultFolder?.trim() || recent[0] || "";
-    this.repoList.replaceChildren(
-      ...recent.map((p) => {
-        const opt = document.createElement("option");
-        opt.value = p;
-        return opt;
-      })
+    // The picker decides its own branch: a pre-filled value that IS a recent
+    // marks that option, one that is not (the split-from pane's cwd, #214)
+    // opens the custom branch carrying it — the datalist could do neither,
+    // which was the defect (#2010).
+    this.repoPicker.setOptions(recent, defaultFolder?.trim() || recent[0] || "");
+    // The pane routes its initial (and keyboard-nav) focus to this marker
+    // (Pane.focus, rev-74 LOW-4/LOW-6) rather than the Kind select, so a welcome
+    // pane is ready for a path the moment it opens. It follows the VISIBLE half
+    // of the picker: on the dropdown branch the free-text input is hidden, and
+    // focus() on a hidden element lands nowhere.
+    (this.repoPicker.input.hidden ? this.repoPicker.select : this.repoPicker.input).setAttribute(
+      "data-initial-focus",
+      ""
     );
     this.autopilotInput.checked = getAutopilot();
     this.channelToolsInput.checked = getChannelTools();
@@ -962,7 +968,7 @@ export class WelcomeForm {
     // Same control, honest caption per kind: a folder to browse or edit, a repository
     // to view — not "a repository to work in".
     this.repoLabel.textContent = k === "files" || k === "editor" ? "Folder" : "Repository";
-    this.repoInput.placeholder =
+    this.repoPicker.input.placeholder =
       k === "files"
         ? "Folder to browse — required"
         : k === "editor"
@@ -1318,7 +1324,7 @@ export class WelcomeForm {
     // brand mark reads as an answer.
     this.rosterFresh = false;
     const advanced = this.advancedInput.checked;
-    const repo = this.repoInput.value.trim();
+    const repo = this.repoPicker.value.trim();
     const cli = orchCliFor(this.agentSel.value).id;
     const seq = ++this.rosterSeq;
     // With the toggle off there is nothing to ask the backend *unless* we want to
@@ -1424,10 +1430,10 @@ export class WelcomeForm {
    *  other kind this form can become — the launcher settings are not carried over,
    *  which the button's tooltip says. */
   private async openWorkflowPane(): Promise<void> {
-    const root = this.repoInput.value.trim();
+    const root = this.repoPicker.value.trim();
     if (!root) {
       this.showError("Enter the repository first — the workflow file lives inside it.");
-      this.repoInput.focus();
+      this.repoPicker.focus();
       return;
     }
     if (!this.latch.begin()) return;
@@ -1440,7 +1446,7 @@ export class WelcomeForm {
     await admitRoot(root);
     if (!(await ftRootIsDir(root))) {
       this.showError(`Folder not found (or not a directory): ${root}`);
-      this.repoInput.focus();
+      this.repoPicker.focus();
       this.setBusy(false);
       this.latch.release();
       return;
@@ -1521,7 +1527,7 @@ export class WelcomeForm {
   private updateName(): void {
     if (this.nameDirty) return;
     const where =
-      this.worktreeInput.value.trim() || basename(this.repoInput.value.trim()) || "home";
+      this.worktreeInput.value.trim() || basename(this.repoPicker.value.trim()) || "home";
     if (this.kind === "ssh") {
       // The connection's own name is the useful title (it is what the human
       // chose to call that host); the destination is the honest fallback while
@@ -1534,7 +1540,7 @@ export class WelcomeForm {
       // just eat width in the header for something the pane's content already says.
       // (Falls back to the kind's own name for an empty path, which validation is
       // about to bounce anyway.)
-      this.nameInput.value = basename(this.repoInput.value.trim()) || this.kind;
+      this.nameInput.value = basename(this.repoPicker.value.trim()) || this.kind;
       return;
     }
     if (this.kind === "terminal") {
@@ -1787,7 +1793,7 @@ export class WelcomeForm {
   private async pickRepo(): Promise<void> {
     const picked = await pickDirectory({
       title: "Choose repository or folder",
-      defaultPath: this.repoInput.value.trim() || undefined,
+      defaultPath: this.repoPicker.value.trim() || undefined,
     });
     if (typeof picked === "string") {
       // #1042: a human chose this folder in a native dialog the backend never
@@ -1796,7 +1802,11 @@ export class WelcomeForm {
       // path the human then edits away simply leaves a declared root nothing
       // uses, which costs nothing locally (the webview may declare anything).
       await admitRoot(picked);
-      this.repoInput.value = picked;
+      // #2010: recorded like a launch, for the same reason — the pick IS the
+      // gesture. A path browsed to once is exactly the one the next pane wants
+      // offered without browsing again.
+      this.repoPicker.value = picked;
+      addRecentRepo(picked);
       this.updateName();
       this.refreshRoster();
     }
@@ -1812,7 +1822,7 @@ export class WelcomeForm {
       builtinCommand: agent.command,
       customCommand: this.customInput.value,
       count: intVal(this.countInput, 1),
-      repo: this.repoInput.value,
+      repo: this.repoPicker.value,
       worktree: this.worktreeInput.value,
       name: this.nameInput.value,
       autopilot: this.autopilotInput.checked,
@@ -1831,7 +1841,7 @@ export class WelcomeForm {
     const res = planPaneSetup(this.collectInput());
     if (!res.ok) {
       this.showError(res.error);
-      if (res.focus === "repo") this.repoInput.focus();
+      if (res.focus === "repo") this.repoPicker.focus();
       else if (res.focus === "custom") this.customInput.focus();
       else if (res.focus === "count") this.countInput.focus();
       else if (res.focus === "ssh") this.sshDestInput.focus();
@@ -1918,7 +1928,7 @@ export class WelcomeForm {
       await admitRoot(plan.root);
       if (!(await ftRootIsDir(plan.root))) {
         this.showError(`Folder not found (or not a directory): ${plan.root}`);
-        this.repoInput.focus();
+        this.repoPicker.focus();
         this.setBusy(false);
         this.latch.release();
         return;
@@ -1950,14 +1960,14 @@ export class WelcomeForm {
         this.showError(
           String(err) === "git-not-found" ? "git was not found on PATH." : `git error: ${String(err)}`
         );
-        this.repoInput.focus();
+        this.repoPicker.focus();
         this.setBusy(false);
         this.latch.release();
         return;
       }
       if (!top) {
         this.showError(`Not a git repository: ${plan.root}`);
-        this.repoInput.focus();
+        this.repoPicker.focus();
         this.setBusy(false);
         this.latch.release();
         return;
