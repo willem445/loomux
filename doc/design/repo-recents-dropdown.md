@@ -48,7 +48,15 @@ Two consequences of the reuse, both deliberate:
   input carries the marker: it is the half the human is typing into. The
   predicate is the same one `ModelPicker.focus()` uses, and `Pane.focus()`
   routes into `focusWelcome()` on every window-refocus and keyboard-nav
-  (rev-std round 1 finding 2 and rev-final B1 on #2010).
+  (rev-std round 1 finding 2 and rev-final B1 on #2010). The class re-homes
+  on all three of its own flip sites — the dropdown's `change`, `set value`,
+  and `setOptions`, because a rebuild flips branches exactly like the other
+  two and cannot assume a host seeds before it stamps (#2108). The contract
+  is pinned by `test/modelpicker.test.ts`, a minimal DOM shim driving the
+  real class — including the red-before-green run against #2104's pre-fix
+  `ca0e4a46` blob. A `set value` that takes the dropdown branch also clears
+  the hidden input's stale text, so flipping back to `custom…` shows an
+  empty box rather than a previously typed path (#2108).
 
 The E2E helpers follow the same contract (`e2e/helpers.ts` `fillRepoField`):
 their structural selectors are declared coupled to `src/launcher.ts`'s DOM
@@ -65,10 +73,23 @@ unchanged:
 - `get select()` / `get input()` — the two elements, so a host can compose the
   picker into its own field layout (the repo row's per-kind placeholder and the
   initial-focus marker above). Read-mostly: the picker owns the structure.
+- The re-homing runs only on the picker's own flip sites. A host that writes
+  `hidden` directly through the `select`/`input` accessors bypasses all of
+  them and could strand the marker again; guarding a direct write would need
+  attribute-mutation observation, not a one-line guard, so the assumption is
+  recorded rather than enforced: hosts flip branches through `set value` or
+  the dropdown itself. The launcher reads `input.hidden` and re-points
+  `placeholder`/`spellcheck` through the accessors; it never writes `hidden`
+  (#2108).
+- Visibility is read from the `hidden` attribute alone — the same trust
+  `focus()` has always made. A stylesheet hiding a half by class or media
+  query would defeat both the marker and `focus()`; if that ever becomes
+  real, the predicate's input widens, not its call sites (#2108).
 - `set value` — the Browse… pick, whose dialog result is not a keystroke. It
   re-runs `pickerSelection` (so an unknown path opens the custom branch) and
   fires nothing, matching how a programmatic write has always behaved; the
-  caller does its own follow-up work.
+  caller does its own follow-up work. A value that takes the dropdown branch
+  also clears the hidden input's stale text (#2108).
 - `focus()` — focuses whichever half is showing, for the validation-error paths
   that bounce the human back to this field.
 
