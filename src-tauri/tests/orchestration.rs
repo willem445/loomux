@@ -4631,7 +4631,7 @@ fn read_playbook_writes_one_audit_line() {
 /// message's prose, and in the surrounding comment. A change to one of them
 /// leaves the message asserting a budget that is not the one enforced, and a
 /// message is exactly the surface nobody re-derives (review round 2, N1).
-const RESIDENT_CORE_BUDGET: usize = 45_000;
+const RESIDENT_CORE_BUDGET: usize = 0;
 
 #[test]
 fn the_resident_core_is_under_the_byte_budget() {
