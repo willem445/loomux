@@ -11,7 +11,9 @@
 // in the repo ever writes, so the marker could never come back to the input.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CUSTOM_OPTION } from "../src/modelcatalog.ts";// --- minimal DOM shim -------------------------------------------------------
+import { CUSTOM_OPTION } from "../src/modelcatalog.ts";
+
+// --- minimal DOM shim -------------------------------------------------------
 // Only what ModelPicker touches. The one fidelity point that matters is the
 // <select> value semantics: a select whose value names no option reads ""
 // (selectedIndex −1), while an input reads back what was written.
