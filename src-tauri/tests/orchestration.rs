@@ -4775,7 +4775,10 @@ fn every_prompt_template_is_checked_out_with_lf_endings() {
                  `git checkout -- <dir>`. `git add --renormalize .` will NOT do it: it \
                  rewrites the index only, silently, so you get a clean `git status` beside \
                  a still-CRLF file. A plain `git checkout --` without deleting first is a \
-                 no-op too, because git considers the file up to date.",
+                 no-op too, because git considers the file up to date. AND IF A CR SURVIVES \
+                 ALL THAT, it is in the BLOB, not the checkout: git's `text` filter converts \
+                 CRLF pairs and leaves a LONE CR untouched at both ends, so `eol=lf` cannot \
+                 strip one and no amount of re-checking-out will either — fix the content.",
                 path.display()
             );
         }
