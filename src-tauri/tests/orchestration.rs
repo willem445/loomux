@@ -22,6 +22,7 @@ use loomux_lib::orchestration::mailbox;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
+use loomux_lib::orchestration::report;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::GroupId;
 use loomux_lib::orchestration::{
@@ -16692,7 +16693,7 @@ fn a_progress_report_with_no_resolvable_task_is_audit_only_and_not_an_error() {
     // …and the answer says so rather than naming a note that does not exist.
     let answer = r["content"][0]["text"].as_str().unwrap();
     assert!(
-        answer.contains("No board task resolved"),
+        answer.contains("No board task on this group's board matched"),
         "the answer must not claim a board note it did not write: {answer}"
     );
     assert_eq!(
@@ -16746,28 +16747,139 @@ fn a_progress_reports_ref_resolves_a_board_row_when_no_session_is_bound() {
 /// **#1958.** `done` and `blocked` are untouched — both still typed into the
 /// orchestrator's pane, because both need it to act.
 ///
-/// Written as a walk of the whole `status` vocabulary rather than two named
-/// cases: the engine predicate is a match over a closed enum, and this is what
-/// catches a fourth status reaching this dispatch with no decision made about it.
+/// **Driven from `report::STATUSES`, not from a literal list** (#1966 rev-final
+/// N1). The earlier revision walked `["done", "blocked", "progress"]` written out
+/// by hand while its own doc claimed to walk "the whole vocabulary" — so a fourth
+/// status was invisible to it twice over: never driven, and never counted. Reading
+/// the real constant makes the claim true of what the test DOES: every member of
+/// the vocabulary is put through the live dispatch, and the delivered set is
+/// asserted as a SET rather than a count, so a fourth status that delivered would
+/// show up here as an unexpected member.
+///
+/// What it still cannot do is decide whether that fourth status SHOULD deliver —
+/// the engine's catch-all says yes, deliberately, and the vocabulary pin in
+/// `report::tests::every_status_is_classified` is the one thing that makes adding
+/// a member a deliberate edit.
 #[test]
 fn done_and_blocked_still_reach_the_orchestrator_and_only_progress_does_not() {
     let (reg, _d, g, w, cw, _tid) = report_routing_setup();
-    for status in ["done", "blocked", "progress"] {
+    for status in report::STATUSES {
         let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
             "status": status, "summary": format!("status word {status}") } }));
     }
     let delivered = delivered_texts(&reg, &g);
-    let reports: Vec<&String> = delivered
+    let prefix = format!("[orrerix] {} reports ", w.id);
+    // The STATUS WORD of each line this worker got delivered, in vocabulary order
+    // — a set, so an unexpected member reads as itself rather than as a count.
+    let mut reached: Vec<&str> = report::STATUSES
         .iter()
-        .filter(|t| t.starts_with(&format!("[orrerix] {} reports", w.id)))
+        .copied()
+        .filter(|s| delivered.iter().any(|t| t.starts_with(&format!("{prefix}{s}:"))))
         .collect();
+    reached.sort_unstable();
+    let mut want: Vec<&str> =
+        report::STATUSES.iter().copied().filter(|s| *s != "progress").collect();
+    want.sort_unstable();
+    assert_eq!(reached, want, "delivered lines were: {delivered:#?}");
+    // Non-vacuity: the walk really drove the dispatch. Without this, a probe that
+    // delivered nothing at all would satisfy the set assertion for `progress` and
+    // fail only by luck on the others.
     assert_eq!(
-        reports.len(),
-        2,
-        "exactly the two action-needing statuses reach the pane: {reports:#?}"
+        delivered.iter().filter(|t| t.starts_with(&prefix)).count(),
+        want.len(),
+        "one delivered line per action-needing status, no more: {delivered:#?}"
     );
-    assert!(reports.iter().any(|t| t.contains("reports done")), "{reports:#?}");
-    assert!(reports.iter().any(|t| t.contains("reports blocked")), "{reports:#?}");
+}
+
+/// **#1966 rev-final N2.** "I could not read the board" is never reported as
+/// "there was no matching row".
+///
+/// `tasks()` maps any read or parse failure to an empty `Vec`, so before this the
+/// delegate was told the board's *contents* on a read that had simply failed —
+/// the same defect one layer down that this change fixes by not saying "reported
+/// to orchestrator". The note is still correctly declined and the audit row is
+/// still written; what changes is the sentence.
+#[test]
+fn an_unreadable_board_is_not_reported_as_no_matching_task() {
+    let (reg, _d, g, _w, cw, tid) = report_routing_setup();
+
+    // The control: the row IS there and resolvable, so the difference below is
+    // the read failing and nothing else.
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "readable board" } })).unwrap();
+    assert!(
+        r["content"][0]["text"].as_str().unwrap().contains("noted on your board task"),
+        "control: a readable board must resolve this row: {r}"
+    );
+    assert_eq!(task_notes(&reg, &g, &tid).len(), 1);
+
+    // Now corrupt it. Same row, same session, same ref.
+    let path = reg.state_root().join(g.as_str()).join("tasks.json");
+    std::fs::write(&path, b"{ this is not json").unwrap();
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "unreadable board" } })).unwrap();
+    assert_eq!(r["isError"], false, "an unreadable board must not fail the report: {r}");
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        answer.contains("could not be read"),
+        "the answer must say the board was unreadable: {answer}"
+    );
+    assert!(
+        !answer.contains("matched your session or ref"),
+        "…and must NOT claim the board had no matching row: {answer}"
+    );
+    // The audit row is still the floor, and it carries the full text.
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string(), "progress".to_string()],
+        "both reports are audited regardless"
+    );
+}
+
+/// **#1966 rev-final premortem 1.** The `ref` fallback skips `done` rows.
+///
+/// Nothing clears `pr` when a task completes, so a long-lived board keeps finished
+/// rows carrying the same PR as the live follow-up work. A first-match-wins scan
+/// over raw board order would pile every note onto whichever sorts first — and the
+/// finished row sorts first, because it was created first.
+///
+/// The fixture is built so the two operands COLLIDE: both rows carry `#900`, the
+/// `done` one is EARLIER in board order, and neither carries the delegate's
+/// session (so the `ref` fallback is the only thing that can resolve either).
+#[test]
+fn the_ref_fallback_skips_a_done_row_carrying_the_same_pr() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap().id;
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 6253);
+    let w = reg.spawn_agent(&g, Role::Worker, "w", "follow-up", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+
+    let finished = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("First pass at #900"), None, None))
+        .unwrap();
+    reg.upsert_task(&g, "orch-1", Some(&finished.id),
+        TaskPatch { pr: Some("#900".into()), status: Some("done".into()), ..Default::default() })
+        .unwrap();
+    let live = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("Follow-up on #900"), None, None))
+        .unwrap();
+    reg.upsert_task(&g, "orch-1", Some(&live.id),
+        TaskPatch { pr: Some("#900".into()), ..Default::default() })
+        .unwrap();
+    // The collision is real: the done row really is first in board order.
+    let order: Vec<String> = reg.tasks(&g).into_iter().map(|t| t.id).collect();
+    assert_eq!(order, vec![finished.id.clone(), live.id.clone()], "fixture: done row sorts first");
+
+    let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "on the follow-up" } }));
+
+    assert_eq!(task_notes(&reg, &g, &live.id).len(), 1, "the note belongs on the LIVE row");
+    assert!(
+        task_notes(&reg, &g, &finished.id).is_empty(),
+        "a finished row is never the row a delegate is reporting progress on"
+    );
 }
 
 #[test]
