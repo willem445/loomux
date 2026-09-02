@@ -651,6 +651,10 @@ strictly above the marker:
 
     gh pr view <N> --json body --jq .body > .scratch/body.md
     sed -n '/^<!-- agent-layer -->$/q;p' .scratch/body.md > .scratch/squash.md
+    # the cut must not drop the issue link: it belongs on the last line of the
+    # human layer, and a body that put it below the marker cuts it away silently
+    diff <(LC_ALL=C.UTF-8 grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+' .scratch/body.md) \
+         <(LC_ALL=C.UTF-8 grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+' .scratch/squash.md)
     # then merge with --body-file .scratch/squash.md
 
 It is an exact-line match on purpose — no HTML parsing, no heuristic, and a legitimate

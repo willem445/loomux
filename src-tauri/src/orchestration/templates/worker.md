@@ -236,6 +236,12 @@ Three literal lines open it, in this order, each on a line of its own:
 - **The closing-keyword scan still reads the WHOLE body**, fold included: a
   `close`/`fix`/`resolve` next to `#N` inside the agent layer closes that issue
   exactly as one above the fold does. Grep the whole file you are about to post.
+- **The issue link is the LAST line of the human layer, directly above the marker.**
+  Put it below the marker and GitHub still closes the issue — the scan reads the
+  whole body — but the squash message does not carry it, so the commit that closed
+  the issue never says which one. Nothing goes red: the cut succeeds, the issue
+  closes, and only the permanent record is wrong. After writing the body, cut it
+  yourself and check the closing line survived.
 
 **What never goes below the fold**, however long it runs: a decision the human has
 to make, a deviation from the brief, a residual you are shipping, an open question,

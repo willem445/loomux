@@ -1159,3 +1159,15 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   a residual being shipped, an open question. `src-tauri/tests/twolayer.rs` pins the shape:
   `worker.md` and `reviewer.md` each carry the canonical summary exactly once with its blank
   line, and every template that opens a fold uses that one wording.
+
+  **A review round added the ordering rule the cut turns out to need, and the check for it.**
+  The marker is a whole-line match, so a body whose issue link sits BELOW it loses that link
+  from the squash message while GitHub still closes the issue — the scan reads the whole body —
+  leaving a commit that closed an issue without saying which. Nothing goes red: the cut
+  succeeds, the issue closes, only the permanent record is wrong. `worker.md` now states that
+  the issue link is the last line of the human layer, directly above the marker, and tells a
+  worker to cut its own body and check the line survived. The playbook's cut recipe gains the
+  merger-side half: a `diff` of the closing/linking references found in the full body against
+  those found in the cut, which prints nothing on a well-formed body and names the lost line on
+  a malformed one. This entry is the single re-bless for the whole PR (#1811's batching rule,
+  which these same templates state), so it covers the final state rather than each round.
