@@ -329,7 +329,7 @@ runs you read, the greps and their positive controls:
 
     <!-- agent-layer -->
     <details>
-    <summary>Agent context — evidence, receipts, instruments</summary>
+    <summary>Agent context — the measurements</summary>
 
     ...the measurements...
     </details>
