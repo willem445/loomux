@@ -43511,7 +43511,7 @@ impl OrchRegistry {
                 a.group == *group
                     && a.status != AgentStatus::Dead
                     && a.session_id.as_deref() == Some(session)
-                    && a.block == block
+                    && !block.is_empty()
                     && a.idle_since_ms.is_some()
                     && a.pty_id.is_some()
             })
