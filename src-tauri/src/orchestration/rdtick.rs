@@ -2238,11 +2238,11 @@ impl OrchRegistry {
                         // hold over. Those keep the bound they have,
                         // `drive_timeout_minutes`, which asserts nothing.
                         // SCRATCH #2109 M7: the pre-fix WIRING — the tick never
-                        // stamps the starvation, so `decide` (unchanged, and its
-                        // own unit tests still green) is handed nothing to
-                        // report. Neutering the wiring rather than the pure
-                        // function is what keeps the lib test binary passing, so
-                        // `cargo test` reaches the integration target at all.
+                        // stamps the starvation, so `decide` (unchanged, its own
+                        // unit tests still green) is handed nothing to report.
+                        // Neutering the wiring rather than the pure function is
+                        // what keeps the lib test binary passing, so `cargo test`
+                        // reaches the integration target at all.
                         let _ = cap;
                         out.audits.push((
                             rddrive::audit_action::REFUSED,
