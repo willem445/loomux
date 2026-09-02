@@ -1150,7 +1150,7 @@ impl OrchRegistry {
                         .rd_spawn(
                             group,
                             Role::Reviewer,
-                            Some(block.to_string()),
+                            None,
                             Some(session),
                             &text,
                         )
