@@ -451,22 +451,11 @@ doesn't — your call"), and it holds the merge like any other question (INVARIA
 
 ## Delivery notices
 
-**Silent-agent recovery — silence is not evidence, the pane is (#1958).** A working delegate is
-silent by design: `done` and `blocked` reach you, and nothing else does, so a worker that got its
-brief and is three steps into it looks from here exactly like one whose kickoff was lost. Never
-infer a lost kickoff from having heard nothing.
-
-Decide it from the pane instead. `get_output` the agent: **the kickoff is in its own scrollback
-if it landed**, whether or not the agent has said anything, so re-send with `send_prompt` only
-when the brief itself is absent — an idle CLI with an empty input box AND no brief above it.
-`get_task` on its board row is the second read: a delegate that has started leaves notes there.
-Re-sending on silence alone duplicates a brief on a worker that is mid-task, and the delegate's
-own duplicate-delivery check will NOT catch it — that keys on the delivery id, and your re-send
-carries a new one.
-
-orrerix tells you when a delivery is genuinely in doubt (the `unconfirmed` notice below); the
-watchdog backstops a pane that has gone quiet for real. Between them, "I have heard nothing" is
-never the thing you act on.
+**Silent-agent recovery.** A freshly spawned agent reads its instructions and reports
+ready/progress within a couple of minutes. If one stays silent, `get_output` its pane: an idle
+CLI with an empty input box means its kickoff was lost — re-send the task with `send_prompt`.
+Never assume a spawned agent received its brief until it has reported. The watchdog backstops
+this, but don't wait for it: check any agent quiet longer than you'd expect.
 
 On an `[orrerix] delivery to <id> unconfirmed …` notice, orrerix couldn't confirm your prompt
 submitted — it may be sitting typed-but-unsent. `get_output` the pane, and **only if the text is
