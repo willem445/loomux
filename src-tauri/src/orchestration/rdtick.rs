@@ -1204,7 +1204,11 @@ impl OrchRegistry {
         // reuse arm delivers the delta into it. It is bounded by the clock it
         // does NOT re-arm — `spawned_ms` stays where the original brief put it,
         // so a pane that never comes back is `held(lane-stalled)` naming it,
-        // exactly as if it had gone quiet without a re-brief.
+        // exactly as if it had gone quiet without a re-brief. That bound is only
+        // REACHABLE because `decide_review_wait`'s stall check is keyed on the
+        // head rather than on the full (head, digest) key; the two changes ship
+        // together for that reason, and refusing without the re-key would swap a
+        // duplicate reviewer for a four-hour `drive-stalled`.
         //
         // **A head change is deliberately not covered.** There the recorded pane
         // is reviewing a revision the drive has moved past, its verdict binds to

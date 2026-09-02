@@ -2245,15 +2245,31 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
         // (head, digest) key.
         Some(Verdict::Pass) | None => {
             match entry.lane(&lane.block) {
-                Some(rec) if lane_open_for(rec, &facts.head, digest) => {
-                    if facts.now_ms.saturating_sub(rec.spawned_ms)
-                        >= minutes_ms(limits.lane_timeout_minutes)
-                    {
-                        DriveStep::held(HeldReason::LaneStalled)
-                    } else {
-                        DriveStep::Wait
-                    }
+                // **The stall clock is keyed on the HEAD, not on the full
+                // (head, digest) key** (#2109).
+                //
+                // It used to hang off the arm below, so it was asked only of a
+                // lane that was still open for this exact revision — and a body
+                // edit under a silent reviewer moved the digest, dropped through
+                // to a re-brief, and re-armed `spawned_ms`. A reviewer that had
+                // said nothing for fifty-nine minutes was given another hour by
+                // an edit it never read, which is the defeat-your-own-bound shape
+                // `decide`'s empty-head guard describes one screen up.
+                //
+                // #2109 makes that reachable rather than theoretical: the
+                // re-brief it produced is now REFUSED while that lane's pane is
+                // live, so without this the drive would retry the refusal until
+                // `drive-stalled` — four hours, on a notice that names no lane.
+                // A lane asked about this head and silent past its timeout is
+                // stalled whatever the body has done since.
+                Some(rec)
+                    if rec.briefed_head == facts.head
+                        && facts.now_ms.saturating_sub(rec.spawned_ms)
+                            >= minutes_ms(limits.lane_timeout_minutes) =>
+                {
+                    DriveStep::held(HeldReason::LaneStalled)
                 }
+                Some(rec) if lane_open_for(rec, &facts.head, digest) => DriveStep::Wait,
                 // **The cap's starvation is reported before another spawn is
                 // proposed** (#2109). The tick stamps
                 // `cap_starved_since_ms` on the first lane spawn the
@@ -3689,6 +3705,49 @@ mod tests {
         assert_eq!(
             decide(&e, &two_lanes(Some(Verdict::Escalate), None), &limits),
             DriveStep::held(HeldReason::Escalate)
+        );
+    }
+
+    /// **#2109.** A lane's stall clock is keyed on the HEAD it was asked about,
+    /// so a body edit under a silent reviewer cannot hand it another hour.
+    ///
+    /// The two halves discriminate. The first is the pre-#2109 behaviour and is
+    /// the control: a lane still open for this exact revision, past its timeout,
+    /// has always been `lane-stalled`. The second is the one that moved — same
+    /// lane, same silence, same clock, and only the DIGEST different — and under
+    /// the old keying it read as a re-brief, which re-armed `spawned_ms` and
+    /// bought the reviewer a fresh timeout it had done nothing to earn.
+    ///
+    /// The third is the negative control, and without it an implementation that
+    /// simply held `lane-stalled` for every lane record would pass both halves.
+    #[test]
+    fn a_lanes_stall_clock_survives_a_body_edit_it_never_read() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
+        let stale = 1_000 + minutes_ms(limits.lane_timeout_minutes);
+        let facts = |now: u64, digest: &str| DriveFacts {
+            now_ms: now,
+            body_digest: Some(digest.to_string()),
+            required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
+            ..facts_at("head-a")
+        };
+
+        assert_eq!(
+            decide(&e, &facts(stale, "d1"), &limits),
+            DriveStep::held(HeldReason::LaneStalled),
+            "the control: a lane open at this revision and past its timeout has always stalled"
+        );
+        assert_eq!(
+            decide(&e, &facts(stale, "d2"), &limits),
+            DriveStep::held(HeldReason::LaneStalled),
+            "and a body edit the silent reviewer never read must not re-arm its clock"
+        );
+        assert_eq!(
+            decide(&e, &facts(stale - 1, "d2"), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "the negative control: inside the timeout a moved digest is still a re-brief"
         );
     }
 
