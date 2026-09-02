@@ -2399,7 +2399,10 @@ on the board where the human reads it.
    classified". What makes adding a status a deliberate act is a **vocabulary pin**:
    `every_status_is_classified` asserts `STATUSES` is exactly the three members classified here,
    and `every_reviewer_outcome_still_reaches_the_pane` does the same for `OUTCOMES`. Nothing else
-   catches it, and the earlier revision's rustdoc and test comments claimed otherwise.
+   catches it, and the earlier revision's rustdoc and test comments claimed otherwise. Both are
+   fixed-size arrays, so an ADDITION does not redden the pin — it stops it COMPILING, which is
+   stronger; a RENAME is what fails the assertion. Measured both ways in the evidence wave, after
+   the first cut of this paragraph said "reddens" for a case that is a compile error.
 2. **"No matching row" and "I could not read the board" are different answers.** `tasks()` maps
    any read or parse failure to an empty `Vec`, so the first cut told a delegate the board's
    *contents* on a read that had merely failed. `tasks_or_err` keeps the distinction (a MISSING

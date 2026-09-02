@@ -77,6 +77,12 @@ pub fn status_for_outcome(outcome: &str) -> &'static str {
 /// from "never classified". What makes an addition deliberate is the VOCABULARY
 /// pin in `every_status_is_classified`, which asserts [`STATUSES`] is exactly
 /// the three members classified here; nothing else catches it.
+///
+/// That pin bites in TWO ways, and the stronger one is not a test failure at all
+/// (measured — #1966's wave round 12): [`STATUSES`] is a fixed-size array, so
+/// ADDING a member stops the pin COMPILING (`can't compare [&str; 4] with
+/// [&str; 3]`) before any test runs. RENAMING one fails the assertion at
+/// runtime. Either way the edit lands here.
 pub fn reaches_orchestrator_pane(status: &str) -> bool {
     match status {
         "progress" => false,
@@ -264,6 +270,10 @@ mod tests {
         // the only thing that does. `STATUSES` is the closed list `mcp.rs`
         // validates against, so adding a member here is a deliberate edit
         // beside a classification, not a silent default.
+        //
+        // It is a fixed-size array, so an ADDITION does not redden this — it
+        // stops it compiling, which is stronger and is what #1966's wave round
+        // 12 measured. A RENAME is what reddens the assertion (round 12a).
         let kept_off: Vec<&str> =
             STATUSES.iter().copied().filter(|s| !reaches_orchestrator_pane(s)).collect();
         assert_eq!(kept_off, vec!["progress"], "STATUSES = {STATUSES:?}");
