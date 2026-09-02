@@ -16837,6 +16837,78 @@ fn an_unreadable_board_is_not_reported_as_no_matching_task() {
     );
 }
 
+/// **#1966 rev-final round 2, N1.** A row that RESOLVED and then failed to be
+/// written is never answered as "no board task matched".
+///
+/// The read-side collapse was round 1's N2; this is the same defect one layer
+/// over. `write_tasks` propagates `create_dir_all` and `atomic_write` errors —
+/// the disk-full case #133 filed — and the first cut mapped every `Err` from
+/// `upsert_task` to `NoRow`, which is a claim about the board's CONTENTS made on
+/// a write that failed.
+///
+/// **The failure is induced for real, not faked**: the group directory is made
+/// non-writable, so `atomic_write`'s `File::create` of its temp sibling fails
+/// while `read_to_string` of the board still succeeds (reading a file needs the
+/// directory's execute bit, not its write bit). That is what makes the read
+/// resolve a row and the write fail on the same call — the interleaving a single
+/// thread cannot otherwise produce.
+///
+/// **Unix only, and the reason is the platform not the property.** Windows
+/// ignores the read-only attribute on a directory for the owner, so there is no
+/// portable in-process lever; the arm under test is platform-independent code
+/// and ubuntu + macos exercise it on every run. The control below is what stops
+/// this passing for the wrong reason if the lever ever stops working.
+#[cfg(unix)]
+#[test]
+fn a_board_write_that_fails_is_not_reported_as_no_matching_task() {
+    use std::os::unix::fs::PermissionsExt;
+    let (reg, _d, g, _w, cw, tid) = report_routing_setup();
+
+    // Control: the row resolves and the note lands while the directory is
+    // writable, so the only thing that changes below is the write failing.
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "writable" } })).unwrap();
+    assert!(
+        r["content"][0]["text"].as_str().unwrap().contains("noted on your board task"),
+        "control: the row must resolve and the note land: {r}"
+    );
+    assert_eq!(task_notes(&reg, &g, &tid).len(), 1);
+
+    let dir = reg.state_root().join(g.as_str());
+    let before = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "unwritable" } }));
+    // Restore BEFORE asserting, so a failure here does not leave the TempDir
+    // undeletable and turn one red into a cleanup cascade.
+    std::fs::set_permissions(&dir, before).unwrap();
+
+    let r = out.unwrap();
+    assert_eq!(r["isError"], false, "a failed board write must not fail the report: {r}");
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !answer.contains("matched your session or ref"),
+        "a write failure must NOT be answered as 'no board task matched': {answer}"
+    );
+    assert!(
+        answer.contains("could not be written"),
+        "…it must say the note could not be written: {answer}"
+    );
+    // The lever really did stop the write: still one note, not two.
+    assert_eq!(
+        task_notes(&reg, &g, &tid).len(),
+        1,
+        "the second note must NOT have landed — otherwise this test passed with the write \
+         succeeding, which measures nothing"
+    );
+    // And the audit row is still the floor, which is what makes the loss survivable.
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string(), "progress".to_string()],
+        "both reports are audited regardless"
+    );
+}
+
 /// **#1966 rev-final premortem 1.** The `ref` fallback skips `done` rows.
 ///
 /// Nothing clears `pr` when a task completes, so a long-lived board keeps finished

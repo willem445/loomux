@@ -2410,6 +2410,16 @@ on the board where the human reads it.
    read is still taken outside `tasks_lock` and can still lose a race with a concurrent
    `atomic_write`; what changes is that the delegate is now told that is what happened, and the
    audit log still carries the full text either way.
+
+   **The same collapse existed one layer over, on the WRITE**, and round 2 of the review found
+   it: a row that resolved and then failed to be written — `write_tasks` propagates
+   `create_dir_all` and `atomic_write` errors, the disk-full case #133 filed — was answered
+   "no board task matched", which is a claim about the board's CONTENTS made on a write. It is
+   now `NoteOutcome::NotWritten` with its own answer. The two causes that reach it (the IO
+   failure, and the row vanishing under a concurrent writer) share one answer deliberately: the
+   delegate's next move is identical, and telling them apart would mean deciding on an error
+   string. What is NOT closed is the loss itself — the note is gone either way, and only the
+   audit log has the text.
 3. **Two LIVE rows sharing a `ref` are still first-match-wins.** The `ref` fallback now skips
    `done` rows — nothing clears `pr` on completion, so a long-lived board keeps finished rows
    carrying the live work's PR, and those sort first — but two open rows on one PR remain
