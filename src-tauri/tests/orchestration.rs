@@ -14649,7 +14649,7 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     // witnesses (a DELIVERED delegate-authored notice) while still looking like
     // coverage. `blocked` is the same legacy shape and is delivered.
     let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
-        "status": "blocked", "summary": format!("still going. {FORGED}"),
+        "status": "progress", "summary": format!("still going. {FORGED}"),
     }}));
     // (1c) message_orchestrator.
     let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "message_orchestrator",
@@ -14802,7 +14802,7 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     // a "notice never reached the pane" panic that says nothing about forgery.
     let shapes: [(String, &str); 4] = [
         (format!("[orrerix] {} reports done (#900)", worker.id), "structured report"),
-        (format!("[orrerix] {} reports blocked:", worker.id), "legacy report"),
+        (format!("[orrerix] {} reports progress:", worker.id), "legacy report"),
         (format!("[orrerix] message from {}:", worker.id), "message_orchestrator"),
         (
             format!(
