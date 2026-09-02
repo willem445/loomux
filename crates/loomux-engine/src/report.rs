@@ -75,7 +75,8 @@ pub fn status_for_outcome(outcome: &str) -> &'static str {
 pub fn reaches_orchestrator_pane(status: &str) -> bool {
     match status {
         "progress" => false,
-        "done" | "blocked" => true,
+        "blocked" => false,
+        "done" => true,
         _ => true,
     }
 }
