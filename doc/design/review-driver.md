@@ -691,6 +691,15 @@ this note first.
    measurement: `prompt-typed`'s `confirm_source` is on every row, so how often a
    reused pane's last delivery was decided by `burst` alone is a countable fact,
    not a judgement call.
+   **And the test is not ATOMIC with the paste**, which is a third thing this
+   predicate does not promise. `rd_reuse_pane` reads readiness and then calls
+   `deliver_prompt`; anything admitted to that pane's queue in between — a human
+   message from the loomux UI, another agent's nudge — is pasted first, and the
+   brief lands behind it after all. That window is not widened here (the
+   pre-#2089 arm had the same gap, with no readiness read to race at all) and
+   closing it means holding a per-pane lock across the whole reuse decision,
+   which `rd_state_lock` already spans a delivery under; it is named so a later
+   slice does not read "the brief will be read" as stronger than it is.
 6. **Decide a disposition.** INVARIANT 3 is the orchestrator's, and the
    gate-satisfied notice says so in as many words (§6).
    **PROMISE, and structurally unenforceable — say so rather than pretend.**

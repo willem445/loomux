@@ -17492,8 +17492,14 @@ impl PaneNotReady {
 /// dialog raised AFTER a confirmed delivery, with nothing queued behind it,
 /// reads ready and is not caught. Closing that would mean judging a pane's
 /// screen, which §3 forbids the driver; it is bounded exactly as it was before
-/// #2089, by `held(fix-stalled)`/`held(lane-stalled)` naming the pane. See
-/// `doc/design/review-driver.md` §3.1 item 5.
+/// #2089, by `held(fix-stalled)`/`held(lane-stalled)` naming the pane.
+///
+/// Nor is it ATOMIC with the paste that follows it: anything admitted to the
+/// pane's queue between this answer and `deliver_prompt` is pasted first. The
+/// window is not widened by #2089 — the arm it replaces had the same gap with no
+/// readiness read to race — but "ready" means "was ready when asked", not "will
+/// still be when the brief lands". See `doc/design/review-driver.md` §3.1 item 5
+/// for both residuals and the trade behind the wider `Confirmed`.
 #[doc(hidden)] // pub for integration tests
 pub fn pane_delivery_readiness(
     queue_depth: usize,
