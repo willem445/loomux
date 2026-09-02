@@ -17448,6 +17448,15 @@ pub enum PaneNotReady {
     /// `Pending` or `Failed` in [`DeliveryConfirmState`]'s three-state sense,
     /// which `DeliveryOutcome::confirmed` folds into one `false`. Its text may
     /// still be sitting unsubmitted in the box.
+    ///
+    /// **The complement is WIDER than the hook signal**, and that is disclosed
+    /// rather than implied: [`confirm_state_for`] resolves `Box`, `Hook` AND
+    /// `Burst` to `Confirmed`, so a delivery decided by #112's Tier 3 output
+    /// heuristic reads ready here even though a repaint can satisfy that tier.
+    /// Narrowing to `Box`/`Hook` needs [`ConfirmSource`] carried on
+    /// `DeliveryOutcome`, which nothing stores; the trade and how to settle it
+    /// from `prompt-typed`'s own `confirm_source` column are in
+    /// `doc/design/review-driver.md` §3.1 item 5.
     Unconfirmed,
     /// Nothing has ever been delivered to this pty, so there is no evidence
     /// either way. Refused rather than assumed: "we could not look" is not
@@ -43611,6 +43620,13 @@ impl OrchRegistry {
     /// Newest first, because when the drive already holds a live idle pane on
     /// this session that pane is the drive's own current one, and speaking to
     /// the pane it last spoke to is the continuity a resume is for.
+    ///
+    /// **Since #2089 that is a PREFERENCE among eligible panes rather than a
+    /// pick**, and the distinction is why this is a sort and not a `max_by_key`:
+    /// readiness can refuse the newest candidate, and the next one down is still
+    /// a live idle pane on this same conversation under this same block, which
+    /// is a better answer than opening a second pane on it. So the arm takes the
+    /// newest READY pane, and only an empty list opens one.
     ///
     /// **The key is `(started_ms, id)` rather than `started_ms` alone, and the
     /// second half is not decoration** (rev-final round 2, premortem 1).

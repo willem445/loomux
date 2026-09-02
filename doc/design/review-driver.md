@@ -676,6 +676,21 @@ this note first.
    safe one — a delivery that landed but resolved `Pending` (a busy CLI no tier
    decided for) reads not-ready and costs one fresh pane, which is the pre-#1960
    cost of a round and not a regression below it.
+   **"Confirmed" here is the delivery machinery's own three-state `Confirmed`,
+   which is WIDER than the hook signal #2089's issue text names**, and that is a
+   disclosed narrowing gap rather than an oversight. `confirm_state_for` resolves
+   `Box`, `Hook` **and** `Burst` to `Confirmed`, and `Burst` is #112's output
+   heuristic — a repaint can clear its 24-byte bar, so a delivery whose Enter was
+   swallowed by a dialog can still be recorded confirmed. The narrower predicate
+   (`Box`/`Hook` only) is available: it needs `ConfirmSource` carried on
+   `DeliveryOutcome`, which nothing stores today. It is not taken here because the
+   cost is borne in the other direction — hook records exist only where a CLI's
+   hook is wired, so requiring one would refuse reuse for most panes and hand
+   #1960's cap pressure straight back — and because the case it would catch is a
+   pane that is doubly wedged, which the holds already name. Reopen it with a
+   measurement: `prompt-typed`'s `confirm_source` is on every row, so how often a
+   reused pane's last delivery was decided by `burst` alone is a countable fact,
+   not a judgement call.
 6. **Decide a disposition.** INVARIANT 3 is the orchestrator's, and the
    gate-satisfied notice says so in as many words (§6).
    **PROMISE, and structurally unenforceable — say so rather than pretend.**
