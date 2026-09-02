@@ -1307,8 +1307,8 @@ impl OrchRegistry {
         let agent = match self.rd_reuse_pane(group, &session, &text) {
             Some(a) => a,
             None => {
-                let block = self.rd_resume_block(group, &session)?;
-                self.rd_spawn(group, Role::Worker, block, Some(session), &text)?.id
+                let _block = self.rd_resume_block(group, &session)?;
+                self.rd_spawn(group, Role::Worker, None, Some(session), &text)?.id
             }
         };
         // Through the method, never a field write: the pane this supersedes is
