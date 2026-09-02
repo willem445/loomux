@@ -43462,6 +43462,30 @@ impl OrchRegistry {
     /// Newest first, because when the drive already holds a live idle pane on
     /// this session that pane is the drive's own current one, and speaking to
     /// the pane it last spoke to is the continuity a resume is for.
+    ///
+    /// **The key is `(started_ms, id)` rather than `started_ms` alone, and the
+    /// second half is not decoration** (rev-final round 2, premortem 1).
+    /// `started_ms` is a wall-clock millisecond, so two panes registered inside
+    /// one — a rapid recovery, or a fallback spawn landing beside a pane that
+    /// was just re-registered — TIE, and `max_by_key` over `HashMap::values()`
+    /// then resolves the tie by iteration order, differently between runs. The
+    /// wrong-persona outcome is excluded either way by the block filter above;
+    /// what a tie loses is exactly the continuity this ordering exists for, and
+    /// non-deterministically. The id is a total, stable tiebreak.
+    ///
+    /// **`idle_since_ms.is_some()` means "the reaper would call this idle", not
+    /// "the CLI is at a prompt", and that residual is stated rather than
+    /// implied** (rev-final round 2, premortem 2). A pane parked on an
+    /// auto-compact, a permission prompt or a tool-approval dialog is idle by
+    /// this signal, and `deliver_prompt` will admit the brief into its queue and
+    /// answer `Ok` — so the caller's fallback-to-spawn does not fire and the
+    /// brief waits for the pane to come back. What bounds it is the state that
+    /// asked for it: `fix-wait` holds on `fix-stalled` and `review-wait` on
+    /// `lane-stalled`, both naming the pane, so the drive degrades to a named
+    /// hold rather than to silence. Narrowing this to a real
+    /// at-a-prompt signal means reading the attention machinery from the
+    /// driver, which is a judgment about a pane's screen — §3 keeps those out of
+    /// the driver — so it is left disclosed and bounded rather than guessed.
     fn idle_pane_on_session(
         &self,
         group: &GroupId,
@@ -43479,7 +43503,7 @@ impl OrchRegistry {
                     && a.idle_since_ms.is_some()
                     && a.pty_id.is_some()
             })
-            .max_by_key(|a| a.started_ms)
+            .max_by_key(|a| (a.started_ms, a.id.clone()))
             .map(|a| a.id.clone())
     }
 

@@ -3179,7 +3179,11 @@ fn a_superseded_worker_pane_is_still_intercepted_and_never_moves_the_drive() {
         .first()
         .cloned()
         .expect("a second red hands back again, into a new pane");
-    assert_ne!(w1, w2, "the driver resumes into a NEW pane, which is the whole premise");
+    assert_ne!(
+        w1, w2,
+        "with no pane to reuse the driver opens one, and the two hand-backs must land in \
+         different panes for the ownership assertions below to have two subjects"
+    );
 
     // Both panes are the drive's; only the second is current.
     assert_eq!(
@@ -4939,11 +4943,25 @@ fn the_fix_brief_names_the_report_that_advances_the_drive() {
 /// is reachable with no legacy at all, since
 /// `spawn_agent(block:, resume_session:)` is permitted and skips inheritance.
 ///
-/// **Both panes are live, idle and typeable in both arms**, and the newer one is
-/// always the wrong-block one — so `max_by_key(started_ms)` prefers it and only
-/// the block filter can reject it. The arms vary exactly whether the RIGHT-block
-/// pane can be typed into, which is what makes the first arm "it refused the
-/// wrong pane" rather than "there was nothing to reuse".
+/// **The two arms carry different halves, and neither is the other's control.**
+/// The wrong-block pane is live, idle and typeable in both; what varies is
+/// whether the RIGHT-block pane is typeable too.
+///
+/// - **Arm 1 (`right_block_typeable == false`)** — the wrong-block pane is the
+///   ONLY candidate `idle_pane_on_session` could return, since the right-block
+///   pane has no `pty_id`. It is refused anyway and the hand-back opens a pane
+///   (`opened == 1`). **This is the arm that carries the red**: the block filter
+///   is the only thing standing between the fix and the wrong persona.
+/// - **Arm 2 (`right_block_typeable == true`)** — both are candidates and the
+///   wrong-block one is NEWER, so `max_by_key(started_ms)` would prefer it; the
+///   right-block pane is reused all the same, and nothing is opened. This is
+///   what stops "refuse everything" from passing arm 1, and it is the only arm
+///   in which the ordering is exercised at all.
+///
+/// Stated this way because the earlier wording claimed both panes were typeable
+/// in both arms and gave recency as the mechanism arm 1 defeats — which is not
+/// what arm 1 does, and a maintainer acting on it could delete the conditional
+/// that creates the red-carrying arm (rev-final round 2 B1).
 #[test]
 fn a_live_idle_pane_on_the_wrong_block_is_not_reused_for_a_handback() {
     for right_block_typeable in [false, true] {
