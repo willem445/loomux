@@ -1361,7 +1361,7 @@ impl DriveEntry {
     /// the arcs into `fix-wait`, so it keeps the property that made the
     /// comparison preferable to a counter in the first place.
     pub fn record_kickback(&mut self, now_ms: u64) {
-        self.fix_kickback_ms = now_ms.max(self.fix_handback_ms);
+        self.fix_kickback_ms = now_ms;
     }
 
     /// Record that this drive has resumed its worker into `agent` — the
