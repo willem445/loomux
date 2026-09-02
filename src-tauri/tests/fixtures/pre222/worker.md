@@ -16,7 +16,9 @@ skip anything in this file.
    (see **Duplicate deliveries**).
 2. A directive, scope decision, or feedback in the kickoff? `note_directive(text)` before you
    act on it (see **Directive ledger**).
-3. Work the brief step by step (**Execute the plan step by step**); `message_orchestrator(text)`
+3. `report("progress", ref, detail_url, "starting <task>")` so the orchestrator knows you're
+   on it.
+4. Work the brief step by step (**Execute the plan step by step**); `message_orchestrator(text)`
    for anything ambiguous rather than guessing.
 
 Everything below is the detail — including the mandatory parts (**Git workflow**, **Definition
