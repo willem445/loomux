@@ -2024,11 +2024,7 @@ impl OrchRegistry {
                                 // different actions. Classified on the shared
                                 // literal `live_cap_refusal` writes, so the
                                 // producer and this reader cannot drift.
-                                let reason = if super::is_live_cap_refusal(&why) {
-                                    reviewdrive::HeldReason::CapRefused
-                                } else {
-                                    reviewdrive::HeldReason::WorkerUnresumable
-                                };
+                                let reason = reviewdrive::HeldReason::WorkerUnresumable;
                                 out.refusal = why.clone();
                                 out.audits.push((
                                     rddrive::audit_action::REFUSED,
