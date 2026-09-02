@@ -5275,14 +5275,21 @@ fn the_reuse_readiness_predicate_is_a_confirmed_delivery_and_an_empty_queue() {
 /// each is asserted by the WORD on its `rd-reuse-declined` row — not merely by
 /// "a pane was opened" — so an implementation that refused for the right count
 /// of panes and the wrong reason fails here.
+///
+/// **Every arm is walked and the whole table is compared ONCE, rather than each
+/// arm asserting as it goes.** A red evidences only the assertion it reached, and
+/// an assert-per-arm loop stops at the first failure — the round that reddened
+/// this test for the first time reached `unconfirmed` and never ran `no-record`
+/// or `queued` at all, so three arms would have been claimed on one arm's
+/// evidence. Collecting first makes one run say what every arm did.
 #[test]
 fn a_pane_that_is_idle_but_not_delivery_ready_is_not_reused_for_a_handback() {
-    for (arm, reason) in [
-        ("ready", ""),
-        ("unconfirmed", "unconfirmed"),
-        ("no-record", "no-record"),
-        ("queued", "queued"),
-    ] {
+    // (arm, reused the existing pane, panes opened, decline reasons, fix brief
+    // typed into the candidate) — filled per arm, compared once at the end.
+    type Row = (&'static str, bool, usize, Vec<String>, bool);
+    let mut observed: Vec<Row> = Vec::new();
+
+    for arm in ["ready", "unconfirmed", "no-record", "queued"] {
         let dir = tempfile::tempdir().unwrap();
         let reg = relaunch_registry(dir.path());
         let repo = Repo::new();
@@ -5331,45 +5338,42 @@ fn a_pane_that_is_idle_but_not_delivery_ready_is_not_reused_for_a_handback() {
         let (_pr, agent) = handed.handbacks.first().cloned().unwrap_or_else(|| panic!("{arm}: the drive hands back"));
         let opened = action_count(&reg, &group, "agent-spawn") - before;
 
-        let declined: Vec<serde_json::Value> = audit_details(&reg, &group, "rd-reuse-declined")
+        let declined: Vec<String> = audit_details(&reg, &group, "rd-reuse-declined")
             .into_iter()
             .filter(|d| d["pane"] == json!(w.id))
+            .map(|d| d["reason"].as_str().unwrap_or("<no reason field>").to_string())
             .collect();
+        let briefed =
+            texts_to(&reg, &group, &w.id).iter().any(|t| t.contains("is back with you at head"));
 
-        if arm == "ready" {
-            assert_eq!(
-                agent, w.id,
-                "the control: a confirmed last delivery with an empty queue IS reused, so \
-                 the three refusing arms are about the predicate and not about a driver \
-                 that stopped reusing anything"
-            );
-            assert_eq!(opened, 0, "…opening nothing, which is #1960's whole point");
-            assert!(declined.is_empty(), "…and declining nothing: {declined:?}");
-            continue;
-        }
-
-        assert_ne!(
-            agent, w.id,
-            "{arm}: the brief was typed into a pane that will not read it — it lands in the \
-             queue, `deliver_prompt` answers Ok, and the fallback-to-spawn never fires"
-        );
-        assert_eq!(opened, 1, "{arm}: so the hand-back opens a pane instead: {handed:?}");
-        assert!(
-            !texts_to(&reg, &group, &w.id).iter().any(|t| t.contains("is back with you at head")),
-            "{arm}: …and no fix brief may be typed into the pane that was refused"
-        );
-        assert_eq!(
-            declined.len(),
-            1,
-            "{arm}: the refusal is audited, because its only other visible effect is a fresh \
-             pane and that is what NO candidate looks like too: {declined:?}"
-        );
-        assert_eq!(
-            declined[0]["reason"],
-            json!(reason),
-            "{arm}: the row must name what the predicate actually read: {declined:?}"
-        );
+        observed.push((arm, agent == w.id, opened, declined, briefed));
     }
+
+    let expected: Vec<Row> = vec![
+        // The control. A confirmed last delivery with an empty queue IS reused,
+        // opening nothing and declining nothing — so the three rows below are
+        // about the predicate and not about a driver that stopped reusing
+        // anything at all.
+        ("ready", true, 0, vec![], true),
+        // The last delivery is on record as not having landed: its text may
+        // still be sitting unsubmitted in that box.
+        ("unconfirmed", false, 1, vec!["unconfirmed".into()], false),
+        // Nothing was ever delivered to this pty, so there is no evidence
+        // either way — "we could not look" is not "there was nothing there".
+        ("no-record", false, 1, vec!["no-record".into()], false),
+        // Something is already waiting to be pasted; a brief admitted now lands
+        // behind it. Queue depth is asked first, so this arm reads `queued`
+        // even though its last delivery is confirmed.
+        ("queued", false, 1, vec!["queued".into()], false),
+    ];
+    assert_eq!(
+        observed, expected,
+        "each row is (arm, reused the existing pane, panes opened, decline reasons, fix brief \
+         typed into it). A row whose `reused` is true under a refusing arm means the brief was \
+         typed into a pane that will not read it — it lands in the queue, `deliver_prompt` \
+         answers Ok, and the fallback-to-spawn never fires. A row with the wrong decline reason \
+         means the driver refused for a fact other than the one it read."
+    );
 }
 
 /// **The two conditions are a CONJUNCTION, and it may not collapse into either
@@ -5392,8 +5396,16 @@ fn a_pane_that_is_idle_but_not_delivery_ready_is_not_reused_for_a_handback() {
 /// is the reason this is not just "a pane was opened": a non-idle pane never
 /// reaches the readiness test at all, so a decline row for it would mean the two
 /// conditions had been folded into one.
+///
+/// Both arms are walked before anything is compared, for the reason
+/// `a_pane_that_is_idle_but_not_delivery_ready_is_not_reused_for_a_handback`
+/// gives: an assert-per-arm loop evidences only the arm it stopped at.
 #[test]
 fn a_delivery_ready_pane_that_is_not_idle_is_not_reused_for_a_handback() {
+    // (idle, reused the existing pane, panes opened, decline rows naming it)
+    type Row = (bool, bool, usize, usize);
+    let mut observed: Vec<Row> = Vec::new();
+
     for idle in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let reg = relaunch_registry(dir.path());
@@ -5429,26 +5441,34 @@ fn a_delivery_ready_pane_that_is_not_idle_is_not_reused_for_a_handback() {
         reg.rd_drive_group_with(&group, &gh, 30_000);
         let before = action_count(&reg, &group, "agent-spawn");
         let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
-        let (_pr, agent) = handed.handbacks.first().cloned().expect("the drive hands back");
+        let (_pr, agent) = handed
+            .handbacks
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("idle={idle}: the drive hands back"));
         let opened = action_count(&reg, &group, "agent-spawn") - before;
+        let declined = audit_details(&reg, &group, "rd-reuse-declined")
+            .iter()
+            .filter(|d| d["pane"] == json!(w.id))
+            .count();
 
-        if idle {
-            assert_eq!(agent, w.id, "the control: idle AND ready is the pane that is reused");
-            assert_eq!(opened, 0);
-            continue;
-        }
-        assert_ne!(
-            agent, w.id,
-            "a delivery-ready pane that is MID-TURN must not be reused — the brief would land \
-             behind whatever that agent is doing"
-        );
-        assert_eq!(opened, 1, "…so the hand-back opens one: {handed:?}");
-        assert!(
-            audit_details(&reg, &group, "rd-reuse-declined")
-                .iter()
-                .all(|d| d["pane"] != json!(w.id)),
-            "…and it is the IDLE filter that refused it, not the readiness test: a pane that \
-             is not idle is never a readiness candidate at all"
-        );
+        observed.push((idle, agent == w.id, opened, declined));
     }
+
+    assert_eq!(
+        observed,
+        vec![
+            // The control: idle AND ready is the pane that gets reused.
+            (true, true, 0, 0),
+            // Delivery-ready but MID-TURN. Not reused — the brief would land
+            // behind whatever that agent is doing — and the ZERO decline rows
+            // say WHICH half refused it: a pane that is not idle is never a
+            // readiness candidate at all, so a row here would mean the two
+            // conditions had been folded into one.
+            (false, false, 1, 0),
+        ],
+        "each row is (idle, reused the existing pane, panes opened, `rd-reuse-declined` rows \
+         naming it). Both panes are delivery-ready, so an implementation that dropped the idle \
+         conjunct reuses the mid-turn one and the second row's `reused` goes true."
+    );
 }
