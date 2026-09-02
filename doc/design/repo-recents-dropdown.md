@@ -39,6 +39,13 @@ Two consequences of the reuse, both deliberate:
   showing, the recents select when the dropdown branch hides it, because
   `focus()` on a hidden element lands nowhere.
 
+The E2E helpers follow the same contract (`e2e/helpers.ts` `fillRepoField`):
+their structural selectors are declared coupled to `src/launcher.ts`'s DOM
+shape, and `fill()` on the picker's hidden input waits until the test times out
+— how the first run of this change reddened five soak/workflow specs. The
+helper picks `custom…` when the input is not showing, exactly like a human
+typing an unknown path does.
+
 ## What was widened on ModelPicker
 
 Additive, and forced by the repo host's needs; the workflow pane's usage is
