@@ -198,3 +198,46 @@ test("a pane whose marker is not on the picker gains none from a branch flip", (
   pickCustom(p);
   assert.equal(markedHalf(p), null);
 });
+
+// --- #2108 item 2: setOptions is a branch-flip site too ---------------------
+
+test("setOptions re-homes the marker when a rebuild flips to the custom branch", () => {
+  // Recents changed underneath the control (a launch recorded a new
+  // directory): the seeded value is no longer on the list and the fallback is
+  // not a recent either, so the rebuild opens the custom branch.
+  const p = makePicker(["C:\\a", "C:\\b"], "C:\\a");
+  assert.equal(markedHalf(p), "select");
+  p.setOptions(["C:\\x", "C:\\y"], "C:\\new");
+  assert.equal(p.input.hidden, false);
+  assert.equal(markedHalf(p), "input");
+});
+
+test("setOptions re-homes the marker when a rebuild flips to the dropdown branch", () => {
+  // The custom branch's own value becoming a recent flips the rebuild to the
+  // dropdown branch, hiding the input under the marker.
+  const p = makePicker(["C:\\a", "C:\\b"], "C:\\typed-path");
+  assert.equal(markedHalf(p), "input");
+  p.setOptions(["C:\\typed-path", "C:\\a"], "C:\\a");
+  assert.equal(p.input.hidden, true);
+  assert.equal(markedHalf(p), "select");
+});
+
+// --- #2108 item 3: stale custom text ----------------------------------------
+
+test("a value set that takes the dropdown branch clears the stale custom text", () => {
+  const p = makePicker(["C:\\a", "C:\\b"], "C:\\not-a-recent");
+  (p.input as unknown as ShimElement).value = "C:\\half-typed";
+  p.value = "C:\\a";
+  assert.equal(p.input.value, "", "the input is hidden by this branch; its old text must not survive");
+  assert.equal(p.value, "C:\\a");
+  // Flipping back to custom… shows an empty box, not the stale path.
+  pickCustom(p);
+  assert.equal(p.input.value, "");
+});
+
+test("a value set that takes the custom branch still carries the value", () => {
+  const p = makePicker(["C:\\a", "C:\\b"], "C:\\a");
+  p.value = "C:\\elsewhere";
+  assert.equal(p.input.value, "C:\\elsewhere");
+  assert.equal(p.value, "C:\\elsewhere");
+});
