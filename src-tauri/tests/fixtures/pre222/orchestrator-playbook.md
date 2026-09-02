@@ -322,22 +322,6 @@ not start it: filing it is not doing it, exactly as with a deferred finding, and
 human is what gives it a future. An observation that never became an issue is one nobody will ever
 act on.
 
-**Write it in two layers, like every other thing you post.** Above the fold, for the human who
-has to decide whether this is worth doing: the problem, the shape of a fix, what "done" looks
-like. Below it, collapsed, the measurements that made you file it — the sizes you counted, the
-runs you read, the greps and their positive controls:
-
-    <!-- agent-layer -->
-    <details>
-    <summary>Agent context — evidence, receipts, instruments</summary>
-
-    ...the measurements...
-    </details>
-
-The blank line after `</summary>` is load-bearing — without it a table inside the fold renders
-as literal pipes. An issue whose acceptance criteria are below the fold is filed wrong: what a
-worker must satisfy is the human layer's job.
-
 **Polling for new signals.** Newly labeled issues are a queue you must watch, so fold this into
 the **Monitoring open PRs** rhythm — every natural wake-up, and the slow periodic cadence while
 idle:
@@ -642,29 +626,6 @@ standing class authorization IS the human's own authorized action exercised thro
 audited as such. Absent one of those, you never merge or publish.)*
 
 ## Squash closes issues
-
-**Cut the squash body at `<!-- agent-layer -->`.** Agent-authored bodies carry a human layer
-above that marker line and a collapsed agent layer below it. `git log` has no fold, so an
-agent layer left in a commit message is raw HTML plus every receipt it wrapped — worse than
-before it was collapsed. When you take the squash body from the PR body, take everything
-strictly above the marker:
-
-    gh pr view <N> --json body --jq .body > .scratch/body.md
-    sed -n '/^<!-- agent-layer -->$/q;p' .scratch/body.md > .scratch/squash.md
-    # the cut must not drop the issue link: it belongs on the last line of the
-    # human layer, and a body that put it below the marker cuts it away silently
-    diff <(LC_ALL=C.UTF-8 grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+' .scratch/body.md) \
-         <(LC_ALL=C.UTF-8 grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?|part of|mitigates)[ :]*#[0-9]+' .scratch/squash.md)
-    # then merge with --body-file .scratch/squash.md
-
-It is an exact-line match on purpose — no HTML parsing, no heuristic, and a legitimate
-`<details>` in the human layer is untouched by it. A body with no marker cuts to itself, so
-the failure mode is a verbose commit message, never a truncated one.
-
-**The keyword sweep still runs on the FULL body.** GitHub's closing scan reads the whole PR
-body regardless of what the commit message says, so a `close`/`fix`/`resolve` next to `#N`
-inside the agent layer closes that issue even when the squash body never carried it. Sweep
-`.scratch/body.md`, not `.scratch/squash.md`.
 
 Before you squash-merge a PR that links `Part of #N` / `Mitigates #N`, read the message
 GitHub is about to commit — the default squash body **aggregates every commit message on the
