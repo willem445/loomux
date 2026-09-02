@@ -258,9 +258,15 @@ struct RdOut {
     lanes_opened: Vec<(String, String)>,
     handback: Option<String>,
     /// `(agent, text)` for a kick-back this tick owes the WORKER's own pane
-    /// (#1959). Carried out of the step like [`RdOut::notices`] and for the same
-    /// reason: a delivery is an enqueue and an enqueue re-enters registry locks,
-    /// so it must happen with `rd_state_lock` released.
+    /// (#1959). Carried out of the step like [`RdOut::notices`], and for the
+    /// same reason those are: it is the PRODUCT of a step that is over, not a
+    /// part of one, so there is nothing for the state lock to protect while it
+    /// is sent.
+    ///
+    /// Not because a delivery under `rd_state_lock` would deadlock — it would
+    /// not, and `rd_reuse_pane` performs one there deliberately. See
+    /// [`OrchRegistry::rd_drive_group_with`] for the property that makes both
+    /// safe, and why "span the spawn" and #467/#468 do not actually conflict.
     kickback: Option<(String, String)>,
     audits: Vec<(&'static str, Value)>,
     notices: Vec<String>,
@@ -630,16 +636,30 @@ impl OrchRegistry {
     /// lock across the read-modify-write, perform the spawns and resumes, emit
     /// the audit events, and deliver the notices.
     ///
-    /// **The lock spans the spawn and never a delivery**, which is §2.4's
-    /// prescription with its one ambiguity resolved rather than ignored. §2.4
-    /// wants the load-decide-store to span the spawn, because a `drive_review`
-    /// landing inside that window would read the pre-spawn file and write it
-    /// back, erasing the entry; #467/#468 want no registry lock held across a
-    /// notice, because a delivery enqueues and an enqueue re-enters registry
-    /// locks. Both hold here, on a property of the LOCK rather than a count of
-    /// its callers: no site that takes `rd_state_lock` is reachable from a pane
-    /// delivery, so a spawn's own kickoff cannot cycle back onto it — and the
-    /// orchestrator notices this produces are delivered below, outside it.
+    /// **The lock spans the spawn, and a DELEGATE delivery; never a notice to
+    /// the orchestrator.** That is §2.4's prescription with its one ambiguity
+    /// resolved rather than ignored. §2.4 wants the load-decide-store to span
+    /// the spawn, because a `drive_review` landing inside that window would read
+    /// the pre-spawn file and write it back, erasing the entry; #467/#468 want
+    /// no registry lock held across a delivery, because a delivery enqueues and
+    /// an enqueue re-enters registry locks. Both hold here, on a property of the
+    /// LOCK rather than a count of its callers: **no site that takes
+    /// `rd_state_lock` is reachable from a pane delivery**, so a spawn's own
+    /// kickoff cannot cycle back onto it.
+    ///
+    /// Since #1960 a hand-back or lane brief may be typed into a live idle pane
+    /// instead of spawning one ([`rd_reuse_pane`](Self::rd_reuse_pane)), so the
+    /// lock now spans a `deliver_prompt` DIRECTLY rather than only one a spawn
+    /// performs. That is the same delivery under the same property — the design
+    /// note already anticipated it ("a spawn delivers its own kickoff, so 'span
+    /// the spawn' reads as 'span a delivery'") — and it introduces no new lock
+    /// ORDER either: `spawn_agent_bound` already takes `agents` under this lock,
+    /// which is the only lock `deliver_prompt` needs before its own queue.
+    ///
+    /// What stays OUTSIDE is unchanged: the orchestrator notices this produces
+    /// are delivered below, and so is #1959's kick-back into a worker's pane —
+    /// not because either is unsafe under the lock, but because both are
+    /// products of a completed step rather than part of one.
     ///
     /// The sites today are the tick (here and at the prune), the restart
     /// reconcile, the three MCP tools of §5.1, and the two interception helpers

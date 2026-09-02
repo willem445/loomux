@@ -426,6 +426,16 @@ hold, on one fact about this lock in particular: **no site that takes
 cannot cycle back onto it. The orchestrator notices §6 produces are a different
 matter and are delivered outside it.
 
+**#1960 makes that reading literal, and it needs no new argument.** A hand-back
+or a lane brief may now be typed into a live idle pane rather than spawning one
+(`rd_reuse_pane`), so the lock spans a `deliver_prompt` *directly* and not only
+one a spawn performs. It is the same delivery under the same property, and it
+adds no lock ORDER either — `spawn_agent_bound` already takes `agents` under
+this lock, which is the only registry lock a delivery needs ahead of its own
+queue. What stays outside is unchanged: §6's notices, and §2.1's kick-back into
+a worker's own pane, both because they are products of a completed step rather
+than parts of one.
+
 The argument is stated as a property of the lock rather than as a count of its
 callers, because the count moves. The sites today are the tick (twice), the
 restart reconcile, the three tools of §5.1, and the two interception helpers
