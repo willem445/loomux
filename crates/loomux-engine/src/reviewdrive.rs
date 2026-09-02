@@ -1347,8 +1347,9 @@ impl DriveEntry {
     /// `decide`'s empty-head guard describes, where every tick re-armed the
     /// clock meant to catch it.
     pub fn note_cap_starvation(&mut self, now_ms: u64) -> bool {
-        // SCRATCH #2109 M5: re-stamp on every refusal, which is what makes
-        // `CAP_HOLD_MS` unreachable.
+        if self.cap_starved_since_ms.is_some() {
+            return false;
+        }
         self.cap_starved_since_ms = Some(now_ms);
         true
     }
@@ -2261,17 +2262,14 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // `drive-stalled` — four hours, on a notice that names no lane.
                 // A lane asked about this head and silent past its timeout is
                 // stalled whatever the body has done since.
-                // SCRATCH #2109 M6: the pre-fix keying — the stall clock is
-                // read only of a lane still open for this exact (head, digest).
-                Some(rec) if lane_open_for(rec, &facts.head, digest) => {
-                    if facts.now_ms.saturating_sub(rec.spawned_ms)
-                        >= minutes_ms(limits.lane_timeout_minutes)
-                    {
-                        DriveStep::held(HeldReason::LaneStalled)
-                    } else {
-                        DriveStep::Wait
-                    }
+                Some(rec)
+                    if rec.briefed_head == facts.head
+                        && facts.now_ms.saturating_sub(rec.spawned_ms)
+                            >= minutes_ms(limits.lane_timeout_minutes) =>
+                {
+                    DriveStep::held(HeldReason::LaneStalled)
                 }
+                Some(rec) if lane_open_for(rec, &facts.head, digest) => DriveStep::Wait,
                 // **The cap's starvation is reported before another spawn is
                 // proposed** (#2109). The tick stamps
                 // `cap_starved_since_ms` on the first lane spawn the
@@ -2285,8 +2283,9 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // 37 identical `rd-refused` rows, `lanes: []`, no notice, three
                 // hours. §2.2's exits are the only thing an orchestrator reads,
                 // so a condition that needs an orchestrator has to become one.
-                // SCRATCH #2109 M4: the pre-fix arm — the starvation is never
-                // reported, the tick just proposes the spawn again.
+                _ if entry.cap_starved_for(facts.now_ms).is_some_and(|d| d >= CAP_HOLD_MS) => {
+                    DriveStep::held(HeldReason::CapFull)
+                }
                 _ => DriveStep::OpenLane { index: k },
             }
         }
