@@ -332,8 +332,8 @@ compiles.
   #682). A red evidences only the assertion it REACHED and MOVED: a panic before it,
   a split test's already-green half, or a companion that also passed broken prove
   nothing — split the test, or say which half moved (#710, #712, #727). A mutation a
-  *reviewer* names is still unrun; run it before quoting it into the body, which
-  becomes the squash message (#868). A suite green ACROSS a redesign is a
+  *reviewer* names is still unrun; run it before quoting it into the body, which the
+  reviewer reads and the gate digests (#868). A suite green ACROSS a redesign is a
   control, not coverage — its fixtures were written against the old shape's
   failure modes. List what the NEW predicate reads and check some fixture varies
   each; a value every fixture happens to share is an unpinned axis. Signature:
@@ -653,6 +653,13 @@ narrow their ask back down to the original ticket on your own judgment.
 - User-visible behavior changes must update the matching user-docs page under
   `docs/` (the README is a pitch, not a manual — only touch it when the pitch
   itself changes); substantial designs get a `doc/design/*.md` note.
+- **"The PR body" in every evidence rule below means the body's AGENT LAYER** — the
+  collapsed `<details>` block opened by `<!-- agent-layer -->` +
+  `<summary>Agent context — evidence, receipts, instruments</summary>`, which is where
+  agent-authored bodies, reviews and issues put receipts, run ids, mutation tables and
+  measurements while the human layer above the fold stays short (#1968). Position only:
+  every rule below applies to it in full, and GitHub's closing-keyword scan still reads
+  the whole body, fold included.
 - **Every number in a PR body is measured at the base AND at the head** — never
   derived by arithmetic, remembered, or carried from a mid-branch run. Counts,
   deltas, diffstats and run ids all go stale on the next commit. Read both
@@ -774,7 +781,7 @@ narrow their ask back down to the original ticket on your own judgment.
   operands are both zero-byte files (#1361 review round 1; #1471 N5 for the multi-`-e` form).
 - **Correcting a false claim is a multi-surface edit.** A design rationale here
   lives on several permanent surfaces at once — the code comment, the
-  `doc/design/*.md` note, the PR body (which becomes the squash message), and
+  `doc/design/*.md` note, the PR body (whose human layer becomes the squash message), and
   the `docs/` page when the claim is user-visible (the bullet above mandates
   it) — so a claim deleted from one survives on the others. Verify the purge by
   grepping the *entity* the claim names, never the phrasing you rewrote.
@@ -868,7 +875,8 @@ narrow their ask back down to the original ticket on your own judgment.
   at a space is harmless (`` `delivered_mask_lines(pty,` `` / `` `session)` ``), a
   break inside a token is the defect (`src-tauri/src/orchestration/ mod.rs`). It is
   outside the trigger list above: the subject is a SPAN, not a table, list or fence,
-  and the PR body counts because the squash makes it permanent. Signature: the fix
+  and the PR body counts because a squash makes its human layer permanent and the
+  agent layer renders on GitHub either way. Signature: the fix
   for one instance ships another one surface over (#1703 B2 in the design note, then
   R1 in the body it re-posted); the repo-wide backlog and the scanner are #1716.
   **Two ways that endpoint lies about its own output.** Pass the file as `-F text=@file.md`:

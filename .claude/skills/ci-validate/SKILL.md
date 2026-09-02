@@ -288,6 +288,38 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    gh pr ready <pr>
    ```
 
+## Where in the body all of this goes
+
+Everything this skill tells you to put "in the body" goes in the body's **agent
+layer** — the collapsed block that opens with these three lines and is the last
+block in the body:
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...everything below...
+</details>
+```
+
+Run ids and the SHAs they belong to, red-before-green commands and their failure
+lines, mutation tables, diffstats, blob hashes, sweep receipts and their positive
+controls, per-section SHA dating, the residual — all of it, below the fold. The
+blank line after `</summary>` is load-bearing: without it a table inside the fold
+renders as literal pipes on github.com.
+
+**None of the rigour changes.** Every check in this skill still runs, every number
+is still measured at base and head, every citation is still re-derived after the
+push it describes, and a receipt is still quoted with the command that produced it.
+The fold is a position, not a discount — the human layer above it is a summary of
+what happened, never a substitute for a receipt.
+
+Two consequences worth stating once. A **squash message is cut at the marker line**
+(the orchestrator's playbook carries the `sed`), so a body with no marker puts the
+whole agent layer into `git log`, where nothing folds. And GitHub's **closing-keyword
+scan reads the whole body**, fold included — sweep the posted body, not the cut.
+
 ## Definition of validated
 
 The PR's checks are green on all three platforms **for the head you are

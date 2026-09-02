@@ -48,8 +48,8 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    the behaviour aside on a throwaway scratch branch — for Rust that is a scratch draft PR read
    through CI, since local `cargo` is banned. The `ci-validate` skill carries the procedure and
    the trap that costs a round (to redden an *integration* test, neuter the wiring, not the lib
-   function). Paste the command and the failure line into the PR body, next to the same
-   command passing on your branch. `rev-lead` is going to
+   function). Paste the command and the failure line into the PR body's agent layer (below),
+   next to the same command passing on your branch. `rev-lead` is going to
    try to break your pins anyway; a pin you have already seen go red is one you don't lose that
    argument over. If a new test can't be made to fail, it isn't testing your change — find out
    why before you ship it.
@@ -75,7 +75,42 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    findings rather than reading diffs — the cheapest place to catch a defect is here.
 8. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 6 — update
    the description with what changed, why, and how it was validated (the CI run, on
-   the platform matrix). Then report.
+   the platform matrix), in the two-layer shape below. Then report.
+
+## Two layers — the human reads the first one
+
+Every body you post — a PR, a review reply, an issue — is a short **human layer**
+followed by a collapsed **agent layer**.
+
+Above the fold: what changed and why, in a paragraph; what to look at or try; how
+each review finding was dispositioned; `Closes #N`. Roughly 15 lines. Below the
+fold, everything the evidence discipline owes — red-before-green commands and the
+failure lines they printed, run ids and the SHA each belongs to, blob hashes,
+base-and-head figures, mutation tables with their `tsc` column, sweep receipts and
+their positive controls, the residual. **Rigour is unchanged**: every rule in
+`CLAUDE.md` about numbers, sweeps, citations and mutation tables applies to the
+agent layer in full. Only its position moves — nothing gets shorter by being folded.
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the evidence...
+</details>
+```
+
+- The blank line after `</summary>` is load-bearing — without it a table inside the
+  fold renders as literal pipes.
+- Exactly one whole LINE of the body is the marker and one is the `<summary>`; the
+  agent layer is the last block. Naming either inside a code span changes nothing —
+  the squash cut matches a whole line.
+- The marker is where a squash message is cut, so omitting it puts the whole
+  evidence layer into `git log`, which cannot fold anything.
+- The closing-keyword scan reads the WHOLE body, fold included.
+- A decision the human has to make, a deviation from the brief, a residual you are
+  shipping, an open question: those stay above the fold however long they run. The
+  rule bounds shape, not size.
 
 ## Hard constraints — non-negotiable, and check them before you code
 

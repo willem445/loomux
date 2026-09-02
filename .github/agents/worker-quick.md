@@ -68,8 +68,34 @@ and costs the human a debugging session later.
    behaviour. If it needs a *new* design note, that is a sign the task was not
    quick: escalate.
 5. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 3, with the
-   description saying what changed and how it was validated. Then `report("done",
-   …)` with the URL. **You never merge** — the human gates every merge.
+   description saying what changed and how it was validated, in the two-layer shape
+   below. Then `report("done", …)` with the URL. **You never merge** — the human
+   gates every merge.
+
+## Two layers — the human reads the first one
+
+The PR description is a short **human layer** with the evidence collapsed under it.
+Above the fold: what changed and why, what to look at, `Closes #N` — a handful of
+lines. Below it, the red-before-green command and its failure line, the passing run,
+the CI matrix, every number you measured. **Rigour is unchanged** — the evidence
+still has to be there, and every `CLAUDE.md` rule about numbers and citations still
+governs it. Only its position moves.
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the evidence...
+</details>
+```
+
+The blank line after `</summary>` is load-bearing (without it a table inside the fold
+renders as literal pipes); exactly one whole LINE of the body is the marker and one is
+the `<summary>`, and the agent layer is the last block; the marker is where a squash
+message is cut; and the
+closing-keyword scan still reads the whole body, fold included. Anything the human
+has to decide — a deviation, a residual, an open question — stays above the fold.
 
 ## Hard constraints — they apply to small diffs exactly as much as to large ones
 
