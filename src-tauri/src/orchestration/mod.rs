@@ -13292,15 +13292,17 @@ pub struct OrchRegistry {
     /// would make the review driver's spawn — which this one is held across —
     /// block a `queue_merge` that has nothing to do with it.
     ///
-    /// **Held across a spawn, never across a notice.** §2.4 wants the
-    /// load-decide-store to span the spawn, because a `drive_review` landing
-    /// inside that window would read the pre-spawn file and write it back,
-    /// erasing the entry; #467/#468 want no registry lock held across a
-    /// delivery. Both hold, on a property of the lock rather than a count of
-    /// its callers: no site that takes it is reachable from a pane delivery, so
-    /// a spawn's own kickoff cannot cycle back onto it. The site list, and why
-    /// the two interception helpers do not break it, is on
-    /// [`Registry::rd_drive_group_with`].
+    /// **Held across a spawn and across a delegate delivery; never across a
+    /// notice to the orchestrator.** §2.4 wants the load-decide-store to span
+    /// the spawn, because a `drive_review` landing inside that window would read
+    /// the pre-spawn file and write it back, erasing the entry; #467/#468 want
+    /// no registry lock held across a delivery. Both hold, on a property of the
+    /// lock rather than a count of its callers: no site that takes it is
+    /// reachable from a pane delivery, so a spawn's own kickoff cannot cycle
+    /// back onto it — and since #1960 neither can the `deliver_prompt` a
+    /// hand-back makes directly when it resumes into a live idle pane instead of
+    /// opening one. The site list, and why the two interception helpers do not
+    /// break it, is on [`Registry::rd_drive_group_with`].
     rd_state_lock: Arc<TrackedMutex<()>>,
     /// Earliest wall-clock at which the review driver may service each group
     /// again (§2.4). Absent = now.
