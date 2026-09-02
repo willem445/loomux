@@ -477,9 +477,12 @@ separately, because collapsing them is a live defect in either direction:
 
 - **Ownership** is what §7 keys interception on, and it is *every* pane the drive
   spawned or resumed for as long as the drive is live — not merely the latest.
-  The driver resumes the worker into a NEW pane on every hand-back and re-briefs
-  a lane into a new pane on every round, and the pane it replaced keeps running:
-  same session, same worktree, same PR. Before this the record held one slot per
+  A hand-back or a re-brief that cannot reuse the session's own live idle pane
+  opens a NEW one, and the pane it replaced keeps running: same session, same
+  worktree, same PR. (Before #1960 that was *every* resume, which is what made
+  supersession the normal case rather than the fallback it is now; reuse changed
+  how often a pane is superseded, never what is owed to one that is.)
+  Before this the record held one slot per
   side (`worker_agent`, and `LaneRecord::agent`, which `open_lane` overwrote by
   `retain`-then-push), so the second hand-back evicted the first pane's id
   outright and that pane's `report` reached the orchestrator as if nobody owned
@@ -614,6 +617,15 @@ this note first.
    that pane over on the first hand-back and never opens the second, so the cap
    cost of a round is zero rather than one to be reclaimed, and this item stays
    the closed sentence it is. See `rd_reuse_pane`.
+   **A pane is reused only if it is running the block the resume resolved**, and
+   that condition is not redundant: a pane can be alive, idle, typeable and on
+   the WRONG block, because the pre-#1961 driver minted exactly that — a
+   default-block pane on a non-default session, which where the two blocks share
+   a CLI did not die on `Invalid session ID` and is idle there still.
+   `spawn_agent(block:, resume_session:)` mints the same thing with no legacy
+   required. Reusing one would be #1961's own defect arriving through #1960's
+   mechanism, so the block is resolved FIRST and the reuse filtered on it; a
+   session whose only live idle pane is on the wrong block opens a new one.
 6. **Decide a disposition.** INVARIANT 3 is the orchestrator's, and the
    gate-satisfied notice says so in as many words (§6).
    **PROMISE, and structurally unenforceable — say so rather than pretend.**
@@ -1441,10 +1453,10 @@ Three properties bound that narrowing, and all three are load-bearing:
   never keyed on a `ref` string a delegate typed, because a delegate that could
   choose whether its report reaches the orchestrator by naming a PR number is a
   delegate that can route around the orchestrator.
-- **The key is EVERY pane the drive opened, not the latest one** (#1871 B2). The
-  driver resumes the worker into a new pane on every hand-back and re-briefs a
-  lane into a new pane on every round; the pane it replaced keeps running, on the
-  same session and the same PR. While the record held one slot per side, the
+- **The key is EVERY pane the drive owns, not the latest one** (#1871 B2). A
+  hand-back or re-brief that cannot reuse the session's own live idle pane opens
+  a new one (§3.1 item 5), and the pane it replaced keeps running, on the same
+  session and the same PR. While the record held one slot per side, the
   second hand-back evicted the first pane's id and that pane's `report` then
   reached the orchestrator as if undriven — measured on PR #1870, where `w-1715`
   was consumed correctly until `w-1716` replaced it and both of `w-1715`'s

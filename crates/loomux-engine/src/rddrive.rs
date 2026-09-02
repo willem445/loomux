@@ -819,7 +819,16 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
             " {}.",
             crate::notify::sanitize_pane_text(
                 f.refusal.trim_end_matches('.'),
-                400,
+                // **Sized to the longest refusal there is, the cap guardrail's**
+                // (rev-final premortem 1). Its tail is the live-delegate roster
+                // — one `w-1737 (worker, idle), ` entry per live delegate — and
+                // this notice's whole remedy is "kill an idle one", so a roster
+                // cut mid-entry hands the orchestrator a truncated list of the
+                // very panes it is told to choose from. The population is
+                // bounded: `MAX_AGENTS_CEILING` is 12, so twelve entries at a
+                // generous 40 characters is 480 plus a ~120-character prefix.
+                // 900 clears that with room and is still a bound.
+                900,
                 crate::notify::Lines::Collapse,
             )
         )

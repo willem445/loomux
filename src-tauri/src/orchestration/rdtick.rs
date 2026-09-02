@@ -1143,7 +1143,7 @@ impl OrchRegistry {
             this.rd_spawn(group, Role::Reviewer, Some(block.to_string()), None, &text)
         };
         let (agent, session_id) = match prior {
-            Some(session) => match self.rd_reuse_pane(group, &session, &text) {
+            Some(session) => match self.rd_reuse_pane(group, &session, block, &text) {
                 Some(a) => (a, session),
                 None => {
                     let sp = self
@@ -1168,8 +1168,12 @@ impl OrchRegistry {
     }
 
     /// **Reuse before spawn** (#1960): resume `session` into the live idle pane
-    /// already running it, by typing the brief into that pane, and answer which
-    /// pane took it. `None` = there is none, so the caller opens one.
+    /// already running it **under `block`**, by typing the brief into that pane,
+    /// and answer which pane took it. `None` = there is none, so the caller
+    /// opens one — which includes the case where the only live idle pane on this
+    /// session is running the WRONG block, and reusing it would be #1961 one arm
+    /// over. `idle_pane_on_session` carries that argument and the input that
+    /// produces such a pane.
     ///
     /// # Why this rather than releasing what a new pane supersedes
     ///
@@ -1198,14 +1202,24 @@ impl OrchRegistry {
     /// hand-back: `deliver_prompt` can refuse for reasons that say nothing
     /// about the drive (a pane that died between the lookup and the write),
     /// and the spawn is the path that already existed.
-    fn rd_reuse_pane(&self, group: &GroupId, session: &str, text: &str) -> Option<String> {
-        let agent = self.idle_pane_on_session(group, session)?;
+    fn rd_reuse_pane(
+        &self,
+        group: &GroupId,
+        session: &str,
+        block: &str,
+        text: &str,
+    ) -> Option<String> {
+        let agent = self.idle_pane_on_session(group, session, block)?;
         self.deliver_prompt(&agent, text, brand::AUDIT_ACTOR, Delivery::MidSession).ok()?;
         Some(agent)
     }
 
-    /// Whether the pane this drive resumed its worker into is **dead**, and
-    /// what it died saying (#1961).
+    /// Whether the pane this drive's worker is running in is **dead**, and what
+    /// it went out saying (#1961).
+    ///
+    /// Not "the pane it resumed the worker into": since #1960 that pane may be
+    /// one the drive TOOK OVER rather than opened, and the clause this returns
+    /// lands in the orchestrator's own notice.
     ///
     /// §2.1's `fix-wait` row waits for a push or a `report`, and neither ever
     /// arrives from a pane that exited on boot: the measured incident had a
@@ -1225,16 +1239,29 @@ impl OrchRegistry {
         if a.status != AgentStatus::Dead {
             return None;
         }
+        // **What the tick OBSERVED, not a story about how the pane got there**
+        // (rev-final premortem 2). "The pane it resumed the worker into" is
+        // false whenever the drive REUSED a pane the orchestrator opened
+        // (#1960) — and that composition is reachable on the driver's own
+        // advice: a `cap-refused` notice says to kill an idle delegate, the
+        // reused pane is idle and on that list, and killing it lands here. The
+        // clause names the pane and, when orrerix knows who ended it, says so,
+        // so an orchestrator that has just killed a pane reads a line matching
+        // what it did rather than a resume that appears to have died.
         let tail = a.last_exit_tail.as_deref().unwrap_or("").trim().to_string();
+        let how = match a.killed_by {
+            Some(who) => format!(" (ended by {})", who.as_str()),
+            None => String::new(),
+        };
         Some(if tail.is_empty() {
             format!(
-                "the pane it resumed the worker into ({agent_id}) exited before reporting, \
-                 with no output"
+                "the pane its worker was running in ({agent_id}) is gone{how} with nothing \
+                 reported, so there is no longer anything on this session to hand the fix to"
             )
         } else {
             format!(
-                "the pane it resumed the worker into ({agent_id}) exited before reporting; \
-                 last output: {}",
+                "the pane its worker was running in ({agent_id}) is gone{how} with nothing \
+                 reported; last output: {}",
                 tail_snippet(&tail, 200)
             )
         })
@@ -1299,17 +1326,31 @@ impl OrchRegistry {
         if session.is_empty() {
             return Err("this drive has no recorded worker session".into());
         }
-        // Reuse before spawn (#1960). Asked BEFORE the block is resolved: a
-        // session with a live idle pane is already running under the right
-        // block by construction, and refusing that hand-back because the
-        // roster no longer declares that block would be a refusal with a live,
-        // correct, typeable pane sitting in front of it.
-        let agent = match self.rd_reuse_pane(group, &session, &text) {
+        // **The block is resolved FIRST, and the reuse is filtered on it**
+        // (#1960, corrected by rev-final B3). The first version asked for a pane
+        // before resolving the block, on the premise that a session with a live
+        // idle pane is already running under the right one "by construction". It
+        // is not — the pre-#1961 driver minted exactly that pane, and where two
+        // blocks share a CLI it is still alive and idle today. See
+        // `idle_pane_on_session`.
+        //
+        // A pre-#222 roster row records a role and no block, and its identity IS
+        // that class's default block — resolved here rather than left as `None`,
+        // so the reuse filter has a value to compare AND
+        // [`rd_resume_cwd`](Self::rd_resume_cwd) reads the CLI off the session's
+        // own identity instead of falling back to the last-touched row
+        // (rev-final N3). `None` survives only when the roster declares no
+        // worker block at all, which `spawn_agent_bound` refuses with the
+        // sentence that knows why.
+        let block = self.rd_resume_block(group, &session)?.or_else(|| {
+            self.group(group)
+                .and_then(|g| g.guardrails.block_for(Role::Worker).map(|b| b.id.clone()))
+        });
+        let reused =
+            block.as_deref().and_then(|b| self.rd_reuse_pane(group, &session, b, &text));
+        let agent = match reused {
             Some(a) => a,
-            None => {
-                let block = self.rd_resume_block(group, &session)?;
-                self.rd_spawn(group, Role::Worker, block, Some(session), &text)?.id
-            }
+            None => self.rd_spawn(group, Role::Worker, block, Some(session), &text)?.id,
         };
         // Through the method, never a field write: the pane this supersedes is
         // still the drive's and still live (#1871 B2). Idempotent when the pane

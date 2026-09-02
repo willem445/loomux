@@ -766,9 +766,11 @@ pub struct LaneRecord {
     /// pane, which is the one thing the drive exists to absorb.
     ///
     /// Superseded is not dead: `rd_open_lane` resumes the lane's SESSION, and
-    /// orrerix mints a new pane id for the resume while the old pane keeps
-    /// running until something closes it. Both panes are this drive's, for as
-    /// long as the drive is live.
+    /// where it cannot type the brief into that session's own live idle pane
+    /// (#1960) orrerix mints a new pane id for the resume while the old pane
+    /// keeps running until something closes it. Both panes are this drive's, for
+    /// as long as the drive is live. Reuse changed how OFTEN a lane pane is
+    /// superseded; it changed nothing about what this field owes one that is.
     #[serde(default)]
     pub prior_agents: Vec<String>,
     /// The last verdict seen for this lane — a **record of what was read**,

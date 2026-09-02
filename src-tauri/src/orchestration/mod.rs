@@ -43432,7 +43432,7 @@ impl OrchRegistry {
     /// (#1960) — what the review driver resumes INTO instead of opening a
     /// second pane on the same conversation.
     ///
-    /// Three conditions, each load-bearing:
+    /// Four conditions, each load-bearing:
     ///
     /// - **not `Dead`**, or the "reuse" is a delivery into a pane that is gone;
     /// - **idle** (`idle_since_ms.is_some()`, the same signal the idle reaper
@@ -43441,12 +43441,33 @@ impl OrchRegistry {
     ///   mid-thought?" is not a question a driver may answer;
     /// - **has a pane** — `deliver_prompt` resolves `pty_id` before it does
     ///   anything else and refuses an agent with none, so an agent registered
-    ///   without a terminal is not something to type into.
+    ///   without a terminal is not something to type into;
+    /// - **running the block the caller asked for.**
+    ///
+    /// **That last one is #1961 one arm over, and it is not redundant**
+    /// (rev-final B3). The first version of this took the pane on the other
+    /// three and justified skipping the block because "a session with a live
+    /// idle pane is already running under the right block by construction". It
+    /// is not: a pane can be alive, idle, typeable and on the WRONG block, and
+    /// the state that produces one is the very defect #1961 fixes — the
+    /// pre-#1961 driver opened a default-block pane on a non-default session,
+    /// and where the two blocks share a CLI that pane did not die on `Invalid
+    /// session ID`, it opened, went idle, and is still there.
+    /// `spawn_agent(block:, resume_session:)` mints the same thing
+    /// deliberately, with no legacy required. Reusing one would hand the fix to
+    /// the wrong persona on the wrong model while `rd_resume_block` never ran —
+    /// the hand-back failing to run under the session's own block, which is
+    /// exactly what that issue exists to stop.
     ///
     /// Newest first, because when the drive already holds a live idle pane on
     /// this session that pane is the drive's own current one, and speaking to
     /// the pane it last spoke to is the continuity a resume is for.
-    fn idle_pane_on_session(&self, group: &GroupId, session: &str) -> Option<String> {
+    fn idle_pane_on_session(
+        &self,
+        group: &GroupId,
+        session: &str,
+        block: &str,
+    ) -> Option<String> {
         self.agents
             .lock_safe()
             .values()
@@ -43454,6 +43475,7 @@ impl OrchRegistry {
                 a.group == *group
                     && a.status != AgentStatus::Dead
                     && a.session_id.as_deref() == Some(session)
+                    && a.block == block
                     && a.idle_since_ms.is_some()
                     && a.pty_id.is_some()
             })

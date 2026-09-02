@@ -3359,9 +3359,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // verdict file.
                     //
                     // **A SUPERSEDED pane is owned and is not believed** (#1871
-                    // B2, and the amendment that decided it). The drive resumes
-                    // its worker into a new pane on every hand-back, and the
-                    // pane it replaced keeps running: consuming its traffic is
+                    // B2, and the amendment that decided it). A hand-back that
+                    // cannot reuse the session's own live idle pane opens a new
+                    // one (#1960), and the pane it replaced keeps running —
+                    // superseded is the fallback rather than every resume now,
+                    // but nothing about what is owed to a superseded pane
+                    // changed. Consuming its traffic is
                     // right — it is this drive's delegate on this PR, and
                     // letting it reach the orchestrator is the leak §7 exists to
                     // stop — but FEEDING it in is not. A `done` from a worker

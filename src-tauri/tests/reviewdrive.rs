@@ -4923,3 +4923,148 @@ fn the_fix_brief_names_the_report_that_advances_the_drive() {
         );
     }
 }
+
+// ── review round 1: rev-final B3 and N1 ─────────────────────────────────────
+
+/// **rev-final B3.** A live idle pane on the session is reused only if it is
+/// running the block the hand-back resolved — and the pane that makes this a
+/// defect rather than a hypothetical is one the PRE-#1961 driver minted.
+///
+/// The old `rd_handback` opened a DEFAULT-block pane on a non-default session.
+/// Where the two blocks share a CLI — `worker` and `worker-adv` here, both
+/// claude — that pane did not die on `Invalid session ID`: it opened fine, went
+/// idle, and is still sitting there. Reusing it hands the fix to the wrong
+/// persona on the wrong model, with `rd_resume_block` never consulted — #1961's
+/// own defect, arriving through the mechanism added to fix #1960. The same pane
+/// is reachable with no legacy at all, since
+/// `spawn_agent(block:, resume_session:)` is permitted and skips inheritance.
+///
+/// **Both panes are live, idle and typeable in both arms**, and the newer one is
+/// always the wrong-block one — so `max_by_key(started_ms)` prefers it and only
+/// the block filter can reject it. The arms vary exactly whether the RIGHT-block
+/// pane can be typed into, which is what makes the first arm "it refused the
+/// wrong pane" rather than "there was nothing to reuse".
+#[test]
+fn a_live_idle_pane_on_the_wrong_block_is_not_reused_for_a_handback() {
+    for right_block_typeable in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::with(WORKFLOW_TWO_WORKERS);
+        let gh = FakeGh::green(HEAD_A);
+        let (group, session, worker) = driven_as(&reg, &repo, &gh, "worker-adv");
+
+        // The pane the pre-#1961 driver would have left behind: same session,
+        // DEFAULT block, alive, idle, and with a terminal to type into.
+        let wrong = reg
+            .spawn_agent_ex(
+                &group, Role::Worker, Some("worker".into()), "w-wrong", "", false, None, None,
+                Some(session.clone()), Some(reg.agent(&worker).unwrap().cwd), None,
+            )
+            .expect("a default-block pane on a non-default session");
+        assert_eq!(
+            (reg.agent(&worker).unwrap().block, reg.agent(&wrong).unwrap().block),
+            ("worker-adv".to_string(), "worker".to_string()),
+            "the fixture's premise: two live panes on ONE session, different blocks"
+        );
+        make_delivery_land(&reg, &group, &wrong.id, 7801);
+        if right_block_typeable {
+            with_pane(&reg, &worker, 7802);
+        }
+        for id in [&worker, &wrong.id] {
+            assert!(
+                reg.agent(id).unwrap().idle_since_ms.is_some(),
+                "both panes must be idle, or the block filter is not the axis under test"
+            );
+        }
+
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        reg.rd_drive_group_with(&group, &gh, 20_000);
+        gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+        gh.set_facts("OPEN", HEAD_B);
+        reg.rd_drive_group_with(&group, &gh, 30_000);
+        let before = action_count(&reg, &group, "agent-spawn");
+        let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
+        let (_pr, agent) = handed.handbacks.first().cloned().expect("the drive hands back");
+        let opened = action_count(&reg, &group, "agent-spawn") - before;
+
+        assert_ne!(
+            agent, wrong.id,
+            "the hand-back reused a pane running the WRONG block — that is #1961's defect \
+             reached through #1960's mechanism: the wrong persona, the wrong model, and \
+             rd_resume_block never consulted"
+        );
+        assert!(
+            !texts_to(&reg, &group, &wrong.id).iter().any(|t| t.contains("is back with you")),
+            "…and no fix brief may be typed into it either"
+        );
+        assert_eq!(
+            reg.agent(&agent).unwrap().block,
+            "worker-adv",
+            "whichever pane took the hand-back, it runs the session's own block"
+        );
+
+        if right_block_typeable {
+            assert_eq!(
+                agent, worker,
+                "the control: with the RIGHT-block pane typeable the hand-back reuses IT, \
+                 even though the wrong-block pane is newer and would win on recency alone"
+            );
+            assert_eq!(opened, 0, "…opening nothing, which is #1960's whole point");
+        } else {
+            assert_eq!(
+                opened, 1,
+                "with no eligible pane the hand-back opens one, rather than settling for \
+                 the wrong-block pane sitting in front of it"
+            );
+        }
+    }
+}
+
+/// **rev-final N1.** The `cap` field on a LANE's `rd-refused` row — a documented
+/// telemetry contract (§8: "so a reader can tell a capped lane … from a broken
+/// one") that no assertion reached.
+///
+/// The negative control is the discriminator and is a real refusal rather than a
+/// contrived one: the spawn-rate backstop refuses in exactly the same place with
+/// a different sentence, so a `cap` hard-coded true, or read off "did the spawn
+/// fail", passes the first half and fails here.
+#[test]
+fn a_lane_spawn_refused_by_the_cap_says_so_on_its_audit_row() {
+    for capped in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        // One slot, or one spawn an hour: either way the WORKER takes it and the
+        // reviewer lane is the spawn that gets refused.
+        let rails = if capped {
+            Guardrails { max_agents: 1, ..rails() }
+        } else {
+            Guardrails { max_spawns_per_hour: 1, ..rails() }
+        };
+        let group = reg.create_group(&repo.path(), rails).unwrap().id;
+        let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).unwrap();
+        let session = w.session_id.clone().expect("claude mints a session id at spawn");
+        let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+        assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let opened = reg.rd_drive_group_with(&group, &gh, 20_000);
+        assert!(opened.lanes_opened.is_empty(), "the lane spawn must actually be refused");
+
+        let rows = audit_details(&reg, &group, "rd-refused");
+        let lane = rows
+            .iter()
+            .find(|d| d["reason"] == json!("lane-spawn-refused"))
+            .unwrap_or_else(|| panic!("no lane-spawn-refused row: {rows:?}"));
+        assert_eq!(
+            lane["cap"],
+            json!(capped),
+            "the row must say whether the LIVE-DELEGATE CAP is what refused — a capped lane \
+             retries and clears itself, a rate-limited or broken one does not: {lane:?}"
+        );
+        // …and either way the lane refusal is a back-off, never a hold: §8's
+        // asymmetry with `fix-wait`, which has already spent its round.
+        assert_eq!(status_state(&reg, &group), "review-wait");
+    }
+}
