@@ -25,7 +25,7 @@
 pub const OUTCOMES: [&str; 5] = ["done", "blocked", "approved", "request_changes", "progress"];
 
 /// Legal legacy `status` values — unchanged from the pre-#398 tool.
-pub const STATUSES: [&str; 3] = ["progress", "done", "blocked"];
+pub const STATUSES: [&str; 4] = ["progress", "done", "blocked", "paused"];
 
 /// Hard cap on `note`'s length, in **characters** (never bytes — a cap
 /// measured in bytes could split a multi-byte codepoint mid-character).
