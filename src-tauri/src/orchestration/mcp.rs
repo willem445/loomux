@@ -3397,6 +3397,14 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         (false, false) => "report:superseded-lane",
                     };
                     reg.rd_consume(&caller.group, pr, &caller.agent_id, kind, event);
+                    if !report::reaches_orchestrator_pane(status) {
+                        let _ = reg.report_task_note(
+                            &caller.group,
+                            &caller.agent_id,
+                            arg_str(args, "ref"),
+                            &message,
+                        );
+                    }
                 }
                 // #1958: **a delegate delivery reaches the orchestrator's pane
                 // only if it needs an orchestrator ACTION**, and that is the
