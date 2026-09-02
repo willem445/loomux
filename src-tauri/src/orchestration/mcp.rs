@@ -3429,12 +3429,6 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
                 }
                 None => {
-                    note_outcome = reg.report_task_note(
-                        &caller.group,
-                        &caller.agent_id,
-                        arg_str(args, "ref"),
-                        &message,
-                    );
                     off_pane = true;
                 }
             }
