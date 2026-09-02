@@ -7603,10 +7603,10 @@ fn gate_missing_blocks_reports_a_block_named_by_id_but_not_kind_reviewer() {
 // ────────── loomux's own workflow, and what a block's model: is worth ─────────
 //
 // The repo dogfoods the feature (#222): `.orrerix/workflow.yml` at the root declares
-// loomux's own roster — two worker tiers, one JUDGING reviewer lane (`rev-lead`) and
-// three cheap mechanical quick-review lanes ahead of it on `cli: opencode` (#1388),
-// each with a persona in `.github/agents/` — and the tests below are what keep that
-// file honest.
+// loomux's own roster — the CHEAP-TIER one: two worker tiers and two reviewer lanes,
+// with the standard worker and the every-round reviewer on `cli: opencode` and the
+// judgment-shaped worker and the once-last final validator on Opus, each with a
+// persona in `.github/agents/` — and the tests below are what keep that file honest.
 // The pane's half of the same pin lives in `test/workflowdogfood.test.ts`.
 
 /// The loomux repo root (the crate's manifest dir is `src-tauri/`).
@@ -7635,24 +7635,23 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
         [
             "orchestrator",
             "planner",
-            "worker-deep",
-            "worker-quick",
-            "rev-lead",
-            "qr-evidence",
-            "qr-tests",
-            "qr-constraints",
+            "worker-std",
+            "worker-adv",
+            "rev-std",
+            "rev-final",
             "process"
         ],
         "ids are what edges, gates and spawn_agent(block:) reference — a rename here breaks the gate"
     );
 
-    // THE THREE CHEAP LANES (#1388), and the one ordering property this roster leans
-    // on. `Guardrails::block_for(Role::Reviewer)` resolves a bare
+    // THE TWO REVIEWER LANES, and the one ordering property this roster leans on.
+    // `Guardrails::block_for(Role::Reviewer)` resolves a bare
     // `spawn_agent(kind: "reviewer")` to the FIRST reviewing block in roster order, so
-    // rev-lead must be declared ahead of the qr-* lanes: a checklist lane sitting first
-    // would answer an unrouted review request with a grep report instead of a review.
-    // Stated as an ordered list rather than as a set, so a reordering edit fails HERE
-    // rather than silently changing what a bare spawn does.
+    // rev-std must be declared ahead of rev-final: rev-final is the ONCE-LAST validator,
+    // spawned only after rev-std has recorded PASS on a final body, so an unrouted review
+    // request landing on it would spend the expensive lane first AND break the sequencing
+    // the roster is built around. Stated as an ordered list rather than as a set, so a
+    // reordering edit fails HERE rather than silently changing what a bare spawn does.
     let reviewers: Vec<(&str, &str, &str, &str)> = wf
         .blocks
         .iter()
@@ -7664,24 +7663,35 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
     assert_eq!(
         reviewers,
         [
-            ("rev-lead", "claude", "opus", ".github/agents/rev-lead.md"),
-            ("qr-evidence", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-evidence.md"),
-            ("qr-tests", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-tests.md"),
-            ("qr-constraints", "opencode", "opencode/deepseek-v4-flash-free", ".github/agents/qr-constraints.md")
+            ("rev-std", "opencode", "openrouter/z-ai/glm-5.3-flash", ".github/agents/rev-std.md"),
+            ("rev-final", "claude", "opus", ".github/agents/rev-final.md")
         ],
-        "the judging lane is declared first; the three cheap lanes run opencode on the free Zen model"
+        "the every-round lane is declared first; the strong final validator runs once, last"
     );
 
-    // The model id is pinned in FULL on purpose. `default_model("opencode", …)` is
-    // deliberately EMPTY — opencode has no vendor-neutral alias, its ids are
-    // `provider_id/model_id` against a catalog of dozens of providers — so a block that
-    // dropped the provider half would name a model that does not exist, handed over with
-    // no error (doc/design/opencode.md, the pre-#722 `sanitize_model` bug). This asserts
-    // the `/` survives the parser, which is the character #722 had to widen it to admit.
-    for (id, cli, model, _) in reviewers.iter().filter(|r| r.1 == "opencode") {
+    // The model id is pinned in FULL on purpose, and this checks EVERY opencode block —
+    // the default worker as well as the reviewer, since both tiers of the cheap roster
+    // run on it. `default_model("opencode", …)` is deliberately EMPTY — opencode has no
+    // vendor-neutral alias, its ids are `provider_id/model_id` against a catalog of dozens
+    // of providers — so a block that dropped the `openrouter/` half would name a model that
+    // does not exist, handed over with no error (doc/design/opencode.md, the pre-#722
+    // `sanitize_model` bug). This asserts the `/` survives the parser, which is the
+    // character #722 had to widen it to admit. The provider is not hardcoded, and a second
+    // `/` is allowed, because this provider's own model ids carry one
+    // (`openrouter` + `z-ai/glm-5.3-flash`).
+    let via_opencode: Vec<&workflow::Block> =
+        wf.blocks.iter().filter(|b| b.cli == "opencode").collect();
+    assert!(!via_opencode.is_empty(), "the cheap tier is the point of this roster");
+    for b in &via_opencode {
+        let (provider, rest) = b
+            .model
+            .split_once('/')
+            .unwrap_or_else(|| panic!("{}: an opencode model id names its provider, got {:?}", b.id, b.model));
         assert!(
-            model.starts_with("opencode/") && model.len() > "opencode/".len(),
-            "{id} on {cli} must name its provider in the model id, got {model:?}"
+            !provider.is_empty() && !rest.is_empty(),
+            "{}: an opencode model id names its provider, got {:?}",
+            b.id,
+            b.model
         );
     }
 
@@ -7740,21 +7750,49 @@ blocks:
     }
 
     let gate = wf.gates.get("merge").expect("the dogfood file exists partly to demo the gate");
-    // ALL-PASS. With one lane, all-pass and threshold are numerically equivalent, but
-    // all-pass is the honest spelling AND the safe one for growth: the gate counts
-    // passes, not lanes, so the day a second lane is declared, a threshold left at 1
-    // would let either lane's abstention open the gate alone (rev-14 F1's shape).
+    // ALL-PASS. The gate counts PASSES, not lanes, and an abstention counts as a pass,
+    // so a `threshold:` left behind as lanes are added would let the lanes that did not
+    // review a change open the gate ahead of the lane whose change it is (rev-14 F1's
+    // shape). #1176 also refuses `routing:` and `require: threshold` together at parse,
+    // so all-pass is the only spelling this roster could use anyway.
     assert_eq!(gate.require, GateRequire::AllPass);
-    // The GENERIC safety property, same shape as the frontend dogfood pin: every
-    // declared reviewer-kind block is in the gate — a lane declared in the roster
-    // but unwired from `gates.merge` would go unreviewed while the gate still opens.
+    // The GENERIC safety property, same shape as the frontend dogfood pin — and it is
+    // NAMEDNESS, not reachability, so say so rather than overclaim. Stated over a UNION
+    // because that is what #1176 made the required set: every declared reviewer-kind
+    // block must be named by `gates.merge.reviewers` OR by at least one `routing:`
+    // rule. A lane named by NEITHER can never enter the required set at all — it would
+    // sit in the roster looking wired while the gate opened without it, which is exactly
+    // what "an abstention is a pass" makes dangerous. `rev-std` is static (every PR);
+    // `rev-final` is required by routing, on the paths a prose review cannot judge. A
+    // docs-only PR that runs rev-std alone is the rule working, not a hole.
+    //
+    // What namedness does NOT catch, found in review (rev-final round 1, N4) rather than
+    // by the author: a rule whose `paths:` match nothing still NAMES its reviewer, so the
+    // lane is named and required on no PR — the same end state from the other side. The
+    // `must be able to FIRE` block below is the partial close, with its own residual.
     let declared: Vec<&str> =
         wf.blocks.iter().filter(|b| b.kind == Role::Reviewer).map(|b| b.id.as_str()).collect();
-    assert_eq!(gate.reviewers, declared, "every declared reviewer lane is in the gate");
+    let reachable: std::collections::BTreeSet<&str> = gate
+        .reviewers
+        .iter()
+        .map(String::as_str)
+        .chain(gate.routing.iter().flat_map(|r| r.reviewers.iter().map(String::as_str)))
+        .collect();
+    let unnamed: Vec<&str> = declared.iter().copied().filter(|id| !reachable.contains(id)).collect();
+    assert!(
+        unnamed.is_empty(),
+        "every declared reviewer lane must be reachable by the gate; these are named by nothing: {unnamed:?}"
+    );
+    // …and the SPLIT itself, pinned positively, so a lane sliding out of the static list
+    // into nothing — or the routing block emptying — fails here too and not only above.
+    assert_eq!(gate.reviewers, ["rev-std"], "the static lane is the one that runs every round");
+    assert!(!gate.routing.is_empty(), "the routing block is what makes rev-final reachable at all");
+    let by_routing: std::collections::BTreeSet<&str> =
+        gate.routing.iter().flat_map(|r| r.reviewers.iter().map(String::as_str)).collect();
     assert_eq!(
-        gate.reviewers,
-        ["rev-lead", "qr-evidence", "qr-tests", "qr-constraints"],
-        "…and today that is the lead lane plus the three cheap pre-lead lanes"
+        by_routing.into_iter().collect::<Vec<_>>(),
+        ["rev-final"],
+        "…and the routing rules add exactly the final validator"
     );
     assert_eq!(
         workflow::gate_need(gate),
@@ -7762,11 +7800,93 @@ blocks:
         "every named reviewer must have to speak — abstention is a pass, so a threshold would let \
          the lanes that didn't review it open the gate ahead of the lane that must"
     );
-    // Every named reviewer is a reviewer block that actually exists — a gate naming a
-    // worker, or a block that was renamed out from under it, could never open.
-    for r in &gate.reviewers {
+    // Every reviewer the gate can require — static or routed — is a reviewer block that
+    // actually exists. A rule naming a worker, or a block renamed out from under it,
+    // could never open.
+    for r in gate.reviewers.iter().chain(gate.routing.iter().flat_map(|rule| rule.reviewers.iter())) {
         assert_eq!(wf.block(r).map(|b| b.kind), Some(Role::Reviewer), "gate reviewer {r}");
     }
+    // ROUTING RULES MUST BE ABLE TO FIRE — the partial close on the gap named above, and
+    // partial for a reason worth stating rather than leaving for the next reader. Deciding
+    // full reachability ("does this glob match a file a PR could touch") means running the
+    // repo's tracked-file list through `glob_match`; what is checkable without either is
+    // that a glob ROOTED at a literal path is rooted at one that EXISTS. That is exactly
+    // the shape a directory rename or a typo produces, which is the arrival route the
+    // review's premortem named (`src/**` narrowed to `src/orchestration/**` during a
+    // refactor that moved it).
+    let literal_root = |glob: &str| -> Option<String> {
+        match glob.find(|c| c == '*' || c == '?' || c == '[') {
+            None => Some(glob.to_string()),
+            Some(w) => {
+                let upto = &glob[..w];
+                match upto.rfind('/') {
+                    Some(i) if i > 0 => Some(upto[..i].to_string()),
+                    _ => None,
+                }
+            }
+        }
+    };
+    // The check's own POSITIVE CONTROL: the exact shape review found (a rooted glob naming
+    // a directory that does not exist) must be one this check would refuse. Without it the
+    // loop below passes just as well when `literal_root` returns None for everything and
+    // nothing is ever verified.
+    assert_eq!(literal_root("zzz-no-such-dir/**").as_deref(), Some("zzz-no-such-dir"));
+    assert!(
+        !Path::new(&repo).join("zzz-no-such-dir").exists(),
+        "the control's negative arm: a bogus root really is absent, so the loop below has teeth"
+    );
+
+    let mut roots_checked = 0usize;
+    for (i, rule) in gate.routing.iter().enumerate() {
+        let mut checked_in_rule = 0usize;
+        for p in &rule.paths {
+            let Some(root) = literal_root(p) else { continue };
+            assert!(
+                Path::new(&repo).join(&root).exists(),
+                "routing[{i}] path {p:?} is rooted at {root:?}, which does not exist — the rule can never fire"
+            );
+            roots_checked += 1;
+            checked_in_rule += 1;
+        }
+        // POPULATION CONTROL, counted at the VERIFIED site: a rule made entirely of
+        // unrooted globs would sail through the loop having certified nothing.
+        assert!(
+            checked_in_rule > 0,
+            "routing[{i}] needs at least one path this check can verify: {:?}",
+            rule.paths
+        );
+    }
+    assert!(roots_checked > 0, "…and some path was actually verified, not zero of them");
+
+    // THE RESIDUAL, PERFORMED rather than merely disclosed (CLAUDE.md's escape-hatch
+    // rule) — and performing it is what corrected it. Two shapes LOOK like the blind
+    // spot; only one is one, and the first draft of this comment named the wrong one:
+    //
+    //  * a rule made ONLY of unrooted globs is CAUGHT — not by the existence check, which
+    //    skips them, but by the per-rule population control above. Measured on the
+    //    frontend twin: mutating rule 1 to `["**/nope.zzz"]` reddens it.
+    //  * what DOES slip through is a glob whose literal root EXISTS but which matches no
+    //    file. `src/**/*.zzz` roots at `src`, which is there, so the check passes it
+    //    while the rule can still never fire. This verifies the ROOT, not a match;
+    //    closing that last step means running the tracked-file list through
+    //    `glob_match`. Measured: that mutation leaves the suite green.
+    assert_eq!(literal_root("**/nope.zzz"), None, "an unrooted glob has no root to check…");
+    assert_eq!(
+        literal_root("src/**/*.zzz").as_deref(),
+        Some("src"),
+        "…but a rooted-yet-unmatchable glob IS checked, and passes — the real blind spot"
+    );
+    assert!(Path::new(&repo).join("src").exists(), "…because its root really does exist, which is all this check asks");
+    assert_eq!(literal_root("**/Cargo.toml"), None, "…and the shipped file really does contain an unrooted path");
+    assert_eq!(
+        gate.routing
+            .iter()
+            .map(|r| r.paths.iter().filter(|p| literal_root(p).is_none()).count())
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0, 1],
+        "…in exactly one rule, beside three rooted paths — so the blind spot is not load-bearing here"
+    );
+
     // And every `also:` condition is one THIS build can check. An unknown condition is
     // not ignored — it fails closed and refuses every merge — so shipping one in the
     // repo's own file would mean loomux could never merge its own PRs.
@@ -7787,20 +7907,27 @@ blocks:
 }
 
 #[test]
-fn the_dogfood_reviewer_persona_carries_the_question_set() {
+fn the_checklist_reviewer_persona_carries_the_question_set() {
     // #1292 PR B: `rev-lead.md`'s "Questions every review answers" section is five
     // fixed headings the review body must carry. This loads the REAL persona through
-    // the REAL profile loader — same as the roster pin above — so a heading dropped
-    // from the file (accidentally, or by a rename that drifts from PR A's product-side
-    // `## Premortem` spelling) reddens here instead of silently thinning the review.
+    // the REAL profile loader, so a heading dropped from the file (accidentally, or by
+    // a rename that drifts from PR A's product-side `## Premortem` spelling) reddens
+    // here instead of silently thinning the review.
+    //
+    // BOUND TO THE FILE, NOT TO ROSTER MEMBERSHIP. The live cheap-tier roster does not
+    // declare `rev-lead` — its lanes are `rev-std` and `rev-final` — but `rev-lead.md`
+    // is still checked in, so the property is pinned on the persona file itself rather
+    // than looked up through `wf.block("rev-lead")`, which would panic. What that buys
+    // is checkable from the repo alone: the persona survives a roster change, so a roster
+    // that declares `rev-lead` again gets a file whose contract never silently drifted
+    // while nothing pointed at it. Nothing is relaxed: every assertion below is what it
+    // was.
+    // These headings are `rev-lead.md`'s contract specifically — they are NOT asserted
+    // of `rev-final.md`, which does not carry them and was never written to.
     let repo = repo_root();
-    let wf = match workflow::load_workflow(&repo) {
-        Ok(Some(wf)) => wf,
-        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
-    };
-    let block = wf.block("rev-lead").expect("rev-lead is the roster's JUDGING reviewer lane");
-    let rel = block.profile.as_deref().expect("rev-lead must point at a persona file");
-    let p = profiles::load_block_profile(&repo, rel, block.kind).unwrap_or_else(|e| panic!("rev-lead: {e}"));
+    let rel = ".github/agents/rev-lead.md";
+    let p = profiles::load_block_profile(&repo, rel, Role::Reviewer)
+        .unwrap_or_else(|e| panic!("rev-lead: {e}"));
     let body = flat(&p.instructions);
 
     for heading in [
@@ -7844,38 +7971,57 @@ fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
     // were all FALSE BLOCKS — a lane refusing a healthy change — which is the one
     // direction `all-pass` over four lanes is not safe in. Hence a pin, not a
     // comment.
+    //
+    // BOUND TO THE FILES, NOT TO ROSTER MEMBERSHIP, for the same reason as the pin
+    // above: the live cheap-tier roster declares one opencode reviewer (`rev-std`),
+    // which is an ITERATING reviewer rather than a fixed-checklist instrument and
+    // carries none of these rules — deriving the population from the roster would
+    // therefore assert this file's rules of a persona they were never written for.
+    // The three checklist personas are still checked in, so the same thing holds as for
+    // the pin above: their contracts stay pinned while no roster points at them, and a
+    // roster that declares them again gets files that never drifted.
+    //
+    // Every `pinned(...)` rule below is byte-identical to what it was — the per-persona
+    // rules are the whole point and none of them moved. The POPULATION CONTROL is the one
+    // thing that did: a literal list makes `assert_eq!(lanes.len(), 3)` a sentence that
+    // cannot fail, so it is re-earned from the directory instead, immediately below.
+    // (Said precisely because an earlier draft of this comment said "every assertion",
+    // which this test's own next commit then falsified — rev-final round 1, N1.)
     let repo = repo_root();
-    let wf = match workflow::load_workflow(&repo) {
-        Ok(Some(wf)) => wf,
-        other => panic!("loomux must ship its own parseable {}: {other:?}", workflow::workflow_path(&repo)),
-    };
+    let lanes = [".github/agents/qr-evidence.md", ".github/agents/qr-tests.md", ".github/agents/qr-constraints.md"];
 
-    // Derived from the ROSTER by capability + CLI, never from a hardcoded id list:
-    // a fourth cheap lane added later is covered the day it is declared, and a
-    // renamed one does not quietly stop being checked.
-    let lanes: Vec<&workflow::Block> = wf
-        .blocks
-        .iter()
-        .filter(|b| b.kind == Role::Reviewer && b.cli == "opencode")
+    // POPULATION CONTROL. Binding the population to a literal list is what a
+    // roster-derived filter used to do for free, so the control has to be re-earned
+    // rather than restated: `assert_eq!(lanes.len(), 3)` against a fixed array is a
+    // sentence that cannot fail. This asks the DIRECTORY instead — the list above must
+    // be exactly the `qr-*.md` personas that exist — so a fourth checklist lane added
+    // later, or one renamed or deleted, reddens here on the round it lands instead of
+    // silently sitting outside the loop. The count is then checked at the VERIFIED site
+    // below as well, since an empty or shrunken list would otherwise sail through the
+    // loop and certify nothing.
+    let mut on_disk: Vec<String> = fs::read_dir(Path::new(&repo).join(".github/agents"))
+        .expect("the persona directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("qr-") && n.ends_with(".md"))
+        .map(|n| format!(".github/agents/{n}"))
         .collect();
-
-    // POPULATION CONTROL, counted at the VERIFIED site below rather than here: an
-    // empty or shrunken list would sail through the loop and certify nothing.
+    on_disk.sort();
+    let mut declared_lanes: Vec<String> = lanes.iter().map(|r| (*r).to_string()).collect();
+    declared_lanes.sort();
     assert_eq!(
-        lanes.len(),
-        3,
-        "expected the three cheap lanes; got {:?} — if a lane was added or removed, move this \
-         number in the same commit",
-        lanes.iter().map(|b| b.id.as_str()).collect::<Vec<_>>()
+        declared_lanes, on_disk,
+        "the checklist personas this test covers must be exactly the qr-*.md files that exist — \
+         add a new one to the list in the commit that adds the file"
     );
+    assert!(!on_disk.is_empty(), "…and there must be some, or the loop below certifies nothing");
 
     let mut verified = 0usize;
-    for b in &lanes {
-        let rel = b.profile.as_deref().unwrap_or_else(|| panic!("{}: a lane must carry a persona file", b.id));
-        let p = profiles::load_block_profile(&repo, rel, b.kind)
-            .unwrap_or_else(|e| panic!("{}: {e}", b.id));
+    for rel in &lanes {
+        let p = profiles::load_block_profile(&repo, rel, Role::Reviewer)
+            .unwrap_or_else(|e| panic!("{rel}: {e}"));
         let body = flat(&p.instructions);
-        let label = format!("{rel}");
+        let label = (*rel).to_string();
 
         // The three rules EVERY lane owes, whatever it checks.
         pinned(
@@ -7904,7 +8050,7 @@ fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
         // Two spellings, because qr-constraints' checks are sweeps whose failure is a
         // line PRESENT rather than an artifact absent; both say the same thing, that a
         // FAIL must be quotable.
-        let fail_rule = if b.id == "qr-constraints" {
+        let fail_rule = if rel.ends_with("qr-constraints.md") {
             "fail means a line you can quote"
         } else {
             "fail means absence of a named artifact you can quote"
@@ -7925,9 +8071,9 @@ fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
     // succeed by printing NOTHING, and an uncontrolled zero is byte-identical to a
     // grep that never worked. CLAUDE.md states this for the repo; a small model will
     // not infer it, so it has to be in the prompt — and therefore pinned.
-    let qc = wf.block("qr-constraints").expect("the constraints lane");
-    let qcp = profiles::load_block_profile(&repo, qc.profile.as_deref().unwrap(), qc.kind)
-        .expect("qr-constraints persona");
+    let qcrel = ".github/agents/qr-constraints.md";
+    let qcp =
+        profiles::load_block_profile(&repo, qcrel, Role::Reviewer).expect("qr-constraints persona");
     let qcbody = flat(&qcp.instructions);
     pinned(
         ".github/agents/qr-constraints.md",
@@ -7948,7 +8094,7 @@ fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
 #[test]
 fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
     // The end-to-end dogfood pin: the REAL file, through the REAL load + clamp, into
-    // the command line loomux would actually run. The teeth: worker-deep and rev-lead
+    // the command line loomux would actually run. The teeth: worker-adv and rev-final
     // both declare `opus` while the launcher picks say `sonnet` — if either arrived at
     // the CLI as the launcher pick, the file would be a comment, not a roster.
     let (reg, _d) = test_registry();
@@ -7967,10 +8113,8 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
 
     // The anti-flattening witnesses: blocks whose declared model DIFFERS from the
     // launcher's per-role pick, so "declared model honored" and "flattened to the
-    // pick" produce different argv. worker-quick is deliberately NOT here — it
-    // declares sonnet, the launcher pick, so the two cases are indistinguishable
-    // for it and it cannot witness this property (see the weaker loop below).
-    for (block, model) in [("worker-deep", "opus"), ("rev-lead", "opus")] {
+    // pick" produce different argv.
+    for (block, model) in [("worker-adv", "opus"), ("rev-final", "opus")] {
         let (cmd, argv, _kickoff) = compile(&reg, &g, block);
         assert!(cmd.contains(&format!("--model {model}")), "{block} must run {model}: {cmd}");
         assert!(
@@ -7985,48 +8129,46 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
         // command (round #417 correction 6: via a generated file's handle).
         assert!(cmd.contains(&format!("--agent loomux-{}-{block}", g.id)), "{block}: persona must reach the CLI: {cmd}");
     }
-    // The strictly weaker claim for the converged block: worker-quick's declared
-    // sonnet equals the launcher pick, so only carriage (model + persona reach the
-    // CLI) is assertable — NOT anti-flattening, which needs a distinguishing witness.
-    {
-        let (cmd, argv, _kickoff) = compile(&reg, &g, "worker-quick");
-        assert!(cmd.contains("--model sonnet"), "worker-quick must run sonnet: {cmd}");
-        assert!(
-            argv.windows(2).any(|w| w == ["--model", "sonnet"]),
-            "worker-quick: the argv path must agree with the command line: {argv:?}"
-        );
-        assert!(
-            cmd.contains(&format!("--agent loomux-{}-worker-quick", g.id)),
-            "worker-quick: persona must reach the CLI: {cmd}"
-        );
-    }
+    // WHY THERE IS NO WEAKER "CONVERGED BLOCK" CASE HERE ANY MORE. The previous roster
+    // declared `worker-quick` at `sonnet`, which WAS the launcher's worker pick, so
+    // "honored" and "flattened" produced identical argv for it and only the strictly
+    // weaker carriage claim (model + persona reach the CLI) was assertable of it. The
+    // cheap-tier roster has no such block: every claude block declares `fable` or
+    // `opus` against picks of `opus`/`sonnet`, and the two opencode blocks differ in
+    // `cli` as well, so every specimen left distinguishes. Nothing was relaxed to fit
+    // that — the loop above is the full-strength claim, and the day a block whose model
+    // equals its role's pick returns to the roster, its weaker carriage-only claim goes
+    // back here rather than being folded into the loop above (#689's rule: a converged
+    // case gets its own explicitly-labelled weaker assertion, never a loosened shared
+    // one).
 
-    // THE OPENCODE LANES, end to end (#1388). These are the strongest anti-flattening
-    // witnesses in this file: the launcher's picks say `claude`/`sonnet` for every
-    // reviewer, so a roster that flattened either field would emit a claude command
-    // line with `--model sonnet`, and there is no fallback anywhere that could produce
-    // `opencode/deepseek-v4-flash-free` by accident. This is also the pin behind the
-    // DOGFOOD pin, not the general guard — say which, because the distinction is the
-    // difference between evidence and a comfortable assumption. opencode's `--agent`
-    // carriage is ALREADY policed upstream by
+    // THE OPENCODE LANES, end to end (#1388, and now both tiers of the cheap roster —
+    // the DEFAULT worker as well as the every-round reviewer). These are the strongest
+    // anti-flattening witnesses in this file: the launcher's picks say `claude` with
+    // `sonnet` for both roles, so a roster that flattened either field would emit a
+    // claude command line with `--model sonnet`, and there is no fallback anywhere that
+    // could produce `openrouter/z-ai/glm-5.3-flash` by accident. This is also the pin
+    // behind the DOGFOOD pin, not the general guard — say which, because the distinction
+    // is the difference between evidence and a comfortable assumption. opencode's
+    // `--agent` carriage is ALREADY policed upstream by
     // `an_opencode_spawn_delivers_its_config_and_containment_by_env` (tests/
     // orchestration.rs), which asserts the emitted command line directly; a mutation
     // removing the handle reddens THERE, in an earlier binary, and cargo stops before
     // this file runs. So what this loop adds is not the property — it is that THIS
     // REPO'S OWN declared blocks carry their declared model and persona through the
     // real load + clamp, the opencode analogue of the worker-tier pin above.
-    for block in ["qr-evidence", "qr-tests", "qr-constraints"] {
+    for block in ["worker-std", "rev-std"] {
         let (cmd, argv, kickoff) = compile(&reg, &g, block);
         assert!(
             cmd.starts_with("opencode "),
             "{block}: the declared cli must reach the launch line, not the launcher pick: {cmd}"
         );
         assert!(
-            cmd.contains("--model opencode/deepseek-v4-flash-free"),
+            cmd.contains("--model openrouter/z-ai/glm-5.3-flash"),
             "{block}: the full provider/model id must survive sanitize_model: {cmd}"
         );
         assert!(
-            argv.windows(2).any(|w| w == ["--model", "opencode/deepseek-v4-flash-free"]),
+            argv.windows(2).any(|w| w == ["--model", "openrouter/z-ai/glm-5.3-flash"]),
             "{block}: the argv path must agree with the command line: {argv:?}"
         );
         assert!(

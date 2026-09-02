@@ -1888,8 +1888,34 @@ is likewise only rendered for a group whose workflow is in play.
 
 ## loomux runs its own workflow (sub-PR 5)
 
-The feature ships with the repo using it. `.loomux/workflow.yml` at the root declares
-loomux's own roster, and `.github/agents/*.md` holds the five personas it points at:
+The feature ships with the repo using it: `.orrerix/workflow.yml` at the root declares
+loomux's own roster, and `.github/agents/*.md` holds the personas it points at.
+
+**What the file declares today** — the *cheap-tier* roster (`name:
+loomux-cheap-tier`), five persona files, two workers and two reviewer lanes:
+
+| block | kind | cli | model | what it is for |
+|---|---|---|---|---|
+| `worker-std` | worker | opencode | `openrouter/z-ai/glm-5.3-flash` | the DEFAULT worker: briefs the orchestrator can write literally — exact files, commands and acceptance checks. Not for work whose deliverable is evidence about itself |
+| `worker-adv` | worker | claude | opus | from the start on a design-shaped issue, on work whose deliverable is EVIDENCE ABOUT ITSELF (a sweep and its population, a coverage or residual claim), or after `worker-std` failed the same finding twice |
+| `rev-std` | reviewer | opencode | `openrouter/z-ai/glm-5.3-flash` | EVERY round: every finding carries a repro; iterates with the worker to PASS on a final body |
+| `rev-final` | reviewer | claude | opus | ONCE, last, after `rev-std` passed: validates the work **and** the review |
+| `process` | worker (`role_hint: process`) | claude | opus | the post-merge process-pro |
+
+The gate is `require: all-pass` with `reviewers: [rev-std]` — and `rev-final` is
+required by **routing rules** (`gates.merge.routing`, #1176) rather than by the static
+list: it is added whenever the diff touches `src/**`, `src-tauri/**`, `crates/**`,
+`test/**`, `e2e/**`, `scripts/**`, `npm/**`, `doc/design/**`, `.github/workflows/**`, or
+a dependency manifest. A prose-only PR therefore merges on `rev-std` alone, by design.
+The safety property that survives this is stated as a union: every declared
+reviewer-kind block must be named by the gate **or** by at least one routing rule, since
+an abstention is a pass and a lane named by neither could never be required at all.
+Both halves of the dogfood pin assert it that way (`test/workflowdogfood.test.ts`,
+`src-tauri/tests/workflow.rs`).
+
+**The roster this section was written against (sub-PR 5)** is kept below as the record
+of the argument, not as a description of the file today — the three points after the
+table are decisions that outlived it:
 
 | block | kind | model | what it is for |
 |---|---|---|---|
@@ -1909,12 +1935,19 @@ Three things about it are decisions rather than filler:
 - **The block descriptions are the routing surface.** The orchestrator template already
   says to route with judgment; what it routes *on* is what each block says it is for. So
   the deep/quick split is written as a *deployment heuristic* (ambiguity and design →
-  deep; mechanical and clearly-directed → quick), and `worker-deep` is declared **first**,
+  deep; mechanical and clearly-directed → quick), and `worker-deep` was declared **first**,
   because the first block of a class is what a bare `spawn_agent(kind: "worker")` resolves
-  to and the safe default for an unrouted task is the tier that can handle being wrong.
+  to and the safe default for an unrouted task was taken to be the tier that can handle
+  being wrong. The *mechanism* outlived that roster; the *choice* did not, and it is worth
+  seeing both. The cheap-tier roster declares `worker-std` first on purpose: its rule 3
+  puts the tier decision at intake, in the brief, so the fallback is the tier that costs
+  least when nobody made one. Which way round is right is a repo's call, and the file is
+  where it gets made — that is the point of the block descriptions being the routing
+  surface.
 - **The gate is `all-pass` over every declared reviewer, plus `ci-green`** (three of
-  them when this was written; see *Cheap lanes ahead of the lead lane* below for what
-  the roster names today) — and the reason is
+  them when this was written; the current roster and its gate are the table at the top of
+  this section, where `all-pass` over *every declared reviewer* has since become
+  all-pass over a union with `routing:`) — and the reason is
   worth stating, because the first draft of this file said `threshold: 2` and a review
   (rev-14 F1) showed why that is wrong *for a lane-scoped roster specifically*. **An
   abstention is a pass.** A reviewer whose lane a PR doesn't touch is told to record
@@ -1962,7 +1995,19 @@ remove.
 
 ### Cheap lanes ahead of the lead lane (#1388)
 
-The roster now runs **three quick-review lanes before `rev-lead`** —
+**Not in the live roster.** The cheap-tier roster above declares no checklist lane at
+all — its cheap tier is `rev-std`, an *iterating* reviewer rather than a fixed-checklist
+instrument — so the three lanes described here are history plus a standing option:
+`qr-evidence.md`, `qr-tests.md` and `qr-constraints.md` remain checked in under
+`.github/agents/`, so the lanes are reconstructable from the repo alone: a roster that
+declares them again gets three personas whose contracts never drifted while nothing
+pointed at them. The pins on those three personas are bound to
+the FILES for exactly that reason (`the_cheap_review_lanes_carry_the_rules_that_make_them_safe`,
+`src-tauri/tests/workflow.rs`) — a roster-derived population would have asserted their
+rules of a persona never written for them. The argument below is what the lanes are for
+and why the split is by instrument; it is unchanged by their absence from today's file.
+
+The roster that introduced them runs **three quick-review lanes before `rev-lead`** —
 `qr-evidence`, `qr-tests` and `qr-constraints` — on `cli: opencode`,
 `model: opencode/deepseek-v4-flash-free`, with `gates.merge.reviewers` naming all
 four. They exist because a large share of what a review spends attention on is not
@@ -2063,13 +2108,16 @@ Finally, worth stating plainly because it bounds the blast radius: the gh shim i
 wedged lane stops every agent-driven merge until someone acts; it never permanently bricks
 the repo.
 
-One ordering detail is load-bearing rather than cosmetic: `rev-lead` is declared
-**first** among the reviewer blocks, for the same reason `worker-deep` is declared
-first among the workers. `Guardrails::block_for(Role::Reviewer)` resolves a bare
-`spawn_agent(kind: "reviewer")` to the first *reviewing* block in roster order, so a
-qr-* lane sitting first would answer an unrouted review request with a grep report.
-Both dogfood tests pin the order as an ordered list rather than a set, so a
-reordering edit fails there instead of silently changing what a bare spawn does.
+One ordering detail is load-bearing rather than cosmetic, and it is the half of this
+section that still governs the file today. `Guardrails::block_for(Role::Reviewer)`
+resolves a bare `spawn_agent(kind: "reviewer")` to the first *reviewing* block in roster
+order, so which lane is declared first decides what an unrouted review request gets. In
+the three-lane roster that meant `rev-lead` first, or a qr-* lane would have answered a
+review request with a grep report; in the cheap-tier roster it means `rev-std` first, or
+the once-last `rev-final` would be spent on an unrouted request and the sequencing the
+roster is built around would break. Both dogfood tests pin the order as an ordered list
+rather than a set, so a reordering edit fails there instead of silently changing what a
+bare spawn does.
 
 ### Tiered models: what a block's `model:` is actually worth
 
@@ -2119,19 +2167,33 @@ Two parsers, deliberately (the pane is an editor giving live feedback on text; t
 the engine). A file only one of them accepts is a file the human is being lied to about, and
 these two tests are what stop that drifting apart.
 
-Two further pins protect narrower promises inside the same file.
-`the_dogfood_reviewer_persona_carries_the_question_set` loads `rev-lead.md` through the same
-real profile loader used above and pins its five `## Questions every review answers`
-headings, plus the rule that an empty/"n/a" section is a finding rather than a pass (#1292 PR
-B) — the JUDGING reviewer lane and its review-body contract staying in lockstep, not the
-two-parser parity the pair above defends.
+Two further pins protect narrower promises, and both are bound to a **persona file** rather
+than to roster membership. `the_checklist_reviewer_persona_carries_the_question_set` loads
+`rev-lead.md` through the same real profile loader used above and pins its five
+`## Questions every review answers` headings, plus the rule that an empty/"n/a" section is a
+finding rather than a pass (#1292 PR B) — a review-body contract staying in lockstep with the
+persona that carries it, not the two-parser parity the pair above defends.
 `the_cheap_review_lanes_carry_the_rules_that_make_them_safe` does the same job for the three
-`qr-*` lanes (#1388), pinning per lane the silent-off-checklist rule, the never-review-design
+`qr-*` personas (#1388), pinning per lane the silent-off-checklist rule, the never-review-design
 scope floor, the when-in-doubt-escalate tiebreak and the FAIL rule itself — plus, on
 `qr-constraints` alone, the two zero-shaped-sweep rules. Those sentences ARE the safety
-argument for `all-pass` over four lanes, and they live in a markdown file where nothing but a
-pin can notice one going missing. Its lane list is derived from the roster by kind + CLI, so a
-fourth cheap lane is covered the day it is declared.
+argument for `all-pass` over four checklist lanes, and they live in a markdown file where
+nothing but a pin can notice one going missing.
+
+Why the FILE and not the roster, since a roster-derived population is the better default and
+these pins used to be written that way: the cheap-tier roster declares neither `rev-lead` nor
+any qr-* lane, so a roster lookup panics and a kind+CLI filter would hand these assertions
+`rev-std` — an *iterating* reviewer that was never written to any of these rules and rightly
+carries none of them. Asserting a checklist lane's contract of it would be measuring one thing
+under another's label. The three checklist personas and `rev-lead.md` stay checked in, so
+what these pins now guard is exactly what they always guarded: those files' sentences — and
+they keep guarding them while no roster points at the files, which is the whole reason a
+persona that leaves a roster should not take its pin with it. What the roster-derived population used to give for free is a population CONTROL, and
+that has to be re-earned rather than restated: `assert_eq!(lanes.len(), 3)` against a fixed array
+is a sentence that cannot fail. So the test asks the DIRECTORY — the list it iterates must be
+exactly the `qr-*.md` personas that exist under `.github/agents/` — and a fourth checklist
+persona, or one renamed or deleted, reddens on the round it lands rather than sitting silently
+outside the loop.
 
 "In CI" was not true when this section was first written, and the fix was to make it true
 rather than to soften the sentence: `ci.yml` ran `npm run build` (a **typecheck**, not the

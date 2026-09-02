@@ -1813,9 +1813,12 @@ quote, escalating anything it cannot decide. A small model asked for judgment gi
 you unreliable judgment; asked what a command printed, it is accurate. Be clear-eyed
 about the trade: a cheap lane can pass a check it should have failed, so the strong
 lane stays in the gate and stays the bar — the cheap lanes buy its time, they do not
-carry its verdict. orrerix's own `.orrerix/workflow.yml` runs three of them
-(`qr-evidence`, `qr-tests`, `qr-constraints`) ahead of its lead reviewer, and their
-persona files in `.github/agents/` are worth reading as worked examples.
+carry its verdict. orrerix's own repo keeps three such lanes as worked examples —
+`qr-evidence.md`, `qr-tests.md` and `qr-constraints.md` in `.github/agents/`, each a
+numbered checklist written exactly this way, and worth reading before you write your own.
+Its `.orrerix/workflow.yml` does not declare them today (its cheap tier is one
+*iterating* reviewer rather than fixed-checklist lanes), which is the other half of the
+trade: the shape is worth having in the drawer, not necessarily in every roster.
 
 If what you want instead is an opinion on *some* PRs — a design review before code
 is written, a premortem on something risky — that is the opposite shape and wants
