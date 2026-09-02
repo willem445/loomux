@@ -51211,7 +51211,10 @@ impl OrchRegistry {
     /// ad-hoc brief, a group not using the board — reports exactly as before and
     /// simply has no note to leave. Failing the tool call there would make the
     /// board mandatory, which it is not.
-    fn report_task_note(&self, group: &GroupId, agent_id: &str, ref_: Option<&str>, text: &str) {
+    /// Answers whether a row was found and written, so the caller can tell the
+    /// delegate what really happened instead of naming a board note that does
+    /// not exist.
+    fn report_task_note(&self, group: &GroupId, agent_id: &str, ref_: Option<&str>, text: &str) -> bool {
         let tasks = self.tasks(group);
         let session = self.agents.lock_safe().get(agent_id).and_then(|a| a.session_id.clone());
         let by_session = session.as_deref().and_then(|s| {
@@ -51225,14 +51228,15 @@ impl OrchRegistry {
                 .or_else(|| tasks.iter().find(|t| t.issue.as_deref().and_then(pr_number) == Some(n)))
         };
         let Some(id) = by_session.or_else(by_ref).map(|t| t.id.clone()) else {
-            return;
+            return false;
         };
-        let _ = self.upsert_task(
+        self.upsert_task(
             group,
             brand::AUDIT_ACTOR,
             Some(&id),
             TaskPatch { note: Some(text.to_string()), ..TaskPatch::default() },
-        );
+        )
+        .is_ok()
     }
 
     /// `deliver_to_orchestrator` for a notice that relays ONE agent's own words
