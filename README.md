@@ -31,12 +31,18 @@ adversarially reviewing and shipping the work, with humans holding only the merg
 and release gates. 48 human touch-points (prompts, merge approvals, release
 grants) against ~21,600 audited agent/system events — about 0.2%.
 
-It is a native desktop terminal for Windows, macOS and Linux — instant matrix
-splits, nameable panes, project tabs, session restore — with an
-**orchestrator/worker workflow built in**. Point a group at a repo, label some
-GitHub issues, and an orchestrator plans the work, spawns workers and reviewers
-into their own panes and their own git worktrees, and drives each issue to a pull
-request. Every prompt it sends is *typed into a pane you can read*, so you can
+It started as a terminal. I tried every multiplexer I could find and each one
+had a quirk I couldn't live with, so I built the one I wanted — a native desktop
+terminal for Windows, macOS and Linux with instant matrix splits, nameable panes,
+project tabs and session restore — and kept building. Today it is everything I
+need in one window: terminals, SSH, git, a file explorer and editor, and the
+agents themselves, with an **orchestrator/worker workflow built in**. It has
+replaced VS Code for me.
+
+Point a group at a repo, label some GitHub issues, and an orchestrator plans the
+work, spawns workers and reviewers into their own panes and their own git
+worktrees, and drives each issue to a pull request. Every prompt it sends is
+*typed into a pane you can read*, so you can
 steer any agent mid-task by just typing, or take the keyboard entirely. And by
 default no agent merges: that button stays yours.
 
