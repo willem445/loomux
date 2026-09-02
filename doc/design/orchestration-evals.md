@@ -278,9 +278,10 @@ names all eleven benchmark PRs) would be attributed to all eleven.
   check; it is expected to be non-empty (an `agent-spawn` is named but not counted).
 - `has_usage_row: false` on a delegate — neither the session index nor the `agent_id`
   fallback had a row for it, so it contributes 0 and the delegate side is an
-  under-count. On the eleven benchmark PRs this is **28 of 94** delegate entries, and
-  it falls hardest on the hand-routed side, which means the before/after gap this
-  scorecard reports is if anything **understated**, not flattered.
+  under-count. On the eleven benchmark PRs it is **0 of 94** delegate entries: every
+  one resolves through the session index. Under the `agent_id` join this replaced it
+  was **28 of 94**, which is how that defect was found — so read a non-zero here as a
+  reason to distrust the delegate totals, not as noise.
 - `usage_sessions_shared_by_more_than_one_agent` — how many sessions the H8 split had
   to divide, and `usage_rows_unusable` — rows with neither a session key nor an
   `agent_id`, which are skipped.
