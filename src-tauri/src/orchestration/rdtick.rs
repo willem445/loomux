@@ -1992,7 +1992,7 @@ impl OrchRegistry {
                                     // to find out, and the answer decides
                                     // whether anything is wrong at all — a
                                     // capped lane retries and clears itself.
-                                    "cap": super::is_live_cap_refusal(&why),
+                                    "cap": true,
                                     "detail": why }),
                         ));
                     }
