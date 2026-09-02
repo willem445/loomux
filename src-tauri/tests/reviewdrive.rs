@@ -1328,6 +1328,21 @@ fn delivered_texts(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
         .collect()
 }
 
+/// [`delivered_texts`] scoped to ONE recipient (#1959).
+///
+/// The whole of the driver's saving is *which pane* a line lands in, and
+/// `drive_notices` cannot answer that: it matches on the `review drive PR #N:`
+/// prefix every drive line carries, so it finds a line addressed to the worker
+/// just as happily as one addressed to the orchestrator. The `to` field is the
+/// answer, and it is on the audit row already.
+fn texts_to(reg: &OrchRegistry, group: &GroupId, agent_id: &str) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "prompt" && e.detail["to"] == json!(agent_id))
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn audit_actions(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
     reg.audit_log(group).into_iter().map(|e| e.action).collect()
 }
@@ -4485,7 +4500,13 @@ fn a_handback_resumes_into_the_live_idle_pane_on_that_session() {
              only axis this loop varies is whether it has a terminal to type into"
         );
         if has_pane {
-            with_pane(&reg, &w.id, 7401);
+            // A pane AND a paused group: `deliver_prompt` withdraws its own
+            // admission and answers `Err` when no drainer can be spawned, and a
+            // headless test has no `AppHandle` — so without the pause the reuse
+            // path falls through to the spawn it is meant to replace, and this
+            // test would read as the defect. Same probe #569 built for the
+            // orchestrator-delivery tests, pointed at the worker.
+            make_delivery_land(&reg, &group, &w.id, 7401);
         }
         let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
         assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
@@ -4530,6 +4551,10 @@ fn handback_then_report(
 ) -> String {
     let handed = to_first_handback(reg, group, gh);
     let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+    // A pane is all this one needs: `deliver_prompt` writes its `prompt` audit
+    // line BEFORE it decides whether it can actually paste, so `delivered_texts`
+    // sees every delivery ATTEMPTED at a live pane — which is what the recipient
+    // assertions below read, and what keeps them non-vacuous with no pause.
     with_pane(reg, &worker, 7502);
     let caller = Caller {
         agent_id: worker.clone(),
@@ -4626,11 +4651,20 @@ fn a_workers_progress_report_in_fix_wait_is_answered_in_its_own_pane() {
             typed[0]
         );
 
-        // §7's whole point: this costs the orchestrator no turn.
+        // §7's whole point: this costs the orchestrator no turn. Read by
+        // RECIPIENT, never by text — `drive_notices` matches on the "review
+        // drive PR #N:" prefix the kick-back shares with every drive notice, so
+        // it finds this line wherever it went, which is the opposite of the
+        // question being asked.
         assert!(
-            !drive_notices(&reg, &group, 1758).iter().any(|t| t.contains("advances on report")),
+            !texts_to(&reg, &group, &orch.id).iter().any(|t| t.contains("advances on report")),
             "the kick-back must not reach the orchestrator's pane — the watchdog waking it \
              is the turn this exists to remove"
+        );
+        assert!(
+            texts_to(&reg, &group, &worker).iter().any(|t| t.contains("advances on report")),
+            "…and the control for that: it DID go to the worker's pane, so the assertion \
+             above is about the recipient rather than about a line nobody sent"
         );
     }
 }
