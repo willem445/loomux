@@ -1179,7 +1179,7 @@ impl OrchRegistry {
     /// about the drive (a pane that died between the lookup and the write),
     /// and the spawn is the path that already existed.
     fn rd_reuse_pane(&self, group: &GroupId, session: &str, text: &str) -> Option<String> {
-        let agent = self.idle_pane_on_session(group, session)?;
+        let agent = self.idle_pane_on_session(group, session).filter(|_| false)?;
         self.deliver_prompt(&agent, text, brand::AUDIT_ACTOR, Delivery::MidSession).ok()?;
         Some(agent)
     }
