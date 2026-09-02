@@ -51314,7 +51314,7 @@ impl OrchRegistry {
             // failed — the same defect this whole change fixes by not saying
             // "reported to orchestrator" (#1966 rev-final round 2 N1). See
             // [`NoteOutcome::NotWritten`] for the two causes that land here.
-            Err(_) => NoteOutcome::NotWritten,
+            Err(_) => NoteOutcome::NoRow,
         }
     }
 
