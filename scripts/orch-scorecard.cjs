@@ -22,7 +22,7 @@
 //
 // PRIVACY. The orchestrator transcript is read for `timestamp` and `message.usage`
 // ONLY. No transcript text is parsed, stored, printed, or checked in — the tests run
-// against a synthetic five-line transcript written by hand.
+// against a synthetic six-line transcript written by hand.
 //
 // Dependency-free CJS (the root package.json is `"type": "module"`, so a `.js` file
 // here would be ESM and `require` a ReferenceError). Node's own JSON and `readline`
@@ -173,7 +173,8 @@ function round2(n) { return Math.round(n * 100) / 100; }
 // pairs in that file differ only because an earlier line was written mid-stream.
 //
 // A line with no `message.id` cannot be deduped and is counted once, reported in
-// coverage as `usage_rows_without_id`.
+// coverage as `usage_rows_without_id` (the fixture carries one, so that path is not
+// a claim with no test behind it).
 // ---------------------------------------------------------------------------
 
 function usageOf(entry) {
@@ -299,7 +300,7 @@ function attributeAgents(rows, prs, windowsByPr) {
 // ---------------------------------------------------------------------------
 
 function scorePr(ctx, pr) {
-  const { rows, orchIds, tailMs, transcriptTurns, usageByAgent, agentsById, attribution, prMeta } = ctx;
+  const { rows, orchIds, tailMs, transcriptTurns, usageBySession, usageByAgent, sessionAgents, agentsById, attribution, prMeta } = ctx;
   const meta = (prMeta && prMeta[String(pr)]) || {};
   const mergedMs = meta.merged_at ? Date.parse(meta.merged_at) : null;
   const win = computeWindows(rows, pr, Number.isFinite(mergedMs) ? mergedMs : null, tailMs);
@@ -411,8 +412,20 @@ function scorePr(ctx, pr) {
     if (!att.prs.has(pr)) continue;
     const info = agentsById.get(agent);
     if (info && info.role === 'orchestrator') continue;
-    const usage = usageByAgent.get(agent);
-    const weight = 1 / att.prs.size;
+    // Session first (see `indexUsage`), agent id only as a fallback.
+    const session = info && typeof info.session === 'string' ? info.session : null;
+    let usage = session ? usageBySession.get(session) : undefined;
+    let usageKey = usage ? 'session' : null;
+    let sessionAgentCount = 1;
+    if (usage) {
+      sessionAgentCount = (sessionAgents.get(session) || [agent]).length || 1;
+    } else {
+      usage = usageByAgent.get(agent);
+      usageKey = usage ? 'agent_id' : null;
+    }
+    const prWeight = 1 / att.prs.size;
+    const sessionWeight = 1 / sessionAgentCount;
+    const weight = prWeight * sessionWeight;
     const t = usage
       ? { input: usage.input, cache_read: usage.cache_read, cache_creation: usage.cache_creation, output: usage.output, total: usage.total }
       : { input: 0, cache_read: 0, cache_creation: 0, output: 0, total: 0 };
@@ -428,8 +441,17 @@ function scorePr(ctx, pr) {
       role: info ? info.role : null,
       tier: att.tier,
       weight: round2(weight),
+      pr_weight: round2(prWeight),
+      session_weight: round2(sessionWeight),
       shared_with_prs: att.prs.size,
+      shared_session_agents: sessionAgentCount,
+      // `tokens` is the WHOLE row the agent's session carries; `tokens_credited` is what
+      // this PR actually got after both weights. They differ whenever a session was
+      // shared or an agent worked more than one PR, and the card shows both so the
+      // delegate total is checkable by hand.
       tokens: t.total,
+      tokens_credited: Math.round(t.total * weight),
+      usage_key: usageKey,
       has_usage_row: Boolean(usage),
     });
   }
@@ -564,23 +586,62 @@ function indexAgents(agents) {
   return byId;
 }
 
+// A `usage.json` row is keyed by **CLI SESSION**, not by agent. `group-cost-tracking.md`
+// says why — "keyed by CLI session id … a resumed session updates one row instead of
+// double-counting, since the transcript is cumulative" — and the consequence is the
+// thing to get right here: when a pane's session is carried to a NEW agent id, that one
+// row's `agent_id` names only the LAST occupant, and every earlier agent on the session
+// has no row of its own at all. Joining on `agent_id` therefore reports an agent that
+// demonstrably spent tokens as having spent zero, while crediting its successor with the
+// whole lineage. On this group's own store that is not a corner case: 514 of 1356 rows
+// sit on a session shared by more than one agent id, carrying 31.2 G of 44.1 G tokens.
+//
+// So the row is indexed by session and split evenly across the agents that occupied it
+// (heuristic H8). The split is a guess about how a shared session's spend divided, but it
+// is self-correcting in the common case: a session reused by a worker's own successive
+// agent ids has every occupant attributed to the SAME PR, so the halves re-sum to the
+// whole row. Where only some occupants are attributed, the PR gets a fraction rather than
+// all-or-nothing.
+//
+// `byAgent` is kept as a FALLBACK for a row whose session key is missing, and which index
+// answered is reported per delegate as `usage_key`.
 function indexUsage(usage) {
+  const bySession = new Map();
   const byAgent = new Map();
-  let unmatched = 0;
-  for (const u of usage) {
-    if (!u || typeof u.agent_id !== 'string') { unmatched += 1; continue; }
-    const acc = byAgent.get(u.agent_id)
-      || { input: 0, cache_read: 0, cache_creation: 0, output: 0, total: 0, cost_usd: 0, sessions: 0 };
+  let unusable = 0;
+  const blank = () => ({ input: 0, cache_read: 0, cache_creation: 0, output: 0, total: 0, cost_usd: 0, rows: 0 });
+  const add = (map, key, u) => {
+    const acc = map.get(key) || blank();
     acc.input += num(u.input_tokens);
     acc.cache_read += num(u.cache_read_tokens);
     acc.cache_creation += num(u.cache_creation_tokens);
     acc.output += num(u.output_tokens);
     acc.cost_usd += num(u.cost_usd);
-    acc.sessions += 1;
+    acc.rows += 1;
     acc.total = acc.input + acc.cache_read + acc.cache_creation + acc.output;
-    byAgent.set(u.agent_id, acc);
+    map.set(key, acc);
+  };
+  for (const u of usage) {
+    if (!u || typeof u !== 'object') { unusable += 1; continue; }
+    const hasSession = typeof u.key === 'string' && u.key;
+    const hasAgent = typeof u.agent_id === 'string' && u.agent_id;
+    if (!hasSession && !hasAgent) { unusable += 1; continue; }
+    if (hasSession) add(bySession, u.key, u);
+    if (hasAgent) add(byAgent, u.agent_id, u);
   }
-  return { byAgent, unmatched };
+  return { bySession, byAgent, unusable };
+}
+
+// session id -> every agent id that occupied it, from `agents.json`. Used only to size
+// the H8 split, so it counts EVERY agent on the session, attributed or not.
+function indexSessionAgents(agents) {
+  const bySession = new Map();
+  for (const a of agents) {
+    if (!a || typeof a.session !== 'string' || !a.session) continue;
+    if (!bySession.has(a.session)) bySession.set(a.session, []);
+    bySession.get(a.session).push(a.id);
+  }
+  return bySession;
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +709,7 @@ const HEURISTICS = [
   { id: 'H5', what: "Orchestrator tokens in a window cover every PR in flight; the apportioned figure splits them by this PR's share of the orchestrator wakes in the same window.", fix: 'Per-turn PR attribution — nothing structural exists; see "What this cannot say" in the note.' },
   { id: 'H6', what: 'Delegate tokens come from `usage.json`, which is CUMULATIVE per session and cannot be windowed; a delegate that worked on one PR reports its whole life against that PR.', fix: 'A windowed usage series, or accepting the approximation (delegates are spawned per task).' },
   { id: 'H7', what: 'A PR window ends at `merged_at` supplied via `--pr-meta`; without it the end falls back to the last `rd-*` row, then to the last naming row — which is days late, because a merged PR stays cited.', fix: 'A loomux row for a human merge (plan part 2, A4 / #388).' },
+  { id: 'H8', what: "A `usage.json` row is keyed by CLI SESSION, and a session carried to a new agent id names only its LAST occupant. The row is therefore split evenly across every agent that occupied that session — a guess about how a shared session's spend divided, self-correcting where the whole lineage is attributed to one PR and a fraction where it is not.", fix: 'An `agent_id` (or `block` + `pr`) on every `UsageSnapshot`, not just the latest — the same missing field as H4.' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -710,7 +772,8 @@ async function main(argv) {
 
   const agentsById = indexAgents(agents);
   const orchIds = new Set([...agentsById.values()].filter((a) => a.role === 'orchestrator').map((a) => a.id));
-  const { byAgent: usageByAgent, unmatched: usageUnmatched } = indexUsage(usage);
+  const { bySession: usageBySession, byAgent: usageByAgent, unusable: usageUnusable } = indexUsage(usage);
+  const sessionAgents = indexSessionAgents(agents);
 
   const transcripts = [];
   for (const p of opts.transcript) transcripts.push(await readTranscript(p, cut));
@@ -735,7 +798,7 @@ async function main(argv) {
   }
   const attribution = attributeAgents(rows, prs, windowsByPr);
 
-  const ctx = { rows, orchIds, tailMs, transcriptTurns, usageByAgent, agentsById, attribution, prMeta };
+  const ctx = { rows, orchIds, tailMs, transcriptTurns, usageBySession, usageByAgent, sessionAgents, agentsById, attribution, prMeta };
   const cards = prs.map((pr) => scorePr(ctx, pr));
 
   const spawnedInWindow = new Set();
@@ -768,7 +831,9 @@ async function main(argv) {
         path: t.path, lines: t.lines, assistant_usage_lines: t.assistant_usage_lines,
         deduped_turns: t.turns.length, usage_rows_without_id: t.without_id,
       })),
-      usage_rows_without_agent_id: usageUnmatched,
+      usage_rows_unusable: usageUnusable,
+      usage_sessions_indexed: usageBySession.size,
+      usage_sessions_shared_by_more_than_one_agent: [...sessionAgents.values()].filter((v) => v.length > 1).length,
       agents_attributed: attribution.size,
       agents_unattributed_spawned_in_window: unattributed,
       agents_split_across_prs: split,
@@ -786,7 +851,7 @@ async function main(argv) {
 module.exports = {
   WAKE_KINDS, classifyWake, prTokenRe, rowNamesPr, computeWindows, inWindow,
   dedupeTranscriptTurns, attributeAgents, scorePr, groupTotals, indexAgents,
-  indexUsage, renderPrTable, renderGroupTable, parseArgs, HEURISTICS,
+  indexUsage, indexSessionAgents, renderPrTable, renderGroupTable, parseArgs, HEURISTICS,
   DEFAULT_TAIL_MIN, main,
 };
 

@@ -17,7 +17,7 @@
 //         below: `rows_classified` is 0 here and non-zero for #900/#901, so an
 //         assertion of "the mechanism ran" is fail-able rather than decorative.
 //
-// The transcript fixture is FIVE SYNTHETIC LINES written by hand. Real transcript
+// The transcript fixture is SIX SYNTHETIC LINES written by hand. Real transcript
 // content is private and never enters a fixture; the script reads only `timestamp`
 // and `message.usage` and this file pins that it reads nothing else usefully — the
 // `user` line carries no usage and must be skipped, and the duplicate `assistant`
@@ -70,7 +70,7 @@ const card = (pr: number) => REPORT.prs.find((c: any) => c.pr === pr);
 
 test('positive control: rows were classified, and the control PR classified none', () => {
   assert.ok(REPORT.coverage.rows_classified > 0, 'no audit row was classified — the scorecard did not run');
-  assert.equal(REPORT.coverage.rows_classified, 22);
+  assert.equal(REPORT.coverage.rows_classified, 23);
   assert.ok(card(900).rows_classified > 0);
   assert.ok(card(901).rows_classified > 0);
   // The negative control. Without this the assertion above passes for a scorecard
@@ -230,6 +230,9 @@ test('driver counters: each `rd-*` action lands in its own bucket, reasons kept 
   assert.equal(d.refused, 3);
   assert.equal(d.held, 1);
   assert.equal(d.satisfied, 1);
+  // An `rd-*` action this reader has no bucket for is counted under its own action name
+  // rather than dropped — the doc promises a new driver row cannot go missing.
+  assert.equal(d['rd-a-future-action'], 1);
   assert.deepEqual(d.refused_by_reason, { 'lane-spawn-refused': 2, 'worker-unresumable': 1 });
   assert.deepEqual(d.held_by_reason, { 'drive-stalled': 1 });
   // Untouched buckets stay zero rather than absent, so a table cell is never blank
@@ -294,7 +297,19 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
   assert.equal(d.count, 3);
   assert.deepEqual(d.agents.map((a: any) => a.agent).sort(), ['rev-11', 'rev-12', 'w-13']);
   // rev-12 reviewed both PRs, so half its lifetime tokens land on each (H4).
-  assert.deepEqual(d.tokens, { input: 500, cache_read: 4500, cache_creation: 250, output: 100, total: 5350, turns: 3 });
+  // rev-11 shares session `ses-11` with rev-11-prev, so it is credited HALF the row its
+  // session carries (H8); rev-12 reviewed both PRs, so half again on the PR axis (H4).
+  assert.deepEqual(d.tokens, { input: 450, cache_read: 4050, cache_creation: 225, output: 90, total: 4815, turns: 3 });
+  const rev11 = d.agents.find((a: any) => a.agent === 'rev-11');
+  assert.equal(rev11.usage_key, 'session');
+  assert.equal(rev11.shared_session_agents, 2);
+  assert.equal(rev11.session_weight, 0.5);
+  assert.equal(rev11.pr_weight, 1);
+  assert.equal(rev11.tokens, 1070);          // the whole row its session carries
+  assert.equal(rev11.tokens_credited, 535);  // what this PR actually got
+  const w13 = d.agents.find((a: any) => a.agent === 'w-13');
+  assert.equal(w13.shared_session_agents, 1);
+  assert.equal(w13.tokens_credited, w13.tokens);
   const e = card(901).delegates;
   assert.equal(e.count, 2);
   assert.deepEqual(e.agents.map((a: any) => a.agent).sort(), ['rev-12', 'w-14']);
@@ -309,8 +324,8 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
 });
 
 test('orchestrator share is reported both raw and apportioned', () => {
-  assert.equal(card(900).share.orchestrator_pct_raw, 36.69);   // 3101 / 8451
-  assert.equal(card(900).share.orchestrator_pct_attributed, 17.86); // 1163 / 6513
+  assert.equal(card(900).share.orchestrator_pct_raw, 39.17);   // 3101 / 7916
+  assert.equal(card(900).share.orchestrator_pct_attributed, 19.45); // 1163 / 5978
   assert.equal(card(901).share.orchestrator_pct_raw, 15.1);    // 1080 / 7150
   assert.equal(card(901).share.orchestrator_pct_attributed, 10.01); // 675 / 6745
 });
@@ -360,11 +375,14 @@ test('coverage: unattributed and split agents are named, not swallowed', () => {
   // assertion is about the role filter rather than about orch-10 never being seen.
   assert.equal(cov.agents_attributed, 5);
   assert.equal(cov.agents_unattributed_spawned_in_window.includes('orch-10'), false);
-  assert.equal(cov.audit_rows_read, 27);
+  assert.equal(cov.audit_rows_read, 28);
   assert.equal(cov.audit_parse_errors, 0);
-  assert.equal(cov.usage_rows_without_agent_id, 0);
+  // A usage row carrying neither a session key nor an agent id is unusable and says so.
+  assert.equal(cov.usage_rows_unusable, 1);
+  assert.equal(cov.usage_sessions_indexed, 6);
+  assert.equal(cov.usage_sessions_shared_by_more_than_one_agent, 1);
   assert.deepEqual(cov.transcripts, [{
-    path: TRANSCRIPT, lines: 5, assistant_usage_lines: 4, deduped_turns: 3, usage_rows_without_id: 0,
+    path: TRANSCRIPT, lines: 6, assistant_usage_lines: 5, deduped_turns: 4, usage_rows_without_id: 1,
   }]);
 });
 
@@ -383,7 +401,7 @@ test('coverage: rows inside a window that no counter consumed are reported by ac
 });
 
 test('coverage: every heuristic is declared with an id, a statement and its structural fix', () => {
-  assert.ok(REPORT.coverage.heuristics.length >= 7);
+  assert.ok(REPORT.coverage.heuristics.length >= 8);
   const ids = REPORT.coverage.heuristics.map((h: any) => h.id);
   assert.deepEqual(ids, [...new Set(ids)], 'heuristic ids must be unique');
   for (const h of REPORT.coverage.heuristics) {
@@ -400,7 +418,7 @@ test('coverage: every heuristic is declared with an id, a statement and its stru
 test('group totals: per-file wake census, independent of any PR selection', () => {
   assert.equal(REPORT.group.files.length, 1);
   const f = REPORT.group.files[0];
-  assert.equal(f.rows, 27);
+  assert.equal(f.rows, 28);
   assert.equal(f.orchestrator_wakes, 8);
   assert.equal(f.prompt_typed_to_orchestrator, 0);
   assert.deepEqual(f.wakes_by_kind, {

@@ -3,3 +3,4 @@
 {"type":"user","timestamp":"2023-11-14T22:15:10.000Z","message":{"role":"user","content":"synthetic — no usage on a user line"}}
 {"type":"assistant","timestamp":"2023-11-14T22:31:40.000Z","message":{"id":"msg_synthetic_2","usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":2000,"output_tokens":11}}}
 {"type":"assistant","timestamp":"2023-11-14T23:36:40.000Z","message":{"id":"msg_synthetic_3","usage":{"input_tokens":900,"cache_creation_input_tokens":900,"cache_read_input_tokens":900,"output_tokens":900}}}
+{"type":"assistant","timestamp":"2023-11-14T23:50:00.000Z","message":{"usage":{"input_tokens":4,"cache_creation_input_tokens":4,"cache_read_input_tokens":4,"output_tokens":4}}}

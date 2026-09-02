@@ -48,7 +48,7 @@ per-turn record.
 **What the script reads from the transcript, and nothing else:** `timestamp` and
 `message.usage`. Each line is projected to those two fields at parse time and the
 rest is dropped before anything is retained, so no transcript prose is ever held in
-memory, printed, or written to a fixture. The tests run against a five-line synthetic
+memory, printed, or written to a fixture. The tests run against a six-line synthetic
 transcript written by hand.
 
 ---
@@ -60,8 +60,13 @@ have the same answer.
 
 | Window | Start | End | Used for |
 | --- | --- | --- | --- |
-| **loop** | the first `rd-*` row with `detail.pr == N` | the last such row | driver counters, `span_h`, loop notices |
-| **pr** | the first audit row **naming** the PR (§3) | `merged_at`, else the last `rd-*` row, else the last naming row | wakes, review rounds, tokens |
+| **loop** | the first `rd-*` row with `detail.pr == N` | the last such row | `span_h`, loop notices |
+| **pr** | the first audit row **naming** the PR (§3) | `merged_at`, else the last `rd-*` row, else the last naming row | wakes, orchestrator tokens |
+
+The **driver counters and the review rounds sit in neither** — they are matched
+structurally on `detail.pr` and counted wherever the row lands, which §4.3, §4.4 and
+§5 all state and which `rows_counted_outside_pr_window` reports on. Only the four
+counters named in the table above are window-gated.
 
 Both take a **+10 minute tail** for membership tests (`--tail-min`, default 10) —
 the rule #1778's S5 table used, and for the same reason: a merge or CI notice the
@@ -146,12 +151,18 @@ look worse. See §7.
 ### 4.3 Review rounds
 
 `review-verdict` rows with `detail.pr == N`, bucketed by `detail.block` then
-`detail.verdict` (lower-cased). `rounds` is the total. This counter is driver-blind:
-it reads the same row for a hand-routed PR and a driven one.
+`detail.verdict` (lower-cased). `rounds` is the total. Matched **structurally and
+counted wherever the row lands**, like the driver counters above — a verdict recorded
+after the merge is still a round the PR cost. This counter is driver-blind: it reads
+the same row for a hand-routed PR and a driven one.
 
 ### 4.4 Driver counters
 
-`rd-*` rows with `detail.pr == N`, one bucket per action, over the loop window:
+`rd-*` rows with `detail.pr == N`, one bucket per action. These are matched
+**structurally and counted wherever the row lands** — NOT gated on either window, so a
+re-drive after the merge still counts; §5's `rows_counted_outside_pr_window` is what
+reports the spill. (The loop window is derived FROM these rows, so in practice every
+one of them is inside it; the `--pr-meta` merge time is what a late row can fall past.)
 
 | Field | Row | Notes |
 | --- | --- | --- |
@@ -195,10 +206,34 @@ both operands so the apportionment is checkable rather than trusted.
 
 ### 4.6 Delegate tokens
 
-`usage.json` rows for every agent attributed to the PR (§5), summed, weighted by
-`1/k` where the agent is attributed to *k* PRs. An agent whose `agents.json` role is
-`orchestrator` is **excluded** — its spend is already in §4.5 and counting it here
-would double it.
+A `usage.json` row is keyed by **CLI session**, not by agent. `group-cost-tracking.md`
+says why ("keyed by CLI session id … a resumed session updates one row instead of
+double-counting"), and the consequence has to be handled here: when a pane's session is
+carried to a new agent id, that one row's `agent_id` names only the **last** occupant,
+and every earlier agent on the session has no row of its own. Joining on `agent_id`
+would report an agent that demonstrably spent tokens as having spent zero while
+crediting its successor with the whole lineage — and on this group's store that is not
+a corner case: **514 of 1356 rows sit on a session shared by more than one agent id,
+carrying 31.2 G of 44.1 G tokens**.
+
+So the row is looked up by the agent's **session** and split evenly across every agent
+that occupied it (heuristic **H8**), then weighted by `1/k` where the agent is
+attributed to *k* PRs (**H4**). The session split is self-correcting in the common
+case — a pane reused by a worker's own successive agent ids has every occupant
+attributed to the same PR, so the halves re-sum to the whole row — and gives a
+fraction rather than all-or-nothing where only some occupants are attributed. An
+`agent_id` lookup remains as a **fallback** for a row with no session key, and
+`usage_key` per delegate says which index answered.
+
+Each delegate reports `tokens` (the whole row its session carries) beside
+`tokens_credited` (what this PR actually got after both weights), so the delegate
+total is checkable by hand. `has_usage_row: false` means neither index had anything
+for that agent: it contributes **0**, which makes the delegate side an
+under-count and the orchestrator share correspondingly an over-estimate. The coverage
+block is where a reader sees how often that happens.
+
+An agent whose `agents.json` role is `orchestrator` is **excluded** — its spend is
+already in §4.5 and counting it here would double it.
 
 `usage.json` is cumulative per session and cannot be windowed (§1), so a delegate
 reports its whole life against the PR it is attributed to. That is heuristic **H6**,
@@ -241,6 +276,14 @@ names all eleven benchmark PRs) would be attributed to all eleven.
 - `rows_unclassified_in_window` — rows naming the PR inside its window that no
   counter consumed, grouped by action. This is the "did the scorecard see everything"
   check; it is expected to be non-empty (an `agent-spawn` is named but not counted).
+- `has_usage_row: false` on a delegate — neither the session index nor the `agent_id`
+  fallback had a row for it, so it contributes 0 and the delegate side is an
+  under-count. On the eleven benchmark PRs this is **28 of 94** delegate entries, and
+  it falls hardest on the hand-routed side, which means the before/after gap this
+  scorecard reports is if anything **understated**, not flattered.
+- `usage_sessions_shared_by_more_than_one_agent` — how many sessions the H8 split had
+  to divide, and `usage_rows_unusable` — rows with neither a session key nor an
+  `agent_id`, which are skipped.
 - `rows_counted_outside_pr_window` — the reverse direction. A `review-verdict` or
   `rd-*` row is matched **structurally** on `detail.pr`, so it counts wherever it
   occurs: a late verdict or a re-drive after the merge is still a round the PR cost,
@@ -264,6 +307,7 @@ The script emits this list in every run, under `coverage.heuristics`, and it **i
 | H5 | Orchestrator tokens are apportioned by wake share. | Per-turn PR attribution — nothing structural exists (§7). |
 | H6 | `usage.json` is cumulative, so a delegate's whole life counts against its PR. | A windowed usage series, or accepting the approximation. |
 | H7 | The PR window ends at `merged_at` passed in by the caller. | A loomux row for a human merge (#388). |
+| H8 | A `usage.json` row is keyed by CLI **session**; a session carried to a new agent id names only its last occupant, so the row is split evenly across every agent that occupied it. | An `agent_id` (or `block` + `pr`) on **every** `UsageSnapshot`, not just the latest — the same missing field as H4. |
 
 A run that adds a heuristic adds a row here in the same commit. The test suite
 asserts every emitted heuristic has an id, a statement and a named fix, so an
@@ -333,13 +377,16 @@ One JSON object. `--format table` renders the per-PR GFM table instead;
     review:       { rounds, by_block: { <block>: { <verdict>: n } } },
     driver:       { drives, lane_spawns, hand_backs, refused, held, ...,
                     refused_by_reason, held_by_reason },
-    delegates:    { count, tokens, agents: [ { agent, block, role, tier, weight, tokens } ] },
+    delegates:    { count, tokens, agents: [ { agent, block, role, tier, weight, pr_weight,
+                    session_weight, shared_session_agents, tokens, tokens_credited,
+                    usage_key, has_usage_row } ] },
     share:        { orchestrator_pct_raw, orchestrator_pct_attributed },
     rows_classified, rows_counted_outside_pr_window, rows_unclassified_in_window
   } ],
   coverage: { audit_rows_read, audit_parse_errors, rows_classified, transcripts[],
               agents_attributed, agents_unattributed_spawned_in_window,
-              agents_split_across_prs, heuristics[] }
+              agents_split_across_prs, usage_rows_unusable, usage_sessions_indexed,
+              usage_sessions_shared_by_more_than_one_agent, heuristics[] }
 }
 ```
 
@@ -358,8 +405,14 @@ mechanism ran" assertion fail-able. The corpus is built so that no two counters 
 a value — a fixture whose axes are all one constant cannot tell a working counter
 from a broken one.
 
-The transcript fixture is five hand-written lines. Real transcript content is private
+The transcript fixture is six hand-written lines. Real transcript content is private
 and never enters a fixture.
+
+The corpus also carries one instance of each edge the text above promises to handle,
+so none of them is a claim with no test behind it: a session shared by two agent ids
+(the H8 split), an `rd-*` action this reader has no bucket for, a transcript line with
+usage but **no** `message.id`, and a `usage.json` row with neither a session key nor an
+`agent_id`.
 
 The one instrument here is `npm test`. `tsconfig.json`'s `include` is `["src"]`, so
 `tsc --noEmit` typechecks neither `scripts/` nor `test/` and has no opinion on any of
