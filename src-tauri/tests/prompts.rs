@@ -250,6 +250,43 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
          demand, but the trigger is what tells the orchestrator to fetch it");
 }
 
+/// **#1958, review round 1.** The two shipped surfaces that READ the signal #1958 removed.
+///
+/// A rule that deletes a signal has to reach every reader of it, not only its writer, and
+/// prose with no pin under it is prose the next compression deletes. Both of these were
+/// live failure modes rather than stale wording: the playbook told the orchestrator to
+/// re-send a brief on silence that is now normal, and `worker.md` told an idle worker to
+/// confirm through a channel that reaches nobody.
+///
+/// Anchored on the RULE each surface now states, plus a negative assertion on the retracted
+/// one — a test that quotes a claim enforces it, so the correction has to move the pin in
+/// the same commit and forbid the return (CLAUDE.md, #1502).
+#[test]
+fn no_shipped_template_still_waits_for_a_progress_report() {
+    let pb = flat(&playbook_instructions());
+    let recovery = section(&pb, "**silent-agent recovery", "on an `[orrerix] delivery to");
+    pinned("the playbook's silent-agent recovery", recovery, "the kickoff is in its own scrollback",
+        "after #1958 a working delegate is SILENT: the orchestrator must decide a lost kickoff \
+         from the pane's own transcript, never from having heard nothing");
+    pinned("the playbook's silent-agent recovery", recovery, "never infer a lost kickoff from having heard nothing",
+        "the retracted rule's remedy was to re-send the brief, which duplicates work on a \
+         delegate that is mid-task — the delivery-id check does not catch a fresh send_prompt");
+    assert!(
+        !recovery.contains("reports ready/progress within a couple of minutes"),
+        "the playbook must not wait for a signal no role produces any more (#1958): {recovery}"
+    );
+
+    let w = flat(&instructions("worker.md"));
+    let idle = section(&w, "## if idle", "## ");
+    pinned("worker.md's If idle", idle, "idle and ready for a brief",
+        "being idle and ready IS an orchestrator action (it has to send a brief), so it goes \
+         through the one delegate channel #1958 never touches");
+    assert!(
+        !idle.contains("report(\"progress\", \"ready\")"),
+        "an idle worker must not confirm through a report that reaches no pane (#1958): {idle}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The findings-disposition policy — the most load-bearing prose in the suite
 // ---------------------------------------------------------------------------------------------
@@ -836,8 +873,25 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
     pinned("worker.md's first-turn primer", worker_primer, "delivery id",
         "the duplicate-delivery check must be the FIRST thing a worker does, or it can burn a \
          whole turn re-doing work it already did");
-    pinned("worker.md's first-turn primer", worker_primer, "report(\"progress\"",
-        "the orchestrator should hear a worker is on the task before anything else happens");
+    // #1958 repinned this. The old anchor was `report("progress"` and its stated reason —
+    // "the orchestrator should hear a worker is on the task" — is the claim #1958 RETRACTS: a
+    // progress report reaches no pane at all, so mandating one on every spawn mandated a
+    // notification to nobody. Correcting the template without correcting the pin would have
+    // reddened this test and read as a regression, which is the pressure to revert the fix
+    // rather than the pin (CLAUDE.md, #1502).
+    //
+    // What survives is the rule the primer really owes: after the two checks, WORK. The
+    // `delivery id` pin above is this region's positive control — it fails loudly on an empty
+    // or mislocated `worker_primer`, so the absence assertion below cannot pass vacuously.
+    pinned("worker.md's first-turn primer", worker_primer, "work the brief step by step",
+        "after the duplicate-delivery and directive checks, the primer's job is to send the worker at the brief — not at a ceremony report");
+    assert!(
+        !worker_primer.contains("report(\"progress\""),
+        "worker.md's first-turn primer must not mandate a starting progress report (#1958): a progress report is a RECORD, written to the audit log and the board, and reaches no pane — so a mandated one on every spawn is a notification to nobody. If you are re-adding it deliberately, say why in the PR.
+
+Region as rendered:
+{worker_primer}"
+    );
 
     let r = flat(&reviewer);
     let reviewer_primer = section(&r, "## your first turn", "## your orrerix mcp tools");

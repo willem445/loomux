@@ -2272,6 +2272,161 @@ side).
   convention) — a prose pin (`tests/prompts.rs`) audited clean, since none of #398's edits touched
   a pinned region.
 
+### A delivery reaches the orchestrator only if it needs an orchestrator action (#1958)
+
+#398 above made each report SMALLER. It left the delivery COUNT alone, and that turned out to
+be the larger half: every `report(...)` is typed into the orchestrator's pane and wakes it for a
+turn on the group's most expensive model, re-paying its whole resident context. Measured on
+group `loomux-68435179`'s audit log, `reports progress` was 64 of 106 delegate→orchestrator
+deliveries — 60% — and the mandated "starting `<task>`" line from `worker.md`'s first-turn
+primer was every one of the five in the session that filed the issue.
+
+The rule the human chose, stated once and implemented once: **a delegate delivery reaches the
+orchestrator's pane only if it needs an orchestrator action.**
+
+- **`done` and `blocked` do.** Both name something only the orchestrator resolves — route the
+  next step, drive the PR, take it to the merge gate, ask the human. Unchanged.
+- **`progress` never does.** A delegate saying it is still going changes nothing the
+  orchestrator would otherwise do; it is a fact about the past, and the orchestrator is not a
+  reader of those. So it is not delivered.
+- **It is REROUTED, not dropped**, and that distinction is the whole of why this is cheap
+  rather than lossy. The `tool-call` audit row every MCP call writes is unchanged, and
+  `Registry::report_task_note` appends the composed notice to the board row the report
+  resolves to. The human sees it where they already look — the delegate's own pane, and the
+  board beside it — and the orchestrator reads it on demand with `get_task`/`get_output`. What
+  went away is the interrupt. **The tool's own answer says which of the three happened** — noted,
+  recorded-but-no-row, or delivered — because "reported to orchestrator" would be a false claim
+  to the one caller in a position to act on it. A chatty delegate cannot flood a row: notes are
+  already capped at `MAX_TASK_NOTES` (20) with an orrerix-authored collapse placeholder, and the
+  full text of every note is in the audit log regardless.
+- **`message_orchestrator` is unchanged and is the residual on purpose.** It is the delegate's
+  channel for something that DOES need an action and is not a status change, and #1958
+  deliberately does not touch it: a delegate with a real reason to wake the orchestrator must
+  keep a way to, or the saving is paid for in stalls. It is also the reason the template can
+  say "never use `progress` to get attention" without leaving the delegate stuck.
+
+**The predicate is pure and keyed on `status`, not `outcome`** (`report::reaches_orchestrator_pane`
+in `loomux-engine`). `status_for_outcome` already folds a reviewer's `approved` and
+`request_changes` into `done`, and those are what open this repo's merge gate — the LAST
+reports that may be silenced — so reading `outcome` here would be a second vocabulary to keep
+in step with the first. The catch-all DELIVERS: an unrecognised status word is a change that
+forgot to come here, and a surplus wake-up costs one turn where a silently undelivered `done`
+strands a PR nobody routes.
+
+**The driven arm is deliberately untouched.** Under a live review drive the recipient of a
+delegate's report is not the orchestrator at all (§7 of `review-driver.md`): `rd_consume`
+takes it and audits it as `rd-consumed`, and the driver writes its own board notes through
+`rd_task_note`. Silencing a `progress` there would be changing a drive's inputs on the way
+past, and adding a second note stream from the delegate onto the same row would duplicate the
+drive's own record — so the routing decision sits BELOW the `rd_owner` match, in the undriven
+arm only. `a_driven_workers_progress_report_is_still_consumed_by_the_driver` pins both halves.
+
+**Board-row resolution is orrerix-minted first, caller-supplied second.** The delegate's
+`session_id` is what orrerix recorded at spawn and what the orchestrator writes onto the row it
+assigns; a delegate cannot choose it. Only when that resolves nothing is the report's `ref` —
+an agent-authored string — matched against the row's `pr` and then its `issue`. That order is
+not an authorization: this WRITES a note and reads nothing back, so a wrong match costs a
+misfiled note, never a decision (the same argument `rd_task_note` carries). Resolving nothing
+is not an error — the audit row is the floor, and a group that does not use the board reports
+exactly as it did before.
+
+**What still wakes the orchestrator, and why each needs an action.** `report(done | blocked |
+approved | request_changes)`; `message_orchestrator`; a recorded `review_verdict`'s courtesy
+notice (§ *The verdict notice is a signal*); the driver's own kick-backs and notices; the
+human's board actions (start, approve, proceed, request changes); queue, pause and watchdog
+notices orrerix itself mints. Every one of those names something the orchestrator decides.
+`progress` was the only class on the list that named nothing.
+
+**Template lockstep.** `worker.md`'s first-turn primer loses the mandatory
+`report("progress", …, "starting <task>")` step — the spawn IS the start signal — and its
+reporting paragraph, which opened "on start (`progress`, one line restating the task)", now
+states which two outcomes reach the pane. The `progress` bullet in the tool-doc list stays as
+the only rule for `progress`, with its premise corrected: it said "only when it changes what
+the orchestrator would otherwise assume", which is the claim this change retracts.
+`reviewer.md` names `progress` nowhere and mandates no start report, so it did not move.
+`tests/fixtures/pre222` re-blessed in the same commit; `tests/prompts.rs` repinned, because
+its old anchor was the retracted mandate itself and a test quoting a claim ENFORCES it.
+
+#### The lockstep runs to every READER of the signal, not just its writer (review round 1)
+
+The first cut edited the template that SENT a `progress` report and stopped there. Two shipped
+surfaces still keyed on RECEIVING one, and both are failure modes rather than stale prose.
+
+- **`orchestrator-playbook.md`'s silent-agent recovery** told the orchestrator that a freshly
+  spawned agent "reports ready/progress within a couple of minutes", and that silence past that
+  means "its kickoff was lost — re-send the task with `send_prompt`". After this change a working
+  delegate is silent by design, so a worker three steps into its brief reads identically to one
+  that never received it — and the re-send is not idempotent from the delegate's side, because
+  its duplicate-delivery check keys on the delivery id and a fresh `send_prompt` carries a new
+  one. The paragraph now decides from the PANE: **the kickoff is in the agent's own scrollback if
+  it landed**, whether or not the agent has said anything, so `send_prompt` again only when the
+  brief itself is absent. `get_task` is the second read; orrerix's `unconfirmed` notice and the
+  watchdog are what say a delivery is genuinely in doubt. "I have heard nothing" is never the
+  thing to act on.
+- **`worker.md`'s "If idle"** told an idle worker to "confirm with `report("progress", "ready")`
+  and wait" — a notification semantic on a report that now reaches nobody, and an idle worker has
+  no board row either, so it was audit-only and the wait never ended.
+
+**What replaces the idle confirmation, and why it is the rule rather than an exception to it.**
+The candidates were a `blocked`-class report, a board note the orchestrator polls, and
+`message_orchestrator`. The rule decides it: a delivery reaches the pane **iff it needs an
+orchestrator action**, and an idle worker with no task is asking for one — the orchestrator has
+to send it a brief. That is an action, so this belongs on the pane, and it belongs there through
+the channel that was never in scope to change.
+
+- Not `blocked`: that word means work that has STALLED, and it carries side effects that would be
+  lies here — `set_agent_idle`, and an attention badge reading `blocked` on a pane that is
+  perfectly healthy and simply unemployed.
+- Not a polled board note: an idle worker has no row to write one on (that is the same finding),
+  and inventing one would make the board a mailbox. A signal nobody is scheduled to read is a
+  worse version of the problem this change fixes — the orchestrator would have to poll, which
+  costs more turns than the one delivery it replaces.
+- `message_orchestrator` is unchanged, always lands, and is already documented as the delegate's
+  channel for "something that needs an action and is not a status change". Using it here does not
+  resurrect a `progress` delivery: no `report` call reaches a pane, and the residual list above is
+  unchanged.
+
+The two `report("progress", …)` calls that remain in `worker.md` — both in the CI-wait
+instructions — are deliberate. Neither claims the orchestrator hears it, and "waiting on CI,
+watch registered" is exactly the fact-worth-finding-later the tool-doc bullet describes, landing
+on the board where the human reads it.
+
+#### Three residuals this change accepts, each stated where it can be checked
+
+1. **An unclassified status silently delivers, and no test can fail for it.**
+   `reaches_orchestrator_pane`'s catch-all is deliberate — delivering is the safe direction — but
+   that also means there is no input distinguishing "classified as delivering" from "never
+   classified". What makes adding a status a deliberate act is a **vocabulary pin**:
+   `every_status_is_classified` asserts `STATUSES` is exactly the three members classified here,
+   and `every_reviewer_outcome_still_reaches_the_pane` does the same for `OUTCOMES`. Nothing else
+   catches it, and the earlier revision's rustdoc and test comments claimed otherwise. Both are
+   fixed-size arrays, so an ADDITION does not redden the pin — it stops it COMPILING, which is
+   stronger; a RENAME is what fails the assertion. Measured both ways in the evidence wave, after
+   the first cut of this paragraph said "reddens" for a case that is a compile error.
+2. **"No matching row" and "I could not read the board" are different answers.** `tasks()` maps
+   any read or parse failure to an empty `Vec`, so the first cut told a delegate the board's
+   *contents* on a read that had merely failed. `tasks_or_err` keeps the distinction (a MISSING
+   file is still the ordinary empty case, not an error) and the tool has a third answer. The
+   read is still taken outside `tasks_lock` and can still lose a race with a concurrent
+   `atomic_write`; what changes is that the delegate is now told that is what happened, and the
+   audit log still carries the full text either way.
+
+   **The same collapse existed one layer over, on the WRITE**, and round 2 of the review found
+   it: a row that resolved and then failed to be written — `write_tasks` propagates
+   `create_dir_all` and `atomic_write` errors, the disk-full case #133 filed — was answered
+   "no board task matched", which is a claim about the board's CONTENTS made on a write. It is
+   now `NoteOutcome::NotWritten` with its own answer. The two causes that reach it (the IO
+   failure, and the row vanishing under a concurrent writer) share one answer deliberately: the
+   delegate's next move is identical, and telling them apart would mean deciding on an error
+   string. What is NOT closed is the loss itself — the note is gone either way, and only the
+   audit log has the text.
+3. **Two LIVE rows sharing a `ref` are still first-match-wins.** The `ref` fallback now skips
+   `done` rows — nothing clears `pr` on completion, so a long-lived board keeps finished rows
+   carrying the live work's PR, and those sort first — but two open rows on one PR remain
+   ambiguous. The session is what disambiguates, which is why it is tried first; a `ref` is an
+   agent-authored string and the board cannot tell which open row the delegate meant. The cost is
+   a misfiled note, never a decision.
+
 ## Notification backend (#243)
 
 Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the

@@ -1518,7 +1518,7 @@ fn tool_defs(
     } else {
         tools.extend([
             tool("report",
-                "Report to the orchestrator — decision-grade, not a narrative: it is a router whose next action depends on one bit plus a reference, and every paragraph beyond that is context it pays for on every future turn. Post your FULL detail to GitHub first (PR body/comment, issue comment — the system of record); this tool is the notification, not the record. Prefer the structured shape: `outcome` (done | blocked | approved | request_changes | progress — approved/request_changes are for a reviewer's report after `review_verdict`, and both count as this agent's turn being over, same as done), `ref` (the PR/issue this is about, e.g. \"#123\"), `detail_url` (the GitHub comment/PR where the full detail lives), and `note` — a short pointer (~1-2 lines), hard-capped at 500 characters and truncated WITH a stated marker if you go over, so the cap is enforced, not merely asked for. The legacy shape (`status` + free-text `summary`, no cap) still works — nothing breaks — but is soft-deprecated: write new reports the structured way. Give exactly one of `status`/`outcome` and one of `summary`/`note`.",
+                "Report to the orchestrator — decision-grade, not a narrative: it is a router whose next action depends on one bit plus a reference, and every paragraph beyond that is context it pays for on every future turn. Post your FULL detail to GitHub first (PR body/comment, issue comment — the system of record); this tool is the notification, not the record. Prefer the structured shape: `outcome` (done | blocked | approved | request_changes | progress — approved/request_changes are for a reviewer's report after `review_verdict`, and both count as this agent's turn being over, same as done), `ref` (the PR/issue this is about, e.g. \"#123\"), `detail_url` (the GitHub comment/PR where the full detail lives), and `note` — a short pointer (~1-2 lines), hard-capped at 500 characters and truncated WITH a stated marker if you go over, so the cap is enforced, not merely asked for. The legacy shape (`status` + free-text `summary`, no cap) still works — nothing breaks — but is soft-deprecated: write new reports the structured way. Give exactly one of `status`/`outcome` and one of `summary`/`note`. WHAT REACHES THE ORCHESTRATOR'S PANE: only a report that needs an orchestrator ACTION. `done` and `blocked` do (route the next step, drive the PR, merge, ask the human) and are typed into that pane. `progress` never does — it is recorded in the audit log and appended as a note on your board task, where the human sees it and the orchestrator reads it on demand (`get_task`), and nothing is typed into any pane. So do not use `progress` to get someone's attention, and do not send a 'starting' report at all: the orchestrator wrote your brief, so it already knows. When something genuinely needs the orchestrator NOW and is not a status change, that is `message_orchestrator`, which always lands.",
                 json!({
                     "status": { "type": "string", "enum": ["progress", "done", "blocked"], "description": "Legacy — soft-deprecated. Prefer `outcome`." },
                     "summary": { "type": "string", "description": "Legacy free text, uncapped — soft-deprecated. Prefer `note`." },
@@ -3301,6 +3301,13 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     report::relay_payload(note.or(summary).unwrap())
                 ),
             };
+            // Set by the one arm below that neither delivers to the orchestrator
+            // nor hands the event to a driver, so the tool's own answer says what
+            // really happened instead of "reported to orchestrator" (#1958). The
+            // driven arm's wording is deliberately left alone — what a driver
+            // consumed is #1778 §7's story to tell, not this change's.
+            let mut off_pane = false;
+            let mut note_outcome = super::NoteOutcome::NoRow;
             // #1778 §7: **for a driven PR the recipient changes.** A delegate
             // this group's review driver spawned or resumed reports to the
             // DRIVER; the orchestrator's visible prompt is the kick-back (§6),
@@ -3391,13 +3398,44 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     };
                     reg.rd_consume(&caller.group, pr, &caller.agent_id, kind, event);
                 }
+                // #1958: **a delegate delivery reaches the orchestrator's pane
+                // only if it needs an orchestrator ACTION**, and that is the
+                // whole rule — `report::reaches_orchestrator_pane` states it
+                // once, over the closed `status` vocabulary. `done`/`blocked`
+                // need one (route, drive, merge, ask the human); `progress`
+                // never does, and waking the group's most expensive model to
+                // re-pay its whole resident context for a line it routes on
+                // nowhere was 60% of this group's delegate deliveries.
+                //
+                // The report is NOT dropped, it is REROUTED: the `tool-call`
+                // audit row above is written for every MCP call regardless, and
+                // `report_task_note` puts the same composed notice on the board
+                // row this delegate is working — the pane it was typed in, the
+                // board beside it, and `get_task` on demand. What goes away is
+                // the interrupt, not the trail.
+                //
+                // Deliberately BELOW the `rd_owner` match rather than above it:
+                // a driven PR's reports are consumed by the DRIVER (#1778 §7),
+                // which is a different recipient with a different contract, and
+                // silencing a `progress` on that arm would be changing the
+                // drive's inputs on the way past. That arm is untouched.
+                //
                 // #576 residual: the relay variant, which opts this notice into
                 // the question gate's delivery record — the note is the CALLER's
                 // words landing in the ORCHESTRATOR's pane, which is the
                 // cross-pane authorship the record requires. See
                 // `deliver_relayed_to_orchestrator`.
-                None => {
+                None if report::reaches_orchestrator_pane(status) => {
                     reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+                }
+                None => {
+                    note_outcome = reg.report_task_note(
+                        &caller.group,
+                        &caller.agent_id,
+                        arg_str(args, "ref"),
+                        &message,
+                    );
+                    off_pane = true;
                 }
             }
             // #203: a planner's contract is one plan → one report → exit. Close
@@ -3410,7 +3448,23 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role == Role::Planner && status == "done" {
                 reg.close_completed_planner(&caller.agent_id);
             }
-            Ok("reported to orchestrator".into())
+            // FOUR answers, not one (#1966 rev-final N2, then round 2's N1):
+            // "the board says no such row", "I could not read the board" and "a
+            // row matched but the note did not land" are different facts, and
+            // collapsing any of them into another puts a false claim in front of
+            // the one caller who could act on it — the same defect this change
+            // fixes one layer up by not saying "reported to orchestrator". The
+            // count is stated because it went stale once already: the third
+            // answer's comment still said "three" after the fourth arrived
+            // (rev-std round 3).
+            Ok(match (off_pane, &note_outcome) {
+                (true, super::NoteOutcome::Noted) => "recorded in the audit log and noted on your board task. A progress report never reaches the orchestrator's pane (#1958) — report done or blocked when you need it to act, or message_orchestrator when something else does.",
+                (true, super::NoteOutcome::NoRow) => "recorded in the audit log. No board task on this group's board matched your session or ref, so there is no note; a progress report never reaches the orchestrator's pane either (#1958) — report done or blocked when you need it to act.",
+                (true, super::NoteOutcome::Unreadable) => "recorded in the audit log. This group's board could not be read just now, so no note was written — that is NOT the same as there being no matching task, and nothing was lost: the audit log has the full text. A progress report never reaches the orchestrator's pane either (#1958).",
+                (true, super::NoteOutcome::NotWritten) => "recorded in the audit log. A board task DID match, but the note could not be written to it — the board write failed, or that row went away underneath this call. Nothing was lost: the audit log has the full text. A progress report never reaches the orchestrator's pane either (#1958).",
+                _ => "reported to orchestrator",
+            }
+            .into())
         }
         "review_verdict" => {
             // Authorization is enforced twice on purpose: here, and again in

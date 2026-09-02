@@ -11782,6 +11782,41 @@ pub enum DigestLookup {
     Pr(String),
 }
 
+/// What [`OrchRegistry::report_task_note`] did, so the caller can tell the
+/// delegate the truth rather than a plausible sentence (#1966 rev-final N2).
+///
+/// `NoRow` and `Unreadable` were one answer in the first cut, and that answer
+/// — "no board task resolved from your session or ref" — is a claim about the
+/// board's CONTENTS made on a read that may simply have failed. It is the
+/// same defect one layer down as the "reported to orchestrator" this change
+/// set out to fix.
+#[derive(Debug, PartialEq, Eq)]
+enum NoteOutcome {
+    /// A row resolved and the note is on it.
+    Noted,
+    /// The board was read and nothing on it matched — the ordinary case for
+    /// an ad-hoc brief or a group that does not use the board.
+    NoRow,
+    /// The board could not be read or parsed. "I could not look" is not
+    /// "there was nothing there", so it is never reported as `NoRow`.
+    Unreadable,
+    /// A row DID resolve and the write did not land (#1966 rev-final round 2
+    /// N1). Two causes reach this, and neither is `NoRow`:
+    ///
+    ///  - the board write itself failed — `write_tasks` propagates
+    ///    `create_dir_all` and `atomic_write` errors, which is the disk-full
+    ///    case #133 filed;
+    ///  - the row was gone when `upsert_task` re-read under the lock
+    ///    (`unknown task`). In-process that needs a concurrent writer, since a
+    ///    single thread's two reads see the same file — so the IO cause is the
+    ///    reachable one, and the first cut of this arm named only the other.
+    ///
+    /// They share one answer deliberately: the delegate's next move is the same
+    /// either way (nothing, the audit log has the text), and splitting them
+    /// would mean deciding between them on an error STRING.
+    NotWritten,
+}
+
 /// Field edits for `upsert_task`; `None` leaves a field untouched.
 #[derive(Default)]
 pub struct TaskPatch {
@@ -28948,10 +28983,30 @@ impl OrchRegistry {
     // ---------- task board ----------
 
     pub fn tasks(&self, group: &GroupId) -> Vec<Task> {
-        fs::read_to_string(self.group_dir(group).join("tasks.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        self.tasks_or_err(group).unwrap_or_default()
+    }
+
+    /// The board, with a read or parse failure kept DISTINCT from an empty board
+    /// (#1966 rev-final N2). `tasks()` is this function with the distinction
+    /// thrown away, which is right for every caller that has nothing different to
+    /// do about it — and wrong for the one that would otherwise tell a delegate
+    /// "there was no matching row" when the truth is "I could not look".
+    ///
+    /// **A MISSING file is not a failure**: a group that has never written a board
+    /// has none, and that is the ordinary empty case. Anything else — an
+    /// unreadable file, a partial or malformed one — is an error.
+    fn tasks_or_err(&self, group: &GroupId) -> Result<Vec<Task>, String> {
+        match fs::read_to_string(self.group_dir(group).join("tasks.json")) {
+            // NOTE: neither message names the board FILE, and that is not
+            // stylistic — `tests/pathseg.rs` default-denies an interpolation
+            // sharing a `format!` template with a file-extension literal, and a
+            // `SANCTIONED` entry is only for a binding that really is a
+            // `PathSegment`. Writing the argument down is the point of that
+            // test, and there is no argument to write here.
+            Ok(s) => serde_json::from_str(&s).map_err(|e| format!("the task board could not be parsed: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("the task board could not be read: {e}")),
+        }
     }
 
     /// Compact rows for the MCP `list_tasks` tool (#245) — see `TaskSummary`.
@@ -51185,6 +51240,82 @@ impl OrchRegistry {
             .map(|a| a.id.clone())
             .ok_or("no live orchestrator in this group")?;
         self.deliver_prompt(&orch, text, from, Delivery::MidSession)
+    }
+
+    /// Put a `progress` report on the board row this delegate is working, so the
+    /// trail survives the delivery that no longer happens (#1958).
+    ///
+    /// A `progress` report needs no orchestrator action, so it never reaches that
+    /// pane ([`report::reaches_orchestrator_pane`]). It is still recorded twice:
+    /// the `tool-call` audit row every MCP call writes, and — where a row can be
+    /// resolved — this note, which is what puts it where the human is already
+    /// looking and what `get_task` hands the orchestrator on demand.
+    ///
+    /// **Resolution is orrerix-minted first, caller-supplied second.** The
+    /// delegate's own `session_id` is what orrerix recorded at spawn and what the
+    /// orchestrator writes onto the row it assigns; a delegate cannot choose it.
+    /// Only when that finds nothing does the report's `ref` — an agent-authored
+    /// string — get matched against the row's `pr` and then its `issue`. That
+    /// order is not an authorization (this WRITES a note and reads nothing back,
+    /// `rd_task_note`'s reason), it is about landing the note on the
+    /// right row: a `ref` naming a PR two rows over costs a misfiled note, and
+    /// the session never does.
+    ///
+    /// **No resolvable row is not an error.** The audit row is the floor and it
+    /// is already written; a delegate whose work has no board row at all — an
+    /// ad-hoc brief, a group not using the board — reports exactly as before and
+    /// simply has no note to leave. Failing the tool call there would make the
+    /// board mandatory, which it is not.
+    ///
+    /// Answers which of the four [`NoteOutcome`]s happened.
+    fn report_task_note(
+        &self,
+        group: &GroupId,
+        agent_id: &str,
+        ref_: Option<&str>,
+        text: &str,
+    ) -> NoteOutcome {
+        let tasks = match self.tasks_or_err(group) {
+            Ok(t) => t,
+            Err(_) => return NoteOutcome::Unreadable,
+        };
+        let session = self.agents.lock_safe().get(agent_id).and_then(|a| a.session_id.clone());
+        let by_session = session.as_deref().and_then(|s| {
+            tasks.iter().find(|t| t.session.as_deref() == Some(s))
+        });
+        // **The `ref` fallback skips `done` rows** (#1966 rev-final premortem 1).
+        // Nothing clears `pr` when a task completes, so a long-lived board keeps
+        // finished rows carrying the same PR as the live follow-up work, and a
+        // first-match-wins scan over raw board order piles every note onto
+        // whichever sorts first. A `done` row is never the row a delegate is
+        // reporting progress ON, so it is the one class that can be excluded
+        // without guessing. TWO live rows sharing a `ref` remain ambiguous and
+        // first-match-wins — the residual, argued in the design note: the session
+        // is what disambiguates, and it is tried first for exactly this reason.
+        let by_ref = || {
+            let n = ref_.filter(|s| !s.is_empty()).and_then(pr_number)?;
+            let open = || tasks.iter().filter(|t| t.status != "done");
+            open()
+                .find(|t| t.pr.as_deref().and_then(pr_number) == Some(n))
+                .or_else(|| open().find(|t| t.issue.as_deref().and_then(pr_number) == Some(n)))
+        };
+        let Some(id) = by_session.or_else(by_ref).map(|t| t.id.clone()) else {
+            return NoteOutcome::NoRow;
+        };
+        match self.upsert_task(
+            group,
+            brand::AUDIT_ACTOR,
+            Some(&id),
+            TaskPatch { note: Some(text.to_string()), ..TaskPatch::default() },
+        ) {
+            Ok(_) => NoteOutcome::Noted,
+            // NEVER `NoRow`: a row DID resolve, so answering "nothing matched"
+            // would be a claim about the board's contents made on a write that
+            // failed — the same defect this whole change fixes by not saying
+            // "reported to orchestrator" (#1966 rev-final round 2 N1). See
+            // [`NoteOutcome::NotWritten`] for the two causes that land here.
+            Err(_) => NoteOutcome::NotWritten,
+        }
     }
 
     /// `deliver_to_orchestrator` for a notice that relays ONE agent's own words

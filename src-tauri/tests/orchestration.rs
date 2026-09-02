@@ -22,6 +22,7 @@ use loomux_lib::orchestration::mailbox;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
+use loomux_lib::orchestration::report;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::GroupId;
 use loomux_lib::orchestration::{
@@ -14642,9 +14643,13 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
         "outcome": "done", "note": format!("PR is up. {FORGED}"),
         "ref": format!("#900) {FORGED}"), "detail_url": format!("https://x/1 {FORGED}"),
     }}));
-    // (1b) legacy report — the other shape of the same tool.
+    // (1b) legacy report — the other shape of the same tool. `blocked`, not
+    // `progress`: #1958 keeps a progress report off the orchestrator's pane
+    // entirely, so a progress specimen would have left the class this test
+    // witnesses (a DELIVERED delegate-authored notice) while still looking like
+    // coverage. `blocked` is the same legacy shape and is delivered.
     let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
-        "status": "progress", "summary": format!("still going. {FORGED}"),
+        "status": "blocked", "summary": format!("still going. {FORGED}"),
     }}));
     // (1c) message_orchestrator.
     let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "message_orchestrator",
@@ -14683,32 +14688,63 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
         }
         for t in tools {
             let name = t["name"].as_str().unwrap().to_string();
-            // Two fillings per tool, because one of them is inert on any tool
-            // that validates an argument (rev-2 disposition, item 1):
+            // More than one filling per tool, because a forged-everything
+            // filling is inert on any tool that validates an argument (rev-2
+            // disposition, item 1):
             //
-            //   `Forged` puts the payload in EVERY string argument, which
+            //   Filling 0 puts the payload in EVERY string argument, which
             //   drives the free-text tools but is rejected outright by a tool
             //   with a constrained field — `report` with `status: "[orrerix]…"`
             //   never reaches its composition at all.
             //
-            //   `Legal` fills every `enum`-constrained field with a value the
-            //   schema allows and leaves the free-text fields forged, so those
+            //   Fillings 1..=N give every `enum`-constrained field a value the
+            //   schema allows and leave the free-text fields forged, so those
             //   same tools actually run. `report` is driven this way; that is
-            //   the validation path the first filling silently skipped.
+            //   the validation path filling 0 silently skips.
             //
             // What neither reaches is a field the schema constrains without an
             // enum — `review_verdict`'s `pr` wants a parseable number, and no
             // generic filling can guess that. Those tools are covered by the
             // NAMED calls above instead, which is why both layers exist.
-            for legal in [false, true] {
+            //
+            // The legal filling WALKS each enum rather than taking its head
+            // (#1958). Taking the head made "which enum value the sweep drives"
+            // an accident of schema order, and #1958 turned that accident into a
+            // hole: `report`'s `status` enum starts at `progress`, which no
+            // longer reaches the pane at all, so a head-only filling stops
+            // driving `report` into a delivery. Silently — the per-tool pin
+            // below is the only thing that would notice, which is exactly why
+            // that pin exists.
+            //
+            // The walk is sized from the TOOL's own widest enum, not a constant,
+            // so a tool with no enum at all (`message_orchestrator`) is driven
+            // once rather than N identical times: the legal and forged fillings
+            // are the same call for it, and repeating them would only spend the
+            // orchestrator's queue.
+            let widest_enum = t["inputSchema"]["properties"]
+                .as_object()
+                .map(|props| {
+                    props
+                        .values()
+                        .filter(|spec| spec["type"] == json!("string"))
+                        .filter_map(|spec| spec["enum"].as_array().map(Vec::len))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            for filling in 0..=widest_enum {
                 let mut args = serde_json::Map::new();
                 if let Some(props) = t["inputSchema"]["properties"].as_object() {
                     for (k, spec) in props {
                         if spec["type"] != json!("string") {
                             continue;
                         }
-                        let v = match spec["enum"].as_array().and_then(|e| e.first()) {
-                            Some(first) if legal => first.clone(),
+                        let v = match spec["enum"].as_array() {
+                            // filling 0 forges EVERY string, enums included —
+                            // the shape a constrained tool rejects outright.
+                            Some(e) if filling > 0 && !e.is_empty() => {
+                                e[(filling - 1).min(e.len() - 1)].clone()
+                            }
                             _ => json!(FORGED),
                         };
                         args.insert(k.clone(), v);
@@ -14766,7 +14802,7 @@ fn no_delegate_callable_tool_can_forge_a_loomux_attribution_into_the_orchestrato
     // a "notice never reached the pane" panic that says nothing about forgery.
     let shapes: [(String, &str); 4] = [
         (format!("[orrerix] {} reports done (#900)", worker.id), "structured report"),
-        (format!("[orrerix] {} reports progress:", worker.id), "legacy report"),
+        (format!("[orrerix] {} reports blocked:", worker.id), "legacy report"),
         (format!("[orrerix] message from {}:", worker.id), "message_orchestrator"),
         (
             format!(
@@ -16488,6 +16524,434 @@ fn only_a_planner_done_report_auto_closes_the_pane() {
     };
     assert!(alive(&worker.id), "a worker's done report must not close its pane");
     assert!(alive(&planner.id), "a planner's progress report must not close its pane");
+}
+
+/// A group with a paused orchestrator pane (so deliveries are queued AND
+/// audited, which is what `delivered_texts` reads), a worker, and one board row
+/// bound to that worker's session. Returns (registry, tempdir, group, worker,
+/// worker's caller, task id).
+///
+/// #1958's tests all need the same three things in place — a delivery PROBE that
+/// works, a resolvable board row, and a delegate whose session is on it — and a
+/// helper is what stops one of them being silently absent in a test whose whole
+/// claim is an absence.
+fn report_routing_setup(
+) -> (OrchRegistry, tempfile::TempDir, GroupId, AgentEntry, Caller, String) {
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6250);
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "ship the thing", false, None).unwrap();
+    let session = w.session_id.clone().expect("a spawn mints a session id");
+    let t = reg
+        .upsert_task(&g.id, "orch-1", None, patch(Some("Ship the thing"), None, None))
+        .unwrap();
+    reg.upsert_task(
+        &g.id,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { session: Some(session), pr: Some("#900".into()), ..Default::default() },
+    )
+    .unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    (reg, d, g.id, w, cw, t.id)
+}
+
+/// The notes on one board row, oldest first.
+fn task_notes(reg: &OrchRegistry, group: &GroupId, id: &str) -> Vec<String> {
+    reg.tasks(group)
+        .into_iter()
+        .find(|t| t.id == id)
+        .unwrap_or_else(|| panic!("task {id} must exist"))
+        .notes
+        .into_iter()
+        .map(|n| n.text)
+        .collect()
+}
+
+/// The status/outcome word of every `report` tool call this group audited.
+fn audited_reports(reg: &OrchRegistry, group: &GroupId) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "tool-call" && e.detail["tool"] == json!("report"))
+        .filter_map(|e| {
+            let a = e.detail["args"].clone();
+            a["outcome"]
+                .as_str()
+                .or_else(|| a["status"].as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// **#1958.** A `progress` report is RECORDED and REROUTED, never delivered: the
+/// audit row every MCP call writes, plus a note on the board row it resolves to,
+/// and nothing typed into the orchestrator's pane.
+///
+/// **The positive control is the same session's `done`, in the same test.** An
+/// assertion that no line reached the pane passes just as well when the probe is
+/// broken, the orchestrator has no pane, or the report never dispatched at all —
+/// so the `done` half is what proves the pane was reachable the whole time, and
+/// the audit and note halves are what prove the progress report really ran.
+#[test]
+fn a_progress_report_is_recorded_and_noted_but_never_reaches_the_orchestrators_pane() {
+    let (reg, _d, g, w, cw, tid) = report_routing_setup();
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "rebasing onto main, CI next" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "a progress report must still succeed: {r}");
+    // The tool's own answer says what really happened. "reported to orchestrator"
+    // would be a false claim to the one caller in a position to act on it.
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        answer.contains("noted on your board task")
+            && answer.contains("never reaches the orchestrator's pane"),
+        "the answer must name the reroute, not claim a delivery: {answer}"
+    );
+
+    // 1. The audit row, exactly as before this change.
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string()],
+        "the tool-call audit row is the floor and must be unchanged"
+    );
+
+    // 2. The board note — the trail the human reads beside the pane, and the
+    //    one the orchestrator reads on demand with get_task.
+    let notes = task_notes(&reg, &g, &tid);
+    assert_eq!(notes.len(), 1, "exactly one note, got {notes:?}");
+    assert!(
+        notes[0].contains("rebasing onto main"),
+        "the note must carry the delegate's own words: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains(&w.id),
+        "…attributed to the delegate that wrote it: {}",
+        notes[0]
+    );
+
+    // 3. Nothing was typed into the orchestrator's pane.
+    let delivered = delivered_texts(&reg, &g);
+    assert!(
+        !delivered.iter().any(|t| t.contains("reports progress")),
+        "a progress report reached the orchestrator's pane: {delivered:#?}"
+    );
+
+    // 4. THE POSITIVE CONTROL. Same worker, same session, same pane: a `done`
+    //    IS delivered. Without this, every assertion above is satisfied by a
+    //    registry that delivers nothing to anybody.
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "done", "ref": "#900", "note": "CI green, ready for review" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "the control report must succeed: {r}");
+    let delivered = delivered_texts(&reg, &g);
+    assert!(
+        delivered.iter().any(|t| t.starts_with(&format!("[orrerix] {} reports done", w.id))),
+        "the control `done` must reach the pane the progress report did not: {delivered:#?}"
+    );
+    assert!(
+        !delivered.iter().any(|t| t.contains("reports progress")),
+        "the control delivery must not have carried the progress line with it: {delivered:#?}"
+    );
+}
+
+/// **#1958.** No resolvable board row is not an error and invents nothing: the
+/// audit row is the floor, and a group that does not use the board reports
+/// exactly as it did before.
+#[test]
+fn a_progress_report_with_no_resolvable_task_is_audit_only_and_not_an_error() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap().id;
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 6251);
+    let w = reg.spawn_agent(&g, Role::Worker, "w", "ship it", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+
+    // A board row matching NEITHER the session nor the ref, so "resolved
+    // nothing" is a real miss rather than an empty board.
+    let other = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("Someone elses work"), None, None))
+        .unwrap();
+    reg.upsert_task(
+        &g,
+        "orch-1",
+        Some(&other.id),
+        TaskPatch {
+            session: Some("11111111-2222-3333-4444-555555555555".into()),
+            pr: Some("#4242".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "still going" } }))
+        .unwrap();
+    assert_eq!(r["isError"], false, "an unresolvable progress report must not fail: {r}");
+    // …and the answer says so rather than naming a note that does not exist.
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        answer.contains("No board task on this group's board matched"),
+        "the answer must not claim a board note it did not write: {answer}"
+    );
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string()],
+        "the audit row is the floor and is written regardless"
+    );
+    assert!(
+        task_notes(&reg, &g, &other.id).is_empty(),
+        "a report that resolves nothing must not land on somebody elses row"
+    );
+    assert_eq!(reg.tasks(&g).len(), 1, "…and must not invent a row of its own");
+    assert!(
+        !delivered_texts(&reg, &g).iter().any(|t| t.contains("reports progress")),
+        "it is still not delivered"
+    );
+}
+
+/// **#1958.** The `ref` fallback: a row the orchestrator never bound a session
+/// to is still reachable through the PR the delegate names.
+///
+/// The session is tried FIRST and this test does not contradict that — the
+/// worker's session is on no row at all here, which is what makes the fallback
+/// the only thing that can resolve it.
+#[test]
+fn a_progress_reports_ref_resolves_a_board_row_when_no_session_is_bound() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap().id;
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 6252);
+    let w = reg.spawn_agent(&g, Role::Worker, "w", "ship it", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+    let t = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("Ship the thing"), None, None))
+        .unwrap();
+    reg.upsert_task(
+        &g,
+        "orch-1",
+        Some(&t.id),
+        TaskPatch { pr: Some("https://github.com/o/r/pull/900".into()), ..Default::default() },
+    )
+    .unwrap();
+
+    let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "pushed the fix" } }));
+    let notes = task_notes(&reg, &g, &t.id);
+    assert_eq!(notes.len(), 1, "the ref must resolve the row it names: {notes:?}");
+    assert!(notes[0].contains("pushed the fix"), "{}", notes[0]);
+}
+
+/// **#1958.** `done` and `blocked` are untouched — both still typed into the
+/// orchestrator's pane, because both need it to act.
+///
+/// **Driven from `report::STATUSES`, not from a literal list** (#1966 rev-final
+/// N1). The earlier revision walked `["done", "blocked", "progress"]` written out
+/// by hand while its own doc claimed to walk "the whole vocabulary" — so a fourth
+/// status was invisible to it twice over: never driven, and never counted. Reading
+/// the real constant makes the claim true of what the test DOES: every member of
+/// the vocabulary is put through the live dispatch, and the delivered set is
+/// asserted as a SET rather than a count, so a fourth status that delivered would
+/// show up here as an unexpected member.
+///
+/// What it still cannot do is decide whether that fourth status SHOULD deliver —
+/// the engine's catch-all says yes, deliberately, and the vocabulary pin in
+/// `report::tests::every_status_is_classified` is the one thing that makes adding
+/// a member a deliberate edit.
+#[test]
+fn done_and_blocked_still_reach_the_orchestrator_and_only_progress_does_not() {
+    let (reg, _d, g, w, cw, _tid) = report_routing_setup();
+    for status in report::STATUSES {
+        let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+            "status": status, "summary": format!("status word {status}") } }));
+    }
+    let delivered = delivered_texts(&reg, &g);
+    let prefix = format!("[orrerix] {} reports ", w.id);
+    // The STATUS WORD of each line this worker got delivered, in vocabulary order
+    // — a set, so an unexpected member reads as itself rather than as a count.
+    let mut reached: Vec<&str> = report::STATUSES
+        .iter()
+        .copied()
+        .filter(|s| delivered.iter().any(|t| t.starts_with(&format!("{prefix}{s}:"))))
+        .collect();
+    reached.sort_unstable();
+    let mut want: Vec<&str> =
+        report::STATUSES.iter().copied().filter(|s| *s != "progress").collect();
+    want.sort_unstable();
+    assert_eq!(reached, want, "delivered lines were: {delivered:#?}");
+    // Non-vacuity: the walk really drove the dispatch. Without this, a probe that
+    // delivered nothing at all would satisfy the set assertion for `progress` and
+    // fail only by luck on the others.
+    assert_eq!(
+        delivered.iter().filter(|t| t.starts_with(&prefix)).count(),
+        want.len(),
+        "one delivered line per action-needing status, no more: {delivered:#?}"
+    );
+}
+
+/// **#1966 rev-final N2.** "I could not read the board" is never reported as
+/// "there was no matching row".
+///
+/// `tasks()` maps any read or parse failure to an empty `Vec`, so before this the
+/// delegate was told the board's *contents* on a read that had simply failed —
+/// the same defect one layer down that this change fixes by not saying "reported
+/// to orchestrator". The note is still correctly declined and the audit row is
+/// still written; what changes is the sentence.
+#[test]
+fn an_unreadable_board_is_not_reported_as_no_matching_task() {
+    let (reg, _d, g, _w, cw, tid) = report_routing_setup();
+
+    // The control: the row IS there and resolvable, so the difference below is
+    // the read failing and nothing else.
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "readable board" } })).unwrap();
+    assert!(
+        r["content"][0]["text"].as_str().unwrap().contains("noted on your board task"),
+        "control: a readable board must resolve this row: {r}"
+    );
+    assert_eq!(task_notes(&reg, &g, &tid).len(), 1);
+
+    // Now corrupt it. Same row, same session, same ref.
+    let path = reg.state_root().join(g.as_str()).join("tasks.json");
+    std::fs::write(&path, b"{ this is not json").unwrap();
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "unreadable board" } })).unwrap();
+    assert_eq!(r["isError"], false, "an unreadable board must not fail the report: {r}");
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        answer.contains("could not be read"),
+        "the answer must say the board was unreadable: {answer}"
+    );
+    assert!(
+        !answer.contains("matched your session or ref"),
+        "…and must NOT claim the board had no matching row: {answer}"
+    );
+    // The audit row is still the floor, and it carries the full text.
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string(), "progress".to_string()],
+        "both reports are audited regardless"
+    );
+}
+
+/// **#1966 rev-final round 2, N1.** A row that RESOLVED and then failed to be
+/// written is never answered as "no board task matched".
+///
+/// The read-side collapse was round 1's N2; this is the same defect one layer
+/// over. `write_tasks` propagates `create_dir_all` and `atomic_write` errors —
+/// the disk-full case #133 filed — and the first cut mapped every `Err` from
+/// `upsert_task` to `NoRow`, which is a claim about the board's CONTENTS made on
+/// a write that failed.
+///
+/// **The failure is induced for real, not faked**: the group directory is made
+/// non-writable, so `atomic_write`'s `File::create` of its temp sibling fails
+/// while `read_to_string` of the board still succeeds (reading a file needs the
+/// directory's execute bit, not its write bit). That is what makes the read
+/// resolve a row and the write fail on the same call — the interleaving a single
+/// thread cannot otherwise produce.
+///
+/// **Unix only, and the reason is the platform not the property.** Windows
+/// ignores the read-only attribute on a directory for the owner, so there is no
+/// portable in-process lever; the arm under test is platform-independent code
+/// and ubuntu + macos exercise it on every run. The control below is what stops
+/// this passing for the wrong reason if the lever ever stops working.
+#[cfg(unix)]
+#[test]
+fn a_board_write_that_fails_is_not_reported_as_no_matching_task() {
+    use std::os::unix::fs::PermissionsExt;
+    let (reg, _d, g, _w, cw, tid) = report_routing_setup();
+
+    // Control: the row resolves and the note lands while the directory is
+    // writable, so the only thing that changes below is the write failing.
+    let r = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "writable" } })).unwrap();
+    assert!(
+        r["content"][0]["text"].as_str().unwrap().contains("noted on your board task"),
+        "control: the row must resolve and the note land: {r}"
+    );
+    assert_eq!(task_notes(&reg, &g, &tid).len(), 1);
+
+    let dir = reg.state_root().join(g.as_str());
+    let before = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "unwritable" } }));
+    // Restore BEFORE asserting, so a failure here does not leave the TempDir
+    // undeletable and turn one red into a cleanup cascade.
+    std::fs::set_permissions(&dir, before).unwrap();
+
+    let r = out.unwrap();
+    assert_eq!(r["isError"], false, "a failed board write must not fail the report: {r}");
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !answer.contains("matched your session or ref"),
+        "a write failure must NOT be answered as 'no board task matched': {answer}"
+    );
+    assert!(
+        answer.contains("could not be written"),
+        "…it must say the note could not be written: {answer}"
+    );
+    // The lever really did stop the write: still one note, not two.
+    assert_eq!(
+        task_notes(&reg, &g, &tid).len(),
+        1,
+        "the second note must NOT have landed — otherwise this test passed with the write \
+         succeeding, which measures nothing"
+    );
+    // And the audit row is still the floor, which is what makes the loss survivable.
+    assert_eq!(
+        audited_reports(&reg, &g),
+        vec!["progress".to_string(), "progress".to_string()],
+        "both reports are audited regardless"
+    );
+}
+
+/// **#1966 rev-final premortem 1.** The `ref` fallback skips `done` rows.
+///
+/// Nothing clears `pr` when a task completes, so a long-lived board keeps finished
+/// rows carrying the same PR as the live follow-up work. A first-match-wins scan
+/// over raw board order would pile every note onto whichever sorts first — and the
+/// finished row sorts first, because it was created first.
+///
+/// The fixture is built so the two operands COLLIDE: both rows carry `#900`, the
+/// `done` one is EARLIER in board order, and neither carries the delegate's
+/// session (so the `ref` fallback is the only thing that can resolve either).
+#[test]
+fn the_ref_fallback_skips_a_done_row_carrying_the_same_pr() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap().id;
+    let orch = reg.spawn_agent(&g, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g, &orch.id, 6253);
+    let w = reg.spawn_agent(&g, Role::Worker, "w", "follow-up", false, None).unwrap();
+    let cw = reg.resolve_token(&w.token).unwrap();
+
+    let finished = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("First pass at #900"), None, None))
+        .unwrap();
+    reg.upsert_task(&g, "orch-1", Some(&finished.id),
+        TaskPatch { pr: Some("#900".into()), status: Some("done".into()), ..Default::default() })
+        .unwrap();
+    let live = reg
+        .upsert_task(&g, "orch-1", None, patch(Some("Follow-up on #900"), None, None))
+        .unwrap();
+    reg.upsert_task(&g, "orch-1", Some(&live.id),
+        TaskPatch { pr: Some("#900".into()), ..Default::default() })
+        .unwrap();
+    // The collision is real: the done row really is first in board order.
+    let order: Vec<String> = reg.tasks(&g).into_iter().map(|t| t.id).collect();
+    assert_eq!(order, vec![finished.id.clone(), live.id.clone()], "fixture: done row sorts first");
+
+    let _ = dispatch(&reg, &cw, "tools/call", &json!({ "name": "report", "arguments": {
+        "outcome": "progress", "ref": "#900", "note": "on the follow-up" } }));
+
+    assert_eq!(task_notes(&reg, &g, &live.id).len(), 1, "the note belongs on the LIVE row");
+    assert!(
+        task_notes(&reg, &g, &finished.id).is_empty(),
+        "a finished row is never the row a delegate is reporting progress on"
+    );
 }
 
 #[test]

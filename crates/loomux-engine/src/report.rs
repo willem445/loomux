@@ -47,6 +47,50 @@ pub fn status_for_outcome(outcome: &str) -> &'static str {
     }
 }
 
+/// Whether a report with this **status** reaches the orchestrator's pane at all
+/// (#1958). One rule, stated once: a delegate delivery wakes the orchestrator
+/// only if it needs an orchestrator ACTION.
+///
+/// `done` and `blocked` do — route the next step, drive the PR, merge, ask the
+/// human. `progress` never does: a delegate saying it is still going changes
+/// nothing the orchestrator would otherwise do, and the wake-up costs a whole
+/// turn on the group's most expensive model, re-paying its resident context for
+/// a line it routes on nowhere. A `progress` report is still RECORDED — in the
+/// audit log, and as a note on the board row it resolves to — so the trail the
+/// human and the orchestrator read on demand (`get_task`, `get_output`) is
+/// unchanged; what goes away is the interrupt.
+///
+/// **Keyed on `status`, the closed three-value vocabulary** ([`STATUSES`]),
+/// never on `outcome`: [`status_for_outcome`] already folds `approved` and
+/// `request_changes` into `done`, and a reviewer's verdict report is exactly
+/// the kind that needs an action. Reading `outcome` here would be a second
+/// vocabulary to keep in step with the first.
+///
+/// **The catch-all DELIVERS.** A status word this function has never heard of
+/// is a orrerix change that forgot to come here, and the two failures are not
+/// symmetric: a surplus wake-up costs one turn, while a silently undelivered
+/// `done` strands a PR nobody routes.
+///
+/// **What that costs, stated rather than papered over.** An unrecognised status
+/// SILENTLY inherits the deliver arm — no test can fail for one, because there
+/// is no input to this function that distinguishes "classified as delivering"
+/// from "never classified". What makes an addition deliberate is the VOCABULARY
+/// pin in `every_status_is_classified`, which asserts [`STATUSES`] is exactly
+/// the three members classified here; nothing else catches it.
+///
+/// That pin bites in TWO ways, and the stronger one is not a test failure at all
+/// (measured — #1966's wave round 12): [`STATUSES`] is a fixed-size array, so
+/// ADDING a member stops the pin COMPILING (`can't compare [&str; 4] with
+/// [&str; 3]`) before any test runs. RENAMING one fails the assertion at
+/// runtime. Either way the edit lands here.
+pub fn reaches_orchestrator_pane(status: &str) -> bool {
+    match status {
+        "progress" => false,
+        "done" | "blocked" => true,
+        _ => true,
+    }
+}
+
 /// Hard cap, in **characters**, on how much of a recorded verdict's summary is
 /// copied into the orchestrator's pane by the courtesy notice `review_verdict`
 /// types there (#850).
@@ -203,6 +247,67 @@ mod tests {
     fn status_for_outcome_preserves_blocked_and_progress() {
         assert_eq!(status_for_outcome("blocked"), "blocked");
         assert_eq!(status_for_outcome("progress"), "progress");
+    }
+
+    #[test]
+    fn only_progress_is_kept_off_the_orchestrator_pane() {
+        assert!(!reaches_orchestrator_pane("progress"), "a progress report needs no orchestrator action (#1958)");
+        assert!(reaches_orchestrator_pane("done"), "done needs routing");
+        assert!(reaches_orchestrator_pane("blocked"), "blocked needs a decision");
+    }
+
+    #[test]
+    fn every_status_is_classified() {
+        // TWO assertions, because the earlier revision of this test claimed a
+        // guard it did not have (#1966 rev-final N1). Filtering `STATUSES` says
+        // which member is kept off the pane — and a FOURTH status would fall to
+        // the deliver-by-default catch-all, stay out of `kept_off`, and leave
+        // that filter perfectly green. There is no input to this predicate that
+        // fails for an unclassified status; the catch-all is what makes that so,
+        // deliberately, because delivering is the safe direction.
+        //
+        // So what catches the addition is the VOCABULARY pin below, and it is
+        // the only thing that does. `STATUSES` is the closed list `mcp.rs`
+        // validates against, so adding a member here is a deliberate edit
+        // beside a classification, not a silent default.
+        //
+        // It is a fixed-size array, so an ADDITION does not redden this — it
+        // stops it compiling, which is stronger and is what #1966's wave round
+        // 12 measured. A RENAME is what reddens the assertion (round 12a).
+        let kept_off: Vec<&str> =
+            STATUSES.iter().copied().filter(|s| !reaches_orchestrator_pane(s)).collect();
+        assert_eq!(kept_off, vec!["progress"], "STATUSES = {STATUSES:?}");
+        assert_eq!(
+            STATUSES,
+            ["progress", "done", "blocked"],
+            "the status vocabulary changed. `reaches_orchestrator_pane` has a deliver-by-default \
+             catch-all, so a new member inherits it SILENTLY (the filter above stays green) — \
+             classify it there, then update this pin."
+        );
+    }
+
+    #[test]
+    fn every_reviewer_outcome_still_reaches_the_pane() {
+        // Composed through `status_for_outcome`, the way mcp.rs composes it: a
+        // reviewer's `approved`/`request_changes` are what open this repo's
+        // merge gate, so they are the LAST reports that may be silenced. The
+        // predicate reads `status`, so this pins the COMPOSITION rather than
+        // re-asserting the mapping its own tests above already pin.
+        //
+        // Same shape as the test above and for the same reason: the loop cannot
+        // see a NEW outcome (it would map to `done` and reach the pane, which is
+        // what the loop expects of everything but `progress`), so the vocabulary
+        // pin is what makes an addition deliberate.
+        for o in OUTCOMES {
+            let reaches = reaches_orchestrator_pane(status_for_outcome(o));
+            assert_eq!(reaches, o != "progress", "outcome {o} classified wrong");
+        }
+        assert_eq!(
+            OUTCOMES,
+            ["done", "blocked", "approved", "request_changes", "progress"],
+            "the outcome vocabulary changed. The loop above cannot fail for a new member — \
+             decide what it means for the pane, then update this pin."
+        );
     }
 
     #[test]
