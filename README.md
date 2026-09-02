@@ -11,7 +11,7 @@ too — eyes on the terminal, phone out at dinner, refreshing to see if it's don
 so you can type the next prompt. You bought an assistant and became one.
 
 I built Orrerix to end that loop. Hand it a backlog, close the laptop, and come
-back to reviewed pull requests — while you're out living your life instead of
+back to merged pull requests — while you're out living your life instead of
 babysitting a cursor.
 
 Orrerix runs fleets of AI coding agents unsupervised, on real software
