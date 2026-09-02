@@ -63,3 +63,25 @@ An `[orrerix]` notice arrives by typing into a pane, and a mid-turn pane can't t
 delivery — waiting on CI queues the answer behind the turn (#590). Register the watch,
 END the turn, act on the notice. Same for any pane-delivered answer: reading once is
 fine, waiting is the defect.
+
+## Cheap-tier roster: literal briefs, sequenced lanes, worker chosen at intake
+When the roster carries `worker-std`/`rev-std` (opencode + GLM Flash):
+1. A brief names EXACT files and functions, the EXACT commands to run and the
+   EXACT output that means done; one task, no judgment calls left open; grep
+   every anchor before briefing. PR bodies carry the diffstat and run ids —
+   no derived receipts (each one costs a review round).
+2. Every claim in a report/PR body must quote the command and its output;
+   a claim with no output is a failure, not a nit.
+3. Choose the worker AT INTAKE: `worker-std` for a brief you can write
+   literally; `worker-adv` from the start when the issue carries a design call.
+   `worker-adv` also takes over after `worker-std` reports blocked or fails the
+   same finding twice — briefed fresh, never resumed.
+4. `rev-std` runs every round, to PASS on a FINAL body (batch body edits before
+   the record). `rev-final` is spawned ONCE, last, only then — and only where
+   the gate's routing requires it (code, tests, CI, manifests).
+5. A rev-std brief lists explicit steps AND says: base check, full-body claim
+   list, completeness list against every case the text names, squash-awareness.
+   The persona carries the rules; the brief names the cases. Numbers: two
+   instruments, pasted; a mismatch is a finding, never an explanation.
+6. Read rev-final's "review findings" per PR; when three consecutive PRs show no
+   blocking miss by rev-std, propose dropping rev-final (the human's rule).
