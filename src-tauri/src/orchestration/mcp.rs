@@ -3380,7 +3380,6 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     let event = match (is_worker && pane.current, status) {
                         (true, "done") => Some(super::RdEvent::WorkerDone),
                         (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
-                        (true, "progress") => Some(super::RdEvent::WorkerProgress),
                         _ => None,
                     };
                     let kind = match (is_worker, pane.current) {
