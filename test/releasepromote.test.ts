@@ -133,6 +133,11 @@ test("the count check accepts N and refuses N-1 and N+1, for both expected const
     );
     assert.match(over.stderr, /MORE than expected/, "the surplus refusal must name the direction");
     assert.match(over.stderr, /#282/, "the surplus refusal must diagnose it as the #282 duplicate-upload class");
+    assert.match(
+      over.stderr,
+      /EXPECTED_ASSETS_/,
+      "the surplus refusal must tell the reader that a legitimately added matrix leg means bumping the constants"
+    );
     assert.ok(
       over.stderr.includes(`${expected + 1}/${expected}`),
       `the surplus refusal must carry the actual vs expected numbers: ${over.stderr}`
@@ -173,6 +178,13 @@ test("promote's count step delegates to the script and keeps the expected consta
     text.slice(promoteStart, verifyStart),
     /uses: actions\/checkout@v4/,
     "promote must check out the repo — the count check calls scripts/check-release-assets.js"
+  );
+  // The checkout must not leave a credential behind: promote is a
+  // contents:write job and nothing downstream of the script call uses git.
+  assert.match(
+    text.slice(promoteStart, verifyStart),
+    /persist-credentials:\s*false/,
+    "promote's checkout must set persist-credentials: false — a contents:write job with no git use should not persist a token"
   );
   // Not part of this change; pinned so the behavioral test's constants and
   // the workflow's cannot drift apart silently.

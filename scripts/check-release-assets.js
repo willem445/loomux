@@ -41,7 +41,8 @@ function main() {
 
   const direction = count < expected
     ? "FEWER than expected — a build matrix leg is missing or failed to upload its assets"
-    : "MORE than expected — a duplicate upload or stray asset shipped with the release (#282 class)";
+    : "MORE than expected — a duplicate upload or stray asset shipped with the release (#282 class); " +
+      "if the extra asset is a legitimately added matrix leg's output, bump EXPECTED_ASSETS_* on release.yml's promote job instead of deleting it";
   console.error(
     `::error::Asset count mismatch: ${count}/${expected} — ${direction}. ` +
       "Refusing to promote; the release stays draft."

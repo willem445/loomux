@@ -357,6 +357,11 @@ jobs:
       # execute (#1962). The script enforces the EQUALITY — any count other
       # than the expected one refuses, naming the direction in the error.
       - uses: actions/checkout@v4
+        with:
+          # contents:write job and nothing downstream of the script call
+          # uses git — the checkout exists only so the script can be read,
+          # so do not leave a credential on the runner.
+          persist-credentials: false
 
       - name: Verify asset count before promoting
         env:

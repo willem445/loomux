@@ -108,7 +108,9 @@ order.
   same tag first; if it's a genuinely missing/failed matrix leg instead,
   re-run that leg, then re-run `promote`. MORE: find the unexpected asset
   (a duplicate under a variant name, or a stray from a re-run leg), delete
-  it from the release, then re-run `promote`.
+  it from the release, then re-run `promote` — but if the extra asset is a
+  legitimately added matrix leg's output, bump `EXPECTED_ASSETS_*` on
+  release.yml's promote job instead of deleting it.
 - npm auth is **trusted publishing (OIDC)** — no `NPM_TOKEN` secret exists; if
   publish fails with an *auth* error, the fix is in npm's trusted-publisher
   config for the repo, not in secrets.
