@@ -43681,12 +43681,11 @@ impl OrchRegistry {
         // out as a sort because readiness can now reject the front of the list
         // and the next candidate is still a pane on this same conversation.
         candidates.sort_by(|x, y| (y.0, &y.1).cmp(&(x.0, &x.1)));
-        let mut declined = Vec::new();
-        for (_started, id, pty) in candidates {
-            match self.pane_readiness(pty) {
-                None => return ReusablePane { agent: Some(id), declined },
-                Some(why) => declined.push((id, why)),
-            }
+        // SCRATCH (#2089 red-before-green): the PRE-fix behaviour, with the
+        // new API kept so the suite still compiles and the reds are behavioural.
+        let declined = Vec::new();
+        for (_started, id, _pty) in candidates {
+            return ReusablePane { agent: Some(id), declined };
         }
         ReusablePane { agent: None, declined }
     }
