@@ -3290,6 +3290,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // driven arm's wording is deliberately left alone — what a driver
             // consumed is #1778 §7's story to tell, not this change's.
             let mut off_pane = false;
+            let mut noted = false;
             // #1778 §7: **for a driven PR the recipient changes.** A delegate
             // this group's review driver spawned or resumed reports to the
             // DRIVER; the orchestrator's visible prompt is the kick-back (§6),
@@ -3400,7 +3401,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
                 }
                 None => {
-                    reg.report_task_note(
+                    noted = reg.report_task_note(
                         &caller.group,
                         &caller.agent_id,
                         arg_str(args, "ref"),
@@ -3419,10 +3420,10 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role == Role::Planner && status == "done" {
                 reg.close_completed_planner(&caller.agent_id);
             }
-            Ok(if off_pane {
-                "recorded: a progress report goes to the audit log and this task's board notes, never the orchestrator's pane (#1958). Report done or blocked when you need the orchestrator to act."
-            } else {
-                "reported to orchestrator"
+            Ok(match (off_pane, noted) {
+                (true, true) => "recorded in the audit log and noted on your board task. A progress report never reaches the orchestrator's pane (#1958) — report done or blocked when you need it to act, or message_orchestrator when something else does.",
+                (true, false) => "recorded in the audit log. No board task resolved from your session or ref, so there is no note; a progress report never reaches the orchestrator's pane either (#1958) — report done or blocked when you need it to act.",
+                _ => "reported to orchestrator",
             }
             .into())
         }

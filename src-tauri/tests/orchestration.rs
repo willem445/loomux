@@ -16600,6 +16600,14 @@ fn a_progress_report_is_recorded_and_noted_but_never_reaches_the_orchestrators_p
         "outcome": "progress", "ref": "#900", "note": "rebasing onto main, CI next" } }))
         .unwrap();
     assert_eq!(r["isError"], false, "a progress report must still succeed: {r}");
+    // The tool's own answer says what really happened. "reported to orchestrator"
+    // would be a false claim to the one caller in a position to act on it.
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        answer.contains("noted on your board task")
+            && answer.contains("never reaches the orchestrator's pane"),
+        "the answer must name the reroute, not claim a delivery: {answer}"
+    );
 
     // 1. The audit row, exactly as before this change.
     assert_eq!(
@@ -16681,6 +16689,12 @@ fn a_progress_report_with_no_resolvable_task_is_audit_only_and_not_an_error() {
         "outcome": "progress", "ref": "#900", "note": "still going" } }))
         .unwrap();
     assert_eq!(r["isError"], false, "an unresolvable progress report must not fail: {r}");
+    // …and the answer says so rather than naming a note that does not exist.
+    let answer = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        answer.contains("No board task resolved"),
+        "the answer must not claim a board note it did not write: {answer}"
+    );
     assert_eq!(
         audited_reports(&reg, &g),
         vec!["progress".to_string()],

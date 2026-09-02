@@ -2294,7 +2294,11 @@ orchestrator's pane only if it needs an orchestrator action.**
   `Registry::report_task_note` appends the composed notice to the board row the report
   resolves to. The human sees it where they already look — the delegate's own pane, and the
   board beside it — and the orchestrator reads it on demand with `get_task`/`get_output`. What
-  went away is the interrupt.
+  went away is the interrupt. **The tool's own answer says which of the three happened** — noted,
+  recorded-but-no-row, or delivered — because "reported to orchestrator" would be a false claim
+  to the one caller in a position to act on it. A chatty delegate cannot flood a row: notes are
+  already capped at `MAX_TASK_NOTES` (20) with an orrerix-authored collapse placeholder, and the
+  full text of every note is in the audit log regardless.
 - **`message_orchestrator` is unchanged and is the residual on purpose.** It is the delegate's
   channel for something that DOES need an action and is not a status change, and #1958
   deliberately does not touch it: a delegate with a real reason to wake the orchestrator must
