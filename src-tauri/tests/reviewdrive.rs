@@ -4962,7 +4962,7 @@ fn a_live_idle_pane_on_the_wrong_block_is_not_reused_for_a_handback() {
             )
             .expect("a default-block pane on a non-default session");
         assert_eq!(
-            (reg.agent(&worker).unwrap().block, reg.agent(&wrong).unwrap().block),
+            (reg.agent(&worker).unwrap().block, reg.agent(&wrong.id).unwrap().block),
             ("worker-adv".to_string(), "worker".to_string()),
             "the fixture's premise: two live panes on ONE session, different blocks"
         );
