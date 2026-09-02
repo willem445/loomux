@@ -4503,8 +4503,20 @@ fn a_handback_resumes_into_the_live_idle_pane_on_that_session() {
         let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
         assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
 
+        // **Counted across the HAND-BACK tick alone.** Taking the baseline
+        // before the whole drive folds in the reviewer lane's own spawn, which
+        // is a pane the hand-back neither opens nor reuses — a delta of 1 that
+        // reads exactly like the defect. So the drive is walked inline to the
+        // tick that hands back, and the baseline is banked at the tick before
+        // it. (Same sequence `to_first_handback` performs; not that helper,
+        // because the whole point here is to measure inside it.)
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        reg.rd_drive_group_with(&group, &gh, 20_000); // lane 0 opens: one spawn
+        gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+        gh.set_facts("OPEN", HEAD_B);
+        reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> ci-wait (arc 6)
         let before = action_count(&reg, &group, "agent-spawn");
-        let handed = to_first_handback(&reg, &group, &gh);
+        let handed = reg.rd_drive_group_with(&group, &gh, 40_000); // -> fix-wait + hand-back
         let (_pr, agent) = handed.handbacks.first().cloned().expect("the drive hands back");
         let opened = action_count(&reg, &group, "agent-spawn") - before;
 
