@@ -6,10 +6,13 @@
 
 **Define the vision. Walk away. Come back to shipped software.**
 
-Tired of watching for an agent's turn to end so you can kick off the next
-feature? Always in front of a screen — PC or phone — watching output scroll?
-Me too. So I built this to build my projects autonomously while I go live my
-life.
+Every agent turn ends the same way: it stops and waits for you. So you wait
+too — eyes on the terminal, phone out at dinner, refreshing to see if it's done
+so you can type the next prompt. You bought an assistant and became one.
+
+I built Orrerix to end that loop. Hand it a backlog, close the laptop, and come
+back to reviewed pull requests — while you're out living your life instead of
+babysitting a cursor.
 
 Orrerix runs fleets of AI coding agents unsupervised, on real software
 discipline: review gates and green CI before anything merges, work tracked on
