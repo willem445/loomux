@@ -91,9 +91,15 @@ fn instructions(reg: &OrchRegistry, group: &GroupId, file: &str) -> String {
         .unwrap_or_else(|e| panic!("{file} must exist in the group dir: {e}"))
 }
 
-/// The rendered instruction file, line endings normalized. There is no
-/// `.gitattributes` covering these, so the template is CRLF on Windows and LF
-/// elsewhere; these assertions are about the words, not about the checkout.
+/// The rendered instruction file, line endings normalized — these assertions are
+/// about the words, not about the checkout.
+///
+/// The file read here is WRITTEN AT RUNTIME from a template, so it carries
+/// whatever endings that template had on disk. Since #1845 `.gitattributes` pins
+/// `src-tauri/src/orchestration/templates/**/*.md` to `eol=lf`, which makes this
+/// a no-op on a correct checkout; it stays as the safety net for a worktree cut
+/// before the pin, where the templates are still CRLF because changing an
+/// attribute rewrites nothing already on disk.
 fn instructions_lf(reg: &OrchRegistry, group: &GroupId, file: &str) -> String {
     let text = instructions(reg, group, file).replace("\r\n", "\n");
     assert!(!text.contains("{{"), "{file} has an unsubstituted template variable:\n{text}");

@@ -36,13 +36,24 @@ opinions — see the `ci-validate` skill.)
   and not shared between worktrees, so a freshly-cut one has none. A
   missing-package error is *you never installed*, never a red suite — the
   `ci-validate` skill has the trap in full.
-- **Every text file is CRLF on disk and LF in the blob** — `core.autocrlf=true`
-  is this project's Windows baseline (see `.gitattributes`, which overrides it
-  for exactly the files a build rewrites). So a `node -e` anchor built from an
-  LF string, or from `git show <ref>:<file>`, never matches the worktree copy,
-  and writing one back with bare LF silently flips that region's endings.
-  Read the file's own EOL and rewrite your anchor to match; run a byte-identity
-  or prefix proof blob-vs-blob (`git show` both sides), never blob-vs-worktree.
+- **Most text files are CRLF on disk and LF in the blob** — `core.autocrlf=true`
+  is this project's Windows baseline. `.gitattributes` overrides that with
+  `eol=lf` for three classes, which are LF at BOTH ends: the files a build
+  rewrites, the vendored trees whose contract is byte-identity with upstream,
+  and the prompt templates plus their `pre222` goldens, whose embedded bytes
+  are a measured budget rather than a checkout artefact (#1845). Never assume
+  which side a file is on — `git ls-files --eol <path>` answers it, and a file
+  whose rule was added after your worktree was cut is CRLF on disk anyway until
+  you DELETE it and check it out again (`rm` the files, then `git checkout --
+  <dir>`). `git add --renormalize .` does NOT fix a worktree — it rewrites the
+  index only, silently, leaving a clean `git status` beside a still-CRLF file —
+  and a plain `git checkout --` without deleting first is a no-op, because git
+  considers the file up to date (#1845).
+  For the CRLF majority, a `node -e` anchor built from an LF string, or from
+  `git show <ref>:<file>`, never matches the worktree copy, and writing one back
+  with bare LF silently flips that region's endings. Read the file's own EOL and
+  rewrite your anchor to match; run a byte-identity or prefix proof
+  blob-vs-blob (`git show` both sides), never blob-vs-worktree.
   Signature: `anchor not found` on a string you can see in the file (#1196).
 - **Anchor every `cd` at an absolute path.** The Bash tool's cwd persists
   between calls, so a second relative `cd src-tauri/src/...` resolves against

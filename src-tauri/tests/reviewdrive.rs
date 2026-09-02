@@ -1081,16 +1081,24 @@ fn lane_brief(reg: &OrchRegistry, agent: &str) -> String {
 /// Line endings normalised — `workflow.rs`'s own `lf`, for its reason.
 ///
 /// The brief templates are `include_str!`'d, so they carry whatever line endings
-/// the checkout has: LF on the Linux and macOS runners, CRLF on the Windows one
-/// under this project's `core.autocrlf=true` baseline. A byte-for-byte golden
-/// written with `\n` therefore passes on two platforms and fails on the third,
-/// which is a fact about the checkout rather than about the rendered brief.
+/// the checkout has. That USED to split by platform — LF on the Linux and macOS
+/// runners, CRLF on the Windows one under this project's `core.autocrlf=true`
+/// baseline — so a byte-for-byte golden written with `\n` passed on two platforms
+/// and failed on the third, which was a fact about the checkout rather than about
+/// the rendered brief. Since #1845 `.gitattributes` pins
+/// `src-tauri/src/orchestration/templates/**/*.md` to `eol=lf`, and the driver
+/// briefs live there, so that split is gone on a correct checkout and this call is
+/// a no-op over them — a safety net for a worktree cut before the pin, where they
+/// are still CRLF on disk.
 ///
-/// It matters for the hostile-value test too, and less obviously: a stray `\r`
-/// is a CONTROL CHARACTER, so an assertion that no control character survived
-/// into a brief fires on the template's own line endings rather than on anything
-/// the sanitizer let through. Normalising first is what makes that assertion
-/// about the interpolated VALUE, which is what it is for.
+/// **It is still LOAD-BEARING for the hostile-value test, and the pin does not
+/// change that.** A stray `\r` is a CONTROL CHARACTER, so an assertion that no
+/// control character survived into a brief would otherwise fire on the template's
+/// own line endings rather than on anything the sanitizer let through. Normalising
+/// first is what makes that assertion about the interpolated VALUE, which is what
+/// it is for. Note this replaces the `\r\n` SEQUENCE only, so a lone `\r` still
+/// fails — deliberately, and `eol=lf` cannot substitute for it: git's `text` filter
+/// converts CRLF pairs and leaves a lone CR untouched at both ends.
 fn lf(s: &str) -> String {
     s.replace("\r\n", "\n")
 }

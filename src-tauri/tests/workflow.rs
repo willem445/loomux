@@ -5967,11 +5967,20 @@ fn render_with_legacy_vars(tpl: &str, g: &loomux_lib::orchestration::GroupInfo) 
     lf(&out)
 }
 
-/// Line endings normalized to `\n`. There is no `.gitattributes`, so every file
-/// here — live template, golden fixture, written instruction file — is CRLF on
-/// Windows and LF elsewhere. These assertions are about the words and the markdown
-/// shape; making them also assertions about the checkout would mean passing in CI
-/// and failing on the machine that wrote them.
+/// Line endings normalized to `\n`. These assertions are about the words and the
+/// markdown shape; making them also assertions about the checkout would mean
+/// passing in CI and failing on the machine that wrote them.
+///
+/// **This used to be necessary and is now a safety net** (#1845). `.gitattributes`
+/// pins `src-tauri/src/orchestration/templates/**/*.md` and
+/// `src-tauri/tests/fixtures/pre222/**/*.md` to `eol=lf`, so a live template and a
+/// golden fixture are LF in the blob AND LF on disk on every platform — this call
+/// is a no-op over them on a correct checkout. It still earns its place on two
+/// inputs the pin does not reach: a WRITTEN INSTRUCTION FILE, which is produced at
+/// runtime rather than checked out, and a worktree cut before the pin landed,
+/// where the templates are still CRLF on disk because changing an attribute
+/// rewrites nothing (`every_prompt_template_is_checked_out_with_lf_endings` in
+/// `tests/orchestration.rs` is what turns that into a red).
 fn lf(s: &str) -> String {
     s.replace("\r\n", "\n")
 }

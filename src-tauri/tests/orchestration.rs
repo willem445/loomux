@@ -4624,6 +4624,15 @@ fn read_playbook_writes_one_audit_line() {
     assert!(line.contains("about-this-playbook"), "the line names the section: {line}");
 }
 
+/// The resident core's byte budget (#1683) — ONE definition, quoted by both the
+/// assertion and the message it prints.
+///
+/// The literal used to appear three times: in the comparison, in the failure
+/// message's prose, and in the surrounding comment. A change to one of them
+/// leaves the message asserting a budget that is not the one enforced, and a
+/// message is exactly the surface nobody re-derives (review round 2, N1).
+const RESIDENT_CORE_BUDGET: usize = 45_000;
+
 #[test]
 fn the_resident_core_is_under_the_byte_budget() {
     // The point of #1683: the resident orchestrator template is paid on EVERY
@@ -4631,22 +4640,168 @@ fn the_resident_core_is_under_the_byte_budget() {
     // never derived — the number in this assertion is the budget, the byte
     // count is the fact.
     //
-    // EOL-NORMALIZED, deliberately. The Windows checkout is CRLF and the
-    // Linux checkout is LF, so a raw `len()` makes the same document measure
-    // 622 bytes bigger on Windows — the budget would be a fact about the
-    // checkout, not the content, and the pin would flip platform-by-platform
-    // as prose is edited (it did: run 33345301036 measured 45,327 on Windows
-    // against 44,705 on Linux, same blob). The budget is content bytes; both
-    // platforms must assert the same number.
-    let content = ORCHESTRATOR_TPL.replace("\r\n", "\n");
+    // RAW, and raw is honest only because the endings are pinned (#1845).
+    // `include_str!` embeds the ON-DISK bytes, so before `.gitattributes`
+    // pinned `src-tauri/src/orchestration/templates/**/*.md` to `eol=lf` the same
+    // document measured 622 bytes bigger on a CRLF checkout than on an LF one
+    // (run 33345301036: 45,327 B on windows-latest, 44,705 B on ubuntu, same
+    // blob). #1813 answered that by normalizing before asserting, which made
+    // the pin stable and blinded it in the same stroke: the Windows build
+    // genuinely paid the bigger prompt on every model call and the assertion
+    // could not see it. With the endings pinned, raw and normalized agree on
+    // every platform, and raw is the number the product actually pays.
+    //
+    // What breaks if the pin is removed: this goes back to measuring the
+    // checkout. It does so LOUDLY today, but only INCIDENTALLY — measured on
+    // `orchestrator.md` at blob ad8d53e4, the LF file is 44,692 B over 621
+    // lines, so there are 308 B of margin under this budget against the 621 CR
+    // bytes a CRLF checkout adds. The stale worktree therefore fails here
+    // rather than passing quietly, but shorten the template past that margin
+    // and it goes quiet again, on exactly the platform that pays more. The
+    // polarity is a property of the current margin, not a guarantee, which is
+    // why `every_prompt_template_is_checked_out_with_lf_endings` below asserts
+    // the endings themselves and does not depend on the margin at all.
     assert!(
-        content.len() <= 45_000,
-        "the resident core is {} bytes EOL-normalized ({} bytes raw in this checkout — \
-         CRLF on Windows, LF elsewhere; that difference is the checkout, not the content) \
-         against a 45,000 budget — sections move to the playbook, they do not get \
-         rewritten longer in place (#1683)",
-        content.len(),
+        ORCHESTRATOR_TPL.len() <= RESIDENT_CORE_BUDGET,
+        "the resident core is {} bytes against a {RESIDENT_CORE_BUDGET}-byte budget — \
+         sections move to the playbook, they do not get rewritten longer in place \
+         (#1683)",
         ORCHESTRATOR_TPL.len()
+    );
+}
+
+/// Every `.md` at ANY depth under `dir` (#1845, review round 1 finding 1).
+///
+/// Recursive because the `.gitattributes` patterns it checks are `**`: a flat
+/// `read_dir` would police a NARROWER population than the rule, so a template
+/// added in a subdirectory would be pinned by git, invisible to the guard, and
+/// still over the floor. No subdirectory exists in either tree today, which is
+/// exactly why the flat version read as correct.
+fn markdown_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("{} is not readable: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("a readable directory yields readable entries").path();
+        if path.is_dir() {
+            markdown_files_recursive(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+}
+
+/// The checkout is the thing under test here (#1845).
+///
+/// `include_str!` embeds ON-DISK bytes, so each of these files ships its
+/// checkout's line endings straight into the running product: the resident
+/// prompt the orchestrator pays for on every model call, the goldens that pin
+/// it byte-for-byte, and the driver briefs. `.gitattributes` pins both trees to
+/// `eol=lf` so those bytes are identical on every platform — but changing a
+/// gitattribute does NOT rewrite files already in a worktree, so an agent
+/// worktree cut before the rule landed, or a checkout whose `.gitattributes`
+/// line was later removed, still carries CRLF with nothing else to say so.
+///
+/// **Why this sits beside the budget assertion rather than inside it.** The
+/// budget test does notice a CRLF checkout today, but only because the CR bytes
+/// happen to exceed the margin left under `RESIDENT_CORE_BUDGET` — 308 B of it,
+/// against 621 CR bytes, measured on `orchestrator.md` at blob ad8d53e4 while
+/// that constant is 45,000. Shorten the template
+/// past that and the budget goes quiet again on exactly the platform that pays
+/// more, which is the issue's own "the guard is worse than none" case (#1845).
+/// This test is margin-independent and covers every template, not only the one
+/// with a budget.
+///
+/// **Default-deny over the directory, not over a list of consts.** Two template
+/// consts (`WORKFLOW_TPL`, `BLOCK_TPL`) are private to the lib and unreachable
+/// from an integration test, and a template added tomorrow would be on no list
+/// at all — so the population is whatever the directories hold, walked
+/// RECURSIVELY because the attribute patterns match at any depth and a flat walk
+/// would police a narrower population than the rule. The floors below are the
+/// vacuity control (an unreadable or empty walk passes a `!contains` check
+/// trivially) and are deliberately looser than the counts observed when this was
+/// written — 11 templates and 7 fixture files, no subdirectories — so an
+/// ordinary add or removal does not touch this test.
+///
+/// **The `.md` filter is the RULE's scope, not a shortcut.** `.gitattributes`
+/// pins `**/*.md` rather than `**` on purpose: `text` is an explicit override,
+/// so a bare `**` would force EOL conversion on a future non-`.md` fixture — a
+/// rendered-bytes golden, anything genuinely binary — and corrupt it at
+/// checkout, while this walk would not police it either. Rule and guard cover
+/// the same set, and a non-`.md` file added to either tree is a deliberate act
+/// that decides its own treatment in both places (review round 2, N2/N3).
+///
+/// **Do not delete this as redundant with the budget assertion.** It reads as
+/// redundant only while the margin happens to be smaller than the CR count, and
+/// that is the one condition under which it is NOT redundant that a reader can
+/// check. Shorten `orchestrator.md` by more than the margin and the budget
+/// assertion goes green on a CRLF checkout, at which point this is the only
+/// thing standing between a stale worktree and a silently platform-dependent
+/// resident prompt — the #1683 number, measured in a unit nobody pays. The
+/// PR's own one-mechanism argument is about not adding a SECOND budget, not
+/// about dropping the checkout guard.
+///
+/// **Residual:** the walk reads the tree the test binary is RUN against, which
+/// need not be the tree it was COMPILED against. The final assertion on
+/// `ORCHESTRATOR_TPL` closes that for the one file whose bytes the budget
+/// measures; every other file in both trees is covered by the walk alone.
+#[test]
+fn every_prompt_template_is_checked_out_with_lf_endings() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // (the `.gitattributes` pattern, the dir under `src-tauri/`, the floor)
+    let trees = [
+        (
+            "src-tauri/src/orchestration/templates/**/*.md",
+            "src/orchestration/templates",
+            8usize,
+        ),
+        ("src-tauri/tests/fixtures/pre222/**/*.md", "tests/fixtures/pre222", 5usize),
+    ];
+    let mut scanned = 0usize;
+    for (pattern, rel, floor) in trees {
+        let dir = root.join(rel);
+        let mut files = Vec::new();
+        markdown_files_recursive(&dir, &mut files);
+        let here = files.len();
+        for path in &files {
+            let bytes = fs::read(path)
+                .unwrap_or_else(|e| panic!("{} is not readable: {e}", path.display()));
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{} carries a CR, so this checkout is CRLF and `include_str!` embeds one \
+                 extra byte per line — the resident-prompt budget would be measuring the \
+                 checkout instead of the content (#1845). `.gitattributes` pins `{pattern}` \
+                 to `eol=lf`, but an attribute never rewrites files already on disk. FIX: \
+                 delete these files and check them out again — `rm` them, then \
+                 `git checkout -- <dir>`. `git add --renormalize .` will NOT do it: it \
+                 rewrites the index only, silently, so you get a clean `git status` beside \
+                 a still-CRLF file. A plain `git checkout --` without deleting first is a \
+                 no-op too, because git considers the file up to date. AND IF A CR SURVIVES \
+                 ALL THAT, it is in the BLOB, not the checkout: git's `text` filter converts \
+                 CRLF pairs and leaves a LONE CR untouched at both ends, so `eol=lf` cannot \
+                 strip one and no amount of re-checking-out will either — fix the content.",
+                path.display()
+            );
+        }
+        assert!(
+            here >= floor,
+            "{} yielded {here} markdown files, under the floor of {floor} — a walk that \
+             finds nothing passes the CR check vacuously, so an empty one is a broken guard, \
+             not a clean tree",
+            dir.display()
+        );
+        scanned += here;
+    }
+    // Not implied by the floors above: an emptied `trees` array runs neither of
+    // them, and every assertion in this test would then be unreached.
+    assert!(scanned > 0, "the walk must reach files in at least one tree");
+
+    // The walk is the population; this is the wiring half — the bytes the
+    // COMPILER embedded, which is what the budget assertion above measures and
+    // what the product ships.
+    assert!(
+        !ORCHESTRATOR_TPL.contains('\r'),
+        "the EMBEDDED resident core carries a CR: this test binary was compiled against a \
+         CRLF checkout, whatever the directory walk above found (#1845)"
     );
 }
 
