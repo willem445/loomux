@@ -2187,9 +2187,12 @@ carries none of them. Asserting a checklist lane's contract of it would be measu
 under another's label. The three checklist personas and `rev-lead.md` stay checked in
 (`.orrerix/workflow.yml`'s preamble records that the previous roster is restored by renaming
 two files), so what these pins now guard is exactly what they always guarded: those files'
-sentences. The cost is stated rather than hidden — a *fourth* checklist persona added later is
-not covered until it is added to the list, which a roster-derived population would have picked
-up for free.
+sentences. What the roster-derived population used to give for free is a population CONTROL, and
+that has to be re-earned rather than restated: `assert_eq!(lanes.len(), 3)` against a fixed array
+is a sentence that cannot fail. So the test asks the DIRECTORY — the list it iterates must be
+exactly the `qr-*.md` personas that exist under `.github/agents/` — and a fourth checklist
+persona, or one renamed or deleted, reddens on the round it lands rather than sitting silently
+outside the loop.
 
 "In CI" was not true when this section was first written, and the fix was to make it true
 rather than to soften the sentence: `ci.yml` ran `npm run build` (a **typecheck**, not the

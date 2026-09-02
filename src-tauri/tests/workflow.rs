@@ -7884,9 +7884,31 @@ fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
     let repo = repo_root();
     let lanes = [".github/agents/qr-evidence.md", ".github/agents/qr-tests.md", ".github/agents/qr-constraints.md"];
 
-    // POPULATION CONTROL, counted at the VERIFIED site below rather than here: an
-    // empty or shrunken list would sail through the loop and certify nothing.
-    assert_eq!(lanes.len(), 3, "expected the three cheap lanes");
+    // POPULATION CONTROL. Binding the population to a literal list is what a
+    // roster-derived filter used to do for free, so the control has to be re-earned
+    // rather than restated: `assert_eq!(lanes.len(), 3)` against a fixed array is a
+    // sentence that cannot fail. This asks the DIRECTORY instead — the list above must
+    // be exactly the `qr-*.md` personas that exist — so a fourth checklist lane added
+    // later, or one renamed or deleted, reddens here on the round it lands instead of
+    // silently sitting outside the loop. The count is then checked at the VERIFIED site
+    // below as well, since an empty or shrunken list would otherwise sail through the
+    // loop and certify nothing.
+    let mut on_disk: Vec<String> = fs::read_dir(Path::new(&repo).join(".github/agents"))
+        .expect("the persona directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("qr-") && n.ends_with(".md"))
+        .map(|n| format!(".github/agents/{n}"))
+        .collect();
+    on_disk.sort();
+    let mut declared_lanes: Vec<String> = lanes.iter().map(|r| (*r).to_string()).collect();
+    declared_lanes.sort();
+    assert_eq!(
+        declared_lanes, on_disk,
+        "the checklist personas this test covers must be exactly the qr-*.md files that exist — \
+         add a new one to the list in the commit that adds the file"
+    );
+    assert!(!on_disk.is_empty(), "…and there must be some, or the loop below certifies nothing");
 
     let mut verified = 0usize;
     for rel in &lanes {
