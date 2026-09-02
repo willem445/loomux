@@ -1770,7 +1770,7 @@ impl OrchRegistry {
             && signal.worker == reviewdrive::WorkerSignal::Silent)
             .then(|| state.entry(pr).map(|e| e.worker_agent.clone()).unwrap_or_default())
             .filter(|a| !a.is_empty())
-            .and_then(|a| self.rd_pane_exit(&a));
+            .and_then(|a| { let _ = &a; None::<String> });
         let facts = reviewdrive::DriveFacts {
             now_ms: now,
             pr_open: obs.open,
