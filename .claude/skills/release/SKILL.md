@@ -93,15 +93,22 @@ order.
   exists (e.g. a "Re-run all jobs" after a partial failure), it reuses that
   release's id instead of spawning a second draft.
 - `promote` verifies the release's own **asset count** (expects 10) before
-  flipping it public, and refuses — leaving the release in draft — if short.
+  flipping it public, and refuses — leaving the release in draft — on any
+  mismatch, not just a shortfall (#1962): **fewer** than expected means a
+  missing/failed matrix leg, **more** means a duplicate upload or stray
+  asset (#282 class). The comparison lives in
+  `scripts/check-release-assets.js`, which the workflow step calls.
   The authoritative counts are the `EXPECTED_ASSETS_STABLE` /
   `EXPECTED_ASSETS_BETA` env values on the `promote` job in
   `.github/workflows/release.yml`; the numbers in this skill defer to
   those — check the workflow's value if they ever disagree.
-  If `promote` fails with "Only N/10 assets" in the logs, don't just re-run
-  it: check `gh api repos/OWNER/REPO/releases` for a stray duplicate release
-  on the same tag first. If it's a genuinely missing/failed matrix leg
-  instead, re-run that leg, then re-run `promote`.
+  If `promote` fails with "Asset count mismatch" in the logs, read the
+  direction. FEWER: don't just re-run it — check
+  `gh api repos/OWNER/REPO/releases` for a stray duplicate release on the
+  same tag first; if it's a genuinely missing/failed matrix leg instead,
+  re-run that leg, then re-run `promote`. MORE: find the unexpected asset
+  (a duplicate under a variant name, or a stray from a re-run leg), delete
+  it from the release, then re-run `promote`.
 - npm auth is **trusted publishing (OIDC)** — no `NPM_TOKEN` secret exists; if
   publish fails with an *auth* error, the fix is in npm's trusted-publisher
   config for the repo, not in secrets.
