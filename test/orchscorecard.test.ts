@@ -70,7 +70,7 @@ const card = (pr: number) => REPORT.prs.find((c: any) => c.pr === pr);
 
 test('positive control: rows were classified, and the control PR classified none', () => {
   assert.ok(REPORT.coverage.rows_classified > 0, 'no audit row was classified — the scorecard did not run');
-  assert.equal(REPORT.coverage.rows_classified, 21);
+  assert.equal(REPORT.coverage.rows_classified, 22);
   assert.ok(card(900).rows_classified > 0);
   assert.ok(card(901).rows_classified > 0);
   // The negative control. Without this the assertion above passes for a scorecard
@@ -209,10 +209,12 @@ test('loop notices: the corrected count and the #1778 S5 count differ by the del
 // ---------------------------------------------------------------------------
 
 test('review rounds: verdicts keyed by block and verdict, from `review-verdict` rows', () => {
-  assert.equal(card(900).review.rounds, 3);
+  // Four verdicts, one of them recorded AFTER the merge (see the outside-window
+  // counter below) — a round is a round wherever the row lands.
+  assert.equal(card(900).review.rounds, 4);
   assert.deepEqual(card(900).review.by_block, {
     'rev-std': { fail: 1, pass: 1 },
-    'rev-final': { pass: 1 },
+    'rev-final': { pass: 2 },
   });
   // A hand-routed PR still has rounds — this counter predates the driver entirely,
   // which is what makes a before/after comparison possible.
@@ -358,7 +360,7 @@ test('coverage: unattributed and split agents are named, not swallowed', () => {
   // assertion is about the role filter rather than about orch-10 never being seen.
   assert.equal(cov.agents_attributed, 5);
   assert.equal(cov.agents_unattributed_spawned_in_window.includes('orch-10'), false);
-  assert.equal(cov.audit_rows_read, 26);
+  assert.equal(cov.audit_rows_read, 27);
   assert.equal(cov.audit_parse_errors, 0);
   assert.equal(cov.usage_rows_without_agent_id, 0);
   assert.deepEqual(cov.transcripts, [{
@@ -371,6 +373,13 @@ test('coverage: rows inside a window that no counter consumed are reported by ac
   // "the scorecard saw everything" is checkable rather than assumed.
   assert.deepEqual(card(900).rows_unclassified_in_window, { 'agent-spawn': 2, prompt: 1 });
   assert.deepEqual(card(901).rows_unclassified_in_window, { 'agent-spawn': 1 });
+  // A `review-verdict` / `rd-*` row is matched structurally on `detail.pr`, so it counts
+  // wherever it occurs — wider than the PR window. How many did is reported rather than
+  // left for a reader to wonder about. The corpus carries one such row on #900 (a verdict
+  // recorded after the merge) and none on #901.
+  assert.equal(card(900).rows_counted_outside_pr_window, 1); // the post-merge verdict
+  // NEGATIVE CONTROL: #901 has no such row, so a non-zero here is not a constant.
+  assert.equal(card(901).rows_counted_outside_pr_window, 0);
 });
 
 test('coverage: every heuristic is declared with an id, a statement and its structural fix', () => {
@@ -391,7 +400,7 @@ test('coverage: every heuristic is declared with an id, a statement and its stru
 test('group totals: per-file wake census, independent of any PR selection', () => {
   assert.equal(REPORT.group.files.length, 1);
   const f = REPORT.group.files[0];
-  assert.equal(f.rows, 26);
+  assert.equal(f.rows, 27);
   assert.equal(f.orchestrator_wakes, 8);
   assert.equal(f.prompt_typed_to_orchestrator, 0);
   assert.deepEqual(f.wakes_by_kind, {

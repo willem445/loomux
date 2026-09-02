@@ -24,3 +24,4 @@
 {"action":"prompt","actor":"rev-12","detail":{"to":"orch-10","text":"[orrerix] rev-12 (rev-final) recorded verdict PASS on PR #900: gate satisfied."},"ts_ms":1700000720000}
 {"action":"rd-satisfied","actor":"orrerix","detail":{"pr":900,"head":"ccccccc","on_behalf_of":"orch-10"},"ts_ms":1700000780000}
 {"action":"prompt","actor":"w-13","detail":{"to":"orch-10","text":"[orrerix] w-13 reports done (#900): green on all three platforms, ready for review."},"ts_ms":1700000900000}
+{"action":"review-verdict","actor":"rev-12","detail":{"pr":900,"block":"rev-final","verdict":"pass","head":"ccccccc","body_digest":"d5"},"ts_ms":1700002000000}

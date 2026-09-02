@@ -320,6 +320,12 @@ function scorePr(ctx, pr) {
   const heldByReason = {};
   const unclassified = {};
   let rowsClassified = 0;
+  // A `review-verdict` or `rd-*` row is matched STRUCTURALLY on `detail.pr`, so it is
+  // counted wherever it occurs — a re-drive or a late verdict after the merge is still
+  // a round the PR cost. That makes those counters wider than the PR window, so the
+  // number that fall outside it is reported rather than left for a reader to wonder
+  // about. It is 0 on all eleven benchmark PRs.
+  let structuralOutsideWindow = 0;
 
   for (const row of rows) {
     const d = row.detail;
@@ -345,6 +351,7 @@ function scorePr(ctx, pr) {
       continue;
     }
     if (row.action === 'review-verdict' && d.pr === pr) {
+      if (!inWindow(row.ts_ms, win.pr)) structuralOutsideWindow += 1;
       const block = d.block || 'unknown';
       const verdict = String(d.verdict || 'unknown').toLowerCase();
       verdicts[block] = verdicts[block] || {};
@@ -354,6 +361,7 @@ function scorePr(ctx, pr) {
       continue;
     }
     if (typeof row.action === 'string' && row.action.startsWith('rd-') && d.pr === pr) {
+      if (!inWindow(row.ts_ms, win.pr)) structuralOutsideWindow += 1;
       rowsClassified += 1;
       switch (row.action) {
         case 'rd-started': driver.drives += 1; break;
@@ -453,6 +461,7 @@ function scorePr(ctx, pr) {
       orchestrator_pct_attributed: pct(orchTokensAttributed.total, orchTokensAttributed.total + delegateTokens.total),
     },
     rows_classified: rowsClassified,
+    rows_counted_outside_pr_window: structuralOutsideWindow,
     rows_unclassified_in_window: unclassified,
   };
 }
@@ -635,7 +644,7 @@ const HEURISTICS = [
   { id: 'H1', what: 'A PR is joined to an audit row by the `#N` token in the serialized `detail` wherever `detail.pr` is absent.', fix: 'A `pr` field on `prompt` / `delivery-queued` rows (plan part 2, A1 / missing row 2).' },
   { id: 'H2', what: 'An agent is joined to a PR by the `#N` token in its `agent-spawn` detail (brief text, name, branch) when no `rd-*` or `review-verdict` row carries both.', fix: 'A `pr` field on `agent-spawn`.' },
   { id: 'H3', what: 'A text-tier attribution counts only when the `agent-spawn` row falls inside the PR window; outside it the same token is ignored.', fix: 'Same as H2 — the window bound exists only because the token is ambiguous.' },
-  { id: 'H4', what: 'An agent attributed to k PRs contributes 1/k of its lifetime tokens to each.', fix: 'A `block` and a `pr` on `UsageSnapshot` (plan part 2, A6 / missing row 4).' },
+  { id: 'H4', what: "An agent attributed to k PRs contributes 1/k of its lifetime tokens to each — and k counts only the PRs in THIS run's selection, so running one PR alone gives its shared agents full weight. Always run the whole comparison set together.", fix: 'A `block` and a `pr` on `UsageSnapshot` (plan part 2, A6 / missing row 4).' },
   { id: 'H5', what: "Orchestrator tokens in a window cover every PR in flight; the apportioned figure splits them by this PR's share of the orchestrator wakes in the same window.", fix: 'Per-turn PR attribution — nothing structural exists; see "What this cannot say" in the note.' },
   { id: 'H6', what: 'Delegate tokens come from `usage.json`, which is CUMULATIVE per session and cannot be windowed; a delegate that worked on one PR reports its whole life against that PR.', fix: 'A windowed usage series, or accepting the approximation (delegates are spawned per task).' },
   { id: 'H7', what: 'A PR window ends at `merged_at` supplied via `--pr-meta`; without it the end falls back to the last `rd-*` row, then to the last naming row — which is days late, because a merged PR stays cited.', fix: 'A loomux row for a human merge (plan part 2, A4 / #388).' },

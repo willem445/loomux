@@ -241,6 +241,12 @@ names all eleven benchmark PRs) would be attributed to all eleven.
 - `rows_unclassified_in_window` — rows naming the PR inside its window that no
   counter consumed, grouped by action. This is the "did the scorecard see everything"
   check; it is expected to be non-empty (an `agent-spawn` is named but not counted).
+- `rows_counted_outside_pr_window` — the reverse direction. A `review-verdict` or
+  `rd-*` row is matched **structurally** on `detail.pr`, so it counts wherever it
+  occurs: a late verdict or a re-drive after the merge is still a round the PR cost,
+  and excluding it would silently under-count. That makes those two counters wider
+  than the PR window, so the number of rows that fell outside it is reported. It is
+  **0 on all eleven benchmark PRs**, so the widening is latent there rather than live.
 
 ---
 
@@ -254,7 +260,7 @@ The script emits this list in every run, under `coverage.heuristics`, and it **i
 | H1 | A PR is joined to a row by the `#N` token wherever `detail.pr` is absent. | A `pr` field on `prompt` / `delivery-queued` rows. |
 | H2 | An agent is joined to a PR by the `#N` token in its `agent-spawn` detail. | A `pr` field on `agent-spawn`. |
 | H3 | A text-tier join counts only inside the PR window. | Same as H2 — the bound exists only because the token is ambiguous. |
-| H4 | An agent attributed to *k* PRs contributes `1/k` of its tokens to each. | A `block` and a `pr` on `UsageSnapshot`. |
+| H4 | An agent attributed to *k* PRs contributes `1/k` of its tokens to each, and *k* counts only the PRs in **this run's selection** — run one PR alone and its shared agents get full weight, so always run the whole comparison set together. | A `block` and a `pr` on `UsageSnapshot`. |
 | H5 | Orchestrator tokens are apportioned by wake share. | Per-turn PR attribution — nothing structural exists (§7). |
 | H6 | `usage.json` is cumulative, so a delegate's whole life counts against its PR. | A windowed usage series, or accepting the approximation. |
 | H7 | The PR window ends at `merged_at` passed in by the caller. | A loomux row for a human merge (#388). |
@@ -329,7 +335,7 @@ One JSON object. `--format table` renders the per-PR GFM table instead;
                     refused_by_reason, held_by_reason },
     delegates:    { count, tokens, agents: [ { agent, block, role, tier, weight, tokens } ] },
     share:        { orchestrator_pct_raw, orchestrator_pct_attributed },
-    rows_classified, rows_unclassified_in_window
+    rows_classified, rows_counted_outside_pr_window, rows_unclassified_in_window
   } ],
   coverage: { audit_rows_read, audit_parse_errors, rows_classified, transcripts[],
               agents_attributed, agents_unattributed_spawned_in_window,
