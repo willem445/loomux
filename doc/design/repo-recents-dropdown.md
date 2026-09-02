@@ -37,12 +37,18 @@ Two consequences of the reuse, both deliberate:
 - The pane's initial-focus marker (`data-initial-focus`, rev-74 LOW-4/LOW-6)
   follows the VISIBLE half of the picker: the free-text input when it is
   showing, the recents select when the dropdown branch hides it, because
-  `focus()` on a hidden element lands nowhere. It is re-homed on every branch
-  flip, not just stamped once — a Browse… pick of a folder already in the
-  recents, or the human picking one in the dropdown, can hide the half the
-  marker was on while the pane stays open, and `Pane.focus()` routes into
-  `focusWelcome()` on every window-refocus and keyboard-nav (rev-std round 1,
-  finding 2 on #2010).
+  `focus()` on a hidden element lands nowhere. The re-homing runs in BOTH
+  directions on every branch flip, not just stamped once: a Browse… pick of a
+  folder already in the recents, or the human picking one in the dropdown, can
+  hide the half the marker was on while the pane stays open, and picking
+  `custom…` again moves it back to the input — a stranded marker on the
+  select would be worse than a dead end, because a select is a value-changing
+  control (one arrow key fires `change` and silently replaces a half-typed
+  path with a recent directory). When both halves are showing the free-text
+  input carries the marker: it is the half the human is typing into. The
+  predicate is the same one `ModelPicker.focus()` uses, and `Pane.focus()`
+  routes into `focusWelcome()` on every window-refocus and keyboard-nav
+  (rev-std round 1 finding 2 and rev-final B1 on #2010).
 
 The E2E helpers follow the same contract (`e2e/helpers.ts` `fillRepoField`):
 their structural selectors are declared coupled to `src/launcher.ts`'s DOM

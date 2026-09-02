@@ -231,21 +231,31 @@ export class ModelPicker {
   }
 
   /** Keep a host's `data-initial-focus` marker on the VISIBLE half (rev-std
-   *  round 1, finding 2 on #2010). The launcher stamps it on whichever half
-   *  shows at construction, but a branch flip afterwards — a Browse… pick that
-   *  lands on a recent, or the human picking one in the dropdown — would
-   *  strand it on the now-hidden element, where `focus()` is a no-op and the
-   *  pane's focusWelcome() lands nowhere. Moved only between these two
-   *  elements: a marker this picker did not stamp on one of its own halves is
-   *  never touched. */
+   *  round 1, finding 2 on #2010; predicate corrected in round 4, B1). The
+   *  launcher stamps it on whichever half shows at construction, and a branch
+   *  flip afterwards — a Browse… pick that lands on a recent, or the human
+   *  picking one in the dropdown — would otherwise strand it on the now-hidden
+   *  element, where `focus()` is a no-op and the pane's focusWelcome() falls to
+   *  the marker's DOM-order first match. That stranded select is a
+   *  value-changing control: one arrow key fires `change`, hides the input and
+   *  silently replaces a half-typed path with a recent directory. The marker
+   *  therefore follows the visible half in BOTH directions — the predicate is
+   *  the same one `focus()` uses below, and when both halves are showing the
+   *  free-text input wins, because that is the half a human is typing into.
+   *  Touched only when found on the picker's own two elements: a marker this
+   *  picker did not stamp is never moved. */
   private rehomeInitialFocus(): void {
-    if (this.custom.hasAttribute("data-initial-focus") && this.custom.hidden) {
-      this.custom.removeAttribute("data-initial-focus");
-      this.sel.setAttribute("data-initial-focus", "");
-    } else if (this.sel.hasAttribute("data-initial-focus") && this.sel.hidden) {
-      this.sel.removeAttribute("data-initial-focus");
-      this.custom.setAttribute("data-initial-focus", "");
-    }
+    const MARKER = "data-initial-focus";
+    const marked = this.custom.hasAttribute(MARKER)
+      ? this.custom
+      : this.sel.hasAttribute(MARKER)
+        ? this.sel
+        : null;
+    if (!marked) return;
+    const visible = this.custom.hidden ? this.sel : this.custom;
+    if (marked === visible) return;
+    marked.removeAttribute(MARKER);
+    visible.setAttribute(MARKER, "");
   }
 
   /** Focus whichever half is showing. The validation-error paths bounce the
