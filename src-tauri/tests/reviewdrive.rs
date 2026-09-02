@@ -5759,8 +5759,72 @@ fn rails_capped() -> Guardrails {
     Guardrails { max_agents: 1, ..rails() }
 }
 
-/// **#2109 ask 3.** A drive the cap will not let spawn becomes one of §2.2's
-/// exits instead of sitting invisible.
+/// A capped group with the drive already in `review-wait` and its first lane
+/// spawn refused — the fixture both #2109 ask-3 tests start from.
+///
+/// Answers the group, the orchestrator's pane and the clock of the tick that
+/// took the refusal, so a caller can measure the window from where the
+/// starvation actually began rather than from a number it remembered.
+fn cap_starved(reg: &OrchRegistry, repo: &Repo, gh: &FakeGh) -> (GroupId, String, u64) {
+    let group = reg.create_group(&repo.path(), rails_capped()).unwrap().id;
+    let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).expect("the one slot");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+
+    reg.rd_drive_group_with(&group, gh, 10_000); // ci-wait -> review-wait
+    let first = reg.rd_drive_group_with(&group, gh, 20_000); // lane spawn, refused
+    assert!(first.lanes_opened.is_empty(), "the control: the cap is full, so nothing spawned");
+    (group, orch.id, 20_000)
+}
+
+/// **#2109 ask 3, the record.** A cap refusal says how long the cap has been
+/// refusing *this drive*, not merely that it refused on this tick.
+///
+/// `cap: true` (#1960) already answered "was a slot the problem here", and that
+/// was the whole of what the log carried while PR #2105's drive sat starved for
+/// three hours: thirty-seven identical rows, each true, none of them saying the
+/// drive had been stuck since the first one. `starved_ms` is the run, and it is
+/// the number `held(cap-full)` is decided from — so a row with `cap: true` and
+/// no run is a log that can report the condition but never its duration.
+///
+/// Split from the hold below rather than asserted before it, because a test
+/// that fails here tells you nothing about whether the hold works: the first
+/// assertion to move is the only one a red evidences.
+#[test]
+fn a_cap_refusal_records_how_long_the_cap_has_been_refusing_this_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+
+    let refused = rows_for(&reg, &group, "rd-refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["cap"], json!(true), "the cap is what refused it: {refused:?}");
+    assert_eq!(
+        refused[0]["starved_ms"],
+        json!(0),
+        "and the run is zero long, because this is its first tick: {refused:?}"
+    );
+
+    // A second refusal on a later tick is the SAME run, and the row says so by
+    // the number growing. Without this the field could be a constant zero.
+    reg.rd_drive_group_with(&group, &gh, at + 90_000);
+    let again = rows_for(&reg, &group, "rd-refused");
+    assert_eq!(again.len(), 2, "the cap refused again: {again:?}");
+    assert_eq!(
+        again[1]["starved_ms"],
+        json!(90_000),
+        "…measured from the FIRST refusal, so a reader sees the run and not the tick: {again:?}"
+    );
+}
+
+/// **#2109 ask 3, the exit.** A drive the cap will not let spawn becomes one of
+/// §2.2's exits instead of sitting invisible.
 ///
 /// The measured incident: PR #2105's drive sat in `review-wait` with
 /// `lanes: []` for about three hours — `since_ms` 11,083,045 at the read —
@@ -5783,29 +5847,10 @@ fn a_cap_that_starves_a_drive_parks_it_as_cap_full_rather_than_leaving_it_silent
     let reg = relaunch_registry(dir.path());
     let repo = Repo::new();
     let gh = FakeGh::green(HEAD_A);
-    let group = reg.create_group(&repo.path(), rails_capped()).unwrap().id;
-    let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).expect("the one slot");
-    let session = w.session_id.clone().expect("claude mints a session id at spawn");
-    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
-    with_pane(&reg, &orch.id, 7001);
-    reg.set_pr_head_override(Some(HEAD_A.to_string()));
-    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
-    assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
-
-    reg.rd_drive_group_with(&group, &gh, 10_000); // ci-wait -> review-wait
-    let first = reg.rd_drive_group_with(&group, &gh, 20_000); // lane spawn, refused
-    assert!(first.lanes_opened.is_empty(), "the cap is full, so nothing spawned");
-    let refused = rows_for(&reg, &group, "rd-refused");
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert_eq!(refused[0]["cap"], json!(true), "the cap is what refused it: {refused:?}");
-    assert_eq!(
-        refused[0]["starved_ms"],
-        json!(0),
-        "and the run is zero long, because this is its first tick: {refused:?}"
-    );
+    let (group, orch, at) = cap_starved(&reg, &repo, &gh);
 
     // One tick short of the window: still trying, still no orchestrator turn.
-    let short = reg.rd_drive_group_with(&group, &gh, 20_000 + reviewdrive::CAP_HOLD_MS - 1);
+    let short = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS - 1);
     assert_eq!(
         status_state(&reg, &group),
         "review-wait",
@@ -5817,7 +5862,7 @@ fn a_cap_that_starves_a_drive_parks_it_as_cap_full_rather_than_leaving_it_silent
         short.notices
     );
 
-    let held = reg.rd_drive_group_with(&group, &gh, 20_000 + reviewdrive::CAP_HOLD_MS);
+    let held = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
     assert_eq!(status_state(&reg, &group), "held");
     let status = reg.review_drive_status(&group);
     assert_eq!(
@@ -5843,7 +5888,7 @@ fn a_cap_that_starves_a_drive_parks_it_as_cap_full_rather_than_leaving_it_silent
         "and say why the driver did not free the slot itself (3.1 item 5): {notice}"
     );
     assert!(
-        texts_to(&reg, &group, &orch.id).iter().any(|t| t.contains("HELD")),
+        texts_to(&reg, &group, &orch).iter().any(|t| t.contains("HELD")),
         "and it must land in the ORCHESTRATOR pane, which is the whole point of the hold"
     );
 }
