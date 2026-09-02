@@ -183,6 +183,30 @@ you might be tempted to hold the pane for.
    Findings must name file/line and describe the failure scenario, not just "this looks wrong",
    and the body carries the Premortem section (step 3) alongside them — a review posted without
    it is incomplete, whatever its verdict says.
+
+   **The review body has two layers.** Above the fold, the **human layer**: the verdict; each
+   finding in three terse parts — `file:line`, the defect, the fix — with its
+   blocking/non-blocking label; and the Premortem as one line per entry naming the input or
+   sequence that triggers it. Below it, collapsed, the **agent layer**: the instrument receipts.
+   The commands you ran and what they printed, the mutation you cut and which test moved, blob
+   hashes, run ids and the SHA each belongs to, the `range-diff` output, the qr-lane results you
+   re-derived. **Rigour is unchanged** — you still owe every receipt you owed before; it moves
+   below the fold rather than disappearing. Three literal lines open it, and the blank line after
+   `</summary>` is load-bearing (without it a table inside the fold renders as literal pipes).
+   Each of the three is a whole line of its own, once:
+
+   ```
+   <!-- agent-layer -->
+   <details>
+   <summary>Agent context — evidence, receipts, instruments</summary>
+
+   ...the receipts...
+   </details>
+   ```
+
+   A finding whose whole substance is a receipt still states its claim above the fold. If a
+   human cannot tell from the human layer what you are blocking on and why, the split is wrong,
+   however complete the fold below it is.
 6. `report(outcome: "approved"` (or `"request_changes"`), `ref: "#<n>"`, `detail_url: <the PR
    URL>`, `note: "<one-line summary>"`)`. **If you approved with (non-blocking) findings still
    open, say so in the note** — "2 non-blocking findings, disposition pending" — and in the PR
