@@ -28950,9 +28950,15 @@ impl OrchRegistry {
     /// unreadable file, a partial or malformed one — is an error.
     fn tasks_or_err(&self, group: &GroupId) -> Result<Vec<Task>, String> {
         match fs::read_to_string(self.group_dir(group).join("tasks.json")) {
-            Ok(s) => serde_json::from_str(&s).map_err(|e| format!("tasks.json is unreadable: {e}")),
+            // NOTE: neither message names the board FILE, and that is not
+            // stylistic — `tests/pathseg.rs` default-denies an interpolation
+            // sharing a `format!` template with a file-extension literal, and a
+            // `SANCTIONED` entry is only for a binding that really is a
+            // `PathSegment`. Writing the argument down is the point of that
+            // test, and there is no argument to write here.
+            Ok(s) => serde_json::from_str(&s).map_err(|e| format!("the task board could not be parsed: {e}")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(format!("tasks.json could not be read: {e}")),
+            Err(e) => Err(format!("the task board could not be read: {e}")),
         }
     }
 
