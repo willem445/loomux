@@ -1999,8 +1999,9 @@ remove.
 all — its cheap tier is `rev-std`, an *iterating* reviewer rather than a fixed-checklist
 instrument — so the three lanes described here are history plus a standing option:
 `qr-evidence.md`, `qr-tests.md` and `qr-constraints.md` remain checked in under
-`.github/agents/`, and `.orrerix/workflow.yml`'s own preamble records that the previous
-roster comes back by renaming two files. The pins on those three personas are bound to
+`.github/agents/`, so the lanes are reconstructable from the repo alone: a roster that
+declares them again gets three personas whose contracts never drifted while nothing
+pointed at them. The pins on those three personas are bound to
 the FILES for exactly that reason (`the_cheap_review_lanes_carry_the_rules_that_make_them_safe`,
 `src-tauri/tests/workflow.rs`) — a roster-derived population would have asserted their
 rules of a persona never written for them. The argument below is what the lanes are for
@@ -2184,10 +2185,10 @@ these pins used to be written that way: the cheap-tier roster declares neither `
 any qr-* lane, so a roster lookup panics and a kind+CLI filter would hand these assertions
 `rev-std` — an *iterating* reviewer that was never written to any of these rules and rightly
 carries none of them. Asserting a checklist lane's contract of it would be measuring one thing
-under another's label. The three checklist personas and `rev-lead.md` stay checked in
-(`.orrerix/workflow.yml`'s preamble records that the previous roster is restored by renaming
-two files), so what these pins now guard is exactly what they always guarded: those files'
-sentences. What the roster-derived population used to give for free is a population CONTROL, and
+under another's label. The three checklist personas and `rev-lead.md` stay checked in, so
+what these pins now guard is exactly what they always guarded: those files' sentences — and
+they keep guarding them while no roster points at the files, which is the whole reason a
+persona that leaves a roster should not take its pin with it. What the roster-derived population used to give for free is a population CONTROL, and
 that has to be re-earned rather than restated: `assert_eq!(lanes.len(), 3)` against a fixed array
 is a sentence that cannot fail. So the test asks the DIRECTORY — the list it iterates must be
 exactly the `qr-*.md` personas that exist under `.github/agents/` — and a fourth checklist

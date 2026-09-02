@@ -7747,14 +7747,20 @@ blocks:
     // shape). #1176 also refuses `routing:` and `require: threshold` together at parse,
     // so all-pass is the only spelling this roster could use anyway.
     assert_eq!(gate.require, GateRequire::AllPass);
-    // The GENERIC safety property, same shape as the frontend dogfood pin, and stated
-    // over a UNION because that is what #1176 made the required set: every declared
-    // reviewer-kind block must be named by `gates.merge.reviewers` OR by at least one
-    // `routing:` rule. A lane named by NEITHER is one no PR can ever require — it would
+    // The GENERIC safety property, same shape as the frontend dogfood pin — and it is
+    // NAMEDNESS, not reachability, so say so rather than overclaim. Stated over a UNION
+    // because that is what #1176 made the required set: every declared reviewer-kind
+    // block must be named by `gates.merge.reviewers` OR by at least one `routing:`
+    // rule. A lane named by NEITHER can never enter the required set at all — it would
     // sit in the roster looking wired while the gate opened without it, which is exactly
     // what "an abstention is a pass" makes dangerous. `rev-std` is static (every PR);
     // `rev-final` is required by routing, on the paths a prose review cannot judge. A
     // docs-only PR that runs rev-std alone is the rule working, not a hole.
+    //
+    // What namedness does NOT catch, found in review (rev-final round 1, N4) rather than
+    // by the author: a rule whose `paths:` match nothing still NAMES its reviewer, so the
+    // lane is named and required on no PR — the same end state from the other side. The
+    // `must be able to FIRE` block below is the partial close, with its own residual.
     let declared: Vec<&str> =
         wf.blocks.iter().filter(|b| b.kind == Role::Reviewer).map(|b| b.id.as_str()).collect();
     let reachable: std::collections::BTreeSet<&str> = gate
@@ -7791,6 +7797,87 @@ blocks:
     for r in gate.reviewers.iter().chain(gate.routing.iter().flat_map(|rule| rule.reviewers.iter())) {
         assert_eq!(wf.block(r).map(|b| b.kind), Some(Role::Reviewer), "gate reviewer {r}");
     }
+    // ROUTING RULES MUST BE ABLE TO FIRE — the partial close on the gap named above, and
+    // partial for a reason worth stating rather than leaving for the next reader. Deciding
+    // full reachability ("does this glob match a file a PR could touch") means running the
+    // repo's tracked-file list through `glob_match`; what is checkable without either is
+    // that a glob ROOTED at a literal path is rooted at one that EXISTS. That is exactly
+    // the shape a directory rename or a typo produces, which is the arrival route the
+    // review's premortem named (`src/**` narrowed to `src/orchestration/**` during a
+    // refactor that moved it).
+    let literal_root = |glob: &str| -> Option<String> {
+        match glob.find(|c| c == '*' || c == '?' || c == '[') {
+            None => Some(glob.to_string()),
+            Some(w) => {
+                let upto = &glob[..w];
+                match upto.rfind('/') {
+                    Some(i) if i > 0 => Some(upto[..i].to_string()),
+                    _ => None,
+                }
+            }
+        }
+    };
+    // The check's own POSITIVE CONTROL: the exact shape review found (a rooted glob naming
+    // a directory that does not exist) must be one this check would refuse. Without it the
+    // loop below passes just as well when `literal_root` returns None for everything and
+    // nothing is ever verified.
+    assert_eq!(literal_root("zzz-no-such-dir/**").as_deref(), Some("zzz-no-such-dir"));
+    assert!(
+        !Path::new(&repo).join("zzz-no-such-dir").exists(),
+        "the control's negative arm: a bogus root really is absent, so the loop below has teeth"
+    );
+
+    let mut roots_checked = 0usize;
+    for (i, rule) in gate.routing.iter().enumerate() {
+        let mut checked_in_rule = 0usize;
+        for p in &rule.paths {
+            let Some(root) = literal_root(p) else { continue };
+            assert!(
+                Path::new(&repo).join(&root).exists(),
+                "routing[{i}] path {p:?} is rooted at {root:?}, which does not exist — the rule can never fire"
+            );
+            roots_checked += 1;
+            checked_in_rule += 1;
+        }
+        // POPULATION CONTROL, counted at the VERIFIED site: a rule made entirely of
+        // unrooted globs would sail through the loop having certified nothing.
+        assert!(
+            checked_in_rule > 0,
+            "routing[{i}] needs at least one path this check can verify: {:?}",
+            rule.paths
+        );
+    }
+    assert!(roots_checked > 0, "…and some path was actually verified, not zero of them");
+
+    // THE RESIDUAL, PERFORMED rather than merely disclosed (CLAUDE.md's escape-hatch
+    // rule) — and performing it is what corrected it. Two shapes LOOK like the blind
+    // spot; only one is one, and the first draft of this comment named the wrong one:
+    //
+    //  * a rule made ONLY of unrooted globs is CAUGHT — not by the existence check, which
+    //    skips them, but by the per-rule population control above. Measured on the
+    //    frontend twin: mutating rule 1 to `["**/nope.zzz"]` reddens it.
+    //  * what DOES slip through is a glob whose literal root EXISTS but which matches no
+    //    file. `src/**/*.zzz` roots at `src`, which is there, so the check passes it
+    //    while the rule can still never fire. This verifies the ROOT, not a match;
+    //    closing that last step means running the tracked-file list through
+    //    `glob_match`. Measured: that mutation leaves the suite green.
+    assert_eq!(literal_root("**/nope.zzz"), None, "an unrooted glob has no root to check…");
+    assert_eq!(
+        literal_root("src/**/*.zzz").as_deref(),
+        Some("src"),
+        "…but a rooted-yet-unmatchable glob IS checked, and passes — the real blind spot"
+    );
+    assert!(Path::new(&repo).join("src").exists(), "…because its root really does exist, which is all this check asks");
+    assert_eq!(literal_root("**/Cargo.toml"), None, "…and the shipped file really does contain an unrooted path");
+    assert_eq!(
+        gate.routing
+            .iter()
+            .map(|r| r.paths.iter().filter(|p| literal_root(p).is_none()).count())
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0, 1],
+        "…in exactly one rule, beside three rooted paths — so the blind spot is not load-bearing here"
+    );
+
     // And every `also:` condition is one THIS build can check. An unknown condition is
     // not ignored — it fails closed and refuses every merge — so shipping one in the
     // repo's own file would mean loomux could never merge its own PRs.
@@ -7820,10 +7907,12 @@ fn the_checklist_reviewer_persona_carries_the_question_set() {
     //
     // BOUND TO THE FILE, NOT TO ROSTER MEMBERSHIP. The live cheap-tier roster does not
     // declare `rev-lead` — its lanes are `rev-std` and `rev-final` — but `rev-lead.md`
-    // is still checked in, and `.orrerix/workflow.yml`'s own preamble says the previous
-    // roster can be swapped back in by renaming two files. So the property is pinned on
-    // the persona file itself rather than looked up through `wf.block("rev-lead")`,
-    // which would panic. Nothing is relaxed: every assertion below is what it was.
+    // is still checked in, so the property is pinned on the persona file itself rather
+    // than looked up through `wf.block("rev-lead")`, which would panic. What that buys
+    // is checkable from the repo alone: the persona survives a roster change, so a roster
+    // that declares `rev-lead` again gets a file whose contract never silently drifted
+    // while nothing pointed at it. Nothing is relaxed: every assertion below is what it
+    // was.
     // These headings are `rev-lead.md`'s contract specifically — they are NOT asserted
     // of `rev-final.md`, which does not carry them and was never written to.
     let repo = repo_root();
@@ -7879,8 +7968,16 @@ fn the_cheap_review_lanes_carry_the_rules_that_make_them_safe() {
     // which is an ITERATING reviewer rather than a fixed-checklist instrument and
     // carries none of these rules — deriving the population from the roster would
     // therefore assert this file's rules of a persona they were never written for.
-    // The three checklist personas are still checked in and come back with the
-    // previous roster; every assertion below is byte-identical to what it was.
+    // The three checklist personas are still checked in, so the same thing holds as for
+    // the pin above: their contracts stay pinned while no roster points at them, and a
+    // roster that declares them again gets files that never drifted.
+    //
+    // Every `pinned(...)` rule below is byte-identical to what it was — the per-persona
+    // rules are the whole point and none of them moved. The POPULATION CONTROL is the one
+    // thing that did: a literal list makes `assert_eq!(lanes.len(), 3)` a sentence that
+    // cannot fail, so it is re-earned from the directory instead, immediately below.
+    // (Said precisely because an earlier draft of this comment said "every assertion",
+    // which this test's own next commit then falsified — rev-final round 1, N1.)
     let repo = repo_root();
     let lanes = [".github/agents/qr-evidence.md", ".github/agents/qr-tests.md", ".github/agents/qr-constraints.md"];
 

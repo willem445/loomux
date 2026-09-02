@@ -15,7 +15,7 @@
 // precisely the drift this test catches, forever.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   parseWorkflow,
   validateWorkflow,
@@ -134,27 +134,33 @@ test("every declared reviewer lane is named by the gate or by a routing rule, be
   const { workflow } = parseWorkflow(text);
   const gate = workflow.gates.merge;
   assert.ok(gate, "the point of the dogfood file is that the human can demo the gate");
-  // THE SAFETY PROPERTY, stated generically so it survives roster changes. Under
-  // `all-pass` an abstention still counts as a pass, so the required set has to be
-  // able to REACH every declared reviewer: a reviewer-kind block in the roster that
-  // neither `gates.merge.reviewers` nor any `routing:` rule names is a lane no PR
-  // can ever require, and it would sit there looking wired while the gate opened
-  // without it.
+  // THE SAFETY PROPERTY — and it is NAMEDNESS, not reachability, so say so rather
+  // than overclaim. Under `all-pass` an abstention counts as a pass, so a
+  // reviewer-kind block in the roster that neither `gates.merge.reviewers` nor any
+  // `routing:` rule NAMES can never enter the required set at all: it would sit
+  // there looking wired while the gate opened without it. That is what the
+  // assertion below catches, and all of it.
+  //
+  // What it does NOT catch, found in review (rev-final N4) rather than by the
+  // author: a rule whose `paths:` match nothing still NAMES its reviewer, so the
+  // lane is named and required on no PR — the same end state, arrived at from the
+  // other side. Measured there by pointing rule 1 at `zzz-no-such-dir/**` and
+  // watching this suite stay 9/9 green. The `routing rules must be able to FIRE`
+  // block further down is the partial close, with its own residual pinned.
   //
   // "In the gate" is a UNION of two lists, and that is the roster's design rather
   // than a loosening: `rev-std` is static (every PR), `rev-final` is REQUIRED BY
   // ROUTING (#1176) on the paths a prose review cannot judge — code, tests, CI,
   // manifests, doc/design. A docs-only PR that runs rev-std alone is the rule
-  // working (#1952), not a hole. The hole is a lane NOTHING names, and that is what
-  // this asserts.
+  // working (#1952), not a hole.
   const declaredReviewers = workflow.blocks.filter((b) => b.kind === "reviewer").map((b) => b.id);
   const namedBy = (g: typeof gate): Set<string> =>
     new Set([...(g?.reviewers ?? []), ...(g?.routing ?? []).flatMap((r) => r.reviewers)]);
   const unnamed = (w: typeof workflow): string[] => {
-    const reachable = namedBy(w.gates.merge);
-    return w.blocks.filter((b) => b.kind === "reviewer" && !reachable.has(b.id)).map((b) => b.id);
+    const named = namedBy(w.gates.merge);
+    return w.blocks.filter((b) => b.kind === "reviewer" && !named.has(b.id)).map((b) => b.id);
   };
-  assert.deepEqual(unnamed(workflow), [], "every declared reviewer lane is reachable by the gate");
+  assert.deepEqual(unnamed(workflow), [], "every declared reviewer lane is named by the gate");
   // …and the SPLIT itself, pinned positively, so a lane sliding out of the static
   // list into nothing — or the routing block emptying — fails here and not only in
   // the generic assertion above.
@@ -166,6 +172,74 @@ test("every declared reviewer lane is named by the gate or by a routing rule, be
   );
   assert.ok((gate.routing ?? []).length > 0, "the routing block is what makes rev-final reachable at all");
   assert.deepEqual(declaredReviewers, ["rev-std", "rev-final"]);
+
+  // ROUTING RULES MUST BE ABLE TO FIRE — the partial close on the namedness/reachability
+  // gap above, and the reason it is only partial is stated rather than left for the next
+  // reader to discover. Full reachability ("does this glob match a file a PR could touch")
+  // needs a glob engine and the repo's tracked-file list, and this suite is DOM-free pure
+  // modules with neither. What it can check without either is that a glob ROOTED at a
+  // literal path is rooted at one that EXISTS — which is exactly the shape a directory
+  // rename or a typo produces, i.e. the arrival route the review's premortem named
+  // (`src/**` narrowed to `src/orchestration/**` during a refactor that moved it).
+  const literalRoot = (glob: string): string | null => {
+    const wild = glob.search(/[*?[]/);
+    if (wild < 0) return glob; // no wildcard at all: the path itself must exist
+    const upto = glob.slice(0, wild);
+    const cut = upto.slice(0, upto.lastIndexOf("/") + 1).replace(/\/$/, "");
+    return cut || null; // `**/Cargo.toml` has no literal root — the residual, pinned below
+  };
+  // The check's own POSITIVE CONTROL, in-test: the exact shape review found (a rooted
+  // glob naming a directory that does not exist) must be one this check would refuse.
+  // Without this the loop below passes just as well when `literalRoot` returns null for
+  // everything and nothing is ever verified.
+  assert.equal(literalRoot("zzz-no-such-dir/**"), "zzz-no-such-dir");
+  assert.equal(existsSync(new URL("../zzz-no-such-dir", import.meta.url)), false, "…and it really is absent, so the arm below has teeth");
+
+  let rootsChecked = 0;
+  for (const rule of gate.routing ?? []) {
+    let checkedInRule = 0;
+    for (const p of rule.paths) {
+      const root = literalRoot(p);
+      if (root === null) continue;
+      assert.ok(
+        existsSync(new URL(`../${root}`, import.meta.url)),
+        `routing path ${JSON.stringify(p)} is rooted at ${JSON.stringify(root)}, which does not exist — the rule can never fire`
+      );
+      rootsChecked++;
+      checkedInRule++;
+    }
+    // POPULATION CONTROL, counted at the VERIFIED site: a rule made entirely of unrooted
+    // globs would sail through the loop above having certified nothing.
+    assert.ok(
+      checkedInRule > 0,
+      `every routing rule needs at least one path this check can verify: ${JSON.stringify(rule.paths)}`
+    );
+  }
+  assert.ok(rootsChecked > 0, "…and some path was actually verified, not zero of them");
+
+  // THE RESIDUAL, PERFORMED rather than merely disclosed (CLAUDE.md's escape-hatch rule) —
+  // and performing it is what corrected it. Two shapes LOOK like the blind spot; only one
+  // is one, and the first draft of this comment named the wrong one:
+  //
+  //  * a rule made ONLY of unrooted globs is CAUGHT — not by the existence check, which
+  //    skips them, but by the per-rule population control above. Measured: mutating rule 1
+  //    to `["**/nope.zzz"]` reddens this test. Worth writing down, because the obvious
+  //    reading of "an unrooted glob is not checked" is that such a rule slips through, and
+  //    it does not.
+  //  * what DOES slip through is a glob whose literal root EXISTS but which matches no
+  //    file. `src/**/*.zzz` roots at `src`, which is there, so the check passes it while
+  //    the rule can still never fire. This check verifies the ROOT, not a match; closing
+  //    that last step needs the glob engine and the tracked-file list this suite has
+  //    neither of. Measured: that mutation leaves the suite green.
+  assert.equal(literalRoot("**/nope.zzz"), null, "an unrooted glob has no root to check…");
+  assert.equal(literalRoot("src/**/*.zzz"), "src", "…but a rooted-yet-unmatchable glob IS checked, and passes — the real blind spot");
+  assert.equal(existsSync(new URL("../src", import.meta.url)), true, "…because its root really does exist, which is all this check asks");
+  assert.equal(literalRoot("**/Cargo.toml"), null, "…and the shipped file really does contain an unrooted path");
+  assert.deepEqual(
+    (gate.routing ?? []).map((r) => r.paths.filter((p) => literalRoot(p) === null).length),
+    [0, 0, 0, 1],
+    "…in exactly one rule, which carries three rooted paths beside it — so the blind spot is not load-bearing here"
+  );
 
   // POSITIVE CONTROL — the assertion above passes just as well against a check that
   // never ran, so this performs the one edit it exists to catch: drop rev-final from
