@@ -2514,8 +2514,13 @@ workflow file declares more than one worker: a session belongs to one CLI, and r
 transcript under an opencode block does not produce a different persona, it fails to open at all.
 If the block a session was minted under is no longer declared, the drive holds and names it rather
 than quietly resuming the work as somebody else. Where that session already has a live, idle pane
-running that same block, the driver types the brief into it instead of opening a second pane on one
-conversation — so a review round normally costs no new delegate slot at all.
+running that same block **and that pane is ready to be typed into**, the driver types the brief into
+it instead of opening a second pane on one conversation — so a review round normally costs no new
+delegate slot at all. "Ready" is a fact about deliveries, not about what is on the screen: the last
+thing orrerix typed into that pane is on record as having landed, and nothing is still queued for
+it. A pane that is idle but parked — behind a permission prompt, a CLI question, an install gate —
+fails that test, and the driver opens a fresh pane rather than adding a brief to a queue nobody is
+draining. The refusal is on the group's audit log as `rd-reuse-declined`, naming the pane and why.
 
 **Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
 PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be

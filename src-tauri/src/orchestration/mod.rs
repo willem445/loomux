@@ -17432,6 +17432,102 @@ pub fn recorded_confirmed(last_delivery: &TrackedMutex<HashMap<u32, DeliveryOutc
     last_delivery.lock_safe().get(&pty_id).map(|o| o.confirmed)
 }
 
+/// Why a live, idle, typeable pane on the right session is **not** ready to take
+/// a brief (#2089). `None` from [`pane_delivery_readiness`] means it is.
+///
+/// Every variant is a fact orrerix's own delivery machinery already recorded —
+/// never a reading of the pane's screen, which `doc/design/review-driver.md` §3
+/// keeps out of the review driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneNotReady {
+    /// Something is already waiting to be pasted into this pane. Whatever the
+    /// CLI is doing, it has not drained what it was last given, so a brief
+    /// admitted now lands BEHIND that.
+    Queued,
+    /// The last delivery to this pane is on record as not having landed —
+    /// `Pending` or `Failed` in [`DeliveryConfirmState`]'s three-state sense,
+    /// which `DeliveryOutcome::confirmed` folds into one `false`. Its text may
+    /// still be sitting unsubmitted in the box.
+    ///
+    /// **The complement is WIDER than the hook signal**, and that is disclosed
+    /// rather than implied: [`confirm_state_for`] resolves `Box`, `Hook` AND
+    /// `Burst` to `Confirmed`, so a delivery decided by #112's Tier 3 output
+    /// heuristic reads ready here even though a repaint can satisfy that tier.
+    /// Narrowing to `Box`/`Hook` needs [`ConfirmSource`] carried on
+    /// `DeliveryOutcome`, which nothing stores; the trade and how to settle it
+    /// from `prompt-typed`'s own `confirm_source` column are in
+    /// `doc/design/review-driver.md` §3.1 item 5.
+    Unconfirmed,
+    /// Nothing has ever been delivered to this pty, so there is no evidence
+    /// either way. Refused rather than assumed: "we could not look" is not
+    /// "there was nothing there" — the same asymmetry `rd_pane_exit` states
+    /// about a `Dead` reading.
+    NoRecord,
+}
+
+impl PaneNotReady {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneNotReady::Queued => "queued",
+            PaneNotReady::Unconfirmed => "unconfirmed",
+            PaneNotReady::NoRecord => "no-record",
+        }
+    }
+}
+
+/// **Is a pane at a point where a brief typed into it will be READ rather than
+/// parked behind something?** (#2089) `None` = ready.
+///
+/// Pure, so the rule itself is pinnable without a live pty; the impure reader is
+/// [`OrchRegistry::pane_readiness`], which supplies
+/// [`OrchRegistry::queue_depth`] and [`recorded_confirmed`].
+///
+/// **Queue depth is asked FIRST**, and the precedence is a decision rather than
+/// an ordering accident: a non-empty queue decides on its own, whatever the last
+/// delivery did, because the brief would sit behind entries nothing has pasted
+/// yet. `Unconfirmed` and `NoRecord` are only ever reached for an empty queue.
+///
+/// **What this CANNOT see, stated because a predicate must state its residual.**
+/// It is evidence about the last DELIVERY, not about the pane right now: a
+/// dialog raised AFTER a confirmed delivery, with nothing queued behind it,
+/// reads ready and is not caught. Closing that would mean judging a pane's
+/// screen, which §3 forbids the driver; it is bounded exactly as it was before
+/// #2089, by `held(fix-stalled)`/`held(lane-stalled)` naming the pane.
+///
+/// Nor is it ATOMIC with the paste that follows it: anything admitted to the
+/// pane's queue between this answer and `deliver_prompt` is pasted first. The
+/// window is not widened by #2089 — the arm it replaces had the same gap with no
+/// readiness read to race — but "ready" means "was ready when asked", not "will
+/// still be when the brief lands". See `doc/design/review-driver.md` §3.1 item 5
+/// for both residuals and the trade behind the wider `Confirmed`.
+#[doc(hidden)] // pub for integration tests
+pub fn pane_delivery_readiness(
+    queue_depth: usize,
+    last_confirmed: Option<bool>,
+) -> Option<PaneNotReady> {
+    if queue_depth > 0 {
+        return Some(PaneNotReady::Queued);
+    }
+    match last_confirmed {
+        Some(true) => None,
+        Some(false) => Some(PaneNotReady::Unconfirmed),
+        None => Some(PaneNotReady::NoRecord),
+    }
+}
+
+/// What [`OrchRegistry::idle_pane_on_session`] found: the pane to reuse, if any,
+/// and every candidate that got as far as the readiness test and was refused by
+/// it (#2089).
+///
+/// `declined` exists so that refusal is not SILENT. Its only other visible
+/// effect is a fresh pane, and on the audit log that is indistinguishable from
+/// there having been no candidate at all — the shape of silence §3 objects to.
+/// `rd_reuse_pane` turns each entry into an `rd-reuse-declined` row (§5.4).
+pub struct ReusablePane {
+    pub agent: Option<String>,
+    pub declined: Vec<(String, PaneNotReady)>,
+}
+
 /// Record a stranded (unconfirmed) delivery whose submit happened at an
 /// EXPLICIT time (#518, integration tests only). `record_aborted_preenter_
 /// outcome` always stamps `now_ms()`, which cannot express the one state
@@ -43495,11 +43591,11 @@ impl OrchRegistry {
             .count() as u32
     }
 
-    /// A **live, idle, typeable** pane in `group` already running `session`
-    /// (#1960) — what the review driver resumes INTO instead of opening a
-    /// second pane on the same conversation.
+    /// A **live, idle, typeable, ready** pane in `group` already running
+    /// `session` (#1960, #2089) — what the review driver resumes INTO instead of
+    /// opening a second pane on the same conversation.
     ///
-    /// Four conditions, each load-bearing:
+    /// Five conditions, each load-bearing:
     ///
     /// - **not `Dead`**, or the "reuse" is a delivery into a pane that is gone;
     /// - **idle** (`idle_since_ms.is_some()`, the same signal the idle reaper
@@ -43509,7 +43605,8 @@ impl OrchRegistry {
     /// - **has a pane** — `deliver_prompt` resolves `pty_id` before it does
     ///   anything else and refuses an agent with none, so an agent registered
     ///   without a terminal is not something to type into;
-    /// - **running the block the caller asked for.**
+    /// - **running the block the caller asked for**;
+    /// - **ready** — [`pane_delivery_readiness`], below.
     ///
     /// **That last one is #1961 one arm over, and it is not redundant**
     /// (rev-final B3). The first version of this took the pane on the other
@@ -43530,6 +43627,13 @@ impl OrchRegistry {
     /// this session that pane is the drive's own current one, and speaking to
     /// the pane it last spoke to is the continuity a resume is for.
     ///
+    /// **Since #2089 that is a PREFERENCE among eligible panes rather than a
+    /// pick**, and the distinction is why this is a sort and not a `max_by_key`:
+    /// readiness can refuse the newest candidate, and the next one down is still
+    /// a live idle pane on this same conversation under this same block, which
+    /// is a better answer than opening a second pane on it. So the arm takes the
+    /// newest READY pane, and only an empty list opens one.
+    ///
     /// **The key is `(started_ms, id)` rather than `started_ms` alone, and the
     /// second half is not decoration** (rev-final round 2, premortem 1).
     /// `started_ms` is a wall-clock millisecond, so two panes registered inside
@@ -43541,25 +43645,49 @@ impl OrchRegistry {
     /// non-deterministically. The id is a total, stable tiebreak.
     ///
     /// **`idle_since_ms.is_some()` means "the reaper would call this idle", not
-    /// "the CLI is at a prompt", and that residual is stated rather than
-    /// implied** (rev-final round 2, premortem 2). A pane parked on an
+    /// "the CLI is at a prompt", and the readiness condition is what supplies
+    /// the second half** (#2089; the residual was stated here by rev-final round
+    /// 2, premortem 2, and deferred out of #1967). A pane parked on an
     /// auto-compact, a permission prompt or a tool-approval dialog is idle by
     /// this signal, and `deliver_prompt` will admit the brief into its queue and
-    /// answer `Ok` — so the caller's fallback-to-spawn does not fire and the
-    /// brief waits for the pane to come back. What bounds it is the state that
-    /// asked for it: `fix-wait` holds on `fix-stalled` and `review-wait` on
-    /// `lane-stalled`, both naming the pane, so the drive degrades to a named
-    /// hold rather than to silence. Narrowing this to a real
-    /// at-a-prompt signal means reading the attention machinery from the
-    /// driver, which is a judgment about a pane's screen — §3 keeps those out of
-    /// the driver — so it is left disclosed and bounded rather than guessed.
+    /// answer `Ok` — so the fallback-to-spawn never fires and the brief waits
+    /// for the pane to come back.
+    ///
+    /// **The two conditions are a CONJUNCTION, and neither half is the other's
+    /// restatement.** #2089 asked for the idle test to be replaced; it is
+    /// narrowed instead, because delivery-readiness alone is exactly what a pane
+    /// MID-TURN looks like — it took a brief, the brief confirmed, and its queue
+    /// is empty because the CLI is now thinking. Dropping `idle_since_ms` would
+    /// make the driver type into a working delegate, which the second bullet
+    /// above forbids. `idle_since_ms` answers "does this agent have work"; the
+    /// readiness test answers "will what I type be read"; the reuse needs both.
+    ///
+    /// **What it still cannot see** is [`pane_delivery_readiness`]'s own
+    /// residual: a dialog raised AFTER a confirmed delivery, with nothing queued
+    /// behind it. That case is bounded exactly as the whole class was before —
+    /// `fix-wait` holds on `fix-stalled`, `review-wait` on `lane-stalled`, both
+    /// naming the pane, so the drive degrades to a named hold rather than to
+    /// silence. Narrowing it further means reading the attention machinery from
+    /// the driver, which is a judgment about a pane's screen; §3 keeps those out
+    /// of the driver, so it stays disclosed and bounded rather than guessed.
+    ///
+    /// **Fail direction.** A pane whose last delivery landed but resolved
+    /// `Pending` (a busy CLI that no tier decided for) reads NOT ready, and the
+    /// caller opens a fresh pane. That is the pre-#1960 cost of one round, not a
+    /// regression below it — the predicate fails toward a spare pane, never
+    /// toward a brief nobody reads.
     fn idle_pane_on_session(
         &self,
         group: &GroupId,
         session: &str,
         block: &str,
-    ) -> Option<String> {
-        self.agents
+    ) -> ReusablePane {
+        // The candidates are collected under `agents` and that guard is DROPPED
+        // before any readiness read. `queues` is rank 400 and `agents` 510
+        // (`doc/design/lock-order.md` §4), so asking a candidate's queue depth
+        // from inside the filter would take them in the inverted order.
+        let mut candidates: Vec<(u64, String, u32)> = self
+            .agents
             .lock_safe()
             .values()
             .filter(|a| {
@@ -43568,10 +43696,39 @@ impl OrchRegistry {
                     && a.session_id.as_deref() == Some(session)
                     && a.block == block
                     && a.idle_since_ms.is_some()
-                    && a.pty_id.is_some()
             })
-            .max_by_key(|a| (a.started_ms, a.id.clone()))
-            .map(|a| a.id.clone())
+            .filter_map(|a| Some((a.started_ms, a.id.clone(), a.pty_id?)))
+            .collect();
+        // Newest first — the ordering argument above, with `max_by_key` written
+        // out as a sort because readiness can now reject the front of the list
+        // and the next candidate is still a pane on this same conversation.
+        candidates.sort_by(|x, y| (y.0, &y.1).cmp(&(x.0, &x.1)));
+        let mut declined = Vec::new();
+        for (_started, id, pty) in candidates {
+            match self.pane_readiness(pty) {
+                None => return ReusablePane { agent: Some(id), declined },
+                Some(why) => declined.push((id, why)),
+            }
+        }
+        ReusablePane { agent: None, declined }
+    }
+
+    /// [`pane_delivery_readiness`] against the live registry — the impure half,
+    /// split out for that function's reason (#2089).
+    ///
+    /// Both reads are of state the delivery machinery already keeps: the pane's
+    /// own queue, and the outcome recorded for the last delivery to it. Nothing
+    /// here looks at the pane.
+    ///
+    /// `pub` so a seam test can state its own fixture's premise — that a pane it
+    /// built IS ready — without reaching into `last_delivery`, which stays
+    /// private (`DeliveryConfirmation`'s doc).
+    #[doc(hidden)] // pub for integration tests
+    pub fn pane_readiness(&self, pty_id: u32) -> Option<PaneNotReady> {
+        pane_delivery_readiness(
+            self.queue_depth(pty_id),
+            recorded_confirmed(&self.last_delivery, pty_id),
+        )
     }
 
     /// Human-readable roster of the group's live delegates (workers, reviewers,
@@ -49357,6 +49514,40 @@ impl OrchRegistry {
         }
         self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
     }
+    /// Test-only: record an outcome for the last delivery to `pty_id`, in the
+    /// two shapes `deliver_now` writes (#2089).
+    ///
+    /// The reuse-readiness predicate reads this map, and a headless test cannot
+    /// fill it the production way: `deliver_now` needs a live pty and an
+    /// `AppHandle` to run its confirm window at all — the same obstacle
+    /// `reviewdrive.rs`'s `make_delivery_land` documents from the other side.
+    /// `confirmed: false` goes through production's own writer
+    /// ([`record_inflight_delivery`]) rather than a second insert here, so the
+    /// unconfirmed shape cannot drift; `true` is the one shape no `pub` writer
+    /// exists for, because `DeliveryOutcome` is deliberately private
+    /// (`DeliveryConfirmation`'s doc).
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_last_delivery_for_test(&self, pty_id: u32, confirmed: bool) {
+        if !confirmed {
+            record_inflight_delivery(
+                &self.last_delivery,
+                pty_id,
+                now_ms(),
+                brand::AUDIT_ACTOR.to_string(),
+                None,
+            );
+            return;
+        }
+        self.last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
+            confirmed: true,
+            submit_sent_ms: now_ms(),
+            from: brand::AUDIT_ACTOR.to_string(),
+            // Mirrors the confirmed branch of `deliver_now`'s own write: #813,
+            // our text went in, so there is nothing stranded to look for.
+            stranded_text: None,
+        });
+    }
+
     /// Test-only companion to [`OrchRegistry::set_pty_for_test`]: give an agent
     /// the CLI session id a real spawn would have assigned it, so the
     /// session-keyed prompt record (#903) is reachable from a headless test.
