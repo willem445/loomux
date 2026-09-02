@@ -3051,7 +3051,6 @@ mod tests {
       ]
     }"#;
 
-    #[test]
     /// **The kick-back budget survives a backwards wall-clock step** (rev-std
     /// round 2, premortem 1).
     ///
