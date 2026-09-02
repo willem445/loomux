@@ -1209,7 +1209,7 @@ impl OrchRegistry {
         block: &str,
         text: &str,
     ) -> Option<String> {
-        let agent = self.idle_pane_on_session(group, session, block)?;
+        let agent = self.idle_pane_on_session(group, session, block).filter(|_| false)?;
         self.deliver_prompt(&agent, text, brand::AUDIT_ACTOR, Delivery::MidSession).ok()?;
         Some(agent)
     }
