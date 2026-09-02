@@ -1,0 +1,8 @@
+[
+  { "key": "ses-orch", "agent_id": "orch-10", "name": "orchestrator", "role": "orchestrator", "source": "transcript", "input_tokens": 1, "output_tokens": 4, "cache_creation_tokens": 3, "cache_read_tokens": 2, "cost_usd": 0.01, "estimated": true, "model": "synthetic", "updated_ms": 1700001000000 },
+  { "key": "ses-11", "agent_id": "rev-11", "name": "r: #900 std", "role": "reviewer", "source": "transcript", "input_tokens": 100, "output_tokens": 20, "cache_creation_tokens": 50, "cache_read_tokens": 900, "cost_usd": 0.02, "estimated": true, "model": "synthetic", "updated_ms": 1700001000000 },
+  { "key": "ses-12", "agent_id": "rev-12", "name": "r: #900 final", "role": "reviewer", "source": "transcript", "input_tokens": 200, "output_tokens": 40, "cache_creation_tokens": 100, "cache_read_tokens": 1800, "cost_usd": 0.04, "estimated": true, "model": "synthetic", "updated_ms": 1700001000000 },
+  { "key": "ses-13", "agent_id": "w-13", "name": "w: #900", "role": "worker", "source": "transcript", "input_tokens": 300, "output_tokens": 60, "cache_creation_tokens": 150, "cache_read_tokens": 2700, "cost_usd": 0.06, "estimated": true, "model": "synthetic", "updated_ms": 1700001000000 },
+  { "key": "ses-14", "agent_id": "w-14", "name": "w: #901", "role": "worker", "source": "transcript", "input_tokens": 500, "output_tokens": 200, "cache_creation_tokens": 300, "cache_read_tokens": 4000, "cost_usd": 0.08, "estimated": true, "model": "synthetic", "updated_ms": 1700001000000 },
+  { "key": "ses-15", "agent_id": "w-15", "name": "w: unrelated", "role": "worker", "source": "none", "input_tokens": 9, "output_tokens": 9, "cache_creation_tokens": 9, "cache_read_tokens": 9, "cost_usd": null, "estimated": false, "model": null, "updated_ms": 1700001000000 }
+]
