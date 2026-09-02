@@ -6,6 +6,11 @@
 
 **Define the vision. Walk away. Come back to shipped software.**
 
+Tired of watching for an agent's turn to end so you can kick off the next
+feature? Always in front of a screen — PC or phone — watching output scroll?
+Me too. So I built this to build my projects autonomously while I go live my
+life.
+
 Orrerix runs fleets of AI coding agents unsupervised, on real software
 discipline: review gates and green CI before anything merges, work tracked on
 GitHub and a live task board, your own CLIs and custom workflows — agents
