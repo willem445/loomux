@@ -37,6 +37,40 @@ say you ran. So:
 - Quote file paths and function names exactly as they appear in the repo. If you
   are not sure a name exists, `grep` for it and paste the hit.
 
+## Two layers - the human reads the first one
+
+Every body you post - a PR, an issue, a comment - is a short **human layer** with
+the evidence collapsed under it.
+
+Above the fold, in about 15 lines: what changed and why, what to look at, how each
+review finding was dispositioned, `Closes #N`. Below the fold, every command and
+output the section above owes - the red-before-green failure line, the passing run,
+the CI jobs and their conclusions, every number and the two instruments that
+produced it. **Rigour is unchanged**: "no output, no claim" still holds in full, and
+every `CLAUDE.md` rule about numbers and citations governs the fold exactly as
+before. Only the position moves - nothing gets shorter by being folded.
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the evidence...
+</details>
+```
+
+- The blank line after `</summary>` is load-bearing: without it a table inside the
+  fold renders as literal pipes on github.com.
+- Exactly one whole LINE of the body is the marker and one is the `<summary>`, and
+  the agent layer is the last block. Naming either inside a code span mid-sentence
+  changes nothing - the squash cut matches a whole line.
+- That marker is where a squash message is cut, so omitting it puts the whole
+  evidence layer into `git log`, which cannot fold anything.
+- The closing-keyword scan reads the WHOLE body, fold included.
+- Never fold a decision. A deviation from the brief, a residual you are shipping, an
+  open question, anything you are handing back: those stay above the fold however
+  long they run. The rule bounds shape, not size.
+
 ## Local builds
 
 This repo bans local `cargo` builds and tests for agent workers (CLAUDE.md):

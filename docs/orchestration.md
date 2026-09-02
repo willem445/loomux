@@ -298,6 +298,16 @@ any other finding. A repo that
 wants more of the question set than that — design alternatives, misuse, operational futures —
 puts it in its own reviewer persona (see **Custom agent workflows**).
 
+**Everything an agent posts on GitHub has two layers.** A PR body, a review, an issue an agent
+files: a short human layer first — what changed and why, what to look at, how each finding was
+dispositioned — and below it a collapsed `<details>` block, headed *Agent context — evidence,
+receipts, instruments*, carrying the evidence the process demands of agents but not of you: run
+ids, red-before-green failure lines, mutation tables, blob hashes, base-and-head figures. Click
+it open if you want it; skip it if you don't. Nothing about the evidence gets weaker for being
+folded — only its position moves — and the standing review sections above stay above the fold,
+because they are the part a human most needs to read. When a merge takes its commit message
+from the PR body, it takes the human layer only: `git log` has no fold.
+
 **No agent ever merges.** Agents open PRs; you merge, after your own review.
 
 Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`

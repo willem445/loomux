@@ -122,7 +122,7 @@ plan itself, rather than silently continuing as though it had verified clean.
 - Commit in logical units with clear messages referencing the issue (`#N`).
 - Push and open a PR with `gh pr create`, linking the issue (`Closes #N` **only if this PR
   finishes it** — otherwise `Part of #N`; see **Definition of done**) and describing what
-  changed, why, and how it was tested.
+  changed, why, and how it was tested — in the two-layer shape below (**Two layers**).
 - **You may be fed several slices on one branch. Never open a second PR for one.** Open the
   draft PR on your first push and keep pushing into it as slices arrive: do not branch again
   mid-batch, do not open a follow-up PR for the next slice, and do not request review — the
@@ -196,6 +196,60 @@ the cost of a review round nobody needed. If you genuinely cannot reach green af
 real attempt, `report("blocked", …)` naming what's still red and what you tried, and
 say the same on the issue — that beats a PR that looks done and isn't.
 
+## Two layers: what you write for the human, what you write for the next agent
+
+Everything you post on GitHub — a PR body, a review, an issue you file — has a
+**human layer** first and an **agent layer** collapsed under it.
+
+**The human layer, above the fold, short.** What changed and why (a paragraph);
+what to look at or try; how each review finding was dispositioned; `Closes #N`.
+Write it for someone who has under a minute — roughly 15 lines for a PR body.
+
+**The agent layer, collapsed below it.** Everything the evidence rules owe:
+red-before-green commands and the failure lines they printed, run ids, blob
+hashes, base-and-head figures, mutation tables, the residual, the instruments you
+used and their positive controls. **Its rigour is unchanged** — every rule in
+`CLAUDE.md` about numbers, sweeps, citations and mutation tables still applies to
+it in full. Only its position moves.
+
+Three literal lines open it, in this order, each on a line of its own:
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the evidence...
+</details>
+```
+
+- **The blank line after `</summary>` is load-bearing.** Without it a table inside
+  the fold renders as literal pipes on github.com.
+- **Once each, as a whole line.** Exactly one line of the body is `<!-- agent-layer -->`
+  and exactly one is the `<summary>`; the agent layer is the **last** block. Naming
+  either inside a code span mid-sentence is fine and changes nothing — the cut below
+  matches a whole line, so a mention cannot be mistaken for the fold.
+- **`<!-- agent-layer -->` is where a squash message is cut.** When the merge takes
+  the squash body from the PR body, it takes everything strictly above that line —
+  `git log` has no fold, so an agent layer left in it is strictly worse than before
+  it was collapsed. Omit the marker and the whole evidence layer lands in history.
+- **The closing-keyword scan still reads the WHOLE body**, fold included: a
+  `close`/`fix`/`resolve` next to `#N` inside the agent layer closes that issue
+  exactly as one above the fold does. Grep the whole file you are about to post.
+- **The issue link is the LAST line of the human layer, directly above the marker.**
+  Put it below the marker and GitHub still closes the issue — the scan reads the
+  whole body — but the squash message does not carry it, so the commit that closed
+  the issue never says which one. Nothing goes red: the cut succeeds, the issue
+  closes, and only the permanent record is wrong. After writing the body, cut it
+  yourself and check the closing line survived.
+
+**What never goes below the fold**, however long it runs: a decision the human has
+to make, a deviation from the brief, a residual you are shipping, an open question,
+or anything the issue explicitly asked you to state. The 15-line aim is a target for
+the summary, not a licence to fold a decision out of sight. The rule bounds SHAPE —
+what sits above the fold — and not size; nothing measures your prose for you.
+
+
 ## Definition of done
 
 A task is done when ALL of these hold:
@@ -212,8 +266,8 @@ A task is done when ALL of these hold:
    branch, or set the implementation aside another way — a WIP commit, a copied file — and keep
    the tests; never `git stash` it, see below) and confirm they fail **for the reason
    you expect** — not on a compile error, which masks behavior rather than testing it. Put the
-   evidence in the **PR description** and your `done` report: the command, the failure line it
-   printed, and the same command passing on your branch. If a new test can't be made to fail,
+   evidence in the PR body's **agent layer** (see **Two layers** above) and your `done` report:
+   the command, the failure line it printed, and the same command passing on your branch. If a new test can't be made to fail,
    either it isn't testing your change or your change isn't doing anything — find out which
    before you ship it.
 
@@ -237,8 +291,8 @@ A task is done when ALL of these hold:
    tell. After **any** push or rebase, treat every citation in the body as **stale until
    re-derived**: list the runs for the new head (`gh run list --branch <your branch> --json
    headSha,databaseId,conclusion`), assert the run's `headSha` **is** the head you are reporting
-   on (`git rev-parse HEAD`), then update the body — before you `report`, not after a reviewer
-   asks. Three stale-green citations landed in one batch: #571 cited a run three commits behind
+   on (`git rev-parse HEAD`), then update the body's agent layer — before you `report`, not
+   after a reviewer asks. Three stale-green citations landed in one batch: #571 cited a run three commits behind
    head, and #588 cited a pre-rebase run at review 1 and then the *same* pre-rebase run again
    after the rebase at review 2. Every one was caught by a reviewer; none by the worker who
    wrote it.
@@ -260,7 +314,8 @@ A task is done when ALL of these hold:
    **The keyword scan is textual and context-blind — grep your own prose for it.** GitHub
    matches `close`/`fix`/`resolve` (any inflection) immediately followed by `#N` **anywhere**
    in the PR body and in every commit message a squash merge aggregates: inside a blockquote,
-   inside a caveat, inside a sentence asking a human to do it by hand. #569 was auto-closed a
+   inside a caveat, inside a sentence asking a human to do it by hand, and inside the collapsed
+   agent layer, which is part of the body however a squash message is cut. #569 was auto-closed a
    *second* time by PR #615 — which linked `Part of #569` deliberately, explained the choice
    at length, and ended that explanation "Please close #569 by hand if you agree", which is
    the closing directive it was arguing against. Before you open or update a `Part of` PR,

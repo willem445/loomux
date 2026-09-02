@@ -510,8 +510,9 @@ the open-question hold, and dangerous mode: `read_playbook("merge-gate")`.
 ### A squash merge closes issues nobody meant to close
 
 **Before any squash-merge — especially of a PR linking `Part of #N`** — scrub
-the aggregated message, and re-read the partly-addressed issues after:
-`read_playbook("squash-closes-issues")`.
+the aggregated message, and re-read the partly-addressed issues after. Cut the
+squash body at the `<!-- agent-layer -->` marker, and sweep the FULL body for
+closing keywords regardless: `read_playbook("squash-closes-issues")`.
 
 ### After any merge, the default branch is yours until it's green
 

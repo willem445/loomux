@@ -89,10 +89,37 @@ clear it.
   own and the tests' — nothing left means it is wired to nothing. Wire it, or
   name the deferred caller and its issue in the PR (#661 `e20`, #698, #700).
 
+## The review body has two layers
+Above the fold, the **human layer**: the verdict; every finding as `file:line`,
+the defect, the fix, with its blocking/non-blocking label; and the five standing
+sections below, each answered terse — the Premortem as one line per entry naming
+the input or sequence that triggers it. Below the fold, collapsed, the **agent
+layer**: the receipts. Commands you ran and what they printed, the mutation you
+cut and which test moved, blob hashes, run ids with the SHA each belongs to, the
+`range-diff`, the qr-lane results you re-derived. Rigour is unchanged — you owe
+every receipt you owed before, in the same detail; it moves below the fold rather
+than shrinking.
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the receipts...
+</details>
+```
+
+The blank line after `</summary>` is load-bearing — without it a table inside the
+fold renders as literal pipes. Exactly one whole LINE of the body is the marker
+and one is the `<summary>`, and the agent layer is the last block. A finding whose whole substance is a receipt
+still states its claim above the fold: if a human cannot tell from the human
+layer what you are blocking on and why, the split is wrong however complete the
+fold below it is.
+
 ## Questions every review answers
-Every review body carries these five headings, verbatim. An empty or "n/a"
-section is a finding against the review, not a pass — the `review_verdict`
-summary itself stays ~100 words; this section is for the PR body.
+Every review body carries these five headings, verbatim, in the human layer. An
+empty or "n/a" section is a finding against the review, not a pass — the
+`review_verdict` summary itself stays ~100 words; this section is for the PR body.
 - `## Premortem` — two ways this ships and fails in production that no test
   in this PR catches, or an argued none. Bar: the #45→#1218 class, where
   correctness stayed green through four crashes.
@@ -148,12 +175,17 @@ summary itself stays ~100 words; this section is for the PR body.
 - **Rebase purity via normalized comparison** (`git range-diff` old-base
   range vs new-base range) — a raw diff false-alarms whenever the base moved
   shared files. Confirm the new base is an ancestor (a rebase, not a merge).
-- **The PR body is the squash commit message.** Check it claim-by-claim
-  against the diff; a body that misdescribes the change blocks, and your
-  verdict digests it (`body-unchanged` is armed on this gate).
-- **Freshness gates the merge**: a branch behind main at pass time means the
-  green never tested the merged tree — refuse on the base, approve the
-  content, and re-pin after the rebase.
+- **The PR body is the record, and its human layer is the squash commit
+  message.** Check the WHOLE body claim-by-claim against the diff — the gate
+  digests all of it (`body-unchanged` is armed here) and GitHub's closing scan
+  reads all of it. A body that misdescribes the change blocks. Read the human
+  layer once more as the commit message it becomes: a claim that needed the
+  fold's receipts to be true, stated above the fold without them, is a false
+  claim in `git log` forever.
+- **Mergeability gates the merge, not freshness**: a PR merges when GitHub reports
+  it mergeable, so a branch merely behind `main` is not a finding and never needs a
+  rebase, a re-run or a re-review; only `CONFLICTING` is work, and it is the owning
+  worker's.
 - Findings you cannot defend with a repro or a cited line do not block.
   Label blocking vs non-blocking honestly: a blocking finding means a
   request-changes verdict, never a pass-with-a-note.
