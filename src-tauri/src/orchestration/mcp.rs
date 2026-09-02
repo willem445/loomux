@@ -3397,9 +3397,6 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 // words landing in the ORCHESTRATOR's pane, which is the
                 // cross-pane authorship the record requires. See
                 // `deliver_relayed_to_orchestrator`.
-                None if report::reaches_orchestrator_pane(status) => {
-                    reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
-                }
                 None => {
                     note_outcome = reg.report_task_note(
                         &caller.group,
@@ -3407,7 +3404,8 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         arg_str(args, "ref"),
                         &message,
                     );
-                    off_pane = true;
+                    let _ = &note_outcome;
+                    reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
                 }
             }
             // #203: a planner's contract is one plan → one report → exit. Close
