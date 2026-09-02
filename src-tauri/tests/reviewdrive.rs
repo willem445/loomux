@@ -34,7 +34,8 @@ use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    AgentStatus, Caller, GroupId, Guardrails, Launch, OrchRegistry, RdDriveReport, Role, TaskPatch,
+    pane_delivery_readiness, AgentStatus, Caller, Delivery, GroupId, Guardrails, Launch,
+    OrchRegistry, PaneNotReady, RdDriveReport, Role, TaskPatch,
 };
 use serde_json::json;
 
@@ -3802,6 +3803,22 @@ fn make_delivery_land(reg: &OrchRegistry, group: &GroupId, agent_id: &str, pty: 
     reg.pause_group(group).expect("a live group pauses");
 }
 
+/// **Make `pty` pass the driver's reuse-readiness predicate** (#2089): a
+/// CONFIRMED last delivery on record, and nothing queued behind it.
+///
+/// A second, orthogonal obstacle to `make_delivery_land`'s, and it is why that
+/// helper is not simply extended: that one is about whether `deliver_prompt`
+/// answers `Ok` at all, this one about whether the driver will call the pane
+/// ready in the first place. The production path that writes this record is
+/// `deliver_now`'s confirm window, which needs a live pty and an `AppHandle`
+/// — see `OrchRegistry::set_last_delivery_for_test`.
+///
+/// Called with `confirmed: false` it produces the OTHER half of the axis: a
+/// pane whose last delivery is on record as not having landed.
+fn make_pane_ready(reg: &OrchRegistry, pty: u32, confirmed: bool) {
+    reg.set_last_delivery_for_test(pty, confirmed);
+}
+
 /// A drive walked to a terminal exit with the orchestrator's pane **down**, so
 /// the exit notice's delivery genuinely fails.
 ///
@@ -4611,6 +4628,11 @@ fn a_handback_resumes_into_the_live_idle_pane_on_that_session() {
             // test would read as the defect. Same probe #569 built for the
             // orchestrator-delivery tests, pointed at the worker.
             make_delivery_land(&reg, &group, &w.id, 7401);
+            // #2089: and a pane the driver will call READY. Since that issue
+            // the reuse needs delivery-state evidence as well as a terminal,
+            // and this fixture's premise is that the pane is reusable — the
+            // axis this loop varies is still `with_pane` alone.
+            make_pane_ready(&reg, 7401, true);
         }
         let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
         assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
@@ -5085,8 +5107,14 @@ fn a_live_idle_pane_on_the_wrong_block_is_not_reused_for_a_handback() {
             "the fixture's premise: two live panes on ONE session, different blocks"
         );
         make_delivery_land(&reg, &group, &wrong.id, 7801);
+        // #2089: BOTH panes are made delivery-ready, so readiness is constant
+        // across the arms and the block filter stays the only axis. Leaving the
+        // wrong-block pane unready would let this test pass on the readiness
+        // refusal instead of on the thing it is named for.
+        make_pane_ready(&reg, 7801, true);
         if right_block_typeable {
             with_pane(&reg, &worker, 7802);
+            make_pane_ready(&reg, 7802, true);
         }
         for id in [&worker, &wrong.id] {
             assert!(
@@ -5184,5 +5212,243 @@ fn a_lane_spawn_refused_by_the_cap_says_so_on_its_audit_row() {
         // …and either way the lane refusal is a back-off, never a hold: §8's
         // asymmetry with `fix-wait`, which has already spent its round.
         assert_eq!(status_state(&reg, &group), "review-wait");
+    }
+}
+
+// ── #2089: reuse takes DELIVERY STATE as "this pane will read what I type" ──
+
+/// The pure predicate, whole: which `(queue depth, last-delivery outcome)` pairs
+/// read ready, and what each refusal is CALLED (#2089).
+///
+/// The precedence rows are the ones a table-shaped rewrite would lose. A
+/// non-empty queue decides on its own — an implementation that asked the last
+/// delivery first would answer `Unconfirmed` for `(1, Some(false))` and
+/// `NoRecord` for `(3, None)`, both of which are true statements about a pane
+/// whose real problem is the queue, and both of which would put the wrong word
+/// on the `rd-reuse-declined` row a human reads.
+///
+/// The `as_str` row is not decoration either: those three words ARE the audit
+/// contract (§5.4), so a rename that leaves the variants intact still breaks
+/// every reader keyed on them.
+#[test]
+fn the_reuse_readiness_predicate_is_a_confirmed_delivery_and_an_empty_queue() {
+    assert_eq!(pane_delivery_readiness(0, Some(true)), None, "the only ready pair");
+
+    assert_eq!(pane_delivery_readiness(0, Some(false)), Some(PaneNotReady::Unconfirmed));
+    assert_eq!(pane_delivery_readiness(0, None), Some(PaneNotReady::NoRecord));
+    assert_eq!(pane_delivery_readiness(1, Some(true)), Some(PaneNotReady::Queued));
+
+    assert_eq!(
+        pane_delivery_readiness(1, Some(false)),
+        Some(PaneNotReady::Queued),
+        "queue depth is asked FIRST: a pane that is both reads as queued"
+    );
+    assert_eq!(pane_delivery_readiness(3, None), Some(PaneNotReady::Queued));
+
+    assert_eq!(
+        [PaneNotReady::Queued, PaneNotReady::Unconfirmed, PaneNotReady::NoRecord]
+            .map(PaneNotReady::as_str),
+        ["queued", "unconfirmed", "no-record"],
+        "the words the `rd-reuse-declined` row carries (§5.4)"
+    );
+}
+
+/// **A pane the REAPER calls idle is not thereby a pane at its prompt** (#2089,
+/// deferred out of #1967).
+///
+/// `idle_since_ms` is stamped when an agent reports done or is spawned without a
+/// task. A pane that then parks behind a dialog — a permission prompt, a CLI
+/// question, an `allow-scripts` gate — is still idle by that signal, and
+/// `deliver_prompt` admits the brief into its queue and answers `Ok`, so the
+/// caller's fallback-to-spawn never fires and the drive sits until
+/// `fix-stalled`. The reuse arm therefore asks delivery state as well: last
+/// delivery CONFIRMED, and nothing queued behind it.
+///
+/// **The `ready` arm is the negative control and it carries the whole
+/// discriminator.** Three of these four arms are satisfied by an implementation
+/// that never reuses anything at all; `ready` is the one that is not, and it is
+/// the row that would still pass under the pre-#2089 code, so a run where only
+/// it goes green says the predicate is refusing everything rather than refusing
+/// the right thing.
+///
+/// The three refusing arms differ in exactly the fact the predicate reads, and
+/// each is asserted by the WORD on its `rd-reuse-declined` row — not merely by
+/// "a pane was opened" — so an implementation that refused for the right count
+/// of panes and the wrong reason fails here.
+#[test]
+fn a_pane_that_is_idle_but_not_delivery_ready_is_not_reused_for_a_handback() {
+    for (arm, reason) in [
+        ("ready", ""),
+        ("unconfirmed", "unconfirmed"),
+        ("no-record", "no-record"),
+        ("queued", "queued"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+        let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).unwrap();
+        let session = w.session_id.clone().expect("claude mints a session id at spawn");
+        assert!(
+            reg.agent(&w.id).unwrap().idle_since_ms.is_some(),
+            "{arm}: every arm's pane is IDLE by the reaper's signal — that is the premise \
+             this test exists to show is not enough on its own"
+        );
+        // A terminal and a paused group, so a delivery is really admitted (see
+        // `make_delivery_land`); then this arm's delivery state on top of it.
+        make_delivery_land(&reg, &group, &w.id, 7901);
+        match arm {
+            "ready" | "queued" => make_pane_ready(&reg, 7901, true),
+            "unconfirmed" => make_pane_ready(&reg, 7901, false),
+            // …and "no-record" writes nothing at all.
+            _ => {}
+        }
+        if arm == "queued" {
+            reg.deliver_prompt(&w.id, "[test] not pasted yet", "orch-1", Delivery::MidSession)
+                .expect("a paused group admits a delivery into the queue");
+        }
+        assert_eq!(
+            reg.queue_depth(7901),
+            usize::from(arm == "queued"),
+            "{arm}: the fixture's own premise — only the queued arm has anything waiting"
+        );
+
+        let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+        assert_eq!(out["driving"], json!(true), "{arm}: drive_review refused: {out}");
+
+        // Counted across the HAND-BACK tick alone, for the reason
+        // `a_handback_resumes_into_the_live_idle_pane_on_that_session` states:
+        // a baseline taken before the whole drive folds in the reviewer lane's
+        // own spawn, which is a pane the hand-back neither opens nor reuses.
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        reg.rd_drive_group_with(&group, &gh, 20_000);
+        gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+        gh.set_facts("OPEN", HEAD_B);
+        reg.rd_drive_group_with(&group, &gh, 30_000);
+        let before = action_count(&reg, &group, "agent-spawn");
+        let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
+        let (_pr, agent) = handed.handbacks.first().cloned().unwrap_or_else(|| panic!("{arm}: the drive hands back"));
+        let opened = action_count(&reg, &group, "agent-spawn") - before;
+
+        let declined: Vec<serde_json::Value> = audit_details(&reg, &group, "rd-reuse-declined")
+            .into_iter()
+            .filter(|d| d["pane"] == json!(w.id))
+            .collect();
+
+        if arm == "ready" {
+            assert_eq!(
+                agent, w.id,
+                "the control: a confirmed last delivery with an empty queue IS reused, so \
+                 the three refusing arms are about the predicate and not about a driver \
+                 that stopped reusing anything"
+            );
+            assert_eq!(opened, 0, "…opening nothing, which is #1960's whole point");
+            assert!(declined.is_empty(), "…and declining nothing: {declined:?}");
+            continue;
+        }
+
+        assert_ne!(
+            agent, w.id,
+            "{arm}: the brief was typed into a pane that will not read it — it lands in the \
+             queue, `deliver_prompt` answers Ok, and the fallback-to-spawn never fires"
+        );
+        assert_eq!(opened, 1, "{arm}: so the hand-back opens a pane instead: {handed:?}");
+        assert!(
+            !texts_to(&reg, &group, &w.id).iter().any(|t| t.contains("is back with you at head")),
+            "{arm}: …and no fix brief may be typed into the pane that was refused"
+        );
+        assert_eq!(
+            declined.len(),
+            1,
+            "{arm}: the refusal is audited, because its only other visible effect is a fresh \
+             pane and that is what NO candidate looks like too: {declined:?}"
+        );
+        assert_eq!(
+            declined[0]["reason"],
+            json!(reason),
+            "{arm}: the row must name what the predicate actually read: {declined:?}"
+        );
+    }
+}
+
+/// **The two conditions are a CONJUNCTION, and it may not collapse into either
+/// half** (#2089).
+///
+/// #2089 asked for the `idle_since_ms` test to be REPLACED by delivery
+/// readiness. It is narrowed instead, and this is the pin for why: a pane that
+/// is delivery-ready is exactly what one MID-TURN looks like — it took a brief,
+/// the brief confirmed, and its queue is empty because the CLI is now thinking.
+/// A swap would hand the driver a working delegate's pane, which
+/// `idle_pane_on_session`'s second bullet forbids ("is this agent mid-thought?"
+/// is not a question a driver may answer).
+///
+/// The two arms differ in ONE fact — whether the worker was spawned with a task,
+/// which is what stamps `idle_since_ms` — and both panes are delivery-ready, so
+/// this test is blind to the readiness half by construction and reddens only
+/// against an implementation that dropped the idle half.
+///
+/// **The empty `rd-reuse-declined` assertion says WHICH half refused**, and it
+/// is the reason this is not just "a pane was opened": a non-idle pane never
+/// reaches the readiness test at all, so a decline row for it would mean the two
+/// conditions had been folded into one.
+#[test]
+fn a_delivery_ready_pane_that_is_not_idle_is_not_reused_for_a_handback() {
+    for idle in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+        // A task-less spawn is stamped idle at birth; one carrying a task is
+        // not. That is the production route to both states, and the only thing
+        // this loop varies.
+        let task = if idle { "" } else { "still mid-turn on its last brief" };
+        let w = reg.spawn_agent(&group, Role::Worker, "w", task, false, None).unwrap();
+        let session = w.session_id.clone().expect("claude mints a session id at spawn");
+        assert_eq!(
+            reg.agent(&w.id).unwrap().idle_since_ms.is_some(),
+            idle,
+            "idle={idle}: the fixture's premise"
+        );
+        make_delivery_land(&reg, &group, &w.id, 7911);
+        make_pane_ready(&reg, 7911, true);
+        assert!(
+            reg.pane_readiness(7911).is_none(),
+            "idle={idle}: BOTH arms' panes are delivery-ready, so readiness cannot be what \
+             separates them"
+        );
+
+        let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+        assert_eq!(out["driving"], json!(true), "idle={idle}: drive_review refused: {out}");
+
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        reg.rd_drive_group_with(&group, &gh, 20_000);
+        gh.set_checks(r#"[{"name":"build","state":"FAILURE","link":"x"}]"#);
+        gh.set_facts("OPEN", HEAD_B);
+        reg.rd_drive_group_with(&group, &gh, 30_000);
+        let before = action_count(&reg, &group, "agent-spawn");
+        let handed = reg.rd_drive_group_with(&group, &gh, 40_000);
+        let (_pr, agent) = handed.handbacks.first().cloned().expect("the drive hands back");
+        let opened = action_count(&reg, &group, "agent-spawn") - before;
+
+        if idle {
+            assert_eq!(agent, w.id, "the control: idle AND ready is the pane that is reused");
+            assert_eq!(opened, 0);
+            continue;
+        }
+        assert_ne!(
+            agent, w.id,
+            "a delivery-ready pane that is MID-TURN must not be reused — the brief would land \
+             behind whatever that agent is doing"
+        );
+        assert_eq!(opened, 1, "…so the hand-back opens one: {handed:?}");
+        assert!(
+            audit_details(&reg, &group, "rd-reuse-declined")
+                .iter()
+                .all(|d| d["pane"] != json!(w.id)),
+            "…and it is the IDLE filter that refused it, not the readiness test: a pane that \
+             is not idle is never a readiness candidate at all"
+        );
     }
 }

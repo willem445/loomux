@@ -462,6 +462,21 @@ What is new, and what deserves saying rather than burying: **orrerix now spawns
 a delegate and resumes a worker's session on its own initiative, with no
 orchestrator turn in between.**
 
+**The driver never judges a pane's SCREEN, and every signal it takes about a
+pane is one orrerix already recorded.** That is what "an idle reviewer lane
+cannot be told from a lane mid-review without the LLM judgment §3 forbids"
+(§3.1 item 5) means in general, and #2089 is where the line had to be drawn
+sharply enough to build on: the reuse arm needed to know whether a pane would
+READ what was typed into it, and the answer it takes is *delivery state* — the
+outcome recorded for the last delivery to that pty, and that pty's queue depth —
+never a reading of what is rendered there. Consuming a fact the delivery
+machinery already wrote is not the same act as inspecting a pane, and the
+distinction is what keeps this rule usable rather than absolute: a driver that
+may read no per-pane signal at all can only ever spawn. What stays out is
+*interpretation* — attention state, dialog detection, "does this look like a
+prompt" — because that is a judgment about a screen, and judgments are the
+orchestrator's. §3.1 item 5 carries the predicate and the residual it leaves.
+
 That authority is the **orchestrator's own**, exercised on a PR the orchestrator
 handed over explicitly, and every action taken under it is audited as
 `actor: <the host actor>` with a new `on_behalf_of: <orchestrator agent id>`
@@ -626,6 +641,41 @@ this note first.
    required. Reusing one would be #1961's own defect arriving through #1960's
    mechanism, so the block is resolved FIRST and the reuse filtered on it; a
    session whose only live idle pane is on the wrong block opens a new one.
+   **A pane is also reused only if it is READY to be typed into** (#2089), and
+   that is a second condition rather than a restatement of "idle".
+   `idle_since_ms` is the idle REAPER's signal — stamped when an agent reports
+   done, or at birth for a task-less spawn — and a pane parked behind a
+   permission prompt, a CLI question or an `allow-scripts` gate is idle by it.
+   `deliver_prompt` then admits the brief into that pane's queue and answers
+   `Ok`, so the fallback-to-spawn never fires and the drive waits out
+   `fix-stalled` for a brief nobody read. The readiness test is
+   `pane_delivery_readiness`, and it is built from state orrerix's own delivery
+   machinery already records rather than from anything on the screen: **the last
+   delivery to that pane is on record CONFIRMED, and its queue is empty.** Queue
+   depth is asked first and decides on its own; the two refusals below it are
+   `unconfirmed` (a delivery recorded `Pending`/`Failed` — its text may still be
+   sitting unsubmitted in the box) and `no-record` (nothing has ever been
+   delivered to this pty, which is "we could not look", not "there was nothing
+   there"). Every candidate refused this way is audited as `rd-reuse-declined`
+   (§5.4), because the refusal's only other visible effect is a fresh pane, and
+   that is what "there was no candidate at all" looks like too.
+   **The two conditions are a CONJUNCTION, and #2089 asked for a swap.** The
+   deviation is deliberate: a pane that is delivery-ready is exactly what one
+   MID-TURN looks like — it took a brief, the brief confirmed, and its queue is
+   empty because the CLI is now thinking — so readiness ALONE would hand the
+   driver a working delegate's pane, which is the judgment §3 forbids it
+   ("is this agent mid-thought?"). `idle_since_ms` answers "does this agent have
+   work"; readiness answers "will what I type be read"; the reuse needs both.
+   **The residual, which #2089 narrows rather than closes.** A dialog raised
+   AFTER a confirmed delivery, with nothing queued behind it, still reads ready.
+   Nothing short of judging the pane's screen can see that, and §3 keeps those
+   judgments out of the driver, so it stays bounded exactly as the whole class
+   was before: `fix-wait` holds on `fix-stalled` and `review-wait` on
+   `lane-stalled`, both naming the pane, so the drive degrades to a named hold
+   rather than to silence. The fail direction of the predicate itself is the
+   safe one — a delivery that landed but resolved `Pending` (a busy CLI no tier
+   decided for) reads not-ready and costs one fresh pane, which is the pre-#1960
+   cost of a round and not a regression below it.
 6. **Decide a disposition.** INVARIANT 3 is the orchestrator's, and the
    gate-satisfied notice says so in as many words (§6).
    **PROMISE, and structurally unenforceable — say so rather than pretend.**
@@ -1229,7 +1279,7 @@ like `mq-*` and the rest:
 `rd-started` · `rd-refused` · `rd-ci-green` · `rd-ci-red` · `rd-conflicting` ·
 `rd-lane-spawned` · `rd-verdict` · `rd-handback` · `rd-consumed` ·
 `rd-satisfied` · `rd-held` · `rd-resumed` · `rd-cancelled` · `rd-pruned` ·
-`rd-kickback` · `rd-recovered` · `rd-state-unreadable`
+`rd-kickback` · `rd-recovered` · `rd-state-unreadable` · `rd-reuse-declined`
 
 Every state transition, every spawn or resume, and every consumed delegate event
 (§7) appears here, each carrying `on_behalf_of`. `rd-started` carries
@@ -1247,7 +1297,12 @@ pane from a **superseded** one — `report:worker` / `report:superseded-worker`,
 otherwise never intercepted at all — because only a current pane's word moves the
 drive (§3), and "consumed" and "consumed and acted on" are different facts. `rd-cancelled`
 carries the `panes` the cancel released (§5.1, #1871 B3), so the disposal is on
-the record even if the notice's delivery is lost.
+the record even if the notice's delivery is lost. `rd-reuse-declined` (#2089)
+carries `pane`, `session`, `block` and a `reason` from the closed set
+`queued` | `unconfirmed` | `no-record` (§3.1 item 5) — one row per candidate the
+reuse arm refused on readiness, for the same reason `rd-cancelled` names its
+panes: the refusal's only other visible effect is a fresh pane, which on this
+log is indistinguishable from there having been no candidate at all.
 
 ### 5.5 The brief templates, and the trust boundary they cross
 

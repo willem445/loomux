@@ -1142,8 +1142,12 @@ impl OrchRegistry {
         let fresh = |this: &Self| {
             this.rd_spawn(group, Role::Reviewer, Some(block.to_string()), None, &text)
         };
+        // #2089: cloned out of `entry` because the reuse below borrows `self`
+        // while `entry` is held `&mut` — the shape `rd_reconcile_with` and
+        // `rd_step_entry` already use before their own `rd_audit` calls.
+        let on_behalf = entry.on_behalf_of.clone();
         let (agent, session_id) = match prior {
-            Some(session) => match self.rd_reuse_pane(group, &session, block, &text) {
+            Some(session) => match self.rd_reuse_pane(group, &on_behalf, &session, block, &text) {
                 Some(a) => (a, session),
                 None => {
                     let sp = self
@@ -1168,12 +1172,18 @@ impl OrchRegistry {
     }
 
     /// **Reuse before spawn** (#1960): resume `session` into the live idle pane
-    /// already running it **under `block`**, by typing the brief into that pane,
-    /// and answer which pane took it. `None` = there is none, so the caller
-    /// opens one — which includes the case where the only live idle pane on this
-    /// session is running the WRONG block, and reusing it would be #1961 one arm
-    /// over. `idle_pane_on_session` carries that argument and the input that
-    /// produces such a pane.
+    /// already running it **under `block`** and **ready to be typed into**
+    /// (#2089), by typing the brief into that pane, and answer which pane took
+    /// it. `None` = there is none, so the caller opens one — which includes the
+    /// case where the only live idle pane on this session is running the WRONG
+    /// block, and reusing it would be #1961 one arm over.
+    /// `idle_pane_on_session` carries both arguments and the inputs that produce
+    /// such a pane.
+    ///
+    /// **A candidate refused on readiness is audited, not dropped** (#2089).
+    /// `rd-reuse-declined` (§5.4) names the pane and why, because the only other
+    /// visible effect of the refusal is a fresh pane, and a fresh pane is what
+    /// "there was no candidate at all" looks like too.
     ///
     /// # Why this rather than releasing what a new pane supersedes
     ///
@@ -1205,11 +1215,21 @@ impl OrchRegistry {
     fn rd_reuse_pane(
         &self,
         group: &GroupId,
+        on_behalf_of: &str,
         session: &str,
         block: &str,
         text: &str,
     ) -> Option<String> {
-        let agent = self.idle_pane_on_session(group, session, block)?;
+        let found = self.idle_pane_on_session(group, session, block);
+        for (pane, why) in &found.declined {
+            self.rd_audit(group, on_behalf_of, "rd-reuse-declined", json!({
+                "pane": pane,
+                "session": session,
+                "block": block,
+                "reason": why.as_str(),
+            }));
+        }
+        let agent = found.agent?;
         self.deliver_prompt(&agent, text, brand::AUDIT_ACTOR, Delivery::MidSession).ok()?;
         Some(agent)
     }
@@ -1346,8 +1366,11 @@ impl OrchRegistry {
             self.group(group)
                 .and_then(|g| g.guardrails.block_for(Role::Worker).map(|b| b.id.clone()))
         });
-        let reused =
-            block.as_deref().and_then(|b| self.rd_reuse_pane(group, &session, b, &text));
+        // #2089: see the same clone in `rd_open_lane`.
+        let on_behalf = entry.on_behalf_of.clone();
+        let reused = block
+            .as_deref()
+            .and_then(|b| self.rd_reuse_pane(group, &on_behalf, &session, b, &text));
         let agent = match reused {
             Some(a) => a,
             None => self.rd_spawn(group, Role::Worker, block, Some(session), &text)?.id,
