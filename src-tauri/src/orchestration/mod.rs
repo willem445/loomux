@@ -31105,6 +31105,18 @@ impl OrchRegistry {
     /// is why the human's click-to-rejoin recovered the pane that the tool
     /// call could not. This function is that rule, named once.
     ///
+    /// **The rule survives the roster being lost, and it is worth saying why**
+    /// (rev-std round 2, premortem 2). `merged_records` falls through to
+    /// audit-derived rows for a session no roster row names, so "the first
+    /// record" becomes the earliest SURVIVING one — and the concern is that it
+    /// could then be a resume row carrying the resumed block rather than the
+    /// minting pane. It cannot, because `records_from_audit` walks the audit
+    /// generations oldest-first and pushes in file order, and the audit is
+    /// append-only: the first `agent-spawn` line naming a session is the spawn
+    /// that minted it. What would break the rule is a TRUNCATED audit, not a
+    /// lost roster, and that is a state in which the group has lost the record
+    /// of its own spawns rather than one this function can rule out.
+    ///
     /// **Not the same question as "where does its work live".** A workspace
     /// legitimately MOVES over a session's life (a worktree re-cut, a resume
     /// placed elsewhere), so cwd inheritance keeps reading the LAST-touched

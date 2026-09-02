@@ -1349,8 +1349,19 @@ impl DriveEntry {
 
     /// Record that this drive answered its worker at `now_ms` — see
     /// [`kickback_owed`](DriveEntry::kickback_owed).
+    ///
+    /// **Stamped at no earlier than the hand-back it answers**, which is what
+    /// makes the budget hold across a backwards clock step (rev-std round 2,
+    /// premortem 1). `now_ms` is wall-clock: a host NTP correction between the
+    /// hand-back and the worker's `report(progress)` writes a stamp that never
+    /// overtakes `fix_handback_ms`, `kickback_owed` stays true, and the tick
+    /// re-emits the kick-back on EVERY tick for as long as the progress signal
+    /// stands — the unbounded emission the bound exists to prevent, arriving
+    /// through the bound itself. The clamp costs a `max` and needs no reset on
+    /// the arcs into `fix-wait`, so it keeps the property that made the
+    /// comparison preferable to a counter in the first place.
     pub fn record_kickback(&mut self, now_ms: u64) {
-        self.fix_kickback_ms = now_ms;
+        self.fix_kickback_ms = now_ms.max(self.fix_handback_ms);
     }
 
     /// Record that this drive has resumed its worker into `agent` — the
@@ -3039,6 +3050,40 @@ mod tests {
           "started_ms": 0 }
       ]
     }"#;
+
+    #[test]
+    /// **The kick-back budget survives a backwards wall-clock step** (rev-std
+    /// round 2, premortem 1).
+    ///
+    /// `kickback_owed` compares two wall-clock stamps, so an unclamped
+    /// `record_kickback` fed a `now` from before the hand-back writes a stamp
+    /// that never overtakes `fix_handback_ms` — the budget never spends, and the
+    /// tick re-emits on every wake for as long as the progress signal stands.
+    /// The forward case is the control: without it this would pass against a
+    /// `record_kickback` that ignored its argument entirely.
+    #[test]
+    fn a_kick_back_stamped_before_its_own_hand_back_still_spends_the_budget() {
+        let mut e = entry_at(DriveState::FixWait);
+        e.fix_handback_ms = 10_000;
+        assert!(e.kickback_owed(), "the pre-state: a fresh hand-back owes one");
+
+        // A clock that stepped backwards between the hand-back and the report.
+        e.record_kickback(9_000);
+        assert!(
+            !e.kickback_owed(),
+            "a backwards clock step must not re-arm the budget — that is one prompt per \
+             tick into the worker's pane for as long as it keeps reporting progress"
+        );
+
+        // The control: an ordinary forward stamp spends it too, and the next
+        // hand-back renews it with nothing having to reset anything.
+        let mut f = entry_at(DriveState::FixWait);
+        f.fix_handback_ms = 10_000;
+        f.record_kickback(11_000);
+        assert!(!f.kickback_owed(), "the ordinary case still spends");
+        f.fix_handback_ms = 20_000;
+        assert!(f.kickback_owed(), "…and the next hand-back renews it");
+    }
 
     #[test]
     fn the_notes_own_example_entry_parses() {
