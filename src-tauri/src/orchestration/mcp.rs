@@ -3448,11 +3448,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role == Role::Planner && status == "done" {
                 reg.close_completed_planner(&caller.agent_id);
             }
-            // Three answers, not two (#1966 rev-final N2): "the board says no
-            // such row" and "I could not read the board" are different facts,
-            // and collapsing them would put a false claim in front of the one
-            // caller who could act on it — the same defect this change fixes one
-            // layer up by not saying "reported to orchestrator".
+            // FOUR answers, not one (#1966 rev-final N2, then round 2's N1):
+            // "the board says no such row", "I could not read the board" and "a
+            // row matched but the note did not land" are different facts, and
+            // collapsing any of them into another puts a false claim in front of
+            // the one caller who could act on it — the same defect this change
+            // fixes one layer up by not saying "reported to orchestrator". The
+            // count is stated because it went stale once already: the third
+            // answer's comment still said "three" after the fourth arrived
+            // (rev-std round 3).
             Ok(match (off_pane, &note_outcome) {
                 (true, super::NoteOutcome::Noted) => "recorded in the audit log and noted on your board task. A progress report never reaches the orchestrator's pane (#1958) — report done or blocked when you need it to act, or message_orchestrator when something else does.",
                 (true, super::NoteOutcome::NoRow) => "recorded in the audit log. No board task on this group's board matched your session or ref, so there is no note; a progress report never reaches the orchestrator's pane either (#1958) — report done or blocked when you need it to act.",
