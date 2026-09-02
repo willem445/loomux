@@ -847,10 +847,10 @@ fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actual
     // `delivery id` pin above is this region's positive control — it fails loudly on an empty
     // or mislocated `worker_primer`, so the absence assertion below cannot pass vacuously.
     pinned("worker.md's first-turn primer", worker_primer, "work the brief step by step",
-        "after the duplicate-delivery and directive checks, the primer's job is to send the          worker at the brief — not at a ceremony report");
+        "after the duplicate-delivery and directive checks, the primer's job is to send the worker at the brief — not at a ceremony report");
     assert!(
         !worker_primer.contains("report(\"progress\""),
-        "worker.md's first-turn primer must not mandate a starting progress report (#1958): a          progress report is a RECORD, written to the audit log and the board, and reaches no          pane — so a mandated one on every spawn is a notification to nobody. If you are          re-adding it deliberately, say why in the PR.
+        "worker.md's first-turn primer must not mandate a starting progress report (#1958): a progress report is a RECORD, written to the audit log and the board, and reaches no pane — so a mandated one on every spawn is a notification to nobody. If you are re-adding it deliberately, say why in the PR.
 
 Region as rendered:
 {worker_primer}"
