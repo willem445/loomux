@@ -508,6 +508,15 @@ pub mod audit_action {
     /// reason — a filter looking for the thing that happened must not match the
     /// thing that did not.
     pub const NOTICE_DROPPED: &str = "rd-notice-dropped";
+    /// The drive answered a worker's `report(progress)` in the worker's own
+    /// pane (#1959) — one line, one per hand-back, no orchestrator turn.
+    ///
+    /// Its own action rather than a `rd-consumed` detail, for `CI_RED`'s
+    /// reason: consuming a report and ANSWERING it are different things that
+    /// happen at different times (the MCP thread, then the tick), and a reader
+    /// asking "did the driver ever say anything back" must not have to match
+    /// the action that says it did not.
+    pub const KICKBACK: &str = "rd-kickback";
     /// Reconcile re-evaluated a persisted entry after a restart (§2.4).
     pub const RECOVERED: &str = "rd-recovered";
     /// `review_drives.json` is torn or hand-edited: the tick refuses, backs off,
@@ -748,15 +757,30 @@ pub struct HeldFacts {
     pub max_ci_attempts: u32,
     /// The failing CI run's checks, for `ci-limit`.
     pub failing_jobs: Vec<String>,
-    /// Every pane this drive has opened and still owns (#1871 B3). A parked
-    /// drive keeps them — see [`panes_clause`].
+    /// Every pane this drive still owns (#1871 B3) — the ones it opened, and
+    /// (since #1960) the live idle panes it resumed a session INTO rather than
+    /// opening a new one. A parked drive keeps them; see [`panes_clause`].
     pub panes: Vec<(String, DrivenRole)>,
+    /// **What actually refused, when the hold is about a refusal** (#1961) —
+    /// the spawn error, or the line a resumed pane exited on.
+    ///
+    /// `worker-unresumable` used to be one fixed sentence ("the recorded worker
+    /// session no longer resolves"), and that sentence is a diagnosis rather
+    /// than an observation: it was printed for a hand-back refused by the live
+    /// delegate cap and for one whose block had left the roster, telling the
+    /// orchestrator to find another session in both cases — the one remedy that
+    /// does not help, on a session that resolves fine. The reason enum says
+    /// which CLASS of thing happened; this says which thing.
+    ///
+    /// Empty renders as no clause at all, which is the pre-#1961 wording
+    /// exactly, so a hold that genuinely has nothing to add is unchanged.
+    pub refusal: String,
 }
 
 /// §6's hold kick-back, in one shape carrying **the one fact that decides what
 /// the orchestrator does next** for this reason.
 ///
-/// One function rather than twelve, because §2.2 makes `held` one state with a
+/// One function rather than thirteen, because §2.2 makes `held` one state with a
 /// closed reason enum for exactly this reason: a reader asking "is this drive
 /// parked" asks one question, and the reason travels in the notice rather than
 /// being inferred from which counter happens to sit at its bound.
@@ -778,6 +802,36 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         String::new()
     } else {
         format!(" \"{}\"", lane_summary(&f.lane_summary))
+    };
+    // Scrubbed, because this text is not orrerix's: it can carry a block id out
+    // of the repo's own workflow file, a CLI's last line of output, or the
+    // live-delegate roster — and it lands in the orchestrator's pane (§5.5).
+    //
+    // `sanitize_pane_text` rather than `lane_summary`, which is the same
+    // sanitizer plus a VERDICT-shaped truncation marker ("full summary on the
+    // PR and via list_verdicts") — a pointer at a place a spawn refusal or a
+    // pane's dying line is not, on the one hold where the reader most needs the
+    // pointer to be right.
+    let refusal = if f.refusal.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {}.",
+            crate::notify::sanitize_pane_text(
+                f.refusal.trim_end_matches('.'),
+                // **Sized to the longest refusal there is, the cap guardrail's**
+                // (rev-final premortem 1). Its tail is the live-delegate roster
+                // — one `w-1737 (worker, idle), ` entry per live delegate — and
+                // this notice's whole remedy is "kill an idle one", so a roster
+                // cut mid-entry hands the orchestrator a truncated list of the
+                // very panes it is told to choose from. The population is
+                // bounded: `MAX_AGENTS_CEILING` is 12, so twelve entries at a
+                // generous 40 characters is 480 plus a ~120-character prefix.
+                // 900 clears that with room and is still a bound.
+                900,
+                crate::notify::Lines::Collapse,
+            )
+        )
     };
     let body = match reason {
         // **The remedy named is the one that CLEARS it**, which for this hold is
@@ -857,10 +911,29 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              the disposition is yours (INVARIANT 3).{session} drive_review resumes the \
              drive once you have unblocked it."
         ),
+        // **The refusal is quoted, not diagnosed** (#1961). This arm used to
+        // state "the recorded worker session no longer resolves" as a fact, and
+        // it was printed for every hand-back failure whatever its cause — a
+        // block that had left the roster, a pane that opened and exited on
+        // `Invalid session ID`, a cap refusal — each time sending the
+        // orchestrator after another session id while the recorded one was
+        // fine. The reason enum names the class; `refusal` names what happened.
         HeldReason::WorkerUnresumable => format!(
-            "HELD — the recorded worker session no longer resolves, so there is nothing \
-             to hand a fix back to.{session} drive_review(pr, <a session that resolves>) \
-             re-points the drive, or cancel_review_drive stops it."
+            "HELD — the driver could not hand the fix back to its worker{at}.{refusal}\
+             {session} drive_review(pr, <a session that resolves>) re-points the drive, \
+             or cancel_review_drive stops it."
+        ),
+        // **Its own reason because its own REMEDY** (#1960). Reported as
+        // `worker-unresumable`, this hold told the orchestrator to find another
+        // session — for a session that resolves fine, while what was actually
+        // exhausted was a delegate slot. The panes clause below is the rest of
+        // the answer: it names the drive's own panes, which are the ones the
+        // orchestrator can free.
+        HeldReason::CapRefused => format!(
+            "HELD — this group's live-delegate cap refused the pane the drive needed{at}.\
+             {refusal} The recorded worker session is fine; what is exhausted is a slot. \
+             Free one (kill_agent on an idle delegate — list_agents shows which) and \
+             drive_review resumes, or cancel_review_drive stops it."
         ),
         HeldReason::Messaged => format!(
             "HELD — {} called message_orchestrator{at}; its own line is above, \
@@ -871,6 +944,30 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
     };
     let panes = panes_clause(&f.panes, PaneStanding::Owned);
     format!("[orrerix] review drive PR #{pr}: {body}{panes}")
+}
+
+/// **The one line the driver types back at a worker that reported progress**
+/// (#1959) — into the WORKER's pane, never the orchestrator's.
+///
+/// It is not one of §2.2's exits and must not read like one: the drive has not
+/// moved, nothing is parked, and no orchestrator turn is being asked for. It
+/// says the one thing the worker got wrong and what to send instead, including
+/// the case the brief's old wording had no trigger for — a body-only fix, where
+/// there is nothing to push and no new checks to go green, which is exactly the
+/// round that produced the ten-minute stall.
+///
+/// Interpolates the PR number and nothing else, so there is no author- or
+/// delegate-controlled string in it and §5.5's sanitization has no subject.
+pub fn fix_kickback_notice(pr: u64) -> String {
+    format!(
+        "[orrerix] review drive PR #{pr}: this drive advances on report(outcome=done, \
+         ref=#{pr}) and on nothing else — a report(progress) is consumed and moves it \
+         no further. If the fix is done, report done now: that includes a fix with \
+         nothing to push (a PR-body or comment edit, or a finding you answered rather \
+         than changed code for), which the driver reads as a body-only fix and sends \
+         straight back for re-review. If it is not done, carry on — this line is not a \
+         question and needs no reply."
+    )
 }
 
 /// §2.2's `cancelled` exit.
@@ -918,7 +1015,7 @@ pub enum PaneStanding {
     Released,
 }
 
-/// **The panes a drive opened, named on the way out** — the clause every exit
+/// **The panes a drive owns, named on the way out** — the clause every exit
 /// notice carries (#1871 B3).
 ///
 /// The driver kills none of them, and that is a decision rather than an
@@ -952,14 +1049,21 @@ pub fn panes_clause(panes: &[(String, DrivenRole)], standing: PaneStanding) -> S
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // **"Owns", not "opened"** (#1960). Since the driver resumes into a LIVE
+    // IDLE pane on the session where one exists, a pane in this list may be one
+    // the orchestrator opened and the drive merely took over — which is the
+    // whole point of the reuse, and makes "opened" a false claim about the
+    // commonest entry in the list (the original worker pane, on the first
+    // hand-back). Ownership is the property the clause is actually about: it is
+    // what decides whether a `drive_review` resume speaks to the pane again.
     match standing {
         PaneStanding::Owned => format!(
-            " Panes this drive opened and still owns, all still running: {list} — a \
+            " Panes this drive still owns, all still running: {list} — a \
              drive_review resume speaks to them again, and kill_agent is yours if you \
              would rather it did not."
         ),
         PaneStanding::Released => format!(
-            " Panes this drive opened and has now RELEASED, all still running and none \
+            " Panes this drive has now RELEASED, all still running and none \
              of them killed: {list} — nothing will speak to them again, and worker panes \
              sharing one session share one worktree (#338/#359), so disposing of them is \
              yours."
@@ -1173,6 +1277,7 @@ mod tests {
             max_ci_attempts: 3,
             failing_jobs: vec!["build (windows)".into()],
             messaged_by: "w-7".into(),
+            refusal: "unknown block \"worker-adv\"".into(),
             panes: vec![
                 ("w-1715".into(), DrivenRole::Worker),
                 ("rev-1714".into(), DrivenRole::Lane("rev-std".into())),

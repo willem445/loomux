@@ -2474,15 +2474,38 @@ consumed event is in the audit log (as `rd-consumed`, naming the kind, the agent
 **never** intercepted. If a reviewer or a worker has something to say that is not a status change,
 you still see it, unchanged, and the drive then stops so someone reads it.
 
-**A drive stops, it does not drift.** There are fourteen ways out and each produces exactly one
+**A driven worker that reports progress gets answered, in its own pane.** A drive advances on a
+worker's `report(done)` — including the case where the fix moved nothing to push, such as a PR-body
+edit or a finding the worker answered rather than changed code for. A `report(progress)` moves it
+no further, so instead of waiting the fix timeout out the driver types one line back into that
+worker's pane saying so. Once per hand-back, never to you.
+
+**A drive stops, it does not drift.** There are fifteen ways out and each produces exactly one
 line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
 by orrerix on its own when it sees the PR has been closed — or one of
-twelve holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
+thirteen holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
 the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
-could not read, a worker that reported blocked or whose session no longer resolves, or a delegate
-messaging the orchestrator. **A hold is parked, not finished**: it keeps what it has spent, so
+could not read, a worker that reported blocked, a delegate messaging the orchestrator, this group's
+live-delegate cap refusing the pane a hand-back needed, or a fix that could not be handed back to
+its worker. The last of those quotes what actually refused rather than
+diagnosing one cause: the session may no longer resolve, the block it was minted under may no
+longer be declared in this group's roster, or the pane the driver resumed may have opened and then
+exited without saying anything. The cap one (`cap-refused`) is deliberately separate from it,
+because its remedy is: the recorded session is fine and what is exhausted is a *slot*, so freeing
+one — `kill_agent` on an idle delegate, and the notice names which are idle — is what clears it,
+not re-pointing the drive at a different session. It is the one hold reason named here by its own
+word, because it is the one whose remedy is a different action from its neighbour's. **A hold is parked, not finished**: it keeps what it has spent, so
 resuming it does not silently grant a fresh budget, and clearing the counters is a separate,
 audited decision.
+
+**A hand-back reopens the worker's own session under the worker's own block** — the persona and CLI
+that session was minted with, never the roster's default worker block. That matters wherever a
+workflow file declares more than one worker: a session belongs to one CLI, and reopening a Claude
+transcript under an opencode block does not produce a different persona, it fails to open at all.
+If the block a session was minted under is no longer declared, the drive holds and names it rather
+than quietly resuming the work as somebody else. Where that session already has a live, idle pane
+running that same block, the driver types the brief into it instead of opening a second pane on one
+conversation — so a review round normally costs no new delegate slot at all.
 
 **Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
 PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be

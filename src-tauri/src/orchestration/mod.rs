@@ -6702,6 +6702,37 @@ fn format_delegate_roster(mut rows: Vec<(String, &'static str, bool)>) -> String
         .join(", ")
 }
 
+/// The distinctive span of the live-delegate cap's refusal — the ONE literal
+/// [`live_cap_refusal`] writes and [`is_live_cap_refusal`] reads (#1960).
+///
+/// Built from what the message CONTAINS rather than from what follows it: the
+/// two numbers around it vary per group, so the constant sits between them.
+const LIVE_CAP_MARKER: &str = "live agents already (max";
+
+/// The live-delegate cap's refusal, written in one place.
+///
+/// It had two producers — `spawn_agent_bound`'s fast check and the race-safe
+/// re-check inside the `agents` lock — and now has a CONSUMER: the review
+/// driver classifies a refused hand-back, because a cap refusal and a session
+/// it cannot resume are different holds naming different remedies, and
+/// reporting the first as the second sends an orchestrator looking for a
+/// replacement session for a session that is fine (#1960). A classifier reading
+/// a literal one of its producers could edit away is a classifier that silently
+/// stops classifying, so the literal is shared rather than duplicated a third
+/// time.
+fn live_cap_refusal(live: u32, max: u32, roster: &str) -> String {
+    format!(
+        "guardrail: {live} {LIVE_CAP_MARKER} {max}). Reuse an idle agent or kill one \
+         first. Live delegates: {roster}."
+    )
+}
+
+/// Whether a spawn refusal is the live-delegate cap's — see
+/// [`live_cap_refusal`], whose literal this reads.
+pub(crate) fn is_live_cap_refusal(err: &str) -> bool {
+    err.contains(LIVE_CAP_MARKER)
+}
+
 /// Whether a queued `orch-spawn-request` has expired and must be dropped
 /// unserviced (#106). The backend stamps each request with the wall-clock
 /// deadline of its own `bind` wait (`now + BIND_TIMEOUT`); a frontend that was
@@ -13261,15 +13292,17 @@ pub struct OrchRegistry {
     /// would make the review driver's spawn — which this one is held across —
     /// block a `queue_merge` that has nothing to do with it.
     ///
-    /// **Held across a spawn, never across a notice.** §2.4 wants the
-    /// load-decide-store to span the spawn, because a `drive_review` landing
-    /// inside that window would read the pre-spawn file and write it back,
-    /// erasing the entry; #467/#468 want no registry lock held across a
-    /// delivery. Both hold, on a property of the lock rather than a count of
-    /// its callers: no site that takes it is reachable from a pane delivery, so
-    /// a spawn's own kickoff cannot cycle back onto it. The site list, and why
-    /// the two interception helpers do not break it, is on
-    /// [`Registry::rd_drive_group_with`].
+    /// **Held across a spawn and across a delegate delivery; never across a
+    /// notice to the orchestrator.** §2.4 wants the load-decide-store to span
+    /// the spawn, because a `drive_review` landing inside that window would read
+    /// the pre-spawn file and write it back, erasing the entry; #467/#468 want
+    /// no registry lock held across a delivery. Both hold, on a property of the
+    /// lock rather than a count of its callers: no site that takes it is
+    /// reachable from a pane delivery, so a spawn's own kickoff cannot cycle
+    /// back onto it — and since #1960 neither can the `deliver_prompt` a
+    /// hand-back makes directly when it resumes into a live idle pane instead of
+    /// opening one. The site list, and why the two interception helpers do not
+    /// break it, is on [`Registry::rd_drive_group_with`].
     rd_state_lock: Arc<TrackedMutex<()>>,
     /// Earliest wall-clock at which the review driver may service each group
     /// again (§2.4). Absent = now.
@@ -31044,6 +31077,55 @@ impl OrchRegistry {
         records
     }
 
+    /// **The roster row that says what CAPABILITY CLASS a session is** — the
+    /// one lookup every resume path asks, so they cannot disagree (#1961).
+    ///
+    /// # Why the FIRST row and not the last-touched one
+    ///
+    /// A session is minted by one pane, running one block, under one CLI, and
+    /// that is not a property later panes get to revise: a Claude transcript
+    /// resumed under an opencode block does not come back as a different
+    /// persona, it fails to open at all (`Invalid session ID`). So the question
+    /// this answers — *whose conversation is this* — has exactly one true
+    /// answer for the life of the session, and it is the one the roster wrote
+    /// first.
+    ///
+    /// `agents.json` is a `Vec` that `persist_agent_record` **appends** to and
+    /// then updates in place, so its order is spawn order and the first row
+    /// naming a session is the pane that originally ran it. `updated_ms` cannot
+    /// answer this: it is last-*touched*, not created, so a long-lived original
+    /// pane sorts AFTER a resume opened minutes ago, and `max_by_key` returns
+    /// the newest identity rather than the real one. That is #1961's amplifier
+    /// exactly — the driver wrote one wrong row for a session and every later
+    /// bare `spawn_agent(resume_session:)` inherited the wrong block from it,
+    /// including the orchestrator's own hand recovery.
+    ///
+    /// The session browser's rejoin already resolved the block with `find`
+    /// (this rule) while the MCP arm used `max_by_key` (the other one), which
+    /// is why the human's click-to-rejoin recovered the pane that the tool
+    /// call could not. This function is that rule, named once.
+    ///
+    /// **The rule survives the roster being lost, and it is worth saying why**
+    /// (rev-std round 2, premortem 2). `merged_records` falls through to
+    /// audit-derived rows for a session no roster row names, so "the first
+    /// record" becomes the earliest SURVIVING one — and the concern is that it
+    /// could then be a resume row carrying the resumed block rather than the
+    /// minting pane. It cannot, because `records_from_audit` walks the audit
+    /// generations oldest-first and pushes in file order, and the audit is
+    /// append-only: the first `agent-spawn` line naming a session is the spawn
+    /// that minted it. What would break the rule is a TRUNCATED audit, not a
+    /// lost roster, and that is a state in which the group has lost the record
+    /// of its own spawns rather than one this function can rule out.
+    ///
+    /// **Not the same question as "where does its work live".** A workspace
+    /// legitimately MOVES over a session's life (a worktree re-cut, a resume
+    /// placed elsewhere), so cwd inheritance keeps reading the LAST-touched
+    /// record and is deliberately left alone. Identity is immutable; location
+    /// is not.
+    fn session_identity_record(&self, group: &GroupId, session: &str) -> Option<AgentRecord> {
+        self.merged_records(group).into_iter().find(|r| r.session.as_deref() == Some(session))
+    }
+
     /// Every recorded session across all groups on disk, with role identity
     /// — drives the session browser's ORCH/W/REV badges and restore flow.
     pub fn session_roles(&self) -> Vec<SessionRole> {
@@ -43358,6 +43440,85 @@ impl OrchRegistry {
             .count() as u32
     }
 
+    /// A **live, idle, typeable** pane in `group` already running `session`
+    /// (#1960) — what the review driver resumes INTO instead of opening a
+    /// second pane on the same conversation.
+    ///
+    /// Four conditions, each load-bearing:
+    ///
+    /// - **not `Dead`**, or the "reuse" is a delivery into a pane that is gone;
+    /// - **idle** (`idle_since_ms.is_some()`, the same signal the idle reaper
+    ///   kills on and the cap-refusal roster reports) — a pane mid-turn would
+    ///   take the brief behind whatever it is doing, and "is this agent
+    ///   mid-thought?" is not a question a driver may answer;
+    /// - **has a pane** — `deliver_prompt` resolves `pty_id` before it does
+    ///   anything else and refuses an agent with none, so an agent registered
+    ///   without a terminal is not something to type into;
+    /// - **running the block the caller asked for.**
+    ///
+    /// **That last one is #1961 one arm over, and it is not redundant**
+    /// (rev-final B3). The first version of this took the pane on the other
+    /// three and justified skipping the block because "a session with a live
+    /// idle pane is already running under the right block by construction". It
+    /// is not: a pane can be alive, idle, typeable and on the WRONG block, and
+    /// the state that produces one is the very defect #1961 fixes — the
+    /// pre-#1961 driver opened a default-block pane on a non-default session,
+    /// and where the two blocks share a CLI that pane did not die on `Invalid
+    /// session ID`, it opened, went idle, and is still there.
+    /// `spawn_agent(block:, resume_session:)` mints the same thing
+    /// deliberately, with no legacy required. Reusing one would hand the fix to
+    /// the wrong persona on the wrong model while `rd_resume_block` never ran —
+    /// the hand-back failing to run under the session's own block, which is
+    /// exactly what that issue exists to stop.
+    ///
+    /// Newest first, because when the drive already holds a live idle pane on
+    /// this session that pane is the drive's own current one, and speaking to
+    /// the pane it last spoke to is the continuity a resume is for.
+    ///
+    /// **The key is `(started_ms, id)` rather than `started_ms` alone, and the
+    /// second half is not decoration** (rev-final round 2, premortem 1).
+    /// `started_ms` is a wall-clock millisecond, so two panes registered inside
+    /// one — a rapid recovery, or a fallback spawn landing beside a pane that
+    /// was just re-registered — TIE, and `max_by_key` over `HashMap::values()`
+    /// then resolves the tie by iteration order, differently between runs. The
+    /// wrong-persona outcome is excluded either way by the block filter above;
+    /// what a tie loses is exactly the continuity this ordering exists for, and
+    /// non-deterministically. The id is a total, stable tiebreak.
+    ///
+    /// **`idle_since_ms.is_some()` means "the reaper would call this idle", not
+    /// "the CLI is at a prompt", and that residual is stated rather than
+    /// implied** (rev-final round 2, premortem 2). A pane parked on an
+    /// auto-compact, a permission prompt or a tool-approval dialog is idle by
+    /// this signal, and `deliver_prompt` will admit the brief into its queue and
+    /// answer `Ok` — so the caller's fallback-to-spawn does not fire and the
+    /// brief waits for the pane to come back. What bounds it is the state that
+    /// asked for it: `fix-wait` holds on `fix-stalled` and `review-wait` on
+    /// `lane-stalled`, both naming the pane, so the drive degrades to a named
+    /// hold rather than to silence. Narrowing this to a real
+    /// at-a-prompt signal means reading the attention machinery from the
+    /// driver, which is a judgment about a pane's screen — §3 keeps those out of
+    /// the driver — so it is left disclosed and bounded rather than guessed.
+    fn idle_pane_on_session(
+        &self,
+        group: &GroupId,
+        session: &str,
+        block: &str,
+    ) -> Option<String> {
+        self.agents
+            .lock_safe()
+            .values()
+            .filter(|a| {
+                a.group == *group
+                    && a.status != AgentStatus::Dead
+                    && a.session_id.as_deref() == Some(session)
+                    && a.block == block
+                    && a.idle_since_ms.is_some()
+                    && a.pty_id.is_some()
+            })
+            .max_by_key(|a| (a.started_ms, a.id.clone()))
+            .map(|a| a.id.clone())
+    }
+
     /// Human-readable roster of the group's live delegates (workers, reviewers,
     /// planners — the orchestrator and the manager are exempt from the cap) for
     /// the cap-rejection guardrail message (#203). Locks `agents`; the race-safe
@@ -45583,10 +45744,7 @@ impl OrchRegistry {
                 // clue that a zombie planner is squatting a slot is this bare
                 // rejection.
                 let roster = self.live_delegate_roster(group_id);
-                return Err(format!(
-                    "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
-                    group.guardrails.max_agents
-                ));
+                return Err(live_cap_refusal(live, group.guardrails.max_agents, &roster));
             }
             // Guardrail: spawn-rate backstop against a runaway orchestrator.
             // Checked (and the timestamp recorded only when the check passes)
@@ -45972,10 +46130,7 @@ impl OrchRegistry {
                             .collect(),
                     );
                     let _ = fs::remove_file(&cfg.path);
-                    return Err(format!(
-                        "guardrail: {live} live agents already (max {}). Reuse an idle agent or kill one first. Live delegates: {roster}.",
-                        group.guardrails.max_agents
-                    ));
+                    return Err(live_cap_refusal(live, group.guardrails.max_agents, &roster));
                 }
             }
             agents.insert(agent_id.clone(), entry.clone());
@@ -55076,10 +55231,11 @@ pub fn resume_recorded_session(
     // `Human` tier and stays un-clobberable, not silently demoted to
     // orchestrator (#95r). Absent (hint-restored, pre-roster) → `None`, and
     // spawn derives the tier from the name as usual.
-    let matched = reg
-        .merged_records(&record.group_id)
-        .into_iter()
-        .find(|r| r.session.as_deref() == Some(session_id));
+    // The first roster row naming this session — this rejoin has always read
+    // it that way, and since #1961 it says so by calling the function that
+    // owns the rule rather than by open-coding a `find` that reads like an
+    // accident beside the MCP arm's `max_by_key`.
+    let matched = reg.session_identity_record(&record.group_id, session_id);
     let restore_source = matched.as_ref().map(|r| r.name_source);
     let reg2 = reg.clone();
     let sid = session_id.to_string();

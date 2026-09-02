@@ -1497,7 +1497,7 @@ fn tool_defs(
                 }),
                 &["pr", "worker_session"]),
             tool("review_drive_status",
-                "Where this group's review drives stand: {enabled, drives:[{pr, state, held_reason?, head, lanes:[{block, last_verdict?}], counters, since_ms}]}. States are ci-wait | review-wait | fix-wait | gate-check | held. `held` is PARKED, not finished — it keeps its counters and comes back with drive_review, or stops with cancel_review_drive — and `held_reason` says which of the twelve it is. Terminal drives are not listed. `since_ms` is an AGE, not a timestamp. Read this after a compaction: it is how you recover which PRs orrerix is driving for you, and a drive you have forgotten is still running. `refused: rd-state-unreadable` means orrerix cannot read its own record, which is NOT 'nothing is driven'. Read-only: calling this never changes anything.",
+                "Where this group's review drives stand: {enabled, drives:[{pr, state, held_reason?, head, lanes:[{block, last_verdict?}], counters, since_ms}]}. States are ci-wait | review-wait | fix-wait | gate-check | held. `held` is PARKED, not finished — it keeps its counters and comes back with drive_review, or stops with cancel_review_drive — and `held_reason` says which of the thirteen it is. Terminal drives are not listed. `since_ms` is an AGE, not a timestamp. Read this after a compaction: it is how you recover which PRs orrerix is driving for you, and a drive you have forgotten is still running. `refused: rd-state-unreadable` means orrerix cannot read its own record, which is NOT 'nothing is driven'. Read-only: calling this never changes anything.",
                 json!({}), &[]),
             tool("cancel_review_drive",
                 "Stop driving a PR. Works on any drive that has not already finished, held ones included; the entry is dropped and its counters go with it, so a later drive_review on that PR starts fresh. Use it when the PR needs something the driver cannot do — a conflict you want to resolve by hand, a change of plan, a PR you have decided to review yourself. Refuses `driver-disabled` if this repo has not enabled the driver at all, and `not-driven` if that PR has no live drive. `rd-state-unreadable` is DIFFERENT and means orrerix cannot read its drive record at all, so it cannot tell you whether that PR is driven — which is not the same as saying it isn't; `rd-state-unwritable` means the cancel was computed and could not be saved, so it did not happen. Neither should appear in a running build.",
@@ -2710,11 +2710,22 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         .into(),
                 );
             }
-            // The last-touched roster record naming this session, if any —
-            // shared by #254's block inheritance and the cwd inheritance
-            // below, so both agree on the same record instead of running two
-            // independent lookups that could (in principle, if the roster
-            // changed between them) disagree on which one is "last-touched".
+            // The last-touched roster record naming this session, if any — the
+            // WORKSPACE half, and only that half since #1961.
+            //
+            // It used to be shared with #254's block inheritance below, on the
+            // argument that one record kept the two answers from disagreeing.
+            // The two are not one question: a workspace legitimately MOVES over
+            // a session's life (a worktree re-cut, a resume placed elsewhere),
+            // so "where does its work live" wants the newest record — while
+            // "what capability class is this" has one true answer fixed when
+            // the session was minted, and `max_by_key(updated_ms)` returns
+            // whatever pane touched it most recently instead. That is #1961's
+            // amplifier: the driver wrote one wrong-block row for a session and
+            // every later bare resume — the orchestrator's own hand recovery
+            // included — inherited the wrong block from it. Identity now comes
+            // from `session_identity_record`; see that function for why the
+            // roster's FIRST row is the one that answers it.
             let owner: Option<super::AgentRecord> = resume.as_deref().and_then(|session_id| {
                 reg.merged_records(&caller.group)
                     .into_iter()
@@ -2794,14 +2805,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // follow-up contract) gets inherited instead of guessed.
             let block = if block.is_none() && kind.is_none() {
                 if resumed {
-                    // A session can appear more than once (roster + audit
-                    // backfill can both carry it, or it was re-spawned into
-                    // a different block over its lifetime) — `owner` (above)
-                    // already picked the last-touched record deliberately,
-                    // since that is the agent's most recent identity, not its
-                    // first one.
+                    // A session can appear more than once — roster + audit
+                    // backfill can both carry it, and a driver hand-back or a
+                    // hand resume writes a fresh row per pane. **The FIRST row
+                    // naming it is the one that answers this** (#1961): a
+                    // session is minted by one pane under one block and one
+                    // CLI, and no later row revises that. The
+                    // most-recently-touched row used to answer here, which is
+                    // how one wrong-block resume poisoned every later bare one.
+                    // `session_identity_record` carries the full argument, and
+                    // is the same rule the session browser's rejoin has always
+                    // used.
                     let session_id = resume.as_deref().expect("resumed implies Some");
-                    let owner_rec = owner.as_ref().ok_or_else(|| {
+                    let identity = reg.session_identity_record(&caller.group, session_id);
+                    let owner_rec = identity.as_ref().ok_or_else(|| {
                         format!(
                             "unknown session {session_id:?} — cannot resume without an \
                              explicit block or kind (no roster record maps this session \
@@ -3330,14 +3347,24 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     // rides in the audit line so the record says which side
                     // spoke.
                     //
-                    // A `progress` report carries no signal from either side: a
-                    // drive advances on the head, the checks and the verdict
-                    // files, never on a delegate saying it is still going.
+                    // A `progress` report carries no DRIVE signal from either
+                    // side: a drive advances on the head, the checks and the
+                    // verdict files, never on a delegate saying it is still
+                    // going. Since #1959 the current WORKER's progress report
+                    // is still fed in — as `WorkerProgress`, a field of its own
+                    // that `decide` cannot read — so the tick can answer it in
+                    // that worker's own pane. It moves nothing; see
+                    // `RdEvent::WorkerProgress`. A LANE's progress report still
+                    // carries nothing at all: a lane's word to the drive is its
+                    // verdict file.
                     //
                     // **A SUPERSEDED pane is owned and is not believed** (#1871
-                    // B2, and the amendment that decided it). The drive resumes
-                    // its worker into a new pane on every hand-back, and the
-                    // pane it replaced keeps running: consuming its traffic is
+                    // B2, and the amendment that decided it). A hand-back that
+                    // cannot reuse the session's own live idle pane opens a new
+                    // one (#1960), and the pane it replaced keeps running —
+                    // superseded is the fallback rather than every resume now,
+                    // but nothing about what is owed to a superseded pane
+                    // changed. Consuming its traffic is
                     // right — it is this drive's delegate on this PR, and
                     // letting it reach the orchestrator is the leak §7 exists to
                     // stop — but FEEDING it in is not. A `done` from a worker
@@ -3353,6 +3380,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     let event = match (is_worker && pane.current, status) {
                         (true, "done") => Some(super::RdEvent::WorkerDone),
                         (true, "blocked") => Some(super::RdEvent::WorkerBlocked),
+                        (true, "progress") => Some(super::RdEvent::WorkerProgress),
                         _ => None,
                     };
                     let kind = match (is_worker, pane.current) {

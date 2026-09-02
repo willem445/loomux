@@ -50,6 +50,10 @@
 //!   this slice actually shipped and CI caught.
 //! - [`DriveEntry::fix_handback_ms`] — when the drive last entered `fix-wait`.
 //!   The `fix-stalled` anchor; the hand-back is the moment that wait began.
+//! - [`DriveEntry::fix_kickback_ms`] — when the drive last answered a worker's
+//!   `report(progress)` in that worker's own pane (#1959). Not a timeout
+//!   anchor: it is compared against `fix_handback_ms`, which makes the budget
+//!   one answer per hand-back and renews it with no reset to remember.
 //!
 //! `drive-stalled` needs none of these: §2.2 is emphatic that it is the drive's
 //! **age**, `now - started_ms`, "never an idle clock reset by each state
@@ -200,11 +204,11 @@ impl DriveState {
 }
 
 /// Why a drive is parked (§2.2). **One state carrying a closed reason enum, not
-/// twelve states**, so a reader asking "is this drive parked" asks one
+/// thirteen states**, so a reader asking "is this drive parked" asks one
 /// question, and the reason travels in the notice and the audit line rather
 /// than being inferred from which counter happens to sit at its bound.
 ///
-/// Twelve reasons. With `satisfied` and `cancelled` that is §2.2's fourteen
+/// Thirteen reasons. With `satisfied` and `cancelled` that is §2.2's fifteen
 /// exits back to the LLM orchestrator, and [`HeldReason::ALL`] is what makes
 /// that count checkable rather than asserted.
 ///
@@ -243,8 +247,33 @@ pub enum HeldReason {
     GateUnreadable,
     /// The worker reported `blocked`.
     WorkerBlocked,
-    /// The recorded worker session no longer resolves.
+    /// **The fix could not be handed back to its worker** — the class, not one
+    /// cause. A session that no longer resolves is the original one; a block
+    /// that has left the roster and a pane that opened and exited before saying
+    /// anything are the two #1961 added, and each names itself in
+    /// [`crate::rddrive::HeldFacts::refusal`] rather than being reported as the
+    /// first. Narrowing this doc to "the session no longer resolves" is how the
+    /// notice came to send an orchestrator after a replacement session for a
+    /// session that was fine.
     WorkerUnresumable,
+    /// **The group's live-delegate cap refused the pane the drive needed**
+    /// (#1960) — its own reason, and the reason it is not
+    /// [`WorkerUnresumable`](HeldReason::WorkerUnresumable).
+    ///
+    /// It was reported as that one, which named a remedy that does not work: it
+    /// tells the orchestrator the recorded session no longer resolves and to
+    /// re-point the drive at another one. The session resolves fine. What is
+    /// exhausted is a slot, the remedy is to free one (or wait), and those are
+    /// different actions — measured on the dogfood, an orchestrator went
+    /// looking for a replacement session for a session whose `.jsonl` was on
+    /// disk and which re-pointed successfully the moment panes were killed.
+    ///
+    /// A **lane** spawn refused by the cap does not reach this: `review-wait`
+    /// backs off and retries, counted only against `drive_timeout_minutes`
+    /// (§8's live-delegate-cap row). The asymmetry is the states': a lane can
+    /// be opened on any later tick, while `fix-wait` has already taken its arc
+    /// and spent its round.
+    CapRefused,
     /// A driven delegate called `message_orchestrator` (§7 — that call is never
     /// intercepted; the delegate's own line arrives by its own path and this
     /// hold is the routing fact beside it).
@@ -254,7 +283,7 @@ pub enum HeldReason {
 impl HeldReason {
     /// Every reason, so a caller — or a test counting §2.2's exits — can
     /// enumerate them without matching on the enum. Order is §2.2's table.
-    pub const ALL: [HeldReason; 12] = [
+    pub const ALL: [HeldReason; 13] = [
         HeldReason::Escalate,
         HeldReason::ReviewLimit,
         HeldReason::CiLimit,
@@ -266,6 +295,7 @@ impl HeldReason {
         HeldReason::GateUnreadable,
         HeldReason::WorkerBlocked,
         HeldReason::WorkerUnresumable,
+        HeldReason::CapRefused,
         HeldReason::Messaged,
     ];
 
@@ -284,6 +314,7 @@ impl HeldReason {
             HeldReason::GateUnreadable => "gate-unreadable",
             HeldReason::WorkerBlocked => "worker-blocked",
             HeldReason::WorkerUnresumable => "worker-unresumable",
+            HeldReason::CapRefused => "cap-refused",
             HeldReason::Messaged => "messaged",
         }
     }
@@ -302,6 +333,7 @@ impl HeldReason {
             "gate-unreadable" => Some(HeldReason::GateUnreadable),
             "worker-blocked" => Some(HeldReason::WorkerBlocked),
             "worker-unresumable" => Some(HeldReason::WorkerUnresumable),
+            "cap-refused" => Some(HeldReason::CapRefused),
             "messaged" => Some(HeldReason::Messaged),
             _ => None,
         }
@@ -734,9 +766,11 @@ pub struct LaneRecord {
     /// pane, which is the one thing the drive exists to absorb.
     ///
     /// Superseded is not dead: `rd_open_lane` resumes the lane's SESSION, and
-    /// orrerix mints a new pane id for the resume while the old pane keeps
-    /// running until something closes it. Both panes are this drive's, for as
-    /// long as the drive is live.
+    /// where it cannot type the brief into that session's own live idle pane
+    /// (#1960) orrerix mints a new pane id for the resume while the old pane
+    /// keeps running until something closes it. Both panes are this drive's, for
+    /// as long as the drive is live. Reuse changed how OFTEN a lane pane is
+    /// superseded; it changed nothing about what this field owes one that is.
     #[serde(default)]
     pub prior_agents: Vec<String>,
     /// The last verdict seen for this lane — a **record of what was read**,
@@ -1069,6 +1103,22 @@ pub struct DriveEntry {
     /// owes this field a decision, and this paragraph is the one it invalidates.
     #[serde(default)]
     pub fix_handback_ms: u64,
+    /// When this drive last answered a worker's `report(progress)` in its own
+    /// pane (#1959) — the bound on [`kickback_owed`](DriveEntry::kickback_owed).
+    ///
+    /// **Compared against `fix_handback_ms` rather than counted**, so the budget
+    /// is one per HAND-BACK and renews on the next one without anything having
+    /// to reset it: a worker that reports progress five times in one fix round
+    /// is answered once, and a worker that does it again after the next
+    /// hand-back is answered again. A counter would have needed a reset on
+    /// arcs 3 and 5, which is a second thing to remember beside the anchor those
+    /// arcs already stamp.
+    ///
+    /// Zero means "never answered", and reads correctly against a zero
+    /// `fix_handback_ms` too: `0 < 0` is false, so a drive that has never handed
+    /// back owes nothing.
+    #[serde(default)]
+    pub fix_kickback_ms: u64,
     /// The notice this entry owes the orchestrator's pane, and the reason
     /// retention may not drop it yet (#1857). See [`OwedNotice`].
     ///
@@ -1111,6 +1161,7 @@ impl DriveEntry {
             counters,
             started_ms: now_ms,
             fix_handback_ms: 0,
+            fix_kickback_ms: 0,
             owed_notice: None,
             extra: BTreeMap::new(),
         }
@@ -1271,6 +1322,48 @@ impl DriveEntry {
         });
     }
 
+    /// **Does this drive still owe its worker a kick-back for the CURRENT
+    /// hand-back?** (#1959)
+    ///
+    /// A `report(progress)` in `fix-wait` is a delivery the drive consumed and
+    /// cannot act on: it moves nothing (a drive turns on the head, the checks
+    /// and the verdict files) and it is exactly what a worker sends when it
+    /// believes it has finished and has reached for the wrong word — a
+    /// body-only fix has nothing to push and no new checks, so "report when the
+    /// checks are green" has no trigger. Swallowing it silently is #1857's
+    /// shape one arm over: the drive sat until the watchdog woke the
+    /// orchestrator.
+    ///
+    /// The answer is one line typed into the worker's OWN pane, which costs the
+    /// orchestrator nothing. It is bounded to one per hand-back rather than one
+    /// per report, so a chatty worker cannot turn its own progress reports into
+    /// a stream of prompts — an unbounded emission driven by a signal the drive
+    /// does not control is the mirror image of the unbounded SUPPRESSION rule,
+    /// and wants the same answer.
+    ///
+    /// **Only in `fix-wait`.** In any other state there is no hand-back to be
+    /// waiting on and nothing the worker was asked for.
+    pub fn kickback_owed(&self) -> bool {
+        self.state == DriveState::FixWait && self.fix_kickback_ms < self.fix_handback_ms
+    }
+
+    /// Record that this drive answered its worker at `now_ms` — see
+    /// [`kickback_owed`](DriveEntry::kickback_owed).
+    ///
+    /// **Stamped at no earlier than the hand-back it answers**, which is what
+    /// makes the budget hold across a backwards clock step (rev-std round 2,
+    /// premortem 1). `now_ms` is wall-clock: a host NTP correction between the
+    /// hand-back and the worker's `report(progress)` writes a stamp that never
+    /// overtakes `fix_handback_ms`, `kickback_owed` stays true, and the tick
+    /// re-emits the kick-back on EVERY tick for as long as the progress signal
+    /// stands — the unbounded emission the bound exists to prevent, arriving
+    /// through the bound itself. The clamp costs a `max` and needs no reset on
+    /// the arcs into `fix-wait`, so it keeps the property that made the
+    /// comparison preferable to a counter in the first place.
+    pub fn record_kickback(&mut self, now_ms: u64) {
+        self.fix_kickback_ms = now_ms.max(self.fix_handback_ms);
+    }
+
     /// Record that this drive has resumed its worker into `agent` — the
     /// hand-back's twin of [`open_lane`](DriveEntry::open_lane), and the reason
     /// the assignment is a method rather than a field write at the call site.
@@ -1331,7 +1424,7 @@ impl DriveEntry {
         before != after
     }
 
-    /// Every pane this drive has opened and still owns, superseded ones included
+    /// Every pane this drive still owns, superseded ones included
     /// — what an exit owes the orchestrator (#1871 B3), and the same population
     /// [`driven_role`](DriveEntry::driven_role) recognises.
     ///
@@ -1654,7 +1747,8 @@ pub enum WorkerSignal {
     Done,
     /// `report(blocked)`.
     Blocked,
-    /// The recorded worker session no longer resolves.
+    /// The fix could not be handed back to this drive's worker — see
+    /// [`HeldReason::WorkerUnresumable`] for the causes this covers.
     ///
     /// **This is not a drive-time check, and the note is honest about why.**
     /// §5.1: a full, well-shaped session id this group never recorded takes
@@ -1662,6 +1756,12 @@ pub enum WorkerSignal {
     /// *accepted* by `drive_review`, so its unresumability surfaces here, at
     /// the first hand-back, possibly hours on. Resolving is not the same as
     /// proving resumable, and v1 does not prove it.
+    ///
+    /// **It is also produced AFTER a hand-back that succeeded** (#1961): the
+    /// registry raises it when the pane the drive resumed exits in `fix-wait`
+    /// with nothing reported, which is a resume that "worked" and then died on
+    /// `Invalid session ID`. Before that the drive waited a full fix timeout on
+    /// a process that was already gone.
     Unresumable,
 }
 
@@ -2172,13 +2272,13 @@ mod tests {
     }
 
     #[test]
-    fn the_held_reasons_are_the_notes_twelve() {
-        assert_eq!(HeldReason::ALL.len(), 12);
-        // §2.2: "There are **fourteen**" exits back to the LLM orchestrator —
-        // the twelve holds plus `satisfied` and `cancelled`.
+    fn the_held_reasons_are_the_notes_thirteen() {
+        assert_eq!(HeldReason::ALL.len(), 13);
+        // §2.2: "There are **fifteen**" exits back to the LLM orchestrator —
+        // the thirteen holds plus `satisfied` and `cancelled`.
         let exits =
             HeldReason::ALL.len() + DriveState::ALL.iter().filter(|s| s.is_terminal()).count();
-        assert_eq!(exits, 14);
+        assert_eq!(exits, 15);
         for r in HeldReason::ALL {
             assert_eq!(HeldReason::parse(r.as_str()), Some(r), "{}", r.as_str());
         }
@@ -2951,6 +3051,39 @@ mod tests {
       ]
     }"#;
 
+    /// **The kick-back budget survives a backwards wall-clock step** (rev-std
+    /// round 2, premortem 1).
+    ///
+    /// `kickback_owed` compares two wall-clock stamps, so an unclamped
+    /// `record_kickback` fed a `now` from before the hand-back writes a stamp
+    /// that never overtakes `fix_handback_ms` — the budget never spends, and the
+    /// tick re-emits on every wake for as long as the progress signal stands.
+    /// The forward case is the control: without it this would pass against a
+    /// `record_kickback` that ignored its argument entirely.
+    #[test]
+    fn a_kick_back_stamped_before_its_own_hand_back_still_spends_the_budget() {
+        let mut e = entry_at(DriveState::FixWait);
+        e.fix_handback_ms = 10_000;
+        assert!(e.kickback_owed(), "the pre-state: a fresh hand-back owes one");
+
+        // A clock that stepped backwards between the hand-back and the report.
+        e.record_kickback(9_000);
+        assert!(
+            !e.kickback_owed(),
+            "a backwards clock step must not re-arm the budget — that is one prompt per \
+             tick into the worker's pane for as long as it keeps reporting progress"
+        );
+
+        // The control: an ordinary forward stamp spends it too, and the next
+        // hand-back renews it with nothing having to reset anything.
+        let mut f = entry_at(DriveState::FixWait);
+        f.fix_handback_ms = 10_000;
+        f.record_kickback(11_000);
+        assert!(!f.kickback_owed(), "the ordinary case still spends");
+        f.fix_handback_ms = 20_000;
+        assert!(f.kickback_owed(), "…and the next hand-back renews it");
+    }
+
     #[test]
     fn the_notes_own_example_entry_parses() {
         let s = parse_state(NOTE_EXAMPLE).unwrap();
@@ -2963,6 +3096,11 @@ mod tests {
         assert_eq!(e.lanes[0].last_verdict, Some(Verdict::Pass));
         // The added fields default rather than refusing the published shape.
         assert_eq!(e.fix_handback_ms, 0);
+        // #1959's, and its default is load-bearing rather than incidental: an
+        // entry that has never handed back must owe no kick-back, which is what
+        // `0 < 0` being false says.
+        assert_eq!(e.fix_kickback_ms, 0);
+        assert!(!e.kickback_owed(), "a `review-wait` entry owes nobody a kick-back");
         assert_eq!(e.lanes[0].spawned_ms, 0);
         assert_eq!(e.lanes[0].briefed_head, "");
         assert_eq!(e.lanes[0].briefed_digest, "");
