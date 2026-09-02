@@ -21,12 +21,26 @@
 //! are named, and required exactly once each, so a rename fails loudly rather
 //! than silently watching nothing.
 //!
+//! The third test covers the OTHER half of what an agent here reads: this
+//! repo's own personas. Its population is not a list — it is derived from
+//! `.orrerix/workflow.yml` through the REAL parser, so it is every worker- and
+//! reviewer-kind block that declares a `profile:`. Change the roster and the
+//! population follows; a persona that stops being read stops being required,
+//! and one that starts being read is covered the day it is declared. That is
+//! the same dogfood pin `tests/workflow.rs` and `test/workflowdogfood.test.ts`
+//! already make, asked of the prose rather than of the schema.
+//!
 //! **Residual, stated:** this is a scan over instruction text. It cannot see a
 //! body an agent actually posts, and it does not bound prose LENGTH — the rule
-//! it enforces is about what sits above the fold, never how much.
+//! it enforces is about what sits above the fold, never how much. Nor does it
+//! reach a `prompt:` persona written inline in the workflow file, or a repo
+//! that ships no workflow file at all: both are outside the population by
+//! construction, and the third test says so where it skips them.
 
+use loomux_lib::orchestration::workflow;
+use loomux_lib::orchestration::Role;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The one `<summary>` an agent-authored fold ever carries.
 ///
@@ -83,45 +97,8 @@ fn the_worker_and_reviewer_templates_name_both_layers_and_open_the_fold() {
     for want in REQUIRE_BOTH_LAYERS {
         let hits: Vec<_> = all.iter().filter(|(n, _)| n == want).collect();
         assert_eq!(hits.len(), 1, "{want} must exist exactly once in the templates dir");
-        let text = lf(&hits[0].1);
         seen += 1;
-
-        // Counted as whole LINES, which is the rule the template states and the
-        // shape the squash cut matches (`sed -n '/^<!-- agent-layer -->$/q;p'`).
-        // A substring count would be the wrong instrument in both directions:
-        // it reads a legitimate mid-sentence mention inside a code span — which
-        // `worker.md` itself makes, stating this very rule — as a second fold.
-        let lines: Vec<&str> = text.lines().map(str::trim).collect();
-        let n = lines.iter().filter(|l| **l == SUMMARY).count();
-        assert_eq!(
-            n, 1,
-            "{want} must carry the canonical agent-layer <summary> on exactly one line, found {n}:\n  {SUMMARY}"
-        );
-        let m = lines.iter().filter(|l| **l == MARKER).count();
-        assert_eq!(
-            m, 1,
-            "{want} must show the {MARKER} line on exactly one line, found {m} — it is where a squash message is cut"
-        );
-
-        // Both layers NAMED, not merely a fold pasted in: an agent that is told
-        // to collapse evidence but never told what belongs above the fold has
-        // been given half the rule.
-        let lower = text.to_lowercase();
-        assert!(lower.contains("human layer"), "{want} must name the human layer");
-        assert!(lower.contains("agent layer"), "{want} must name the agent layer");
-
-        // The blank line after `</summary>` is load-bearing: without it a table
-        // inside the fold renders as literal pipes on github.com (measured
-        // through the GFM endpoint, #1968). Pin it where the template SHOWS the
-        // shape, so an edit that closes the gap is caught here rather than in a
-        // body somebody already posted.
-        let at = lines.iter().position(|l| *l == SUMMARY).expect("counted above");
-        assert_eq!(
-            lines.get(at + 1).copied(),
-            Some(""),
-            "{want}: the line after the <summary> must be blank — without it a table \
-             inside the fold renders as literal pipes on github.com"
-        );
+        assert_two_layer_shape(want, &hits[0].1);
     }
     assert_eq!(seen, REQUIRE_BOTH_LAYERS.len());
 }
@@ -172,5 +149,118 @@ fn every_fold_in_every_template_uses_the_one_canonical_wording() {
     assert!(
         folds >= REQUIRE_BOTH_LAYERS.len(),
         "only {folds} template(s) carried a fold — the scan saw nothing to judge"
+    );
+}
+
+/// Assert one instruction file carries the whole two-layer shape.
+///
+/// Shared by the template pin and the persona pin so the two cannot drift into
+/// enforcing different rules under the same name.
+fn assert_two_layer_shape(label: &str, raw: &str) {
+    let text = lf(raw);
+    // Whole LINES, not substrings: that is the rule the files state and the
+    // shape a squash cut matches (`sed -n '/^<!-- agent-layer -->$/q;p'`). A
+    // substring count reads a legitimate mid-sentence mention inside a code
+    // span — which several of these files make, stating this very rule — as a
+    // second fold.
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+
+    let n = lines.iter().filter(|l| **l == SUMMARY).count();
+    assert_eq!(
+        n, 1,
+        "{label} must carry the canonical agent-layer <summary> on exactly one line, found {n}:\n  {SUMMARY}"
+    );
+    let m = lines.iter().filter(|l| **l == MARKER).count();
+    assert_eq!(
+        m, 1,
+        "{label} must show the {MARKER} line on exactly one line, found {m} — it is where a squash message is cut"
+    );
+
+    // Both layers NAMED, not merely a fold pasted in: an agent told to collapse
+    // evidence but never told what belongs above the fold has half the rule.
+    let lower = text.to_lowercase();
+    assert!(lower.contains("human layer"), "{label} must name the human layer");
+    assert!(lower.contains("agent layer"), "{label} must name the agent layer");
+
+    // The blank line after `</summary>` is load-bearing: without it a table
+    // inside the fold renders as literal pipes on github.com (measured through
+    // the GFM endpoint, #1968). Pinned where the file SHOWS the shape, so an
+    // edit that closes the gap is caught here rather than in a posted body.
+    let at = lines.iter().position(|l| *l == SUMMARY).expect("counted above");
+    assert_eq!(
+        lines.get(at + 1).copied(),
+        Some(""),
+        "{label}: the line after the <summary> must be blank — without it a table \
+         inside the fold renders as literal pipes on github.com"
+    );
+}
+
+/// The loomux repo root (this crate's manifest dir is `src-tauri/`), spelled
+/// the way `tests/workflow.rs`'s dogfood pins spell it.
+fn repo_root() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri always has a parent")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+#[test]
+fn every_persona_the_live_roster_reads_carries_the_two_layer_rule() {
+    let repo = repo_root();
+    let wf = match workflow::load_workflow(&repo) {
+        Ok(Some(wf)) => wf,
+        Ok(None) => panic!("the repo dogfoods its own roster; {} must exist", workflow::workflow_path(&repo)),
+        Err(errors) => panic!("loomux's own workflow file does not validate: {errors:#?}"),
+    };
+
+    // DERIVED, never listed. The population is every block that (a) authors a
+    // body on GitHub — worker and reviewer kinds; an orchestrator's own filing
+    // shape lives in its playbook, and a planner posts a plan comment through
+    // the orchestrator — and (b) points at a persona FILE. A `prompt:` persona
+    // is inline in the workflow file and has no file to scan; it is skipped
+    // here rather than silently counted, and the tally below is what makes
+    // that visible.
+    let mut inline = 0usize;
+    let mut checked: Vec<String> = Vec::new();
+    for b in &wf.blocks {
+        if !matches!(b.kind, Role::Worker | Role::Reviewer) {
+            continue;
+        }
+        let Some(rel) = b.profile.as_deref() else {
+            if b.prompt.is_some() {
+                inline += 1;
+            }
+            continue;
+        };
+        let path = Path::new(&repo).join(rel);
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("block `{}` declares profile `{rel}`, which does not read: {e}", b.id));
+        assert_two_layer_shape(&format!("{rel} (block `{}`)", b.id), &raw);
+        checked.push(rel.to_string());
+    }
+
+    // Population control, counted at the VERIFIED site (CLAUDE.md: a control
+    // counts what the guard actually judged, never what it matched). Four
+    // profiles is the roster as it stands; the floor is deliberately loose so
+    // a roster change is not a false red, while an empty or near-empty
+    // population — a parse that returned nothing, a `kind` rename — still is.
+    assert!(
+        checked.len() >= 3,
+        "only {} roster persona(s) were checked ({checked:?}); {inline} inline `prompt:` persona(s) \
+         were skipped. A population this small means the roster parse found almost nothing, not \
+         that the rule stopped applying",
+        checked.len()
+    );
+
+    // Distinct files, so two blocks sharing one profile cannot inflate the
+    // count above into a coverage claim it did not earn.
+    let mut distinct = checked.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert!(
+        distinct.len() >= 3,
+        "the roster's worker/reviewer blocks point at only {} distinct persona file(s): {distinct:?}",
+        distinct.len()
     );
 }

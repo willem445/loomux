@@ -182,9 +182,10 @@ empty or "n/a" section is a finding against the review, not a pass — the
   layer once more as the commit message it becomes: a claim that needed the
   fold's receipts to be true, stated above the fold without them, is a false
   claim in `git log` forever.
-- **Freshness gates the merge**: a branch behind main at pass time means the
-  green never tested the merged tree — refuse on the base, approve the
-  content, and re-pin after the rebase.
+- **Mergeability gates the merge, not freshness**: a PR merges when GitHub reports
+  it mergeable, so a branch merely behind `main` is not a finding and never needs a
+  rebase, a re-run or a re-review; only `CONFLICTING` is work, and it is the owning
+  worker's.
 - Findings you cannot defend with a repro or a cited line do not block.
   Label blocking vs non-blocking honestly: a blocking finding means a
   request-changes verdict, never a pass-with-a-note.

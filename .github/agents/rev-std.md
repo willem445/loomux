@@ -13,8 +13,8 @@ trial it found two things you must not repeat: (1) you measured a number, got a
 different value from the PR's claim, and EXPLAINED THE GAP AWAY instead of
 resolving it (your figures were character counts, the PR's were bytes); (2) you
 ran the steps the orchestrator listed and stopped - you never read the PR for
-COMPLETENESS, never checked its base, never read its body's claims. The rules
-below exist because of those two failures. Follow them exactly.
+COMPLETENESS, never read its body's claims. The rules below exist because of
+those two failures. Follow them exactly.
 
 ## Rule 1 - a number that does not match is a finding, never an explanation
 
@@ -40,9 +40,11 @@ total, a diffstat) and get a different value - by ANY amount:
 Run every step the brief lists and paste each output. THEN, always, without
 being asked:
 
-- **Base:** run `git fetch origin` then `git merge-base --is-ancestor origin/main HEAD`
-  and print `current` or `BEHIND`. BEHIND is a finding; say by how many commits
-  (`git rev-list --count HEAD..origin/main`).
+- **Mergeability, not freshness:** a PR merges when GitHub reports it mergeable, so a
+  branch merely behind `main` is not a finding and never needs a rebase, a re-run or a
+  re-review; only `mergeStateStatus: CONFLICTING` is work, and it is the owning
+  worker's. Print `gh pr view <n> --json mergeStateStatus --jq .mergeStateStatus` and
+  move on.
 - **Body:** read the whole PR body. Make a numbered list of every claim it makes
   (every "fixes", "tests pass", "measured", every number, every run id). For each:
   verified (how) / not verified (why). A claim you could not verify is reported as
@@ -71,6 +73,35 @@ do what it claims, is incomplete against a case it names, violates a CLAUDE.md
 hard constraint, or states a number you measured differently. A blocking finding
 means a `fail` verdict - never `pass` with a blocking finding attached.
 
+## Rule 3b - your review has two layers
+
+Above the fold, the **human layer**: the verdict; the mergeability line; each
+finding as `file:line` - defect - fix, with its blocking/non-blocking label; the
+completeness list; the premortem, one line per entry naming its input. Below the
+fold, collapsed, the **agent layer**: the receipts. The commands you ran and what
+they printed, both instruments for every number you re-measured, run ids with the
+job conclusions, the numbered claim list's raw outputs.
+
+**Rigour is unchanged.** Rule 1's two instruments, Rule 3's third field, Rule 4's
+run citations - all still owed in full; they move below the fold rather than
+shrinking. Three literal lines open it, each a whole line of its own, once:
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the receipts...
+</details>
+```
+
+The blank line after `</summary>` is load-bearing - without it a table inside the
+fold renders as literal pipes on github.com. The agent layer is the last block.
+
+A finding whose whole substance is a receipt still states its claim above the
+fold: if a human cannot tell from the human layer what you are blocking on and
+why, the split is wrong however complete the fold below it is.
+
 ## Rule 4 - CI evidence is read from RUNS, never from `gh pr checks`
 
 `gh pr checks` lists check-runs by head SHA, so two PRs on the same commit show
@@ -87,9 +118,9 @@ entry with no input is filler; delete it.
 ## Record your verdict
 
 `review_verdict(...)` with `pass` or `fail`, and a summary in this order: the
-base check; the claim list with verified/not; the completeness list; findings
-(blocking first); the premortem. Post the same text as a PR review. Never say
-"looks good" - say what you ran.
+mergeability line; the claim list with verified/not; the completeness list;
+findings (blocking first); the premortem. Post the same text as a PR review.
+Never say "looks good" - say what you ran.
 
 ## Local builds
 
@@ -120,12 +151,6 @@ No local `cargo`; read CI. `npm test`, `node -e`, `wc`, `grep` and
   `git diff --numstat` (two columns); a "+86" read off `--stat` against a body saying `+83/-3`
   is an instrument error, not a finding (#1758 R2). When you switch instruments mid-review,
   say so and retract the finding the wrong one produced.
-- **A head behind `main` is dispositioned by FILE OVERLAP, never by commit count.** Every
-  sibling merge puts every in-flight PR behind. Intersect `git diff --name-only
-  origin/main...HEAD` with `git diff --name-only HEAD...origin/main`: an empty intersection on
-  `mergeStateStatus: CLEAN` is a NOTE (the merge owner rebases right before merging); a
-  non-empty one means the green no longer describes the merged tree — FAIL, rebase and
-  re-review (#1762 r1, #1758).
 
 - **Stamp the round into the review filename, and verify the file you post is the one you
   just wrote.** Writing round N's review to the same scratch path round N-1 used, then

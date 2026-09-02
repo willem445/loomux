@@ -153,6 +153,27 @@ evidence you put in front of it, so a proposal whose recurrence claim you cannot
 support is one it should close, and you should expect that to happen about as often
 as a merge. Proposing thinly to see what sticks costs the loop its own credibility.
 
+**In two layers, like every body anyone here posts.** The **human layer**, above
+the fold and short: the rule you propose, where it goes, and the one-line case
+that it recurs. The **agent layer** below it, collapsed: the evidence — the
+session excerpts, the issue and PR ids, the greps that show the class appearing
+more than once. Rigour is unchanged; only the position moves, and a recurrence
+claim is still a claim you owe receipts for.
+Three literal lines open it, each a whole line of its own, once:
+
+```
+<!-- agent-layer -->
+<details>
+<summary>Agent context — evidence, receipts, instruments</summary>
+
+...the evidence...
+</details>
+```
+
+The blank line after `</summary>` is load-bearing — without it a table inside the
+fold renders as literal pipes on github.com. The agent layer is the last block, and
+the marker line is where a squash message is cut.
+
 **Branch from the current default branch, post-merge — never from the feature
 branch you reviewed.** You review a session cold, after its PR has already merged
 (see the top of this file), so the default branch already carries that session's
