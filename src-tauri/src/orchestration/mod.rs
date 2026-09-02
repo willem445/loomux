@@ -51126,7 +51126,7 @@ impl OrchRegistry {
         // is what disambiguates, and it is tried first for exactly this reason.
         let by_ref = || {
             let n = ref_.filter(|s| !s.is_empty()).and_then(pr_number)?;
-            let open = || tasks.iter().filter(|t| t.status != "done");
+            let open = || tasks.iter().filter(|_t| true);
             open()
                 .find(|t| t.pr.as_deref().and_then(pr_number) == Some(n))
                 .or_else(|| open().find(|t| t.issue.as_deref().and_then(pr_number) == Some(n)))
