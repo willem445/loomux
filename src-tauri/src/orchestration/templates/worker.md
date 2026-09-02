@@ -218,7 +218,6 @@ Three literal lines open it, in this order, each on a line of its own:
 <!-- agent-layer -->
 <details>
 <summary>Agent context — evidence, receipts, instruments</summary>
-
 ...the evidence...
 </details>
 ```
