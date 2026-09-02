@@ -6,6 +6,14 @@
 
 **Define the vision. Walk away. Come back to shipped software.**
 
+Every agent turn ends the same way: it stops and waits for you. So you wait
+too — eyes on the terminal, phone out at dinner, refreshing to see if it's done
+so you can type the next prompt. You bought an assistant and became one.
+
+I built Orrerix to end that loop. Hand it a backlog, close the laptop, and come
+back to merged pull requests — while you're out living your life instead of
+babysitting a cursor.
+
 Orrerix runs fleets of AI coding agents unsupervised, on real software
 discipline: review gates and green CI before anything merges, work tracked on
 GitHub and a live task board, your own CLIs and custom workflows — agents
@@ -13,30 +21,30 @@ follow the process, not the other way around.
 
 [![CI](https://github.com/willem445/orrerix/actions/workflows/ci.yml/badge.svg)](https://github.com/willem445/orrerix/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://willem445.github.io/orrerix/)
-
-![An orrerix window running an orchestrator and several agent panes](sample.jpg)
-
 [![Autonomous](https://img.shields.io/badge/autonomous-82%25%20unsupervised-blueviolet)](#hand-it-a-batch-of-work-and-walk-away)
 
-**orrerix builds itself.** 82% of its own active development time ran fully
-unsupervised — agents alone planning, building, adversarially reviewing, and
-shipping the work, with humans holding only the merge and release gates.
+![An orrerix window: an orchestrator pane top-left, a reviewer and a worker in their own panes below and beside it, with the git view and file explorer docked on the right](sample.jpg)
 
-- 82% of development time unsupervised — 22.3 of 27.2 hours of active
-  development ran with no human present, 4.9h with one
-- 48 human touch-points (prompts, merge approvals, release grants) against ~21,600
-  audited agent/system events — about 0.2%
+**Orrerix builds itself.** 82% of its own active development time — 22.3 of
+27.2 hours — ran with no human present: agents alone planning, building,
+adversarially reviewing and shipping the work, with humans holding only the merge
+and release gates. 48 human touch-points (prompts, merge approvals, release
+grants) against ~21,600 audited agent/system events — about 0.2%.
 
-Orrerix is a native desktop terminal for Windows, macOS and Linux — instant matrix
-splits, nameable panes, project tabs, session restore — with an
-**orchestrator/worker workflow built in**. Point a group at a repo, label some
-GitHub issues, and an orchestrator plans the work, spawns workers and reviewers
-into their own panes and their own git worktrees, and drives each issue to a pull
-request.
+It started as a terminal. I tried every multiplexer I could find and each one
+had a quirk I couldn't live with, so I built the one I wanted — a native desktop
+terminal for Windows, macOS and Linux with instant matrix splits, nameable panes,
+project tabs and session restore — and kept building. Today it is everything I
+need in one window: terminals, SSH, git, a file explorer and editor, and the
+agents themselves, with an **orchestrator/worker workflow built in**. It has
+replaced VS Code for me.
 
-Every prompt it sends is *typed into a pane you can read* — so you can steer any
-agent mid-task by just typing, or take the keyboard entirely. And by default no
-agent merges: that button stays yours.
+Point a group at a repo, label some GitHub issues, and an orchestrator plans the
+work, spawns workers and reviewers into their own panes and their own git
+worktrees, and drives each issue to a pull request. Every prompt it sends is
+*typed into a pane you can read*, so you can
+steer any agent mid-task by just typing, or take the keyboard entirely. And by
+default no agent merges: that button stays yours.
 
 The name comes from the **orrery**: a desk-sized geared model of the solar
 system where every planet and moon runs its own track at its own period, and the
@@ -51,14 +59,13 @@ npx orrerix            # Node 18+, any platform — downloads and launches
 npm install -g orrerix # …or install it and just run `orrerix`
 ```
 
-> **Coming from Loomux?** `loomux-desktop` is off npm entirely and there is no shim:
-> `npm uninstall -g loomux-desktop && npm install -g orrerix`. Installing Orrerix
-> leaves your old Loomux app in place rather than replacing it —
-> [Getting started](https://willem445.github.io/orrerix/getting-started) has the
-> uninstall commands.
+Then, in the app: open a pane → **Orchestrator + workers** → pick the repo, an
+agent CLI and model per role, and how many workers to start with. You'll need the
+`claude` or `copilot` CLI on `PATH`, and an authenticated `gh` for the issue/PR
+flow. Full walkthrough in [Getting started](https://willem445.github.io/orrerix/getting-started).
 
 <details>
-<summary>Other install paths — Windows / macOS / Linux one-liners, release assets, betas</summary>
+<summary>Other install paths — Windows / macOS / Linux one-liners, release assets, betas, upgrading from Loomux</summary>
 
 **Windows**
 
@@ -83,12 +90,12 @@ from [the releases page](https://github.com/willem445/orrerix/releases) directly
 Builds are unsigned for now — on macOS, if the app is reported as damaged, run
 `xattr -cr /Applications/Orrerix.app` (the install script does this for you).
 
-</details>
+**Coming from Loomux?** Orrerix installs beside your old Loomux app rather than
+over it, and `loomux-desktop` is off npm with no shim. The uninstall commands and
+what carries over are in
+[Getting started → Upgrading from Loomux](https://willem445.github.io/orrerix/getting-started#upgrading-from-loomux).
 
-Then, in the app: open a pane → **Orchestrator + workers** → pick the repo, an
-agent CLI and model per role, and how many workers to start with. You'll need the
-`claude` or `copilot` CLI on `PATH`, and an authenticated `gh` for the issue/PR
-flow. Full walkthrough in [Getting started](https://willem445.github.io/orrerix/getting-started).
+</details>
 
 ## Hand it a batch of work and walk away
 
@@ -138,6 +145,24 @@ committed to from under you, and parallel work starts from a clean base. The
 planner is read-only: no worktree, no file edits, no `git commit`/`push`,
 enforced at the CLI level.
 
+## Why orrerix over…
+
+- **tmux / zellij / [herdr](https://github.com/ogulcancelik/herdr)** — they
+  multiplex your agents; orrerix manages your agents' *work*.
+- **Prompt-layer orchestrators
+  ([superpowers](https://github.com/obra/superpowers),
+  [gstack](https://github.com/garrytan/gstack),
+  [oh-my-claudecode](https://github.com/yeachan-heo/oh-my-claudecode),
+  [gsd-pi](https://github.com/open-gsd/gsd-pi))** — review gates written as
+  prompts *inside* one agent CLI, which an agent can talk its way past. Orrerix
+  gates from outside the process instead — host-side, and backed by a machine
+  account when you want it airtight. Complementary, not competing — install them
+  inside a worker's pane.
+- **IDE-shaped agent platforms** — orrerix is still a terminal: lightweight,
+  native, and it opens *your* editor instead of embedding one.
+- **Unattended fleets you can't see** — every agent here works in a pane you can
+  read and interrupt mid-task, and the merge button stays human by default.
+
 ## What else is in the box
 
 - **Agent-aware panes** — alert chips when a CLI needs you, badges per role and
@@ -173,24 +198,6 @@ enforced at the CLI level.
   that plots it alongside the repo's issue and PR history.
 - **Lessons that outlive a session** — a committed `.orrerix/lessons.md` feeds
   hard-won repo knowledge into the next orchestrator's kickoff.
-
-## Why orrerix over…
-
-- **tmux / zellij / [herdr](https://github.com/ogulcancelik/herdr)** — they
-  multiplex your agents; orrerix manages your agents' *work*.
-- **Prompt-layer orchestrators
-  ([superpowers](https://github.com/obra/superpowers),
-  [gstack](https://github.com/garrytan/gstack),
-  [oh-my-claudecode](https://github.com/yeachan-heo/oh-my-claudecode),
-  [gsd-pi](https://github.com/open-gsd/gsd-pi))** — review gates written as
-  prompts *inside* one agent CLI, which an agent can talk its way past. Orrerix
-  gates from outside the process instead — host-side, and backed by a machine
-  account when you want it airtight. Complementary, not competing — install them
-  inside a worker's pane.
-- **IDE-shaped agent platforms** — orrerix is still a terminal: lightweight,
-  native, and it opens *your* editor instead of embedding one.
-- **Unattended fleets you can't see** — every agent here works in a pane you can
-  read and interrupt mid-task, and the merge button stays human by default.
 
 ## Documentation
 
@@ -230,32 +237,16 @@ Backend checks (what CI gates on) run from the repo root: `cargo check --locked
 - **E2E** (experimental, `e2e-windows` CI job) — Playwright over CDP against the
   real WebView2 webview: [`doc/design/e2e-testing.md`](doc/design/e2e-testing.md).
 - `ORRERIX_DATA_DIR` redirects the **entire** app-data root to an absolute path,
-  for a fully isolated second profile (the E2E harness uses it). Empty or relative
-  values are rejected rather than resolved against the working directory. The
-  pre-rename `LOOMUX_DATA_DIR` still works: every `ORRERIX_*` variable falls back
-  to its `LOOMUX_*` spelling, and setting both means `ORRERIX_*` wins.
-- Without an override, the root is `<platform data dir>/orrerix`. An install that
-  predates the rename is **moved there once**, from `<platform data dir>/loomux`,
-  on the first launch that finds only the old name — a single directory rename,
-  nothing deleted, with a note left behind at the old location saying where it
-  went. See [`doc/design/rebrand-filesystem.md`](doc/design/rebrand-filesystem.md).
-- A repo's committed config lives in `.orrerix/` (`workflow.yml`, `lessons.md`,
-  `workflow.layout.json`). A repo still using `.loomux/` is read exactly as before
-  and is **never** renamed for you; `.orrerix/` wins if both are present.
-- The strings agents match on — the `[orrerix]` notice marker, the MCP server and
-  its token header, the audit actor, the `ORRERIX_GROUP_DIR`/`ORRERIX_AGENT_ID`
-  exports — moved with the same rule and one extra clause: **one spelling is
-  emitted, every spelling is accepted.** A session recorded, a group created or a
-  tab saved before the rename still resolves. Let a running agent group finish
-  before upgrading, though: its agents were briefed with the old vocabulary. See
-  [`doc/design/rebrand-protocol.md`](doc/design/rebrand-protocol.md).
-- The published identities — the npm package and its command (both now `orrerix`),
-  the installed app, and the `Orrerix_*` release-asset filenames — moved together,
-  with no `loomux-desktop` shim. The launcher still recognises an app installed
-  under the old name, so `orrerix update` reads its version and will not downgrade
-  it; what no installer can do is replace it in place, so **Orrerix installs beside**
-  **Loomux rather than over it** and the old app is yours to uninstall when you are
-  ready. See [`doc/design/rebrand-external.md`](doc/design/rebrand-external.md).
+  for a fully isolated second profile (the E2E harness uses it). Without it the
+  root is `<platform data dir>/orrerix`. A repo's committed config lives in
+  `.orrerix/` (`workflow.yml`, `lessons.md`, `workflow.layout.json`).
+- **The Loomux → Orrerix rename** — the one-time data-dir move, the `LOOMUX_*`
+  env-var and `.loomux/` config fallbacks, the protocol strings agents match on
+  (one spelling emitted, every spelling accepted), and the npm/app/asset
+  identities are each specified in their own note:
+  [`rebrand-filesystem.md`](doc/design/rebrand-filesystem.md),
+  [`rebrand-protocol.md`](doc/design/rebrand-protocol.md),
+  [`rebrand-external.md`](doc/design/rebrand-external.md).
 
 The Windows installer ships one prebuilt, MIT-licensed runtime — a modern ConPTY
 host (`conpty.dll` + `OpenConsole.exe`, committed in
