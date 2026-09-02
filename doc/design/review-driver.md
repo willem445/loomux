@@ -1054,13 +1054,13 @@ file without one is exactly what that manifest exists to catch.
 
 ```yaml
 driver:
-  enabled: true               # default false
-  max_review_rounds: 3        # default 3, refused outside 1..=3
-  max_ci_attempts: 3          # default 3, refused outside 1..=3
-  max_rebase_attempts: 1      # default 1, refused outside 0..=1
-  lane_timeout_minutes: 60    # default 60, clamped like the notify TTLs
-  fix_timeout_minutes: 60     # default 60, same clamp family
-  drive_timeout_minutes: 240  # default 240, same clamp family
+  enabled: true               # default false; every other line below is its
+  max_review_rounds: 3        #   own default. A counter is REFUSED outside its
+  max_ci_attempts: 3          #   range and a timeout is CLAMPED into it; the
+  max_rebase_attempts: 1      #   ranges are in the pinned table in
+  lane_timeout_minutes: 60    #   docs/orchestration.md and are not repeated in
+  fix_timeout_minutes: 60     #   this example (#1872). Sec 2.3 above states the
+  drive_timeout_minutes: 240  #   counters' ranges; that copy is NOT pinned.
 ```
 
 **An absent block means the feature is off and behaviour is byte-for-byte
@@ -1105,6 +1105,37 @@ argument — about what a repo may pin on the **orchestrator block** — which
 `workflows.md` itself labels: "This one is not a capability argument … It is a
 **trust** argument." The conclusion survived the mis-citation; the reasoning did
 not, and §9 was inheriting it.)*
+
+**The user-facing statement of these bounds is pinned to the manifest.**
+`docs/orchestration.md`'s "The review driver's `driver:` block" states every
+field's range, default and refuse-vs-clamp policy in a table anchored by a
+`<!-- pinned-to-schema: sections.driver - ... -->` marker, and
+`test/docsdriverbounds.test.ts` reads that table, the YAML example above it and
+the bounds-summary row further up the page against `sections.driver` in
+`src/workflow-schema.json`. The join is default-deny in both directions: a
+manifest field with no row fails, and a row naming no manifest field fails, so a
+rename on either side cannot step over it. That is #1872's shape 1 for this one
+block: the BOUNDED half of what #1870 found, whose `:1699` finding named the
+three timeouts as the refused family when the engine refuses the three counters
+and clamps the timeouts - a false sentence a fully green suite could not see.
+
+**What is NOT pinned, named rather than implied.** §2.3 above restates the counters'
+ranges (`1..=3`, `0..=1`) as part of its refusal argument, and its opening paragraph
+restates INVARIANT 9's three numbers. Neither copy is pinned by anything, and neither
+was removed: §2.3's subject IS those numbers, so deleting them would cost the argument
+more than the duplication costs. This note is a developer surface read alongside the
+code; `docs/orchestration.md` is the user-facing one, and that is the one the test
+reads. A bound change therefore reddens on the two pinned sites and must be carried to
+§2.3 by hand.
+
+The rule that keeps it closed: **a new bounded, enumerable claim about `driver:`
+goes in that table, never in fresh prose.** The test locates its subjects by the
+marker and by the summary row's own lead-in, so a fourth statement of the same
+numbers somewhere else on the page is invisible to it. What the test does not
+reach is stated in its own header comment, including the one it must not be read
+as covering: the round-trip promise about ticking the driver on and off (#1949)
+is a claim about behaviour, has no counterpart in the manifest, and is pinned by
+nothing here.
 
 ### 5.4 Audit vocabulary
 
