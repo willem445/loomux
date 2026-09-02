@@ -69,9 +69,14 @@ pub fn status_for_outcome(outcome: &str) -> &'static str {
 /// **The catch-all DELIVERS.** A status word this function has never heard of
 /// is a orrerix change that forgot to come here, and the two failures are not
 /// symmetric: a surplus wake-up costs one turn, while a silently undelivered
-/// `done` strands a PR nobody routes. [`STATUSES`] is closed, and
-/// `every_status_is_classified` pins which member is kept off the pane — so a
-/// fourth status is a deliberate edit here rather than a silent default.
+/// `done` strands a PR nobody routes.
+///
+/// **What that costs, stated rather than papered over.** An unrecognised status
+/// SILENTLY inherits the deliver arm — no test can fail for one, because there
+/// is no input to this function that distinguishes "classified as delivering"
+/// from "never classified". What makes an addition deliberate is the VOCABULARY
+/// pin in `every_status_is_classified`, which asserts [`STATUSES`] is exactly
+/// the three members classified here; nothing else catches it.
 pub fn reaches_orchestrator_pane(status: &str) -> bool {
     match status {
         "progress" => false,
@@ -247,14 +252,28 @@ mod tests {
 
     #[test]
     fn every_status_is_classified() {
-        // The vocabulary is closed and this predicate must have an OPINION on
-        // every member of it rather than a catch-all doing the work: exactly
-        // one status is kept off the pane, and it is `progress`. A fourth
-        // status added without coming here reddens this instead of silently
-        // inheriting the deliver-by-default arm.
+        // TWO assertions, because the earlier revision of this test claimed a
+        // guard it did not have (#1966 rev-final N1). Filtering `STATUSES` says
+        // which member is kept off the pane — and a FOURTH status would fall to
+        // the deliver-by-default catch-all, stay out of `kept_off`, and leave
+        // that filter perfectly green. There is no input to this predicate that
+        // fails for an unclassified status; the catch-all is what makes that so,
+        // deliberately, because delivering is the safe direction.
+        //
+        // So what catches the addition is the VOCABULARY pin below, and it is
+        // the only thing that does. `STATUSES` is the closed list `mcp.rs`
+        // validates against, so adding a member here is a deliberate edit
+        // beside a classification, not a silent default.
         let kept_off: Vec<&str> =
             STATUSES.iter().copied().filter(|s| !reaches_orchestrator_pane(s)).collect();
         assert_eq!(kept_off, vec!["progress"], "STATUSES = {STATUSES:?}");
+        assert_eq!(
+            STATUSES,
+            ["progress", "done", "blocked"],
+            "the status vocabulary changed. `reaches_orchestrator_pane` has a deliver-by-default \
+             catch-all, so a new member inherits it SILENTLY (the filter above stays green) — \
+             classify it there, then update this pin."
+        );
     }
 
     #[test]
@@ -264,10 +283,21 @@ mod tests {
         // merge gate, so they are the LAST reports that may be silenced. The
         // predicate reads `status`, so this pins the COMPOSITION rather than
         // re-asserting the mapping its own tests above already pin.
+        //
+        // Same shape as the test above and for the same reason: the loop cannot
+        // see a NEW outcome (it would map to `done` and reach the pane, which is
+        // what the loop expects of everything but `progress`), so the vocabulary
+        // pin is what makes an addition deliberate.
         for o in OUTCOMES {
             let reaches = reaches_orchestrator_pane(status_for_outcome(o));
             assert_eq!(reaches, o != "progress", "outcome {o} classified wrong");
         }
+        assert_eq!(
+            OUTCOMES,
+            ["done", "blocked", "approved", "request_changes", "progress"],
+            "the outcome vocabulary changed. The loop above cannot fail for a new member — \
+             decide what it means for the pane, then update this pin."
+        );
     }
 
     #[test]

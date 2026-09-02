@@ -11782,6 +11782,27 @@ pub enum DigestLookup {
     Pr(String),
 }
 
+/// What [`OrchRegistry::report_task_note`] did, so the caller can tell the
+/// delegate the truth rather than a plausible sentence (#1966 rev-final N2).
+///
+/// `NoRow` and `Unreadable` were one answer in the first cut, and that answer
+/// — "no board task resolved from your session or ref" — is a claim about the
+/// board's CONTENTS made on a read that may simply have failed. It is the
+/// same defect one layer down as the "reported to orchestrator" this change
+/// set out to fix.
+#[derive(Debug, PartialEq, Eq)]
+enum NoteOutcome {
+    /// A row resolved and the note is on it.
+    Noted,
+    /// The board was read and nothing on it matched — the ordinary case for
+    /// an ad-hoc brief or a group that does not use the board.
+    NoRow,
+    /// The board could not be read or parsed. "I could not look" is not
+    /// "there was nothing there", so it is never reported as `NoRow`.
+    Unreadable,
+}
+
+
 /// Field edits for `upsert_task`; `None` leaves a field untouched.
 #[derive(Default)]
 pub struct TaskPatch {
@@ -28948,10 +28969,24 @@ impl OrchRegistry {
     // ---------- task board ----------
 
     pub fn tasks(&self, group: &GroupId) -> Vec<Task> {
-        fs::read_to_string(self.group_dir(group).join("tasks.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        self.tasks_or_err(group).unwrap_or_default()
+    }
+
+    /// The board, with a read or parse failure kept DISTINCT from an empty board
+    /// (#1966 rev-final N2). `tasks()` is this function with the distinction
+    /// thrown away, which is right for every caller that has nothing different to
+    /// do about it — and wrong for the one that would otherwise tell a delegate
+    /// "there was no matching row" when the truth is "I could not look".
+    ///
+    /// **A MISSING file is not a failure**: a group that has never written a board
+    /// has none, and that is the ordinary empty case. Anything else — an
+    /// unreadable file, a partial or malformed one — is an error.
+    fn tasks_or_err(&self, group: &GroupId) -> Result<Vec<Task>, String> {
+        match fs::read_to_string(self.group_dir(group).join("tasks.json")) {
+            Ok(s) => serde_json::from_str(&s).map_err(|e| format!("tasks.json is unreadable: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("tasks.json could not be read: {e}")),
+        }
     }
 
     /// Compact rows for the MCP `list_tasks` tool (#245) — see `TaskSummary`.
@@ -51211,32 +51246,55 @@ impl OrchRegistry {
     /// ad-hoc brief, a group not using the board — reports exactly as before and
     /// simply has no note to leave. Failing the tool call there would make the
     /// board mandatory, which it is not.
-    /// Answers whether a row was found and written, so the caller can tell the
-    /// delegate what really happened instead of naming a board note that does
-    /// not exist.
-    fn report_task_note(&self, group: &GroupId, agent_id: &str, ref_: Option<&str>, text: &str) -> bool {
-        let tasks = self.tasks(group);
+    /// Put a `progress` report on the board row this delegate is working.
+    ///
+    /// Answers which of the three [`NoteOutcome`]s happened.
+    fn report_task_note(
+        &self,
+        group: &GroupId,
+        agent_id: &str,
+        ref_: Option<&str>,
+        text: &str,
+    ) -> NoteOutcome {
+        let tasks = match self.tasks_or_err(group) {
+            Ok(t) => t,
+            Err(_) => return NoteOutcome::Unreadable,
+        };
         let session = self.agents.lock_safe().get(agent_id).and_then(|a| a.session_id.clone());
         let by_session = session.as_deref().and_then(|s| {
             tasks.iter().find(|t| t.session.as_deref() == Some(s))
         });
+        // **The `ref` fallback skips `done` rows** (#1966 rev-final premortem 1).
+        // Nothing clears `pr` when a task completes, so a long-lived board keeps
+        // finished rows carrying the same PR as the live follow-up work, and a
+        // first-match-wins scan over raw board order piles every note onto
+        // whichever sorts first. A `done` row is never the row a delegate is
+        // reporting progress ON, so it is the one class that can be excluded
+        // without guessing. TWO live rows sharing a `ref` remain ambiguous and
+        // first-match-wins — the residual, argued in the design note: the session
+        // is what disambiguates, and it is tried first for exactly this reason.
         let by_ref = || {
             let n = ref_.filter(|s| !s.is_empty()).and_then(pr_number)?;
-            tasks
-                .iter()
+            let open = || tasks.iter().filter(|t| t.status != "done");
+            open()
                 .find(|t| t.pr.as_deref().and_then(pr_number) == Some(n))
-                .or_else(|| tasks.iter().find(|t| t.issue.as_deref().and_then(pr_number) == Some(n)))
+                .or_else(|| open().find(|t| t.issue.as_deref().and_then(pr_number) == Some(n)))
         };
         let Some(id) = by_session.or_else(by_ref).map(|t| t.id.clone()) else {
-            return false;
+            return NoteOutcome::NoRow;
         };
-        self.upsert_task(
+        match self.upsert_task(
             group,
             brand::AUDIT_ACTOR,
             Some(&id),
             TaskPatch { note: Some(text.to_string()), ..TaskPatch::default() },
-        )
-        .is_ok()
+        ) {
+            Ok(_) => NoteOutcome::Noted,
+            // The row resolved from a snapshot and was gone by the time
+            // `upsert_task` re-read under the lock — `Err("unknown task")`. The
+            // board WAS readable; the row simply is not there any more.
+            Err(_) => NoteOutcome::NoRow,
+        }
     }
 
     /// `deliver_to_orchestrator` for a notice that relays ONE agent's own words

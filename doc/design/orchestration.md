@@ -2347,6 +2347,73 @@ the orchestrator would otherwise assume", which is the claim this change retract
 `tests/fixtures/pre222` re-blessed in the same commit; `tests/prompts.rs` repinned, because
 its old anchor was the retracted mandate itself and a test quoting a claim ENFORCES it.
 
+#### The lockstep runs to every READER of the signal, not just its writer (review round 1)
+
+The first cut edited the template that SENT a `progress` report and stopped there. Two shipped
+surfaces still keyed on RECEIVING one, and both are failure modes rather than stale prose.
+
+- **`orchestrator-playbook.md`'s silent-agent recovery** told the orchestrator that a freshly
+  spawned agent "reports ready/progress within a couple of minutes", and that silence past that
+  means "its kickoff was lost — re-send the task with `send_prompt`". After this change a working
+  delegate is silent by design, so a worker three steps into its brief reads identically to one
+  that never received it — and the re-send is not idempotent from the delegate's side, because
+  its duplicate-delivery check keys on the delivery id and a fresh `send_prompt` carries a new
+  one. The paragraph now decides from the PANE: **the kickoff is in the agent's own scrollback if
+  it landed**, whether or not the agent has said anything, so `send_prompt` again only when the
+  brief itself is absent. `get_task` is the second read; orrerix's `unconfirmed` notice and the
+  watchdog are what say a delivery is genuinely in doubt. "I have heard nothing" is never the
+  thing to act on.
+- **`worker.md`'s "If idle"** told an idle worker to "confirm with `report("progress", "ready")`
+  and wait" — a notification semantic on a report that now reaches nobody, and an idle worker has
+  no board row either, so it was audit-only and the wait never ended.
+
+**What replaces the idle confirmation, and why it is the rule rather than an exception to it.**
+The candidates were a `blocked`-class report, a board note the orchestrator polls, and
+`message_orchestrator`. The rule decides it: a delivery reaches the pane **iff it needs an
+orchestrator action**, and an idle worker with no task is asking for one — the orchestrator has
+to send it a brief. That is an action, so this belongs on the pane, and it belongs there through
+the channel that was never in scope to change.
+
+- Not `blocked`: that word means work that has STALLED, and it carries side effects that would be
+  lies here — `set_agent_idle`, and an attention badge reading `blocked` on a pane that is
+  perfectly healthy and simply unemployed.
+- Not a polled board note: an idle worker has no row to write one on (that is the same finding),
+  and inventing one would make the board a mailbox. A signal nobody is scheduled to read is a
+  worse version of the problem this change fixes — the orchestrator would have to poll, which
+  costs more turns than the one delivery it replaces.
+- `message_orchestrator` is unchanged, always lands, and is already documented as the delegate's
+  channel for "something that needs an action and is not a status change". Using it here does not
+  resurrect a `progress` delivery: no `report` call reaches a pane, and the residual list above is
+  unchanged.
+
+The two `report("progress", …)` calls that remain in `worker.md` — both in the CI-wait
+instructions — are deliberate. Neither claims the orchestrator hears it, and "waiting on CI,
+watch registered" is exactly the fact-worth-finding-later the tool-doc bullet describes, landing
+on the board where the human reads it.
+
+#### Three residuals this change accepts, each stated where it can be checked
+
+1. **An unclassified status silently delivers, and no test can fail for it.**
+   `reaches_orchestrator_pane`'s catch-all is deliberate — delivering is the safe direction — but
+   that also means there is no input distinguishing "classified as delivering" from "never
+   classified". What makes adding a status a deliberate act is a **vocabulary pin**:
+   `every_status_is_classified` asserts `STATUSES` is exactly the three members classified here,
+   and `every_reviewer_outcome_still_reaches_the_pane` does the same for `OUTCOMES`. Nothing else
+   catches it, and the earlier revision's rustdoc and test comments claimed otherwise.
+2. **"No matching row" and "I could not read the board" are different answers.** `tasks()` maps
+   any read or parse failure to an empty `Vec`, so the first cut told a delegate the board's
+   *contents* on a read that had merely failed. `tasks_or_err` keeps the distinction (a MISSING
+   file is still the ordinary empty case, not an error) and the tool has a third answer. The
+   read is still taken outside `tasks_lock` and can still lose a race with a concurrent
+   `atomic_write`; what changes is that the delegate is now told that is what happened, and the
+   audit log still carries the full text either way.
+3. **Two LIVE rows sharing a `ref` are still first-match-wins.** The `ref` fallback now skips
+   `done` rows — nothing clears `pr` on completion, so a long-lived board keeps finished rows
+   carrying the live work's PR, and those sort first — but two open rows on one PR remain
+   ambiguous. The session is what disambiguates, which is why it is tried first; a `ref` is an
+   agent-authored string and the board cannot tell which open row the delegate meant. The cost is
+   a misfiled note, never a decision.
+
 ## Notification backend (#243)
 
 Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the

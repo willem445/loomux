@@ -250,6 +250,43 @@ fn the_invariants_digest_leads_the_document_and_carries_what_compaction_would_co
          demand, but the trigger is what tells the orchestrator to fetch it");
 }
 
+/// **#1958, review round 1.** The two shipped surfaces that READ the signal #1958 removed.
+///
+/// A rule that deletes a signal has to reach every reader of it, not only its writer, and
+/// prose with no pin under it is prose the next compression deletes. Both of these were
+/// live failure modes rather than stale wording: the playbook told the orchestrator to
+/// re-send a brief on silence that is now normal, and `worker.md` told an idle worker to
+/// confirm through a channel that reaches nobody.
+///
+/// Anchored on the RULE each surface now states, plus a negative assertion on the retracted
+/// one — a test that quotes a claim enforces it, so the correction has to move the pin in
+/// the same commit and forbid the return (CLAUDE.md, #1502).
+#[test]
+fn no_shipped_template_still_waits_for_a_progress_report() {
+    let pb = flat(&playbook_instructions());
+    let recovery = section(&pb, "**silent-agent recovery", "on an `[orrerix] delivery to");
+    pinned("the playbook's silent-agent recovery", recovery, "the kickoff is in its own scrollback",
+        "after #1958 a working delegate is SILENT: the orchestrator must decide a lost kickoff \
+         from the pane's own transcript, never from having heard nothing");
+    pinned("the playbook's silent-agent recovery", recovery, "never infer a lost kickoff from having heard nothing",
+        "the retracted rule's remedy was to re-send the brief, which duplicates work on a \
+         delegate that is mid-task — the delivery-id check does not catch a fresh send_prompt");
+    assert!(
+        !recovery.contains("reports ready/progress within a couple of minutes"),
+        "the playbook must not wait for a signal no role produces any more (#1958): {recovery}"
+    );
+
+    let w = flat(&instructions("worker.md"));
+    let idle = section(&w, "## if idle", "## ");
+    pinned("worker.md's If idle", idle, "idle and ready for a brief",
+        "being idle and ready IS an orchestrator action (it has to send a brief), so it goes \
+         through the one delegate channel #1958 never touches");
+    assert!(
+        !idle.contains("report(\"progress\", \"ready\")"),
+        "an idle worker must not confirm through a report that reaches no pane (#1958): {idle}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The findings-disposition policy — the most load-bearing prose in the suite
 // ---------------------------------------------------------------------------------------------

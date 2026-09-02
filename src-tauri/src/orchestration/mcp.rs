@@ -3307,7 +3307,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // driven arm's wording is deliberately left alone — what a driver
             // consumed is #1778 §7's story to tell, not this change's.
             let mut off_pane = false;
-            let mut noted = false;
+            let mut note_outcome = super::NoteOutcome::NoRow;
             // #1778 §7: **for a driven PR the recipient changes.** A delegate
             // this group's review driver spawned or resumed reports to the
             // DRIVER; the orchestrator's visible prompt is the kick-back (§6),
@@ -3429,7 +3429,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
                 }
                 None => {
-                    noted = reg.report_task_note(
+                    note_outcome = reg.report_task_note(
                         &caller.group,
                         &caller.agent_id,
                         arg_str(args, "ref"),
@@ -3448,9 +3448,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role == Role::Planner && status == "done" {
                 reg.close_completed_planner(&caller.agent_id);
             }
-            Ok(match (off_pane, noted) {
-                (true, true) => "recorded in the audit log and noted on your board task. A progress report never reaches the orchestrator's pane (#1958) — report done or blocked when you need it to act, or message_orchestrator when something else does.",
-                (true, false) => "recorded in the audit log. No board task resolved from your session or ref, so there is no note; a progress report never reaches the orchestrator's pane either (#1958) — report done or blocked when you need it to act.",
+            // Three answers, not two (#1966 rev-final N2): "the board says no
+            // such row" and "I could not read the board" are different facts,
+            // and collapsing them would put a false claim in front of the one
+            // caller who could act on it — the same defect this change fixes one
+            // layer up by not saying "reported to orchestrator".
+            Ok(match (off_pane, &note_outcome) {
+                (true, super::NoteOutcome::Noted) => "recorded in the audit log and noted on your board task. A progress report never reaches the orchestrator's pane (#1958) — report done or blocked when you need it to act, or message_orchestrator when something else does.",
+                (true, super::NoteOutcome::NoRow) => "recorded in the audit log. No board task on this group's board matched your session or ref, so there is no note; a progress report never reaches the orchestrator's pane either (#1958) — report done or blocked when you need it to act.",
+                (true, super::NoteOutcome::Unreadable) => "recorded in the audit log. This group's board could not be read just now, so no note was written — that is NOT the same as there being no matching task, and nothing was lost: the audit log has the full text. A progress report never reaches the orchestrator's pane either (#1958).",
                 _ => "reported to orchestrator",
             }
             .into())
