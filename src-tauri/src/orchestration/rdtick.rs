@@ -1267,9 +1267,13 @@ impl OrchRegistry {
                             if super::is_live_cap_refusal(&why) {
                                 return Err(why);
                             }
-                            // SCRATCH #2109 M2: the pre-fix arm — the resume
-                            // failure falls through to a fresh pane silently.
-                            let _ = (&on_behalf, pr, &session, why);
+                            self.rd_audit(group, &on_behalf, rddrive::audit_action::LANE_RESUME_FAILED, json!({
+                                "pr": pr,
+                                "block": block,
+                                "session": session,
+                                "head": brief.head,
+                                "detail": why,
+                            }));
                             (fresh(self)?, false)
                         }
                     };
@@ -1315,10 +1319,22 @@ impl OrchRegistry {
         group: &GroupId,
         lane: Option<&reviewdrive::LaneRecord>,
     ) -> Option<String> {
-        // SCRATCH #2109 M1: the pre-fix arm — the lane RECORD and nothing else.
-        let _ = group;
         let lane = lane?;
-        Some(lane.session.clone()).filter(|s| !s.trim().is_empty())
+        let keep = |s: String| Some(s).filter(|s| !s.trim().is_empty());
+        if let Some(s) = keep(lane.session.clone()) {
+            return Some(s);
+        }
+        if lane.agent.trim().is_empty() {
+            return None;
+        }
+        if let Some(s) = self.agent(&lane.agent).and_then(|a| a.session_id).and_then(keep) {
+            return Some(s);
+        }
+        self.merged_records(group)
+            .into_iter()
+            .find(|r| r.id == lane.agent)
+            .and_then(|r| r.session)
+            .and_then(keep)
     }
 
     /// The pane that already holds this lane's round, when opening another
@@ -1344,9 +1360,14 @@ impl OrchRegistry {
         lane: Option<&reviewdrive::LaneRecord>,
         head: &str,
     ) -> Option<String> {
-        // SCRATCH #2109 M3: the pre-fix arm — no duplicate is ever refused.
-        let _ = (lane?, head);
-        None
+        let lane = lane?;
+        if lane.agent.trim().is_empty() || head.is_empty() || lane.briefed_head != head {
+            return None;
+        }
+        match self.agent(&lane.agent) {
+            Some(a) if a.status != AgentStatus::Dead => Some(lane.agent.clone()),
+            _ => None,
+        }
     }
 
     /// **Reuse before spawn** (#1960): resume `session` into the live idle pane
@@ -2216,9 +2237,13 @@ impl OrchRegistry {
                         // the diagnosis-for-observation swap #1961 fixed one
                         // hold over. Those keep the bound they have,
                         // `drive_timeout_minutes`, which asserts nothing.
-                        if cap && entry.note_cap_starvation(now) {
-                            out.changed = true;
-                        }
+                        // SCRATCH #2109 M7: the pre-fix WIRING — the tick never
+                        // stamps the starvation, so `decide` (unchanged, and its
+                        // own unit tests still green) is handed nothing to
+                        // report. Neutering the wiring rather than the pure
+                        // function is what keeps the lib test binary passing, so
+                        // `cargo test` reaches the integration target at all.
+                        let _ = cap;
                         out.audits.push((
                             rddrive::audit_action::REFUSED,
                             json!({ "pr": pr, "block": block, "reason": "lane-spawn-refused",
