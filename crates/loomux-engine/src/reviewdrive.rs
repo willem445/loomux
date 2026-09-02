@@ -1342,7 +1342,7 @@ impl DriveEntry {
     /// **Only in `fix-wait`.** In any other state there is no hand-back to be
     /// waiting on and nothing the worker was asked for.
     pub fn kickback_owed(&self) -> bool {
-        self.state == DriveState::FixWait && self.fix_kickback_ms < self.fix_handback_ms
+        self.state == DriveState::FixWait
     }
 
     /// Record that this drive answered its worker at `now_ms` — see
