@@ -37,7 +37,12 @@ Two consequences of the reuse, both deliberate:
 - The pane's initial-focus marker (`data-initial-focus`, rev-74 LOW-4/LOW-6)
   follows the VISIBLE half of the picker: the free-text input when it is
   showing, the recents select when the dropdown branch hides it, because
-  `focus()` on a hidden element lands nowhere.
+  `focus()` on a hidden element lands nowhere. It is re-homed on every branch
+  flip, not just stamped once — a Browse… pick of a folder already in the
+  recents, or the human picking one in the dropdown, can hide the half the
+  marker was on while the pane stays open, and `Pane.focus()` routes into
+  `focusWelcome()` on every window-refocus and keyboard-nav (rev-std round 1,
+  finding 2 on #2010).
 
 The E2E helpers follow the same contract (`e2e/helpers.ts` `fillRepoField`):
 their structural selectors are declared coupled to `src/launcher.ts`'s DOM
@@ -66,10 +71,16 @@ unchanged:
 - Recorded on every launch (as before: terminal cwd, content/git root,
   orchestrator/agent repo) **and now on every Browse… pick** — the pick IS the
   gesture, the same argument the #1042 `admitRoot` call beside it makes.
-- Not recorded from elsewhere, on purpose: the side dock re-roots to the active
-  pane's cwd and opens no directory itself, and the terminal pane's "Change
-  folder" chip is a shell `cd`, not a launch — neither is a directory the human
-  asked the launcher to work in.
+- NOT recorded from the side dock, though the dock does open directories: its
+  File-explorer 📁 picker (`fileexplorer.ts` `pickRoot`) and the dock-embedded
+  editor's folder browse (`fileedit.ts`) both re-root the DOCK itself
+  (`sidedock.ts` `adoptRoot`, "re-roots the DOCK, not just itself"). The reason
+  they stay out: the pick chooses the dock's own viewing context, and the dock
+  also re-roots itself to follow the active pane's cwd — neither is a directory
+  the human asked the launcher to launch a pane into, which is the question the
+  recents list answers (the issue's QoL ask: every launch means browsing
+  again). The terminal pane's "Change folder" chip is the same shape: it is a
+  shell `cd`, not a launch.
 - The ordering/dedup/cap decision lives in `src/recentdirs.ts`
   (`mergeRecentDir`, node-tested in `test/recentdirs.test.ts`): trimmed, then
   deduplicated to the front, capped at `MAX_RECENT_REPOS` (8 — the cap

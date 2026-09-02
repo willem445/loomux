@@ -93,6 +93,7 @@ export class ModelPicker {
     this.custom.hidden = true;
     this.sel.addEventListener("change", () => {
       this.custom.hidden = this.sel.value !== CUSTOM_OPTION;
+      this.rehomeInitialFocus();
       if (!this.custom.hidden) this.custom.focus();
       this.paintSummary();
       this.onChange?.();
@@ -225,7 +226,26 @@ export class ModelPicker {
     this.sel.value = state.selected;
     if (state.showCustom) this.custom.value = state.custom;
     this.custom.hidden = !state.showCustom;
+    this.rehomeInitialFocus();
     this.paintSummary();
+  }
+
+  /** Keep a host's `data-initial-focus` marker on the VISIBLE half (rev-std
+   *  round 1, finding 2 on #2010). The launcher stamps it on whichever half
+   *  shows at construction, but a branch flip afterwards — a Browse… pick that
+   *  lands on a recent, or the human picking one in the dropdown — would
+   *  strand it on the now-hidden element, where `focus()` is a no-op and the
+   *  pane's focusWelcome() lands nowhere. Moved only between these two
+   *  elements: a marker this picker did not stamp on one of its own halves is
+   *  never touched. */
+  private rehomeInitialFocus(): void {
+    if (this.custom.hasAttribute("data-initial-focus") && this.custom.hidden) {
+      this.custom.removeAttribute("data-initial-focus");
+      this.sel.setAttribute("data-initial-focus", "");
+    } else if (this.sel.hasAttribute("data-initial-focus") && this.sel.hidden) {
+      this.sel.removeAttribute("data-initial-focus");
+      this.custom.setAttribute("data-initial-focus", "");
+    }
   }
 
   /** Focus whichever half is showing. The validation-error paths bounce the
