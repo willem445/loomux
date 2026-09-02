@@ -1267,13 +1267,9 @@ impl OrchRegistry {
                             if super::is_live_cap_refusal(&why) {
                                 return Err(why);
                             }
-                            self.rd_audit(group, &on_behalf, rddrive::audit_action::LANE_RESUME_FAILED, json!({
-                                "pr": pr,
-                                "block": block,
-                                "session": session,
-                                "head": brief.head,
-                                "detail": why,
-                            }));
+                            // SCRATCH #2109 M2: the pre-fix arm — the resume
+                            // failure falls through to a fresh pane silently.
+                            let _ = (&on_behalf, pr, &session, why);
                             (fresh(self)?, false)
                         }
                     };
@@ -1319,22 +1315,10 @@ impl OrchRegistry {
         group: &GroupId,
         lane: Option<&reviewdrive::LaneRecord>,
     ) -> Option<String> {
+        // SCRATCH #2109 M1: the pre-fix arm — the lane RECORD and nothing else.
+        let _ = group;
         let lane = lane?;
-        let keep = |s: String| Some(s).filter(|s| !s.trim().is_empty());
-        if let Some(s) = keep(lane.session.clone()) {
-            return Some(s);
-        }
-        if lane.agent.trim().is_empty() {
-            return None;
-        }
-        if let Some(s) = self.agent(&lane.agent).and_then(|a| a.session_id).and_then(keep) {
-            return Some(s);
-        }
-        self.merged_records(group)
-            .into_iter()
-            .find(|r| r.id == lane.agent)
-            .and_then(|r| r.session)
-            .and_then(keep)
+        Some(lane.session.clone()).filter(|s| !s.trim().is_empty())
     }
 
     /// The pane that already holds this lane's round, when opening another
@@ -1360,14 +1344,9 @@ impl OrchRegistry {
         lane: Option<&reviewdrive::LaneRecord>,
         head: &str,
     ) -> Option<String> {
-        let lane = lane?;
-        if lane.agent.trim().is_empty() || head.is_empty() || lane.briefed_head != head {
-            return None;
-        }
-        match self.agent(&lane.agent) {
-            Some(a) if a.status != AgentStatus::Dead => Some(lane.agent.clone()),
-            _ => None,
-        }
+        // SCRATCH #2109 M3: the pre-fix arm — no duplicate is ever refused.
+        let _ = (lane?, head);
+        None
     }
 
     /// **Reuse before spawn** (#1960): resume `session` into the live idle pane
