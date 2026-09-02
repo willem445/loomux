@@ -11800,8 +11800,22 @@ enum NoteOutcome {
     /// The board could not be read or parsed. "I could not look" is not
     /// "there was nothing there", so it is never reported as `NoRow`.
     Unreadable,
+    /// A row DID resolve and the write did not land (#1966 rev-final round 2
+    /// N1). Two causes reach this, and neither is `NoRow`:
+    ///
+    ///  - the board write itself failed — `write_tasks` propagates
+    ///    `create_dir_all` and `atomic_write` errors, which is the disk-full
+    ///    case #133 filed;
+    ///  - the row was gone when `upsert_task` re-read under the lock
+    ///    (`unknown task`). In-process that needs a concurrent writer, since a
+    ///    single thread's two reads see the same file — so the IO cause is the
+    ///    reachable one, and the first cut of this arm named only the other.
+    ///
+    /// They share one answer deliberately: the delegate's next move is the same
+    /// either way (nothing, the audit log has the text), and splitting them
+    /// would mean deciding between them on an error STRING.
+    NotWritten,
 }
-
 
 /// Field edits for `upsert_task`; `None` leaves a field untouched.
 #[derive(Default)]
@@ -51252,9 +51266,8 @@ impl OrchRegistry {
     /// ad-hoc brief, a group not using the board — reports exactly as before and
     /// simply has no note to leave. Failing the tool call there would make the
     /// board mandatory, which it is not.
-    /// Put a `progress` report on the board row this delegate is working.
     ///
-    /// Answers which of the three [`NoteOutcome`]s happened.
+    /// Answers which of the four [`NoteOutcome`]s happened.
     fn report_task_note(
         &self,
         group: &GroupId,
@@ -51296,10 +51309,12 @@ impl OrchRegistry {
             TaskPatch { note: Some(text.to_string()), ..TaskPatch::default() },
         ) {
             Ok(_) => NoteOutcome::Noted,
-            // The row resolved from a snapshot and was gone by the time
-            // `upsert_task` re-read under the lock — `Err("unknown task")`. The
-            // board WAS readable; the row simply is not there any more.
-            Err(_) => NoteOutcome::NoRow,
+            // NEVER `NoRow`: a row DID resolve, so answering "nothing matched"
+            // would be a claim about the board's contents made on a write that
+            // failed — the same defect this whole change fixes by not saying
+            // "reported to orchestrator" (#1966 rev-final round 2 N1). See
+            // [`NoteOutcome::NotWritten`] for the two causes that land here.
+            Err(_) => NoteOutcome::NotWritten,
         }
     }
 

@@ -3457,6 +3457,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 (true, super::NoteOutcome::Noted) => "recorded in the audit log and noted on your board task. A progress report never reaches the orchestrator's pane (#1958) — report done or blocked when you need it to act, or message_orchestrator when something else does.",
                 (true, super::NoteOutcome::NoRow) => "recorded in the audit log. No board task on this group's board matched your session or ref, so there is no note; a progress report never reaches the orchestrator's pane either (#1958) — report done or blocked when you need it to act.",
                 (true, super::NoteOutcome::Unreadable) => "recorded in the audit log. This group's board could not be read just now, so no note was written — that is NOT the same as there being no matching task, and nothing was lost: the audit log has the full text. A progress report never reaches the orchestrator's pane either (#1958).",
+                (true, super::NoteOutcome::NotWritten) => "recorded in the audit log. A board task DID match, but the note could not be written to it — the board write failed, or that row went away underneath this call. Nothing was lost: the audit log has the full text. A progress report never reaches the orchestrator's pane either (#1958).",
                 _ => "reported to orchestrator",
             }
             .into())
