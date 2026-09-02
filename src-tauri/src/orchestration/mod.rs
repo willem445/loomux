@@ -43673,7 +43673,6 @@ impl OrchRegistry {
                     && a.status != AgentStatus::Dead
                     && a.session_id.as_deref() == Some(session)
                     && a.block == block
-                    && a.idle_since_ms.is_some()
             })
             .filter_map(|a| Some((a.started_ms, a.id.clone(), a.pty_id?)))
             .collect();
