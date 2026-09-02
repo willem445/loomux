@@ -1274,12 +1274,7 @@ impl OrchRegistry {
     /// present and losing the persona beats losing the session, while here
     /// nobody is watching and a silently re-personad worker is #1961.
     fn rd_resume_block(&self, group: &GroupId, session: &str) -> Result<Option<String>, String> {
-        let rec = self.session_identity_record(group, session).ok_or_else(|| {
-            format!(
-                "no roster record maps session {session:?} to a block, so the class it must \
-                 resume under cannot be established — refusing to guess one"
-            )
-        })?;
+        let Some(rec) = self.session_identity_record(group, session) else { return Ok(None) };
         let block = rec.block.trim();
         Ok((!block.is_empty()).then(|| block.to_string()))
     }
