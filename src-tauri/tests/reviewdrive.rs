@@ -4709,3 +4709,171 @@ fn the_kick_back_is_bounded_to_one_per_handback_and_renews_on_the_next() {
     );
     assert_eq!(action_count(&reg, &group, "rd-kickback"), 2);
 }
+
+/// A roster whose required reviewer lane is **not** the default reviewer block
+/// (#1961), so a lane RESUME that named no block is visible.
+///
+/// `rev-std` is declared first and is therefore `block_for(Reviewer)`'s answer;
+/// the gate requires `rev-final`. Under the one-reviewer fixture the two are
+/// the same string and the lane half of #1961 is unfalsifiable, exactly as the
+/// worker half was.
+const WORKFLOW_TWO_REVIEWERS: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+  - id: rev-final
+    name: Final review
+    kind: reviewer
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-final]
+    routing:
+      - paths: [src/**]
+        reviewers: [rev-final]
+merge_queue:
+  enabled: true
+driver:
+  enabled: true
+"#;
+
+/// **The lane half of #1961's root cause.** `rd_open_lane`'s RESUME arm passed
+/// `block: None` too, so a re-briefed lane came back as the roster's default
+/// reviewer block: a `rev-final` lane resumed as `rev-std`, on that block's CLI
+/// and persona, still filed under `rev-final` and still expected to record
+/// `rev-final`'s verdict.
+///
+/// The first spawn is the control and it always passed the block, so a run
+/// where only the first assertion holds says the resume is still guessing.
+#[test]
+fn a_lane_re_brief_resumes_under_that_lanes_own_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_REVIEWERS);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+
+    reg.rd_drive_group_with(&group, &gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    let (_pr, block, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    assert_eq!(block, "rev-final", "the fixture's premise: the gate requires the NON-default lane");
+    assert_eq!(reg.agent(&lane).unwrap().block, "rev-final", "the control: a FRESH lane spawn already named its block");
+
+    // The lane answers, then the head moves under it — which stales the pass and
+    // sends the drive back round to re-brief the SAME lane, by resume.
+    let caller =
+        Caller { agent_id: lane.clone(), group: group.clone(), role: Role::Reviewer, role_hint: None };
+    dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+    )
+    .expect("the lane records");
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> ci-wait (arc 6)
+    reg.rd_drive_group_with(&group, &gh, 40_000); // ci-wait -> review-wait (arc 2)
+    let again = reg.rd_drive_group_with(&group, &gh, 50_000); // re-brief, by resume
+    let (_pr, _b, lane2) =
+        again.lanes_opened.first().cloned().expect("the stale lane is re-briefed");
+    assert_ne!(lane2, lane, "the re-brief opened a pane, which is what carries the block");
+    assert_eq!(
+        reg.agent(&lane2).unwrap().block,
+        "rev-final",
+        "the RESUME dropped the lane's block and fell through to the roster's default \
+         reviewer — a different persona and CLI, still filed under rev-final"
+    );
+}
+
+/// **A session this group has no record of refuses rather than defaults**
+/// (#1961). `drive_review` accepts a well-shaped session id it never recorded
+/// (§5.1: `resolve_session_ref`'s passthrough arm, and resolving is not proving
+/// resumable), so the hand-back is where that is learned — and what it must not
+/// do there is invent a capability class, which is #544's rule reaching the
+/// driver. The pre-#1961 code defaulted to the roster's worker block and opened
+/// a pane; a pane opened under a guessed class is exactly what produced the
+/// dead worker this issue is about.
+///
+/// Its own test rather than a corollary of the stale-block one: that refusal
+/// comes from `spawn_agent_bound`'s roster check, this one from the driver
+/// declining to ask.
+#[test]
+fn a_handback_for_a_session_this_group_never_recorded_refuses_rather_than_guessing() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let group = reg.create_group(&repo.path(), rails()).unwrap().id;
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7701);
+
+    // A full, well-shaped session id this roster has never seen.
+    let stranger = "deadbeef-0000-4000-8000-000000000000";
+    let out = reg.drive_review_with(&group, &gh, 1758, stranger, false, 0, "orch-1", 0);
+    assert_eq!(
+        out["driving"],
+        json!(true),
+        "the premise: drive_review ACCEPTS it — §5.1 says resolving is not proving \
+         resumable, and this is the deferral that makes: {out}"
+    );
+
+    let handed = to_first_handback(&reg, &group, &gh);
+    assert!(handed.handbacks.is_empty(), "no pane may be opened on a guessed class");
+    assert_eq!(status_state(&reg, &group), "held");
+    let held = audit_details(&reg, &group, "rd-held");
+    assert_eq!(held[0]["reason"], json!("worker-unresumable"), "{held:?}");
+    let refusal = held[0]["refusal"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("refusing to guess"),
+        "the row must say it DECLINED to pick a class, not that something failed: \
+         {refusal:?}"
+    );
+}
+
+/// **`driver-fix.md` names the report the drive advances on** (#1959), read off
+/// the brief a real hand-back typed rather than off the template source — the
+/// §5.5 rule that a pin must exercise the live render path.
+///
+/// The old sentence was *"Address it, push, and report when the checks are
+/// green"*, which has no trigger at all for a body-only fix: nothing to push,
+/// no new checks. A literal reader picks `progress`, and that is the round that
+/// stalled for ten minutes.
+#[test]
+fn the_fix_brief_names_the_report_that_advances_the_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _s) = driven(&reg, &repo, &gh);
+    let handed = to_first_handback(&reg, &group, &gh);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+    let brief = lane_brief(&reg, &worker);
+
+    assert!(
+        brief.contains("report(outcome=done, ref=#1758)"),
+        "the brief must name the exact call, with this PR's number: {brief}"
+    );
+    assert!(
+        brief.contains("If it did not move the head"),
+        "…and the head-unchanged case, which the old wording had no trigger for: {brief}"
+    );
+    assert!(
+        !brief.contains("report when the checks are green. This is attempt"),
+        "the retracted sentence is what a literal reader answered with progress: {brief}"
+    );
+    // The fix brief is ONE paragraph per sentence, like the lane brief — a
+    // rendered `\n` plus source indentation would ship the template's own
+    // wrapping into a worker's pane.
+    for line in brief.lines() {
+        assert!(
+            !line.starts_with(' '),
+            "a rendered brief line must not be indented: {line:?}"
+        );
+    }
+}
