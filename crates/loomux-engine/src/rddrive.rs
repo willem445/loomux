@@ -800,7 +800,7 @@ pub struct HeldFacts {
 /// §6's hold kick-back, in one shape carrying **the one fact that decides what
 /// the orchestrator does next** for this reason.
 ///
-/// One function rather than thirteen, because §2.2 makes `held` one state with a
+/// One function rather than fourteen, because §2.2 makes `held` one state with a
 /// closed reason enum for exactly this reason: a reader asking "is this drive
 /// parked" asks one question, and the reason travels in the notice rather than
 /// being inferred from which counter happens to sit at its bound.
