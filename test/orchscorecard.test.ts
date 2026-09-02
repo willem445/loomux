@@ -298,7 +298,9 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
   assert.deepEqual(e.agents.map((a: any) => a.agent).sort(), ['rev-12', 'w-14']);
   assert.equal(e.tokens.total, 6070);
   // The orchestrator's own `usage.json` row must never be counted as a delegate —
-  // it would be double-counted against the transcript figure.
+  // it would be double-counted against the transcript figure. orch-10 IS attributed
+  // to #900 by its restore brief (see the coverage test), so this is the role filter
+  // being exercised, not an agent that was never a candidate.
   for (const c of REPORT.prs) {
     assert.equal(c.delegates.agents.some((a: any) => a.agent === 'orch-10'), false);
   }
@@ -351,8 +353,12 @@ test('coverage: unattributed and split agents are named, not swallowed', () => {
   // the gap #2011 B2 exists to close, so it must appear by name.
   assert.deepEqual(cov.agents_unattributed_spawned_in_window, ['w-15']);
   assert.deepEqual(cov.agents_split_across_prs, [{ agent: 'rev-12', prs: [900, 901], tier: 'structural' }]);
-  assert.equal(cov.agents_attributed, 4);
-  assert.equal(cov.audit_rows_read, 25);
+  // POSITIVE CONTROL for the delegate test's "orchestrator excluded" assertion: the
+  // corpus DOES attribute orch-10 to #900 (its restore brief names the PR), so that
+  // assertion is about the role filter rather than about orch-10 never being seen.
+  assert.equal(cov.agents_attributed, 5);
+  assert.equal(cov.agents_unattributed_spawned_in_window.includes('orch-10'), false);
+  assert.equal(cov.audit_rows_read, 26);
   assert.equal(cov.audit_parse_errors, 0);
   assert.equal(cov.usage_rows_without_agent_id, 0);
   assert.deepEqual(cov.transcripts, [{
@@ -363,7 +369,7 @@ test('coverage: unattributed and split agents are named, not swallowed', () => {
 test('coverage: rows inside a window that no counter consumed are reported by action', () => {
   // Not every row naming a PR is a counter's input. Those that are not are named, so
   // "the scorecard saw everything" is checkable rather than assumed.
-  assert.deepEqual(card(900).rows_unclassified_in_window, { 'agent-spawn': 1, prompt: 1 });
+  assert.deepEqual(card(900).rows_unclassified_in_window, { 'agent-spawn': 2, prompt: 1 });
   assert.deepEqual(card(901).rows_unclassified_in_window, { 'agent-spawn': 1 });
 });
 
@@ -385,7 +391,7 @@ test('coverage: every heuristic is declared with an id, a statement and its stru
 test('group totals: per-file wake census, independent of any PR selection', () => {
   assert.equal(REPORT.group.files.length, 1);
   const f = REPORT.group.files[0];
-  assert.equal(f.rows, 25);
+  assert.equal(f.rows, 26);
   assert.equal(f.orchestrator_wakes, 8);
   assert.equal(f.prompt_typed_to_orchestrator, 0);
   assert.deepEqual(f.wakes_by_kind, {
@@ -400,7 +406,7 @@ test('group totals: per-file wake census, independent of any PR selection', () =
 test('--cut reproduces a historical measurement on a log that has since grown', () => {
   const cut = JSON.parse(runScorecard(['--cut', '1700000500000']));
   const f = cut.group.files[0];
-  assert.equal(f.rows, 19, 'rows after the cut instant are dropped');
+  assert.equal(f.rows, 20, 'rows after the cut instant are dropped');
   assert.ok(f.rows < REPORT.group.files[0].rows);
   // The cut lands between the first verdict and the hand-back, so #900 keeps one
   // round and loses the rest — a non-zero survivor, so this is not the vacuous

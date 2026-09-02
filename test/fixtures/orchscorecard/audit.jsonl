@@ -1,4 +1,5 @@
 {"action":"agent-spawn","actor":"orrerix","detail":{"agent":"w-13","block":"worker-adv","role":"worker","task":"open the fix for #900 and drive it to green"},"ts_ms":1700000000000}
+{"action":"agent-spawn","actor":"orrerix","detail":{"agent":"orch-10","block":"orchestrator","role":"orchestrator","task":"orchestrator pane restored; in flight: #900 and its review rounds"},"ts_ms":1700000015000}
 {"action":"agent-spawn","actor":"orrerix","detail":{"agent":"w-14","block":"worker-std","role":"worker","task":"hand-route the review rounds on #901"},"ts_ms":1700000030000}
 {"action":"agent-spawn","actor":"orrerix","detail":{"agent":"w-15","block":"worker-std","role":"worker","task":"unrelated errand, names no pull request"},"ts_ms":1700000045000}
 {"action":"prompt","actor":"w-13","detail":{"to":"orch-10","text":"[orrerix] w-13 reports progress (#900): pushed the first commit, CI queued."},"ts_ms":1700000060000}
