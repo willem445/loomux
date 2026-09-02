@@ -53,30 +53,24 @@ test("the roster is the one the repo means to run", () => {
   // renamed *id* must, because it breaks the gate.
   assert.deepEqual(
     workflow.blocks.map((b) => b.id),
-    [
-      "orchestrator",
-      "planner",
-      "worker-deep",
-      "worker-quick",
-      "rev-lead",
-      "qr-evidence",
-      "qr-tests",
-      "qr-constraints",
-      "process",
-    ]
+    ["orchestrator", "planner", "worker-std", "worker-adv", "rev-std", "rev-final", "process"]
   );
-  // Two worker tiers, and the deep one FIRST: the first block of a class is what a
-  // bare `spawn_agent(kind: "worker")` resolves to, and the safe default for an
-  // unrouted task is the model that can handle ambiguity. `process` is worker-kind
-  // too (#324) but role_hint-gated, so it is excluded from this default-tier pin.
+  // Two worker tiers, and the STANDARD one FIRST — which is the opposite default
+  // from the roster this replaced, and deliberate. The first block of a class is
+  // what a bare `spawn_agent(kind: "worker")` resolves to, and this file's own
+  // rule 3 ("CLASSIFY THE WORKER AT INTAKE") is that the orchestrator chooses the
+  // tier when it writes the brief; the fallback is therefore the cheap one, so an
+  // unrouted task is one nobody classified rather than one that silently cost
+  // Opus. `process` is worker-kind too (#324) but role_hint-gated, so it is
+  // excluded from this default-tier pin.
   const tiers = workflow.blocks.filter((b) => b.kind === "worker" && !b.role_hint);
   assert.deepEqual(
-    tiers.map((b) => [b.id, b.model]),
+    tiers.map((b) => [b.id, b.cli, b.model]),
     [
-      ["worker-deep", "opus"],
-      ["worker-quick", "sonnet"],
+      ["worker-std", "opencode", "openrouter/z-ai/glm-5.3-flash"],
+      ["worker-adv", "claude", "opus"],
     ],
-    "the tiers are the demo: a deep worker on the strong model, a quick one on the cheap one"
+    "the tiers are the demo: a cheap default worker, and a strong one for work with judgment in it"
   );
   // process (#324): role_hint pairs with the kind it requires — the worker-side
   // half of that rule is exercised end to end by this real file. (The
@@ -84,31 +78,40 @@ test("the roster is the one the repo means to run", () => {
   // below when the advisor block left the roster; the rule outlives the block.)
   // THE REVIEWER LANES, and the one ordering property the roster now leans on.
   // `block_for(Role::Reviewer)` resolves a bare `spawn_agent(kind: "reviewer")` to
-  // the FIRST reviewing block in roster order, so rev-lead must be declared ahead
-  // of the three cheap qr-* lanes: a checklist lane sitting first would answer an
-  // unrouted review request with a grep report instead of a review. Same shape as
-  // the worker-tier pin above, and stated as an index rather than as a set so a
-  // reordering edit fails here rather than silently changing what a bare spawn does.
+  // the FIRST reviewing block in roster order, so rev-std must be declared ahead
+  // of rev-final: rev-final is the ONCE-LAST validator (rule 1), so an unrouted
+  // review request landing on it would both spend the expensive lane first and
+  // break the sequencing the whole roster is built around. Same shape as the
+  // worker-tier pin above, and stated as an index rather than as a set so a
+  // reordering edit fails here rather than silently changing what a bare spawn
+  // does.
   const reviewers = workflow.blocks.filter((b) => b.kind === "reviewer");
   assert.deepEqual(
     reviewers.map((b) => [b.id, b.cli, b.model]),
     [
-      ["rev-lead", "claude", "opus"],
-      ["qr-evidence", "opencode", "opencode/deepseek-v4-flash-free"],
-      ["qr-tests", "opencode", "opencode/deepseek-v4-flash-free"],
-      ["qr-constraints", "opencode", "opencode/deepseek-v4-flash-free"],
+      ["rev-std", "opencode", "openrouter/z-ai/glm-5.3-flash"],
+      ["rev-final", "claude", "opus"],
     ],
-    "the judging lane is declared first; the three cheap lanes run opencode on the free Zen model"
+    "the every-round lane is declared first; the strong final validator runs once, last"
   );
-  assert.equal(reviewers[0].id, "rev-lead", "a bare spawn_agent(kind: \"reviewer\") must reach the lane that judges");
-  // The model id is pinned in FULL on purpose. `default_model("opencode", …)` is
+  assert.equal(
+    reviewers[0].id,
+    "rev-std",
+    "a bare spawn_agent(kind: \"reviewer\") must reach the lane that runs every round"
+  );
+  // The model id is pinned in FULL on purpose, and the loop below covers every
+  // opencode block (both tiers of it — the default worker AND the every-round
+  // reviewer), not just the reviewers. `default_model("opencode", …)` is
   // deliberately empty — opencode has no vendor-neutral alias, its ids are
-  // `provider_id/model_id` — so the bare `deepseek-v4-flash-free` half is not a
-  // model that exists, and a block that dropped the provider would spawn against
-  // nothing. This asserts the `/` specifically, which is the character #722 had to
-  // widen `sanitize_model` to admit.
-  for (const b of reviewers.filter((r) => r.cli === "opencode")) {
-    assert.match(b.model ?? "", /^opencode\/[a-z0-9.-]+$/, `${b.id}: an opencode model id names its provider`);
+  // `provider_id/model_id` — so a block that dropped the `openrouter/` half would
+  // spawn against a model that does not exist. This asserts the `/` specifically,
+  // which is the character #722 had to widen `sanitize_model` to admit; the
+  // pattern allows a second one because this provider's own model ids carry it
+  // (`openrouter` + `z-ai/glm-5.3-flash`).
+  const viaOpencode = workflow.blocks.filter((b) => b.cli === "opencode");
+  assert.ok(viaOpencode.length > 0, "the cheap tier is the point of this roster — it must have opencode blocks");
+  for (const b of viaOpencode) {
+    assert.match(b.model ?? "", /^[a-z0-9-]+\/[a-z0-9./-]+$/, `${b.id}: an opencode model id names its provider`);
   }
 
   const processPro = workflow.blocks.find((b) => b.id === "process");
@@ -127,23 +130,63 @@ test("the roster is the one the repo means to run", () => {
   }
 });
 
-test("the merge gate names EVERY declared reviewer lane, because an abstention is a pass", () => {
+test("every declared reviewer lane is named by the gate or by a routing rule, because an abstention is a pass", () => {
   const { workflow } = parseWorkflow(text);
   const gate = workflow.gates.merge;
   assert.ok(gate, "the point of the dogfood file is that the human can demo the gate");
-  // THE SAFETY PROPERTY, stated generically so it survives roster changes: with
-  // all-pass, an abstention still counts as a pass, so a reviewer-kind block
-  // declared in the roster but omitted from `gates.merge` would let its lane go
-  // unreviewed while the gate still opens. Every declared reviewer must be in
-  // the gate — today that set is exactly [rev-lead], and this assertion is what
-  // catches a future second lane someone forgets to wire in.
+  // THE SAFETY PROPERTY, stated generically so it survives roster changes. Under
+  // `all-pass` an abstention still counts as a pass, so the required set has to be
+  // able to REACH every declared reviewer: a reviewer-kind block in the roster that
+  // neither `gates.merge.reviewers` nor any `routing:` rule names is a lane no PR
+  // can ever require, and it would sit there looking wired while the gate opened
+  // without it.
+  //
+  // "In the gate" is a UNION of two lists, and that is the roster's design rather
+  // than a loosening: `rev-std` is static (every PR), `rev-final` is REQUIRED BY
+  // ROUTING (#1176) on the paths a prose review cannot judge — code, tests, CI,
+  // manifests, doc/design. A docs-only PR that runs rev-std alone is the rule
+  // working (#1952), not a hole. The hole is a lane NOTHING names, and that is what
+  // this asserts.
   const declaredReviewers = workflow.blocks.filter((b) => b.kind === "reviewer").map((b) => b.id);
-  assert.deepEqual(gate.reviewers, declaredReviewers, "every declared reviewer lane is in the gate");
+  const namedBy = (g: typeof gate): Set<string> =>
+    new Set([...(g?.reviewers ?? []), ...(g?.routing ?? []).flatMap((r) => r.reviewers)]);
+  const unnamed = (w: typeof workflow): string[] => {
+    const reachable = namedBy(w.gates.merge);
+    return w.blocks.filter((b) => b.kind === "reviewer" && !reachable.has(b.id)).map((b) => b.id);
+  };
+  assert.deepEqual(unnamed(workflow), [], "every declared reviewer lane is reachable by the gate");
+  // …and the SPLIT itself, pinned positively, so a lane sliding out of the static
+  // list into nothing — or the routing block emptying — fails here and not only in
+  // the generic assertion above.
+  assert.deepEqual(gate.reviewers, ["rev-std"], "the static lane is the one that runs every round");
   assert.deepEqual(
-    gate.reviewers,
-    ["rev-lead", "qr-evidence", "qr-tests", "qr-constraints"],
-    "…and today that is the lead lane plus the three cheap pre-lead lanes"
+    [...new Set((gate.routing ?? []).flatMap((r) => r.reviewers))].sort(),
+    ["rev-final"],
+    "…and the routing rules add exactly the final validator, on the paths rule 2 names"
   );
+  assert.ok((gate.routing ?? []).length > 0, "the routing block is what makes rev-final reachable at all");
+  assert.deepEqual(declaredReviewers, ["rev-std", "rev-final"]);
+
+  // POSITIVE CONTROL — the assertion above passes just as well against a check that
+  // never ran, so this performs the one edit it exists to catch: drop rev-final from
+  // EVERY routing rule and leave everything else alone. The mutation is asserted to
+  // have LANDED (a `replace` whose anchor missed exits happily and leaves a suite
+  // green for the wrong reason), and the mutated file is asserted to still parse
+  // clean — so the red below is about the RULE, not about a file the pane rejects.
+  const anchor = /reviewers: \[rev-final\]/g;
+  const hits = text.match(anchor) ?? [];
+  assert.equal(hits.length, 4, "the four routing rules that require the final lane");
+  const mutated = text.replace(anchor, "reviewers: [rev-std]");
+  assert.notEqual(mutated, text, "the mutation landed");
+  assert.equal((mutated.match(anchor) ?? []).length, 0, "…on every rule, not just the first");
+  const after = parseWorkflow(mutated);
+  assert.deepEqual([...after.findings, ...validateWorkflow(after.workflow)], [], "the mutant is a file the pane blesses");
+  assert.deepEqual(
+    unnamed(after.workflow),
+    ["rev-final"],
+    "a declared lane that no rule and no gate names must fail — that is the whole point"
+  );
+
   assert.equal(gate.require, "all-pass");
   assert.equal(gate.threshold, undefined, "an all-pass gate takes no threshold");
   // ci-green: the PR's own checks. body-unchanged (#565/#634): the squash record
@@ -199,13 +242,66 @@ test("a canonical save preserves the workflow's MEANING, exactly", () => {
   // What serialization actually guarantees, and all it guarantees: the workflow that comes back
   // is the workflow that went in — every block, persona, edge and gate — and the canonical form
   // is stable, so saving twice is a no-op.
+  //
+  // "MEANING" is the word that has to be precise here, and the canonical form's own contract
+  // supplies it: every list that REFERENCES a block (an edge's fan-out, `gates.merge.reviewers`)
+  // is normalized into ROSTER order on the way out — `sortByBlocks`, argued at length in
+  // `connectToGate`'s docblock ("SEAT ORDER IS NOT THE HUMAN'S") and pinned on minimal fixtures
+  // in `test/workflowmodel.test.ts` ("a fan-out collapses to one entry per source, its targets in
+  // ROSTER order" and "As a SET, not a sequence — and that is a property, not a concession"). It
+  // is what makes two humans who wire the same graph in a different order get the same file. So
+  // the graph is compared as a SET here, and the ORDERING is asserted separately, as the
+  // direction it is supposed to move in — which is strictly stronger than the sequence equality
+  // this used to assert, because a serializer that DROPPED an edge fails the set check whatever
+  // it does to the order.
   const { workflow } = parseWorkflow(lfText);
   const saved = serializeWorkflow(workflow);
   const reread = parseWorkflow(saved);
 
   assert.deepEqual(reread.findings, [], "a saved copy must still be clean");
-  assert.deepEqual(reread.workflow, workflow, "…and must mean exactly what the original meant");
+
+  // Everything that is not the edge list comes back deepEqual — blocks, personas, the gate and
+  // its routing, and every policy section.
+  assert.deepEqual(
+    { ...reread.workflow, edges: [] },
+    { ...workflow, edges: [] },
+    "…and must mean exactly what the original meant"
+  );
+
+  // The graph itself: the same edges, none invented, none lost.
+  const key = (e: { from: string; to: string }): string => `${e.from}->${e.to}`;
+  assert.deepEqual([...reread.workflow.edges.map(key)].sort(), [...workflow.edges.map(key)].sort());
+  assert.equal(reread.workflow.edges.length, workflow.edges.length, "no edge invented, none lost");
+
   assert.equal(serializeWorkflow(reread.workflow), saved, "…and saving it twice must be a no-op");
+
+  // The normalization, pinned in the direction it moves: every fan-out in the SAVED file is in
+  // roster order. A serializer that stopped sorting fails here rather than silently making the
+  // file a function of the human's clicking sequence again.
+  const rosterIndex = new Map(workflow.blocks.map((b, i) => [b.id, i]));
+  const fanouts = (w: typeof workflow): [string, string[]][] => {
+    const byFrom = new Map<string, string[]>();
+    for (const e of w.edges) byFrom.set(e.from, [...(byFrom.get(e.from) ?? []), e.to]);
+    return [...byFrom.entries()];
+  };
+  for (const [from, to] of fanouts(reread.workflow)) {
+    assert.deepEqual(
+      to,
+      [...to].sort((a, b) => (rosterIndex.get(a) ?? 0) - (rosterIndex.get(b) ?? 0)),
+      `${from}: the canonical file lists a fan-out in roster order`
+    );
+  }
+  // THE CONTROL that keeps the set comparison above from being a tautology: the shipped file
+  // must actually EXERCISE the reorder, or "same set, different order" is a property nothing
+  // here witnesses. Today `worker-std -> [rev-std, worker-adv]` is authored out of roster order
+  // and comes back as `[worker-adv, rev-std]`. If a future edit puts every fan-out in the
+  // file into roster order, this fails first and on purpose: move the divergence onto a
+  // synthetic fixture rather than deleting the pin.
+  assert.notDeepEqual(
+    fanouts(workflow),
+    fanouts(reread.workflow),
+    "the shipped file must keep authored order and roster order DIFFERENT, or the set comparison above witnesses nothing"
+  );
 });
 
 test("the EXPLICIT Format action still rewrites this file wholesale — and still warns first", () => {
@@ -251,9 +347,15 @@ test("re-serializing this file with NOTHING changed reproduces it exactly", () =
 
 test("editing one block's model keeps every other block's comments — and the section headers", () => {
   const { workflow } = parseWorkflow(text);
+  // `worker-adv` is the SECOND worker tier, so the `# -- workers:` header sits above its
+  // untouched sibling rather than above the block being edited — which is what makes the
+  // "every OTHER block's comments" claim in the title a discrimination and not a coincidence.
+  // (Editing `worker-std`, the first tier, legitimately costs that one header line: the model's
+  // documented bar is "untouched regions keep their comments", and a comment directly above the
+  // edited block is not an untouched region. That is what the `- 1` tolerance below is for.)
   const edited = {
     ...workflow,
-    blocks: workflow.blocks.map((b) => (b.id === "worker-quick" ? { ...b, model: "opus" } : b)),
+    blocks: workflow.blocks.map((b) => (b.id === "worker-adv" ? { ...b, model: "sonnet" } : b)),
   };
   const out = serializeWorkflowPreserving(edited, text);
 
@@ -261,18 +363,20 @@ test("editing one block's model keeps every other block's comments — and the s
 
   // The file header, the untouched blocks' own comments, and both section headers survive —
   // only the roster in general was touched, not edges or gates, and not the OTHER blocks.
-  assert.match(out, /orrerix's own agent workflow/, "the file preamble survives");
-  assert.match(out, /The orchestrator is orrerix's trust root/, "an untouched block's comment survives");
-  assert.match(out, /two worker tiers, routed by difficulty/, "the comment on the untouched sibling worker survives");
-  assert.match(out, /the lead reviewer: the one lane that JUDGES/, "the reviewer's comment survives");
-  assert.match(out, /three cheap quick-review lanes/, "…and so does the qr-* section's own header");
-  assert.match(out, /the bisecting merge queue/, "the merge_queue block's comment survives");
+  assert.match(out, /# CHEAP-TIER ROSTER/, "the file preamble survives");
+  assert.match(out, /CLASSIFY THE WORKER AT INTAKE/, "…all ~90 lines of it, not just the first");
+  assert.match(out, /-- workers: classified at intake/, "the untouched sibling worker's section header survives");
+  assert.match(out, /-- reviewers: rev-std runs every round/, "the reviewers' section header survives");
+  assert.match(out, /S5 dogfood \(#1778\)/, "the driver block's comment survives");
   assert.match(out, /^edges:/m, "the edges section is untouched");
   assert.match(out, /^# ADVISORY/m, "…and keeps its own header comment");
   assert.match(out, /^# ENFORCED/m, "the gates section keeps its header comment too");
+  assert.match(out, /application code, tests, the E2E lane/, "a comment NESTED inside the gate's routing survives");
+  assert.match(out, /lessons\.md ENTRY/, "…and so does the block trailing the last section");
 
   const commentLines = out.split("\n").filter((l) => /^\s*#/.test(l)).length;
   const originalCommentLines = text.split("\n").filter((l) => /^\s*#/.test(l)).length;
+  assert.ok(originalCommentLines > 100, `the file's comments are load-bearing (${originalCommentLines} lines)`);
   assert.ok(
     commentLines >= originalCommentLines - 1,
     `a one-field edit must not cost more than its own block's comment (had ${originalCommentLines}, now ${commentLines})`
