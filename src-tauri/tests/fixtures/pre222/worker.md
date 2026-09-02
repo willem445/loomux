@@ -292,12 +292,5 @@ Follow-ups and review fixes for YOUR OWN task are yours to handle.
 
 ## If idle
 
-If you have no task yet: read these instructions, then say so with
-`message_orchestrator("read my instructions, idle and ready for a brief")` and wait. Do not
-invent work.
-
-**Not `report("progress", …)`, and the reason is the rule, not an exception to it.** A progress
-report reaches no pane — it is a record — so "confirm and wait" would be waiting on a message
-nobody received. Being idle and ready IS something the orchestrator has to act on: it has to
-send you a brief. That is what `message_orchestrator` is for, and it is the one delegate channel
-this never touches.
+If you have no task yet: read these instructions, confirm with
+`report("progress", "ready")`, and wait. Do not invent work.
