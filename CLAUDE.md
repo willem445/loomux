@@ -588,6 +588,10 @@ narrow their ask back down to the original ticket on your own judgment.
   `orchestration`, `pty`, `gitview`, `launcher`, `tasks`, `clipboard`,
   `metrics`, `ui`, `build`, `release`.
 - Branch from `main`; PR to `main`.
+- **No tool footer or session link in a PR body or commit message.** Claude Code's
+  default `🤖 Generated with [Claude Code](…)` line and any `claude.ai/code/session_…`
+  URL or `Claude-Session:` trailer are dropped before posting; the squash message
+  is permanent and a chat-session link is not provenance. `Co-Authored-By:` stays.
 - **Delete a PR's branch once it merges.** `gh pr merge --delete-branch`
   handles it, but skips the remote delete when a local worktree still holds
   the branch — after cleaning the worktree, verify with
