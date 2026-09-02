@@ -803,14 +803,26 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
     } else {
         format!(" \"{}\"", lane_summary(&f.lane_summary))
     };
-    // Scrubbed through the same filter a lane summary goes through: this text
-    // can carry a spawn refusal that names a block id out of the repo's own
-    // workflow file, or a CLI's last line of output — neither is orrerix's
-    // string, and both land in the orchestrator's pane (§5.5).
+    // Scrubbed, because this text is not orrerix's: it can carry a block id out
+    // of the repo's own workflow file, a CLI's last line of output, or the
+    // live-delegate roster — and it lands in the orchestrator's pane (§5.5).
+    //
+    // `sanitize_pane_text` rather than `lane_summary`, which is the same
+    // sanitizer plus a VERDICT-shaped truncation marker ("full summary on the
+    // PR and via list_verdicts") — a pointer at a place a spawn refusal or a
+    // pane's dying line is not, on the one hold where the reader most needs the
+    // pointer to be right.
     let refusal = if f.refusal.trim().is_empty() {
         String::new()
     } else {
-        format!(" {}.", lane_summary(&f.refusal))
+        format!(
+            " {}.",
+            crate::notify::sanitize_pane_text(
+                f.refusal.trim_end_matches('.'),
+                400,
+                crate::notify::Lines::Collapse,
+            )
+        )
     };
     let body = match reason {
         // **The remedy named is the one that CLEARS it**, which for this hold is
