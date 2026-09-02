@@ -1350,7 +1350,7 @@ impl OrchRegistry {
             block.as_deref().and_then(|b| self.rd_reuse_pane(group, &session, b, &text));
         let agent = match reused {
             Some(a) => a,
-            None => self.rd_spawn(group, Role::Worker, block, Some(session), &text)?.id,
+            None => self.rd_spawn(group, Role::Worker, None, Some(session), &text)?.id,
         };
         // Through the method, never a field write: the pane this supersedes is
         // still the drive's and still live (#1871 B2). Idempotent when the pane
