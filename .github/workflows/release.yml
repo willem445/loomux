@@ -333,11 +333,14 @@ jobs:
       # with the SKILL.md release doc's asset checklist if the matrix
       # ever changes.
       #
-      # The check below is `-lt`, so the new symbols asset would have
-      # passed the old constant unchanged. It is bumped anyway: leaving
-      # it at 9 would have left the gate tolerating one genuinely
-      # missing installer, which is the exact failure #282 exists to
-      # catch.
+      # The check below is an EQUALITY (`scripts/check-release-assets.js`):
+      # any count other than this refuses promotion (#1962) — fewer is a
+      # missing/failed leg, more is a duplicate upload (#282 class). The new
+      # symbols asset forced the bump under equality (at 9 every stable
+      # release would refuse); under the old one-directional `-lt` it would
+      # merely have passed uncounted, and the bump also kept the gate from
+      # tolerating one genuinely missing installer, which is the exact
+      # failure #282 exists to catch.
       EXPECTED_ASSETS_STABLE: 10
       # Beta count: same as stable minus the Windows .msi, which the build
       # job skips for hyphenated (prerelease) tags — see the `--bundles
@@ -348,6 +351,18 @@ jobs:
       # glance.
       EXPECTED_ASSETS_BETA: 9
     steps:
+      # The count comparison lives in scripts/check-release-assets.js,
+      # not inline (checked out below): promote only fires on a pushed tag,
+      # so the script is the only form of this check a test can actually
+      # execute (#1962). The script enforces the EQUALITY — any count other
+      # than the expected one refuses, naming the direction in the error.
+      - uses: actions/checkout@v4
+        with:
+          # contents:write job and nothing downstream of the script call
+          # uses git — the checkout exists only so the script can be read,
+          # so do not leave a credential on the runner.
+          persist-credentials: false
+
       - name: Verify asset count before promoting
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -360,10 +375,7 @@ jobs:
           fi
           count=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --jq 'length')
           echo "Release $GITHUB_REF_NAME (id $RELEASE_ID) has $count/$expected assets"
-          if [ "$count" -lt "$expected" ]; then
-            echo "::error::Only $count/$expected assets on release $GITHUB_REF_NAME (id $RELEASE_ID) — refusing to promote. Staying draft; check for a stray duplicate release for this tag before retrying."
-            exit 1
-          fi
+          node scripts/check-release-assets.js "$count" "$expected"
 
       - name: Warn if release notes are empty
         env:

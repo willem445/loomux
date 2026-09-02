@@ -20,6 +20,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const text = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
 
@@ -41,6 +43,20 @@ function publishStepRunBlock(src: string): string {
 
 function ghApiLines(step: string): string[] {
   return [...step.matchAll(/^\s*gh api .+$/gm)].map((m) => m[0]);
+}
+
+// Same scoping rule as publishStepRunBlock, for promote's "Verify asset
+// count before promoting" step — the run block only, not the job's env
+// comment block, so the pins below read the real shell, never prose.
+function verifyStepRunBlock(src: string): string {
+  const stepStart = src.indexOf("- name: Verify asset count before promoting");
+  assert.ok(stepStart >= 0, "the 'Verify asset count before promoting' step must exist in promote");
+  const runStart = src.indexOf("run: |", stepStart);
+  assert.ok(runStart >= 0, "the step must have a `run: |` block");
+  const bodyStart = src.indexOf("\n", runStart) + 1;
+  const nextStepOrJob = src.slice(bodyStart).search(/\n\s{0,6}(- name:|\S+:\s*$)/m);
+  const end = nextStepOrJob >= 0 ? bodyStart + nextStepOrJob : src.length;
+  return src.slice(bodyStart, end);
 }
 
 test("promote's publish step never combines make_latest with the draft flip, in either direction", () => {
@@ -79,4 +95,99 @@ test("promote's publish step stays RELEASE_ID-addressed — never a tag-based lo
   for (const line of ghApiLines(step)) {
     assert.match(line, /\$RELEASE_ID/, `every \`gh api\` call in this step must address RELEASE_ID: ${line}`);
   }
+});
+
+// The behavioral half of #1962. promote's asset-count gate is extracted to
+// scripts/check-release-assets.js precisely so it can be EXECUTED without a
+// real release (promote only fires on a pushed `vX.Y.Z` tag, so CI can never
+// run the workflow step itself): these spawn the very file the workflow step
+// calls, against N-1 / N / N+1 for BOTH expected constants.
+const countScript = fileURLToPath(new URL("../scripts/check-release-assets.js", import.meta.url));
+
+function runCountCheck(args: string[]) {
+  return spawnSync(process.execPath, [countScript, ...args], { encoding: "utf8" });
+}
+
+test("the count check accepts N and refuses N-1 and N+1, for both expected constants (#1962)", () => {
+  for (const expected of [10, 9]) {
+    // EXPECTED_ASSETS_STABLE / EXPECTED_ASSETS_BETA — the same values the
+    // workflow-pin test below asserts, so the two cannot drift apart.
+
+    const match = runCountCheck([String(expected), String(expected)]);
+    assert.equal(match.status, 0, `N (${expected}/${expected}) must promote`);
+    assert.match(match.stdout, /Asset count matches/, "the accept path must say so, not exit silently");
+
+    const under = runCountCheck([String(expected - 1), String(expected)]);
+    assert.equal(under.status, 1, `N-1 (${expected - 1}/${expected}) must refuse promotion`);
+    assert.match(under.stderr, /FEWER than expected/, "the deficit refusal must name the direction");
+    assert.ok(
+      under.stderr.includes(`${expected - 1}/${expected}`),
+      `the deficit refusal must carry the actual vs expected numbers: ${under.stderr}`
+    );
+
+    const over = runCountCheck([String(expected + 1), String(expected)]);
+    assert.equal(
+      over.status,
+      1,
+      `N+1 (${expected + 1}/${expected}) must refuse — the old -lt check promoted a surplus uncounted (#1962)`
+    );
+    assert.match(over.stderr, /MORE than expected/, "the surplus refusal must name the direction");
+    assert.match(over.stderr, /#282/, "the surplus refusal must diagnose it as the #282 duplicate-upload class");
+    assert.match(
+      over.stderr,
+      /EXPECTED_ASSETS_/,
+      "the surplus refusal must tell the reader that a legitimately added matrix leg means bumping the constants"
+    );
+    assert.ok(
+      over.stderr.includes(`${expected + 1}/${expected}`),
+      `the surplus refusal must carry the actual vs expected numbers: ${over.stderr}`
+    );
+  }
+});
+
+test("the count check refuses malformed counts instead of comparing garbage", () => {
+  for (const args of [["ten", "10"], ["-3", "10"], ["11"]]) {
+    const bad = runCountCheck(args);
+    assert.equal(
+      bad.status,
+      2,
+      `malformed args ${JSON.stringify(args)} must exit 2 (usage), not 0/1 (a count verdict)`
+    );
+  }
+});
+
+test("promote's count step delegates to the script and keeps the expected constants (#1962)", () => {
+  const step = verifyStepRunBlock(text);
+  assert.match(
+    step,
+    /node scripts\/check-release-assets\.js "\$count" "\$expected"/,
+    "promote must call scripts/check-release-assets.js — the inline shell check is the one that let a surplus through (#1962)"
+  );
+  assert.doesNotMatch(
+    step,
+    /-lt\b|-ne\b|-gt\b/,
+    "no inline shell comparison may survive in the step — the script owns the check now"
+  );
+  // The script call needs the repo on disk, so promote must check it out
+  // (it previously ran on the bare runner). Scoped to the span between the
+  // job key and the verify step, not the whole file's other checkout uses.
+  const promoteStart = text.indexOf("\n  promote:");
+  const verifyStart = text.indexOf("- name: Verify asset count before promoting");
+  assert.ok(promoteStart >= 0 && verifyStart > promoteStart, "promote's job and verify step must exist");
+  assert.match(
+    text.slice(promoteStart, verifyStart),
+    /uses: actions\/checkout@v4/,
+    "promote must check out the repo — the count check calls scripts/check-release-assets.js"
+  );
+  // The checkout must not leave a credential behind: promote is a
+  // contents:write job and nothing downstream of the script call uses git.
+  assert.match(
+    text.slice(promoteStart, verifyStart),
+    /persist-credentials:\s*false/,
+    "promote's checkout must set persist-credentials: false — a contents:write job with no git use should not persist a token"
+  );
+  // Not part of this change; pinned so the behavioral test's constants and
+  // the workflow's cannot drift apart silently.
+  assert.match(text, /^ {6}EXPECTED_ASSETS_STABLE: 10$/m, "the stable expected count is unchanged by #1962");
+  assert.match(text, /^ {6}EXPECTED_ASSETS_BETA: 9$/m, "the beta expected count is unchanged by #1962");
 });
