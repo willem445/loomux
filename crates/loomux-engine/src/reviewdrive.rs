@@ -999,7 +999,7 @@ impl LaneRecord {
             prior_agents: retain_panes(prior, ""),
             last_verdict: None,
             at_head: String::new(),
-            briefed_head: String::new(),
+            briefed_head: self.briefed_head.clone(),
             briefed_digest: String::new(),
             spawned_ms: 0,
             // Preserved for `ReviewDrivesState`'s reason: a field a newer build
