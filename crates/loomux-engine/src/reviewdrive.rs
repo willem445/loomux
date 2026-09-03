@@ -1214,6 +1214,19 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 ///   its own failure mode (a drive that never ticks would never bound), and
 ///   that is a decision this issue did not ask for. Pinned by
 ///   `orrerix_downtime_is_charged_to_the_state_it_spanned`.
+/// - **The `review-wait` bound moves when the GATE does**, because
+///   `required_lanes` is read fresh from `facts` on every tick rather than
+///   stamped when the state was entered (#2117 review 6, premortem 1). A
+///   workflow edit or a path-scoped routing rule that takes a three-lane gate
+///   down to one shrinks this bound from six hours to four **retroactively**,
+///   so a drive five hours into a legitimate three-lane sequence parks on the
+///   next tick for time it spent inside the wider bound it was actually
+///   running under. Reading the count fresh is what makes the bound track the
+///   gate at all, and stamping it at state entry would freeze a six-hour
+///   bound onto a drive whose gate had since narrowed — the opposite error,
+///   and the one that fails toward NOT parking. Disclosed rather than
+///   chosen between: every test here holds `required_lanes` constant, so
+///   nothing pins bound stability against a moving lane list.
 /// - **A backward wall-clock step suspends every bound** rather than firing
 ///   one: the subtraction saturates, so `state_elapsed_ms` reads zero until the
 ///   clock catches up. That is the fail-safe direction — no false park — and it
@@ -1502,9 +1515,13 @@ pub struct DriveEntry {
     /// **Zero on an entry written before this field existed**, which reads as
     /// "entered at the epoch" and so as a state older than any bound. That is
     /// the safe direction and it is bounded rather than merely tolerable: such
-    /// an entry holds `state-stalled` on its first tick under this build, whose
-    /// notice names the state and whose remedy — `drive_review` — re-stamps
-    /// this field through `advance` and does not re-hold. The alternative
+    /// an entry holds `state-stalled` on the first tick at which the DRIVE'S OWN
+    /// AGE reaches the bound: [`state_elapsed_ms`](DriveEntry::state_elapsed_ms)
+    /// is capped at that age (#2117 review 3), so a young entry is not parked —
+    /// which is correct, and is what this sentence overstated as "on its first
+    /// tick" for as long as the cap existed. Its notice names the state, and its
+    /// remedy — `drive_review` — re-stamps this field through `advance` and does
+    /// not re-hold. The alternative
     /// (treating zero as "unknown, exempt") would make the field's own bound
     /// unreachable for exactly the entries that predate it.
     #[serde(default)]

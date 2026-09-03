@@ -663,7 +663,8 @@ pub const DRIVER_MAX_REBASE_ATTEMPTS_MAX: u32 = 1;
 /// design named 240 because that was the family's ceiling and the total age was
 /// then the only clock over a working drive; both halves of that stopped being
 /// true at once. Once a drive is bounded state by state — `ci-wait` at ninety
-/// minutes, `review-wait` at three hours, and so on, each reset by every
+/// minutes, `review-wait` at its constant plus one `lane_timeout_minutes` per
+/// required lane, and so on, each reset by every
 /// transition — a total age measured in the same units is not a second opinion
 /// about the same thing, it is the *only* bound that a drive making steady
 /// progress can still trip. At 240 it tripped: two drives were parked

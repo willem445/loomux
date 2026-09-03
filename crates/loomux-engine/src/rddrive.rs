@@ -970,8 +970,8 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         // sentence, and an orchestrator reading it had exactly one move —
         // resume and see. The state, the time in it and the bound are what make
         // the resume a decision: a `ci-wait` that sat ninety minutes says go and
-        // read the checks; a `review-wait` that sat three hours says go and read
-        // the lane. The exclusion is named because it is the difference between
+        // read the checks; a `review-wait` that sat past its own bound — four
+        // hours on a one-lane gate at stock knobs — says go and read the lane. The exclusion is named because it is the difference between
         // this figure and the wall clock, and a reader who cannot see it would
         // reasonably think the notice had got the arithmetic wrong.
         HeldReason::StateStalled => format!(

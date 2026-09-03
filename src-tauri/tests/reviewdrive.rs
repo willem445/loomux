@@ -6126,7 +6126,8 @@ fn a_drive_that_keeps_advancing_is_not_parked_for_its_age_alone() {
 
     // Eleven cycles half an hour apart: five hours of wall clock, every state
     // left well inside its own bound (29 minutes in `ci-wait` against ninety,
-    // one minute in `review-wait` against three hours).
+    // one minute in `review-wait` against four hours — its constant plus this
+    // one-lane gate's own sixty-minute timeout).
     let last = progressing(&reg, &gh, &group, 11, 30 * 60_000);
 
     // **Read on the clock the ticks ran on.** `review_drive_status` derives every
