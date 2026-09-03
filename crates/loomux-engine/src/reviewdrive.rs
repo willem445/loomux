@@ -1047,11 +1047,25 @@ pub const CAP_HOLD_MS: u64 = 15 * 60_000;
 // **They are constants and not `driver:` policy**, on [`CAP_HOLD_MS`]'s
 // argument: how long orrerix waits on its OWN machinery — a check run, a
 // reviewer lane, a resumed worker — before telling an orchestrator is not a
-// repo's call, and every one of them already has a repo-facing knob beside it
-// (`lane_timeout_minutes`, `fix_timeout_minutes`) that this may never shadow.
-// That last clause is the whole of [`state_bound_ms`]: a per-state bound is
-// the LARGER of its constant and whatever the repo configured for that state,
-// so tuning a knob up can never be silently overruled by a number in this file.
+// repo's call.
+//
+// **How each combines with the repo's knobs differs per arm, and there is no
+// one sentence for all four.** This block used to carry one — "a per-state
+// bound is the LARGER of its constant and whatever the repo configured" — and
+// it was the fifth surface of a claim rounds 3 and 4 had already corrected
+// elsewhere. It was true of one arm, never true of two, and stopped being true
+// of the fourth when #2117's W3 made that arm an add. [`state_bound_ms`] is
+// where the per-arm rule is argued; the short form:
+//
+// - `ci-wait` and `gate-check` have **no knob at all** — [`DriveLimits`]
+//   carries no `ci_` or `gate_` timeout — so there is nothing to combine with
+//   and nothing to shadow.
+// - `fix-wait` is the LARGER of its constant and `fix_timeout_minutes`. It is
+//   the only arm where the shadowing hazard exists, and the only one the
+//   retracted sentence described.
+// - `review-wait` is its constant PLUS `lane_timeout_minutes` per required
+//   lane, because that state holds several waits in sequence and the product
+//   alone funds their silences and none of the gaps between them.
 
 /// How long a drive may sit in `ci-wait` (§2.1) before [`HeldReason::StateStalled`].
 ///
