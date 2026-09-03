@@ -305,12 +305,14 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
   // half, and the halves must re-sum to the whole row — 535 + 535 = 1070, the single
   // `usage.json` row that session has.
   //
-  // Both halves are asserted, and that is deliberate: the SUM alone cannot tell an even
-  // split from an implementation that credits a shared row ONCE to one occupant, since
-  // 1070 + 0 sums to the same 1070. The per-occupant credits are what make credit-once
-  // redden; the sum is what makes a no-split implementation redden (1070 + 1070). In the
-  // live store 514 of 1210 sessions are shared and carry 31.2 G of 44.1 G tokens, so
-  // this is the common case rather than a corner.
+  // Both halves are asserted, and that is deliberate: the per-occupant credits are
+  // pinned at 535 each, so they redden on their own under EITHER regression —
+  // crediting a shared row ONCE reads 1070 + 0, and a no-split implementation reads
+  // 1070 + 1070; neither value passes an assert against 535. The sum is a cross-check:
+  // it states the re-sum property outright instead of leaving it implied by the two
+  // halves. How common this case is on the live store is a dated figure, not a
+  // constant — doc/design/orchestration-evals.md §4.6 carries it (§10 names these
+  // asserts).
   const rev11 = d.agents.find((a: any) => a.agent === 'rev-11');
   const rev11prev = d.agents.find((a: any) => a.agent === 'rev-11-prev');
   assert.equal(rev11.usage_key, 'session');
