@@ -2604,6 +2604,16 @@ fix was to the PR body alone, because the commit never moves. A new *commit* is 
 again: there the reviewer in flight is reading code that no longer exists, so a successor is opened
 for the new revision exactly as before.
 
+**A reviewer's pane going away is noticed, not waited out.** If a lane's pane is killed — by you,
+by the idle reaper, or because the CLI exited — the driver sees it on the next tick and reopens
+that reviewer's session in a fresh pane, rather than sitting there waiting for a verdict that can
+no longer arrive. The audit log records it as `rd-lane-reopened`, naming the pane that went — and who
+ended it, where orrerix knows (a pane that exited on its own says nothing about who). This matters most right after a `cap-refused` notice, which asks you to free a slot by
+killing an idle delegate: a lane that has finished its turn looks idle, and before this killing one
+cost the drive a full hour of silence. A lane whose panes keep dying still parks on
+`held(lane-stalled)` at the usual timeout, measured from when the lane was first asked — replacing
+a pane does not buy it another hour.
+
 **Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
 PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be
 driven; each refusal names the other holder. The asymmetry is the `held` case: a parked drive

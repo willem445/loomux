@@ -497,6 +497,20 @@ pub mod audit_action {
     /// `block`, `head` and the `pane` that already holds the round, because
     /// the refusal's only other visible effect is a tick that did nothing.
     pub const LANE_DUPLICATE_REFUSED: &str = "rd-lane-duplicate-refused";
+    /// A lane was re-opened because the pane this drive recorded for it had
+    /// **died** (#2163), carrying the dead `pane`, who ended it (`killed_by`,
+    /// `null` where orrerix does not know) and the `agent` that replaced it.
+    ///
+    /// Its own action rather than a [`LANE_SPAWNED`] detail, for [`CI_RED`]'s
+    /// reason: a reader asking "did this drive ever lose a reviewer pane" must
+    /// not have to match every row where it did not. It says what a
+    /// `rd-lane-spawned … resumed=true` alone cannot — that the previous pane
+    /// is gone and who ended it — which is the whole of what an orchestrator
+    /// that has just killed an idle delegate needs to read.
+    ///
+    /// The row is written on the SPAWN succeeding, never on the intent: a
+    /// re-open that the cap refuses has re-opened nothing.
+    pub const LANE_REOPENED: &str = "rd-lane-reopened";
     /// A lane's verdict was read at this revision.
     pub const VERDICT: &str = "rd-verdict";
     /// The worker's session was resumed with a hand-back brief.

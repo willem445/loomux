@@ -1113,7 +1113,14 @@ impl OrchRegistry {
         let lanes: Vec<reviewdrive::LaneFact> = routed
             .required
             .iter()
-            .map(|b| reviewdrive::LaneFact { block: b.clone(), verdict: verdicts.get(b).cloned() })
+            .map(|b| reviewdrive::LaneFact {
+                block: b.clone(),
+                verdict: verdicts.get(b).cloned(),
+                // Filled by the caller (#2163): whether a lane's recorded pane
+                // is dead is a fact about the ENTRY and the agent map, and this
+                // function is deliberately given neither — it reads the gate.
+                pane_dead: false,
+            })
             .collect();
         let notices: Vec<rddrive::LaneNotice> = lanes
             .iter()
@@ -1191,6 +1198,16 @@ impl OrchRegistry {
         // that pane carries the session, the block and the cwd — the three
         // `spawn_agent(resume_session:)` needs.
         let prior = self.rd_lane_session(group, entry.lane(block));
+        // #2163: the `lane-stalled` anchor this brief must carry. A brief that
+        // is only REPLACING a dead pane at the same head keeps the anchor the
+        // original brief set — see `lane_stall_anchor` for why that is both the
+        // honest reading of a silence clock and the thing that bounds a pane
+        // which dies on every spawn. Computed here, before `open_lane` replaces
+        // the record it reads.
+        let pane_dead =
+            entry.lane(block).is_some_and(|rec| self.rd_dead_lane_pane(rec).is_some());
+        let anchor =
+            reviewdrive::lane_stall_anchor(entry.lane(block), &brief.head, pane_dead, now);
         // **The resume names the lane's own block** (#1961). A resume that
         // named neither `kind` nor `block` reached `spawn_agent_bound`, which
         // has no session-inheritance rule of its own and falls straight through
@@ -1346,7 +1363,7 @@ impl OrchRegistry {
                 (sp.id, sp.session_id.unwrap_or_default(), false)
             }
         };
-        entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), now);
+        entry.open_lane(block, &session_id, &agent, &brief.head, brief.body_digest_opt(), anchor);
         Ok(RdLaneOpen { agent, session: session_id, resumed })
     }
 
@@ -1547,6 +1564,39 @@ impl OrchRegistry {
     /// asymmetry [`reviewdrive::DriveEntry::forget_dead_panes`] states, and the
     /// same fail-direction: an emptied map (a restart) would otherwise park
     /// every live drive in `fix-wait` on a hold about panes that are fine.
+    /// This lane's recorded pane, when it is **dead**, and who ended it
+    /// (#2163) — `(pane, killed_by)`, with `killed_by` `None` where orrerix
+    /// does not know.
+    ///
+    /// The lane-side twin of [`rd_pane_exit`](Self::rd_pane_exit), and it
+    /// answers a pair rather than a sentence because its two consumers want
+    /// different things: `decide_review_wait` wants the BOOLEAN (this lane
+    /// cannot be waited for), and the `rd-lane-reopened` row wants the two
+    /// facts an orchestrator that has just killed an idle delegate reads —
+    /// which pane went, and whether it was its own doing.
+    ///
+    /// **`Dead` and nothing else counts**, on `rd_pane_exit`'s own argument:
+    /// an agent this registry has no record of is "we could not check", and an
+    /// emptied map (a restart) must not re-open every lane in the group.
+    ///
+    /// An empty recorded pane answers `None` — a lane seeded across a re-drive
+    /// (#2153) carries a session and no pane, and there is nothing there to be
+    /// dead.
+    fn rd_dead_lane_pane(
+        &self,
+        lane: &reviewdrive::LaneRecord,
+    ) -> Option<(String, Option<&'static str>)> {
+        let id = lane.agent.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let a = self.agent(id)?;
+        if a.status != AgentStatus::Dead {
+            return None;
+        }
+        Some((id.to_string(), a.killed_by.map(|who| who.as_str())))
+    }
+
     fn rd_pane_exit(&self, agent_id: &str) -> Option<String> {
         let a = self.agent(agent_id)?;
         if a.status != AgentStatus::Dead {
@@ -2189,6 +2239,26 @@ impl OrchRegistry {
             // of the two states that land here can read it at all.
             (reviewdrive::GateOutcome::NotEvaluated, None, Vec::new())
         };
+        // **The lane-side twin of `worker_exit` below** (#2163). A pane exit was
+        // observed only for the worker and only in `fix-wait`, on the argument
+        // that "`review-wait` has `lane-stalled` for its own panes" — which is
+        // true and is an HOUR away, measured from the brief rather than from the
+        // death. A reviewer pane killed twelve minutes into its round left the
+        // drive silent for forty-eight more with no rd-* row at all.
+        //
+        // Read here rather than in `rd_gate_facts` because it is a fact about
+        // the ENTRY (which pane this lane recorded) and the agent map, and that
+        // function is given neither on purpose. `_` on a lane the entry has no
+        // record for: there is no pane to be dead.
+        let required = required.map(|mut lanes| {
+            for l in lanes.iter_mut() {
+                l.pane_dead = state
+                    .entry(pr)
+                    .and_then(|e| e.lane(&l.block))
+                    .is_some_and(|rec| self.rd_dead_lane_pane(rec).is_some());
+            }
+            lanes
+        });
         let signal = self.rd_signal(group, pr);
         let messaged_by = signal.messaged_by.clone();
         // **The driver watches the pane it resumed** (#1961), and only where
@@ -2198,9 +2268,15 @@ impl OrchRegistry {
         // A `done` or a `blocked` already in hand outranks it — a worker that
         // reported and then exited is a worker that finished, and reading its
         // exit as a failure would throw away the arc its own report earned.
-        // Nor is this asked in any other state: `review-wait` has
-        // `lane-stalled` for its own panes, and a worker pane exiting outside a
+        // Nor is this asked in any other state: a worker pane exiting outside a
         // hand-back is not this drive's business.
+        //
+        // **This used to add "`review-wait` has `lane-stalled` for its own
+        // panes", and that was the whole of #2163.** It is true and it is an
+        // HOUR away, anchored at the brief rather than at the death, so a
+        // reviewer pane killed twelve minutes in cost forty-eight more of
+        // silence. `LaneFact::pane_dead` above is the lane-side observation
+        // that answers it on the next tick instead.
         let worker_exit = (here == reviewdrive::DriveState::FixWait
             && signal.worker == reviewdrive::WorkerSignal::Silent)
             .then(|| state.entry(pr).map(|e| e.worker_agent.clone()).unwrap_or_default())
@@ -2339,9 +2415,21 @@ impl OrchRegistry {
                 // skips a load-bearing write is how the reachable one gets
                 // broken later.
                 let block = brief.required.get(*index).cloned().unwrap_or_default();
+                // #2163: read BEFORE the open, which replaces the record this
+                // asks about — and turned into a row only on the `Ok` arm,
+                // because a re-open the cap refused has re-opened nothing.
+                let replaced = entry.lane(&block).and_then(|rec| self.rd_dead_lane_pane(rec));
                 match self.rd_open_lane(group, entry, &block, &brief, limits, now) {
                     Ok(RdLaneOpen { agent, session, resumed }) => {
                         entry.lane_index = *index;
+                        if let Some((pane, killed_by)) = replaced {
+                            out.audits.push((
+                                rddrive::audit_action::LANE_REOPENED,
+                                json!({ "pr": pr, "block": block, "head": brief.head,
+                                        "pane": pane, "killed_by": killed_by,
+                                        "agent": agent, "resumed": resumed }),
+                            ));
+                        }
                         // #2109: a lane opened is the refusal run ending. Not
                         // folded into `advance` — opening a lane is not an arc
                         // (§2.1), so there is no transition here to hang it on.
