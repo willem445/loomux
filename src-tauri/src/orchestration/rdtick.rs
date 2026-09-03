@@ -1201,18 +1201,32 @@ impl OrchRegistry {
         //
         // The refusal is an `Err`, which `OpenLane`'s arm already handles as a
         // back-off: the tick retries, and the moment that pane goes idle the
-        // reuse arm delivers the delta into it. It is bounded by the clock it
-        // does NOT re-arm — `spawned_ms` stays where the original brief put it,
+        // reuse arm delivers the delta into it.
+        //
+        // **What bounds the retry depends on whether that lane has ANSWERED at
+        // this head**, and the two cases are genuinely different (#2109 review
+        // 2 and review 4; §8's duplicate-refusal row states the same split).
+        //
+        // A lane that has NOT answered — the common case, a pane still writing
+        // the review it was briefed for — is bounded by the clock this refusal
+        // does not re-arm: `spawned_ms` stays where the original brief put it,
         // so a pane that never comes back is `held(lane-stalled)` naming it,
         // exactly as if it had gone quiet without a re-brief. That bound is only
         // REACHABLE because `decide_review_wait`'s stall check is keyed on the
-        // head, for a lane that has NOT answered at it, rather than on the full
-        // (head, digest) key; the two changes ship together for that reason, and
-        // refusing without the re-key would swap a duplicate reviewer for a
-        // four-hour `drive-stalled`. The refusal and the bound meet on the same
-        // subject: a pane still holding the round has by definition recorded no
-        // verdict for it, so the exemption for an ANSWERED lane never covers the
-        // lane this refusal is about.
+        // head rather than on the full (head, digest) key; the two changes ship
+        // together for that reason, and refusing without the re-key would swap a
+        // duplicate reviewer for a four-hour `drive-stalled`.
+        //
+        // A lane that HAS answered here and whose pane then went busy on
+        // something else — a human re-tasking it, another drive taking it over —
+        // is the residual, and it is bounded by the drive's AGE alone: the stall
+        // arm exempts it precisely because it answered. An earlier version of
+        // this comment claimed that case could not arise ("a pane still holding
+        // the round has by definition recorded no verdict for it"), and that
+        // premise is false — answering and then being given other work are not
+        // exclusive. `an_answered_lane_whose_re_brief_is_refused_is_bounded_only_by_the_drives_age`
+        // pins the gap itself; closing it wants a per-lane refusal clock, which
+        // is #2110's.
         //
         // **A head change is deliberately not covered.** There the recorded pane
         // is reviewing a revision the drive has moved past, its verdict binds to
@@ -2235,13 +2249,45 @@ impl OrchRegistry {
                         //
                         // **Only a CAP refusal stamps it**, because the hold it
                         // leads to names the cap: a persistent non-cap refusal
-                        // (an unknown block, a workspace that will not resolve)
-                        // would park as `held(cap-full)` on a notice telling an
-                        // orchestrator to free a slot that is not the problem —
-                        // the diagnosis-for-observation swap #1961 fixed one
-                        // hold over. Those keep the bound they have,
+                        // (an unknown block, a workspace that will not resolve,
+                        // this drive's own duplicate refusal) would park as
+                        // `held(cap-full)` on a notice telling an orchestrator to
+                        // free a slot that is not the problem — the
+                        // diagnosis-for-observation swap #1961 fixed one hold
+                        // over. Those keep the bound they have,
                         // `drive_timeout_minutes`, which asserts nothing.
-                        if cap && entry.note_cap_starvation(now) {
+                        //
+                        // **And only a cap refusal may LET it stand** (#2109
+                        // review 4). Guarding the write alone made the stamp a
+                        // latch: nothing on a non-cap refusal re-stamped it and
+                        // nothing cleared it, so a single early cap refusal
+                        // aged into `held(cap-full)` behind a run of refusals
+                        // that were nothing of the kind — the exact outcome the
+                        // paragraph above says is prevented, reached from the
+                        // read edge instead of the write edge. Worse, the stamp
+                        // is the ENTRY's while `first_stale_lane` re-picks the
+                        // lane every tick, so a two-lane drive could park on a
+                        // stamp left by a lane that is no longer the subject,
+                        // while the lane that IS the subject sits in a live pane
+                        // the reuse arm could have delivered into for free.
+                        //
+                        // Clearing on every non-cap refusal closes both, and it
+                        // closes the second WITHOUT keying the stamp on a block,
+                        // which would be worse than the defect: a drive that
+                        // cannot open ANY lane is starved whichever lane the
+                        // tick happens to select, and a per-block clock would
+                        // restart every time the selection moved — letting a
+                        // genuinely starved multi-lane drive evade the bound by
+                        // alternating. The cost is that a mixed run restarts the
+                        // window at each cap refusal after a non-cap one, which
+                        // is the fail-safe direction and is what the word
+                        // "continuously" on `HeldReason::CapFull` promises.
+                        let moved = if cap {
+                            entry.note_cap_starvation(now)
+                        } else {
+                            entry.clear_cap_starvation()
+                        };
+                        if moved {
                             out.changed = true;
                         }
                         out.audits.push((

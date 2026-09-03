@@ -279,6 +279,12 @@ pub enum HeldReason {
     /// **The cap has refused this drive's LANE, continuously, for
     /// [`CAP_HOLD_MS`]** (#2109) — the starvation made visible.
     ///
+    /// "Continuously" is a promise the TICK keeps, not this enum: a refusal
+    /// that is not the cap's clears the stamp rather than letting it age, so
+    /// this reason cannot be reached behind a run of refusals that were
+    /// something else. Guarding only the write made the stamp a latch, which is
+    /// review 4's W1 on #2112.
+    ///
     /// Its own reason rather than [`CapRefused`](HeldReason::CapRefused), and
     /// the argument is a DURATION rather than a remedy. The two share a remedy
     /// (free a slot), so a reader deciding what to *do* could be served by one
