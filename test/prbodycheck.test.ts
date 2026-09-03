@@ -111,7 +111,8 @@ test('a byte count stated for a named blob is checked against THAT blob (#2140 r
   // well when the figure has fallen through to the compare-against-head arm, which is a
   // different check answering a different question.
   assert.match(b[0].message, /is stated for blob `61855f9c`/);
-  assert.match(b[0].message, /325,375 bytes .* \(git cat-file -s\)/);
+  assert.match(b[0].message, /matches no blob bound to it on this line \(git cat-file -s\)/);
+  assert.match(b[0].message, /`61855f9c` = 325,375 bytes \/ 323,044 chars \/ 6,892 lines/);
 
   // The discriminating half. `body-good.md` states the BASE blob's size beside the head
   // blob's, with the path on the same line: pairing each figure with the blob next to it
@@ -120,6 +121,64 @@ test('a byte count stated for a named blob is checked against THAT blob (#2140 r
   // pairing rule fail-able rather than merely exercised.
   assert.equal(good.findings.filter((f) => f.check === 'byte-figure').length, 0);
   assert.ok(good.claims.byte_figures >= 2, `byte figures read from the good body: ${good.claims.byte_figures}`);
+});
+
+test('two blob tokens straddling one figure are a CHECK, not a refusal (rev-std round 1, premortem 2)', () => {
+  // The reviewer's arrangement: "blob X ... figure ... blob Y", where nearest-to-the-left
+  // pairs the figure with the blob the sentence is contrasting it against. No rule can read
+  // which one the prose means, so the script says exactly that.
+  const straddled = 'The blob `728f7407` grew to **325,375** bytes at `61855f9c`.';
+  const s = (pbc.analyze(straddled, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+  assert.equal(s.length, 1);
+  assert.equal(s[0].severity, 'CHECK');
+  assert.match(s[0].message, /nearest blob `728f7407` but matches `61855f9c`/);
+  assert.match(s[0].message, /two blobs straddle this figure/);
+
+  // The discriminating half, and the reason "matches ANY blob on the line" is NOT the rule:
+  // a figure matching neither candidate is still a MISMATCH. On the real #2140 body the
+  // stale figure sits in the same sentence as the wave-1 blob it came from, so a
+  // membership rule reads that defect as clean.
+  const wrong = 'The blob `728f7407` grew to **324,776** bytes at `61855f9c`.';
+  const w = (pbc.analyze(wrong, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+  assert.equal(w.length, 1);
+  assert.equal(w[0].severity, 'MISMATCH');
+  assert.match(w[0].message, /`728f7407` = 300,527 bytes/);
+  assert.match(w[0].message, /`61855f9c` = 325,375 bytes/);
+});
+
+test('a blob further than the binding window is not that figure subject', () => {
+  // The window and the boundary are two separate constraints, and the arrow test below
+  // exercises only the boundary. Here `728f7407` sits well past BLOB_BIND_CHARS with no
+  // punctuation between it and the figure, so only the window can exclude it: bound, it
+  // would be the nearest candidate, would not match, and no other candidate is on the line
+  // — a MISMATCH on a sentence that claims nothing about it.
+  const far = 'Blob `728f7407` was the subject of a much earlier round and is mentioned here only in passing before we get to **325,375** bytes';
+  assert.ok(far.indexOf('325,375') - far.indexOf('728f7407') > 40, 'the fixture must actually exceed the window');
+  assert.doesNotMatch(far.slice(far.indexOf('728f7407'), far.indexOf('325,375')), /[.;|—→]/, 'and must carry no boundary, or the window is not what is under test');
+  assert.equal((pbc.analyze(far, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure').length, 0);
+
+  // Positive control: the identical sentence with the blob inside the window IS bound, and
+  // the same figure then reddens — so the silence above is the window, not the checker
+  // having stopped looking at this line.
+  const near = 'Blob `728f7407` grew to **325,375** bytes';
+  const n = (pbc.analyze(near, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+  assert.equal(n.length, 1);
+  assert.equal(n[0].severity, 'MISMATCH');
+});
+
+test('an arrow separates an append proof into two claims, each bound to its own blob', () => {
+  // `base X N bytes -> head Y M bytes` is two claims, and binding across the arrow makes
+  // the head figure a candidate for the base blob. Both halves are correct here and both
+  // are silent; swapping one value reddens only that half.
+  const proof = 'base `728f7407` **300,527** bytes → head `61855f9c` **325,375** bytes';
+  assert.equal((pbc.analyze(proof, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure').length, 0);
+  const broken = 'base `728f7407` **300,527** bytes → head `61855f9c` **324,776** bytes';
+  const r = (pbc.analyze(broken, FACTS) as Result).findings.filter((f) => f.check === 'byte-figure');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].severity, 'MISMATCH');
+  assert.match(r[0].message, /"324,776 bytes" is stated for blob `61855f9c`/);
+  // ...and the base blob is NOT among its candidates, because the arrow ended the binding.
+  assert.doesNotMatch(r[0].message, /728f7407/);
 });
 
 test('a byte figure with no blob beside it is checked against head, with all four instruments named (#1764 r7)', () => {

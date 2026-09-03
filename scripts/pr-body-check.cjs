@@ -169,6 +169,12 @@ function isIdentifierToken(tok) {
   return /_/.test(core) || /::/.test(core) || /\(\)$/.test(t);
 }
 
+// How near a blob token must sit to a byte figure to be read as that figure's subject, and
+// what ends the binding. `→` is a boundary because an append proof uses it to separate two
+// claims about two different blobs.
+const BLOB_BIND_CHARS = 40;
+const BIND_BOUNDARY = /[.;|—→]|-->/;
+
 // An HTML comment whose TEXT tells somebody to fill it in is a placeholder however it is
 // named — `<!-- RED-EVIDENCE: paste the failing test output here -->` is the #1758 r1 shape,
 // and it carries none of the bare markers above.
@@ -368,15 +374,43 @@ function analyze(body, facts) {
   const figuresOnLine = new Map();
   for (const b of claims.byteFigures) figuresOnLine.set(b.line, (figuresOnLine.get(b.line) || 0) + 1);
   for (const b of claims.byteFigures) {
-    const blobTok = claims.shas
-      .filter((s) => s.line === b.line && s.index < b.index && (f.blobs || {})[s.sha])
-      .sort((x, y) => y.index - x.index)[0];
-    if (blobTok) {
-      const bl = f.blobs[blobTok.sha];
-      const got = b.unit === 'char' ? bl.chars : b.unit === 'line' ? bl.lines : bl.bytes;
-      if (b.value !== got) {
+    // Which blob a figure is stated FOR, by adjacency rather than by membership of the
+    // line. A receipt line routinely names three blobs — the base, the head, and the one an
+    // earlier round got wrong — so "any blob on the line matches" accepts the wrong figure:
+    // #2140's round-3 defect names the wave-1 blob in the same sentence that states the
+    // stale figure, and a membership rule reads that as clean.
+    //
+    // A blob is a CANDIDATE when it sits within `BLOB_BIND_CHARS` of the figure with no
+    // sentence, cell or arrow boundary between — the same shape the run/SHA pairing uses.
+    // `→` is in that boundary set because it is how an append proof separates its halves:
+    // "base `X` 300,527 bytes → head `Y` 325,375 bytes" is two claims, not one.
+    //
+    //   matches the NEAREST candidate      -> silent, the ordinary case
+    //   matches another candidate          -> CHECK. Two blobs straddle one figure ("blob
+    //                                        `X` grew to 325,375 bytes at `Y`") and no rule
+    //                                        can read which the sentence means; saying so
+    //                                        is right, refusing is not
+    //   matches no candidate               -> MISMATCH
+    //
+    // Residual: a blob named past a boundary is not a candidate at all, so a figure whose
+    // real subject sits in the next clause falls through to the compare-against-head arm.
+    const candidates = claims.shas
+      .filter((s) => s.line === b.line && (f.blobs || {})[s.sha]
+        && Math.abs(s.index - b.index) <= BLOB_BIND_CHARS
+        && !BIND_BOUNDARY.test(b.text.slice(Math.min(s.index, b.index), Math.max(s.index, b.index))))
+      .sort((x, y) => Math.abs(x.index - b.index) - Math.abs(y.index - b.index));
+    if (candidates.length) {
+      const sizeOf = (bl) => (b.unit === 'char' ? bl.chars : b.unit === 'line' ? bl.lines : bl.bytes);
+      const nearest = candidates[0];
+      if (sizeOf(f.blobs[nearest.sha]) === b.value) continue;
+      const other = candidates.find((s) => sizeOf(f.blobs[s.sha]) === b.value);
+      const table = candidates.map((s) => `\`${s.sha}\` = ${fmt(f.blobs[s.sha].bytes)} bytes / ${fmt(f.blobs[s.sha].chars)} chars / ${fmt(f.blobs[s.sha].lines)} lines`).join('; ');
+      if (other) {
+        add('CHECK', 'byte-figure', b.line,
+          `"${fmt(b.value)} ${b.unit}s" is nearest blob \`${nearest.sha}\` but matches \`${other.sha}\` — two blobs straddle this figure, so name the one it is stated for. ${table}`, b.text);
+      } else {
         add('MISMATCH', 'byte-figure', b.line,
-          `"${fmt(b.value)} ${b.unit}s" is stated for blob \`${blobTok.sha}\`, which is ${fmt(bl.bytes)} bytes / ${fmt(bl.chars)} chars / ${fmt(bl.lines)} lines (git cat-file -s)`, b.text);
+          `"${fmt(b.value)} ${b.unit}s" is stated for blob \`${nearest.sha}\`, and matches no blob bound to it on this line (git cat-file -s): ${table}`, b.text);
       }
       continue;
     }
