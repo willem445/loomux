@@ -722,7 +722,15 @@ function mergeClippy(legs) {
     parsed += leg.parsed || 0;
     ignored += leg.ignored || 0;
     for (const f of leg.functions || []) {
-      const key = f.file + '#' + (f.name || f.line);
+      // `file:line`, NOT `file#name`. A name is not a function identity in Rust —
+      // `src-tauri/src/orchestration/mod.rs` declares 16 `fn as_str`, and keying on
+      // the name collapsed all 16 into one row that published the LARGEST of their
+      // values at the FIRST one's line (#2139 review round 3). 52 of 2,380 merged
+      // rows sat on such a key. The accumulator above already keys `file:line`, and
+      // the site union below already rests on span coordinates being identical
+      // across legs for one source blob, so the same argument licenses it here: one
+      // function is one `file:line` on every leg, and two functions never share one.
+      const key = f.file + ':' + f.line;
       const cur = fns.get(key);
       if (!cur) {
         fns.set(key, Object.assign({}, f));
@@ -1077,19 +1085,50 @@ function distDeltaRow(label, base, head) {
   );
 }
 
+// The ratchet identity. Unlike the merge above this one may NOT be `file:line`: a
+// function moves lines whenever anything above it changes, and a ratchet that
+// called every shifted function new would be pure false-positive. `file#name` is
+// the stable identity — but it is used as a MULTISET below, not a set, because a
+// file that already has one `render` and gains a second has a key the base already
+// knows. At head, 1,323 of 3,686 TS functions share a key with a sibling, so the
+// set-difference form made that the common case rather than a corner (#2139
+// review round 3).
 function fnKey(f) {
   return f.file + '#' + f.name;
 }
 
-// A function is NEW when its file+name pair is absent at the base — the ratchet key
-// #2128 part 7 proposes for slice C, computed here in report mode so the false-block
-// count exists before any gate is armed.
+// A function is NEW when the head has MORE functions under its `file#name` than the
+// base did — the ratchet key #2128 part 7 proposes for slice C, computed here in
+// report mode so the false-block count exists before any gate is armed.
+//
+// The count, not the presence of the key: a second `render` added to a file that
+// already had one is a new function, and a set-difference cannot see it. Which of
+// the same-named siblings is "the new one" is not knowable from the rows, so the
+// LARGEST are taken — a ratchet may over-report and be argued with, but it must not
+// silently miss the case it exists for.
 function newFunctionsOverP95(baseFns, headFns, baseP95, key) {
   if (baseP95 === null || baseP95 === undefined) return [];
-  const seen = new Set((baseFns || []).map(fnKey));
-  return (headFns || [])
-    .filter((f) => typeof f[key] === 'number' && f[key] > baseP95 && !seen.has(fnKey(f)))
-    .sort((a, b) => b[key] - a[key]);
+  const baseCount = new Map();
+  for (const f of baseFns || []) {
+    const k = fnKey(f);
+    baseCount.set(k, (baseCount.get(k) || 0) + 1);
+  }
+  const byKey = new Map();
+  for (const f of headFns || []) {
+    const k = fnKey(f);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(f);
+  }
+  const out = [];
+  for (const [k, list] of byKey) {
+    const added = list.length - (baseCount.get(k) || 0);
+    if (added <= 0) continue;
+    const ranked = list
+      .filter((f) => typeof f[key] === 'number')
+      .sort((a, b) => b[key] - a[key]);
+    for (const f of ranked.slice(0, added)) if (f[key] > baseP95) out.push(f);
+  }
+  return out.sort((a, b) => b[key] - a[key]);
 }
 
 function buildDelta(base, head, meta) {
@@ -1268,7 +1307,18 @@ function cmdDelta(args) {
   } catch {
     base = null;
   }
-  const head = JSON.parse(fs.readFileSync(args.head, 'utf8'));
+  // Guarded like every sibling read here. A truncated head artifact — an upload cut
+  // short, a disk-full runner — degrades to no comment and a reason on stderr,
+  // rather than throwing out of the process. `continue-on-error` would have hidden
+  // the throw in this workflow, which is what made the CLAIM at the top of this file
+  // the thing at risk rather than the build (#2139 review round 3, premortem).
+  let head;
+  try {
+    head = JSON.parse(fs.readFileSync(args.head, 'utf8'));
+  } catch (e) {
+    process.stderr.write('code-metrics: head report unreadable (' + e.message + ') — no delta comment written\n');
+    return;
+  }
   // The diff may arrive here rather than with the head report: slice B computes
   // the merge-base only once it has one, and re-running the whole report just to
   // attach a diff would measure the tree twice for one extra field.

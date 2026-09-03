@@ -552,6 +552,131 @@ test('the mod.rs row carries base, head and the signed delta', () => {
   assert.match(body, /mod\.rs` lines \| 1000 \| 1191 \| \+191 \|/);
 });
 
+// Review round 3 (#2139), blocking finding: `file#name` is not a function identity.
+// Rust `impl` blocks routinely give one file many `fn as_str`, `fn new`, `fn fmt`,
+// `fn drop` — `src-tauri/src/orchestration/mod.rs` declares 16 `as_str` alone, and
+// the head artifact carried ONE row for them, publishing the maximum of their values
+// at the first one's line. 52 of 2,380 merged Rust rows sat on an ambiguous key.
+//
+// Both fixtures below make the two operands COLLIDE, which the round-1 fixtures did
+// not: they had no file with two same-named functions, so a `file#name` merge and a
+// per-function merge produced identical output and the assertion held under both
+// (CLAUDE.md #1182 / #1300 B1).
+
+test('two same-named functions in one file stay two rows, with their own values', () => {
+  const leg = {
+    platform: 'ubuntu-22.04',
+    messagesSeen: 2,
+    parsed: 2,
+    ignored: 0,
+    unparsed: [],
+    perFile: [],
+    functions: [
+      { file: 'src-tauri/src/x.rs', line: 10, endLine: 16, name: 'as_str', lines: 5, cognitive: 1, args: null },
+      { file: 'src-tauri/src/x.rs', line: 900, endLine: 1400, name: 'as_str', lines: 480, cognitive: 70, args: null },
+    ],
+  };
+  const m = cm.mergeClippy([leg]);
+
+  // Two in, two out. Under a `file#name` key this is 1, and `n` below is 1.
+  assert.equal(m.functions.length, 2);
+  const small = m.functions.find((f: any) => f.line === 10);
+  const big = m.functions.find((f: any) => f.line === 900);
+  // Neither row may carry the other's numbers — the failure was the big function's
+  // 480 lines being stamped on the 5-line one at line 10.
+  assert.equal(small.lines, 5);
+  assert.equal(small.cognitive, 1);
+  assert.equal(big.lines, 480);
+  assert.equal(big.cognitive, 70);
+  // The population the percentiles run over is the real one.
+  assert.equal(m.percentiles.fnLines.n, 2);
+  assert.equal(m.percentiles.fnLines.max, 480);
+});
+
+test('one function reported by two legs is still one row, taking the larger value', () => {
+  // The other direction, and the reason the key is `file:line` rather than anything
+  // per-leg: a `cfg`-gated body genuinely is one function with two measurements.
+  const leg = (platform: string, lines: number) => ({
+    platform,
+    messagesSeen: 1,
+    parsed: 1,
+    ignored: 0,
+    unparsed: [],
+    perFile: [],
+    functions: [{ file: 'src-tauri/src/x.rs', line: 42, endLine: 99, name: 'gated', lines, cognitive: null, args: null }],
+  });
+  const m = cm.mergeClippy([leg('ubuntu-22.04', 20), leg('windows-latest', 55)]);
+  assert.equal(m.functions.length, 1);
+  assert.equal(m.functions[0].lines, 55);
+  assert.equal(m.functions[0].name, 'gated');
+});
+
+test('a NEW same-named function above the base p95 is reported, and its sibling is not', () => {
+  // The ratchet key. `newFunctionsOverP95` diffed base against head on `file#name`,
+  // so adding a SECOND `render` to a file that already had one was invisible — the
+  // key was already known. 1,323 of 3,686 TS functions at head share a key with a
+  // sibling, so this is the common case, not a corner.
+  const base = [
+    { file: 'src/a.ts', name: 'render', line: 10, lines: 10 },
+    { file: 'src/a.ts', name: 'helper', line: 40, lines: 8 },
+  ];
+  const head = [
+    { file: 'src/a.ts', name: 'render', line: 10, lines: 10 },
+    { file: 'src/a.ts', name: 'helper', line: 40, lines: 8 },
+    { file: 'src/a.ts', name: 'render', line: 200, lines: 600 },
+  ];
+  const out = cm.newFunctionsOverP95(base, head, 100, 'lines');
+  assert.deepEqual(out.map((f: any) => f.line), [200]);
+  assert.equal(out[0].lines, 600);
+});
+
+test('an EXISTING function that merely grew past the p95 is not reported as new', () => {
+  // The discriminating half. A ratchet keyed on new ENTITIES must not fire when the
+  // same function got bigger — that is existing debt, which #2128 part 7 is explicit
+  // must never block. A count-only test would pass under an implementation that
+  // reported every oversized function.
+  const base = [{ file: 'src/a.ts', name: 'render', line: 10, lines: 10 }];
+  const head = [{ file: 'src/a.ts', name: 'render', line: 10, lines: 600 }];
+  assert.deepEqual(cm.newFunctionsOverP95(base, head, 100, 'lines'), []);
+});
+
+test('when several same-named siblings are added at once, the largest is the one named', () => {
+  // Two new `render`s, one over the p95 and one under. Exactly one row, and it is the
+  // one worth a reviewer's attention.
+  const base = [{ file: 'src/a.ts', name: 'render', line: 10, lines: 10 }];
+  const head = [
+    { file: 'src/a.ts', name: 'render', line: 10, lines: 10 },
+    { file: 'src/a.ts', name: 'render', line: 200, lines: 600 },
+    { file: 'src/a.ts', name: 'render', line: 900, lines: 12 },
+  ];
+  const out = cm.newFunctionsOverP95(base, head, 100, 'lines');
+  assert.deepEqual(out.map((f: any) => f.lines), [600]);
+});
+
+test('the delta subcommand degrades on an unreadable head report instead of throwing', () => {
+  // `code-metrics.cjs`'s header promises "every parse error degrades to a missing
+  // row". The head read was the one unguarded `JSON.parse` in the CLI, so a truncated
+  // artifact threw out of the process — `continue-on-error` would have hidden it in
+  // this workflow, which is exactly what makes the claim, not the behaviour, the
+  // thing at risk (#2139 review round 3, premortem).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codemetrics-'));
+  const head = path.join(dir, 'head.json');
+  const out = path.join(dir, 'comment.md');
+  try {
+    fs.writeFileSync(head, '{"schemaVersion":1,"ts":{"percenti');
+    const res = execFileSync(
+      process.execPath,
+      [scriptPath, 'delta', '--head', head, '--out', out],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    // Exit 0, no comment written, and the reason on stderr rather than a stack trace.
+    assert.equal(fs.existsSync(out), false);
+    assert.match(String(res), /^$|code-metrics/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // The CLI and the persisted schema
 // ---------------------------------------------------------------------------
