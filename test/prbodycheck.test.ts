@@ -69,6 +69,17 @@ test('a body whose every receipt is correct produces no MISMATCH', () => {
   assert.ok(good.claims.byte_figures >= 2, `byte figures read: ${good.claims.byte_figures}`);
 });
 
+test('a blob cited beside a file that is not that file blob at head is a CHECK (#2139 r2)', () => {
+  // The append proof's BASE blob. It is correct and the script cannot read that it is
+  // correct — a blob cited for a file is as often last round's as this round's — so it
+  // asks rather than refuses, and names both blobs so the answer is one glance away.
+  const b = of(good, 'blob');
+  assert.equal(b.length, 1);
+  assert.equal(b[0].severity, 'CHECK');
+  assert.match(b[0].message, /blob `728f7407` is cited beside src-tauri\/tests\/reviewdrive\.rs/);
+  assert.match(b[0].message, /whose blob at head is 61855f9c/);
+});
+
 test('the good body still reports the one thing that is genuinely unsettled', () => {
   // `65ecd6ae` is main's head during review — resolvable, correct, and not on the PR ref.
   // That is a CHECK by design, and asserting it here stops the negative control above from
@@ -92,14 +103,23 @@ test('a diffstat left at the previous round value is a MISMATCH naming both figu
 });
 
 test('a byte count stated for a named blob is checked against THAT blob (#2140 r3)', () => {
-  const b = stale.findings.filter((f) => f.check === 'byte-figure' && /61855f9c/.test(f.message));
+  const b = stale.findings.filter((f) => f.check === 'byte-figure' && /324,776/.test(f.message));
   assert.equal(b.length, 1);
   assert.equal(b[0].severity, 'MISMATCH');
-  assert.match(b[0].message, /324,776 bytes/);
-  assert.match(b[0].message, /325,375 bytes/);
-  // The same sentence in `body-good.md` states 325,375 against the same blob and is silent,
-  // so this pin fails on the value rather than on the shape of the sentence.
+  // The message shape is asserted, not just the numbers: only the blob-pairing arm says
+  // "stated for blob ... (git cat-file -s)". Matching on the values alone passes just as
+  // well when the figure has fallen through to the compare-against-head arm, which is a
+  // different check answering a different question.
+  assert.match(b[0].message, /is stated for blob `61855f9c`/);
+  assert.match(b[0].message, /325,375 bytes .* \(git cat-file -s\)/);
+
+  // The discriminating half. `body-good.md` states the BASE blob's size beside the head
+  // blob's, with the path on the same line: pairing each figure with the blob next to it
+  // settles both and says nothing. Without pairing, the base figure is measured against
+  // the file at head and 300,527 becomes a finding — so this assertion is what makes the
+  // pairing rule fail-able rather than merely exercised.
   assert.equal(good.findings.filter((f) => f.check === 'byte-figure').length, 0);
+  assert.ok(good.claims.byte_figures >= 2, `byte figures read from the good body: ${good.claims.byte_figures}`);
 });
 
 test('a byte figure with no blob beside it is checked against head, with all four instruments named (#1764 r7)', () => {

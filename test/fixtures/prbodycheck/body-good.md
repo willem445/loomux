@@ -25,9 +25,11 @@ Run **33791843349** at `c7a3626a`, all three platforms green.
 
 ### Append proof
 
-The base blob of `src-tauri/tests/reviewdrive.rs` is a verbatim prefix of the head blob:
-base `728f7407` **300,527** bytes, head `61855f9c` **325,375** bytes, both by
-`git cat-file -s`.
+The base blob of `src-tauri/tests/reviewdrive.rs` is `728f7407`, **300,527** bytes, and its
+head blob `61855f9c` is **325,375** bytes — a verbatim prefix, both by `git cat-file -s`.
+(Both figures and the path sit on ONE line on purpose: that is what makes the blob-pairing
+rule fail-able. Pairing each figure with the blob beside it settles both; without it the
+base figure is measured against the file at head and 300,527 becomes a finding.)
 
 `origin/main` moved during review, to `65ecd6ae` (#2124), which this branch does not carry.
 
