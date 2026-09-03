@@ -2281,9 +2281,10 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // the delta re-brief below, which resets both `at_head` and the
                 // clock. Only a lane asked about this head and still silent past
                 // its timeout stalls.
+                // SCRATCH #2109 review-1 M8: the pre-fix arm — head and clock
+                // only, blind to whether the lane ANSWERED.
                 Some(rec)
                     if rec.briefed_head == facts.head
-                        && rec.at_head != facts.head
                         && facts.now_ms.saturating_sub(rec.spawned_ms)
                             >= minutes_ms(limits.lane_timeout_minutes) =>
                 {
