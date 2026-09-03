@@ -85,3 +85,12 @@ When the roster carries `worker-std`/`rev-std` (opencode + GLM Flash):
    instruments, pasted; a mismatch is a finding, never an explanation.
 6. Read rev-final's "review findings" per PR; when three consecutive PRs show no
    blocking miss by rev-std, propose dropping rev-final (the human's rule).
+
+## Non-blocking findings at review round >= 2: defer, don't route another round
+
+When every required lane has passed and the only open findings are non-blocking, at
+review round >= 2 the orchestrator DEFERS them to a follow-up issue (reason, filed
+issue, one line to the human) instead of routing another round — UNLESS a finding
+names a defect: a wrong value, an unreachable arm, a claim the code contradicts.
+Those route as blocking. Round-1 non-blocking findings are still fixed in the PR.
+(#2168, #2104, #1758)

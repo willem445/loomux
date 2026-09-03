@@ -17,6 +17,13 @@
 #     worker fixes -> rev-std re-records (cheap) -> ONE rev-final delta.
 #     Measured: run in parallel, rev-final was resumed 3-4x per PR for rounds
 #     that were pure re-verification (#1764: four Opus deltas for body receipts).
+#     DEFER RULE (human decision q-38, #2168): when every required lane has
+#     passed and the only open findings are non-blocking, at review round >= 2
+#     the orchestrator DEFERS them to a follow-up issue (reason, filed issue,
+#     one line to the human) instead of routing another round -- UNLESS a
+#     finding names a defect: a wrong value, an unreachable arm, a claim the
+#     code contradicts. Those route as blocking. Round-1 non-blocking findings
+#     are still fixed in the PR. (#2168)
 #
 #  2. ROUTE BY DIFF SHAPE (gates.merge.routing below, #1176). The static gate is
 #     rev-std alone; rev-final is REQUIRED only when the diff touches code, tests,
