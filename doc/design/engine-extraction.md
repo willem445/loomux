@@ -65,6 +65,18 @@ against an empty crate:
   PTYs directly. `NullPaneHost` replaces today's "if the app handle is `None`"
   test branch, which is the same idea already, just spelled as an `Option`.
 
+**`PaneHost` hands back a driver object, not a byte pipe (#84).**
+`request_pane` returns a `Box<dyn AgentPane>` — send a turn, answer a
+permission request, read an event stream, ask for the session id — so a PTY
+pane and a structured harness pane (Claude Code over `stream-json`) are two
+implementations of one trait rather than two seams. That is what keeps one
+spawn path, one delivery front door and one idle model across both kinds, and
+it is what the daemon-side `PaneHost` implements once instead of twice. The
+event vocabulary, the `driver:` block key that selects an implementation, and
+the rendering contract are `doc/design/harness-adapters.md`; the
+behavioural-silence bar below is the bar for wrapping today’s PTY machinery in
+it.
+
 The bar for both is **behavioural silence**: the existing integration suite
 green with no test edits. A trait swap that needs the tests rewritten to pass is
 a trait swap that changed behaviour.
