@@ -2604,6 +2604,15 @@ fix was to the PR body alone, because the commit never moves. A new *commit* is 
 again: there the reviewer in flight is reading code that no longer exists, so a successor is opened
 for the new revision exactly as before.
 
+**Driving the same PR again keeps the reviewers you already paid for.** When a drive ends and you
+start another one on the same PR — the usual shape: the gate is satisfied, you decide what to do
+with the findings, then you drive again at the new head — each reviewer's conversation is carried
+over, so it comes back to a PR it has already read instead of starting cold — and it is asked
+again in its own words: "your previous verdict was `pass` at that commit; here is what changed
+since". Nothing the previous drive concluded counts toward the new one; every lane still has to
+answer at the new head before the gate is satisfied. A reviewer whose session can no longer be
+reopened simply starts fresh, as it always did.
+
 **A reviewer's pane going away is noticed, not waited out.** If a lane's pane is killed — by you,
 by the idle reaper, or because the CLI exited — the driver sees it on the next tick and reopens
 that reviewer's session in a fresh pane, rather than sitting there waiting for a verdict that can

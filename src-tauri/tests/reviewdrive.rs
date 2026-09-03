@@ -5919,6 +5919,151 @@ fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
     );
 }
 
+// ── #2153: a re-drive keeps the lanes' conversations ────────────────────────
+
+/// **#2153.** A drive started on a PR whose previous drive is over resumes each
+/// lane's conversation instead of spawning it cold — and a lane whose session
+/// can no longer be reopened still falls through to a fresh pane, on the record.
+///
+/// The gap is the CROSS-DRIVE boundary, and it is the ordinary path rather than
+/// an edge: satisfied → the orchestrator dispositions the findings → re-drive is
+/// the sequence a satisfied gate is designed to produce. Lane memory lives only
+/// on the entry, and `drive_review` replaces a terminal entry with a
+/// `DriveEntry::new`, so it went with it. Measured on PR #2141: both lanes
+/// re-opened `resumed=false` although each had a live, resolvable session that
+/// had already read the PR once.
+///
+/// **The gone-session arm is the control**, and it is not decoration: without it
+/// this test passes under an implementation that seeded a session it never
+/// checked and then reported every fresh spawn as a resume. It also pins the
+/// fail direction — toward a COLD lane, never toward a brief on a conversation
+/// that is not there.
+#[test]
+fn a_re_drive_resumes_each_lanes_conversation_and_a_lost_one_still_opens_fresh() {
+    // (arm, resumed on the re-drive's first lane open, `rd-lane-resume-failed` rows)
+    type Row = (&'static str, bool, usize);
+    let mut observed: Vec<Row> = Vec::new();
+
+    for arm in ["warm", "session-gone"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, session) = driven(&reg, &repo, &gh);
+        let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+        with_pane(&reg, &orch.id, 7001);
+        reg.set_pr_head_override(Some(HEAD_A.to_string()));
+        reg.set_pr_body_override(Some("b".to_string()));
+
+        reg.rd_drive_group_with(&group, &gh, 10_000);
+        let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+        let (_pr, _b, lane) =
+            first.lanes_opened.first().cloned().unwrap_or_else(|| panic!("{arm}: lane 0 opens"));
+        assert_eq!(
+            lane_spawn_rows(&reg, &group)[0]["resumed"],
+            json!(false),
+            "{arm}: the control — a first round is never a resume"
+        );
+
+        // The lane passes, the gate is satisfied, and the drive ends.
+        dispatch(
+            &reg,
+            &Caller {
+                agent_id: lane.clone(),
+                group: group.clone(),
+                role: Role::Reviewer,
+                role_hint: None,
+            },
+            "tools/call",
+            &json!({ "name": "review_verdict", "arguments": {
+                "pr": "1758", "verdict": "pass", "summary": "pass - nothing blocking" } }),
+        )
+        .unwrap_or_else(|e| panic!("{arm}: the lane records: {e:?}"));
+        reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> gate-check
+        reg.rd_drive_group_with(&group, &gh, 40_000); // gate-check -> satisfied
+        assert!(
+            reg.review_drive_status(&group)["drives"].as_array().is_some_and(|d| d.is_empty()),
+            "{arm}: the fixture's premise — the previous drive really is TERMINAL, which is \
+             the only state that reaches the replace branch: {}",
+            reg.review_drive_status(&group)
+        );
+
+        if arm == "session-gone" {
+            // The same refusal a reaped worktree produces: the recorded
+            // workspace is gone, so the resume cannot be performed (#338/#359).
+            let cwd = reg.agent(&lane).expect("the lane is on the roster").cwd;
+            std::fs::remove_dir_all(&cwd).expect("take the lane's workspace away");
+        }
+
+        // The orchestrator dispositioned the findings, the worker pushed, and
+        // the PR is driven again.
+        gh.set_facts("OPEN", HEAD_B);
+        reg.set_pr_head_override(Some(HEAD_B.to_string()));
+        let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 50_000);
+        assert_eq!(out["driving"], json!(true), "{arm}: the re-drive was refused: {out}");
+
+        reg.rd_drive_group_with(&group, &gh, 60_000);
+        let again = reg.rd_drive_group_with(&group, &gh, 70_000);
+        assert!(
+            !again.lanes_opened.is_empty(),
+            "{arm}: the re-drive must brief its lane at the new head: {:?}",
+            rows_for(&reg, &group, "rd-refused")
+        );
+        let rows = lane_spawn_rows(&reg, &group);
+        assert_eq!(rows.len(), 2, "{arm}: one spawn per round: {rows:?}");
+        observed.push((
+            arm,
+            rows[1]["resumed"] == json!(true),
+            rows_for(&reg, &group, "rd-lane-resume-failed").len(),
+        ));
+
+        if arm == "warm" {
+            assert_eq!(
+                rows[1]["session"], rows[0]["session"],
+                "…and on the SAME conversation the first drive opened: {rows:?}"
+            );
+            // **The RECORD carries no verdict and the BRIEF still does, and
+            // both are right.** `reseeded` clears `last_verdict`/`at_head`
+            // because the new entry may not assert something this drive has not
+            // read; the tick then re-reads the live verdict FILE, which outlives
+            // the drive that produced it, and `record_verdict_seen` re-derives
+            // the pair from it before the brief is built. So a lane that really
+            // did answer gets the delta template naming the head it answered at
+            // — which is #2109's whole point, a reviewer asked again in its own
+            // conversation rather than replaced by a stranger. Asserting the
+            // first-call template here would be asserting that a warm reviewer
+            // is told nothing about what it already said.
+            let delta = lane_brief(&reg, &again.lanes_opened[0].2);
+            assert!(
+                delta.starts_with("DELTA on PR #1758"),
+                "a lane whose own previous verdict is still on file is asked again in its \
+                 own conversation, not briefed as a stranger: {delta}"
+            );
+            assert!(
+                delta.contains(&format!("at head {HEAD_A}")),
+                "…naming the revision it answered about: {delta}"
+            );
+            assert!(delta.contains(HEAD_B), "…and the one it is asked about now: {delta}");
+        }
+    }
+
+    let expected: Vec<Row> = vec![
+        ("warm", true, 0),
+        // The fail direction is toward a cold lane, and it is audited rather
+        // than silent — a fresh pane is what "there was no session" looks like
+        // on this log too.
+        ("session-gone", false, 1),
+    ];
+    assert_eq!(
+        observed, expected,
+        "each row is (arm, the re-drive's first lane open was a resume, \
+         `rd-lane-resume-failed` rows). A `false` on the warm arm is the whole of #2153: a \
+         reviewer that has already read this PR paying for a cold read on the round where \
+         its warm session is cheapest. A `true` on the gone arm is a row claiming a resume \
+         that did not happen."
+    );
+}
+
 // ── #2163: a dead lane pane is observed in `review-wait`, not waited out ────
 
 /// **#2163.** A reviewer lane whose pane has died is re-opened on the next

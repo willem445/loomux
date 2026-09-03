@@ -911,6 +911,86 @@ pub struct LaneRecord {
     pub extra: BTreeMap<String, Value>,
 }
 
+impl LaneRecord {
+    /// This lane's **memory**, carried onto a fresh drive of the same PR and
+    /// nothing else (#2153).
+    ///
+    /// **The gap is the cross-drive boundary, and it is the ordinary path.**
+    /// Inside a live drive the resume is complete: `rd_lane_session` falls back
+    /// from the record to the roster to the merged records, so even a killed
+    /// lane pane resumes its conversation. But lane memory lives only on the
+    /// entry, and `drive_review` on a PR whose previous entry is TERMINAL drops
+    /// that entry and pushes a `DriveEntry::new` with `lanes: []` — so the
+    /// sequence a satisfied gate is designed to produce (satisfied →
+    /// orchestrator dispositions the findings → re-drive) spawned every lane
+    /// cold. Measured on PR #2141: two lanes with live, resolvable sessions
+    /// that had already read the PR once, both re-opened `resumed=false`, on
+    /// the round where the warm session is cheapest.
+    ///
+    /// **What is kept is the conversation and what §7 owns; what is dropped is
+    /// every claim about a revision.** `briefed_head`, `briefed_digest`,
+    /// `last_verdict` and `at_head` all describe the drive that ended, so
+    /// carrying any of them would have the first tick either wait on a brief
+    /// nobody sent or read a stale verdict as this round's answer.
+    /// `lane_open_for` is then false for every head, which is what makes the
+    /// first tick BRIEF each lane rather than wait on it.
+    ///
+    /// **That is a claim about the RECORD, not about what the brief says.** The
+    /// verdict FILE outlives the drive that produced it, and the tick re-reads
+    /// it through the gate's own parser as it does on every other tick — so
+    /// [`DriveEntry::record_verdict_seen`] re-derives `last_verdict`/`at_head`
+    /// from the file before the brief is built, and a lane that really did
+    /// answer gets the §5.5 delta template naming the head it answered at. That
+    /// is #2109's point rather than a leak past this one: a reviewer is asked
+    /// again in its own conversation instead of being replaced by a stranger who
+    /// is told what "its" previous verdict had been. What clearing the pair buys
+    /// is that the new entry asserts nothing this drive has not itself read —
+    /// so a first tick whose verdict file is absent or unreadable brief this
+    /// lane as new rather than as having answered.
+    ///
+    /// **The pane moves to `prior_agents` rather than staying current.** It is
+    /// still this drive's to intercept — a reviewer finishing its previous
+    /// round must not report to the orchestrator as if undriven — but it is no
+    /// longer the pane the drive would speak to, and [`DrivenPane::current`] is
+    /// exactly that distinction. Leaving it as `agent` would also make
+    /// `rd_live_lane_pane` treat it as a duplicate and `pane_dead` treat its
+    /// death as this drive's, both of which are claims about a round that is
+    /// over.
+    ///
+    /// `spawned_ms` goes to zero: it is the `lane-stalled` anchor, and a lane
+    /// that has not been briefed has not been silent.
+    ///
+    /// **`session` is passed in rather than copied off this record**, and that
+    /// is #2109's lesson applied one boundary over: `LaneRecord::session` is
+    /// what the spawn RETURNED, which is a session id only on a CLI that
+    /// pre-assigns one, so a copilot or opencode lane carries `""` for its whole
+    /// life and its conversation lives on the pane and the roster row instead.
+    /// A seed built from this field alone would therefore drop exactly the lanes
+    /// #2109 was about. The caller resolves it through `rd_lane_session` — the
+    /// one function that knows all three sources — and hands the answer here.
+    pub fn reseeded(&self, session: &str) -> LaneRecord {
+        let mut prior = self.prior_agents.clone();
+        prior.push(self.agent.clone());
+        LaneRecord {
+            block: self.block.clone(),
+            session: session.to_string(),
+            agent: String::new(),
+            // `""` as the "superseding" pane, which `retain_panes` treats as no
+            // pane at all — it drops empties either way, so nothing is excluded
+            // by it and the dedup and ordering still apply.
+            prior_agents: retain_panes(prior, ""),
+            last_verdict: None,
+            at_head: String::new(),
+            briefed_head: String::new(),
+            briefed_digest: String::new(),
+            spawned_ms: 0,
+            // Preserved for `ReviewDrivesState`'s reason: a field a newer build
+            // wrote is not this build's to drop.
+            extra: self.extra.clone(),
+        }
+    }
+}
+
 /// Which side of a drive an agent is — the answer §7's interception asks of
 /// every incoming `report` and `review_verdict`.
 ///
@@ -4516,6 +4596,55 @@ mod tests {
             "…and time in `review-wait` is what ends it now, where before #2110 nothing \
              but the twelve-hour age could"
         );
+    }
+
+    /// **#2153: a re-drive carries the CONVERSATION and nothing that describes a
+    /// revision.**
+    ///
+    /// Every field is asserted, and that is deliberate rather than exhaustive
+    /// for its own sake: this record is what the next drive's first tick decides
+    /// from, and each field it must NOT carry produces a different wrong answer.
+    /// A carried `briefed_head`/`briefed_digest` makes `lane_open_for` true, so
+    /// the first tick waits on a brief nobody sent; a carried `last_verdict` and
+    /// `at_head` make `lane_has_answered` true, so the delta template describes
+    /// a round that is over and the duplicate guard reads the previous drive's
+    /// pane as holding this one; a carried `spawned_ms` starts `lane-stalled`
+    /// counting from a brief in another drive's lifetime; and a carried `agent`
+    /// makes a pane the new drive never spoke to its CURRENT one.
+    #[test]
+    fn a_reseeded_lane_keeps_its_session_and_its_owned_panes_and_no_claim_about_a_revision() {
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.open_lane("rev-std", "sess-1", "rev-4", "head-a", Some("d1"), 1_000);
+        e.open_lane("rev-std", "sess-1", "rev-9", "head-a", Some("d1"), 2_000);
+        assert!(e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"));
+        let before = e.lane("rev-std").expect("the fixture's own premise").clone();
+        assert_eq!(before.prior_agents, vec!["rev-4".to_string()], "the fixture: one supersede");
+
+        let after = before.reseeded("sess-resolved");
+        assert_eq!(after.block, "rev-std", "the lane is the same lane");
+        assert_eq!(
+            after.session, "sess-resolved",
+            "and it carries the session the CALLER resolved, not the one on the record — a \
+             lane on a CLI that mints its session after boot has `\"\"` here for its whole \
+             life, and seeding off this field would drop exactly those lanes (#2109)"
+        );
+        assert_eq!(
+            after.agent, "",
+            "the previous drive's pane is not this drive's CURRENT one — leaving it here \
+             would have the duplicate guard read it as holding this round and `pane_dead` \
+             read its death as this drive's"
+        );
+        assert_eq!(
+            after.prior_agents,
+            vec!["rev-4".to_string(), "rev-9".to_string()],
+            "…but both panes are still OWNED, oldest first, so a reviewer finishing the \
+             previous round is intercepted rather than reporting as if undriven (§7)"
+        );
+        assert_eq!(after.last_verdict, None, "the previous drive's answer is not this one's");
+        assert_eq!(after.at_head, "", "…and nothing may claim this lane has answered here");
+        assert_eq!(after.briefed_head, "", "…nor that it has been asked");
+        assert_eq!(after.briefed_digest, "");
+        assert_eq!(after.spawned_ms, 0, "a lane that has not been briefed has not been silent");
     }
 
     /// **#2163: a lane whose pane is GONE is re-opened, not waited for — and
