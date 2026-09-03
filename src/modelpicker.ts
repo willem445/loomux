@@ -121,6 +121,22 @@ export class ModelPicker {
    *  which CLI's vocabulary the ids belong to — an alias means what the CLI that
    *  documents it says it means, and nothing on any other CLI (#687). */
   setOptions(models: readonly string[], fallback: string, cli = ""): void {
+    // A reply-driven rebuild can land while the human is mid-type in the
+    // `custom…` box — the launcher's probe reply (applyRoleModels' `.then`)
+    // was the one call site no host-side guard ever reached (#2124). The
+    // hazard, and the event that ends it, are this module's knowledge
+    // (runWhenNotEditing's doc), so the rebuild defers ITSELF past the
+    // mid-type window instead of trusting every host to ask: skipped while
+    // the box is focused, never dropped — at blur it runs for real and
+    // resolves the committed value exactly as an unguarded rebuild would,
+    // dropdown-branch staleness clear included. A queued rebuild cannot paint
+    // a CLI the role has already left: moving off the role's CLI select
+    // requires focusing it, and that blur is the very event that runs the
+    // queued rebuild — before the CLI's change handler can move rc.cli.
+    if (this.editingCustom) {
+      this.runWhenNotEditing(() => this.setOptions(models, fallback, cli));
+      return;
+    }
     this.options = models;
     const state = pickerSelection(models, this.value || fallback);
     this.sel.replaceChildren(

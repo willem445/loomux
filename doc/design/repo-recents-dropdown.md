@@ -97,6 +97,16 @@ unchanged:
   also clears the hidden input's stale text (#2108).
 - `focus()` — focuses whichever half is showing, for the validation-error paths
   that bounce the human back to this field.
+- `setOptions` defers itself past the mid-type window (#2124): a reply-driven
+  rebuild is no longer trusted to every host's guard, because the launcher's
+  probe reply was the one call site none of them reached. While the custom
+  input is focused (`editingCustom`) the rebuild queues on the input's next
+  `blur` through `runWhenNotEditing` — skipped under the caret, never dropped —
+  and at blur it resolves the committed value exactly as an unguarded rebuild
+  would, dropdown-branch staleness clear included. A queued rebuild cannot
+  paint a CLI the host has already left: moving off the control requires the
+  blur that runs the queue. Pinned by the two #2124 tests in
+  `test/modelpicker.test.ts`.
 
 ## Recording and persistence
 

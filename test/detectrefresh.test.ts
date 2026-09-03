@@ -529,8 +529,15 @@ test("the deferral schedules the rebuild rather than returning without it", () =
   // hand-validated like the rest of the DOM wiring. An earlier version of this
   // comment claimed behaviour coverage; it never had any.
   const text = stripComments(src("modelpicker.ts"));
-  const at = text.indexOf("runWhenNotEditing(");
-  assert.notEqual(at, -1, "`runWhenNotEditing` was renamed — the host scans above are asserting a name that is gone");
+  // Anchored on the method DEFINITION, not the first occurrence of the name:
+  // #2124 added a call site inside setOptions, and a first-occurrence anchor
+  // read that call's surroundings as the deferral's body.
+  const at = text.indexOf("runWhenNotEditing(rebuild");
+  assert.notEqual(
+    at,
+    -1,
+    "`runWhenNotEditing`'s definition moved or its parameter was renamed — the host scans above are asserting a name that is gone"
+  );
   const body = text.slice(at, text.indexOf("\n  }", at));
   assert.match(body, /rebuild\(\)/, "the not-editing path must actually run the rebuild");
   assert.match(
@@ -561,7 +568,9 @@ test("the deferral listens on the same element the edit guard reads", () => {
   const guarded = /this\.(\w+)\.hidden/.exec(guard);
   assert.notEqual(guarded, null, `the edit guard no longer reads a \`this.<field>.hidden\`, so this check cannot pair it: ${guard}`);
 
-  const deferAt = text.indexOf("runWhenNotEditing(");
+  // Same definition anchor as above: the first `runWhenNotEditing(` in the
+  // file is now setOptions' own call site (#2124), not the deferral's body.
+  const deferAt = text.indexOf("runWhenNotEditing(rebuild");
   const defer = text.slice(deferAt, text.indexOf("\n  }", deferAt));
   const listened = /this\.(\w+)\.addEventListener\("blur"/.exec(defer);
   assert.notEqual(listened, null, `the deferral no longer attaches a blur listener to a \`this.<field>\`: ${defer}`);
@@ -572,4 +581,26 @@ test("the deferral listens on the same element the edit guard reads", () => {
     `the deferral waits on \`this.${listened?.[1]}\` but the guard watches \`this.${guarded?.[1]}\` — ` +
       `\`blur\` does not bubble, so the element the human is actually typing in would never release the deferred rebuild`
   );
+
+  // …and the definition is not the only deferral any more: #2124 added one
+  // inside setOptions, routed through the seam precisely so it cannot drift.
+  // Sweep EVERY blur-attach site in the file, not just the first — the
+  // mutation that produced this scan moved the listener to the `<select>` and
+  // stayed green, and a second copy of the seam is where that drift grows
+  // back. A site routed through `runWhenNotEditing` has no attach of its own
+  // to check; a bypass that attaches directly is what this catches.
+  const attaches = [...text.matchAll(/this\.(\w+)\.addEventListener\("blur"/g)].map((m) => m[1]);
+  assert.notEqual(
+    attaches.length,
+    0,
+    "no blur listener remains in modelpicker.ts — the deferral is gone and the host scans above assert a ghost"
+  );
+  for (const field of attaches) {
+    assert.equal(
+      field,
+      guarded?.[1],
+      `a blur listener on \`this.${field}\` but the edit guard watches \`this.${guarded?.[1]}\` — ` +
+        `\`blur\` does not bubble, so a deferral waiting on any other element never releases`
+    );
+  }
 });

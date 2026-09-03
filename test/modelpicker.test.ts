@@ -83,9 +83,15 @@ class ShimElement {
 
 // Installed before the dynamic import below; the constructor runs at test
 // time and nothing in the module graph touches `document` before that.
-(globalThis as Record<string, unknown>).document = {
+//
+// `activeElement` is what `editingCustom` reads (#2124): null is focus
+// elsewhere — the state every pre-existing test here runs under, since a real
+// document's activeElement is never a control the page never focused.
+const documentShim: { createElement: (tag: string) => ShimElement; activeElement: ShimElement | null } = {
   createElement: (tag: string) => new ShimElement(tag),
+  activeElement: null,
 };
+(globalThis as Record<string, unknown>).document = documentShim;
 
 const { ModelPicker, seedPicker } = await import("../src/modelpicker.ts");
 
@@ -263,4 +269,52 @@ test("a value set that takes the custom branch still carries the value", () => {
   p.value = "C:\\elsewhere";
   assert.equal(p.input.value, "C:\\elsewhere");
   assert.equal(p.value, "C:\\elsewhere");
+});
+
+// --- #2124: the probe reply lands mid-type ------------------------------------
+//
+// The launcher's probe-reply path (applyRoleModels' `.then`) is the one
+// setOptions call site no host-side mid-type guard ever reached. The sequence:
+// the human picks custom…, types a model id, and the probe reply arrives with
+// the merged list while they are still in the box — and when that list
+// contains the typed id, the rebuild resolves to the dropdown branch, which
+// hides the input under the caret and (#2108's symmetric clear) deletes the
+// text.
+
+test("a probe reply landing mid-type defers the rebuild: the typed id survives", () => {
+  const p = makePicker(["sonnet", "opus"], "sonnet");
+  pickCustom(p);
+  const input = p.input as unknown as ShimElement;
+  input.value = "opusplan"; // the id the probe is about to confirm
+  fire(input, "input");
+  documentShim.activeElement = input;
+  p.setOptions(["sonnet", "opus", "opusplan"], "sonnet");
+  assert.equal(p.input.hidden, false, "the rebuild must not hide the input under the caret");
+  assert.equal(p.input.value, "opusplan", "the typed text must survive the reply");
+  assert.equal(documentShim.activeElement, input, "focus stays in the box");
+  documentShim.activeElement = null;
+});
+
+test("the deferred probe-reply rebuild applies at blur, not never", () => {
+  // The negative half of the guard: skipping the mid-type rebuild must not
+  // drop it — nothing else would repaint this menu with the reply's models
+  // for the life of the dialog (the reason detectrefresh pins DEFER, not
+  // drop, on both hosts). At blur the rebuild runs for real and resolves the
+  // committed value exactly as an unguarded rebuild would.
+  const p = makePicker(["sonnet", "opus"], "sonnet");
+  pickCustom(p);
+  const input = p.input as unknown as ShimElement;
+  input.value = "opusplan";
+  fire(input, "input");
+  documentShim.activeElement = input;
+  p.setOptions(["sonnet", "opus", "opusplan"], "sonnet");
+  assert.equal(p.input.hidden, false, "the rebuild must not run while the human is in the box");
+  // The human clicks away: focus moves first, THEN the input's blur fires —
+  // the event the deferral waits on.
+  documentShim.activeElement = p.select as unknown as ShimElement;
+  fire(input, "blur");
+  assert.equal(p.select.value, "opusplan", "the reply's models are applied once typing ends");
+  assert.equal(p.input.hidden, true, "the confirmed id resolves to the dropdown branch");
+  assert.equal(p.input.value, "", "…and the dropdown-branch staleness clear still runs");
+  documentShim.activeElement = null;
 });
