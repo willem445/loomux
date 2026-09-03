@@ -1,0 +1,58 @@
+[
+  {
+    "id": "orch-10",
+    "role": "orchestrator",
+    "block": "orchestrator",
+    "name": "orchestrator",
+    "session": "ses-orch"
+  },
+  {
+    "id": "rev-11",
+    "role": "reviewer",
+    "block": "rev-std",
+    "name": "r: #900 std",
+    "session": "ses-11"
+  },
+  {
+    "id": "rev-11-prev",
+    "role": "reviewer",
+    "block": "rev-std",
+    "name": "r: #900 std (earlier pane, same session)",
+    "session": "ses-11"
+  },
+  {
+    "id": "rev-12",
+    "role": "reviewer",
+    "block": "rev-final",
+    "name": "r: #900 final",
+    "session": "ses-12"
+  },
+  {
+    "id": "w-13",
+    "role": "worker",
+    "block": "worker-adv",
+    "name": "w: #900",
+    "session": "ses-13"
+  },
+  {
+    "id": "w-14",
+    "role": "worker",
+    "block": "worker-std",
+    "name": "w: #901",
+    "session": "ses-14"
+  },
+  {
+    "id": "w-16",
+    "role": "worker",
+    "block": "worker-std",
+    "name": "w: earlier pane on ses-14, never attributed to any PR",
+    "session": "ses-14"
+  },
+  {
+    "id": "w-15",
+    "role": "worker",
+    "block": "worker-std",
+    "name": "w: unrelated",
+    "session": "ses-15"
+  }
+]

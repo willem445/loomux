@@ -1,0 +1,29 @@
+{"action":"agent-spawn","actor":"orrerix","detail":{"agent":"w-13","block":"worker-adv","role":"worker","task":"open the fix for #900 and drive it to green"},"ts_ms":1700000000000}
+{"action":"agent-spawn","actor":"orrerix","detail":{"agent":"orch-10","block":"orchestrator","role":"orchestrator","task":"orchestrator pane restored; in flight: #900 and its review rounds"},"ts_ms":1700000015000}
+{"action":"agent-spawn","actor":"orrerix","detail":{"agent":"w-14","block":"worker-std","role":"worker","task":"hand-route the review rounds on #901"},"ts_ms":1700000030000}
+{"action":"agent-spawn","actor":"orrerix","detail":{"agent":"w-15","block":"worker-std","role":"worker","task":"unrelated errand, names no pull request"},"ts_ms":1700000045000}
+{"action":"prompt","actor":"w-13","detail":{"to":"orch-10","text":"[orrerix] w-13 reports progress (#900): pushed the first commit, CI queued."},"ts_ms":1700000060000}
+{"action":"prompt","actor":"w-14","detail":{"to":"orch-10","text":"[orrerix] w-14 reports blocked (#901): needs a human call on the wire shape."},"ts_ms":1700000090000}
+{"action":"rd-started","actor":"orrerix","detail":{"pr":900,"on_behalf_of":"orch-10","rounds_already_spent":0},"ts_ms":1700000120000}
+{"action":"prompt","actor":"w-14","detail":{"to":"orch-10","text":"[orrerix] message from w-14 (#901): answering your question inline."},"ts_ms":1700000150000}
+{"action":"rd-lane-spawned","actor":"orrerix","detail":{"pr":900,"agent":"rev-11-prev","block":"rev-std","round":1,"head":"aaaaaaa"},"ts_ms":1700000170000}
+{"action":"rd-lane-spawned","actor":"orrerix","detail":{"pr":900,"agent":"rev-11","block":"rev-std","round":1,"head":"aaaaaaa"},"ts_ms":1700000180000}
+{"action":"review-verdict","actor":"rev-12","detail":{"pr":901,"block":"rev-final","verdict":"escalate","head":"bbbbbbb","body_digest":"d1"},"ts_ms":1700000210000}
+{"action":"rd-lane-spawned","actor":"orrerix","detail":{"pr":900,"agent":"rev-12","block":"rev-final","round":1,"head":"aaaaaaa"},"ts_ms":1700000240000}
+{"action":"prompt","actor":"rev-12","detail":{"to":"orch-10","text":"[orrerix] rev-12 reports request_changes (#901): three findings, one blocking."},"ts_ms":1700000270000}
+{"action":"rd-refused","actor":"orrerix","detail":{"pr":900,"reason":"lane-spawn-refused","block":"rev-std","on_behalf_of":"orch-10"},"ts_ms":1700000300000}
+{"action":"rd-refused","actor":"orrerix","detail":{"pr":900,"reason":"lane-spawn-refused","block":"rev-std","on_behalf_of":"orch-10"},"ts_ms":1700000310000}
+{"action":"rd-refused","actor":"orrerix","detail":{"pr":900,"reason":"worker-unresumable","on_behalf_of":"orch-10"},"ts_ms":1700000320000}
+{"action":"prompt","actor":"human","detail":{"to":"orch-10","text":"please look at #901 by hand, the reviewer escalated"},"ts_ms":1700000330000}
+{"action":"rd-held","actor":"orrerix","detail":{"pr":900,"reason":"drive-stalled","head":"aaaaaaa","on_behalf_of":"orch-10"},"ts_ms":1700000360000}
+{"action":"prompt","actor":"orrerix","detail":{"to":"orch-10","text":"[orrerix] PR #901 checks: SUCCESS — all 5 checks passed."},"ts_ms":1700000390000}
+{"action":"review-verdict","actor":"rev-11","detail":{"pr":900,"block":"rev-std","verdict":"fail","head":"aaaaaaa","body_digest":"d2"},"ts_ms":1700000420000}
+{"action":"prompt","actor":"orrerix","detail":{"to":"w-13","text":"[orrerix] drive PR #900: rev-std recorded FAIL, address every finding and report when green."},"ts_ms":1700000480000}
+{"action":"rd-handback","actor":"orrerix","detail":{"pr":900,"agent":"w-13","why":"review-findings","head":"aaaaaaa"},"ts_ms":1700000540000}
+{"action":"review-verdict","actor":"rev-11","detail":{"pr":900,"block":"rev-std","verdict":"pass","head":"ccccccc","body_digest":"d3"},"ts_ms":1700000600000}
+{"action":"review-verdict","actor":"rev-12","detail":{"pr":900,"block":"rev-final","verdict":"pass","head":"ccccccc","body_digest":"d4"},"ts_ms":1700000660000}
+{"action":"prompt","actor":"rev-12","detail":{"to":"orch-10","text":"[orrerix] rev-12 (rev-final) recorded verdict PASS on PR #900: gate satisfied."},"ts_ms":1700000720000}
+{"action":"rd-satisfied","actor":"orrerix","detail":{"pr":900,"head":"ccccccc","on_behalf_of":"orch-10"},"ts_ms":1700000780000}
+{"action":"prompt","actor":"w-13","detail":{"to":"orch-10","text":"[orrerix] w-13 reports done (#900): green on all three platforms, ready for review."},"ts_ms":1700000900000}
+{"action":"review-verdict","actor":"rev-12","detail":{"pr":900,"block":"rev-final","verdict":"pass","head":"ccccccc","body_digest":"d5"},"ts_ms":1700002000000}
+{"action":"rd-a-future-action","actor":"orrerix","detail":{"pr":900,"on_behalf_of":"orch-10","note":"an rd-* action this reader has no bucket for"},"ts_ms":1700000700000}
