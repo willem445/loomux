@@ -4389,6 +4389,62 @@ mod tests {
             "a drive that MOVED is not the drive that was stuck"
         );
     }
+    /// **#2110's exclusion, at the decision itself.** A drive the live-delegate
+    /// cap will not let spawn is neither progressing nor stalled, and no clock
+    /// may charge it for the difference.
+    ///
+    /// **The two halves differ in exactly one call** — `note_cap_starvation` —
+    /// so this pins the EXCLUSION and not the bound: same entry, same state,
+    /// same head, same lane list, same clock, and only whether the cap had been
+    /// refusing throughout. Without the control half an implementation that
+    /// never holds `state-stalled` at all would pass it; without the starved
+    /// half one that ignores starvation would.
+    ///
+    /// And the starved half parks on the CAP rather than on nothing, which is
+    /// the outcome #2110 asks for: the orchestrator is told the one thing it
+    /// can act on (free a slot), instead of being told a drive stalled when
+    /// what happened is that it was never allowed to move.
+    #[test]
+    fn time_the_cap_refused_a_lane_advances_neither_age_bound() {
+        let limits = DriveLimits::default();
+        let facts = |now: u64| DriveFacts {
+            now_ms: now,
+            required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
+            ..facts_at("head-a")
+        };
+        // `review-wait`'s bound is three hours here — the constant, since one
+        // lane at the default sixty-minute timeout floors it lower. Four hours
+        // is past that and well short of the twelve-hour backstop, so exactly
+        // one time bound is in play and a red is attributable to it.
+        let past = 1_000 + 4 * 60 * 60_000;
+
+        let mut moving = entry_at(DriveState::ReviewWait);
+        moving.head = "head-a".to_string();
+        assert_eq!(
+            decide(&moving, &facts(past), &limits),
+            DriveStep::held(HeldReason::StateStalled),
+            "a drive that really did sit four hours in `review-wait` must park"
+        );
+
+        let mut starved = entry_at(DriveState::ReviewWait);
+        starved.head = "head-a".to_string();
+        starved.note_cap_starvation(1_000);
+        assert_eq!(
+            decide(&starved, &facts(past), &limits),
+            DriveStep::held(HeldReason::CapFull),
+            "the cap held this drive still for four hours; charging that to its own state clock reports a stall, which is the false claim #2110 is about"
+        );
+        assert_eq!(
+            starved.state_elapsed_ms(past),
+            0,
+            "…because every millisecond of that state was time it could not spawn"
+        );
+        assert_eq!(
+            starved.bounded_age_ms(past),
+            1_000,
+            "and the age the backstop reads is the drive's own, not the cap's"
+        );
+    }
 
     /// **#1871 B1 at the decision layer.** A verdict decides only for the
     /// revision it reviewed, and the rule is word-blind.
