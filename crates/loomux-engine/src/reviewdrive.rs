@@ -1904,6 +1904,10 @@ impl DriveEntry {
     /// That residual is real and is pinned rather than merely admitted, by
     /// `an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal`.
     pub fn discard_cap_starvation_run(&mut self) -> bool {
+        if let Some(since) = self.cap_starved_since_ms {
+            self.starved_total_ms = self.starved_total_ms.saturating_add(since);
+            self.starved_state_ms = self.starved_state_ms.saturating_add(since);
+        }
         self.cap_starved_since_ms.take().is_some()
     }
 
