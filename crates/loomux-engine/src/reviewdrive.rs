@@ -1718,7 +1718,6 @@ impl DriveEntry {
         now_ms
             .saturating_sub(self.state_since_ms)
             .saturating_sub(self.starved_in_state_ms(now_ms))
-            .min(self.bounded_age_ms(now_ms))
     }
 
     /// Record that the live-delegate cap refused this drive's lane spawn, and
