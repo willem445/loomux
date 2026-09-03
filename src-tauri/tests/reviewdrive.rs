@@ -5945,6 +5945,16 @@ fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another
     let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
     with_pane(&reg, &orch.id, 7001);
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    // **The verdict's own body digest, which is a SECOND source from the
+    // drive's.** `review_verdict` records `workflow::body_digest` of what
+    // `pr_body` answers, while the drive digests the body `observe_pr` read out
+    // of `FakeGh`. Left unset the first fails, the verdict records an EMPTY
+    // digest, and `body_changed` then answers `None` — "we could not tell" —
+    // which `lane_verdict_is_current` reads as still current. The body edit
+    // below would move the drive's digest and stale nothing, and step 3 would
+    // silently re-select lane 1 instead of lane 0. Both sources are set, and
+    // both are moved together.
+    reg.set_pr_body_override(Some("b".to_string()));
     let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
     assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
 
@@ -5978,6 +5988,7 @@ fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another
     // 3. The body moves, so lane 0's pass no longer stands and the gate comes
     //    back to it — where the duplicate refusal, not the cap, is what answers.
     gh.set_body("b2");
+    reg.set_pr_body_override(Some("b2".to_string()));
     let dup = reg.rd_drive_group_with(&group, &gh, 40_000);
     assert!(dup.lanes_opened.is_empty(), "lane 0's pane holds the round");
     let dups = rows_for(&reg, &group, "rd-lane-duplicate-refused");
