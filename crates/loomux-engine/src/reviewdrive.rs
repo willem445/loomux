@@ -1751,7 +1751,6 @@ impl DriveEntry {
         // because the arc out of `held(cap-full)` is precisely the arc after the
         // longest run there is.
         self.end_starvation_run(now_ms);
-        self.cap_starved_since_ms = None;
         // The per-state clock, re-stamped on EVERY arc — see `state_since_ms`
         // for why that is the stamp §2.2 used to forbid and why the backstop is
         // what makes it safe.
