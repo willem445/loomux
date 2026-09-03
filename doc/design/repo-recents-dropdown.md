@@ -102,10 +102,20 @@ unchanged:
   probe reply was the one call site none of them reached. While the custom
   input is focused (`editingCustom`) the rebuild queues on the input's next
   `blur` through `runWhenNotEditing` — skipped under the caret, never dropped —
-  and at blur it resolves the committed value exactly as an unguarded rebuild
-  would, dropdown-branch staleness clear included. A queued rebuild cannot
-  paint a CLI the host has already left: moving off the control requires the
-  blur that runs the queue. Pinned by the two #2124 tests in
+  and at blur it re-derives the committed VALUE exactly as an unguarded
+  rebuild would (`pickerSelection` re-runs against `this.value`), so the
+  branch resolution and the dropdown-branch staleness clear still apply. The
+  ARGUMENTS are the opposite — `models`, `fallback` and `cli` freeze at reply
+  time, unlike the host-side funnels whose closures re-read; not live today
+  because later-armed deferrals run after earlier ones, and a fresher reply
+  still wins (rev-final W1 on #2124). A queued rebuild cannot paint a CLI the
+  host has already left: moving off the control requires the blur that runs
+  the queue. And every branch flip this class makes OUT of the input
+  re-homes focus to the visible half, which delivers that blur even when the
+  flip is a programmatic `set value` landing on a focused box — a queued
+  rebuild strands only if a host hides the input without going through the
+  picker, the write class the #2108 note already records as absent
+  (rev-std finding 1 on #2124). Pinned by the #2124 tests in
   `test/modelpicker.test.ts`.
 
 ## Recording and persistence

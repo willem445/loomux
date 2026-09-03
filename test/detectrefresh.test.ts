@@ -531,8 +531,12 @@ test("the deferral schedules the rebuild rather than returning without it", () =
   const text = stripComments(src("modelpicker.ts"));
   // Anchored on the method DEFINITION, not the first occurrence of the name:
   // #2124 added a call site inside setOptions, and a first-occurrence anchor
-  // read that call's surroundings as the deferral's body.
-  const at = text.indexOf("runWhenNotEditing(rebuild");
+  // read that call's surroundings as the deferral's body. The trailing COLON
+  // is what makes it call-proof (rev-final W2 on #2124): `rebuild` alone is a
+  // prefix any call argument can match (`this.runWhenNotEditing(rebuildLater)`
+  // moved the anchor and scan 2 stayed green on the wrong body), while
+  // `rebuild:` — the parameter's type annotation — only a definition has.
+  const at = text.indexOf("runWhenNotEditing(rebuild:");
   assert.notEqual(
     at,
     -1,
@@ -568,9 +572,11 @@ test("the deferral listens on the same element the edit guard reads", () => {
   const guarded = /this\.(\w+)\.hidden/.exec(guard);
   assert.notEqual(guarded, null, `the edit guard no longer reads a \`this.<field>.hidden\`, so this check cannot pair it: ${guard}`);
 
-  // Same definition anchor as above: the first `runWhenNotEditing(` in the
-  // file is now setOptions' own call site (#2124), not the deferral's body.
-  const deferAt = text.indexOf("runWhenNotEditing(rebuild");
+  // Same definition anchor as the scan above — and the trailing colon is
+  // what makes it call-proof: without it, a call whose argument starts with
+  // `rebuild` (`this.runWhenNotEditing(rebuildLater)`) matched and this scan
+  // read the wrong body while staying green (rev-final W2 on #2124).
+  const deferAt = text.indexOf("runWhenNotEditing(rebuild:");
   const defer = text.slice(deferAt, text.indexOf("\n  }", deferAt));
   const listened = /this\.(\w+)\.addEventListener\("blur"/.exec(defer);
   assert.notEqual(listened, null, `the deferral no longer attaches a blur listener to a \`this.<field>\`: ${defer}`);

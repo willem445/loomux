@@ -94,6 +94,7 @@ export class ModelPicker {
     this.sel.addEventListener("change", () => {
       this.custom.hidden = this.sel.value !== CUSTOM_OPTION;
       this.rehomeInitialFocus();
+      this.refocusOnHide();
       if (!this.custom.hidden) this.custom.focus();
       this.paintSummary();
       this.onChange?.();
@@ -127,10 +128,19 @@ export class ModelPicker {
     // hazard, and the event that ends it, are this module's knowledge
     // (runWhenNotEditing's doc), so the rebuild defers ITSELF past the
     // mid-type window instead of trusting every host to ask: skipped while
-    // the box is focused, never dropped — at blur it runs for real and
-    // resolves the committed value exactly as an unguarded rebuild would,
-    // dropdown-branch staleness clear included. A queued rebuild cannot paint
-    // a CLI the role has already left: moving off the role's CLI select
+    // the box is focused, never dropped. What re-derives at blur is the
+    // committed VALUE — pickerSelection re-runs against `this.value`, so the
+    // branch resolution and the dropdown-branch staleness clear are exactly
+    // an unguarded rebuild's. The ARGUMENTS are the opposite, and this is a
+    // snapshot, not a re-derivation: `models`, `fallback` and `cli` freeze as
+    // the reply delivered them, unlike the host-side funnels whose closures
+    // re-read (refreshRoleFromDetection's staleness re-check, workflowview's
+    // repaint re-read of the block's model). Not live today: later-armed
+    // deferrals run after earlier ones, so a fresher reply still wins — but
+    // a future path that arms THIS guard last would repaint the older list
+    // at blur, and this comment is where that hazard is recorded (rev-final
+    // W1 on #2124). Within the snapshot's lifetime the queued rebuild cannot
+    // paint a CLI the role has already left: moving off the role's CLI select
     // requires focusing it, and that blur is the very event that runs the
     // queued rebuild — before the CLI's change handler can move rc.cli.
     if (this.editingCustom) {
@@ -176,6 +186,7 @@ export class ModelPicker {
     // second place a fix has to be remembered") is why the method cannot
     // assume it (#2108).
     this.rehomeInitialFocus();
+    this.refocusOnHide();
     this.cli = cli;
     this.paintSummary();
   }
@@ -259,7 +270,23 @@ export class ModelPicker {
     else this.custom.value = "";
     this.custom.hidden = !state.showCustom;
     this.rehomeInitialFocus();
+    this.refocusOnHide();
     this.paintSummary();
+  }
+
+  /** When a branch flip hides the input, a human who was typing in it must
+   *  not be left focused on a control that may no longer take focus — the
+   *  visible half gets the caret, the same "focus follows the visible half"
+   *  rule the marker follows above. That move is also what GUARANTEES the
+   *  blur a queued deferral waits on: a browser's blur-on-hide behavior for a
+   *  focused element is not something to bet a queued rebuild on, so every
+   *  flip this class makes out of the input delivers a real blur
+   *  (rev-std finding 1 on #2124 — "release any pending rebuild where
+   *  `custom.hidden` flips true, not only on `blur`"). No-op unless the
+   *  input actually holds focus, so ordinary dropdown picks from the select
+   *  never steal the caret. */
+  private refocusOnHide(): void {
+    if (this.custom.hidden && document.activeElement === this.custom) this.focus();
   }
 
   /** Keep a host's `data-initial-focus` marker on the VISIBLE half (rev-std

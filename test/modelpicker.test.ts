@@ -34,6 +34,12 @@ class ShimElement {
     this.tagName = tag.toUpperCase();
   }
 
+  // W3 on #2124: the real signature carries options ({ once: true } among
+  // them); the shim accepts and DISCARDS them, and `fire` below iterates the
+  // live listener array. So nothing in this file can distinguish
+  // "released once" from "never released" from "released on every blur" —
+  // runWhenNotEditing's once-per-deferral property is pinned textually in
+  // detectrefresh.test.ts and hand-validated, never behaviorally here.
   addEventListener(type: string, fn: () => void): void {
     const list = this.listeners.get(type) ?? [];
     list.push(fn);
@@ -68,9 +74,14 @@ class ShimElement {
     return this.attrs.has(name);
   }
 
-  // No-op: focus resolution is asserted through the marker (see
-  // focusWelcomeTarget below), the way pane.ts's focusWelcome reads it.
-  focus(): void {}
+  // Focus moves activeElement, the way a real document does — the marker
+  // assertions still resolve through the attribute (focusWelcomeTarget
+  // below), and the branch-flip release test reads the caret move directly:
+  // re-homing focus OFF a hidden input is what delivers the blur a queued
+  // deferral waits on (rev-std finding 1 on #2124).
+  focus(): void {
+    documentShim.activeElement = this;
+  }
 
   get value(): string {
     if (this.tagName !== "SELECT") return this.storedValue;
@@ -316,5 +327,36 @@ test("the deferred probe-reply rebuild applies at blur, not never", () => {
   assert.equal(p.select.value, "opusplan", "the reply's models are applied once typing ends");
   assert.equal(p.input.hidden, true, "the confirmed id resolves to the dropdown branch");
   assert.equal(p.input.value, "", "…and the dropdown-branch staleness clear still runs");
+  documentShim.activeElement = null;
+});
+
+test("a branch flip that hides a focused input delivers the blur that releases the queue", () => {
+  // rev-std finding 1 on #2124: runWhenNotEditing releases on the input's
+  // blur alone, and a browser's blur-on-hide for a focused element is not
+  // something to bet a queued rebuild on. So every flip this class makes out
+  // of the input re-homes the caret to the visible half — the move IS the
+  // blur. The premortem input: a host `set value` branch-flip lands while
+  // the box is focused with a rebuild queued.
+  const p = makePicker(["C:\\a", "C:\\b"], "C:\\a");
+  pickCustom(p);
+  const input = p.input as unknown as ShimElement;
+  input.value = "C:\\half-typed";
+  // Positive control: the box really holds focus (the change listener's own
+  // focus() put it there) before the flip under test.
+  assert.equal(documentShim.activeElement, input, "the human is in the box before the flip");
+  p.setOptions(["C:\\a", "C:\\b"], "C:\\a");
+  assert.equal(p.input.hidden, false, "the reply deferred while the human is in the box");
+  p.value = "C:\\a"; // the host flip: dropdown branch, input now hidden
+  assert.equal(p.input.hidden, true);
+  assert.equal(
+    documentShim.activeElement,
+    p.select as unknown as ShimElement,
+    "the flip re-homed the caret to the visible half — the blur that releases the queue"
+  );
+  // The queue really released: the blur that caret move delivers runs the
+  // rebuild, staleness clear included.
+  fire(input, "blur");
+  assert.equal(p.input.value, "", "the uncommitted text does not survive the applied rebuild");
+  assert.equal(p.select.value, "C:\\a");
   documentShim.activeElement = null;
 });
