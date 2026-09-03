@@ -6516,7 +6516,11 @@ fn a_cap_stamp_from_a_previous_process_does_not_park_a_drive_whose_cap_the_resta
     // been no stamp at all. The first row is the first process's own reconcile,
     // which had nothing to forget, and is the non-vacuity control for the flag.
     let recovered = rows_for(&reg, &group, "rd-recovered");
-    assert_eq!(recovered.len(), 2, "one reconcile per process: {recovered:?}");
+    assert_eq!(
+        recovered.len(),
+        2,
+        "one reconcile per REGISTRY INSTANCE — which this fixture cannot tell apart from \n         per process, because `relaunch_registry` builds its second registry inside this \n         one (#2135 review 2, premortem 1): {recovered:?}"
+    );
     assert_eq!(
         recovered[0]["cap_run_forgotten"],
         json!(false),
@@ -6544,6 +6548,12 @@ fn a_cap_stamp_from_a_previous_process_does_not_park_a_drive_whose_cap_the_resta
 /// It is the right direction (a drive really starved for fifteen minutes is
 /// parked whether or not orrerix was busy), and closing it wants a
 /// `last_tick_ms` and a gap rule, which is #2117's own disclosed non-decision.
+///
+/// **What this fixture structurally cannot witness**: the latch is a field of
+/// the REGISTRY, so the guarantee is once per group per registry instance, and
+/// `relaunch_registry` builds its second registry inside this same process.
+/// "Restart" here therefore means "a second registry", and no test in this file
+/// can separate the two (#2135 review 2, premortem 1).
 /// Pinning it is what stops the disclosure in `discard_cap_starvation_run` from
 /// going false quietly in either direction.
 #[test]

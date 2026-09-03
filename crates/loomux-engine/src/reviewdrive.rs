@@ -1475,8 +1475,14 @@ pub struct DriveEntry {
     /// by the cap refusals after it, so what it measures is the duration of the
     /// starvation and not the age of the most recent tick.
     ///
-    /// **Cleared at four sites, and the fourth is what makes the word
+    /// **Cleared at four sites, and the NON-CAP one is what makes the word
     /// "continuously" on [`HeldReason::CapFull`] true** (#2109 review 4).
+    /// Named rather than numbered, because an ordinal here is a claim about a
+    /// list's ORDER and goes stale the moment the list grows: #2135 added a
+    /// fourth site and bumped "the third" to "the fourth" in step, which
+    /// silently moved the credit onto the restart clear — contradicting the
+    /// citation on this very sentence, the sentence after it, and two other
+    /// surfaces.
     /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) runs when a
     /// lane does open, and on any refusal that is **not** the cap's;
     /// [`advance`](DriveEntry::advance) runs on every arc; and
@@ -1886,7 +1892,15 @@ impl DriveEntry {
     ///
     /// **Scoped to the process boundary, and no wider.** An in-process tick gap
     /// longer than [`CAP_HOLD_MS`] still parks on a single observed refusal —
-    /// the reconcile is once per group per process, so nothing here reaches it.
+    /// the reconcile is once per group per REGISTRY INSTANCE, so nothing here
+    /// reaches it. Registry and not process, precisely: the latch is a field of
+    /// the registry, so the two coincide only while a process holds one, which
+    /// is true today and is not a thing the type system holds true. A second
+    /// registry built over a live state root would forgive a genuinely open run
+    /// — this defect in reverse, with `cap_run_forgotten: true` on the row to
+    /// make it look intended. No test here can see the difference, because
+    /// `relaunch_registry` IS a second registry in one process (#2135 review 2,
+    /// premortem 1).
     /// That residual is real and is pinned rather than merely admitted, by
     /// `an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal`.
     pub fn discard_cap_starvation_run(&mut self) -> bool {

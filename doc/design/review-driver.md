@@ -407,8 +407,11 @@ treats that as "the world does not match", never as "probably fine", and §8's
 row says what the driver does with it.
 
 The reconcile also **drops any cap-starvation run the previous process left
-standing** (#2135), on every live entry and whatever else it decides about the
-PR. A run cannot straddle a process boundary — every other site that touches
+standing** (#2135), on every **non-terminal** entry — parked ones included —
+and whatever else it decides about the PR. Not "every live entry": `is_parked`
+is explicit that a parked drive is "not terminal, **not live**", and the
+reconcile walks `!is_terminal()`, so borrowing the narrower word would read as
+excluding exactly the entries the cancel arm beside it does act on. A run cannot straddle a process boundary — every other site that touches
 that stamp is a tick that OBSERVED the cap refuse a spawn, and across the gap no
 tick ran — so a stamp older than `CAP_HOLD_MS` would park the resumed drive
 `held(cap-full)` on its first tick, before one spawn was attempted, in a group
@@ -1192,10 +1195,13 @@ S3 added two more, described after them:
   Stamped on the FIRST **cap** refusal of a run and left alone by the cap
   refusals after it, so what it measures is the duration of one starvation
   rather than the age of the newest tick. **Cleared at four sites**, and the
-  second is what makes `held(cap-full)`'s "continuously" true (review 4 on
-  #2112): when a lane does open, when the tick takes a refusal that is **not**
-  the cap's, on every state arc — that one because a drive that MOVED is not
-  the drive that was stuck — and at §2.4's **restart reconcile** (#2135).
+  **non-cap** one is what makes `held(cap-full)`'s "continuously" true (review
+  4 on #2112): when a lane does open, when the tick takes a refusal that is
+  **not** the cap's, on every state arc — that one because a drive that MOVED
+  is not the drive that was stuck — and at §2.4's **restart reconcile**
+  (#2135). Named rather than numbered on both this surface and the field's own
+  doc, because an ordinal is a claim about the list's ORDER and goes stale as
+  soon as a site is added to it.
   Guarded on the write edge alone the stamp was a
   latch, and one early cap refusal aged into the hold behind a run of refusals
   that were nothing of the kind. **Optional rather than a zero
@@ -1217,11 +1223,20 @@ S3 added two more, described after them:
   price is that a genuinely starved stretch before the shutdown loses its
   forgiveness, which fails toward parking rather than toward silence. The
   `rd-recovered` row carries `cap_run_forgotten` so the clear is visible; its
-  only other effect is a drive that did NOT park.
+  only other effect is a drive that did NOT park. That flag reports the
+  **durable** outcome, not the decision: the reconcile's write is the last
+  thing that can undo the clear, and a row asserting one the write unmade is
+  the single state in which this log actively misleads its reader.
   **The residual is the in-process gap**: the reconcile runs once per group per
-  process, so a tick gap longer than `CAP_HOLD_MS` inside ONE process still
-  parks on a single observed refusal. Closing that wants a `last_tick_ms` and a
-  gap rule — #2117's own disclosed non-decision, for the same reason. Pinned by
+  **registry instance**, so a tick gap longer than `CAP_HOLD_MS` inside ONE
+  process still parks on a single observed refusal. Closing that wants a
+  `last_tick_ms` and a gap rule — #2117's own disclosed non-decision, for the
+  same reason. "Registry instance" and not "process" is deliberate: the latch
+  is a field of the registry, so the two coincide only while a process builds
+  one of these — true today, held true by nothing. A second registry over a
+  live state root would forgive a genuinely open run, which is this defect in
+  reverse; no fixture can distinguish the two, because `relaunch_registry` is
+  itself a second registry inside one process. Pinned by
   `an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal`,
   alongside `a_cap_stamp_from_a_previous_process_does_not_park_a_drive_whose_cap_the_restart_freed`
   and `a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking`,

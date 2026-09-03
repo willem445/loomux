@@ -1925,7 +1925,9 @@ impl OrchRegistry {
         )
     }
 
-    /// §2.4's restart reconcile, once per group per process, before driving.
+    /// §2.4's restart reconcile, once per group per registry instance, before
+    /// driving — `rd_reconciled` is a field of the registry, so "per process"
+    /// holds only while a process builds one of these (#2135 review 2).
     ///
     /// The `recover_persisted_queue` posture: a PR **positively established** as
     /// closed or merged becomes `cancelled` with its notice; anything else
@@ -1951,6 +1953,10 @@ impl OrchRegistry {
         }
         let dir = self.group_dir(group);
         let mut audits: Vec<(String, u64, bool, bool)> = Vec::new();
+        // #2135 N2: set false only when a write this reconcile NEEDED actually
+        // failed. It stays true when nothing had to be written, which is the
+        // honest reading — there was no durable outcome to miss.
+        let mut persisted = true;
         {
             let _state_guard = self.rd_state_lock.lock_safe();
             // **The once-only latch is set below, on a reconcile that actually
@@ -2021,8 +2027,22 @@ impl OrchRegistry {
                     audits.push((on_behalf, pr, false, forgot_cap_run));
                 }
             }
+            // #2135 N2: whether this reconcile's decisions reached DISK. The
+            // in-memory `state` is dropped at the end of this block and the
+            // once-only latch is already set, so a failed write means the clear
+            // is lost for the life of the process — the next tick reloads the
+            // stale stamp and parks `held(cap-full)` anyway. The audit row below
+            // therefore reports the durable outcome rather than the decision:
+            // a row asserting a clear the write unmade is the one state in which
+            // this log actively misleads whoever is reading it. Same rule as the
+            // tick's own `persisted` flag one function down, applied to the
+            // reconcile, which had no counterpart.
+            //
+            // **The latch itself is deliberately left alone** and is the
+            // residual: it predates #2135, and moving it is a change to when
+            // every reconcile re-runs rather than to what this row says.
             if changed {
-                let _ = reviewdrive::store_state(&dir, &state);
+                persisted = reviewdrive::store_state(&dir, &state).is_ok();
             }
         }
         for (on_behalf, pr, cancelled, forgot_cap_run) in audits {
@@ -2040,7 +2060,8 @@ impl OrchRegistry {
                 group,
                 &on_behalf,
                 action,
-                json!({ "pr": pr, "at": "reconcile", "cap_run_forgotten": forgot_cap_run }),
+                json!({ "pr": pr, "at": "reconcile",
+                        "cap_run_forgotten": forgot_cap_run && persisted }),
             );
         }
     }
