@@ -725,8 +725,13 @@ function mergeClippy(legs) {
       // `file:line`, NOT `file#name`. A name is not a function identity in Rust —
       // `src-tauri/src/orchestration/mod.rs` declares 16 `fn as_str`, and keying on
       // the name collapsed all 16 into one row that published the LARGEST of their
-      // values at the FIRST one's line (#2139 review round 3). 52 of 2,380 merged
-      // rows sat on such a key. The accumulator above already keys `file:line`, and
+      // values at the FIRST one's line (#2139 review round 3). Measured on the head
+      // artifact, one instrument: 2,441 rows under `file:line` collapse to 2,380
+      // distinct `file#name` keys. 39 keys carry more than one row, 100 rows sit
+      // under those 39, and the 61 duplicates beyond the first row of each key are
+      // exactly what the old key deleted — which is why 2,380 is also the row count
+      // the pre-fix artifact reported. The accumulator above already keys
+      // `file:line`, and
       // the site union below already rests on span coordinates being identical
       // across legs for one source blob, so the same argument licenses it here: one
       // function is one `file:line` on every leg, and two functions never share one.
@@ -1090,9 +1095,30 @@ function distDeltaRow(label, base, head) {
 // called every shifted function new would be pure false-positive. `file#name` is
 // the stable identity — but it is used as a MULTISET below, not a set, because a
 // file that already has one `render` and gains a second has a key the base already
-// knows. At head, 1,323 of 3,686 TS functions share a key with a sibling, so the
-// set-difference form made that the common case rather than a corner (#2139
-// review round 3).
+// knows. At head, 3,686 TS function rows collapse to 2,363 distinct `file#name`
+// keys: 133 keys carry more than one row, and 1,323 rows are duplicates beyond the
+// first of their key — that is the definition of the 1,323, not "functions sharing
+// a name". So the set-difference form missed the common case rather than a corner.
+// 1,176 of the 1,323 are `<anonymous>` callbacks, which a ratchet could not name
+// usefully anyway; the 147 NAMED duplicates are what this multiset recovers
+// (#2139 review round 3).
+// The comment written when the head report cannot be read at all. Marker-led, so
+// the workflow finds and REPLACES the sticky comment; carries no figures, because
+// an `n/a` a reader can see beats numbers from a run that is no longer the head.
+function unavailableComment(reason) {
+  return [
+    COMMENT_MARKER,
+    '## Code metrics — unavailable for this run',
+    '',
+    'The head report could not be read, so no base-vs-head figures are shown. This is ' +
+      'the report-only job degrading, not a build failure: nothing here gates the merge.',
+    '',
+    '> Reason: ' + String(reason).slice(0, 300),
+    '',
+    '<sub>`scripts/code-metrics.cjs` · schema v' + SCHEMA_VERSION + ' · see `doc/design/code-metrics.md`</sub>',
+  ].join('\n') + '\n';
+}
+
 function fnKey(f) {
   return f.file + '#' + f.name;
 }
@@ -1307,16 +1333,21 @@ function cmdDelta(args) {
   } catch {
     base = null;
   }
-  // Guarded like every sibling read here. A truncated head artifact — an upload cut
-  // short, a disk-full runner — degrades to no comment and a reason on stderr,
-  // rather than throwing out of the process. `continue-on-error` would have hidden
-  // the throw in this workflow, which is what made the CLAIM at the top of this file
-  // the thing at risk rather than the build (#2139 review round 3, premortem).
+  // Guarded like every sibling read here: a truncated head artifact — an upload cut
+  // short, a disk-full runner — must not throw out of the process, because the
+  // header of this file promises every parse error degrades to a missing row.
+  //
+  // It degrades to an n/a COMMENT, not to no comment. Writing nothing would leave
+  // the sticky comment from the PREVIOUS run standing with its numbers, and a
+  // reviewer would read them as current: silently stale is worse than visibly
+  // absent. The n/a body leads with the same marker, so it REPLACES that comment
+  // rather than sitting beside it (#2139 final round).
   let head;
   try {
     head = JSON.parse(fs.readFileSync(args.head, 'utf8'));
   } catch (e) {
-    process.stderr.write('code-metrics: head report unreadable (' + e.message + ') — no delta comment written\n');
+    process.stderr.write('code-metrics: head report unreadable (' + e.message + ')\n');
+    fs.writeFileSync(args.out || 'code-metrics-comment.md', unavailableComment(e.message));
     return;
   }
   // The diff may arrive here rather than with the head report: slice B computes

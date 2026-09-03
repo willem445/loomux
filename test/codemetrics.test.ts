@@ -556,7 +556,10 @@ test('the mod.rs row carries base, head and the signed delta', () => {
 // Rust `impl` blocks routinely give one file many `fn as_str`, `fn new`, `fn fmt`,
 // `fn drop` — `src-tauri/src/orchestration/mod.rs` declares 16 `as_str` alone, and
 // the head artifact carried ONE row for them, publishing the maximum of their values
-// at the first one's line. 52 of 2,380 merged Rust rows sat on an ambiguous key.
+// at the first one's line. Measured on the head artifact: 2,441 rows under
+// `file:line` collapse to 2,380 distinct `file#name` keys — 39 keys carry more than
+// one row, 100 rows sit under those 39, and the 61 duplicates beyond the first row of
+// each key are exactly what the old key deleted.
 //
 // Both fixtures below make the two operands COLLIDE, which the round-1 fixtures did
 // not: they had no file with two same-named functions, so a `file#name` merge and a
@@ -614,8 +617,11 @@ test('one function reported by two legs is still one row, taking the larger valu
 test('a NEW same-named function above the base p95 is reported, and its sibling is not', () => {
   // The ratchet key. `newFunctionsOverP95` diffed base against head on `file#name`,
   // so adding a SECOND `render` to a file that already had one was invisible — the
-  // key was already known. 1,323 of 3,686 TS functions at head share a key with a
-  // sibling, so this is the common case, not a corner.
+  // key was already known. At head, 3,686 TS function rows collapse to 2,363 distinct
+  // `file#name` keys: 133 keys carry more than one row and 1,323 rows are duplicates
+  // beyond the first of their key — that is what the 1,323 counts, not "functions
+  // sharing a name". 1,176 of them are `<anonymous>`; the 147 NAMED duplicates are
+  // what this multiset recovers, and are the common case this test stands for.
   const base = [
     { file: 'src/a.ts', name: 'render', line: 10, lines: 10 },
     { file: 'src/a.ts', name: 'helper', line: 40, lines: 8 },
@@ -664,14 +670,26 @@ test('the delta subcommand degrades on an unreadable head report instead of thro
   const out = path.join(dir, 'comment.md');
   try {
     fs.writeFileSync(head, '{"schemaVersion":1,"ts":{"percenti');
-    const res = execFileSync(
-      process.execPath,
-      [scriptPath, 'delta', '--head', head, '--out', out],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
-    );
-    // Exit 0, no comment written, and the reason on stderr rather than a stack trace.
-    assert.equal(fs.existsSync(out), false);
-    assert.match(String(res), /^$|code-metrics/);
+    execFileSync(process.execPath, [scriptPath, 'delta', '--head', head, '--out', out], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    // Exit 0 — and an n/a COMMENT, not silence. Writing nothing would leave the
+    // sticky comment from the previous run standing with its numbers, which a
+    // reviewer reads as current; silently stale is worse than visibly absent.
+    assert.equal(fs.existsSync(out), true);
+    const body = fs.readFileSync(out, 'utf8');
+    // Marker-led, so the workflow REPLACES the stale sticky comment rather than
+    // posting beside it.
+    assert.equal(body.split('\n')[0], cm.COMMENT_MARKER);
+    assert.match(body, /unavailable for this run/);
+    // It says why, and it says the job did not fail.
+    assert.match(body, /Reason:/);
+    assert.match(body, /nothing here gates the merge/);
+    // And it carries NO figures: a number here would be from a run that is no longer
+    // the head, which is the whole failure being degraded away from.
+    assert.ok(!/\| Metric \|/.test(body));
+    assert.ok(!/p95/.test(body));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -114,9 +114,14 @@ row need different ones:
   The key matters as much as the rule: `file#name` is NOT a function identity —
   `src-tauri/src/orchestration/mod.rs` declares sixteen `fn as_str` — and keying on
   the name collapsed all sixteen into one row carrying the largest of their values
-  at the first one's line, 52 such rows in all (#2139 review round 3). A span's
-  line is identical across legs for one source blob, which is the same argument the
-  site union below rests on.
+  at the first one's line. Measured on the head artifact, one instrument: 2,441 rows
+  under `file:line` collapse to 2,380 distinct `file#name` keys — **39** keys carry
+  more than one row, **100** rows sit under those 39, and the **61** duplicates
+  beyond the first row of each key are exactly what the old key deleted. That 2,380
+  is also the row count the pre-fix artifact reported, which is the check that the
+  three figures reconcile. A span's line is identical across legs for one source
+  blob, which is the same argument the site union below rests on (#2139 review
+  round 3).
 - **Per-file `unwrap`/`expect`/`panic` counts** take the **union of the sites**, not
   the larger count. `max` would be the union only if one leg's site set were a
   subset of the other's: a file holding one `cfg(windows)` and one `cfg(unix)`
