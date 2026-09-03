@@ -2595,8 +2595,14 @@ always did, and the audit log says so (`rd-lane-resume-failed`) with what refuse
 the driver waits for that reviewer and hands it the update, rather than starting a second one
 beside it — two panes reviewing one round is two reviews paid for and one verdict slot to put them
 in. The refusal is on the audit log as `rd-lane-duplicate-refused`, naming the pane that already
-has the round. A new *commit* is a different matter: there the reviewer in flight is reading code
-that no longer exists, so a successor is opened for the new revision exactly as before.
+has the round. **"Still writing" means the pane is actually working.** A reviewer that has finished its turn is
+idle, and an idle pane is one the driver would rather type into than replace — so if it turns out
+not to be typeable-into (parked behind a prompt, or with something already queued for it), its
+session is reopened in a fresh pane instead. Before this those two rules could deadlock on one
+pane: too unsettled to type into, too alive to replace, which is what happens on every round whose
+fix was to the PR body alone, because the commit never moves. A new *commit* is a different matter
+again: there the reviewer in flight is reading code that no longer exists, so a successor is opened
+for the new revision exactly as before.
 
 **Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
 PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be

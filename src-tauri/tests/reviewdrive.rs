@@ -5753,6 +5753,168 @@ fn a_block_that_already_has_a_live_pane_at_this_head_is_refused_a_second_lane() 
     );
 }
 
+// ── #2162: a declined pane is not a pane that is still reviewing ────────────
+
+/// **#2162.** A round whose fix is BODY-ONLY re-opens its lane instead of
+/// deadlocking on the very pane the reuse arm has just declined.
+///
+/// The measured failure (PR #2140, v1.3.0-beta6) is two guards composing, each
+/// right alone and both about ONE pane. `rd_reuse_pane` declined the lane's own
+/// pane on readiness — the #2089 class, `unconfirmed` — and #2109's duplicate
+/// guard then refused a replacement because that same pane was "live … briefed
+/// at this head", which is true precisely because a body-only fix cannot move
+/// the head. Too unconfirmed to reuse and too live to replace: 38 minutes with
+/// no lane open, the same three rows every tick, `lane-stalled` structurally
+/// unreachable because its arm exempts the lane that has answered, and a human
+/// in the end killing the pane.
+///
+/// **The fixture reproduces the incident's own state, not a shortcut to it.**
+/// The reuse arm only ever considers an IDLE pane, so `rd-reuse-declined`
+/// appearing at all proves the pane was idle — this lane therefore reports
+/// (which is what stamps `idle_since_ms`) and its last delivery is on record as
+/// not having landed, which is the exact pair the audit rows on #2162 show.
+/// Both PR-body seams are set, because `review_verdict` digests what `pr_body`
+/// answers while the drive digests what `observe_pr` read: left unset the
+/// verdict records an EMPTY digest, `body_changed` answers "cannot tell", the
+/// stale `fail` reads as CURRENT, and the drive hands the worker back a second
+/// time instead of ever reaching the re-brief.
+///
+/// **The negative control is `a_block_that_already_has_a_live_pane_at_this_head_
+/// is_refused_a_second_lane`**, which moves the same body under the same head
+/// with the one difference that decides — that lane's pane never went idle.
+/// Duplicating its assertions here would make a red ambiguous between the two.
+#[test]
+fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+    reg.set_pr_body_override(Some("b".to_string()));
+    assert!(
+        reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_none(),
+        "the control: a lane spawned WITH a brief is working, and a working pane is what \
+         #2109's refusal is for"
+    );
+
+    // The lane answers `fail` at HEAD_A and then reports, which is what ends its
+    // turn and stamps the idle signal the reuse arm reads.
+    let reviewer = Caller {
+        agent_id: lane.clone(),
+        group: group.clone(),
+        role: Role::Reviewer,
+        role_hint: None,
+    };
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "fail", "summary": "fail - one stale byte count" } }),
+    )
+    .expect("the lane records its verdict");
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "request_changes", "note": "one stale byte count", "ref": "#1758" } }),
+    )
+    .expect("the lane reports, which ends its turn");
+    assert!(
+        reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
+        "the fixture's premise: that pane has finished its turn"
+    );
+    // …and its last delivery is on record as not having landed, so the reuse
+    // arm will decline it. This is the pane's own pty, which a reuse candidate
+    // must have.
+    with_pane(&reg, &lane, 7002);
+    make_pane_ready(&reg, 7002, false);
+
+    // Arc 5: the fail routes, spending a round, and the worker is handed back.
+    let handed = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let (_pr, worker) = handed
+        .handbacks
+        .first()
+        .cloned()
+        .expect("a current fail hands the PR back to its worker");
+    assert_eq!(status_state(&reg, &group), "fix-wait");
+
+    // The fix is BODY-ONLY: the body moves, the head does not.
+    gh.set_body("b2");
+    reg.set_pr_body_override(Some("b2".to_string()));
+    dispatch(
+        &reg,
+        &Caller { agent_id: worker, group: group.clone(), role: Role::Worker, role_hint: None },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "body fixed", "ref": "#1758" } }),
+    )
+    .expect("a driven worker reports");
+
+    // Arc 8 back to `review-wait` at the same head…
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "the fixture's premise: arc 8 returns at an UNCHANGED head, which is the only \
+         shape this defect has"
+    );
+
+    // …and the very next tick must open the lane again rather than refuse it.
+    let reopened = reg.rd_drive_group_with(&group, &gh, 50_000);
+    let (_pr, _b, lane2) = reopened.lanes_opened.first().cloned().unwrap_or_else(|| {
+        panic!(
+            "the pane the reuse arm just declined was then refused as a duplicate of itself \
+             — the #2162 deadlock. duplicate refusals: {:?}",
+            rows_for(&reg, &group, "rd-lane-duplicate-refused")
+        )
+    });
+    let declined = rows_for(&reg, &group, "rd-reuse-declined");
+    assert_eq!(
+        declined.len(),
+        1,
+        "the deadlock's other half must really have happened, or this test is about a pane \
+         nobody tried to reuse: {declined:?}"
+    );
+    assert_eq!(declined[0]["pane"], json!(lane), "…and it is THIS lane's pane: {declined:?}");
+    assert_eq!(declined[0]["reason"], json!("unconfirmed"), "…for the incident's own reason");
+    assert!(
+        rows_for(&reg, &group, "rd-lane-duplicate-refused").is_empty(),
+        "one pane cannot be both too unsettled to type into and too busy to replace: {:?}",
+        rows_for(&reg, &group, "rd-lane-duplicate-refused")
+    );
+    assert_ne!(lane2, lane, "the delta goes to a pane that will read it");
+
+    // The conversation is kept — what makes this a resume rather than a fresh
+    // reviewer paying for a cold PR read.
+    let rows = lane_spawn_rows(&reg, &group);
+    assert_eq!(rows.len(), 2, "one spawn per round, and exactly two rounds: {rows:?}");
+    assert_eq!(rows[1]["resumed"], json!(true), "the re-brief is a resume: {rows:?}");
+    assert_eq!(
+        rows[1]["session"], rows[0]["session"],
+        "…of the SAME conversation, not a new one that happens to be filed as a resume: \
+         {rows:?}"
+    );
+
+    // §7 still owns the pane the re-brief superseded: a late report from it is
+    // consumed rather than reaching the orchestrator as if undriven. That is
+    // `prior_agents` doing its job across a supersede the refusal used to make
+    // impossible.
+    dispatch(
+        &reg,
+        &reviewer,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "a late word from the superseded pane", "ref": "#1758" } }),
+    )
+    .expect("a superseded lane may still report");
+    assert!(
+        !delivered_texts(&reg, &group).iter().any(|t| t.contains("a late word")),
+        "the superseded pane's late report reached the orchestrator's pane"
+    );
+}
+
 /// The roster with a delegate cap of one, so the worker `drive_review` needs is
 /// the whole of it and every lane spawn is refused.
 fn rails_capped() -> Guardrails {

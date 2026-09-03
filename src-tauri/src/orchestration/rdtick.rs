@@ -1264,6 +1264,12 @@ impl OrchRegistry {
         // pins the gap and that exit; closing it properly still wants the
         // per-lane clock.
         //
+        // **#2162 narrowed this refusal and left that residual where it is.** A
+        // pane the reuse arm DECLINED is idle by construction, and refusing a
+        // replacement for it deadlocked the drive — so `rd_live_lane_pane` now
+        // refuses only a pane that is still WORKING. The residual above is the
+        // busy case, which is exactly what this refusal still covers.
+        //
         // **A head change is deliberately not covered.** There the recorded pane
         // is reviewing a revision the drive has moved past, its verdict binds to
         // a head that is gone, and superseding it is what `prior_agents` exists
@@ -1279,7 +1285,7 @@ impl OrchRegistry {
                 "pane": pane,
             }));
             Err(format!(
-                "lane {block} already has a live pane ({pane}) briefed at this head; \
+                "lane {block} already has a live pane ({pane}) working on this head; \
                  refusing to open a second reviewer for the same round"
             ))
         };
@@ -1409,6 +1415,38 @@ impl OrchRegistry {
     /// supersede: after a push the recorded pane is reviewing a revision the
     /// drive has moved past, and opening its successor is what
     /// [`reviewdrive::LaneRecord::prior_agents`] exists for.
+    ///
+    /// **And live is not enough: the pane must be WORKING** (#2162). #2109's own
+    /// subject is "a pane still writing the review it was briefed for", and
+    /// `idle_since_ms` is the registry's answer to exactly that — the same half
+    /// of `idle_pane_on_session`'s conjunction, which asks "does this agent have
+    /// work". An IDLE pane has none: it took the brief, finished its turn and
+    /// reported, and there is no second review for a second pane to duplicate.
+    ///
+    /// Without this the guard composed with `rd_reuse_pane`'s readiness decline
+    /// into a hard deadlock, and the two are about ONE pane. Reuse only ever
+    /// declines a pane that is idle (`idle_pane_on_session` filters on
+    /// `idle_since_ms` before the readiness test, so an `rd-reuse-declined` row
+    /// PROVES the pane was idle), and this refusal then named that same pane as
+    /// live and briefed at this head — which it was, because a body-only fix
+    /// cannot move the head. Too unconfirmed to reuse and too live to replace:
+    /// measured on PR #2140 as 38 minutes with no lane open, the same three rows
+    /// every tick, ended by a human killing the pane. Since a body-only fix is
+    /// #1875's whole class, that was the common case rather than a corner.
+    ///
+    /// **The two conditions do not overlap, which is why this costs #2109
+    /// nothing.** The reuse arm considers only idle panes; this refusal now
+    /// protects only busy ones — and busy is what the measured duplicate was
+    /// (`rev-1825` and `rev-1826` both reviewing PR #2104's round 2, the second
+    /// spawned while the first was still writing). An idle pane that is
+    /// delivery-READY never reaches here at all: the reuse arm types the delta
+    /// into it and `rd_open_lane` returns before this is asked.
+    ///
+    /// **What is left over is unchanged**: a lane whose pane went busy on
+    /// something else — a human re-tasking it, another drive taking it over —
+    /// is still refused, still with no per-lane clock, and still bounded by
+    /// `review-wait`'s state bound where it has answered and by `lane-stalled`
+    /// where it has not.
     fn rd_live_lane_pane(
         &self,
         lane: Option<&reviewdrive::LaneRecord>,
@@ -1419,7 +1457,9 @@ impl OrchRegistry {
             return None;
         }
         match self.agent(&lane.agent) {
-            Some(a) if a.status != AgentStatus::Dead => Some(lane.agent.clone()),
+            Some(a) if a.status != AgentStatus::Dead && a.idle_since_ms.is_none() => {
+                Some(lane.agent.clone())
+            }
             _ => None,
         }
     }

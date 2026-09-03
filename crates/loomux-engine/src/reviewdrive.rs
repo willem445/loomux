@@ -4336,8 +4336,9 @@ mod tests {
     /// something else — a human re-tasking it, another drive taking it over. The
     /// re-brief the moved digest calls for cannot be delivered (the reuse arm
     /// needs an idle pane) and must not be spawned beside it (#2109's duplicate
-    /// refusal), while `lane-stalled` is exempt because the lane did answer. So
-    /// the drive retries and audits two rows a tick.
+    /// refusal, which #2162 narrowed to exactly this busy case), while
+    /// `lane-stalled` is exempt because the lane did answer. So the drive
+    /// retries and audits two rows a tick.
     ///
     /// **What #2110 changed is the exit, and only the exit.** #2109 disclosed
     /// this gap and said closing it needs a per-lane refusal clock, "which

@@ -484,7 +484,13 @@ pub mod audit_action {
     /// looks like on this log too.
     pub const LANE_RESUME_FAILED: &str = "rd-lane-resume-failed";
     /// A lane spawn was refused because this block already has a LIVE pane
-    /// briefed at this head (#2109) — the duplicate, named rather than opened.
+    /// **working on** this head (#2109, narrowed by #2162) — the duplicate,
+    /// named rather than opened.
+    ///
+    /// "Working" rather than merely live is not a restatement: a pane that has
+    /// finished its turn is idle, the reuse arm's readiness decline can only
+    /// ever name an idle pane, and refusing a replacement for one that had just
+    /// been declined left the drive with no lane at all.
     ///
     /// Distinct from [`REFUSED`], which is a tool-call refusal from §5.1's
     /// closed vocabulary; this is a spawn the driver declined to make. Carries
