@@ -453,11 +453,11 @@
         {
           "name": "drive_timeout_minutes",
           "type": "number",
-          "default": 240,
+          "default": 720,
           "min": 5,
-          "max": 240,
+          "max": 1440,
           "on_out_of_range": "clamp",
-          "help": "Backstop on the drive's whole age — age since the entry began, never an idle clock reset by each state advance. Same clamp family; the default is its ceiling because a drive's whole budget is what this bounds."
+          "help": "Last-resort backstop on the drive's whole age, under the four per-state bounds that do the work. Twelve hours, on its OWN range rather than the notify-TTL family the two waits above ride: a backstop measured in the same hours as those waits is the one clock a drive making steady progress can still trip. Time the live-delegate cap refused this drive a lane is excluded from it."
         }
       ]
     },

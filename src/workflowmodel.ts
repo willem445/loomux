@@ -445,11 +445,24 @@ export const DRIVER_MAX_CI_ATTEMPTS_MIN = 1;
 export const DRIVER_MAX_CI_ATTEMPTS_MAX = 3;
 export const DRIVER_MAX_REBASE_ATTEMPTS_MIN = 0;
 export const DRIVER_MAX_REBASE_ATTEMPTS_MAX = 1;
-/** The driver's three backstops ride the same notify-TTL clamp family the merge
- *  queue's checks timeout rides (`clamp_expires_minutes`) - CLAMPED, not refused:
- *  outside this range is a warning here, not an error. */
+/** Two of the driver's three backstops ride the same notify-TTL clamp family the
+ *  merge queue's checks timeout rides (`clamp_expires_minutes`) - CLAMPED, not
+ *  refused: outside this range is a warning here, not an error. */
 export const DRIVER_TIMEOUT_MIN = 5;
 export const DRIVER_TIMEOUT_MAX = 240;
+/** `drive_timeout_minutes` left that family in #2110 and carries its own range.
+ *
+ *  It stopped being the same quantity. The two above bound ONE wait on ONE
+ *  fallible signal, which is what a notify TTL is; this is the last-resort bound
+ *  over a whole drive, and since #2110 there are four per-state bounds beneath it
+ *  doing the work. A backstop measured in the same hours as the waits under it is
+ *  the one clock a drive making steady progress can still trip - which is exactly
+ *  what happened at four hours. Twelve hours is the first figure that cannot be an
+ *  honest review loop; the ceiling of one day bounds the field at something a
+ *  human would recognise as a mistake. Mirrors `DRIVER_DRIVE_TIMEOUT_*` in
+ *  `crates/loomux-engine/src/workflow.rs`, and `workflow-schema.json` beside it. */
+export const DRIVER_DRIVE_TIMEOUT_MIN = 5;
+export const DRIVER_DRIVE_TIMEOUT_MAX = 1440;
 
 /** The board statuses a `board.wip:` cap may name (#1175), in board order — the pane's
  *  mirror of the engine's `RawWip` fields. `done` is deliberately absent: it is the
@@ -516,7 +529,10 @@ export const POLICY_BOUNDS: Readonly<Record<string, FieldBounds>> = {
   },
   "driver.lane_timeout_minutes": { min: DRIVER_TIMEOUT_MIN, max: DRIVER_TIMEOUT_MAX },
   "driver.fix_timeout_minutes": { min: DRIVER_TIMEOUT_MIN, max: DRIVER_TIMEOUT_MAX },
-  "driver.drive_timeout_minutes": { min: DRIVER_TIMEOUT_MIN, max: DRIVER_TIMEOUT_MAX },
+  "driver.drive_timeout_minutes": {
+    min: DRIVER_DRIVE_TIMEOUT_MIN,
+    max: DRIVER_DRIVE_TIMEOUT_MAX,
+  },
   "resource.slots": { min: RESOURCE_SLOTS_MIN, max: RESOURCE_SLOTS_MAX },
   "resource.max_hold_minutes": {
     min: RESOURCE_MAX_HOLD_MINUTES_MIN,
@@ -723,7 +739,7 @@ export const DRIVER_DEFAULTS: Readonly<{
   max_rebase_attempts: 1,
   lane_timeout_minutes: 60,
   fix_timeout_minutes: 60,
-  drive_timeout_minutes: 240,
+  drive_timeout_minutes: 720,
 };
 
 /** The driver form's enable-toggle write rule (#1869; narrowed by review round 3).
@@ -3665,7 +3681,12 @@ function sectionFindings(w: Workflow): Finding[] {
     // (`2.5`) and an integer outside u32 (`-1`, `4294967296`) are refused by
     // the engine outright, and a clamp warning about a file that refuses to
     // load is the same lie in a friendlier tone (#1784 review round 2).
-    const backstop = (field: string, v: number | undefined): void => {
+    const backstop = (
+      field: string,
+      v: number | undefined,
+      min = DRIVER_TIMEOUT_MIN,
+      max = DRIVER_TIMEOUT_MAX
+    ): void => {
       if (v === undefined) return;
       if (!Number.isInteger(v) || outsideU32(v)) {
         err(
@@ -3676,12 +3697,12 @@ function sectionFindings(w: Workflow): Finding[] {
         );
         return;
       }
-      if (v < DRIVER_TIMEOUT_MIN || v > DRIVER_TIMEOUT_MAX) {
+      if (v < min || v > max) {
         out.push({
           severity: "warning",
           code: "section-out-of-range",
           message:
-            `driver.${field}: ${v} is outside ${DRIVER_TIMEOUT_MIN}-${DRIVER_TIMEOUT_MAX}, ` +
+            `driver.${field}: ${v} is outside ${min}-${max}, ` +
             `so orrerix will clamp it - the driver will not wait for the time this file names.`,
           section: "driver",
         });
@@ -3689,7 +3710,13 @@ function sectionFindings(w: Workflow): Finding[] {
     };
     backstop("lane_timeout_minutes", dv.lane_timeout_minutes);
     backstop("fix_timeout_minutes", dv.fix_timeout_minutes);
-    backstop("drive_timeout_minutes", dv.drive_timeout_minutes);
+    // #2110: its own range, not the family's - see DRIVER_DRIVE_TIMEOUT_MAX.
+    backstop(
+      "drive_timeout_minutes",
+      dv.drive_timeout_minutes,
+      DRIVER_DRIVE_TIMEOUT_MIN,
+      DRIVER_DRIVE_TIMEOUT_MAX
+    );
   }
 
   const resources = w.resources;
