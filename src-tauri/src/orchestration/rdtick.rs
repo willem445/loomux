@@ -3135,15 +3135,7 @@ impl OrchRegistry {
                 // order, not a new one: `rd_step_entry` runs the whole
                 // load-decide-store — that call and the spawn after it included
                 // — under this same lock (§2.4).
-                let seeded: Vec<reviewdrive::LaneRecord> = state
-                    .entries
-                    .iter()
-                    .filter(|e| e.pr == pr)
-                    .flat_map(|e| e.lanes.iter())
-                    .filter_map(|l| {
-                        self.rd_lane_session(group, Some(l)).map(|s| l.reseeded(&s))
-                    })
-                    .collect();
+                let seeded: Vec<reviewdrive::LaneRecord> = Vec::new();
                 state.entries.retain(|e| e.pr != pr);
                 // **The clock is the caller's, and that is what makes the age
                 // bound testable at all.** `started_ms` is the anchor §2.2
