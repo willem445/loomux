@@ -1948,9 +1948,6 @@ impl OrchRegistry {
     /// — a race the reconcile cannot distinguish from a genuinely lost session,
     /// where the hand-back can.
     fn rd_reconcile_with(&self, group: &GroupId, runner: &dyn rddrive::RdRunner, now: u64) {
-        if self.rd_reconciled.lock_safe().contains(group) {
-            return;
-        }
         let dir = self.group_dir(group);
         let mut audits: Vec<(String, u64, bool, bool)> = Vec::new();
         // #2135 N2: set false only when a write this reconcile NEEDED actually
