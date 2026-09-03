@@ -4428,7 +4428,12 @@ mod tests {
 
         let mut starved = entry_at(DriveState::ReviewWait);
         starved.head = "head-a".to_string();
-        starved.note_cap_starvation(1_000);
+        // One minute of ordinary life, THEN the cap. Not starved from the
+        // instant it was created: both figures below would then read zero,
+        // which is also what every arithmetic error produces, and they would
+        // stop discriminating between an exclusion that works and one that
+        // returns nothing.
+        starved.note_cap_starvation(61_000);
         assert_eq!(
             decide(&starved, &facts(past), &limits),
             DriveStep::held(HeldReason::CapFull),
@@ -4436,13 +4441,18 @@ mod tests {
         );
         assert_eq!(
             starved.state_elapsed_ms(past),
-            0,
-            "…because every millisecond of that state was time it could not spawn"
+            60_000,
+            "the state clock must hold at the one minute this drive spent able to act"
         );
         assert_eq!(
             starved.bounded_age_ms(past),
-            1_000,
-            "and the age the backstop reads is the drive's own, not the cap's"
+            60_000,
+            "and so must the age the backstop reads: it is the drive's own, not the cap's"
+        );
+        assert_eq!(
+            starved.age_ms(past),
+            past - 1_000,
+            "…while the WALL age is untouched, which is what `since_ms` reports"
         );
     }
 
