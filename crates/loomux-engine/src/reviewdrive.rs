@@ -1752,9 +1752,8 @@ impl DriveEntry {
     /// the drive's real age, which is both true and the figure they want.
     pub fn state_elapsed_ms(&self, now_ms: u64) -> u64 {
         now_ms
-            .saturating_sub(self.state_since_ms)
+            .wrapping_sub(self.state_since_ms)
             .saturating_sub(self.starved_in_state_ms(now_ms))
-            .min(self.bounded_age_ms(now_ms))
     }
 
     /// Record that the live-delegate cap refused this drive's lane spawn, and
