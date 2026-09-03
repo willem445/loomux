@@ -220,6 +220,7 @@ impl RdBrief {
         &self,
         entry: &reviewdrive::DriveEntry,
         limits: &reviewdrive::DriveLimits,
+        reason: reviewdrive::HeldReason,
         messaged_by: &str,
         refusal: &str,
     ) -> rddrive::HeldFacts {
@@ -242,6 +243,32 @@ impl RdBrief {
             max_review_rounds: limits.max_review_rounds,
             max_ci_attempts: limits.max_ci_attempts,
             failing_jobs: self.failing_jobs.clone(),
+            // **Read off the entry AFTER the arc, which is the only place
+            // they exist** (#2110). `advance` stamps `held_from` and
+            // `held_after_ms` from the clock it is about to reset, so a
+            // reader here recomputing them would report the age of the hold
+            // rather than the wait that caused it — and this function is
+            // called from the `Held` arm below, after `entry.take`.
+            held_state: entry.held_from,
+            held_state_ms: entry.held_after_ms,
+            // **The bound named is the one that FIRED, and the two holds
+            // fired on different ones.** `state-stalled` is this state's
+            // bound; `drive-stalled` is the drive's total, and printing the
+            // state's figure there would be a notice quoting a number that
+            // did not decide anything. Every other reason has no time bound
+            // behind it, and its notice reads none of this.
+            held_bound_ms: match reason {
+                reviewdrive::HeldReason::StateStalled => entry
+                    .held_from
+                    .and_then(|st| {
+                        reviewdrive::state_bound_ms(st, limits, self.required.len())
+                    })
+                    .unwrap_or(0),
+                reviewdrive::HeldReason::DriveStalled => {
+                    limits.drive_timeout_minutes.saturating_mul(60_000)
+                }
+                _ => 0,
+            },
         }
     }
 }
@@ -1215,18 +1242,27 @@ impl OrchRegistry {
         // REACHABLE because `decide_review_wait`'s stall check is keyed on the
         // head rather than on the full (head, digest) key; the two changes ship
         // together for that reason, and refusing without the re-key would swap a
-        // duplicate reviewer for a four-hour `drive-stalled`.
+        // duplicate reviewer for a hold hours away that names no lane.
         //
         // A lane that HAS answered here and whose pane then went busy on
         // something else — a human re-tasking it, another drive taking it over —
-        // is the residual, and it is bounded by the drive's AGE alone: the stall
-        // arm exempts it precisely because it answered. An earlier version of
-        // this comment claimed that case could not arise ("a pane still holding
-        // the round has by definition recorded no verdict for it"), and that
-        // premise is false — answering and then being given other work are not
-        // exclusive. `an_answered_lane_whose_re_brief_is_refused_is_bounded_only_by_the_drives_age`
-        // pins the gap itself; closing it wants a per-lane refusal clock, which
-        // is #2110's.
+        // is the residual: the stall arm exempts it precisely because it
+        // answered. An earlier version of this comment claimed that case could
+        // not arise ("a pane still holding the round has by definition recorded
+        // no verdict for it"), and that premise is false — answering and then
+        // being given other work are not exclusive.
+        //
+        // **What bounds it moved in #2110, and only what bounds it.** That
+        // issue built no per-lane refusal clock, so there is still nothing
+        // per-lane here and the hold still names no lane; what it added is a
+        // per-STATE bound, and `review-wait` is a state, so this composition
+        // now leaves at its `review-wait` state bound as `held(state-stalled)`
+        // rather than at twelve hours as `held(drive-stalled)` — four hours on a
+        // one-lane gate at stock knobs, since #2117 review 2 made that bound the
+        // constant PLUS one `lane_timeout_minutes` per required lane.
+        // `an_answered_lane_whose_re_brief_is_refused_is_bounded_by_the_review_wait_state_bound`
+        // pins the gap and that exit; closing it properly still wants the
+        // per-lane clock.
         //
         // **A head change is deliberately not covered.** There the recorded pane
         // is reviewing a revision the drive has moved past, its verdict binds to
@@ -2211,7 +2247,10 @@ impl OrchRegistry {
                         // #2109: a lane opened is the refusal run ending. Not
                         // folded into `advance` — opening a lane is not an arc
                         // (§2.1), so there is no transition here to hang it on.
-                        entry.clear_cap_starvation();
+                        // #2110: it takes the clock, because ending a run is
+                        // what charges its cost to the exclusion totals the
+                        // two age bounds subtract.
+                        entry.clear_cap_starvation(now);
                         out.changed = true;
                         out.lanes_opened.push((block.clone(), agent.clone()));
                         out.audits.push((
@@ -2285,10 +2324,17 @@ impl OrchRegistry {
                         // window at each cap refusal after a non-cap one, which
                         // is the fail-safe direction and is what the word
                         // "continuously" on `HeldReason::CapFull` promises.
+                        // #2110: the clear takes the clock, because ending a
+                        // run is what CHARGES its cost to the exclusion totals
+                        // both age bounds subtract. That matters most on this
+                        // site rather than least: a mixed run restarts the
+                        // window here, and a restart that forgot what the
+                        // previous stretch cost would hand the drive back time
+                        // it never had.
                         let moved = if cap {
                             entry.note_cap_starvation(now)
                         } else {
-                            entry.clear_cap_starvation()
+                            entry.clear_cap_starvation(now)
                         };
                         if moved {
                             out.changed = true;
@@ -2528,7 +2574,7 @@ impl OrchRegistry {
                     let n = rddrive::held_notice(
                         pr,
                         r,
-                        &brief.held_facts(entry, limits, &messaged_by, &refusal),
+                        &brief.held_facts(entry, limits, r, &messaged_by, &refusal),
                     );
                     // The refusal rides the `rd-held` row rather than a
                     // `rd-refused` row of its own, and only when there is one:
@@ -2768,6 +2814,14 @@ impl OrchRegistry {
                 // without this a resumed drive re-holds on the FIRST tick for a
                 // lane the orchestrator has just looked at and chosen to resume.
                 entry.started_ms = now;
+                // #2110: and with it the starvation the age bound was going
+                // to forgive. The exclusion is a credit against THIS age; a
+                // resume starts the age over, so carrying the credit would
+                // hand the new run a head start it did not earn. The
+                // per-state clock and its own accumulator are reset by the
+                // `advance` above, on the arc, which is where every arc
+                // resets them.
+                entry.starved_total_ms = 0;
                 for l in entry.lanes.iter_mut() {
                     l.spawned_ms = now;
                 }
@@ -3077,8 +3131,25 @@ impl OrchRegistry {
     /// is the cost this whole feature exists to remove. Parked entries ARE
     /// listed — a `held` drive is the one thing an orchestrator most needs to
     /// see, and §5.2 never prunes one.
+    /// **The clock is the caller's**, for `cancel_review_drive_with`'s reason,
+    /// one function over: every figure below is DERIVED from `now`, and a status
+    /// view reading the wall clock while the tick decides on an injected one puts
+    /// the two on different scales. `state_ms` and `since_ms` then come back in
+    /// wall units against anchors stamped in the test's units, so a test can
+    /// assert nothing about them except where the wall terms happen to cancel —
+    /// which is how #2110's first published figures were written, and they were
+    /// wrong in the direction that reads as passing. B2 shipped out of exactly
+    /// this shape.
+    ///
+    /// The only production caller passes `now_ms()`, so nothing about live
+    /// behaviour changes.
     #[doc(hidden)] // pub for integration tests
     pub fn review_drive_status(&self, group: &GroupId) -> Value {
+        self.review_drive_status_with(group, now_ms())
+    }
+
+    #[doc(hidden)] // pub for integration tests
+    pub fn review_drive_status_with(&self, group: &GroupId, now: u64) -> Value {
         let enabled = self.driver_enabled(group);
         let dir = self.group_dir(group);
         let state = {
@@ -3093,7 +3164,6 @@ impl OrchRegistry {
                 }
             }
         };
-        let now = now_ms();
         let drives: Vec<Value> = state
             .entries
             .iter()
@@ -3117,7 +3187,23 @@ impl OrchRegistry {
                     // it is written and meaningless across a restart, which is
                     // the queue's own split between `enqueued_ms` and
                     // `status_view`'s `since_ms`.
+                    //
+                    // **`since_ms` stays the WALL age and the exclusion is
+                    // published beside it** (#2110), rather than being netted
+                    // off inside it. A human asking how long a drive has been
+                    // going wants the wall figure, and an age that silently
+                    // shrank when a cap cleared would be a worse answer than
+                    // the one it replaced; what the backstop measures is
+                    // `since_ms - starved_ms`, which is checkable here rather
+                    // than inferable. `state_ms` is the clock that actually
+                    // bounds a working drive, and `held_state`/`held_state_ms`
+                    // are what it was doing when a bound fired — the third
+                    // bullet of #2110, so a resume is a decision.
                     "since_ms": e.age_ms(now),
+                    "starved_ms": e.starved_ms(now),
+                    "state_ms": e.state_elapsed_ms(now),
+                    "held_state": e.held_from.map(|s| s.as_str()),
+                    "held_state_ms": e.held_from.map(|_| e.held_after_ms),
                 })
             })
             .collect();

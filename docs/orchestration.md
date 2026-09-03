@@ -1744,8 +1744,8 @@ family — read each row as its own policy, never inferred from a neighbour:
   no ceiling; `checks_timeout_minutes` is 5–240 minutes, **clamped**.
 - **Review driver** (`driver:`): `max_review_rounds` and `max_ci_attempts` are
   1–3 rounds each and `max_rebase_attempts` is 0–1 rebases, all **refused**
-  outside; `lane_timeout_minutes`, `fix_timeout_minutes` and
-  `drive_timeout_minutes` are 5–240 minutes, **clamped**.
+  outside; `lane_timeout_minutes` and `fix_timeout_minutes` are 5–240 minutes
+  and `drive_timeout_minutes` is 5–1440 minutes, all **clamped**.
 - **Lock resources** (`resources:`): `slots` is 1–64 and `max_hold_minutes`
   is 1–480 minutes, both refused outside; at most 32 resources may be
   declared. These are the fields the inputs themselves enforce — they cannot
@@ -2051,7 +2051,7 @@ driver:
   max_rebase_attempts: 1
   lane_timeout_minutes: 60
   fix_timeout_minutes: 60
-  drive_timeout_minutes: 240
+  drive_timeout_minutes: 720
 ```
 
 Every number in that example is its field's own default, so a block naming only
@@ -2069,13 +2069,23 @@ example does not show at its default - it defaults to **false**, and an absent
 | `max_rebase_attempts` | 0–1 | 1 | refuse |
 | `lane_timeout_minutes` | 5–240 | 60 | clamp |
 | `fix_timeout_minutes` | 5–240 | 60 | clamp |
-| `drive_timeout_minutes` | 5–240 | 240 | clamp |
+| `drive_timeout_minutes` | 5–1440 | 720 | clamp |
 
 **refuse** fails the parse of the whole file: a value outside the range is a policy
 you believe is in force and is not, so orrerix will not load the file at all.
 **clamp** pulls the value into range and reports the edit as a warning - the three
 timeouts are backstops on a wait, and every notify-TTL wait in orrerix clamps the
 same way.
+
+`drive_timeout_minutes` is the odd one of the three and its range says so. The other
+two bound **one** wait on one fallible signal - a reviewer answering, a worker
+pushing - which is the same quantity a notify watch's TTL is, so they take that
+family's 5–240. This one is the **last-resort** bound over a whole drive, and it sits
+under four per-state bounds that do the real work (below). A backstop measured in the
+same hours as the waits beneath it is the one clock a drive making steady progress can
+still trip, and at four hours it did: two drives were parked "stalled" while one of
+them was mid-round with a finding just fixed and CI green at the new head. Twelve
+hours is the first figure that cannot be an honest review loop.
 
 A repo may run a *tighter* loop than the orchestrator template promises, never a looser one:
 the driver acts on the orchestrator's authority, and a config file that raised the bound
@@ -2490,11 +2500,12 @@ edit or a finding the worker answered rather than changed code for. A `report(pr
 no further, so instead of waiting the fix timeout out the driver types one line back into that
 worker's pane saying so. Once per hand-back, never to you.
 
-**A drive stops, it does not drift.** There are sixteen ways out and each produces exactly one
+**A drive stops, it does not drift.** There are seventeen ways out and each produces exactly one
 line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
 by orrerix on its own when it sees the PR has been closed — or one of
-fourteen holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
-the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
+fifteen holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
+the drive sitting in one state past that state's bound, the drive itself getting old,
+a reviewer requirement orrerix could not compute, a gate file it
 could not read, a worker that reported blocked, a delegate messaging the orchestrator, this group's
 live-delegate cap refusing the pane a hand-back needed, that same cap refusing a *reviewer* for
 long enough that the drive cannot get started at all, or a fix that could not be handed back to
@@ -2507,7 +2518,7 @@ one — `kill_agent` on an idle delegate, and the notice names which are idle �
 not re-pointing the drive at a different session. It is the one hold reason named here by its own
 word, because it is the one whose remedy is a different action from its neighbour's.
 
-**A drive the cap starves says so, in fifteen minutes rather than four hours.** A reviewer spawn
+**A drive the cap starves says so, in fifteen minutes rather than hours.** A reviewer spawn
 refused by the live-delegate cap is normally nothing to act on — another drive's lane finishes, a
 pane is closed, and the next tick spawns — so the drive simply retries. But a group whose slots are
 all held goes on refusing, and before this the drive sat in `review-wait` with no lanes and no line
@@ -2525,6 +2536,33 @@ still owns, so you can see at a glance whether the pressure is even its own. A d
 pane per reviewer for its whole life — its lanes are resumed round to round rather than respawned,
 and a reviewer that is still writing is never given a second pane alongside it — so a drive is no
 longer competing with itself for the slots it is waiting on.
+
+**A drive is bounded by where it is stuck, not by how long it has existed.** Each of the four
+working states has its own bound, and it starts again from zero every time the drive moves:
+90 minutes in `ci-wait`, 90 minutes in `fix-wait`, and 15 minutes in `gate-check`, which is a
+decision rather than a wait. `review-wait` is the one that is not a flat number: it holds your
+reviewers one after another, so its bound is three hours **plus** one `lane_timeout_minutes`
+per required lane — four hours for a one-lane gate at the default, six for three. Past one of
+these the drive parks as `state-stalled`, and its line says which state, how long it sat there
+and what the bound was — so resuming it is a decision you make rather than a reflex. None of
+these numbers can overrule a `driver:` value you set: raise `lane_timeout_minutes` or
+`fix_timeout_minutes` and the state bound above it rises with it. And the
+holds that name a real remedy — `lane-stalled`, `fix-stalled`, `cap-full`, each of which can
+tell you which pane to read or which slot to free — all fire well inside these, so this is the
+catch-all rather than the usual answer.
+
+**The total age is still there, as the backstop, at twelve hours.** It is what catches the one
+drive the per-state bounds structurally cannot: one that advances on every wake and never
+finishes, such as a PR whose gate requires a green default branch that stays red — it resets
+every state clock for ever, so only the whole-drive clock can see it. That hold is
+`drive-stalled`, and its line now says the same three things, plus that it is the backstop, so
+"the drive kept moving and never finished" cannot be mistaken for "the drive sat still".
+
+**Neither clock charges a drive for time it could not act.** While this group's live-delegate
+cap is refusing the drive a reviewer, both clocks are paused — a hold is not progress and it is
+not a stall. `review_drive_status` publishes both halves rather than netting them: `since_ms`
+stays the plain wall age, `starved_ms` is how much of it the drive spent unable to spawn, and
+`state_ms` is the clock the state bound actually reads.
 
 **A hold is parked, not finished**: it keeps what it has spent, so
 resuming it does not silently grant a fresh budget, and clearing the counters is a separate,

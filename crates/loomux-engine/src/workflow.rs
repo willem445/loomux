@@ -656,11 +656,52 @@ pub const DRIVER_MAX_CI_ATTEMPTS_MAX: u32 = 3;
 pub const DRIVER_MAX_REBASE_ATTEMPTS_MIN: u32 = 0;
 pub const DRIVER_MAX_REBASE_ATTEMPTS_MAX: u32 = 1;
 
-/// How long a drive may sit before it is `held(drive-stalled)` (§2.1). The
-/// design names 240 (§5.3) — today the notify-TTL family's ceiling, but spelled
-/// as its own default: the *bounds* are the clamp family's (they ride
-/// [`clamp_expires_minutes`]); the default is this block's own policy choice.
-pub const DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN: u32 = 240;
+/// How long a drive may sit before it is `held(drive-stalled)` (§2.1) — the
+/// **backstop**, since #2110, beneath `reviewdrive`'s per-state bounds.
+///
+/// **Twelve hours, and it left the notify-TTL clamp family to get there.** The
+/// design named 240 because that was the family's ceiling and the total age was
+/// then the only clock over a working drive; both halves of that stopped being
+/// true at once. Once a drive is bounded state by state — `ci-wait` at ninety
+/// minutes, `review-wait` at its constant plus one `lane_timeout_minutes` per
+/// required lane, and so on, each reset by every
+/// transition — a total age measured in the same units is not a second opinion
+/// about the same thing, it is the *only* bound that a drive making steady
+/// progress can still trip. At 240 it tripped: two drives were parked
+/// `drive-stalled` at four hours with rounds in flight and CI green, which is
+/// #2110. What the backstop is for is the drive that advances forever without
+/// finishing — §8's `also: [base-green]` row — and half a day is the first
+/// figure that cannot be an honest review loop.
+///
+/// **This is a looser number than it replaces, and §2.3's closure still holds**,
+/// because that closure is about INVARIANT 9's *counters* — rounds, CI attempts,
+/// rebases — which are unchanged and still refuse a repo that tries to widen
+/// them. The timeouts are pacing, not budget, and the pacing this ships is
+/// strictly tighter overall: before, a stuck drive waited four hours whatever it
+/// was stuck on; now the state it is stuck IN answers, in ninety minutes or
+/// less for three of the four.
+pub const DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN: u32 = 720;
+
+/// The closed range for `driver.drive_timeout_minutes` — its **own**, no longer
+/// the notify-TTL family's, since its default now sits above that family's
+/// ceiling. The floor is still the family's, so a repo that already declares a
+/// tight backstop keeps it; the ceiling is a day, which bounds the value at
+/// something a human would recognise as a mistake rather than at nothing.
+///
+/// Its two siblings, `lane_timeout_minutes` and `fix_timeout_minutes`, stay on
+/// [`clamp_expires_minutes`]: each really is one bounded wait on one fallible
+/// signal, which is the quantity that clamp is about, and neither is the
+/// last-resort bound over a whole drive.
+pub const DRIVER_DRIVE_TIMEOUT_MIN: u32 = NOTIFY_EXPIRES_MIN;
+pub const DRIVER_DRIVE_TIMEOUT_MAX: u32 = 24 * 60;
+
+/// `driver.drive_timeout_minutes` brought inside [`DRIVER_DRIVE_TIMEOUT_MIN`]
+/// ..=[`DRIVER_DRIVE_TIMEOUT_MAX`], with the default standing in for an absent
+/// value — `clamp_expires_minutes`' shape, on this field's own range.
+pub fn clamp_drive_timeout_minutes(raw: Option<u32>) -> u32 {
+    raw.unwrap_or(DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN)
+        .clamp(DRIVER_DRIVE_TIMEOUT_MIN, DRIVER_DRIVE_TIMEOUT_MAX)
+}
 
 /// The `driver:` block — policy for the engine-driven review-loop driver
 /// (`doc/design/review-driver.md`), a sibling of [`MergeQueuePolicy`] and the
@@ -1906,14 +1947,16 @@ pub fn workflow_schema_field_facts() -> BTreeMap<String, serde_json::Value> {
     fact("driver.max_ci_attempts", "max", json!(DRIVER_MAX_CI_ATTEMPTS_MAX));
     fact("driver.max_rebase_attempts", "min", json!(DRIVER_MAX_REBASE_ATTEMPTS_MIN));
     fact("driver.max_rebase_attempts", "max", json!(DRIVER_MAX_REBASE_ATTEMPTS_MAX));
-    // The three backstops ride the notify-TTL clamp itself (`clamp_expires_minutes`),
-    // so their bounds are that family's, exactly as `checks_timeout_minutes`' are.
+    // Two of the three backstops ride the notify-TTL clamp itself
+    // (`clamp_expires_minutes`); `drive_timeout_minutes` carries its own range,
+    // published here so the manifest states each field's real range rather than
+    // the family's for all three (#2110).
     fact("driver.lane_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("driver.lane_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
     fact("driver.fix_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
     fact("driver.fix_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
-    fact("driver.drive_timeout_minutes", "min", json!(NOTIFY_EXPIRES_MIN));
-    fact("driver.drive_timeout_minutes", "max", json!(NOTIFY_EXPIRES_MAX));
+    fact("driver.drive_timeout_minutes", "min", json!(DRIVER_DRIVE_TIMEOUT_MIN));
+    fact("driver.drive_timeout_minutes", "max", json!(DRIVER_DRIVE_TIMEOUT_MAX));
     // #1457. A LENGTH bound on a string, so it is `maxLength` rather than `max`:
     // this manifest documents `max` as "highest accepted number", and a generated
     // text control needs a maxlength, not a numeric ceiling. Stated here because
@@ -2919,8 +2962,9 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
     //   like the notify TTLs" - and by the notify TTL clamp *itself*, not by a
     //   second copy of those bounds. Same quantity as
     //   `merge_queue.checks_timeout_minutes`: a bounded wait on a fallible
-    //   signal. `drive_timeout_minutes`' default is its own constant (the
-    //   design's 240) fed through the same clamp.
+    //   signal. `drive_timeout_minutes` left that family in #2110: its default
+    //   is twelve hours, above the family's ceiling, so it carries its own
+    //   range and its own clamp (`clamp_drive_timeout_minutes`).
     /// One INVARIANT-9 counter (#1778 §2.3): refused outside its closed range
     /// the way `merge_queue.max_batch: 0` is refused, with the design's own
     /// default standing in when the value was written and refused - an error
@@ -2976,9 +3020,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             ),
             lane_timeout_minutes: clamp_expires_minutes(rd.lane_timeout_minutes),
             fix_timeout_minutes: clamp_expires_minutes(rd.fix_timeout_minutes),
-            drive_timeout_minutes: clamp_expires_minutes(
-                rd.drive_timeout_minutes.or(Some(DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN)),
-            ),
+            drive_timeout_minutes: clamp_drive_timeout_minutes(rd.drive_timeout_minutes),
         },
     };
 
