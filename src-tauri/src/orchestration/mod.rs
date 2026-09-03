@@ -40895,7 +40895,7 @@ impl OrchRegistry {
         let mut live_keys: HashSet<String> = HashSet::new();
         let mut fresh: Vec<UsageSnapshot> = Vec::with_capacity(live_agents.len());
         for a in &live_agents {
-            let cli = rails.as_ref().map(|g| g.cli_for_block(&a.block, a.role)).unwrap_or("claude");
+            let cli = rails.as_ref().map(|g| g.cli_for(a.role)).unwrap_or("claude");
             let snap = self.compute_usage_snapshot(a, cli);
             live_keys.insert(snap.key.clone());
             fresh.push(snap);
@@ -43605,7 +43605,7 @@ impl OrchRegistry {
             return cli.clone();
         }
         self.group(&a.group)
-            .map(|g| g.guardrails.cli_for_block(&a.block, a.role).to_string())
+            .map(|g| g.guardrails.cli_for(a.role).to_string())
             .unwrap_or_else(|| "claude".to_string())
     }
 
