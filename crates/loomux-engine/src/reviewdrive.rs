@@ -1112,13 +1112,25 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 /// that is not a wait — `held` is parked and the two terminals are over, so
 /// none of the three has a clock at all.
 ///
-/// **`max` of the constant and the state's OWN configured bound, never the
-/// constant alone.** A repo that raises `lane_timeout_minutes` to four hours
-/// has said what it thinks a reviewer is owed, and a constant in this file
-/// quietly parking that drive at three would be loomux overruling a knob it
-/// published — the shadowing hazard is the one thing per-state bounds could
-/// plausibly get wrong, so it is closed here in one place rather than argued
-/// once per call site.
+/// **What each state's bound is made of, per state** — there is no single rule,
+/// and an earlier version of this paragraph claimed one ("`max` of the constant
+/// and the state's own configured bound"). That was true of every arm when it
+/// was written and stopped being true of `review-wait` the moment #2117's W3
+/// made that arm an ADD, while never having been true of the two arms that have
+/// no knob to take a max against:
+///
+/// - `ci-wait` and `gate-check` are **bare constants**. [`DriveLimits`] has no
+///   `ci_` or `gate_` timeout, so there is nothing to shadow and nothing to
+///   take a maximum with. `ci-wait` is the state that most needed a bound at
+///   all: `CiObservation::Pending` and `Unknown` both return `Wait` forever.
+/// - `fix-wait` is `max(constant, fix_timeout_minutes)` — a floor over the
+///   knob, so a repo that raises `fix_timeout_minutes` to four hours raises
+///   this with it rather than being parked at ninety minutes by a number in
+///   loomux. That is the shadowing hazard, and this is the one arm where it can
+///   arise at all.
+/// - `review-wait` is the constant **PLUS** `lane_timeout_minutes * lanes`, for
+///   the reason argued below. It is the arm that is not a max, and the sentence
+///   above exists because saying "max" of all four read as covering it.
 ///
 /// # `review-wait`'s floor is the sum of the SILENCES, plus slack
 ///
@@ -1137,9 +1149,9 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 /// lane's silence is unfunded by the product: the stretch from entering the
 /// state to the first brief, and the tick-detection gap after each verdict
 /// lands. With three lanes at the sixty-minute default, three reviewers each
-/// answering at fifty-nine minutes and two inter-lane gaps costing ninety
-/// seconds between them crosses a bare 180-minute floor — and the margin is
-/// exactly zero wherever `lane_timeout_minutes * required_lanes` reaches
+/// answering at fifty-nine minutes and three such intervals costing ninety
+/// seconds apiece crosses a bare 180-minute floor — and the margin is exactly
+/// zero wherever `lane_timeout_minutes * required_lanes` reaches
 /// [`REVIEW_WAIT_BOUND_MS`], which is precisely the configuration the floor
 /// exists to protect. A drive whose reviewers all answered promptly would park
 /// `state-stalled` naming no lane, which is the same class of false park
@@ -1164,6 +1176,30 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 /// Zero required lanes (a routing answer this tick could not produce) falls
 /// back to the constant plus its slack; that drive holds
 /// `routing-unaccountable` on the same tick anyway.
+///
+/// # What these clocks charge that nobody wants them to
+///
+/// Two properties are disclosed rather than closed, both inherited from
+/// [`DriveEntry::state_elapsed_ms`] being wall time minus cap starvation and
+/// nothing else (#2117 review 3):
+///
+/// - **orrerix's own downtime is charged to the state.** The clocks are
+///   absolute stamps, not tick counts, so a group paused or an app closed for
+///   two hours while a drive sat in `ci-wait` parks it `state-stalled` on the
+///   first tick after the restart. The age bound had this property before
+///   #2110 and nobody hit it at four hours; these bounds are tighter, so it is
+///   now reachable in an ordinary lunch break. It is not silent (the notice
+///   names the state and the elapsed figure) and it is recoverable by the
+///   remedy that notice prints — arc 11 re-stamps every clock. Closing it wants
+///   a `last_tick_ms` and a gap-detection rule, which is a second clock with
+///   its own failure mode (a drive that never ticks would never bound), and
+///   that is a decision this issue did not ask for. Pinned by
+///   `orrerix_downtime_is_charged_to_the_state_it_spanned`.
+/// - **A backward wall-clock step suspends every bound** rather than firing
+///   one: the subtraction saturates, so `state_elapsed_ms` reads zero until the
+///   clock catches up. That is the fail-safe direction — no false park — and it
+///   is the same behaviour `age_ms` has had since #1778. Pinned by
+///   `a_clock_that_steps_backward_suspends_the_bound_rather_than_firing_it`.
 pub fn state_bound_ms(
     state: DriveState,
     limits: &DriveLimits,
@@ -5096,6 +5132,93 @@ mod tests {
             e.held_after_ms,
             minutes_ms(limits.drive_timeout_minutes),
             "…and for how long, which is what the notice interpolates"
+        );
+    }
+
+    /// **orrerix's own downtime is charged to the state it spanned** (#2117
+    /// review 3, premortem 1) — disclosed at [`state_bound_ms`], and pinned here
+    /// so the disclosure cannot go false with nothing red to say so.
+    ///
+    /// The clocks are absolute stamps rather than tick counts, so a group paused
+    /// or an app closed across a two-hour gap is indistinguishable from a drive
+    /// that sat in `ci-wait` for two hours. The age bound had this property
+    /// before #2110 and nobody reached it at four hours; at ninety minutes it is
+    /// an ordinary lunch break.
+    ///
+    /// **This pins the residual itself, not a fix**, and the second half is what
+    /// makes that honest: the drive is recoverable by the remedy its own notice
+    /// prints, because arc 11 re-stamps every clock. A pin on the first half
+    /// alone would read as a defect nobody had thought about.
+    #[test]
+    fn orrerix_downtime_is_charged_to_the_state_it_spanned() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::CiWait);
+        e.head = "head-a".into();
+        // One tick at 1_000, then nothing for two hours — orrerix was not
+        // running. No starvation was recorded, because no tick was there to
+        // record one.
+        let after_gap = 1_000 + minutes_ms(120);
+        assert_eq!(
+            decide(&e, &DriveFacts { now_ms: after_gap, ..facts_at("head-a") }, &limits),
+            DriveStep::held(HeldReason::StateStalled),
+            "the gap is charged to `ci-wait`, which is the disclosed residual — if this ever \
+             stops being true, `state_bound_ms`'s downtime paragraph is what needs rewriting"
+        );
+
+        // …and the remedy the notice prints really does clear it: arc 11
+        // re-stamps `state_since_ms`, so the drive goes back to work rather than
+        // re-holding on its first tick.
+        e.advance(DriveState::Held, Some(HeldReason::StateStalled), None, after_gap).unwrap();
+        e.advance(DriveState::CiWait, None, None, after_gap).unwrap();
+        assert_eq!(
+            e.state_elapsed_ms(after_gap),
+            0,
+            "a resume must start the state clock over, or the hold is unrecoverable"
+        );
+        assert_eq!(
+            decide(&e, &DriveFacts { now_ms: after_gap + 1_000, ..facts_at("head-a") }, &limits),
+            DriveStep::Wait,
+            "…and the very next tick must not re-hold on the gap it already reported"
+        );
+    }
+
+    /// **A backward wall-clock step suspends the bound rather than firing it**
+    /// (#2117 review 3, premortem 2) — the fail-safe direction, disclosed at
+    /// [`state_bound_ms`] and pinned here.
+    ///
+    /// Every clock here is a `saturating_sub` against an absolute stamp, so a
+    /// `now` behind `state_since_ms` reads zero rather than wrapping to
+    /// `u64::MAX` and parking the drive instantly. The three halves are the
+    /// suspension, its non-vacuity control (the same entry at a forward clock
+    /// DOES hold, so the first assertion is not passing because nothing ever
+    /// holds), and the recovery once the clock is ahead again.
+    #[test]
+    fn a_clock_that_steps_backward_suspends_the_bound_rather_than_firing_it() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::CiWait);
+        e.head = "head-a".into();
+        e.state_since_ms = minutes_ms(500);
+        e.started_ms = minutes_ms(500);
+
+        // The clock steps back behind the stamp.
+        let behind = minutes_ms(400);
+        assert_eq!(e.state_elapsed_ms(behind), 0, "saturating, not wrapping");
+        assert_eq!(e.bounded_age_ms(behind), 0, "…and the age with it");
+        assert_eq!(
+            decide(&e, &DriveFacts { now_ms: behind, ..facts_at("head-a") }, &limits),
+            DriveStep::Wait,
+            "a clock that went backwards must not park a drive; failing toward WAIT is the \
+             only safe direction here"
+        );
+
+        // The control: the same entry at a forward clock past the bound holds,
+        // so the assertion above is about the step and not about a drive that
+        // could never hold at all.
+        let ahead = minutes_ms(500) + CI_WAIT_BOUND_MS;
+        assert_eq!(
+            decide(&e, &DriveFacts { now_ms: ahead, ..facts_at("head-a") }, &limits),
+            DriveStep::held(HeldReason::StateStalled),
+            "the same entry past its bound on a forward clock must still park"
         );
     }
 }
