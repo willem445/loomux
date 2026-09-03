@@ -217,13 +217,14 @@ carried to a new agent id, that one row's `agent_id` names only the **last** occ
 and every earlier agent on the session has no row of its own. Joining on `agent_id`
 would report an agent that demonstrably spent tokens as having spent zero while
 crediting its successor with the whole lineage — and on this group's store that is not
-a corner case: **514 of the 1210 distinct sessions in `agents.json` are shared by more
-than one agent id — the same 514 usage rows — carrying 31.2 G of the store's 44.1 G
-tokens** (measured 2026-09-03, the `usage.json` read recorded in #2114's coverage
-block). The store is LIVE: it held 1356 rows at the first measurement and 1362 an hour
-later, with 514 shared both times — so quote the shared count and re-derive the
-denominator rather than citing a ratio. §10 refers here for these figures instead of
-restating them.
+a corner case. On the `usage.json` / `agents.json` read recorded in #2114's coverage
+block (measured 2026-09-03): **514 distinct sessions in `agents.json` are shared by
+more than one agent id — the same 514 usage rows — carrying 31.2 G of the store's
+44.1 G tokens**, and the same read counts 1210 distinct sessions in all. The store is
+LIVE: `usage.json` held 1356 rows at the first measurement and 1362 an hour later,
+with 514 shared both times, so no figure here is a standing ratio — quote the shared
+**count** and re-derive the denominators from a fresh read. §10 refers here for these
+figures instead of restating them.
 
 So the row is looked up by the agent's **session** and split evenly across every agent
 that occupied it (heuristic **H8**), then weighted by `1/k` where the agent is
@@ -441,13 +442,17 @@ What the test pins, named as `test/orchscorecard.test.ts` asserts it: each per-o
 credit **individually** (`rev-11.tokens_credited === 535`,
 `rev-11-prev.tokens_credited === 535`), the row each occupant reads (`tokens === 1070`
 for both — one session row, two occupants) beside the split's operands (`usage_key` is
-`session`, `shared_session_agents` is 2, `session_weight` is 0.5), and their **sum**
-(`535 + 535 === 1070`, asserted with "a fully-attributed lineage must re-sum to its
-session row, neither doubled nor halved"). Because the per-occupant credits are pinned
-at 535 each, they redden on their own under either regression: crediting a shared row
-*once* reads 1070 + 0, a *no-split* implementation reads 1070 + 1070, and neither value
-passes an assert against 535. The sum is a cross-check, not the only witness — it
-states the re-sum property outright instead of leaving it implied by the two halves.
+`session`, `shared_session_agents` is 2, and the two weights that multiply into the
+credit — `session_weight` is 0.5, `pr_weight` is 1) — and their **sum**, asserted as
+`535 + 535 === 1070` with "a fully-attributed lineage must re-sum to its session row,
+neither doubled nor halved". Beside them the unshared control `w-13`
+(`shared_session_agents` is 1, credited whole — `tokens_credited` equals `tokens`)
+pins that the split is not a blanket halving. Because the per-occupant credits are
+pinned at 535 each, they redden on their own under either regression: crediting a
+shared row *once* reads 1070 + 0, a *no-split* implementation reads 1070 + 1070, and
+neither value passes an assert against 535. The sum is a cross-check, not the only
+witness — it states the re-sum property outright instead of leaving it implied by the
+two halves.
 
 What no test can reach is whether an **even** split is the right one: it is an
 assumption about how a shared pane's spend divided, and only the structural field named
