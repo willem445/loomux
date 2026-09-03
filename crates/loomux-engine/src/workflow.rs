@@ -679,7 +679,7 @@ pub const DRIVER_MAX_REBASE_ATTEMPTS_MAX: u32 = 1;
 /// strictly tighter overall: before, a stuck drive waited four hours whatever it
 /// was stuck on; now the state it is stuck IN answers, in ninety minutes or
 /// less for three of the four.
-pub const DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN: u32 = 720;
+pub const DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN: u32 = 240;
 
 /// The closed range for `driver.drive_timeout_minutes` — its **own**, no longer
 /// the notify-TTL family's, since its default now sits above that family's
