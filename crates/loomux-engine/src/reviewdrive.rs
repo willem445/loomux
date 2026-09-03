@@ -2762,12 +2762,8 @@ pub fn lane_stall_anchor(
     pane_dead: bool,
     now_ms: u64,
 ) -> u64 {
-    match rec {
-        Some(r) if pane_dead && !head.is_empty() && r.briefed_head == head && r.spawned_ms != 0 => {
-            r.spawned_ms
-        }
-        _ => now_ms,
-    }
+    let _ = (rec, head, pane_dead);
+    now_ms
 }
 
 /// The first lane whose `pass` does not stand at this (head, digest) — where
