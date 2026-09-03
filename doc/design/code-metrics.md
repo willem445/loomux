@@ -132,6 +132,16 @@ If a leg ever costs more than it is worth, the honest fix is to drop that leg **
 record here that its `cfg` bodies are unmetered — not to leave the merged number
 looking complete. The measured per-leg cost is in the table below.
 
+**A leg that fails before its clippy step drops out silently, and this is not yet
+fixed.** No per-leg artifact exists, the merge simply has one fewer input, and the
+report reads exactly as complete as a three-leg run — `platforms` names the legs
+that contributed, but nothing compares that list against the legs that were
+supposed to run. The consequence is under-reporting of whatever that platform
+`cfg`-gates, in the same direction the union merge above was fixed to avoid. The
+shape of the fix is to pass the expected leg list into the report and mark the
+output incomplete when one is missing, the way `sitesComplete` already does for
+the per-file union (#2139 review round 1, premortem).
+
 ## The artifact
 
 `code-metrics.json`, uploaded by the `code-metrics` job with 30-day retention. It is a
@@ -201,10 +211,10 @@ read-only fork variant (#2128 part 6d).
 
 ## Measured distributions
 
-All of it measured by run **33779750324** at commit `22aa13d0`, by the job this
-note describes — not by hand, and not carried over from #2128's estimates. Re-derive
-it, do not edit it: download that run's `code-metrics` artifact, or read any later
-run's job summary.
+All of it measured by run **33787554369** at commit `6e364493`, by the job this note
+describes — not by hand, and not carried over from #2128's estimates. Re-derive it,
+do not edit it: download that run's `code-metrics` artifact, or read any later run's
+job summary.
 
 Clippy merged three legs there: `macos-latest`, `ubuntu-22.04`, `windows-latest`.
 15,232 coded diagnostics read, 14,970 parsed into rows, 262 from lints this report
@@ -258,7 +268,7 @@ Roots, same run:
 | Root | Files | Lines | Comment share | file p95 | file max |
 | --- | --- | --- | --- | --- | --- |
 | `src` | 153 | 65,416 | 16% | 2,105 | 5,255 |
-| `test` | 142 | 45,011 | 21% | 939 | 3,311 |
+| `test` | 142 | 45,172 | 21% | 939 | 3,311 |
 | `e2e` | 14 | 3,640 | 28% | 767 | 767 |
 | `src-tauri/src` | 32 | 88,461 | 49% | 3,902 | 57,085 |
 | `src-tauri/tests` | 40 | 101,815 | 28% | 6,376 | 59,528 |
@@ -276,6 +286,13 @@ with clippy file by file — `locks.rs` 70 total and 0 outside `#[cfg(test)]`, `
 90 and 0, `mod.rs` 13 and 12 against clippy's 12. `obs.rs` looked like an off-by-one
 until the one apparent product site turned out to be a `.unwrap()` inside a `///`
 doc line.
+
+These three figures are **unchanged** by the move from a `max` merge to a site union
+(#2139 review round 1): `sitesComplete` is true and the union comes to the same 27 /
+22 / 10, because no file in the tree today has an `unwrap`, `expect` or `panic!` on
+one leg that another leg does not also report. The fix changed the GUARANTEE, not
+this number — a file that later gains a `cfg(windows)` and a `cfg(unix)` site would
+have merged to 1 under `max` and now merges to 2.
 
 ### What the cost is
 
