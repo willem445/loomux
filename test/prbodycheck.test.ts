@@ -208,6 +208,49 @@ test('a line cite inside the file prints the line it points at, at head (#1764 r
 });
 
 // ---------------------------------------------------------------------------
+// Three more Part 1 rows, each stated in the shape its own round was failed in.
+// ---------------------------------------------------------------------------
+
+const SMALL = {
+  pr: 900,
+  head: 'c7a3626a',
+  mergeBase: '517073c4',
+  diffstat: { files: 2, insertions: 17, deletions: 2 },
+  numstat: { 'doc/design/a.md': { insertions: 9, deletions: 0 }, 'doc/design/b.md': { insertions: 8, deletions: 2 } },
+  files: { 'doc/design/a.md': { blob: 'aabbccdd', blobBytes: 100, blobChars: 98, blobLines: 10, diskBytes: 110, lineAt: {} } },
+};
+
+test('a numstat written from recollection is caught even when its figures are in code spans (#2105 r2)', () => {
+  // The worker's own words on that round: "that figure was never measured — I wrote it
+  // from recollection". The real edit was 9 + 8 insertions and 2 deletions.
+  const r = pbc.analyze('The change is `9 + 6` insertions, `0` deletions across the two notes.', SMALL) as Result;
+  const i = of(r, 'insertions');
+  assert.equal(i.length, 1);
+  assert.match(i[0].message, /"6 insertions" is neither the head total \(17\)/);
+  // The discriminating half: the same sentence with the figures that DO reconcile is
+  // silent, so this fails on the value and not on the code spans.
+  const ok = pbc.analyze('The change is `9 + 8` insertions, `2` deletions across the two notes.', SMALL) as Result;
+  assert.equal(of(ok, 'insertions').length, 0);
+  assert.equal(of(ok, 'deletions').length, 0);
+});
+
+test('two size figures on a line naming one file are a CHECK with the instrument table (#1764 r7)', () => {
+  const r = pbc.analyze('The heading section of `doc/design/a.md` is 7 lines, and the new one is 35 lines.', SMALL) as Result;
+  const b = of(r, 'byte-figure', 'CHECK');
+  assert.equal(b.length, 2);
+  assert.ok(b.every((x) => /the line states several figures/.test(x.message)));
+  assert.ok(b.every((x) => /blob 100 bytes .* 98 chars .* 10 lines/.test(x.message)));
+});
+
+test('one quantity stated twice with two values is reported with both lines (#1751 r5)', () => {
+  const r = pbc.analyze('There are 17 surviving sites.\n\nOnly 14 surviving sites remain after the sweep.', SMALL) as Result;
+  const q = of(r, 'quantity');
+  assert.equal(q.length, 1);
+  assert.match(q[0].message, /"surviving sites" is stated with 2 different values: 17, 14/);
+  assert.match(q[0].message, /lines 1, 3/);
+});
+
+// ---------------------------------------------------------------------------
 // Extraction and classification, where the corpus run forced a rule.
 // ---------------------------------------------------------------------------
 

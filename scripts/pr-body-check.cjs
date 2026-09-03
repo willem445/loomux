@@ -133,12 +133,15 @@ const RE = {
   // `12 files changed, 2,959 insertions(+), 41 deletions(-)` — git's own summary line.
   diffstatCanonical: /(\d[\d,]*)\s+files?\s+changed,\s*(\d[\d,]*)\s+insertions?\(\+\)(?:,\s*(\d[\d,]*)\s+deletions?\(-\))?/g,
   // `4 files, **773 insertions, 27 deletions**` — the prose form bodies actually use.
-  diffstatProse: /(\d[\d,]*)\s+files?\b[^.\n]{0,40}?\*{0,2}(\d[\d,]*)\*{0,2}\s+insertions?\b(?:[^.\n]{0,30}?\*{0,2}(\d[\d,]*)\*{0,2}\s+deletions?)?/g,
+  diffstatProse: /(\d[\d,]*)\s+files?\b[^.\n]{0,40}?[*`]{0,2}(\d[\d,]*)[*`]{0,2}\s+insertions?\b(?:[^.\n]{0,30}?[*`]{0,2}(\d[\d,]*)[*`]{0,2}\s+deletions?)?/g,
   // A bare `N insertions` / `N deletions` with no file count beside it.
-  insertions: /\*{0,2}(\d[\d,]*)\*{0,2}\s+insertions?\b/g,
-  deletions: /\*{0,2}(\d[\d,]*)\*{0,2}\s+deletions?\b/g,
+  // A figure in a body is wrapped in bold or in a code span about as often as it is bare,
+  // and the two mix inside one sentence: "`9 + 6` insertions, `0` deletions" (#2105 r2) is
+  // invisible to a class that admits asterisks only.
+  insertions: /[*`]{0,2}(\d[\d,]*)[*`]{0,2}\s+insertions?\b/g,
+  deletions: /[*`]{0,2}(\d[\d,]*)[*`]{0,2}\s+deletions?\b/g,
   // `325,375 bytes`, `100 chars`, `4,211 lines`.
-  byteFigure: /\*{0,2}(\d[\d,]*)\*{0,2}[- ]?(bytes?|chars?|characters?|lines?)\b/gi,
+  byteFigure: /[*`]{0,2}(\d[\d,]*)[*`]{0,2}[- ]?(bytes?|chars?|characters?|lines?)\b/gi,
   // Any hex token 7..40 long: a commit SHA or a blob hash.
   hex: /\b([0-9a-f]{7,40})\b/g,
   // Run ids: 9-12 digits, bare or inside an actions URL.
