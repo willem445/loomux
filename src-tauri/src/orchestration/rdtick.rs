@@ -1480,9 +1480,7 @@ impl OrchRegistry {
             return None;
         }
         match self.agent(&lane.agent) {
-            Some(a) if a.status != AgentStatus::Dead && a.idle_since_ms.is_none() => {
-                Some(lane.agent.clone())
-            }
+            Some(a) if a.status != AgentStatus::Dead => Some(lane.agent.clone()),
             _ => None,
         }
     }
