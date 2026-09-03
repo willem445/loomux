@@ -1071,10 +1071,16 @@ pub const CI_WAIT_BOUND_MS: u64 = 90 * 60_000;
 /// holds several waits in a row.** The gate's lanes are reviewed in SEQUENCE
 /// and `lane_index` advancing is deliberately not a transition (§2.1), so a
 /// three-lane gate whose reviewers each take their full `lane_timeout_minutes`
-/// spends three hours here with nothing wrong. That product is exactly what
-/// [`state_bound_ms`] floors this against, so the constant is the answer for
-/// the ordinary gate and the floor is the answer for a repo that configured a
-/// longer lane timeout or declared more lanes.
+/// spends three hours here with nothing wrong.
+///
+/// **It is the SLACK over that product, not a rival to it** (#2117 review 2,
+/// W3): [`state_bound_ms`] ADDS this to `lane_timeout_minutes * lanes` rather
+/// than taking the larger of the two. The product covers the lanes' silences;
+/// this covers everything inside `review-wait` that is not one of them — the
+/// stretch before the first brief, and the tick-detection gap after each
+/// verdict. Compared rather than added, the margin is exactly zero at the
+/// configurations the floor exists to protect, and a drive whose reviewers all
+/// answered in time parks anyway. See [`state_bound_ms`] for the worked case.
 pub const REVIEW_WAIT_BOUND_MS: u64 = 180 * 60_000;
 
 /// How long a drive may sit in `fix-wait` (§2.1) before
@@ -1114,10 +1120,49 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 /// plausibly get wrong, so it is closed here in one place rather than argued
 /// once per call site.
 ///
-/// `required_lanes` is how many lanes the gate requires at this head, which is
-/// what makes `review-wait`'s floor the SUM of the waits it may legitimately
-/// contain rather than one of them. Zero (a routing answer this tick could not
-/// produce) falls back to the constant; that drive holds
+/// # `review-wait`'s floor is the sum of the SILENCES, plus slack
+///
+/// `required_lanes` is how many lanes the gate requires at this head, and the
+/// gate's lanes are reviewed in SEQUENCE — `first_stale_lane` picks one at a
+/// time and a lane brief is not an arc, so nothing re-stamps
+/// [`DriveEntry::state_since_ms`] between them. So a legitimate `review-wait`
+/// can hold `required_lanes` full `lane_timeout_minutes` waits end to end, and
+/// the floor has to cover their sum or the bound fires on a drive whose every
+/// reviewer answered in time.
+///
+/// **That product alone is not enough, and the gap is what review 2 on #2117
+/// found.** `lane_timeout_minutes` bounds a lane's SILENCE, measured from that
+/// lane's own `spawned_ms`; this bound measures ELAPSED time in the state, from
+/// `state_since_ms`. Every interval inside `review-wait` that is not one
+/// lane's silence is unfunded by the product: the stretch from entering the
+/// state to the first brief, and the tick-detection gap after each verdict
+/// lands. With three lanes at the sixty-minute default, three reviewers each
+/// answering at fifty-nine minutes and two inter-lane gaps costing ninety
+/// seconds between them crosses a bare 180-minute floor — and the margin is
+/// exactly zero wherever `lane_timeout_minutes * required_lanes` reaches
+/// [`REVIEW_WAIT_BOUND_MS`], which is precisely the configuration the floor
+/// exists to protect. A drive whose reviewers all answered promptly would park
+/// `state-stalled` naming no lane, which is the same class of false park
+/// #2110 exists to remove.
+///
+/// So the slack is [`REVIEW_WAIT_BOUND_MS`] itself, ADDED to the product rather
+/// than compared against it. It is not a tuned allowance-per-lane: an
+/// allowance sized to the detection gap would be a guess about tick timing that
+/// goes stale with `RD_BACKOFF_MS`, while a whole extra copy of the constant is
+/// a bound whose looseness is stated rather than estimated. The cost of being
+/// generous here is small and one-directional — this is the catch-all, and
+/// every wait-specific hold (`lane-stalled`, `cap-full`) still fires inside it.
+///
+/// **The residual is that the sum can exceed the twelve-hour backstop**, and
+/// then the backstop fires first because [`decide`] checks the age above the
+/// state bound: `lane_timeout_minutes: 240` on a three-lane gate floors this at
+/// 900 minutes, so such a drive parks `drive-stalled`. That is degraded but not
+/// the pre-#2110 notice — `held_from` is stamped on every hold arc, so the
+/// `drive-stalled` notice still names the state and the time in it. Pinned by
+/// `a_review_wait_floor_that_outruns_the_backstop_still_names_the_state`.
+///
+/// Zero required lanes (a routing answer this tick could not produce) falls
+/// back to the constant plus its slack; that drive holds
 /// `routing-unaccountable` on the same tick anyway.
 pub fn state_bound_ms(
     state: DriveState,
@@ -1128,7 +1173,8 @@ pub fn state_bound_ms(
     match state {
         DriveState::CiWait => Some(CI_WAIT_BOUND_MS),
         DriveState::ReviewWait => Some(
-            REVIEW_WAIT_BOUND_MS.max(lane.saturating_mul(required_lanes.max(1) as u64)),
+            REVIEW_WAIT_BOUND_MS
+                .saturating_add(lane.saturating_mul(required_lanes.max(1) as u64)),
         ),
         DriveState::FixWait => {
             Some(FIX_WAIT_BOUND_MS.max(minutes_ms(limits.fix_timeout_minutes)))
@@ -1656,10 +1702,23 @@ impl DriveEntry {
 
     /// How long this drive has been in its current state, starvation excluded
     /// — the [`HeldReason::StateStalled`] measure (#2110).
+    ///
+    /// **Capped at the drive's own age, because a drive cannot have been in a
+    /// state longer than it has existed** (#2117 review 2, premortem 1). That
+    /// is a tautology about a healthy entry and load-bearing about one entry
+    /// class that is not: an entry written before
+    /// [`state_since_ms`](DriveEntry::state_since_ms) existed reads zero there,
+    /// so the raw subtraction answers `now` — an epoch-scaled figure. The HOLD
+    /// that produces is correct and argued at that field; what was wrong is the
+    /// number, because [`advance`](DriveEntry::advance) stamps `held_after_ms`
+    /// from here and the notice then told an operator their drive had been in
+    /// `ci-wait` for some twenty thousand days. Capping makes that notice read
+    /// the drive's real age, which is both true and the figure they want.
     pub fn state_elapsed_ms(&self, now_ms: u64) -> u64 {
         now_ms
             .saturating_sub(self.state_since_ms)
             .saturating_sub(self.starved_in_state_ms(now_ms))
+            .min(self.bounded_age_ms(now_ms))
     }
 
     /// Record that the live-delegate cap refused this drive's lane spawn, and
@@ -4126,8 +4185,9 @@ mod tests {
     /// belongs with #2110's age work". #2110 did not build that clock: there is
     /// still nothing per-lane here, and the hold that ends this still names no
     /// lane. What it built is a per-STATE bound, and `review-wait` is a state,
-    /// so the drive now leaves at three hours as `held(state-stalled)` instead
-    /// of at twelve as `held(drive-stalled)` — a quarter of the wait, and a
+    /// so the drive now leaves at the `review-wait` state bound as
+    /// `held(state-stalled)` instead
+    /// of at twelve as `held(drive-stalled)` — a fraction of the wait, and a
     /// notice that at least says which wait. The honest description of the
     /// residual is therefore *bounded per state, still not per lane*, and §8's
     /// row says exactly that.
@@ -4170,25 +4230,32 @@ mod tests {
         );
 
         // The bound that now limits it, and its own non-vacuity control one tick
-        // short. `REVIEW_WAIT_BOUND_MS` is the effective bound at these limits:
-        // `state_bound_ms` floors it against one lane at a sixty-minute timeout,
-        // which is smaller, so the constant is what decides.
+        // short. Asked of `state_bound_ms` rather than spelled here, because
+        // this test is about WHICH bound ends the composition; the bound's own
+        // value is pinned against literals by
+        // `the_review_wait_floor_exceeds_the_sequential_gate_it_covers`, so the
+        // number is not built from the code under test without a witness.
+        let bound = state_bound_ms(DriveState::ReviewWait, &limits, 1).unwrap();
         assert!(
-            REVIEW_WAIT_BOUND_MS > minutes_ms(limits.lane_timeout_minutes),
-            "the floor must not be what fires, or the two assertions below are about the \
-             wrong bound"
+            bound > minutes_ms(limits.lane_timeout_minutes),
+            "the lane timeout must not be what fires, or the assertions below are \
+             about the wrong bound"
+        );
+        assert!(
+            bound < minutes_ms(limits.drive_timeout_minutes),
+            "…and neither must the backstop, which outranks it in `decide`"
         );
         assert_eq!(
-            decide(&e, &facts(1_000 + REVIEW_WAIT_BOUND_MS - 1), &limits),
+            decide(&e, &facts(1_000 + bound - 1), &limits),
             DriveStep::OpenLane { index: 0 },
             "…still inside the state bound, so the hold below is that bound and not a \
              coincidence"
         );
         assert_eq!(
-            decide(&e, &facts(1_000 + REVIEW_WAIT_BOUND_MS), &limits),
+            decide(&e, &facts(1_000 + bound), &limits),
             DriveStep::held(HeldReason::StateStalled),
-            "…and time in `review-wait` is what ends it now — three hours, where before \
-             #2110 nothing but the twelve-hour age could"
+            "…and time in `review-wait` is what ends it now, where before #2110 nothing \
+             but the twelve-hour age could"
         );
     }
 
@@ -4888,5 +4955,140 @@ mod tests {
         // assertions above are not passing over an empty walk.
         assert!(seen_held > 0, "the sweep produced no hold at all");
         assert!(seen_other > 0, "the sweep produced no ordinary advance");
+    }
+
+    /// **The `review-wait` floor must EXCEED the sum of the silences it covers,
+    /// not equal it** (#2117 review 2, W3).
+    ///
+    /// `lane_timeout_minutes` bounds one lane's SILENCE, from that lane's own
+    /// `spawned_ms`; `state-stalled` measures ELAPSED time, from
+    /// `state_since_ms`, which nothing re-stamps between sequential lane briefs.
+    /// A floor equal to the product funds the silences and nothing else, so the
+    /// gaps between them — before the first brief, and after each verdict lands
+    /// — come out of a margin of exactly zero, at precisely the configurations
+    /// the floor exists to protect.
+    ///
+    /// The strict inequality is the property and the literals are the pin: the
+    /// first would pass under any generous formula, and the second alone would
+    /// go stale silently if the slack were ever folded back into a `max`.
+    #[test]
+    fn the_review_wait_floor_exceeds_the_sequential_gate_it_covers() {
+        let limits = DriveLimits::default();
+        let lane = minutes_ms(limits.lane_timeout_minutes);
+        let bound = |lanes: usize| state_bound_ms(DriveState::ReviewWait, &limits, lanes).unwrap();
+
+        for lanes in 1..=4 {
+            assert!(
+                bound(lanes) > lane * lanes as u64,
+                "a {lanes}-lane gate whose reviewers each answer just inside their own \
+                 timeout must not park: the floor has to fund the gaps between them too"
+            );
+        }
+
+        // The literals, so folding the slack back into a `max` is not silent.
+        assert_eq!(bound(1), minutes_ms(240));
+        assert_eq!(bound(3), minutes_ms(360));
+        // Zero required lanes reads as one — a routing answer this tick could
+        // not produce, which holds `routing-unaccountable` on the same tick.
+        assert_eq!(bound(0), bound(1));
+
+        // The worked case from the finding: three reviewers each answering at
+        // fifty-nine minutes, with two inter-lane gaps. Under the bare product
+        // this sum parks a drive nothing was wrong with.
+        let real = minutes_ms(59) * 3 + 90_000;
+        assert!(real > lane * 3, "the fixture must exceed the bare product, or it pins nothing");
+        assert!(real < bound(3), "…and must sit inside the floor as shipped");
+    }
+
+    /// **A state clock may not outrun the drive's own age** (#2117 review 2,
+    /// premortem 1).
+    ///
+    /// `state_since_ms` is `serde(default)`, so an entry written before it
+    /// existed reads zero and the raw subtraction answers `now` — epoch-scaled.
+    /// The HOLD that produces is correct and argued at the field; the NUMBER was
+    /// not, and `advance` stamps `held_after_ms` from it, so the notice told an
+    /// operator their drive had been in `ci-wait` for some twenty thousand days.
+    ///
+    /// The two halves are the cap and its non-vacuity control: without the
+    /// second, an implementation returning a constant zero would pass.
+    #[test]
+    fn a_state_clock_never_outruns_the_drives_own_age() {
+        // The pre-#2110 entry, reconstructed the way serde would: a real
+        // `started_ms`, and a `state_since_ms` the older build never wrote.
+        let mut old = entry_at(DriveState::CiWait);
+        old.started_ms = 1_000;
+        old.state_since_ms = 0;
+        let now = 1_000 + minutes_ms(200);
+
+        assert_eq!(
+            old.state_elapsed_ms(now),
+            minutes_ms(200),
+            "a drive that has existed for 200 minutes cannot have been in one state longer"
+        );
+        assert!(
+            old.state_elapsed_ms(now) >= CI_WAIT_BOUND_MS,
+            "…and it still reaches the bound, so the argued hold-then-resume is unchanged"
+        );
+
+        // The control: an ordinary entry, where the cap must not be what decides.
+        let mut fresh = entry_at(DriveState::CiWait);
+        fresh.started_ms = 1_000;
+        fresh.state_since_ms = 1_000 + minutes_ms(150);
+        assert_eq!(
+            fresh.state_elapsed_ms(now),
+            minutes_ms(50),
+            "an entry whose state clock is younger than the drive reports the state clock"
+        );
+    }
+
+    /// **A `review-wait` floor that outruns the backstop still names the
+    /// state** (#2117 review 2, premortem 2).
+    ///
+    /// `lane_timeout_minutes: 240` on a three-lane gate floors `review-wait`
+    /// above the twelve-hour age, and [`decide`] checks the age first — so that
+    /// drive parks `drive-stalled` and the state bound is unreachable for it.
+    /// That is a real residual and it is disclosed at `state_bound_ms`.
+    ///
+    /// What it is NOT is the pre-#2110 notice, and this pins the difference:
+    /// `held_from` is stamped on every arc into `held`, so the hold still
+    /// records which state the drive was in and for how long. The reviewer's
+    /// premise — "parks `drive-stalled` naming no state" — is the half that does
+    /// not hold, and an assertion is worth more here than a correction in prose.
+    #[test]
+    fn a_review_wait_floor_that_outruns_the_backstop_still_names_the_state() {
+        let limits = DriveLimits::new(3, 3, 1, 240, 60, 720);
+        assert!(
+            state_bound_ms(DriveState::ReviewWait, &limits, 3).unwrap()
+                > minutes_ms(limits.drive_timeout_minutes),
+            "the fixture must actually be the configuration the premortem names"
+        );
+
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        let past = 1_000 + minutes_ms(limits.drive_timeout_minutes);
+        let facts = DriveFacts {
+            now_ms: past,
+            required_lanes: Some(vec![
+                lane_fact("rev-std", None, "", ""),
+                lane_fact("rev-two", None, "", ""),
+                lane_fact("rev-final", None, "", ""),
+            ]),
+            ..facts_at("head-a")
+        };
+        assert_eq!(
+            decide(&e, &facts, &limits),
+            DriveStep::held(HeldReason::DriveStalled),
+            "the age outranks a state bound this config put out of reach"
+        );
+
+        // …and the hold still carries what the drive was doing, which is the
+        // whole of #2110's third ask and the half the premortem got wrong.
+        e.advance(DriveState::Held, Some(HeldReason::DriveStalled), None, past).unwrap();
+        assert_eq!(e.held_from, Some(DriveState::ReviewWait));
+        assert_eq!(
+            e.held_after_ms,
+            minutes_ms(limits.drive_timeout_minutes),
+            "…and for how long, which is what the notice interpolates"
+        );
     }
 }

@@ -2539,13 +2539,14 @@ longer competing with itself for the slots it is waiting on.
 
 **A drive is bounded by where it is stuck, not by how long it has existed.** Each of the four
 working states has its own bound, and it starts again from zero every time the drive moves:
-90 minutes in `ci-wait`, three hours in `review-wait` (which holds several reviewers in
-sequence), 90 minutes in `fix-wait`, and 15 minutes in `gate-check`, which is a decision rather
-than a wait. Past one of those the drive parks as `state-stalled`, and its line says which
-state, how long it sat there and what the bound was — so resuming it is a decision you make
-rather than a reflex. Each of those numbers is a floor over the matching `driver:` knob rather
-than a rival to it: raise `lane_timeout_minutes` or `fix_timeout_minutes` and the state bound
-above it rises too, so a value you set can never be quietly overruled by one of these. And the
+90 minutes in `ci-wait`, 90 minutes in `fix-wait`, and 15 minutes in `gate-check`, which is a
+decision rather than a wait. `review-wait` is the one that is not a flat number: it holds your
+reviewers one after another, so its bound is three hours **plus** one `lane_timeout_minutes`
+per required lane — four hours for a one-lane gate at the default, six for three. Past one of
+these the drive parks as `state-stalled`, and its line says which state, how long it sat there
+and what the bound was — so resuming it is a decision you make rather than a reflex. None of
+these numbers can overrule a `driver:` value you set: raise `lane_timeout_minutes` or
+`fix_timeout_minutes` and the state bound above it rises with it. And the
 holds that name a real remedy — `lane-stalled`, `fix-stalled`, `cap-full`, each of which can
 tell you which pane to read or which slot to free — all fire well inside these, so this is the
 catch-all rather than the usual answer.
