@@ -3728,6 +3728,66 @@ mod tests {
         );
     }
 
+    /// **The residual the answered-lane exemption leaves, pinned as itself**
+    /// (#2109 review 2, premortem 1).
+    ///
+    /// One composition escapes every per-lane bound: a reviewer answers at this
+    /// head, the body then moves, and that reviewer's pane goes BUSY on
+    /// something else — a human re-tasking it, another drive taking it over. The
+    /// re-brief the moved digest calls for cannot be delivered (the reuse arm
+    /// needs an idle pane) and must not be spawned beside it (#2109's duplicate
+    /// refusal), while `lane-stalled` is exempt because the lane did answer. So
+    /// the drive retries, audits two rows a tick, and its only remaining exit is
+    /// the drive's own age.
+    ///
+    /// That is disclosed rather than closed, and a disclosure is a claim like
+    /// any other: without this test the suite pins only the arms that work, and
+    /// the §8 row admitting the gap could go false with nothing red to say so.
+    /// The first half is the gap itself — the lane timeout passes and the drive
+    /// keeps trying — and the second is the bound that limits it.
+    ///
+    /// Closing it properly needs a per-lane refusal clock, which is a second
+    /// mechanism beside `cap_starved_since_ms` and belongs with #2110's age
+    /// work, not here.
+    #[test]
+    fn an_answered_lane_whose_re_brief_is_refused_is_bounded_only_by_the_drives_age() {
+        let limits = DriveLimits::default();
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.head = "head-a".into();
+        e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
+        assert!(e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"));
+        let facts = |now: u64| DriveFacts {
+            now_ms: now,
+            body_digest: Some("d2".to_string()),
+            required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Fail), "head-a", "d1")]),
+            ..facts_at("head-a")
+        };
+
+        // The gap: well past the LANE timeout, this keeps proposing the re-brief
+        // the tick will refuse. `lane-stalled` never fires here, by design.
+        let past_lane = 1_000 + minutes_ms(limits.lane_timeout_minutes) * 3;
+        assert_eq!(
+            decide(&e, &facts(past_lane), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "the exemption really does leave this composition unbounded per-lane — if this \
+             ever becomes a hold, the §8 row disclosing the gap is what needs rewriting"
+        );
+
+        // The bound that limits it, and its own non-vacuity control one tick
+        // short: the drive's age, which needs no lane to fire.
+        let age = minutes_ms(limits.drive_timeout_minutes);
+        assert_eq!(
+            decide(&e, &facts(1_000 + age - 1), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "…still inside the age bound, so the hold below is that bound and not a coincidence"
+        );
+        assert_eq!(
+            decide(&e, &facts(1_000 + age), &limits),
+            DriveStep::held(HeldReason::DriveStalled),
+            "…and the drive's own age is what ends it"
+        );
+    }
+
     /// **#2109 review 1, finding 1.** The stall clock is a SILENCE test, and a
     /// reviewer that answered is not silent however long the round has run.
     ///
