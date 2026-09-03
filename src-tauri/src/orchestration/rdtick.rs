@@ -2851,6 +2851,7 @@ impl OrchRegistry {
                 // without this a resumed drive re-holds on the FIRST tick for a
                 // lane the orchestrator has just looked at and chosen to resume.
                 entry.started_ms = now;
+                entry.cap_starved_since_ms = Some(0);
                 // #2110: and with it the starvation the age bound was going
                 // to forgive. The exclusion is a credit against THIS age; a
                 // resume starts the age over, so carrying the credit would
