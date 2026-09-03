@@ -55,18 +55,35 @@
 //!   anchor: it is compared against `fix_handback_ms`, which makes the budget
 //!   one answer per hand-back and renews it with no reset to remember.
 //!
-//! `drive-stalled` needs none of these: §2.2 is emphatic that it is the drive's
-//! **age**, `now - started_ms`, "never an idle clock reset by each state
-//! advance", so it keeps §5.2's own `started_ms`.
+//! `drive-stalled` needs none of these: it is the drive's **age**,
+//! `now - started_ms`, so it keeps §5.2's own `started_ms`.
 //!
-//! **That last field is named for what it anchors, and the name is the point.**
-//! The obvious spelling — a general "when did the state last change" stamp,
-//! written on every arc — is *precisely* the idle clock §2.2 forbids, with §8's
-//! `also: [base-green]` row as the worked example of what it breaks. Leaving
-//! one in the struct would put that clock one field-access away from any future
-//! timeout, and the next implementer finds the field long before they find the
-//! paragraph. So it is written on entry to `fix-wait` and nowhere else, and it
-//! is a hazard closed by construction rather than by comment.
+//! **§2.2 used to forbid a general "when did the state last change" stamp, and
+//! #2110 adds exactly that field on purpose** —
+//! [`DriveEntry::state_since_ms`], written on every arc. The ban was never
+//! about the stamp; it was about a drive whose ONLY bound is one, and its
+//! worked example is §8's `also: [base-green]` row: that drive advances
+//! `gate-check` → `ci-wait` on every wake, resets any per-state clock forever,
+//! and would sit on a red default branch in silence. So the age is kept, as the
+//! backstop that cycler falls through to, and the per-state clocks are added
+//! above it. Both, not either.
+//!
+//! What forced the addition is the other half of the same question. Two drives
+//! were parked `drive-stalled` at four hours, and neither was stalled: one was
+//! mid-round with CI green at a new head, the other had spent three of those
+//! hours unable to spawn a lane at all because another drive held every slot.
+//! An age cannot tell those from paralysis, because every drive's age grows at
+//! the same rate whatever it is doing — and the reason the *first* clock in
+//! this struct was an age is that a bound with no anchor is not a bound, not
+//! that an age was the right measure. See [`state_bound_ms`], and
+//! [`DriveEntry::starved_total_ms`] for the time both clocks now exclude.
+//!
+//! - [`DriveEntry::state_since_ms`] — the `state-stalled` anchor.
+//! - [`DriveEntry::starved_total_ms`], [`DriveEntry::starved_state_ms`] — what
+//!   the drive spent unable to spawn, which neither clock charges it for.
+//! - [`DriveEntry::held_from`], [`DriveEntry::held_after_ms`] — what the drive
+//!   was doing when a bound fired, so a resume is a decision rather than a
+//!   reflex.
 //!
 //! # One seam here is not a contract
 //!
@@ -86,7 +103,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::workflow::{BlockId, ReviewVerdict, Verdict};
+use crate::workflow::{BlockId, ReviewVerdict, Verdict, DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN};
 
 // ── §2.1 the states ─────────────────────────────────────────────────────────
 
@@ -204,11 +221,11 @@ impl DriveState {
 }
 
 /// Why a drive is parked (§2.2). **One state carrying a closed reason enum, not
-/// fourteen states**, so a reader asking "is this drive parked" asks one
+/// fifteen states**, so a reader asking "is this drive parked" asks one
 /// question, and the reason travels in the notice and the audit line rather
 /// than being inferred from which counter happens to sit at its bound.
 ///
-/// Fourteen reasons. With `satisfied` and `cancelled` that is §2.2's sixteen
+/// Fifteen reasons. With `satisfied` and `cancelled` that is §2.2's seventeen
 /// exits back to the LLM orchestrator, and [`HeldReason::ALL`] is what makes
 /// that count checkable rather than asserted.
 ///
@@ -232,8 +249,35 @@ pub enum HeldReason {
     /// A resumed **worker** neither pushed nor reported inside
     /// `fix_timeout_minutes`.
     FixStalled,
-    /// The drive's **age** passed `drive_timeout_minutes`.
+    /// The drive's **age** passed `drive_timeout_minutes` — the backstop, and
+    /// since #2110 only the backstop. Its notice names the state the drive was
+    /// in and how long it had been there, because at twelve hours the age alone
+    /// says nothing about what to do next.
     DriveStalled,
+    /// **The drive sat in ONE working state past that state's own bound**
+    /// (#2110) — [`state_bound_ms`], reset by every transition.
+    ///
+    /// Its own reason rather than [`DriveStalled`](HeldReason::DriveStalled),
+    /// and the argument is what the orchestrator LEARNS. The two measured
+    /// incidents that produced #2110 both reported `drive-stalled`, and in
+    /// neither was anything stalled: one drive was mid-round with CI green at a
+    /// new head, the other had spent three of its four hours unable to spawn a
+    /// lane because another drive held every slot. An age is the one quantity
+    /// that cannot distinguish those from a drive that is genuinely stuck,
+    /// because every drive's age grows at the same rate whatever it is doing.
+    /// This one grows only while nothing moves, so a drive that reaches it
+    /// really is sitting still — and the notice says where.
+    ///
+    /// **Not a replacement for the wait-specific holds, and never their
+    /// preemption.** `lane-stalled`, `fix-stalled` and `cap-full` each name a
+    /// remedy this cannot ("read that pane", "free a slot"), and each fires
+    /// well inside its state's bound; [`state_bound_ms`] is floored against the
+    /// repo's own knobs so that stays true however they are configured. What is
+    /// left for this to catch is the state with no bound of its own (`ci-wait`
+    /// on a check run that never resolves), the state that should never be a
+    /// wait at all (`gate-check`), and any future path that sits in a state
+    /// none of the others can see.
+    StateStalled,
     /// `route_reviewers` returned `None` — the changed-file list could not be
     /// shown complete, so *which reviewers are required* is unknown. Never a
     /// guess: guessing "no rule fired" is guessing in favour of merging.
@@ -314,7 +358,7 @@ pub enum HeldReason {
 impl HeldReason {
     /// Every reason, so a caller — or a test counting §2.2's exits — can
     /// enumerate them without matching on the enum. Order is §2.2's table.
-    pub const ALL: [HeldReason; 14] = [
+    pub const ALL: [HeldReason; 15] = [
         HeldReason::Escalate,
         HeldReason::ReviewLimit,
         HeldReason::CiLimit,
@@ -322,6 +366,7 @@ impl HeldReason {
         HeldReason::LaneStalled,
         HeldReason::FixStalled,
         HeldReason::DriveStalled,
+        HeldReason::StateStalled,
         HeldReason::RoutingUnaccountable,
         HeldReason::GateUnreadable,
         HeldReason::WorkerBlocked,
@@ -342,6 +387,7 @@ impl HeldReason {
             HeldReason::LaneStalled => "lane-stalled",
             HeldReason::FixStalled => "fix-stalled",
             HeldReason::DriveStalled => "drive-stalled",
+            HeldReason::StateStalled => "state-stalled",
             HeldReason::RoutingUnaccountable => "routing-unaccountable",
             HeldReason::GateUnreadable => "gate-unreadable",
             HeldReason::WorkerBlocked => "worker-blocked",
@@ -362,6 +408,7 @@ impl HeldReason {
             "lane-stalled" => Some(HeldReason::LaneStalled),
             "fix-stalled" => Some(HeldReason::FixStalled),
             "drive-stalled" => Some(HeldReason::DriveStalled),
+            "state-stalled" => Some(HeldReason::StateStalled),
             "routing-unaccountable" => Some(HeldReason::RoutingUnaccountable),
             "gate-unreadable" => Some(HeldReason::GateUnreadable),
             "worker-blocked" => Some(HeldReason::WorkerBlocked),
@@ -562,7 +609,7 @@ impl Default for DriveLimits {
             max_rebase_attempts: 1,
             lane_timeout_minutes: 60,
             fix_timeout_minutes: 60,
-            drive_timeout_minutes: 240,
+            drive_timeout_minutes: DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN as u64,
             _seal: (),
         }
     }
@@ -976,14 +1023,120 @@ pub const NOTICE_RETENTION_MS: u64 = 60 * 60_000;
 /// transient cap never reaches it, and short enough that the measured incident —
 /// three hours in `review-wait` with `lanes: []`, invisible until a human read
 /// `review_drive_status` by hand — is impossible. The other bound that would
-/// eventually have caught it is `drive_timeout_minutes` at four hours, whose
-/// notice says nothing about the cap.
+/// eventually have caught it is `drive_timeout_minutes`, at its twelve-hour
+/// default, whose notice does now name the state and the clock but still says
+/// nothing about the cap.
 ///
 /// **Not a `driver:` policy knob**, on `NOTICE_RETENTION_MS`'s argument: §5.3's
 /// block paces a drive against INVARIANT 9's budget, and how long orrerix waits
 /// on its own group's slot pressure before saying so is not a repo's call. A
 /// repo that wants a longer wait raises its own `max_agents`.
 pub const CAP_HOLD_MS: u64 = 15 * 60_000;
+
+// ── §2.2's per-state bounds (#2110) ────────────────────────────────────────
+//
+// **Why these exist at all, and what they replaced.** Until #2110 the only
+// clock over a working drive was its total age, and the two measured failures
+// were the two that measure cannot tell apart: a drive making steady progress
+// across four hours of transitions was parked as "stalled", and a drive that
+// spent three of its four hours unable to spawn a lane at all had that
+// starvation counted against its own budget. An age answers "how long has this
+// drive existed"; nobody wanted that bounded. What a bound is *for* is "how
+// long has this drive sat in one place", and that is what these measure.
+//
+// **They are constants and not `driver:` policy**, on [`CAP_HOLD_MS`]'s
+// argument: how long orrerix waits on its OWN machinery — a check run, a
+// reviewer lane, a resumed worker — before telling an orchestrator is not a
+// repo's call, and every one of them already has a repo-facing knob beside it
+// (`lane_timeout_minutes`, `fix_timeout_minutes`) that this may never shadow.
+// That last clause is the whole of [`state_bound_ms`]: a per-state bound is
+// the LARGER of its constant and whatever the repo configured for that state,
+// so tuning a knob up can never be silently overruled by a number in this file.
+
+/// How long a drive may sit in `ci-wait` (§2.1) before [`HeldReason::StateStalled`].
+///
+/// **Ninety minutes, and `ci-wait` is the state that most needed one**: it is
+/// the only working state with no bound of its own at all —
+/// `CiObservation::Pending` and `Unknown` both return `Wait`, forever, and
+/// before #2110 the first thing to notice was the total age hours later. This
+/// project's own matrix is three platforms at twenty to thirty minutes; ninety
+/// covers a full re-run behind a queue and is still an hour clear of anything
+/// that has ever been legitimate here.
+pub const CI_WAIT_BOUND_MS: u64 = 90 * 60_000;
+
+/// How long a drive may sit in `review-wait` (§2.1) before
+/// [`HeldReason::StateStalled`].
+///
+/// **Three hours, because `review-wait` is the one state that legitimately
+/// holds several waits in a row.** The gate's lanes are reviewed in SEQUENCE
+/// and `lane_index` advancing is deliberately not a transition (§2.1), so a
+/// three-lane gate whose reviewers each take their full `lane_timeout_minutes`
+/// spends three hours here with nothing wrong. That product is exactly what
+/// [`state_bound_ms`] floors this against, so the constant is the answer for
+/// the ordinary gate and the floor is the answer for a repo that configured a
+/// longer lane timeout or declared more lanes.
+pub const REVIEW_WAIT_BOUND_MS: u64 = 180 * 60_000;
+
+/// How long a drive may sit in `fix-wait` (§2.1) before
+/// [`HeldReason::StateStalled`].
+///
+/// **Ninety minutes, a floor over `fix_timeout_minutes` rather than a second
+/// opinion about it.** `held(fix-stalled)` already bounds the wait this state
+/// is for — a worker that neither pushes nor reports — and it is the better
+/// notice whenever it applies, so this is sized *above* that knob's own
+/// sixty-minute default and named in [`state_bound_ms`] so a repo that raises
+/// the knob raises this with it. What is left for this to catch is the case
+/// `fix-stalled` cannot see: a drive in `fix-wait` whose worker is neither
+/// silent nor finished.
+pub const FIX_WAIT_BOUND_MS: u64 = 90 * 60_000;
+
+/// How long a drive may sit in `gate-check` (§2.1) before
+/// [`HeldReason::StateStalled`].
+///
+/// **Fifteen minutes, and it is the tightest because `gate-check` is a
+/// decision rather than a wait.** Every outcome but one leaves the state on the
+/// tick that entered it; the exception is `GateOutcome::NotEvaluated`, a tick
+/// that reached `gate-check` without evaluating the gate, which is a fault in
+/// the read and not a thing to wait out. Three back-off intervals — the same
+/// number [`CAP_HOLD_MS`] allows a transient cap — is generous for a condition
+/// that ought to clear on the next tick.
+pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
+
+/// The bound on time spent in one working state (#2110), or `None` for a state
+/// that is not a wait — `held` is parked and the two terminals are over, so
+/// none of the three has a clock at all.
+///
+/// **`max` of the constant and the state's OWN configured bound, never the
+/// constant alone.** A repo that raises `lane_timeout_minutes` to four hours
+/// has said what it thinks a reviewer is owed, and a constant in this file
+/// quietly parking that drive at three would be loomux overruling a knob it
+/// published — the shadowing hazard is the one thing per-state bounds could
+/// plausibly get wrong, so it is closed here in one place rather than argued
+/// once per call site.
+///
+/// `required_lanes` is how many lanes the gate requires at this head, which is
+/// what makes `review-wait`'s floor the SUM of the waits it may legitimately
+/// contain rather than one of them. Zero (a routing answer this tick could not
+/// produce) falls back to the constant; that drive holds
+/// `routing-unaccountable` on the same tick anyway.
+pub fn state_bound_ms(
+    state: DriveState,
+    limits: &DriveLimits,
+    required_lanes: usize,
+) -> Option<u64> {
+    let lane = minutes_ms(limits.lane_timeout_minutes);
+    match state {
+        DriveState::CiWait => Some(CI_WAIT_BOUND_MS),
+        DriveState::ReviewWait => Some(
+            REVIEW_WAIT_BOUND_MS.max(lane.saturating_mul(required_lanes.max(1) as u64)),
+        ),
+        DriveState::FixWait => {
+            Some(FIX_WAIT_BOUND_MS.max(minutes_ms(limits.fix_timeout_minutes)))
+        }
+        DriveState::GateCheck => Some(GATE_CHECK_BOUND_MS),
+        DriveState::Held | DriveState::Satisfied | DriveState::Cancelled => None,
+    }
+}
 
 /// A notice a terminal entry owes the orchestrator's pane, persisted **on the
 /// entry** so it outlives the tick that produced it (#1857).
@@ -1125,9 +1278,14 @@ pub struct DriveEntry {
     /// conservative direction here is to refuse the file, not to guess low.
     pub counters: Counters,
     /// When the drive began, absolute. The `drive-stalled` anchor: §2.2 derives
-    /// an **age** from it (`now - started_ms`), never an idle clock reset by
-    /// each state advance. A stored *age* would be stale the instant it was
-    /// written and meaningless across a restart.
+    /// an **age** from it (`now - started_ms`), and since #2110 that age is the
+    /// BACKSTOP — the bound §8's `also: [base-green]` cycler cannot reset,
+    /// beneath the per-state clocks that do the work
+    /// ([`state_since_ms`](DriveEntry::state_since_ms)). A stored *age* would be
+    /// stale the instant it was written and meaningless across a restart.
+    ///
+    /// Time the drive spent unable to spawn is subtracted from it rather than
+    /// charged to it — [`bounded_age_ms`](DriveEntry::bounded_age_ms).
     #[serde(default)]
     pub started_ms: u64,
     /// When this drive last entered `fix-wait` — the `fix-stalled` anchor, and
@@ -1212,6 +1370,92 @@ pub struct DriveEntry {
     /// `owed_notice`'s reason, unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_starved_since_ms: Option<u64>,
+    /// When the drive entered the state it is in now — the
+    /// [`HeldReason::StateStalled`] anchor (#2110).
+    ///
+    /// **This IS the general "when did the state last change" stamp the module
+    /// header used to say must never exist, and the ban is discharged rather
+    /// than ignored.** What §2.2 forbade was an idle clock *as the drive's only
+    /// bound*, and its worked example is §8's `also: [base-green]` row: a drive
+    /// that advances `gate-check` → `ci-wait` on every wake resets a per-state
+    /// stamp forever, so a bound measured from one alone would leave it parked
+    /// on a red default branch in silence. That is still true, and it is still
+    /// the reason `started_ms` and `drive-stalled` remain — as the BACKSTOP the
+    /// base-green cycler falls through to. The two clocks answer different
+    /// questions, and the incident that produced #2110 is what happens when only
+    /// the second is asked: a drive with progress on every axis was reported as
+    /// stalled, because an age cannot tell progress from paralysis.
+    ///
+    /// Written by [`advance`](DriveEntry::advance) on EVERY arc, which is the
+    /// difference from [`fix_handback_ms`](DriveEntry::fix_handback_ms) beside
+    /// it — that one is stamped on two arcs and means something narrower.
+    ///
+    /// **Zero on an entry written before this field existed**, which reads as
+    /// "entered at the epoch" and so as a state older than any bound. That is
+    /// the safe direction and it is bounded rather than merely tolerable: such
+    /// an entry holds `state-stalled` on its first tick under this build, whose
+    /// notice names the state and whose remedy — `drive_review` — re-stamps
+    /// this field through `advance` and does not re-hold. The alternative
+    /// (treating zero as "unknown, exempt") would make the field's own bound
+    /// unreachable for exactly the entries that predate it.
+    #[serde(default)]
+    pub state_since_ms: u64,
+    /// Milliseconds this drive has spent unable to spawn, summed over the
+    /// STARVATION RUNS THAT HAVE ENDED, for the whole life of the drive —
+    /// subtracted from the age `drive-stalled` measures (#2110).
+    ///
+    /// **A hold is not progress and it is not a stall**, which is the whole of
+    /// why this is subtracted rather than counted: the measured drive spent
+    /// three of its four hours in `review-wait` with `lanes: []` because
+    /// another drive's released lanes held every slot, and that starvation was
+    /// charged to the budget of the drive that was starved. Nothing about that
+    /// time was the driven PR's doing and nothing about it was recoverable by
+    /// the orchestrator the notice went to.
+    ///
+    /// **The run in flight is NOT in here**, deliberately: it is
+    /// [`cap_starved_since_ms`](DriveEntry::cap_starved_since_ms), and
+    /// [`starved_ms`](DriveEntry::starved_ms) adds it live. A stored total that
+    /// included an open run would have to be re-written on every tick to stay
+    /// true, which is the stored-age mistake `started_ms` argues against one
+    /// field up.
+    ///
+    /// Reset with `started_ms` on arc 11, for that field's reason: a resumed
+    /// drive's age starts again, so what it had spent starved before the resume
+    /// is not owed back twice.
+    #[serde(default)]
+    pub starved_total_ms: u64,
+    /// The same sum, but only over the runs that ended since the drive entered
+    /// its current state — subtracted from the elapsed time
+    /// [`HeldReason::StateStalled`] measures (#2110).
+    ///
+    /// A second accumulator rather than a subtraction of two snapshots, because
+    /// `advance` clears [`cap_starved_since_ms`](DriveEntry::cap_starved_since_ms)
+    /// on every arc, so a starvation run can never straddle a transition and
+    /// the two totals genuinely diverge only in what they are reset by. It is
+    /// not always zero: `clear_cap_starvation` ends a run when a lane opens,
+    /// which is not a transition, so one `review-wait` may contain several.
+    #[serde(default)]
+    pub starved_state_ms: u64,
+    /// The working state this drive parked OUT of, and how long it had been
+    /// there — what a hold's notice and `review_drive_status` need to say what
+    /// the drive was doing when a bound fired (#2110).
+    ///
+    /// Stamped by [`advance`](DriveEntry::advance) on every arc into `held` and
+    /// cleared on every other, so it describes THIS hold and never a previous
+    /// one. `None` on an entry that is not parked.
+    ///
+    /// **The elapsed figure is stamped rather than derived**, because the arc
+    /// that records it is the same arc that re-stamps
+    /// [`state_since_ms`](DriveEntry::state_since_ms): by the time anything
+    /// reads the entry the clock the hold fired on has already been reset, and
+    /// a reader recomputing it would report the age of the hold instead of the
+    /// wait that caused it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_from: Option<DriveState>,
+    /// Time in [`held_from`](DriveEntry::held_from) at the moment of the hold,
+    /// starvation already excluded — see that field.
+    #[serde(default)]
+    pub held_after_ms: u64,
     /// Preserved unknown fields — see [`ReviewDrivesState`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -1246,6 +1490,11 @@ impl DriveEntry {
             fix_kickback_ms: 0,
             owed_notice: None,
             cap_starved_since_ms: None,
+            state_since_ms: now_ms,
+            starved_total_ms: 0,
+            starved_state_ms: 0,
+            held_from: None,
+            held_after_ms: 0,
             extra: BTreeMap::new(),
         }
     }
@@ -1301,10 +1550,12 @@ impl DriveEntry {
     /// Both are refused as [`InvalidTransition`] rather than silently fixed.
     ///
     /// [`fix_handback_ms`](DriveEntry::fix_handback_ms) is stamped **only** on
-    /// an arc into `fix-wait`, never on every arc: a stamp written on each
-    /// advance is the idle clock §2.2's `drive-stalled` row forbids, and the
-    /// module header argues why that must be impossible to reach rather than
-    /// merely discouraged.
+    /// an arc into `fix-wait`, and stays that way now that
+    /// [`state_since_ms`](DriveEntry::state_since_ms) beside it IS written on
+    /// every arc (#2110): they anchor different bounds, and folding the narrow
+    /// one into the general one would give `held(fix-stalled)` — a claim about
+    /// the WORKER's silence — a clock that a lane opening or a gate re-check
+    /// could restart.
     /// `bump` is a **parameter rather than a separate call** for the same
     /// reason `reason` is checked here: a caller that could take arc 5 and
     /// forget the `review_rounds` increment would spend an unbounded number of
@@ -1324,6 +1575,11 @@ impl DriveEntry {
         if reason.is_some() != (to == DriveState::Held) {
             return Err(InvalidTransition { from: self.state, to });
         }
+        // Read before the arc is taken and before any clock below is re-stamped
+        // (#2110). A refused arc must spend nothing, so nothing is written from
+        // these until `transition` has accepted.
+        let from = self.state;
+        let state_elapsed = self.state_elapsed_ms(now_ms);
         self.state = transition(self.state, to)?;
         self.held_reason = reason;
         match bump {
@@ -1335,13 +1591,75 @@ impl DriveEntry {
         if to == DriveState::FixWait {
             self.fix_handback_ms = now_ms;
         }
+        // **What the drive was doing, recorded before the clocks that say so
+        // are reset** (#2110). `held_from` and `held_after_ms` are read by this
+        // hold's notice and by `review_drive_status`; both are computed from
+        // `state_since_ms`, which the next three lines overwrite.
+        if to == DriveState::Held {
+            self.held_from = Some(from);
+            self.held_after_ms = state_elapsed;
+        } else {
+            self.held_from = None;
+            self.held_after_ms = 0;
+        }
         // #2109: an arc is proof the drive is no longer stuck on the cap, so
         // the starvation clock does not survive one. Including the arc INTO
         // `held(cap-full)` itself — the hold is the report, and a resume must
         // start the clock over rather than re-hold on the next tick from a
         // stamp the previous starvation left behind.
+        //
+        // #2110: what that run COST is kept, though, and the lifetime total is
+        // what `drive-stalled` subtracts. Folded here rather than discarded,
+        // because the arc out of `held(cap-full)` is precisely the arc after the
+        // longest run there is.
+        self.end_starvation_run(now_ms);
         self.cap_starved_since_ms = None;
+        // The per-state clock, re-stamped on EVERY arc — see `state_since_ms`
+        // for why that is the stamp §2.2 used to forbid and why the backstop is
+        // what makes it safe.
+        self.state_since_ms = now_ms;
+        self.starved_state_ms = 0;
         Ok(())
+    }
+
+    /// Fold any starvation run in flight into both accumulators and end it.
+    ///
+    /// Shared by [`advance`](DriveEntry::advance) and
+    /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) so that the
+    /// two ways a run can end cost the same thing — a run charged by one path
+    /// and not the other would make the exclusion depend on whether the cap
+    /// cleared before or after the drive moved, which is the arbitrary half of
+    /// the original defect.
+    fn end_starvation_run(&mut self, now_ms: u64) {
+        if let Some(since) = self.cap_starved_since_ms {
+            let d = now_ms.saturating_sub(since);
+            self.starved_total_ms = self.starved_total_ms.saturating_add(d);
+            self.starved_state_ms = self.starved_state_ms.saturating_add(d);
+        }
+    }
+
+    /// Everything this drive has spent unable to spawn, the run in flight
+    /// included (#2110). The quantity `drive-stalled` subtracts.
+    pub fn starved_ms(&self, now_ms: u64) -> u64 {
+        self.starved_total_ms.saturating_add(self.open_starvation_ms(now_ms))
+    }
+
+    /// The same, since the current state was entered — what
+    /// [`HeldReason::StateStalled`] subtracts.
+    pub fn starved_in_state_ms(&self, now_ms: u64) -> u64 {
+        self.starved_state_ms.saturating_add(self.open_starvation_ms(now_ms))
+    }
+
+    fn open_starvation_ms(&self, now_ms: u64) -> u64 {
+        self.cap_starved_since_ms.map_or(0, |since| now_ms.saturating_sub(since))
+    }
+
+    /// How long this drive has been in its current state, starvation excluded
+    /// — the [`HeldReason::StateStalled`] measure (#2110).
+    pub fn state_elapsed_ms(&self, now_ms: u64) -> u64 {
+        now_ms
+            .saturating_sub(self.state_since_ms)
+            .saturating_sub(self.starved_in_state_ms(now_ms))
     }
 
     /// Record that the live-delegate cap refused this drive's lane spawn, and
@@ -1362,7 +1680,13 @@ impl DriveEntry {
 
     /// Forget any recorded cap starvation, and answer whether there was one.
     /// Called when a lane DOES open — the refusal run is over.
-    pub fn clear_cap_starvation(&mut self) -> bool {
+    ///
+    /// Takes `now_ms` since #2110 because ending a run is no longer free: what
+    /// it cost is folded into the accumulators the age bound subtracts, and a
+    /// run ended without charging it would leave the time in the budget of the
+    /// drive that was starved.
+    pub fn clear_cap_starvation(&mut self, now_ms: u64) -> bool {
+        self.end_starvation_run(now_ms);
         self.cap_starved_since_ms.take().is_some()
     }
 
@@ -1570,9 +1894,26 @@ impl DriveEntry {
         out
     }
 
-    /// The drive's age (§2.2's `drive-stalled` measure).
+    /// The drive's age on the wall — what `review_drive_status` reports as
+    /// `since_ms`, and **no longer what `drive-stalled` measures**: see
+    /// [`bounded_age_ms`](DriveEntry::bounded_age_ms).
+    ///
+    /// The two are kept apart rather than folded because they answer different
+    /// questions and a reader needs both. A human asking "how long has this
+    /// drive been going" wants the wall figure — the queue's own `since_ms` is
+    /// this, and an age that silently shrank when a cap cleared would be a
+    /// worse answer than the one it replaced. A BOUND asking the same question
+    /// must not charge the drive for time it was not allowed to act, which is
+    /// #2110. `review_drive_status` publishes the wall age and the excluded
+    /// total side by side so the difference is visible rather than inferred.
     pub fn age_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.started_ms)
+    }
+
+    /// The drive's age with starvation excluded — §2.2's `drive-stalled`
+    /// measure since #2110.
+    pub fn bounded_age_ms(&self, now_ms: u64) -> u64 {
+        self.age_ms(now_ms).saturating_sub(self.starved_ms(now_ms))
     }
 
     /// Record what a lane's verdict file said this tick, onto that lane.
@@ -2100,8 +2441,16 @@ pub fn first_stale_lane(required: &[LaneFact], head: &str, body_digest: Option<&
 ///    `gate-check` -> `ci-wait` on every wake; that drive *always* has an
 ///    advance available, so an age check that ran after the per-state logic
 ///    would never be reached and the drive would cycle forever. The bound is
-///    what keeps stopping the line from being silent.
-/// 5. Then the state's own logic.
+///    what keeps stopping the line from being silent. Since #2110 it is the
+///    BACKSTOP rather than the working bound, and the reason it still outranks
+///    everything below is unchanged: it is the one bound the base-green cycler
+///    cannot reset.
+/// 5. **Then time in the current state** (#2110) — [`state_bound_ms`], reset by
+///    every transition, which is what an orchestrator actually wants bounded.
+///    Below the age for the reason argued at the line itself: both are past
+///    only for a drive resumed out of a very long park, where the twelve-hour
+///    figure is the more important of the two.
+/// 6. Then the state's own logic.
 pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
     let state = entry.state();
     if state.is_terminal() || state.is_parked() {
@@ -2123,8 +2472,33 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     // reach without going through S2's parser. A boundary that holds only when
     // the expected caller is upstream is not a boundary.
     let limits = &limits.clamped();
-    if entry.age_ms(facts.now_ms) >= minutes_ms(limits.drive_timeout_minutes) {
+    if entry.bounded_age_ms(facts.now_ms) >= minutes_ms(limits.drive_timeout_minutes) {
         return DriveStep::held(HeldReason::DriveStalled);
+    }
+    // **5a. Then time in THIS state** (#2110) — the bound that does the work,
+    // with the age above it as the backstop it falls through to.
+    //
+    // Below the age deliberately, and the ordering is not the one it looks like
+    // it should be. The state bounds are smaller, so in the ordinary run of
+    // events one of them fires first *in time* and this line is never reached
+    // with both past. Where both ARE past, the drive has just been resumed out
+    // of a long park — arc 11 re-stamps `started_ms` and `state_since_ms`
+    // together, so the only way to be past the twelve-hour backstop at all is a
+    // drive that has genuinely run that long, and that fact outranks whichever
+    // state it happens to be sitting in. Putting this first would also reopen
+    // §8's `also: [base-green]` row from the other end: that drive resets this
+    // clock on every wake, so it must reach the age check, and an ordering that
+    // let a per-state bound answer first for some other drive is one more thing
+    // to keep true.
+    //
+    // `required_lanes` is the gate's list at this head; `None` is a routing
+    // answer this tick could not produce, and that drive holds
+    // `routing-unaccountable` in `decide_review_wait` below on this same tick.
+    let lanes = facts.required_lanes.as_deref().map_or(0, |l| l.len());
+    if let Some(bound) = state_bound_ms(state, limits, lanes) {
+        if entry.state_elapsed_ms(facts.now_ms) >= bound {
+            return DriveStep::held(HeldReason::StateStalled);
+        }
     }
     // **An unresolved head is not a head, and acting on one is an unbounded
     // spawn loop.** Two of the four states below read `facts.head`, and the
@@ -2265,7 +2639,9 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // #2109 makes that reachable rather than theoretical: the
                 // re-brief it produced is now REFUSED while that lane's pane is
                 // live, so without this the drive would retry the refusal until
-                // `drive-stalled` — four hours, on a notice that names no lane.
+                // `state-stalled` at the `review-wait` bound, and then
+                // `drive-stalled` — three hours and twelve, on notices that
+                // name no lane (#2110 renumbered those two; neither names one).
                 //
                 // **`at_head` is what makes this a silence test rather than a
                 // stopwatch** (#2109 review 1). The first version keyed on
@@ -2441,16 +2817,16 @@ mod tests {
     }
 
     #[test]
-    fn the_held_reasons_are_the_notes_fourteen() {
-        assert_eq!(HeldReason::ALL.len(), 14);
-        // §2.2: "There are **sixteen**" exits back to the LLM orchestrator —
-        // the fourteen holds plus `satisfied` and `cancelled`.
+    fn the_held_reasons_are_the_notes_fifteen() {
+        assert_eq!(HeldReason::ALL.len(), 15);
+        // §2.2: "There are **seventeen**" exits back to the LLM orchestrator —
+        // the fifteen holds plus `satisfied` and `cancelled`.
         let exits =
             HeldReason::ALL.len() + DriveState::ALL.iter().filter(|s| s.is_terminal()).count();
-        assert_eq!(exits, 16);
+        assert_eq!(exits, 17);
         // The two cap reasons are DIFFERENT exits, and nothing else here would
         // notice them collapsing into one spelling: `ALL` would still hold
-        // fourteen entries and every one of them would still round-trip.
+        // fifteen entries and every one of them would still round-trip.
         assert_ne!(
             HeldReason::CapFull.as_str(),
             HeldReason::CapRefused.as_str(),
@@ -3807,7 +4183,7 @@ mod tests {
     /// reviewer that answered promptly — and parks it STUCK, because only
     /// `open_lane` writes `spawned_ms`, so a resume re-decides on unchanged
     /// facts and re-holds. Its only exits were a head change, a cancel, or the
-    /// four-hour age bound.
+    /// age backstop.
     ///
     /// **The two halves differ in exactly one field**, which is what makes this
     /// a pin on `at_head` rather than on the timeout: same lane, same clock,
@@ -3967,9 +4343,22 @@ mod tests {
             "the duration is measured from the FIRST refusal, not the newest tick"
         );
 
-        assert!(e.clear_cap_starvation(), "a lane that opens ends the run");
+        assert!(e.clear_cap_starvation(20_000), "a lane that opens ends the run");
         assert_eq!(e.cap_starved_for(20_000), None);
-        assert!(!e.clear_cap_starvation(), "and clearing an unstarved entry changes nothing");
+        assert!(
+            !e.clear_cap_starvation(20_000),
+            "and clearing an unstarved entry changes nothing"
+        );
+        // #2110: what the run COST survives the clear, because that is the
+        // quantity both age bounds subtract. A `clear` that only forgot the
+        // anchor would leave the ten seconds charged to the drive that was
+        // starved — which is the whole defect, one code path over from where
+        // it was reported.
+        assert_eq!(
+            e.starved_ms(20_000),
+            10_000,
+            "ending a starvation run must bank what it cost, not discard it"
+        );
 
         // An arc clears it too, including the arc into the hold it produces: a
         // resume must start the window over rather than re-hold on the next tick
