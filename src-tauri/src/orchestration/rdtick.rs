@@ -2282,12 +2282,10 @@ impl OrchRegistry {
                         // window at each cap refusal after a non-cap one, which
                         // is the fail-safe direction and is what the word
                         // "continuously" on `HeldReason::CapFull` promises.
-                        let moved = if cap {
-                            entry.note_cap_starvation(now)
-                        } else {
-                            entry.clear_cap_starvation()
-                        };
-                        if moved {
+                        // SCRATCH #2109 review-4 M9: the pre-fix write-edge
+                        // guard — the stamp is a latch, so a non-cap refusal
+                        // lets it age.
+                        if cap && entry.note_cap_starvation(now) {
                             out.changed = true;
                         }
                         out.audits.push((
