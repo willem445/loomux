@@ -3339,9 +3339,11 @@ limit.
   (`set_compact_nudge_minutes` / `set_compact_nudge_roles`, `orch_set_compact_nudge_minutes`
   / `orch_set_compact_nudge_roles`, mirroring `orch_set_idle_tick_minutes`).
 - **Per-CLI gate.** `/compact` is a Claude Code built-in with no equivalent on the other
-  supported CLIs, so `compact_nudge_cli_supported` gates the nudge to `Guardrails::cli_for`
-  resolving to `"claude"` for the eligible agent's role — an unsupported CLI is silently
-  excluded rather than typing a slash command it won't understand.
+  supported CLIs, so `compact_nudge_cli_supported` gates the nudge to
+  `Guardrails::cli_for_block` resolving to `"claude"` for the eligible agent's own
+  BLOCK — not for its role's default block, which is a different question
+  wherever a roster declares two blocks of one kind (#2167) — and an unsupported CLI
+  is silently excluded rather than typing a slash command it won't understand.
 - **`request_compact` (#328): agent-initiated, self-scoped, no new trust surface beyond a
   one-bit flag.** An MCP tool (shared tier — every non-solo role, not orchestrator-only) that
   sets `AgentEntry.compact_requested` on the CALLING agent's own entry, resolved from its MCP

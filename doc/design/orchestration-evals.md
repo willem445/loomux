@@ -46,11 +46,14 @@ window can be cut from it. The orchestrator's session spans the whole benchmark
 row is a single number covering every PR at once. The transcript is the only
 per-turn record.
 
-**What the script reads from the transcript, and nothing else:** `timestamp` and
-`message.usage`. Each line is projected to those two fields at parse time and the
-rest is dropped before anything is retained, so no transcript prose is ever held in
-memory, printed, or written to a fixture. The tests run against a six-line synthetic
-transcript written by hand.
+**What the script reads from ANY transcript, and nothing else:** `timestamp` and
+`message.usage`. Every transcript it opens — the orchestrator's here, and a
+delegate's for the §4.6 backfill — goes through the one reader, which projects each
+line to those two fields at parse time and drops the rest before anything is
+retained, so no transcript prose is ever held in memory, printed, or written to a
+fixture. What coverage publishes about a backfilled row is its PATH and its token
+totals, never a byte of its content. The tests run against synthetic transcripts
+written by hand — six lines for the orchestrator, three for the delegate.
 
 ---
 

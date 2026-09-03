@@ -12,17 +12,24 @@
 //
 // WHY A SCRIPT AND NOT PRODUCT CODE. This slice adds no Rust. Every number below is
 // a projection over files the app already writes: the group's `audit.jsonl`,
-// `usage.json`, `agents.json`, and the orchestrator CLI's own transcript. Nothing
-// here is a new row, a new field, or a new gate.
+// `usage.json`, `agents.json`, and the CLI's own transcripts — the orchestrator's,
+// named with `--transcript`, and (since #2167) a DELEGATE's, located under
+// `--claude-projects` to repair a `usage.json` row the collector wrote as zero.
+// Nothing here is a new row, a new field, or a new gate.
 //
 // RETIREMENT. `doc/design/orchestration-evals.md` carries the clause: this file is
 // DELETED in #2011 S3, once an engine module (`crates/loomux-engine`, exposed as the
 // `group_metrics` MCP tool) reproduces this output byte-for-byte on the fixture
 // corpus. Until then it is the only reader, and the design note is its spec.
 //
-// PRIVACY. The orchestrator transcript is read for `timestamp` and `message.usage`
-// ONLY. No transcript text is parsed, stored, printed, or checked in — the tests run
-// against a synthetic six-line transcript written by hand.
+// PRIVACY. EVERY transcript this script opens — the orchestrator's and, since
+// #2167, a delegate's — goes through the one reader (`readTranscript`), which
+// projects each line to `timestamp` and `message.usage` and drops the rest BEFORE
+// anything is retained. No transcript text is parsed, stored, printed, or checked
+// in. What the coverage block publishes about a backfilled row is its PATH and its
+// token totals, never a byte of its content. The tests run against synthetic
+// transcripts written by hand — six lines for the orchestrator, three for the
+// delegate.
 //
 // Dependency-free CJS (the root package.json is `"type": "module"`, so a `.js` file
 // here would be ESM and `require` a ReferenceError). Node's own JSON and `readline`

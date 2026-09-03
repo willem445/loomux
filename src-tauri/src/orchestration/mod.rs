@@ -40880,9 +40880,11 @@ impl OrchRegistry {
             .filter(|a| a.group == group && a.status != AgentStatus::Dead)
             .cloned()
             .collect();
-        // Each agent's CLI is per-role (issue #4), so resolve it per agent.
-        // The group-level `cli` in the summary is the group default (workers/
-        // reviewers/planners may each run a different one).
+        // Each agent's CLI is its BLOCK's (#222, corrected from per-ROLE by
+        // #2167), so resolve it per agent below. The group-level `cli` in the
+        // summary is the group default; two blocks of the same kind may each
+        // run a different one, which is exactly the case a per-role resolution
+        // got wrong.
         let rails = self.group(group).map(|g| g.guardrails);
         let cli = rails
             .as_ref()
