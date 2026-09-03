@@ -109,6 +109,21 @@ each other's jobs. Cite the run instead: `gh run list --branch BRANCH --workflow
 CI --limit 1 --json databaseId`, then `gh run view ID --json jobs` and paste the
 job names with their conclusions.
 
+## Rule 4b - read the `code-metrics` comment on the PR
+
+A sticky comment marked `<!-- code-metrics -->` carries base-vs-head numbers for
+the PR: function-length and complexity percentiles, functions NEW at head that
+exceed the base p95 (by name), import cycles new at head, `.unwrap()`/`.expect(`/
+`panic!(` added on product-Rust lines, and `orchestration/mod.rs`'s delta. Read it.
+A new function over the base p95, a new cycle, or a new product `unwrap` is a
+finding to RAISE - with the usual Rule 3 substance, since none of them is
+automatically a defect and none of them blocks anything on its own. A row reading
+`n/a` means that side was not measured, never that it was zero.
+
+The comment is the INSTRUMENT that produces numbers, not a second place the
+"measured at base and head" rule applies: that rule stays on the PR BODY's
+numbers, and this comment is where a worker can get them (#2138).
+
 ## Rule 5 - premortem: name the input, or leave it out
 
 Two entries at most. Each names a CONCRETE input or sequence that triggers the
