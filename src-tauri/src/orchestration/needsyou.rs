@@ -46,23 +46,28 @@
 //!
 //! # The resolve boundary
 //!
-//! An item is settled three ways, and they are deliberately not one operation:
+//! An item is settled four ways, and they are deliberately not one operation:
 //!
 //! 1. **The human resolves it** — [`ResolveSource`] is a closed enum supplied by
 //!    the entry point (`orch_needs_you_resolve` hard-codes
 //!    [`ResolveSource::Webview`]), never a caller-supplied string, so "resolve as
 //!    the human" has no spelling. Same shape and same reason as
 //!    [`super::humanq`]'s own answer-source enum.
-//! 2. **The raiser withdraws it** — an item overtaken by events should not need
+//! 2. **The human dismisses it** (#2137) — the same surface and the same closed
+//!    enum ([`ResolveSource::WebviewDismiss`], via `orch_needs_you_dismiss`),
+//!    saying something different: *this no longer matters*, as opposed to *I
+//!    have looked*. Settles as `dismissed:webview`.
+//! 3. **The raiser withdraws it** — an item overtaken by events should not need
 //!    a human click. Settles as `withdrawn:<agent>`, which is visibly not a
 //!    human's acknowledgement.
-//! 3. **The board resolves it** — a task leaving the demo-gated statuses
+//! 4. **The board resolves it** — a task leaving the demo-gated statuses
 //!    auto-resolves its demo item as `board:<new-status>`. The board moved, so
 //!    the ask is moot.
 //!
-//! Taking your own ask back, and the board moving on, are both weaker than a
-//! human saying "seen" — `resolved_by` is what keeps them distinguishable
-//! forever, which is why every settle records one and none of them deletes a row.
+//! Taking your own ask back, the board moving on, and the human declining to
+//! look at all are each weaker than a human saying "seen" — `resolved_by` is
+//! what keeps them distinguishable forever, which is why every settle records
+//! one and none of them deletes a row.
 //!
 //! # Clearing is not deleting
 //!
@@ -104,6 +109,18 @@ pub const ITEM_TEXT_MAX: usize = 2000;
 
 /// Longest close-out note a human may attach when resolving an item.
 pub const RESOLUTION_TEXT_MAX: usize = 2000;
+
+/// Longest reason a human may attach when DISMISSING an item (#2137).
+///
+/// [`super::humanq::DISMISS_REASON_MAX`], shared as a number and as an
+/// argument: a dismissal says why the ask stopped mattering in a line, and one
+/// that needs a page of explanation is a close-out note — which the Resolve
+/// dialog beside it already takes at [`RESOLUTION_TEXT_MAX`].
+pub const DISMISS_REASON_MAX: usize = super::humanq::DISMISS_REASON_MAX;
+
+/// Total cap on the composed `[orrerix] … dismissed …` notice (#2137).
+/// [`RESOLVE_NOTICE_CAP`]'s role for the narrower payload above.
+pub const DISMISS_NOTICE_CAP: usize = 900;
 
 /// A board task's title is not written for this file, so it is cut to something
 /// a panel row can hold before it becomes an auto-raised item's text. Cutting
@@ -187,16 +204,28 @@ impl Kind {
     }
 }
 
-/// Where an item is in its life. Two states, not three: withdrawal and a board
-/// move are both *resolutions* with a different `resolved_by`, rather than
-/// statuses of their own.
+/// Where an item is in its life. Two states, not four: withdrawal, a board
+/// move and a human's dismissal are all *resolutions* with a different
+/// `resolved_by`, rather than statuses of their own.
 ///
 /// That asymmetry with [`humanq::Status`](super::humanq::Status) — which does
-/// carry a separate `Withdrawn` — is deliberate. A question's terminal states
-/// differ in whether the human's DECISION was ever obtained, which every reader
-/// of a settled question needs. An item's do not: nobody decided anything, the
-/// row is simply closed, and the provenance of the close lives in `resolved_by`
-/// where a reader who cares can read it exactly.
+/// carry a separate `Withdrawn`, and since #2137 a separate `Dismissed` — is
+/// deliberate. A question's terminal states differ in whether the human's
+/// DECISION was ever obtained, which every reader of a settled question needs.
+/// An item's do not: nobody decided anything, the row is simply closed, and
+/// the provenance of the close lives in `resolved_by` where a reader who cares
+/// can read it exactly.
+///
+/// **#2137 is where that argument was tested and kept.** The issue asked for
+/// "a new terminal state" on both registries; adding one HERE would have meant
+/// a `dismissed` status whose only content was a `resolved_by` this file
+/// already carries, and would have contradicted the paragraph above for no
+/// reader's benefit. So the item side expresses a dismissal as
+/// [`ResolveSource::WebviewDismiss`], writing `resolved_by:
+/// "dismissed:webview"` — the fourth of the four tags, alongside `webview`,
+/// `board:<new-status>` and `withdrawn:<agent>`. The question side, where the
+/// state model genuinely distinguishes settle KINDS, got the new status the
+/// issue asked for. See `doc/design/needs-you-items.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -252,9 +281,19 @@ pub struct Item {
     pub created_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_ms: Option<u64>,
-    /// Who closed it: [`ResolveSource::tag`] (`webview`), `board:<new-status>`,
-    /// or `withdrawn:<agent>`. See this module's resolve-boundary section for
-    /// why all three are kept distinguishable.
+    /// Who closed it, and what the close MEANT — four spellings, and the
+    /// field this registry deliberately keeps that meaning in rather than in
+    /// `status` (see [`Status`]):
+    ///
+    /// - `webview` — the human looked and cleared it ([`ResolveSource::Webview`]).
+    /// - `dismissed:webview` — the human said it no longer matters, #2137
+    ///   ([`ResolveSource::WebviewDismiss`]).
+    /// - `board:<new-status>` — the linked task moved on and the ask went moot.
+    /// - `withdrawn:<agent>` — the raiser took it back.
+    ///
+    /// See this module's resolve-boundary section for why all four are kept
+    /// distinguishable; only the first is an acknowledgement that the human
+    /// actually looked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
     /// The human's optional close-out note, verbatim as the trusted surface
@@ -321,9 +360,21 @@ impl Dedupe {
 /// acknowledgement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveSource {
-    /// The human clicking in the app's own webview, via the
-    /// `orch_needs_you_resolve` Tauri command.
+    /// The human clicking Resolve in the app's own webview, via the
+    /// `orch_needs_you_resolve` Tauri command. *I have seen this.*
     Webview,
+    /// The human clicking **Dismiss** in the same webview, via the
+    /// `orch_needs_you_dismiss` command (#2137). *This no longer matters* —
+    /// which is a different fact from having looked, and the reason it is a
+    /// variant rather than a flag on the one above: `resolved_by` is where
+    /// this registry keeps the MEANING of a settle, so a new meaning is a new
+    /// tag, exactly as `board:<status>` and `withdrawn:<agent>` are.
+    ///
+    /// **Both variants are the same party** — the human, in loomux's own
+    /// webview — so this widens no trust boundary: it adds no surface, only a
+    /// second thing the surface it already had can say. The boundary this
+    /// enum guards is that no AGENT-shaped variant exists, and none does.
+    WebviewDismiss,
 }
 
 impl ResolveSource {
@@ -331,10 +382,25 @@ impl ResolveSource {
     /// rather than `&'static str` for the question registry's equivalent tag's
     /// reason: a future surface carries an identity, and a signature that has to
     /// widen later is a signature every call site re-touches.
+    ///
+    /// `dismissed:webview` deliberately reads as one of the four
+    /// `resolved_by` shapes rather than as a fifth kind of thing — the
+    /// `<what>:<who>` spelling `withdrawn:<agent>` already established.
     pub fn tag(&self) -> String {
         match self {
             ResolveSource::Webview => "webview".to_string(),
+            ResolveSource::WebviewDismiss => "dismissed:webview".to_string(),
         }
+    }
+
+    /// Whether this settle is the human saying the ask no longer matters,
+    /// rather than saying they have looked at it.
+    ///
+    /// Read by the registry to pick the audit action and the notice, so the
+    /// two cannot disagree about which gesture happened — one predicate, not a
+    /// `matches!` at each site.
+    pub fn is_dismissal(&self) -> bool {
+        matches!(self, ResolveSource::WebviewDismiss)
     }
 }
 
@@ -441,6 +507,80 @@ pub fn validate_resolution(note: &str) -> Result<String, String> {
         ));
     }
     Ok(note)
+}
+
+/// **The settle transition for a dismissal, as a pure function** (#2137).
+///
+/// [`humanq::dismiss`](super::humanq::dismiss)'s twin, split out of the
+/// registry method for its reason: the rule is testable without a registry, a
+/// temp dir or a clock, and there is exactly one place that decides what a
+/// dismissal may be applied to.
+///
+/// It returns [`Status::Resolved`] rather than a `Dismissed` of its own — the
+/// asymmetry [`Status`] argues for — so what makes this a DISMISSAL is the tag
+/// the caller writes beside it ([`ResolveSource::WebviewDismiss`]), not the
+/// status. An already-resolved item is refused, so a dismissal can never
+/// overwrite a close-out the human already made or a withdrawal the raiser
+/// already recorded.
+pub fn dismiss(status: Status) -> Result<Status, String> {
+    if status.is_resolved() {
+        return Err("already resolved — a settled item cannot be dismissed".to_string());
+    }
+    Ok(Status::Resolved)
+}
+
+/// Bounds-check an optional dismissal reason from a trusted surface (#2137).
+///
+/// OPTIONAL, unlike [`validate_resolution`]: "this stopped mattering" is a
+/// complete thought, so a blank box is `Ok(None)` rather than the error a
+/// blank close-out NOTE gets. Rejects rather than truncates, for
+/// [`validate_raise`]'s reason.
+pub fn validate_dismiss_reason(reason: Option<&str>) -> Result<Option<String>, String> {
+    let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    if reason.chars().count() > DISMISS_REASON_MAX {
+        return Err(format!(
+            "dismissal reason is {} characters, max {DISMISS_REASON_MAX} — a dismissal says why \
+             the ask stopped mattering in a line; a longer close-out is a Resolve note",
+            reason.chars().count()
+        ));
+    }
+    Ok(Some(reason.to_string()))
+}
+
+/// The notice delivered into the orchestrator's pane when the human DISMISSES
+/// an item (#2137).
+///
+/// **Delivered even with no reason**, which is where this differs from
+/// [`resolve_notice`] and the difference is the point: a note-less resolve is
+/// the human tidying a queue after looking, and one delivery per tidy is
+/// noise the orchestrator pays for — but a dismissal says the ask itself was
+/// not worth the human's time, which is news to the agent that raised it and
+/// the only signal it will ever get.
+///
+/// **The fixed clause precedes the reason** for
+/// [`humanq::dismiss_notice`](super::humanq::dismiss_notice)'s reason: the
+/// words that stop this being read as "the human looked and approved" are
+/// loomux-built, so [`DISMISS_NOTICE_CAP`] can only trim a reason's tail.
+/// Both `reason` and `task` are untrusted text entering an `[orrerix]` line —
+/// the task ref is raiser-controlled and nothing validates it — so both go
+/// through `sanitize_gh_text`.
+pub fn dismiss_notice(id: &str, task: Option<&str>, reason: Option<&str>) -> String {
+    let about = match task {
+        Some(t) => format!(" ({})", sanitize_gh_text(t, NOTICE_TASK_MAX)),
+        None => String::new(),
+    };
+    let tail = match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => format!(" — reason: {}", sanitize_gh_text(r, DISMISS_REASON_MAX)),
+        None => String::new(),
+    };
+    let text = format!(
+        "[orrerix] needs-you item {id}{about} dismissed by the human — NOT A LOOK: they did not \
+         open it, nothing was judged, and the task is exactly where it was. Do not raise this \
+         ask again unless something changed.{tail}"
+    );
+    text.chars().filter(|c| !c.is_control()).take(DISMISS_NOTICE_CAP).collect()
 }
 
 /// The outcome of a raise: the row the caller should quote back, and **whether
@@ -586,11 +726,13 @@ pub fn prune(items: &mut Vec<Item>, keep: usize) {
 /// next: the id to quote, what was asked, which row it is about, how loud it is,
 /// and — once settled — *how* it was settled. `resolved_by` is included
 /// deliberately: an orchestrator must be able to tell "the human looked" from
-/// "the board moved on" from "I withdrew this myself", which is the whole reason
-/// those three tags stay distinguishable.
+/// "the human said it no longer matters" from "the board moved on" from "I
+/// withdrew this myself", which is the whole reason those four tags stay
+/// distinguishable.
 ///
-/// **What is withheld, and why.** `resolution` — the human's verbatim close-out
-/// note. It is *not* a secret: `resolve_notice` delivers it, sanitized, into the
+/// **What is withheld, and why.** `resolution` — the human's verbatim words
+/// about the close: a close-out note when they resolved, a reason when they
+/// dismissed (#2137). It is *not* a secret: `resolve_notice` delivers it, sanitized, into the
 /// orchestrator's own pane, which is the surface it was written for. But
 /// [`project_list`] feeds a **shared** read that every delegate may call, and a
 /// note the human typed to their orchestrator is not thereby addressed to every
@@ -613,7 +755,9 @@ pub struct AgentItem {
     pub resolved_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
-    /// Whether a human close-out note exists — not the note itself. See above.
+    /// Whether the human left words with the close — a close-out note, or a
+    /// dismissal reason — not the text itself. Read `resolved_by` to know
+    /// which of the two it was. See above.
     pub had_resolution: bool,
 }
 
