@@ -1173,8 +1173,7 @@ pub fn state_bound_ms(
     match state {
         DriveState::CiWait => Some(CI_WAIT_BOUND_MS),
         DriveState::ReviewWait => Some(
-            REVIEW_WAIT_BOUND_MS
-                .saturating_add(lane.saturating_mul(required_lanes.max(1) as u64)),
+            REVIEW_WAIT_BOUND_MS.max(lane.saturating_mul(required_lanes.max(1) as u64)),
         ),
         DriveState::FixWait => {
             Some(FIX_WAIT_BOUND_MS.max(minutes_ms(limits.fix_timeout_minutes)))
