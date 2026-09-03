@@ -2392,7 +2392,7 @@ impl OrchRegistry {
                         let moved = if cap {
                             entry.note_cap_starvation(now)
                         } else {
-                            entry.clear_cap_starvation(now)
+                            false
                         };
                         if moved {
                             out.changed = true;
