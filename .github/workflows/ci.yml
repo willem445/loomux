@@ -381,8 +381,15 @@ jobs:
     # below) or the run was cancelled.
     if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     runs-on: ubuntu-22.04
+    # Scoped to what the delta comment needs and nothing else (#2128 part 6d):
+    # `pull-requests: write` to post and edit the one sticky comment, `actions:
+    # read` to find the base commit's run and download its artifact, `contents:
+    # read` for the checkout. ci.yml declares no other job scopes; these PRs come
+    # from same-repo branches, so the token is not the read-only fork variant.
     permissions:
       contents: read
+      actions: read
+      pull-requests: write
     steps:
       # The PR's own head, not the merge commit checkout@v4 defaults to on a
       # pull_request: every number this job prints is dated to a SHA, and that SHA
@@ -427,6 +434,135 @@ jobs:
             "${legs[@]}" \
             --out code-metrics.json \
             --summary "$GITHUB_STEP_SUMMARY"
+
+
+      # ----- the per-PR delta comment (#2138 slice B) --------------------------
+      #
+      # NEVER FAILS ON A MISSING BASE. Three arms, in order: the base SHA's own
+      # stored `code-metrics.json` artifact; a second measurement taken on a
+      # worktree checked out at the base; and `n/a`, which the comment prints as
+      # "base unavailable" instead of a guess. Every step here is
+      # `continue-on-error` on top of that, so B cannot red a build any more than A
+      # can.
+      #
+      # BOTH SIDES ARE MEASURED. The comment never derives a base figure by
+      # subtracting a delta from a head figure — that is the CLAUDE.md rule this
+      # instrument exists to serve, and an instrument that broke it would be worse
+      # than no instrument. What it does NOT do is become a second place a worker
+      # "measures at base and head": that rule stays on PR-body numbers. This
+      # comment is where the numbers come FROM (#2128 part 11).
+      - name: Resolve the base
+        id: base
+        continue-on-error: true
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -u
+          base_sha="$(git merge-base "origin/$BASE_REF" HEAD || true)"
+          if [ -z "$base_sha" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "source=none" >> "$GITHUB_OUTPUT"
+            echo "note=no merge-base against origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "base merge-base: $base_sha"
+
+          # Arm 1: the artifact the base commit's own CI run kept.
+          run_id="$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$base_sha&per_page=20" \
+            --jq '[.workflow_runs[] | select(.status=="completed")] | .[0].id' 2>/dev/null || true)"
+          if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
+            art_id="$(gh api "repos/$REPO/actions/runs/$run_id/artifacts" \
+              --jq '[.artifacts[] | select(.name=="code-metrics" and .expired==false)] | .[0].id' 2>/dev/null || true)"
+            if [ -n "$art_id" ] && [ "$art_id" != "null" ]; then
+              if gh api "repos/$REPO/actions/artifacts/$art_id/zip" > base.zip 2>/dev/null \
+                 && unzip -o -q base.zip -d base-artifact 2>/dev/null \
+                 && [ -f base-artifact/code-metrics.json ]; then
+                cp base-artifact/code-metrics.json base-metrics.json
+                echo "source=artifact from run $run_id" >> "$GITHUB_OUTPUT"
+                echo "note=" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          fi
+
+          # Arm 2: measure the base ourselves. The INSTRUMENT stays the head's —
+          # `scripts/code-metrics.cjs` is run from this checkout, with `--repo-root`
+          # pointed at a worktree of the base — because a script that changed shape
+          # with its subject would make the two sides incomparable. `require`
+          # resolves `typescript` from this checkout's node_modules for the same
+          # reason, so the base worktree needs no install of its own.
+          #
+          # No clippy on this arm: it is a full workspace build, and the Rust rows
+          # printing `n/a` is the honest outcome, not a reason to spend eight
+          # minutes here.
+          if git worktree add --detach "$RUNNER_TEMP/base-tree" "$base_sha" >/dev/null 2>&1; then
+            if node scripts/code-metrics.cjs report \
+                 --repo-root "$RUNNER_TEMP/base-tree" \
+                 --commit "$base_sha" \
+                 --ref "$BASE_REF" \
+                 --out base-metrics.json; then
+              echo "source=measured here on a worktree of the base" >> "$GITHUB_OUTPUT"
+              echo "note=the base run kept no code-metrics artifact, so the base was re-measured without clippy" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Arm 3.
+          rm -f base-metrics.json
+          echo "source=unavailable" >> "$GITHUB_OUTPUT"
+          echo "note=no artifact for the base run and the base worktree could not be measured" >> "$GITHUB_OUTPUT"
+
+      - name: Build the delta comment
+        continue-on-error: true
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -u
+          # `...HEAD` — the diff against the merge-base, so a busy `main` underneath
+          # this PR is not reported as lines the PR added.
+          git diff "${{ steps.base.outputs.sha }}...HEAD" > pr.diff || true
+          args=(--head code-metrics.json --diff pr.diff --out code-metrics-comment.md)
+          if [ -f base-metrics.json ]; then
+            args+=(--base base-metrics.json)
+          fi
+          node scripts/code-metrics.cjs delta \
+            "${args[@]}" \
+            --base-sha "${{ steps.base.outputs.sha }}" \
+            --base-source "${{ steps.base.outputs.source }}" \
+            --base-note "${{ steps.base.outputs.note }}"
+          cat code-metrics-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      # One comment, edited in place. The marker is the identity: the search is for
+      # a comment BY THIS WORKFLOW'S BOT whose body starts with it, so a human
+      # quoting the marker cannot capture the slot. `gh api` rather than a
+      # marketplace action — nothing here needs one.
+      - name: Post or update the sticky comment
+        continue-on-error: true
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -u
+          [ -f code-metrics-comment.md ] || { echo "no comment body was built"; exit 0; }
+          jq -Rs '{body: .}' code-metrics-comment.md > payload.json
+          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq '[.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("<!-- code-metrics -->"))] | .[0].id' 2>/dev/null || true)"
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input payload.json --silent
+            echo "updated comment $existing"
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" --input payload.json --silent
+            echo "posted a new comment"
+          fi
+      # ----- end the per-PR delta comment (#2138 slice B) ----------------------
 
       - name: Upload the report
         continue-on-error: true

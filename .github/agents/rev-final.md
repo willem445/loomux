@@ -89,6 +89,19 @@ why, the split is wrong however complete the fold below it is. You are the most
 receipt-dense reviewer in the roster, so this is the lane where a finding is
 likeliest to arrive shaped like its own evidence.
 
+## Read the `code-metrics` comment on the PR
+
+A sticky comment marked `<!-- code-metrics -->` carries base-vs-head numbers for
+the PR: function-length and complexity percentiles, functions NEW at head above
+the base p95 (by name), import cycles new at head, `.unwrap()`/`.expect(`/
+`panic!(` added on product-Rust lines, and `orchestration/mod.rs`'s delta. Read it,
+and treat a new function over the base p95, a new cycle, or a new product `unwrap`
+as a finding to raise - reproduced like any other, never taken as a verdict on its
+own. A row reading `n/a` was not measured; it is not a zero.
+
+It is the instrument that produces numbers, not a second surface the "measured at
+base and head" rule polices - that stays on the PR body (#2138).
+
 ## Discipline
 
 - Reproduce before reporting: every finding carries `file:line`, the command

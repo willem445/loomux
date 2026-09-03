@@ -32,7 +32,8 @@
 //            thresholds are set to 1, and none of it is worth keeping.
 //   report   walk the tree, merge any number of clippy files, write
 //            `code-metrics.json` and a markdown summary.
-//   delta    compare two `code-metrics.json` files and write the PR comment body.
+//   delta    compare two `code-metrics.json` files (plus, optionally, the PR's
+//            unified diff) and write the sticky PR comment body.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -1175,6 +1176,16 @@ function cmdDelta(args) {
     base = null;
   }
   const head = JSON.parse(fs.readFileSync(args.head, 'utf8'));
+  // The diff may arrive here rather than with the head report: slice B computes
+  // the merge-base only once it has one, and re-running the whole report just to
+  // attach a diff would measure the tree twice for one extra field.
+  if (args.diff) {
+    try {
+      head.diff = analyzeDiff(fs.readFileSync(args.diff, 'utf8'));
+    } catch {
+      /* a missing diff is a missing section, never a failure */
+    }
+  }
   const body = buildDelta(base, head, {
     baseSha: args['base-sha'],
     baseSource: args['base-source'],
