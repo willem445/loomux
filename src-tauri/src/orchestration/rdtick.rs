@@ -1199,15 +1199,21 @@ impl OrchRegistry {
         // `spawn_agent(resume_session:)` needs.
         let prior = self.rd_lane_session(group, entry.lane(block));
         // #2163: the `lane-stalled` anchor this brief must carry. A brief that
-        // is only REPLACING a dead pane at the same head keeps the anchor the
-        // original brief set — see `lane_stall_anchor` for why that is both the
-        // honest reading of a silence clock and the thing that bounds a pane
-        // which dies on every spawn. Computed here, before `open_lane` replaces
-        // the record it reads.
+        // is only REPLACING a dead pane at the same REVISION — the full
+        // `(head, digest)` key, which is why the digest is passed — keeps the
+        // anchor the original brief set; see `lane_stall_anchor` for why that
+        // is both the honest reading of a silence clock and the thing that
+        // bounds a pane which dies on every spawn. Computed here, before
+        // `open_lane` replaces the record it reads.
         let pane_dead =
             entry.lane(block).is_some_and(|rec| self.rd_dead_lane_pane(rec).is_some());
-        let anchor =
-            reviewdrive::lane_stall_anchor(entry.lane(block), &brief.head, pane_dead, now);
+        let anchor = reviewdrive::lane_stall_anchor(
+            entry.lane(block),
+            &brief.head,
+            brief.body_digest_opt(),
+            pane_dead,
+            now,
+        );
         // **The resume names the lane's own block** (#1961). A resume that
         // named neither `kind` nor `block` reached `spawn_agent_bound`, which
         // has no session-inheritance rule of its own and falls straight through
@@ -1564,39 +1570,6 @@ impl OrchRegistry {
     /// asymmetry [`reviewdrive::DriveEntry::forget_dead_panes`] states, and the
     /// same fail-direction: an emptied map (a restart) would otherwise park
     /// every live drive in `fix-wait` on a hold about panes that are fine.
-    /// This lane's recorded pane, when it is **dead**, and who ended it
-    /// (#2163) — `(pane, killed_by)`, with `killed_by` `None` where orrerix
-    /// does not know.
-    ///
-    /// The lane-side twin of [`rd_pane_exit`](Self::rd_pane_exit), and it
-    /// answers a pair rather than a sentence because its two consumers want
-    /// different things: `decide_review_wait` wants the BOOLEAN (this lane
-    /// cannot be waited for), and the `rd-lane-reopened` row wants the two
-    /// facts an orchestrator that has just killed an idle delegate reads —
-    /// which pane went, and whether it was its own doing.
-    ///
-    /// **`Dead` and nothing else counts**, on `rd_pane_exit`'s own argument:
-    /// an agent this registry has no record of is "we could not check", and an
-    /// emptied map (a restart) must not re-open every lane in the group.
-    ///
-    /// An empty recorded pane answers `None` — a lane seeded across a re-drive
-    /// (#2153) carries a session and no pane, and there is nothing there to be
-    /// dead.
-    fn rd_dead_lane_pane(
-        &self,
-        lane: &reviewdrive::LaneRecord,
-    ) -> Option<(String, Option<&'static str>)> {
-        let id = lane.agent.trim();
-        if id.is_empty() {
-            return None;
-        }
-        let a = self.agent(id)?;
-        if a.status != AgentStatus::Dead {
-            return None;
-        }
-        Some((id.to_string(), a.killed_by.map(|who| who.as_str())))
-    }
-
     fn rd_pane_exit(&self, agent_id: &str) -> Option<String> {
         let a = self.agent(agent_id)?;
         if a.status != AgentStatus::Dead {
@@ -1628,6 +1601,39 @@ impl OrchRegistry {
                 tail_snippet(&tail, 200)
             )
         })
+    }
+
+    /// This lane's recorded pane, when it is **dead**, and who ended it
+    /// (#2163) — `(pane, killed_by)`, with `killed_by` `None` where orrerix
+    /// does not know.
+    ///
+    /// The lane-side twin of [`rd_pane_exit`](Self::rd_pane_exit), and it
+    /// answers a pair rather than a sentence because its two consumers want
+    /// different things: `decide_review_wait` wants the BOOLEAN (this lane
+    /// cannot be waited for), and the `rd-lane-reopened` row wants the two
+    /// facts an orchestrator that has just killed an idle delegate reads —
+    /// which pane went, and whether it was its own doing.
+    ///
+    /// **`Dead` and nothing else counts**, on `rd_pane_exit`'s own argument:
+    /// an agent this registry has no record of is "we could not check", and an
+    /// emptied map (a restart) must not re-open every lane in the group.
+    ///
+    /// An empty recorded pane answers `None` — a lane seeded across a re-drive
+    /// (#2153) carries a session and no pane, and there is nothing there to be
+    /// dead.
+    fn rd_dead_lane_pane(
+        &self,
+        lane: &reviewdrive::LaneRecord,
+    ) -> Option<(String, Option<&'static str>)> {
+        let id = lane.agent.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let a = self.agent(id)?;
+        if a.status != AgentStatus::Dead {
+            return None;
+        }
+        Some((id.to_string(), a.killed_by.map(|who| who.as_str())))
     }
 
     /// The block a driver-initiated resume of `session` must run under (#1961).
@@ -2250,6 +2256,17 @@ impl OrchRegistry {
         // the ENTRY (which pane this lane recorded) and the agent map, and that
         // function is given neither on purpose. `_` on a lane the entry has no
         // record for: there is no pane to be dead.
+        //
+        // **Filled for EVERY required lane, though `decide_review_wait` consults
+        // only `first_stale_lane`'s `k`** (#2169 review 2, premortem 1). That is
+        // deliberate rather than an oversight: `LaneFact` is a per-lane reading
+        // of the world, and one whose fields were populated only for whichever
+        // lane happened to be selected would be a struct whose meaning depends
+        // on its index — so a later change that reads another lane's entry
+        // would silently read a `false` nobody wrote. The cost is one agent-map
+        // lookup per required lane per tick. Lanes open strictly sequentially
+        // today, so nothing else can reach a non-`k` lane; this keeps that a
+        // property of the DECISION rather than of the facts it is handed.
         let required = required.map(|mut lanes| {
             for l in lanes.iter_mut() {
                 l.pane_dead = state

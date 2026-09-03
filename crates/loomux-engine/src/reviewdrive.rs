@@ -2747,11 +2747,36 @@ pub fn lane_open_for(rec: &LaneRecord, head: &str, body_digest: Option<&str>) ->
 /// silent about the head it was asked about. Re-arming would be the
 /// defeat-your-own-bound shape `decide`'s empty-head guard describes.
 ///
-/// **Only for a replacement at the SAME head.** Where the head has moved the
-/// lane is a new round about a new revision, so it is owed the full window and
-/// gets `now_ms`; a lane with no record, or one whose recorded pane is alive
-/// (an ordinary re-brief, a reuse fall-through), gets `now_ms` too — nothing
-/// about those is a replacement.
+/// **Only for a replacement at the SAME REVISION, and the revision is the full
+/// `(head, digest)` key** — [`lane_open_for`], the one place that comparison is
+/// written. A lane with no record, or one whose recorded pane is alive (an
+/// ordinary re-brief, a reuse fall-through), gets `now_ms` too: nothing about
+/// those is a replacement.
+///
+/// **The digest half is not decoration, and keying on the head alone was an
+/// asymmetry** (#2169 review 2, N1). This module treats `(head, digest)` as ONE
+/// revision key — §5.2 says so in as many words, `lane_open_for` implements it,
+/// and a verdict binds to both — so a head-only test here answered "same round"
+/// for a case the rest of the module calls a new one: a lane briefed at
+/// `(H, d1)` whose pane dies, followed by a BODY-ONLY fix moving the digest to
+/// `d2`, re-opens with a reviewer that has read nothing and inherits the
+/// original anchor. Fifty minutes in, that fresh reviewer had nine minutes
+/// before `held(lane-stalled)` — while the *same* body-only fix under a LIVE
+/// idle pane re-arms to `now` and gets the full window, which is the same
+/// revision getting two different clocks depending on whether a pane happened
+/// to die.
+///
+/// **And the bound does not need the digest case.** The runaway this exists to
+/// stop is a pane that dies on every spawn, which loops on the tick's own clock
+/// with nothing else moving; a digest only moves when a human or a worker edits
+/// the PR body, so it cannot drive a loop. Widening the exception to a new
+/// revision therefore costs the bound nothing.
+///
+/// An **unknown** live digest does not re-arm: `lane_open_for` reads "we could
+/// not check" as still-open rather than as drift, which is the same asymmetry
+/// [`ReviewVerdict::body_changed`] encodes and the fail-safe direction here —
+/// one transient `gh` failure to read a PR body must not hand every dying lane
+/// a fresh hour.
 ///
 /// A recorded anchor of `0` is a pre-field row, which is "unset" rather than
 /// "the epoch"; it takes `now_ms` for the same reason `fix_handback_ms == 0`
@@ -2759,11 +2784,17 @@ pub fn lane_open_for(rec: &LaneRecord, head: &str, body_digest: Option<&str>) ->
 pub fn lane_stall_anchor(
     rec: Option<&LaneRecord>,
     head: &str,
+    body_digest: Option<&str>,
     pane_dead: bool,
     now_ms: u64,
 ) -> u64 {
     match rec {
-        Some(r) if pane_dead && !head.is_empty() && r.briefed_head == head && r.spawned_ms != 0 => {
+        Some(r)
+            if pane_dead
+                && !head.is_empty()
+                && lane_open_for(r, head, body_digest)
+                && r.spawned_ms != 0 =>
+        {
             r.spawned_ms
         }
         _ => now_ms,
@@ -4718,30 +4749,55 @@ mod tests {
     /// that passed `now` would restart `lane-stalled` on every death and the
     /// loop would run until the drive's own age bound.
     ///
-    /// Four rows, and no single wrong implementation passes them all. Always
+    /// Six rows, each killing an implementation the others let through. Always
     /// returning `now_ms` fails row 1; always returning the record's value fails
-    /// rows 2 and 3; ignoring the head fails row 2, which is the case a re-open
-    /// is genuinely owed a fresh window because it is a new round about a new
-    /// revision.
+    /// rows 2, 3 and 5; ignoring the head fails row 2.
+    ///
+    /// **Rows 3 and 4 are #2169 review 2's N1, and the first version of this
+    /// table did not have them** — that is the finding, not a footnote. Four
+    /// rows read as discriminating while leaving the DIGEST half of the
+    /// revision key untested, because the function took no digest at all: a
+    /// head-only implementation passed every one of them. Row 3 is the case
+    /// that exposed (a lane whose pane died, then a body-only fix moving the
+    /// digest, inheriting an anchor a reviewer that has read nothing did not
+    /// earn); row 4 is its own control, so "re-arm whenever the digest does not
+    /// match" — which would re-arm on an unreadable body too — cannot pass row 3
+    /// by being wrong in the other direction.
+    ///
+    /// A test that cannot express an axis is a test that does not pin it, and
+    /// the missing axis was in the SIGNATURE rather than in the rows.
     #[test]
     fn a_dead_panes_replacement_inherits_the_stall_anchor_and_a_new_round_does_not() {
         let mut e = entry_at(DriveState::ReviewWait);
         e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
         let rec = || e.lane("rev-std");
 
+        let d1 = Some("d1");
         let observed = vec![
-            ("dead pane, same head", lane_stall_anchor(rec(), "head-a", true, 9_000)),
-            ("dead pane, new head", lane_stall_anchor(rec(), "head-b", true, 9_000)),
-            ("live pane, same head", lane_stall_anchor(rec(), "head-a", false, 9_000)),
-            ("no record at all", lane_stall_anchor(None, "head-a", true, 9_000)),
+            ("dead pane, same revision", lane_stall_anchor(rec(), "head-a", d1, true, 9_000)),
+            ("dead pane, new head", lane_stall_anchor(rec(), "head-b", d1, true, 9_000)),
+            // The row #2169 review 2 (N1) showed was unpinned: same head, moved
+            // DIGEST. A head-only implementation answers 1_000 here and passes
+            // every other row in this table unchanged.
+            ("dead pane, moved digest", lane_stall_anchor(rec(), "head-a", Some("d2"), true, 9_000)),
+            // …and its own control: an UNKNOWN live digest is "we could not
+            // check", not drift, so it still inherits. Without this row an
+            // implementation that re-armed on any non-matching digest — `None`
+            // included — passes the row above.
+            ("dead pane, digest unknown", lane_stall_anchor(rec(), "head-a", None, true, 9_000)),
+            ("live pane, same revision", lane_stall_anchor(rec(), "head-a", d1, false, 9_000)),
+            ("no record at all", lane_stall_anchor(None, "head-a", d1, true, 9_000)),
         ];
         let expected = vec![
             // The replacement inherits the silence this lane has already spent.
-            ("dead pane, same head", 1_000),
-            // A new revision is a new round, owed the full window.
+            ("dead pane, same revision", 1_000),
+            // A new revision is a new round, owed the full window — and the
+            // revision is the FULL key, so either half moving is a new one.
             ("dead pane, new head", 9_000),
+            ("dead pane, moved digest", 9_000),
+            ("dead pane, digest unknown", 1_000),
             // Not a replacement — an ordinary re-brief re-arms, as it always has.
-            ("live pane, same head", 9_000),
+            ("live pane, same revision", 9_000),
             ("no record at all", 9_000),
         ];
         assert_eq!(
@@ -4749,7 +4805,9 @@ mod tests {
             "each row is (fixture, the `spawned_ms` the next brief must carry). A `9_000` on \
              row 1 hands a lane whose pane keeps dying a fresh hour on every death, so \
              `lane-stalled` never fires and nothing per-lane bounds the loop. A `1_000` on \
-             rows 2-4 stalls a lane that has not been silent at all."
+             the `new head`, `moved digest` or `live pane` rows stalls a lane that has not \
+             been silent at all — and on `moved digest` it does so to a reviewer that has \
+             read nothing, while the same body-only fix under a live pane gets a full window."
         );
     }
 

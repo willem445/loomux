@@ -1140,8 +1140,16 @@ S3 added two more, described after them:
   every tick for as long as the drive lived if each replacement started the
   timer over; keeping the anchor makes `lane-stalled` reachable through the
   loop, at `lane_timeout_minutes` from the original brief and naming the lane.
-  Scoped to a replacement at the SAME head — a moved head is a new round about a
-  new revision and is owed the full window. `lane_stall_anchor` is that choice,
+  Scoped to a replacement at the SAME REVISION, and the revision is the full
+  `(head, digest)` key this section already calls one key — `lane_open_for` is
+  what asks it. Either half moving is a new round, owed the full window: a lane
+  whose pane died and whose body has since been edited is re-briefed to a
+  reviewer that has read nothing, and inheriting there would give the same
+  body-only fix two different clocks depending on whether a pane happened to
+  die. The bound does not need that case, because a digest moves only when a
+  human or a worker edits the PR body and so cannot drive a loop. An **unknown**
+  live digest still inherits — "we could not check" is not drift.
+  `lane_stall_anchor` is that choice,
   made in one place, and `a_dead_panes_replacement_inherits_the_stall_anchor_and_a_new_round_does_not`
   pins all four of its cases.
 - **`briefed_head` and `briefed_digest`** (per lane) — the revision that lane
@@ -1572,9 +1580,12 @@ two remaining ways a fresh pane can appear.
   that could neither reuse nor replace it. See §8's row.
 
 `rd-lane-reopened` (#2163) is the row for the one remaining way a lane's pane
-changes: it **died**, and the drive replaced it. It carries the dead `pane`,
-`killed_by` (`null` where orrerix does not know), the `agent` that replaced it,
-`block` and `head`. Its own action on `rd-ci-red`'s argument — a reader asking
+changes: it **died**, and the drive replaced it. It carries `pr`, `block`,
+`head`, the dead `pane`, `killed_by` (`null` where orrerix does not know), the
+`agent` that replaced it, and `resumed` — the last of these because a
+replacement that had to open a fresh conversation is a different event from one
+that continued the old reviewer's, exactly as it is on `rd-lane-spawned`. Its
+own action on `rd-ci-red`'s argument — a reader asking
 "did this drive ever lose a reviewer pane" must not have to match every row
 where it did not — and it says the two things a `rd-lane-spawned … resumed=true`
 beside it cannot: that the previous pane is gone, and whether the reader is the
