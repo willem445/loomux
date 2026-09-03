@@ -34,6 +34,12 @@ class ShimElement {
     this.tagName = tag.toUpperCase();
   }
 
+  // W3 on #2124: the real signature carries options ({ once: true } among
+  // them); the shim accepts and DISCARDS them, and `fire` below iterates the
+  // live listener array. So nothing in this file can distinguish
+  // "released once" from "never released" from "released on every blur" —
+  // runWhenNotEditing's once-per-deferral property is pinned textually in
+  // detectrefresh.test.ts and hand-validated, never behaviorally here.
   addEventListener(type: string, fn: () => void): void {
     const list = this.listeners.get(type) ?? [];
     list.push(fn);
@@ -68,9 +74,14 @@ class ShimElement {
     return this.attrs.has(name);
   }
 
-  // No-op: focus resolution is asserted through the marker (see
-  // focusWelcomeTarget below), the way pane.ts's focusWelcome reads it.
-  focus(): void {}
+  // Focus moves activeElement, the way a real document does — the marker
+  // assertions still resolve through the attribute (focusWelcomeTarget
+  // below), and the branch-flip release test reads the caret move directly:
+  // re-homing focus OFF a hidden input is what delivers the blur a queued
+  // deferral waits on (rev-std finding 1 on #2124).
+  focus(): void {
+    documentShim.activeElement = this;
+  }
 
   get value(): string {
     if (this.tagName !== "SELECT") return this.storedValue;
@@ -83,9 +94,15 @@ class ShimElement {
 
 // Installed before the dynamic import below; the constructor runs at test
 // time and nothing in the module graph touches `document` before that.
-(globalThis as Record<string, unknown>).document = {
+//
+// `activeElement` is what `editingCustom` reads (#2124): null is focus
+// elsewhere — the state every pre-existing test here runs under, since a real
+// document's activeElement is never a control the page never focused.
+const documentShim: { createElement: (tag: string) => ShimElement; activeElement: ShimElement | null } = {
   createElement: (tag: string) => new ShimElement(tag),
+  activeElement: null,
 };
+(globalThis as Record<string, unknown>).document = documentShim;
 
 const { ModelPicker, seedPicker } = await import("../src/modelpicker.ts");
 
@@ -263,4 +280,83 @@ test("a value set that takes the custom branch still carries the value", () => {
   p.value = "C:\\elsewhere";
   assert.equal(p.input.value, "C:\\elsewhere");
   assert.equal(p.value, "C:\\elsewhere");
+});
+
+// --- #2124: the probe reply lands mid-type ------------------------------------
+//
+// The launcher's probe-reply path (applyRoleModels' `.then`) is the one
+// setOptions call site no host-side mid-type guard ever reached. The sequence:
+// the human picks custom…, types a model id, and the probe reply arrives with
+// the merged list while they are still in the box — and when that list
+// contains the typed id, the rebuild resolves to the dropdown branch, which
+// hides the input under the caret and (#2108's symmetric clear) deletes the
+// text.
+
+test("a probe reply landing mid-type defers the rebuild: the typed id survives", () => {
+  const p = makePicker(["sonnet", "opus"], "sonnet");
+  pickCustom(p);
+  const input = p.input as unknown as ShimElement;
+  input.value = "opusplan"; // the id the probe is about to confirm
+  fire(input, "input");
+  documentShim.activeElement = input;
+  p.setOptions(["sonnet", "opus", "opusplan"], "sonnet");
+  assert.equal(p.input.hidden, false, "the rebuild must not hide the input under the caret");
+  assert.equal(p.input.value, "opusplan", "the typed text must survive the reply");
+  assert.equal(documentShim.activeElement, input, "focus stays in the box");
+  documentShim.activeElement = null;
+});
+
+test("the deferred probe-reply rebuild applies at blur, not never", () => {
+  // The negative half of the guard: skipping the mid-type rebuild must not
+  // drop it — nothing else would repaint this menu with the reply's models
+  // for the life of the dialog (the reason detectrefresh pins DEFER, not
+  // drop, on both hosts). At blur the rebuild runs for real and resolves the
+  // committed value exactly as an unguarded rebuild would.
+  const p = makePicker(["sonnet", "opus"], "sonnet");
+  pickCustom(p);
+  const input = p.input as unknown as ShimElement;
+  input.value = "opusplan";
+  fire(input, "input");
+  documentShim.activeElement = input;
+  p.setOptions(["sonnet", "opus", "opusplan"], "sonnet");
+  assert.equal(p.input.hidden, false, "the rebuild must not run while the human is in the box");
+  // The human clicks away: focus moves first, THEN the input's blur fires —
+  // the event the deferral waits on.
+  documentShim.activeElement = p.select as unknown as ShimElement;
+  fire(input, "blur");
+  assert.equal(p.select.value, "opusplan", "the reply's models are applied once typing ends");
+  assert.equal(p.input.hidden, true, "the confirmed id resolves to the dropdown branch");
+  assert.equal(p.input.value, "", "…and the dropdown-branch staleness clear still runs");
+  documentShim.activeElement = null;
+});
+
+test("a branch flip that hides a focused input delivers the blur that releases the queue", () => {
+  // rev-std finding 1 on #2124: runWhenNotEditing releases on the input's
+  // blur alone, and a browser's blur-on-hide for a focused element is not
+  // something to bet a queued rebuild on. So every flip this class makes out
+  // of the input re-homes the caret to the visible half — the move IS the
+  // blur. The premortem input: a host `set value` branch-flip lands while
+  // the box is focused with a rebuild queued.
+  const p = makePicker(["C:\\a", "C:\\b"], "C:\\a");
+  pickCustom(p);
+  const input = p.input as unknown as ShimElement;
+  input.value = "C:\\half-typed";
+  // Positive control: the box really holds focus (the change listener's own
+  // focus() put it there) before the flip under test.
+  assert.equal(documentShim.activeElement, input, "the human is in the box before the flip");
+  p.setOptions(["C:\\a", "C:\\b"], "C:\\a");
+  assert.equal(p.input.hidden, false, "the reply deferred while the human is in the box");
+  p.value = "C:\\a"; // the host flip: dropdown branch, input now hidden
+  assert.equal(p.input.hidden, true);
+  assert.equal(
+    documentShim.activeElement,
+    p.select as unknown as ShimElement,
+    "the flip re-homed the caret to the visible half — the blur that releases the queue"
+  );
+  // The queue really released: the blur that caret move delivers runs the
+  // rebuild, staleness clear included.
+  fire(input, "blur");
+  assert.equal(p.input.value, "", "the uncommitted text does not survive the applied rebuild");
+  assert.equal(p.select.value, "C:\\a");
+  documentShim.activeElement = null;
 });

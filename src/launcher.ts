@@ -1125,6 +1125,9 @@ export class WelcomeForm {
       // would rebuild the menu under a human who may be mid-type in the custom
       // box. The merge itself (order, dedupe, the pinned inherit row) is the
       // catalog's — see `mergeModelOptions`.
+      // A reply that lands MID-type is guarded in the picker itself (#2124):
+      // setOptions defers past the custom box's focus instead of rebuilding
+      // under the caret, so this bare call needs no host-side guard.
       if (p.models.length) {
         rc.model.setOptions(this.catalog.models(cli.id), cli.defaults[role], cli.id);
         this.applyRoleKnobs(role);
