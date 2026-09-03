@@ -567,8 +567,14 @@ jobs:
           set -u
           [ -f code-metrics-comment.md ] || { echo "no comment body was built"; exit 0; }
           jq -Rs '{body: .}' code-metrics-comment.md > payload.json
-          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq '[.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("<!-- code-metrics -->"))] | .[0].id' 2>/dev/null || true)"
+          # `--jq` is applied ONCE PER PAGE, so on a PR past the first page of comments
+          # this emits one line per page — `null` for every page with no match. Taking
+          # `.[0].id` alone would then yield "null" and the id on separate lines and
+          # splice a newline into the PATCH URL. Emit ids only, drop the nulls, and take
+          # the first survivor: the oldest matching comment, so the slot is stable.
+          existing="$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            --jq '.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("<!-- code-metrics -->")) | .id' 2>/dev/null \
+            | grep -v '^null$' | head -n 1 || true)"
           if [ -n "$existing" ] && [ "$existing" != "null" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input payload.json --silent
             echo "updated comment $existing"
