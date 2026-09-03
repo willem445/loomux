@@ -928,10 +928,28 @@ impl LaneRecord {
     /// the round where the warm session is cheapest.
     ///
     /// **What is kept is the conversation and what §7 owns; what is dropped is
-    /// every claim about a revision.** `briefed_head`, `briefed_digest`,
-    /// `last_verdict` and `at_head` all describe the drive that ended, so
-    /// carrying any of them would have the first tick either wait on a brief
-    /// nobody sent or read a stale verdict as this round's answer.
+    /// every claim about a revision THIS BUILD CAN NAME.** `briefed_head`,
+    /// `briefed_digest`, `last_verdict`, `at_head` and `spawned_ms` all describe
+    /// the drive that ended, so carrying any of them would have the first tick
+    /// either wait on a brief nobody sent or read a stale verdict as this
+    /// round's answer.
+    ///
+    /// **`extra` is the disclosed exception, and the qualifier above is what
+    /// makes this doc honest** (#2169 review 2, premortem 2). That field is by
+    /// construction the lane fields this build has no name for
+    /// ([`ReviewDrivesState`]), and it is carried across rather than dropped
+    /// because "a field a newer build wrote is not this build's to erase" is
+    /// the rule the whole passthrough exists for — an older binary that
+    /// silently deleted one would be the data-loss this type is designed to
+    /// prevent. The residual is the mirror of that: if a FUTURE build stores a
+    /// revision-scoped lane field in `extra`, an older binary performing the
+    /// re-drive carries that build's claim about the round that just ended into
+    /// the new one, and cannot know it did. No test can reach it — a fixture
+    /// would have to invent a field the code does not know — so it is stated
+    /// here and its trigger named: **any new per-revision lane field must be
+    /// cleared in this function at the same time it is added.** Every field
+    /// this build knows about is named above, so that check is a read of one
+    /// function rather than a search.
     /// `lane_open_for` is then false for every head, which is what makes the
     /// first tick BRIEF each lane rather than wait on it.
     ///
@@ -985,7 +1003,9 @@ impl LaneRecord {
             briefed_digest: String::new(),
             spawned_ms: 0,
             // Preserved for `ReviewDrivesState`'s reason: a field a newer build
-            // wrote is not this build's to drop.
+            // wrote is not this build's to drop. **This is the one thing here
+            // that is NOT re-derived**, and the doc above names the residual it
+            // leaves and the trigger that would close it.
             extra: self.extra.clone(),
         }
     }
