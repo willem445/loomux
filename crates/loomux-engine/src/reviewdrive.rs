@@ -3063,9 +3063,7 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // the roster or the merged records; a session that no longer
                 // resolves falls to the existing `rd-lane-resume-failed` →
                 // fresh-spawn path.
-                Some(rec) if lane_open_for(rec, &facts.head, digest) && !lane.pane_dead => {
-                    DriveStep::Wait
-                }
+                Some(rec) if lane_open_for(rec, &facts.head, digest) => DriveStep::Wait,
                 // **The cap's starvation is reported before another spawn is
                 // proposed** (#2109). The tick stamps
                 // `cap_starved_since_ms` on the first lane spawn the
