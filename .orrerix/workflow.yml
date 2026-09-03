@@ -23,9 +23,7 @@
 #     one line to the human) instead of routing another round -- UNLESS a
 #     finding names a defect: a wrong value, an unreachable arm, a claim the
 #     code contradicts. Those route as blocking. Round-1 non-blocking findings
-#     are still fixed in the PR. Evidence: 6 of 35 driven reviews ended with
-#     only non-blocking findings open, and two routed-nit rounds introduced
-#     regressions (#2104 r4, #1758 r5).
+#     are still fixed in the PR. (#2168)
 #
 #  2. ROUTE BY DIFF SHAPE (gates.merge.routing below, #1176). The static gate is
 #     rev-std alone; rev-final is REQUIRED only when the diff touches code, tests,
