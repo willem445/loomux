@@ -40714,10 +40714,12 @@ impl OrchRegistry {
                         + s.cache_creation_tokens
                         + s.cache_read_tokens
                 };
-                let new_empty =
-                    tokens_of(&snap) == 0 && snap.cost_usd.unwrap_or(0.0) <= 0.0;
-                let old_has_data =
-                    tokens_of(&*existing) > 0 || existing.cost_usd.unwrap_or(0.0) > 0.0;
+                let new_empty = snap.source == "none"
+                    && snap.cost_usd.is_none()
+                    && tokens_of(&snap) == 0;
+                let old_has_data = existing.source != "none"
+                    || existing.cost_usd.is_some()
+                    || tokens_of(&*existing) > 0;
                 if new_empty && old_has_data {
                     existing.agent_id = snap.agent_id;
                     existing.name = snap.name;
