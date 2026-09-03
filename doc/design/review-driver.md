@@ -250,7 +250,7 @@ own delivery arrives by its own path; §7.)
 | `held(worker-blocked)` | the worker reported `blocked` |
 | `held(worker-unresumable)` | **the fix could not be handed back to the worker.** Three causes, and the notice quotes which (`HeldFacts::refusal`) rather than diagnosing one: the recorded session no longer resolves; the block that session was minted under is no longer declared in this group's roster, so the class it must resume under cannot be established (#1961 — the driver refuses rather than degrading to the class default, which is what the session browser's rejoin does, because there a human is present and losing the persona beats losing the session); or the pane the driver DID resume exited in `fix-wait` before reporting anything, which is the resume that "worked" and then died on `Invalid session ID`. Reporting all three as the first is what sent an orchestrator after a replacement session for a session that was fine |
 | `held(cap-refused)` | this group’s **live-delegate cap** refused the pane a hand-back needed (#1960). Its own reason because its own REMEDY: the recorded session resolves fine and what is exhausted is a slot, so “re-point the drive at another session” — which is what `worker-unresumable` tells the orchestrator — is the one action that does not help. Free a slot and resume. A **lane** spawn refused by the cap does not reach here at all: `review-wait` backs off and retries (§8’s live-delegate-cap row), because a lane can be opened on any later tick while `fix-wait` has already taken its arc and spent its round. A lane refusal that does **not** clear is `held(cap-full)`, the row below, and never this one |
-| `held(cap-full)` | this group's **live-delegate cap** has refused this drive's next reviewer lane continuously for `CAP_HOLD_MS` (15 minutes), so no lane is open and none can be opened (#2109). Its own reason rather than `cap-refused`, and the argument is a DURATION rather than a remedy: the two share a remedy, and what one spelling cannot say is how long. `cap-refused` is a single hand-back refusal held on the spot with a round already spent; this is a refusal RUN. The measured incident is exactly that difference — PR #2105's drive sat in `review-wait` with `lanes: []` for about three hours (`since_ms` 11,083,045 at the read), emitting one `rd-refused` row per tick and no notice at all, and an orchestrator reading `cap-refused` on tick one would have learned something that was true and harmless thirty-seven ticks earlier. §6's own rule — every notice names the tool that acts on it, and `held(escalate)` already had to be widened to name the remedy that CLEARS it rather than merely the tool — is what makes these two different lines rather than one. The grace period is deliberate in both directions: a capped lane usually clears itself within a back-off, so holding on the FIRST refusal would spend an orchestrator turn on nothing, which is the opposite defect |
+| `held(cap-full)` | this group's **live-delegate cap** has refused this drive's next reviewer lane continuously for `CAP_HOLD_MS` (15 minutes), so no lane is open and none can be opened (#2109). Its own reason rather than `cap-refused`, and the argument is a DURATION rather than a remedy: the two share a remedy, and what one spelling cannot say is how long. `cap-refused` is a single hand-back refusal held on the spot with a round already spent; this is a refusal RUN. The measured incident is exactly that difference — PR #2105's drive sat in `review-wait` with `lanes: []` for about three hours (`since_ms` 11,083,045 at the read), emitting one `rd-refused` row per tick and no notice at all, and an orchestrator reading `cap-refused` on tick one would have learned something that was true and harmless thirty-seven ticks earlier. §6's own rule — every notice names the tool that acts on it, and `held(escalate)` already had to be widened to name the remedy that CLEARS it rather than merely the tool — is what makes these two different lines rather than one. The grace period is deliberate in both directions: a capped lane usually clears itself within a back-off, so holding on the FIRST refusal would spend an orchestrator turn on nothing, which is the opposite defect. **A run cannot straddle a restart** (#2135): §2.4's reconcile drops the stamp, because no tick observed the cap across the gap and after a restart every pane the cap was counting is gone — see §5.2's `cap_starved_since_ms` for why nothing is charged for that interval and for the in-process residual it leaves. **And under a strict ALTERNATION of cap and non-cap refusals this hold never fires at all**, which is the full price of the clear that makes "continuously" true rather than a defect in it: what bounds such a drive is `state-stalled` above, at close to twice its nominal `review-wait` bound, because #2110's accumulators forgive every ended cap run and the alternation makes those runs half the timeline. Measured rather than asserted, by `alternating_cap_and_non_cap_refusals_postpone_the_park_by_a_bounded_factor` |
 | `held(messaged)` | a driven delegate called `message_orchestrator` (that call is never intercepted; see §7) |
 | `cancelled` | `cancel_review_drive`, or reconcile **positively established** the PR is closed or merged |
 
@@ -405,6 +405,19 @@ against the head the file remembers. A PR whose state could not be determined is
 neither — `mqloop::draft_pr_open` returns `None` there and its doc says reconcile
 treats that as "the world does not match", never as "probably fine", and §8's
 row says what the driver does with it.
+
+The reconcile also **drops any cap-starvation run the previous process left
+standing** (#2135), on every live entry and whatever else it decides about the
+PR. A run cannot straddle a process boundary — every other site that touches
+that stamp is a tick that OBSERVED the cap refuse a spawn, and across the gap no
+tick ran — so a stamp older than `CAP_HOLD_MS` would park the resumed drive
+`held(cap-full)` on its first tick, before one spawn was attempted, in a group
+where every pane the cap was counting died with the process. §5.2's
+`cap_starved_since_ms` carries the whole argument, including why nothing is
+charged for the gap and what residual that leaves. The **per-state and age
+clocks are deliberately not reset here**: §2.2 charges orrerix's own downtime to
+the state it spanned, and the remedy for a drive parked on that is arc 11, not a
+reconcile that quietly forgives it.
 
 `review_drives.json` is **never deleted on read and never repaired**: a file that
 does not parse refuses the tick, audits `rd-state-unreadable` and backs off — a
@@ -1139,8 +1152,9 @@ S3 added two more, described after them:
   DRIVE'S OWN AGE reaches the bound, because #2117 review 3 capped the state
   clock at that age — not unconditionally on the first tick, which is what this
   said before the cap existed and which nothing could have failed on. Its
-  remedy (`drive_review`) re-stamps the field and does not re-hold. Treating zero as "unknown, exempt" would make the bound unreachable
-  for exactly the entries that predate it.
+  remedy (`drive_review`) re-stamps the field and does not re-hold. Treating
+  zero as "unknown, exempt" would make the bound unreachable for exactly the
+  entries that predate it.
 - **`starved_total_ms` and `starved_state_ms`** (per entry, #2110) — how long
   the drive has spent unable to spawn, over the starvation runs that have
   ENDED: for the whole life of the drive, and since it entered its current
@@ -1177,17 +1191,41 @@ S3 added two more, described after them:
   started refusing this drive's lane spawns, and the `held(cap-full)` anchor.
   Stamped on the FIRST **cap** refusal of a run and left alone by the cap
   refusals after it, so what it measures is the duration of one starvation
-  rather than the age of the newest tick. **Cleared at three sites**, and the
-  third is what makes `held(cap-full)`'s "continuously" true (review 4 on
+  rather than the age of the newest tick. **Cleared at four sites**, and the
+  second is what makes `held(cap-full)`'s "continuously" true (review 4 on
   #2112): when a lane does open, when the tick takes a refusal that is **not**
-  the cap's, and on every state arc — the last because a drive that MOVED is not
-  the drive that was stuck. Guarded on the write edge alone the stamp was a
+  the cap's, on every state arc — that one because a drive that MOVED is not
+  the drive that was stuck — and at §2.4's **restart reconcile** (#2135).
+  Guarded on the write edge alone the stamp was a
   latch, and one early cap refusal aged into the hold behind a run of refusals
   that were nothing of the kind. **Optional rather than a zero
   sentinel**: `fix_handback_ms` argues at length that a zero cannot occur while
   a drive is in `fix-wait`, and that argument does not transfer — a refusal is
   observed at whatever clock the tick was handed. Absent is the resting state,
   so it is not serialized when absent (`owed_notice`'s reason, unchanged).
+  **The fourth clear is a process-boundary rule, and it is the only one that
+  charges nothing** (#2135). A run cannot straddle a shutdown: every other site
+  that touches this stamp is a tick that OBSERVED the cap refuse a spawn, and
+  across the gap no tick ran — so the interval is time the cap refused nothing,
+  and after a restart every pane the cap was counting is gone. Left standing, a
+  stamp older than `CAP_HOLD_MS` parked the resumed drive `held(cap-full)` on
+  its FIRST tick, before one spawn was attempted, on a notice telling an
+  orchestrator to free a slot in a group whose slots were all free. Nothing is
+  charged because the gap is mostly orrerix's own downtime, and #2110's two
+  accumulators are a CREDIT against the age bounds that §2.2 deliberately
+  charges downtime to — banking it would forgive the downtime instead. The
+  price is that a genuinely starved stretch before the shutdown loses its
+  forgiveness, which fails toward parking rather than toward silence. The
+  `rd-recovered` row carries `cap_run_forgotten` so the clear is visible; its
+  only other effect is a drive that did NOT park.
+  **The residual is the in-process gap**: the reconcile runs once per group per
+  process, so a tick gap longer than `CAP_HOLD_MS` inside ONE process still
+  parks on a single observed refusal. Closing that wants a `last_tick_ms` and a
+  gap rule — #2117's own disclosed non-decision, for the same reason. Pinned by
+  `an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal`,
+  alongside `a_cap_stamp_from_a_previous_process_does_not_park_a_drive_whose_cap_the_restart_freed`
+  and `a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking`,
+  so neither half of this paragraph can go false quietly.
 
 **S3's two, and both are the same field for two subjects: the PANE.** `agent`
 (per lane) and `worker_agent` (per entry) record the agent id the delegate is
@@ -1478,6 +1516,12 @@ two remaining ways a fresh pane can appear.
 says a slot was the problem on THIS tick; a reader chasing a drive that has
 opened no lane for hours wants the RUN, and that is the number `held(cap-full)`
 is decided from.
+
+`rd-recovered` and `rd-cancelled` carry `cap_run_forgotten` (#2135) — whether
+this reconcile dropped a cap-starvation run the previous process left standing
+(§5.2). On the row for `rd-lane-duplicate-refused`'s reason: the clear's only
+other visible effect is a drive that did **not** park, which on this log is
+indistinguishable from there having been no stamp at all.
 
 ### 5.5 The brief templates, and the trust boundary they cross
 

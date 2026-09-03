@@ -6374,3 +6374,429 @@ fn the_total_age_backstop_still_parks_a_drive_that_advances_for_ever() {
         "…and that this is the backstop rather than a claim the drive sat still: {notice}"
     );
 }
+
+// ── #2135: the cap-starvation stamp across a process boundary, and under ─────
+// ── alternating refusal kinds                                            ─────
+
+/// The whole of `<group-dir>/review_drives.json`, parsed.
+///
+/// Read as JSON rather than through `reviewdrive::load_state`, because what
+/// these tests are about is the FILE: an optional field is invisible to a typed
+/// load (it deserializes to the same `None` whether it was absent or written
+/// `null`), and "the stamp reached disk" is exactly the claim a typed read
+/// cannot make.
+fn drives_json(reg: &OrchRegistry, group: &GroupId) -> serde_json::Value {
+    let p = reg.state_root().join(group.as_str()).join(reviewdrive::REVIEW_DRIVES_FILE);
+    let body = std::fs::read_to_string(&p)
+        .unwrap_or_else(|e| panic!("review_drives.json at {}: {e}", p.display()));
+    serde_json::from_str(&body).expect("review_drives.json must be JSON")
+}
+
+/// The worker session the drive record holds, so a test can resume a drive
+/// without every fixture in this file having to hand one back.
+fn driven_worker_session(reg: &OrchRegistry, group: &GroupId) -> String {
+    drives_json(reg, group)["entries"][0]["worker_session"]
+        .as_str()
+        .expect("a live drive record names the worker session it is driving")
+        .to_string()
+}
+
+/// **#2135(a), the record.** The `held(cap-full)` anchor is written to
+/// `review_drives.json`, so it is a fact the next process inherits rather than
+/// one the shutdown discards.
+///
+/// This is the premise the two behaviour tests below rest on, and it is not
+/// obvious either way: the field is `skip_serializing_if = "Option::is_none"`,
+/// and a field that is sometimes omitted is one edit from a field that is
+/// always omitted. Split from those tests rather than asserted inside them
+/// because a red here and a red there mean different things — one is a
+/// persistence defect, the other a decision defect — and a red evidences only
+/// the assertion it reached.
+///
+/// The second half is the control: the key really is optional, so its presence
+/// in the first half is caused by the cap refusal and not by a serializer that
+/// writes it unconditionally.
+#[test]
+fn the_cap_starvation_stamp_is_written_to_the_drive_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+
+    let stored = drives_json(&reg, &group);
+    assert_eq!(
+        stored["entries"][0]["cap_starved_since_ms"],
+        json!(at),
+        "the anchor `held(cap-full)` is decided from must reach the file, or a resumed drive \
+         decides from a different entry than the one that was stored: {stored}"
+    );
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let reg2 = relaunch_registry(dir2.path());
+    let repo2 = Repo::new();
+    let gh2 = FakeGh::green(HEAD_A);
+    reg2.set_pr_head_override(Some(HEAD_A.to_string()));
+    let (group2, _s) = driven(&reg2, &repo2, &gh2);
+    reg2.rd_drive_group_with(&group2, &gh2, 10_000);
+    let clean = drives_json(&reg2, &group2);
+    assert_eq!(
+        clean["entries"][0]["cap_starved_since_ms"],
+        json!(null),
+        "a drive the cap never refused must carry no stamp at all — otherwise the assertion \
+         above is about a serializer and not about a starvation: {clean}"
+    );
+}
+
+/// **#2135(a), the exit — and the defect it found.** A cap-starvation run
+/// cannot straddle a process boundary, so §2.4's restart reconcile drops it.
+///
+/// The shipped behaviour before this test: the stamp is persisted (above),
+/// nothing on the restart path touched it, and `decide` reads
+/// `cap_starved_for >= CAP_HOLD_MS` **above** the arm that proposes a spawn. So
+/// the first tick of the new process parked the drive `held(cap-full)` before
+/// one spawn was attempted — on a notice telling an orchestrator to free a
+/// slot, in a group where every pane died with the previous process and the cap
+/// is empty. The stamp's own field doc is what makes that wrong: what it
+/// measures is a run of refusals ticks OBSERVED, and across the gap no tick
+/// ran.
+///
+/// **The relaunched registry's empty `agents` map is the fixture, not a
+/// shortcut.** That is what a real restart looks like — panes do not survive
+/// the process — and it is what makes the two outcomes distinguishable here at
+/// all: with the cap still full, "parked on a stale stamp" and "parked on a
+/// live one" produce the same state.
+#[test]
+fn a_cap_stamp_from_a_previous_process_does_not_park_a_drive_whose_cap_the_restart_freed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, at) = {
+        let reg = relaunch_registry(dir.path());
+        let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+        (group, at)
+    };
+
+    // The restart: a second registry over the same state root. Its `agents` map
+    // is empty, so this group's live-delegate cap is empty too.
+    let reg = relaunch_registry(dir.path());
+    reg.create_group(&repo.path(), rails_capped()).unwrap();
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(&reg, &orch.id, 7001);
+    assert_eq!(
+        drives_json(&reg, &group)["entries"][0]["cap_starved_since_ms"],
+        json!(at),
+        "the control: the new process really did inherit a live stamp, so what follows is \
+         about the decision and not about a stamp that was never there"
+    );
+
+    let first = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "a stamp from a process that is gone must not park the resumed drive on its first \
+         tick: no tick observed the cap across the gap, and after the restart the cap this \
+         drive was starved by is empty"
+    );
+    assert!(
+        !first.lanes_opened.is_empty(),
+        "…and the drive must actually try the slot the restart freed: {:?}",
+        rows_for(&reg, &group, "rd-refused")
+    );
+    assert!(
+        first.notices.iter().all(|n| !n.contains("cap")),
+        "…and nothing may tell the orchestrator to free a slot in a group whose slots are \
+         all free: {:?}",
+        first.notices
+    );
+
+    // The clear is on the record, because its only other visible effect is a
+    // drive that did NOT park — indistinguishable on this log from there having
+    // been no stamp at all. The first row is the first process's own reconcile,
+    // which had nothing to forget, and is the non-vacuity control for the flag.
+    let recovered = rows_for(&reg, &group, "rd-recovered");
+    assert_eq!(recovered.len(), 2, "one reconcile per process: {recovered:?}");
+    assert_eq!(
+        recovered[0]["cap_run_forgotten"],
+        json!(false),
+        "the first process's reconcile ran before any refusal, so it forgot nothing: \
+         {recovered:?}"
+    );
+    assert_eq!(
+        recovered[1]["cap_run_forgotten"],
+        json!(true),
+        "…and the restart's says it dropped the run the shutdown left standing: {recovered:?}"
+    );
+}
+
+/// **#2135's residual, pinned rather than merely admitted.** The restart clear
+/// is scoped to the PROCESS boundary, and an in-process tick gap longer than
+/// `CAP_HOLD_MS` still parks on a single observed refusal.
+///
+/// Distinct from `a_cap_that_starves_a_drive_parks_it_as_cap_full_rather_than_leaving_it_silent`
+/// in the one way that matters: that test ticks at `CAP_HOLD_MS - 1` first, so
+/// the cap is re-observed a millisecond before the hold. Here nothing is
+/// observed between the single refusal and the park, so what parks the drive is
+/// a stamp whose run no tick re-confirmed — the same shape the restart case is
+/// about, on the one side of the boundary the fix deliberately does not cross.
+///
+/// It is the right direction (a drive really starved for fifteen minutes is
+/// parked whether or not orrerix was busy), and closing it wants a
+/// `last_tick_ms` and a gap rule, which is #2117's own disclosed non-decision.
+/// Pinning it is what stops the disclosure in `discard_cap_starvation_run` from
+/// going false quietly in either direction.
+#[test]
+fn an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+
+    // One tick, a whole window later, in the SAME process — nothing between.
+    reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "the clear is the RESTART reconcile's and nothing wider: in one process the stamp \
+         still ages across a gap no tick observed"
+    );
+    let status = reg.review_drive_status_with(&group, at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status["drives"][0]["held_reason"],
+        json!("cap-full"),
+        "…and it is still the cap that is named: {status}"
+    );
+    assert_eq!(
+        rows_for(&reg, &group, "rd-refused").len(),
+        1,
+        "the point of the fixture: exactly ONE refusal was ever observed"
+    );
+}
+
+/// **#2135(a), the resume half.** `drive_review` on a parked drive starts the
+/// cap window over, so the resumed drive does not re-park on the stamp that
+/// parked it.
+///
+/// Already true before #2135 and asserted here anyway, because it is true for a
+/// reason that is easy to delete: arc 11 goes through `advance`, and `advance`
+/// zeroes the field on EVERY arc. Nothing in the resume path names the cap, so
+/// a reader looking for "what clears the stamp on a resume" finds nothing, and
+/// the property had no witness at the registry level at all — the engine's own
+/// `the_starvation_clock_is_stamped_once_per_run_and_no_arc_carries_one_across`
+/// pins the arc, not the tool.
+///
+/// The last two ticks are the discriminator: the window is genuinely restarted,
+/// so the resumed drive survives a FULL `CAP_HOLD_MS` from its first new
+/// refusal and parks only after it. An implementation that merely suppressed
+/// the first re-park would pass the middle assertion and fail the last.
+#[test]
+fn a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+    reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "the fixture parks first, or there is nothing to resume"
+    );
+
+    let resumed_at = at + reviewdrive::CAP_HOLD_MS + 1_000;
+    let session = driven_worker_session(&reg, &group);
+    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", resumed_at);
+    assert_eq!(out["driving"], json!(true), "the resume must be accepted: {out}");
+    assert_eq!(
+        drives_json(&reg, &group)["entries"][0]["cap_starved_since_ms"],
+        json!(null),
+        "arc 11 is an arc, and no arc carries a starvation run across it"
+    );
+
+    // `ci-wait` -> `review-wait`, then the first refusal of the NEW run.
+    reg.rd_drive_group_with(&group, &gh, resumed_at + 1_000);
+    let refused_at = resumed_at + 2_000;
+    reg.rd_drive_group_with(&group, &gh, refused_at);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "the cap is still full, but this run is seconds old: {:?}",
+        rows_for(&reg, &group, "rd-refused")
+    );
+
+    reg.rd_drive_group_with(&group, &gh, refused_at + reviewdrive::CAP_HOLD_MS - 1);
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "one tick short of a whole NEW window, measured from the first refusal after the \
+         resume rather than from anything the old run left behind"
+    );
+    reg.rd_drive_group_with(&group, &gh, refused_at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "…and a genuinely new full run parks it again, so the resume is a fresh window and \
+         not an exemption"
+    );
+}
+
+/// One cycle of the alternation #2135(b) is about: a **cap** refusal, then a
+/// refusal of another kind — one of each, in that order, `step_ms` apart.
+///
+/// Continues the state `two_lane_stamp_then_duplicate` leaves, whose last tick
+/// was the duplicate. Lane 0 answers about the body in front of it, so
+/// `first_stale_lane` moves on to lane 1, whose spawn the cap refuses and which
+/// STAMPS the clock; then the body moves, lane 0's pass no longer stands, the
+/// gate comes back to lane 0, and the duplicate refusal — not the cap's —
+/// CLEARS it.
+///
+/// **`step_ms` must be under `CAP_HOLD_MS` or the fixture stops being about
+/// alternation**: a single cap run longer than the window parks the drive
+/// `cap-full` on the very next tick, and the non-cap refusal that would have
+/// cleared it never happens, because `decide` holds above the arm that proposes
+/// the spawn. That is the real tick cadence's own property (`RD_BACKOFF_MS` is
+/// minutes, the window is fifteen), and it is asserted rather than assumed.
+///
+/// Answers the clock of the tick that closed the cycle.
+fn alternate_refusal_kinds(
+    reg: &OrchRegistry,
+    gh: &FakeGh,
+    group: &GroupId,
+    lane0: &str,
+    at: u64,
+    step_ms: u64,
+    nth: u64,
+) -> u64 {
+    assert!(step_ms < reviewdrive::CAP_HOLD_MS, "see this function's doc: {step_ms}");
+    dispatch(
+        reg,
+        &Caller {
+            agent_id: lane0.to_string(),
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - lane one is still happy" } }),
+    )
+    .expect("lane 0 records");
+    // Lane 1 is what the gate wants next, and the cap is full: the stamp opens.
+    reg.rd_drive_group_with(group, gh, at + step_ms);
+    // The body moves, so the gate comes back to lane 0 and the duplicate
+    // refusal — which is not the cap's — closes the run.
+    let body = format!("b-alt-{nth}");
+    gh.set_body(&body);
+    reg.set_pr_body_override(Some(body));
+    reg.rd_drive_group_with(group, gh, at + 2 * step_ms);
+    at + 2 * step_ms
+}
+
+/// **#2135(b).** Alternating cap and non-cap refusals postpone the park, and
+/// the postponement is BOUNDED — rev-std's premortem on #2112 named the
+/// opposite ("silent-loop aging of a standing stamp").
+///
+/// It is coverage rather than a fix, and what it covers is a cost #2109 review
+/// 4 chose deliberately: clearing the stamp on every non-cap refusal is what
+/// makes `held(cap-full)`'s word "continuously" true, and its stated price is
+/// that a mixed run restarts the window at each cap refusal. Under a strict
+/// alternation that price is total — `cap-full` never fires at all — so what
+/// answers the premortem is not that hold but the one below it, and the two
+/// numbers this pins are the ones nobody had measured.
+///
+/// **What comes out, on stock knobs and a two-lane gate**: the drive parks
+/// `held(state-stalled)` at close to TWICE the `review-wait` bound of five
+/// hours, because #2110's accumulators forgive every ended cap run and a strict
+/// alternation makes those runs half the timeline. So the floor and the ceiling
+/// are both assertions: an implementation that forgave nothing would park at
+/// the bound itself and fail the floor, and one that let the exclusion run away
+/// — a per-block clock, say, which #2109 review 4 rejected for exactly this
+/// reason — would fail the ceiling.
+///
+/// The two refusal counts are the population control. A fixture that drifted
+/// into a RUN of one kind would still park, on a bound that would then be
+/// measuring something this test does not claim.
+#[test]
+fn alternating_cap_and_non_cap_refusals_postpone_the_park_by_a_bounded_factor() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = two_lane_stamp_then_duplicate(&reg, &repo, &gh);
+    let lane0 = drives_json(&reg, &group)["entries"][0]["lanes"][0]["agent"]
+        .as_str()
+        .expect("lane 0 opened, so the record names its pane")
+        .to_string();
+
+    // `review-wait`'s own bound at this gate: the three-hour constant plus one
+    // `lane_timeout_minutes` per required lane (#2117 review 2), both at stock.
+    let nominal = 180 * 60_000 + 2 * 60 * 60_000;
+    let step = 5 * 60_000;
+    let mut t = at;
+    let mut parked_at = None;
+    for nth in 0..120 {
+        t = alternate_refusal_kinds(&reg, &gh, &group, &lane0, t, step, nth);
+        if status_state(&reg, &group) == "held" {
+            parked_at = Some(t);
+            break;
+        }
+    }
+    let parked_at = parked_at.unwrap_or_else(|| {
+        panic!(
+            "the alternation postponed the park past {t} ms — it must be bounded, not silent \
+             (refusals: {} cap, {} duplicate)",
+            rows_for(&reg, &group, "rd-refused").len(),
+            rows_for(&reg, &group, "rd-lane-duplicate-refused").len()
+        )
+    });
+
+    let status = reg.review_drive_status_with(&group, parked_at);
+    assert_eq!(
+        status["drives"][0]["held_reason"],
+        json!("state-stalled"),
+        "`cap-full` cannot fire under an alternation — every non-cap refusal restarts its \
+         window — so what answers the premortem is the per-state bound: {status}"
+    );
+    assert_eq!(
+        status["drives"][0]["held_state"],
+        json!("review-wait"),
+        "…and the notice still names the wait the drive was actually in: {status}"
+    );
+    assert!(
+        parked_at > nominal * 3 / 2,
+        "the postponement is REAL and is the cost #2109 review 4 chose: the ended cap runs \
+         are forgiven, so the bound is reached at wall time well past the {nominal} ms it \
+         nominally names (parked at {parked_at})"
+    );
+    assert!(
+        parked_at < nominal * 3,
+        "…but it is bounded by a small factor, not indefinite: {parked_at} against a nominal \
+         {nominal}"
+    );
+
+    // The population control: the fixture really did alternate, one refusal of
+    // each kind per cycle, rather than drifting into a run of one.
+    let caps = rows_for(&reg, &group, "rd-refused").len() as i64;
+    let dups = rows_for(&reg, &group, "rd-lane-duplicate-refused").len() as i64;
+    assert!(caps >= 10 && dups >= 10, "too few cycles to be about alternation: {caps}/{dups}");
+    assert!(
+        (caps - dups).abs() <= 1,
+        "the kinds must alternate one for one — a RUN of either is a different subject: \
+         {caps} cap, {dups} duplicate"
+    );
+    // And no single run ever reached the window, which is WHY `cap-full` never
+    // fired: the mechanism, not merely its outcome.
+    let longest = rows_for(&reg, &group, "rd-refused")
+        .iter()
+        .filter_map(|r| r["starved_ms"].as_u64())
+        .max()
+        .expect("every cap refusal publishes the run it belongs to");
+    assert!(
+        longest < reviewdrive::CAP_HOLD_MS,
+        "no run may reach {} ms, or the drive would have parked `cap-full` and this test \
+         would be about a different hold: longest {longest}",
+        reviewdrive::CAP_HOLD_MS
+    );
+}
