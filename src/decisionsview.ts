@@ -36,6 +36,8 @@ import { invoke, listen, type UnlistenFn } from "./transport.ts";
 import {
   answerQuestion,
   clearNeedsYou,
+  dismissNeedsYou,
+  dismissQuestion,
   needsYouList,
   questionsList,
   resolveNeedsYou,
@@ -44,11 +46,17 @@ import { CoalescingRefresh } from "./refreshgate";
 import { WakeGate } from "./wakegate";
 import {
   answerFor,
+  canDismissItem,
+  canDismissQuestion,
   citedTask,
+  dismissBlock,
+  dismissReason,
+  DISMISS_REASON_MAX,
   EMPTY_DRAFT,
   EMPTY_VIEW,
   feedbackSubmitStep,
   freeTextAllowed,
+  isDismissedRow,
   isPending,
   isUrgent,
   itemTask,
@@ -480,9 +488,26 @@ export class DecisionsView {
       answerBtn.addEventListener("click", () => this.toggleOpen(q.id));
       const actions = el("div", "decisions-card-actions");
       actions.append(answerBtn);
+      // #2137. Offered on the COLLAPSED card only, deliberately: the answer
+      // form's action row is where the human is composing a decision, and a
+      // second, opposite verb sitting beside Send there is a misclick that
+      // throws away what they just typed. Cancel returns to this row, which
+      // has it — one extra click, in exchange for the two gestures never
+      // being adjacent.
+      if (canDismissQuestion(q)) actions.append(this.dismissBtn(() => this.dismissQuestionRow(q)));
       card.append(actions);
     }
     return card;
+  }
+
+  /** The **Dismiss** button itself, one builder for both registries so the two
+   *  cards cannot drift on the label or the tooltip. Not `primary`: dismissing
+   *  is never the action a card is inviting, it is the escape from one. */
+  private dismissBtn(onClick: () => void): HTMLButtonElement {
+    const b = el("button", "dlg-btn decisions-dismiss", "Dismiss") as HTMLButtonElement;
+    b.title = "Not relevant any more — clears this without answering it";
+    b.addEventListener("click", onClick);
+    return b;
   }
 
   private toggleOpen(id: string): void {
@@ -606,6 +631,11 @@ export class DecisionsView {
   private settledCard(row: SettledRow): HTMLElement {
     const card = el("div", "decisions-card settled");
     card.dataset.itemId = row.anchor;
+    // #2137: a dismissed row is marked on the CARD, not only by its status
+    // chip. `isDismissedRow` reads whichever field that registry keeps the
+    // fact in, so the two tail shapes cannot disagree about it.
+    const dismissed = isDismissedRow(row);
+    if (dismissed) card.classList.add("dismissed");
     const head = el("div", "decisions-card-head");
     if (row.source === "question") {
       const q = row.question;
@@ -614,7 +644,11 @@ export class DecisionsView {
       if (q.settled_ms) head.append(el("span", "decisions-when", fmtTime(q.settled_ms)));
       card.append(head);
       card.append(el("div", "decisions-text", q.text));
+      // `answer` and `reason` are separate fields on the record and separate
+      // classes here, so a dismissal's reason can never be read back as a
+      // decision the human made — the whole point of the backend split.
       if (q.answer) card.append(el("div", "decisions-answer", q.answer));
+      if (q.reason) card.append(el("div", "decisions-reason", `Dismissed: ${q.reason}`));
       return card;
     }
     const item = row.item;
@@ -631,7 +665,17 @@ export class DecisionsView {
     if (linked) head.append(el("span", "decisions-asker", linked));
     card.append(head);
     card.append(el("div", "decisions-text", item.text));
-    if (item.resolution) card.append(el("div", "decisions-answer", item.resolution));
+    // One stored field (`resolution`) carrying two different things — a
+    // close-out note, or a dismissal reason — with `resolved_by` saying which.
+    // Rendered as the thing it actually is, rather than under one label that
+    // would be wrong half the time.
+    if (item.resolution) {
+      card.append(
+        dismissed
+          ? el("div", "decisions-reason", `Dismissed: ${item.resolution}`)
+          : el("div", "decisions-answer", item.resolution)
+      );
+    }
     return card;
   }
 
@@ -725,6 +769,12 @@ export class DecisionsView {
     resolve.title = "Clear this from needs-you — the task stays exactly where it is";
     resolve.addEventListener("click", () => this.resolveItem(item));
     actions.append(resolve);
+    // #2137, beside Resolve rather than instead of it: the two say different
+    // things and the registry keeps them apart for ever in `resolved_by`.
+    // Resolve is "I have looked"; Dismiss is "this was not worth looking at",
+    // which is the fact the agent that raised the ask needs and the only
+    // signal it gets.
+    if (canDismissItem(item)) actions.append(this.dismissBtn(() => this.dismissItem(item)));
     card.append(actions);
     return card;
   }
@@ -839,6 +889,119 @@ export class DecisionsView {
     cancel.addEventListener("click", close);
     send.addEventListener("click", submit);
     ta.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submit();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    this.el.appendChild(overlay);
+    sync();
+    ta.focus();
+  }
+
+  /** The human dismisses a pending question: *this no longer matters* (#2137).
+   *
+   *  Routed through the shared dialog below rather than firing on the click,
+   *  for `resolveItem`'s two reasons and one of its own: a dismissal is the
+   *  one gesture here that throws a decision away unanswered, and the dialog
+   *  is where "this is not an answer, and the orchestrator will be told so"
+   *  can be said in a sentence instead of only in a tooltip nobody hovers. */
+  private dismissQuestionRow(q: OrchQuestion): void {
+    const cited = citedTask(q);
+    this.dismissDialog({
+      title: `Dismiss ${q.id}`,
+      hint: cited
+        ? `Settles this as dismissed — NOT as answered. The orchestrator is told nothing was decided, so it can release the hold on ${cited}; whether ${cited} moves is still its call.`
+        : "Settles this as dismissed — NOT as answered. The orchestrator is told nothing was decided, and re-asks only if it still needs the decision.",
+      send: (reason) => dismissQuestion(this.groupId, q.id, reason),
+    });
+  }
+
+  /** The human dismisses a needs-you item: *this was not worth looking at*
+   *  (#2137). Distinct from Resolve, which says they looked — the registry
+   *  keeps the two apart for ever in `resolved_by`, and the dialog says which
+   *  one this is so the human is not choosing between two identical buttons. */
+  private dismissItem(item: NeedsYouItem): void {
+    const linked = itemTask(item);
+    this.dismissDialog({
+      title: `Dismiss ${item.id}`,
+      hint: linked
+        ? `Clears this without looking at it, and tells the orchestrator not to raise it again. ${linked} keeps whatever status it has — dismissing is not a board move.`
+        : "Clears this without looking at it, and tells the orchestrator not to raise it again. Nothing else changes.",
+      send: (reason) => dismissNeedsYou(this.groupId, item.id, reason),
+    });
+  }
+
+  /** The confirm-with-optional-reason dialog both Dismiss buttons open.
+   *
+   *  ONE dialog for both registries because the gesture is one gesture: only
+   *  the wording and the command differ, and two near-identical dialogs is how
+   *  the cap, the in-flight guard or the close-on-success rule would come to
+   *  hold on one card and not the other.
+   *
+   *  Closes on SUCCESS, never before the write — `resolveItem`'s rule, learned
+   *  by the feedback dialog before it: a rejection that had already closed the
+   *  dialog would take the human's typed reason with it. */
+  private dismissDialog(opts: {
+    title: string;
+    hint: string;
+    send: (reason: string | null) => Promise<void>;
+  }): void {
+    if (this.el.querySelector(".tasks-dialog")) return; // one at a time
+    const overlay = el("div", "tasks-dialog");
+    const box = el("div", "tasks-dialog-box");
+    box.append(el("div", "tasks-dialog-title", opts.title));
+    box.append(el("div", "decisions-hint", opts.hint));
+
+    const ta = document.createElement("textarea");
+    ta.className = "dlg-input tasks-dialog-text";
+    ta.placeholder = "Optional one-line reason — leave empty to just clear it.";
+    ta.spellcheck = false;
+    ta.rows = 2;
+
+    const actions = el("div", "dlg-actions");
+    const hint = el("span", "decisions-block-hint");
+    const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
+    const send = el("button", "dlg-btn primary", "Dismiss") as HTMLButtonElement;
+    actions.append(hint, cancel, send);
+    box.append(ta, actions);
+    overlay.append(box);
+
+    const close = () => overlay.remove();
+    let inFlight = false;
+    // The cap is the backend's (`validate_dismiss_reason` REFUSES over it
+    // rather than truncating), mirrored so the human is stopped before the
+    // click rather than losing a paste to a rejection after it.
+    const sync = () => {
+      const block = dismissBlock(ta.value);
+      send.disabled = block !== null || inFlight;
+      hint.textContent = block
+        ? `Too long — the reason must be ${DISMISS_REASON_MAX} characters or fewer.`
+        : "";
+    };
+    const submit = () => {
+      if (inFlight || dismissBlock(ta.value) !== null) return;
+      inFlight = true;
+      sync();
+      opts
+        .send(dismissReason(ta.value))
+        .then(() => close())
+        .catch((err) => {
+          inFlight = false;
+          sync();
+          this.toast(String(err));
+          ta.focus();
+        })
+        .finally(() => this.refresh());
+    };
+    ta.addEventListener("input", sync);
+    cancel.addEventListener("click", close);
+    send.addEventListener("click", submit);
+    ta.addEventListener("keydown", (e) => {
+      // Keystrokes must not reach the terminal underneath.
       e.stopPropagation();
       if (e.key === "Escape") close();
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submit();

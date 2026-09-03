@@ -309,6 +309,32 @@ export const questionsList = (groupId: string): Promise<OrchQuestion[]> =>
 export const answerQuestion = (groupId: string, id: string, answer: string): Promise<void> =>
   invoke("orch_question_answer", { groupId, id, answer });
 
+/** Settle a pending question because the human says it no longer matters
+ *  (#2137) — a DISMISSAL, which is not an answer.
+ *
+ *  **There is no `source` argument**, `answerQuestion`'s trust boundary for its
+ *  reason, and the backend hard-codes a `DismissSource::Webview` that is a
+ *  *separate* closed enum from the answer one: which surfaces may decide and
+ *  which may merely clear are two decisions, not one.
+ *
+ *  The row settles as `dismissed` and carries no `answer`, ever. The
+ *  orchestrator is told in words that nothing was decided, so it releases the
+ *  hold rather than reading a decision into it, and re-asks only if it still
+ *  needs one.
+ *
+ *  `reason` is optional and must be `null` rather than `""` when the human
+ *  typed nothing — unlike a resolve note, a blank one is not an error here
+ *  (the backend takes `None`), but sending `""` would ask the backend to store
+ *  an empty string as a reason. `dismissReason` in `decisions.ts` is the one
+ *  place that mapping happens. Rejects with the backend's own message when the
+ *  row is already settled or the reason is over its cap, which it REFUSES
+ *  rather than truncating. */
+export const dismissQuestion = (
+  groupId: string,
+  id: string,
+  reason: string | null = null
+): Promise<void> => invoke("orch_question_dismiss", { groupId, id, reason });
+
 // ---------- needs-you items (#1151 slice A engine, slice C panel) ----------
 
 /** The group's `needs-you.json` rows AND the clear-completed watermark, in one
@@ -352,6 +378,23 @@ export const resolveNeedsYou = (
   id: string,
   note: string | null = null
 ): Promise<void> => invoke("orch_needs_you_resolve", { groupId, id, note });
+
+/** The human clears one item because it no longer matters (#2137).
+ *
+ *  `resolveNeedsYou`'s shape and trust boundary, with two differences the
+ *  caller can see. It settles the row as `dismissed:webview` rather than
+ *  `webview`, which is what keeps "I looked" and "this was not worth looking
+ *  at" distinguishable for ever in `resolved_by`. And it ALWAYS delivers a
+ *  pane notice, reason or no reason, where a note-less resolve deliberately
+ *  delivers none — a dismissal is news to the agent that raised the ask, and
+ *  the only signal it will ever get.
+ *
+ *  **Dismissing does not move the task**, exactly as resolving does not. */
+export const dismissNeedsYou = (
+  groupId: string,
+  id: string,
+  reason: string | null = null
+): Promise<void> => invoke("orch_needs_you_dismiss", { groupId, id, reason });
 
 /** "Clear completed": stamp this group's watermark, and resolve to the new
  *  stamp so the panel can apply it without a second read.

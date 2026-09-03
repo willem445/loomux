@@ -3122,6 +3122,14 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
   font-size: 11px; line-height: 1.4; color: var(--ink-dim); user-select: text;
   padding-left: 8px; border-left: 2px solid var(--line-strong);
 }
+/* A dismissal's reason (#2137) — the same block shape as an answer, and
+   deliberately a FAINTER rule than one. An answer is a decision to act on; a
+   reason is a note about why nobody decided, so it must not read with an
+   answer's weight to someone skimming the tail. */
+.decisions-reason {
+  font-size: 11px; line-height: 1.4; color: var(--ink-faint); user-select: text;
+  padding-left: 8px; border-left: 2px dashed var(--line);
+}
 /* A cross-embed citation: a t-N that opens the board, or a PR that opens
    GitHub. Reads as a link, not a button, so it never competes with the card's
    real actions. */
@@ -3162,6 +3170,11 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
    the task where it is, so the gap says "different kind of thing" before the
    tooltip has to. */
 .decisions-resolve { margin-left: 8px; }
+/* Dismiss (#2137) sits with Resolve on the far side of that gap — both clear
+   the row rather than moving the work — but it is the quieter of the two: it
+   is the escape from a card, never the action a card is inviting. */
+.decisions-dismiss { color: var(--ink-dim); }
+.decisions-dismiss:hover { color: var(--ink); }
 /* Why the send button is disabled — a sentence, never a dead button. */
 .decisions-block-hint {
   flex: 1; min-width: 0; font-size: 10.5px; color: var(--ink-faint);
