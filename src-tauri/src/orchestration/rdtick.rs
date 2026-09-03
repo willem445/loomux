@@ -2269,10 +2269,7 @@ impl OrchRegistry {
         // property of the DECISION rather than of the facts it is handed.
         let required = required.map(|mut lanes| {
             for l in lanes.iter_mut() {
-                l.pane_dead = state
-                    .entry(pr)
-                    .and_then(|e| e.lane(&l.block))
-                    .is_some_and(|rec| self.rd_dead_lane_pane(rec).is_some());
+                l.pane_dead = false;
             }
             lanes
         });
