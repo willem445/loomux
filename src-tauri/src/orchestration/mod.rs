@@ -7268,7 +7268,13 @@ fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
 /// function — see `git log` for the prior two-gate shape if a future CLI ever
 /// needs hook-admission without `/compact`-paste (or vice versa), which would
 /// be the reason to split them again. Pure so the gate is testable without a
-/// registry; `cli` comes from `Guardrails::cli_for`.
+/// registry; `cli` comes from `Guardrails::cli_for_block` — the agent's OWN
+/// block, not its class's default block (#2167). Both feeders pass it: the loop
+/// admission gate reads `g.cli_for_block(&a.block, a.role)` directly, and
+/// `request_compact` reaches it through `OrchRegistry::cli_for_agent`. Feeding
+/// this `cli_for(role)` instead is what silently excluded every claude delegate
+/// in a two-block class from compact nudges, since this list does not admit
+/// `opencode`.
 ///
 /// **This is no longer "every supported CLI" (#267).** Gemini is spawnable
 /// since #267 stage 2 and is deliberately NOT in this list: its equivalent
@@ -9828,11 +9834,14 @@ pub struct AgentEntry {
     pub idle_tick_skip_rearm_ms: u64,
     /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
     /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
-    /// resolution (`Guardrails::cli_for`) that every orchestration-group
+    /// resolution (`Guardrails::cli_for_block`) that every orchestration-group
     /// agent's delivery/usage code paths use cannot answer this for a solo
     /// pane, since `__solo__` is one shared group across panes running
-    /// arbitrary, possibly-different CLIs. `None` for every non-solo agent
-    /// (its CLI always comes from its block). See
+    /// arbitrary, possibly-different CLIs. `None` for every non-solo agent —
+    /// and that is the same statement as the sentence below, now that the
+    /// resolver named above is the per-BLOCK one: a non-solo agent's CLI always
+    /// comes from its block (#2167 made those two halves agree; this doc used
+    /// to name `cli_for`, the per-CLASS resolver, and contradict itself). See
     /// `OrchRegistry::cli_for_agent`, the single read site.
     pub solo_cli: Option<String>,
     /// Rolling output tail captured at exit (#281), stripped of ANSI. The live
@@ -27979,8 +27988,11 @@ impl OrchRegistry {
         self.group_dir(group).join(format!("ledger-{agent_id}.log"))
     }
 
-    /// The CLI the group's orchestrator runs (`claude`/`copilot`/…), resolving
-    /// per-role overrides through `cli_for`. Used to format image references the
+    /// The CLI the group's orchestrator runs (`claude`/`copilot`/…) — a CLASS
+    /// question with no agent in hand, so `cli_for` is the right resolver here
+    /// and this is the one call site #2167 deliberately left alone. (A group has
+    /// exactly one orchestrator, so its class default cannot diverge from the
+    /// pane the way a two-block worker class can.) Used to format image references the
     /// way that CLI consumes them (#72). Falls back to the default `claude`
     /// wording if the group isn't loaded (a save always follows a live steer, so
     /// this is just a safety net).
@@ -36213,8 +36225,10 @@ impl OrchRegistry {
     ) -> Vec<String> {
         let paused = self.paused.lock_safe().clone();
         // Snapshot per-group guardrails (Clone) rather than per-agent CLI
-        // lookups while holding the agents lock — `Guardrails::cli_for` needs
-        // the whole roster, and `cli_for_agent` would re-lock `self.groups`.
+        // lookups while holding the agents lock — `Guardrails::cli_for_block`
+        // needs the whole roster, and `cli_for_agent` would re-lock
+        // `self.groups`. (The resolver was `cli_for` until #2167; the lock
+        // reasoning is unchanged, both read `self.blocks`.)
         let groups: HashMap<GroupId, Guardrails> = self
             .groups
             .lock_safe()

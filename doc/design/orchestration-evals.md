@@ -273,11 +273,15 @@ computed two different ways. `--no-backfill` reproduces the old, wrong reading
 for comparison. The backfill is UNPRICED and does not honour `--cut` (heuristic
 **H9**), and `coverage.usage_rows_backfilled_from_transcript` reports how many
 rows were considered, how many were repaired and from which files, and which
-zero rows were skipped — split into the ones with no transcript at all and the
-ones whose transcript folds to nothing, because only the first says the store
-lost a session. All three reconcile against the count considered, or the script
-throws rather than publish a coverage figure counted at the match site instead
-of the verified one.
+zero rows were skipped — split three ways, because only ONE of them says the
+store lost a session: no transcript on disk, a transcript that folds to nothing,
+and a row keyed `agent:<id>` rather than by a CLI session (`UsageSnapshot::key`
+produces that for a pane that never got one, so no transcript could ever match).
+That last case was 86% of the skips on this group's own store. All four outcomes
+reconcile against the count considered, or `reconcileBackfill` throws rather
+than publish a coverage figure counted at the match site instead of the verified
+one — a guard pinned directly, since no pipeline branch can produce a record
+that fails it.
 
 The candidate test is the four counters, never the `source` label: a zero row
 can carry `none`, `statusline`, or even `transcript`, and a row with tokens is
@@ -330,13 +334,13 @@ names all eleven benchmark PRs) would be attributed to all eleven.
   `agent_id`, which are skipped.
 - `usage_rows_backfilled_from_transcript` — the #2167 repair (§4.6):
   `zero_rows_considered`, `rows` repaired with the file and token breakdown of
-  each under `from`, and two skip buckets —
-  `zero_rows_without_a_transcript` and
-  `zero_rows_whose_transcript_summed_to_zero`. A non-zero `rows` says the store
-  was written by a build carrying the collector defect; a non-empty first bucket
-  says which figures are still an under-count and cannot be recovered from disk
-  at all, where the second says the file is there and simply holds no billable
-  turn.
+  each under `from`, and three skip buckets —
+  `zero_rows_without_a_transcript`, `zero_rows_whose_transcript_summed_to_zero`
+  and `zero_rows_with_no_session_id`. A non-zero `rows` says the store was
+  written by a build carrying the collector defect. Of the skips, only the FIRST
+  bucket says a figure is an under-count that cannot be recovered from disk: the
+  second says the file is there and holds no billable turn, and the third says
+  the row was never keyed by a session, so nothing was ever lost.
 - `rows_counted_outside_pr_window` — the reverse direction. A `review-verdict` or
   `rd-*` row is matched **structurally** on `detail.pr`, so it counts wherever it
   occurs: a late verdict or a re-drive after the merge is still a round the PR cost,
@@ -447,7 +451,8 @@ One JSON object. `--format table` renders the per-PR GFM table instead;
                 zero_rows_considered, rows, tokens,
                 from: [ { session, agent_id, role, was_source, path, turns, tokens } ],
                 zero_rows_without_a_transcript[],
-                zero_rows_whose_transcript_summed_to_zero[] },
+                zero_rows_whose_transcript_summed_to_zero[],
+                zero_rows_with_no_session_id[] },
               heuristics[] }
 }
 ```
@@ -488,10 +493,10 @@ there as a **non-regression witness**: neither this script's scan nor
 name never decided anything. Two controls sit beside it — `ses-14`, a NON-zero row
 whose transcript is also on disk and which must be left exactly alone, and
 `ses-19`, a zero row with no transcript, which must be REPORTED as skipped rather
-than silently dropped, and `ses-20`, a zero row whose transcript EXISTS and folds
-to nothing, which must be reported in the OTHER skip bucket — the one that says
-the store did not lose anything. Without `ses-20` that second bucket would be a
-field nothing ever fills. The backfilled run's #900 card is asserted equal to the
+than silently dropped; `ses-20`, a zero row whose transcript EXISTS and folds to
+nothing; and `agent:w-21`, a zero row keyed by agent id rather than by a session.
+Each must land in its own skip bucket — only the first says the store lost
+anything — and each is what stops its bucket being a field nothing ever fills. The backfilled run's #900 card is asserted equal to the
 shared corpus's own, field for field: the backfill's job is to reconstruct exactly
 what a working collector would have written.
 

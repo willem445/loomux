@@ -11760,8 +11760,14 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   unchanged. Resolution is centralized in `Guardrails::cli_for(role)` / `model_for(role)`,
   which every spawn site now calls instead of reading `agent_cli` directly — so the
   claude-vs-copilot decisions (session-id pre-assignment, copilot baseline/session watch,
-  folder pre-trust, MCP-config shape, command adapter) are made **per agent** rather than
-  per group. Model fallbacks follow the role's *effective* CLI (`default_model`: copilot →
+  folder pre-trust, MCP-config shape, command adapter) are made per ROLE rather than
+  per group.
+  **That "per agent" is what #222 and then #2167 corrected, and the correction is
+  the point of both:** a role is a capability CLASS, and `cli_for(role)` answers
+  what that class's DEFAULT block runs. The per-AGENT resolver is
+  `Guardrails::cli_for_block(block_id, role)`, added in #2167 after the
+  class-level one was found answering for panes in a class's second block — see
+  `doc/design/group-cost-tracking.md`, "Which CLI's reader runs". Model fallbacks follow the role's *effective* CLI (`default_model`: copilot →
   `auto`; on Claude the reasoning roles orchestrator/planner → the strong tier, worker/
   reviewer → the mid tier). All new fields persist additively in `group.json` (coexisting
   with #56's live `max_agents` patch, which only touches that one key), and are read back

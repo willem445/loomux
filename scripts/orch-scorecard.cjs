@@ -703,6 +703,49 @@ function usageRowTokens(u) {
     + num(u.cache_creation_tokens) + num(u.cache_read_tokens);
 }
 
+// Is this row a backfill candidate? ONE definition, called by the backfill and
+// by `main`'s `--no-backfill` count — which used to spell it out a second time
+// inline, exactly the two-sites-drift this whole PR exists to close (rev-std).
+function isZeroUsageRow(u) {
+  return !!u && typeof u === 'object'
+    && typeof u.key === 'string' && u.key !== ''
+    && usageRowTokens(u) === 0;
+}
+
+// A `usage.json` row is keyed by CLI session id **or by `agent:<id>` when the
+// pane never got one** (`UsageSnapshot::key`, `mod.rs`). An `agent:`-keyed row
+// can never match a transcript index, so filing it under "no transcript" would
+// report a session as LOST that was never there — on the live store that was
+// 125 of 146 skips (86%). It is the third outcome, not a missing file.
+//
+// The prefix is a safe discriminator, not a heuristic: a CLI session id reaching
+// the key has been through `PathSegment::parse`, which rejects `:`.
+function isAgentKeyedRow(u) {
+  return typeof u.key === 'string' && u.key.startsWith('agent:');
+}
+
+// The backfill's accounting: every candidate leaves by exactly one door.
+//
+// **Honest scope, re-derived on the round that added the third door (#2167
+// review N2).** Against today's branch set this cannot fire — the four outcomes
+// are exhaustive by construction, and a reviewer's mutation disabling the throw
+// left the suite at 32/32, which is the correct result and not a coverage gap.
+// It is a tripwire for a FUTURE branch that forgets to record its skip, so it
+// is pinned DIRECTLY (`reconcileBackfill` is exported and tested with a record
+// no branch here can produce) rather than through the pipeline, where it would
+// be a guard the suite cannot redden.
+function reconcileBackfill(cov) {
+  const skipped = cov.zero_rows_without_a_transcript.length
+    + cov.zero_rows_whose_transcript_summed_to_zero.length
+    + cov.zero_rows_with_no_session_id.length;
+  if (cov.rows + skipped !== cov.zero_rows_considered) {
+    throw new Error('backfill accounting: '
+      + `${cov.rows} backfilled + ${skipped} skipped `
+      + `!= ${cov.zero_rows_considered} zero rows considered`);
+  }
+  return cov;
+}
+
 function defaultClaudeProjectsRoot() {
   return path.join(os.homedir(), '.claude', 'projects');
 }
@@ -733,8 +776,7 @@ function claudeTranscriptIndex(root) {
 // store with nothing to backfill never walks the projects tree.
 async function backfillZeroUsageRows(usage, root) {
   const rows = Array.isArray(usage) ? usage : [];
-  const zero = rows.filter((u) => u && typeof u === 'object'
-    && typeof u.key === 'string' && u.key && usageRowTokens(u) === 0);
+  const zero = rows.filter(isZeroUsageRow);
   const cov = {
     claude_projects_root: root,
     scanned: false,
@@ -745,6 +787,10 @@ async function backfillZeroUsageRows(usage, root) {
     tokens: 0,
     from: [],
     zero_rows_without_a_transcript: [],
+    // Not keyed by a CLI session at all, so no transcript could ever match.
+    // Kept apart from the line below because that one says the store lost a
+    // file; this one says there was never a file to lose.
+    zero_rows_with_no_session_id: [],
     // A transcript that EXISTS and folds to nothing is its own outcome, not a
     // missing file: reporting it under the line above would tell a reader the
     // store lost a session it did not lose. Both are skips; only one is
@@ -758,14 +804,20 @@ async function backfillZeroUsageRows(usage, root) {
   if (idx === null) {
     // The root could not be read. That is not "no transcripts": say which rows
     // were left alone, so a zero column is never silently blamed on the store.
-    cov.zero_rows_without_a_transcript = zero.map((u) => u.key).sort();
-    return { usage: rows, backfill: cov };
+    for (const u of zero) {
+      (isAgentKeyedRow(u) ? cov.zero_rows_with_no_session_id : cov.zero_rows_without_a_transcript)
+        .push(u.key);
+    }
+    cov.zero_rows_without_a_transcript.sort();
+    cov.zero_rows_with_no_session_id.sort();
+    return { usage: rows, backfill: reconcileBackfill(cov) };
   }
   cov.projects_scanned = idx.projects_scanned;
   cov.transcripts_indexed = idx.bySession.size;
 
   const patched = new Map();
   for (const u of zero) {
+    if (isAgentKeyedRow(u)) { cov.zero_rows_with_no_session_id.push(u.key); continue; }
     const file = idx.bySession.get(u.key);
     if (!file) { cov.zero_rows_without_a_transcript.push(u.key); continue; }
     const read = await readTranscript(file, null);
@@ -793,18 +845,10 @@ async function backfillZeroUsageRows(usage, root) {
   cov.rows = cov.from.length;
   cov.zero_rows_without_a_transcript.sort();
   cov.zero_rows_whose_transcript_summed_to_zero.sort();
-  const skipped = cov.zero_rows_without_a_transcript.length
-    + cov.zero_rows_whose_transcript_summed_to_zero.length;
+  cov.zero_rows_with_no_session_id.sort();
   // Population control (CLAUDE.md: count at the VERIFIED site, not the matched
-  // one). Every zero row this pass considered is accounted for by exactly one of
-  // the two outcomes; a mismatch means a row was matched and then dropped by a
-  // branch nobody reported, which is the shape that certifies coverage it never
-  // delivered.
-  if (cov.rows + skipped !== cov.zero_rows_considered) {
-    throw new Error('backfill accounting: '
-      + `${cov.rows} backfilled + ${skipped} skipped `
-      + `!= ${cov.zero_rows_considered} zero rows considered`);
-  }
+  // one) — see `reconcileBackfill` for what it can and cannot catch today.
+  reconcileBackfill(cov);
   cov.from.sort((a, b) => (a.session < b.session ? -1 : a.session > b.session ? 1 : 0));
   return { usage: rows.map((u) => (u && patched.get(u.key)) || u), backfill: cov };
 }
@@ -874,8 +918,8 @@ const HEURISTICS = [
   { id: 'H5', what: "Orchestrator tokens in a window cover every PR in flight; the apportioned figure splits them by this PR's share of the orchestrator wakes in the same window.", fix: 'Per-turn PR attribution — nothing structural exists; see "What this cannot say" in the note.' },
   { id: 'H6', what: 'Delegate tokens come from `usage.json`, which is CUMULATIVE per session and cannot be windowed; a delegate that worked on one PR reports its whole life against that PR.', fix: 'A windowed usage series, or accepting the approximation (delegates are spawned per task).' },
   { id: 'H7', what: 'A PR window ends at `merged_at` supplied via `--pr-meta`; without it the end falls back to the last `rd-*` row, then to the last naming row — which is days late, because a merged PR stays cited.', fix: 'A loomux row for a human merge (plan part 2, A4 / #388).' },
-  { id: 'H9', what: "A zero-token `usage.json` row whose Claude transcript is on disk is backfilled by summing that transcript, which is UNCUT and UNPRICED: `--cut` cannot rewind a `usage.json` row either (a row is cumulative-to-now with no history), so cutting a backfilled row and not its neighbours would make the two kinds disagree about what instant the table describes; and no dollar figure is derived, so a backfilled row keeps the `cost_usd` it had — its tokens are right and its cost is still whatever the collector recorded.", fix: "The collector recording the row correctly in the first place (#2167's own fix, shipped alongside this) — after which nothing is backfilled and `rows` reads 0." },
   { id: 'H8', what: "A `usage.json` row is keyed by CLI SESSION, and a session carried to a new agent id names only its LAST occupant. The row is therefore split evenly across every agent that occupied that session — a guess about how a shared session's spend divided, self-correcting where the whole lineage is attributed to one PR and a fraction where it is not.", fix: 'An `agent_id` (or `block` + `pr`) on every `UsageSnapshot`, not just the latest — the same missing field as H4.' },
+  { id: 'H9', what: "A zero-token `usage.json` row whose Claude transcript is on disk is backfilled by summing that transcript, which is UNCUT and UNPRICED: `--cut` cannot rewind a `usage.json` row either (a row is cumulative-to-now with no history), so cutting a backfilled row and not its neighbours would make the two kinds disagree about what instant the table describes; and no dollar figure is derived, so a backfilled row keeps the `cost_usd` it had — its tokens are right and its cost is still whatever the collector recorded.", fix: "The collector recording the row correctly in the first place (#2167's own fix, shipped alongside this) — after which nothing is backfilled and `rows` reads 0." },
 ];
 
 // ---------------------------------------------------------------------------
@@ -952,7 +996,7 @@ async function main(argv) {
   const projectsRoot = opts.claudeProjects || defaultClaudeProjectsRoot();
   const { usage, backfill } = opts.backfill
     ? await backfillZeroUsageRows(rawUsage, projectsRoot)
-    : { usage: rawUsage, backfill: { claude_projects_root: projectsRoot, scanned: false, projects_scanned: 0, transcripts_indexed: 0, zero_rows_considered: (Array.isArray(rawUsage) ? rawUsage : []).filter((u) => u && typeof u.key === 'string' && u.key && usageRowTokens(u) === 0).length, rows: 0, tokens: 0, from: [], zero_rows_without_a_transcript: [], zero_rows_whose_transcript_summed_to_zero: [], disabled: true } };
+    : { usage: rawUsage, backfill: { claude_projects_root: projectsRoot, scanned: false, projects_scanned: 0, transcripts_indexed: 0, zero_rows_considered: (Array.isArray(rawUsage) ? rawUsage : []).filter(isZeroUsageRow).length, rows: 0, tokens: 0, from: [], zero_rows_without_a_transcript: [], zero_rows_whose_transcript_summed_to_zero: [], zero_rows_with_no_session_id: [], disabled: true } };
 
   const agentsById = indexAgents(agents);
   const orchIds = new Set([...agentsById.values()].filter((a) => a.role === 'orchestrator').map((a) => a.id));
@@ -1038,7 +1082,8 @@ module.exports = {
   WAKE_KINDS, classifyWake, prTokenRe, rowNamesPr, computeWindows, inWindow,
   dedupeTranscriptTurns, attributeAgents, scorePr, groupTotals, indexAgents,
   indexUsage, indexSessionAgents, renderPrTable, renderGroupTable, parseArgs, HEURISTICS,
-  usageRowTokens, claudeTranscriptIndex, backfillZeroUsageRows, defaultClaudeProjectsRoot,
+  usageRowTokens, isZeroUsageRow, isAgentKeyedRow, reconcileBackfill,
+  claudeTranscriptIndex, backfillZeroUsageRows, defaultClaudeProjectsRoot,
   DEFAULT_TAIL_MIN, main,
 };
 

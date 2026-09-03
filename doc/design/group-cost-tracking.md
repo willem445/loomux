@@ -127,10 +127,19 @@ is cumulative.
   the `source` label** (#2167). It used to mean `source == "none"`, which let
   the one fallback that reports a genuine zero — a statusline parse on a
   subscription account, where the CLI prints `$0.00` whatever was really spent —
-  overwrite a `transcript` row carrying millions of real tokens. A residual
-  stays open and is not closed by this: a statusline read with a NON-zero dollar
-  figure still replaces a token-bearing row, trading its tokens for a cost
-  estimate. What changed is only that a row saying nothing at all stops winning.
+  overwrite a `transcript` row carrying millions of real tokens.
+  A residual stays open and is not closed by this: a statusline read with a
+  NON-zero dollar figure still replaces a token-bearing row, trading exact tokens for a
+  price-table estimate. What changed is only that a row saying nothing at all
+  stops winning. **The trigger is an account that pays per token** — a
+  subscription prints `$0.00`, which the fix now handles, while an API-key
+  account prints a real figure, which still wins — on any tick where the
+  transcript read misses. And it matters MORE after this fix, not less: the
+  transcript row it can destroy now carries the tokens the collector was
+  previously failing to capture at all. Pinned as a counterfactual by
+  `the_disclosed_residual_holds_a_priced_statusline_row_still_replaces_tokens`,
+  so the disclosure cannot go stale in either direction with nothing red to say
+  so.
 - **Crash-safe persistence.** Writes go to `usage.json.tmp` and are atomically
   renamed over `usage.json`, so a crash mid-write never leaves a half-written
   file. On load, a parse failure (corruption, manual edit) preserves the file
@@ -403,12 +412,21 @@ ways.
 
 `coverage.usage_rows_backfilled_from_transcript` reports how many rows were
 considered, how many were backfilled and from which files, and which zero rows
-were left alone — in TWO buckets, because a missing transcript and a transcript
-that folds to nothing are different facts and only one of them is recoverable by
-putting the file back. All three outcomes reconcile against the count of rows
-considered, and the script throws rather than publish a figure that does not (a
-coverage figure counted at the MATCH site rather than the VERIFIED one certifies
-coverage it never delivered). `--claude-projects` names the root
+were left alone — in THREE buckets, because the reasons are different facts and
+only one of them means anything was lost: no transcript on disk (the store lost
+it), a transcript that folds to nothing (nothing was lost), and a row not keyed
+by a CLI session at all — `UsageSnapshot::key` is `agent:<id>` for a pane that
+never got one, so no transcript could ever match and there was never a file to
+lose. That third case was 86% of the skips on this group's own store, every one
+of them a phantom loss until it got its own bucket. All four outcomes reconcile
+against the count of rows considered, and `reconcileBackfill` throws rather than
+publish a figure that does not (a coverage figure counted at the MATCH site
+rather than the VERIFIED one certifies coverage it never delivered).
+
+That guard is **structurally unfireable through the pipeline today** — the four
+outcomes are exhaustive by construction — so it is pinned directly, against a
+record no branch here can produce, rather than left as a guard the suite cannot
+redden. It is a tripwire for a future branch that forgets to record its skip. `--claude-projects` names the root
 (default `~/.claude/projects`), `--no-backfill` turns it off — and the projects
 tree is walked only when at least one zero row exists, so a run over a healthy
 store never touches it.
@@ -457,9 +475,11 @@ disagree about which instant they describe.
   reproducing the shared corpus's own figures field for field; a non-zero row
   whose transcript is also on disk is never rewritten; a zero row with no
   transcript is named rather than dropped, in a DIFFERENT bucket from a zero row
-  whose transcript exists and folds to nothing; an unreadable root names every
-  zero row, because "I could not look" is not "there was nothing there"; and
-  `--no-backfill` still reports the count.
+  whose transcript exists and folds to nothing, and from one keyed `agent:<id>`
+  rather than by a session; an unreadable root names every zero row, because "I
+  could not look" is not "there was nothing there"; `reconcileBackfill` refuses a
+  record that does not add up, pinned directly because no pipeline branch can
+  produce one; and `--no-backfill` still reports the count.
 - `tests/usage_memory.rs` (#1218) still pins peak live heap against a ~16 MiB
   transcript. The polled path is now the cursor, but both go through the one
   streaming reader (`fold_appended`), so the property is shared by

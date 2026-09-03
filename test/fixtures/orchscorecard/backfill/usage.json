@@ -133,5 +133,20 @@
     "estimated": false,
     "model": null,
     "updated_ms": 1700001000000
+  },
+  {
+    "key": "agent:w-21",
+    "agent_id": "w-21",
+    "name": "w: pane that never got a CLI session id",
+    "role": "worker",
+    "source": "none",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "cost_usd": null,
+    "estimated": false,
+    "model": null,
+    "updated_ms": 1700001000000
   }
 ]
