@@ -961,23 +961,36 @@ These deserve their own detail — see:
     is** — resolving is not a board move, and Proceed/Feedback stay the
     board actions they always were. You can attach a note, which goes to the
     orchestrator's pane; resolving without one just tidies your queue
-    quietly. A pending **question** has no Resolve: answer it, or the
-    orchestrator withdraws it — a dismissed-unanswered question is a
-    decision silently dropped.
+    quietly.
 
-    Settled rows — answered or withdrawn questions, resolved items — fall
-    into a faded tail (the ten most recent) instead of vanishing.
+    **Dismiss** is on every open card, question and item alike: *this no
+    longer matters.* You can add a one-line reason (up to 500 characters, or
+    leave it empty). It clears the row without answering it and **without
+    moving any task** — and unlike a note-less Resolve, it always tells the
+    orchestrator, in a notice that says in words that nothing was decided,
+    so it releases whatever the row was holding instead of reading a
+    decision into your click. Un-blocking the board row a dismissed question
+    cited is then the orchestrator's call, not something that happens
+    behind it; it re-asks only if it still needs the decision. Dismissing an
+    item also tells the raiser not to raise that ask again. Nothing is
+    deleted: a dismissed row settles as `dismissed` (a question) or
+    `dismissed:webview` (an item), which is a different fact from *answered*,
+    from *withdrawn* and from *I looked*, and stays readable as one for ever.
+
+    Settled rows — answered, withdrawn or dismissed questions, resolved
+    items — fall into a faded tail (the ten most recent) instead of vanishing.
     **Clear completed** in the header hides that tail. It **deletes
     nothing**: the rows stay on disk for the audit trail, the choice
     survives a restart, and nothing still open can be touched by it, which
     is why it doesn't ask you to confirm.
 
-    The panel is the only place a question gets **answered**, and the only
-    place an item gets **resolved** — no agent can do either, by any path.
-    Withdrawing stays the separate, agent-side path it always was, and there
-    is now one of those for each tier: `withdraw_question` settles an
-    overtaken question, `withdraw_attention` an overtaken item, each of them
-    visibly *withdrawn* rather than answered or seen.
+    The panel is the only place a question gets **answered**, the only place
+    an item gets **resolved**, and the only place either gets **dismissed** —
+    no agent can do any of the three, by any path. Withdrawing stays the
+    separate, agent-side path it always was, and there is one of those for
+    each tier: `withdraw_question` settles an overtaken question,
+    `withdraw_attention` an overtaken item, each of them visibly *withdrawn*
+    rather than answered, seen or dismissed.
 
     **The orchestrator's own side of the item tier is three tools.**
     `request_attention` raises one, `withdraw_attention` takes one back, and

@@ -15,8 +15,14 @@ import {
   anchorOf,
   ANSWER_MAX,
   answerFor,
+  canDismissItem,
+  canDismissQuestion,
   canSubmit,
   citedTask,
+  dismissBlock,
+  dismissReason,
+  DISMISSED_ITEM_TAG,
+  DISMISS_REASON_MAX,
   composeAnswer,
   EMPTY_DRAFT,
   EMPTY_VIEW,
@@ -24,6 +30,7 @@ import {
   feedbackSubmitStep,
   freeTextAllowed,
   isCleared,
+  isDismissedRow,
   isOpenItem,
   isPending,
   isUrgent,
@@ -637,6 +644,164 @@ test("the note cap is the backend's, counted in characters and not UTF-16 units"
   assert.equal(resolveBlock(astral), null);
   // The cap applies to what TRAVELS, which is the trimmed string.
   assert.equal(resolveBlock(` ${"x".repeat(RESOLUTION_MAX)} `), null);
+});
+
+// ---------- dismissal (#2137) ----------
+
+test("a dismissed question is settled — it leaves the open list and the count", () => {
+  // The board's ❓ badge is drawn from `blockedTaskMap(questions.filter(isPending))`,
+  // so this is also what makes the badge clear: `isPending` tests FOR "pending"
+  // rather than against a list of settled values, and a fourth terminal state
+  // is therefore settled the moment it exists.
+  const pend = q({ id: "q-1" });
+  const gone = q({ id: "q-2", status: "dismissed", reason: "moot", settled_ms: 3000 });
+  const { open, settled } = projectPanel(view([]), [pend, gone]);
+  assert.deepEqual(
+    open.map((r) => r.anchor),
+    ["q-1"],
+    "a dismissed question is not waiting on anyone"
+  );
+  assert.deepEqual(settled.map((r) => r.anchor), ["q-2"], "…it is history, in the faded tail");
+  assert.equal(needsYouCount(view([]), [pend, gone]), 1, "and it does not count");
+});
+
+test("an UNKNOWN status reads as settled, never as answerable", () => {
+  // A file written by a newer build. `isPending` is a test FOR "pending", so a
+  // state this build has never heard of lands inert in the tail instead of
+  // offering a Send the backend would then refuse. Cast because the point is a
+  // value outside the union — the type cannot express it, and the runtime can.
+  const alien = q({ id: "q-9", status: "deferred" as unknown as OrchQuestion["status"] });
+  assert.equal(isPending(alien), false);
+  assert.equal(canDismissQuestion(alien), false, "and it is not dismissable either");
+  assert.equal(projectPanel(view([]), [alien]).open.length, 0);
+});
+
+test("Dismiss is offered on exactly what is still open, on both registries", () => {
+  assert.equal(canDismissQuestion(q({ status: "pending" })), true);
+  for (const status of ["answered", "withdrawn", "dismissed"] as const) {
+    assert.equal(canDismissQuestion(q({ status })), false, `a ${status} question is settled`);
+  }
+  assert.equal(canDismissItem(item({ status: "open" })), true);
+  assert.equal(canDismissItem(item({ status: "resolved" })), false);
+});
+
+test("an empty reason box dismisses with NULL, never with an empty string", () => {
+  // The mirror image of `resolveNote`'s rule and the reason it is not the same
+  // rule: `validate_dismiss_reason` ACCEPTS an absent reason — a dismissal is
+  // complete without one — so "" is not an error the human would see, it is an
+  // empty string stored as an explanation.
+  assert.equal(dismissReason(""), null);
+  assert.equal(dismissReason("   \n "), null);
+  assert.equal(dismissReason("  moot now  "), "moot now", "a real reason is trimmed, not padded");
+});
+
+test("the reason cap is the backend's, counted in characters and not UTF-16 units", () => {
+  // `validate_dismiss_reason` counts `chars()` and REJECTS over the cap rather
+  // than truncating, so the panel must block before the click — and must not
+  // refuse an all-astral reason the backend would have taken.
+  assert.equal(DISMISS_REASON_MAX, 500);
+  assert.equal(dismissBlock(""), null, "an empty box is not a block — the reason is optional");
+  assert.equal(dismissBlock("moot"), null);
+  assert.equal(dismissBlock("x".repeat(DISMISS_REASON_MAX)), null, "exactly at the cap is fine");
+  assert.equal(dismissBlock("x".repeat(DISMISS_REASON_MAX + 1)), "too-long");
+  const astral = "🙂".repeat(300);
+  assert.equal(astral.length, 600, "precondition: over the cap by UTF-16 units");
+  assert.equal(dismissBlock(astral), null);
+  // The cap applies to what TRAVELS, which is the trimmed string.
+  assert.equal(dismissBlock(` ${"x".repeat(DISMISS_REASON_MAX)} `), null);
+});
+
+test("the reason cap is NARROWER than the close-out note's, because they are different asks", () => {
+  // Not a tidy coincidence to pin: a dismissal says why something stopped
+  // mattering in a line, while a resolve note is a close-out the human writes
+  // after looking. Collapsing the two caps would be the first step to
+  // collapsing the two gestures.
+  assert.ok(
+    DISMISS_REASON_MAX < RESOLUTION_MAX,
+    `a reason cap of ${DISMISS_REASON_MAX} must stay under the note cap of ${RESOLUTION_MAX}`
+  );
+});
+
+test("a dismissed row is readable as dismissed from EITHER registry's own field", () => {
+  // The two registries record the fact in different places on purpose — a
+  // question in `status`, an item in `resolved_by` (see `needsyou::Status`) —
+  // and this is the one function that knows which to read.
+  const dq = q({ id: "q-1", status: "dismissed", settled_ms: 5000 });
+  const di = item({ id: "n-1", status: "resolved", resolved_by: "dismissed:webview", resolved_ms: 5000 });
+  const { settled } = projectPanel(view([di]), [dq]);
+  assert.equal(settled.length, 2);
+  assert.ok(settled.every(isDismissedRow), "both rows read as dismissed");
+});
+
+test("the OTHER three ways an item settles are not dismissals", () => {
+  // The vacuity control for the test above: `isDismissedRow` returning true for
+  // two rows proves nothing unless it can return false, and `resolved_by` has
+  // four spellings of which exactly one is this. A question settled the other
+  // two ways is checked here too, for the same reason.
+  const rows = [
+    item({ id: "n-2", status: "resolved", resolved_by: "webview", resolved_ms: 1 }),
+    item({ id: "n-3", status: "resolved", resolved_by: "board:done", resolved_ms: 2 }),
+    item({ id: "n-4", status: "resolved", resolved_by: "withdrawn:orch-1", resolved_ms: 3 }),
+  ];
+  const qs = [
+    q({ id: "q-8", status: "answered", answer: "B", settled_ms: 4 }),
+    q({ id: "q-9", status: "withdrawn", settled_ms: 5 }),
+  ];
+  const { settled } = projectPanel(view(rows), qs);
+  assert.equal(settled.length, 5, "precondition: every row reached the tail");
+  assert.equal(
+    settled.filter(isDismissedRow).length,
+    0,
+    "none of the other settles is a dismissal"
+  );
+});
+
+test("the item tag this panel reads is the one the backend writes", () => {
+  // A literal mirrored across the language boundary, so it is named ONCE here
+  // and asserted against the shape the backend's `ResolveSource::tag()`
+  // produces. `the_resolve_and_dismiss_tags_are_not_the_same_string`
+  // (src-tauri/tests/orchestration.rs) is the other end of this pin.
+  assert.equal(DISMISSED_ITEM_TAG, "dismissed:webview");
+  const almost = item({ id: "n-5", status: "resolved", resolved_by: "dismissed", resolved_ms: 1 });
+  const { settled } = projectPanel(view([almost]), []);
+  assert.equal(
+    settled.filter(isDismissedRow).length,
+    0,
+    "a near-miss tag is not a dismissal — the panel matches the whole tag, not a prefix"
+  );
+});
+
+test("a dismissal reason never travels in the answer field", () => {
+  // The backend keeps `answer` and `reason` in separate fields precisely so a
+  // reader cannot mistake one for the other, and the wire type does not
+  // collapse them back together. The panel's tail renders them under different
+  // classes on the strength of exactly this.
+  const dq = q({ id: "q-1", status: "dismissed", reason: "moot", settled_ms: 1 });
+  assert.equal(dq.answer, undefined, "a dismissed row carries no answer");
+  const { settled } = projectPanel(view([]), [dq]);
+  const row = settled[0];
+  assert.equal(row.source, "question");
+  if (row.source === "question") {
+    assert.equal(row.question.reason, "moot");
+    assert.equal(row.question.answer, undefined);
+  }
+});
+
+test("a draft for a question that gets DISMISSED is dropped like any other settle", () => {
+  // Drafts are frontend-only and outlive their rows: the human can dismiss in
+  // another window while a half-typed answer sits here. `retainDrafts` keys on
+  // `isPending`, so a fourth terminal state is handled the day it exists —
+  // pinned because "handled by construction" is exactly the claim that goes
+  // stale silently.
+  const drafts = new Map<string, AnswerDraft>([
+    ["q-1", { chosen: [0], freeText: "half a thought" }],
+    ["q-2", { chosen: [], freeText: "the other one" }],
+  ]);
+  const live = retainDrafts(drafts, [
+    q({ id: "q-1", status: "pending" }),
+    q({ id: "q-2", status: "dismissed" }),
+  ]);
+  assert.deepEqual([...live.keys()], ["q-1"], "the dismissed row's draft cannot come back");
 });
 
 test("the linked task an item names is normalized the way a question's cited one is", () => {
