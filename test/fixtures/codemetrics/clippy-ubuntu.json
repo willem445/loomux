@@ -1,0 +1,13 @@
+{"reason":"compiler-artifact","target":{"name":"orrerix"}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::too_many_lines"},"message":"this function has too many lines (140/1)","spans":[{"file_name":"rust/lib.rs","line_start":4,"line_end":6,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::cognitive_complexity"},"message":"the function has a cognitive complexity of (31/1)","spans":[{"file_name":"rust/lib.rs","line_start":4,"line_end":6,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::too_many_arguments"},"message":"this function has too many arguments (9/1)","spans":[{"file_name":"rust/lib.rs","line_start":4,"line_end":6,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::too_many_lines"},"message":"this function has too many lines (4/1)","spans":[{"file_name":"rust/lib.rs","line_start":10,"line_end":14,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::unwrap_used"},"message":"used `unwrap()` on a `Result` value","spans":[{"file_name":"rust/lib.rs","line_start":5,"line_end":5,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::unwrap_used"},"message":"used `unwrap()` on an `Option` value","spans":[{"file_name":"rust/lib.rs","line_start":5,"line_end":5,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::unwrap_used"},"message":"used `unwrap()` on a `Result` value","spans":[{"file_name":"rust/other.rs","line_start":9,"line_end":9,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::expect_used"},"message":"used `expect()` on a `Result` value","spans":[{"file_name":"rust/other.rs","line_start":11,"line_end":11,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::panic"},"message":"`panic` should not be present in production code","spans":[{"file_name":"rust/other.rs","line_start":13,"line_end":13,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"code":{"code":"clippy::too_many_lines"},"message":"this function is rather long indeed","spans":[{"file_name":"rust/other.rs","line_start":20,"line_end":60,"is_primary":true}]}}
+not json at all
+{"reason":"build-finished","success":true}

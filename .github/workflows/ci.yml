@@ -4,6 +4,24 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The dry-run instrument for #2128 slice C (#2138 slice A). Running the
+  # code-metrics report over a list of arbitrary commits is how a proposed gate's
+  # false-block count gets measured over already-merged PRs BEFORE the gate is
+  # armed — CLAUDE.md's "a guard that REFUSES ships only after it has run clean
+  # over known-good subjects", mechanised. Nothing else on this workflow runs for
+  # a dispatch: `plan` is gated off below, so `build` and `e2e-windows` are
+  # skipped with it.
+  workflow_dispatch:
+    inputs:
+      shas:
+        description: "Commits to report on (space- or comma-separated). Leave empty to do nothing."
+        required: false
+        default: ""
+      clippy:
+        description: "Also run clippy on each commit (slow; Rust rows are n/a without it)."
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   # [scratch]-titled PRs (red-before-green counterfactuals,
@@ -11,6 +29,10 @@ jobs:
   # reads green at every gate) run one platform
   # and no E2E (#1685).
   plan:
+    # A `workflow_dispatch` is the code-metrics dry-run (see `on:` above), not a
+    # build. Gating the gate job here rather than on `build` and `e2e-windows`
+    # separately keeps it one line: both `needs: plan`, so both skip with it.
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-22.04
     outputs:
       scratch: ${{ steps.decide.outputs.scratch }}
@@ -61,6 +83,11 @@ jobs:
         run: node scripts/check-versions.js
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # This action installs with `--profile minimal`, which does NOT include
+          # clippy. The code-metrics step below is the only thing in this job that
+          # needs it (#2138).
+          components: clippy
 
       # `.` since #888 slice A1: the Cargo workspace root is the repo root, so
       # that is where Cargo.lock and target/ live. Pointing this at src-tauri
@@ -102,6 +129,62 @@ jobs:
       # all and a broken engine manifest could merge green.
       - name: Check backend
         run: cargo check --locked --workspace
+
+      # ----- code metrics, per-leg clippy pass (#2138 slice A) -----------------
+      #
+      # REPORT-ONLY, AND STRUCTURALLY UNABLE TO FAIL THE BUILD. Both steps are
+      # `continue-on-error`, neither is depended on by anything in this job, and the
+      # parser downstream turns an unreadable message into a MISSING row rather than
+      # a number. If clippy will not run at all, the Rust half of the report is
+      # marked unavailable and the job carries on.
+      #
+      # ON EVERY LEG, on purpose. A `cfg(windows)` body is invisible to a clippy run
+      # on ubuntu, so a single-leg measurement would silently under-report exactly
+      # the platform-specific code this project has most of. The report job merges
+      # the legs and keeps the larger value per function. If this ever costs more
+      # than it is worth on a leg, the honest fix is to drop that leg AND record in
+      # `doc/design/code-metrics.md` that its `cfg` bodies are unmetered — not to
+      # leave the merged number looking complete.
+      #
+      # `CLIPPY_CONF_DIR` is scoped to this step, so `.github/clippy/clippy.toml`'s
+      # thresholds-of-1 never reach `cargo check`, `cargo test`, or anyone's local
+      # clippy. `--force-warn` rather than `-W`: these lints are allow-by-default,
+      # and 20 `allow(clippy::…)` attributes in the tree would otherwise leave their
+      # functions unmeasured (#2128 part 3).
+      #
+      # No `pipefail`: clippy's exit status is deliberately discarded. This step
+      # reports on warnings, it does not enforce them.
+      - name: Code metrics — clippy pass (report-only, #2138)
+        continue-on-error: true
+        shell: bash
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/clippy
+        run: |
+          set +e
+          start=$(date +%s)
+          cargo clippy --locked --workspace --message-format=json --quiet -- \
+            --force-warn clippy::too_many_lines \
+            --force-warn clippy::cognitive_complexity \
+            --force-warn clippy::too_many_arguments \
+            --force-warn clippy::unwrap_used \
+            --force-warn clippy::expect_used \
+            --force-warn clippy::panic \
+            | node scripts/code-metrics.cjs clippy \
+                --platform "${{ matrix.platform }}" \
+                --repo-root . \
+                --out "clippy-metrics-${{ matrix.platform }}.json"
+          echo "code-metrics: clippy leg ${{ matrix.platform }} took $(( $(date +%s) - start ))s"
+
+      - name: Code metrics — upload this leg's clippy numbers
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-metrics-clippy-${{ matrix.platform }}
+          path: clippy-metrics-${{ matrix.platform }}.json
+          if-no-files-found: ignore
+          retention-days: 30
+      # ----- end code metrics (#2138 slice A) ---------------------------------
 
       # #464: a whole-suite backstop the backend tests themselves can't
       # provide. A test can pin its OWN fixture's cleanup, but nothing
@@ -271,3 +354,188 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+
+  # ===== Code metrics report (#2138 slice A) ================================
+  #
+  # WHAT THIS IS. A REPORT on the shape of this repo's own code — function
+  # lengths, nesting, argument counts, TypeScript import cycles, exports nobody
+  # imports, comment share per root, and `orchestration/mod.rs`'s line count. It
+  # produces `code-metrics.json` (an artifact) and a job summary. It is the
+  # instrument #2128 part 8 asks for: the distributions have to EXIST before any
+  # threshold can honestly be chosen.
+  #
+  # IT CANNOT TURN CI RED ON A METRIC. Every step is `continue-on-error`, no
+  # threshold is compared against anything, and nothing in the merge gate depends
+  # on this job. That is the acceptance criterion of the slice, not a nicety.
+  #
+  # WHY A SEPARATE JOB. The clippy numbers are measured per build leg (a
+  # `cfg(windows)` body is invisible on ubuntu) and the legs are separate matrix
+  # jobs, so the merge has to happen somewhere that can see all of them. This job
+  # downloads each leg's artifact and merges them.
+  code-metrics:
+    name: Code metrics (report-only)
+    needs: build
+    # Runs even when a build leg went red: the report is diagnostic, and a leg that
+    # failed after its clippy step still uploaded usable numbers. Skipped only when
+    # `build` itself was skipped (a `workflow_dispatch`, handled by its own job
+    # below) or the run was cancelled.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      # The PR's own head, not the merge commit checkout@v4 defaults to on a
+      # pull_request: every number this job prints is dated to a SHA, and that SHA
+      # has to be one a reader can check out.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `typescript` is a devDependency and the compiler API is the whole TS half
+      # of the script. No new dependency is installed here or anywhere in #2138.
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Download each build leg's clippy numbers
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: code-metrics-clippy-*
+          path: clippy-legs
+
+      - name: Build the report
+        id: report
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          legs=()
+          while IFS= read -r f; do
+            legs+=(--clippy "$f")
+          done < <(find clippy-legs -name '*.json' 2>/dev/null | sort)
+          echo "code-metrics: ${#legs[@]} clippy leg argument(s)"
+          node scripts/code-metrics.cjs report \
+            --repo-root . \
+            --commit "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --ref "${{ github.ref_name }}" \
+            "${legs[@]}" \
+            --out code-metrics.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-metrics
+          path: code-metrics.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ===== Code metrics over arbitrary commits (#2138 slice A) ================
+  #
+  # The dry-run instrument for #2128 slice C. Given a list of commits, this reports
+  # on each one in turn and uploads a JSON per commit, so a proposed gate's
+  # false-block count over already-merged PRs can be MEASURED before the gate is
+  # armed. Manual only, and it does nothing at all unless `shas` is non-empty.
+  #
+  # Clippy is opt-in here because it is a full workspace build per commit; without
+  # it the Rust rows are `n/a`, which the report says out loud rather than filling
+  # in with a zero.
+  code-metrics-dispatch:
+    name: Code metrics over arbitrary commits
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.shas != '' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux dependencies
+        if: ${{ inputs.clippy }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ inputs.clippy }}
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        if: ${{ inputs.clippy }}
+        with:
+          workspaces: .
+
+      - name: Report on each commit
+        continue-on-error: true
+        shell: bash
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/clippy
+          # Through the environment, never interpolated into the script body: a
+          # dispatch input is caller-supplied text, and `${{ }}` splices it in
+          # before bash ever sees a quote.
+          SHAS: ${{ inputs.shas }}
+          WANT_CLIPPY: ${{ inputs.clippy }}
+        run: |
+          set -u
+          mkdir -p dispatch-out
+          # The scripts and the fixtures come from the commit that STARTED the run,
+          # never from the commit being measured: an instrument that changes shape
+          # per subject measures nothing comparable.
+          mkdir -p .instrument && cp scripts/code-metrics.cjs .instrument/
+          for sha in $(echo "$SHAS" | tr ',' ' '); do
+            echo "::group::$sha"
+            git checkout --force --detach "$sha" || { echo "::warning::unknown commit $sha"; echo "::endgroup::"; continue; }
+            npm ci --no-audit --no-fund
+            legs=()
+            if [ "$WANT_CLIPPY" = "true" ]; then
+              set +e
+              cargo clippy --locked --workspace --message-format=json --quiet -- \
+                --force-warn clippy::too_many_lines \
+                --force-warn clippy::cognitive_complexity \
+                --force-warn clippy::too_many_arguments \
+                --force-warn clippy::unwrap_used \
+                --force-warn clippy::expect_used \
+                --force-warn clippy::panic \
+                | node .instrument/code-metrics.cjs clippy --platform "ubuntu-22.04" --repo-root . --out "dispatch-out/clippy-$sha.json"
+              set -e
+              # An `if`, not `[ -f ] && …`: a false test as the last command of a
+              # line would end the step under `set -e`, and a missing clippy file
+              # is an expected outcome here, not a failure.
+              if [ -f "dispatch-out/clippy-$sha.json" ]; then
+                legs=(--clippy "dispatch-out/clippy-$sha.json")
+              fi
+            fi
+            node .instrument/code-metrics.cjs report \
+              --repo-root . \
+              --commit "$sha" \
+              --ref "dispatch" \
+              "${legs[@]}" \
+              --out "dispatch-out/code-metrics-$sha.json" \
+              --summary "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done
+
+      - name: Upload the per-commit reports
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-metrics-dispatch
+          path: dispatch-out/
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,27 @@
+# CI-ONLY clippy configuration for the code-metrics report (#2138, #2128 part 5).
+#
+# This file is NEVER on the path of a normal build. It is reached only by the
+# code-metrics step in `.github/workflows/ci.yml`, which sets `CLIPPY_CONF_DIR` to
+# this directory for that one command; `cargo check`, `cargo test`, `cargo clippy`
+# run by hand, and every product build see none of it. Putting it here rather than
+# at the repo root is the whole point — a root `clippy.toml` would apply to
+# everyone, and thresholds of 1 would make every human clippy run unreadable.
+#
+# WHY THE THRESHOLDS ARE 1. `too_many_lines`, `cognitive_complexity` and
+# `too_many_arguments` are threshold lints: they fire only ABOVE their threshold,
+# and the value they measured appears only in the message text ("this function has
+# too many lines (140/1)"). There is no clippy mode that just prints the number. So
+# the report sets the threshold to its minimum, every function fires, and
+# `scripts/code-metrics.cjs` reads each value back out of the message. The lints are
+# allow-by-default, so the workflow additionally passes `--force-warn` for each —
+# `--force-warn` and not `-W`, because 20 `allow(clippy::…)` attributes already sit
+# in the tree (#2128 part 3) and `-W` would leave exactly those functions unmeasured.
+#
+# NOTHING HERE GATES ANYTHING. The step is report-only: the whole clippy run is
+# `continue-on-error`, its output is piped into a parser, and no threshold in this
+# file is a rule anyone must satisfy. The gates #2128 slice C proposes will carry
+# their own numbers, chosen from the distributions this report measures.
+
+too-many-lines-threshold = 1
+cognitive-complexity-threshold = 1
+too-many-arguments-threshold = 1
