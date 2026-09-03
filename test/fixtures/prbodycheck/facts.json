@@ -1,0 +1,73 @@
+{
+  "_comment": [
+    "Synthetic facts for test/prbodycheck.test.ts — everything `git` and `gh` would have",
+    "said about one pull request. The tests never run either, so the suite is offline and",
+    "deterministic. The shapes are modelled on the real bodies the #2168 classification",
+    "read, and the numbers are chosen so that NO TWO AXES SHARE A VALUE (#1182): a fixture",
+    "whose figures all coincide cannot tell a working check from a broken one. In",
+    "particular the four instruments of `src-tauri/tests/reviewdrive.rs` are four distinct",
+    "numbers, which is what makes the instrument-naming assertions fail-able."
+  ],
+  "pr": 900,
+  "head": "c7a3626a14e3fa4f1d8a283691ced63163eda74d",
+  "mergeBase": "517073c45590a1ef04398b56e3414cbbb6808067",
+  "diffstat": { "files": 4, "insertions": 773, "deletions": 27 },
+  "numstat": {
+    "crates/loomux-engine/src/reviewdrive.rs": { "insertions": 125, "deletions": 9 },
+    "doc/design/review-driver.md": { "insertions": 67, "deletions": 12 },
+    "src-tauri/src/orchestration/rdtick.rs": { "insertions": 65, "deletions": 6 },
+    "src-tauri/tests/reviewdrive.rs": { "insertions": 516, "deletions": 0 }
+  },
+  "files": {
+    "src-tauri/tests/reviewdrive.rs": {
+      "blob": "61855f9cd77d7bdcfba0c7e3d158c6a76d18a3d2",
+      "blobBytes": 325375,
+      "blobChars": 323044,
+      "blobLines": 6892,
+      "diskBytes": 332267,
+      "lineAt": { "6495": "    assert_ne!(", "6830": "    assert_eq!(" }
+    },
+    ".orrerix/lessons.md": {
+      "blob": "aa11bb22cc33dd44ee55ff6677889900aabbccdd",
+      "blobBytes": 3296,
+      "blobChars": 3281,
+      "blobLines": 74,
+      "diskBytes": 3370,
+      "lineAt": { "40": "## A claim is a deliverable" }
+    },
+    "CLAUDE.md": {
+      "blob": "1234abcd5678ef901234abcd5678ef901234abcd",
+      "blobBytes": 60123,
+      "blobChars": 59001,
+      "blobLines": 722,
+      "diskBytes": 60845,
+      "lineAt": { "722": "  the guard's own doc quotes the line it was written for." }
+    }
+  },
+  "blobs": {
+    "61855f9c": { "bytes": 325375, "chars": 323044, "lines": 6892 },
+    "728f7407": { "bytes": 300527, "chars": 298310, "lines": 6376 },
+    "aa11bb22": { "bytes": 3296, "chars": 3281, "lines": 74 }
+  },
+  "shaInfo": {
+    "c7a3626a": { "resolves": true, "type": "commit", "onPrRef": true, "subject": "fix(orchestration): a cap-starvation run cannot straddle a restart (#2135)" },
+    "7396a0bd": { "resolves": true, "type": "commit", "onPrRef": true, "subject": "fix(orchestration): round-1 head (#2135)" },
+    "517073c4": { "resolves": true, "type": "commit", "onPrRef": true, "subject": "chore(release): bump version to 1.3.0-beta6 (#2136)" },
+    "deadbee1": { "resolves": false, "type": null, "onPrRef": false, "subject": null },
+    "65ecd6ae": { "resolves": true, "type": "commit", "onPrRef": false, "subject": "launcher: defer the probe-reply picker rebuild past mid-type (#2124)" },
+    "61855f9c": { "resolves": true, "type": "blob", "onPrRef": false, "subject": null },
+    "728f7407": { "resolves": true, "type": "blob", "onPrRef": false, "subject": null },
+    "aa11bb22": { "resolves": true, "type": "blob", "onPrRef": false, "subject": null }
+  },
+  "runs": {
+    "33791843349": { "exists": true, "headSha": "c7a3626a14e3fa4f1d8a283691ced63163eda74d", "conclusion": "success", "status": "completed", "runAttempt": "1" },
+    "33793501946": { "exists": true, "headSha": "7396a0bd0000000000000000000000000000aaaa", "conclusion": "failure", "status": "completed", "runAttempt": "1" },
+    "33999999999": { "exists": false }
+  },
+  "identifierHits": {
+    "note_cap_starvation": 4,
+    "cap_starved_since_ms": 17,
+    "NAME_SITES": 0,
+    "SITES": 9
+  }
+}

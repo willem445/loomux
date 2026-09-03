@@ -1,0 +1,19 @@
+diff --git a/doc/design/review-driver.md b/doc/design/review-driver.md
+index 1111111..2222222 100644
+--- a/doc/design/review-driver.md
++++ b/doc/design/review-driver.md
+@@ -1190,6 +1190,9 @@ The drive clears the stamp on the fourth of these.
++The fourth clear site is the restart reconcile, and it is the only one that runs
++outside a tick. No other site charges the gap.
++There are four sites that clear the anchor; three tests cover them.
+ unchanged context line
+diff --git a/crates/loomux-engine/src/reviewdrive.rs b/crates/loomux-engine/src/reviewdrive.rs
+index 3333333..4444444 100644
+--- a/crates/loomux-engine/src/reviewdrive.rs
++++ b/crates/loomux-engine/src/reviewdrive.rs
+@@ -1470,6 +1470,8 @@ impl ReviewDrive {
++// The fourth clear site: nothing else zeroes the anchor across a restart.
++pub fn discard_cap_starvation_run(&mut self) {
++    self.cap_starved_since_ms = None;
++}
+ unchanged context line

@@ -320,6 +320,24 @@ Two consequences worth stating once. A **squash message is cut at the marker lin
 whole agent layer into `git log`, where nothing folds. And GitHub's **closing-keyword
 scan reads the whole body**, fold included — sweep the posted body, not the cut.
 
+## Re-derive the whole body at once: `scripts/pr-body-check.cjs`
+
+Most of the recipes above are checks a script can run for you. `node
+scripts/pr-body-check.cjs --pr <n>` reads the POSTED body and re-measures it against
+head: the diffstat and per-file counts, every byte figure against all four instruments
+(blob bytes, on-disk bytes, blob chars, blob lines) plus the blob it is stated for,
+every SHA resolved and classified head / base / run-receipt by its own sentence, every
+run id through `gh run view`, every backticked identifier grepped, every line cite
+printed back at head, and any placeholder still in the body. It REFUSES nothing and
+exits 0 always: **MISMATCH** rows are facts that disagree with head and must be zero
+before `report(done)`; **CHECK** rows are sentences to re-read. Run it after every push
+and on a body-only fix, because a fix is where the next stale figure comes from. It runs
+clean over the ten merged bodies of the #2168 corpus, so a MISMATCH is a finding rather
+than noise. `--list-claims` prints the ordinals, counts and only/never/no-other phrases
+in the ADDED prose of the diff — the claims a twin sweep has to re-derive by hand; the
+script lists the candidates, the judgment stays yours. What it does NOT check: whether a
+sentence is true (#2139 r1’s “touches only X”), a claim about a scope it cannot see, and
+anything inside a fenced block for the figure checks (quoted machine output).
 ## Definition of validated
 
 The PR's checks are green on all three platforms **for the head you are
