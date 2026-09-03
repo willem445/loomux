@@ -166,8 +166,13 @@ function ubuntuLeg() {
 test('three lints on one span merge into one function row carrying three distinct numbers', () => {
   const leg = ubuntuLeg();
   // Positive control: the stream really was read.
-  assert.equal(leg.messagesSeen, 10);
+  assert.equal(leg.messagesSeen, 11);
   assert.equal(leg.parsed, 9);
+  // Every coded diagnostic is accounted for exactly once. Without this, a lint
+  // this report does not read would leave `parsed` short of `messagesSeen` and
+  // be indistinguishable from a parser that stopped matching.
+  assert.equal(leg.ignored, 1);
+  assert.equal(leg.messagesSeen, leg.parsed + leg.ignored + leg.unparsed.length);
 
   const big = leg.functions.find((f: any) => f.name === 'big_fn');
   assert.ok(big, 'big_fn not found');
@@ -207,8 +212,8 @@ test('a message whose value cannot be read produces no row and is disclosed, nev
 
 test('non-diagnostic cargo lines and non-JSON noise are skipped rather than counted', () => {
   // The fixture carries a `compiler-artifact` line, a `build-finished` line and one
-  // line of plain text; messagesSeen stays at the ten diagnostics.
-  assert.equal(ubuntuLeg().messagesSeen, 10);
+  // line of plain text; messagesSeen stays at the eleven diagnostics.
+  assert.equal(ubuntuLeg().messagesSeen, 11);
 });
 
 test('merging the legs keeps the larger value and the functions only one platform can see', () => {
@@ -369,8 +374,8 @@ test('a base with no clippy figures says so on the Rust rows rather than guessin
   // Every cell of every Rust row reads `n/a → <head>`, including `n`. A base with
   // no clippy leg has no population, so `0 → 2` would read as a measurement nobody
   // made — the row must be absent, not zero.
-  assert.match(body, /\| Rust function lines \| n\/a → 2 \| n\/a → 4 \| n\/a → 140 \| n\/a → 140 \| n\/a → 140 \|/);
-  assert.ok(!/\| Rust function lines \| 0 →/.test(body));
+  assert.match(body, /\| Rust function CODE lines \(clippy\) \| n\/a → 2 \| n\/a → 4 \| n\/a → 140 \| n\/a → 140 \| n\/a → 140 \|/);
+  assert.ok(!/\| Rust function CODE lines \(clippy\) \| 0 →/.test(body));
 });
 
 test('the delta comment says plainly that every row is report-only', () => {

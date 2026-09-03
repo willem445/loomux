@@ -10,4 +10,5 @@
 {"reason":"compiler-message","message":{"code":{"code":"clippy::panic"},"message":"`panic` should not be present in production code","spans":[{"file_name":"rust/other.rs","line_start":13,"line_end":13,"is_primary":true}]}}
 {"reason":"compiler-message","message":{"code":{"code":"clippy::too_many_lines"},"message":"this function is rather long indeed","spans":[{"file_name":"rust/other.rs","line_start":20,"line_end":60,"is_primary":true}]}}
 not json at all
+{"reason":"compiler-message","message":{"code":{"code":"clippy::needless_return"},"message":"unneeded `return` statement","spans":[{"file_name":"rust/lib.rs","line_start":5,"line_end":5,"is_primary":true}]}}
 {"reason":"build-finished","success":true}

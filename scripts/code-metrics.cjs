@@ -547,6 +547,11 @@ function newClippyAccumulator(platform) {
     perFile: new Map(),
     messagesSeen: 0,
     parsed: 0,
+    // Every coded diagnostic is accounted for exactly once:
+    // messagesSeen === parsed + ignored + unparsed.length. Without `ignored`,
+    // a clippy lint this report does not read (the default-on ones fire too)
+    // would leave `parsed` short of `messagesSeen` and read as breakage.
+    ignored: 0,
     unparsed: [],
   };
 }
@@ -597,6 +602,7 @@ function clippyAddMessage(acc, msg) {
     acc.parsed += 1;
     return;
   }
+  acc.ignored += 1;
 }
 
 // Clippy's spans do not carry the function's NAME, so it is read back out of the
@@ -634,6 +640,7 @@ function clippyFinish(acc) {
     platform: acc.platform,
     messagesSeen: acc.messagesSeen,
     parsed: acc.parsed,
+    ignored: acc.ignored,
     unparsed: acc.unparsed,
     functions: Array.from(acc.fns.values()).sort((a, b) =>
       a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1
@@ -674,11 +681,13 @@ function mergeClippy(legs) {
   const platforms = [];
   let messagesSeen = 0;
   let parsed = 0;
+  let ignored = 0;
   for (const leg of legs) {
     if (!leg) continue;
     platforms.push(leg.platform || 'unknown');
     messagesSeen += leg.messagesSeen || 0;
     parsed += leg.parsed || 0;
+    ignored += leg.ignored || 0;
     for (const f of leg.functions || []) {
       const key = f.file + '#' + (f.name || f.line);
       const cur = fns.get(key);
@@ -709,6 +718,7 @@ function mergeClippy(legs) {
     platforms,
     messagesSeen,
     parsed,
+    ignored,
     functions,
     perFile: files,
     totals: {
@@ -891,14 +901,16 @@ function renderSummary(report, topN) {
   L.push('');
   L.push('### Distributions');
   L.push('');
+  L.push('The two function-length rows are DIFFERENT measurements and must not be compared with each other: the TS row is physical lines from the `fn` line to the closing brace, and the Rust row is clippy&#39;s `too_many_lines`, which counts CODE lines only. See `doc/design/code-metrics.md`.');
+  L.push('');
   L.push('| Metric | n | p50 | p90 | p95 | max |');
   L.push('| --- | --- | --- | --- | --- | --- |');
-  L.push(distRow('TS function lines', report.ts.percentiles.fnLines));
+  L.push(distRow('TS function lines (physical: `fn` line to closing brace)', report.ts.percentiles.fnLines));
   L.push(distRow('TS nesting depth', report.ts.percentiles.depth));
   L.push(distRow('TS argument count', report.ts.percentiles.args));
   L.push(distRow('TS file lines', report.ts.percentiles.fileLines));
   if (report.rust.available) {
-    L.push(distRow('Rust function lines', report.rust.percentiles.fnLines));
+    L.push(distRow('Rust function CODE lines (clippy; comments and blanks excluded)', report.rust.percentiles.fnLines));
     L.push(distRow('Rust cognitive complexity', report.rust.percentiles.cognitive));
     L.push(distRow('Rust argument count', report.rust.percentiles.args));
   } else {
@@ -1026,10 +1038,10 @@ function buildDelta(base, head, meta) {
 
   L.push('| Metric | n | p50 | p90 | p95 | max |');
   L.push('| --- | --- | --- | --- | --- | --- |');
-  L.push(distDeltaRow('TS function lines', baseTs.percentiles.fnLines, head.ts.percentiles.fnLines));
+  L.push(distDeltaRow('TS function lines (physical)', baseTs.percentiles.fnLines, head.ts.percentiles.fnLines));
   L.push(distDeltaRow('TS nesting depth', baseTs.percentiles.depth, head.ts.percentiles.depth));
   L.push(distDeltaRow('TS argument count', baseTs.percentiles.args, head.ts.percentiles.args));
-  L.push(distDeltaRow('Rust function lines', baseRustPct.fnLines, headRustPct.fnLines));
+  L.push(distDeltaRow('Rust function CODE lines (clippy)', baseRustPct.fnLines, headRustPct.fnLines));
   L.push(distDeltaRow('Rust cognitive complexity', baseRustPct.cognitive, headRustPct.cognitive));
   L.push(distDeltaRow('Rust argument count', baseRustPct.args, headRustPct.args));
   L.push('');
