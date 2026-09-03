@@ -462,11 +462,19 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -u
-          base_sha="$(git merge-base "origin/$BASE_REF" HEAD || true)"
+          # Belt and braces. `origin/$BASE_REF` WAS present in run 33779750324, whose
+          # checkout was given a SHA as its `ref` — but nothing in `actions/checkout`'s
+          # contract promises that ref for a SHA checkout, and if it ever goes missing
+          # every arm below degrades to "no merge-base" for a reason that has nothing to
+          # do with the base. Fetching it costs nothing and cannot fail the step.
+          git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" >/dev/null 2>&1 || true
+          base_sha="$(git merge-base "origin/$BASE_REF" HEAD 2>/dev/null || true)"
           if [ -z "$base_sha" ]; then
-            echo "sha=" >> "$GITHUB_OUTPUT"
-            echo "source=none" >> "$GITHUB_OUTPUT"
-            echo "note=no merge-base against origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+            {
+              echo "sha="
+              echo "source=none"
+              echo "note=no merge-base against origin/$BASE_REF"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
@@ -483,8 +491,10 @@ jobs:
                  && unzip -o -q base.zip -d base-artifact 2>/dev/null \
                  && [ -f base-artifact/code-metrics.json ]; then
                 cp base-artifact/code-metrics.json base-metrics.json
-                echo "source=artifact from run $run_id" >> "$GITHUB_OUTPUT"
-                echo "note=" >> "$GITHUB_OUTPUT"
+                {
+                  echo "source=artifact from run $run_id"
+                  echo "note="
+                } >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
@@ -506,16 +516,20 @@ jobs:
                  --commit "$base_sha" \
                  --ref "$BASE_REF" \
                  --out base-metrics.json; then
-              echo "source=measured here on a worktree of the base" >> "$GITHUB_OUTPUT"
-              echo "note=the base run kept no code-metrics artifact, so the base was re-measured without clippy" >> "$GITHUB_OUTPUT"
+              {
+                echo "source=measured here on a worktree of the base"
+                echo "note=the base run kept no code-metrics artifact, so the base was re-measured without clippy"
+              } >> "$GITHUB_OUTPUT"
               exit 0
             fi
           fi
 
           # Arm 3.
           rm -f base-metrics.json
-          echo "source=unavailable" >> "$GITHUB_OUTPUT"
-          echo "note=no artifact for the base run and the base worktree could not be measured" >> "$GITHUB_OUTPUT"
+          {
+            echo "source=unavailable"
+            echo "note=no artifact for the base run and the base worktree could not be measured"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build the delta comment
         continue-on-error: true

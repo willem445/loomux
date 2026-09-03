@@ -33,8 +33,8 @@ Report-only is structural, not a promise:
 - nothing in the merge gate `needs` either job;
 - no number in the script is ever compared against a threshold;
 - an unreadable clippy message produces a **missing row**, never a number, and the
-  output carries `messagesSeen` beside `parsed` so a parser that stopped matching is
-  visible rather than silent.
+  output balances `messagesSeen` against `parsed + ignored + unparsed` so a parser
+  that stopped matching is visible rather than silent.
 
 ## What is measured, and with what
 
@@ -49,7 +49,7 @@ and building one over 150-odd files would cost seconds this job should not spend
 
 | Row | How |
 | --- | --- |
-| Function lines | `fn` start line to closing brace, from the AST. A nested function is counted in its parent's span AND gets its own row, the same convention clippy's `too_many_lines` uses. |
+| Function lines | `fn` start line to closing brace, from the AST. A nested function is counted inside its parent's span AND gets its own row. |
 | Nesting depth | Maximum depth of branching constructs inside the body, relative to the body. `if`/`for`/`while`/`do`/`switch`/`try`/`catch`/ternary count; a bare block, an object literal and a class body do not. A nested function starts its own scale. |
 | Argument count | `node.parameters.length`. |
 | Import graph | Relative specifiers only, resolved against the scanned file set (`./x.ts`, `./x`, `./x/index.ts` all resolve). Bare specifiers are external and produce no edge. |
@@ -173,7 +173,105 @@ read-only fork variant (#2128 part 6d).
 
 ## Measured distributions
 
-<!-- MEASUREMENTS -->
+All of it measured by run **33779750324** at commit `22aa13d0`, by the job this
+note describes — not by hand, and not carried over from #2128's estimates. Re-derive
+it, do not edit it: download that run's `code-metrics` artifact, or read any later
+run's job summary.
+
+Clippy merged three legs there: `macos-latest`, `ubuntu-22.04`, `windows-latest`.
+15,232 coded diagnostics read, 14,970 parsed into rows, 262 from lints this report
+does not read, 0 unreadable.
+
+| Metric | n | p50 | p90 | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| TS function lines (physical) | 3,686 | 4 | 24 | 39 | 616 |
+| TS nesting depth | 3,686 | 0 | 2 | 2 | 9 |
+| TS argument count | 3,686 | 1 | 2 | 3 | 7 |
+| TS file lines | 153 | 159 | 984 | 2,105 | 5,255 |
+| Rust function CODE lines (clippy) | 1,927 | 9 | 36 | 54 | 991 |
+| Rust cognitive complexity | 1,530 | 2 | 6 | 8 | 85 |
+| Rust argument count | 1,454 | 3 | 5 | 6 | 19 |
+
+**The two length rows are not comparable, and this is the reason the labels say so.**
+The TS row is physical lines from the `fn` line to the closing brace. The Rust row is
+clippy's `too_many_lines`, which counts CODE lines — comments and blanks excluded.
+`deliver_now` is 526 by clippy and 1,220 physically (#2128 part 2 measured the latter
+by hand): the same function, two honest numbers, and a p95 comparison across the two
+columns would be meaningless.
+
+Three population notes, because a percentile is only as good as the set under it:
+
+- The Rust `n` differs per row (1,927 / 1,530 / 1,454) because each threshold lint
+  fires only ABOVE its threshold of 1. A function of one code line, no branches, or
+  one argument does not emit, so it is absent from that row. These are distributions
+  over "functions with more than one", not over all functions.
+- 2,380 distinct Rust functions carry at least one row; the tree has ~3,564 `fn`
+  lines. The gap is one-line bodies, trait signatures, and `#[cfg]` arms no leg
+  compiled.
+- The clippy run covers the LIB targets only — no `--all-targets` — so
+  `#[cfg(test)]` modules are not compiled and their contents never appear. That is
+  deliberate: these rows are about product code.
+
+Worst functions at that run:
+
+| Language | Function | File | Value |
+| --- | --- | --- | --- |
+| TS | `renderTask` | `src/tasksview.ts` | 616 lines |
+| TS | `WelcomeForm.constructor` | `src/launcher.ts` | 479 lines |
+| TS | `openActionPane` | `src/main.ts` | 471 lines |
+| Rust | `call_tool` | `src-tauri/src/orchestration/mcp.rs` | 991 code lines |
+| Rust | `gh_shim_sh` | `src-tauri/src/orchestration/mod.rs` | 579 code lines |
+| Rust | `deliver_now` | `src-tauri/src/orchestration/mod.rs` | 526 code lines |
+| Rust | `parse_workflow` | `crates/loomux-engine/src/workflow.rs` | cognitive 85 |
+| Rust | `create_orchestration` | `src-tauri/src/orchestration/mod.rs` | 19 arguments |
+
+Roots, same run:
+
+| Root | Files | Lines | Comment share | file p95 | file max |
+| --- | --- | --- | --- | --- | --- |
+| `src` | 153 | 65,416 | 16% | 2,105 | 5,255 |
+| `test` | 142 | 45,011 | 21% | 939 | 3,311 |
+| `e2e` | 14 | 3,640 | 28% | 767 | 767 |
+| `src-tauri/src` | 32 | 88,461 | 49% | 3,902 | 57,085 |
+| `src-tauri/tests` | 40 | 101,815 | 28% | 6,376 | 59,528 |
+| `crates/loomux-engine/src` | 33 | 44,014 | 44% | 4,902 | 5,316 |
+| `crates/loomux-server/src` | 4 | 952 | 28% | 503 | 503 |
+
+One TypeScript import cycle: a single strongly-connected component of 28 modules
+(`pane` ↔ `orchestration` ↔ `workflowmodel` and 25 more). 324 exports have no
+importer in `src/`, `test/` or `e2e/`. `orchestration/mod.rs` is 57,085 lines.
+
+`unwrap` 27, `expect` 22, `panic!` 10 across the product crates, counted by clippy at
+its lint sites. These are far below #2128 part 3's grep figures (679 / 93 / 53) and
+the difference is entirely `#[cfg(test)]`: a brace-depth scan of the sources agrees
+with clippy file by file — `locks.rs` 70 total and 0 outside `#[cfg(test)]`, `git.rs`
+90 and 0, `mod.rs` 13 and 12 against clippy's 12. `obs.rs` looked like an off-by-one
+until the one apparent product site turned out to be a `.unwrap()` inside a `///`
+doc line.
+
+### What the cost is
+
+Per-leg clippy time, from run 33777565510's own step timestamps (the FIRST run, so
+no clippy artifacts were cached anywhere):
+
+| Leg | Clippy step | `cargo check` in the same job, for scale |
+| --- | --- | --- |
+| `ubuntu-22.04` | 13 s | 1 m 33 s |
+| `macos-latest` | 20 s | 1 m 23 s |
+| `windows-latest` | 19 s | 2 m 57 s |
+
+Far under the +3 min per-leg budget #2128 part 11 set for dropping a leg, so clippy
+runs on all three and **no leg's `cfg` bodies are unmetered**. It is this cheap
+because `cargo clippy` reuses the dependency artifacts `cargo check` just built in
+the same job and runs clippy-driver over the three workspace members only. The
+`code-metrics` job itself was 16 s wall.
+
+### What a first PR sees
+
+The base-artifact arm cannot fire until this lands on `main` and a `main` run stores
+a `code-metrics.json`. Until then every PR takes arm 2, whose measurement carries no
+clippy, so the Rust rows read `n/a` on the base side — visible on this feature's own
+PR, and correct rather than a zero.
 
 ## What slice C will gate on, when it does
 

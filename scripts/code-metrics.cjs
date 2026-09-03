@@ -1065,7 +1065,10 @@ function buildDelta(base, head, meta) {
   L.push('### New TypeScript import cycles');
   L.push('');
   if (!haveBase) L.push('Base unavailable — not computed.');
-  else if (newCycles.length === 0) L.push('None. (' + (head.ts.cycles || []).length + ' cycles at head, unchanged set.)');
+  else if (newCycles.length === 0) {
+    const n = (head.ts.cycles || []).length;
+    L.push('None. (' + n + (n === 1 ? ' cycle' : ' cycles') + ' at head, unchanged set.)');
+  }
   else for (const c of newCycles) L.push('- ' + c);
   L.push('');
 
