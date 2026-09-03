@@ -2553,12 +2553,7 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
     // `required_lanes` is the gate's list at this head; `None` is a routing
     // answer this tick could not produce, and that drive holds
     // `routing-unaccountable` in `decide_review_wait` below on this same tick.
-    let lanes = facts.required_lanes.as_deref().map_or(0, |l| l.len());
-    if let Some(bound) = state_bound_ms(state, limits, lanes) {
-        if entry.state_elapsed_ms(facts.now_ms) >= bound {
-            return DriveStep::held(HeldReason::StateStalled);
-        }
-    }
+    let _lanes = facts.required_lanes.as_deref().map_or(0, |l| l.len());
     // **An unresolved head is not a head, and acting on one is an unbounded
     // spawn loop.** Two of the four states below read `facts.head`, and the
     // guard is here rather than in each of them because it is the *drive* that
