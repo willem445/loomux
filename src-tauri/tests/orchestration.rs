@@ -9035,10 +9035,13 @@ fn the_manifests_bounds_are_the_ones_parse_workflow_actually_enforces() {
         );
     }
 
-    // The driver's three backstops ride the same notify-TTL clamp family
-    // (#1778 §5.3), so the same both-ends check over each of them.
+    // Two of the driver's three backstops ride the same notify-TTL clamp
+    // family (#1778 §5.3), so the same both-ends check over each of them;
+    // `drive_timeout_minutes` carries its own range since #2110 and is checked
+    // against the ceiling the manifest publishes for it.
     for field in ["lane_timeout_minutes", "fix_timeout_minutes", "drive_timeout_minutes"] {
-        for (given, want) in [(1_u32, 5_u32), (9999, 240)] {
+        let ceiling = if field == "drive_timeout_minutes" { 1440 } else { 240 };
+        for (given, want) in [(1_u32, 5_u32), (9999, ceiling)] {
             let wf = workflow::parse_workflow(&format!(
                 "version: 1\n{block}driver:\n  enabled: true\n  {field}: {given}\n"
             ))

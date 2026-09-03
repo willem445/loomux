@@ -9001,7 +9001,11 @@ fn an_absent_driver_block_means_the_feature_is_off() {
     assert_eq!(wf.driver.max_rebase_attempts, 1, "INVARIANT 9's one rebase (§2.3)");
     assert_eq!(wf.driver.lane_timeout_minutes, 60);
     assert_eq!(wf.driver.fix_timeout_minutes, 60);
-    assert_eq!(wf.driver.drive_timeout_minutes, 240);
+    // #2110: twelve hours, and off the notify-TTL family whose ceiling this
+    // used to borrow. It is the BACKSTOP now, under `reviewdrive`’s per-state
+    // bounds, and a backstop measured in the same hours as the waits beneath
+    // it is the one clock a drive making steady progress can still trip.
+    assert_eq!(wf.driver.drive_timeout_minutes, 720);
 }
 
 #[test]
@@ -9018,7 +9022,7 @@ fn a_declared_driver_block_fills_in_the_defaults_it_omits() {
     assert_eq!(wf.driver.max_rebase_attempts, 1);
     assert_eq!(wf.driver.lane_timeout_minutes, 60);
     assert_eq!(wf.driver.fix_timeout_minutes, 60);
-    assert_eq!(wf.driver.drive_timeout_minutes, 240);
+    assert_eq!(wf.driver.drive_timeout_minutes, 720);
 
     // …and every default is overridable, including in the TIGHTER direction —
     // which is the only direction §2.3 allows a repo file to move the counters.
@@ -9108,8 +9112,14 @@ fn driver_counters_refuse_out_of_range_values_instead_of_clamping() {
 fn driver_timeouts_are_clamped_by_the_notify_ttl_clamp_itself() {
     // §5.3: "clamped like the notify TTLs" — the same quantity as
     // `merge_queue.checks_timeout_minutes` (a bounded wait on a fallible
-    // signal), so the same one definition bounds all three backstops rather
-    // than a second copy that can drift.
+    // signal), so the same one definition bounds the two per-wait backstops
+    // rather than a second copy that can drift.
+    //
+    // **`drive_timeout_minutes` left that family in #2110** and is checked
+    // below on its own range. It stopped being the same quantity: the other
+    // two bound ONE wait on ONE fallible signal, which is what the notify TTL
+    // is, and this one is the last-resort bound over a whole drive with four
+    // per-state clocks beneath it.
     let of = |field: &str, v: &str, want: u32| {
         let wf = workflow::parse_workflow(&format!(
             "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
@@ -9123,13 +9133,26 @@ fn driver_timeouts_are_clamped_by_the_notify_ttl_clamp_itself() {
         };
         assert_eq!(got, want, "{field}: {v} must land on {want}");
     };
-    for field in ["lane_timeout_minutes", "fix_timeout_minutes", "drive_timeout_minutes"] {
+    for field in ["lane_timeout_minutes", "fix_timeout_minutes"] {
         of(field, "0", 5);
         of(field, "1", 5);
         of(field, "30", 30);
         of(field, "240", 240);
         of(field, "99999", 240);
     }
+
+    // The backstop's own range (#2110): the same floor, a ceiling of one day,
+    // and a default of twelve hours. The 240 row is what pins the two ranges
+    // apart — it is the OLD ceiling, so it clamps for the two fields above and
+    // passes through untouched here, and an implementation that quietly left
+    // this field on the notify clamp fails on the row below it rather than on
+    // a value nobody would notice.
+    of("drive_timeout_minutes", "0", 5);
+    of("drive_timeout_minutes", "1", 5);
+    of("drive_timeout_minutes", "240", 240);
+    of("drive_timeout_minutes", "600", 600);
+    of("drive_timeout_minutes", "1440", 1440);
+    of("drive_timeout_minutes", "99999", 1440);
 }
 
 #[test]

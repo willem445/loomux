@@ -2007,7 +2007,7 @@ fn a_resume_recovers_a_drive_older_than_its_own_timeouts() {
     let (group, session) = driven(&reg, &repo, &gh);
 
     // Park it on the drive's own age bound — the hold this test is about.
-    let past_drive_timeout = 241 * 60 * 1000;
+    let past_drive_timeout = 721 * 60 * 1000;
     reg.rd_drive_group_with(&group, &gh, past_drive_timeout);
     assert_eq!(status_state(&reg, &group), "held", "the drive must actually be parked");
     assert_eq!(
@@ -2198,7 +2198,7 @@ fn a_resume_out_of_a_different_hold_does_not_re_brief_a_working_lane() {
 
     // Park on the drive's AGE, not the lane's: this lane is inside its own
     // timeout and has simply not answered yet.
-    let past_drive_timeout = 241 * 60 * 1000;
+    let past_drive_timeout = 721 * 60 * 1000;
     reg.rd_drive_group_with(&group, &gh, past_drive_timeout);
     assert_eq!(
         reg.review_drive_status(&group)["drives"][0]["held_reason"],
@@ -6031,5 +6031,296 @@ fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another
         status_state(&reg2, &group2),
         "held",
         "the control: an unbroken cap run still reaches the hold"
+    );
+}
+
+// ── #2110: the bound measures time IN a state, and forgives what the cap took ──
+
+/// Drive a PR that keeps MOVING, for `cycles` rounds spaced `step_ms` apart.
+///
+/// Each cycle is two arcs and no counter: `ci-wait -> review-wait` on a green
+/// tick, then `review-wait -> ci-wait` on the tick after the head has moved
+/// under the lane (arc 6, which `decide_review_wait` checks before it reads a
+/// verdict or opens a lane — so no lane is ever spawned and the fixture stays a
+/// statement about the clocks). The head alternates between the two constants,
+/// which is enough: what arc 6 reads is that the live head DIFFERS from the
+/// recorded one, not which sha it is.
+///
+/// Answers the clock of the last tick it took.
+fn progressing(
+    reg: &OrchRegistry,
+    gh: &FakeGh,
+    group: &GroupId,
+    cycles: u64,
+    step_ms: u64,
+) -> u64 {
+    let mut last = 0;
+    for i in 0..cycles {
+        let t = i * step_ms;
+        reg.rd_drive_group_with(group, gh, t);
+        let head = if i % 2 == 0 { HEAD_B } else { HEAD_A };
+        gh.set_facts("OPEN", head);
+        reg.set_pr_head_override(Some(head.to_string()));
+        last = t + 60_000;
+        reg.rd_drive_group_with(group, gh, last);
+    }
+    last
+}
+
+/// **#2110's first ask.** A drive that is making progress must not be parked
+/// for having existed a while.
+///
+/// The measured incident: PR #2104's drive was parked `held(drive-stalled)` —
+/// "the drive passed its total age bound" — at about four hours, with round 2
+/// live, a blocking finding just fixed and CI green at the new head. Nothing
+/// was stalled. An age cannot tell progress from paralysis, because every
+/// drive's age grows at the same rate whatever it is doing, and four hours of
+/// real review rounds is what the driver exists to spend.
+///
+/// So the fixture is a drive doing nothing but advancing, taken past the bound
+/// that used to park it. It is the ONE assertion a fixture like this can carry
+/// honestly — "still not held" — so the two things that would make it vacuous
+/// are pinned beside it: that the drive really did reach that age, and that it
+/// really is still working rather than sitting in some state a bound forgot.
+#[test]
+fn a_drive_that_keeps_advancing_is_not_parked_for_its_age_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // Eleven cycles half an hour apart: five hours of wall clock, every state
+    // left well inside its own bound (29 minutes in `ci-wait` against ninety,
+    // one minute in `review-wait` against three hours).
+    let last = progressing(&reg, &gh, &group, 11, 30 * 60_000);
+
+    let status = reg.review_drive_status(&group);
+    let drive = &status["drives"][0];
+    assert!(
+        drive["since_ms"].as_u64().unwrap_or(0) > 240 * 60_000,
+        "the fixture must actually pass the bound that used to park it, or this pins \
+         nothing: {status}"
+    );
+    assert_ne!(
+        drive["state"],
+        json!("held"),
+        "a drive advancing every half hour was parked for its age: {status}"
+    );
+    assert_eq!(
+        drive["held_reason"],
+        json!(null),
+        "…and with no reason, which is what a working drive has: {status}"
+    );
+    // Not vacuous by the drive having quietly stopped: it is in a working state
+    // and its own per-state clock is short, so the reason nothing fired is that
+    // nothing was stuck — not that some state has no bound.
+    assert_eq!(drive["state"], json!("ci-wait"), "{status}");
+    assert!(
+        drive["state_ms"].as_u64().unwrap_or(u64::MAX) <= 30 * 60_000,
+        "the drive must be freshly in this state, or 'not held' says nothing: {status}"
+    );
+    assert!(last > 240 * 60_000, "sanity on the fixture's own clock");
+}
+
+/// **#2110's second ask.** A drive that really is stuck is parked on the state
+/// it is stuck IN, and the notice says which, for how long, and against what.
+///
+/// `ci-wait` is the state chosen because before this it had no bound of its own
+/// at all: `CiObservation::Pending` returns `Wait` for ever, and the first thing
+/// to notice used to be the total age hours later, on a notice that named
+/// neither the state nor a number. An orchestrator reading "the drive passed its
+/// total age bound" has exactly one move available — resume and see — which is
+/// the reflex #2110 asks to turn back into a decision.
+///
+/// The one-tick-short half is the discriminator. An implementation that parks a
+/// drive the moment it stops advancing fails there, and one that never parks
+/// fails below it.
+#[test]
+fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    // CI that never resolves — the wait `ci-wait` is for, and the one no other
+    // hold can see.
+    gh.set_checks(r#"[{"name":"build","state":"IN_PROGRESS","link":"x"}]"#);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    let short = reg.rd_drive_group_with(&group, &gh, reviewdrive::CI_WAIT_BOUND_MS - 1);
+    assert_eq!(
+        status_state(&reg, &group),
+        "ci-wait",
+        "a check run that is merely slow is a wait, not a hold"
+    );
+    assert!(
+        short.notices.iter().all(|n| !n.contains("HELD")),
+        "and it costs no orchestrator turn: {:?}",
+        short.notices
+    );
+
+    let held = reg.rd_drive_group_with(&group, &gh, reviewdrive::CI_WAIT_BOUND_MS);
+    assert_eq!(status_state(&reg, &group), "held");
+    let status = reg.review_drive_status(&group);
+    let drive = &status["drives"][0];
+    assert_eq!(
+        drive["held_reason"],
+        json!("state-stalled"),
+        "the hold names the state clock, not the drive's age: {status}"
+    );
+    assert_eq!(
+        drive["held_state"],
+        json!("ci-wait"),
+        "…and the status says what the drive was doing, so a resume is a decision: {status}"
+    );
+    assert_eq!(
+        drive["held_state_ms"],
+        json!(reviewdrive::CI_WAIT_BOUND_MS),
+        "…and for how long, measured on the clock that fired: {status}"
+    );
+
+    let notice = held
+        .notices
+        .iter()
+        .find(|n| n.contains("HELD"))
+        .expect("a hold delivers exactly one notice");
+    assert!(
+        notice.contains("in ci-wait for 1h 30m"),
+        "the notice must name the state and the time in it: {notice}"
+    );
+    assert!(
+        notice.contains("bound for that state is 1h 30m"),
+        "…and the bound that decided, so a near miss reads differently from a long \
+         stall: {notice}"
+    );
+    assert!(
+        notice.contains("drive_review") && notice.contains("cancel_review_drive"),
+        "…and the two things an orchestrator can do about it: {notice}"
+    );
+}
+
+/// **#2110's third ask, through the seam that publishes it.** Time the cap
+/// refused this drive a lane is excluded from both clocks, and the numbers say
+/// so where an orchestrator can read them.
+///
+/// The measured incident: PR #2105's drive spent about three of its four hours
+/// in `review-wait` with `lanes: []` because another drive's released lanes held
+/// every slot, and that starvation was charged to the age budget of the drive
+/// that was starved. A hold is not progress and it is not a stall.
+///
+/// **The figures asserted here ARE the bound's inputs**, which is what makes
+/// this more than a status-view test: `decide` reads `state_elapsed_ms` — the
+/// same call `state_ms` is rendered from — and `age_ms` minus `starved_ms`,
+/// both published here. The decision-level half, where the exclusion changes
+/// which hold fires, is `time_the_cap_refused_a_lane_advances_neither_age_bound`
+/// in the engine crate.
+///
+/// Measured one tick short of `CAP_HOLD_MS` deliberately: the drive is still
+/// working there, so these are the clocks of a live drive rather than of a
+/// parked one.
+#[test]
+fn time_the_cap_refused_this_drive_is_excluded_from_the_clocks_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    // `cap_starved` enters `review-wait` at 10_000 and takes the first refusal
+    // at `at` (20_000). Everything after `at` is time this drive could not act.
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+
+    let now = at + reviewdrive::CAP_HOLD_MS - 1;
+    reg.rd_drive_group_with(&group, &gh, now);
+    let status = reg.review_drive_status(&group);
+    let drive = &status["drives"][0];
+    assert_eq!(
+        drive["state"],
+        json!("review-wait"),
+        "the drive must still be working, or these are a parked drive's clocks: {status}"
+    );
+    assert_eq!(
+        drive["since_ms"],
+        json!(now),
+        "`since_ms` stays the WALL age — an age that shrank when a cap cleared would be a \
+         worse answer than the one it replaced: {status}"
+    );
+    assert_eq!(
+        drive["starved_ms"],
+        json!(now - at),
+        "…and the excluded total is published beside it, so the difference is checkable \
+         rather than inferred: {status}"
+    );
+    assert_eq!(
+        drive["state_ms"],
+        json!(10_000),
+        "the state clock must hold at the ten seconds this drive actually spent able to \
+         act; charging it the cap's fifteen minutes is what reported PR #2105 as \
+         stalled: {status}"
+    );
+}
+
+/// **#2110's fourth ask.** The backstop is still a backstop: a drive that
+/// advances for ever and never finishes is still parked, and its notice now
+/// says what it was doing.
+///
+/// This is §8's `also: [base-green]` row in miniature — a drive with an advance
+/// available on every wake resets every per-state clock, so the per-state bounds
+/// can never see it and the total age is the only thing that can. Which is why
+/// the age was kept rather than replaced, and why it is checked BEFORE the state
+/// bounds in `decide`.
+///
+/// Same fixture as the first test in this section, run past twelve hours instead
+/// of stopped at five — so the pair is one drive under two clocks, and the
+/// difference between them is the whole design.
+#[test]
+fn the_total_age_backstop_still_parks_a_drive_that_advances_for_ever() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // Twenty-four cycles at half an hour: eleven and a half hours of advancing,
+    // one tick short of the backstop.
+    let last = progressing(&reg, &gh, &group, 24, 30 * 60_000);
+    assert!(last < 720 * 60_000, "the fixture must stop SHORT of the bound: {last}");
+    assert_ne!(
+        status_state(&reg, &group),
+        "held",
+        "eleven and a half hours of advancing is inside the backstop"
+    );
+
+    let held = reg.rd_drive_group_with(&group, &gh, 720 * 60_000);
+    assert_eq!(status_state(&reg, &group), "held");
+    let status = reg.review_drive_status(&group);
+    assert_eq!(
+        status["drives"][0]["held_reason"],
+        json!("drive-stalled"),
+        "the backstop is what fires on a drive no per-state clock can catch: {status}"
+    );
+    assert_eq!(
+        status["drives"][0]["held_state"],
+        json!("ci-wait"),
+        "…and it still records what the drive was doing: {status}"
+    );
+
+    let notice = held
+        .notices
+        .iter()
+        .find(|n| n.contains("HELD"))
+        .expect("a hold delivers exactly one notice");
+    assert!(
+        notice.contains("total age bound of 12h"),
+        "the notice must name the bound's value, which is #2110's second bullet: {notice}"
+    );
+    assert!(
+        notice.contains("in ci-wait for"),
+        "…and what the drive was doing when it fired, which is the third: {notice}"
+    );
+    assert!(
+        notice.contains("BACKSTOP"),
+        "…and that this is the backstop rather than a claim the drive sat still: {notice}"
     );
 }
