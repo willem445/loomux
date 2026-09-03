@@ -109,8 +109,14 @@ lot of platform-specific code. Each leg uploads a compact per-leg JSON and the
 row need different ones:
 
 - **Per-function values** (lines, cognitive complexity, argument count) take the
-  **larger** of the legs. One function has one value per leg, so the larger is the
-  complete one and a `cfg`-gated body is never under-reported.
+  **larger** of the legs, keyed on `file:line`. One function has one value per leg,
+  so the larger is the complete one and a `cfg`-gated body is never under-reported.
+  The key matters as much as the rule: `file#name` is NOT a function identity —
+  `src-tauri/src/orchestration/mod.rs` declares sixteen `fn as_str` — and keying on
+  the name collapsed all sixteen into one row carrying the largest of their values
+  at the first one's line, 52 such rows in all (#2139 review round 3). A span's
+  line is identical across legs for one source blob, which is the same argument the
+  site union below rests on.
 - **Per-file `unwrap`/`expect`/`panic` counts** take the **union of the sites**, not
   the larger count. `max` would be the union only if one leg's site set were a
   subset of the other's: a file holding one `cfg(windows)` and one `cfg(unix)`
@@ -211,7 +217,7 @@ read-only fork variant (#2128 part 6d).
 
 ## Measured distributions
 
-All of it measured by run **33787554369** at commit `6e364493`, by the job this note
+All of it measured by run **33795043467** at commit `29353e97`, by the job this note
 describes — not by hand, and not carried over from #2128's estimates. Re-derive it,
 do not edit it: download that run's `code-metrics` artifact, or read any later run's
 job summary.
@@ -226,9 +232,9 @@ does not read, 0 unreadable.
 | TS nesting depth | 3,686 | 0 | 2 | 2 | 9 |
 | TS argument count | 3,686 | 1 | 2 | 3 | 7 |
 | TS file lines | 153 | 159 | 984 | 2,105 | 5,255 |
-| Rust function CODE lines (clippy) | 1,927 | 9 | 36 | 54 | 991 |
-| Rust cognitive complexity | 1,530 | 2 | 6 | 8 | 85 |
-| Rust argument count | 1,454 | 3 | 5 | 6 | 19 |
+| Rust function CODE lines (clippy) | 1,976 | 9 | 35 | 54 | 991 |
+| Rust cognitive complexity | 1,560 | 2 | 6 | 8 | 85 |
+| Rust argument count | 1,472 | 3 | 5 | 6 | 19 |
 
 **The two length rows are not comparable, and this is the reason the labels say so.**
 The TS row is physical lines from the `fn` line to the closing brace. The Rust row is
@@ -239,13 +245,15 @@ columns would be meaningless.
 
 Three population notes, because a percentile is only as good as the set under it:
 
-- The Rust `n` differs per row (1,927 / 1,530 / 1,454) because each threshold lint
+- The Rust `n` differs per row (1,976 / 1,560 / 1,472) because each threshold lint
   fires only ABOVE its threshold of 1. A function of one code line, no branches, or
   one argument does not emit, so it is absent from that row. These are distributions
   over "functions with more than one", not over all functions.
-- 2,380 distinct Rust functions carry at least one row; the tree has ~3,564 `fn`
+- 2,441 Rust functions carry at least one row; the tree has ~3,564 `fn`
   lines. The gap is one-line bodies, trait signatures, and `#[cfg]` arms no leg
-  compiled.
+  compiled. Each row is one function: the merge keys `file:line`, so same-named
+  siblings in one file — `mod.rs` has sixteen `fn as_str` — stay sixteen rows
+  (#2139 review round 3; a `file#name` key had collapsed them into one).
 - The clippy run covers the LIB targets only — no `--all-targets` — so
   `#[cfg(test)]` modules are not compiled and their contents never appear. That is
   deliberate: these rows are about product code.
@@ -268,7 +276,7 @@ Roots, same run:
 | Root | Files | Lines | Comment share | file p95 | file max |
 | --- | --- | --- | --- | --- | --- |
 | `src` | 153 | 65,416 | 16% | 2,105 | 5,255 |
-| `test` | 142 | 45,172 | 21% | 939 | 3,311 |
+| `test` | 142 | 45,297 | 21% | 939 | 3,311 |
 | `e2e` | 14 | 3,640 | 28% | 767 | 767 |
 | `src-tauri/src` | 32 | 88,461 | 49% | 3,902 | 57,085 |
 | `src-tauri/tests` | 40 | 101,815 | 28% | 6,376 | 59,528 |
@@ -288,11 +296,14 @@ until the one apparent product site turned out to be a `.unwrap()` inside a `///
 doc line.
 
 These three figures are **unchanged** by the move from a `max` merge to a site union
-(#2139 review round 1): `sitesComplete` is true and the union comes to the same 27 /
-22 / 10, because no file in the tree today has an `unwrap`, `expect` or `panic!` on
-one leg that another leg does not also report. The fix changed the GUARANTEE, not
-this number — a file that later gains a `cfg(windows)` and a `cfg(unix)` site would
-have merged to 1 under `max` and now merges to 2.
+(#2139 review round 1): `sitesComplete` is true and the union comes to the same
+27 / 22 / 10, because no file in the tree today has an `unwrap`, `expect` or
+`panic!` on one leg that another leg does not also report. The fix changed the
+GUARANTEE, not this number — a file that later gains a `cfg(windows)` and a
+`cfg(unix)` site would have merged to 1 under `max` and now merges to 2. The round-3
+merge-key fix does not touch them either: that merge is the site union and never used
+the function key.
+
 
 ### What the cost is
 
