@@ -2490,13 +2490,14 @@ edit or a finding the worker answered rather than changed code for. A `report(pr
 no further, so instead of waiting the fix timeout out the driver types one line back into that
 worker's pane saying so. Once per hand-back, never to you.
 
-**A drive stops, it does not drift.** There are fifteen ways out and each produces exactly one
+**A drive stops, it does not drift.** There are sixteen ways out and each produces exactly one
 line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
 by orrerix on its own when it sees the PR has been closed — or one of
-thirteen holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
+fourteen holds — a counter reaching INVARIANT 9's bound, a reviewer escalating, a lane or a worker going quiet past its timeout,
 the drive itself getting old, a reviewer requirement orrerix could not compute, a gate file it
 could not read, a worker that reported blocked, a delegate messaging the orchestrator, this group's
-live-delegate cap refusing the pane a hand-back needed, or a fix that could not be handed back to
+live-delegate cap refusing the pane a hand-back needed, that same cap refusing a *reviewer* for
+long enough that the drive cannot get started at all, or a fix that could not be handed back to
 its worker. The last of those quotes what actually refused rather than
 diagnosing one cause: the session may no longer resolve, the block it was minted under may no
 longer be declared in this group's roster, or the pane the driver resumed may have opened and then
@@ -2504,7 +2505,28 @@ exited without saying anything. The cap one (`cap-refused`) is deliberately sepa
 because its remedy is: the recorded session is fine and what is exhausted is a *slot*, so freeing
 one — `kill_agent` on an idle delegate, and the notice names which are idle — is what clears it,
 not re-pointing the drive at a different session. It is the one hold reason named here by its own
-word, because it is the one whose remedy is a different action from its neighbour's. **A hold is parked, not finished**: it keeps what it has spent, so
+word, because it is the one whose remedy is a different action from its neighbour's.
+
+**A drive the cap starves says so, in fifteen minutes rather than four hours.** A reviewer spawn
+refused by the live-delegate cap is normally nothing to act on — another drive's lane finishes, a
+pane is closed, and the next tick spawns — so the drive simply retries. But a group whose slots are
+all held goes on refusing, and before this the drive sat in `review-wait` with no lanes and no line
+in your pane until its total age bound expired: the longest measured was about three hours, and
+nothing on screen said why. Now a refusal that lasts a quarter of an hour parks the drive as
+`cap-full`, whose line names what to free and what to run afterwards. It is a **separate** word
+from `cap-refused` above even though the remedy is the same, because the two say different things
+about how long: one is a single refusal on the spot, this is a run of them, and telling a drive
+that has just hit the cap from one that has been stuck all afternoon is the whole point.
+
+**The driver still never kills a pane, including to make room for itself.** Freeing a slot is
+yours or the orchestrator's — or the idle reaper's, where you have set one. What the driver owes
+instead is the sentence, and that is what `cap-full` is; its line also lists the panes that drive
+still owns, so you can see at a glance whether the pressure is even its own. A drive now costs one
+pane per reviewer for its whole life — its lanes are resumed round to round rather than respawned,
+and a reviewer that is still writing is never given a second pane alongside it — so a drive is no
+longer competing with itself for the slots it is waiting on.
+
+**A hold is parked, not finished**: it keeps what it has spent, so
 resuming it does not silently grant a fresh budget, and clearing the counters is a separate,
 audited decision.
 
@@ -2521,6 +2543,22 @@ thing orrerix typed into that pane is on record as having landed, and nothing is
 it. A pane that is idle but parked — behind a permission prompt, a CLI question, an install gate —
 fails that test, and the driver opens a fresh pane rather than adding a brief to a queue nobody is
 draining. The refusal is on the group's audit log as `rd-reuse-declined`, naming the pane and why.
+
+**A reviewer is asked again in its own conversation, not replaced by a stranger.** Every round
+after the first is a delta brief — "your previous verdict was `fail`; here is what changed" — and
+that only means anything said to the reviewer that recorded the verdict. So the driver reopens
+that reviewer's session, whether or not that session was known at the moment the pane was
+spawned: some CLIs hand orrerix a session id up front and some only mint one after they boot, and
+before this the second kind got a brand-new reviewer every round, told about a verdict it had
+never given. Where a session genuinely cannot be reopened the driver opens a fresh reviewer, as it
+always did, and the audit log says so (`rd-lane-resume-failed`) with what refused.
+
+**One reviewer per round, never two.** If a PR's body changes while its reviewer is still writing,
+the driver waits for that reviewer and hands it the update, rather than starting a second one
+beside it — two panes reviewing one round is two reviews paid for and one verdict slot to put them
+in. The refusal is on the audit log as `rd-lane-duplicate-refused`, naming the pane that already
+has the round. A new *commit* is a different matter: there the reviewer in flight is reading code
+that no longer exists, so a successor is opened for the new revision exactly as before.
 
 **Drives and the merge queue do not overlap, and the exclusion is deliberately not symmetric.** A
 PR with a LIVE drive cannot be queued, and a PR with a queue entry that has not finished cannot be

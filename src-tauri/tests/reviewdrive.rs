@@ -661,6 +661,11 @@ const HEAD_B: &str = "bb22cc33dd44ee55ff6677889900aabbccddeeff";
 struct FakeGh {
     /// `Ok((state, head))`, or `Err` for the seam itself failing.
     facts: std::sync::Mutex<Result<(String, String), String>>,
+    /// The PR **body**, which `observe_pr` digests. Its own field for
+    /// `merge`'s reason: §8's body-changed row is a re-brief at an UNCHANGED
+    /// head, and before this the body was a `"b"` literal inside
+    /// [`facts_json`], so no test in this file could reach that row at all.
+    body: std::sync::Mutex<String>,
     /// The `mergeStateStatus` the PR-facts read reports.
     merge: std::sync::Mutex<String>,
     checks: std::sync::Mutex<String>,
@@ -671,6 +676,7 @@ impl FakeGh {
     fn green(head: &str) -> FakeGh {
         FakeGh {
             facts: std::sync::Mutex::new(Ok(("OPEN".to_string(), head.to_string()))),
+            body: std::sync::Mutex::new("b".to_string()),
             merge: std::sync::Mutex::new("CLEAN".to_string()),
             checks: std::sync::Mutex::new(
                 r#"[{"name":"build","state":"SUCCESS","link":"x"}]"#.to_string(),
@@ -692,6 +698,11 @@ impl FakeGh {
         *self.facts.lock().unwrap_or_else(|e| e.into_inner()) =
             Ok((state.to_string(), head.to_string()));
     }
+    /// The PR body the next observation reads — how a test moves the DIGEST
+    /// while leaving the head where it is (§8's body-changed row).
+    fn set_body(&self, body: &str) {
+        *self.body.lock().unwrap_or_else(|e| e.into_inner()) = body.to_string();
+    }
     /// The mergeability GitHub reports — `CLEAN`, `CONFLICTING`, or any of the
     /// several words that are neither (`BEHIND`, `BLOCKED`, …), which
     /// `pr_mergeability_result` deliberately does not short-circuit on.
@@ -708,9 +719,9 @@ impl FakeGh {
     }
 }
 
-fn facts_json(state: &str, head: &str, merge: &str) -> String {
+fn facts_json(state: &str, head: &str, merge: &str, body: &str) -> String {
     format!(
-        r#"{{"state":"{state}","headRefOid":"{head}","baseRefName":"main","body":"b",
+        r#"{{"state":"{state}","headRefOid":"{head}","baseRefName":"main","body":"{body}",
              "mergeStateStatus":"{merge}","additions":1,"deletions":1}}"#
     )
 }
@@ -749,6 +760,7 @@ impl RdRunner for FakeGh {
                 state,
                 head,
                 &self.merge.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                &self.body.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             )),
             Err(e) => Err(e.clone()),
         }
@@ -5470,5 +5482,587 @@ fn a_delivery_ready_pane_that_is_not_idle_is_not_reused_for_a_handback() {
         "each row is (idle, reused the existing pane, panes opened, `rd-reuse-declined` rows \
          naming it). Both panes are delivery-ready, so an implementation that dropped the idle \
          conjunct reuses the mid-turn one and the second row's `reused` goes true."
+    );
+}
+
+// ── #2109: lanes are resumed, never duplicated, and a starved drive says so ──
+
+/// The same roster with the reviewer block on a CLI that does **not** pre-assign
+/// a session id.
+///
+/// `spawn_agent_bound` mints a uuid up front for `cli == "claude"` and for
+/// nothing else, so this one fixture is the difference between a lane whose
+/// session is on its record at `open_lane` time and one whose session exists
+/// only on the pane, discovered after boot. Every claude fixture in this file
+/// is on the first side of that line, which is why #2109 was invisible here.
+const WORKFLOW_LATE_SESSION_REVIEWER: &str = r#"version: 1
+blocks:
+  - id: worker
+    kind: worker
+  - id: rev-std
+    name: Standard review
+    kind: reviewer
+    cli: copilot
+gates:
+  merge:
+    require: all-pass
+    reviewers: [rev-std]
+    routing:
+      - paths: [src/**]
+        reviewers: [rev-std]
+driver:
+  enabled: true
+"#;
+
+fn rows_for(reg: &OrchRegistry, group: &GroupId, action: &str) -> Vec<serde_json::Value> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == action)
+        .map(|e| e.detail)
+        .collect()
+}
+
+/// Every `rd-lane-spawned` row this group recorded, in order.
+fn lane_spawn_rows(reg: &OrchRegistry, group: &GroupId) -> Vec<serde_json::Value> {
+    rows_for(reg, group, "rd-lane-spawned")
+}
+
+/// Drive one PR to the end of its first `review-wait` round, and answer the
+/// group, the orchestrator pane and the lane pane that round opened.
+///
+/// Factored out because three tests below need the same seven lines and differ
+/// only in what they do between the rounds; three inline copies is how the
+/// second and third drift from the first.
+fn lane_round_one(reg: &OrchRegistry, repo: &Repo, gh: &FakeGh) -> (GroupId, String, String) {
+    let (group, _s) = driven(reg, repo, gh);
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    reg.rd_drive_group_with(&group, gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, gh, 20_000);
+    let (_pr, _b, lane) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    (group, orch.id, lane)
+}
+
+/// **#2109 ask 1.** A lane is resumed on the conversation it already had, and
+/// the lane RECORD is not the only place that conversation is written down.
+///
+/// The fixture is the whole finding. `LaneRecord::session` is what the spawn
+/// RETURNED, and `spawn_agent_bound` returns one only for claude; copilot and
+/// opencode mint theirs after boot, and the watcher binds the discovered id to
+/// the PANE and the roster row — never to the drive's own lane record. So on
+/// those CLIs the recorded session was empty for the life of the lane, the
+/// resume arm read it, found nothing, and opened a fresh pane on a fresh
+/// conversation every round. Measured on the dogfood: nine reviewer panes across
+/// three PRs where six would have done, each new pane briefed `Your previous
+/// verdict was fail` about a verdict it had never recorded.
+///
+/// **Round one is the control**, and it is not decoration: it pins that this
+/// lane really does spawn with no session on its record, so the round-two
+/// assertion is about the fall-back and not about a field that was populated all
+/// along. A claude fixture passes the round-two assertion under the defect.
+#[test]
+fn a_lane_whose_session_arrived_after_the_spawn_is_resumed_rather_than_respawned() {
+    const DISCOVERED: &str = "9f2c41ab-7777-4444-8888-1c0de5e55107";
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_LATE_SESSION_REVIEWER);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+
+    assert_eq!(
+        reg.agent(&lane).expect("the lane is on the roster").session_id,
+        None,
+        "the control: this CLI mints its session AFTER boot, so the spawn returned none"
+    );
+    let round1 = lane_spawn_rows(&reg, &group);
+    assert_eq!(round1.len(), 1);
+    assert_eq!(round1[0]["resumed"], json!(false), "a first round is never a resume");
+    assert_eq!(
+        round1[0]["session"],
+        json!(""),
+        "and the lane record therefore has no session to resume, which is the premise"
+    );
+
+    // The session watcher finds the id the CLI minted and binds it — to the pane
+    // and the roster, which is everywhere it has ever been written.
+    assert!(
+        reg.associate_session(&group, &lane, DISCOVERED),
+        "the watcher binds a discovered session to its pane"
+    );
+
+    // The head moves, which stales the lane and sends the drive back round.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 30_000); // review-wait -> ci-wait (arc 6)
+    reg.rd_drive_group_with(&group, &gh, 40_000); // ci-wait -> review-wait (arc 2)
+    let again = reg.rd_drive_group_with(&group, &gh, 50_000);
+    let (_pr, _b, lane2) =
+        again.lanes_opened.first().cloned().expect("the staled lane re-opens at the new head");
+
+    let rows = lane_spawn_rows(&reg, &group);
+    assert_eq!(rows.len(), 2, "one row per round: {rows:?}");
+    assert_eq!(
+        rows[1]["resumed"],
+        json!(true),
+        "round two must CONTINUE the reviewer conversation, not start a new one: {rows:?}"
+    );
+    assert_eq!(
+        rows[1]["session"],
+        json!(DISCOVERED),
+        "and on the session the watcher bound to round one's pane: {rows:?}"
+    );
+    assert_eq!(
+        reg.agent(&lane2).expect("the resumed lane is on the roster").session_id.as_deref(),
+        Some(DISCOVERED),
+        "the pane the brief went to is running that same conversation"
+    );
+    assert!(
+        rows_for(&reg, &group, "rd-lane-resume-failed").is_empty(),
+        "nothing refused this resume, so nothing may claim one failed"
+    );
+}
+
+/// **#2109 ask 1, the other half.** A resume that cannot be performed still
+/// opens a lane — and says on the record why it had to.
+///
+/// The fall-through already existed and was SILENT (`.or_else(|_| fresh(self))`
+/// discarded the error), so a reviewer that lost its conversation and one that
+/// never had one produced the same row, the same kind of pane and the same
+/// brief. That is `rd-reuse-declined`'s argument one arm over: the refusal's
+/// only other visible effect is a fresh pane, which is what "there was nothing
+/// to resume" looks like too.
+///
+/// The refusal is manufactured the way a reaped worktree produces one — the
+/// recorded workspace is gone and the session is not in the CLI's own store, so
+/// `resolve_worker_resume_cwd` refuses rather than resuming into the group's
+/// main clone (#338/#359).
+#[test]
+fn a_resume_that_cannot_be_performed_opens_a_fresh_lane_and_records_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+
+    let session = reg
+        .agent(&lane)
+        .expect("the lane is on the roster")
+        .session_id
+        .expect("claude pre-assigns a session id at spawn");
+    let cwd = reg.agent(&lane).unwrap().cwd;
+    assert!(std::path::Path::new(&cwd).is_dir(), "the control: the workspace exists first");
+    std::fs::remove_dir_all(&cwd).expect("take the lane's workspace away");
+
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 30_000);
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    let again = reg.rd_drive_group_with(&group, &gh, 50_000);
+    let (_pr, _b, lane2) = again
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("a resume that refuses must still open a lane, not park the drive");
+    assert_ne!(lane2, lane, "a fresh pane, since the recorded one could not be resumed");
+
+    let failed = rows_for(&reg, &group, "rd-lane-resume-failed");
+    assert_eq!(failed.len(), 1, "one row for the one refused resume: {failed:?}");
+    assert_eq!(failed[0]["block"], json!("rev-std"));
+    assert_eq!(
+        failed[0]["session"],
+        json!(session),
+        "the row names the conversation that was lost"
+    );
+    assert!(
+        failed[0]["detail"].as_str().unwrap_or_default().contains("resume-"),
+        "and quotes what refused rather than diagnosing it: {failed:?}"
+    );
+    let rows = lane_spawn_rows(&reg, &group);
+    assert_eq!(
+        rows[1]["resumed"],
+        json!(false),
+        "resumed records what HAPPENED, and a resume that fell through is not one: {rows:?}"
+    );
+}
+
+/// **#2109 ask 2.** One block, one live pane, one round — a second is refused,
+/// on the record, rather than opened.
+///
+/// §8's body-changed row re-briefs a lane at an UNCHANGED head, and where that
+/// lane's pane is idle the reuse arm types the delta into it. Where the pane is
+/// BUSY — still writing the review it was briefed for — the reuse declines on
+/// readiness and the spawn used to mint a second pane on the same conversation.
+/// Measured: `rev-1825` and `rev-1826` both reviewed PR #2104's round 2, and
+/// `rev-1832` reported "a duplicate rev-std round-2 review from a parallel pane
+/// landed 41 seconds after mine with the same verdict and lead finding".
+///
+/// **The head-move half is the discriminator, not a bonus.** A refusal keyed on
+/// nothing but "this lane has a live pane" would pass the first half and block
+/// every legitimate supersede — the pane reviewing a revision the drive has
+/// moved past is exactly what `prior_agents` exists for. Asserting both is what
+/// makes this a pin on the (pr, block, head) key rather than on "never twice".
+#[test]
+fn a_block_that_already_has_a_live_pane_at_this_head_is_refused_a_second_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+    assert_eq!(lane_spawn_rows(&reg, &group).len(), 1);
+
+    // The body moves under the same head. The lane is stale, the drive wants it
+    // re-briefed, and its pane is mid-review — never idle, so never a reuse
+    // candidate.
+    gh.set_body("b2");
+    let blocked = reg.rd_drive_group_with(&group, &gh, 30_000);
+    assert!(
+        blocked.lanes_opened.is_empty(),
+        "no second pane while round one's is still holding the round: {:?}",
+        blocked.lanes_opened
+    );
+    assert_eq!(
+        lane_spawn_rows(&reg, &group).len(),
+        1,
+        "and no second rd-lane-spawned row either"
+    );
+    let refused = rows_for(&reg, &group, "rd-lane-duplicate-refused");
+    assert_eq!(refused.len(), 1, "the refusal is on the record: {refused:?}");
+    assert_eq!(refused[0]["pane"], json!(lane), "naming the pane that holds the round");
+    assert_eq!(refused[0]["head"], json!(HEAD_A));
+    assert_eq!(refused[0]["block"], json!("rev-std"));
+    assert_eq!(status_state(&reg, &group), "review-wait", "the drive backs off, it does not park");
+
+    // Now the HEAD moves. That pane is reviewing a revision the drive has left,
+    // so a successor is exactly what is owed — and the refusal must not stand in
+    // its way.
+    gh.set_facts("OPEN", HEAD_B);
+    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+    reg.rd_drive_group_with(&group, &gh, 40_000);
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    let moved = reg.rd_drive_group_with(&group, &gh, 60_000);
+    assert!(
+        !moved.lanes_opened.is_empty(),
+        "a head change is a new round, and the refusal is keyed on the head: {:?}",
+        rows_for(&reg, &group, "rd-lane-duplicate-refused")
+    );
+    assert_eq!(
+        rows_for(&reg, &group, "rd-lane-duplicate-refused").len(),
+        1,
+        "so no second refusal was recorded either"
+    );
+}
+
+/// The roster with a delegate cap of one, so the worker `drive_review` needs is
+/// the whole of it and every lane spawn is refused.
+fn rails_capped() -> Guardrails {
+    Guardrails { max_agents: 1, ..rails() }
+}
+
+/// A capped group with the drive already in `review-wait` and its first lane
+/// spawn refused — the fixture both #2109 ask-3 tests start from.
+///
+/// Answers the group, the orchestrator's pane and the clock of the tick that
+/// took the refusal, so a caller can measure the window from where the
+/// starvation actually began rather than from a number it remembered.
+fn cap_starved(reg: &OrchRegistry, repo: &Repo, gh: &FakeGh) -> (GroupId, String, u64) {
+    let group = reg.create_group(&repo.path(), rails_capped()).unwrap().id;
+    let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).expect("the one slot");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+
+    reg.rd_drive_group_with(&group, gh, 10_000); // ci-wait -> review-wait
+    let first = reg.rd_drive_group_with(&group, gh, 20_000); // lane spawn, refused
+    assert!(first.lanes_opened.is_empty(), "the control: the cap is full, so nothing spawned");
+    (group, orch.id, 20_000)
+}
+
+/// **#2109 ask 3, the record.** A cap refusal says how long the cap has been
+/// refusing *this drive*, not merely that it refused on this tick.
+///
+/// `cap: true` (#1960) already answered "was a slot the problem here", and that
+/// was the whole of what the log carried while PR #2105's drive sat starved for
+/// three hours: thirty-seven identical rows, each true, none of them saying the
+/// drive had been stuck since the first one. `starved_ms` is the run, and it is
+/// the number `held(cap-full)` is decided from — so a row with `cap: true` and
+/// no run is a log that can report the condition but never its duration.
+///
+/// Split from the hold below rather than asserted before it, because a test
+/// that fails here tells you nothing about whether the hold works: the first
+/// assertion to move is the only one a red evidences.
+#[test]
+fn a_cap_refusal_records_how_long_the_cap_has_been_refusing_this_drive() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+
+    let refused = rows_for(&reg, &group, "rd-refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["cap"], json!(true), "the cap is what refused it: {refused:?}");
+    assert_eq!(
+        refused[0]["starved_ms"],
+        json!(0),
+        "and the run is zero long, because this is its first tick: {refused:?}"
+    );
+
+    // A second refusal on a later tick is the SAME run, and the row says so by
+    // the number growing. Without this the field could be a constant zero.
+    reg.rd_drive_group_with(&group, &gh, at + 90_000);
+    let again = rows_for(&reg, &group, "rd-refused");
+    assert_eq!(again.len(), 2, "the cap refused again: {again:?}");
+    assert_eq!(
+        again[1]["starved_ms"],
+        json!(90_000),
+        "…measured from the FIRST refusal, so a reader sees the run and not the tick: {again:?}"
+    );
+}
+
+/// **#2109 ask 3, the exit.** A drive the cap will not let spawn becomes one of
+/// §2.2's exits instead of sitting invisible.
+///
+/// The measured incident: PR #2105's drive sat in `review-wait` with
+/// `lanes: []` for about three hours — `since_ms` 11,083,045 at the read —
+/// emitting one `rd-refused` row per tick and no notice at all, while released
+/// lanes from a finished drive held the cap. Nothing was wrong with the drive,
+/// the PR or the session; a slot was missing, and the only surface that said so
+/// was a log a human read by hand.
+///
+/// **The driver still never kills a pane** (§3.1 item 5), which is why this is a
+/// hold rather than a reap: what the driver owes is the sentence naming who can
+/// free a slot, and the notice carries both that and the drive's own panes.
+///
+/// The one-tick-short assertion is the discriminator. Holding on the FIRST
+/// refusal would be the opposite defect — a capped lane usually clears itself
+/// within a back-off — so an implementation that parks immediately fails here,
+/// and one that never parks fails below.
+#[test]
+fn a_cap_that_starves_a_drive_parks_it_as_cap_full_rather_than_leaving_it_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, orch, at) = cap_starved(&reg, &repo, &gh);
+
+    // One tick short of the window: still trying, still no orchestrator turn.
+    let short = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS - 1);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "a cap refusal that has not lasted the window is a back-off, not a hold"
+    );
+    assert!(
+        short.notices.iter().all(|n| !n.contains("HELD")),
+        "and it costs no orchestrator turn: {:?}",
+        short.notices
+    );
+
+    let held = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(status_state(&reg, &group), "held");
+    let status = reg.review_drive_status(&group);
+    assert_eq!(
+        status["drives"][0]["held_reason"],
+        json!("cap-full"),
+        "the hold names the CAP, not the drive's age: {status}"
+    );
+    let notice = held
+        .notices
+        .iter()
+        .find(|n| n.contains("HELD"))
+        .expect("a hold delivers exactly one notice");
+    assert!(
+        notice.contains("live-delegate cap"),
+        "the notice must say a SLOT is what is missing: {notice}"
+    );
+    assert!(
+        notice.contains("kill_agent") && notice.contains("drive_review"),
+        "and name what frees one and what resumes the drive: {notice}"
+    );
+    assert!(
+        notice.contains("never kills a pane"),
+        "and say why the driver did not free the slot itself (3.1 item 5): {notice}"
+    );
+    assert!(
+        texts_to(&reg, &group, &orch).iter().any(|t| t.contains("HELD")),
+        "and it must land in the ORCHESTRATOR pane, which is the whole point of the hold"
+    );
+}
+
+/// The two-lane roster with a cap that admits the worker and **one** lane.
+fn rails_capped_two() -> Guardrails {
+    Guardrails { max_agents: 2, ..rails() }
+}
+
+/// The state review 4's W1 needs, which no fixture in this file could reach: a
+/// live cap stamp **beside a live lane pane**, with the tick's per-refusal kind
+/// no longer the cap's.
+///
+/// `rails_capped`'s cap of one cannot produce it — it refuses every lane, so the
+/// stamp's owner is always also the selected lane, which is the one case the
+/// defect does not show up in. This needs a cap that admits the worker and
+/// exactly one lane.
+///
+/// 1. Lane 0 opens and records `pass` at `(head-a, d1)`; its pane stays live and
+///    busy, because recording a verdict is not going idle.
+/// 2. `first_stale_lane` moves to lane 1, whose spawn the cap refuses — both
+///    slots are held by the worker and lane 0's pane. The entry is stamped.
+/// 3. The PR body is edited. The digest moves, lane 0's `pass` no longer stands,
+///    and `first_stale_lane` comes back to **lane 0** — whose re-brief the
+///    duplicate refusal declines, because its pane is live at this head. That
+///    refusal is not the cap's.
+///
+/// Answers the group, the orchestrator's pane, and the clock of the tick that
+/// took the non-cap refusal.
+///
+/// **The digest has two sources here and both are set.** `review_verdict`
+/// records `body_digest` of what `pr_body` answers, while the drive digests the
+/// body `observe_pr` read out of `FakeGh`. Left unset the first fails, the
+/// verdict records an EMPTY digest, and `body_changed` then answers `None` —
+/// "we could not tell" — which `lane_verdict_is_current` reads as still current.
+/// The body edit would then stale nothing and step 3 would silently re-select
+/// lane 1, which is how this fixture first went green for the wrong reason.
+fn two_lane_stamp_then_duplicate(
+    reg: &OrchRegistry,
+    repo: &Repo,
+    gh: &FakeGh,
+) -> (GroupId, String, u64) {
+    let group = reg.create_group(&repo.path(), rails_capped_two()).unwrap().id;
+    let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).expect("slot 1 of 2");
+    let session = w.session_id.clone().expect("claude mints a session id at spawn");
+    let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+    with_pane(reg, &orch.id, 7001);
+    reg.set_pr_head_override(Some(HEAD_A.to_string()));
+    reg.set_pr_body_override(Some("b".to_string()));
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1", 0);
+    assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
+
+    // 1. Lane 0 opens — slot 2 of 2 — and answers.
+    reg.rd_drive_group_with(&group, gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, gh, 20_000);
+    let (_pr, block0, lane0) = first.lanes_opened.first().cloned().expect("lane 0 opens");
+    assert_eq!(block0, "rev-std");
+    dispatch(
+        reg,
+        &Caller {
+            agent_id: lane0,
+            group: group.clone(),
+            role: Role::Reviewer,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "review_verdict", "arguments": {
+            "pr": "1758", "verdict": "pass", "summary": "pass - lane one is happy" } }),
+    )
+    .expect("lane 0 records");
+
+    // 2. Lane 1 is what the gate wants next, and the cap is full.
+    let capped = reg.rd_drive_group_with(&group, gh, 30_000);
+    assert!(capped.lanes_opened.is_empty(), "both slots are held, so lane 1 cannot open");
+    let refused = rows_for(reg, &group, "rd-refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["block"], json!("rev-final"), "…and it is LANE 1 that was refused");
+    assert_eq!(refused[0]["cap"], json!(true), "…by the cap, which is what stamps: {refused:?}");
+
+    // 3. The body moves, so lane 0's pass no longer stands and the gate comes
+    //    back to it — where the duplicate refusal, not the cap, is what answers.
+    gh.set_body("b2");
+    reg.set_pr_body_override(Some("b2".to_string()));
+    let dup = reg.rd_drive_group_with(&group, gh, 40_000);
+    assert!(dup.lanes_opened.is_empty(), "lane 0's pane holds the round");
+    let dups = rows_for(reg, &group, "rd-lane-duplicate-refused");
+    assert_eq!(dups.len(), 1, "the tick's refusal is the DUPLICATE one: {dups:?}");
+    assert_eq!(dups[0]["block"], json!("rev-std"), "…and its subject is lane 0 now: {dups:?}");
+    (group, orch.id, 40_000)
+}
+
+/// **#2109 review 4, W1 — the record.** A refusal that is not the cap's must
+/// stop publishing a cap-run duration beside itself.
+///
+/// `cap: false` and a growing `starved_ms` on one row is a second surface saying
+/// the run is a cap run when it is not, and it is the surface a reader chasing a
+/// starved drive looks at first.
+///
+/// Split from the hold below rather than asserted before it, for the reason that
+/// bit this PR twice already: a red evidences only the assertion it reaches, so
+/// two claims in one test means the second is never seen to fail.
+#[test]
+fn a_refusal_that_is_not_the_caps_stops_publishing_a_cap_run_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, _at) = two_lane_stamp_then_duplicate(&reg, &repo, &gh);
+
+    let all = rows_for(&reg, &group, "rd-refused");
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[0]["starved_ms"], json!(0), "the cap refusal opened the run: {all:?}");
+    assert_eq!(all[1]["cap"], json!(false), "the second refusal is not the cap's: {all:?}");
+    assert_eq!(
+        all[1]["starved_ms"],
+        json!(null),
+        "…so the row must not go on publishing a cap-run duration beside it: {all:?}"
+    );
+}
+
+/// **#2109 review 4, W1 — the exit.** The cap-starvation stamp is a claim about
+/// the run happening NOW, so a refusal that is not the cap's ends it.
+///
+/// The stamp used to be guarded on the write edge alone — written only when
+/// `cap`, cleared only by a lane opening or a state arc — which made it a
+/// **latch**: a single early cap refusal aged into `held(cap-full)` behind a run
+/// of refusals that were nothing of the kind, which is exactly what the comment
+/// above the write says must not happen.
+///
+/// This drives the composition rather than the mechanism, because the mechanism
+/// was already green in isolation and that is the point: the stamp belongs to
+/// the ENTRY while `first_stale_lane` re-picks the lane every tick, so the two
+/// can come apart. At the moment of the hold a lane IS open, and the action
+/// actually owed — a delta into lane 0's own pane once it frees up — costs no
+/// slot at all, so the notice's remedy would send an orchestrator to kill a pane
+/// for a condition killing a pane does not fix.
+///
+/// The second half is the non-vacuity control, and it is why this is a pin on
+/// the *clear* rather than on `cap-full` being hard to reach: with the cap
+/// genuinely refusing throughout, the same drive at the same clock does park.
+#[test]
+fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = two_lane_stamp_then_duplicate(&reg, &repo, &gh);
+
+    let later = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "a stamp left by lane 1's cap refusal must not park the drive on lane 0's duplicate \
+         refusal — the cap is not what is refusing, a lane IS open, and the delta the drive \
+         owes costs no slot"
+    );
+    assert!(
+        later.notices.iter().all(|n| !n.contains("cap")),
+        "…and nothing may tell the orchestrator to free a slot: {:?}",
+        later.notices
+    );
+
+    // The control: the same clock, with the cap genuinely refusing throughout,
+    // DOES park. Without it the assertions above pass under an implementation
+    // that simply never holds.
+    let dir2 = tempfile::tempdir().unwrap();
+    let reg2 = relaunch_registry(dir2.path());
+    let repo2 = Repo::new();
+    let gh2 = FakeGh::green(HEAD_A);
+    let (group2, _orch2, at2) = cap_starved(&reg2, &repo2, &gh2);
+    reg2.rd_drive_group_with(&group2, &gh2, at2 + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status_state(&reg2, &group2),
+        "held",
+        "the control: an unbroken cap run still reaches the hold"
     );
 }
