@@ -3088,6 +3088,45 @@ impl OrchRegistry {
                 for (dropped_pr, text) in superseded {
                     dropped_notices.push((dropped_pr, text));
                 }
+                // **The lanes' CONVERSATIONS survive the entry that held them**
+                // (#2153). Lane memory lives only here, so dropping the entry
+                // used to drop it — and the sequence a satisfied gate is
+                // designed to produce (satisfied, the orchestrator dispositions
+                // the findings, a re-drive at the new head) is the ordinary
+                // path, not an edge. Measured on PR #2141: two lanes with live,
+                // resolvable sessions that had already read the PR once, both
+                // re-opened `resumed=false`, on the round where the warm session
+                // is cheapest.
+                //
+                // Read BEFORE the `retain` that discards them, and through
+                // `rd_lane_session` rather than off `LaneRecord::session`: that
+                // field is what the spawn RETURNED, which is a session id only
+                // on a CLI that pre-assigns one, so seeding from it alone would
+                // drop exactly the copilot and opencode lanes #2109 was about.
+                // A lane with no session to carry from any of the three sources
+                // is seeded not at all — an absent record is already "open this
+                // one fresh", and a seeded record with nothing to resume would
+                // only make `rd_open_lane` audit a resume failure for a session
+                // that was never recorded.
+                //
+                // A seeded session that no longer resolves needs nothing here:
+                // `rd_open_lane`'s existing `rd-lane-resume-failed` arm audits
+                // the fall-through and spawns fresh, exactly as it does for a
+                // lane reaped inside a live drive.
+                //
+                // `rd_lane_session` under `rd_state_lock` is the established
+                // order, not a new one: `rd_step_entry` runs the whole
+                // load-decide-store — that call and the spawn after it included
+                // — under this same lock (§2.4).
+                let seeded: Vec<reviewdrive::LaneRecord> = state
+                    .entries
+                    .iter()
+                    .filter(|e| e.pr == pr)
+                    .flat_map(|e| e.lanes.iter())
+                    .filter_map(|l| {
+                        self.rd_lane_session(group, Some(l)).map(|s| l.reseeded(&s))
+                    })
+                    .collect();
                 state.entries.retain(|e| e.pr != pr);
                 // **The clock is the caller's, and that is what makes the age
                 // bound testable at all.** `started_ms` is the anchor §2.2
@@ -3096,13 +3135,22 @@ impl OrchRegistry {
                 // the two on different scales: `age_ms` saturated to zero for
                 // every synthetic clock, so `drive-stalled` could not fire in a
                 // test and never had. That is most of why B2 shipped.
-                state.entries.push(reviewdrive::DriveEntry::new(
+                let mut fresh = reviewdrive::DriveEntry::new(
                     pr,
                     &session,
                     on_behalf_of,
                     reviewdrive::Counters::seeded(rounds_already_spent),
                     now,
-                ));
+                );
+                // #2153. Assigned after construction rather than threaded
+                // through `DriveEntry::new`, which is arc 1 — a drive is CREATED
+                // with no lanes, and a constructor that could be handed some
+                // would make "a fresh drive has reviewed nothing" a caller's
+                // discipline instead of the type's. The counters stay as
+                // `rounds_already_spent` says: a warm conversation is not a
+                // spent round.
+                fresh.lanes = seeded;
+                state.entries.push(fresh);
             }
             if reviewdrive::store_state(&dir, &state).is_err() {
                 return self.rd_refuse(group, pr, r::STATE_UNWRITABLE);
