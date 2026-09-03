@@ -1256,8 +1256,10 @@ impl OrchRegistry {
         // issue built no per-lane refusal clock, so there is still nothing
         // per-lane here and the hold still names no lane; what it added is a
         // per-STATE bound, and `review-wait` is a state, so this composition
-        // now leaves at three hours as `held(state-stalled)` rather than at
-        // twelve as `held(drive-stalled)`.
+        // now leaves at its `review-wait` state bound as `held(state-stalled)`
+        // rather than at twelve hours as `held(drive-stalled)` — four hours on a
+        // one-lane gate at stock knobs, since #2117 review 2 made that bound the
+        // constant PLUS one `lane_timeout_minutes` per required lane.
         // `an_answered_lane_whose_re_brief_is_refused_is_bounded_by_the_review_wait_state_bound`
         // pins the gap and that exit; closing it properly still wants the
         // per-lane clock.

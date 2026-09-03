@@ -2758,8 +2758,9 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // re-brief it produced is now REFUSED while that lane's pane is
                 // live, so without this the drive would retry the refusal until
                 // `state-stalled` at the `review-wait` bound, and then
-                // `drive-stalled` — three hours and twelve, on notices that
-                // name no lane (#2110 renumbered those two; neither names one).
+                // `drive-stalled` — four hours and twelve on a one-lane gate at
+                // stock knobs, on notices that name no lane (#2110 renumbered
+                // those two; neither names one).
                 //
                 // **`at_head` is what makes this a silence test rather than a
                 // stopwatch** (#2109 review 1). The first version keyed on
@@ -4542,9 +4543,10 @@ mod tests {
             required_lanes: Some(vec![lane_fact("rev-std", None, "", "")]),
             ..facts_at("head-a")
         };
-        // `review-wait`'s bound is three hours here — the constant, since one
-        // lane at the default sixty-minute timeout floors it lower. Four hours
-        // is past that and well short of the twelve-hour backstop, so exactly
+        // `review-wait`'s bound is FOUR hours here: the three-hour constant
+        // plus one lane at the default sixty-minute timeout (#2117 review 2
+        // made it an add rather than a max). Four hours therefore reaches it
+        // exactly, and is well short of the twelve-hour backstop, so exactly
         // one time bound is in play and a red is attributable to it.
         let past = 1_000 + 4 * 60 * 60_000;
 
