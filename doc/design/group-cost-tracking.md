@@ -32,6 +32,33 @@ root causes, all stemming from the original best-effort statusline scrape
 4. **Live vs lifetime split.** The panel shows current burn (live agents) and
    total spend (everything ever in the group, including killed agents).
 
+## Which CLI's reader runs — the agent's BLOCK decides (#2167)
+
+Every section below is an arm of `compute_usage_snapshot`, and which arm runs is
+decided by ONE string: the agent's CLI. That string is a property of the
+**block** the agent was spawned from (#222 — the block *is* the agent's
+identity, and it carries its own `cli`), never of the agent's capability class.
+
+`Guardrails::cli_for(role)` answers a different question — "what CLI does this
+class's DEFAULT block run", the first block of that kind in roster order — and
+the two agree only while every class declares exactly one block. A roster
+declaring two workers, a cheap one first and `worker-adv` on Claude second,
+makes them disagree for every pane in the second block.
+`cli_for_block(block_id, role)` is the resolver every caller holding an agent
+must use; it falls back to the class default for a block id the roster no longer
+declares (a renamed block, or an `AgentRecord` persisted before #222 with an
+empty `block`).
+
+Getting this wrong is silent and total: the Claude arm never runs, the OpenCode
+arm looks for a Claude session id in a store that has none, and the row falls
+through to the statusline with four zero counters — while the transcript sits on
+disk under the session id the SPAWN path had resolved per-block correctly the
+whole time. That is #2167, and it cost every Claude delegate's tokens from
+2026-08-30 until it was fixed. The pin is
+`a_claude_pane_reads_its_transcript_when_the_class_default_block_runs_another_cli`
+(`src-tauri/tests/orchestration.rs`), whose fixture is a roster whose ORDERING
+makes the two questions differ.
+
 ## Source of truth per CLI (and its limits)
 
 ### Claude Code — transcript token records (primary)
@@ -96,6 +123,14 @@ is cumulative.
   read that comes back empty (transient failure, or a Copilot pane that never
   wrote a token record) must not zero a session's captured spend; the merge
   keeps the richer data and just refreshes identity.
+  **"Empty" is read off the four token counters and the dollar figure, never off
+  the `source` label** (#2167). It used to mean `source == "none"`, which let
+  the one fallback that reports a genuine zero — a statusline parse on a
+  subscription account, where the CLI prints `$0.00` whatever was really spent —
+  overwrite a `transcript` row carrying millions of real tokens. A residual
+  stays open and is not closed by this: a statusline read with a NON-zero dollar
+  figure still replaces a token-bearing row, trading its tokens for a cost
+  estimate. What changed is only that a row saying nothing at all stops winning.
 - **Crash-safe persistence.** Writes go to `usage.json.tmp` and are atomically
   renamed over `usage.json`, so a crash mid-write never leaves a half-written
   file. On load, a parse failure (corruption, manual edit) preserves the file
@@ -118,6 +153,10 @@ is `estimated` (all token-derived), `reported` (all CLI statusline), `mixed`, or
 under one label. Each agent row carries its token breakdown, `source`
 (`transcript`/`statusline`/`none`), `model`, `cost_usd`, and an `estimated`
 flag.
+
+`transcript-backfill` is a FOURTH `source` value, and loomux never writes it:
+it exists only in `scripts/orch-scorecard.cjs`'s in-memory copy of a row it
+reconstructed from the transcript on disk (below).
 
 ## Reading the transcript incrementally — the cursor contract (#1239)
 
@@ -344,13 +383,54 @@ for "no usage". A lifetime line (survives kills) sits above a dimmer live line
 (current burn). Per-agent rows show tokens plus the labelled cost, with a
 tooltip giving the source, model, and full token breakdown.
 
+## Reading a store that was written wrong — the scorecard's backfill (#2167)
+
+A row already on disk stays wrong after the collector is fixed: `usage.json` is
+cumulative-to-now with no history, so there is nothing to recompute it from
+inside the app. `scripts/orch-scorecard.cjs` therefore repairs it at READ time.
+A row whose four token counters are all zero, and whose session has a transcript
+at `<claude-projects>/*/<session>.jsonl`, is summed from that transcript before
+the usage index is built, so every counter downstream sees one kind of row.
+
+The rule is narrow on purpose, so a correct row can never be rewritten: the four
+counters decide (never the `source` label — the same rule the merge above now
+follows), the file must exist, and the sum must exceed zero. The presence of
+that file is also what identifies the row as a Claude one at all; an OpenCode
+row has none. The fold is `dedupeTranscriptTurns` — the same message-id dedup
+the orchestrator's own transcript goes through, so a backfilled delegate row and
+the orchestrator row it is compared against cannot be computed two different
+ways.
+
+`coverage.usage_rows_backfilled_from_transcript` reports how many rows were
+considered, how many were backfilled and from which files, and which zero rows
+were left alone because no transcript was found. Those last two reconcile
+against the first, and the script throws rather than publish a count that does
+not (a coverage figure counted at the MATCH site rather than the VERIFIED one
+certifies coverage it never delivered). `--claude-projects` names the root
+(default `~/.claude/projects`), `--no-backfill` turns it off — and the projects
+tree is walked only when at least one zero row exists, so a run over a healthy
+store never touches it.
+
+Two limits are declared as heuristic **H9** rather than left to be discovered: a
+backfilled row is UNPRICED (it keeps whatever `cost_usd` the collector recorded
+— its tokens are right and its dollars are not), and it does not honour
+`--cut`, because `--cut` cannot rewind an ordinary `usage.json` row either and
+cutting one kind and not the other would make the table's two kinds of row
+disagree about which instant they describe.
+
 ## Testing
 
 - `usage.rs` unit tests parse synthetic transcripts: token summing + per-model
   pricing, message-id dedup, skipping non-assistant/synthetic/malformed lines,
   unknown-model → token-only, empty transcript.
-- Integration tests (`tests/orchestration.rs`): a killed agent stays in the
-  lifetime total but drops out of live (with the no-downgrade merge);
+- Integration tests (`tests/orchestration.rs`): an agent's CLI comes from its
+  own block rather than its class's default block, against a roster whose
+  ORDERING makes the two answers differ (#2167 — the resolver directly, and the
+  whole collector through both the live `group_usage` path and the `mark_dead`
+  one); a zero-dollar statusline row never overwrites captured transcript
+  tokens, with a richer row that still does as the negative control; a killed
+  agent stays in the lifetime total but drops out of live (with the no-downgrade
+  merge);
   `mark_dead` captures usage from a fixture transcript (via the registry
   override) with no prior `group_usage` call; the durable write is atomic and
   leaves no temp file; a corrupt `usage.json` is preserved as `.bad` rather than
@@ -369,6 +449,14 @@ tooltip giving the source, model, and full token breakdown.
   `CursorWork::bytes_read`, which the reader increments at the single place
   bytes leave the disk, because the bound is invisible in the totals: the old
   whole-file re-parse produced identical numbers.
+- `test/orchscorecard.test.ts` pins the read-time backfill (#2167) against
+  `test/fixtures/orchscorecard/backfill/`: a zero row is summed from a
+  transcript under a WORKTREE-cwd project folder and reaches the PR card,
+  reproducing the shared corpus's own figures field for field; a non-zero row
+  whose transcript is also on disk is never rewritten; a zero row with no
+  transcript is named rather than dropped; an unreadable root names every zero
+  row, because "I could not look" is not "there was nothing there"; and
+  `--no-backfill` still reports the count.
 - `tests/usage_memory.rs` (#1218) still pins peak live heap against a ~16 MiB
   transcript. The polled path is now the cursor, but both go through the one
   streaming reader (`fold_appended`), so the property is shared by

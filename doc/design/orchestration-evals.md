@@ -33,6 +33,7 @@ field, or a new gate.
 | `usage.json` | tokens and cost per CLI session, with `agent_id` | `<group>/` |
 | `agents.json` | `id → role, block, session, task` | `<group>/` |
 | the orchestrator's CLI transcript | per-turn token usage with a timestamp | `~/.claude/projects/<slug>/<session>.jsonl` |
+| a DELEGATE's CLI transcript | the tokens a zero `usage.json` row lost (#2167, §4.6) | the same tree, located by `--claude-projects` |
 | `--pr-meta` (optional) | `merged_at`, `build`, `issue` per PR | supplied by the caller from `gh` |
 
 **Why the transcript is required for the orchestrator's tokens and `usage.json` is
@@ -250,6 +251,34 @@ reports its whole life against the PR it is attributed to. That is heuristic **H
 and it is a good approximation here only because delegates are spawned per task: a
 worker or reviewer pane in this group serves one PR and is killed.
 
+**A zero row is repaired from the transcript before any of this runs (#2167).**
+Between 2026-08-30 and the fix, loomux resolved a delegate's CLI from its
+capability class's DEFAULT block rather than from its own block, so on this
+group's two-blocks-per-class roster every Claude delegate was read as an
+OpenCode one: its transcript arm never ran and its row landed as
+`statusline`/`none` with four zero counters. `group-cost-tracking.md` carries
+the mechanism and the fix. The consequence HERE is that every delegate-token and
+orchestrator-share figure this script has ever produced was an under-count on
+the delegate side and correspondingly an over-estimate of the orchestrator's
+share — the tables posted on #2011 included.
+
+So a row whose four counters are all zero, and whose session has a transcript at
+`<claude-projects>/*/<session>.jsonl`, is summed from that transcript before the
+usage index is built. The fold is the SAME message-id dedup §4.5 puts the
+orchestrator's transcript through, so the two sides of the share ratio cannot be
+computed two different ways. `--no-backfill` reproduces the old, wrong reading
+for comparison. The backfill is UNPRICED and does not honour `--cut` (heuristic
+**H9**), and
+`coverage.usage_rows_backfilled_from_transcript` reports how many rows were
+considered, how many were repaired and from which files, and which zero rows had
+no transcript — the last two reconciling against the first, or the script throws
+rather than publish a coverage figure counted at the match site instead of the
+verified one.
+
+The candidate test is the four counters, never the `source` label: a zero row
+can carry `none`, `statusline`, or even `transcript`, and a row with tokens is
+never rewritten from disk however its source reads.
+
 ### 4.7 Orchestrator share
 
 `orch / (orch + delegates)`, reported twice — once from `tokens_window`
@@ -295,6 +324,12 @@ names all eleven benchmark PRs) would be attributed to all eleven.
 - `usage_sessions_shared_by_more_than_one_agent` — how many sessions the H8 split had
   to divide, and `usage_rows_unusable` — rows with neither a session key nor an
   `agent_id`, which are skipped.
+- `usage_rows_backfilled_from_transcript` — the #2167 repair (§4.6):
+  `zero_rows_considered`, `rows` repaired with the file and token breakdown of
+  each under `from`, and `zero_rows_without_a_transcript` for the rest. A
+  non-zero `rows` says the store was written by a build carrying the collector
+  defect; a non-empty `zero_rows_without_a_transcript` says which figures are
+  still an under-count and cannot be recovered from disk.
 - `rows_counted_outside_pr_window` — the reverse direction. A `review-verdict` or
   `rd-*` row is matched **structurally** on `detail.pr`, so it counts wherever it
   occurs: a late verdict or a re-drive after the merge is still a round the PR cost,
@@ -319,6 +354,7 @@ The script emits this list in every run, under `coverage.heuristics`, and it **i
 | H6 | `usage.json` is cumulative, so a delegate's whole life counts against its PR. | A windowed usage series, or accepting the approximation. |
 | H7 | The PR window ends at `merged_at` passed in by the caller. | A loomux row for a human merge (#388). |
 | H8 | A `usage.json` row is keyed by CLI **session**; a session carried to a new agent id names only its last occupant, so the row is split evenly across every agent that occupied it. | An `agent_id` (or `block` + `pr`) on **every** `UsageSnapshot`, not just the latest — the same missing field as H4. |
+| H9 | A zero row backfilled from its transcript (§4.6) is **unpriced** — it keeps whatever `cost_usd` the collector recorded, so its tokens are right and its dollars are not — and does not honour `--cut`, because `--cut` cannot rewind an ordinary `usage.json` row either. | The collector recording the row correctly, which #2167 does: after it, `rows` reads 0 on any store written by a fixed build. |
 
 A run that adds a heuristic adds a row here in the same commit. The test suite
 asserts every emitted heuristic has an id, a statement and a named fix, so an
@@ -376,7 +412,8 @@ One JSON object. `--format table` renders the per-PR GFM table instead;
 
 ```
 {
-  generated_ms, inputs: { audit[], usage, agents, transcript[], pr_meta, tail_min, cut_ms },
+  generated_ms, inputs: { audit[], usage, agents, transcript[], pr_meta, tail_min, cut_ms,
+                          claude_projects, backfill },
   group:    { files: [ { path, rows, span_h, orchestrator_wakes, wakes_by_kind, ... } ] },
   prs:      [ {
     pr, build, issue, outcome,
@@ -397,7 +434,13 @@ One JSON object. `--format table` renders the per-PR GFM table instead;
   coverage: { audit_rows_read, audit_parse_errors, rows_classified, transcripts[],
               agents_attributed, agents_unattributed_spawned_in_window,
               agents_split_across_prs, usage_rows_unusable, usage_sessions_indexed,
-              usage_sessions_shared_by_more_than_one_agent, heuristics[] }
+              usage_sessions_shared_by_more_than_one_agent,
+              usage_rows_backfilled_from_transcript: {
+                claude_projects_root, scanned, projects_scanned, transcripts_indexed,
+                zero_rows_considered, rows, tokens,
+                from: [ { session, agent_id, role, was_source, path, turns, tokens } ],
+                zero_rows_without_a_transcript[] },
+              heuristics[] }
 }
 ```
 
@@ -423,6 +466,23 @@ The corpus also carries one instance of each edge the text above promises to han
 so none of them is a claim with no test behind it: an `rd-*` action this reader has no
 bucket for, a transcript line with usage but **no** `message.id`, and a `usage.json` row
 with neither a session key nor an `agent_id`.
+
+The #2167 backfill (§4.6) has its own corpus, `test/fixtures/orchscorecard/backfill/`,
+rather than an extra row in the shared one: the shared corpus's counters are pinned
+to the digit and a new session would move several of them for a reason unrelated to
+what those tests are about. It is the shared corpus with ONE change — `ses-13`
+(`w-13`, attributed to #900) carries the row the broken collector wrote, four zero
+counters under `source: "statusline"` — and its transcript sits under a
+WORKTREE-cwd project folder (`C--Projects-loomux-worktrees-agent-rev-1919`). That
+folder name is the shape #2167 first suspected of breaking the lookup, and it is
+there as a **non-regression witness**: neither this script's scan nor
+`usage::claude_transcript_path` derives a slug from a cwd at all, so the folder's
+name never decided anything. Two controls sit beside it — `ses-14`, a NON-zero row
+whose transcript is also on disk and which must be left exactly alone, and
+`ses-19`, a zero row with no transcript, which must be REPORTED as skipped rather
+than silently dropped. The backfilled run's #900 card is asserted equal to the
+shared corpus's own, field for field: the backfill's job is to reconstruct exactly
+what a working collector would have written.
 
 The H8 split gets **both** of its branches, and they are genuinely different — which
 matters, because the branch this PR originally claimed to cover was not in the corpus

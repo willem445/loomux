@@ -29,6 +29,8 @@
 // are all this needs; the transcript is ~230 MB, so it is streamed, never slurped.
 
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
 
 // The S5 rule (#1778): a notice arriving up to ten minutes after the loop's last row
@@ -648,6 +650,145 @@ function indexSessionAgents(agents) {
 }
 
 // ---------------------------------------------------------------------------
+// Transcript backfill for a zero `usage.json` row (#2167).
+//
+// The collector resolved a claude delegate's CLI from its class's DEFAULT block
+// rather than from its own, so on a roster with two blocks in one class every
+// claude pane in the second block was read as the first block's CLI, its
+// transcript arm never ran, and its row landed as `statusline`/`none` with four
+// zero counters — for a session whose transcript was on disk the whole time.
+// That is fixed in `src-tauri`; this is the reader's half, and it stays useful
+// after the fix for the same reason every other counter here is defensive: the
+// rows already written are still zero, and no backfill runs against a store
+// whose rows are right.
+//
+// The rule is deliberately narrow, so a correct row can never be rewritten:
+//
+//   - only a row whose FOUR token counters are all zero is a candidate;
+//   - only when `<root>/*/<session>.jsonl` exists — the same one-level scan
+//     `usage::claude_transcript_path` does, and the same reason it is a scan and
+//     not a slug derivation: Claude encodes the cwd into the folder name and we
+//     do not re-derive that encoding. It is also what identifies the row as a
+//     CLAUDE one at all: an opencode row has no such file;
+//   - only when the transcript sums to more than zero.
+//
+// The sum is `dedupeTranscriptTurns` — the SAME fold the orchestrator's own
+// transcript goes through, message-id dedup and the four usage fields, so a
+// backfilled delegate row and the orchestrator row it is compared against
+// cannot be computed two different ways.
+//
+// TWO THINGS A BACKFILL DOES NOT DO, both stated as H9 rather than left for a
+// reader to discover: it derives no dollar figure (the row keeps the `cost_usd`
+// it had), and it does not honour `--cut`. `--cut` cannot rewind a `usage.json`
+// row either — the row is cumulative-to-now with no history — so cutting the
+// backfilled rows and not the others would make the two kinds of row disagree
+// about what instant the table describes.
+// ---------------------------------------------------------------------------
+
+function usageRowTokens(u) {
+  return num(u.input_tokens) + num(u.output_tokens)
+    + num(u.cache_creation_tokens) + num(u.cache_read_tokens);
+}
+
+function defaultClaudeProjectsRoot() {
+  return path.join(os.homedir(), '.claude', 'projects');
+}
+
+// session id -> transcript path, from one level of `<root>/<encoded-cwd>/`.
+// `null` when the root cannot be read at all (no `~/.claude`, a bad `--claude-projects`).
+function claudeTranscriptIndex(root) {
+  let projects;
+  try { projects = fs.readdirSync(root, { withFileTypes: true }); } catch { return null; }
+  const bySession = new Map();
+  let scanned = 0;
+  for (const p of projects) {
+    if (!p.isDirectory()) continue;
+    let files;
+    try { files = fs.readdirSync(path.join(root, p.name)); } catch { continue; }
+    scanned += 1;
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue;
+      const id = f.slice(0, -'.jsonl'.length);
+      if (!bySession.has(id)) bySession.set(id, path.join(root, p.name, f));
+    }
+  }
+  return { bySession, projects_scanned: scanned };
+}
+
+// Returns the usage array to use (patched copies, never the caller's rows mutated)
+// plus the coverage record. The index is built ONLY when a zero row exists, so a
+// store with nothing to backfill never walks the projects tree.
+async function backfillZeroUsageRows(usage, root) {
+  const rows = Array.isArray(usage) ? usage : [];
+  const zero = rows.filter((u) => u && typeof u === 'object'
+    && typeof u.key === 'string' && u.key && usageRowTokens(u) === 0);
+  const cov = {
+    claude_projects_root: root,
+    scanned: false,
+    projects_scanned: 0,
+    transcripts_indexed: 0,
+    zero_rows_considered: zero.length,
+    rows: 0,
+    tokens: 0,
+    from: [],
+    zero_rows_without_a_transcript: [],
+  };
+  if (zero.length === 0) return { usage: rows, backfill: cov };
+
+  const idx = claudeTranscriptIndex(root);
+  cov.scanned = idx !== null;
+  if (idx === null) {
+    // The root could not be read. That is not "no transcripts": say which rows
+    // were left alone, so a zero column is never silently blamed on the store.
+    cov.zero_rows_without_a_transcript = zero.map((u) => u.key).sort();
+    return { usage: rows, backfill: cov };
+  }
+  cov.projects_scanned = idx.projects_scanned;
+  cov.transcripts_indexed = idx.bySession.size;
+
+  const patched = new Map();
+  for (const u of zero) {
+    const file = idx.bySession.get(u.key);
+    if (!file) { cov.zero_rows_without_a_transcript.push(u.key); continue; }
+    const read = await readTranscript(file, null);
+    const t = read.turns.reduce((acc, turn) => addTokens(acc, turn.usage), emptyTokens());
+    if (t.total === 0) { cov.zero_rows_without_a_transcript.push(u.key); continue; }
+    patched.set(u.key, {
+      ...u,
+      source: 'transcript-backfill',
+      input_tokens: t.input,
+      output_tokens: t.output,
+      cache_creation_tokens: t.cache_creation,
+      cache_read_tokens: t.cache_read,
+    });
+    cov.from.push({
+      session: u.key,
+      agent_id: typeof u.agent_id === 'string' ? u.agent_id : null,
+      role: typeof u.role === 'string' ? u.role : null,
+      was_source: typeof u.source === 'string' ? u.source : null,
+      path: file,
+      turns: t.turns,
+      tokens: { input: t.input, cache_read: t.cache_read, cache_creation: t.cache_creation, output: t.output, total: t.total },
+    });
+    cov.tokens += t.total;
+  }
+  cov.rows = cov.from.length;
+  cov.zero_rows_without_a_transcript.sort();
+  // Population control (CLAUDE.md: count at the VERIFIED site, not the matched
+  // one). Every zero row this pass considered is accounted for by exactly one of
+  // the two outcomes; a mismatch means a row was matched and then dropped by a
+  // branch nobody reported, which is the shape that certifies coverage it never
+  // delivered.
+  if (cov.rows + cov.zero_rows_without_a_transcript.length !== cov.zero_rows_considered) {
+    throw new Error('backfill accounting: '
+      + `${cov.rows} backfilled + ${cov.zero_rows_without_a_transcript.length} skipped `
+      + `!= ${cov.zero_rows_considered} zero rows considered`);
+  }
+  cov.from.sort((a, b) => (a.session < b.session ? -1 : a.session > b.session ? 1 : 0));
+  return { usage: rows.map((u) => (u && patched.get(u.key)) || u), backfill: cov };
+}
+
+// ---------------------------------------------------------------------------
 // Rendering.
 // ---------------------------------------------------------------------------
 
@@ -712,6 +853,7 @@ const HEURISTICS = [
   { id: 'H5', what: "Orchestrator tokens in a window cover every PR in flight; the apportioned figure splits them by this PR's share of the orchestrator wakes in the same window.", fix: 'Per-turn PR attribution — nothing structural exists; see "What this cannot say" in the note.' },
   { id: 'H6', what: 'Delegate tokens come from `usage.json`, which is CUMULATIVE per session and cannot be windowed; a delegate that worked on one PR reports its whole life against that PR.', fix: 'A windowed usage series, or accepting the approximation (delegates are spawned per task).' },
   { id: 'H7', what: 'A PR window ends at `merged_at` supplied via `--pr-meta`; without it the end falls back to the last `rd-*` row, then to the last naming row — which is days late, because a merged PR stays cited.', fix: 'A loomux row for a human merge (plan part 2, A4 / #388).' },
+  { id: 'H9', what: "A zero-token `usage.json` row whose Claude transcript is on disk is backfilled by summing that transcript, which is UNCUT and UNPRICED: `--cut` cannot rewind a `usage.json` row either (a row is cumulative-to-now with no history), so cutting a backfilled row and not its neighbours would make the two kinds disagree about what instant the table describes; and no dollar figure is derived, so a backfilled row keeps the `cost_usd` it had — its tokens are right and its cost is still whatever the collector recorded.", fix: "The collector recording the row correctly in the first place (#2167's own fix, shipped alongside this) — after which nothing is backfilled and `rows` reads 0." },
   { id: 'H8', what: "A `usage.json` row is keyed by CLI SESSION, and a session carried to a new agent id names only its LAST occupant. The row is therefore split evenly across every agent that occupied that session — a guess about how a shared session's spend divided, self-correcting where the whole lineage is attributed to one PR and a fraction where it is not.", fix: 'An `agent_id` (or `block` + `pr`) on every `UsageSnapshot`, not just the latest — the same missing field as H4.' },
 ];
 
@@ -723,6 +865,7 @@ function parseArgs(argv) {
   const opts = {
     audit: [], transcript: [], usage: null, agents: null, prMeta: null,
     prs: [], all: false, tailMin: DEFAULT_TAIL_MIN, format: 'json', cut: null, help: false,
+    claudeProjects: null, backfill: true,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -733,6 +876,8 @@ function parseArgs(argv) {
       case '--usage': opts.usage = next(); break;
       case '--agents': opts.agents = next(); break;
       case '--pr-meta': opts.prMeta = next(); break;
+      case '--claude-projects': opts.claudeProjects = next(); break;
+      case '--no-backfill': opts.backfill = false; break;
       case '--pr': opts.prs.push(Number(next())); break;
       case '--all': opts.all = true; break;
       case '--tail-min': opts.tailMin = Number(next()); break;
@@ -752,12 +897,20 @@ const USAGE_TEXT = `orch-scorecard — per-PR orchestration cost from existing l
       [--transcript <session.jsonl>]... [--pr-meta <meta.json>]
       (--pr <n> [--pr <n>]... | --all)
       [--tail-min 10] [--cut <ms|iso>] [--format json|table|both]
+      [--claude-projects <dir>] [--no-backfill]
 
   --all        every PR that any rd-* row names (the driven set).
   --pr-meta    {"2104": {"merged_at": "...", "build": "beta5", "issue": 2010}} —
                without merged_at a PR window ends at its last rd row (coverage says so).
   --cut        drop audit rows and transcript turns after this instant; reproduces a
                historical measurement on a log that has since grown.
+  --claude-projects
+               where Claude Code keeps its per-project transcript folders
+               (default ~/.claude/projects). A usage.json row with four zero
+               token counters whose session transcript is there is summed from it
+               (#2167); coverage says how many rows and from which files.
+  --no-backfill
+               leave zero rows at zero. Coverage still reports how many there are.
 `;
 
 async function main(argv) {
@@ -770,8 +923,15 @@ async function main(argv) {
   const files = opts.audit.map((p) => readJsonl(p, cut));
   const rows = files.flatMap((f) => f.rows).sort((a, b) => (a.ts_ms || 0) - (b.ts_ms || 0));
   const agents = JSON.parse(fs.readFileSync(opts.agents, 'utf8'));
-  const usage = JSON.parse(fs.readFileSync(opts.usage, 'utf8'));
+  const rawUsage = JSON.parse(fs.readFileSync(opts.usage, 'utf8'));
   const prMeta = opts.prMeta ? JSON.parse(fs.readFileSync(opts.prMeta, 'utf8')) : {};
+
+  // #2167: a zero row whose transcript is on disk is summed from it, BEFORE the
+  // usage index is built, so every counter downstream sees one kind of row.
+  const projectsRoot = opts.claudeProjects || defaultClaudeProjectsRoot();
+  const { usage, backfill } = opts.backfill
+    ? await backfillZeroUsageRows(rawUsage, projectsRoot)
+    : { usage: rawUsage, backfill: { claude_projects_root: projectsRoot, scanned: false, projects_scanned: 0, transcripts_indexed: 0, zero_rows_considered: (Array.isArray(rawUsage) ? rawUsage : []).filter((u) => u && typeof u.key === 'string' && u.key && usageRowTokens(u) === 0).length, rows: 0, tokens: 0, from: [], zero_rows_without_a_transcript: [], disabled: true } };
 
   const agentsById = indexAgents(agents);
   const orchIds = new Set([...agentsById.values()].filter((a) => a.role === 'orchestrator').map((a) => a.id));
@@ -822,6 +982,7 @@ async function main(argv) {
     inputs: {
       audit: opts.audit, usage: opts.usage, agents: opts.agents,
       transcript: opts.transcript, pr_meta: opts.prMeta, tail_min: opts.tailMin, cut_ms: cut,
+      claude_projects: projectsRoot, backfill: opts.backfill,
     },
     group: { files: groupTotals(files, orchIds) },
     prs: cards,
@@ -835,6 +996,7 @@ async function main(argv) {
         deduped_turns: t.turns.length, usage_rows_without_id: t.without_id,
       })),
       usage_rows_unusable: usageUnusable,
+      usage_rows_backfilled_from_transcript: backfill,
       usage_sessions_indexed: usageBySession.size,
       usage_sessions_shared_by_more_than_one_agent: [...sessionAgents.values()].filter((v) => v.length > 1).length,
       agents_attributed: attribution.size,
@@ -855,6 +1017,7 @@ module.exports = {
   WAKE_KINDS, classifyWake, prTokenRe, rowNamesPr, computeWindows, inWindow,
   dedupeTranscriptTurns, attributeAgents, scorePr, groupTotals, indexAgents,
   indexUsage, indexSessionAgents, renderPrTable, renderGroupTable, parseArgs, HEURISTICS,
+  usageRowTokens, claudeTranscriptIndex, backfillZeroUsageRows, defaultClaudeProjectsRoot,
   DEFAULT_TAIL_MIN, main,
 };
 
