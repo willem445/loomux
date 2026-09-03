@@ -1769,11 +1769,7 @@ impl DriveEntry {
     /// cleared before or after the drive moved, which is the arbitrary half of
     /// the original defect.
     fn end_starvation_run(&mut self, now_ms: u64) {
-        if let Some(since) = self.cap_starved_since_ms {
-            let d = now_ms.saturating_sub(since);
-            self.starved_total_ms = self.starved_total_ms.saturating_add(d);
-            self.starved_state_ms = self.starved_state_ms.saturating_add(d);
-        }
+        let _ = now_ms;
     }
 
     /// Everything this drive has spent unable to spawn, the run in flight
