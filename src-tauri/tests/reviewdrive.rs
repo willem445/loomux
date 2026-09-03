@@ -6707,17 +6707,21 @@ fn alternate_refusal_kinds(
 /// numbers this pins are the ones nobody had measured.
 ///
 /// **What comes out, on stock knobs and a two-lane gate**: the drive parks
-/// `held(state-stalled)` at close to TWICE the `review-wait` bound of five
-/// hours, because #2110's accumulators forgive every ended cap run and a strict
-/// alternation makes those runs half the timeline. So the floor and the ceiling
-/// are both assertions: an implementation that forgave nothing would park at
-/// the bound itself and fail the floor, and one that let the exclusion run away
-/// — a per-block clock, say, which #2109 review 4 rejected for exactly this
-/// reason — would fail the ceiling.
+/// `held(state-stalled)` at **2.00x** the `review-wait` bound of five hours —
+/// 36,040,000 ms against a nominal 18,000,000 — because #2110's accumulators
+/// forgive every ended cap run and a strict alternation makes those runs
+/// exactly half the timeline. The floor, the ceiling and the factor are all
+/// assertions: an implementation that forgave nothing would park at the bound
+/// itself and fail the floor, and one that let the exclusion run away — a
+/// per-block clock, say, which #2109 review 4 rejected for exactly this reason
+/// — would fail the ceiling. Every clock is injected, so the factor is
+/// deterministic and is pinned rather than bracketed.
 ///
-/// The two refusal counts are the population control. A fixture that drifted
-/// into a RUN of one kind would still park, on a bound that would then be
-/// measuring something this test does not claim.
+/// The refusal counts are the population control, and they are taken off the
+/// `cap` boolean rather than off row totals: `rd-refused` is written for EVERY
+/// refused lane spawn and only that flag says which kind it was. Counting rows
+/// instead reads a one-for-one alternation as a run of caps twice as long,
+/// which is what this control caught on its own first CI round.
 #[test]
 fn alternating_cap_and_non_cap_refusals_postpone_the_park_by_a_bounded_factor() {
     let dir = tempfile::tempdir().unwrap();
@@ -6775,20 +6779,56 @@ fn alternating_cap_and_non_cap_refusals_postpone_the_park_by_a_bounded_factor() 
         "…but it is bounded by a small factor, not indefinite: {parked_at} against a nominal \
          {nominal}"
     );
+    // **The figure itself, pinned rather than bracketed.** Under an even
+    // alternation the ended cap runs are exactly half the timeline, so the
+    // forgiveness is half and the bound is reached at twice the wall time it
+    // nominally names. Every clock here is injected, so this is deterministic
+    // and not a tolerance — and it is pinned EXACTLY because publishing the
+    // number is the point: a change to it is a change in what the exclusion
+    // costs, and a band would hide that behind a range nobody re-derives.
+    // A deliberate move of `REVIEW_WAIT_BOUND_MS` or of this fixture's step is
+    // meant to redden this; re-measure it here rather than widening the band.
+    assert_eq!(
+        parked_at, 36_040_000,
+        "the forgiven half is what sets this: 2.00x the nominal {nominal} ms, measured — \
+         got {parked_at}"
+    );
 
     // The population control: the fixture really did alternate, one refusal of
     // each kind per cycle, rather than drifting into a run of one.
-    let caps = rows_for(&reg, &group, "rd-refused").len() as i64;
+    //
+    // **Counted off the `cap` boolean, not off the row count.** `rd-refused` is
+    // written for EVERY refused lane spawn and distinguishes the kinds with
+    // that flag (#1960); `rd-lane-duplicate-refused` is an additional row the
+    // duplicate arm writes from inside `rd_open_lane`. So a bare
+    // `rows_for("rd-refused").len()` counts both kinds and reads as a run of
+    // caps twice as long as the alternation — which is exactly what this
+    // assertion caught on its first CI round (120 / 60 against a real 60 / 60).
+    let refused = rows_for(&reg, &group, "rd-refused");
+    let caps = refused.iter().filter(|r| r["cap"] == json!(true)).count() as i64;
+    let non_caps = refused.iter().filter(|r| r["cap"] == json!(false)).count() as i64;
     let dups = rows_for(&reg, &group, "rd-lane-duplicate-refused").len() as i64;
-    assert!(caps >= 10 && dups >= 10, "too few cycles to be about alternation: {caps}/{dups}");
+    assert!(caps >= 10 && non_caps >= 10, "too few cycles to be about alternation: {caps}/{non_caps}");
     assert!(
-        (caps - dups).abs() <= 1,
+        (caps - non_caps).abs() <= 1,
         "the kinds must alternate one for one — a RUN of either is a different subject: \
-         {caps} cap, {dups} duplicate"
+         {caps} cap, {non_caps} non-cap"
+    );
+    assert_eq!(
+        non_caps, dups,
+        "…and every non-cap refusal here really was the DUPLICATE one, which is the fixture's \
+         whole mechanism: {non_caps} non-cap rows against {dups} duplicate rows"
+    );
+    assert_eq!(
+        caps + non_caps,
+        refused.len() as i64,
+        "…and the flag partitions the rows, so neither count is reading past a row it \
+         cannot classify: {} rows",
+        refused.len()
     );
     // And no single run ever reached the window, which is WHY `cap-full` never
     // fired: the mechanism, not merely its outcome.
-    let longest = rows_for(&reg, &group, "rd-refused")
+    let longest = refused
         .iter()
         .filter_map(|r| r["starved_ms"].as_u64())
         .max()
