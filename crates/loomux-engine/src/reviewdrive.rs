@@ -1696,8 +1696,8 @@ impl DriveEntry {
         self.starved_state_ms.saturating_add(self.open_starvation_ms(now_ms))
     }
 
-    fn open_starvation_ms(&self, now_ms: u64) -> u64 {
-        self.cap_starved_since_ms.map_or(0, |since| now_ms.saturating_sub(since))
+    fn open_starvation_ms(&self, _now_ms: u64) -> u64 {
+        0
     }
 
     /// How long this drive has been in its current state, starvation excluded
