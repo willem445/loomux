@@ -5894,79 +5894,62 @@ fn a_cap_that_starves_a_drive_parks_it_as_cap_full_rather_than_leaving_it_silent
 }
 
 /// The two-lane roster with a cap that admits the worker and **one** lane.
-///
-/// Review 4's W1 needs a drive that can open lane 0 and cannot open lane 1, so
-/// the entry carries a cap stamp while a live lane pane exists — a state no
-/// fixture in this file could reach. `rails_capped`'s cap of one cannot: it
-/// refuses every lane, so the stamp's owner is always also the selected lane,
-/// which is the one case the defect does not show up in.
 fn rails_capped_two() -> Guardrails {
     Guardrails { max_agents: 2, ..rails() }
 }
 
-/// **#2109 review 4, W1.** The cap-starvation stamp is a claim about the run
-/// happening NOW, so a refusal that is not the cap's ends it.
+/// The state review 4's W1 needs, which no fixture in this file could reach: a
+/// live cap stamp **beside a live lane pane**, with the tick's per-refusal kind
+/// no longer the cap's.
 ///
-/// The stamp used to be guarded on the write edge alone — written only when
-/// `cap`, cleared only by a lane opening or a state arc — which made it a
-/// **latch**: a single early cap refusal aged into `held(cap-full)` behind a run
-/// of refusals that were nothing of the kind, which is exactly what the comment
-/// above the write says must not happen.
-///
-/// This drives the composition rather than the mechanism, because the mechanism
-/// was already green in isolation and that is the point: the stamp belongs to
-/// the ENTRY while `first_stale_lane` re-picks the lane every tick, so the two
-/// can come apart.
+/// `rails_capped`'s cap of one cannot produce it — it refuses every lane, so the
+/// stamp's owner is always also the selected lane, which is the one case the
+/// defect does not show up in. This needs a cap that admits the worker and
+/// exactly one lane.
 ///
 /// 1. Lane 0 opens and records `pass` at `(head-a, d1)`; its pane stays live and
-///    busy (recording a verdict is not going idle).
+///    busy, because recording a verdict is not going idle.
 /// 2. `first_stale_lane` moves to lane 1, whose spawn the cap refuses — both
 ///    slots are held by the worker and lane 0's pane. The entry is stamped.
 /// 3. The PR body is edited. The digest moves, lane 0's `pass` no longer stands,
 ///    and `first_stale_lane` comes back to **lane 0** — whose re-brief the
 ///    duplicate refusal declines, because its pane is live at this head. That
 ///    refusal is not the cap's.
-/// 4. Past `CAP_HOLD_MS` the drive must NOT be parked `cap-full`: the cap is not
-///    what is refusing now, a lane IS open, and the action actually owed — a
-///    delta into lane 0's own pane once it frees up — costs no slot at all.
 ///
-/// The second half is the non-vacuity control, and it is why this is a pin on
-/// the *clear* rather than on `cap-full` being hard to reach: with the cap
-/// genuinely refusing throughout, the same drive at the same clock does park.
-#[test]
-fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another_kind() {
-    let dir = tempfile::tempdir().unwrap();
-    let reg = relaunch_registry(dir.path());
-    let repo = Repo::with(WORKFLOW_TWO_LANES);
-    let gh = FakeGh::green(HEAD_A);
+/// Answers the group, the orchestrator's pane, and the clock of the tick that
+/// took the non-cap refusal.
+///
+/// **The digest has two sources here and both are set.** `review_verdict`
+/// records `body_digest` of what `pr_body` answers, while the drive digests the
+/// body `observe_pr` read out of `FakeGh`. Left unset the first fails, the
+/// verdict records an EMPTY digest, and `body_changed` then answers `None` —
+/// "we could not tell" — which `lane_verdict_is_current` reads as still current.
+/// The body edit would then stale nothing and step 3 would silently re-select
+/// lane 1, which is how this fixture first went green for the wrong reason.
+fn two_lane_stamp_then_duplicate(
+    reg: &OrchRegistry,
+    repo: &Repo,
+    gh: &FakeGh,
+) -> (GroupId, String, u64) {
     let group = reg.create_group(&repo.path(), rails_capped_two()).unwrap().id;
     let w = reg.spawn_agent(&group, Role::Worker, "w", "", false, None).expect("slot 1 of 2");
     let session = w.session_id.clone().expect("claude mints a session id at spawn");
     let orch = reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
-    with_pane(&reg, &orch.id, 7001);
+    with_pane(reg, &orch.id, 7001);
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
-    // **The verdict's own body digest, which is a SECOND source from the
-    // drive's.** `review_verdict` records `workflow::body_digest` of what
-    // `pr_body` answers, while the drive digests the body `observe_pr` read out
-    // of `FakeGh`. Left unset the first fails, the verdict records an EMPTY
-    // digest, and `body_changed` then answers `None` — "we could not tell" —
-    // which `lane_verdict_is_current` reads as still current. The body edit
-    // below would move the drive's digest and stale nothing, and step 3 would
-    // silently re-select lane 1 instead of lane 0. Both sources are set, and
-    // both are moved together.
     reg.set_pr_body_override(Some("b".to_string()));
-    let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 0);
+    let out = reg.drive_review_with(&group, gh, 1758, &session, false, 0, "orch-1", 0);
     assert_eq!(out["driving"], json!(true), "drive_review refused: {out}");
 
     // 1. Lane 0 opens — slot 2 of 2 — and answers.
-    reg.rd_drive_group_with(&group, &gh, 10_000);
-    let first = reg.rd_drive_group_with(&group, &gh, 20_000);
+    reg.rd_drive_group_with(&group, gh, 10_000);
+    let first = reg.rd_drive_group_with(&group, gh, 20_000);
     let (_pr, block0, lane0) = first.lanes_opened.first().cloned().expect("lane 0 opens");
     assert_eq!(block0, "rev-std");
     dispatch(
-        &reg,
+        reg,
         &Caller {
-            agent_id: lane0.clone(),
+            agent_id: lane0,
             group: group.clone(),
             role: Role::Reviewer,
             role_hint: None,
@@ -5978,9 +5961,9 @@ fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another
     .expect("lane 0 records");
 
     // 2. Lane 1 is what the gate wants next, and the cap is full.
-    let capped = reg.rd_drive_group_with(&group, &gh, 30_000);
+    let capped = reg.rd_drive_group_with(&group, gh, 30_000);
     assert!(capped.lanes_opened.is_empty(), "both slots are held, so lane 1 cannot open");
-    let refused = rows_for(&reg, &group, "rd-refused");
+    let refused = rows_for(reg, &group, "rd-refused");
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0]["block"], json!("rev-final"), "…and it is LANE 1 that was refused");
     assert_eq!(refused[0]["cap"], json!(true), "…by the cap, which is what stamps: {refused:?}");
@@ -5989,22 +5972,72 @@ fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another
     //    back to it — where the duplicate refusal, not the cap, is what answers.
     gh.set_body("b2");
     reg.set_pr_body_override(Some("b2".to_string()));
-    let dup = reg.rd_drive_group_with(&group, &gh, 40_000);
+    let dup = reg.rd_drive_group_with(&group, gh, 40_000);
     assert!(dup.lanes_opened.is_empty(), "lane 0's pane holds the round");
-    let dups = rows_for(&reg, &group, "rd-lane-duplicate-refused");
+    let dups = rows_for(reg, &group, "rd-lane-duplicate-refused");
     assert_eq!(dups.len(), 1, "the tick's refusal is the DUPLICATE one: {dups:?}");
     assert_eq!(dups[0]["block"], json!("rev-std"), "…and its subject is lane 0 now: {dups:?}");
+    (group, orch.id, 40_000)
+}
+
+/// **#2109 review 4, W1 — the record.** A refusal that is not the cap's must
+/// stop publishing a cap-run duration beside itself.
+///
+/// `cap: false` and a growing `starved_ms` on one row is a second surface saying
+/// the run is a cap run when it is not, and it is the surface a reader chasing a
+/// starved drive looks at first.
+///
+/// Split from the hold below rather than asserted before it, for the reason that
+/// bit this PR twice already: a red evidences only the assertion it reaches, so
+/// two claims in one test means the second is never seen to fail.
+#[test]
+fn a_refusal_that_is_not_the_caps_stops_publishing_a_cap_run_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, _at) = two_lane_stamp_then_duplicate(&reg, &repo, &gh);
+
     let all = rows_for(&reg, &group, "rd-refused");
     assert_eq!(all.len(), 2, "{all:?}");
-    assert_eq!(all[1]["cap"], json!(false), "this refusal is not the cap's: {all:?}");
+    assert_eq!(all[0]["starved_ms"], json!(0), "the cap refusal opened the run: {all:?}");
+    assert_eq!(all[1]["cap"], json!(false), "the second refusal is not the cap's: {all:?}");
     assert_eq!(
         all[1]["starved_ms"],
         json!(null),
         "…so the row must not go on publishing a cap-run duration beside it: {all:?}"
     );
+}
 
-    // 4. The window passes with the cap no longer the thing refusing.
-    let later = reg.rd_drive_group_with(&group, &gh, 40_000 + reviewdrive::CAP_HOLD_MS);
+/// **#2109 review 4, W1 — the exit.** The cap-starvation stamp is a claim about
+/// the run happening NOW, so a refusal that is not the cap's ends it.
+///
+/// The stamp used to be guarded on the write edge alone — written only when
+/// `cap`, cleared only by a lane opening or a state arc — which made it a
+/// **latch**: a single early cap refusal aged into `held(cap-full)` behind a run
+/// of refusals that were nothing of the kind, which is exactly what the comment
+/// above the write says must not happen.
+///
+/// This drives the composition rather than the mechanism, because the mechanism
+/// was already green in isolation and that is the point: the stamp belongs to
+/// the ENTRY while `first_stale_lane` re-picks the lane every tick, so the two
+/// can come apart. At the moment of the hold a lane IS open, and the action
+/// actually owed — a delta into lane 0's own pane once it frees up — costs no
+/// slot at all, so the notice's remedy would send an orchestrator to kill a pane
+/// for a condition killing a pane does not fix.
+///
+/// The second half is the non-vacuity control, and it is why this is a pin on
+/// the *clear* rather than on `cap-full` being hard to reach: with the cap
+/// genuinely refusing throughout, the same drive at the same clock does park.
+#[test]
+fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::with(WORKFLOW_TWO_LANES);
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = two_lane_stamp_then_duplicate(&reg, &repo, &gh);
+
+    let later = reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
     assert_eq!(
         status_state(&reg, &group),
         "review-wait",
@@ -6018,15 +6051,15 @@ fn a_cap_stamp_does_not_outlive_the_cap_and_park_a_drive_on_a_refusal_of_another
         later.notices
     );
 
-    // The control: the same drive, the same clock, with the cap genuinely
-    // refusing throughout, DOES park. Without this the assertions above pass
-    // under an implementation that simply never holds.
+    // The control: the same clock, with the cap genuinely refusing throughout,
+    // DOES park. Without it the assertions above pass under an implementation
+    // that simply never holds.
     let dir2 = tempfile::tempdir().unwrap();
     let reg2 = relaunch_registry(dir2.path());
     let repo2 = Repo::new();
     let gh2 = FakeGh::green(HEAD_A);
-    let (group2, _orch2, at) = cap_starved(&reg2, &repo2, &gh2);
-    reg2.rd_drive_group_with(&group2, &gh2, at + reviewdrive::CAP_HOLD_MS);
+    let (group2, _orch2, at2) = cap_starved(&reg2, &repo2, &gh2);
+    reg2.rd_drive_group_with(&group2, &gh2, at2 + reviewdrive::CAP_HOLD_MS);
     assert_eq!(
         status_state(&reg2, &group2),
         "held",
