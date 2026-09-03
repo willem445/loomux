@@ -3126,8 +3126,25 @@ impl OrchRegistry {
     /// is the cost this whole feature exists to remove. Parked entries ARE
     /// listed — a `held` drive is the one thing an orchestrator most needs to
     /// see, and §5.2 never prunes one.
+    /// **The clock is the caller's**, for `cancel_review_drive_with`'s reason,
+    /// one function over: every figure below is DERIVED from `now`, and a status
+    /// view reading the wall clock while the tick decides on an injected one puts
+    /// the two on different scales. `state_ms` and `since_ms` then come back in
+    /// wall units against anchors stamped in the test's units, so a test can
+    /// assert nothing about them except where the wall terms happen to cancel —
+    /// which is how #2110's first published figures were written, and they were
+    /// wrong in the direction that reads as passing. B2 shipped out of exactly
+    /// this shape.
+    ///
+    /// The only production caller passes `now_ms()`, so nothing about live
+    /// behaviour changes.
     #[doc(hidden)] // pub for integration tests
     pub fn review_drive_status(&self, group: &GroupId) -> Value {
+        self.review_drive_status_with(group, now_ms())
+    }
+
+    #[doc(hidden)] // pub for integration tests
+    pub fn review_drive_status_with(&self, group: &GroupId, now: u64) -> Value {
         let enabled = self.driver_enabled(group);
         let dir = self.group_dir(group);
         let state = {
@@ -3142,7 +3159,6 @@ impl OrchRegistry {
                 }
             }
         };
-        let now = now_ms();
         let drives: Vec<Value> = state
             .entries
             .iter()

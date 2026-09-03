@@ -6096,7 +6096,12 @@ fn a_drive_that_keeps_advancing_is_not_parked_for_its_age_alone() {
     // one minute in `review-wait` against three hours).
     let last = progressing(&reg, &gh, &group, 11, 30 * 60_000);
 
-    let status = reg.review_drive_status(&group);
+    // **Read on the clock the ticks ran on.** `review_drive_status` derives every
+    // figure from the `now` it is handed, so the wall-clock reading answers in wall
+    // units against anchors stamped in this test's units — which is how the first
+    // draft of this test passed: `since_ms` was an epoch-sized number that cleared
+    // the bound below without the fixture having advanced at all.
+    let status = reg.review_drive_status_with(&group, last);
     let drive = &status["drives"][0];
     assert!(
         drive["since_ms"].as_u64().unwrap_or(0) > 240 * 60_000,
@@ -6121,7 +6126,18 @@ fn a_drive_that_keeps_advancing_is_not_parked_for_its_age_alone() {
         drive["state_ms"].as_u64().unwrap_or(u64::MAX) <= 30 * 60_000,
         "the drive must be freshly in this state, or 'not held' says nothing: {status}"
     );
-    assert!(last > 240 * 60_000, "sanity on the fixture's own clock");
+    assert_eq!(
+        drive["starved_ms"],
+        json!(0),
+        "…and nothing here was excluded, so the age above is the whole five hours \
+         rather than a figure the exclusion flattered: {status}"
+    );
+    assert_eq!(
+        status_head(&reg, &group),
+        HEAD_B,
+        "the drive must have followed the last head move, or it stopped advancing \
+         somewhere in the loop and this is a test about a drive that stalled quietly"
+    );
 }
 
 /// **#2110's second ask.** A drive that really is stuck is parked on the state
@@ -6232,7 +6248,7 @@ fn time_the_cap_refused_this_drive_is_excluded_from_the_clocks_it_publishes() {
 
     let now = at + reviewdrive::CAP_HOLD_MS - 1;
     reg.rd_drive_group_with(&group, &gh, now);
-    let status = reg.review_drive_status(&group);
+    let status = reg.review_drive_status_with(&group, now);
     let drive = &status["drives"][0];
     assert_eq!(
         drive["state"],
@@ -6294,7 +6310,7 @@ fn the_total_age_backstop_still_parks_a_drive_that_advances_for_ever() {
 
     let held = reg.rd_drive_group_with(&group, &gh, 720 * 60_000);
     assert_eq!(status_state(&reg, &group), "held");
-    let status = reg.review_drive_status(&group);
+    let status = reg.review_drive_status_with(&group, 720 * 60_000);
     assert_eq!(
         status["drives"][0]["held_reason"],
         json!("drive-stalled"),
