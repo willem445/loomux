@@ -1168,7 +1168,12 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 /// **The residual is that the sum can exceed the twelve-hour backstop**, and
 /// then the backstop fires first because [`decide`] checks the age above the
 /// state bound: `lane_timeout_minutes: 240` on a three-lane gate floors this at
-/// 900 minutes, so such a drive parks `drive-stalled`. That is degraded but not
+/// 900 minutes, so such a drive parks `drive-stalled`. **On STOCK knobs the
+/// crossover is nine lanes** — `180 + 60n >= 720` from `n = 9` — which is the
+/// number an operator declaring a wide gate wants and which the worked example
+/// above does not give; pinned by
+/// `the_review_wait_floor_overtakes_the_backstop_at_nine_lanes_on_stock_knobs`.
+/// That is degraded but not
 /// the pre-#2110 notice — `held_from` is stamped on every hold arc, so the
 /// `drive-stalled` notice still names the state and the time in it. Pinned by
 /// `a_review_wait_floor_that_outruns_the_backstop_still_names_the_state`.
@@ -5237,6 +5242,42 @@ mod tests {
             decide(&e, &DriveFacts { now_ms: ahead, ..facts_at("head-a") }, &limits),
             DriveStep::held(HeldReason::StateStalled),
             "the same entry past its bound on a forward clock must still park"
+        );
+    }
+
+    /// **Where the `review-wait` floor overtakes the backstop, on STOCK
+    /// knobs** (#2117 review 4's premortem) — the crossover asserted rather
+    /// than left to arithmetic in a doc comment.
+    ///
+    /// The residual was already disclosed at [`state_bound_ms`], but only with
+    /// a worked example on a NON-default `lane_timeout_minutes: 240`, and the
+    /// floor test beside it covers one to four lanes. Neither says where the
+    /// crossover actually is at defaults, which is the number an operator
+    /// declaring a wide gate would want. It is **nine**: `180 + 60n >= 720`
+    /// from `n = 9`, so a nine-lane gate on stock knobs already has an
+    /// unreachable state bound, one lane earlier than the review's estimate of
+    /// ten.
+    ///
+    /// The two halves are the last reachable width and the first unreachable
+    /// one, so this fails if the crossover moves in either direction — which it
+    /// does if any of the three numbers involved is retuned.
+    #[test]
+    fn the_review_wait_floor_overtakes_the_backstop_at_nine_lanes_on_stock_knobs() {
+        let limits = DriveLimits::default();
+        let backstop = minutes_ms(limits.drive_timeout_minutes);
+        let bound = |lanes: usize| state_bound_ms(DriveState::ReviewWait, &limits, lanes).unwrap();
+
+        assert_eq!(bound(8), minutes_ms(660));
+        assert!(
+            bound(8) < backstop,
+            "an eight-lane gate on stock knobs must still be able to reach its state bound"
+        );
+        assert_eq!(bound(9), minutes_ms(720));
+        assert!(
+            bound(9) >= backstop,
+            "…and at nine the floor has overtaken the twelve-hour backstop, so `decide`'s \
+             age check — which runs first — is what such a drive parks on. Disclosed at \
+             `state_bound_ms`; this is where it starts"
         );
     }
 }
