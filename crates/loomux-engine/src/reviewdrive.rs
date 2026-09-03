@@ -1199,13 +1199,21 @@ pub struct DriveEntry {
     /// a test harness ticks from small numbers. `Option` makes "not currently
     /// starved" a value the type carries rather than one a comment defends.
     ///
-    /// Stamped by the tick on the FIRST refusal of a run and left alone by the
-    /// rest, so what it measures is the duration of the starvation and not the
-    /// age of the most recent tick. Cleared by
-    /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) whenever a
-    /// lane does open, and by [`advance`](DriveEntry::advance) on every arc:
-    /// a drive that MOVED is not the drive that was stuck, and carrying the
-    /// stamp across an arc would let a later, unrelated refusal inherit a
+    /// Stamped by the tick on the FIRST **cap** refusal of a run and left alone
+    /// by the cap refusals after it, so what it measures is the duration of the
+    /// starvation and not the age of the most recent tick.
+    ///
+    /// **Cleared at three sites, and the third is what makes the word
+    /// "continuously" on [`HeldReason::CapFull`] true** (#2109 review 4).
+    /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) runs when a
+    /// lane does open, and on any refusal that is **not** the cap's;
+    /// [`advance`](DriveEntry::advance) runs on every arc. The first two are
+    /// the tick's, and it is the non-cap one that keeps this a claim about the
+    /// run happening NOW: guarded on the write edge alone, the stamp was a
+    /// latch, and a single early cap refusal aged into `held(cap-full)` behind
+    /// a run of refusals that were nothing of the kind. The arc clear is its own
+    /// reason — a drive that MOVED is not the drive that was stuck, and carrying
+    /// the stamp across an arc would let a later, unrelated refusal inherit a
     /// duration it did not spend.
     ///
     /// Absent is the resting state, so it is not serialized when absent —
@@ -1361,7 +1369,17 @@ impl DriveEntry {
     }
 
     /// Forget any recorded cap starvation, and answer whether there was one.
-    /// Called when a lane DOES open — the refusal run is over.
+    ///
+    /// **Two callers, both the tick's**: a lane DOES open, or the tick takes a
+    /// refusal that is **not** the cap's. Both mean the cap run is over, and the
+    /// second is #2109 review 4's — without it this doc described a rule the
+    /// tick had stopped following.
+    ///
+    /// The stamp has a THIRD clear site that is not a call of this function:
+    /// [`advance`](DriveEntry::advance) zeroes the field directly on every arc.
+    /// Said explicitly because "who calls this" and "what clears the stamp" are
+    /// different questions, and a reader who conflates them will grep for this
+    /// name and conclude the arc case does not exist.
     pub fn clear_cap_starvation(&mut self) -> bool {
         self.cap_starved_since_ms.take().is_some()
     }

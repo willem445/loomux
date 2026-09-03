@@ -1114,10 +1114,15 @@ S3 added two more, described after them:
   it absent, and reads as "never answered", which is true of every such entry.
 - **`cap_starved_since_ms`** (per entry, #2109) — when the live-delegate cap
   started refusing this drive's lane spawns, and the `held(cap-full)` anchor.
-  Stamped on the FIRST refusal of a run and left alone by the rest, so what it
-  measures is the duration of one starvation rather than the age of the newest
-  tick; cleared when a lane does open, and by every state arc, because a drive
-  that MOVED is not the drive that was stuck. **Optional rather than a zero
+  Stamped on the FIRST **cap** refusal of a run and left alone by the cap
+  refusals after it, so what it measures is the duration of one starvation
+  rather than the age of the newest tick. **Cleared at three sites**, and the
+  third is what makes `held(cap-full)`'s "continuously" true (review 4 on
+  #2112): when a lane does open, when the tick takes a refusal that is **not**
+  the cap's, and on every state arc — the last because a drive that MOVED is not
+  the drive that was stuck. Guarded on the write edge alone the stamp was a
+  latch, and one early cap refusal aged into the hold behind a run of refusals
+  that were nothing of the kind. **Optional rather than a zero
   sentinel**: `fix_handback_ms` argues at length that a zero cannot occur while
   a drive is in `fix-wait`, and that argument does not transfer — a refusal is
   observed at whatever clock the tick was handed. Absent is the resting state,

@@ -2242,10 +2242,13 @@ impl OrchRegistry {
                         // about slots: the measured drive sat in `review-wait`
                         // with `lanes: []` for three hours, emitting one of
                         // these rows per tick and no §2.2 exit at all. The stamp
-                        // is written on the FIRST refusal of a run and left
-                        // alone by the rest, so `decide` reads a duration
-                        // rather than the age of the newest tick, and `clear`
-                        // on the Ok arm and on every arc is what keeps it a RUN.
+                        // is written on the FIRST cap refusal of a run and left
+                        // alone by the cap refusals after it, so `decide` reads
+                        // a duration rather than the age of the newest tick.
+                        // What keeps it a RUN is the three clears: the Ok arm
+                        // below, every state arc, and — since review 4 — the
+                        // `else` on this very branch, for any refusal that is
+                        // not the cap's.
                         //
                         // **Only a CAP refusal stamps it**, because the hold it
                         // leads to names the cap: a persistent non-cap refusal
