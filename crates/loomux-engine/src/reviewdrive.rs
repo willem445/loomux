@@ -4128,8 +4128,8 @@ mod tests {
         );
     }
 
-    /// **The residual the answered-lane exemption leaves, pinned as itself**
-    /// (#2109 review 2, premortem 1).
+    /// **The residual the answered-lane exemption leaves — NARROWED by #2110,
+    /// not closed** (#2109 review 2, premortem 1).
     ///
     /// One composition escapes every per-lane bound: a reviewer answers at this
     /// head, the body then moves, and that reviewer's pane goes BUSY on
@@ -4137,20 +4137,32 @@ mod tests {
     /// re-brief the moved digest calls for cannot be delivered (the reuse arm
     /// needs an idle pane) and must not be spawned beside it (#2109's duplicate
     /// refusal), while `lane-stalled` is exempt because the lane did answer. So
-    /// the drive retries, audits two rows a tick, and its only remaining exit is
-    /// the drive's own age.
+    /// the drive retries and audits two rows a tick.
     ///
-    /// That is disclosed rather than closed, and a disclosure is a claim like
-    /// any other: without this test the suite pins only the arms that work, and
-    /// the §8 row admitting the gap could go false with nothing red to say so.
-    /// The first half is the gap itself — the lane timeout passes and the drive
-    /// keeps trying — and the second is the bound that limits it.
+    /// **What #2110 changed is the exit, and only the exit.** #2109 disclosed
+    /// this gap and said closing it needs a per-lane refusal clock, "which
+    /// belongs with #2110's age work". #2110 did not build that clock: there is
+    /// still nothing per-lane here, and the hold that ends this still names no
+    /// lane. What it built is a per-STATE bound, and `review-wait` is a state,
+    /// so the drive now leaves at three hours as `held(state-stalled)` instead
+    /// of at twelve as `held(drive-stalled)` — a quarter of the wait, and a
+    /// notice that at least says which wait. The honest description of the
+    /// residual is therefore *bounded per state, still not per lane*, and §8's
+    /// row says exactly that.
     ///
-    /// Closing it properly needs a per-lane refusal clock, which is a second
-    /// mechanism beside `cap_starved_since_ms` and belongs with #2110's age
-    /// work, not here.
+    /// A disclosure is a claim like any other: without this test the suite pins
+    /// only the arms that work, and that §8 row could go false with nothing red
+    /// to say so. The three halves are the gap itself (past the LANE timeout,
+    /// still proposing the re-brief), the non-vacuity control one tick short of
+    /// the bound that now ends it, and the bound.
+    ///
+    /// **The age backstop is deliberately not asserted here any more**, and its
+    /// absence is the finding rather than an omission: the narrower bound fires
+    /// first, so from `review-wait` the twelve-hour clock is now unreachable for
+    /// this composition. Asserting it would be asserting a path the code no
+    /// longer takes.
     #[test]
-    fn an_answered_lane_whose_re_brief_is_refused_is_bounded_only_by_the_drives_age() {
+    fn an_answered_lane_whose_re_brief_is_refused_is_bounded_by_the_review_wait_state_bound() {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = "head-a".into();
@@ -4163,28 +4175,38 @@ mod tests {
             ..facts_at("head-a")
         };
 
-        // The gap: well past the LANE timeout, this keeps proposing the re-brief
-        // the tick will refuse. `lane-stalled` never fires here, by design.
-        let past_lane = 1_000 + minutes_ms(limits.lane_timeout_minutes) * 3;
+        // The gap: twice the LANE timeout and still inside the state bound, so
+        // this keeps proposing the re-brief the tick will refuse. `lane-stalled`
+        // never fires here, by design, and nothing per-lane replaces it.
+        let past_lane = 1_000 + minutes_ms(limits.lane_timeout_minutes) * 2;
         assert_eq!(
             decide(&e, &facts(past_lane), &limits),
             DriveStep::OpenLane { index: 0 },
-            "the exemption really does leave this composition unbounded per-lane — if this \
-             ever becomes a hold, the §8 row disclosing the gap is what needs rewriting"
+            "the exemption really does leave this composition unbounded PER LANE — if this \
+             ever becomes a lane-named hold, the §8 row disclosing the gap is what needs \
+             rewriting"
         );
 
-        // The bound that limits it, and its own non-vacuity control one tick
-        // short: the drive's age, which needs no lane to fire.
-        let age = minutes_ms(limits.drive_timeout_minutes);
-        assert_eq!(
-            decide(&e, &facts(1_000 + age - 1), &limits),
-            DriveStep::OpenLane { index: 0 },
-            "…still inside the age bound, so the hold below is that bound and not a coincidence"
+        // The bound that now limits it, and its own non-vacuity control one tick
+        // short. `REVIEW_WAIT_BOUND_MS` is the effective bound at these limits:
+        // `state_bound_ms` floors it against one lane at a sixty-minute timeout,
+        // which is smaller, so the constant is what decides.
+        assert!(
+            REVIEW_WAIT_BOUND_MS > minutes_ms(limits.lane_timeout_minutes),
+            "the floor must not be what fires, or the two assertions below are about the \
+             wrong bound"
         );
         assert_eq!(
-            decide(&e, &facts(1_000 + age), &limits),
-            DriveStep::held(HeldReason::DriveStalled),
-            "…and the drive's own age is what ends it"
+            decide(&e, &facts(1_000 + REVIEW_WAIT_BOUND_MS - 1), &limits),
+            DriveStep::OpenLane { index: 0 },
+            "…still inside the state bound, so the hold below is that bound and not a \
+             coincidence"
+        );
+        assert_eq!(
+            decide(&e, &facts(1_000 + REVIEW_WAIT_BOUND_MS), &limits),
+            DriveStep::held(HeldReason::StateStalled),
+            "…and time in `review-wait` is what ends it now — three hours, where before \
+             #2110 nothing but the twelve-hour age could"
         );
     }
 
