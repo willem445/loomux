@@ -80,7 +80,7 @@ import {
 } from "./pty";
 import { type CliProbe } from "./modelcatalog";
 import { modelCatalog } from "./modelprobe";
-import { ModelPicker } from "./modelpicker";
+import { ModelPicker, seedPicker } from "./modelpicker";
 import { ORCH_CLIS, orchCliFor } from "./orchclis";
 import { ICON_SETUP_PREVIEW_PX, setupPreviewMark } from "./setuppreview";
 import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
@@ -913,17 +913,12 @@ export class WelcomeForm {
     // The picker decides its own branch: a pre-filled value that IS a recent
     // marks that option, one that is not (the split-from pane's cwd, #214)
     // opens the custom branch carrying it — the datalist could do neither,
-    // which was the defect (#2010).
-    this.repoPicker.setOptions(recent, defaultFolder?.trim() || recent[0] || "");
-    // The pane routes its initial (and keyboard-nav) focus to this marker
-    // (Pane.focus, rev-74 LOW-4/LOW-6) rather than the Kind select, so a welcome
-    // pane is ready for a path the moment it opens. It follows the VISIBLE half
-    // of the picker: on the dropdown branch the free-text input is hidden, and
-    // focus() on a hidden element lands nowhere.
-    (this.repoPicker.input.hidden ? this.repoPicker.select : this.repoPicker.input).setAttribute(
-      "data-initial-focus",
-      ""
-    );
+    // which was the defect (#2010). The pane routes its initial (and
+    // keyboard-nav) focus to the marker the seed stamps (Pane.focus, rev-74
+    // LOW-4/LOW-6) rather than the Kind select, so a welcome pane is ready
+    // for a path the moment it opens; the marker follows the VISIBLE half of
+    // the picker, since focus() on a hidden element lands nowhere.
+    seedPicker(this.repoPicker, recent, defaultFolder?.trim() || recent[0] || "");
     this.autopilotInput.checked = getAutopilot();
     this.channelToolsInput.checked = getChannelTools();
     this.applyKind();

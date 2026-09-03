@@ -147,7 +147,19 @@ export class ModelPicker {
     this.sel.appendChild(custom);
     this.sel.value = state.selected;
     if (state.showCustom) this.custom.value = state.custom;
+    // Symmetric with set value: a dropdown-branch rebuild hides the input,
+    // and the previously typed path would sit there invisibly and resurface
+    // on the next custom… pick (#2108 review).
+    else this.custom.value = "";
     this.custom.hidden = !state.showCustom;
+    // A rebuild flips branches exactly like the two host-facing sites do, so
+    // it re-homes the marker the same way. The launcher's seed (seedPicker)
+    // stamps the marker only after setOptions returns, where this is a
+    // no-op — that ordering is a host's choice, not this class's guarantee,
+    // and the module header's rule ("the second copy of a control is the
+    // second place a fix has to be remembered") is why the method cannot
+    // assume it (#2108).
+    this.rehomeInitialFocus();
     this.cli = cli;
     this.paintSummary();
   }
@@ -225,6 +237,10 @@ export class ModelPicker {
     const state = pickerSelection(this.options, v);
     this.sel.value = state.selected;
     if (state.showCustom) this.custom.value = state.custom;
+    // The dropdown branch hides the input, so the previously typed path would
+    // sit there invisibly and resurface on the next custom… pick — clear it
+    // the way a human clearing the field would (#2108).
+    else this.custom.value = "";
     this.custom.hidden = !state.showCustom;
     this.rehomeInitialFocus();
     this.paintSummary();
@@ -265,4 +281,25 @@ export class ModelPicker {
   focus(): void {
     (this.custom.hidden ? this.sel : this.custom).focus();
   }
+}
+
+/** Seed a picker the way the launcher's welcome form does: `setOptions`
+ *  decides the branch from the pre-fill, then the host's `data-initial-focus`
+ *  marker is stamped on whichever half that left showing (rev-74 LOW-4/LOW-6
+ *  — the pane routes its initial and keyboard-nav focus to it).
+ *
+ *  One function because the ORDER is the contract the review flagged as
+ *  hand-copied (#2108): the test harness must drive the same seed the host
+ *  runs, so a reorder here moves both callers together instead of leaving
+ *  the tests mirroring a stale copy. */
+export function seedPicker(
+  picker: ModelPicker,
+  recents: readonly string[],
+  fallback: string,
+): void {
+  picker.setOptions(recents, fallback);
+  (picker.input.hidden ? picker.select : picker.input).setAttribute(
+    "data-initial-focus",
+    "",
+  );
 }
