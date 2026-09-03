@@ -138,9 +138,13 @@ Two numbers, and the difference between them is a correction to #1778's S5 table
 
 - **`loop_notices`** — an `[orrerix]`-prefixed wake naming the PR inside the **loop**
   window. This is orchestrator attention the loop actually cost.
-- **`loop_notices_any_pane_s5`** — the same filter without the "delivered to an
-  orchestrator pane" test. This is what S5's "orch notices" column counted, reproduced
-  so that table stays checkable.
+- **`loop_notices_any_pane_s5`** — the same filter with **two** of those tests
+  dropped, not one: neither the "delivered to an orchestrator pane" test nor the PR
+  window applies (`scorePr` counts it above the `isWake` branch, so only the loop
+  window and the `[orrerix]` prefix gate it). This is what S5's "orch notices" column
+  counted, reproduced so that table stays checkable. The second dropped test changes
+  no figure on the eleven benchmark PRs — every such prompt already falls inside the
+  PR window — but the two counters differ by more than the pane test in principle.
 
 They differ by 1–2 per PR on all six driven PRs, and the difference is entirely the
 driver's own resume prompts typed into a **worker** pane — which is precisely the
@@ -416,14 +420,25 @@ so none of them is a claim with no test behind it: an `rd-*` action this reader 
 bucket for, a transcript line with usage but **no** `message.id`, and a `usage.json` row
 with neither a session key nor an `agent_id`.
 
-The H8 split gets **both** of its branches, which is the difference between pinning an
-even split and pinning no split at all:
+The H8 split gets **both** of its branches, and they are genuinely different — which
+matters, because the branch this PR originally claimed to cover was not in the corpus
+at all: `rev-11-prev` existed only in `agents.json`, named by no audit row, so both
+shared sessions were the partial case and the self-correcting branch was pinned by
+nothing:
 
-- `ses-11` — both occupants attributed to the same PR. The halves re-sum to the whole
-  row, so this branch alone passes under an implementation that does not split.
+- `ses-11` — **both** occupants attributed to #900, via an `rd-lane-spawned` row that
+  names `rev-11-prev`. Each is credited half and the halves **re-sum to the whole row**
+  (535 + 535 = 1070). This is the case the benchmark's delegate column rests on: 514 of
+  the 1210 sessions in this group's store are shared, carrying 31.2 G of its 44.1 G
+  tokens.
 - `ses-14` — one occupant attributed, one not. Half the row is **dropped**, so the
   delegate side under-counts and the orchestrator share correspondingly over-estimates.
-  This is the branch that fails if the split is removed.
+
+The test asserts **both per-occupant credits and their sum**, because neither alone is
+enough. The sum cannot distinguish an even split from an implementation that credits a
+shared row *once* to one occupant (1070 + 0 sums to the same 1070); the per-occupant
+credits cannot distinguish an even split from *no* split without the sum (each would
+read 1070). Together they redden for both regressions.
 
 What no test can reach is whether an **even** split is the right one: it is an
 assumption about how a shared pane's spend divided, and only the structural field named

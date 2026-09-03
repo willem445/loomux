@@ -70,7 +70,7 @@ const card = (pr: number) => REPORT.prs.find((c: any) => c.pr === pr);
 
 test('positive control: rows were classified, and the control PR classified none', () => {
   assert.ok(REPORT.coverage.rows_classified > 0, 'no audit row was classified — the scorecard did not run');
-  assert.equal(REPORT.coverage.rows_classified, 23);
+  assert.equal(REPORT.coverage.rows_classified, 24);
   assert.ok(card(900).rows_classified > 0);
   assert.ok(card(901).rows_classified > 0);
   // The negative control. Without this the assertion above passes for a scorecard
@@ -225,7 +225,7 @@ test('review rounds: verdicts keyed by block and verdict, from `review-verdict` 
 test('driver counters: each `rd-*` action lands in its own bucket, reasons kept apart', () => {
   const d = card(900).driver;
   assert.equal(d.drives, 1);
-  assert.equal(d.lane_spawns, 2);
+  assert.equal(d.lane_spawns, 3);
   assert.equal(d.hand_backs, 1);
   assert.equal(d.refused, 3);
   assert.equal(d.held, 1);
@@ -294,19 +294,36 @@ test('orchestrator tokens are also apportioned by this PR\'s share of the window
 
 test('delegate tokens: attributed agents only, weighted, orchestrator excluded', () => {
   const d = card(900).delegates;
-  assert.equal(d.count, 3);
-  assert.deepEqual(d.agents.map((a: any) => a.agent).sort(), ['rev-11', 'rev-12', 'w-13']);
+  assert.equal(d.count, 4);
+  assert.deepEqual(d.agents.map((a: any) => a.agent).sort(), ['rev-11', 'rev-11-prev', 'rev-12', 'w-13']);
   // rev-12 reviewed both PRs, so half its lifetime tokens land on each (H4).
-  // rev-11 shares session `ses-11` with rev-11-prev, so it is credited HALF the row its
-  // session carries (H8); rev-12 reviewed both PRs, so half again on the PR axis (H4).
-  assert.deepEqual(d.tokens, { input: 450, cache_read: 4050, cache_creation: 225, output: 90, total: 4815, turns: 3 });
+  assert.deepEqual(d.tokens, { input: 500, cache_read: 4500, cache_creation: 250, output: 100, total: 5350, turns: 4 });
+
+  // THE SELF-CORRECTING BRANCH of the H8 split, and the one the benchmark's delegate
+  // column rests on: `ses-11` is ONE session carried across TWO agent ids, BOTH
+  // attributed to #900 (an `rd-lane-spawned` row names rev-11-prev). Each is credited
+  // half, and the halves must re-sum to the whole row — 535 + 535 = 1070, the single
+  // `usage.json` row that session has.
+  //
+  // Both halves are asserted, and that is deliberate: the SUM alone cannot tell an even
+  // split from an implementation that credits a shared row ONCE to one occupant, since
+  // 1070 + 0 sums to the same 1070. The per-occupant credits are what make credit-once
+  // redden; the sum is what makes a no-split implementation redden (1070 + 1070). In the
+  // live store 514 of 1210 sessions are shared and carry 31.2 G of 44.1 G tokens, so
+  // this is the common case rather than a corner.
   const rev11 = d.agents.find((a: any) => a.agent === 'rev-11');
+  const rev11prev = d.agents.find((a: any) => a.agent === 'rev-11-prev');
   assert.equal(rev11.usage_key, 'session');
   assert.equal(rev11.shared_session_agents, 2);
   assert.equal(rev11.session_weight, 0.5);
   assert.equal(rev11.pr_weight, 1);
   assert.equal(rev11.tokens, 1070);          // the whole row its session carries
-  assert.equal(rev11.tokens_credited, 535);  // what this PR actually got
+  assert.equal(rev11.tokens_credited, 535);
+  assert.equal(rev11prev.tokens, 1070);      // the SAME row — one session, two occupants
+  assert.equal(rev11prev.tokens_credited, 535);
+  assert.equal(rev11.tokens_credited + rev11prev.tokens_credited, 1070,
+    'a fully-attributed lineage must re-sum to its session row, neither doubled nor halved');
+  // An unshared session is credited whole, so the split is not a blanket halving.
   const w13 = d.agents.find((a: any) => a.agent === 'w-13');
   assert.equal(w13.shared_session_agents, 1);
   assert.equal(w13.tokens_credited, w13.tokens);
@@ -341,8 +358,8 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
 });
 
 test('orchestrator share is reported both raw and apportioned', () => {
-  assert.equal(card(900).share.orchestrator_pct_raw, 39.17);   // 3101 / 7916
-  assert.equal(card(900).share.orchestrator_pct_attributed, 19.45); // 1163 / 5978
+  assert.equal(card(900).share.orchestrator_pct_raw, 36.69);   // 3101 / 8451
+  assert.equal(card(900).share.orchestrator_pct_attributed, 17.86); // 1163 / 6513
   assert.equal(card(901).share.orchestrator_pct_raw, 23.23);   // 1080 / 4650
   assert.equal(card(901).share.orchestrator_pct_attributed, 15.9);  // 675 / 4245
 });
@@ -393,17 +410,21 @@ test('coverage: unattributed and split agents are named, not swallowed', () => {
   // POSITIVE CONTROL for the delegate test's "orchestrator excluded" assertion: the
   // corpus DOES attribute orch-10 to #900 (its restore brief names the PR), so that
   // assertion is about the role filter rather than about orch-10 never being seen.
-  assert.equal(cov.agents_attributed, 5);
+  assert.equal(cov.agents_attributed, 6);
   assert.equal(cov.agents_unattributed_spawned_in_window.includes('orch-10'), false);
-  assert.equal(cov.audit_rows_read, 28);
+  assert.equal(cov.audit_rows_read, 29);
   assert.equal(cov.audit_parse_errors, 0);
   // A usage row carrying neither a session key nor an agent id is unusable and says so.
   assert.equal(cov.usage_rows_unusable, 1);
   assert.equal(cov.usage_sessions_indexed, 6);
-  // Two shared sessions, and they exercise DIFFERENT branches: `ses-11` has both
-  // occupants attributed to #900 (the halves re-sum to the whole row), `ses-14` has
-  // only one attributed (half the row is dropped).
+  // Two shared sessions, and they really do exercise DIFFERENT branches — `ses-11`
+  // has BOTH occupants attributed to #900 (an `rd-lane-spawned` row names rev-11-prev),
+  // so its halves re-sum to the whole row; `ses-14` has only one attributed, so half of
+  // its row is dropped. Until an audit row named rev-11-prev, both sessions were the
+  // partial case and the self-correcting branch was pinned by nothing.
   assert.equal(cov.usage_sessions_shared_by_more_than_one_agent, 2);
+  assert.ok(REPORT.prs.find((c: any) => c.pr === 900).delegates.agents
+    .some((a: any) => a.agent === 'rev-11-prev'), 'ses-11 must have BOTH occupants attributed');
   assert.deepEqual(cov.transcripts, [{
     path: TRANSCRIPT, lines: 6, assistant_usage_lines: 5, deduped_turns: 4, usage_rows_without_id: 1,
   }]);
@@ -441,7 +462,7 @@ test('coverage: every heuristic is declared with an id, a statement and its stru
 test('group totals: per-file wake census, independent of any PR selection', () => {
   assert.equal(REPORT.group.files.length, 1);
   const f = REPORT.group.files[0];
-  assert.equal(f.rows, 28);
+  assert.equal(f.rows, 29);
   assert.equal(f.orchestrator_wakes, 8);
   assert.equal(f.prompt_typed_to_orchestrator, 0);
   assert.deepEqual(f.wakes_by_kind, {
@@ -456,13 +477,13 @@ test('group totals: per-file wake census, independent of any PR selection', () =
 test('--cut reproduces a historical measurement on a log that has since grown', () => {
   const cut = JSON.parse(runScorecard(['--cut', '1700000500000']));
   const f = cut.group.files[0];
-  assert.equal(f.rows, 20, 'rows after the cut instant are dropped');
+  assert.equal(f.rows, 21, 'rows after the cut instant are dropped');
   assert.ok(f.rows < REPORT.group.files[0].rows);
   // The cut lands between the first verdict and the hand-back, so #900 keeps one
   // round and loses the rest — a non-zero survivor, so this is not the vacuous
   // 'everything is gone' reading of a cut.
   assert.equal(cut.prs.find((c: any) => c.pr === 900).review.rounds, 1);
-  assert.equal(cut.prs.find((c: any) => c.pr === 900).driver.lane_spawns, 2);
+  assert.equal(cut.prs.find((c: any) => c.pr === 900).driver.lane_spawns, 3);
   assert.equal(cut.prs.find((c: any) => c.pr === 900).driver.hand_backs, 0);
   assert.equal(cut.prs.find((c: any) => c.pr === 900).driver.satisfied, 0);
   // ... and the transcript is cut too: only the +100 s turn survives.
@@ -480,7 +501,7 @@ test('the GFM table renders one row per PR with the counters the benchmark quote
   const cells = (l: string) => l.split('|').length;
   for (const l of lines) assert.equal(cells(l), cells(lines[0]));
   const row900 = lines.find((l) => l.startsWith('| #900 '))!;
-  assert.match(row900, /\| 2 \| 1 \| 3 \| 1 \|/); // lane spawns, hand-backs, refused, held
+  assert.match(row900, /\| 3 \| 1 \| 3 \| 1 \|/); // lane spawns, hand-backs, refused, held
   assert.match(row900, /\| 2 \(3\) \|/);          // corrected notices (S5's own count)
   const row902 = lines.find((l) => l.startsWith('| #902 '))!;
   assert.match(row902, /\| — \| — \|/);           // no loop window

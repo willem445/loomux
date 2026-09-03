@@ -6,6 +6,7 @@
 {"action":"prompt","actor":"w-14","detail":{"to":"orch-10","text":"[orrerix] w-14 reports blocked (#901): needs a human call on the wire shape."},"ts_ms":1700000090000}
 {"action":"rd-started","actor":"orrerix","detail":{"pr":900,"on_behalf_of":"orch-10","rounds_already_spent":0},"ts_ms":1700000120000}
 {"action":"prompt","actor":"w-14","detail":{"to":"orch-10","text":"[orrerix] message from w-14 (#901): answering your question inline."},"ts_ms":1700000150000}
+{"action":"rd-lane-spawned","actor":"orrerix","detail":{"pr":900,"agent":"rev-11-prev","block":"rev-std","round":1,"head":"aaaaaaa"},"ts_ms":1700000170000}
 {"action":"rd-lane-spawned","actor":"orrerix","detail":{"pr":900,"agent":"rev-11","block":"rev-std","round":1,"head":"aaaaaaa"},"ts_ms":1700000180000}
 {"action":"review-verdict","actor":"rev-12","detail":{"pr":901,"block":"rev-final","verdict":"escalate","head":"bbbbbbb","body_digest":"d1"},"ts_ms":1700000210000}
 {"action":"rd-lane-spawned","actor":"orrerix","detail":{"pr":900,"agent":"rev-12","block":"rev-final","round":1,"head":"aaaaaaa"},"ts_ms":1700000240000}
