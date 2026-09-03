@@ -1206,9 +1206,13 @@ impl OrchRegistry {
         // so a pane that never comes back is `held(lane-stalled)` naming it,
         // exactly as if it had gone quiet without a re-brief. That bound is only
         // REACHABLE because `decide_review_wait`'s stall check is keyed on the
-        // head rather than on the full (head, digest) key; the two changes ship
-        // together for that reason, and refusing without the re-key would swap a
-        // duplicate reviewer for a four-hour `drive-stalled`.
+        // head, for a lane that has NOT answered at it, rather than on the full
+        // (head, digest) key; the two changes ship together for that reason, and
+        // refusing without the re-key would swap a duplicate reviewer for a
+        // four-hour `drive-stalled`. The refusal and the bound meet on the same
+        // subject: a pane still holding the round has by definition recorded no
+        // verdict for it, so the exemption for an ANSWERED lane never covers the
+        // lane this refusal is about.
         //
         // **A head change is deliberately not covered.** There the recorded pane
         // is reviewing a revision the drive has moved past, its verdict binds to

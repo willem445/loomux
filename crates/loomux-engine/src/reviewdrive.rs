@@ -2260,10 +2260,30 @@ fn decide_review_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimi
                 // re-brief it produced is now REFUSED while that lane's pane is
                 // live, so without this the drive would retry the refusal until
                 // `drive-stalled` — four hours, on a notice that names no lane.
-                // A lane asked about this head and silent past its timeout is
-                // stalled whatever the body has done since.
+                //
+                // **`at_head` is what makes this a silence test rather than a
+                // stopwatch** (#2109 review 1). The first version keyed on
+                // `(briefed_head, spawned_ms)` alone, and that pair cannot see
+                // whether the reviewer ANSWERED — which is the very distinction
+                // [`LaneRecord::at_head`] exists to carry. A lane that recorded
+                // `fail` at this head, whose worker then made a BODY-ONLY fix,
+                // returns here through arc 8 at the same head with a moved
+                // digest: the stale verdict reads as absent, this arm is
+                // reached, and `now - spawned_ms` is review time PLUS fix time.
+                // Past sixty minutes of that sum the drive parked
+                // `held(lane-stalled)` on a reviewer that had never been
+                // silent — and stuck, since only `open_lane` writes
+                // `spawned_ms`, so a `drive_review` resume re-decided on
+                // unchanged facts and re-held.
+                //
+                // A lane that has answered about THIS revision is therefore
+                // exempt, whatever the body has done since; what it is owed is
+                // the delta re-brief below, which resets both `at_head` and the
+                // clock. Only a lane asked about this head and still silent past
+                // its timeout stalls.
                 Some(rec)
                     if rec.briefed_head == facts.head
+                        && rec.at_head != facts.head
                         && facts.now_ms.saturating_sub(rec.spawned_ms)
                             >= minutes_ms(limits.lane_timeout_minutes) =>
                 {
@@ -3708,8 +3728,80 @@ mod tests {
         );
     }
 
+    /// **#2109 review 1, finding 1.** The stall clock is a SILENCE test, and a
+    /// reviewer that answered is not silent however long the round has run.
+    ///
+    /// This is the arc-8 return the first version of that arm could not see. The
+    /// lane records `fail` at `head-a`; the worker's fix is BODY-ONLY, so
+    /// `report(done)` at an unchanged head returns the drive straight to
+    /// `review-wait` with the digest moved; the stale verdict then reads as
+    /// absent and this arm is reached with `now - spawned_ms` equal to review
+    /// time PLUS fix time. Keyed on `(briefed_head, spawned_ms)` alone that sum
+    /// crosses `lane_timeout_minutes` and parks the drive `lane-stalled` on a
+    /// reviewer that answered promptly — and parks it STUCK, because only
+    /// `open_lane` writes `spawned_ms`, so a resume re-decides on unchanged
+    /// facts and re-holds. Its only exits were a head change, a cancel, or the
+    /// four-hour age bound.
+    ///
+    /// **The two halves differ in exactly one field**, which is what makes this
+    /// a pin on `at_head` rather than on the timeout: same lane, same clock,
+    /// same moved digest, same stale-verdict fact handed to `decide` — and only
+    /// whether `record_verdict_seen` ever ran. Without the second half an
+    /// implementation that simply deleted the stall arm would pass.
+    #[test]
+    fn a_lane_that_answered_at_this_head_is_not_stalled_by_the_fix_round_that_followed() {
+        let limits = DriveLimits::default();
+        let past = 1_000 + minutes_ms(limits.lane_timeout_minutes);
+        // The gate's own fact for the lane: the `fail` it recorded, bound to the
+        // head it reviewed and to the digest that has since moved. `decide`
+        // reads this as ABSENT (`lane_verdict_is_current`), which is what puts
+        // the lane back on the arm under test.
+        let facts = DriveFacts {
+            now_ms: past,
+            body_digest: Some("d2".to_string()),
+            required_lanes: Some(vec![lane_fact("rev-std", Some(Verdict::Fail), "head-a", "d1")]),
+            ..facts_at("head-a")
+        };
+
+        let answered = {
+            let mut e = entry_at(DriveState::ReviewWait);
+            e.head = "head-a".into();
+            e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
+            assert!(
+                e.record_verdict_seen("rev-std", Verdict::Fail, "head-a"),
+                "the fixture must actually record the answer, or this pins nothing"
+            );
+            e
+        };
+        assert_eq!(
+            decide(&answered, &facts, &limits),
+            DriveStep::OpenLane { index: 0 },
+            "a reviewer that ANSWERED at this head is not silent — arc 8 owes it the delta \
+             re-brief, not a hold naming it as the thing that went quiet"
+        );
+
+        // The control: the identical entry that never answered. One field apart,
+        // and it must still stall.
+        let silent = {
+            let mut e = entry_at(DriveState::ReviewWait);
+            e.head = "head-a".into();
+            e.open_lane("rev-std", "sess", "rev-4", "head-a", Some("d1"), 1_000);
+            e
+        };
+        assert_eq!(
+            decide(&silent, &facts, &limits),
+            DriveStep::held(HeldReason::LaneStalled),
+            "…while the lane that was asked and said nothing still stalls, which is the \
+             whole point of keying the clock on the head"
+        );
+    }
+
     /// **#2109.** A lane's stall clock is keyed on the HEAD it was asked about,
-    /// so a body edit under a silent reviewer cannot hand it another hour.
+    /// so a body edit under a SILENT reviewer cannot hand it another hour.
+    ///
+    /// The silence half of that key is pinned by the sibling above; every
+    /// fixture here builds its record through `open_lane` alone, so `at_head`
+    /// is empty and the lane has answered nothing.
     ///
     /// The two halves discriminate. The first is the pre-#2109 behaviour and is
     /// the control: a lane still open for this exact revision, past its timeout,
