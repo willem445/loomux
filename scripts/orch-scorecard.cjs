@@ -679,6 +679,12 @@ function indexSessionAgents(agents) {
 //     CLAUDE one at all: an opencode row has no such file;
 //   - only when the transcript sums to more than zero.
 //
+// COST. One extra STREAMED pass per repaired row. The index itself is readdir-only
+// (630 files across 537 folders on the store this was written against), but a row
+// that IS repaired costs a full read of its transcript, and those run to hundreds of
+// MB. That read is inherent — it is the data being recovered — but it is why the
+// index is built ONLY when a zero row exists, and why --no-backfill exists.
+//
 // The sum is `dedupeTranscriptTurns` — the SAME fold the orchestrator's own
 // transcript goes through, message-id dedup and the four usage fields, so a
 // backfilled delegate row and the orchestrator row it is compared against
