@@ -1508,7 +1508,7 @@ pub struct DriveEntry {
     ///
     /// Absent is the resting state, so it is not serialized when absent —
     /// `owed_notice`'s reason, unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub cap_starved_since_ms: Option<u64>,
     /// When the drive entered the state it is in now — the
     /// [`HeldReason::StateStalled`] anchor (#2110).
