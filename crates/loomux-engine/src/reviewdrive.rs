@@ -4993,9 +4993,16 @@ mod tests {
         assert_eq!(bound(0), bound(1));
 
         // The worked case from the finding: three reviewers each answering at
-        // fifty-nine minutes, with two inter-lane gaps. Under the bare product
-        // this sum parks a drive nothing was wrong with.
-        let real = minutes_ms(59) * 3 + 90_000;
+        // fifty-nine minutes, plus the THREE unfunded intervals a three-lane
+        // gate has — the stretch before the first brief, and one detection gap
+        // after each of the first two verdicts. Under the bare product this sum
+        // parks a drive nothing was wrong with.
+        //
+        // The first draft of this fixture used two gaps and came to 178.5
+        // minutes, which is UNDER the 180-minute product — so it asserted the
+        // finding was not reachable, and CI said so. Three intervals is what
+        // the mechanism actually has.
+        let real = minutes_ms(59) * 3 + 90_000 * 3;
         assert!(real > lane * 3, "the fixture must exceed the bare product, or it pins nothing");
         assert!(real < bound(3), "…and must sit inside the floor as shipped");
     }
