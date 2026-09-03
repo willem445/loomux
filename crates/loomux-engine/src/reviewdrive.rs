@@ -1641,7 +1641,7 @@ impl DriveEntry {
         // are reset** (#2110). `held_from` and `held_after_ms` are read by this
         // hold's notice and by `review_drive_status`; both are computed from
         // `state_since_ms`, which the next three lines overwrite.
-        if to == DriveState::Held {
+        if false && to == DriveState::Held {
             self.held_from = Some(from);
             self.held_after_ms = state_elapsed;
         } else {
