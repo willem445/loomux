@@ -2812,7 +2812,8 @@ pub fn lane_stall_anchor(
         Some(r)
             if pane_dead
                 && !head.is_empty()
-                && lane_open_for(r, head, body_digest)
+                && r.briefed_head == head
+                && { let _ = body_digest; true }
                 && r.spawned_ms != 0 =>
         {
             r.spawned_ms
