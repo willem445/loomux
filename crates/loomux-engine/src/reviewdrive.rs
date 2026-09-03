@@ -1475,30 +1475,18 @@ pub struct DriveEntry {
     /// by the cap refusals after it, so what it measures is the duration of the
     /// starvation and not the age of the most recent tick.
     ///
-    /// **Cleared at four sites, and the fourth is what makes the word
+    /// **Cleared at three sites, and the third is what makes the word
     /// "continuously" on [`HeldReason::CapFull`] true** (#2109 review 4).
     /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) runs when a
     /// lane does open, and on any refusal that is **not** the cap's;
-    /// [`advance`](DriveEntry::advance) runs on every arc; and
-    /// [`discard_cap_starvation_run`](DriveEntry::discard_cap_starvation_run)
-    /// runs at §2.4's restart reconcile. The first two are the tick's, and it is
-    /// the non-cap one that keeps this a claim about the
+    /// [`advance`](DriveEntry::advance) runs on every arc. The first two are
+    /// the tick's, and it is the non-cap one that keeps this a claim about the
     /// run happening NOW: guarded on the write edge alone, the stamp was a
     /// latch, and a single early cap refusal aged into `held(cap-full)` behind
     /// a run of refusals that were nothing of the kind. The arc clear is its own
     /// reason — a drive that MOVED is not the drive that was stuck, and carrying
     /// the stamp across an arc would let a later, unrelated refusal inherit a
-    /// duration it did not spend. The restart clear is #2135's, and is the only
-    /// one that charges nothing: a run cannot straddle a process boundary,
-    /// because no tick observed the cap across it — that function carries the
-    /// whole argument.
-    ///
-    /// **This field IS serialized, so the stamp survives a shutdown**, and the
-    /// restart clear above is what stops that from being a defect rather than a
-    /// feature. It is written for the same reason every other clock here is:
-    /// §5.2 is the drive's whole memory, and a field the tick decides from that
-    /// the file omitted would make a resumed drive decide from a different
-    /// entry than the one that was stored.
+    /// duration it did not spend.
     ///
     /// Absent is the resting state, so it is not serialized when absent —
     /// `owed_notice`'s reason, unchanged.
@@ -1816,11 +1804,8 @@ impl DriveEntry {
     /// Record that the live-delegate cap refused this drive's lane spawn, and
     /// answer whether that changed anything (#2109).
     ///
-    /// **First-refusal-wins**: a run of CAP refusals is one starvation, and the
-    /// stamp is when it began. ("Cap" rather than bare "refusals" because that
-    /// is the only kind that reaches here at all, and the loose word read as a
-    /// claim the field's own doc contradicts — #2135, folded from #2112's final
-    /// pass.) Re-stamping on each tick would make
+    /// **First-refusal-wins**: a run of refusals is one starvation, and the
+    /// stamp is when it began. Re-stamping on each tick would make
     /// [`CAP_HOLD_MS`] unreachable — the same defeat-your-own-bound shape
     /// `decide`'s empty-head guard describes, where every tick re-armed the
     /// clock meant to catch it.
@@ -1839,57 +1824,18 @@ impl DriveEntry {
     /// second is #2109 review 4's — without it this doc described a rule the
     /// tick had stopped following.
     ///
-    /// The stamp has two clear sites that are not calls of this function, and
-    /// they are said explicitly because "who calls this" and "what clears the
-    /// stamp" are different questions — a reader who conflates them will grep
-    /// for this name and conclude the other two do not exist.
-    /// [`advance`](DriveEntry::advance) zeroes the field directly on every arc,
-    /// and [`discard_cap_starvation_run`](DriveEntry::discard_cap_starvation_run)
-    /// is the restart reconcile's (#2135).
+    /// The stamp has a THIRD clear site that is not a call of this function:
+    /// [`advance`](DriveEntry::advance) zeroes the field directly on every arc.
+    /// Said explicitly because "who calls this" and "what clears the stamp" are
+    /// different questions, and a reader who conflates them will grep for this
+    /// name and conclude the arc case does not exist.
     ///
     /// Takes `now_ms` since #2110 because ending a run is no longer free: what
     /// it cost is folded into the accumulators the age bound subtracts, and a
     /// run ended without charging it would leave the time in the budget of the
-    /// drive that was starved. That is exactly why the restart clear is a
-    /// separate function rather than a call of this one — see it.
+    /// drive that was starved.
     pub fn clear_cap_starvation(&mut self, now_ms: u64) -> bool {
         self.end_starvation_run(now_ms);
-        self.cap_starved_since_ms.take().is_some()
-    }
-
-    /// Drop a starvation run **without charging what it cost**, and answer
-    /// whether there was one — §2.4's restart reconcile (#2135).
-    ///
-    /// **A starvation run cannot straddle a process boundary**, because every
-    /// other site that touches this stamp is a tick that OBSERVED the cap, and
-    /// across a shutdown no tick ran. What the field means — "the cap has been
-    /// refusing this drive's lane spawns continuously since this instant" — is
-    /// therefore not a claim the surviving stamp can still make: the interval
-    /// between the last tick of the old process and the first of the new one is
-    /// time in which the cap refused nothing, and after a restart every pane
-    /// this group's cap was counting is gone. Left standing, a stamp older than
-    /// [`CAP_HOLD_MS`] parks the resumed drive `held(cap-full)` on its FIRST
-    /// tick, before a single spawn is attempted, on a notice telling an
-    /// orchestrator to free a slot in a group whose slots are all free.
-    ///
-    /// **Nothing is charged, and that is the choice rather than an oversight.**
-    /// [`clear_cap_starvation`](DriveEntry::clear_cap_starvation) folds
-    /// `now - since` into the two accumulators both age bounds subtract, and
-    /// here that difference is mostly orrerix's own downtime — so charging it
-    /// would FORGIVE the downtime from `drive-stalled` and `state-stalled`,
-    /// which is precisely the property #2117 disclosed and pinned as charged
-    /// (`orrerix_downtime_is_charged_to_the_state_it_spanned`). The stamp is a
-    /// START and not a total, so the genuinely-starved stretch before the
-    /// shutdown cannot be recovered from it either; discarding loses that
-    /// forgiveness, which fails toward parking rather than toward silence and
-    /// is the direction every other unknown here is resolved in.
-    ///
-    /// **Scoped to the process boundary, and no wider.** An in-process tick gap
-    /// longer than [`CAP_HOLD_MS`] still parks on a single observed refusal —
-    /// the reconcile is once per group per process, so nothing here reaches it.
-    /// That residual is real and is pinned rather than merely admitted, by
-    /// `an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal`.
-    pub fn discard_cap_starvation_run(&mut self) -> bool {
         self.cap_starved_since_ms.take().is_some()
     }
 
@@ -4605,51 +4551,6 @@ mod tests {
             "a drive that MOVED is not the drive that was stuck"
         );
     }
-
-    /// **#2135's restart clear, and the ONE thing that distinguishes it from
-    /// the tick's.** A starvation run cannot straddle a process boundary, and
-    /// the interval it would otherwise be charged for is mostly orrerix's own
-    /// downtime.
-    ///
-    /// The two halves are the same entry, the same stamp and the same clock,
-    /// differing in exactly one call — so this pins that the restart clear
-    /// charges NOTHING, and not merely that it forgets the anchor. An
-    /// implementation spelled `clear_cap_starvation(now)` forgets the anchor
-    /// perfectly and fails the second assertion, which is the point: charging
-    /// the gap would FORGIVE orrerix's own downtime from both age bounds, and
-    /// that downtime being CHARGED is the property #2117 disclosed and pinned
-    /// (`orrerix_downtime_is_charged_to_the_state_it_spanned`).
-    #[test]
-    fn the_restart_clear_forgets_a_run_without_charging_the_downtime_it_spans() {
-        let mut restarted = entry_at(DriveState::ReviewWait);
-        assert!(
-            !restarted.discard_cap_starvation_run(),
-            "an entry with no run has none to drop, and says so"
-        );
-        assert!(restarted.note_cap_starvation(10_000));
-        assert!(restarted.discard_cap_starvation_run(), "…and a stamped one says it dropped one");
-        assert_eq!(restarted.cap_starved_for(2_000_000), None, "the run is over");
-        assert_eq!(
-            restarted.starved_ms(2_000_000),
-            0,
-            "and the half hour between the last tick of one process and the first of the next \
-             is charged to the drive, never forgiven as a starvation nobody observed"
-        );
-
-        // The contrast, which is what makes the assertion above a discriminator
-        // rather than a restatement: the TICK's clear, over the same stamp at
-        // the same clock, banks every millisecond of it.
-        let mut ticked = entry_at(DriveState::ReviewWait);
-        assert!(ticked.note_cap_starvation(10_000));
-        assert!(ticked.clear_cap_starvation(2_000_000));
-        assert_eq!(
-            ticked.starved_ms(2_000_000),
-            1_990_000,
-            "the tick's clear banks what the run cost — that IS the difference, and it is why \
-             the restart clear is a separate function rather than a call of this one"
-        );
-    }
-
     /// **#2110's exclusion, at the decision itself.** A drive the live-delegate
     /// cap will not let spawn is neither progressing nor stalled, and no clock
     /// may charge it for the difference.

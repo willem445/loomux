@@ -1934,11 +1934,6 @@ impl OrchRegistry {
     /// state could not be determined is neither — `None` is "the world does not
     /// match", never "probably fine".
     ///
-    /// It also drops any cap-starvation run the previous process left standing
-    /// (#2135) — see the comment on the call, and
-    /// `DriveEntry::discard_cap_starvation_run` for why that run cannot survive
-    /// a process boundary and why nothing is charged for it.
-    ///
     /// An unresolvable *session* is deliberately not held here, though §2.4
     /// names it: that is what the first hand-back discovers
     /// (`held(worker-unresumable)`), and holding at reconcile would park every
@@ -1950,7 +1945,7 @@ impl OrchRegistry {
             return;
         }
         let dir = self.group_dir(group);
-        let mut audits: Vec<(String, u64, bool, bool)> = Vec::new();
+        let mut audits: Vec<(String, u64, bool)> = Vec::new();
         {
             let _state_guard = self.rd_state_lock.lock_safe();
             // **The once-only latch is set below, on a reconcile that actually
@@ -1974,28 +1969,6 @@ impl OrchRegistry {
                 let open = rddrive::pr_is_open(runner, pr);
                 let Some(entry) = state.entry_mut(pr) else { continue };
                 let on_behalf = entry.on_behalf_of.clone();
-                // **A cap-starvation run cannot straddle a process boundary**
-                // (#2135). The stamp is written and read by ticks that OBSERVED
-                // the cap refuse a lane spawn, and across a shutdown no tick
-                // ran: the gap is time the cap refused nothing, and after a
-                // restart every pane this group's cap was counting is gone.
-                // Left standing, a stamp older than `CAP_HOLD_MS` parks the
-                // resumed drive `held(cap-full)` on its FIRST tick — before one
-                // spawn is attempted — on a notice telling an orchestrator to
-                // free a slot in a group whose slots are all free.
-                //
-                // Unconditional, and above the cancel arm rather than in the
-                // `else`: a cancelled entry's `advance` clears the stamp anyway,
-                // so putting this in one branch would make the reconcile's rule
-                // depend on a fact that has nothing to do with the cap. Charging
-                // nothing is `discard_cap_starvation_run`'s own argument — the
-                // gap is mostly downtime, and #2110's accumulators are a CREDIT
-                // against the age bounds that #2117 deliberately charges
-                // downtime to.
-                let forgot_cap_run = entry.discard_cap_starvation_run();
-                if forgot_cap_run {
-                    changed = true;
-                }
                 if open == Some(false)
                     && entry.advance(reviewdrive::DriveState::Cancelled, None, None, 0).is_ok()
                 {
@@ -2016,32 +1989,22 @@ impl OrchRegistry {
                     let panes = entry.owned_panes();
                     let n = rddrive::cancelled_notice(pr, rddrive::CancelCause::PrGone, &panes);
                     entry.owe_notice(&n, now);
-                    audits.push((on_behalf, pr, true, forgot_cap_run));
+                    audits.push((on_behalf, pr, true));
                 } else {
-                    audits.push((on_behalf, pr, false, forgot_cap_run));
+                    audits.push((on_behalf, pr, false));
                 }
             }
             if changed {
                 let _ = reviewdrive::store_state(&dir, &state);
             }
         }
-        for (on_behalf, pr, cancelled, forgot_cap_run) in audits {
+        for (on_behalf, pr, cancelled) in audits {
             let action = if cancelled {
                 rddrive::audit_action::CANCELLED
             } else {
                 rddrive::audit_action::RECOVERED
             };
-            // #2135: whether this reconcile dropped a cap-starvation run the
-            // previous process left behind. On the row rather than silent for
-            // `rd-lane-duplicate-refused`'s reason — the clear's only other
-            // visible effect is a drive that did NOT park, which on this log is
-            // indistinguishable from there having been no stamp at all.
-            self.rd_audit(
-                group,
-                &on_behalf,
-                action,
-                json!({ "pr": pr, "at": "reconcile", "cap_run_forgotten": forgot_cap_run }),
-            );
+            self.rd_audit(group, &on_behalf, action, json!({ "pr": pr, "at": "reconcile" }));
         }
     }
 
