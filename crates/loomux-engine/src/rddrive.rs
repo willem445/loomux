@@ -37,7 +37,7 @@ use serde::Deserialize;
 
 use crate::mqdriver::{self, BatchVerification, CmdOut, MqRunner};
 use crate::notify::{self, PollResult};
-use crate::reviewdrive::{CiObservation, Counters, DrivenRole, HeldReason};
+use crate::reviewdrive::{CiObservation, Counters, DriveState, DrivenRole, HeldReason};
 use crate::workflow::{self, Verdict};
 
 // ── §2.4 the rate bound ─────────────────────────────────────────────────────
@@ -795,12 +795,68 @@ pub struct HeldFacts {
     /// Empty renders as no clause at all, which is the pre-#1961 wording
     /// exactly, so a hold that genuinely has nothing to add is unchanged.
     pub refusal: String,
+    /// **What the drive was doing when a time bound fired** (#2110) — the
+    /// working state it parked out of, how long it had been there with
+    /// starvation already excluded, and the bound that decided.
+    ///
+    /// The whole ask of #2110's third bullet. Both time bounds used to print a
+    /// sentence with no quantity in it ("the drive passed its total age
+    /// bound"), and an orchestrator reading that has exactly one move available
+    /// — resume and see — which is the reflex the issue asks to turn back into
+    /// a decision. With the state and the two figures, `held(state-stalled)` on
+    /// a `ci-wait` at ninety-one minutes says go and look at the checks, and the
+    /// same hold out of `review-wait` says go and look at the lane.
+    ///
+    /// Filled for EVERY hold — `advance` stamps the entry on every arc into
+    /// `held`, so a future notice that wants to say where a drive was parked
+    /// already has it — and read today by the two time notices alone. `None`
+    /// only where the caller has no entry to read it off.
+    pub held_state: Option<DriveState>,
+    /// Time in [`held_state`](HeldFacts::held_state), starvation excluded.
+    pub held_state_ms: u64,
+    /// The bound that fired — `reviewdrive::state_bound_ms` for
+    /// `state-stalled`, `drive_timeout_minutes` for `drive-stalled`.
+    pub held_bound_ms: u64,
+}
+
+/// A duration as an orchestrator reads one — `"3h 12m"`, `"47m"`, `"12h"`.
+///
+/// **Minutes are the smallest unit and the floor is one**, because every
+/// subject is a bound measured in minutes and a hold reported as `"0m"` would
+/// read as a clock that never started rather than as one that fired early. Not
+/// a general formatter: it is here, private, sized to the two notices that use
+/// it, so no other surface inherits a rounding rule it did not ask for.
+fn human_ms(ms: u64) -> String {
+    let mins = ms / 60_000;
+    let (h, m) = (mins / 60, mins % 60);
+    match (h, m) {
+        (0, 0) => "under a minute".to_string(),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// The `It was in <state> for <t>.` clause both time holds carry (#2110), or
+/// nothing when the facts do not describe a wait.
+///
+/// **The BOUND is left to the caller** and is not in here, because the two
+/// holds fired on different ones: `state-stalled` fired on this state's bound,
+/// `drive-stalled` on the drive's total, and one clause naming
+/// [`HeldFacts::held_bound_ms`] as "that state's bound" would be a false claim
+/// in the second — the exact shape of claim this repo treats as a defect. What
+/// is true for both is where the drive was and for how long.
+fn state_clause(f: &HeldFacts) -> String {
+    match f.held_state {
+        Some(s) => format!(" It was in {} for {}.", s.as_str(), human_ms(f.held_state_ms)),
+        None => String::new(),
+    }
 }
 
 /// §6's hold kick-back, in one shape carrying **the one fact that decides what
 /// the orchestrator does next** for this reason.
 ///
-/// One function rather than fourteen, because §2.2 makes `held` one state with a
+/// One function rather than fifteen, because §2.2 makes `held` one state with a
 /// closed reason enum for exactly this reason: a reader asking "is this drive
 /// parked" asks one question, and the reason travels in the notice rather than
 /// being inferred from which counter happens to sit at its bound.
@@ -909,11 +965,33 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
             "HELD — the worker neither pushed nor reported inside the fix timeout{at}.\
              {session} drive_review resumes the drive, cancel_review_drive stops it."
         ),
-        HeldReason::DriveStalled => {
-            "HELD — the drive passed its total age bound. Nothing about the PR is \
-             asserted by this: drive_review resumes it, cancel_review_drive stops it."
-                .to_string()
-        }
+        // **The two time holds print WHAT THE DRIVE WAS DOING, not only that a
+        // clock expired** (#2110). Both used to print one quantity-free
+        // sentence, and an orchestrator reading it had exactly one move —
+        // resume and see. The state, the time in it and the bound are what make
+        // the resume a decision: a `ci-wait` that sat ninety minutes says go and
+        // read the checks; a `review-wait` that sat three hours says go and read
+        // the lane. The exclusion is named because it is the difference between
+        // this figure and the wall clock, and a reader who cannot see it would
+        // reasonably think the notice had got the arithmetic wrong.
+        HeldReason::StateStalled => format!(
+            "HELD — the drive stopped moving{at}.{state} The bound for that state \
+             is {bound}, and time the live-delegate cap refused it a lane is not \
+             counted against it. Nothing about the PR is asserted by this: read \
+             the state named above, then drive_review resumes it or \
+             cancel_review_drive stops it.",
+            state = state_clause(f),
+            bound = human_ms(f.held_bound_ms),
+        ),
+        HeldReason::DriveStalled => format!(
+            "HELD — the drive passed its total age bound of {bound}. That is the \
+             BACKSTOP, so what it says is that the drive kept moving and never \
+             finished — not that it sat still, which is what state-stalled says.\
+             {state} Nothing about the PR is asserted by this: drive_review \
+             resumes it, cancel_review_drive stops it.",
+            bound = human_ms(f.held_bound_ms),
+            state = state_clause(f),
+        ),
         HeldReason::RoutingUnaccountable => format!(
             "HELD — orrerix could not account for every file this PR changed, so it \
              cannot say which reviewer lanes are required{at}. This is refused rather \
@@ -1319,6 +1397,9 @@ mod tests {
                 ("w-1715".into(), DrivenRole::Worker),
                 ("rev-1714".into(), DrivenRole::Lane("rev-std".into())),
             ],
+            held_state: Some(DriveState::ReviewWait),
+            held_state_ms: 3 * 60 * 60_000,
+            held_bound_ms: 3 * 60 * 60_000,
         };
         for r in HeldReason::ALL {
             let n = held_notice(1758, r, &f);
