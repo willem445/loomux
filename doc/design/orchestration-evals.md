@@ -213,8 +213,10 @@ carried to a new agent id, that one row's `agent_id` names only the **last** occ
 and every earlier agent on the session has no row of its own. Joining on `agent_id`
 would report an agent that demonstrably spent tokens as having spent zero while
 crediting its successor with the whole lineage — and on this group's store that is not
-a corner case: **514 of 1356 rows sit on a session shared by more than one agent id,
-carrying 31.2 G of 44.1 G tokens**.
+a corner case: **514 rows sit on a session shared by more than one agent id, carrying
+31.2 G of the store's 44.1 G tokens** (2026-09-03). The store is LIVE: it held 1356
+rows at the first measurement and 1362 an hour later, with 514 shared both times — so
+quote the shared count and re-derive the denominator rather than citing a ratio.
 
 So the row is looked up by the agent's **session** and split evenly across every agent
 that occupied it (heuristic **H8**), then weighted by `1/k` where the agent is
@@ -410,10 +412,22 @@ The transcript fixture is six hand-written lines. Real transcript content is pri
 and never enters a fixture.
 
 The corpus also carries one instance of each edge the text above promises to handle,
-so none of them is a claim with no test behind it: a session shared by two agent ids
-(the H8 split), an `rd-*` action this reader has no bucket for, a transcript line with
-usage but **no** `message.id`, and a `usage.json` row with neither a session key nor an
-`agent_id`.
+so none of them is a claim with no test behind it: an `rd-*` action this reader has no
+bucket for, a transcript line with usage but **no** `message.id`, and a `usage.json` row
+with neither a session key nor an `agent_id`.
+
+The H8 split gets **both** of its branches, which is the difference between pinning an
+even split and pinning no split at all:
+
+- `ses-11` — both occupants attributed to the same PR. The halves re-sum to the whole
+  row, so this branch alone passes under an implementation that does not split.
+- `ses-14` — one occupant attributed, one not. Half the row is **dropped**, so the
+  delegate side under-counts and the orchestrator share correspondingly over-estimates.
+  This is the branch that fails if the split is removed.
+
+What no test can reach is whether an **even** split is the right one: it is an
+assumption about how a shared pane's spend divided, and only the structural field named
+in H8 would settle it.
 
 The one instrument here is `npm test`. `tsconfig.json`'s `include` is `["src"]`, so
 `tsc --noEmit` typechecks neither `scripts/` nor `test/` and has no opinion on any of

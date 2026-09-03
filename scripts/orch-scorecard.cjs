@@ -593,8 +593,11 @@ function indexAgents(agents) {
 // row's `agent_id` names only the LAST occupant, and every earlier agent on the session
 // has no row of its own at all. Joining on `agent_id` therefore reports an agent that
 // demonstrably spent tokens as having spent zero, while crediting its successor with the
-// whole lineage. On this group's own store that is not a corner case: 514 of 1356 rows
-// sit on a session shared by more than one agent id, carrying 31.2 G of 44.1 G tokens.
+// whole lineage. On this group's own store that is not a corner case: 514 rows sit on a
+// session shared by more than one agent id, carrying 31.2 G of the store's 44.1 G tokens
+// (2026-09-03). That store is LIVE — it grew from 1356 rows to 1362 in the hour between
+// two measurements, with 514 shared both times — so the shared COUNT is the figure to
+// quote and the denominator is the one to re-derive.
 //
 // So the row is indexed by session and split evenly across the agents that occupied it
 // (heuristic H8). The split is a guess about how a shared session's spend divided, but it

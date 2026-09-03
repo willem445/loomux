@@ -313,7 +313,24 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
   const e = card(901).delegates;
   assert.equal(e.count, 2);
   assert.deepEqual(e.agents.map((a: any) => a.agent).sort(), ['rev-12', 'w-14']);
-  assert.equal(e.tokens.total, 6070);
+  // PARTIAL ATTRIBUTION, the branch the H8 split exists for: w-14 shares session
+  // `ses-14` with w-16, which no row ties to any PR. w-14 is therefore credited HALF
+  // the row its session carries, and the other half is dropped rather than assigned —
+  // an under-count of the delegate side, which the note says makes the orchestrator
+  // share an over-estimate. Without this fixture the split is only ever exercised where
+  // BOTH occupants land on one PR, which cannot tell an even split from no split.
+  assert.equal(e.tokens.total, 3570);
+  const w14 = e.agents.find((a: any) => a.agent === 'w-14');
+  assert.equal(w14.shared_session_agents, 2);
+  assert.equal(w14.session_weight, 0.5);
+  assert.equal(w14.pr_weight, 1);
+  assert.equal(w14.tokens, 5000);
+  assert.equal(w14.tokens_credited, 2500);
+  // ... and w-16 is not a delegate of anything: an unattributed session-mate consumes
+  // its share of the row without appearing on any card.
+  for (const c of REPORT.prs) {
+    assert.equal(c.delegates.agents.some((a: any) => a.agent === 'w-16'), false);
+  }
   // The orchestrator's own `usage.json` row must never be counted as a delegate —
   // it would be double-counted against the transcript figure. orch-10 IS attributed
   // to #900 by its restore brief (see the coverage test), so this is the role filter
@@ -326,8 +343,8 @@ test('delegate tokens: attributed agents only, weighted, orchestrator excluded',
 test('orchestrator share is reported both raw and apportioned', () => {
   assert.equal(card(900).share.orchestrator_pct_raw, 39.17);   // 3101 / 7916
   assert.equal(card(900).share.orchestrator_pct_attributed, 19.45); // 1163 / 5978
-  assert.equal(card(901).share.orchestrator_pct_raw, 15.1);    // 1080 / 7150
-  assert.equal(card(901).share.orchestrator_pct_attributed, 10.01); // 675 / 6745
+  assert.equal(card(901).share.orchestrator_pct_raw, 23.23);   // 1080 / 4650
+  assert.equal(card(901).share.orchestrator_pct_attributed, 15.9);  // 675 / 4245
 });
 
 // ---------------------------------------------------------------------------
@@ -344,7 +361,10 @@ test('attribution: a structural row beats a text join, and the tier is reported'
   assert.equal(byAgent.get('rev-12@901').tier, 'structural');
   // w-14 has no such row anywhere — only its spawn brief names #901.
   assert.equal(byAgent.get('w-14@901').tier, 'text');
-  assert.equal(byAgent.get('w-14@901').weight, 1);
+  // w-14 works ONE PR, so its PR-axis weight is 1; its overall weight is 0.5 because
+  // its session is shared. Asserting `weight` alone would conflate the two axes.
+  assert.equal(byAgent.get('w-14@901').pr_weight, 1);
+  assert.equal(byAgent.get('w-14@901').weight, 0.5);
   assert.equal(byAgent.get('rev-12@900').weight, 0.5);
   assert.equal(byAgent.get('rev-12@900').shared_with_prs, 2);
 });
@@ -380,7 +400,10 @@ test('coverage: unattributed and split agents are named, not swallowed', () => {
   // A usage row carrying neither a session key nor an agent id is unusable and says so.
   assert.equal(cov.usage_rows_unusable, 1);
   assert.equal(cov.usage_sessions_indexed, 6);
-  assert.equal(cov.usage_sessions_shared_by_more_than_one_agent, 1);
+  // Two shared sessions, and they exercise DIFFERENT branches: `ses-11` has both
+  // occupants attributed to #900 (the halves re-sum to the whole row), `ses-14` has
+  // only one attributed (half the row is dropped).
+  assert.equal(cov.usage_sessions_shared_by_more_than_one_agent, 2);
   assert.deepEqual(cov.transcripts, [{
     path: TRANSCRIPT, lines: 6, assistant_usage_lines: 5, deduped_turns: 4, usage_rows_without_id: 1,
   }]);
