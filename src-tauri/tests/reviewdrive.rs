@@ -6575,33 +6575,26 @@ fn an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal() {
     );
 }
 
-/// **#2135(a), the resume half.** `drive_review` on a parked drive starts the
-/// cap window over, so the resumed drive does not re-park on the stamp that
-/// parked it.
+/// **#2135(a), the half that makes the resume safe — and it is not the
+/// resume's doing.** Taking `held(cap-full)` disarms the very clock it fired
+/// on, because the hold is an ARC and `advance` zeroes the stamp on every one.
 ///
-/// **The clear that makes this true is NOT arc 11's, and saying so was the
-/// point of cutting a counterfactual for it.** The obvious reading — "the
-/// resume clears the stamp" — is wrong: `advance` zeroes the field on every
-/// arc, and *the hold is an arc*, so the stamp is already gone the moment
-/// `held(cap-full)` is taken, one whole tick before anyone resumes anything. A
-/// draft of this test asserted the field was `None` **after** the resume and
-/// called that arc 11's doing; that assertion is true under every
-/// implementation of arc 11 there is, including one that carries the run,
-/// because there is no run left to carry. The scratch round cut to redden it
-/// passed, which is how the claim was caught rather than shipped.
-///
-/// So the first read is taken BEFORE the resume, where it says something that
-/// can be false: the park itself disarmed the clock. What arc 11 then owes is
-/// the second half, and that IS discriminating — the resumed drive gets a
-/// WHOLE new `CAP_HOLD_MS` measured from its first post-resume refusal, so an
-/// implementation that handed it a run it did not spend re-parks immediately
-/// and fails there.
+/// Split out and asserted here, one whole tick before anyone resumes anything,
+/// because that is the only place it can be FALSE. A draft asserted the field
+/// was `None` **after** the resume and credited arc 11 with it; that assertion
+/// holds under every implementation of arc 11 there is — including one that
+/// carries the run faithfully — because by then there is no run left to carry.
+/// Two scratch rounds cut to redden it passed before the claim was corrected
+/// rather than shipped, and the second of those is what showed the reason is
+/// structural: arc 11 lands the drive in `ci-wait`, so it must take a SECOND
+/// arc to reach `review-wait` where the cap is even consulted, and that arc
+/// clears anything the first one left.
 ///
 /// Registry-level on purpose: the engine's own
 /// `the_starvation_clock_is_stamped_once_per_run_and_no_arc_carries_one_across`
-/// pins the arc, and nothing pinned the TOOL.
+/// pins the arc, and nothing pinned it through the tick that takes the hold.
 #[test]
-fn a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking() {
+fn the_cap_full_hold_disarms_the_clock_it_fired_on() {
     let dir = tempfile::tempdir().unwrap();
     let reg = relaunch_registry(dir.path());
     let repo = Repo::new();
@@ -6613,21 +6606,41 @@ fn a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking() {
         "the control: a run really is open going into the park, or the read below says nothing"
     );
     reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
-    assert_eq!(
-        status_state(&reg, &group),
-        "held",
-        "the fixture parks first, or there is nothing to resume"
-    );
-    // **Read BEFORE the resume, because this is where it can be false.** The
-    // hold is an arc, so taking it disarmed the very clock it fired on — and
-    // that, not anything in arc 11, is why a resumed drive cannot inherit the
-    // run that parked it. Reading after the resume would assert the same
-    // `null` under an arc 11 that carried the run faithfully.
+    assert_eq!(status_state(&reg, &group), "held", "the fixture must park, or nothing fired");
     assert_eq!(
         drives_json(&reg, &group)["entries"][0]["cap_starved_since_ms"],
         json!(null),
         "the arc INTO `held(cap-full)` clears the stamp: the hold is the report, and a drive \
          that has reported is no longer one accumulating a run"
+    );
+}
+
+/// **#2135(a), the resume half.** A resumed drive gets a WHOLE new
+/// `CAP_HOLD_MS`, measured from its own first refusal and not from anything the
+/// run that parked it left behind.
+///
+/// Split from the disarm above rather than asserted after it, for the reason
+/// that shape keeps earning here: a red evidences only the assertion it
+/// REACHED, and the two are different claims — one about the hold, one about
+/// the resume. Together in one test the disarm reddens first and the window is
+/// never measured.
+///
+/// The last two ticks are the discriminator, and they are why this is a pin on
+/// the WINDOW rather than on "it did not re-park immediately": an
+/// implementation that merely suppressed the first re-park passes the middle
+/// assertion and fails the last.
+#[test]
+fn a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+    reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
+    assert_eq!(
+        status_state(&reg, &group),
+        "held",
+        "the fixture parks first, or there is nothing to resume"
     );
 
     let resumed_at = at + reviewdrive::CAP_HOLD_MS + 1_000;
