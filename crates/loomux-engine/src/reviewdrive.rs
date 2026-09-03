@@ -1699,7 +1699,6 @@ impl DriveEntry {
         // The per-state clock, re-stamped on EVERY arc — see `state_since_ms`
         // for why that is the stamp §2.2 used to forbid and why the backstop is
         // what makes it safe.
-        self.state_since_ms = now_ms;
         self.starved_state_ms = 0;
         Ok(())
     }
