@@ -112,9 +112,10 @@ core carries `#[serde(default)]`, so a file written by an older build loads.
 | `text`, `options`, `task`, `urgency` | as asked; `options` omitted when empty |
 | `select` | `single` (default) \| `multi` — how many options may be picked (#1091) |
 | `allow_free_text` | bool, **default `true`** — may the human type their own answer (#1091) |
-| `status` | `pending` \| `answered` \| `withdrawn` |
+| `status` | `pending` \| `answered` \| `withdrawn` \| `dismissed` (#2137) |
 | `created_ms` | |
 | `answer`, `settled_by`, `settled_ms` | present once settled |
+| `reason` | the human's optional one-line dismissal reason; present only on a `dismissed` row (#2137) |
 
 **`urgency` is carried and rendered, but does not key either the attention item
 or the toast.** The NEEDS-YOU panel (slice C) reads it to flag a question's own
@@ -242,9 +243,10 @@ gate.
 
 ### Tauri commands
 
-`orch_questions_list(group_id)` (orch-read) and
-`orch_question_answer(group_id, id, answer)` (orch-control). Both parse
-`group_id` at the boundary through `command_group`, like every sibling command.
+`orch_questions_list(group_id)` (orch-read), `orch_question_answer(group_id,
+id, answer)` (orch-control) and `orch_question_dismiss(group_id, id, reason?)`
+(orch-control, #2137). All three parse `group_id` at the boundary through
+`command_group`, like every sibling command.
 
 `orch_questions_list` returns the **whole file**, deliberately not the capped
 `list_questions` projection: that cap buys an agent context economy, and this
@@ -254,6 +256,86 @@ answer here.
 Membership is enforced by *which file was read*: each group's questions live in
 its own group dir, so another group's id is simply absent, and the refusal is the
 same one an id that never existed gets.
+
+### #2137 — the human dismisses a question
+
+`orch_question_dismiss(group_id, id, reason?)` (orch-control) is a third
+trusted entry point beside the two above. It settles a pending question as
+`dismissed`, with an optional reason of at most 500 characters, and tells the
+orchestrator.
+
+**Why a fourth status rather than an answer with empty text.** The three
+settled states are three different facts about whether a decision was ever
+obtained, and every reader of a settled question needs to tell them apart:
+*answered* = the human decided and the orchestrator acts on it; *withdrawn* =
+the asker took it back before the human reached it; *dismissed* = the human
+says it no longer matters, so nobody decided anything and the hold is
+released. Folding a dismissal into `answered` with a blank `answer` would give
+the orchestrator a decision-shaped row with no decision in it, which is the one
+misreading this whole feature has to prevent. `answer` therefore stays `None`
+on a dismissed row and the reason lives in its own `reason` field — two facts,
+two slots, and neither readable as the other.
+
+**`DismissSource` is its own closed enum, not an `AnswerSource` variant.** Both
+are entry-point-supplied closed sets, never caller-supplied strings, and
+neither has an agent-shaped variant — the trust boundary at the top of this
+note applies to dismissal unchanged, with its own behavioural sweep
+(`no_agent_token_can_answer_a_question_through_the_mcp_surface` asserts the
+row is not `Dismissed` either) and its own source scan
+(`the_mcp_surface_has_no_path_to_the_dismiss_entry_point`). What they do not
+share is the LIST. Answering is a strictly greater power: an answer is a
+decision the fleet then acts on, a dismissal decides nothing and only releases
+a hold. One list behind both would mean a surface added for one — #947's chat
+bridge is the planned answering surface — silently acquired the other. Which
+surfaces may decide, and which may merely clear, is a decision worth making
+twice.
+
+Both variants happen to `tag()` as `"webview"`, and that is deliberate rather
+than an oversight: `settled_by` answers *which surface settled this*, and it
+was the same surface. *What it did* is `status`, which already tells a
+dismissal from an answer, and spelling the distinction into the tag as well
+would give two fields one job.
+
+**An agent still cannot dismiss.** The verb an agent has for its own stale
+question is `withdraw_question`, which settles the row visibly as `withdrawn`.
+"The human says this no longer matters" is not something an agent may say on
+the human's behalf — the same no-self-served-gate line the answer boundary
+draws.
+
+### The dismissal notice
+
+```
+[orrerix] question q-N dismissed by the human (via <source>) — NOT AN ANSWER:
+nothing was decided, and the hold this question was placing on the work is
+released. Un-block the task it cited and carry on; re-ask only if you still
+need the decision. — reason: <reason>
+```
+
+(one line on the wire; wrapped here to fit the page).
+
+**The fixed clause precedes the reason, and that ordering is the point.** The
+orchestrator's one dangerous misreading is to treat this as an answer, so the
+words that rule it out are loomux-built, sit ahead of the payload, and are
+therefore the part the 900-character cap can never trim. A long reason loses
+its own tail instead of the sentence that gives it its meaning — the same rule
+the answer notice follows for its attribution. The reason is untrusted text
+entering an `[orrerix]` line and goes through `sanitize_gh_text` like every
+other notice field; with no reason the trailing clause is omitted entirely,
+because `— reason:` with nothing after it reads like a truncation the
+orchestrator has no way to distinguish from one.
+
+**It is delivered whether or not there is a reason**, which is where this
+differs from a note-less needs-you resolve (which deliberately delivers
+nothing). A pending question is *holding work*: the orchestrator marked a task
+`blocked` citing `q-N` and is waiting for the row to settle, so a silent
+dismissal would leave that task blocked on a question that no longer exists.
+A delivery failure never fails the dismissal — the row is settled durably and
+a cold orchestrator finds it through `list_questions`.
+
+**Nothing here touches the board.** The notice asks the orchestrator to
+un-block the task; it does not do it. Which row moves, and whether the
+question is worth re-asking, stay the orchestrator's calls, exactly as they
+are for an answer.
 
 ### The answer notice
 

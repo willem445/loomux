@@ -9874,7 +9874,8 @@ pub struct AgentEntry {
 /// - `question` — this agent (orchestrator-only today) has a pending
 ///   `ask_human` row nobody has answered yet (#1091 slice D); DERIVED from
 ///   the `questions.json` registry each scan, never latched, so it clears
-///   the instant the row is answered or withdrawn — but it is the live-pane
+///   the instant the row is settled — answered, withdrawn or dismissed — but
+///   it is the live-pane
 ///   PROJECTION of that registry (the asker's pane must still be running),
 ///   not the registry itself; a pending row against a stopped pane raises
 ///   no item here even though the registry still durably holds it
@@ -28233,6 +28234,7 @@ impl OrchRegistry {
                 status: humanq::Status::Pending,
                 created_ms: now_ms(),
                 answer: None,
+                reason: None,
                 settled_by: None,
                 settled_ms: None,
             };

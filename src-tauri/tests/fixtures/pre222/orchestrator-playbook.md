@@ -53,6 +53,14 @@ tool on your surface — or any other agent's — can answer it.
 6. **Withdraw generously.** `withdraw_question(q-N)` the moment one is overtaken by events —
    the decision made itself, the work was dropped, you found the answer elsewhere. A stale
    question costs the human's attention and teaches them their inbox is noise.
+7. **A dismissal is not an answer.** The human can settle a question themselves as
+   **dismissed** — *this no longer matters* — and you learn about it as an
+   `[orrerix] question q-N dismissed by the human … NOT AN ANSWER` notice, or as
+   `status: "dismissed"` in `list_questions`. Treat it as *no answer, hold released*: un-block
+   the task that cited `q-N` and carry on, decide nothing on its behalf, and re-ask only if
+   you genuinely still need the decision — with the ask rewritten, since the last one was not
+   worth the human's time. A `reason`, if there is one, says why it stopped mattering; it is
+   never a decision to act on.
 
 **What makes a question answerable.** It may be read away from this machine with no pane in
 front of them, so it has to stand alone:
