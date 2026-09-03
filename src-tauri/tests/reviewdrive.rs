@@ -6579,18 +6579,27 @@ fn an_in_process_tick_gap_still_parks_on_a_single_observed_cap_refusal() {
 /// cap window over, so the resumed drive does not re-park on the stamp that
 /// parked it.
 ///
-/// Already true before #2135 and asserted here anyway, because it is true for a
-/// reason that is easy to delete: arc 11 goes through `advance`, and `advance`
-/// zeroes the field on EVERY arc. Nothing in the resume path names the cap, so
-/// a reader looking for "what clears the stamp on a resume" finds nothing, and
-/// the property had no witness at the registry level at all — the engine's own
-/// `the_starvation_clock_is_stamped_once_per_run_and_no_arc_carries_one_across`
-/// pins the arc, not the tool.
+/// **The clear that makes this true is NOT arc 11's, and saying so was the
+/// point of cutting a counterfactual for it.** The obvious reading — "the
+/// resume clears the stamp" — is wrong: `advance` zeroes the field on every
+/// arc, and *the hold is an arc*, so the stamp is already gone the moment
+/// `held(cap-full)` is taken, one whole tick before anyone resumes anything. A
+/// draft of this test asserted the field was `None` **after** the resume and
+/// called that arc 11's doing; that assertion is true under every
+/// implementation of arc 11 there is, including one that carries the run,
+/// because there is no run left to carry. The scratch round cut to redden it
+/// passed, which is how the claim was caught rather than shipped.
 ///
-/// The last two ticks are the discriminator: the window is genuinely restarted,
-/// so the resumed drive survives a FULL `CAP_HOLD_MS` from its first new
-/// refusal and parks only after it. An implementation that merely suppressed
-/// the first re-park would pass the middle assertion and fail the last.
+/// So the first read is taken BEFORE the resume, where it says something that
+/// can be false: the park itself disarmed the clock. What arc 11 then owes is
+/// the second half, and that IS discriminating — the resumed drive gets a
+/// WHOLE new `CAP_HOLD_MS` measured from its first post-resume refusal, so an
+/// implementation that handed it a run it did not spend re-parks immediately
+/// and fails there.
+///
+/// Registry-level on purpose: the engine's own
+/// `the_starvation_clock_is_stamped_once_per_run_and_no_arc_carries_one_across`
+/// pins the arc, and nothing pinned the TOOL.
 #[test]
 fn a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking() {
     let dir = tempfile::tempdir().unwrap();
@@ -6598,22 +6607,33 @@ fn a_drive_review_resume_starts_the_cap_window_over_rather_than_re_parking() {
     let repo = Repo::new();
     let gh = FakeGh::green(HEAD_A);
     let (group, _orch, at) = cap_starved(&reg, &repo, &gh);
+    assert_eq!(
+        drives_json(&reg, &group)["entries"][0]["cap_starved_since_ms"],
+        json!(at),
+        "the control: a run really is open going into the park, or the read below says nothing"
+    );
     reg.rd_drive_group_with(&group, &gh, at + reviewdrive::CAP_HOLD_MS);
     assert_eq!(
         status_state(&reg, &group),
         "held",
         "the fixture parks first, or there is nothing to resume"
     );
+    // **Read BEFORE the resume, because this is where it can be false.** The
+    // hold is an arc, so taking it disarmed the very clock it fired on — and
+    // that, not anything in arc 11, is why a resumed drive cannot inherit the
+    // run that parked it. Reading after the resume would assert the same
+    // `null` under an arc 11 that carried the run faithfully.
+    assert_eq!(
+        drives_json(&reg, &group)["entries"][0]["cap_starved_since_ms"],
+        json!(null),
+        "the arc INTO `held(cap-full)` clears the stamp: the hold is the report, and a drive \
+         that has reported is no longer one accumulating a run"
+    );
 
     let resumed_at = at + reviewdrive::CAP_HOLD_MS + 1_000;
     let session = driven_worker_session(&reg, &group);
     let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", resumed_at);
     assert_eq!(out["driving"], json!(true), "the resume must be accepted: {out}");
-    assert_eq!(
-        drives_json(&reg, &group)["entries"][0]["cap_starved_since_ms"],
-        json!(null),
-        "arc 11 is an arc, and no arc carries a starvation run across it"
-    );
 
     // `ci-wait` -> `review-wait`, then the first refusal of the NEW run.
     reg.rd_drive_group_with(&group, &gh, resumed_at + 1_000);
@@ -6768,6 +6788,27 @@ fn alternating_cap_and_non_cap_refusals_postpone_the_park_by_a_bounded_factor() 
         json!("review-wait"),
         "…and the notice still names the wait the drive was actually in: {status}"
     );
+    // **The figure itself, pinned rather than bracketed — and asserted FIRST,
+    // above the band it sits inside.** Under an even alternation the ended cap
+    // runs are exactly half the timeline, so the forgiveness is half and the
+    // bound is reached at twice the wall time it nominally names. Every clock
+    // here is injected, so this is deterministic and not a tolerance; it is
+    // pinned exactly because publishing the number is the point, and a band
+    // would hide a change behind a range nobody re-derives.
+    //
+    // Ordered above the floor and ceiling deliberately: a red evidences only
+    // the assertion it REACHED, and with the loose pair first every mutation
+    // large enough to move the park trips one of those and leaves this one
+    // unreached — which is exactly what the first cut of the counterfactual
+    // round did. The tightest pin goes first so it is the one that speaks.
+    //
+    // A deliberate move of `REVIEW_WAIT_BOUND_MS` or of this fixture's step is
+    // meant to redden this; re-measure it here rather than widening the band.
+    assert_eq!(
+        parked_at, 36_040_000,
+        "the forgiven half is what sets this: 2.00x the nominal {nominal} ms, measured — \
+         got {parked_at}"
+    );
     assert!(
         parked_at > nominal * 3 / 2,
         "the postponement is REAL and is the cost #2109 review 4 chose: the ended cap runs \
@@ -6778,20 +6819,6 @@ fn alternating_cap_and_non_cap_refusals_postpone_the_park_by_a_bounded_factor() 
         parked_at < nominal * 3,
         "…but it is bounded by a small factor, not indefinite: {parked_at} against a nominal \
          {nominal}"
-    );
-    // **The figure itself, pinned rather than bracketed.** Under an even
-    // alternation the ended cap runs are exactly half the timeline, so the
-    // forgiveness is half and the bound is reached at twice the wall time it
-    // nominally names. Every clock here is injected, so this is deterministic
-    // and not a tolerance — and it is pinned EXACTLY because publishing the
-    // number is the point: a change to it is a change in what the exclusion
-    // costs, and a band would hide that behind a range nobody re-derives.
-    // A deliberate move of `REVIEW_WAIT_BOUND_MS` or of this fixture's step is
-    // meant to redden this; re-measure it here rather than widening the band.
-    assert_eq!(
-        parked_at, 36_040_000,
-        "the forgiven half is what sets this: 2.00x the nominal {nominal} ms, measured — \
-         got {parked_at}"
     );
 
     // The population control: the fixture really did alternate, one refusal of
