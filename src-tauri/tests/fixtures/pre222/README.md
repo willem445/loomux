@@ -1234,3 +1234,25 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   `worker.md` — both in the CI-wait instructions — are deliberate and make no delivery claim:
   "waiting on CI, watch registered" is precisely the fact-worth-finding-later the corrected
   tool-doc bullet describes, and it lands on the board where the human reads it.
+
+- **#2181, non-blocking findings defer at review round ≥ 2** — `orchestrator.md` only;
+  `orchestrator-playbook.md`, `worker.md`, `reviewer.md`, `planner.md` and `manager.md` are
+  byte-identical to their previous blessed copies.
+
+  The human adopted #2168 S4 (q-38): at review round ≥ 2, when every required lane has passed
+  and the only open findings are non-blocking, they are DEFERRED to a follow-up issue (the
+  existing three-cost shape) instead of routing another round — unless a finding names a defect
+  (a wrong value, an unreachable arm, a claim the code contradicts), which routes as blocking.
+  Round-1 non-blocking findings are still fixed in the PR. Delegation protocol step 3 stated the
+  old default in as many words — "**Default: fix it in this PR.**" and, below it, "Deferring is
+  the exception" — so a default group WITHOUT this repo's lessons file (#2173 carries the rule
+  there and in the workflow header) would have kept routing fix-rounds that #2168 S4 retired.
+  The disposition bullets now say **Round 1: fix it in this PR** and, for round ≥ 2, DEFER; the
+  three deferral costs and the bounded third-round bullet are unchanged, and INVARIANT 3's
+  "(the default)" became "(the round-1 default)". The playbook was checked for a mirror of the
+  paragraph and carries none — it points at step 3 ("settle step 3 of **Delegation protocol**
+  *before* you touch the gate") — so it did not move. `tests/prompts.rs` and `tests/workflow.rs`
+  repinned the disposition anchors on the new rule (round-1 default, the round ≥ 2 flip, the
+  defect carve-out) and added a negative assertion so the retracted wording cannot silently
+  return. The resident core stays under its 45,000-byte budget: 44,807 → 44,977 bytes (raw,
+  LF on both ends — the budget test's own instrument).
