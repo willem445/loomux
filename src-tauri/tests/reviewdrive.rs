@@ -34,8 +34,8 @@ use loomux_lib::orchestration::mqdriver::CmdOut;
 use loomux_lib::orchestration::rddrive::RdRunner;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::{
-    pane_delivery_readiness, AgentStatus, Caller, Delivery, GroupId, Guardrails, Launch,
-    OrchRegistry, PaneNotReady, RdDriveReport, Role, TaskPatch,
+    pane_delivery_readiness, AgentStatus, Caller, Delivery, ExitInitiator, GroupId, Guardrails,
+    Launch, OrchRegistry, PaneNotReady, RdDriveReport, Role, TaskPatch,
 };
 use serde_json::json;
 
@@ -103,6 +103,10 @@ fn lane_fact(block: &str, v: Option<Verdict>, at_head: &str, digest: &str) -> La
             summary: String::new(),
             ts_ms: 0,
         }),
+        // #2163's axis, defaulted to the common reading; the tick fills it from
+        // the entry and the agent map, and the tests that are ABOUT it drive a
+        // real pane to `Dead` through the seam rather than setting it here.
+        pane_dead: false,
     }
 }
 
@@ -5912,6 +5916,92 @@ fn a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle() {
     assert!(
         !delivered_texts(&reg, &group).iter().any(|t| t.contains("a late word")),
         "the superseded pane's late report reached the orchestrator's pane"
+    );
+}
+
+// ── #2163: a dead lane pane is observed in `review-wait`, not waited out ────
+
+/// **#2163.** A reviewer lane whose pane has died is re-opened on the next
+/// tick, on its own session, rather than waited out to `lane-stalled`.
+///
+/// Measured on PR #2140 (v1.3.0-beta6): the rev-final lane's pane was killed at
+/// 20:12 by the orchestrator — on the driver's OWN advice, since a
+/// `cap-refused` notice says to kill an idle delegate — and the drive then sat
+/// in `review-wait` with no rd-* row for the PR for 25+ minutes. A pane exit was
+/// observed only for the WORKER and only in `fix-wait`; the code's own comment
+/// gave the reason as "`review-wait` has `lane-stalled` for its own panes",
+/// which is true and is `lane_timeout_minutes` away, anchored at the brief
+/// rather than at the death.
+///
+/// **The live arm is the control**, and it is the half that makes the dead arm
+/// mean anything: an implementation that re-opened every lane on every tick
+/// would satisfy the first assertion and destroy the wait `review-wait` is made
+/// of. Both arms are collected and compared once, so one run says what each did
+/// rather than stopping at the first.
+#[test]
+fn a_dead_lane_pane_is_re_opened_next_tick_and_a_live_one_is_left_alone() {
+    // (arm, panes opened on the tick after, `rd-lane-reopened` rows)
+    type Row = (&'static str, usize, usize);
+    let mut observed: Vec<Row> = Vec::new();
+
+    for arm in ["live", "dead"] {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = relaunch_registry(dir.path());
+        let repo = Repo::new();
+        let gh = FakeGh::green(HEAD_A);
+        let (group, _orch, lane) = lane_round_one(&reg, &repo, &gh);
+        assert_eq!(lane_spawn_rows(&reg, &group).len(), 1, "{arm}: one lane, round one");
+
+        if arm == "dead" {
+            // The incident's own cause: an orchestrator's `kill_agent`. The
+            // initiator is stamped through the real recorder rather than being
+            // faked onto the record, so the `killed_by` asserted below is the
+            // field `kill_agent` writes and not a literal this test invented.
+            reg.record_exit_initiator(&lane, ExitInitiator::Orchestrator);
+            assert!(reg.mark_agent_dead_for_test(&lane), "{arm}: the fixture's own premise");
+        }
+        // Nothing else moves: same head, same body, no verdict. The ONE axis is
+        // whether that pane is still alive.
+        let next = reg.rd_drive_group_with(&group, &gh, 30_000);
+        observed.push((
+            arm,
+            next.lanes_opened.len(),
+            rows_for(&reg, &group, "rd-lane-reopened").len(),
+        ));
+
+        if arm == "dead" {
+            let rows = lane_spawn_rows(&reg, &group);
+            assert_eq!(rows.len(), 2, "the replacement is a spawn row of its own: {rows:?}");
+            assert_eq!(
+                rows[1]["resumed"],
+                json!(true),
+                "…and it RESUMES the lane's conversation — a reviewer that has read this PR \
+                 once must not pay for a cold read because its pane was killed: {rows:?}"
+            );
+            let re = rows_for(&reg, &group, "rd-lane-reopened");
+            assert_eq!(re[0]["pane"], json!(lane), "the row names the pane that went");
+            assert_eq!(
+                re[0]["killed_by"],
+                json!("orchestrator"),
+                "…and who ended it, which is what an orchestrator that has just killed an \
+                 idle delegate needs to read: {re:?}"
+            );
+            assert_eq!(re[0]["head"], json!(HEAD_A));
+            assert_eq!(re[0]["block"], json!("rev-std"));
+        }
+    }
+
+    let expected: Vec<Row> = vec![
+        // A live pane mid-review is waited for. Without this row a driver that
+        // re-opened unconditionally passes the one below.
+        ("live", 0, 0),
+        ("dead", 1, 1),
+    ];
+    assert_eq!(
+        observed, expected,
+        "each row is (arm, panes opened on the tick after, `rd-lane-reopened` rows). A `0` on \
+         the dead arm is the drive waiting on a verdict nothing can produce until \
+         `lane-stalled` an hour later; a `1` on the live arm is a second reviewer per tick."
     );
 }
 
