@@ -479,6 +479,11 @@ test('coverage: every heuristic is declared with an id, a statement and its stru
 //           blanket "recompute every row from disk".
 //   ses-19  a zero row with NO transcript — it must be reported as skipped
 //           rather than silently dropped.
+//   ses-20  a zero row whose transcript EXISTS and folds to nothing (one user
+//           line, no usage). A missing file and an empty one are different
+//           facts — only one of them is recoverable by putting the file back —
+//           so they are reported in different buckets, and this is what stops
+//           the second bucket being a field nothing ever fills.
 // ---------------------------------------------------------------------------
 
 const BACKFILL = path.join(fixtures, 'backfill');
@@ -535,14 +540,22 @@ test('backfill: coverage says how many rows, from where, and what it left alone'
   // outcome. The script itself throws if these do not reconcile; asserting the
   // parts here is what makes the reconciliation fail-able rather than a tautology
   // over whatever it happened to count.
-  assert.equal(cov.zero_rows_considered, 2);
+  assert.equal(cov.zero_rows_considered, 3);
   assert.equal(cov.rows, 1);
+  // The two skip outcomes are kept APART: ses-19 has no file, ses-20 has one that
+  // folds to nothing. Reporting the second as "without a transcript" would tell a
+  // reader the store lost a session it did not lose.
   assert.deepEqual(cov.zero_rows_without_a_transcript, ['ses-19']);
-  assert.equal(cov.rows + cov.zero_rows_without_a_transcript.length, cov.zero_rows_considered);
+  assert.deepEqual(cov.zero_rows_whose_transcript_summed_to_zero, ['ses-20']);
+  assert.equal(
+    cov.rows + cov.zero_rows_without_a_transcript.length
+      + cov.zero_rows_whose_transcript_summed_to_zero.length,
+    cov.zero_rows_considered,
+  );
   // The scan really did walk more than the one folder it needed, so "found it"
   // is not "there was only one thing there".
   assert.equal(cov.projects_scanned, 2);
-  assert.equal(cov.transcripts_indexed, 2);
+  assert.equal(cov.transcripts_indexed, 3);
 
   assert.equal(cov.from.length, 1);
   const [row] = cov.from;
@@ -583,7 +596,7 @@ test('backfill: --no-backfill still reports how many zero rows there are', () =>
   assert.equal(cov.rows, 0);
   // The zero rows are still COUNTED, so turning the backfill off cannot hide the
   // condition it exists for.
-  assert.equal(cov.zero_rows_considered, 2);
+  assert.equal(cov.zero_rows_considered, 3);
 });
 
 test('backfill: an unreadable projects root leaves every zero row named, not silently at zero', () => {
@@ -591,9 +604,11 @@ test('backfill: an unreadable projects root leaves every zero row named, not sil
   const cov = out.coverage.usage_rows_backfilled_from_transcript;
   assert.equal(cov.scanned, false);
   assert.equal(cov.rows, 0);
-  // "I could not look" is not "there was nothing there": both zero rows are
+  // "I could not look" is not "there was nothing there": every zero row is
   // named, where a readable root names only the one that really had no file.
-  assert.deepEqual(cov.zero_rows_without_a_transcript, ['ses-13', 'ses-19']);
+  assert.deepEqual(cov.zero_rows_without_a_transcript, ['ses-13', 'ses-19', 'ses-20']);
+  assert.deepEqual(cov.zero_rows_whose_transcript_summed_to_zero, [],
+    'nothing was read, so nothing can be reported as having folded to nothing');
 });
 
 test('backfill: the shared corpus has no zero row, so its run never walks a projects tree', () => {

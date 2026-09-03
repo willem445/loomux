@@ -118,5 +118,20 @@
     "estimated": false,
     "model": null,
     "updated_ms": 1700001000000
+  },
+  {
+    "key": "ses-20",
+    "agent_id": "w-20",
+    "name": "w: zero row whose transcript folds to nothing",
+    "role": "worker",
+    "source": "statusline",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "cost_usd": 0,
+    "estimated": false,
+    "model": null,
+    "updated_ms": 1700001000000
   }
 ]

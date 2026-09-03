@@ -403,10 +403,12 @@ ways.
 
 `coverage.usage_rows_backfilled_from_transcript` reports how many rows were
 considered, how many were backfilled and from which files, and which zero rows
-were left alone because no transcript was found. Those last two reconcile
-against the first, and the script throws rather than publish a count that does
-not (a coverage figure counted at the MATCH site rather than the VERIFIED one
-certifies coverage it never delivered). `--claude-projects` names the root
+were left alone — in TWO buckets, because a missing transcript and a transcript
+that folds to nothing are different facts and only one of them is recoverable by
+putting the file back. All three outcomes reconcile against the count of rows
+considered, and the script throws rather than publish a figure that does not (a
+coverage figure counted at the MATCH site rather than the VERIFIED one certifies
+coverage it never delivered). `--claude-projects` names the root
 (default `~/.claude/projects`), `--no-backfill` turns it off — and the projects
 tree is walked only when at least one zero row exists, so a run over a healthy
 store never touches it.
@@ -454,8 +456,9 @@ disagree about which instant they describe.
   transcript under a WORKTREE-cwd project folder and reaches the PR card,
   reproducing the shared corpus's own figures field for field; a non-zero row
   whose transcript is also on disk is never rewritten; a zero row with no
-  transcript is named rather than dropped; an unreadable root names every zero
-  row, because "I could not look" is not "there was nothing there"; and
+  transcript is named rather than dropped, in a DIFFERENT bucket from a zero row
+  whose transcript exists and folds to nothing; an unreadable root names every
+  zero row, because "I could not look" is not "there was nothing there"; and
   `--no-backfill` still reports the count.
 - `tests/usage_memory.rs` (#1218) still pins peak live heap against a ~16 MiB
   transcript. The polled path is now the cursor, but both go through the one

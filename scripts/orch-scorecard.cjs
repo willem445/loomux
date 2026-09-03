@@ -745,6 +745,11 @@ async function backfillZeroUsageRows(usage, root) {
     tokens: 0,
     from: [],
     zero_rows_without_a_transcript: [],
+    // A transcript that EXISTS and folds to nothing is its own outcome, not a
+    // missing file: reporting it under the line above would tell a reader the
+    // store lost a session it did not lose. Both are skips; only one is
+    // recoverable by putting the file back.
+    zero_rows_whose_transcript_summed_to_zero: [],
   };
   if (zero.length === 0) return { usage: rows, backfill: cov };
 
@@ -765,7 +770,7 @@ async function backfillZeroUsageRows(usage, root) {
     if (!file) { cov.zero_rows_without_a_transcript.push(u.key); continue; }
     const read = await readTranscript(file, null);
     const t = read.turns.reduce((acc, turn) => addTokens(acc, turn.usage), emptyTokens());
-    if (t.total === 0) { cov.zero_rows_without_a_transcript.push(u.key); continue; }
+    if (t.total === 0) { cov.zero_rows_whose_transcript_summed_to_zero.push(u.key); continue; }
     patched.set(u.key, {
       ...u,
       source: 'transcript-backfill',
@@ -787,14 +792,17 @@ async function backfillZeroUsageRows(usage, root) {
   }
   cov.rows = cov.from.length;
   cov.zero_rows_without_a_transcript.sort();
+  cov.zero_rows_whose_transcript_summed_to_zero.sort();
+  const skipped = cov.zero_rows_without_a_transcript.length
+    + cov.zero_rows_whose_transcript_summed_to_zero.length;
   // Population control (CLAUDE.md: count at the VERIFIED site, not the matched
   // one). Every zero row this pass considered is accounted for by exactly one of
   // the two outcomes; a mismatch means a row was matched and then dropped by a
   // branch nobody reported, which is the shape that certifies coverage it never
   // delivered.
-  if (cov.rows + cov.zero_rows_without_a_transcript.length !== cov.zero_rows_considered) {
+  if (cov.rows + skipped !== cov.zero_rows_considered) {
     throw new Error('backfill accounting: '
-      + `${cov.rows} backfilled + ${cov.zero_rows_without_a_transcript.length} skipped `
+      + `${cov.rows} backfilled + ${skipped} skipped `
       + `!= ${cov.zero_rows_considered} zero rows considered`);
   }
   cov.from.sort((a, b) => (a.session < b.session ? -1 : a.session > b.session ? 1 : 0));
@@ -944,7 +952,7 @@ async function main(argv) {
   const projectsRoot = opts.claudeProjects || defaultClaudeProjectsRoot();
   const { usage, backfill } = opts.backfill
     ? await backfillZeroUsageRows(rawUsage, projectsRoot)
-    : { usage: rawUsage, backfill: { claude_projects_root: projectsRoot, scanned: false, projects_scanned: 0, transcripts_indexed: 0, zero_rows_considered: (Array.isArray(rawUsage) ? rawUsage : []).filter((u) => u && typeof u.key === 'string' && u.key && usageRowTokens(u) === 0).length, rows: 0, tokens: 0, from: [], zero_rows_without_a_transcript: [], disabled: true } };
+    : { usage: rawUsage, backfill: { claude_projects_root: projectsRoot, scanned: false, projects_scanned: 0, transcripts_indexed: 0, zero_rows_considered: (Array.isArray(rawUsage) ? rawUsage : []).filter((u) => u && typeof u.key === 'string' && u.key && usageRowTokens(u) === 0).length, rows: 0, tokens: 0, from: [], zero_rows_without_a_transcript: [], zero_rows_whose_transcript_summed_to_zero: [], disabled: true } };
 
   const agentsById = indexAgents(agents);
   const orchIds = new Set([...agentsById.values()].filter((a) => a.role === 'orchestrator').map((a) => a.id));
