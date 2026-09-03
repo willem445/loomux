@@ -166,8 +166,8 @@ function ubuntuLeg() {
 test('three lints on one span merge into one function row carrying three distinct numbers', () => {
   const leg = ubuntuLeg();
   // Positive control: the stream really was read.
-  assert.equal(leg.messagesSeen, 11);
-  assert.equal(leg.parsed, 9);
+  assert.equal(leg.messagesSeen, 12);
+  assert.equal(leg.parsed, 10);
   // Every coded diagnostic is accounted for exactly once. Without this, a lint
   // this report does not read would leave `parsed` short of `messagesSeen` and
   // be indistinguishable from a parser that stopped matching.
@@ -201,19 +201,36 @@ test('a message whose value cannot be read produces no row and is disclosed, nev
   assert.equal(leg.functions.filter((f: any) => f.file === 'rust/other.rs').length, 0);
   assert.deepEqual(
     leg.perFile.find((r: any) => r.file === 'rust/other.rs'),
-    { file: 'rust/other.rs', unwrap: 1, expect: 1, panic: 1 }
+    {
+      file: 'rust/other.rs',
+      unwrap: 1,
+      expect: 1,
+      panic: 1,
+      // No `column_start` on these fixture spans, so the column defaults to 0 — a
+      // site is still one site, and the line still identifies it.
+      sites: { unwrap: ['9:0'], expect: ['11:0'], panic: ['13:0'] },
+    }
   );
   // Distinct counts per file, so a row cannot be read off the wrong file.
   assert.deepEqual(
     leg.perFile.find((r: any) => r.file === 'rust/lib.rs'),
-    { file: 'rust/lib.rs', unwrap: 2, expect: 0, panic: 0 }
+    {
+      file: 'rust/lib.rs',
+      // TWO messages at line 5, at columns 9 and 30 — the `a.unwrap().b.unwrap()`
+      // shape. A site is `line:column`, so these are two sites; keying on the line
+      // alone would have reported one and under-counted every such line in the tree.
+      unwrap: 2,
+      expect: 0,
+      panic: 0,
+      sites: { unwrap: ['5:9', '5:30'], expect: [], panic: [] },
+    }
   );
 });
 
 test('non-diagnostic cargo lines and non-JSON noise are skipped rather than counted', () => {
   // The fixture carries a `compiler-artifact` line, a `build-finished` line and one
-  // line of plain text; messagesSeen stays at the eleven diagnostics.
-  assert.equal(ubuntuLeg().messagesSeen, 11);
+  // line of plain text; messagesSeen stays at the twelve diagnostics.
+  assert.equal(ubuntuLeg().messagesSeen, 12);
 });
 
 test('merging the legs keeps the larger value and the functions only one platform can see', () => {
@@ -240,9 +257,13 @@ test('merging the legs keeps the larger value and the functions only one platfor
   assert.ok(merged.functions.some((f: any) => f.file === 'rust/win.rs'));
   assert.ok(merged.perFile.some((r: any) => r.file === 'rust/win.rs'));
 
-  assert.equal(merged.totals.unwrap, 2 + 1 + 1);
+  // lib.rs 2 (two columns on one line) + other.rs 1 + win.rs 1 + split.rs 2 (the
+  // disjoint cross-leg pair the union test above is built on).
+  assert.equal(merged.totals.unwrap, 2 + 1 + 1 + 2);
   assert.equal(merged.totals.expect, 1);
   assert.equal(merged.totals.panic, 1);
+  // Every leg carried sites, so the union is exact rather than a floor.
+  assert.equal(merged.sitesComplete, true);
   assert.equal(merged.percentiles.fnLines.max, 186);
 });
 
@@ -252,6 +273,80 @@ test('no clippy leg at all is a report with the Rust half marked unavailable, no
   assert.deepEqual(merged.functions, []);
   assert.equal(merged.percentiles.fnLines.n, 0);
   assert.equal(merged.percentiles.fnLines.p95, null);
+});
+
+// Review finding 3 (#2139 round 1): per-file `unwrap`/`expect`/`panic` counts were
+// merged across legs with `Math.max`, while the design note claimed the merge means
+// a `cfg`-gated body "is never under-reported". `max` is the union only when one
+// leg's site set is a SUBSET of the other's. A file holding one `cfg(windows)` and
+// one `cfg(unix)` unwrap reports 1 on each leg and merges to 1, not 2.
+//
+// The fixture is exactly that: `rust/split.rs` has its unwrap at line 10 on ubuntu
+// and at line 40 on windows — same count per leg, disjoint sites, so a `max` merge
+// and a union merge give DIFFERENT answers and the assertion can fail. A fixture
+// where one leg simply had more sites would pass under both.
+
+test('per-file unwrap counts merge as a union of SITES, not as the larger count', () => {
+  const ubuntu = cm.parseClippyText(
+    fs.readFileSync(path.join(fixtures, 'clippy-ubuntu.json'), 'utf8'),
+    'ubuntu-22.04',
+    fixtures
+  );
+  const windows = cm.parseClippyText(
+    fs.readFileSync(path.join(fixtures, 'clippy-windows.json'), 'utf8'),
+    'windows-latest',
+    fixtures
+  );
+
+  // Positive control: the two legs really do disagree in the way the fixture is
+  // built for — one site each, at different lines.
+  const uSplit = ubuntu.perFile.find((r: any) => r.file === 'rust/split.rs');
+  const wSplit = windows.perFile.find((r: any) => r.file === 'rust/split.rs');
+  assert.equal(uSplit.unwrap, 1);
+  assert.equal(wSplit.unwrap, 1);
+  assert.deepEqual(uSplit.sites.unwrap, ['10:0']);
+  assert.deepEqual(wSplit.sites.unwrap, ['40:0']);
+
+  const merged = cm.mergeClippy([ubuntu, windows]);
+  const m = merged.perFile.find((r: any) => r.file === 'rust/split.rs');
+  // A `max` merge would say 1 here and silently drop the platform-specific site
+  // that running clippy on every leg exists to catch.
+  assert.equal(m.unwrap, 2);
+  assert.deepEqual(m.sites.unwrap, ['10:0', '40:0']);
+});
+
+test('a site seen on every leg is counted once, not once per leg', () => {
+  // The other direction, and the reason this is a union and not a sum: a plain
+  // `unwrap` outside any `cfg` fires on all three legs and must still be one site.
+  const leg = (platform: string) =>
+    cm.parseClippyText(
+      JSON.stringify({
+        reason: 'compiler-message',
+        message: {
+          code: { code: 'clippy::unwrap_used' },
+          message: 'used `unwrap()` on a `Result` value',
+          spans: [{ file_name: 'rust/shared.rs', line_start: 7, line_end: 7, is_primary: true }],
+        },
+      }),
+      platform,
+      fixtures
+    );
+  const merged = cm.mergeClippy([leg('a'), leg('b'), leg('c')]);
+  const row = merged.perFile.find((r: any) => r.file === 'rust/shared.rs');
+  assert.equal(row.unwrap, 1);
+  assert.equal(merged.totals.unwrap, 1);
+});
+
+test('a leg file with no site list degrades to its counts rather than throwing', () => {
+  // An artifact written before sites were recorded (or by a future writer that drops
+  // them) must not crash the merge. It cannot contribute to a union, so its counts
+  // are taken as-is — the honest floor — and `sitesComplete` says the union is
+  // partial rather than letting a reader believe otherwise.
+  const legacy = { platform: 'old', functions: [], perFile: [{ file: 'rust/x.rs', unwrap: 5, expect: 0, panic: 0 }] };
+  const merged = cm.mergeClippy([legacy]);
+  const row = merged.perFile.find((r: any) => r.file === 'rust/x.rs');
+  assert.equal(row.unwrap, 5);
+  assert.equal(merged.sitesComplete, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -298,6 +393,72 @@ test('the added-lines view of an empty diff is zeros, not a throw', () => {
   const d = cm.analyzeDiff('');
   assert.equal(d.addedLines, 0);
   assert.equal(d.commentShare, 0);
+});
+
+// Review finding 2 (#2139 round 1): a diff whose ADDED CONTENT is itself a line
+// beginning with `+++ ` was consumed as a file header. `files` inflated by one, the
+// line never counted as added, and every later added line attributed to the bogus
+// path — which, after the `b/` strip, can read as product Rust and misdirect the
+// unwrap rows.
+//
+// The fixture is a docs file, because that is the realistic subject: a design note or
+// a skill quoting a diff. It carries BOTH a `--- ` and a `+++ ` content line, so a
+// fix that only special-cases one of them still fails.
+
+const DIFF_QUOTING_A_DIFF = [
+  'diff --git a/doc/design/example.md b/doc/design/example.md',
+  '--- a/doc/design/example.md',
+  '+++ b/doc/design/example.md',
+  '@@ -1,0 +1,5 @@',
+  '+Worked example of a diff:',
+  '+',
+  '+```diff',
+  '+--- a/src-tauri/src/evil.rs',
+  '+++ b/src-tauri/src/evil.rs',
+].join('\n');
+
+test('a diff whose added content is itself a `+++ ` line does not start a new file', () => {
+  const d = cm.analyzeDiff(DIFF_QUOTING_A_DIFF);
+  // One real file, not two: the `+++ b/src-tauri/src/evil.rs` inside the hunk is
+  // content, not a header.
+  assert.equal(d.files, 1);
+  // Five `+` lines in the hunk, all of them added lines of the docs file.
+  assert.equal(d.addedLines, 5);
+  // And nothing is attributed to the path that only ever appeared inside a code
+  // fence. Without this, `evil.rs` reads as product Rust and owns every later row.
+  assert.equal(d.addedUnwrap.length, 0);
+  assert.equal(d.addedExpect.length, 0);
+});
+
+test('a hunk that adds a line starting with `-- ` still counts it as an addition', () => {
+  // The mirror case: `--- ` inside a hunk is a DELETED line whose content starts
+  // `-- `, and must not be mistaken for a header either. Here the deleted line is
+  // real, so the added count must exclude it and include only the two `+` lines.
+  const d = cm.analyzeDiff(
+    [
+      'diff --git a/notes.md b/notes.md',
+      '--- a/notes.md',
+      '+++ b/notes.md',
+      '@@ -1,2 +1,2 @@',
+      '--- old header line',
+      '+++ new header line',
+      '+trailing',
+    ].join('\n')
+  );
+  assert.equal(d.files, 1);
+  assert.equal(d.addedLines, 2);
+});
+
+test('a plain unified diff with no `diff --git` line still resolves its file', () => {
+  // `analyzeDiff` is fed `git diff`, which always emits `diff --git`. But the header
+  // rule must not DEPEND on it, or a hand-made `diff -u` silently measures nothing.
+  const d = cm.analyzeDiff(
+    ['--- a/src-tauri/src/thing.rs', '+++ b/src-tauri/src/thing.rs', '@@ -1,0 +1,1 @@', '+let a = b.unwrap();'].join('\n')
+  );
+  assert.equal(d.files, 1);
+  assert.equal(d.addedLines, 1);
+  assert.equal(d.addedUnwrap.length, 1);
+  assert.equal(d.addedUnwrap[0].file, 'src-tauri/src/thing.rs');
 });
 
 // ---------------------------------------------------------------------------

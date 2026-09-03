@@ -532,6 +532,16 @@ const CLIPPY_VALUE_PATTERNS = [
   ['args', /^clippy::too_many_arguments$/, /has too many arguments \((\d+)\/\d+\)/],
 ];
 
+const COUNT_KINDS = ['unwrap', 'expect', 'panic'];
+
+// A site is the string `line:column`. Sorting it as text would put 10 before 9,
+// so order on the two numbers.
+function siteOrder(a, b) {
+  const [al, ac] = String(a).split(':').map(Number);
+  const [bl, bc] = String(b).split(':').map(Number);
+  return al === bl ? ac - bc : al - bl;
+}
+
 const CLIPPY_COUNT_LINTS = new Map([
   ['clippy::unwrap_used', 'unwrap'],
   ['clippy::expect_used', 'expect'],
@@ -569,8 +579,18 @@ function clippyAddMessage(acc, msg) {
 
   const counted = CLIPPY_COUNT_LINTS.get(code);
   if (counted) {
-    if (!acc.perFile.has(file)) acc.perFile.set(file, { unwrap: 0, expect: 0, panic: 0 });
-    acc.perFile.get(file)[counted] += 1;
+    // The SITE, not a tally. Two legs report the same file, and a count alone
+    // cannot be merged: `max` is the union only when one leg's sites are a subset
+    // of the other's, so a file holding one `cfg(windows)` and one `cfg(unix)`
+    // unwrap would merge to 1 instead of 2 (#2139 review round 1, finding 3).
+    // A site is `line:column` and not just the line, because `a.unwrap().b.unwrap()`
+    // is two sites on one line and a line-keyed set would call it one. Both
+    // coordinates are stable across legs for one source file, so the set unions
+    // exactly: platform-specific sites add, shared sites do not double.
+    if (!acc.perFile.has(file)) {
+      acc.perFile.set(file, { unwrap: new Set(), expect: new Set(), panic: new Set() });
+    }
+    acc.perFile.get(file)[counted].add(line + ':' + (primary.column_start || 0));
     acc.parsed += 1;
     return;
   }
@@ -646,7 +666,19 @@ function clippyFinish(acc) {
       a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1
     ),
     perFile: Array.from(acc.perFile.entries())
-      .map((e) => Object.assign({ file: e[0] }, e[1]))
+      .map((e) => ({
+        file: e[0],
+        unwrap: e[1].unwrap.size,
+        expect: e[1].expect.size,
+        panic: e[1].panic.size,
+        // The counts above are derived from these; the merge unions the sites and
+        // re-derives, so a reader can check one against the other.
+        sites: {
+          unwrap: Array.from(e[1].unwrap).sort(siteOrder),
+          expect: Array.from(e[1].expect).sort(siteOrder),
+          panic: Array.from(e[1].panic).sort(siteOrder),
+        },
+      }))
       .sort((a, b) => (a.file < b.file ? -1 : 1)),
   };
 }
@@ -682,6 +714,7 @@ function mergeClippy(legs) {
   let messagesSeen = 0;
   let parsed = 0;
   let ignored = 0;
+  let sitesComplete = true;
   for (const leg of legs) {
     if (!leg) continue;
     platforms.push(leg.platform || 'unknown');
@@ -700,25 +733,54 @@ function mergeClippy(legs) {
       }
     }
     for (const r of leg.perFile || []) {
-      const cur = perFile.get(r.file);
-      if (!cur) perFile.set(r.file, { file: r.file, unwrap: r.unwrap, expect: r.expect, panic: r.panic });
-      else {
-        cur.unwrap = Math.max(cur.unwrap, r.unwrap);
-        cur.expect = Math.max(cur.expect, r.expect);
-        cur.panic = Math.max(cur.panic, r.panic);
+      let cur = perFile.get(r.file);
+      if (!cur) {
+        cur = {
+          file: r.file,
+          sites: { unwrap: new Set(), expect: new Set(), panic: new Set() },
+          floor: { unwrap: 0, expect: 0, panic: 0 },
+        };
+        perFile.set(r.file, cur);
+      }
+      for (const k of COUNT_KINDS) {
+        if (r.sites && Array.isArray(r.sites[k])) {
+          for (const ln of r.sites[k]) cur.sites[k].add(ln);
+        } else {
+          // A leg with no site list cannot join the union. Keep its count as a
+          // FLOOR rather than dropping it, and record that the union is partial —
+          // `sitesComplete: false` is what stops a reader treating the result as
+          // the exact figure it is for every other leg.
+          sitesComplete = false;
+          cur.floor[k] = Math.max(cur.floor[k], Number(r[k]) || 0);
+        }
       }
     }
   }
   const functions = Array.from(fns.values()).sort((a, b) =>
     a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1
   );
-  const files = Array.from(perFile.values()).sort((a, b) => (a.file < b.file ? -1 : 1));
+  const files = Array.from(perFile.values())
+    .map((r) => ({
+      file: r.file,
+      unwrap: Math.max(r.sites.unwrap.size, r.floor.unwrap),
+      expect: Math.max(r.sites.expect.size, r.floor.expect),
+      panic: Math.max(r.sites.panic.size, r.floor.panic),
+      sites: {
+        unwrap: Array.from(r.sites.unwrap).sort(siteOrder),
+        expect: Array.from(r.sites.expect).sort(siteOrder),
+        panic: Array.from(r.sites.panic).sort(siteOrder),
+      },
+    }))
+    .sort((a, b) => (a.file < b.file ? -1 : 1));
   return {
     available: platforms.length > 0,
     platforms,
     messagesSeen,
     parsed,
     ignored,
+    // False when any leg contributed counts without sites, so the per-file figures
+    // are a floor rather than an exact union.
+    sitesComplete,
     functions,
     perFile: files,
     totals: {
@@ -806,8 +868,22 @@ function analyzeDiff(diffText) {
   let line = 0;
   const isProductRust = (f) =>
     f && f.endsWith('.rs') && (f.startsWith('src-tauri/src/') || /^crates\/[^/]+\/src\//.test(f));
+  // `+++ ` is a file header ONLY outside a hunk. Inside one it is ordinary added
+  // content — a docs page or a skill quoting a diff is the realistic subject, and
+  // treating it as a header inflated `files`, dropped the line from `addedLines`,
+  // and re-pointed every later added line at a path that (after the `b/` strip)
+  // could read as product Rust and own the unwrap rows (#2139 review round 1,
+  // finding 2). `diff --git` reopens the header; `@@` closes it. Keying on the
+  // hunk state rather than on `diff --git` alone keeps a plain `diff -u` — which
+  // has no `diff --git` line at all — working.
+  let inHunk = false;
   for (const raw of diffText.split('\n')) {
-    if (raw.startsWith('+++ ')) {
+    if (raw.startsWith('diff --git ')) {
+      inHunk = false;
+      file = null;
+      continue;
+    }
+    if (!inHunk && raw.startsWith('+++ ')) {
       const p = raw.slice(4).trim();
       file = p === '/dev/null' ? null : posix(p.replace(/^b\//, ''));
       if (file) out.files += 1;
@@ -815,11 +891,13 @@ function analyzeDiff(diffText) {
     }
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
     if (hunk) {
+      inHunk = true;
       line = Number(hunk[1]);
       continue;
     }
-    if (!file) continue;
-    if (raw.startsWith('+') && !raw.startsWith('+++')) {
+    if (!inHunk && raw.startsWith('--- ')) continue;
+    if (!file || !inHunk) continue;
+    if (raw.startsWith('+')) {
       const body = raw.slice(1);
       const t = body.trim();
       out.addedLines += 1;

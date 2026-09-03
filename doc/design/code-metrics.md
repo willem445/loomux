@@ -91,7 +91,10 @@ Two consequences worth stating:
   `test/fixtures/codemetrics/clippy-ubuntu.json` carries a deliberately unreadable
   message to pin that behaviour.
 
-`unwrap_used`, `expect_used` and `panic` are counted per file from the same run.
+`unwrap_used`, `expect_used` and `panic` are recorded per file from the same run, as
+a set of `line:column` sites; the count is that set's size. Sites rather than a
+tally because the legs have to be merged — see below.
+
 
 `clippy.toml` lives under `.github/clippy/` and not at the repo root on purpose: the
 env var scopes it to one step, so `cargo check`, `cargo test`, a local `cargo clippy`
@@ -101,10 +104,29 @@ make every human clippy run unreadable.
 ### Why clippy runs on every build leg
 
 A `cfg(windows)` body is invisible to a clippy run on ubuntu, and this project has a
-lot of platform-specific code. Each leg uploads a compact per-leg JSON; the
-`code-metrics` job merges them and keeps the **larger** value per function, so a
-`cfg`-gated body is never under-reported. `test/codemetrics.test.ts` pins that merge
-against two fixture legs that disagree.
+lot of platform-specific code. Each leg uploads a compact per-leg JSON and the
+`code-metrics` job merges them — by two different rules, because the two kinds of
+row need different ones:
+
+- **Per-function values** (lines, cognitive complexity, argument count) take the
+  **larger** of the legs. One function has one value per leg, so the larger is the
+  complete one and a `cfg`-gated body is never under-reported.
+- **Per-file `unwrap`/`expect`/`panic` counts** take the **union of the sites**, not
+  the larger count. `max` would be the union only if one leg's site set were a
+  subset of the other's: a file holding one `cfg(windows)` and one `cfg(unix)`
+  unwrap reports 1 on each leg and would merge to 1 instead of 2. Each site is
+  recorded as `line:column` — column included, because `a.unwrap().b.unwrap()` is
+  two sites on one line — so the union adds platform-specific sites without
+  double-counting shared ones.
+
+Both rules are pinned in `test/codemetrics.test.ts` against fixture legs built to
+disagree: for the function rule, one leg reports a bigger `big_fn`; for the file
+rule, `rust/split.rs` has ONE unwrap on each leg at DIFFERENT lines, so a `max`
+merge and a union merge give different answers and the assertion can fail.
+
+A leg that supplies counts without sites cannot join the union. Its counts are kept
+as a floor rather than dropped, and `rust.sitesComplete` goes `false` so a reader is
+not told the figure is exact when it is a lower bound.
 
 If a leg ever costs more than it is worth, the honest fix is to drop that leg **and**
 record here that its `cfg` bodies are unmetered — not to leave the merged number
@@ -120,6 +142,12 @@ an implementation detail, and `test/codemetrics.test.ts` pins them:
 ```
 schemaVersion  generator  commit  ref  generatedAt  ts  rust  roots  modRs  diff
 ```
+
+Inside `rust`, two fields carry the merge's own honesty: each `perFile` row holds
+`sites` (the `line:column` set its counts are derived from, so a reader can check
+one against the other), and `sitesComplete` is `false` when any leg contributed
+counts without sites, making the per-file figures a floor rather than an exact
+union.
 
 `schemaVersion` is `1`. Bump it when a reader could misread an old file as a new one.
 The sticky comment's marker string, `<!-- code-metrics -->`, is part of the same
