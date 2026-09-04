@@ -55,12 +55,20 @@ pub trait AgentPane: Send + Sync {
     fn send(&self, turn: Turn) -> Result<SendReceipt, String>;
     fn answer(&self, req: RequestId, d: Decision) -> Result<(), String>;
     fn interrupt(&self) -> Result<(), String>;
-    fn events(&self) -> EventRx;                 // Receiver<HarnessEvent>
+    fn events(&self) -> Option<EventRx>;         // Receiver<HarnessEvent>, take-once
     fn session_id(&self) -> Option<String>;      // None == not known yet
 }
 
 pub enum Turn { Kickoff(String), Prompt(String), Notice(String), Human(String) }
 ```
+
+**`events()` returns an `Option`, and R1 found out why.** An `mpsc::Receiver`
+has exactly one consumer and cannot be cloned, so `&self` has no way to hand one
+back twice; the original signature above was unimplementable as written. The
+take-once shape is the honest fix — a second caller gets `None` rather than a
+silently split stream, which is what a broadcast channel would have cost instead.
+Corrected here rather than in R1's PR, because this file is the contract and R1
+is what discovered the defect in it.
 
 `Turn` is the delivery vocabulary orrerix already has
 (`Delivery::{FreshKickoff, ResumeKickoff, MidSession}` plus the `[orrerix]`
@@ -296,10 +304,16 @@ append only, `n` a monotonically increasing segment number (§4.2).
 
 `<agent-id>` is interpolated into a **file name**, so it is inside the
 `src-tauri/tests/pathseg.rs` scan's trigger shape (an interpolation plus a
-file-extension literal in a `format!` template): R2 adds the allowlist row and
-the proof that row names, and the id is already a `pathseg::check_segment` family
-member (CLAUDE.md constraint 6). `panes/` is created under the group dir, which
-is the single `group_dir_at` join — no second join is added.
+file-extension literal in a `format!` template): **R1** adds the allowlist row
+and the proof that row names — an earlier draft of this section said R2 would,
+which was wrong, because R1 is the slice the interpolation lands in and a scan
+that default-denies fires the moment the line exists. The id is a
+`pathseg::PathSegment` (CLAUDE.md constraint 6), interpolated **directly** rather
+than bound to a `&str` first, so the typed value is at the site the scan reads
+and the row's proof pins the only constructor that can set it. `panes/` is
+created under the group dir, which is the single `group_dir_at` join — no second
+join is added, and R1 takes that directory as an already-resolved `&Path` for
+exactly that reason.
 
 Each line carries a monotonic `seq`, a wall-clock `ts`, and the `HarnessEvent` as
 emitted.
@@ -637,7 +651,11 @@ it — [sessions](https://code.claude.com/docs/en/sessions#name-the-project-dire
 
 **Files:** `crates/loomux-engine/src/harness/mod.rs`, `harness/claude.rs`,
 `harness/transcript.rs`, plus one `pub mod harness;` line in
-`crates/loomux-engine/src/lib.rs`.
+`crates/loomux-engine/src/lib.rs` — and **one allowlist row in
+`src-tauri/tests/pathseg.rs`** (§4.1). That last one is a test file, not
+`mod.rs`, so the zero-`mod.rs` property below is untouched; it is named here
+because a slice that adds a line to a default-deny guard should say so in its
+own file list rather than have a reviewer discover it.
 
 **Ships:** §1's vocabulary; the stream-json decoder (NDJSON line →
 `HarnessEvent`); a child-process driver owning stdin/stdout/stderr and the
@@ -667,14 +685,37 @@ existing `RandomState` path, not by a new crate.
 | `system` / `api_retry` | a log line only; not a `HarnessEvent` |
 | anything else | ignored as an event; the raw line goes to the pane log (§4.1) |
 
-**Tests.** Fixtures under `src-tauri/tests/fixtures/harness/claude/*.jsonl`,
-**recorded once by the human from a real CLI** and committed with a version pin
-(`opencode.md`'s labelling discipline). Agents never regenerate them and never run
-a real CLI (constraint 3). The driver is exercised against a **fake harness
-script** that cats a fixture on a schedule. Decoder tests are table-driven; a
-planted unknown message type must be ignored and logged rather than panic; the
-renderer is pinned on golden VT output. Red-before-green is captured on CI, since
-agents may not run cargo locally.
+**Tests.** Fixtures under
+`crates/loomux-engine/tests/fixtures/harness/claude/*.jsonl`. Agents never
+regenerate them and never run a real CLI (constraint 3). Decoder tests are
+table-driven; a planted unknown message type must be ignored **and logged**
+rather than panic; the renderer is pinned on golden VT output. Red-before-green
+is captured on CI, since agents may not run cargo locally.
+
+**Two things this paragraph said before R1 built it, and what replaced them
+(human-approved 2026-09-04):**
+
+- *Location.* It said `src-tauri/tests/fixtures/`. R1's tests are engine-inline,
+  and an engine test reaching `../../src-tauri` for its data points the boundary
+  arrow backwards even though nothing links — the arrow is a rule about what this
+  crate may depend on, and test data is a dependency. The fixtures live with the
+  crate that owns the decoder; R2's `src-tauri` integration test reads that same
+  path.
+- *Provenance.* It said the fixtures are "recorded once by the human from a real
+  CLI". They are not, and could not be for R1: constraint 3 forbids an agent
+  producing a recording, and none had been made. **R1's fixtures are synthesized
+  from the documented message shapes** and their README says so in its first
+  line. They therefore prove the decoder against the **documented** contract and
+  not against the CLI's real bytes — a real capture is a live-validation item in
+  §9's family, and it is what would close the gap. The rest of the discipline is
+  unchanged: a capture that replaces them records the CLI version it came from,
+  and no agent regenerates a fixture from the code under test.
+
+The fixture set deliberately carries the awkward cases an average capture would
+miss: a `thinking_delta` (which must not become transcript text), a **failing**
+`tool_result`, an `api_retry` (a real message that is not a pane event), a
+message type no build knows, an unrecognized `capabilities` entry, and **two**
+models in `modelUsage` — so a reader that folds only the first is caught.
 
 ### 8.2 R2 — `feat/harness-claude-wire`
 
@@ -706,9 +747,10 @@ pins are the other half.
 ## 9. Live-validation items for the human
 
 Each is a fact the official docs do **not** settle, with the pages searched named
-beside it. None is guessed anywhere above; **R1 depends on none of them**, and R2
-depends on 1, 2, 3 and 6 — item 4 is R2's teardown path and item 5 is a policy
-read rather than a measurement.
+beside it. None is guessed anywhere above; **R1 depends on none of them to
+build**, and R2 depends on 1, 2, 3, 6 and 7 — item 4 is R2's teardown path and
+item 5 is a policy read rather than a measurement. Item 7 is the one R1 *created*
+rather than inherited, and it is stated as a debt against R1's own evidence.
 
 1. **The `--permission-prompt-tool` wire contract.** The docs state that the flag
    "specif[ies] an MCP tool to handle permission prompts in non-interactive mode"
@@ -761,3 +803,11 @@ read rather than a measurement.
    the first real session should record the exact form, because a build that
    answered with something that is not a UUID at all would take the fail-closed
    branch and deserve to be recognised as a version issue rather than a bug.
+7. **A real stream-json capture.** R1's fixtures are synthesized from the
+   documented message shapes (§8.1), so the decoder is proved against the docs
+   and not against the CLI's bytes. A field the pages describe loosely, a key
+   spelled differently in practice, or a message type the docs do not mention
+   would pass the suite and fail live. One recorded session, committed with the
+   CLI version it came from, closes it — and it is the human's to record, because
+   an agent may not run a real CLI (constraint 3). R2 depends on this the way it
+   depends on item 1: not to compile, but to be believed.
