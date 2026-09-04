@@ -314,7 +314,7 @@ impl Decoder {
             Some("api_retry") => {
                 let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
                 let err = v.get("error").and_then(Value::as_str).unwrap_or("unknown");
-                vec![Decoded::Note(format!("api_retry attempt {attempt}: {err}"))]
+                vec![Decoded::Unknown(format!("api_retry attempt {attempt}: {err}"))]
             }
             _ => vec![Decoded::Unknown(raw.to_string())],
         }
