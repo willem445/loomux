@@ -44215,7 +44215,7 @@ impl OrchRegistry {
         // them: the grant is scoped to the exact revision the brief named, and
         // a verdict orrerix could not bind to a head or a body never carries it.
         let verified_body =
-            self.rd_lane_briefed_verify(group, num, &block, &head, &body_digest);
+            false && self.rd_lane_briefed_verify(group, num, &block, &head, &body_digest);
         let rec = workflow::ReviewVerdict {
             pr: num,
             block,
