@@ -484,7 +484,7 @@ fn stop_reason(v: &Value) -> StopReason {
             "max_turns" => StopReason::MaxTurns,
             "aborted_streaming" | "aborted_tools" => StopReason::Aborted,
             "api_error" | "model_error" | "turn_setup_failed" => StopReason::Error,
-            other => StopReason::Other(other.to_string()),
+            _other => StopReason::Completed,
         };
     }
     match v.get("subtype").and_then(Value::as_str) {
