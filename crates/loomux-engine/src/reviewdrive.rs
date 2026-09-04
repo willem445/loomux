@@ -3297,7 +3297,7 @@ fn decide_fix_receipts(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLim
             // zero clears every timeout, which is the false-park direction the
             // field doc argues against, and an unwind out of the poll thread
             // takes the fleet's watches down with it.
-            let since = entry.fix_pushed_ms.unwrap_or(entry.state_since_ms);
+            let since = entry.fix_handback_ms;
             if facts.now_ms.saturating_sub(since) >= minutes_ms(limits.fix_timeout_minutes) {
                 DriveStep::held(HeldReason::FixStalled)
             } else {
