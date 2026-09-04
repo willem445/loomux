@@ -815,7 +815,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
         // opens the session file if it is there and creates it if it is not.
         // So loomux pre-mints a UUID exactly as it does for claude, and no
         // store watcher, baseline or contest refusal exists for pi at all.
-        premints_session_id: true,
+        premints_session_id: false,
         // `--exclude-tools edit,write` denies the two editing built-ins by
         // name, and it is applied AFTER every allowlist — that is `NoEdits`,
         // and it is the ceiling: pi has no bash-pattern deny and no permission
