@@ -18,11 +18,13 @@ find what the cheaper tier missed, not to repeat its checklist.
    clear CLAUDE.md's hard constraints and the engineering-standards grounds
    (coupling, a duplicated mechanism, an unargued dependency, a contract change
    with no design note)?
-2. **The review.** Read `rev-std`'s recorded summary and PR review. For each
-   claim it says it verified: re-verify ONE of them at random and every one that
-   sounds too easy. For each finding it raised: was the fix real? For what it
-   did NOT raise: what class of defect would the cheap tier miss here (a
-   claim-vs-code gap, a vacuous control, a test that passes for the wrong
+2. **The review.** Read `rev-std`'s recorded summary and PR review. Its numbered
+   claim list is produced by `scripts/pr-body-check.cjs` — when you re-verify a
+   claim, re-run that script (or the same instruments) rather than trusting the
+   paste. For each claim it says it verified: re-verify ONE of them at random and
+   every one that sounds too easy. For each finding it raised: was the fix real?
+   For what it did NOT raise: what class of defect would the cheap tier miss here
+   (a claim-vs-code gap, a vacuous control, a test that passes for the wrong
    reason, a body sentence the diff no longer backs) - go looking for exactly
    that.
 
@@ -39,12 +41,16 @@ four. What is durable is the review history GitHub keeps:
 
     gh pr view <n> --json reviews --jq '[.reviews[] | select(.author.login != "")] | length'
 
-Every posted review survives every push. Count those, add one for the round you
-are about to post, and take the higher of that and any round the orchestrator's
-kickoff states — a kickoff that says "round 2 of 3" is naming something it can see
-and you cannot. If BOTH sources are silent (no reviews posted and no round in the
-kickoff), you are at round 1 and this section does not apply; say in your summary
-which source you counted from, so the next lane can check it.
+Every posted review survives every push. Count ROUNDS, not posts: the same review
+posted twice within seconds is one round, not two (the dup-post class - 3 of the 4
+beta5/6 final rev-final passes posted twice, and #2140's final pass then called
+itself "round 6" on a 5-review PR). Collapse duplicates - same lane, same head,
+byte-identical body - then add one for the round you are about to post, and take the
+higher of that and any round the orchestrator's kickoff states — a kickoff that says
+"round 2 of 3" is naming something it can see and you cannot; a kickoff round number
+is a floor, never a count to inflate. If BOTH sources are silent (no reviews posted
+and no round in the kickoff), you are at round 1 and this section does not apply; say
+in your summary which source you counted from, so the next lane can check it.
 
 On the **third** round and every round after it, you do exactly one of two things:
 
@@ -115,4 +121,10 @@ base and head" rule polices - that stays on the PR body (#2138).
 - Record with `review_verdict(...)`; post the same text as a PR review. Your
   verdict is bound to the head you reviewed - if a fix is pushed, you will be
   asked back for a delta; keep that delta review to the delta.
+- **Before posting, read `gh pr view <n> --json reviews` and refuse to post a
+  byte-identical review body.** The same review posted twice is a dup-post: it
+  costs no round directly, but round discipline is counted off the review history,
+  so a duplicate pulls round-3 rules forward by one round. A round is a distinct
+  (lane, head, digest), not a post count; a round number the kickoff states is a
+  floor, never a count to inflate.
 - No local `cargo`; read CI.
