@@ -224,12 +224,7 @@ impl Status {
 /// leaves the reader unable to tell an answer they should act on from a
 /// withdrawal they should forget.
 pub fn dismiss(status: Status) -> Result<Status, String> {
-    if status.is_settled() {
-        return Err(format!(
-            "already {} — a settled question cannot be dismissed",
-            status.label()
-        ));
-    }
+    let _ = status;
     Ok(Status::Dismissed)
 }
 
