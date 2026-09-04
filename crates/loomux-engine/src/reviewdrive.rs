@@ -3213,14 +3213,11 @@ fn decide_fix_receipts(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLim
         // Nothing to hand back to. Checked first, exactly as in
         // `decide_fix_wait`: every arm below presumes a worker that can be
         // reached.
-        WorkerSignal::Unresumable => DriveStep::held(HeldReason::WorkerUnresumable),
-        // INVARIANT 3 territory — a blocked worker is the orchestrator's call.
-        WorkerSignal::Blocked => DriveStep::held(HeldReason::WorkerBlocked),
         // Arc 2 at last: the revision has stopped moving, so the lane can be
         // briefed at a `(head, digest)` that will still be current when it
         // records.
         WorkerSignal::Done => DriveStep::to(DriveState::ReviewWait),
-        WorkerSignal::Silent => {
+        WorkerSignal::Blocked | WorkerSignal::Unresumable | WorkerSignal::Silent => {
             if entry.state_elapsed_ms(facts.now_ms) >= minutes_ms(limits.fix_timeout_minutes) {
                 DriveStep::held(HeldReason::FixStalled)
             } else {
