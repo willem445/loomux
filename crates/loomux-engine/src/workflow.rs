@@ -3409,6 +3409,28 @@ pub struct ReviewVerdict {
     /// Empty when loomux could not resolve the body at record time — read the same
     /// fail-closed way as an empty `head`: unknown, never "unbound, therefore fine".
     pub body_digest: String,
+    /// **This review was a body-verification delta** (#2168 E2): the review
+    /// driver briefed this lane because every required lane had already passed
+    /// the code at this head and only the PR body had moved, so what it was
+    /// asked for is the body as it stands rather than the diff.
+    ///
+    /// It is what lets [`crate::mergeq::recheck_gate`]'s `body-unchanged` clause
+    /// accept the passes this one supersedes — see [`body_verified`] for the
+    /// rule and the property it narrows the clause to.
+    ///
+    /// **Computed by the tool, never passed in, exactly like `body_digest`.**
+    /// `review_verdict` sets it from the drive's own lane record — the brief it
+    /// sent — so a reviewer cannot mark its own pass as a verification, and a
+    /// verdict recorded outside a drive never carries it. That is what confines
+    /// this clause's loosening to the one case the driver produces: an
+    /// undriven repo, and a hand-recorded verdict, see the rule exactly as it
+    /// was.
+    ///
+    /// It rides line 5 beside the digest rather than on a line of its own,
+    /// because everything after line 5 is the summary and the summary is the
+    /// one field a reviewer writes. A marker a reviewer could type would be a
+    /// marker a reviewer could forge.
+    pub verified_body: bool,
     pub summary: String,
     pub ts_ms: u64,
 }
@@ -3432,6 +3454,76 @@ impl ReviewVerdict {
         let now = current_digest.filter(|d| !d.is_empty())?;
         (!self.body_digest.is_empty()).then(|| self.body_digest != now)
     }
+
+    /// Whether this verdict is a **body-verification pass covering the body as
+    /// it stands** (#2168 E2) — a `pass`, bound to this head, marked
+    /// [`verified_body`](ReviewVerdict::verified_body) by the driver, and
+    /// carrying the digest of the body now on the PR.
+    ///
+    /// All four, and each closes a different hole. `pass`: a `fail` that read
+    /// the current body is the fix loop, not an approval of it. `reviewed`: a
+    /// verification of a body sitting on a head nobody passed says nothing
+    /// about what would merge. `verified_body`: an ordinary pass that happens
+    /// to be the newest is not a review OF the delta, and accepting one would
+    /// weaken the clause for every repo rather than for the driven case this
+    /// is for. The digest equality: a verification of a body that has since
+    /// moved again is spent.
+    ///
+    /// `None` for `now` — the body could not be read — is **not** a match, the
+    /// same fail-closed direction [`body_changed`](ReviewVerdict::body_changed)
+    /// takes: "we could not check" may never discharge a gate condition.
+    pub fn verifies_body(&self, head: &str, now: Option<&str>) -> bool {
+        let Some(now) = now.filter(|d| !d.is_empty()) else { return false };
+        self.verdict == Verdict::Pass
+            && self.verified_body
+            && self.reviewed(head)
+            && !self.body_digest.is_empty()
+            && self.body_digest == now
+    }
+
+    /// Whether this **pass** still covers the body that would be committed —
+    /// the question `body-unchanged` asks of one verdict, and the same question
+    /// the review driver asks before it re-briefs a lane (#2168 E2).
+    ///
+    /// Directly, when its own digest is the current one. Or **by delegation**,
+    /// when `verified` says some required reviewer recorded a body-verification
+    /// pass at this head — see [`body_verified`]. A pass with **no** digest is
+    /// covered by neither: unknown is never "unbound, therefore fine".
+    ///
+    /// Delegation additionally requires this pass to be bound to the head that
+    /// would merge, which is the whole of what makes it safe: the verification
+    /// lane read the body, and the code this pass approved has not moved since
+    /// it approved it. Without that clause a `pass` from three commits ago
+    /// would ride in on someone else's body review.
+    pub fn pass_covers_body(&self, head: &str, now: Option<&str>, verified: bool) -> bool {
+        if self.verdict != Verdict::Pass || self.body_digest.is_empty() {
+            return false;
+        }
+        let Some(now) = now.filter(|d| !d.is_empty()) else { return false };
+        self.body_digest == now || (verified && self.reviewed(head))
+    }
+}
+
+/// Whether any of `verdicts` is a body-verification pass at `(head, now)` —
+/// [`ReviewVerdict::verifies_body`] asked of a whole reviewer set (#2168 E2).
+///
+/// **One definition, three consumers**, for §4's reason: the merge gate
+/// ([`crate::mergeq::recheck_gate`]), the review driver's `review-wait`
+/// (`reviewdrive::first_stale_lane`) and the `gh` shim's `body-unchanged` loop
+/// all have to reach the same answer, or a drive reports `satisfied` on a merge
+/// the shim then refuses. The shim is the one that cannot call this; it
+/// reproduces it in POSIX shell, and `the_shim_and_the_gate_agree_*` is what
+/// keeps the two honest.
+///
+/// The caller passes the reviewers the **gate requires** — the routed list, not
+/// every verdict on disk. A block the gate does not name has no standing to
+/// discharge a condition of it.
+pub fn body_verified<'a>(
+    verdicts: impl IntoIterator<Item = &'a ReviewVerdict>,
+    head: &str,
+    now: Option<&str>,
+) -> bool {
+    verdicts.into_iter().any(|v| v.verifies_body(head, now))
 }
 
 /// The PR body reduced to the form both halves of the gate digest (#565).
@@ -3515,19 +3607,47 @@ pub fn sanitize_sha(s: &str) -> String {
     }
 }
 
+/// The word line 5 carries **after** the digest when the verdict is a
+/// body-verification pass (#2168 E2) — see [`ReviewVerdict::verified_body`].
+///
+/// **On line 5 rather than on a line of its own, and that placement is the
+/// security property.** Line 6 onwards is the summary, which is the one field a
+/// reviewer writes; a marker there would be a marker a reviewer could type. Line
+/// 5 is written entirely by the tool whenever there is a digest at all, so a
+/// reviewer cannot reach it.
+pub const VERIFIED_BODY_MARK: &str = "verified-body";
+
 /// Serialize a verdict record for `verdicts/pr-<N>/<block>`. Line-oriented, with
 /// the verdict word FIRST (the shim reads it with `head -n1`), the reviewed head
 /// SECOND and the reviewed body's digest FIFTH (`head -n5 | tail -n1`); the
 /// summary runs to EOF, being the only field that may contain newlines — so every
 /// fixed field has to sit above it.
+///
+/// Line 5 is the digest **alone** unless this verdict is a body verification, in
+/// which case it is `<digest> verified-body` (#2168 E2). Both halves of the gate
+/// therefore read the digest as line 5's FIRST field rather than as the whole
+/// line — a build that compared the whole line would find no match and refuse,
+/// which is the direction every unknown here takes, but it would be refusing a
+/// merge this build's own review driver had already reported satisfied.
 pub fn verdict_file_text(v: &ReviewVerdict) -> String {
+    let digest = sanitize_digest(&v.body_digest);
+    // The marker is meaningless without a digest to qualify it: what it says is
+    // "the body THIS digest names was verified", and there is no such body when
+    // the read failed. Dropped here rather than judged downstream, so the
+    // parser's digest-first guard never has to decide about a bare marker.
+    let mark = if v.verified_body && !digest.is_empty() {
+        format!(" {VERIFIED_BODY_MARK}")
+    } else {
+        String::new()
+    };
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}{}\n{}\n",
         v.verdict.as_str(),
         sanitize_sha(&v.head),
         v.ts_ms,
         v.agent_id,
-        sanitize_digest(&v.body_digest),
+        digest,
+        mark,
         sanitize_summary(&v.summary)
     )
 }
@@ -3540,10 +3660,19 @@ pub fn verdict_file_text(v: &ReviewVerdict) -> String {
 /// #565 has the first line of its summary there, and swallowing it would mangle
 /// durable prose a human reads. So a line 5 that is not a valid digest is handed
 /// back to the summary, and the digest reads empty — *unknown*. The shim is
-/// stricter (it takes line 5 as-is and refuses anything that isn't 64 hex), and
-/// the two still agree on the only thing a gate decides: no readable digest means
-/// the body cannot be shown unchanged, so `body-unchanged` refuses. The
-/// divergence is confined to which text is displayed as the summary.
+/// stricter (it takes line 5's first field as-is and refuses anything that isn't
+/// 64 hex), and the two still agree on the only thing a gate decides: no readable
+/// digest means the body cannot be shown unchanged, so `body-unchanged` refuses.
+/// The divergence is confined to which text is displayed as the summary.
+///
+/// Line 5 may carry [`VERIFIED_BODY_MARK`] after the digest (#2168 E2), and the
+/// split is **shape-checked, not whitespace-split**: the line is read as
+/// `<digest> verified-body` only when the tail is exactly that word. A legacy
+/// line 5 that happens to hold two words therefore parses exactly as it did
+/// before — the whole line is offered to `sanitize_digest`, which refuses it,
+/// and it stays in the summary. Splitting on the first space unconditionally
+/// would have changed how a pre-#565 file reads, which is durable prose a human
+/// wrote.
 pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerdict> {
     let mut lines = text.lines();
     let verdict = Verdict::parse(lines.next()?)?;
@@ -3551,7 +3680,17 @@ pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerd
     let ts_ms = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
     let agent_id = lines.next().unwrap_or("").trim().to_string();
     let rest: Vec<&str> = lines.collect();
-    let body_digest = rest.first().map(|l| sanitize_digest(l)).unwrap_or_default();
+    let line5 = rest.first().copied().unwrap_or("");
+    let (digest_field, marked) = match line5.trim_end().rsplit_once(' ') {
+        Some((d, mark)) if mark == VERIFIED_BODY_MARK => (d, true),
+        _ => (line5, false),
+    };
+    let body_digest = sanitize_digest(digest_field);
+    // The marker only ever qualifies a digest this build could read. A line that
+    // ends in the word but whose leading field is not a digest is not a
+    // verification of anything — the same "unknown is never unbound, therefore
+    // fine" the empty-digest case takes, one field over.
+    let verified_body = marked && !body_digest.is_empty();
     let from = usize::from(!body_digest.is_empty());
     let summary = rest[from.min(rest.len())..].join("\n");
     Some(ReviewVerdict {
@@ -3561,6 +3700,7 @@ pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerd
         verdict,
         head,
         body_digest,
+        verified_body,
         summary: sanitize_summary(&summary),
         ts_ms,
     })

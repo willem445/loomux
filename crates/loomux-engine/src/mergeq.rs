@@ -919,11 +919,58 @@ pub fn recheck_gate(
     GateRecheck::Ok
 }
 
+/// Whether one of the gate's **required** reviewers has recorded a
+/// body-verification pass covering the body as it stands (#2168 E2) — the one
+/// definition, asked here of the routed reviewer list.
+///
+/// Public because the review driver asks the same question before it decides
+/// whether to re-brief a lane, and §4 of `doc/design/review-driver.md` makes
+/// the driver a *reader* of the gate rather than a third implementation of it.
+/// If these two ever answered differently, a drive would report `satisfied` on
+/// a merge the shim then refuses — the exact failure the one-gate-decision rule
+/// exists to prevent.
+pub fn body_verified_by_required(
+    gate: &Gate,
+    verdicts: &BTreeMap<BlockId, ReviewVerdict>,
+    head: &str,
+    now: Option<&str>,
+) -> bool {
+    crate::workflow::body_verified(
+        gate.reviewers.iter().filter_map(|r| verdicts.get(r)),
+        head,
+        now,
+    )
+}
+
 /// The `body-unchanged` clause (#565), mirroring the shim's loop: for every
 /// reviewer the gate names, a verdict that is a **live pass** (the word `pass`,
 /// recorded against the head that would merge) must carry the digest of the
 /// body as it stands now. A pass the threshold does not need is still checked —
 /// "this reviewer approved a different commit message" is true either way.
+///
+/// **One delegation, and it is narrow on purpose (#2168 E2).** Where a required
+/// reviewer's live pass is a *body verification* — the review driver briefed
+/// that lane precisely because every required lane had already passed the code
+/// at this head and only the body had moved — the passes it supersedes are
+/// accepted at their own digest. What the clause then asserts is still a
+/// statement about the bytes that would be committed: **a required reviewer
+/// read the body as it stands and passed it, and every other pass is bound to
+/// the same head, so the code they approved has not moved since.** What it no
+/// longer asserts is that every one of them read this body.
+///
+/// The alternative was the five-lane re-record cascade #2168 measured (five
+/// other-lane re-records at one head on #1764, three on #1751): every reviewer
+/// re-reading a diff it had already passed so that a digest would match. The
+/// two rejected shapes are worth naming, because both are wider than this one:
+/// excluding part of the body from the digest (#1875 shape 1) lets exactly the
+/// class #2168 is about through unreviewed, and "any newer pass carries the
+/// current digest" would weaken the clause for every repo, including one that
+/// runs no driver at all.
+///
+/// The narrowing is carried by [`ReviewVerdict::verified_body`], which only the
+/// tool writes and only for a lane the driver briefed as a verification delta.
+/// A hand-recorded verdict never carries it, so an undriven repo sees this
+/// clause exactly as it was.
 fn body_unchanged(
     gate: &Gate,
     verdicts: &BTreeMap<BlockId, ReviewVerdict>,
@@ -933,6 +980,7 @@ fn body_unchanged(
     let (Some(head), Some(now)) = (head, now.filter(|d| !d.is_empty())) else {
         return Some(ConditionRefusal::BodyUnknown);
     };
+    let verified = body_verified_by_required(gate, verdicts, head, Some(now));
     let mut bad: Vec<BlockId> = Vec::new();
     for r in &gate.reviewers {
         let Some(v) = verdicts.get(r) else { continue };
@@ -941,8 +989,10 @@ fn body_unchanged(
         }
         // An absent digest (a verdict recorded before #565, or one whose body
         // gh could not read) reads as EMPTY, which equals no digest and so
-        // refuses.
-        if v.body_digest != now {
+        // refuses — and `pass_covers_body` refuses it under the delegation too,
+        // because a pass that cannot say which body it read is not a pass the
+        // verification lane can be said to have superseded.
+        if !v.pass_covers_body(head, Some(now), verified) {
             bad.push(r.clone());
         }
     }
@@ -1297,10 +1347,18 @@ mod tests {
                 verdict: v,
                 head: head.into(),
                 body_digest: body.to_string(),
+                verified_body: false,
                 summary: String::new(),
                 ts_ms: 0,
             },
         )
+    }
+
+    /// [`verdict`] marked as the driver's body-verification delta (#2168 E2).
+    fn verify_verdict(block: &str, head: &str, body: &str) -> (BlockId, ReviewVerdict) {
+        let (b, mut v) = verdict(block, Verdict::Pass, head, body);
+        v.verified_body = true;
+        (b, v)
     }
 
     fn observed(ci: Option<bool>, body: Option<&str>) -> PrObservation {

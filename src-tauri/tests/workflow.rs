@@ -6964,6 +6964,7 @@ fn verdicts(
                     verdict: *v,
                     head: head.to_string(),
                     body_digest: String::new(),
+                    verified_body: false,
                     summary: "…".into(),
                     ts_ms: 1,
                 },
@@ -7354,6 +7355,7 @@ fn verdict_file_round_trips_with_its_attribution() {
         verdict: workflow::Verdict::Fail,
         head: "a3f9c21".into(),
         body_digest: workflow::body_digest("## What\n\nA fix.\n"),
+        verified_body: false,
         summary: "release-gate bypass:\n  gh api can create a v* tag ref".into(),
         ts_ms: 1_720_000_000_000,
     };

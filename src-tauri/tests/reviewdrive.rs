@@ -100,6 +100,7 @@ fn lane_fact(block: &str, v: Option<Verdict>, at_head: &str, digest: &str) -> La
             verdict,
             head: at_head.to_string(),
             body_digest: digest.to_string(),
+            verified_body: false,
             summary: String::new(),
             ts_ms: 0,
         }),
@@ -3553,8 +3554,8 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
     let entry_with = |rec: Rec| {
         let mut e = entry_at(DriveState::ReviewWait);
         e.head = HEAD_A.into();
-        e.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
-        e.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
+        e.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0, false);
+        e.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0, false);
         for l in e.lanes.iter_mut() {
             match rec {
                 Rec::Blank => l.briefed_head.clear(),
@@ -3582,7 +3583,7 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
         // its record is in exactly the same state as lane 1's.
         assert_eq!(
             reviewdrive::decide(&e, &facts_with(HEAD_A), &limits),
-            DriveStep::OpenLane { index: 1 },
+            DriveStep::OpenLane { index: 1, verify: false },
             "{rec:?} records: a lane whose pass stands must never be re-opened. Both records \
              are identical here, so a selection rule reading the RECORD rather than the \
              verdict picks lane 0 — which is what turns #1841's all-lanes clear into a \
@@ -3594,7 +3595,7 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
         // that always answered `index: 1` would satisfy every assertion above.
         assert_eq!(
             reviewdrive::decide(&e, &facts_with(HEAD_B), &limits),
-            DriveStep::OpenLane { index: 0 },
+            DriveStep::OpenLane { index: 0, verify: false },
             "{rec:?} records: a lane whose pass no longer stands IS the deciding lane — so \
              the assertion above is the verdict deciding, not a constant"
         );
@@ -3610,8 +3611,8 @@ fn the_deciding_lane_is_verdict_selected_which_is_what_makes_the_all_lanes_clear
     // it into the crossings above would have put a row there that cannot fail.
     let mut open = entry_at(DriveState::ReviewWait);
     open.head = HEAD_A.into();
-    open.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0);
-    open.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0);
+    open.open_lane("rev-std", "s0", "rev-1", HEAD_A, Some("d1"), 0, false);
+    open.open_lane("rev-final", "s1", "rev-2", HEAD_A, Some("d1"), 0, false);
     assert_eq!(
         reviewdrive::decide(&open, &facts_with(HEAD_A), &limits),
         DriveStep::Wait,
