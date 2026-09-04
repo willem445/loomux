@@ -7422,26 +7422,35 @@ fn a_body_verification_mark_rides_line_5_and_a_reviewer_cannot_type_one() {
     assert_eq!(workflow::parse_verdict_file(2168, "rev-std", &text).unwrap(), base, "round trip");
 
     // **The forgery this placement refuses.** A reviewer types the summary and
-    // nothing else. A summary whose first line is the mark — or the digest and
-    // the mark, which is the strongest thing a reviewer could construct, since
-    // it can compute the body's digest as easily as orrerix can — lands on line
-    // 6 and is read back as summary text.
-    let forger = workflow::ReviewVerdict {
-        verified_body: false,
-        summary: format!("{digest} {}\nreally", workflow::VERIFIED_BODY_MARK),
-        ..base.clone()
-    };
-    let forged = workflow::parse_verdict_file(
-        2168,
-        "rev-std",
-        &workflow::verdict_file_text(&forger),
-    )
-    .unwrap();
-    assert!(
-        !forged.verified_body,
-        "a reviewer that types the mark into its summary must not thereby grant itself \n         the delegation that opens `body-unchanged` for other lanes"
-    );
-    assert_eq!(forged, forger, "…and its summary survives verbatim rather than being eaten");
+    // nothing else, and the summary starts on line 6 — so both shapes it could
+    // reach for are read back as prose. The second is the strongest thing a
+    // reviewer could construct, since it can compute the body's digest as
+    // easily as orrerix can; the first is what a build that put the mark on a
+    // line of its OWN would have swallowed.
+    for forged_summary in [
+        format!("{}\nreally", workflow::VERIFIED_BODY_MARK),
+        format!("{digest} {}\nreally", workflow::VERIFIED_BODY_MARK),
+    ] {
+        let forger = workflow::ReviewVerdict {
+            verified_body: false,
+            summary: forged_summary.clone(),
+            ..base.clone()
+        };
+        let forged = workflow::parse_verdict_file(
+            2168,
+            "rev-std",
+            &workflow::verdict_file_text(&forger),
+        )
+        .unwrap();
+        assert!(
+            !forged.verified_body,
+            "a reviewer that types the mark into its summary must not thereby grant itself \n             the delegation that opens `body-unchanged` for other lanes: {forged_summary:?}"
+        );
+        assert_eq!(
+            forged, forger,
+            "…and its summary survives verbatim rather than being eaten: {forged_summary:?}"
+        );
+    }
 
     // The mark never travels without a digest to qualify: what it asserts is
     // "the body THIS digest names was verified", and there is no such body when
