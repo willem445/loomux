@@ -141,10 +141,19 @@ pub const DISMISS_REASON_MAX: usize = 500;
 
 /// Total cap on the composed `[orrerix] question q-N dismissed …` notice.
 ///
-/// Narrower than [`ANSWER_NOTICE_CAP`] because the payload is narrower
-/// ([`DISMISS_REASON_MAX`]), and wide enough that the fixed clause — the part
-/// that says this was not an answer — plus a full-length reason both fit, so
-/// the cap can only ever trim a reason's tail.
+/// **A backstop on the whole line, not the active limiter** — the same
+/// relationship [`ANSWER_NOTICE_CAP`] (2400) has to [`ANSWER_TEXT_MAX`]
+/// (2000). The reason is already bounded by [`DISMISS_REASON_MAX`] inside
+/// [`dismiss_notice`]'s `sanitize_gh_text` call, so the longest line that
+/// function can compose — the fixed clause plus a full-length reason — is
+/// comfortably under this, and in practice this `take` cuts nothing.
+///
+/// It is kept anyway, because a cap on what enters a pane should not depend on
+/// every future edit to the clause above it staying short. That it cannot bite
+/// TODAY is a residual, and it is pinned as one rather than left to be
+/// rediscovered: `the_dismiss_notice_says_not_an_answer_before_it_says_anything_untrusted`
+/// asserts the arithmetic, so growing the clause past the slack reddens a test
+/// with a sentence instead of quietly making this the limiter.
 pub const DISMISS_NOTICE_CAP: usize = 900;
 
 /// Total cap on the composed `[orrerix] answer to q-N …` notice.
@@ -692,10 +701,15 @@ pub fn validate_dismiss_reason(reason: Option<&str>) -> Result<Option<String>, S
 /// point of the shape.** The orchestrator's one dangerous misreading is to
 /// treat this as an answer and act on a decision nobody made, so the words
 /// that rule that out — *not an answer*, *nothing was decided* — are
-/// loomux-built, sit ahead of the payload, and are therefore the part
-/// [`DISMISS_NOTICE_CAP`] can never trim. The reason is last, so a long one
-/// loses its own tail rather than the sentence that gives it its meaning.
-/// [`answer_notice`] orders itself the same way for the same reason.
+/// loomux-built and sit ahead of the payload, so no cap on this line can reach
+/// them. The reason is last and is bounded by [`DISMISS_REASON_MAX`] in the
+/// `sanitize_gh_text` call below, so an over-long one loses its own tail rather
+/// than the sentence that gives it its meaning. [`answer_notice`] orders itself
+/// the same way for the same reason.
+///
+/// [`DISMISS_NOTICE_CAP`] on the composed result is a second, outer bound that
+/// today cuts nothing — see that constant for why it is kept and where the
+/// residual is pinned.
 ///
 /// **`reason` is untrusted text entering an `[orrerix]` line.** A human typed
 /// it rather than an agent, but the pane cannot tell those apart and a newline
