@@ -913,7 +913,7 @@ fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIn
         // Without this arm the `_` fallback below would answer for pi —
         // emitting `claude --resume <id>`, i.e. the WRONG CLI handed an id
         // belonging to another vendor's store.
-        "pi" => format!("pi --session {session_id}"),
+
         _ => {
             let base = format!("claude --resume {session_id}");
             if claude_posture_in(store, session_id) == Some(true) {
