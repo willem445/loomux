@@ -148,12 +148,22 @@ export class SessionBrowser {
       this.render();
     });
 
-    // Fixed-width inner column so content doesn't squash while the
-    // sidebar's width animates open/closed.
-    const inner = document.createElement("div");
-    inner.className = "sessions-inner";
-    inner.append(head, this.searchEl, this.modeEl, this.orchEl, this.listEl, this.toggleEl);
-    this.el.appendChild(inner);
+    // The panel's fixed-width inner column belongs to `leftpanel.ts` as of
+    // #2122 slice B: this class is handed a BODY inside it and appends its own
+    // content there. It used to build `.sessions-inner` itself, which is what
+    // made the browser and the panel one thing — they are two now, and only
+    // the panel's own open/close moves a column (CLAUDE.md constraint 1).
+    //
+    // `modeEl` keeps #2116's position in this list (right after the search
+    // box): that slice augmented the append this slice replaced, and the mode
+    // control has to stay mounted wherever the column is built.
+    this.el.append(head, this.searchEl, this.modeEl, this.orchEl, this.listEl, this.toggleEl);
+  }
+
+  /** Put the cursor in the filter box. The panel calls this when the Sessions
+   *  tab becomes the visible one — the moment the old `toggle()` did it. */
+  focusSearch(): void {
+    this.searchEl.focus();
   }
 
   /** One tab of the mode control. A `<button role="tab">` with `aria-selected`,
@@ -172,17 +182,15 @@ export class SessionBrowser {
   }
 
   /** Switch the view. Nothing here touches the panel's WIDTH: the mode control
-   *  lives inside `.sessions-inner`, which is a fixed-width column, so a click
-   *  moves no layout column and reaches no PTY resize (hard constraint 1). */
+   *  sits inside `.sessions-inner`, a fixed-width column — built by
+   *  `leftpanel.ts` since #2122 slice B, which is also what makes the Sessions
+   *  and Agents TABS free of any width change — so a click here moves no layout
+   *  column and reaches no PTY resize (hard constraint 1). */
   private setMode(mode: SessionMode): void {
     if (this.mode === mode) return;
     this.mode = mode;
     localStorage.setItem(MODE_KEY, mode);
     this.render();
-  }
-
-  get visible(): boolean {
-    return !this.el.classList.contains("hidden");
   }
 
   /** The last-fetched session list, without triggering a scan (#440). The
@@ -208,18 +216,6 @@ export class SessionBrowser {
    *  doc/design/session-index.md). */
   ensureLoaded(): Promise<readonly SessionInfo[]> {
     return this.store.ensureLoaded();
-  }
-
-  toggle(): void {
-    this.el.classList.toggle("hidden");
-    if (this.visible) {
-      void this.refresh();
-      this.searchEl.focus();
-    }
-  }
-
-  hide(): void {
-    this.el.classList.add("hidden");
   }
 
   /** Orchestration identity for a session, merging the durable roster with

@@ -12,7 +12,7 @@ import { safeStyleDeclarations, compositeScale, type PreviewNode, type PreviewFi
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
-import { pauseGroup, resumeGroup, stripView } from "./orchestration";
+import { pauseGroup, resumeGroup, stripView, type StripViewPayload } from "./orchestration";
 import {
   recordSweepFailure,
   recordSweepSuccess,
@@ -113,6 +113,13 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
    *  see `wireDrag`) can tell a drag is in progress without threading a
    *  reference through every tab element. */
   private draggingId: string | null = null;
+
+  /** Who else wants each strip read (#2122 slice B). The strip poll is the
+   *  app's ONE read of `orch_strip_view` (doc/design/polled-views.md: one read
+   *  per strip), so a second consumer subscribes to what this one already
+   *  fetched rather than issuing a poll of its own — the Agents tab needs the
+   *  roster's `idle_since_ms` and that is the only place it arrives. */
+  private stripListeners: ((strip: StripViewPayload) => void)[] = [];
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
@@ -558,6 +565,14 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     status.title = `${status.title} — ${this.stripStale.label} ${this.stripStale.detail}`;
   }
 
+  /** Be told about every strip read that RESOLVED. Not called on a tick the
+   *  backend refused: a failed read leaves every subscriber's previous
+   *  reading in place, which is the same stale-but-true rule the badges
+   *  themselves follow, rather than handing out a fabricated empty roster. */
+  onStrip(cb: (strip: StripViewPayload) => void): void {
+    this.stripListeners.push(cb);
+  }
+
   /** Poll each group-bound tab for its live status; re-render if anything
    *  moved. Single-flighted through `statusFlight` (#1602): a tick that
    *  fires while the previous sweep hasn't settled skips rather than issuing
@@ -661,6 +676,10 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     }
     recordSweepSuccess(boundIds, seenIds, stale.stale, strip.meta.age_ms);
     if (changed) this.render();
+    // LAST, deliberately: the strip's own bookkeeping and render are already
+    // done, so a subscriber that throws cannot cost this sweep its witness or
+    // leave the badges unpainted.
+    for (const cb of this.stripListeners) cb(strip);
   }
 
   /** Inline rename, mirroring the pane title rename (makeRenameCommit +

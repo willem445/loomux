@@ -311,6 +311,18 @@ html, body {
   background: var(--surface-1); cursor: default;
 }
 .bar-btn:disabled:active { transform: none; }
+/* #2122: the needs-you count on a top-bar button. A --state-* token is right
+   here because the number's POSITION is a state one — it counts the two ladder
+   states a PERSON must act on, and nothing else. Hidden rather than rendered
+   as "0" when nothing is waiting: a zero badge is a mark that means nothing,
+   which reads worse than no mark at all. */
+.bar-btn-badge {
+  display: inline-block; margin-left: 6px; min-width: 15px; padding: 0 4px;
+  border-radius: 7px; font-size: 10px; font-weight: 700; line-height: 15px;
+  text-align: center;
+  background: color-mix(in srgb, var(--state-attention) 22%, transparent);
+  color: var(--state-attention);
+}
 
 /* ---------- workspace ---------- */
 #workspace { display: flex; flex: 1; min-height: 0; }
@@ -1536,6 +1548,132 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .sessions-delegate-toggle:hover { color: var(--ink); border-color: var(--ink-dim); }
 .sessions-delegate-toggle.hidden { display: none; }
+
+/* ---------- #2122: the left panel's two tabs ----------
+   NOTHING ABOVE THIS POINT MOVED. `#sessions`, its 344px width, its 240ms
+   width transition and its `.hidden` rule are exactly what they were —
+   `test/resizeburst.test.ts` reads that transition off this stylesheet to
+   derive the app's frame budget, and the panel's open/close is still the one
+   discrete human click CLAUDE.md constraint 1 sanctions. Everything here sits
+   INSIDE `.sessions-inner`, which is already a fixed-width flex column, so a
+   tab switch changes no width and triggers no fit. */
+.leftpanel-tabs {
+  flex: none; display: flex; gap: 2px;
+  padding: 10px 12px 0; border-bottom: 1px solid var(--line);
+}
+.leftpanel-tab {
+  flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 8px; margin-bottom: -1px;
+  background: none; border: 1px solid transparent; border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  color: var(--ink-dim); font: inherit; font-size: 11.5px; cursor: pointer;
+  transition: color 0.14s var(--ease), background 0.14s var(--ease);
+}
+.leftpanel-tab:hover { color: var(--ink); background: var(--surface-2); }
+/* The selected tab is marked on the INTERACTION channel (`--accent`): "the one
+   you picked" is not an agent state, and dyeing it with a --state-* token
+   would put a state hue on a control (styles.css's channel note). */
+.leftpanel-tab.active {
+  color: var(--ink); background: var(--surface-0);
+  border-color: var(--line); border-bottom-color: var(--surface-0);
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+.leftpanel-tab-badge {
+  min-width: 15px; padding: 0 4px; border-radius: 7px;
+  font-size: 10px; font-weight: 700; line-height: 15px; text-align: center;
+  background: color-mix(in srgb, var(--state-attention) 22%, transparent);
+  color: var(--state-attention);
+}
+/* Each tab's body fills the column below the tablist. `[hidden]` is set by
+   leftpanel.ts and needs `display: none` to win against the flex display
+   below it. */
+.leftpanel-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.leftpanel-body[hidden] { display: none; }
+
+/* ---------- #2122: the Agents view ---------- */
+.agents-chips {
+  flex: none; display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 12px 10px;
+}
+.agents-chip {
+  padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px;
+  background: none; color: var(--ink-dim); font: inherit; font-size: 10.5px;
+  cursor: pointer; white-space: nowrap;
+}
+.agents-chip:hover { color: var(--ink); border-color: var(--line-strong); }
+.agents-chip.active {
+  color: var(--ink); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.agents-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
+.agents-list::-webkit-scrollbar { width: 9px; }
+.agents-list::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 5px;
+  border: 2px solid var(--surface-1); background-clip: padding-box;
+}
+.agents-item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: 1px solid transparent; border-radius: 9px;
+  border-left-width: 2px;
+  padding: 7px 10px; margin-bottom: 3px; cursor: pointer;
+  color: var(--ink); font: inherit;
+  transition: background 0.14s var(--ease), border-color 0.14s var(--ease);
+}
+.agents-item:hover { background: var(--surface-2); border-color: var(--line); }
+.agents-top { display: flex; align-items: center; gap: 8px; }
+.agents-name {
+  flex: 1; min-width: 0; font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.agents-state {
+  flex: none; display: flex; align-items: center; gap: 4px;
+  font-size: 10.5px; letter-spacing: 0.3px; color: var(--ink-dim);
+}
+.agents-identity {
+  margin-top: 2px; font-size: 11px; color: var(--ink-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.agents-identity:empty { display: none; }
+/* THE STATE POSITION. The left edge of a row and its state cell are the two
+   places a --state-* token belongs (styles.css's channel-1 note): they report
+   what an agent IS DOING, which is exactly the question that channel answers.
+   `held` and `idle` are achromatic by design — a stopped agent carries no dye
+   — so those rows are separated by their WORD and their edge, not by a hue. */
+.agents-item.state-working { border-left-color: var(--state-working); }
+.agents-item.state-working .agents-state { color: var(--state-working); }
+.agents-item.state-attention { border-left-color: var(--state-danger); }
+.agents-item.state-attention .agents-state { color: var(--state-danger); }
+.agents-item.state-question { border-left-color: var(--state-attention); }
+.agents-item.state-question .agents-state { color: var(--state-attention); }
+.agents-item.state-turn-done { border-left-color: var(--state-ok); }
+.agents-item.state-turn-done .agents-state { color: var(--state-ok); }
+.agents-item.state-held { border-left-color: var(--state-held); }
+.agents-item.state-idle { border-left-color: var(--state-idle); }
+.agents-item.state-dormant { border-left-color: var(--state-idle); }
+.agents-item.state-dead { border-left-color: var(--state-idle); }
+.agents-item.state-dead .agents-name { color: var(--ink-faint); }
+
+/* ---------- #2122: the working spinner ----------
+   A sprite, not a per-frame DOM swap: `spinner.ts` emits ONE <svg> whose inner
+   strip is SPINNER_FRAMES cells wide, and this walks it one cell per step. The
+   window is one cell (the viewBox), so the numbers below are the sprite's own
+   arithmetic and `test/spinner.test.ts` pins them from the other side: 8
+   frames, 5 units per cell, 40 units of strip. Change one and change both.
+   `transform` on a <g> is compositor work; nothing here touches the DOM per
+   frame, which is what the issue asks for in as many words. */
+.pixel-spinner { flex: none; display: block; overflow: hidden; }
+.pixel-spinner-strip {
+  animation: pixel-spin 0.72s steps(8, jump-end) infinite;
+}
+@keyframes pixel-spin {
+  from { transform: translateX(0); }
+  to { transform: translateX(-40px); }
+}
+/* Reduced motion stops it dead on frame 0 (#2122's own acceptance criterion).
+   The row's state WORD is what carries the meaning either way, which is why
+   the word is not optional next to the glyph. */
+@media (prefers-reduced-motion: reduce) {
+  .pixel-spinner-strip { animation: none; }
+}
 
 /* ---------- #1563: the Orchestrations section, above the session list ----------
    Deliberately not a `.session-item`: these rows are GROUPS, not sessions, and
