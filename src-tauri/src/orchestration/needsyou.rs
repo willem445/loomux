@@ -119,7 +119,12 @@ pub const RESOLUTION_TEXT_MAX: usize = 2000;
 pub const DISMISS_REASON_MAX: usize = super::humanq::DISMISS_REASON_MAX;
 
 /// Total cap on the composed `[orrerix] … dismissed …` notice (#2137).
-/// [`RESOLVE_NOTICE_CAP`]'s role for the narrower payload above.
+///
+/// [`RESOLVE_NOTICE_CAP`]'s role for the narrower payload above, and — like
+/// [`super::humanq::DISMISS_NOTICE_CAP`] — a backstop rather than the active
+/// limiter: the reason is already bounded by [`DISMISS_REASON_MAX`] where it is
+/// sanitized, so the longest line [`dismiss_notice`] can compose is under this
+/// and the `take` cuts nothing today.
 pub const DISMISS_NOTICE_CAP: usize = 900;
 
 /// A board task's title is not written for this file, so it is cut to something
@@ -562,7 +567,8 @@ pub fn validate_dismiss_reason(reason: Option<&str>) -> Result<Option<String>, S
 /// **The fixed clause precedes the reason** for
 /// [`humanq::dismiss_notice`](super::humanq::dismiss_notice)'s reason: the
 /// words that stop this being read as "the human looked and approved" are
-/// loomux-built, so [`DISMISS_NOTICE_CAP`] can only trim a reason's tail.
+/// loomux-built, so no cap on this line can reach them; an over-long reason
+/// loses its own tail where it is sanitized, at [`DISMISS_REASON_MAX`].
 /// Both `reason` and `task` are untrusted text entering an `[orrerix]` line —
 /// the task ref is raiser-controlled and nothing validates it — so both go
 /// through `sanitize_gh_text`.

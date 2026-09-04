@@ -54354,7 +54354,7 @@ fn the_dismiss_notice_says_not_an_answer_before_it_says_anything_untrusted() {
     assert!(short.contains("nothing was decided"), "…and spelled out: {short:?}");
     assert!(
         short.ends_with("— reason: we shipped the other one"),
-        "the reason is last, where the cap can only trim its tail: {short:?}"
+        "the reason is last, where a trim can only take its tail: {short:?}"
     );
 
     // A reason-less dismissal omits the clause ENTIRELY rather than emitting an
@@ -54367,20 +54367,56 @@ fn the_dismiss_notice_says_not_an_answer_before_it_says_anything_untrusted() {
     // the notice must not depend on that having happened.
     assert_eq!(humanq::dismiss_notice("q-7", "webview", Some("   ")), bare);
 
-    // The cap trims the REASON, never the clause. `+ 400` so the composed line
-    // is comfortably past DISMISS_NOTICE_CAP whatever the fixed clause's exact
-    // length is — the assertion is about which END gets cut, not about a
-    // character budget the prose could legitimately move.
+    // An over-long reason loses its own TAIL and the clause survives whole —
+    // which is the entire point of emitting the clause first.
+    //
+    // **The reason is trimmed at `DISMISS_REASON_MAX`, not at
+    // `DISMISS_NOTICE_CAP`**, because `sanitize_gh_text` bounds it before it is
+    // composed. So the notice cap is a backstop on the WHOLE line rather than
+    // the active limiter, exactly as `ANSWER_NOTICE_CAP` (2400) is to
+    // `ANSWER_TEXT_MAX` (2000) beside it. An earlier draft of this test
+    // asserted the output was exactly `DISMISS_NOTICE_CAP` long and went red on
+    // all three platforms at 757: worth recording, because that number IS the
+    // property below, and reading it off the failure rather than deriving it is
+    // how a magic constant gets pinned by accident.
     let long = "x".repeat(humanq::DISMISS_REASON_MAX + 400);
     let capped = humanq::dismiss_notice("q-7", "webview", Some(&long));
+    // Split on the marker, NOT on the reason's own filler character: the fixed
+    // clause opens `[orrerix]`, so a `skip_while(|c| *c != 'x')` finds its first
+    // 'x' inside the attribution and measures the whole line.
+    let tail = capped.rsplit_once(" — reason: ").expect("the reason clause is present").1;
     assert_eq!(
-        capped.chars().count(),
-        humanq::DISMISS_NOTICE_CAP,
-        "an over-long reason is trimmed to the cap: {capped:?}"
+        tail.chars().count(),
+        humanq::DISMISS_REASON_MAX,
+        "the reason's own tail is what gets cut, at its own cap: {capped:?}"
     );
     assert!(
         capped.contains("NOT AN ANSWER") && capped.contains("nothing was decided"),
         "the clause survives the trim — that is what the ordering buys: {capped:?}"
+    );
+    assert!(
+        capped.chars().count() <= humanq::DISMISS_NOTICE_CAP,
+        "the whole line stays inside the notice cap: {}",
+        capped.chars().count()
+    );
+
+    // **The residual, pinned rather than asserted away.** `DISMISS_NOTICE_CAP`
+    // cannot bite today: the longest line this function can compose is the
+    // fixed clause plus a reason already bounded by `DISMISS_REASON_MAX`, and
+    // that sum is under it. A cap nobody can reach is a cap nobody has tested,
+    // so the arithmetic that makes it unreachable is the thing pinned — grow
+    // the clause past the slack and THIS reddens, with a sentence, rather than
+    // the notice quietly starting to truncate a human's reason from the tail
+    // for a second reason nobody wrote down.
+    let clause_len = humanq::dismiss_notice("q-7", "webview", None).chars().count();
+    let longest_possible = clause_len + " — reason: ".chars().count() + humanq::DISMISS_REASON_MAX;
+    assert!(
+        longest_possible <= humanq::DISMISS_NOTICE_CAP,
+        "the fixed clause has outgrown the notice cap's slack: {clause_len} + reason \
+         {} > {} — either shorten the clause or raise DISMISS_NOTICE_CAP, but do not let the \
+         outer cap silently become the limiter",
+        humanq::DISMISS_REASON_MAX,
+        humanq::DISMISS_NOTICE_CAP
     );
 
     // Untrusted text cannot forge a second `[orrerix]` line, exactly as an
@@ -54573,9 +54609,13 @@ fn a_dismissed_question_reads_back_through_list_questions_after_a_restart() {
     reg.dismiss_question(&g, "q-1", Some("moot now"), humanq::DismissSource::Webview).unwrap();
 
     // A fresh registry over the same state root: nothing in memory carries
-    // over. `relaunch_registry`, never a raw `OrchRegistry::new` — #464.
+    // over. `relaunch_WITH_GROUP`, not the bare relaunch: the MCP half below
+    // spawns an agent, and `spawn_agent` on a registry that has not resumed the
+    // group answers "unknown group" — a panic BEFORE the assertions, which
+    // would have evidenced nothing about either half (caught on all three
+    // platforms, run 33821135371).
     drop(reg);
-    let reg2 = relaunch_registry(dir.path());
+    let reg2 = relaunch_with_group(&dir, &g);
     let (rows, omitted) = reg2.question_list(&g).expect("questions.json re-reads");
     assert_eq!(omitted, 0);
     assert_eq!(rows.len(), 1);

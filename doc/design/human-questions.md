@@ -315,10 +315,22 @@ need the decision. — reason: <reason>
 
 **The fixed clause precedes the reason, and that ordering is the point.** The
 orchestrator's one dangerous misreading is to treat this as an answer, so the
-words that rule it out are loomux-built, sit ahead of the payload, and are
-therefore the part the 900-character cap can never trim. A long reason loses
-its own tail instead of the sentence that gives it its meaning — the same rule
-the answer notice follows for its attribution. The reason is untrusted text
+words that rule it out are loomux-built and sit ahead of the payload, where no
+cap on the line can reach them. A long reason loses its own tail instead of the
+sentence that gives it its meaning — the same rule the answer notice follows
+for its attribution.
+
+**Two bounds, and only the inner one bites.** The reason is cut to
+`DISMISS_REASON_MAX` (500) where it is sanitized, before composition; the
+900-character `DISMISS_NOTICE_CAP` on the finished line is an outer backstop
+that today cuts nothing, exactly as `ANSWER_NOTICE_CAP` (2400) sits outside
+`ANSWER_TEXT_MAX` (2000). That it cannot bite is a *residual*, so it is pinned
+as one — the test asserts the arithmetic that keeps it unreachable, and growing
+the clause past that slack reddens a test rather than silently promoting the
+outer cap to the limiter. The first draft of this feature asserted the notice
+was exactly 900 characters long and went red at 757 on all three platforms
+(run 33821135371); the number was a fact about the inner bound, not the outer
+one, and the distinction is why both are written down here. The reason is untrusted text
 entering an `[orrerix]` line and goes through `sanitize_gh_text` like every
 other notice field; with no reason the trailing clause is omitted entirely,
 because `— reason:` with nothing after it reads like a truncation the
