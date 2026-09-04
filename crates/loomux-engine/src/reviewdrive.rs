@@ -4319,6 +4319,45 @@ mod tests {
         assert_eq!(e.lanes[0].spawned_ms, 0);
         assert_eq!(e.lanes[0].briefed_head, "");
         assert_eq!(e.lanes[0].briefed_digest, "");
+        // #2168 E1's, and its default is load-bearing in the same way: an entry
+        // written before the field existed must read as a head this drive did
+        // NOT hand back for.
+        assert!(!e.fix_pushed);
+    }
+
+    /// **An entry written before `fix_pushed` existed degrades toward the
+    /// pre-#2168 behaviour, never toward a false park** (#2168 E1).
+    ///
+    /// `serde(default)` gives `false`, and which way that falls is the whole
+    /// question: `false` means such a drive advances on green alone and pays at
+    /// most the one re-record round it was already going to pay, while `true`
+    /// would hold it in `ci-wait` waiting for a `report(done)` its worker was
+    /// never asked for and park it `fix-stalled` an hour later. The default is
+    /// asserted through `decide` rather than off the field, because the field's
+    /// value is not the promise — what the drive DOES with it is.
+    #[test]
+    fn an_entry_from_before_the_field_advances_on_green_as_it_used_to() {
+        let limits = DriveLimits::default();
+        let old = parse_state(NOTE_EXAMPLE).unwrap();
+        let mut e = old.entry(1758).unwrap().clone();
+        // Walk it to `ci-wait` the way arc 6 does, so the state is one the
+        // machine really reaches and `fix_pushed` is whatever the arc leaves.
+        e.advance(DriveState::CiWait, None, None, 1_000).unwrap();
+        assert!(!e.fix_pushed, "the pre-state: nothing in the older file said otherwise");
+        assert_eq!(
+            decide(
+                &e,
+                &DriveFacts {
+                    ci: CiObservation::Green,
+                    worker: WorkerSignal::Silent,
+                    ..facts_at("head-a")
+                },
+                &limits,
+            ),
+            DriveStep::to(DriveState::ReviewWait),
+            "an upgrade mid-drive must not strand the drive on a signal nobody asked \
+             its worker for"
+        );
     }
 
     #[test]
