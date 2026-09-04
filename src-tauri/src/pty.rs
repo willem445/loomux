@@ -329,18 +329,7 @@ impl PtyManager {
     /// agents running in them) don't outlive the window.
     pub fn kill_all(&self) {
         let handles: Vec<_> = self.ptys.lock_safe().drain().collect();
-        for (id, mut h) in handles {
-            // #2365: the `pty-exit … expected=false` line is written by each
-            // pty's waiter thread only after `child.wait()` returns, and this
-            // sweep neither joins those threads nor waits on the children —
-            // the process can exit before a slow child finishes dying, and
-            // live ptys go missing from the shutdown log (a real one lost ptys
-            // 12 and 14 exactly this way). Write the sweep's enumeration HERE,
-            // on the calling thread, BEFORE the kill, so it is on record
-            // independent of that waiter race. The event carries a space on
-            // purpose — it names the whole line, `shutdown kill id=N` — where
-            // every other breadcrumb event is one hyphenated token.
-            crate::obs::breadcrumb("shutdown kill", &format!("id={id}"));
+        for (_, mut h) in handles {
             let _ = h.killer.kill();
         }
     }
