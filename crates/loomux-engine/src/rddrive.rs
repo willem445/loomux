@@ -981,6 +981,32 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
              resume or cancel_review_drive to stop.",
             f.lane, pane_of(&f.lane_agent),
         ),
+        // **Two shapes, because since #2168 E1 this hold has two sites and one
+        // sentence cannot be true of both.** From `fix-wait` the worker did
+        // nothing at all; from `ci-wait` it pushed — which is a thing it DID —
+        // and then never said the round was finished, and an orchestrator
+        // reading "neither pushed nor reported" about a head that visibly moved
+        // is being told something false about the one fact it would act on. The
+        // remedy is the same pane either way, so this stays one reason with one
+        // line rather than a sixteenth exit; what differs is what the line
+        // reports, which is the same call `state_clause` makes for the two time
+        // holds. Any other state is impossible — `decide` proposes this hold
+        // from exactly those two — and reads as the `fix-wait` sentence, which
+        // is the older and more general of the pair.
+        // **"nothing from it since" and not "did not report"**, because the
+        // drive cannot honestly claim the second. A worker that reported done
+        // and pushed inside one tick window has BOTH facts read on the same
+        // tick, arc 7 outranks the report, and the arc clears the signal — so
+        // the drive genuinely has heard nothing since the push, and saying it
+        // never reported would be a false claim about a worker that did. The
+        // sentence states what the drive observed; `decide_fix_receipts`
+        // carries the residual and why a resume clears it on the first tick.
+        HeldReason::FixStalled if f.held_state == Some(DriveState::CiWait) => format!(
+            "HELD — the worker pushed{at} and the driver has heard nothing from it since, \
+             for a whole fix timeout; the reviewer lanes are held until it reports done, \
+             so the PR body stops moving under them.{session} drive_review resumes the \
+             drive and briefs on the next green, cancel_review_drive stops it."
+        ),
         HeldReason::FixStalled => format!(
             "HELD — the worker neither pushed nor reported inside the fix timeout{at}.\
              {session} drive_review resumes the drive, cancel_review_drive stops it."
@@ -989,7 +1015,7 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         // clock expired** (#2110). Both used to print one quantity-free
         // sentence, and an orchestrator reading it had exactly one move —
         // resume and see. The state, the time in it and the bound are what make
-        // the resume a decision: a `ci-wait` that sat ninety minutes says go and
+        // the resume a decision: a `ci-wait` that sat past its own bound says go and
         // read the checks; a `review-wait` that sat past its own bound — four
         // hours on a one-lane gate at stock knobs — says go and read the lane. The exclusion is named because it is the difference between
         // this figure and the wall clock, and a reader who cannot see it would
@@ -1569,6 +1595,57 @@ mod tests {
              precondition everywhere would satisfy both assertions above while saying \
              something false here: {waiting}"
         );
+    }
+
+    /// **`fix-stalled` has two sites since #2168 E1, and each prints what its
+    /// own site observed** (rev-final round 2, finding 2).
+    ///
+    /// The finding this closes is sharper than "untested": no fixture in this
+    /// file could REACH the new arm. The two that drive `held_notice` carry
+    /// `held_state: Some(DriveState::ReviewWait)` and `..HeldFacts::default()`
+    /// (`None`), so both take the fallback — the `for r in HeldReason::ALL`
+    /// sweeps looked like coverage of every reason and were vacuous for this
+    /// one, and deleting the whole arm left every notice test green. That is
+    /// CLAUDE.md's absence-shaped vacuity, on the only new user-visible surface
+    /// in the slice; corroborated by the arm's wording having already moved
+    /// once mid-branch with nothing red to notice either text.
+    ///
+    /// So each arm is asserted to say its own thing AND not the other's. The
+    /// `fix-wait` row is the negative control that keeps this from passing
+    /// under an implementation that prints the `ci-wait` sentence everywhere.
+    #[test]
+    fn fix_stalled_says_which_of_its_two_waits_expired() {
+        let base = HeldFacts { head: HEAD.into(), ..HeldFacts::default() };
+
+        let pushed = HeldFacts { held_state: Some(DriveState::CiWait), ..base.clone() };
+        let n = held_notice(1758, HeldReason::FixStalled, &pushed);
+        assert!(
+            n.contains("pushed") && n.contains("heard nothing from it since"),
+            "the `ci-wait` site reports what the drive observed — a push, then silence: {n}"
+        );
+        assert!(
+            !n.contains("neither pushed nor reported"),
+            "…and never the other site's sentence, which is false about a head that \
+             visibly moved — the exact claim class this arm exists to avoid: {n}"
+        );
+
+        // The control: the older, more general site, whose wording is unchanged
+        // and which any state but `ci-wait` still takes.
+        for from in [None, Some(DriveState::FixWait), Some(DriveState::ReviewWait)] {
+            let m = held_notice(1758, HeldReason::FixStalled, &HeldFacts { held_state: from, ..base.clone() });
+            assert!(
+                m.contains("neither pushed nor reported"),
+                "{from:?} takes the `fix-wait` sentence: {m}"
+            );
+            assert!(!m.contains("heard nothing from it since"), "{from:?}: {m}");
+        }
+
+        // Both sites still name the two tools an orchestrator can reach for,
+        // which §6 requires of every hold and neither arm may drop.
+        for f in [&pushed, &base] {
+            let m = held_notice(1758, HeldReason::FixStalled, f);
+            assert!(m.contains("drive_review") && m.contains("cancel_review_drive"), "{m}");
+        }
     }
 
     #[test]

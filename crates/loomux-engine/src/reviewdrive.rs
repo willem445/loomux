@@ -32,8 +32,9 @@
 //! Three persisted fields exist that §5.2's example entry does not show, and
 //! they are called out here rather than left for a reader to notice as drift.
 //! §2.2 bounds two waits — `held(lane-stalled)` is "no verdict inside
-//! `lane_timeout_minutes`", `held(fix-stalled)` is "neither pushed nor reported
-//! inside `fix_timeout_minutes`" — and the shape in §5.2 carries no timestamp
+//! `lane_timeout_minutes`", `held(fix-stalled)` was "neither pushed nor reported
+//! inside `fix_timeout_minutes`" until #2168 E1 gave it a second site with its own
+//! anchor — and the shape in §5.2 carries no timestamp
 //! from which either could be measured, while §2.4 resumes a drive from disk
 //! across a restart, so an in-memory clock cannot carry them either. A bound
 //! with no anchor is not a bound. So:
@@ -49,11 +50,21 @@
 //!   not the key; [`lane_open_for`] carries why, and the defect it names is one
 //!   this slice actually shipped and CI caught.
 //! - [`DriveEntry::fix_handback_ms`] — when the drive last entered `fix-wait`.
-//!   The `fix-stalled` anchor; the hand-back is the moment that wait began.
+//!   The `fix-stalled` anchor **in `fix-wait`**; the hand-back is the moment
+//!   that wait began. #2168 E1 gives that hold a second site, in `ci-wait`,
+//!   whose wait began at the PUSH rather than at the hand-back and so is
+//!   measured from `state_since_ms` — see [`decide_fix_receipts`].
 //! - [`DriveEntry::fix_kickback_ms`] — when the drive last answered a worker's
 //!   `report(progress)` in that worker's own pane (#1959). Not a timeout
 //!   anchor: it is compared against `fix_handback_ms`, which makes the budget
 //!   one answer per hand-back and renews it with no reset to remember.
+//! - [`DriveEntry::fix_pushed_ms`] — when the worker last pushed onto a head
+//!   this drive handed back for; `None` unless `ci-wait` was entered by arc 7
+//!   (#2168 E1). The `fix-stalled` anchor in THAT state, and the one clock here
+//!   that a non-arc also writes: `note_fix_push` re-stamps it when a further
+//!   push lands mid-wait, which is exactly what `state_since_ms` cannot do,
+//!   since `transition` refuses a `ci-wait` -> `ci-wait` self-arc and so leaves
+//!   the state clock on the FIRST push.
 //!
 //! `drive-stalled` needs none of these: it is the drive's **age**,
 //! `now - started_ms`, so it keeps §5.2's own `started_ms`.
@@ -246,8 +257,14 @@ pub enum HeldReason {
     /// A spawned or resumed **reviewer** lane recorded no verdict inside
     /// `lane_timeout_minutes`.
     LaneStalled,
-    /// A resumed **worker** neither pushed nor reported inside
-    /// `fix_timeout_minutes`.
+    /// A resumed **worker** went quiet on a hand-back for
+    /// `fix_timeout_minutes`. **Two shapes since #2168 E1, and the notice says
+    /// which** (`rddrive::held_notice` branches on `HeldFacts::held_state`):
+    /// from `fix-wait`, the worker neither pushed nor reported; from `ci-wait`,
+    /// it pushed and then did not report on the pushed head, which is the wait
+    /// [`decide_fix_receipts`] adds. One reason rather than two because it is
+    /// one wait for one worker on one hand-back — and one remedy, the pane the
+    /// notice already names.
     FixStalled,
     /// The drive's **age** passed `drive_timeout_minutes` — the backstop, and
     /// since #2110 only the backstop. Its notice names the state the drive was
@@ -272,11 +289,14 @@ pub enum HeldReason {
     /// preemption.** `lane-stalled`, `fix-stalled` and `cap-full` each name a
     /// remedy this cannot ("read that pane", "free a slot"), and each fires
     /// well inside its state's bound; [`state_bound_ms`] is floored against the
-    /// repo's own knobs so that stays true however they are configured. What is
-    /// left for this to catch is the state with no bound of its own (`ci-wait`
-    /// on a check run that never resolves), the state that should never be a
-    /// wait at all (`gate-check`), and any future path that sits in a state
-    /// none of the others can see.
+    /// repo's own knobs so that stays true however they are configured — and
+    /// #2168 E1 is why that clause is load-bearing rather than decorative: it
+    /// put a second, `fix_timeout_minutes`-long wait into `ci-wait` behind the
+    /// check wait, so that arm became its constant PLUS the knob. What is left
+    /// for this to catch is a
+    /// `ci-wait` on a check run that never resolves, the state that should
+    /// never be a wait at all (`gate-check`), and any future path that sits in
+    /// a state none of the others can see.
     StateStalled,
     /// `route_reviewers` returned `None` — the changed-file list could not be
     /// shown complete, so *which reviewers are required* is unknown. Never a
@@ -1157,15 +1177,17 @@ pub const CAP_HOLD_MS: u64 = 15 * 60_000;
 // of the fourth when #2117's W3 made that arm an add. [`state_bound_ms`] is
 // where the per-arm rule is argued; the short form:
 //
-// - `ci-wait` and `gate-check` have **no knob at all** — [`DriveLimits`]
-//   carries no `ci_` or `gate_` timeout — so there is nothing to combine with
-//   and nothing to shadow.
+// - `gate-check` has **no knob at all** — [`DriveLimits`] carries no `gate_`
+//   timeout — so there is nothing to combine with and nothing to shadow.
 // - `fix-wait` is the LARGER of its constant and `fix_timeout_minutes`. It is
-//   the only arm where the shadowing hazard exists, and the only one the
-//   retracted sentence described.
+//   the only arm that is a max at all.
 // - `review-wait` is its constant PLUS `lane_timeout_minutes` per required
 //   lane, because that state holds several waits in sequence and the product
 //   alone funds their silences and none of the gaps between them.
+// - `ci-wait` is its constant PLUS `fix_timeout_minutes` (#2168 E1), on the
+//   same argument: since E1 that state holds the check matrix and then the
+//   worker's report on a pushed head, one after the other. It was a bare
+//   constant before E1 and belonged on the `gate-check` line.
 
 /// How long a drive may sit in `ci-wait` (§2.1) before [`HeldReason::StateStalled`].
 ///
@@ -1176,6 +1198,14 @@ pub const CAP_HOLD_MS: u64 = 15 * 60_000;
 /// project's own matrix is three platforms at twenty to thirty minutes; ninety
 /// covers a full re-run behind a queue and is still an hour clear of anything
 /// that has ever been legitimate here.
+///
+/// **The SLACK since #2168 E1, not the bound outright.** [`state_bound_ms`]
+/// ADDS `fix_timeout_minutes` to this, because that state now holds a second
+/// wait measured on that knob — [`decide_fix_receipts`] — after the check wait
+/// this number is sized for. Compared rather than added, the margin at any
+/// `fix_timeout_minutes` above ninety minutes is exactly zero and
+/// `held(state-stalled)` preempts the `held(fix-stalled)` that names the pane
+/// to read; that is `REVIEW_WAIT_BOUND_MS`'s own argument, one state over.
 pub const CI_WAIT_BOUND_MS: u64 = 90 * 60_000;
 
 /// How long a drive may sit in `review-wait` (§2.1) before
@@ -1229,19 +1259,43 @@ pub const GATE_CHECK_BOUND_MS: u64 = 15 * 60_000;
 /// **What each state's bound is made of, per state** — there is no single rule,
 /// and an earlier version of this paragraph claimed one ("`max` of the constant
 /// and the state's own configured bound"). That was true of every arm when it
-/// was written and stopped being true of `review-wait` the moment #2117's W3
-/// made that arm an ADD, while never having been true of the two arms that have
-/// no knob to take a max against:
+/// was written, stopped being true of `review-wait` the moment #2117's W3 made
+/// that arm an ADD and of `ci-wait` when #2168 E1 made that one an ADD too, and
+/// was never true of the arm that has no knob to take a max against. Three
+/// shapes over four arms:
 ///
-/// - `ci-wait` and `gate-check` are **bare constants**. [`DriveLimits`] has no
-///   `ci_` or `gate_` timeout, so there is nothing to shadow and nothing to
-///   take a maximum with. `ci-wait` is the state that most needed a bound at
-///   all: `CiObservation::Pending` and `Unknown` both return `Wait` forever.
+/// - `gate-check` is a **bare constant**. [`DriveLimits`] has no `gate_`
+///   timeout, so there is nothing to shadow and nothing to take a maximum
+///   with.
 /// - `fix-wait` is `max(constant, fix_timeout_minutes)` — a floor over the
 ///   knob, so a repo that raises `fix_timeout_minutes` to four hours raises
 ///   this with it rather than being parked at ninety minutes by a number in
-///   loomux. That is the shadowing hazard, and this is the one arm where it can
-///   arise at all.
+///   loomux.
+/// - `ci-wait` is the constant **PLUS** `fix_timeout_minutes` since #2168 E1,
+///   on `review-wait`'s argument rather than `fix-wait`'s, and the choice of
+///   ADD over `max` is the whole of the point. That state now holds two waits
+///   in SEQUENCE — the check matrix, and then the worker's read-and-report on
+///   the head it pushed ([`decide_fix_receipts`]) — so a bound that is merely
+///   the LARGER of the two funds only one of them. Under `max`, a repo with
+///   `fix_timeout_minutes` above the constant gets a state bound EQUAL to the
+///   knob, and [`decide`] reads the state bound above the state's own logic:
+///   the first tick past it answers `state-stalled` and the `fix-stalled` that
+///   names the pane to read never fires at all. That is the preemption
+///   [`HeldReason::StateStalled`] says cannot happen, and it is the same
+///   zero-margin defect #2117 review 2 found in `review-wait`, one state over.
+///   Added, the constant is the slack over the second wait exactly as it is
+///   there.
+///
+///   **The add applies to every `ci-wait` drive, including one that never
+///   handed anything back**, and that is chosen rather than overlooked. A bound
+///   scoped to the waiting drives would have to read [`DriveEntry::fix_pushed_ms`],
+///   and `rdtick` computes `held_bound_ms` off the entry AFTER the arc into
+///   `held` — the arc that clears that flag — so the notice would quote a
+///   different bound from the one that fired. What a first drive pays is that a
+///   check run which never resolves is caught at 150 minutes rather than 90 on
+///   stock knobs. It fails toward a later park and never toward an earlier
+///   false one, every wait-specific hold still fires inside it, and the
+///   twelve-hour backstop is unmoved.
 /// - `review-wait` is the constant **PLUS** `lane_timeout_minutes * lanes`, for
 ///   the reason argued below. It is the arm that is not a max, and the sentence
 ///   above exists because saying "max" of all four read as covering it.
@@ -1339,7 +1393,9 @@ pub fn state_bound_ms(
 ) -> Option<u64> {
     let lane = minutes_ms(limits.lane_timeout_minutes);
     match state {
-        DriveState::CiWait => Some(CI_WAIT_BOUND_MS),
+        DriveState::CiWait => {
+            Some(CI_WAIT_BOUND_MS.saturating_add(minutes_ms(limits.fix_timeout_minutes)))
+        }
         DriveState::ReviewWait => Some(
             REVIEW_WAIT_BOUND_MS
                 .saturating_add(lane.saturating_mul(required_lanes.max(1) as u64)),
@@ -1549,6 +1605,65 @@ pub struct DriveEntry {
     /// back owes nothing.
     #[serde(default)]
     pub fix_kickback_ms: u64,
+    /// **This drive reached `ci-wait` by arc 7 — the worker pushed a fix** —
+    /// and has not left it since (#2168 E1). What `decide_ci_wait` reads to
+    /// tell a fix push from every other way into that state.
+    ///
+    /// **Why the state alone cannot answer it.** `ci-wait` is entered five
+    /// ways — the creation (arc 1) and arcs 6, 7, 10 and 11 — and only arc 7
+    /// means "this drive handed the worker a fix and the worker has just
+    /// pushed it". The defect #1875 measures needs exactly that distinction:
+    /// after a push the worker fills the PR body's CI section, which it can
+    /// only do once the checks have settled, so a lane briefed the moment CI
+    /// goes green is briefed at a body digest the worker is about to move —
+    /// and the pass it records is stale before it is written. Every code PR of
+    /// that session paid at least one re-record round for it.
+    ///
+    /// **Arc 6 is a worker push too and is deliberately NOT covered**, because
+    /// the two preconditions for expecting a `report(done)` are the ones arc 7
+    /// carries and arc 6 does not. §7's interception is keyed on
+    /// [`worker_agent`](DriveEntry::worker_agent), which is empty until the
+    /// first hand-back — so before one, a driven worker's `report` goes to the
+    /// orchestrator's pane exactly as it always did and no tick can ever see a
+    /// `Done`. And nothing has asked that worker for one: arc 6 is a push the
+    /// drive did not solicit, mid-review, while arc 7 answers a hand-back whose
+    /// brief says *push, and report when the checks are green*. Gating arc 6 on
+    /// a signal that cannot arrive and was never requested would park every such
+    /// drive on `held(fix-stalled)` at the timeout — a false park, where the
+    /// arc-6 status quo costs at most the one re-record round.
+    ///
+    /// **A STAMP and not a flag, and the first draft of this slice had it the
+    /// other way** (rev-final round 2, premortem 2). The obvious shape is a
+    /// `bool` bounded from [`state_since_ms`](DriveEntry::state_since_ms) — one
+    /// clock instead of two, and true as far as it goes, since
+    /// [`transition`] refuses a `ci-wait` -> `ci-wait` self-arc so the state
+    /// stamp really is the arc-7 moment. What that argument misses is that a
+    /// worker may push AGAIN inside one `ci-wait` stay. No arc fires, nothing
+    /// re-stamps, and the wait therefore runs from the FIRST push: a follow-up
+    /// commit fifty-five minutes into a sixty-minute `fix_timeout_minutes`
+    /// leaves five minutes to run a fresh matrix and report, and the
+    /// `held(fix-stalled)` notice then names the current head beside a clock
+    /// belonging to the previous one. So this is the anchor, re-stamped by
+    /// [`note_fix_push`](DriveEntry::note_fix_push) on every observed head move
+    /// while it is set — and it is a THIRD clock only in the sense that it
+    /// measures a wait `state_since_ms` cannot.
+    ///
+    /// **Written by [`advance`](DriveEntry::advance) on every arc** — `Some` on
+    /// `fix-wait` -> `ci-wait`, `None` otherwise — and re-stamped by
+    /// `note_fix_push` in between. Assigning on every arc is not optional:
+    /// an entry that carried it out of `ci-wait` and back in by arc 10 would
+    /// claim a push that did not happen. And `note_fix_push` re-stamps only
+    /// what is already `Some`, so a head move in any other state cannot
+    /// manufacture one.
+    ///
+    /// **`None` on an entry written before this field existed**, and that is
+    /// the safe direction rather than an accident: such a drive advances on
+    /// green alone, which is the pre-#2168 behaviour, so an upgrade mid-drive
+    /// costs at most the one re-record round it was already going to cost. The
+    /// other direction would park a first drive on `held(fix-stalled)` waiting
+    /// for a `report(done)` its worker was never asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_pushed_ms: Option<u64>,
     /// The notice this entry owes the orchestrator's pane, and the reason
     /// retention may not drop it yet (#1857). See [`OwedNotice`].
     ///
@@ -1732,6 +1847,7 @@ impl DriveEntry {
             started_ms: now_ms,
             fix_handback_ms: 0,
             fix_kickback_ms: 0,
+            fix_pushed_ms: None,
             owed_notice: None,
             cap_starved_since_ms: None,
             state_since_ms: now_ms,
@@ -1745,6 +1861,36 @@ impl DriveEntry {
 
     pub fn state(&self) -> DriveState {
         self.state
+    }
+
+    /// Whether this drive is sitting on a head its own worker pushed in answer
+    /// to a hand-back — see [`fix_pushed_ms`](DriveEntry::fix_pushed_ms).
+    pub fn fix_pushed(&self) -> bool {
+        self.fix_pushed_ms.is_some()
+    }
+
+    /// **A further push landed while the drive is still waiting on this one**
+    /// (#2168 E1, rev-final round 2 premortem 2). Re-anchors the receipts wait
+    /// at `now_ms`, so a worker that pushes a follow-up commit gets a whole
+    /// window to run the new matrix and report rather than the remainder of the
+    /// window the previous push opened.
+    ///
+    /// **Re-stamps only what is already `Some`**, which is what keeps this from
+    /// being a second way to enter the wait: a head move in `review-wait` is
+    /// arc 6 and a head move in `fix-wait` is arc 7, and both go through
+    /// [`advance`](DriveEntry::advance). Called by S3 at the one place a moved
+    /// head is recorded, and that call site already guards on the head having
+    /// actually changed and on the read having succeeded — an empty `facts.head`
+    /// is a failed read, not a push, and re-anchoring on one would hand a silent
+    /// worker a fresh hour every time `gh` hiccuped.
+    ///
+    /// It cannot postpone the drive indefinitely: `state-stalled` measures from
+    /// `state_since_ms`, which nothing here touches, so a drive that pushes
+    /// forever still parks on `ci-wait`'s own bound.
+    pub fn note_fix_push(&mut self, now_ms: u64) {
+        if self.fix_pushed_ms.is_some() {
+            self.fix_pushed_ms = Some(now_ms);
+        }
     }
 
     /// The notice this entry owes a pane, if any (#1857).
@@ -1835,6 +1981,18 @@ impl DriveEntry {
         if to == DriveState::FixWait {
             self.fix_handback_ms = now_ms;
         }
+        // **Arc 7, recorded — an ASSIGNMENT and not a set** (#2168 E1). Every
+        // other arc clears it, including the three that reach `ci-wait` from
+        // somewhere else: an entry that carried the flag out of `ci-wait` and
+        // back in by arc 10 would claim a push nobody made, and hold the drive
+        // waiting on a `report(done)` its worker was never asked for.
+        //
+        // Written here rather than in the tick for `fix_handback_ms`'s reason:
+        // the arc and the fact it establishes may not come apart. And it is
+        // read against `state_since_ms`, which the lines below re-stamp on this
+        // same arc — see the field, and the module header on why that is not a
+        // fourth clock.
+        self.fix_pushed_ms = (from == DriveState::FixWait && to == DriveState::CiWait).then_some(now_ms);
         // **What the drive was doing, recorded before the clocks that say so
         // are reset** (#2110). `held_from` and `held_after_ms` are read by this
         // hold's notice and by `review_drive_status`; both are computed from
@@ -2105,10 +2263,32 @@ impl DriveEntry {
     /// does not control is the mirror image of the unbounded SUPPRESSION rule,
     /// and wants the same answer.
     ///
-    /// **Only in `fix-wait`.** In any other state there is no hand-back to be
-    /// waiting on and nothing the worker was asked for.
+    /// **Wherever a hand-back is outstanding, which since #2168 E1 is two
+    /// states and not one** (rev-final round 2, finding 1). This used to read
+    /// "only in `fix-wait`; in any other state there is no hand-back to be
+    /// waiting on and nothing the worker was asked for", and E1 falsified both
+    /// halves for `ci-wait` on a head that arrived by arc 7: there the worker
+    /// HAS been handed a round and IS being waited on, for the very
+    /// `report(done)` this line tells it to send.
+    ///
+    /// Left state-scoped, the #1959 defect reappears one state over and worse.
+    /// §7's interception is keyed on the calling agent and not on the drive's
+    /// state, so a `report(progress)` there is consumed, the worker is answered
+    /// `"reported to orchestrator"`, nothing reaches the orchestrator's pane and
+    /// nothing is typed back into the worker's — and a fix timeout later the
+    /// hold says the driver has heard nothing from a worker that spoke. That is
+    /// the false claim `rddrive::held_notice`'s own comment goes out of its way
+    /// to avoid, arriving through a guard that reads one worker input by a
+    /// different rule from the other four.
+    ///
+    /// The budget is unchanged and still one per HAND-BACK, not one per state:
+    /// `fix_handback_ms` is not re-stamped by arc 7, so a worker answered in
+    /// `fix-wait` is not answered again after it pushes. The same round, the
+    /// same answer, once.
     pub fn kickback_owed(&self) -> bool {
-        self.state == DriveState::FixWait && self.fix_kickback_ms < self.fix_handback_ms
+        let handed_back = self.state == DriveState::FixWait
+            || (self.state == DriveState::CiWait && self.fix_pushed());
+        handed_back && self.fix_kickback_ms < self.fix_handback_ms
     }
 
     /// Record that this drive answered its worker at `now_ms` — see
@@ -2954,6 +3134,14 @@ pub fn decide(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> D
 
 fn decide_ci_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
     match facts.ci {
+        // **Arc 2, and since #2168 E1 green is not on its own enough when the
+        // head arrived by arc 7.** See [`decide_fix_receipts`] for the whole
+        // argument; the guard is here, on the Green arm alone, because it is
+        // the only arm that briefs a reviewer. Red and CONFLICTING hand the
+        // worker back through arc 3, where `decide_fix_wait`'s own ladder
+        // already answers every worker signal, and `Pending`/`Unknown` wait as
+        // they always did.
+        CiObservation::Green if entry.fix_pushed() => decide_fix_receipts(entry, facts, limits),
         // Arc 2.
         CiObservation::Green => DriveStep::to(DriveState::ReviewWait),
         // Arc 3, spending a CI attempt — or parking, when the budget is gone.
@@ -2977,6 +3165,145 @@ fn decide_ci_wait(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) 
         // Neither an answer nor a reason to move. §8: unknown is never treated
         // as safe, and it is never treated as a fact about the PR either.
         CiObservation::Pending | CiObservation::Unknown => DriveStep::Wait,
+    }
+}
+
+/// Green at a head the worker pushed under arc 7: **arc 2 waits for that
+/// worker's `report(done)` first** (#2168 E1, closing #1875's class).
+///
+/// # What green alone does not mean
+///
+/// A green matrix says the checks settled; it does not say the ROUND is over.
+/// This repo's worker persona forbids a `report(done)` before the whole matrix
+/// has been re-read, and the PR body's CI receipts — run ids, per-platform
+/// conclusions, the head they were measured at — cannot be written until that
+/// same moment. So the sequence a green observation sits in the middle of is
+/// fixed: push, checks settle, worker reads them, worker edits the body, worker
+/// reports. A lane briefed on the green brief is briefed at digest d1 and
+/// re-briefed at d2 the moment the receipts land, because
+/// [`first_stale_lane`] re-reads the `(head, digest)` key every tick and a
+/// `pass` recorded at d1 does not stand at d2. #1875's measurement is that
+/// every code PR of that session paid at least one such round, and #1870 is the
+/// fully instrumented one: `pass` at digest `bbff76b8`, 0 findings, the CI
+/// section filled, `BODY CHANGED SINCE PASS`, gate blocked, re-record — with
+/// the head never having moved and not one line of code having changed.
+///
+/// The digest rule itself is not weakened here and must not be: the body
+/// becomes the squash commit message, so a `pass` recorded against different
+/// text really has approved something else. What changes is only WHEN the lane
+/// is briefed — after the revision has stopped moving rather than during.
+///
+/// # The two shapes this deliberately is not
+///
+/// #1875 offers three candidate fixes and two are refused. A **digest
+/// carve-out** — a fenced evidence region excluded from the digest — needs that
+/// region to be genuinely un-claim-bearing, and a CI section that also carries
+/// prose is back where it started; it would also make `body-unchanged` a
+/// weaker condition than the `gh` shim's, which §4 forbids. **The engine
+/// writing the CI section itself** puts a second author on the PR body beside
+/// the worker, which is a wire change and a new class of §3.1 action, for
+/// receipts the worker already produces.
+///
+/// # The worker ladder is `decide_fix_wait`'s, not a second one
+///
+/// The four signals are read in the same order and answered with the same
+/// holds, because this is the same wait for the same worker on the same
+/// hand-back — only its location moved. Reading them by a different rule here
+/// is the asymmetry `CLAUDE.md` names ("a guard reads every one of its inputs
+/// by one rule"), and the two that would be dropped are the two that matter
+/// most: a `Blocked` worker is INVARIANT 3 territory and a dead resumed pane is
+/// `worker-unresumable`, and letting either fall through to the timeout below
+/// would report both as `fix-stalled` — a claim that the worker went silent,
+/// about a worker that said something.
+///
+/// # The bound, and why it is `fix_timeout_minutes` measured from the push
+///
+/// A silent worker must not hold the drive for ever, and the wait is the same
+/// wait §2.2 already bounds — so it takes the same knob. The anchor is
+/// [`DriveEntry::fix_pushed_ms`], the LATEST push in this `ci-wait` stay. Not
+/// `fix_handback_ms`, which predates the push and would charge the worker for
+/// the time it spent doing the work it was asked to do; and not
+/// `state_since_ms`, which is the FIRST push, so a follow-up commit late in the
+/// window would get the remainder of a window rather than one (rev-final round
+/// 2, premortem 2).
+/// [`state_bound_ms`]'s `ci-wait` arm ADDS the same knob to its constant so
+/// that `held(state-stalled)` cannot preempt this hold on a repo that raised
+/// it — the property [`HeldReason::StateStalled`] states, and the reason that
+/// arm is an add rather than a max is argued there.
+///
+/// **`fix_timeout_minutes` cannot push that bound past the backstop**, which is
+/// why this arm needs no counterpart to [`state_bound_ms`]'s `review-wait`
+/// residual: `parse_workflow` runs the knob through `clamp_expires_minutes`, so
+/// the largest value a workflow file can produce is 240 minutes and the sum
+/// tops out at 330 against a twelve-hour `drive_timeout_minutes`. The engine
+/// deliberately does not re-clamp the timeouts ([`DriveLimits::clamped`] takes
+/// only the counters), so a caller building limits directly can still exceed
+/// it — and there the age answers first, exactly as `review-wait`'s residual
+/// describes. Pinned at the ceiling by
+/// `the_ci_wait_bound_funds_the_receipts_wait_instead_of_preempting_it`.
+///
+/// # Two residuals, both bounded and both recoverable by the resume
+///
+/// **A worker pane that DIES here.** #1961's exit read is asked only in
+/// `fix-wait` (`rdtick`'s `worker_exit`), so a pane killed while the drive
+/// waits in `ci-wait` is not seen as `Unresumable` on the next tick; that drive
+/// waits out `fix_timeout_minutes` and parks `held(fix-stalled)`, which is
+/// bounded and named but is the slower notice. Disclosed rather than closed:
+/// widening the exit read is an S3 change to what a tick OBSERVES, and this
+/// slice changes what `decide` does with what it is already given.
+///
+/// **A worker that pushes and reports inside ONE tick window.** Both facts
+/// reach the same tick, [`decide_fix_wait`]'s arc 7 outranks the report on
+/// purpose ("the code moved and CI is what has to answer next"), and `rdtick`
+/// clears the signal on every arc — so the report is spent on the arc and this
+/// state waits for one that will not come, to `held(fix-stalled)`. It is not
+/// closed here because a `WorkerSignal` is a word and not a timestamp: the same
+/// `Done` beside a moved head is equally consistent with *reported, then
+/// pushed*, where the report is about the pre-push tree and honouring it would
+/// brief a lane over exactly the unfinished revision #1875 is about. Failing
+/// toward a bounded hold rather than toward that defect is the direction this
+/// slice takes everywhere, and the ordering is uncommon here by construction —
+/// the worker persona forbids `report(done)` before the matrix is re-read, and
+/// the matrix takes twenty to thirty minutes against a thirty-second tick.
+///
+/// **Both clear on the first tick after `drive_review`**, which is what §2.2
+/// requires of a hold whose cause is a wait: arc 11 re-enters `ci-wait` from
+/// `held`, so [`DriveEntry::advance`] assigns [`DriveEntry::fix_pushed_ms`] false
+/// and the next green takes arc 2 with nothing further asked of the worker.
+/// Pinned by `a_resume_out_of_fix_stalled_briefs_on_the_next_green`.
+fn decide_fix_receipts(entry: &DriveEntry, facts: &DriveFacts, limits: &DriveLimits) -> DriveStep {
+    match facts.worker {
+        // Nothing to hand back to. Checked first, exactly as in
+        // `decide_fix_wait`: every arm below presumes a worker that can be
+        // reached.
+        WorkerSignal::Unresumable => DriveStep::held(HeldReason::WorkerUnresumable),
+        // INVARIANT 3 territory — a blocked worker is the orchestrator's call.
+        WorkerSignal::Blocked => DriveStep::held(HeldReason::WorkerBlocked),
+        // Arc 2 at last: the revision has stopped moving, so the lane can be
+        // briefed at a `(head, digest)` that will still be current when it
+        // records.
+        WorkerSignal::Done => DriveStep::to(DriveState::ReviewWait),
+        WorkerSignal::Silent => {
+            // **The LATEST push in this `ci-wait` stay**, which is what
+            // `fix_pushed_ms` exists to carry — see that field, and
+            // `note_fix_push` for the re-stamp. `state_since_ms` would be the
+            // first one, and a worker that pushed a follow-up commit late in
+            // the window would get the remainder rather than a window.
+            //
+            // The fallback is unreachable through `decide`: this function is
+            // called from one place, under a guard that already asked
+            // `fix_pushed()`. It is `state_since_ms` rather than a panic or a
+            // zero because those are the two ways a fallback goes wrong — a
+            // zero clears every timeout, which is the false-park direction the
+            // field doc argues against, and an unwind out of the poll thread
+            // takes the fleet's watches down with it.
+            let since = entry.fix_pushed_ms.unwrap_or(entry.state_since_ms);
+            if facts.now_ms.saturating_sub(since) >= minutes_ms(limits.fix_timeout_minutes) {
+                DriveStep::held(HeldReason::FixStalled)
+            } else {
+                DriveStep::Wait
+            }
+        }
     }
 }
 
@@ -4102,6 +4429,45 @@ mod tests {
         assert_eq!(e.lanes[0].spawned_ms, 0);
         assert_eq!(e.lanes[0].briefed_head, "");
         assert_eq!(e.lanes[0].briefed_digest, "");
+        // #2168 E1's, and its default is load-bearing in the same way: an entry
+        // written before the field existed must read as a head this drive did
+        // NOT hand back for.
+        assert!(!e.fix_pushed());
+    }
+
+    /// **An entry written before `fix_pushed_ms` existed degrades toward the
+    /// pre-#2168 behaviour, never toward a false park** (#2168 E1).
+    ///
+    /// `serde(default)` gives `false`, and which way that falls is the whole
+    /// question: `false` means such a drive advances on green alone and pays at
+    /// most the one re-record round it was already going to pay, while `true`
+    /// would hold it in `ci-wait` waiting for a `report(done)` its worker was
+    /// never asked for and park it `fix-stalled` an hour later. The default is
+    /// asserted through `decide` rather than off the field, because the field's
+    /// value is not the promise — what the drive DOES with it is.
+    #[test]
+    fn an_entry_from_before_the_field_advances_on_green_as_it_used_to() {
+        let limits = DriveLimits::default();
+        let old = parse_state(NOTE_EXAMPLE).unwrap();
+        let mut e = old.entry(1758).unwrap().clone();
+        // Walk it to `ci-wait` the way arc 6 does, so the state is one the
+        // machine really reaches and `fix_pushed_ms` is whatever the arc leaves.
+        e.advance(DriveState::CiWait, None, None, 1_000).unwrap();
+        assert!(!e.fix_pushed(), "the pre-state: nothing in the older file said otherwise");
+        assert_eq!(
+            decide(
+                &e,
+                &DriveFacts {
+                    ci: CiObservation::Green,
+                    worker: WorkerSignal::Silent,
+                    ..facts_at("head-a")
+                },
+                &limits,
+            ),
+            DriveStep::to(DriveState::ReviewWait),
+            "an upgrade mid-drive must not strand the drive on a signal nobody asked \
+             its worker for"
+        );
     }
 
     #[test]
@@ -4478,6 +4844,434 @@ mod tests {
         // safe", and it is never treated as a fact about the PR either.
         assert_eq!(with(CiObservation::Pending), DriveStep::Wait);
         assert_eq!(with(CiObservation::Unknown), DriveStep::Wait);
+    }
+
+    // ── #2168 E1: green at a pushed head is not on its own an arc ───────────
+
+    /// A drive that reached `ci-wait` the way arc 7 does: hand back, then the
+    /// worker pushes. Walked through the real arcs rather than assembled, so a
+    /// fixture cannot encode a `fix_pushed_ms` the machine would not stamp.
+    fn pushed_fix_entry() -> DriveEntry {
+        let mut e = entry_at(DriveState::ReviewWait);
+        // Arc 5, the hand-back — this is what stamps `fix_handback_ms`.
+        e.advance(DriveState::FixWait, None, Some(Counter::ReviewRounds), 10_000).unwrap();
+        // Arc 7, the push. `state_since_ms` is now this moment, and it is the
+        // anchor the receipts wait is measured from.
+        e.advance(DriveState::CiWait, None, None, 100_000).unwrap();
+        e
+    }
+
+    /// **The defect, and the test that is red without the guard** (#1875,
+    /// #2168 E1). A worker fills the PR body's CI section only once the checks
+    /// have settled, so a lane briefed on green alone is briefed at a digest
+    /// the worker is about to move — and the `pass` it records is stale before
+    /// it is written. #1870 is the measured instance: `pass` at digest
+    /// `bbff76b8`, 0 findings, the CI section filled, `BODY CHANGED SINCE
+    /// PASS`, gate blocked, re-record, with the head never having moved.
+    #[test]
+    fn green_at_a_pushed_head_waits_for_the_workers_report_before_it_briefs_a_lane() {
+        let limits = DriveLimits::default();
+        let e = pushed_fix_entry();
+        assert!(e.fix_pushed(), "the pre-state: arc 7 is what this test is about");
+        let green_and_silent = DriveFacts {
+            ci: CiObservation::Green,
+            worker: WorkerSignal::Silent,
+            ..facts_at("head-b")
+        };
+        assert_eq!(
+            decide(&e, &green_and_silent, &limits),
+            DriveStep::Wait,
+            "green is the checks settling, not the round ending — the worker has not \
+             reported, so the body may still move under whatever lane this briefs"
+        );
+        // And the arc it is waiting FOR, so this is not "refuse everything".
+        let green_and_done = DriveFacts { worker: WorkerSignal::Done, ..green_and_silent };
+        assert_eq!(
+            decide(&e, &green_and_done, &limits),
+            DriveStep::to(DriveState::ReviewWait),
+            "arc 2 fires once the revision has stopped moving"
+        );
+    }
+
+    /// The negative control, and the property the brief calls out by name: a
+    /// drive that never handed anything back advances on green as it always
+    /// did. `drive_review` is called after the worker has already reported, so
+    /// there is no second report to wait for and waiting would park every first
+    /// drive on a signal nobody was asked for.
+    #[test]
+    fn green_on_a_head_this_drive_never_handed_back_still_advances_on_its_own() {
+        let limits = DriveLimits::default();
+        for e in [entry_at(DriveState::CiWait), gate_check_recycled_entry()] {
+            assert!(!e.fix_pushed(), "neither of these reached `ci-wait` by arc 7");
+            let facts = DriveFacts {
+                ci: CiObservation::Green,
+                worker: WorkerSignal::Silent,
+                ..facts_at("head-a")
+            };
+            assert_eq!(
+                decide(&e, &facts, &limits),
+                DriveStep::to(DriveState::ReviewWait),
+                "a drive with no outstanding hand-back has no report to wait for"
+            );
+        }
+    }
+
+    /// A drive that went out to `gate-check` and came back by arc 10 — one of
+    /// the three non-arc-7 ways into `ci-wait`, and the one that would still be
+    /// carrying the flag if `advance` merely SET it instead of assigning it.
+    fn gate_check_recycled_entry() -> DriveEntry {
+        let mut e = pushed_fix_entry();
+        e.advance(DriveState::ReviewWait, None, None, 200_000).unwrap();
+        e.advance(DriveState::GateCheck, None, None, 200_000).unwrap();
+        // Arc 10: not satisfied, back to `ci-wait`.
+        e.advance(DriveState::CiWait, None, None, 200_000).unwrap();
+        e
+    }
+
+    /// `fix_pushed_ms` is assigned on every arc, not set on one — pinned across
+    /// each way into and out of `ci-wait`, because the failure mode of a set is
+    /// invisible: the flag survives, the drive waits for a `report(done)` its
+    /// worker was never asked for, and it parks `fix-stalled` an hour later
+    /// naming a worker that did nothing wrong.
+    #[test]
+    fn only_arc_seven_marks_a_head_as_one_the_worker_pushed() {
+        // Arc 1: the creation.
+        assert!(!DriveEntry::new(1, "s", "o", Counters::default(), 0).fix_pushed());
+        // Arc 7 sets it…
+        let mut e = pushed_fix_entry();
+        assert!(e.fix_pushed(), "arc 7");
+        // …arc 2 out of `ci-wait` clears it…
+        e.advance(DriveState::ReviewWait, None, None, 110_000).unwrap();
+        assert!(!e.fix_pushed(), "arc 2 leaves `ci-wait`, so the push is spent");
+        // …and arc 6 back INTO `ci-wait` does not re-set it.
+        e.advance(DriveState::CiWait, None, None, 120_000).unwrap();
+        assert!(!e.fix_pushed(), "arc 6 is a push this drive did not hand back for");
+        // Arc 10, the same question from `gate-check`.
+        assert!(!gate_check_recycled_entry().fix_pushed(), "arc 10");
+        // Arc 11, a resume out of a park — the drive that was waiting on a
+        // report before it was held is not still waiting on one after.
+        let mut held = pushed_fix_entry();
+        held.advance(DriveState::Held, Some(HeldReason::FixStalled), None, 300_000).unwrap();
+        held.advance(DriveState::CiWait, None, None, 400_000).unwrap();
+        assert!(!held.fix_pushed(), "arc 11");
+    }
+
+    /// The bound, and **which clock it is measured on**. `fix_handback_ms` is
+    /// the hand-back, which predates the push: measured from there, a worker
+    /// that spent fifty-nine minutes writing the fix would get one minute to
+    /// read a green matrix and report. The anchor is `state_since_ms`, which
+    /// is the LATEST push in this `ci-wait` stay, which is what `fix_pushed_ms`
+    /// carries and `state_since_ms` cannot.
+    #[test]
+    fn a_silent_worker_on_a_pushed_head_parks_fix_stalled_a_fix_timeout_after_the_push() {
+        let limits = DriveLimits::default();
+        let e = pushed_fix_entry();
+        assert!(
+            e.state_since_ms > e.fix_handback_ms,
+            "the fixture's whole point: the two anchors are 90s apart, so a test that \
+             read the wrong one cannot pass by coincidence"
+        );
+        let at = |now_ms| {
+            decide(
+                &e,
+                &DriveFacts {
+                    now_ms,
+                    ci: CiObservation::Green,
+                    worker: WorkerSignal::Silent,
+                    ..facts_at("head-b")
+                },
+                &limits,
+            )
+        };
+        let timeout = minutes_ms(limits.fix_timeout_minutes);
+        assert_eq!(at(e.state_since_ms + timeout - 1), DriveStep::Wait, "one ms inside");
+        assert_eq!(
+            at(e.state_since_ms + timeout),
+            DriveStep::held(HeldReason::FixStalled),
+            "and the bound itself"
+        );
+        // The discriminator: at a `now` that is past the timeout measured from
+        // the HAND-BACK but not from the push, the drive is still waiting.
+        assert_eq!(
+            at(e.fix_handback_ms + timeout),
+            DriveStep::Wait,
+            "measured from `fix_handback_ms` this would already have parked"
+        );
+    }
+
+    /// The other two worker signals, answered by their own names rather than
+    /// waited out. Letting either fall through to the timeout would report a
+    /// worker that SAID something as one that went silent — and would cost an
+    /// hour before saying even that.
+    #[test]
+    fn the_pushed_head_wait_reads_every_worker_signal_by_the_same_rule_fix_wait_does() {
+        let limits = DriveLimits::default();
+        let e = pushed_fix_entry();
+        for (worker, want) in [
+            (WorkerSignal::Blocked, HeldReason::WorkerBlocked),
+            (WorkerSignal::Unresumable, HeldReason::WorkerUnresumable),
+        ] {
+            let facts =
+                DriveFacts { ci: CiObservation::Green, worker, ..facts_at("head-b") };
+            assert_eq!(
+                decide(&e, &facts, &limits),
+                DriveStep::held(want),
+                "{worker:?} is answered here exactly as `decide_fix_wait` answers it"
+            );
+            // …and still by its own name once the clock HAS run out, which is
+            // the discriminator: read below the timeout instead of above it,
+            // both of these would report `fix-stalled` — a claim that the
+            // worker went silent, about a worker that said something.
+            let expired = DriveFacts {
+                now_ms: e.state_since_ms + minutes_ms(limits.fix_timeout_minutes) + 1,
+                ..facts
+            };
+            assert_eq!(
+                decide(&e, &expired, &limits),
+                DriveStep::held(want),
+                "{worker:?} is not reported as `fix-stalled` once the wait expires"
+            );
+        }
+    }
+
+    /// The guard is on the GREEN arm alone. A red or a conflicting matrix at a
+    /// pushed head still hands the worker back through arc 3, where
+    /// `decide_fix_wait`'s ladder answers, and the two unknowns wait as they
+    /// always did. Without this, the receipts wait would swallow the arc that
+    /// tells the worker its fix failed.
+    #[test]
+    fn a_pushed_head_that_is_not_green_takes_the_arcs_it_always_did() {
+        let limits = DriveLimits::default();
+        let e = pushed_fix_entry();
+        let with = |ci| {
+            decide(
+                &e,
+                &DriveFacts { ci, worker: WorkerSignal::Silent, ..facts_at("head-b") },
+                &limits,
+            )
+        };
+        assert_eq!(
+            with(CiObservation::Red),
+            DriveStep::spend(DriveState::FixWait, Counter::CiAttempts)
+        );
+        assert_eq!(
+            with(CiObservation::Conflicting),
+            DriveStep::spend(DriveState::FixWait, Counter::RebaseAttempts)
+        );
+        assert_eq!(with(CiObservation::Pending), DriveStep::Wait);
+        assert_eq!(with(CiObservation::Unknown), DriveStep::Wait);
+    }
+
+    /// **`state-stalled` may not preempt `fix-stalled`, at any configuration**
+    /// — the property `HeldReason::StateStalled` states, and the one a `max`
+    /// would have broken. `decide` reads the state bound ABOVE the state's own
+    /// logic, so at `fix_timeout_minutes` above `CI_WAIT_BOUND_MS` a bound
+    /// equal to the knob would answer first on the very tick the receipts wait
+    /// expires, and the hold naming the pane to read would never fire at all.
+    ///
+    /// The two knobs are the two sides of the constant: 60 (the stock value,
+    /// under it) and 240 (over it, which is where a `max` and an add differ —
+    /// and the CEILING, since `parse_workflow` runs this knob through
+    /// `clamp_expires_minutes`, so no workflow file can ask for more). At that
+    /// ceiling the sum is 330 minutes, comfortably inside the twelve-hour
+    /// backstop, which is why this arm needs no counterpart to `review-wait`'s
+    /// overtake residual — that one is unbounded in the LANE COUNT, and this
+    /// one has a single clamped term.
+    #[test]
+    fn the_ci_wait_bound_funds_the_receipts_wait_instead_of_preempting_it() {
+        for minutes in [60u64, 240] {
+            let limits = DriveLimits { fix_timeout_minutes: minutes, ..DriveLimits::default() };
+            let bound = state_bound_ms(DriveState::CiWait, &limits, 1).unwrap();
+            assert_eq!(
+                bound,
+                CI_WAIT_BOUND_MS + minutes_ms(minutes),
+                "the constant is the SLACK over the receipts wait, not a rival to it"
+            );
+            let e = pushed_fix_entry();
+            let facts = DriveFacts {
+                now_ms: e.state_since_ms + minutes_ms(minutes),
+                ci: CiObservation::Green,
+                worker: WorkerSignal::Silent,
+                ..facts_at("head-b")
+            };
+            assert_eq!(
+                decide(&e, &facts, &limits),
+                DriveStep::held(HeldReason::FixStalled),
+                "at fix_timeout_minutes={minutes} the wait-specific hold is what fires; \
+                 under `max(constant, knob)` this is `state-stalled` at 240"
+            );
+            assert!(
+                bound < minutes_ms(limits.drive_timeout_minutes),
+                "…and the sum stays inside the backstop at the ceiling the workflow \
+                 parser clamps to, so this arm owes no overtake residual"
+            );
+        }
+    }
+
+    /// **A follow-up push mid-wait gets a whole window, not the remainder of
+    /// one** (rev-final round 2, premortem 2). `transition` refuses a `ci-wait`
+    /// -> `ci-wait` self-arc, so nothing re-stamps `state_since_ms` and a
+    /// `bool` bounded from it would run the wait from the FIRST push: a commit
+    /// landing at minute 55 of a 60-minute knob would leave five minutes to run
+    /// a fresh matrix and report.
+    ///
+    /// The three assertions are the defect, the fix and the bound it must not
+    /// remove — a re-stamp that also pushed `state-stalled` out would be an
+    /// unbounded suppression driven by a signal the drive does not control.
+    #[test]
+    fn a_second_push_inside_one_ci_wait_stay_re_anchors_the_receipts_wait() {
+        let limits = DriveLimits::default();
+        let timeout = minutes_ms(limits.fix_timeout_minutes);
+        let mut e = pushed_fix_entry();
+        let first = e.fix_pushed_ms.expect("arc 7 stamps the anchor");
+        let silent = |e: &DriveEntry, now_ms| {
+            decide(
+                e,
+                &DriveFacts {
+                    now_ms,
+                    ci: CiObservation::Green,
+                    worker: WorkerSignal::Silent,
+                    ..facts_at("head-c")
+                },
+                &limits,
+            )
+        };
+        // Without the re-stamp this is the park — the defect, stated as the
+        // pre-state so the fix below cannot pass vacuously.
+        assert_eq!(
+            silent(&e, first + timeout),
+            DriveStep::held(HeldReason::FixStalled),
+            "the pre-state: measured from the first push, the window is spent"
+        );
+
+        // The worker pushes again at minute 55, and the tick records it.
+        let second = first + timeout - minutes_ms(5);
+        e.note_fix_push(second);
+        assert_eq!(e.state_since_ms, first, "the STATE clock is deliberately untouched");
+        assert_eq!(
+            silent(&e, first + timeout),
+            DriveStep::Wait,
+            "the same instant is now five minutes into a fresh window"
+        );
+        assert_eq!(
+            silent(&e, second + timeout),
+            DriveStep::held(HeldReason::FixStalled),
+            "…and the fresh window is a whole one, not an unbounded reprieve"
+        );
+
+        // The bound the re-stamp may not remove: `state-stalled` measures from
+        // `state_since_ms`, so a worker that pushed for ever still parks.
+        let forever = first + state_bound_ms(DriveState::CiWait, &limits, 0).unwrap();
+        e.note_fix_push(forever);
+        assert_eq!(
+            silent(&e, forever),
+            DriveStep::held(HeldReason::StateStalled),
+            "a drive that keeps pushing is still bounded by the state it is sitting in"
+        );
+
+        // And it re-stamps only what exists: a head move in a state that never
+        // took arc 7 must not manufacture a wait.
+        let mut fresh = entry_at(DriveState::CiWait);
+        fresh.note_fix_push(9_999);
+        assert!(!fresh.fix_pushed(), "note_fix_push is a re-stamp, never an entry point");
+    }
+
+    /// **A driven worker's `report(progress)` is answered wherever a hand-back
+    /// is outstanding, which E1 makes two states** (rev-final round 2, finding
+    /// 1). `kickback_owed` was scoped to `fix-wait` on the argument that "in
+    /// any other state there is no hand-back to be waiting on and nothing the
+    /// worker was asked for" — which E1 falsified for `ci-wait` on an arc-7
+    /// head, where the worker has been handed a round and is being waited on
+    /// for the very `report(done)` that line asks it to send.
+    ///
+    /// Left unswept, #1959 reappears one state over and worse: §7 consumes the
+    /// report (its interception is keyed on the agent, not the state), the
+    /// orchestrator's pane gets nothing, the worker's pane gets nothing, and a
+    /// fix timeout later the hold says the driver heard nothing from a worker
+    /// that spoke.
+    ///
+    /// The `review-wait` row is the control that keeps this from becoming
+    /// "answer everywhere": that state has no outstanding hand-back.
+    #[test]
+    fn a_progress_report_is_owed_an_answer_in_both_states_that_are_waiting_on_the_worker() {
+        // `fix-wait`, unchanged — and the pre-state for the arc-7 case below.
+        let mut e = entry_at(DriveState::ReviewWait);
+        e.advance(DriveState::FixWait, None, Some(Counter::ReviewRounds), 10_000).unwrap();
+        assert!(e.kickback_owed(), "#1959's own state, unchanged");
+
+        // Arc 7. The hand-back is still outstanding: the worker was asked to
+        // push AND report, and it has done half of that.
+        e.advance(DriveState::CiWait, None, None, 100_000).unwrap();
+        assert!(e.fix_pushed());
+        assert!(
+            e.kickback_owed(),
+            "the worker is still being waited on, for the report this line asks it to send"
+        );
+
+        // The budget is one per HAND-BACK and not one per state: `fix_handback_ms`
+        // is not re-stamped by arc 7, so a worker answered before it pushed is
+        // not answered again after.
+        let mut answered = e.clone();
+        answered.record_kickback(20_000);
+        assert!(!answered.kickback_owed(), "same round, same answer, once");
+
+        // The control: `ci-wait` on a head this drive never handed back for, and
+        // `review-wait`, owe nobody anything.
+        let first_drive = entry_at(DriveState::CiWait);
+        assert!(!first_drive.fix_pushed());
+        assert!(!first_drive.kickback_owed(), "no hand-back is outstanding here");
+        let mut reviewing = e.clone();
+        reviewing.advance(DriveState::ReviewWait, None, None, 200_000).unwrap();
+        assert!(!reviewing.kickback_owed(), "and the lane's state owes the worker nothing");
+    }
+
+    /// **The two residuals `decide_fix_receipts` discloses are recoverable by
+    /// the remedy their own notice prints**, which §2.2 requires of every hold
+    /// whose cause is a wait — and which a hold on a signal that will never
+    /// arrive would otherwise fail: a resume that only restarted the clocks
+    /// would re-hold an hour later, for ever.
+    ///
+    /// This is the counterfactual for the disclosure, performed rather than
+    /// argued (CLAUDE.md: a documented escape hatch is only pinned by a test
+    /// that performs the edit). Arc 11 re-enters `ci-wait` from `held`, so
+    /// `advance` assigns `fix_pushed_ms` None — it is the ASSIGNMENT, not a
+    /// clock, that makes the resume work, and a `set` would leave the drive
+    /// waiting on the same absent report.
+    ///
+    /// The pre-state is the hold itself, so the test cannot pass by resuming a
+    /// drive that was never stuck.
+    #[test]
+    fn a_resume_out_of_fix_stalled_briefs_on_the_next_green() {
+        let limits = DriveLimits::default();
+        let mut e = pushed_fix_entry();
+        let stalled = DriveFacts {
+            now_ms: e.state_since_ms + minutes_ms(limits.fix_timeout_minutes),
+            ci: CiObservation::Green,
+            worker: WorkerSignal::Silent,
+            ..facts_at("head-b")
+        };
+        assert_eq!(
+            decide(&e, &stalled, &limits),
+            DriveStep::held(HeldReason::FixStalled),
+            "the pre-state: a drive really parked on the wait this test is about"
+        );
+        e.take(&DriveStep::held(HeldReason::FixStalled), stalled.now_ms).unwrap();
+
+        // Arc 11: `drive_review` resumes it, hours later — a human takes their
+        // time over a hold, so the resume must not depend on any clock.
+        let resumed_at = stalled.now_ms + minutes_ms(300);
+        e.advance(DriveState::CiWait, None, None, resumed_at).unwrap();
+        assert!(!e.fix_pushed(), "the resume leaves no outstanding report to wait for");
+        assert_eq!(
+            decide(
+                &e,
+                &DriveFacts { now_ms: resumed_at + 1_000, ..stalled },
+                &limits
+            ),
+            DriveStep::to(DriveState::ReviewWait),
+            "the very next green briefs, with nothing further asked of a worker that \
+             may have said its piece already"
+        );
     }
 
     #[test]
@@ -5640,6 +6434,7 @@ mod tests {
     fn a_state_clock_never_outruns_the_drives_own_age() {
         // The pre-#2110 entry, reconstructed the way serde would: a real
         // `started_ms`, and a `state_since_ms` the older build never wrote.
+        let limits = DriveLimits::default();
         let mut old = entry_at(DriveState::CiWait);
         old.started_ms = 1_000;
         old.state_since_ms = 0;
@@ -5650,8 +6445,11 @@ mod tests {
             minutes_ms(200),
             "a drive that has existed for 200 minutes cannot have been in one state longer"
         );
+        // Asked of `state_bound_ms` rather than of the constant: since #2168 E1
+        // `CI_WAIT_BOUND_MS` is the slack over `fix_timeout_minutes`, so a
+        // comparison against it would understate the bound this half is about.
         assert!(
-            old.state_elapsed_ms(now) >= CI_WAIT_BOUND_MS,
+            old.state_elapsed_ms(now) >= state_bound_ms(DriveState::CiWait, &limits, 0).unwrap(),
             "…and it still reaches the bound, so the argued hold-then-resume is unchanged"
         );
 
@@ -5722,10 +6520,16 @@ mod tests {
     /// so the disclosure cannot go false with nothing red to say so.
     ///
     /// The clocks are absolute stamps rather than tick counts, so a group paused
-    /// or an app closed across a two-hour gap is indistinguishable from a drive
-    /// that sat in `ci-wait` for two hours. The age bound had this property
-    /// before #2110 and nobody reached it at four hours; at ninety minutes it is
-    /// an ordinary lunch break.
+    /// or an app closed across a gap is indistinguishable from a drive that sat
+    /// in `ci-wait` for that long. The age bound had this property before #2110
+    /// and nobody reached it at four hours; at the per-state bounds it is an
+    /// unattended afternoon, and on the three arms shorter than `ci-wait`'s it
+    /// is less than that.
+    ///
+    /// **The gap this test uses is derived from the bound rather than written**,
+    /// because the figure moved once already: it was a literal two hours against
+    /// a bare ninety-minute `ci-wait` bound, and #2168 E1 made that arm the
+    /// constant plus `fix_timeout_minutes`.
     ///
     /// **This pins the residual itself, not a fix**, and the second half is what
     /// makes that honest: the drive is recoverable by the remedy its own notice
@@ -5736,10 +6540,19 @@ mod tests {
         let limits = DriveLimits::default();
         let mut e = entry_at(DriveState::CiWait);
         e.head = "head-a".into();
-        // One tick at 1_000, then nothing for two hours — orrerix was not
-        // running. No starvation was recorded, because no tick was there to
-        // record one.
-        let after_gap = 1_000 + minutes_ms(120);
+        // One tick at 1_000, then nothing at all — orrerix was not running. No
+        // starvation was recorded, because no tick was there to record one.
+        //
+        // **The gap is derived from the bound and not written as a number.** It
+        // was a literal 120 minutes, chosen when `ci-wait`'s bound was the bare
+        // `CI_WAIT_BOUND_MS`; #2168 E1 made that arm the constant PLUS
+        // `fix_timeout_minutes`, and a literal that no longer crosses the bound
+        // stops witnessing the residual while still reading like a lunch break.
+        // Asked of `state_bound_ms` instead, so the next change to that arm
+        // moves the specimen with it (CLAUDE.md: a test's specimen must stay a
+        // member of the class it witnesses).
+        let bound = state_bound_ms(DriveState::CiWait, &limits, 0).unwrap();
+        let after_gap = 1_000 + bound;
         assert_eq!(
             decide(&e, &DriveFacts { now_ms: after_gap, ..facts_at("head-a") }, &limits),
             DriveStep::held(HeldReason::StateStalled),
@@ -5795,8 +6608,11 @@ mod tests {
 
         // The control: the same entry at a forward clock past the bound holds,
         // so the assertion above is about the step and not about a drive that
-        // could never hold at all.
-        let ahead = minutes_ms(500) + CI_WAIT_BOUND_MS;
+        // could never hold at all. **The bound is asked of `state_bound_ms`**,
+        // not restated as `CI_WAIT_BOUND_MS` — since #2168 E1 that constant is
+        // the SLACK over `fix_timeout_minutes` rather than the whole bound, and
+        // a control that stops crossing it is a control that stops controlling.
+        let ahead = minutes_ms(500) + state_bound_ms(DriveState::CiWait, &limits, 0).unwrap();
         assert_eq!(
             decide(&e, &DriveFacts { now_ms: ahead, ..facts_at("head-a") }, &limits),
             DriveStep::held(HeldReason::StateStalled),

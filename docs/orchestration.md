@@ -2554,6 +2554,20 @@ edit or a finding the worker answered rather than changed code for. A `report(pr
 no further, so instead of waiting the fix timeout out the driver types one line back into that
 worker's pane saying so. Once per hand-back, never to you.
 
+**After a hand-back, green checks are not on their own enough to open a review.** A worker can only
+fill its PR body's CI receipts — run ids, what each platform concluded — once the checks have
+settled, so a reviewer briefed the moment the matrix went green was briefed against a body the
+worker was about to edit, and the pass it then recorded was stale before it was written: the gate
+blocks on `body-unchanged`, and a whole re-record round buys nothing but a digest match. So on a
+head the driver handed back and the worker pushed, it waits for that worker's `report(done)` as
+well before opening the lane. What you see while it waits is a drive sitting in `ci-wait` on a
+green PR, which is the driver holding the reviewers until the revision stops moving. A worker that
+pushes and then goes quiet is bounded like any other: `fix_timeout_minutes` from the push, and then
+the drive parks as `fix-stalled` with a line naming the pane to read. A worker that reports
+`blocked`, or a pane that could not be reached, is answered by its own hold at once rather than
+waited out. None of this applies to a drive that has not handed anything back yet — the first pass
+over a PR you drove after your worker already reported is unchanged.
+
 **A drive stops, it does not drift.** There are seventeen ways out and each produces exactly one
 line in the orchestrator's pane: the gate being satisfied, the drive being cancelled — by you, or
 by orrerix on its own when it sees the PR has been closed — or one of
@@ -2593,9 +2607,12 @@ longer competing with itself for the slots it is waiting on.
 
 **A drive is bounded by where it is stuck, not by how long it has existed.** Each of the four
 working states has its own bound, and it starts again from zero every time the drive moves:
-90 minutes in `ci-wait`, 90 minutes in `fix-wait`, and 15 minutes in `gate-check`, which is a
-decision rather than a wait. `review-wait` is the one that is not a flat number: it holds your
-reviewers one after another, so its bound is three hours **plus** one `lane_timeout_minutes`
+90 minutes in `fix-wait`, and 15 minutes in `gate-check`, which is a decision rather than a wait.
+The other two are not flat numbers, and for the same reason — each holds more than one wait end to
+end, so its bound has to cover their sum. `ci-wait` is 90 minutes **plus** one
+`fix_timeout_minutes`, because after a hand-back it waits for the checks and then for the worker's
+report — two and a half hours at the defaults. `review-wait` holds your reviewers one after
+another, so its bound is three hours **plus** one `lane_timeout_minutes`
 per required lane — four hours for a one-lane gate at the default, six for three. Past one of
 these the drive parks as `state-stalled`, and its line says which state, how long it sat there
 and what the bound was — so resuming it is a decision you make rather than a reflex. None of

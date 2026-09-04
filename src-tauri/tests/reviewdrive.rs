@@ -636,6 +636,10 @@ impl Repo {
 
 const HEAD_A: &str = "aa11bb22cc33dd44ee55ff6677889900aabbccdd";
 const HEAD_B: &str = "bb22cc33dd44ee55ff6677889900aabbccddeeff";
+/// A third head, for the one sequence that needs three: brief at A, red at B,
+/// and then the WORKER's fix push, which has to be distinguishable from B or
+/// arc 7 has nothing to fire on (#2168 E1).
+const HEAD_C: &str = "cc33dd44ee55ff6677889900aabbccddeeff1122";
 
 /// A canned `gh`, keyed on the SUBCOMMAND rather than on call order, so a test
 /// asserts what the driver concluded and not the sequence it happened to read
@@ -3042,12 +3046,34 @@ fn a_fix_at_a_new_head_re_opens_the_lane_instead_of_re_routing_the_stale_verdict
     );
     assert_eq!(review_rounds(&reg, &group), 1, "arc 5 spends exactly one round");
     assert_eq!(routed.handbacks.len(), 1, "…and hands the findings back once");
+    let (_pr, worker) = routed.handbacks.first().cloned().expect("the hand-back names a pane");
+    with_pane(&reg, &worker, 7002);
 
     // The worker fixes and pushes. CI stays green, as it was on #1870.
     gh.set_facts("OPEN", HEAD_B);
     reg.set_pr_head_override(Some(HEAD_B.to_string()));
     reg.rd_drive_group_with(&group, &gh, 40_000); // arc 7: the head moved
-    reg.rd_drive_group_with(&group, &gh, 50_000); // arc 2: green again
+
+    // …and then it finishes the round it was handed, which since #2168 E1 is
+    // what arc 2 waits for on a head that arrived by arc 7. The report is part
+    // of the fixture rather than a concession to it: `driver-fix.md` tells the
+    // worker to push AND report, so a fixture that pushed and went silent was
+    // modelling half a round — and under E1 that half is `held(fix-stalled)`,
+    // which is a different subject from the one this test is about.
+    dispatch(
+        &reg,
+        &Caller {
+            agent_id: worker.clone(),
+            group: group.clone(),
+            role: Role::Worker,
+            role_hint: None,
+        },
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "fixed and pushed", "ref": "#1758" } }),
+    )
+    .expect("the driven worker reports its fix finished");
+    reg.rd_drive_group_with(&group, &gh, 50_000); // arc 2: green, and reported
 
     // THE ARC RAN. Everything below is a statement about a drive that really is
     // back in `review-wait` looking at the new head.
@@ -4691,6 +4717,130 @@ fn a_handback_resumes_into_the_live_idle_pane_on_that_session() {
             assert_eq!(opened, 1, "…and that is one new pane: {handed:?}");
         }
     }
+}
+
+// ── #2168 E1: a fix push leaves ci-wait on the report, not on green ──────────
+
+/// **#1875's class, through the whole live seam.** The unit tests in
+/// `reviewdrive.rs` pin `decide`'s answer; this pins that the tick, the
+/// interception, the persisted flag and the lane brief compose into the
+/// property the issue is about — the lane is briefed **once**, at the digest
+/// the receipts left behind, instead of twice.
+///
+/// The sequence is the forced one #1875 documents. The worker cannot fill the
+/// PR body's CI section until the checks have settled, so it lands *after* the
+/// green the drive would have briefed on: brief at d1, receipts move the body
+/// to d2, `first_stale_lane` reads the `(head, digest)` key, the fresh `pass`
+/// is already stale, re-record. Head unmoved, not one line of code changed.
+///
+/// **What makes this non-vacuous** is the spawn count across the whole
+/// sequence. Asserting only "the drive ends in `review-wait` with a lane open"
+/// passes just as well under the defect — it opens a lane too, one round
+/// earlier and one round more.
+#[test]
+fn a_fix_push_briefs_its_lane_once_at_the_digest_the_ci_receipts_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(dir.path());
+    let repo = Repo::new();
+    let gh = FakeGh::green(HEAD_A);
+    let (group, _session) = driven(&reg, &repo, &gh);
+
+    // Round 1 to the hand-back: lane 0 briefed at HEAD_A, CI then red at HEAD_B.
+    let handed = to_first_handback(&reg, &group, &gh);
+    let (_pr, worker) = handed.handbacks.first().cloned().expect("the drive hands back");
+    with_pane(&reg, &worker, 7503);
+    assert_eq!(status_state(&reg, &group), "fix-wait", "the pre-state");
+
+    // The worker pushes its fix. Arc 7 — and this is the arc the whole slice
+    // turns on, so the head really has to move.
+    gh.set_facts("OPEN", HEAD_C);
+    reg.rd_drive_group_with(&group, &gh, 50_000);
+    assert_eq!(status_state(&reg, &group), "ci-wait", "arc 7: the worker pushed");
+
+    // The checks settle green. Before #2168 E1 this alone was arc 2.
+    gh.set_checks(r#"[{"name":"build","state":"SUCCESS","link":"x"}]"#);
+    let spawns_at_green = action_count(&reg, &group, "agent-spawn");
+    let green_tick = reg.rd_drive_group_with(&group, &gh, 60_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "ci-wait",
+        "green says the checks settled, not that the round is over — the worker has not \
+         reported, so its CI receipts have not landed and a lane briefed now is briefed \
+         at a body digest about to move"
+    );
+    assert!(
+        green_tick.lanes_opened.is_empty(),
+        "…and no lane was opened on it: {green_tick:?}"
+    );
+    // **A second tick before the body moves, and it is what makes this test
+    // fail under the defect rather than pass by accident.** Arc 2 and the lane
+    // brief are different ticks (a lane brief is not a transition, §2.1), so a
+    // `decide_ci_wait` that advanced on green alone needs one more tick to open
+    // the lane at the OLD digest — and the whole point is that it is open,
+    // holding a `pass` slot, when the receipts land below. Without this tick
+    // the defect would brief at the new digest too and read green.
+    let settling = reg.rd_drive_group_with(&group, &gh, 65_000);
+    assert!(
+        settling.lanes_opened.is_empty(),
+        "still nothing briefed while the worker is reading its own matrix: {settling:?}"
+    );
+
+    // What green let the worker do: read the matrix, write the receipts into
+    // the PR body, and only then report. This body move is the one that used to
+    // stale a pass recorded seconds earlier.
+    gh.set_body("b — plus the CI receipts the worker could not write until now");
+    let caller = Caller {
+        agent_id: worker.clone(),
+        group: group.clone(),
+        role: Role::Worker,
+        role_hint: None,
+    };
+    dispatch(
+        &reg,
+        &caller,
+        "tools/call",
+        &json!({ "name": "report", "arguments": {
+            "outcome": "done", "note": "fix pushed, matrix green", "ref": "#1758" } }),
+    )
+    .expect("a driven worker must be able to report done");
+
+    let arc2 = reg.rd_drive_group_with(&group, &gh, 70_000);
+    assert_eq!(
+        status_state(&reg, &group),
+        "review-wait",
+        "arc 2 fires once the revision has stopped moving: {arc2:?}"
+    );
+    let opened = reg.rd_drive_group_with(&group, &gh, 80_000);
+    let (_pr, _block, lane) = opened
+        .lanes_opened
+        .first()
+        .cloned()
+        .expect("the tick after arc 2 opens the gate's first lane");
+
+    // **The payoff.** The body does not move again, so the lane's brief is
+    // still current on the next tick and nothing re-briefs it. Under the defect
+    // the lane was opened before `set_body` above and this tick re-opened it.
+    let after = reg.rd_drive_group_with(&group, &gh, 90_000);
+    assert!(
+        after.lanes_opened.is_empty(),
+        "the lane was briefed at the digest the receipts left, so there is nothing to \
+         re-brief: {after:?}"
+    );
+    assert_eq!(
+        action_count(&reg, &group, "agent-spawn") - spawns_at_green,
+        1,
+        "exactly one reviewer pane for round 2 — the re-record round #1875 measures is a \
+         second one, and counting them is what makes this test fail under the defect \
+         rather than merely arrive at the same end state"
+    );
+
+    // And the brief that lane got names the revision the receipts are part of,
+    // not the one the drive saw go green.
+    let brief = lane_brief(&reg, &lane);
+    assert!(
+        brief.contains(HEAD_C),
+        "the delta names the head the worker pushed: {brief}"
+    );
 }
 
 // ── #1959: a worker's progress report in fix-wait is answered, not swallowed ─
@@ -6596,7 +6746,14 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
     reg.set_pr_head_override(Some(HEAD_A.to_string()));
     let (group, _session) = driven(&reg, &repo, &gh);
 
-    let short = reg.rd_drive_group_with(&group, &gh, reviewdrive::CI_WAIT_BOUND_MS - 1);
+    // **The bound is derived, not restated.** `CI_WAIT_BOUND_MS` was the whole
+    // of `ci-wait`'s bound when this was written; since #2168 E1 it is the SLACK
+    // over `fix_timeout_minutes`, which the fixture leaves at its 60-minute
+    // default. Written as the constant, the "one tick short" half would tick at
+    // 89m59s against a 150-minute bound and stop discriminating anything.
+    let bound = reviewdrive::state_bound_ms(reviewdrive::DriveState::CiWait, &DriveLimits::default(), 0)
+        .expect("a working state has a bound");
+    let short = reg.rd_drive_group_with(&group, &gh, bound - 1);
     assert_eq!(
         status_state(&reg, &group),
         "ci-wait",
@@ -6608,7 +6765,7 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
         short.notices
     );
 
-    let held = reg.rd_drive_group_with(&group, &gh, reviewdrive::CI_WAIT_BOUND_MS);
+    let held = reg.rd_drive_group_with(&group, &gh, bound);
     assert_eq!(status_state(&reg, &group), "held");
     let status = reg.review_drive_status(&group);
     let drive = &status["drives"][0];
@@ -6624,7 +6781,7 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
     );
     assert_eq!(
         drive["held_state_ms"],
-        json!(reviewdrive::CI_WAIT_BOUND_MS),
+        json!(bound),
         "…and for how long, measured on the clock that fired: {status}"
     );
 
@@ -6634,11 +6791,11 @@ fn a_drive_stuck_in_one_state_parks_on_that_states_bound_and_the_notice_says_so(
         .find(|n| n.contains("HELD"))
         .expect("a hold delivers exactly one notice");
     assert!(
-        notice.contains("in ci-wait for 1h 30m"),
+        notice.contains("in ci-wait for 2h 30m"),
         "the notice must name the state and the time in it: {notice}"
     );
     assert!(
-        notice.contains("bound for that state is 1h 30m"),
+        notice.contains("bound for that state is 2h 30m"),
         "…and the bound that decided, so a near miss reads differently from a long \
          stall: {notice}"
     );

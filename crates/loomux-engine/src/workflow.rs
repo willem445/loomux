@@ -678,8 +678,9 @@ pub const DRIVER_MAX_REBASE_ATTEMPTS_MAX: u32 = 1;
 /// rebases — which are unchanged and still refuse a repo that tries to widen
 /// them. The timeouts are pacing, not budget, and the pacing this ships is
 /// strictly tighter overall: before, a stuck drive waited four hours whatever it
-/// was stuck on; now the state it is stuck IN answers, in ninety minutes or
-/// less for three of the four.
+/// was stuck on; now the state it is stuck IN answers, on a per-state clock a
+/// transition resets. `reviewdrive::state_bound_ms` is where the per-arm shape
+/// lives, and a figure restated here is how this line went stale once already.
 pub const DRIVER_DRIVE_TIMEOUT_DEFAULT_MIN: u32 = 720;
 
 /// The closed range for `driver.drive_timeout_minutes` — its **own**, no longer
