@@ -61,12 +61,25 @@ const URGENT: ReadonlySet<string> = new Set(["held-dialog", "blocked", "stranded
  *
  *  Deliberately not derivable as "the complement of `URGENT`": `waiting` is
  *  non-urgent too and is emphatically NOT a decision — it is a finished turn,
- *  which the ladder reads on its own `turn-done` rung. The three classes are
- *  independent, which is why `every reason in LABELS is classified exactly
- *  once` in `test/attention.test.ts` pins the partition rather than one set:
- *  adding a reason to `LABELS` without deciding which class it is fails there,
- *  loudly, instead of defaulting into the quietest answer. */
-export const DECISION_REASONS: ReadonlySet<string> = new Set(["question", "gate", "report"]);
+ *  which the ladder reads on its own `turn-done` rung. `report` (#2367) is
+ *  non-urgent and not a decision either — the agent has called `report(...)`
+ *  and is waiting on the ORCHESTRATOR, which is why it has its own class below.
+ *  The classes are independent, which is why `every reason in LABELS is
+ *  classified exactly once` in `test/attention.test.ts` pins the partition
+ *  rather than one set: adding a reason to `LABELS` without deciding which
+ *  class it is fails there, loudly, instead of defaulting into the quietest
+ *  answer. */
+export const DECISION_REASONS: ReadonlySet<string> = new Set(["question", "gate"]);
+
+/** Attention reasons where the agent has CALLED IN and is waiting on its
+ *  orchestrator — not on the human (#2367). The header chip has always worded
+ *  this "✓ reported"; the Agents tab used to file it under `question` because
+ *  the reason sat in `DECISION_REASONS`, which counted it in the needs-you
+ *  badge and told the human a decision was owed when the orchestrator is the
+ *  one who owes the read. Its own exported class so `agentrows.ts` gets its
+ *  own `reported` rung from here and the classification partition pin sees
+ *  all four classes. */
+export const REPORT_REASONS: ReadonlySet<string> = new Set(["report"]);
 
 /** Whether a fresh `(reason, detail)` reading differs from the one currently
  *  applied to a pane — the identity check `Pane.setAttention` gates its DOM

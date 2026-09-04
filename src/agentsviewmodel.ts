@@ -30,6 +30,10 @@ import {
 export const AGENT_STATE_LABEL: Record<AgentState, string> = {
   attention: "needs you",
   question: "question",
+  // #2367: the header chip words the `report` reason "✓ reported", so the row
+  // uses the same word — it used to read "question", which counted a
+  // report-waiting-on-the-orchestrator as a decision owed by the human.
+  reported: "reported",
   held: "held",
   "turn-done": "turn done",
   working: "working",

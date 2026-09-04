@@ -36,6 +36,13 @@ test("every state a row can carry has a word for it", () => {
   }
 });
 
+test("the reported state uses the header chip's own word (#2367)", () => {
+  // The pane header renders the `report` reason as "✓ reported" — the Agents
+  // tab used to call the same pane "question", which is the divergence #2367
+  // exists to fix. Pin the word, so the two surfaces cannot drift apart again.
+  assert.equal(AGENT_STATE_LABEL.reported, "reported");
+});
+
 test("a chip is offered for every state present, and never for one that is not", () => {
   const rows = [row("working"), row("working"), row("idle")];
   const chips = filterChips(rows, "all");

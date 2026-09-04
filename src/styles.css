@@ -1796,6 +1796,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .agents-item.state-attention .agents-state { color: var(--state-danger); }
 .agents-item.state-question { border-left-color: var(--state-attention); }
 .agents-item.state-question .agents-state { color: var(--state-attention); }
+/* #2367: a reported agent has called in and waits on the ORCHESTRATOR, not on
+   the human — ok-green like turn-done (the chip's glyph is a ✓), never the
+   question-amber that used to claim a decision was owed. */
+.agents-item.state-reported { border-left-color: var(--state-ok); }
+.agents-item.state-reported .agents-state { color: var(--state-ok); }
 .agents-item.state-turn-done { border-left-color: var(--state-ok); }
 .agents-item.state-turn-done .agents-state { color: var(--state-ok); }
 .agents-item.state-held { border-left-color: var(--state-held); }

@@ -8,6 +8,7 @@ import {
   attentionDismiss,
   attentionChanged,
   DECISION_REASONS,
+  REPORT_REASONS,
   KNOWN_ATTENTION_REASONS,
 } from "../src/attention.ts";
 
@@ -190,9 +191,12 @@ test("attentionChanged treats a fresh reason and a clear as changes too", () => 
 });
 
 test("every known attention reason is classified exactly once", () => {
-  // #2122 slice A / #2195 review, rev-std finding 2. Three independent classes
+  // #2122 slice A / #2195 review, rev-std finding 2. Four independent classes
   // consume this module: URGENT (via `attentionPresentation().urgent`, the red
-  // chips), DECISION_REASONS (a call waiting on the human's own pace), and
+  // chips), DECISION_REASONS (a call waiting on the human's own pace),
+  // REPORT_REASONS (#2367 — the agent called `report(...)` and is waiting on
+  // the ORCHESTRATOR, not on a human decision; before #2367 `report` sat in
+  // DECISION_REASONS and the Agents tab read it as `question`), and
   // `waiting` — which is non-urgent and emphatically NOT a decision: it is a
   // finished turn, read on `agentrows.ts`'s own `turn-done` rung.
   //
@@ -206,6 +210,7 @@ test("every known attention reason is classified exactly once", () => {
     const classes = [
       attentionPresentation(reason).urgent && "urgent",
       DECISION_REASONS.has(reason) && "decision",
+      REPORT_REASONS.has(reason) && "report",
       reason === "waiting" && "waiting",
     ].filter(Boolean);
     if (classes.length === 0) unclassified.push(reason);
@@ -218,6 +223,7 @@ test("every known attention reason is classified exactly once", () => {
   assert.ok(KNOWN_ATTENTION_REASONS.length >= 7, `only ${KNOWN_ATTENTION_REASONS.length} reasons scanned`);
   assert.ok(KNOWN_ATTENTION_REASONS.some((r) => attentionPresentation(r).urgent));
   assert.ok(KNOWN_ATTENTION_REASONS.some((r) => DECISION_REASONS.has(r)));
+  assert.ok(KNOWN_ATTENTION_REASONS.some((r) => REPORT_REASONS.has(r)));
   assert.ok(KNOWN_ATTENTION_REASONS.includes("waiting"));
 });
 
