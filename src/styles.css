@@ -1122,6 +1122,41 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-btn.pane-overflow { width: 25px; font-size: 14px; }
 .pane.header-folded .pane-btn.pane-overflow,
 .pane-btn.pane-overflow[aria-expanded="true"] { opacity: 1; }
+/* ---------- the narrowest header (#2335) ---------- */
+/* One rung below the fold: the window-control cluster has gone into the menu
+   too, and so has the pane name. Two rules make "the ⋯ button is reachable at
+   EVERY width" true rather than merely intended.
+     1. The name leaves the row. It is `display: none` rather than allowed to
+        ellipsise further because a name clipped to one glyph carries nothing and
+        still spends the ~20px the ⋯ needs; `.pane-overflow-menu`'s first row
+        carries it instead, with the rename gesture attached.
+     2. Every other header child becomes SHRINKABLE. `.pane-btn` and the status
+        chips are `flex: none`, so without this the row does not shrink — it
+        OVERFLOWS, and `.pane`'s own `overflow: hidden` clips whatever hangs off
+        the right end. Once the cluster has folded, the thing hanging off the
+        right end is the ⋯ itself, which is exactly the bug #2335 reports. The
+        policy in `src/paneheader.ts` can decide what the row CONTAINS; only
+        flexbox can promise it FITS, so that promise is made here.
+   The ⋯ button is the one child exempted, so the deficit is taken out of the CLI
+   mark, the role badge and the chips (which ellipsise or clip) before anything is
+   taken out of the one control left. Pure header chrome: the header's height is
+   `--pane-header-h` at every rung, so `.pane-term`'s box never moves and no PTY
+   is resized (CLAUDE.md constraint 1). */
+.pane.header-minimal .pane-title { display: none; }
+.pane.header-minimal .pane-header > *:not(.pane-btn.pane-overflow):not(.pane-overflow-menu) {
+  flex-shrink: 1; min-width: 0; overflow: hidden;
+}
+
+/* The menu's name row. Not an icon button — it is the pane name, so it is
+   text-shaped and takes the menu's whole width rather than sitting in the icon
+   grid beside ⤢ and ✕. */
+.pane-rename-entry {
+  width: 100%; flex-basis: 100%; text-align: left;
+  padding: 0 6px; font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pane-rename-entry[hidden] { display: none; }
+
 @media (prefers-reduced-motion: reduce) {
   .pane-overflow-menu { transition: none; }
 }

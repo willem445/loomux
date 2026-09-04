@@ -1,4 +1,4 @@
-// The pane header's overflow policy (#2191) — DOM-free, so it is unit-testable
+// The pane header's overflow policy (#2191, #2335) — DOM-free, so it is unit-testable
 // under `node --test` (mirrors overlaysize.ts / layout.ts / resizeburst.ts).
 // pane.ts owns every pixel this module reasons about: it measures the header,
 // calls `planHeaderFit`, and moves the elements the plan names.
@@ -6,13 +6,13 @@
 // WHY A POLICY MODULE AT ALL. The question "is this header too narrow for its
 // icon set?" has three inputs that only ever appear together at runtime (the
 // header's box, each control's measured width, which controls are priority) and
-// one that is pure state (are we already folded?). Answering it inside a
+// one that is pure state (which rung are we already on?). Answering it inside a
 // ResizeObserver callback would make it untestable *and* put a feedback loop one
 // typo away — see the invariant below.
 //
-// THE FEEDBACK-LOOP INVARIANT. `planHeaderFit` decides from `fullWidth`, the
-// width the row would need with EVERY control inline. That quantity is
-// deliberately independent of the current fold state:
+// THE FEEDBACK-LOOP INVARIANT. `planHeaderFit` prices each rung of its ladder
+// from the width that rung's row would NEED. Every one of those quantities is
+// deliberately independent of the stage we are currently in:
 //   - the title contributes a CONSTANT floor (`TITLE_MIN_W`), never its rendered
 //     width, which flexbox shrinks;
 //   - `fixedWidth` covers only items that stay in the row either way (the CLI
@@ -64,6 +64,31 @@ export interface HeaderControl {
   priority: boolean;
 }
 
+/** The rungs of the fold ladder, widest row first. Each one is reached only when
+ *  the one above it no longer fits, and each is kept only if it is STRICTLY
+ *  narrower than the rung above (see `planHeaderFit`).
+ *
+ *   - `full`     every control inline, the pane name on its floor;
+ *   - `folded`   the non-priority controls in the menu behind `⋯` (#2191);
+ *   - `squeezed` the same row, with the name's floor RELEASED so it ellipsises
+ *                as far as flexbox needs — the name gives way before a control
+ *                does, which is what "the menu button has priority over the
+ *                title" means (#2335);
+ *   - `minimal`  the terminal state: every control in the menu, the name gone
+ *                from the row, and `⋯` the one thing left standing (#2335). */
+export type HeaderFitStage = "full" | "folded" | "squeezed" | "minimal";
+
+/** How the pane name is treated in the row at a given stage. `"shrink"` is the
+ *  same element with no reserved floor; `"hidden"` takes it out of the row
+ *  altogether, and the menu grows a rename entry in its place
+ *  (`overflowMenuIds`). */
+export type TitleFit = "floor" | "shrink" | "hidden";
+
+/** The menu entry that stands in for the pane name once the row has lost it.
+ *  Not a `HeaderControl`: it never sits in the header row, so it costs the row
+ *  nothing and the policy never has to price it. */
+export const RENAME_ENTRY_ID = "rename";
+
 export interface HeaderFitInput {
   /** The header's CONTENT-box width (padding already excluded — a
    *  `ResizeObserver`'s `contentBoxSize.inlineSize`). */
@@ -78,20 +103,28 @@ export interface HeaderFitInput {
   controls: HeaderControl[];
   /** Width of the single overflow button that replaces the folded set. */
   overflowWidth: number;
-  /** Current state — the only input that makes this decision hysteretic. */
-  folded: boolean;
+  /** Current stage — the only input that makes this decision hysteretic. */
+  stage: HeaderFitStage;
   titleMinWidth?: number;
   gap?: number;
   hysteresis?: number;
 }
 
 export interface HeaderFitPlan {
+  stage: HeaderFitStage;
+  /** True whenever the `⋯` button is in the row (and so the menu is in use).
+   *  NOT the same question as `stage !== "full"`: a header can reach `squeezed`
+   *  with nothing folded, because releasing the name's floor is worth room on
+   *  its own and folding is refused whenever it would buy none. */
   folded: boolean;
-  /** Control ids that stay in the header row, in header order. */
+  /** Control ids that stay in the header row, in header order. Empty at
+   *  `minimal`, where `⋯` is the only control left. */
   inline: string[];
   /** Control ids that move into the overflow menu, in header order. Empty
    *  whenever `folded` is false. */
   overflow: string[];
+  /** What the row does with the pane name at this stage. */
+  title: TitleFit;
 }
 
 /** A measured px value, defaulting a non-finite or negative reading to `fallback`. */
@@ -103,74 +136,124 @@ function controlW(c: HeaderControl): number {
   return px(c.width, CONTROL_W_FALLBACK);
 }
 
-function foldedPlan(controls: HeaderControl[]): HeaderFitPlan {
-  return {
-    folded: true,
-    inline: controls.filter((c) => c.priority).map((c) => c.id),
-    overflow: controls.filter((c) => !c.priority).map((c) => c.id),
-  };
+function ids(cs: HeaderControl[]): string[] {
+  return cs.map((c) => c.id);
 }
 
-/** Decide which header controls stay inline and which fold into the overflow
- *  menu.
+/** Decide which header controls stay inline, which fold into the overflow menu,
+ *  and what happens to the pane name — as a LADDER of progressively narrower
+ *  rows, each reached only when the one above it stops fitting.
  *
- *  Folding is ALL-OR-NOTHING over the non-priority set, which is what the ask
- *  describes ("everything else aggregates into a single overflow icon") and what
- *  keeps the menu's contents predictable: a human who has learned where the git
- *  icon lives in the menu finds it in the same place at every narrow width,
- *  instead of it drifting in and out of the row 20px at a time.
+ *  THE PRIORITY ORDER, last thing dropped first. It is the whole policy, and
+ *  every rung below is one step down it:
+ *    1. the `⋯` button — never dropped once it is in the row, because it is the
+ *       only route to everything that folded (#2335: at minimum width the old
+ *       ladder ran out and dropped it, leaving a header with no reachable
+ *       control at all);
+ *    2. the priority controls (minimize / maximize);
+ *    3. the pane name's readable floor — truncating a name costs legibility that
+ *       degrades gracefully (the rest is in the tooltip, and the full name is in
+ *       the menu's rename entry), where folding a control costs a whole extra
+ *       gesture. So the cheap thing is spent first;
+ *    4. the non-priority controls.
  *
- *  Two cases never fold, whatever the width:
- *   - folding would not save room. That covers both the arithmetic case (the
- *     overflow button costs at least as much as the set it replaces — one
- *     foldable control, on a header whose gap makes the swap a wash) and the
- *     degenerate one (nothing to fold, because every control is priority: the
- *     folded row is then the full row PLUS an overflow button standing in for an
- *     empty set, which is strictly wider). An explicit "nothing to fold" early
- *     return was tried and removed — mutating it reddened no test, because this
- *     guard already decides it;
- *   - the header has no measurable width yet (a pane in an inactive project tab
- *     measures 0). Guessing "fold" there would fold every pane in a hidden tab;
- *     the previous state is carried instead and the next real measurement decides. */
+ *  Folding within a rung is ALL-OR-NOTHING over that rung's set, which is what
+ *  #2191 asked for and what keeps the menu's contents predictable: a human who
+ *  has learned where the git icon lives in the menu finds it in the same place at
+ *  every narrow width, instead of it drifting in and out of the row 20px at a
+ *  time.
+ *
+ *  A RUNG THAT BUYS NOTHING IS NOT ON THE LADDER. Each candidate is kept only if
+ *  it is strictly narrower than the last rung kept above it, so:
+ *   - a welcome pane, whose only control is its `✕`, never folds — the `⋯` costs
+ *     more than the one button it would replace (`OVERFLOW_BTN_W` is deliberately
+ *     wider than `.pane-btn`), at `folded` AND at `minimal`, so both are dropped
+ *     and its `✕` stays inline and clickable at every width;
+ *   - a header whose controls are all priority skips `folded` (there is nothing
+ *     to fold) but still reaches `minimal`, where folding them is what buys the
+ *     room;
+ *   - `squeezed` is dropped when the name floor is already zero.
+ *  This subsumes #2191's single "folding buys nothing" guard rather than
+ *  replacing it, and it runs BEFORE the width check, so a header with nothing
+ *  worth folding can never be carried into a folded state that would render an
+ *  overflow button over an empty menu.
+ *
+ *  A header with no measurable width (a pane in an inactive project tab measures
+ *  0) carries its current stage instead of guessing; guessing "fold" there would
+ *  fold every pane in a hidden tab. A stage that is not on this pane's ladder is
+ *  not carried — it drops to the widest rung, which is the case above. */
 export function planHeaderFit(input: HeaderFitInput): HeaderFitPlan {
   const gap = px(input.gap ?? HEADER_GAP_W);
   const titleMin = px(input.titleMinWidth ?? TITLE_MIN_W);
   const hysteresis = px(input.hysteresis ?? HYSTERESIS_W);
   const controls = input.controls;
 
-  const unfolded = (): HeaderFitPlan => ({
-    folded: false,
-    inline: controls.map((c) => c.id),
-    overflow: [],
-  });
-
   const sum = (cs: HeaderControl[]) => cs.reduce((t, c) => t + controlW(c) + gap, 0);
+  const fixed = px(input.fixedWidth);
+  const overflowCost = px(input.overflowWidth) + gap;
 
-  const base = px(input.fixedWidth) + titleMin;
-  const fullWidth = base + sum(controls);
   const priority = controls.filter((c) => c.priority);
-  const foldedWidth = base + sum(priority) + px(input.overflowWidth) + gap;
+  const foldable = controls.filter((c) => !c.priority);
 
-  // Folding that buys nothing is worse than not folding: it hides controls AND
-  // leaves the row just as tight. Checked BEFORE the width guard below, so a
-  // header with nothing foldable can never be carried into a folded state that
-  // would render an overflow button over an empty menu.
-  if (foldedWidth >= fullWidth) return unfolded();
+  const ladder: { need: number; plan: HeaderFitPlan }[] = [];
+  /** Add a rung, unless it is not strictly narrower than the one above it. */
+  const rung = (
+    stage: HeaderFitStage,
+    inline: HeaderControl[],
+    overflow: HeaderControl[],
+    titleFloor: number,
+    title: TitleFit,
+    folded: boolean
+  ): boolean => {
+    const need = fixed + titleFloor + sum(inline) + (folded ? overflowCost : 0);
+    const above = ladder[ladder.length - 1];
+    if (above && need >= above.need) return false;
+    ladder.push({
+      need,
+      plan: { stage, folded, inline: ids(inline), overflow: ids(overflow), title },
+    });
+    return true;
+  };
+
+  rung("full", controls, [], titleMin, "floor", false);
+  const folds = rung("folded", priority, foldable, titleMin, "floor", true);
+  // `squeezed` keeps whatever row survived above it and only releases the name's
+  // floor — so on a pane where folding buys nothing it is the FULL row with a
+  // shrinking name, not a folded one. Reading the fold decision off `folds`
+  // rather than re-deriving it is what keeps those two answers one answer.
+  rung("squeezed", folds ? priority : controls, folds ? foldable : [], 0, "shrink", folds);
+  rung("minimal", [], controls, 0, "hidden", true);
 
   const headerWidth = px(input.headerWidth, -1);
+  const current = ladder.findIndex((r) => r.plan.stage === input.stage);
   if (headerWidth <= 0) {
-    // Not laid out (or detached). Carry the current state rather than inventing one.
-    return input.folded ? foldedPlan(controls) : unfolded();
+    // Not laid out (or detached). Carry the current stage rather than inventing
+    // one; a stage this pane's ladder does not have falls back to the widest.
+    return ladder[current >= 0 ? current : 0].plan;
   }
 
-  // The two thresholds. Both read `fullWidth`, which does not depend on
-  // `input.folded` — see the feedback-loop invariant at the top of this file —
-  // so the dead band between them is the whole of the hysteresis.
-  const shouldFold = input.folded
-    ? fullWidth > headerWidth - hysteresis // stay folded until there is SPARE room
-    : fullWidth > headerWidth; // fold as soon as the full set stops fitting
+  for (let i = 0; i < ladder.length; i++) {
+    // The dead band applies to WIDENING only: a row folds the moment its set
+    // stops fitting, and unfolds only once there is `hysteresis` px of SPARE
+    // room, so a divider dragged slowly across a threshold settles instead of
+    // strobing. Every rung's `need` is independent of `input.stage` — see the
+    // feedback-loop invariant at the top of this file — so the dead band between
+    // two rungs is the whole of the hysteresis.
+    const widening = current >= 0 && i < current;
+    if (ladder[i].need <= headerWidth - (widening ? hysteresis : 0)) return ladder[i].plan;
+  }
+  return ladder[ladder.length - 1].plan;
+}
 
-  return shouldFold ? foldedPlan(controls) : unfolded();
+/** What the overflow menu holds under a given plan, in the order it is rendered:
+ *  the folded controls, preceded by the rename entry that stands in for the pane
+ *  name at the one stage where the row has lost it. The name leads because that
+ *  is where it sits in the header row it is standing in for.
+ *
+ *  Derived from the plan rather than passed in, so "the row has no name" and "the
+ *  menu offers one" are one decision asked once (#2335). */
+export function overflowMenuIds(plan: HeaderFitPlan): string[] {
+  return plan.title === "hidden" ? [RENAME_ENTRY_ID, ...plan.overflow] : plan.overflow;
 }
 
 /** Where the overflow menu's left edge goes, in its container's coordinates.

@@ -61,8 +61,12 @@ import { planFit, FIT_WINDOW_MS, FIT_MAX_WAIT_MS } from "./resizeburst";
 import {
   planHeaderFit,
   menuLeftFor,
+  overflowMenuIds,
+  RENAME_ENTRY_ID,
   HEADER_GAP_W,
   type HeaderControl,
+  type HeaderFitPlan,
+  type HeaderFitStage,
 } from "./paneheader";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
@@ -943,7 +947,15 @@ export class Pane implements VoiceTargetPane {
   /** The header's content-box width from the last `ResizeObserver` delivery. 0
    *  until the pane is laid out, which `planHeaderFit` reads as "carry state". */
   private headerContentW = 0;
+  /** The fold rung the header is on. Carries the policy's hysteresis across
+   *  passes, and is the ONE record of it — `.header-folded` / `.header-minimal`
+   *  are rendered from the plan, never read back as state (#2335). */
+  private headerStage: HeaderFitStage = "full";
   private headerFolded = false;
+  /** The menu's stand-in for the pane name, shown only at the `minimal` rung
+   *  where the name has left the row. Lives in the menu permanently, so
+   *  `applyHeaderPlan`'s replay never has to know about it. */
+  private renameEntry!: HTMLButtonElement;
   private headerSyncTimer: number | undefined;
   private overflowOpen = false;
   /** Opened by a CLICK rather than by hover, so the pointer leaving does not
@@ -1332,6 +1344,23 @@ export class Pane implements VoiceTargetPane {
     this.overflowMenu.setAttribute("role", "group");
     this.overflowMenu.setAttribute("aria-label", "More pane controls");
     header.appendChild(this.overflowMenu);
+
+    // The name's stand-in (#2335). At the narrowest width the pane name is out
+    // of the row entirely — a name clipped to one character carries nothing and
+    // still spends the room the ⋯ button needs — so the menu carries it
+    // instead: the label IS the current name, and pressing it starts the same
+    // rename F2 and a double-click on the title start. First child, because that
+    // is where the name sits in the row it is standing in for.
+    this.renameEntry = document.createElement("button");
+    this.renameEntry.className = "pane-btn pane-rename-entry";
+    this.renameEntry.hidden = true;
+    this.renameEntry.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.closeOverflowMenu();
+      this.startRename();
+    });
+    this.overflowMenu.appendChild(this.renameEntry);
+
     this.wireOverflowOpen();
     this.wireOverflowDismissal();
 
@@ -1385,7 +1414,7 @@ export class Pane implements VoiceTargetPane {
       // #2116's Notes button folds like every other view toggle. Registered
       // rather than merely appended: the registry is what `headerTail` is
       // filtered from, so an unregistered control is not replayed by
-      // `applyHeaderFold` and drifts out of DOM order the first time the header
+      // `applyHeaderPlan` and drifts out of DOM order the first time the header
       // folds — as well as never folding at all, which is the whole point of
       // #2191. It is `hidden` on any pane without a local harness, and
       // `syncHeaderOverflow` reads a zero natural width as "a control this pane
@@ -1400,7 +1429,7 @@ export class Pane implements VoiceTargetPane {
     // DOM order, including the two non-controls at their slots. Read OFF the
     // header rather than re-listed, so it is the append order above by
     // construction and cannot drift from it — replaying it with `appendChild` is
-    // how `applyHeaderFold` puts the row back exactly as it was, with no
+    // how `applyHeaderPlan` puts the row back exactly as it was, with no
     // per-element anchor to go stale.
     const controlEls = new Set<HTMLElement>(this.headerControls.map((c) => c.el));
     this.headerTail = (Array.from(header.children) as HTMLElement[]).filter(
@@ -1592,7 +1621,7 @@ export class Pane implements VoiceTargetPane {
       // policy's "folding buys nothing" guard refuse to fold a header down to a
       // single control — a welcome pane, whose only control is its ✕.
       overflowWidth: naturalWidth(this.overflowBtn) || OVERFLOW_BTN_W,
-      folded: this.headerFolded,
+      stage: this.headerStage,
     });
     // The strip is placed from the ⋯ button's rect, so a pane that resized under
     // an OPEN menu has a stale `left` even when the fold decision has not moved.
@@ -1610,8 +1639,8 @@ export class Pane implements VoiceTargetPane {
     const misplaced = this.headerControls.some(
       (c) => (c.el.parentElement === this.overflowMenu) !== want.has(c.id)
     );
-    if (plan.folded === this.headerFolded && !misplaced) return;
-    this.applyHeaderFold(plan.folded, want);
+    if (plan.stage === this.headerStage && !misplaced) return;
+    this.applyHeaderPlan(plan, want);
   }
 
   /** Total width of the header items that are neither the pane name nor a
@@ -1643,8 +1672,12 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** Move the folded set into the menu (or back), preserving header order in
-   *  both directions. Called only when the state actually flips. */
-  private applyHeaderFold(folded: boolean, overflowIds: Set<string>): void {
+   *  both directions, and render the plan's treatment of the pane name. Called
+   *  only when the stage actually moves (or a control was found in the wrong
+   *  home). */
+  private applyHeaderPlan(plan: HeaderFitPlan, overflowIds: Set<string>): void {
+    const folded = plan.folded;
+    this.headerStage = plan.stage;
     this.headerFolded = folded;
     if (!folded) this.closeOverflowMenu();
     // Replaying the whole sequence re-establishes order in both directions with
@@ -1660,6 +1693,16 @@ export class Pane implements VoiceTargetPane {
     }
     this.overflowBtn.hidden = !folded;
     this.el.classList.toggle("header-folded", folded);
+    // `minimal` is the rung where the name leaves the row; the CSS class is what
+    // takes it out and what makes every remaining non-⋯ header child
+    // shrinkable, so flexbox absorbs the deficit instead of overflowing the row
+    // and clipping the one control left (#2335). Header chrome only: the header's
+    // height is fixed, so `.pane-term` does not move and no PTY is resized
+    // (constraint 1).
+    this.el.classList.toggle("header-minimal", plan.title === "hidden");
+    const menuIds = overflowMenuIds(plan);
+    this.renameEntry.hidden = !menuIds.includes(RENAME_ENTRY_ID);
+    if (!this.renameEntry.hidden) this.syncRenameEntry();
     if (
       focused instanceof HTMLElement &&
       focused !== document.activeElement &&
@@ -3144,6 +3187,9 @@ export class Pane implements VoiceTargetPane {
     // second: the tooltip's job is now "what is this pane called", and the
     // gesture is the footnote.
     this.titleEl.title = name ? `${name} — double-click to rename (F2)` : "Double-click to rename (F2)";
+    // The menu's stand-in carries the same name, so a rename performed at the
+    // narrowest width shows up where the name currently lives (#2335).
+    if (this.renameEntry) this.syncRenameEntry();
     // A docked pane's header is detached, so refresh its dock chip too — else an
     // orchestrator/human rename leaves the chip showing the stale name (#95r).
     this.dockSyncListener?.();
@@ -5254,6 +5300,15 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
+  /** The menu's name row, re-labelled from the current name. Called when the
+   *  entry is revealed and on every rename, so the menu never shows a stale name
+   *  (the entry is hidden at every other rung, so there is nothing to update). */
+  private syncRenameEntry(): void {
+    const name = this.name || "this pane";
+    this.renameEntry.textContent = `✎  ${name}`;
+    this.renameEntry.title = `${name} — rename (F2)`;
+  }
+
   startRename(): void {
     const input = document.createElement("input");
     input.className = "pane-title-input";
@@ -5294,6 +5349,10 @@ export class Pane implements VoiceTargetPane {
         // input) and only reports `live` — safe to refocus — when the input was
         // still on the document, i.e. the ordinary Enter/click-away path.
         this.titleEl.textContent = this.name;
+        // The commit path assigns `this.name` directly rather than going through
+        // `setName`, so the menu's name row is re-labelled here as well — it is
+        // the only place the name is visible at the narrowest width (#2335).
+        this.syncRenameEntry();
         if (swapEditor(input, this.titleEl).live) this.focus();
       },
     });
