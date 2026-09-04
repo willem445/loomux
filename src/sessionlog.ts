@@ -32,9 +32,14 @@
 // constraint 6's surface is untouched by this file and by the two commands
 // behind it.
 
-import { normalizeNoteText, orderedNotes, type SessionNote } from "./notesmodel.ts";
+import {
+  normalizeNoteText,
+  orderedNotes,
+  type NoteTarget,
+  type SessionNote,
+} from "./notesmodel.ts";
 
-export { MAX_NOTE_LEN, type SessionNote } from "./notesmodel.ts";
+export { MAX_NOTE_LEN, type NoteTarget, type SessionNote } from "./notesmodel.ts";
 
 /** Schema version of the persisted blob. Bumped only when an existing key
  *  changes MEANING — a new per-record or per-note key is preserved verbatim by
@@ -263,10 +268,6 @@ export interface SessionLogIo {
  *  do" from "done". `pending` means the note was held in memory against a pane
  *  with no session id yet. */
 export type SessionLogWrite = "saved" | "unchanged" | "pending" | "declined-unread" | "failed";
-
-/** Where a note is being added: a known harness session, or a pane whose
- *  session id orrerix has not learned yet. */
-export type NoteTarget = { sessionId: string } | { paneKey: string };
 
 /** Reads and writes the whole `sessionlog.json` blob, holding the invariant
  *  that makes one shared file safe for many sessions.

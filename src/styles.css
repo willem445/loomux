@@ -2116,6 +2116,58 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
   cursor: pointer; accent-color: var(--accent);
 }
 .editor-dialog { width: 400px; }
+
+/* ---------- #2116: the per-session Notes overlay ----------
+   The same `.launcher-overlay` / `.agent-dialog` kit every other dialog uses —
+   an OVERLAY, never an in-flow panel, so nothing here can reach a PTY resize
+   (hard constraint 1). Wider than the 440px default because a note is prose,
+   and the list scrolls INTERNALLY so a session with thirty notes cannot push
+   the textarea and its buttons off-screen. */
+.notes-dialog { width: 560px; }
+.notes-subtitle {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink);
+}
+.notes-list {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 46vh; overflow-y: auto;
+  padding-right: 2px;
+}
+.notes-empty {
+  font-size: 11.5px; line-height: 1.5; color: var(--ink-faint);
+  padding: 10px 2px;
+}
+.notes-row {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: start; gap: 8px;
+  background: var(--surface-0);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px;
+}
+.notes-text {
+  font-size: 12.5px; line-height: 1.5; color: var(--ink);
+  white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+}
+.notes-when {
+  font-size: 10.5px; color: var(--ink-faint); white-space: nowrap;
+  font-variant-numeric: tabular-nums; padding-top: 2px;
+}
+.notes-del {
+  background: none; border: none; cursor: pointer;
+  color: var(--ink-faint); font: inherit; font-size: 14px; line-height: 1;
+  padding: 0 2px;
+}
+.notes-del:hover { color: var(--state-danger); }
+.notes-input { resize: vertical; min-height: 56px; line-height: 1.5; }
+/* Only present near the cap — a counter on an empty box is noise. `flex: 1`
+   pushes the buttons right whether or not it has text, so they do not shift
+   position as the counter appears. */
+.notes-counter {
+  flex: 1; align-self: center;
+  font-size: 10.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums;
+  visibility: hidden;
+}
+.notes-counter.visible { visibility: visible; }
+
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
 .dlg-btn {
   background: var(--surface-2); color: var(--ink-dim);

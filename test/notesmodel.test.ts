@@ -4,9 +4,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_NOTE_LEN,
+  NoteDrafts,
+  noteDraftIsPristine,
   normalizeNoteText,
   notesEmptyState,
   orderedNotes,
+  targetKey,
   type SessionNote,
 } from "../src/notesmodel.ts";
 
@@ -72,6 +75,79 @@ test("two notes written in the same millisecond keep the order they arrived in",
     out.map((n) => n.id),
     ["first", "second"]
   );
+});
+
+// ---- the draft book (the in-list-editor rule) ----
+
+test("a draft is pristine exactly when it would not become a note", () => {
+  // ONE predicate, and it must agree with the store's own answer — otherwise
+  // the Add button is enabled for a box the store then refuses, or disabled
+  // for one it would have accepted.
+  for (const raw of ["", "   ", "\n\t "]) {
+    assert.equal(noteDraftIsPristine(raw), true, JSON.stringify(raw));
+    assert.equal(normalizeNoteText(raw), null, `${JSON.stringify(raw)} — and the store agrees`);
+  }
+  for (const raw of ["a", "  a  ", "0"]) {
+    assert.equal(noteDraftIsPristine(raw), false, JSON.stringify(raw));
+    assert.notEqual(normalizeNoteText(raw), null, JSON.stringify(raw));
+  }
+});
+
+test("a whitespace-only box is pristine — which `!raw` would get wrong", () => {
+  // The specific miss the predicate exists for: three call sites ask "is there
+  // anything here", and the obvious spelling disagrees with the store on
+  // exactly this input.
+  assert.equal(noteDraftIsPristine("   "), true);
+  assert.notEqual(noteDraftIsPristine("   "), !"   ");
+});
+
+test("a session target and a pane target never share a draft key", () => {
+  // The two id spaces are unrelated strings and can spell the same thing; a
+  // shared key would show one pane's half-typed note in another's editor.
+  assert.notEqual(targetKey({ sessionId: "x" }), targetKey({ paneKey: "x" }));
+});
+
+test("a draft survives a close and reopen on the same target", () => {
+  const drafts = new NoteDrafts();
+  drafts.set({ sessionId: "s-1" }, "half a thou");
+  assert.equal(drafts.get({ sessionId: "s-1" }), "half a thou");
+});
+
+test("two targets' drafts do not mix", () => {
+  const drafts = new NoteDrafts();
+  drafts.set({ sessionId: "s-1" }, "mine");
+  drafts.set({ paneKey: "pane-2" }, "theirs");
+  assert.equal(drafts.get({ sessionId: "s-1" }), "mine");
+  assert.equal(drafts.get({ paneKey: "pane-2" }), "theirs");
+  assert.equal(drafts.get({ sessionId: "never-typed-in" }), "");
+});
+
+test("a draft that goes pristine is pruned, not stored as an empty string", () => {
+  // Otherwise the book grows one entry per session the human ever opened the
+  // dialog on, and `size` stops meaning "things part-way through".
+  const drafts = new NoteDrafts();
+  drafts.set({ sessionId: "s-1" }, "typing…");
+  assert.equal(drafts.size, 1);
+  drafts.set({ sessionId: "s-1" }, "   ");
+  assert.equal(drafts.size, 0);
+  assert.equal(drafts.get({ sessionId: "s-1" }), "");
+});
+
+test("a submitted draft is cleared", () => {
+  const drafts = new NoteDrafts();
+  drafts.set({ paneKey: "pane-3" }, "submitted");
+  drafts.clear({ paneKey: "pane-3" });
+  assert.equal(drafts.size, 0);
+  assert.equal(drafts.get({ paneKey: "pane-3" }), "");
+});
+
+test("the editor's seed and the pristine predicate answer the same question", () => {
+  // CLAUDE.md: "the renderer's seed and the predicate's default are one
+  // question asked twice". A target with nothing held opens with `""`, and
+  // `""` is pristine — so a freshly opened editor can never start with its Add
+  // button enabled.
+  const drafts = new NoteDrafts();
+  assert.equal(noteDraftIsPristine(drafts.get({ sessionId: "fresh" })), true);
 });
 
 test("the empty state for a known session and for a pending pane say different things", () => {
