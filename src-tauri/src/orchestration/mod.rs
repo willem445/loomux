@@ -45560,7 +45560,7 @@ impl OrchRegistry {
         // opencode branch: that flag records what COPILOT's `--agent` can
         // resolve, and pi resolves neither the file nor its frontmatter. The
         // text is already folded into `contract` by `block_contract_text`.
-        if cli == "pi" {
+        if false {
             match self.write_contract_file(group, block, contract, PI_CONTRACT_FILE_EXT) {
                 Some((_handle, path)) => {
                     out.pi_append_system_prompt_file = Some(path);
