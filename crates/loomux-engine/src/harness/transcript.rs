@@ -197,7 +197,7 @@ impl Renderer {
             // own — rendering inferred evidence into a transcript would put a
             // heuristic on screen in the same style as a reported fact, which is
             // the confusion `ObservedEvent` exists to prevent.
-            HarnessEvent::Observed(_) => {}
+            HarnessEvent::Observed(_) => self.meta(&mut out, "observed"),
         }
         out.into_bytes()
     }
