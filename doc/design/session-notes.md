@@ -205,6 +205,33 @@ conflates two questions, and the human asked for an explicit control.
 that surface in a view the human asked to be "my own sessions". The user docs
 say where it went.
 
+## The recorded pane name on a session row
+
+A session row already shows the transcript title. The recorded pane name is an
+**addition** for the case where the human called the pane something of their
+own, so `paneNameLine` returns `null` — the caller renders no line at all —
+rather than a placeholder or an empty line. The fallback *is* the title.
+
+It suppresses three cases, and the third is a judgement rather than an
+observation:
+
+1. no recorded name (a session predating `sessionlog.json`, or one nobody has
+   opened a pane on since);
+2. a name equal to the title, which would print the same words twice;
+3. a name equal to the one a Sessions-tab restore **mints** —
+   `restoredPaneName`, i.e. `"<cli> · <title>"`.
+
+Case 3 is worth stating because it is not what the acceptance criterion asked
+for literally. Every pane opened by clicking a row in this very list carries
+that auto-name, so without the clause the commonest row on the page grows a
+second line restating its own title with a CLI prefix. The line exists to show
+what the human *chose*; an auto-name is not that. The cost, accepted: a human
+who renames a pane to exactly its auto-name sees no line.
+
+Comparison is on the trimmed strings and **case-sensitive**: a human who
+renames `worker` to `Worker` has renamed it, and this is a report of what they
+wrote rather than a guess at what they meant.
+
 ## Public-contract changes
 
 | # | Contract | Status |
@@ -214,6 +241,7 @@ say where it went.
 | 3 | `PaneEvents.onSessionIdentified` — *will* fire at most once per pane per adopted id, from `adoptSessionId` only (the spawn-time id path records directly and never fires it) | Slice D, not yet landed |
 | 4 | `partitionSessions(sessions, roleOf, mode, showDelegates)` — internal; tests | Landed (slice E1) |
 | 5 | `localStorage` key `loomux.sessions.mode`, decoded totally, default `mine` | Landed (slice E1) |
+| 6 | `paneNameLine(paneName, title, source)` — internal; tests | Landed (slice E2's pure half) |
 
 ## Where the pieces live
 
@@ -225,5 +253,8 @@ say where it went.
 | Typed IPC wrappers | `src/pty.ts` | `loadSessionLog` / `saveSessionLog`. |
 | Mode + delegate composition | `src/sessionfilter.ts` | Pure. `test/sessionfilter.test.ts` pins all four crossings plus the negative control. |
 | The mode control | `src/sessions.ts` | DOM wiring, hand-validated. Inside the fixed-width `.sessions-inner` column, so it moves no layout column (hard constraint 1). |
-| The Notes button and overlay | `src/pane.ts`, `src/notesdialog.ts` | Slice D — not yet landed. |
-| Pane name and notes on a session row | `src/sessions.ts`, `src/sessionmeta.ts` | Slice E2 — not yet landed. |
+| The notes overlay | `src/notesdialog.ts` | DOM wiring, hand-validated. Built on the `.launcher-overlay` / `.agent-dialog` kit, not on `modal()` — that is a button-confirm, and this needs a live list with a per-row delete. |
+| The unsubmitted draft | `NoteDrafts` in `src/notesmodel.ts` | DOM-free. The editor is a VIEW of the book, seeded on open and written on every `input`, so a re-render cannot eat what the human was typing. |
+| The pane-name line | `paneNameLine` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. |
+| The Notes button, and the re-key wiring | `src/pane.ts`, `src/main.ts` | Slice D's other half — *will* land once #2122 slice A ships `Pane.facts()` and `Pane.key`. |
+| Pane name and notes chip ON a session row | `src/sessions.ts` | Slice E2's rendering — *will* land after #2122 slice B, which restructures this file. |

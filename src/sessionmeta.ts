@@ -68,6 +68,43 @@ export function sessionBadgeLabel(source: string): string {
   return source.toUpperCase();
 }
 
+/** The recorded pane-name line for a session row (#2116), or `null` when there
+ *  is nothing worth showing.
+ *
+ *  THE FALLBACK IS THE TITLE ITSELF, NEVER A PLACEHOLDER. The row already shows
+ *  the session's transcript title; this line is an ADDITION for the case where
+ *  the human called the pane something of their own. So it returns `null` — the
+ *  caller renders no line at all — rather than an empty string or a dash.
+ *
+ *  Three things are "nothing worth showing", and the third is the one worth
+ *  arguing:
+ *
+ *   1. no recorded name (a session predating `sessionlog.json`, or one nobody
+ *      has opened a pane on since);
+ *   2. a name equal to the title, which would print the same words twice;
+ *   3. a name equal to the one a Sessions-tab restore MINTS
+ *      (`restoredPaneName`). That is not a name the human chose — it is this
+ *      module's own auto-name, `"<cli> · <title>"` — and every pane restored
+ *      from this very list carries it. Without this clause the commonest row on
+ *      the page grows a second line that restates its own title with a CLI
+ *      prefix, which is noise on the majority of rows rather than the signal
+ *      the line exists for.
+ *
+ *  Compared on the trimmed strings and case-sensitively: a human who renames a
+ *  pane from `worker` to `Worker` has renamed it, and this is a report of what
+ *  they wrote, not a guess at what they meant. */
+export function paneNameLine(
+  paneName: string | undefined,
+  title: string,
+  source: string
+): string | null {
+  const name = paneName?.trim();
+  if (!name) return null;
+  if (name === title.trim()) return null;
+  if (name === restoredPaneName(source, title)) return null;
+  return name;
+}
+
 /** The PR chip label, or null when no PR is known yet. A bare number (how
  *  the board stores most PR refs) renders as "#123"; anything already
  *  prefixed or otherwise shaped is shown verbatim. */
