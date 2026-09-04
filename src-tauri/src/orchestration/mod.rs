@@ -6657,6 +6657,9 @@ pub fn pi_repo_mcp_exposure(
     loomux_tools: &std::collections::BTreeSet<String>,
 ) -> Option<Value> {
     let mut files = Vec::new();
+    if files.is_empty() {
+        return None;
+    }
     for rel in PI_REPO_MCP_FILES {
         let path = workdir.join(rel);
         let Ok(body) = fs::read_to_string(&path) else { continue };
