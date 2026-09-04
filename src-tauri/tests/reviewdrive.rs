@@ -1365,33 +1365,35 @@ fn no_placeholder_survives_into_a_brief_and_none_names_a_disposition() {
 /// used to live inside the delta arm, reached only when
 /// `entry.lane(block).filter(|l| !l.at_head.is_empty())` yielded `Some`. A PR
 /// whose lanes passed with NO drive at all — an orchestrator-spawned reviewer —
-/// and which is then handed to `drive_review` after a body edit arrives with
-/// `lanes: []`, so the first-round template rendered and `open_lane` stamped the
-/// grant anyway. `rd_open_lane` renders the brief BEFORE it writes the record,
-/// so the record can never be what decides.
+/// and which is then driven after a body edit arrives with `lanes: []`, so the
+/// first-round template rendered and `open_lane` stamped the grant anyway.
+/// `rd_open_lane` renders the brief BEFORE it writes the record, so the record
+/// can never be what decides.
 ///
-/// **That shape is a FIRST drive, and a re-drive is not a substitute for it** —
-/// the second cut of this test used one and never reached the shape it named (CI
-/// at `eff08f50`). #2153's `reseeded` carries each lane's conversation across a
-/// re-drive, so the new entry HAS a record; the tick's `record_verdict_seen`
-/// then fills its `at_head` from the verdict file before any brief renders, and
-/// the delta arm is reached after all. `record_verdict_seen` cannot CREATE a
-/// record, which is exactly why a first drive over hand-recorded verdicts is the
-/// one shape that gets there.
+/// **The instrument is WHICH TEMPLATE rendered, not the lane record's
+/// `at_head`.** Two earlier cuts sampled that field and both were wrong about
+/// when it holds (CI at `eff08f50` and `53dd287c`): `review_verdict` writes the
+/// verdict FILE, `record_verdict_seen` fills `at_head` inside a later tick, and
+/// `open_lane` CLEARS it again while applying the very step that renders the
+/// brief — so neither a pre-tick nor a post-tick sample is the value the brief
+/// was rendered against. The rendered text says which arm ran, in one word, and
+/// cannot drift from it: `DELTA on PR #` is `driver-delta.md`, `Review PR #` is
+/// `driver-review.md`.
 ///
-/// Four crossings of {the lane has answered at this head} x {the body moved},
-/// asserting the marker is present **exactly** when the stamped grant is — read
-/// off `review_drives.json` rather than inferred. Each builds its own drive: the
-/// control tick advances a single-lane drive out of `review-wait` to
-/// `gate-check`, so a later tick in the same fixture has no lane to brief (CI at
-/// `39a4d575`).
+/// Four cases, each its own drive, covering both arms on both values of
+/// `verify` — because a marker that appears only on the arm it was written for
+/// is exactly the defect this test exists for.
 #[test]
 fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
     const REVIEWED: &str = "the body every lane passed";
     const EDITED: &str = "the body somebody edited afterwards";
-
-    for (answered, body_moved) in [(false, false), (false, true), (true, false), (true, true)] {
-        let label = format!("answered={answered} body_moved={body_moved}");
+    // (label, the template that must render, the marker is owed)
+    for (label, delta_arm, owed) in [
+        ("A first round, nothing passed yet", false, false),
+        ("B first drive over hand-recorded passes, body moved", false, true),
+        ("C the lane answered under the drive, body moved", true, true),
+        ("D the lane answered under the drive, HEAD moved", true, false),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let reg = relaunch_registry(dir.path());
         let repo = Repo::with(WORKFLOW_BODY_UNCHANGED);
@@ -1400,10 +1402,7 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
         reg.set_pr_head_override(Some(HEAD_A.to_string()));
         reg.set_pr_body_override(Some(REVIEWED.to_string()));
 
-        // The pass has to be on file either way — it is the precondition
-        // `decide_review_wait` reads from the verdict FILES. What the `answered`
-        // axis varies is whether the DRIVE holds a lane record for it.
-        let record_pass = |reg: &OrchRegistry, group: &GroupId, agent: &str| {
+        let record_pass = |group: &GroupId, agent: &str| {
             let caller = Caller {
                 agent_id: agent.to_string(),
                 group: group.clone(),
@@ -1411,98 +1410,23 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
                 role_hint: None,
             };
             dispatch(
-                reg,
+                &reg,
                 &caller,
                 "tools/call",
                 &json!({ "name": "review_verdict", "arguments": {
                     "pr": "1758", "verdict": "pass", "summary": "read the diff and the body" } }),
             )
-            .expect("the lane records its pass");
+            .expect("the pass is recorded");
         };
 
-        let (group, first_brief) = if answered {
-            // The drive opens the lane and the lane answers. One later tick
-            // fills `at_head` from the verdict file AND decides, in that order,
-            // which is why the body is moved before it rather than after.
-            let (group, _session) = driven(&reg, &repo, &gh);
-            let orch =
-                reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
-            with_pane(&reg, &orch.id, 7101);
-            reg.rd_drive_group_with(&group, &gh, 10_000);
-            let report = reg.rd_drive_group_with(&group, &gh, 20_000);
-            let (_pr, _block, lane) = report.lanes_opened.first().cloned().expect("lane 0 opens");
-            let brief = lane_brief(&reg, &lane);
-            record_pass(&reg, &group, &lane);
-            // **And the lane REPORTS, which is what ends its turn.** Recording
-            // a verdict does not: `idle_since_ms` is stamped by the report, and
-            // until it is, #2109's duplicate-lane refusal reads that pane as
-            // still working and refuses every re-brief — so the round under
-            // test never happens. That is how the previous cut failed (CI at
-            // `53dd287c`: `answered=true body_moved=true`, no lane opened
-            // inside the tick budget), and it is the product behaving exactly
-            // as `a_body_only_fix_round_re_opens_the_lane_whose_pane_went_idle`
-            // describes, on a fixture that had skipped the half that makes a
-            // reviewer's turn end.
-            let reviewer = Caller {
-                agent_id: lane.clone(),
-                group: group.clone(),
-                role: Role::Reviewer,
-                role_hint: None,
-            };
-            dispatch(
-                &reg,
-                &reviewer,
-                "tools/call",
-                &json!({ "name": "report", "arguments": {
-                    "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
-            )
-            .expect("the lane reports, which ends its turn");
-            assert!(
-                reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
-                "{label}: the fixture's premise — that pane has finished its turn, so a \
-                 re-brief is not refused as a duplicate"
-            );
-            // **And the lane has to END ITS TURN**, or no later tick can
-            // re-brief it at all: #2109/#2162 refuse a second lane for a block
-            // whose pane is live and still working, so the re-brief this row is
-            // about never happens and there is no brief to assert on (CI at
-            // `53dd287c`). A `report` is what stamps `idle_since_ms`, and the
-            // reuse arm needs the pane's own pty and a delivery on record —
-            // the same fixture `a_body_only_fix_round_re_opens_the_lane_whose_
-            // pane_went_idle` builds, for the same reason.
-            dispatch(
-                &reg,
-                &Caller {
-                    agent_id: lane.clone(),
-                    group: group.clone(),
-                    role: Role::Reviewer,
-                    role_hint: None,
-                },
-                "tools/call",
-                &json!({ "name": "report", "arguments": {
-                    "outcome": "approved", "note": "nothing blocking", "ref": "#1758" } }),
-            )
-            .expect("the lane reports, which ends its turn");
-            assert!(
-                reg.agent(&lane).expect("the lane is on the roster").idle_since_ms.is_some(),
-                "the fixture's premise: that pane has finished its turn"
-            );
-            with_pane(&reg, &lane, 7002);
-            make_pane_ready(&reg, 7002, false);
-            // **One tick before the shape can be claimed.** `review_verdict`
-            // writes the verdict FILE; the lane RECORD's `at_head` is filled by
-            // `record_verdict_seen` inside a tick. Asserting the answered shape
-            // with no tick in between asserts a state the product never claimed
-            // to be in yet, which is how the previous cut failed (CI at
-            // `eff08f50`: `left: false, right: true`). This tick also settles
-            // the gate, so the drive is at `gate-check` from here.
-            reg.rd_drive_group_with(&group, &gh, 30_000);
-            (group, brief)
-        } else {
+        let (group, opened) = if label.starts_with('B') {
             // The undriven-to-driven transition, built the way it really
-            // happens: a reviewer the ORCHESTRATOR spawned records the pass, and
-            // only then is the PR driven, for the first time. Nothing has ever
-            // held a lane record for it.
+            // happens: a reviewer the ORCHESTRATOR spawned records the pass, the
+            // body is then edited, and only then is the PR driven — for the
+            // FIRST time, so nothing has ever held a lane record for it.
+            // `record_verdict_seen` cannot CREATE one, which is why this is the
+            // shape that reaches `rd_lane_brief` with the filter yielding
+            // `None` while `verify` is true.
             let group = reg.create_group(&repo.path(), rails()).unwrap().id;
             let w = reg
                 .spawn_agent(&group, Role::Worker, "w", "", false, None)
@@ -1526,97 +1450,108 @@ fn a_verification_brief_announces_itself_on_every_path_that_grants_it() {
                     None,
                 )
                 .expect("an orchestrator-spawned reviewer");
-            record_pass(&reg, &group, &rev.id);
-            let out = reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 10_000);
-            assert_eq!(out["driving"], json!(true), "{label}: drive_review refused: {out}");
-            // ci-wait -> review-wait on green; no lane opens on that arc.
-            reg.rd_drive_group_with(&group, &gh, 20_000);
-            assert_eq!(status_state(&reg, &group), "review-wait", "{label}");
-            (group, String::new())
-        };
-
-        let at_head_now = |reg: &OrchRegistry, group: &GroupId| {
-            live_lanes(reg, group)
-                .iter()
-                .any(|l| !l["at_head"].as_str().unwrap_or_default().is_empty())
-        };
-        assert_eq!(
-            at_head_now(&reg, &group),
-            answered,
-            "{label}: the fixture must reach the shape it names, or the row proves nothing — \
-             lanes were {:?}",
-            live_lanes(&reg, &group)
-        );
-
-        if body_moved {
+            record_pass(&group, &rev.id);
             gh.set_body(EDITED);
             reg.set_pr_body_override(Some(EDITED.to_string()));
-        }
-
-        // The tick under test. With the body moved, `review-wait` re-briefs lane
-        // 0; with nothing moved a lane whose pass stands settles the gate and no
-        // brief is produced, so the one to examine is the first-round brief
-        // already delivered — a genuine `verify: false` rendering rather than an
-        // absence. The undriven fixture has no such brief, and its no-move row
-        // asserts on the grant alone.
-        // Bounded, because a moved body travels `gate-check -> ci-wait ->
-        // review-wait` before a lane is re-briefed, and §2.4 allows one arc per
-        // tick. `at_head` is sampled at the START of each tick: the tick that
-        // renders the brief also applies `open_lane`, which CLEARS the field,
-        // so the post-tick value is never the one the brief was rendered
-        // against.
-        let mut opened = None;
-        let mut at_head_when_rendered = at_head_now(&reg, &group);
-        for i in 0..8 {
-            let sampled = at_head_now(&reg, &group);
-            let report = reg.rd_drive_group_with(&group, &gh, 40_000 + i * 5_000);
-            if let Some(x) = report.lanes_opened.first().cloned() {
-                at_head_when_rendered = sampled;
-                opened = Some(x);
-                break;
-            }
-        }
-        assert_eq!(
-            at_head_when_rendered, answered,
-            "{label}: the brief under test must have been rendered against the record shape \
-             this row names"
-        );
-        let text = match opened {
-            Some((_pr, _block, agent)) => lane_brief(&reg, &agent),
-            None => {
-                assert!(!body_moved, "{label}: a moved body must re-brief a lane");
-                first_brief.clone()
+            let out =
+                reg.drive_review_with(&group, &gh, 1758, &session, false, 0, "orch-1", 10_000);
+            assert_eq!(out["driving"], json!(true), "{label}: drive_review refused: {out}");
+            let opened = tick_until_lane(&reg, &gh, &group, 20_000);
+            (group, opened)
+        } else {
+            let (group, _session) = driven(&reg, &repo, &gh);
+            let orch =
+                reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+            with_pane(&reg, &orch.id, 7101);
+            reg.rd_drive_group_with(&group, &gh, 10_000);
+            let report = reg.rd_drive_group_with(&group, &gh, 20_000);
+            let (_pr, _block, lane) =
+                report.lanes_opened.first().cloned().expect("the second tick opens lane 0");
+            if !delta_arm {
+                // Case A stops here: the very first brief of a drive with no
+                // verdicts anywhere, which is a genuine `verify: false`
+                // rendering of the first-round template rather than an absence.
+                (group, Some(lane))
+            } else {
+                record_pass(&group, &lane);
+                // **The move goes in BEFORE the tick that observes the verdict**,
+                // and that ordering is the whole of what makes C reach the delta
+                // arm: one tick then fills `at_head` from the verdict file and
+                // decides on the moved revision, in that order, so the brief is
+                // rendered against a record that HAS answered. Moving it after
+                // instead lets the drive settle to `gate-check` first, and the
+                // lane is never re-briefed at all.
+                if owed {
+                    gh.set_body(EDITED);
+                    reg.set_pr_body_override(Some(EDITED.to_string()));
+                } else {
+                    // D stales the pass for a reason that is NOT the body, so
+                    // the re-brief is an ordinary delta and owes no marker.
+                    gh.set_facts("OPEN", HEAD_B);
+                    reg.set_pr_head_override(Some(HEAD_B.to_string()));
+                }
+                (group, tick_until_lane(&reg, &gh, &group, 30_000))
             }
         };
+
+        let agent = opened.unwrap_or_else(|| panic!("{label}: no lane was ever briefed"));
+        let text = lane_brief(&reg, &agent);
+        assert_eq!(
+            text.starts_with("DELTA on PR #"),
+            delta_arm,
+            "{label}: the fixture must reach the template arm it names, or the row says \
+             nothing about which arm carries the marker. Brief was: {text}"
+        );
+        assert!(
+            text.starts_with("DELTA on PR #") || text.starts_with("Review PR #"),
+            "{label}: neither driver template rendered: {text}"
+        );
+
         let granted = live_lanes(&reg, &group)
             .first()
             .and_then(|l| l["briefed_verify"].as_bool())
             .unwrap_or(false);
         let announced = text.contains("VERIFICATION-ONLY");
         assert_eq!(
-            granted, body_moved,
-            "{label}: the grant is owed exactly when the body moved under passes that already \
-             cover this head — lanes were {:?}",
-            live_lanes(&reg, &group)
+            announced, owed,
+            "{label}: the marker is owed exactly when the brief is a verification delta. \
+             Brief was: {text}"
         );
-        if !text.is_empty() {
-            assert_eq!(
-                announced, granted,
-                "{label}: the grant and the sentence announcing it must be ONE decision — \
-                 granted={granted}, announced={announced}. Brief was: {text}"
+        assert_eq!(
+            granted, announced,
+            "{label}: the grant and the sentence announcing it must be ONE decision — \
+             granted={granted}, announced={announced}"
+        );
+        // The shape pin CLAUDE.md mandates for a user-facing message, on the
+        // literal this slice added: one paragraph, no source indentation left
+        // behind by a collapsed line continuation.
+        for line in text.lines() {
+            assert!(
+                !line.contains("          "),
+                "{label}: a brief line leaks source indentation: {line:?}"
             );
-            // The shape pin CLAUDE.md mandates for a user-facing message, on the
-            // literal this slice added: one paragraph, no source indentation
-            // left behind by a collapsed line continuation.
-            for line in text.lines() {
-                assert!(
-                    !line.contains("          "),
-                    "{label}: a brief line leaks source indentation: {line:?}"
-                );
-            }
-            assert!(!text.contains("{{"), "{label}: an unregistered placeholder survived: {text}");
+        }
+        assert!(!text.contains("{{"), "{label}: an unregistered placeholder survived: {text}");
+    }
+}
+
+/// Tick until a lane is briefed, and answer WHICH pane got it. Bounded: a
+/// revision that moves can take several arcs to come back to `review-wait`
+/// (§2.4 allows one per tick), and a case that silently never re-briefs must
+/// fail loudly rather than read a brief from some earlier round.
+fn tick_until_lane(
+    reg: &OrchRegistry,
+    gh: &dyn RdRunner,
+    group: &GroupId,
+    from_ms: u64,
+) -> Option<String> {
+    for i in 0..8 {
+        let report = reg.rd_drive_group_with(group, gh, from_ms + i * 5_000);
+        if let Some((_pr, _block, agent)) = report.lanes_opened.first().cloned() {
+            return Some(agent);
         }
     }
+    None
 }
 
 /// §5.5 part 3 — **the hostile-value case, through the driver's own
