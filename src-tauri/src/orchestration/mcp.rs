@@ -1116,7 +1116,8 @@ fn check_mail_tool() -> Value {
 ///
 /// `Role::Solo`'s two-tool surface is in here too, deliberately: `channel_send`
 /// is as worth warning about as `report`.
-pub(crate) fn every_tool_name() -> std::collections::BTreeSet<String> {
+#[doc(hidden)] // pub for integration tests
+pub fn every_tool_name() -> std::collections::BTreeSet<String> {
     // One declared lock, so the lock tier renders; its NAME is loomux's
     // (`acquire_lock`/`release_lock`), never the resource's, so the sample
     // value cannot leak into the set.
