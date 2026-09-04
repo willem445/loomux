@@ -798,7 +798,7 @@ pub const CLI_CAPS: &[CliCaps] = &[
     },
     CliCaps {
         cli: "pi",
-        orchestration: true,
+        orchestration: false,
         // pi itself ships no MCP at all ("It intentionally does not include
         // built-in MCP, sub-agents, permission popups, plan mode…"), and the
         // seam is the community `pi-mcp-adapter` extension the human installs:
