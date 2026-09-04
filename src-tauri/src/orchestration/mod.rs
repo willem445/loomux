@@ -1407,8 +1407,9 @@ loomux_sha256() { # stdin → 64 hex chars, or empty
 # reproduction. `the_shim_and_the_gate_agree_about_which_passes_a_verification_covers`
 # runs both halves over the same files, including those two.
 loomux_verdict_line5() { # $1=verdict file → sets v_digest, v_mark
-  v_l=$(head -n5 "$1" 2>/dev/null | tail -n1)
-  v_l=$(printf '%s' "$v_l" | tr -d '\r')
+  v_raw=$(head -n5 "$1" 2>/dev/null | tail -n1)
+  v_l=$(printf '%s' "$v_raw" | tr -d '\r')
+  loomux_norm_guard "$v_raw" "$v_l" "a verdict file's line 5"
   v_mark=0
   v_sp=' '
   v_tb=$(printf '\t')
@@ -1432,9 +1433,13 @@ loomux_verdict_line5() { # $1=verdict file → sets v_digest, v_mark
   done
   v_digest=''
   case "$v_l" in
-    *[!0-9a-fA-F]*) : ;;
-    *) [ ${#v_l} -eq 64 ] && v_digest=$(printf '%s' "$v_l" | tr 'A-F' 'a-f') ;;
+    *[!0-9a-fA-F]*) v_l='' ;;
+    *) [ ${#v_l} -eq 64 ] || v_l='' ;;
   esac
+  if [ -n "$v_l" ]; then
+    v_digest=$(printf '%s' "$v_l" | tr 'A-F' 'a-f')
+    loomux_norm_guard "$v_l" "$v_digest" "a verdict file's body digest"
+  fi
 }
 # #256: CLAIM a one-time grant without spending it yet — the MERGE gate's grant
 # (`merge_grants/pr-<N>`) is the only one-time grant left, and it must be
