@@ -871,10 +871,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    `QUEUE_STALLED_AFTER`) — the state #814 was filed for — by borrowing the same
    base look rather than inventing a third visual language. Header chrome: it
    floats in the header and never affects the terminal's geometry. */
-/* The one chip here that is allowed to SHRINK, and the label is ordered for it
-   (rev finding 4). It carries ~18 characters where the other header chips carry
-   1-3, and every `.pane-btn` beside it is `flex: none` — so on a narrow pane a
+/* A chip that is allowed to SHRINK, and the label is ordered for it (rev
+   finding 4). It carries ~18 characters where most header chips carry 1-3, and
+   every `.pane-btn` beside it is `flex: none` — so on a narrow pane a
    fixed-width chip would push the button cluster out rather than give way.
+   (`.pane-mail` below declares the same weight for the same reason, so "the one
+   chip" — which this comment said until #2335 — was never quite right. Both
+   carry `chip-yields`, which is how `styles.css`'s row-shrink rule knows not to
+   flatten this 100 to a 1.)
    (#2191 narrowed how far that goes without making it wrong: below the overflow
    threshold only two buttons are left in the row, so the pressure this chip is
    giving way to is smaller. It still exists — the fold has a dead band, and the
@@ -1122,6 +1126,83 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-btn.pane-overflow { width: 25px; font-size: 14px; }
 .pane.header-folded .pane-btn.pane-overflow,
 .pane-btn.pane-overflow[aria-expanded="true"] { opacity: 1; }
+/* ---------- the header row SHRINKS; it never overflows (#2335) ---------- */
+/* Every `.pane-btn` is `flex: none`, and so is every status chip except the
+   two `.chip-yields` ones, so a row that did not fit did not shrink — it
+   OVERFLOWED, and `.pane`'s own
+   `overflow: hidden` clipped whatever hung off the right end. At the narrowest
+   widths that was the whole control cluster, ⋯ included: a pane header with no
+   reachable control at all, which is what #2335 reports.
+   `src/paneheader.ts` can decide what the row CONTAINS; only flexbox can promise
+   it FITS, so that promise is made here — the row's non-control chrome is
+   shrinkable, and the deficit comes out of the CLI mark, the role badge and the
+   chips before it comes out of a control.
+
+   TWO EXEMPTIONS, both by property rather than by name. `.pane-btn` is a
+   control, and controls are what the row exists to keep. `.chip-yields` marks a
+   chip that declares a HEAVIER shrink weight of its own — `.pane-queue` and
+   `.pane-mail` are both `flex: 0 100 auto`, deliberately, so that they give up
+   their room before the pane name (the drag handle) gives up any — and this
+   rule's specificity (0,4,0) would otherwise flatten that 100 to 1 and take the
+   title's room instead, which is the defect `queue-badge.spec.ts:270` exists to
+   catch and which had no equivalent guard for `.pane-mail`. Marking the chips
+   rather than listing them here is what stops the third one being missed the
+   same way (rev-final round 2, finding 1).
+
+   `.pane-title` and `.pane-meta` already shrink exactly like this, so they need
+   no exemption and no mention. `text-overflow: ellipsis` is on this rule rather
+   than on each chip because a shrunk chip with `overflow: hidden` alone clips
+   mid-glyph, and three of the header's chips (`.pane-attn`,
+   `.pane-attn-dismiss`, `.pane-channel`) are interactive but carry no
+   `text-overflow` of their own (finding 3). */
+.pane-header > *:not(.pane-btn):not(.pane-overflow-menu):not(.chip-yields) {
+  flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ---------- the narrowest rung (#2335) ---------- */
+/* One rung below the fold: the window-control cluster has gone into the menu
+   too, so the only `.pane-btn` left in the row is the ⋯ the rule above exempts.
+   The pane name goes with the cluster rather than ellipsising further — a name
+   clipped to one glyph carries nothing and still spends the ~20px the ⋯ needs —
+   and `.pane-overflow-menu`'s first row carries it instead, with the rename
+   gesture attached. Pure header chrome: the header's height is
+   `--pane-header-h` at every rung, so `.pane-term`'s box never moves and no PTY
+   is resized (CLAUDE.md constraint 1).
+
+   EVERYTHING BUT THE ⋯ LEAVES THE ROW, not just the name. `flex-shrink` cannot
+   touch a chip's border, its padding or the row's 6px `gap`, so a shrunk chip
+   still costs ~20px it cannot give up — and two lit chips were enough to push
+   the ⋯ off an 80px pane (`MIN_PANE_PX`), which is #2335 unfixed. A stranded
+   pane wears two by construction (`.pane-attn` + `.pane-attn-dismiss`), so this
+   was not a corner.
+
+   `position: absolute` + `visibility: hidden`, never `display: none`, and that
+   is the same argument as the overflow menu's own: a `display: none` child
+   measures ZERO, so `measureHeaderFixed` would read a narrower header the moment
+   the rung was entered, the ladder would climb back out, the chips would return,
+   and it would fold again — a flap driven by the fix for the clip. Out of flow
+   but still laid out, every width the policy reads is the same on both sides of
+   the boundary.
+
+   The rename input is exempt: F2 at this rung has to put an editable field
+   somewhere, and it is the one header child that is a control without being a
+   `.pane-btn`. The attention and channel cues are not lost with their chips —
+   `.pane.needs-attention .pane-header` and `.pane.connected .pane-header` carry
+   them on the header itself. */
+.pane.header-minimal .pane-header > *:not(.pane-btn.pane-overflow):not(.pane-overflow-menu):not(.pane-title-input) {
+  position: absolute; visibility: hidden;
+}
+
+/* The menu's name row. Not an icon button — it is the pane name, so it is
+   text-shaped and takes the menu's whole width rather than sitting in the icon
+   grid beside ⤢ and ✕. */
+.pane-rename-entry {
+  width: 100%; flex-basis: 100%; text-align: left;
+  padding: 0 6px; font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pane-rename-entry[hidden] { display: none; }
+
 @media (prefers-reduced-motion: reduce) {
   .pane-overflow-menu { transition: none; }
 }

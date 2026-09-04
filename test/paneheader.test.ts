@@ -1,17 +1,20 @@
-// Unit tests for the pane header's overflow policy (#2191). Run with `npm test`.
+// Unit tests for the pane header's overflow policy (#2191, #2335). Run with `npm test`.
 //
 // Every input `planHeaderFit` reads gets its own varying fixture: the header's
 // width, the fixed chrome's width, each control's width, how many controls there
-// are, which of them are priority, the overflow button's width, the current fold
-// state, and the three tunables (gap, title floor, hysteresis). A fixture that
+// are, which of them are priority, the overflow button's width, the rung the
+// header is currently on, and the three tunables (gap, title floor, hysteresis).
+// A fixture that
 // does not DISCRIMINATE pins nothing, so each of these asserts that moving the
 // axis flips (or provably does not flip) the plan.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { HeaderControl, HeaderFitInput } from "../src/paneheader.ts";
+import type { HeaderControl, HeaderFitInput, HeaderFitStage } from "../src/paneheader.ts";
 import {
   planHeaderFit,
   menuLeftFor,
+  overflowMenuIds,
+  RENAME_ENTRY_ID,
   HEADER_GAP_W,
   TITLE_MIN_W,
   HYSTERESIS_W,
@@ -38,7 +41,7 @@ const BASE: HeaderFitInput = {
   fixedWidth: 100,
   controls: CONTROLS,
   overflowWidth: 23,
-  folded: false,
+  stage: "full",
 };
 
 // Derived by hand from BASE and re-checked by `the arithmetic behind the fixture`
@@ -46,6 +49,14 @@ const BASE: HeaderFitInput = {
 // every threshold in this file.
 const FULL_W = 359; // 100 fixed + 56 title floor + 7 * (23 + 6)
 const UNFOLD_AT = FULL_W + HYSTERESIS_W; // 383
+// The three rungs below it (#2335), each derived the same way and re-checked by
+// `the ladder's four rungs` below.
+const FOLDED_W = 243; // 100 fixed + 56 title floor + 2 priority * 29 + (23 + 6) for ⋯
+// The two rungs below the fold price the chrome at its FLOOR, which BASE leaves
+// at its default of 0 — so `fixedWidth` drops out of both. See
+// `chromeFloorWidth` in the module, and the test that varies it.
+const SQUEEZED_W = 87; // 2 priority * 29 + (23 + 6) for ⋯, with the title floor released
+const MINIMAL_W = 29; // (23 + 6) for ⋯, alone
 
 const fit = (over: Partial<HeaderFitInput> = {}) => planHeaderFit({ ...BASE, ...over });
 
@@ -91,40 +102,40 @@ test("hysteresis: an already-folded header needs SPARE room before it unfolds", 
   // The same width decides differently depending on where we came from — which is
   // the whole point, and is not true of any other input.
   const between = FULL_W + 10; // inside the dead band [FULL_W, FULL_W + HYSTERESIS_W)
-  assert.equal(fit({ headerWidth: between, folded: false }).folded, false);
-  assert.equal(fit({ headerWidth: between, folded: true }).folded, true);
+  assert.equal(fit({ headerWidth: between, stage: "full" }).folded, false);
+  assert.equal(fit({ headerWidth: between, stage: "folded" }).folded, true);
 });
 
 test("hysteresis: the unfold threshold sits a full dead band above the fold one", () => {
-  assert.equal(fit({ headerWidth: UNFOLD_AT - 1, folded: true }).folded, true);
-  assert.equal(fit({ headerWidth: UNFOLD_AT, folded: true }).folded, false);
+  assert.equal(fit({ headerWidth: UNFOLD_AT - 1, stage: "folded" }).folded, true);
+  assert.equal(fit({ headerWidth: UNFOLD_AT, stage: "folded" }).folded, false);
 });
 
 test("hysteresis: a width oscillating inside the dead band never flaps", () => {
   // A divider dragged back and forth across the fold point: feed each width the
   // state the previous width produced, and the set must settle, not strobe.
-  let folded = true;
-  const seen = new Set<boolean>();
+  let stage: HeaderFitStage = "folded";
+  const seen = new Set<HeaderFitStage>();
   for (const w of [FULL_W + 2, FULL_W + 20, FULL_W + 5, FULL_W + 22, FULL_W + 1]) {
-    folded = planHeaderFit({ ...BASE, headerWidth: w, folded }).folded;
-    seen.add(folded);
+    stage = planHeaderFit({ ...BASE, headerWidth: w, stage }).stage;
+    seen.add(stage);
   }
-  assert.deepEqual([...seen], [true], "a width inside the dead band must not change the state");
+  assert.deepEqual([...seen], ["folded"], "a width inside the dead band must not change the state");
 
   // Control: the SAME walk from the unfolded state also never flaps, but settles
   // on the other value — so the assertion above is about the dead band, not about
   // `folded` being ignored.
-  let unfolded = false;
+  let unfolded: HeaderFitStage = "full";
   for (const w of [FULL_W + 2, FULL_W + 20, FULL_W + 5, FULL_W + 22, FULL_W + 1]) {
-    unfolded = planHeaderFit({ ...BASE, headerWidth: w, folded: unfolded }).folded;
+    unfolded = planHeaderFit({ ...BASE, headerWidth: w, stage: unfolded }).stage;
   }
-  assert.equal(unfolded, false);
+  assert.equal(unfolded, "full");
 });
 
 test("hysteresis: zero dead band collapses the two thresholds onto each other", () => {
   const between = FULL_W + 10;
-  assert.equal(fit({ headerWidth: between, folded: true, hysteresis: 0 }).folded, false);
-  assert.equal(fit({ headerWidth: between, folded: true, hysteresis: 24 }).folded, true);
+  assert.equal(fit({ headerWidth: between, stage: "folded", hysteresis: 0 }).folded, false);
+  assert.equal(fit({ headerWidth: between, stage: "folded", hysteresis: 24 }).folded, true);
 });
 
 // ---------------------------------------------------------------- fixed chrome
@@ -173,9 +184,12 @@ test("fewer controls unfold a header that the full set folds", () => {
 
 // -------------------------------------------------------------- priority flags
 
-test("a header whose controls are ALL priority never folds, however narrow", () => {
+test("a header whose controls are ALL priority does not fold above the last rung", () => {
+  // "However narrow" was #2191's wording and is no longer true: the terminal
+  // rung folds the priority set too, which is what #2335 is for. Everything
+  // above that rung is unchanged, and this is the width that says so.
   const allPriority = CONTROLS.map((c) => ctl(c.id, c.width, true));
-  const plan = fit({ headerWidth: 10, controls: allPriority });
+  const plan = fit({ headerWidth: 320, controls: allPriority });
   assert.equal(plan.folded, false);
   assert.deepEqual(plan.overflow, []);
   // Discriminating half: the same width with the same controls, one of them
@@ -183,7 +197,7 @@ test("a header whose controls are ALL priority never folds, however narrow", () 
   // Demoted WIDE, because a 23px control swapped for a 23px overflow button is
   // the wash the next test pins; this axis is the flag, not the arithmetic.
   const oneFoldable = allPriority.map((c) => (c.id === "git" ? ctl("git", 60, false) : c));
-  assert.equal(fit({ headerWidth: 10, controls: oneFoldable }).folded, true);
+  assert.equal(fit({ headerWidth: 320, controls: oneFoldable }).folded, true);
 });
 
 test("which controls are priority decides what survives inline", () => {
@@ -198,8 +212,8 @@ test("which controls are priority decides what survives inline", () => {
 
 test("inline and overflow together are exactly the controls, with nothing duplicated", () => {
   for (const headerWidth of [10, 200, FULL_W - 1, FULL_W, 800]) {
-    for (const folded of [false, true]) {
-      const plan = planHeaderFit({ ...BASE, headerWidth, folded });
+    for (const stage of ["full", "folded", "squeezed", "minimal"] as const) {
+      const plan = planHeaderFit({ ...BASE, headerWidth, stage });
       const all = [...plan.inline, ...plan.overflow].sort();
       assert.deepEqual(all, CONTROLS.map((c) => c.id).sort(), `width ${headerWidth}`);
       if (!plan.folded) assert.deepEqual(plan.overflow, []);
@@ -213,27 +227,27 @@ test("folding is refused when the overflow button costs more than it saves", () 
   // One foldable control: swapping it for a WIDER overflow button hides a control
   // and buys nothing.
   const one = [ctl("git", 20), ctl("min", 23, true), ctl("max", 23, true)];
-  assert.equal(fit({ headerWidth: 10, controls: one, overflowWidth: 40 }).folded, false);
+  assert.equal(fit({ headerWidth: 200, controls: one, overflowWidth: 40 }).folded, false);
   // Discriminating half: the same single foldable with a CHEAPER overflow button
   // does fold.
-  assert.equal(fit({ headerWidth: 10, controls: one, overflowWidth: 10 }).folded, true);
+  assert.equal(fit({ headerWidth: 200, controls: one, overflowWidth: 10 }).folded, true);
 });
 
 test("an overflow button exactly as wide as the set it replaces is refused (a wash)", () => {
   const one = [ctl("git", 23), ctl("min", 23, true)];
-  assert.equal(fit({ headerWidth: 10, controls: one, overflowWidth: 23 }).folded, false);
-  assert.equal(fit({ headerWidth: 10, controls: one, overflowWidth: 22 }).folded, true);
+  assert.equal(fit({ headerWidth: 200, controls: one, overflowWidth: 23 }).folded, false);
+  assert.equal(fit({ headerWidth: 200, controls: one, overflowWidth: 22 }).folded, true);
 });
 
 // -------------------------------------------------------- not-yet-laid-out box
 
 test("a header with no measurable width carries the current state, either way", () => {
   for (const headerWidth of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-    assert.equal(fit({ headerWidth, folded: false }).folded, false, `w=${headerWidth} unfolded`);
-    assert.equal(fit({ headerWidth, folded: true }).folded, true, `w=${headerWidth} folded`);
+    assert.equal(fit({ headerWidth, stage: "full" }).folded, false, `w=${headerWidth} unfolded`);
+    assert.equal(fit({ headerWidth, stage: "folded" }).folded, true, `w=${headerWidth} folded`);
   }
   // The carried folded state is a real plan, not an empty one.
-  const plan = fit({ headerWidth: 0, folded: true });
+  const plan = fit({ headerWidth: 0, stage: "folded" });
   assert.deepEqual(plan.inline, ["min", "max"]);
   assert.deepEqual(plan.overflow, ["git", "issues", "editor", "split", "close"]);
 });
@@ -243,15 +257,17 @@ test("nothing-to-fold beats the not-laid-out carry: never a button over an empty
   // is somehow already marked folded (a kind change while its tab was hidden)
   // must come back unfolded rather than carry a state whose menu holds nothing.
   const allPriority = CONTROLS.map((c) => ctl(c.id, c.width, true));
-  const plan = fit({ headerWidth: 0, folded: true, controls: allPriority });
+  const plan = fit({ headerWidth: 0, stage: "folded", controls: allPriority });
   assert.equal(plan.folded, false);
   assert.deepEqual(plan.overflow, []);
   assert.deepEqual(plan.inline, CONTROLS.map((c) => c.id));
   // Same for a pane with no controls at all.
-  assert.deepEqual(fit({ headerWidth: 0, folded: true, controls: [] }), {
+  assert.deepEqual(fit({ headerWidth: 0, stage: "folded", controls: [] }), {
+    stage: "full",
     folded: false,
     inline: [],
     overflow: [],
+    title: "floor",
   });
 });
 
@@ -269,6 +285,305 @@ test("a bigger title floor folds a header that a smaller one fits", () => {
   assert.equal(fit({ headerWidth: FULL_W }).folded, false);
   assert.equal(fit({ headerWidth: FULL_W, titleMinWidth: TITLE_MIN_W + 1 }).folded, true);
   assert.equal(fit({ headerWidth: FULL_W - 30, titleMinWidth: 20 }).folded, false);
+});
+
+// ------------------------------------------------------------- the fold ladder
+// #2335. Below the #2191 fold there are two more rungs, and the reason there are
+// any is that the old ladder stopped here: at minimum width the row still held
+// ⋯ + minimize + maximize, all three overflowed the box, and `.pane`'s
+// `overflow: hidden` clipped every one of them — a header with no reachable
+// control at all. Each test below pins one step of the priority order.
+
+test("the ladder's four rungs are the thresholds the fixture's arithmetic predicts", () => {
+  // Same role as `the arithmetic behind the fixture` above, for the two new
+  // rungs: every literal in this section is derived here once.
+  assert.equal(FOLDED_W, BASE.fixedWidth + TITLE_MIN_W + 2 * (23 + HEADER_GAP_W) + (23 + HEADER_GAP_W));
+  assert.equal(SQUEEZED_W, FOLDED_W - TITLE_MIN_W - BASE.fixedWidth);
+  assert.equal(MINIMAL_W, 23 + HEADER_GAP_W);
+  // Strictly decreasing — a rung that is not narrower than the one above is not
+  // on the ladder at all, which is the guard the welcome-pane test pins.
+  assert.ok(FULL_W > FOLDED_W && FOLDED_W > SQUEEZED_W && SQUEEZED_W > MINIMAL_W);
+});
+
+test("the fold order at decreasing widths is full → folded → squeezed → minimal", () => {
+  // One walk down, each rung read at its own threshold and one pixel below it.
+  // Every field of the plan is asserted, because the rungs differ in different
+  // fields: `folded` separates 1 from 2, `title` separates 2 from 3, and
+  // `inline` separates 3 from 4.
+  assert.deepEqual(fit({ headerWidth: FULL_W }), {
+    stage: "full",
+    folded: false,
+    inline: ["git", "issues", "editor", "split", "close", "min", "max"],
+    overflow: [],
+    title: "floor",
+  });
+  assert.deepEqual(fit({ headerWidth: FULL_W - 1 }), {
+    stage: "folded",
+    folded: true,
+    inline: ["min", "max"],
+    overflow: ["git", "issues", "editor", "split", "close"],
+    title: "floor",
+  });
+  assert.deepEqual(fit({ headerWidth: FOLDED_W }).stage, "folded");
+  assert.deepEqual(fit({ headerWidth: FOLDED_W - 1 }), {
+    stage: "squeezed",
+    folded: true,
+    inline: ["min", "max"],
+    overflow: ["git", "issues", "editor", "split", "close"],
+    title: "shrink",
+  });
+  assert.deepEqual(fit({ headerWidth: SQUEEZED_W }).stage, "squeezed");
+  assert.deepEqual(fit({ headerWidth: SQUEEZED_W - 1 }), {
+    stage: "minimal",
+    folded: true,
+    inline: [],
+    overflow: ["git", "issues", "editor", "split", "close", "min", "max"],
+    title: "hidden",
+  });
+});
+
+test("the pane name is truncated BEFORE a priority control folds", () => {
+  // The order the issue asks for in as many words: the ⋯ button has priority
+  // over the title, so the title's floor is spent first — there is a whole band
+  // of widths where the name has given way and minimize/maximize have not.
+  const band: number[] = [];
+  for (let w = MINIMAL_W; w <= FULL_W; w++) {
+    const plan = fit({ headerWidth: w });
+    if (plan.title === "shrink" && plan.inline.length > 0) band.push(w);
+  }
+  assert.ok(band.length > 0, "no width truncates the name while keeping a control inline");
+  // ...and that band sits strictly ABOVE every width that folds the cluster, so
+  // the two steps are ordered rather than merely both present.
+  const collapsed: number[] = [];
+  for (let w = MINIMAL_W; w <= FULL_W; w++) {
+    if (fit({ headerWidth: w }).inline.length === 0) collapsed.push(w);
+  }
+  assert.ok(collapsed.length > 0, "no width folds the priority cluster");
+  assert.ok(Math.min(...band) > Math.max(...collapsed));
+});
+
+test("at the narrowest width EVERY control is in the menu and ⋯ is the row", () => {
+  // The terminal state the issue names: minimize, maximize and the rest are all
+  // in the menu, the name is out of the row, and the one thing left is the
+  // button that opens the menu.
+  const plan = fit({ headerWidth: 1 });
+  assert.equal(plan.stage, "minimal");
+  assert.equal(plan.folded, true, "the ⋯ button must be in the row");
+  assert.deepEqual(plan.inline, []);
+  assert.deepEqual(plan.overflow, CONTROLS.map((c) => c.id));
+  assert.equal(plan.title, "hidden");
+  // Discriminating half: the same call one rung up keeps the cluster inline, so
+  // this is the width, not the policy having only one answer.
+  assert.deepEqual(fit({ headerWidth: SQUEEZED_W }).inline, ["min", "max"]);
+});
+
+test("the row's demand falls monotonically with the width, down to ONE control", () => {
+  // The bug, stated as the property that forbids it — and stated as DEMAND
+  // rather than as "the row is never empty", which was already true of the
+  // policy #2335 reports. #2191's ladder bottomed out at ⋯ + minimize +
+  // maximize: three fixed-width buttons plus the chips, which is wider than a
+  // minimum-width pane's header box, so the row overflowed and `.pane`'s
+  // `overflow: hidden` clipped all three. This module cannot see a pixel being
+  // clipped; what it CAN promise is that narrowing the header never asks the row
+  // to hold more, and that the bottom of the ladder asks it to hold one button.
+  const demand = (w: number) => {
+    const plan = fit({ headerWidth: w });
+    return plan.inline.length + (plan.folded ? 1 : 0);
+  };
+  // Swept rather than sampled: the failure was at ONE end of the range, which is
+  // exactly what a sample of three widths misses. `w = 0` is excluded because it
+  // is the not-laid-out carry, which is a different question (pinned below).
+  const climbs: string[] = [];
+  let previous = demand(FULL_W + 200);
+  for (let w = FULL_W + 200; w >= 1; w--) {
+    const d = demand(w);
+    if (d > previous) climbs.push(`w=${w}`);
+    previous = d;
+  }
+  assert.deepEqual(climbs, [], "narrowing the header must never ask the row to hold MORE");
+  // Positive control for that empty result: the sweep really did read both ends,
+  // and they are different — an unchanged demand would satisfy "no climbs" too.
+  assert.equal(demand(FULL_W + 200), CONTROLS.length, "a wide row holds every control");
+  assert.equal(demand(1), 1, "the narrowest row is the ⋯ button and nothing else");
+});
+
+// ------------------------------------------------------------- the menu's rows
+
+test("the menu carries the pane name only at the rung where the row has lost it", () => {
+  const minimal = fit({ headerWidth: 1 });
+  assert.deepEqual(overflowMenuIds(minimal), [
+    RENAME_ENTRY_ID,
+    "git",
+    "issues",
+    "editor",
+    "split",
+    "close",
+    "min",
+    "max",
+  ]);
+  // One rung up the name is still in the row, so the menu must NOT offer it —
+  // two routes to the same thing on a header that has room for one.
+  const squeezed = fit({ headerWidth: SQUEEZED_W });
+  assert.equal(squeezed.title, "shrink");
+  assert.deepEqual(overflowMenuIds(squeezed), squeezed.overflow);
+  assert.ok(!overflowMenuIds(squeezed).includes(RENAME_ENTRY_ID));
+});
+
+test("a wide header folds nothing and offers an empty menu (negative control)", () => {
+  const plan = fit({ headerWidth: 800 });
+  assert.equal(plan.stage, "full");
+  assert.equal(plan.folded, false);
+  assert.equal(plan.title, "floor");
+  assert.deepEqual(plan.overflow, []);
+  assert.deepEqual(overflowMenuIds(plan), []);
+  // ...and it stays that way from the folding threshold upwards, so "wide" is a
+  // band rather than the one width that happened to be sampled.
+  for (const w of [FULL_W, FULL_W + 1, FULL_W + 500, 4000]) {
+    assert.deepEqual(overflowMenuIds(fit({ headerWidth: w })), [], `width ${w}`);
+  }
+});
+
+// -------------------------------------------------- rungs that buy nothing
+
+test("a welcome pane's single ✕ stays inline at EVERY width — it never folds", () => {
+  // `OVERFLOW_BTN_W` is deliberately wider than `.pane-btn`, so replacing one
+  // button with ⋯ costs room instead of saving it. Both folding rungs are
+  // therefore off this pane's ladder, and the narrowest state it can reach still
+  // has its ✕ in the row (#2191's guarantee, which #2335's new rung must not
+  // quietly repeal).
+  const welcome = [ctl("close", 23)];
+  for (const headerWidth of [1, 50, MINIMAL_W, SQUEEZED_W, 400]) {
+    const plan = fit({ headerWidth, controls: welcome, overflowWidth: 25 });
+    assert.equal(plan.folded, false, `width ${headerWidth}`);
+    assert.deepEqual(plan.inline, ["close"], `width ${headerWidth}`);
+    assert.deepEqual(plan.overflow, [], `width ${headerWidth}`);
+  }
+  // Discriminating half: a ⋯ button CHEAPER than the button it replaces puts
+  // both rungs back on the ladder, so the pass above is the arithmetic and not
+  // "a one-control header is special-cased".
+  const cheap = fit({ headerWidth: 1, controls: welcome, overflowWidth: 10 });
+  assert.equal(cheap.folded, true);
+  assert.deepEqual(cheap.overflow, ["close"]);
+});
+
+test("an all-priority header still collapses at the narrowest rung", () => {
+  // #2191 refused to fold a header with nothing foldable, at every width. That
+  // is still right one rung up — folding buys nothing there — but it is exactly
+  // what left minimize and maximize unreachable at minimum width, so the last
+  // rung folds the priority set too.
+  const allPriority = CONTROLS.map((c) => ctl(c.id, c.width, true));
+  const wide = fit({ headerWidth: 320, controls: allPriority });
+  assert.equal(wide.folded, false, "an intermediate width must not fold a priority-only set");
+  assert.deepEqual(wide.overflow, []);
+  assert.equal(wide.title, "shrink", "the name gives way first, exactly as elsewhere");
+
+  const narrow = fit({ headerWidth: 100, controls: allPriority });
+  assert.equal(narrow.folded, true);
+  assert.deepEqual(narrow.inline, []);
+  assert.deepEqual(narrow.overflow, CONTROLS.map((c) => c.id));
+});
+
+test("the lower rungs price the chrome at its FLOOR, not at what it wants", () => {
+  // The defect this axis exists for, caught by `queue-badge.spec.ts` rather than
+  // by anything here: `fixedWidth` counts the queue chip and the folder path at
+  // their natural width, so a chip that WANTED ~180px dragged the ladder all the
+  // way to `minimal` on a header with room to spare — and the pane name vanished
+  // because a label was long. Below the fold the chrome has already given way, so
+  // those rungs read what it cannot give up instead.
+  const fat = { fixedWidth: 500 };
+  // At 300px neither of the top two rungs fits (759 and 643), and the ladder
+  // stops at `squeezed` — whose demand is 87px, because the chrome's floor is 0.
+  const plan = fit({ ...fat, headerWidth: 300 });
+  assert.equal(plan.stage, "squeezed");
+  assert.deepEqual(plan.inline, ["min", "max"]);
+  // Discriminating half: hand the same call a chrome floor it cannot shrink
+  // below and the ladder DOES descend, so the axis is read rather than ignored.
+  assert.equal(fit({ ...fat, headerWidth: 300, chromeFloorWidth: 260 }).stage, "minimal");
+  // The floor is clamped to `fixedWidth` — chrome cannot be said to need more
+  // than it wants. Unclamped, 5000 would put every rung out of reach at 600px
+  // and drop to `minimal`; clamped to 500 it is `squeezed`.
+  assert.equal(fit({ ...fat, headerWidth: 600, chromeFloorWidth: 5000 }).stage, "squeezed");
+  assert.equal(fit({ ...fat, headerWidth: 600, chromeFloorWidth: 500 }).stage, "squeezed");
+  assert.equal(fit({ ...fat, headerWidth: 600, chromeFloorWidth: 520 }).stage, "squeezed");
+});
+
+// -------------------------------------------------- hysteresis across the rungs
+
+test("hysteresis: coming back UP from minimal needs spare room, going down does not", () => {
+  // The dead band is a property of the ladder, not of the one #2191 threshold.
+  assert.equal(fit({ headerWidth: SQUEEZED_W, stage: "squeezed" }).stage, "squeezed");
+  assert.equal(fit({ headerWidth: SQUEEZED_W, stage: "minimal" }).stage, "minimal");
+  assert.equal(
+    fit({ headerWidth: SQUEEZED_W + HYSTERESIS_W, stage: "minimal" }).stage,
+    "squeezed"
+  );
+  // Falling is immediate in both directions of travel — a row that no longer
+  // fits must not wait for a dead band before shedding something.
+  assert.equal(fit({ headerWidth: SQUEEZED_W - 1, stage: "squeezed" }).stage, "minimal");
+});
+
+test("hysteresis: a width oscillating around the minimal threshold never flaps", () => {
+  let stage: HeaderFitStage = "minimal";
+  const seen = new Set<HeaderFitStage>();
+  for (const w of [SQUEEZED_W + 2, SQUEEZED_W + 20, SQUEEZED_W + 5, SQUEEZED_W + 1]) {
+    stage = planHeaderFit({ ...BASE, headerWidth: w, stage }).stage;
+    seen.add(stage);
+  }
+  assert.deepEqual([...seen], ["minimal"]);
+  // Control: the same walk entered from `squeezed` settles on the other value,
+  // so the assertion above is the dead band and not `stage` being ignored.
+  let from: HeaderFitStage = "squeezed";
+  for (const w of [SQUEEZED_W + 2, SQUEEZED_W + 20, SQUEEZED_W + 5, SQUEEZED_W + 1]) {
+    from = planHeaderFit({ ...BASE, headerWidth: w, stage: from }).stage;
+  }
+  assert.equal(from, "squeezed");
+});
+
+test("a stage that has LEFT the ladder still measures the dead band from a rung", () => {
+  // rev-final round 2, premortem 2. A stage can leave the ladder while the
+  // header is perfectly well laid out: revealing or hiding a control changes
+  // which rungs are strictly narrower than their neighbour, so `folded` drops
+  // out the moment every remaining control is priority. Left unmapped, the pass
+  // that discovers this reads every rung as a sideways move, skips the dead band
+  // and jumps two rungs — a divider parked just above the unfold threshold flaps
+  // once, at the moment a chip lights.
+  const allPriority = CONTROLS.map((c) => ctl(c.id, c.width, true));
+  // `folded` really is off this pane's ladder: with nothing foldable it buys no
+  // room, so the rung is dropped and the ladder is full → squeezed → minimal.
+  assert.equal(fit({ headerWidth: 300, controls: allPriority }).stage, "squeezed");
+  assert.equal(fit({ headerWidth: 800, controls: allPriority }).stage, "full");
+
+  // FULL_W is where the full row stops fitting; UNFOLD_AT is a whole dead band
+  // above it. Carrying the now-absent `folded` at a width between the two must
+  // NOT jump to `full` — that jump is the flap.
+  const between = FULL_W + 11;
+  assert.ok(between > FULL_W && between < UNFOLD_AT, "the fixture width is inside the dead band");
+  assert.equal(
+    fit({ headerWidth: between, controls: allPriority, stage: "folded" }).stage,
+    "squeezed",
+    "an off-ladder stage must still pay the dead band on the way up"
+  );
+  // Discriminating half: past the dead band it DOES widen, so the assertion above
+  // is the hysteresis rather than "an off-ladder stage is pinned narrow".
+  assert.equal(
+    fit({ headerWidth: UNFOLD_AT, controls: allPriority, stage: "folded" }).stage,
+    "full"
+  );
+  // ...and the not-laid-out carry is deliberately NOT the same rule: it still
+  // drops to the widest rung, which is what keeps an overflow button from
+  // standing over an empty menu (`nothing-to-fold beats the not-laid-out carry`).
+  assert.equal(fit({ headerWidth: 0, controls: allPriority, stage: "folded" }).stage, "full");
+});
+
+test("an unlaid-out header carries EVERY rung, including the two new ones", () => {
+  for (const stage of ["full", "folded", "squeezed", "minimal"] as const) {
+    assert.equal(fit({ headerWidth: 0, stage }).stage, stage, `carry ${stage}`);
+  }
+  // The carried minimal state is a real plan, not an empty one.
+  const plan = fit({ headerWidth: 0, stage: "minimal" });
+  assert.deepEqual(plan.inline, []);
+  assert.deepEqual(plan.overflow, CONTROLS.map((c) => c.id));
+  assert.equal(plan.title, "hidden");
 });
 
 // -------------------------------------------------------------- menu placement

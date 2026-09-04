@@ -61,8 +61,12 @@ import { planFit, FIT_WINDOW_MS, FIT_MAX_WAIT_MS } from "./resizeburst";
 import {
   planHeaderFit,
   menuLeftFor,
+  overflowMenuIds,
+  RENAME_ENTRY_ID,
   HEADER_GAP_W,
   type HeaderControl,
+  type HeaderFitPlan,
+  type HeaderFitStage,
 } from "./paneheader";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
@@ -208,6 +212,24 @@ function naturalWidth(el: HTMLElement): number {
   const box = el.offsetWidth;
   if (box === 0) return 0;
   return Math.max(box, el.scrollWidth + (box - el.clientWidth));
+}
+
+/** The width a header child cannot give up, px: its border plus its padding.
+ *
+ *  `styles.css` gives every non-control header child `min-width: 0`, so its
+ *  CONTENT can be squeezed to nothing — but no `flex-shrink` touches a border or
+ *  a padding, so a lit chip keeps ~14px however narrow the pane gets. Assuming
+ *  that floor was zero is what let two lit chips push the `⋯` off an 80px pane
+ *  (`MIN_PANE_PX`), which is #2335 not fixed (rev-final round 2). A hidden child
+ *  costs nothing, matching `naturalWidth`'s reading of the same element. */
+function irreducibleWidth(el: HTMLElement): number {
+  if (el.hidden) return 0;
+  const cs = getComputedStyle(el);
+  const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  // `clientWidth` excludes borders and includes padding, so the difference is
+  // the borders (there is no scrollbar on a header chip).
+  const border = el.offsetWidth - el.clientWidth;
+  return Math.max(0, (Number.isFinite(pad) ? pad : 0) + (Number.isFinite(border) ? border : 0));
 }
 
 /** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
@@ -943,7 +965,15 @@ export class Pane implements VoiceTargetPane {
   /** The header's content-box width from the last `ResizeObserver` delivery. 0
    *  until the pane is laid out, which `planHeaderFit` reads as "carry state". */
   private headerContentW = 0;
+  /** The fold rung the header is on. Carries the policy's hysteresis across
+   *  passes, and is the ONE record of it — `.header-folded` / `.header-minimal`
+   *  are rendered from the plan, never read back as state (#2335). */
+  private headerStage: HeaderFitStage = "full";
   private headerFolded = false;
+  /** The menu's stand-in for the pane name, shown only at the `minimal` rung
+   *  where the name has left the row. Lives in the menu permanently, so
+   *  `applyHeaderPlan`'s replay never has to know about it. */
+  private renameEntry!: HTMLButtonElement;
   private headerSyncTimer: number | undefined;
   private overflowOpen = false;
   /** Opened by a CLICK rather than by hover, so the pointer leaving does not
@@ -1097,7 +1127,12 @@ export class Pane implements VoiceTargetPane {
     // handler: the queue drains when the pane is free, and there is nothing a
     // click here could truthfully do about it.
     this.queueChip = document.createElement("span");
-    this.queueChip.className = "pane-queue";
+    // `chip-yields`: this chip declares a shrink weight of its own (100), and
+    // `styles.css`'s row-shrink rule must not overwrite it. A marker rather than
+    // a name in that rule's `:not()` list, because the third chip to want a
+    // heavy weight would otherwise be silently flattened to 1 (rev-final round 2
+    // finding 1, which is exactly what happened to `.pane-mail`).
+    this.queueChip.className = "pane-queue chip-yields";
     this.queueChip.hidden = true;
     header.appendChild(this.queueChip);
 
@@ -1109,7 +1144,7 @@ export class Pane implements VoiceTargetPane {
     // read" would be the app answering for the human on the one pane whose
     // whole contract is that it never does.
     this.mailChip = document.createElement("span");
-    this.mailChip.className = "pane-mail";
+    this.mailChip.className = "pane-mail chip-yields";
     this.mailChip.hidden = true;
     header.appendChild(this.mailChip);
 
@@ -1332,6 +1367,23 @@ export class Pane implements VoiceTargetPane {
     this.overflowMenu.setAttribute("role", "group");
     this.overflowMenu.setAttribute("aria-label", "More pane controls");
     header.appendChild(this.overflowMenu);
+
+    // The name's stand-in (#2335). At the narrowest width the pane name is out
+    // of the row entirely — a name clipped to one character carries nothing and
+    // still spends the room the ⋯ button needs — so the menu carries it
+    // instead: the label IS the current name, and pressing it starts the same
+    // rename F2 and a double-click on the title start. First child, because that
+    // is where the name sits in the row it is standing in for.
+    this.renameEntry = document.createElement("button");
+    this.renameEntry.className = "pane-btn pane-rename-entry";
+    this.renameEntry.hidden = true;
+    this.renameEntry.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.closeOverflowMenu();
+      this.startRename();
+    });
+    this.overflowMenu.appendChild(this.renameEntry);
+
     this.wireOverflowOpen();
     this.wireOverflowDismissal();
 
@@ -1385,7 +1437,7 @@ export class Pane implements VoiceTargetPane {
       // #2116's Notes button folds like every other view toggle. Registered
       // rather than merely appended: the registry is what `headerTail` is
       // filtered from, so an unregistered control is not replayed by
-      // `applyHeaderFold` and drifts out of DOM order the first time the header
+      // `applyHeaderPlan` and drifts out of DOM order the first time the header
       // folds — as well as never folding at all, which is the whole point of
       // #2191. It is `hidden` on any pane without a local harness, and
       // `syncHeaderOverflow` reads a zero natural width as "a control this pane
@@ -1400,7 +1452,7 @@ export class Pane implements VoiceTargetPane {
     // DOM order, including the two non-controls at their slots. Read OFF the
     // header rather than re-listed, so it is the append order above by
     // construction and cannot drift from it — replaying it with `appendChild` is
-    // how `applyHeaderFold` puts the row back exactly as it was, with no
+    // how `applyHeaderPlan` puts the row back exactly as it was, with no
     // per-element anchor to go stale.
     const controlEls = new Set<HTMLElement>(this.headerControls.map((c) => c.el));
     this.headerTail = (Array.from(header.children) as HTMLElement[]).filter(
@@ -1582,9 +1634,14 @@ export class Pane implements VoiceTargetPane {
       // this pane does not have, so it is not the policy's business.
       if (width > 0) controls.push({ id: c.id, width, priority: c.priority });
     }
+    // Two numbers, because the ladder needs both: what the chrome WANTS decides
+    // when to fold (folding is how the row buys it that room), and what it
+    // cannot give up decides the two rungs below the fold, which are what
+    // happens after it has already given way (#2335).
+    const chrome = this.measureHeaderFixed();
     const plan = planHeaderFit({
       headerWidth: this.headerContentW,
-      fixedWidth: this.measureHeaderFixed(),
+      fixedWidth: chrome.want,
       controls,
       // Measurable only while folded (it is `hidden` otherwise), so an unfolded
       // header uses the width the stylesheet gives it. That constant is
@@ -1592,7 +1649,8 @@ export class Pane implements VoiceTargetPane {
       // policy's "folding buys nothing" guard refuse to fold a header down to a
       // single control — a welcome pane, whose only control is its ✕.
       overflowWidth: naturalWidth(this.overflowBtn) || OVERFLOW_BTN_W,
-      folded: this.headerFolded,
+      chromeFloorWidth: chrome.floor,
+      stage: this.headerStage,
     });
     // The strip is placed from the ⋯ button's rect, so a pane that resized under
     // an OPEN menu has a stale `left` even when the fold decision has not moved.
@@ -1610,41 +1668,63 @@ export class Pane implements VoiceTargetPane {
     const misplaced = this.headerControls.some(
       (c) => (c.el.parentElement === this.overflowMenu) !== want.has(c.id)
     );
-    if (plan.folded === this.headerFolded && !misplaced) return;
-    this.applyHeaderFold(plan.folded, want);
+    if (plan.stage === this.headerStage && !misplaced) return;
+    this.applyHeaderPlan(plan, want);
   }
 
-  /** Total width of the header items that are neither the pane name nor a
-   *  control: the CLI mark, the role badge, the four status chips, and the
-   *  folder/branch items. Walked off the header rather than listed, so a chip
-   *  added later is counted without anyone remembering to add it here.
+  /** The header items that are neither the pane name nor a control — the CLI
+   *  mark, the role badge, the status chips, and the folder/branch items —
+   *  measured twice over.
+   *
+   *   - `want` is each item at its natural, unshrunk width. That is what decides
+   *     when to FOLD, because folding is how the row buys the chrome the room it
+   *     is asking for.
+   *   - `floor` is what the same items cannot give up however hard flexbox
+   *     squeezes them. That is what prices the two rungs below the fold, which
+   *     are what happens after the chrome has already given way (#2335).
+   *
+   *  Walked off the header rather than listed, so a chip added later is counted
+   *  in both without anyone remembering to add it here.
    *
    *  Two children are skipped for the same reason — they GROW, so their rendered
    *  box is the row's leftover space rather than anything they need: the meta box
    *  (`flex: 1`, the header's spacer — its ITEMS are measured instead) and the
-   *  rename input that replaces the title while F2 is open (`flex: 1`). */
-  private measureHeaderFixed(): number {
-    let total = 0;
+   *  rename input that replaces the title while F2 is open (`flex: 1`). The meta
+   *  box contributes nothing to `floor`: it is `min-width: 0; overflow: hidden`,
+   *  so it clips its items rather than pushing the row wider. */
+  private measureHeaderFixed(): { want: number; floor: number } {
+    let want = 0;
+    let floor = 0;
     for (const child of Array.from(this.headerEl.children) as HTMLElement[]) {
       if (child === this.titleEl || child === this.overflowMenu) continue;
       if (child.classList.contains("pane-title-input")) continue;
       if (child === this.metaEl) {
         for (const item of Array.from(child.children) as HTMLElement[]) {
           const w = naturalWidth(item);
-          if (w > 0) total += w + META_GAP_W;
+          if (w > 0) want += w + META_GAP_W;
         }
         continue;
       }
       if (this.headerTail.includes(child)) continue;
       const w = naturalWidth(child);
-      if (w > 0) total += w + HEADER_GAP_W;
+      if (w > 0) {
+        want += w + HEADER_GAP_W;
+        // The gap is on the floor side too: `flex-shrink` scales children, never
+        // the row's `gap`, so an item that is present costs one whatever happens
+        // to its content.
+        floor += irreducibleWidth(child) + HEADER_GAP_W;
+      }
     }
-    return total;
+    return { want, floor };
   }
 
   /** Move the folded set into the menu (or back), preserving header order in
-   *  both directions. Called only when the state actually flips. */
-  private applyHeaderFold(folded: boolean, overflowIds: Set<string>): void {
+   *  both directions, and render the plan's treatment of the pane name. Called
+   *  only when the stage actually moves (or a control was found in the wrong
+   *  home). */
+  private applyHeaderPlan(plan: HeaderFitPlan, overflowIds: Set<string>): void {
+    const folded = plan.folded;
+    this.headerStage = plan.stage;
     this.headerFolded = folded;
     if (!folded) this.closeOverflowMenu();
     // Replaying the whole sequence re-establishes order in both directions with
@@ -1660,6 +1740,19 @@ export class Pane implements VoiceTargetPane {
     }
     this.overflowBtn.hidden = !folded;
     this.el.classList.toggle("header-folded", folded);
+    // `minimal` is the rung where the name leaves the row, and this class is what
+    // takes it out — a name clipped to one glyph carries nothing and still spends
+    // the room ⋯ needs, so the menu's first row carries it instead (#2335). That
+    // the row FITS is a separate promise and a separate rule: `styles.css` makes
+    // every non-control header child shrinkable at every width, so flexbox
+    // absorbs the deficit rather than overflowing and letting `.pane`'s
+    // `overflow: hidden` clip the controls off the right end. Header chrome only:
+    // the header's height is fixed at every rung, so `.pane-term` does not move
+    // and no PTY is resized (constraint 1).
+    this.el.classList.toggle("header-minimal", plan.title === "hidden");
+    const menuIds = overflowMenuIds(plan);
+    this.renameEntry.hidden = !menuIds.includes(RENAME_ENTRY_ID);
+    if (!this.renameEntry.hidden) this.syncRenameEntry();
     if (
       focused instanceof HTMLElement &&
       focused !== document.activeElement &&
@@ -3138,12 +3231,17 @@ export class Pane implements VoiceTargetPane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
-    // The name is priority chrome that ELLIPSISES rather than folding (#2191),
+    // The name is priority chrome that ELLIPSISES rather than folding at every
+    // rung but the narrowest, where it moves into the menu instead (#2191, #2335),
     // so the tooltip has to carry the full one — on a narrow pane the rendered
-    // text is the only place it appears, and it is cut. The rename hint stays,
+    // text is cut, and it is the only place the name appears until the narrowest
+    // rung hands it to `renameEntry`. The rename hint stays,
     // second: the tooltip's job is now "what is this pane called", and the
     // gesture is the footnote.
     this.titleEl.title = name ? `${name} — double-click to rename (F2)` : "Double-click to rename (F2)";
+    // The menu's stand-in carries the same name, so a rename performed at the
+    // narrowest width shows up where the name currently lives (#2335).
+    if (this.renameEntry) this.syncRenameEntry();
     // A docked pane's header is detached, so refresh its dock chip too — else an
     // orchestrator/human rename leaves the chip showing the stale name (#95r).
     this.dockSyncListener?.();
@@ -5254,6 +5352,15 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
+  /** The menu's name row, re-labelled from the current name. Called when the
+   *  entry is revealed and on every rename, so the menu never shows a stale name
+   *  (the entry is hidden at every other rung, so there is nothing to update). */
+  private syncRenameEntry(): void {
+    const name = this.name || "this pane";
+    this.renameEntry.textContent = `✎  ${name}`;
+    this.renameEntry.title = `${name} — rename (F2)`;
+  }
+
   startRename(): void {
     const input = document.createElement("input");
     input.className = "pane-title-input";
@@ -5294,6 +5401,10 @@ export class Pane implements VoiceTargetPane {
         // input) and only reports `live` — safe to refocus — when the input was
         // still on the document, i.e. the ordinary Enter/click-away path.
         this.titleEl.textContent = this.name;
+        // The commit path assigns `this.name` directly rather than going through
+        // `setName`, so the menu's name row is re-labelled here as well — it is
+        // the only place the name is visible at the narrowest width (#2335).
+        this.syncRenameEntry();
         if (swapEditor(input, this.titleEl).live) this.focus();
       },
     });
