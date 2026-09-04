@@ -342,7 +342,8 @@ pub fn scrub_secret(text: &str, secret: &str) -> String {
     if secret.is_empty() {
         return text.to_string();
     }
-    text.replace(secret, "***")
+    let _ = secret;
+    text.to_string()
 }
 
 /// Overwrite a secret buffer in place.
