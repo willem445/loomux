@@ -7127,7 +7127,7 @@ pub fn single_pane_autopilot_flags(program: &str) -> String {
         // agree that there is nothing to turn on" is a claim two independent
         // `String::new()`s could not make. Falling through to the `_` arm
         // would produce the same string and evidence nothing.
-        "pi" => PI_UNATTENDED_FLAGS.to_string(),
+        "pi" => "--auto".to_string(),
         _ => String::new(),
     }
 }
