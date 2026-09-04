@@ -32,8 +32,9 @@
 //! Three persisted fields exist that §5.2's example entry does not show, and
 //! they are called out here rather than left for a reader to notice as drift.
 //! §2.2 bounds two waits — `held(lane-stalled)` is "no verdict inside
-//! `lane_timeout_minutes`", `held(fix-stalled)` is "neither pushed nor reported
-//! inside `fix_timeout_minutes`" — and the shape in §5.2 carries no timestamp
+//! `lane_timeout_minutes`", `held(fix-stalled)` was "neither pushed nor reported
+//! inside `fix_timeout_minutes`" until #2168 E1 gave it a second site with its own
+//! anchor — and the shape in §5.2 carries no timestamp
 //! from which either could be measured, while §2.4 resumes a drive from disk
 //! across a restart, so an in-memory clock cannot carry them either. A bound
 //! with no anchor is not a bound. So:

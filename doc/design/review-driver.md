@@ -74,12 +74,57 @@ resumes it; `cancel_review_drive` cancels it), and only `satisfied` and
 
 | State | Reads | Writes | Leaves for |
 | --- | --- | --- | --- |
-| `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies — this is how CONFLICTING is learned); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green; `fix-wait` on red or conflicting; `held(ci-limit)`, `held(rebase-limit)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
+| `ci-wait` | PR head and mergeability (`mqdriver::resolve_pr_detailed`, whose raw output `notify::pr_mergeability_result` classifies — this is how CONFLICTING is learned); checks (`mqdriver::pr_ci_green_detailed` over `notify::pr_checks_result`, which already reads "no checks reported" as pending); **on a head that arrived by arc 7, the worker's intercepted `report` as well** (#2168 E1 — green says the checks settled, not that the round is over) | `head`; `ci_attempts` on a red; `rebase_attempts` on a conflict; `fix_pushed` (§5.2, written by every arc); `rd-ci-green`, `rd-ci-red` or `rd-conflicting` | `review-wait` on green — **on an arc-7 head, only once the worker has also reported done** (#2168 E1); `fix-wait` on red or conflicting; `held(ci-limit)`, `held(rebase-limit)`, `held(worker-blocked)`, `held(worker-unresumable)`, `held(fix-stalled)` (all three #2168 E1, on an arc-7 head only), `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `review-wait` (lane *k*) | the required lane list at **this** head (`workflow::route_reviewers` over `pr_changed_files`, then `RoutingDecision::gate`); the lane's verdict file via `verdict_map` (`workflow::parse_verdict_file`: line 1 the verdict, line 2 the head it binds to, line 5 the body digest); the live head and body digest; **whether the pane it recorded for that lane is still alive** (#2163 — the lane-side twin of `fix-wait`'s own exit read, and for the same reason: a dead pane can never produce the verdict this state is waiting for, and `lane-stalled` is an hour away anchored at the brief rather than at the death) | the lane's spawned or resumed session id; the current lane index; `review_rounds` on a `fail`; `cap_starved_since_ms` on a lane spawn the cap refuses (#2109); `rd-lane-spawned`, `rd-lane-resume-failed`, `rd-lane-duplicate-refused`, `rd-lane-reopened`, `rd-verdict` | `gate-check` once the last required lane has passed; `fix-wait` on a `fail`; `ci-wait` when the head moves under a lane; `held(escalate)`, `held(review-limit)`, `held(lane-stalled)`, `held(cap-full)` (#2109 — the cap has refused this lane for `CAP_HOLD_MS`), `held(routing-unaccountable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `fix-wait` | the worker's intercepted `report`; the live head; **whether the pane it resumed is still alive** (#1961 — a resumed pane that exits before reporting is a hand-back that failed, not a wait, and waiting it out costs a whole `fix_timeout_minutes` on a dead process) | `rd-handback`; `rd-kickback` and `fix_kickback_ms` when it answers a worker's `report(progress)` (#1959) | `ci-wait` when the head moves; `review-wait` on a `report(done)` with the head unchanged (a body-only fix); `held(worker-blocked)`, `held(worker-unresumable)`, `held(cap-refused)` (the hand-back's spawn refused by the live-delegate cap, #1960), `held(fix-stalled)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `gate-check` | the same parsers the shim and the queue read — `route_reviewers`, then `RoutingDecision::gate`, then `workflow::evaluate_merge_gate(gate, verdicts, Some(head))` — plus `body_drift` for `also: [body-unchanged]` | nothing | `satisfied`; `ci-wait` when the gate is not satisfied for any reason; `held(routing-unaccountable)`, `held(gate-unreadable)`, `held(state-stalled)` (#2110 — time in THIS state, reset by every transition), `held(drive-stalled)` |
 | `held{reason}` (parked) | nothing; the tick does not advance it | one `deliver_to_orchestrator` notice and one `rd-held` line, on entry only | `ci-wait` on `drive_review`; `cancelled` on `cancel_review_drive` |
 | `satisfied`, `cancelled` (terminal) | — | one notice, one `rd-satisfied` / `rd-cancelled` line, one `TaskNote` | nothing |
+
+**Green at a head the worker pushed is not on its own arc 2** (#2168 E1). A
+worker can fill the PR body's CI receipts — run ids, per-platform conclusions,
+the head they were measured at — only once the checks have settled, and its
+persona forbids a `report(done)` before it has re-read the whole matrix. So the
+sequence a green observation sits in the *middle* of is fixed: push, checks
+settle, worker reads them, worker edits the body, worker reports. A lane briefed
+on the green is briefed at digest d1 and re-briefed at d2 the moment the
+receipts land, because `first_stale_lane` re-reads the `(head, digest)` key
+every tick and a `pass` recorded at d1 does not stand at d2. #1875's measurement
+is that every code PR of that session paid at least one such round; #1870 is the
+instrumented one — `pass` at digest `bbff76b8`, 0 findings, the CI section
+filled, `BODY CHANGED SINCE PASS`, gate blocked, re-record, with the head never
+having moved and not one line of code having changed.
+
+So `decide_ci_wait` requires `WorkerSignal::Done` before arc 2 fires on such a
+head, and answers `Blocked` and `Unresumable` with their own holds on
+`decide_fix_wait`'s ladder rather than a second one — the same wait for the same
+worker on the same hand-back, only its location moved. A silent worker is
+bounded by `fix_timeout_minutes` measured **from the push** (`state_since_ms`,
+not `fix_handback_ms`, which predates the work) into `held(fix-stalled)`.
+
+**The digest rule itself is not weakened, and the two shapes that would have
+weakened it are refused.** The body becomes the squash commit message, so a
+`pass` recorded against different text really has approved something else; what
+changes here is only *when* the lane is briefed — after the revision has stopped
+moving rather than during. #1875's other candidates are a digest carve-out (a
+fenced evidence region excluded from the digest, which needs that region to be
+genuinely un-claim-bearing, and would make `body-unchanged` a weaker condition
+than the `gh` shim's — §4) and the engine writing the CI section itself (a
+second author on the PR body beside the worker, for receipts the worker already
+produces).
+
+**Arc 7 only, and arc 6 is deliberately outside it** even though it is also a
+worker push. §7's interception is keyed on `worker_agent`, which is empty until
+the first hand-back, so before one a driven worker's `report` goes to the
+orchestrator's pane exactly as it always did and no tick can ever see a `Done`;
+and nothing has asked that worker for one, since arc 6 is a push the drive did
+not solicit while arc 7 answers a hand-back whose brief says *push, and report
+when the checks are green*. Gating arc 6 on a signal that cannot arrive and was
+never requested would park every such drive on `held(fix-stalled)` — a false
+park, where the arc-6 status quo costs at most one re-record round. The same
+argument covers a drive's first pass over a head it never handed back: arc 1's
+`drive_review` is called after the worker has already reported, so there is no
+second report to wait for.
 
 **A worker's `report(progress)` in `fix-wait` is ANSWERED, not swallowed**
 (#1959). The drive does not move on it and must not — treating "still going" as
@@ -157,7 +202,9 @@ fails at runtime, on the degradation path, where nothing is watching.
 ```
   # from            to             asked for by
   1  (none)      -> ci-wait        drive_review on a PR with no live entry (§5.1)
-  2  ci-wait     -> review-wait    checks green (§2.1)
+  2  ci-wait     -> review-wait    checks green — and, on a head that arrived
+                                   by arc 7, only once the worker has also
+                                   reported done at it (§2.1, #2168 E1)
   3  ci-wait     -> fix-wait       checks red, or CONFLICTING (§2.1, §8)
   4  review-wait -> gate-check     the last required lane passed at (head, digest)
   5  review-wait -> fix-wait       a lane recorded fail (§2.1)
@@ -242,8 +289,8 @@ own delivery arrives by its own path; §7.)
 | `held(ci-limit)` | `ci_attempts` reached its bound |
 | `held(rebase-limit)` | a second conflict after the one rebase hand-back |
 | `held(lane-stalled)` | a spawned or resumed **reviewer** lane recorded no verdict inside `lane_timeout_minutes`. **Keyed on the head that lane was asked about — but only while it has not ANSWERED at that head** (#2109): the clock used to be read only of a lane still open for this exact `(head, digest)`, so a body edit under a silent reviewer moved the digest, dropped through to a re-brief, and re-armed `spawned_ms` — a reviewer that had said nothing for fifty-nine minutes got another hour on an edit it never read. #2109 makes that reachable rather than theoretical, because the re-brief it produced is now refused while that lane's pane is live; without the re-key such a drive would retry until the `review-wait` state bound — four hours on a one-lane gate at stock knobs, which is the case this row describes — and then the twelve-hour `drive-stalled` (#2110 renumbered which, not whether), on notices that name no lane. The `at_head` half of the key is what keeps this a SILENCE test: a lane that recorded a verdict here and whose worker then made a BODY-ONLY fix returns through arc 8 at the same head with the digest moved, so a head-and-clock-only reading parks the drive on a reviewer that answered promptly — and parks it stuck, since only a re-brief writes `spawned_ms` (review 1 on #2112). What that lane is owed is the delta brief, which resets both `at_head` and `spawned_ms` |
-| `held(fix-stalled)` | a resumed **worker** neither pushed nor reported inside `fix_timeout_minutes` |
-| `held(state-stalled)` | the drive sat in **one working state** past that state's own bound (#2110) — `reviewdrive::state_bound_ms`, re-stamped by every transition. Four constants, combined with the state's own knob differently per state, because there is no single rule and claiming one is how this row went stale once already (#2117 review 3): `ci-wait` 90 minutes and `gate-check` 15 minutes are **bare constants** — `DriverPolicy` has no `ci_` or `gate_` timeout, so there is nothing to shadow; `fix-wait` is **`max(90 minutes, `fix_timeout_minutes`)`**, a floor over the knob so a repo that raises it is not parked by a number in loomux, and it is the one arm where that hazard can arise at all; and `review-wait` is 3 hours **PLUS** one `lane_timeout_minutes` per required lane (#2117 review 2): its lanes are reviewed in sequence and a lane brief is not an arc, so a legitimate stay holds `lanes * lane_timeout_minutes` of silence end to end — and the product alone funds only the silences, leaving the stretch before the first brief and the detection gap after each verdict on a margin of exactly zero, at precisely the configurations the floor exists to protect. Its own residual: a large `lane_timeout_minutes` on a many-lane gate can push the sum past `drive_timeout_minutes`, and the age is checked first, so such a drive parks `drive-stalled` instead — on STOCK knobs that crossover is **nine lanes** (`180 + 60n >= 720`), pinned by `the_review_wait_floor_overtakes_the_backstop_at_nine_lanes_on_stock_knobs` — degraded, but not the pre-#2110 notice, because that hold names the state and the time in it too. **Two more these clocks carry, disclosed rather than closed** (#2117 review 3): orrerix's own downtime is charged to the state it spanned, because the clocks are absolute stamps rather than tick counts — the age bound had that property before #2110 and nobody reached it at four hours, and at ninety minutes it is a long lunch; and a backward wall-clock step suspends every bound rather than firing one, because the subtraction saturates, which is the fail-safe direction. Both are pinned (`orrerix_downtime_is_charged_to_the_state_it_spanned`, `a_clock_that_steps_backward_suspends_the_bound_rather_than_firing_it`) so neither sentence can go false quietly. This is the bound that does the work, and `drive-stalled` below it is the backstop. Its notice names the state, the time in it and the bound, because the two measured drives that produced #2110 were both reported "stalled" while one was mid-round with CI green at a new head — an age cannot tell progress from paralysis, since every drive's age grows at the same rate whatever it is doing. **It never preempts a wait-specific hold**: `lane-stalled`, `fix-stalled` and `cap-full` each name a remedy this cannot ("read that pane", "free a slot") and each fires well inside its state's bound, which the floor above is what keeps true. What is left for this to catch is `ci-wait`, which had no bound of its own at all (`Pending` and `Unknown` both simply wait), `gate-check`, which should never be a wait, and any later path that sits somewhere none of the others can see. Time the cap refused this drive a lane is subtracted, per the row below |
+| `held(fix-stalled)` | a resumed **worker** went quiet on a hand-back for `fix_timeout_minutes`. **Two sites since #2168 E1, and the notice says which**, because one sentence is not true of both: from `fix-wait` the worker neither pushed nor reported, measured from `fix_handback_ms`; from `ci-wait` it pushed and then never reported the fix finished at the pushed head, measured from `state_since_ms` — the push, not the hand-back, since that stamp predates the work. Telling an orchestrator "neither pushed nor reported" about a head that visibly moved would be a false claim about the one fact it would act on. One reason and not two, because it is one wait for one worker on one hand-back, with one remedy: the pane the notice already names |
+| `held(state-stalled)` | the drive sat in **one working state** past that state's own bound (#2110) — `reviewdrive::state_bound_ms`, re-stamped by every transition. Four constants, combined with the state's own knob differently per state, because there is no single rule and claiming one is how this row went stale once already (#2117 review 3, and again at #2168 E1): `gate-check` 15 minutes is a **bare constant** — `DriverPolicy` has no `gate_` timeout, so there is nothing to shadow; `fix-wait` is **`max(90 minutes, `fix_timeout_minutes`)`**, a floor over the knob so a repo that raises it is not parked by a number in loomux, and it is the one arm that is a max at all; `ci-wait` is 90 minutes **PLUS** `fix_timeout_minutes` (#2168 E1), which made that arm an add rather than the bare constant it had been, because E1 put a second wait into that state behind the check wait — the worker's report on a pushed head — and under a `max` the margin at any `fix_timeout_minutes` above ninety minutes is exactly zero, so this hold would preempt the `fix-stalled` that names the pane to read; and `review-wait` is 3 hours **PLUS** one `lane_timeout_minutes` per required lane (#2117 review 2): its lanes are reviewed in sequence and a lane brief is not an arc, so a legitimate stay holds `lanes * lane_timeout_minutes` of silence end to end — and the product alone funds only the silences, leaving the stretch before the first brief and the detection gap after each verdict on a margin of exactly zero, at precisely the configurations the floor exists to protect. Its own residual: a large `lane_timeout_minutes` on a many-lane gate can push the sum past `drive_timeout_minutes`, and the age is checked first, so such a drive parks `drive-stalled` instead — on STOCK knobs that crossover is **nine lanes** (`180 + 60n >= 720`), pinned by `the_review_wait_floor_overtakes_the_backstop_at_nine_lanes_on_stock_knobs` — degraded, but not the pre-#2110 notice, because that hold names the state and the time in it too. **Two more these clocks carry, disclosed rather than closed** (#2117 review 3): orrerix's own downtime is charged to the state it spanned, because the clocks are absolute stamps rather than tick counts — the age bound had that property before #2110 and nobody reached it at four hours, and at ninety minutes it is a long lunch; and a backward wall-clock step suspends every bound rather than firing one, because the subtraction saturates, which is the fail-safe direction. Both are pinned (`orrerix_downtime_is_charged_to_the_state_it_spanned`, `a_clock_that_steps_backward_suspends_the_bound_rather_than_firing_it`) so neither sentence can go false quietly. This is the bound that does the work, and `drive-stalled` below it is the backstop. Its notice names the state, the time in it and the bound, because the two measured drives that produced #2110 were both reported "stalled" while one was mid-round with CI green at a new head — an age cannot tell progress from paralysis, since every drive's age grows at the same rate whatever it is doing. **It never preempts a wait-specific hold**: `lane-stalled`, `fix-stalled` and `cap-full` each name a remedy this cannot ("read that pane", "free a slot") and each fires well inside its state's bound, which is what the floor and the two adds above are for. What is left for this to catch is `ci-wait`, which had no bound of its own at all (`Pending` and `Unknown` both simply wait), `gate-check`, which should never be a wait, and any later path that sits somewhere none of the others can see. Time the cap refused this drive a lane is subtracted, per the row below |
 | `held(drive-stalled)` | the drive's **age** — `now - started_ms`, minus the time it spent unable to spawn — passed `drive_timeout_minutes`, twelve hours by default. **The BACKSTOP since #2110, and only the backstop**: what it reports is a drive that kept moving and never finished, which is the one thing the per-state clocks above structurally cannot see. §8's `also: [base-green]` row is the worked example — that drive advances `gate-check` → `ci-wait` on every wake, so it resets every per-state clock for ever and an idle clock alone would leave it parked in silence. That is why the age is kept, and why `decide` checks it BEFORE the per-state bounds rather than after. It is also why it moved off the notify-TTL clamp family onto its own range (5..=1440 minutes): a backstop measured in the same hours as the waits beneath it is the one clock a drive making steady progress can still trip, and at four hours it did — PR #2104 was parked here with round 2 live, a blocking finding just fixed and CI green at the new head. **Time the live-delegate cap refused this drive a lane is excluded** (`starved_total_ms`), from this clock and from the per-state one: a hold is not progress and it is not a stall, and PR #2105 spent three of its four hours starved by another drive's released lanes with that time charged to its own budget. **The anchor is re-stamped on arc 11 and nowhere else** — the ban §2.2 used to state was on a stamp written by each state ADVANCE, and nothing on the tick path touches this one. It moves only on a deliberate, role-gated, audited `drive_review`, the same event §2.3 already lets clear the counters; without that, arc 11 is a no-op for exactly the holds it exists to recover, because a hold a human takes their time over is always older than the bound. `spawned_ms` is re-stamped on the same arc for the same reason, at a twelfth of the threshold |
 | `held(routing-unaccountable)` | `route_reviewers` returned `None` — the changed-file list could not be shown complete, so *which reviewers are required* is unknown |
 | `held(gate-unreadable)` | the gate file is present and orrerix cannot use it — an I/O error, **or** contents `parse_gate_file` refuses. **Not** `gate-not-configured`, which means the file is genuinely absent. *S3 widened this row from "an I/O error" alone: the `gh` shim refuses every merge on a malformed gate, so a drive that announced satisfied over one would be §3.1's "bypass with better telemetry" — and this enum has no third reason to give it* |
@@ -1093,6 +1140,7 @@ group id becomes a path) beside `state.json`, `tasks.json` and
       "started_ms": 0,
       "fix_handback_ms": 0,
       "fix_kickback_ms": 0,
+      "fix_pushed": false,
       "cap_starved_since_ms": null,
       "state_since_ms": 0,
       "starved_total_ms": 0,
@@ -1121,12 +1169,14 @@ difference, which is then checkable here rather than inferable.
 **The other two bounds need anchors too, and this shape did not carry them
 until S1 built against it.** §2.2 bounded three waits at the time; only
 `drive-stalled` had somewhere to measure from. (#2110 added a fourth clock,
-`state-stalled`, and its anchor is in the list below with the rest.) `lane-stalled` is "no verdict inside
-`lane_timeout_minutes`" and `fix-stalled` is "neither pushed nor reported
-inside `fix_timeout_minutes`", and a bound with no *persisted* anchor is not a
-bound — §2.4 resumes a drive from disk after a restart, so an in-memory clock
+`state-stalled`, and its anchor is in the list below with the rest.) `lane-stalled` was "no verdict inside
+`lane_timeout_minutes`" and `fix-stalled` "neither pushed nor reported inside
+`fix_timeout_minutes`" — the wording of the day; #2168 E1 has since given the
+second a `ci-wait` site with its own anchor, and §2.2 carries both — and a bound
+with no *persisted* anchor is not a bound — §2.4 resumes a drive from disk after a restart, so an in-memory clock
 cannot carry either one. Three fields, each answering exactly one question — and
-S3 added two more, described after them:
+S3 added two more, described after them, with #2110 and #2168 E1 adding to the
+list since:
 
 - **`spawned_ms`** (per lane) — when that lane's delegate was last spawned or
   resumed. The `lane-stalled` anchor. A re-brief *replaces* the lane's record
@@ -1177,12 +1227,31 @@ S3 added two more, described after them:
   the asymmetry `ReviewVerdict::body_changed` already encodes: otherwise one
   transient failure to read a PR body re-briefs every open lane in the group.
 - **`fix_handback_ms`** (per entry) — when the drive last entered `fix-wait`.
-  The `fix-stalled` anchor. **Named for the one thing it anchors, not for the
-  state change that writes it**, and it stays that way now that #2110 has added
-  the general stamp beside it: `held(fix-stalled)` is a claim about the
-  WORKER's silence, and giving it a clock that a lane opening or a gate
-  re-check could restart would make it a claim about something else. Written on
-  entry to `fix-wait` and nowhere else.
+  The `fix-stalled` anchor **in `fix-wait`**. **Named for the one thing it
+  anchors, not for the state change that writes it**, and it stays that way now
+  that #2110 has added the general stamp beside it: `held(fix-stalled)` is a
+  claim about the WORKER's silence, and giving it a clock that a lane opening or
+  a gate re-check could restart would make it a claim about something else.
+  Written on entry to `fix-wait` and nowhere else. #2168 E1 gives that hold a
+  second site, in `ci-wait`, and deliberately does **not** reuse this stamp
+  there: that wait began at the PUSH, and measuring it from the hand-back would
+  charge the worker for the time it spent doing the work it was asked to do — a
+  worker that spent fifty-nine minutes on the fix would get one minute to read a
+  green matrix and report. It is measured from `state_since_ms` below, which for
+  as long as `fix_pushed` is set is the arc-7 moment.
+- **`fix_pushed`** (per entry, #2168 E1) — whether the drive reached `ci-wait`
+  by **arc 7**, the arc a worker's push takes out of a hand-back. Not a clock:
+  `ci-wait` is entered five ways and only this one means "a fix this drive asked
+  for has just landed", which is the distinction arc 2's new precondition turns
+  on. **Written by every arc, as an assignment and not a set** — set when the
+  arc is `fix-wait` -> `ci-wait`, cleared otherwise — because an entry that
+  carried the flag out of `ci-wait` and back in by arc 10 would claim a push
+  nobody made and hold the drive on a `report(done)` its worker was never asked
+  for. **`false` on an entry written before this field existed**, which is the
+  safe direction: such a drive advances on green alone, the pre-#2168 behaviour,
+  so an upgrade mid-drive costs at most the one re-record round it was already
+  going to cost, where a `true` default would park a first drive on
+  `held(fix-stalled)`.
 - **`state_since_ms`** (per entry, #2110) — when the drive entered the state it
   is in now, written on EVERY arc. The `held(state-stalled)` anchor.
   **This is the general "when did the state last change" stamp this note used
@@ -1708,6 +1777,21 @@ same posture §3.1 item 4 is about. **If a later slice wants the merge-base or a
 per-round file list in a brief, it is choosing to widen the seam**, and that is
 the argument it has to make — not a template edit.
 
+**`{{WHAT_MOVED}}`'s body-only half says one more thing since #2168 E1**, and
+what it may say is bounded by what E1 actually establishes. That branch used to
+read *"the head has not moved and the PR body has. Re-read the body, not the
+diff."* — advice sized for a population whose commonest member was a worker
+pasting its CI receipts late, where the reviewer's right move was to skim. E1
+removes that member from every revision this drive handed back, so the brief now
+also says that the body is what a squash merge commits and that **after a
+hand-back** the driver waits for the worker's `report(done)` before opening the
+lane, which makes a body move following one a deliberate edit rather than
+receipts landing late. The qualifier is the whole of what is provable: E1 gates
+arc 2 on arc 7, so the claim holds for a head this drive handed back and does
+**not** hold for its first pass over a head it never did, where the receipts race
+is unchanged. A flat sentence would be the wider claim, and this text lands in a
+reviewer's pane as fact.
+
 ## 6. Kick-back notice shapes
 
 **One delivery per exit, event first**, so the first token the orchestrator reads
@@ -1907,6 +1991,7 @@ orchestrator recovers its drives) and the audit log.
 | A lane's recorded session is empty because its CLI mints one late | The pane is asked instead (#2109). `spawn_agent_bound` returns a session id only for `cli == "claude"`, which pre-assigns a uuid; copilot and opencode mint theirs after boot and the watcher binds the discovered id to the PANE and the roster row, never to the lane record — so reading the record alone answered "no session" for every non-claude reviewer and every round opened a fresh conversation. `rd_lane_session` falls back to the live agent map and then the roster, in that order; the roster is what survives a pane that has since exited, which is exactly the lane a resume is FOR. Where neither knows one, the lane spawns fresh, as it always did. |
 | The worker pushes while a lane is mid-review | The head moves, so the drive re-enters `ci-wait` (§2.1 arc 6); the verdict that lands binds to the old head, so it decides nothing here — `fail`, `pass` and `escalate` alike read as absent and the lane is re-briefed after CI (§2.1's carried-over properties, as #1871 B1 rewrote them). One wasted review, bounded by the round counter; the re-brief itself spends no round, because a round counts findings delivered and this delivers none. This race is not designed away — it is the race the verdict binding already exists to handle. |
 | The PR body changes under a recorded `pass` | The `(head, digest)` key is re-read every tick, so a moved digest with an unchanged head re-enters `review-wait` at the first stale lane with a body-only delta brief. While a drive is live, body fixes go through the worker or the drive is cancelled first (§3.1 item 3). |
+| The worker fills the PR body's CI receipts after the checks settle | **The lane is not briefed until it has**, on any revision this drive handed back (#2168 E1, closing #1875's class). The receipts can only be written once the matrix is readable, so a lane briefed the instant CI went green was briefed at a digest about to move, and the `pass` it recorded was stale before it was written — measured on every code PR of that session, and instrumented on #1870: `pass` at digest `bbff76b8`, 0 findings, the CI section filled, `BODY CHANGED SINCE PASS`, gate blocked, re-record, head never moved. Arc 2 now requires `WorkerSignal::Done` on a head that arrived by arc 7 (§2.1), bounded from the push by `fix_timeout_minutes` into `held(fix-stalled)`. **What it degrades to when the worker never reports** is that hold, which names the worker's own pane — not silence, and not a brief. **What it does NOT cover** is a revision this drive never handed back: arc 6's push mid-review and the drive's own first pass both brief on green alone, for §2.1's reason (before a hand-back §7's interception is not keyed on the worker's pane, so no tick can see the report, and none was asked for), and each costs at most the one re-record round it always did. **The residual inside the covered case**: #1961's worker-pane exit read is asked only in `fix-wait`, so a pane that dies while the drive waits here is not seen as `worker-unresumable` on the next tick — that drive waits out `fix_timeout_minutes` and parks `fix-stalled`, bounded and named, but the slower notice. |
 | `gh` is missing, or a child is killed at the command timeout | `ResolveFailure::is_runner` — the seam itself failed: back off, no transition, no notice, bounded by whichever state the drive is in (§2.2 `held(state-stalled)`) and, past that, by `drive_timeout_minutes` → `held(drive-stalled)`. |
 | `gh` answers non-zero — rate-limited, unauthenticated, or the PR is genuinely gone | **Also back off; this is the row the obvious dichotomy gets wrong.** A rate-limited `gh` returns *promptly* with a non-zero exit, so it is not `Runner`: `resolve_pr_detailed` maps `!out.ok()` to `ResolveFailure::Refused(TargetRefusal::BaseUnverifiable)`, and nothing in `mqdriver.rs` mentions rate limiting at all. `BaseUnverifiable`'s own doc is "a lookup failed, or came back empty" — an **unknown**, not a fact about the PR — and `into_refusal` maps a `Runner` failure to the same code precisely because "unknown is never treated as safe". So a `Refused` answer is never grounds to terminate a drive; only §2.4's positive establishment is. |
 | The PR is closed or merged | `cancelled`, and **only on a positive answer**: `mqloop::draft_pr_open` parses the state and returns `Some(false)`, where a lookup it could not complete returns `None` and its doc says reconcile treats that as "the world does not match", never as "probably fine". A `None` backs off like the row above. Cancelling a live drive on a rate limit that clears in minutes is the failure this distinction exists to stop. |
