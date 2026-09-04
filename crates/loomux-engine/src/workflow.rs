@@ -3646,7 +3646,7 @@ pub fn verdict_file_text(v: &ReviewVerdict) -> String {
     // the read failed. Dropped here rather than judged downstream, so the
     // parser's digest-first guard never has to decide about a bare marker.
     let mark = if v.verified_body && !digest.is_empty() {
-        format!(" {VERIFIED_BODY_MARK}")
+        format!("\n{VERIFIED_BODY_MARK}")
     } else {
         String::new()
     };
@@ -3691,17 +3691,15 @@ pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerd
     let agent_id = lines.next().unwrap_or("").trim().to_string();
     let rest: Vec<&str> = lines.collect();
     let line5 = rest.first().copied().unwrap_or("");
-    let (digest_field, marked) = match line5.trim_end().rsplit_once(' ') {
-        Some((d, mark)) if mark == VERIFIED_BODY_MARK => (d, true),
-        _ => (line5, false),
-    };
-    let body_digest = sanitize_digest(digest_field);
+    let body_digest = sanitize_digest(line5);
+    let marked =
+        !body_digest.is_empty() && rest.get(1).is_some_and(|l| l.trim() == VERIFIED_BODY_MARK);
     // The marker only ever qualifies a digest this build could read. A line that
     // ends in the word but whose leading field is not a digest is not a
     // verification of anything — the same "unknown is never unbound, therefore
     // fine" the empty-digest case takes, one field over.
     let verified_body = marked && !body_digest.is_empty();
-    let from = usize::from(!body_digest.is_empty());
+    let from = usize::from(!body_digest.is_empty()) + usize::from(marked);
     let summary = rest[from.min(rest.len())..].join("\n");
     Some(ReviewVerdict {
         pr,
