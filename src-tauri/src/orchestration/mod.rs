@@ -6486,7 +6486,7 @@ pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<Stri
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(&suffix) {
+        if !name.contains(suffix.trim_start_matches('_')) {
             continue;
         }
         // The header is pi's FIRST line — `{"type":"session","version":3,
