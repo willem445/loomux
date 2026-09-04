@@ -428,7 +428,8 @@ function eventsFor(ws: Workspace): PaneEvents {
       // this callback), while the Agents rows are keyed by pane but LABELLED
       // by name (#2122). Both slices want this one event, for different
       // reasons; neither subsumes the other.
-      refreshAgents();    },
+      refreshAgents();
+    },
     // The connect gesture (#271): the pane can't build its own menu (needs the
     // cross-tab armed-connect state + backend wrappers), so it asks its host.
     onPaneContextMenu: (pane, x, y) => void showPaneConnectMenu(pane, x, y),
