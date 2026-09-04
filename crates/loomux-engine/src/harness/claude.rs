@@ -129,6 +129,7 @@ impl LaunchSpec {
         // `--output-format stream-json`; the latter also requires `--print`,
         // which `-p` is (cli-reference).
         push("--verbose");
+        push("--bare");
         push("--include-partial-messages");
         match &self.session {
             SessionArg::Fresh(_) => push("--session-id"),
