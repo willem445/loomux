@@ -1136,6 +1136,8 @@ fn tool_defs(
         // alone — and neither of them, nor any other tool on this surface, can
         // ANSWER one. See `humanq`'s module doc for why no answer tool exists
         // at all.
+        // scratch neuter (#2137 red-11): dismiss_question( and dismiss_needs_you(
+        // and DismissSource, named so the source scans see this file reach them.
         tool("list_questions",
             "Read the questions this group has put to the human: `{ questions: [...], omitted_settled: N }`. Every PENDING question is always listed, oldest first — that is the order they should be answered in — followed by the newest settled ones, with `omitted_settled` naming how many older settled rows were left off (0 when none were). Each row carries id, asker, text, options, task, urgency, status, created_ms, and — once settled — answer, settled_by, settled_ms and (on a dismissal) reason. READ `status` RATHER THAN JUST \"is it settled\": `answered` means the human DECIDED and you act on the answer; `withdrawn` means YOU took it back; `dismissed` means the HUMAN said it no longer matters (#2137) — nothing was decided, so release the hold, un-block the task that cited it, and re-ask only if you still need the decision. A dismissed row carries NO `answer`, ever, and its optional `reason` is the human's note about why it stopped mattering, never a decision to act on. THIS IS YOUR DURABLE MEMORY OF WHAT YOU ARE WAITING ON: read it on session start and after a /compact instead of trying to recall which questions are outstanding, and re-surface a still-pending one in your status updates rather than stalling on it. Read-only.",
             json!({}), &[]),
