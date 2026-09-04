@@ -95,10 +95,11 @@ import {
   findResumedPaneIndex,
   hasForkSession,
   shouldWatchCopilotOnRestore,
-  normalizeAgentProgram,
+  sessionCliFromCommand,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
+import { sessionBadgeLabel } from "./sessionmeta";
 import { showRestoreSplash } from "./restoresplash";
 import {
   planSessionAdoption,
@@ -872,18 +873,30 @@ async function openActionPane(
       // only — same exclusion `reconcileCandidates` applies automatically.
       //
       // #457: routed through the same `normalizeAgentProgram` `Pane.agentCli`/
-      // `programFromRestore` now use, instead of a fourth independent
-      // first-token derivation — a path-qualified or `.exe`-suffixed
-      // recorded command is recognized here too now.
-      const first = a.command?.trim().split(/\s+/)[0];
-      const cli = first ? normalizeAgentProgram(first) : undefined;
-      if (a.cwd && (cli === "claude" || cli === "copilot") && !hasForkSession(a.command, a.argv)) {
+      // `programFromRestore` use — reached through `sessionCliFromCommand`,
+      // which calls it — instead of a fourth independent first-token
+      // derivation, so a path-qualified or `.exe`-suffixed recorded command is
+      // recognized here too.
+      //
+      // #2126 P2 corrects TWO things here that were one bug in two shapes.
+      // The gate below used to name claude and copilot by hand, so a dormant
+      // opencode or pi card was never offered a resume even though the scanner
+      // lists both and the reconciler adopts both; and the label below used to
+      // be `cli === "claude" ? "CLAUDE" : "COPILOT"`, which — the moment the
+      // gate widened — would have called every non-claude session COPILOT. Both
+      // are now read off the value: `sessionCliFromCommand` owns the set (the
+      // same one `SessionRecord.cli` is typed by, so a card can only be offered
+      // a candidate the reconciler could actually match), and
+      // `sessionBadgeLabel` owns the label. That is the per-CLI identity rule:
+      // read the harness off the source, never branch on it.
+      const cli = sessionCliFromCommand(a.command);
+      if (a.cwd && cli && !hasForkSession(a.command, a.argv)) {
         void sessionsPrefetch.then(() => {
           if (pane.isDisposed || !pane.isDormant) return; // Start already clicked, or pane closed
           const candidate = dormantResumeCandidate({ cli, cwd: a.cwd }, toRecords(sessions.cached));
           if (!candidate) return;
           const age = timeAgo(candidate.modifiedMs);
-          const cliLabel = cli === "claude" ? "CLAUDE" : "COPILOT";
+          const cliLabel = sessionBadgeLabel(cli);
           addDormantCardAction(
             content,
             "Resume last session",

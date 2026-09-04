@@ -163,7 +163,8 @@ export const PALETTE = {
   //     rejected #2e2a1c draft dropped the fill to 1.32:1, and a selection you can read but
   //     can barely see is still a regression.
 
-  // --- the per-CLI brand hues (#1020 wave 2). Seven pigments that exist for ONE position —
+  // --- the per-CLI brand hues (#1020 wave 2, an eighth added by #2126). Eight pigments that
+  //     exist for ONE position —
   //     the agent-type mark and the session list's CLI chip — and answer one closed
   //     question: *which program is this pane running*. They are not a ninth..fifteenth
   //     identity hue and they do not compete with the eight above; see `CLI_HUES` for why
@@ -175,8 +176,8 @@ export const PALETTE = {
   //     vendor's own hex, and none is presented as one. A trademark colour copied exactly
   //     is a claim of affiliation loomux does not make and does not need: the same
   //     nominative-use reasoning that lets agenticons.ts draw GitHub's own glyph (§Licensing
-  //     there) is why it may lean toward GitHub's blue without taking it. The three CLIs
-  //     whose vendors publish no colour identity at all (opencode, hermes, ante) get hues
+  //     there) is why it may lean toward GitHub's blue without taking it. The four CLIs
+  //     whose vendors publish no colour identity at all (opencode, hermes, ante, pi) get hues
   //     loomux picked outright, for separation and nothing else.
   //
   //     No `Lit` step: unlike the eight, nothing paints an emphasis tier of a CLI hue — a
@@ -189,6 +190,12 @@ export const PALETTE = {
   steel: "#7fa8d8", //    copilot  — a cool desaturated blue
   indigo: "#9677c5", //   gemini   — blue-violet, muted at #1320 ask 3
   fuchsia: "#b67c94", //  hermes   — dusty mauve, muted at #1320 ask 3
+  cerulean: "#00d2f0", // pi       — a bright sky-cyan, and the brightest of the eight. That is
+  //     forced rather than chosen: the one hue region the other seven leave empty is
+  //     cyan-through-blue, and codex's teal and copilot's steel crowd its muted middle, so
+  //     everything below L* ~74 there lands inside the 30 ΔE floor. The search that produced
+  //     this value is in the PR for #2126; what matters here is that a tempered #4ccfe8 measures
+  //     28.5 ΔE from copilot and is therefore not available.
 
   // --- terminal-only. ANSI wants a true green in a slot where the app's greens are a teal
   //     (jade) and a yellow-green (lime); neither reads as "green" to a CLI, so ANSI green
@@ -273,9 +280,9 @@ export const IDENTITY_LIT = {
  * for one closed roster, not a new channel with new rules: an identity hue may still never
  * enter a state position, and neither may one of these.
  *
- * WHY SEVEN MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
+ * WHY EIGHT MORE PIGMENTS DOES NOT BREAK "EIGHT IS A MEASUREMENT". That ceiling was measured
  * for hues that must be told apart ACROSS THE WHOLE APP — a ninth would have landed closer to
- * an existing hue than the eight-set's own closest pair (azure/violet, 15.3 ΔE). These seven
+ * an existing hue than the eight-set's own closest pair (azure/violet, 15.3 ΔE). These eight
  * never have to survive that comparison, because they only ever appear in ONE position
  * against each other: the agent mark and the session list's CLI chip. Measured on their own
  * terms they are legible — closest pair 31.5 ΔE (codex/opencode) — and test/theme.test.ts
@@ -286,18 +293,25 @@ export const IDENTITY_LIT = {
  * seven extra pigments were justified BECAUSE they were the more legible set. De-exoticising
  * the octet dropped its closest pair to 15.3, so the CLI set is now the LOOSER comparison —
  * 31.5 clears 15.3 with room, but it clears it the way any adequate set clears a lowered bar,
- * not by being exemplary. What still justifies the seven is the narrower claim underneath:
+ * not by being exemplary. What still justifies the eight is the narrower claim underneath:
  * they answer one closed question in two positions and never have to be told apart from the
- * eight, only from each other. If a future round tightens the octet back up, this paragraph
- * is the one to re-derive.
+ * identity octet, only from each other. If a future round tightens that octet back up, this
+ * paragraph is the one to re-derive. (#2126 added pi WITHOUT moving 31.5: its nearest
+ * neighbours are codex at 31.7 and copilot at 32.2, so codex/opencode is still the pair this
+ * number names.)
  *
  * COLOUR-VISION DEFICIENCY, HONESTLY — AND THE WORST CASE IS TRITAN, NOT THE RED-GREEN ONES.
- * Seven hues on one ground do not survive CVD and these do not. Closest pair per simulation:
- * protan opencode/ante 15.6, deutan codex/hermes 9.5, and tritan codex/copilot **1.4** —
+ * Eight hues on one ground do not survive CVD and these do not. Closest pair per simulation:
+ * protan copilot/pi 14.2, deutan copilot/pi 8.6, and tritan codex/copilot **1.4** —
  * which is the honest headline, because a tritanope sees those two as one colour. (Every
  * figure here and below is CIE76 over the Viénot LMS simulation in test/theme.test.ts; that
  * is the only method quoted anywhere in this feature, so two surfaces cannot disagree by
  * having measured differently.)
+ *
+ * The protan and deutan rows are pi's arrival, not a regression it caused: before it they
+ * read opencode/ante 15.6 and codex/hermes 9.5, and pi merely takes over both by a little.
+ * Neither is a collapse, and copilot/pi is the safest shape pairing on the roster — the
+ * vendored octicon against a letter P.
  *
  * That collapse is the same trade the identity channel already makes and states — state dyes
  * stay separable, identity does not have to, because identity is also carried by position,
@@ -306,8 +320,8 @@ export const IDENTITY_LIT = {
  * the others are excused from. Today that is exactly one pair — claude and codex both badge
  * `C` — and its worst view is 25.1 ΔE (protan; deutan 42.2, tritan 135.4). Every pair that
  * DOES collapse is shape-distinct: codex/copilot is a `C` against the vendored octicon,
- * claude/hermes (3.8 tritan) a `C` against an `H`. test/theme.test.ts computes the collision
- * set from the renderer rather than hard-coding it, so an eighth CLI starting with `C`
+ * copilot/pi (8.6 deutan) the octicon against a `P`. test/theme.test.ts computes the collision
+ * set from the renderer rather than hard-coding it, so a further CLI starting with `C`
  * inherits the obligation automatically.
  *
  * Keys are program names as `normalizeAgentProgram` spells them, which is what lets
@@ -322,6 +336,7 @@ export const CLI_HUES = {
   gemini: PALETTE.indigo,
   hermes: PALETTE.fuchsia,
   ante: PALETTE.citron,
+  pi: PALETTE.cerulean,
 } as const;
 
 /**
@@ -524,6 +539,7 @@ export const CSS_TOKENS = {
   "--cli-gemini": CLI_HUES.gemini,
   "--cli-hermes": CLI_HUES.hermes,
   "--cli-ante": CLI_HUES.ante,
+  "--cli-pi": CLI_HUES.pi,
   "--font-mono": FONT.mono,
   "--font-ui": FONT.ui,
 } as const;

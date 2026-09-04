@@ -99,6 +99,7 @@ import {
   setDefaultAgent,
 } from "./agents";
 import { soloPrepare } from "./orchestration";
+import { isSoloMcpCli } from "./panerestore";
 
 export interface AgentLaunchSpec {
   name: string;
@@ -1020,21 +1021,25 @@ export class WelcomeForm {
     }
   }
 
-  /** Show the channel-tools toggle only where it applies — agent kind,
-   *  claude/copilot specifically (the only CLIs whose MCP config can be
-   *  delivered as flags appended to the command line this launcher builds;
-   *  every other CLI stays lazy regardless of this toggle, so offering it
-   *  there would promise a capability loomux can't deliver). Purely
-   *  synchronous, unlike `applyAutopilot` — no backend lookup needed.
+  /** Show the channel-tools toggle only where it applies — agent kind, and one
+   *  of the CLIs whose MCP config can be delivered as flags appended to the
+   *  command line this launcher builds; every other CLI stays lazy regardless of
+   *  this toggle, so offering it there would promise a capability loomux can't
+   *  deliver. Purely synchronous, unlike `applyAutopilot` — no backend lookup
+   *  needed.
    *
    *  NOT the same list as `WORKFLOW_CLIS`/`SUPPORTED_CLIS`, since #267: gemini
    *  is group-spawnable but its MCP server reaches it through a settings file
    *  named by an environment variable, which only a pane loomux spawns itself
    *  can be given. That is the backend's `CliCaps.mcp_argv_seam`, and a solo
-   *  gemini pane is delivery-only for exactly this reason. */
+   *  gemini pane is delivery-only for exactly this reason.
+   *
+   *  #2126 P2: the set is `SOLO_MCP_CLIS`, read from panerestore.ts, rather
+   *  than spelled out here — this gate and the mint below used to carry two
+   *  hand-typed copies of it, and a third answer lived in `stripSoloMcpFlags`.
+   *  One rule, one list. */
   private applyChannelTools(): void {
-    this.channelToolsField.hidden =
-      this.kind !== "agent" || (this.agentSel.value !== "claude" && this.agentSel.value !== "copilot");
+    this.channelToolsField.hidden = this.kind !== "agent" || !isSoloMcpCli(this.agentSel.value);
   }
 
   /** Show the autopilot toggle only where it applies — agent kind, a non-custom
@@ -2120,7 +2125,14 @@ export class WelcomeForm {
         // constraint 2 governs src-tauri Rust only, not the frontend.
         let cmd = command;
         let sessionId: string | undefined;
-        if (!plan.isCustom && program === "claude") {
+        // #2126 P2: pi joins claude here because it has the same flag —
+        // `--session-id <id>` opens the named session or creates it with that
+        // id, so an id minted before the pane boots is the pane's identity from
+        // its first turn, with no store watcher and no baseline to contest.
+        // (The backend says the same thing once through `CliCaps`; this is the
+        // launcher's own copy of that fact, and the two are pinned against each
+        // other by the spawn-path tests.)
+        if (!plan.isCustom && (program === "claude" || program === "pi")) {
           sessionId = crypto.randomUUID();
           cmd = `${command} --session-id ${sessionId}`;
         }
@@ -2137,9 +2149,13 @@ export class WelcomeForm {
         // is adopted as a delivery-only member only if/when the human actually
         // connects it (`orch_solo_adopt`), so a codex/gemini/custom launch
         // mints nothing nobody asked for. Best-effort: a failed mint must
-        // never block the launch.
+        // never block the launch — which is also what makes widening
+        // `SOLO_MCP_CLIS` ahead of a backend row SAFE: `solo_prepare` derives
+        // its answer from `CliCaps::mcp_argv_seam` and returns a delivery-only
+        // agent with an empty `mcp_args` for a CLI whose row does not say
+        // otherwise, so the pane simply boots lazy.
         let channelAgent: { agentId: string; canSend: boolean } | undefined;
-        if (!plan.isCustom && channelToolsEnabled && (program === "claude" || program === "copilot")) {
+        if (!plan.isCustom && channelToolsEnabled && isSoloMcpCli(program)) {
           try {
             const prepared = await soloPrepare(program, cwd ?? "", name);
             if (prepared.mcp_args) cmd = `${cmd} ${prepared.mcp_args}`;
