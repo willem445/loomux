@@ -683,11 +683,7 @@ pub(crate) fn truncate_on_char_boundary(s: &str, max: usize) -> (&str, bool) {
     if s.len() <= max {
         return (s, false);
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&s[..end], true)
+    (&s[..max], true)
 }
 
 fn now_millis() -> u64 {
