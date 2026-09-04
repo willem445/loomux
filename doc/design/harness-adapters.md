@@ -122,7 +122,7 @@ for every feature that reads panes.
 | `ToolCall` / `ToolResult` | `tool_use` / `tool_result` blocks | **never** |
 | `PermissionRequest` / `PermissionSettled` | the permission-prompt tool call and its answer | **never** — a suspected question is `Observed(QuestionSuspected{..})` |
 | `TurnEnded{usage, cost}` | the `result` message (§7) | **never** — usage is polled out of band, not evented |
-| `Compacted` | `system` / `compact_boundary` (`SDKCompactBoundaryMessage`, plain stream-json; no flag) | **never** — today's marker hooks stay, and they drive the existing detector, not this event |
+| `Compacted` | `system` / `compact_boundary` (`SDKCompactBoundaryMessage`, documented on the Agent SDK surface only — the CLI capture that confirms it on the wire is §9 item 7) | **never** — today's marker hooks stay, and they drive the existing detector, not this event |
 | `Exited` | child exit | child exit — the one variant both kinds emit identically |
 | `Observed(..)` | **never emitted** | readiness marker, question grid, quiet/painted evidence |
 
