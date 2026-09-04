@@ -396,12 +396,47 @@ it is exactly the shape that rule exists to prevent. `main.ts` keeps the writer
 and supplies the overlay; `SessionLogStore` satisfies the read half
 structurally, so the adapter carries no state of its own.
 
+Two of those reads are **scalars** — `notesCount` and `paneName` — and not
+`get(id)?.…`. `get` returns `cloneRecord`, a fresh object per note on the
+record; a row reads one number and one immutable string, on every render, and
+notes per record are uncapped. Reading through `get` would make that
+O(total notes across shown rows) short-lived objects per gesture. `paneName` is
+`notesCount`'s sibling in every respect, including answering `undefined` for an
+unknown session and for an unread store alike.
+
 **The list re-renders off `store.onChange`**, skipped while the Sessions tab is
 not the visible one — `leftpanel.ts`'s `onShow` calls `refresh()`, which renders,
 so a change that lands behind the Agents tab is picked up on return and a pane
 rename does not rebuild a list nobody is reading. Either way it replaces the
 children of a list inside the fixed-width `.sessions-inner` column: no layout
 column moves, so no path here reaches a PTY resize (hard constraint 1).
+
+### Focus across a rebuild
+
+That second trigger is one a human can reach *while reading the list*: a note
+written from a pane header rebuilds every row under them. A keyboard user
+standing on one then loses the element they were on and focus drops to `<body>`,
+so the next Tab restarts traversal from the top of the document — the defect
+#2259 fixed on the Agents chip strip, in the shape this list has. That strip
+keys and reuses its elements and hands focus on before removing one; this list
+replaces all of them, so the handoff is *decided* before the rebuild and
+*applied* after it.
+
+`refocusAfterRender(held, shownSessionIds)` is that decision, pure and tested.
+Three outcomes, and the first is the one that must not be got wrong:
+
+| held focus | outcome | why |
+| --- | --- | --- |
+| not in the list | `none` | A render fires on a pane rename and on any grid gesture, so the human is usually typing in a terminal. Nothing is stolen, ever — including when the list is empty, where the temptation to "just focus the search box" is strongest. |
+| on a row still shown | `row`, same control | The chip and the restore button are different controls on one row; landing on the wrong one is landing in the wrong place. |
+| on a row now gone | `search` | A note write can drop a row out of the current search and a mode switch drops many. The search box is where a keyboard traversal of this panel starts, so it is somewhere to carry on from rather than somewhere focus fell to. |
+
+Keyed by **session id**, off `data-session-id` on the wrapper, never by
+position: the list is re-sorted on every refresh, so an index would land the
+human on whichever row moved into their slot. The caller resolves the decision
+to an element, because a control it names can be absent — a row has no chip when
+the browser was built without a notes host — and falls back to that row's
+restore button and then to the search box, so every branch lands somewhere real.
 
 **The overlay's target is a constant getter here, unlike the pane header's.**
 A pane's target is live because a not-yet-identified pane can learn its session
@@ -421,7 +456,9 @@ open, and nothing can move it.
 | 6 | `paneNameLine(paneName, title, source)` — internal; tests | Landed (slice E2's pure half) |
 | 7 | `notesChipLabel(count, loaded)` — internal; tests | Landed (slice E2) |
 | 8 | `SessionNotesHost` — the read port `SessionBrowser` takes; internal | Landed (slice E2) |
-| 9 | `.session-row` wraps `.session-item` on every session row — internal DOM/CSS shape | Landed (slice E2) |
+| 9 | `.session-row` wraps `.session-item` on every session row, carrying `data-session-id` — internal DOM/CSS shape | Landed (slice E2) |
+| 10 | `SessionLogStore.paneName(sessionId)` — a scalar read beside `notesCount` | Landed (slice E2) |
+| 11 | `refocusAfterRender(held, shownSessionIds)` — internal; tests | Landed (slice E2) |
 
 ## Where the pieces live
 
@@ -438,4 +475,5 @@ open, and nothing can move it.
 | The pane-name line | `paneNameLine` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. |
 | The Notes button, and the re-key wiring | `src/pane.ts`, `src/main.ts` | DOM wiring, hand-validated. Reads `Pane.facts()` / `Pane.key` from #2122 slice A. |
 | What the notes chip says | `notesChipLabel` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. |
+| Where focus goes after the list is rebuilt | `refocusAfterRender` in `src/sessionmeta.ts` | Pure. `test/sessionmeta.test.ts`. The DOM read (`document.activeElement`) and the element resolution stay in `sessions.ts`. |
 | Pane name and notes chip ON a session row | `src/sessions.ts`, `src/main.ts` | DOM wiring, hand-validated. The read port is `SessionNotesHost`; `main.ts` keeps the store and supplies the overlay. |

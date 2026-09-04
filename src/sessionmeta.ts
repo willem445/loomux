@@ -160,6 +160,54 @@ export function notesChipLabel(count: number, loaded: boolean): NotesChipLabel {
   };
 }
 
+/** Which control on a session row the keyboard was standing on. */
+export type SessionRowControl = "item" | "notes";
+
+/** Where focus goes after the session list is rebuilt. */
+export type SessionFocusTarget =
+  | { kind: "row"; sessionId: string; control: SessionRowControl }
+  | { kind: "search" }
+  | { kind: "none" };
+
+/** Decide where focus lands after `render()` replaces every row (#2116 slice
+ *  E2, review round 1).
+ *
+ *  THE LIST IS REBUILT UNDER THE HUMAN NOW. It always was on a refresh, but
+ *  this slice added a second trigger the human can reach while reading the
+ *  list: `store.onChange`, which fires when a note is added from a *pane
+ *  header*. A keyboard user standing on a row then loses the element under
+ *  them and focus drops to `<body>`, so the next Tab restarts traversal from
+ *  the top of the document. Same defect #2259 fixed on the Agents chip strip,
+ *  in the shape this list has: that one keys and reuses its elements and hands
+ *  focus on before removing one, while this one replaces all of them, so the
+ *  handoff is decided here and applied after the rebuild.
+ *
+ *  Three outcomes, and the first is the one that must not be got wrong:
+ *
+ *   - **`none`** — focus was NOT in the list. A re-render fires on a pane
+ *     rename and on any grid gesture, so the human is usually typing in a
+ *     terminal when one lands; moving focus then would be far worse than the
+ *     defect being fixed. Nothing is stolen, ever.
+ *   - **`row`** — the row the human was on is still shown, so they land back on
+ *     the same control of it, chip or restore button alike.
+ *   - **`search`** — they were on a row that is gone (a note write can drop a
+ *     row out of the current search, and a mode switch drops many). The search
+ *     box is the panel's own home position and is where a keyboard traversal of
+ *     this panel starts, so it is a place to carry on from rather than a place
+ *     focus fell to.
+ *
+ *  Pure: the caller reads `document.activeElement` and resolves the target to
+ *  an element, because a control this names can still be absent — a row has no
+ *  chip when the browser was built without a notes host. */
+export function refocusAfterRender(
+  held: { sessionId: string; control: SessionRowControl } | null,
+  shownSessionIds: readonly string[]
+): SessionFocusTarget {
+  if (held === null) return { kind: "none" };
+  if (!shownSessionIds.includes(held.sessionId)) return { kind: "search" };
+  return { kind: "row", sessionId: held.sessionId, control: held.control };
+}
+
 /** The PR chip label, or null when no PR is known yet. A bare number (how
  *  the board stores most PR refs) renders as "#123"; anything already
  *  prefixed or otherwise shaped is shown verbatim. */

@@ -12,14 +12,16 @@ import {
   notesChipLabel,
   paneNameLine,
   prLabel,
+  refocusAfterRender,
   repoBranchLine,
   sessionBadgeLabel,
   taskSummary,
+  type SessionFocusTarget,
+  type SessionRowControl,
 } from "./sessionmeta";
 import { icon } from "./icons";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
-import type { SessionRecord } from "./sessionlog";
 import {
   DEFAULT_SESSION_MODE,
   decodeSessionMode,
@@ -56,8 +58,11 @@ export interface SessionNotesHost {
   /** Read the log if it has not been read. Never throws; resolves `false` when
    *  the read failed, and a later call retries. */
   ensureLoaded(): Promise<boolean>;
-  /** This session's sidecar record, or `null`. */
-  get(sessionId: string): SessionRecord | null;
+  /** The recorded pane name, or `undefined` for an unknown session and for an
+   *  unread store alike. A SCALAR read, not `get(id)?.pane_name`: `get` clones
+   *  the whole record — a fresh object per note on it — and this is read once
+   *  per row on every render (#2319 review round 1). */
+  paneName(sessionId: string): string | undefined;
   notesCount(sessionId: string): number;
   /** Fires on every change the store makes. Returns an unsubscribe. */
   onChange(cb: () => void): () => void;
@@ -428,6 +433,11 @@ export class SessionBrowser {
   }
 
   private render(): void {
+    // Read BEFORE anything is replaced (#2319 review round 1): once
+    // `replaceChildren` has run, the element the human was standing on is gone
+    // and `document.activeElement` is `<body>`, which cannot be told apart from
+    // "focus was never in this list".
+    const held = this.heldRowFocus();
     const q = this.searchEl.value.trim().toLowerCase();
     for (const tab of this.modeEl.querySelectorAll<HTMLElement>(".sessions-mode-tab")) {
       const on = tab.dataset.mode === this.mode;
@@ -485,9 +495,16 @@ export class SessionBrowser {
               ? "No orchestration sessions found on this machine."
               : "No sessions of your own found on this machine.";
       this.listEl.appendChild(empty);
+      // Not an early return any more: the human may have been standing on a
+      // row that this very render removed, and an empty list is the case where
+      // there is most certainly nothing left under them.
+      this.applyRowFocus(refocusAfterRender(held, []), new Map());
       return;
     }
 
+    /** The rows this render built, keyed by session id — what the focus handoff
+     *  resolves its target against. */
+    const built = new Map<string, { item: HTMLElement; chip: HTMLElement | null }>();
     for (const s of shown) {
       // A ROW IS A WRAPPER, NOT A BUTTON (#2116 slice E2). The restore action
       // and the notes chip are two independent actions on one row, so they are
@@ -498,6 +515,10 @@ export class SessionBrowser {
       // whole row once, rather than the item alone or twice over.
       const row = document.createElement("div");
       row.className = "session-row";
+      // What the focus handoff below keys on. The session id and not the
+      // position: this list is re-sorted on every refresh, so an index would
+      // land the human on whichever row happened to move into their slot.
+      row.dataset.sessionId = s.id;
 
       const item = document.createElement("button");
       item.className = "session-item";
@@ -542,8 +563,7 @@ export class SessionBrowser {
       // The name the human gave the pane (#2116). `paneNameLine` decides when
       // one is worth a second line — the fallback IS the title the row already
       // shows, never a placeholder — so a `null` here renders nothing at all.
-      const record = this.notes?.get(s.id) ?? null;
-      const paneName = paneNameLine(record?.pane_name, s.title, s.source);
+      const paneName = paneNameLine(this.notes?.paneName(s.id), s.title, s.source);
       const paneNameEl = paneName ? document.createElement("div") : null;
       if (paneNameEl) {
         paneNameEl.className = "session-pane-name";
@@ -593,9 +613,54 @@ export class SessionBrowser {
       // one worth showing, and with the transcript title otherwise — the same
       // fallback the line itself uses, so the row and the dialog cannot
       // disagree about what this session is called.
-      if (this.notes) row.appendChild(this.notesChipEl(s, paneName ?? s.title));
+      const chip = this.notes ? this.notesChipEl(s, paneName ?? s.title) : null;
+      if (chip) row.appendChild(chip);
       this.listEl.appendChild(row);
+      built.set(s.id, { item, chip });
     }
+
+    this.applyRowFocus(refocusAfterRender(held, [...built.keys()]), built);
+  }
+
+  /** Which row control the keyboard is standing on right now, or `null` when
+   *  focus is anywhere else — including a terminal, which is where it usually
+   *  is when a store change fires this render.
+   *
+   *  Read off the DOM because that is the only place the answer lives; the
+   *  DECISION it feeds is pure and tested (`refocusAfterRender`). */
+  private heldRowFocus(): { sessionId: string; control: SessionRowControl } | null {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !this.listEl.contains(active)) return null;
+    const sessionId = active.closest<HTMLElement>(".session-row")?.dataset.sessionId;
+    if (!sessionId) return null;
+    return {
+      sessionId,
+      // `closest`, not `classList`: the chip holds a glyph and a count span, so
+      // a focus that ever lands on a descendant must still read as the chip
+      // rather than silently falling through to the restore button.
+      control: active.closest(".session-notes") ? "notes" : "item",
+    };
+  }
+
+  /** Put focus where `refocusAfterRender` decided, on the freshly built rows.
+   *
+   *  The pure half decides from ids alone, so the one thing left here is that a
+   *  control it names can be ABSENT: a row has no chip when this browser was
+   *  built without a notes host. Falling back to that row's restore button, and
+   *  then to the search box, means every branch lands somewhere real — the
+   *  whole point is that focus never ends up on `<body>`. */
+  private applyRowFocus(
+    target: SessionFocusTarget,
+    rows: Map<string, { item: HTMLElement; chip: HTMLElement | null }>
+  ): void {
+    if (target.kind === "none") return;
+    if (target.kind === "search") {
+      this.searchEl.focus();
+      return;
+    }
+    const els = rows.get(target.sessionId);
+    const wanted = target.control === "notes" ? els?.chip : els?.item;
+    (wanted ?? els?.item ?? this.searchEl).focus();
   }
 
   /** The notes chip on a session row (#2116 slice E2): the count, and the way

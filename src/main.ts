@@ -2456,7 +2456,10 @@ const sessions = new SessionBrowser(
       return sessionLog.loaded;
     },
     ensureLoaded: () => sessionLog.ensureLoaded(),
-    get: (id) => sessionLog.get(id),
+    // `paneName` and not `get(id)?.pane_name`: `get` clones the record, a fresh
+    // object per note on it, and this is one immutable string read once per row
+    // on every render (#2319 review round 1).
+    paneName: (id) => sessionLog.paneName(id),
     notesCount: (id) => sessionLog.notesCount(id),
     onChange: (cb) => sessionLog.onChange(cb),
     // A recorded session, live or dead. The target is a constant getter here

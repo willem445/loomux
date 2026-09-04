@@ -366,6 +366,21 @@ export class SessionLogStore {
     return this.data.sessions.get(sessionId)?.notes.length ?? 0;
   }
 
+  /** The recorded pane name, or `undefined` for an unknown session and for an
+   *  unread store alike — the same honesty caveat `notesCount` carries, and
+   *  `paneNameLine` renders no line for either.
+   *
+   *  A SCALAR READ, DELIBERATELY NOT `get(...)?.pane_name` (#2319 review round
+   *  1). `get` returns `cloneRecord`, which allocates a fresh object per NOTE
+   *  on the record; the sessions list reads this one string per row, on every
+   *  render, and `render()` now runs on every store change rather than only on
+   *  a refresh. Notes per record are uncapped, so that would be O(total notes
+   *  across shown rows) short-lived objects per gesture to read a string that
+   *  is immutable anyway. This is `notesCount`'s sibling in every respect. */
+  paneName(sessionId: string): string | undefined {
+    return this.data.sessions.get(sessionId)?.pane_name;
+  }
+
   /** Notes held in memory against a pane with no session id yet, in the order
    *  they were written. Copies. */
   pendingFor(paneKey: string): SessionNote[] {

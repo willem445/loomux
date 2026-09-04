@@ -8,6 +8,7 @@ import {
   notesChipLabel,
   paneNameLine,
   prLabel,
+  refocusAfterRender,
   restoredPaneName,
   sessionBadgeLabel,
 } from "../src/sessionmeta.ts";
@@ -249,6 +250,63 @@ test("a counted session shows the count, and the tooltip agrees with it", () => 
   assert.equal(many.text, "4");
   assert.equal(many.hasNotes, true);
   assert.equal(many.title, "4 notes about this session");
+});
+
+// ---- refocusAfterRender (#2116 slice E2, review round 1) ----
+
+test("a re-render never steals focus from outside the list", () => {
+  // THE ONE THAT MATTERS MOST. `render()` now runs on every store change — a
+  // pane rename, a note written from a pane header — and the human is usually
+  // typing in a terminal when one lands. Moving focus there would be a worse
+  // defect than the one this function fixes.
+  assert.deepEqual(refocusAfterRender(null, ["a", "b"]), { kind: "none" });
+  // Including when the list is empty, where there is nothing to move focus to
+  // and the temptation to "just focus the search box" is strongest.
+  assert.deepEqual(refocusAfterRender(null, []), { kind: "none" });
+});
+
+test("focus returns to the same control of the same row when it survives", () => {
+  assert.deepEqual(refocusAfterRender({ sessionId: "b", control: "item" }, ["a", "b", "c"]), {
+    kind: "row",
+    sessionId: "b",
+    control: "item",
+  });
+  // The chip and the restore button are different controls on one row, so
+  // landing back on the wrong one is landing in the wrong place.
+  assert.deepEqual(refocusAfterRender({ sessionId: "b", control: "notes" }, ["a", "b", "c"]), {
+    kind: "row",
+    sessionId: "b",
+    control: "notes",
+  });
+});
+
+test("a row that is gone hands focus to the search box, never to nothing", () => {
+  // A note write can drop a row out of the current search, and a mode switch
+  // drops many. Returning `none` here is exactly the defect being fixed:
+  // focus would stay on the element that was just removed, i.e. `<body>`.
+  assert.deepEqual(refocusAfterRender({ sessionId: "gone", control: "item" }, ["a", "b"]), {
+    kind: "search",
+  });
+  assert.deepEqual(refocusAfterRender({ sessionId: "gone", control: "notes" }, []), {
+    kind: "search",
+  });
+});
+
+test("membership is decided by id, not by position", () => {
+  // The negative control for the two above: the decision must not be "was the
+  // list long enough" or "is this the same index". A row that moved — the list
+  // is re-sorted by mtime on every refresh — is still the row the human was on.
+  assert.deepEqual(refocusAfterRender({ sessionId: "a", control: "item" }, ["z", "y", "a"]), {
+    kind: "row",
+    sessionId: "a",
+    control: "item",
+  });
+  // And a session id that is a prefix of a shown one is NOT that one. `includes`
+  // on an array cannot make this mistake; a `join`-and-`indexOf` shortcut could,
+  // which is why it is pinned rather than assumed.
+  assert.deepEqual(refocusAfterRender({ sessionId: "a", control: "item" }, ["ab", "abc"]), {
+    kind: "search",
+  });
 });
 
 test("the singular is used for exactly one, and the plural for everything else", () => {
