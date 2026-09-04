@@ -1790,7 +1790,8 @@ mod tests {
         assert_eq!(
             body_unchanged(&g, &moved_head, Some("HEAD"), Some(&now)),
             None,
-            "a pass at another head is skipped by this clause, as it always was — the \n             REVIEWER half is what refuses it"
+            "a pass at another head is skipped by this clause, as it always was — the \
+             REVIEWER half is what refuses it"
         );
         assert!(
             !evaluate_merge_gate(&g, &moved_head, Some("HEAD")).satisfied(),

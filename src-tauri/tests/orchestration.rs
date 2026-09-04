@@ -32272,7 +32272,8 @@ fn the_resume_notice_reports_a_queue_full_refusal_as_a_LIVE_risk_not_as_history(
     };
     let n = pause_suppression_notice(&s);
     assert!(n.contains("REFUSED"), "the refusal must be named as such: {n}");
-    assert!(n.contains("queue was\n         already full") || n.contains("already full"),
+    assert!(n.contains("queue was\
+         already full") || n.contains("already full"),
         "and must say why it was refused: {n}");
     assert!(n.contains("expect it again"),
         "a live risk must read as live — this is the half a reader can still act on: {n}");
@@ -42552,14 +42553,17 @@ fn the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes() {
     assert_eq!(
         text.lines().nth(4),
         Some(format!("{edited_digest} {}", workflow::VERIFIED_BODY_MARK).as_str()),
-        "the tool must have marked it from the DRIVE's lane record, not from anything \n         the reviewer said: {text}"
+        "the tool must have marked it from the DRIVE's lane record, not from anything \
+         the reviewer said: {text}"
     );
 
     regrant();
     let (ok, err) = merge_body(EDITED);
     assert!(
         ok,
-        "one verification pass covers the body, and rev-tests' pass is bound to the same \n         head — if this refuses, the shim and workflow::verdict_file_text disagree about \n         where the mark lives: {err}"
+        "one verification pass covers the body, and rev-tests' pass is bound to the same \
+         head — if this refuses, the shim and workflow::verdict_file_text disagree about \
+         where the mark lives: {err}"
     );
 
     // **The mark is what carried it.** Same two verdicts, line 5 rewritten as

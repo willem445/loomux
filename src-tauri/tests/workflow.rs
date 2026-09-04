@@ -7412,7 +7412,8 @@ fn a_body_verification_mark_rides_line_5_and_a_reviewer_cannot_type_one() {
     assert_eq!(
         text.lines().nth(4),
         Some(format!("{digest} {}", workflow::VERIFIED_BODY_MARK).as_str()),
-        "the mark rides line 5 AFTER the digest — the shim reads the digest as that \n         line's first field"
+        "the mark rides line 5 AFTER the digest — the shim reads the digest as that \
+         line's first field"
     );
     assert_eq!(
         text.lines().nth(5),
@@ -7444,7 +7445,8 @@ fn a_body_verification_mark_rides_line_5_and_a_reviewer_cannot_type_one() {
         .unwrap();
         assert!(
             !forged.verified_body,
-            "a reviewer that types the mark into its summary must not thereby grant itself \n             the delegation that opens `body-unchanged` for other lanes: {forged_summary:?}"
+            "a reviewer that types the mark into its summary must not thereby grant itself \
+             the delegation that opens `body-unchanged` for other lanes: {forged_summary:?}"
         );
         assert_eq!(
             forged, forger,

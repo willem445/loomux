@@ -136,6 +136,77 @@ fn failing_lane_facts(head: &str) -> DriveFacts {
 
 // ── the `DriveLimits` seal, exercised from OUTSIDE the crate that defines it ─
 
+/// **§4's one-definition rule, executed across the crate boundary** (#2168 E2).
+///
+/// The driver's `review-wait` and the merge gate's `body-unchanged` both have
+/// to answer "has a required reviewer verified the body as it stands", and a
+/// driver that answered it differently would advance to `gate-check` and be
+/// refused there on every tick until `state-stalled` — the failure the whole
+/// reader-not-third-implementation rule exists to prevent. Nothing about the
+/// two call sites makes them agree; only running both over one set of verdicts
+/// shows it.
+#[test]
+fn the_driver_and_the_gate_answer_the_verification_question_identically() {
+    use loomux_lib::orchestration::mergeq;
+    use loomux_lib::orchestration::workflow::{Gate, GateRequire};
+
+    const NOW: &str = "d2";
+    let gate = Gate {
+        require: GateRequire::AllPass,
+        reviewers: vec!["rev-std".to_string(), "rev-final".to_string()],
+        also: vec!["body-unchanged".into()],
+        max_diff_lines: None,
+        routing: Vec::new(),
+    };
+
+    // Every crossing of {word} x {the head it binds to} x {digest} x {marked}
+    // for the first lane, with the second held at a plain stale pass
+    // throughout. Each row is fed to BOTH readers from the same verdicts.
+    let mut rows = 0usize;
+    let mut agreed_true = 0usize;
+    for word in [Verdict::Pass, Verdict::Fail, Verdict::Escalate] {
+        for at_head in ["head-a", "head-OLD"] {
+            for digest in [NOW, "d1"] {
+                for marked in [true, false] {
+                    let mut first = lane_fact("rev-std", Some(word), at_head, digest);
+                    if let Some(v) = first.verdict.as_mut() {
+                        v.verified_body = marked;
+                    }
+                    let second = lane_fact("rev-final", Some(Verdict::Pass), "head-a", "d1");
+                    let lanes = vec![first, second];
+                    let verdicts: std::collections::BTreeMap<String, ReviewVerdict> = lanes
+                        .iter()
+                        .filter_map(|l| l.verdict.clone().map(|v| (l.block.clone(), v)))
+                        .collect();
+
+                    let driver = reviewdrive::body_is_verified(&lanes, "head-a", Some(NOW));
+                    let gate_side =
+                        mergeq::body_verified_by_required(&gate, &verdicts, "head-a", Some(NOW));
+                    assert_eq!(
+                        driver, gate_side,
+                        "{word:?} at {at_head} digest {digest} marked={marked}: the driver and \
+                         the gate must not disagree about whether the body has been verified"
+                    );
+                    rows += 1;
+                    if driver {
+                        agreed_true += 1;
+                    }
+                }
+            }
+        }
+    }
+    // **The population control, counted at the verified site.** A predicate
+    // pair that answered `false` for everything would satisfy every row above,
+    // so exactly one crossing must answer TRUE: `pass`, at the live head, at
+    // the current digest, marked.
+    assert_eq!(rows, 24, "the crossing must be complete");
+    assert_eq!(
+        agreed_true, 1,
+        "exactly one of the 24 crossings is a body verification, so the agreement above is \
+         not two functions both saying no"
+    );
+}
+
 /// The corrected claim on `DriveLimits`, **performed rather than asserted in
 /// prose** (#1778 S3; rev-final's non-blocking on #1783, carried here).
 ///
@@ -7074,7 +7145,9 @@ fn a_cap_stamp_from_a_previous_process_does_not_park_a_drive_whose_cap_the_resta
     assert_eq!(
         recovered.len(),
         2,
-        "one reconcile per REGISTRY INSTANCE — which this fixture cannot tell apart from \n         per process, because `relaunch_registry` builds its second registry inside this \n         one (#2135 review 2, premortem 1): {recovered:?}"
+        "one reconcile per REGISTRY INSTANCE — which this fixture cannot tell apart from \
+         per process, because `relaunch_registry` builds its second registry inside this \
+         one (#2135 review 2, premortem 1): {recovered:?}"
     );
     assert_eq!(
         recovered[0]["cap_run_forgotten"],

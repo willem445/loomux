@@ -6615,7 +6615,8 @@ mod tests {
         assert_eq!(
             first_stale_lane(&across_heads, "head-a", Some("d2")),
             1,
-            "a verification of the body may stand in for a pass at THIS head, never for one \n             recorded against code the branch has left"
+            "a verification of the body may stand in for a pass at THIS head, never for one \
+             recorded against code the branch has left"
         );
         // The positive control: the same two lanes with rev-final's pass bound
         // to the live head — so the row above is the head deciding, not a
