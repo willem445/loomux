@@ -824,13 +824,22 @@ export class Grid {
    *  green-lights by accident is worse than none, so the precondition is
    *  carried here and in `doc/design/agents-tab.md` instead.
    *
-   *  Constraint 1 (no PTY resize for a UI feature): every step here is one
-   *  the human can already trigger by hand — `restore` is the dock chip,
-   *  `exitMaximize` is the ⤢ button — reached from a DISCRETE human click on
-   *  a row or a Focus button, and both go through the existing resizeburst
-   *  coalescing. Nothing new fits, and the plain case (a visible pane in the
-   *  showing tab) touches no layout at all. */
-  reveal(pane: Pane): void {
+   *  Constraint 1 (no PTY resize for a UI feature) — and WHO ASKED decides it.
+   *  `restore` and `exitMaximize` genuinely resize a PTY: see their own docs
+   *  below ("it alone issues one debounced fit"; "triggers a single genuine
+   *  fit", plus the siblings that make room). That is permitted from a
+   *  DISCRETE human click — the dock chip, the ⤢ button, an Agents row, the
+   *  Sessions Focus button — and barred from anything else, so `humanInitiated`
+   *  gates both. An agent-initiated reveal (`orch-focus`, emitted by the
+   *  orchestrator's `focus_agent` MCP tool, with no human on the path) gets
+   *  `setActive` + `focus` only and cannot resize anything: it must not drop
+   *  the human out of a fullscreen they chose, nor pull a pane they docked back
+   *  into the split tree. Same ruling as `shouldPreserveMaximize` (#155), which
+   *  closed this exact class for the SPAWN path; this is the reveal path.
+   *  Human clicks go through the existing resizeburst coalescing, so no NEW fit
+   *  is added there either, and the plain case (a visible pane in the showing
+   *  tab) touches no layout at all whoever asked. */
+  reveal(pane: Pane, humanInitiated: boolean): void {
     const plan = revealPlan({
       // The grid does not own the tab question; `main.ts` answers that half
       // and has already switched by the time this runs. Passing `true` keeps
@@ -838,6 +847,10 @@ export class Grid {
       tabIsActive: true,
       docked: this.isDocked(pane),
       maximized: this.maximized === null ? null : this.maximized === pane ? "self" : "other",
+      // Required, not defaulted: a caller that forgets it fails to compile
+      // rather than silently getting the permissive answer. Constraint 1 is
+      // not a default anyone should inherit by omission.
+      humanInitiated,
     });
     for (const step of plan) {
       switch (step) {

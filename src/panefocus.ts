@@ -116,9 +116,32 @@ export interface RevealState {
   /** Whether the pane is parked in the dock (outside the split tree). */
   docked: boolean;
   maximized: "self" | "other" | null;
+  /** True when a HUMAN asked for this pane (an Agents row click, the Sessions
+   *  tab's Focus button), false when an AGENT did (`orch-focus`, emitted by
+   *  the orchestrator's `focus_agent` MCP tool).
+   *
+   *  This is the #155 bit, and it is here for the same reason it exists there:
+   *  the two structural steps below are the ones that RESIZE A PTY, and
+   *  constraint 1 bars an agent from triggering that. See `shouldPreserveMaximize`
+   *  above — same question, same answer, one module apart. */
+  humanInitiated: boolean;
 }
 
 /** The ordered steps that make a pane visible, active and focused.
+ *
+ *  WHO ASKED decides whether the structural steps run at all. `restore-from-dock`
+ *  and `exit-maximize` are the two steps that genuinely resize a PTY —
+ *  `toggleMaximize`'s own doc says the maximized pane "alone issues one debounced
+ *  fit", and `restore`'s says re-attaching "triggers a single genuine fit" and
+ *  makes its new siblings fit too. Constraint 1 permits that from a DISCRETE
+ *  HUMAN CLICK and bars it from anything else, so both are gated on
+ *  `humanInitiated`. An agent-initiated reveal — `orch-focus`, which the
+ *  orchestrator's `focus_agent` MCP tool emits with no human anywhere on the
+ *  path — gets `switch-tab` / `set-active` / `focus` and nothing structural: it
+ *  can say which pane it wants attention on without dropping the human out of a
+ *  fullscreen they chose or pulling a pane they docked back into the grid.
+ *  That is `shouldPreserveMaximize`'s (#155) ruling applied to the reveal path,
+ *  and it is why the two live in the same module.
  *
  *  `switch-tab` first when the pane is in a background tab: its whole workspace
  *  is `display:none`, so nothing below it is visible until the tab is showing.
@@ -127,7 +150,7 @@ export interface RevealState {
  *  already exits fullscreen on its way in, so emitting both would be one
  *  redundant relayout (constraint 1 counts a relayout as a potential PTY fit).
  *
- *  `exit-maximize` only when a DIFFERENT pane is maximized. Revealing the
+ *  For a HUMAN reveal: `exit-maximize` only when a DIFFERENT pane is maximized. Revealing the
  *  fullscreen pane itself leaves fullscreen alone: a human who maximized a pane
  *  and then clicked its own Agents row is already looking at it, and yanking
  *  them out of fullscreen would be a layout change they did not ask for.
@@ -140,8 +163,14 @@ export interface RevealState {
 export function revealPlan(state: RevealState): RevealStep[] {
   const plan: RevealStep[] = [];
   if (!state.tabIsActive) plan.push("switch-tab");
-  if (state.docked) plan.push("restore-from-dock");
-  else if (state.maximized === "other") plan.push("exit-maximize");
+  // The two STRUCTURAL steps, and the only two that resize a PTY, are gated on
+  // the human. An agent-initiated reveal switches tab, activates and focuses —
+  // enough that the pane is the one receiving keystrokes and its tab is the one
+  // on screen — and stops there. See `humanInitiated` on the state.
+  if (state.humanInitiated) {
+    if (state.docked) plan.push("restore-from-dock");
+    else if (state.maximized === "other") plan.push("exit-maximize");
+  }
   plan.push("set-active");
   plan.push("focus");
   return plan;

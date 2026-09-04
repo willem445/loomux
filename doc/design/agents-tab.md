@@ -392,6 +392,14 @@ there as an on-state, the same class as the task board's own filter chip.
   attention change is a wire change for a lag nobody has measured.
 - **The list is this window's open panes.** An agent with no pane open, or a
   pane in another orrerix window, is not here; the session browser is.
+- **An agent-initiated reveal of a hidden pane is deliberately partial.**
+  `focus_agent` on a pane that is docked or behind a fullscreen sibling makes
+  it the active pane and focuses it, but leaves it hidden — constraint 1 will
+  not let an agent resize a PTY to uncover it. The human's own Agents row
+  reveals it fully, and the pane's attention badge is what points them at it.
+  Swapping the fullscreen to the target instead was considered and rejected on
+  the same ground as the human case: it is a layout change nobody asked for,
+  and here nobody human asked for anything at all.
 - **No keyboard chord.** Out of scope for this slice — a new chord needs the
   `agent-cli-reference` sweep `doc/design/side-dock.md` describes, and the two
   buttons plus the tablist cover the gesture.
@@ -451,14 +459,65 @@ A dock restore stands in for the exit: `Grid.restore` already exits fullscreen
 on its way in, so emitting both would be one redundant relayout — and under
 constraint 1 a redundant relayout is a redundant PTY fit.
 
-### Constraint 1: nothing here resizes a PTY that was not resized before
+### Constraint 1: who asked decides whether a PTY may be resized
 
-`exitMaximize` and `restore` are the same discrete-human-click class as the
-header ⤢ button and the dock chip, and they go through the existing
-`resizeburst` coalescing unchanged. No new fit is added, no passive or
-continuous trigger reaches one, and the plain case — a visible pane in the tab
-already showing — touches no layout at all: its plan is exactly
-`["set-active", "focus"]`, which is what the app did before.
+**This section said something false in round 0 and round 1, and the correction
+is the interesting part.** It read: *"`exitMaximize` and `restore` are the same
+discrete-human-click class … No new fit is added, no passive or continuous
+trigger reaches one."* The first half is true of the two surfaces that clause
+was written about — the Agents row and the Sessions Focus button. It was false
+of the third surface this same section lists three paragraphs above:
+`orch-focus` → `OrchWiring.focusPty`.
+
+`orch-focus` has no human on its path at all. It is emitted from exactly one
+place, `Registry::focus_agent`, reached from exactly one place, the
+`focus_agent` MCP tool — advertised to every orchestrator in its own template
+and gated only by `require_orchestrator`. So rewiring `focusPty` to a reveal
+handed an unprompted agent tool call the ability to drop the human out of a
+fullscreen they chose, or pull a pane they had docked back into the split tree.
+Both genuinely resize a PTY — `toggleMaximize`'s own doc says the maximized
+pane *"alone issues one debounced fit"*, `restore`'s says re-attaching
+*"triggers a single genuine fit"*, and a restore re-seats the pane beside the
+active one so its new siblings fit too. That is precisely the trigger class
+constraint 1 bars.
+
+**The repo had already adjudicated this exact case, seventy lines away.**
+`shouldPreserveMaximize` (#155, `src/panefocus.ts`) exists because an
+orchestrator-driven *spawn* used to collapse the human's fullscreen: *"the
+human is watching one pane full-screen and an agent spawning in the background
+must not yank them back to the grid."* `Grid.placeLeaf` honours it. The reveal
+path re-opened the same question and had no equivalent answer.
+
+So `revealPlan` takes a `humanInitiated` bit, and the two structural steps —
+`restore-from-dock` and `exit-maximize`, the only two that resize anything —
+are gated on it:
+
+- **A human gesture** (Agents row click, Sessions **Focus** button, the
+  Mine-row click's reveal) may exit a fullscreen and un-dock a pane. This is
+  the discrete-human-click class constraint 1 sanctions, through the existing
+  `resizeburst` coalescing, so no *new* fit is added there.
+- **An agent-initiated reveal** (`orch-focus`) gets `switch-tab` /
+  `set-active` / `focus` and nothing structural. The agent can still say which
+  pane it wants attention on — the tab comes forward, the pane becomes the one
+  receiving keystrokes — and it cannot resize a thing. `switch-tab` is not
+  gated because it moves no PTY.
+- **The plain case** — a visible pane in the tab already showing — touches no
+  layout at all whoever asked: its plan is exactly `["set-active", "focus"]`,
+  which is what the app did before.
+
+The bit is a **required** parameter on `revealPlan`, `Grid.reveal` and
+`revealPane` rather than an option with a default, so a future caller fails to
+compile instead of silently inheriting the permissive answer.
+
+Pinned by three tests, and the negative control is the load-bearing half: for
+each of the twelve states, the agent plan must contain neither structural step
+**and** the identical state asked for by a human must still contain the one it
+is owed. Asserting only the agent half would pass equally well against a
+`revealPlan` that had stopped emitting structural steps for anybody, which is
+the regression the pair exists to tell apart; a population control asserts that
+8 of the 12 human crossings really are owed one, so the control cannot go
+vacuous. Deleting the gate reddens exactly the three agent tests; inverting it
+reddens those three plus the two human ones.
 
 ### The maximize trigger is INFERRED, not observed
 

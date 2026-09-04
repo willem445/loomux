@@ -495,10 +495,18 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
  * every one of those crossings, so a `pane.focus()` here as well would be a
  * second focus of the same terminal — harmless, but it is exactly the
  * redundant step the design note claims this design does not emit (#2365
- * review round 1, F3). The claim and the code now agree. */
-function revealPane(ws: Workspace, pane: Pane): void {
+ * review round 1, F3). The claim and the code now agree.
+ *
+ * `humanInitiated` is the #155 bit and it is REQUIRED, not defaulted (#2365
+ * review round 2, B1). True for a human gesture — an Agents row click, the
+ * Sessions tab's Focus button. False for `orch-focus`, which the orchestrator's
+ * `focus_agent` MCP tool emits with no human anywhere on the path: an agent may
+ * say which pane it wants attention on, but it may not drop the human out of a
+ * fullscreen they chose or pull a pane they docked back into the grid, because
+ * both of those resize a PTY and constraint 1 bars an agent from doing that. */
+function revealPane(ws: Workspace, pane: Pane, humanInitiated: boolean): void {
   tabs.switchTo(ws.id); // the pane's TAB first — a background tab hides everything in it…
-  ws.grid.reveal(pane); // …then the dock/fullscreen state inside it, ending on the focus.
+  ws.grid.reveal(pane, humanInitiated); // …then whatever the asker is allowed to change, ending on the focus.
 }
 
 /** The live orchestrator pane of a group, in whichever tab of this window
@@ -629,7 +637,18 @@ const orchWiring: OrchWiring = {
     // #2365: a REVEAL, not a focus. This used to be its own copy of switchTo
     // + setActive + focus, which did nothing visible for a pane behind a
     // maximized sibling or in the dock.
-    revealPane(found.ws, found.pane);
+    //
+    // `false` — and this is the whole of B1 (#2365 review round 2). The only
+    // caller of `focusPty` is the `orch-focus` listener, and `orch-focus` is
+    // emitted from exactly one place: `Registry::focus_agent`, reached only
+    // from the `focus_agent` MCP tool, which every orchestrator is told about
+    // in its template and which no human gates. So this is an UNPROMPTED AGENT
+    // ACTION, and a reveal that exited fullscreen or un-docked a pane here
+    // would resize a PTY on an agent's say-so — exactly the class constraint 1
+    // bars and #155 already closed for the spawn path. The agent still gets
+    // the tab switch, the active pane and the focus; it does not get to
+    // rearrange the human's layout.
+    revealPane(found.ws, found.pane, false);
   },
   applyAttention,
   bindGroupForPane(pane, groupId): void {
@@ -2528,7 +2547,7 @@ const sessions = new SessionBrowser(
       );
       return;
     }
-    revealPane(found.ws, found.pane);
+    revealPane(found.ws, found.pane, true); // a button the human pressed
   }
 );
 
@@ -2546,8 +2565,10 @@ agentsView = new AgentsView(leftPanel.agentsBody, {
       for (const pane of ws.grid.allPanes()) {
         if (pane.facts().key !== key) continue;
         // The same reveal `orch-focus` takes — one function, so the two can
-        // never come to disagree about what 'go to this pane' means (#2365).
-        revealPane(ws, pane);
+        // never come to disagree about what 'go to this pane' means (#2365) —
+        // but `true`: this one IS the discrete human click, so it may exit a
+        // fullscreen or bring the pane back from the dock.
+        revealPane(ws, pane, true);
         return;
       }
     }
@@ -2838,7 +2859,7 @@ async function restoreSession(s: SessionInfo): Promise<void> {
       isOrchestratorRow: route.role === "orchestrator",
     });
     if (action === "reveal" && found) {
-      revealPane(found.ws, found.pane);
+      revealPane(found.ws, found.pane, true); // a row the human clicked
       return;
     }
     if (action === "explain") {
