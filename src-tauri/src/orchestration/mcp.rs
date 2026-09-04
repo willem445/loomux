@@ -1100,50 +1100,6 @@ fn check_mail_tool() -> Value {
 /// costs no context — everywhere it was not asked for. The names are folded
 /// into the descriptions because an agent that cannot see what exists guesses
 /// (`cargo`, `build-lock`, `ci`) and gets three refusals instead of one lock.
-/// Every tool NAME loomux can expose to any agent, on any role, in any group
-/// — the union over [`tool_defs`] rather than a hand-kept list, so a tool
-/// added below is covered by whoever consults this without a second edit
-/// (#2126).
-///
-/// **What it is for, and why a union is the right width.** pi's MCP adapter
-/// MERGES its config sources, and the repo's own `.mcp.json` / `.pi/mcp.json`
-/// are among them (`doc/design/pi.md`, the direct-tool shadowing residual). A
-/// repo-declared server registering a direct tool named `report` sits in the
-/// same flat tool namespace as loomux's, so loomux warns about the overlap it
-/// can see. That warning is a MEASUREMENT, never a refusal, and it wants the
-/// generous set: a false positive costs one audit line, while a false negative
-/// costs the warning its entire point.
-///
-/// `Role::Solo`'s two-tool surface is in here too, deliberately: `channel_send`
-/// is as worth warning about as `report`.
-#[doc(hidden)] // pub for integration tests
-pub fn every_tool_name() -> std::collections::BTreeSet<String> {
-    // One declared lock, so the lock tier renders; its NAME is loomux's
-    // (`acquire_lock`/`release_lock`), never the resource's, so the sample
-    // value cannot leak into the set.
-    let locks = [("sample".to_string(), workflow::ResourcePolicy::default())];
-    let mut names = std::collections::BTreeSet::new();
-    for role in [
-        Role::Orchestrator,
-        Role::Worker,
-        Role::Reviewer,
-        Role::Planner,
-        Role::Manager,
-        Role::Solo,
-    ] {
-        for hint in [None, Some("liaison"), Some("process")] {
-            for manager in [false, true] {
-                for def in tool_defs(role, hint, &locks, manager) {
-                    if let Some(n) = def.get("name").and_then(Value::as_str) {
-                        names.insert(n.to_string());
-                    }
-                }
-            }
-        }
-    }
-    names
-}
-
 fn tool_defs(
     role: Role,
     role_hint: Option<&str>,
@@ -1661,6 +1617,50 @@ fn tool_defs(
             &[]));
     }
     tools
+}
+
+/// Every tool NAME loomux can expose to any agent, on any role, in any group
+/// — the union over [`tool_defs`] rather than a hand-kept list, so a tool
+/// added below is covered by whoever consults this without a second edit
+/// (#2126).
+///
+/// **What it is for, and why a union is the right width.** pi's MCP adapter
+/// MERGES its config sources, and the repo's own `.mcp.json` / `.pi/mcp.json`
+/// are among them (`doc/design/pi.md`, the direct-tool shadowing residual). A
+/// repo-declared server registering a direct tool named `report` sits in the
+/// same flat tool namespace as loomux's, so loomux warns about the overlap it
+/// can see. That warning is a MEASUREMENT, never a refusal, and it wants the
+/// generous set: a false positive costs one audit line, while a false negative
+/// costs the warning its entire point.
+///
+/// `Role::Solo`'s two-tool surface is in here too, deliberately: `channel_send`
+/// is as worth warning about as `report`.
+#[doc(hidden)] // pub for integration tests
+pub fn every_tool_name() -> std::collections::BTreeSet<String> {
+    // One declared lock, so the lock tier renders; its NAME is loomux's
+    // (`acquire_lock`/`release_lock`), never the resource's, so the sample
+    // value cannot leak into the set.
+    let locks = [("sample".to_string(), workflow::ResourcePolicy::default())];
+    let mut names = std::collections::BTreeSet::new();
+    for role in [
+        Role::Orchestrator,
+        Role::Worker,
+        Role::Reviewer,
+        Role::Planner,
+        Role::Manager,
+        Role::Solo,
+    ] {
+        for hint in [None, Some("liaison"), Some("process")] {
+            for manager in [false, true] {
+                for def in tool_defs(role, hint, &locks, manager) {
+                    if let Some(n) = def.get("name").and_then(Value::as_str) {
+                        names.insert(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 fn require_orchestrator(caller: &Caller) -> Result<(), String> {
