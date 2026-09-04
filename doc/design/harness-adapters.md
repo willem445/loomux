@@ -692,8 +692,10 @@ table-driven; a planted unknown message type must be ignored **and logged**
 rather than panic; the renderer is pinned on golden VT output. Red-before-green
 is captured on CI, since agents may not run cargo locally.
 
-**Two things this paragraph said before R1 built it, and what replaced them
-(human-approved 2026-09-04):**
+**Three things this paragraph said before R1 built it, and what replaced them
+(location and provenance human-approved 2026-09-04; the third is a correction
+rev-final round 10 found — the earlier list said "two" and did not account for
+its own diff):**
 
 - *Location.* It said `src-tauri/tests/fixtures/`. R1's tests are engine-inline,
   and an engine test reaching `../../src-tauri` for its data points the boundary
@@ -710,6 +712,24 @@ is captured on CI, since agents may not run cargo locally.
   §9's family, and it is what would close the gap. The rest of the discipline is
   unchanged: a capture that replaces them records the CLI version it came from,
   and no agent regenerates a fixture from the code under test.
+- *Mechanism, and this one is a DE-contracting rather than a replacement.* It
+  said "the driver is exercised against a **fake harness script** that cats a
+  fixture on a schedule". Nothing does that, and nothing is contracted to.
+  R1 **split the driver instead of faking a process**: the decode-and-publish
+  loop takes a `BufRead` (`harness::claude::pump`), so it is driven over an
+  in-memory reader and over the fixture, and the argv builder, the session-id
+  comparison, the decoder and the renderer are pure functions with tests of
+  their own. That is a better bar than the script for everything below the
+  reader — no process, no schedule, no platform variance.
+  **What it leaves unexercised, said here so the absence cannot read as
+  coverage:** the process seam itself — `Command` → piped stdin/stdout → the
+  reader thread → `Drop` — has **no test in R1**, because a fake script is the
+  only way to reach it and constraint 3 keeps a real CLI out. So the bar R1's
+  reviewer holds the driver to is: *every branch below the reader is tested, and
+  the spawn seam is a stated residual*, closed by R2's `src-tauri` integration
+  test once there is a pane to spawn into. A driver with no test at all does
+  **not** satisfy this section; a driver whose logic is tested and whose spawn
+  seam is named as a residual does.
 
 The fixture set deliberately carries the awkward cases an average capture would
 miss: a `thinking_delta` (which must not become transcript text), a **failing**
@@ -734,6 +754,18 @@ events (§5.6); `pane_kind` on `agents.json`; the usage collector's `stream` sou
 **The contract between the two slices:** R1 defines the types; **R2 may not
 change a name or a shape in §1, §4.1 or §5.6 without amending this note in the
 same PR.** That is what makes R0 worth reviewing before R1 exists.
+
+**And §8.1's three lists — Ships, Does NOT ship, Tests — are protected the same
+way**, which the earlier wording did not say. They are where a slice's *bar*
+lives, and a bar is the one thing whose removal nothing can redden: the note IS
+the test, so a deleted clause reads as compliance rather than as a gap. This
+paragraph exists because that fired inside this note's own history — the
+fake-harness-script sentence left §8.1 in a commit whose change list said "two
+things" and enumerated the other two, and it survived eight review rounds
+because every round checked the note's figures and citations and none diffed a
+change list against its own diff. So: **a commit that edits any of those lists
+states, in its own summary, every clause it removed** — not only the ones it
+replaced.
 
 **Behavioural-silence bar, inherited from the extraction note:** the existing
 integration suite green with **zero test edits** for everything that is not a
