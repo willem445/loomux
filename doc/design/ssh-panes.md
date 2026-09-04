@@ -252,6 +252,23 @@ exit code, where **0 means the identity was added**. The transcript remains the
 only thing that can decide *what to answer and when to give up*; it is simply not
 the last word on whether the key went in.
 
+#### The answer is one write, and it is re-sent once
+
+A third measured fact, from the same logs: the answer and its Enter sent as
+**two** writes lost the Enter on roughly one run in three. The console had
+echoed the passphrase back — so the read was live and cooked-mode echo had
+run — and the lone `` that followed simply never took effect, leaving
+`ssh-add` blocked on a read nobody would finish. The line and its Enter now go
+in one buffer, and the write result is **returned rather than dropped**: `let _
+= write_all(…)` is what made this invisible in the first place, and a refusal
+naming the failed write is a bug report where a fifteen-second `Timeout` is not.
+
+What is left of the race is bounded by exactly one re-send of the Enter. The
+cost of being wrong is asymmetric: a duplicate Enter can only supply an *empty*
+line, and the only reader that can still be waiting is the retry ask — where an
+empty line is the give-up this driver sends anyway. A lost one costs the user
+the whole bound and refuses a launch that would have worked.
+
 ### Persistence honesty
 
 On Windows the agent keeps the key **until it is forgotten** (`ssh-add -D`, or

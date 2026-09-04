@@ -68,6 +68,12 @@ pub const SSH_ADD_TIMEOUT: Duration = Duration::from_secs(15);
 /// and the only cost of a step is one `try_wait`.
 const POLL_STEP: Duration = Duration::from_millis(50);
 
+/// How long an unanswered-looking answer waits before its Enter is re-sent
+/// once. Comfortably longer than a local console round trip and far shorter
+/// than [`SSH_ADD_TIMEOUT`], so the re-send happens while the run can still
+/// succeed rather than as a formality before the deadline.
+const ANSWER_REARM: Duration = Duration::from_secs(2);
+
 /// How long the pty pump gets to deliver whatever it still holds after the
 /// child has exited. ConPTY renders a screen rather than a stream, so a process
 /// that prints one line and exits immediately can have that line dropped.
@@ -355,6 +361,30 @@ fn zero_secret(buf: &mut [u8]) {
     }
 }
 
+/// Send one answer — the line and its Enter in a **single write**.
+///
+/// Two writes is how the answer gets lost. Measured on CI: the passphrase was
+/// echoed back by the console (so the read was live and cooked-mode echo ran)
+/// and the lone `\r` that followed it never took effect, on roughly one run in
+/// three, leaving `ssh-add` blocked on a read nobody would ever finish. One
+/// buffer removes the second trip through the input pipe entirely.
+///
+/// The result is **returned rather than dropped**. `let _ = write_all(…)` on
+/// this path is precisely what made the failure above invisible: a refusal
+/// naming the write is a bug report, and a fifteen-second `Timeout` is not.
+///
+/// The scratch buffer is zeroed on the way out for the same reason
+/// [`zero_secret`] exists — it is a second copy of the passphrase, and the only
+/// one this function creates.
+fn send_answer(writer: &mut Box<dyn std::io::Write + Send>, line: &[u8]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line);
+    buf.push(b'\r');
+    let result = writer.write_all(&buf).and_then(|()| writer.flush());
+    zero_secret(&mut buf);
+    result
+}
+
 /// Drive one `ssh-add` conversation on a hidden pty and report what it did.
 ///
 /// `argv` is spawned **as argv** through `CommandBuilder` — no shell, so the
@@ -482,6 +512,10 @@ pub fn drive_ssh_add_with_transcript(
     // reaped through the pty, and the two have similar names and distinct types.
     let mut status: Option<portable_pty::ExitStatus> = None;
     let mut drain_until: Option<Instant> = None;
+    // When the last answer was sent, and whether the one permitted re-send has
+    // been used. See the re-arm below.
+    let mut last_write = Instant::now();
+    let mut rearmed = false;
 
     while terminal.is_none() {
         let now = Instant::now();
@@ -511,6 +545,24 @@ pub fn drive_ssh_add_with_transcript(
         if drain_until.is_some_and(|until| now >= until) {
             break;
         }
+        // One re-send of the Enter, and only one.
+        //
+        // A lost Enter is indistinguishable from a slow one, and the cost of
+        // being wrong is asymmetric: a duplicate Enter can only supply an EMPTY
+        // line, and the only reader that can still be waiting is `ssh-add`'s
+        // retry ask — where an empty line is exactly the give-up this driver
+        // sends anyway. A lost one costs the user the whole bound and refuses a
+        // launch that would have worked. `send_answer` above removes the cause
+        // this was written for; this bounds what is left of it, because a
+        // fifteen-second hang is not a failure mode to leave to a race.
+        if (answered || gave_up)
+            && !rearmed
+            && status.is_none()
+            && now.saturating_duration_since(last_write) >= ANSWER_REARM
+        {
+            rearmed = true;
+            let _ = send_answer(&mut writer, b"");
+        }
         // Step rather than wait-to-deadline: the exit poll above only runs
         // between receives, so a long block here would defeat it.
         let step = POLL_STEP.min(deadline.saturating_duration_since(now));
@@ -533,18 +585,25 @@ pub fn drive_ssh_add_with_transcript(
             SshAddEvent::BadPassphrase => {
                 if !gave_up {
                     gave_up = true;
+                    last_write = Instant::now();
                     // ssh-add's own exit: an empty passphrase ends the retry
                     // loop. Anything else re-asks forever.
-                    let _ = writer.write_all(b"\r");
-                    let _ = writer.flush();
+                    if let Err(e) = send_answer(&mut writer, b"") {
+                        terminal = Some(SshAddOutcome::Failed {
+                            detail: format!("could not answer ssh-add: {e}"),
+                        });
+                    }
                 }
             }
             SshAddEvent::Prompt => {
                 if !answered {
                     answered = true;
-                    let _ = writer.write_all(passphrase);
-                    let _ = writer.write_all(b"\r");
-                    let _ = writer.flush();
+                    last_write = Instant::now();
+                    if let Err(e) = send_answer(&mut writer, passphrase) {
+                        terminal = Some(SshAddOutcome::Failed {
+                            detail: format!("could not answer ssh-add: {e}"),
+                        });
+                    }
                 }
             }
             SshAddEvent::Other => {}
