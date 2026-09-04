@@ -682,6 +682,60 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     (reg, dir)
 }
 
+/// The proof the #464 allowlist row for this file names (`tests/orchestration.rs`,
+/// `no_registry_construction_bypasses_the_test_agent_dir_overrides`). That row
+/// permits ONE raw `OrchRegistry::new` here, and it permits it only because
+/// `test_registry` applies every agent/hook dir override — without which a spawn
+/// in this file writes a generated agent file into the maintainer's real
+/// `~/.claude` or `~/.copilot`. A textual scan cannot see that, so the row would
+/// otherwise be pure trust; this makes it a claim that fails in THIS binary the
+/// moment the helper stops applying one.
+#[test]
+fn its_registry_helper_applies_every_override_this_allowlist_row_assumes() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/piusage.rs"),
+    )
+    .expect("this file reads itself");
+
+    // The helper's body: from its signature to the first line that closes it at
+    // column 0 — narrow enough that an override applied by some OTHER function
+    // in this file cannot satisfy the assertions below.
+    let start = src
+        .find("fn test_registry() -> (OrchRegistry, tempfile::TempDir) {")
+        .expect("the sanctioned helper must exist, under the name the row names");
+    let body = &src[start..];
+    let end = body.find("\n}").expect("the helper must terminate") + 2;
+    let body = &body[..end];
+
+    for needed in [
+        "set_claude_agents_dir_override",
+        "set_copilot_agents_dir_override",
+        "set_compact_hook_dir_override",
+        "set_copilot_hooks_dir_override",
+    ] {
+        assert!(
+            body.contains(needed),
+            "the #464 allowlist row for tests/piusage.rs assumes this helper applies every \
+             override; it no longer applies {needed}, so a registry built through it can reach \
+             the real agent dirs and the row's premise is gone"
+        );
+    }
+
+    // The population control: the extraction really did isolate the helper, so
+    // the four assertions above are about ITS body and not about the whole file
+    // — which contains those same names in prose above.
+    assert!(
+        body.len() < 1_200,
+        "the helper's body extraction ran away ({} chars); the assertions above would then be \
+         satisfied by any other function in this file",
+        body.len()
+    );
+    assert!(
+        !body.contains("#[test]"),
+        "the extraction swallowed a test, so it is no longer reading only the helper"
+    );
+}
+
 #[test]
 fn a_pi_agents_usage_comes_from_the_group_store_and_is_reported_not_estimated() {
     let (reg, _d) = test_registry();
