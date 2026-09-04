@@ -489,11 +489,16 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
  * One function, so those surfaces cannot drift apart again. The tab step is
  * here because `main.ts` is the only holder of `tabs`; the structural steps
  * are `Grid.reveal`'s; the ORDER is `revealPlan`'s (`panefocus.ts`), pinned
- * across all twelve crossings in `test/panefocus.test.ts`. */
+ * across all twelve crossings in `test/panefocus.test.ts`.
+ *
+ * Two steps, not three: `Grid.reveal` ends on the plan's own `focus` step in
+ * every one of those crossings, so a `pane.focus()` here as well would be a
+ * second focus of the same terminal — harmless, but it is exactly the
+ * redundant step the design note claims this design does not emit (#2365
+ * review round 1, F3). The claim and the code now agree. */
 function revealPane(ws: Workspace, pane: Pane): void {
   tabs.switchTo(ws.id); // the pane's TAB first — a background tab hides everything in it…
-  ws.grid.reveal(pane); // …then the dock/fullscreen state INSIDE it…
-  pane.focus(); // …then the terminal.
+  ws.grid.reveal(pane); // …then the dock/fullscreen state inside it, ending on the focus.
 }
 
 /** The live orchestrator pane of a group, in whichever tab of this window

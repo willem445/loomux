@@ -808,6 +808,22 @@ export class Grid {
    *  The TAB step is not here: `Grid` does not know about tabs. `main.ts`'s
    *  `revealPane` does it, and `revealPlan` puts it first for both of us.
    *
+   *  PRECONDITION — READ THIS BEFORE ADDING A CALLER (#2365 review round 1,
+   *  premortem 2). This passes `tabIsActive: true` UNCONDITIONALLY, because
+   *  the grid cannot know the answer. So the plan omits `switch-tab`, and if
+   *  the pane’s workspace is not the one on screen every step below runs under
+   *  `display:none` — the caller has reinvented the exact blindness this method
+   *  exists to fix, with nothing red to say so. `main.ts`’s `revealPane` is the
+   *  only caller today and it switches tabs first; any new one must too.
+   *
+   *  Residual, stated rather than implied: this is a COMMENT, not a guard. A
+   *  source scan was written for it and withdrawn — `reveal` is an ordinary
+   *  method name in this tree (`EditorWidget.reveal(line, col)`,
+   *  `src/filemenu.ts`), so a textual check cannot separate this method from
+   *  the others and refused two known-good files on its first run. A guard that
+   *  green-lights by accident is worse than none, so the precondition is
+   *  carried here and in `doc/design/agents-tab.md` instead.
+   *
    *  Constraint 1 (no PTY resize for a UI feature): every step here is one
    *  the human can already trigger by hand — `restore` is the dock chip,
    *  `exitMaximize` is the ⤢ button — reached from a DISCRETE human click on

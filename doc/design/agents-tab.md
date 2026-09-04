@@ -499,3 +499,33 @@ enforces should not live in untested DOM glue.
 `explain` (a live group whose orchestrator pane is in no window here) exists so
 the app never calls into a refusal it can already predict — the round-trip could
 only come back with advice the human has no way to act on.
+
+### Review round 1: two corrections, and one precondition that stays a comment
+
+**`revealPane` is two steps, not three.** It used to end on a `pane.focus()` of
+its own, after `Grid.reveal` had already run the plan's `focus` step — a second
+focus of the same terminal. Harmless, and precisely the redundant step this
+section claims the design does not emit, so the claim and the code disagreed.
+The trailing call is gone. The deletion is safe because the plan *always* ends
+in `focus`: `no plan ever contains a removing step` asserts
+`plan.slice(-2) === ["set-active", "focus"]` on all twelve crossings, and
+deleting `plan.push("focus")` reddens it along with three others.
+
+**`Grid.reveal` has a precondition, and it is a comment rather than a guard.**
+It passes `tabIsActive: true` unconditionally — the grid cannot know the answer —
+so its plan omits `switch-tab`. A caller that has *not* put the pane's tab on
+screen therefore runs every step under `display:none` and has re-entered exactly
+the blindness this whole section is about, with nothing red to say so.
+`revealPane` is the only caller and it switches tabs first.
+
+A source-scanning guard was written for that and **withdrawn**, which is worth
+recording because the reason generalises. `reveal` is an ordinary method name in
+this tree — `EditorWidget.reveal(line, col)` (`src/editorwidget.ts`), and
+`src/filemenu.ts` — so a textual check keyed on the call shape cannot separate
+`Grid.reveal` from the others: run against the real tree it refused two
+known-good files on its first pass. Anchoring it on `.grid.reveal(` instead
+would have passed, but `Grid.allGrids()` hands out bare `Grid` values, so the
+evasion it left open is the one a new caller is most likely to take. A guard
+whose green is an accident is worse than no guard, so the precondition is
+carried in prose — here and on the method — and the residual is stated rather
+than implied.
