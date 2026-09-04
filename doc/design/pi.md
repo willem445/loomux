@@ -398,6 +398,31 @@ saying next to [#2167](https://github.com/willem445/orrerix/issues/2167):
   own directory and the id is loomux's, so the slug-shaped half of #2167's
   original suspicion has no surface on pi.
 
+**Two residuals, stated rather than left to be found.**
+
+*A SOLO pi pane has no usage source.* `compute_usage_snapshot` keys the arm on
+`pi_sessions_dir(entry.group)`, and a solo pane's group is `__solo__` — a
+directory a solo pane never writes to, because loomux passes `--session-dir`
+only on a spawned pane's launch line. A solo pi pane's session lives in the
+human's own `~/.pi` store, which loomux deliberately does not read. The arm
+therefore finds nothing and the pane falls through to the statusline, which is
+the same shape the opencode arm already has for the same reason (`__solo__` has
+no `OPENCODE_DB` either). Reading a human's own store to price a solo pane is a
+change of policy, not a missing line, so it is a follow-up rather than a gap
+this slice left silently open.
+
+*A store-level read error reads as "no usage", with no audit line.* pi's
+locator returns `Ok(None)` for an absent directory and `Err` only for a real IO
+fault on the group's own state directory; the usage reader collapses both into
+its existing `None`. That is deliberately unlike opencode, which writes one
+audit line per degrade episode (`note_opencode_db_degrade`) because a drifted
+SQLite schema and a never-booted pane are otherwise indistinguishable. pi has no
+such ambiguity to resolve — its ordinary "nothing written yet" case is already
+`Ok(None)`, and the residual `Err` is an unreadable group directory, which the
+spawn itself already fails loudly on (`fs::create_dir_all` is an error there,
+not a best-effort mkdir). If that ever stops being true, the opencode shape is
+the one to copy.
+
 ## Knobs (#687)
 
 `--thinking <level>` over `off, minimal, low, medium, high, xhigh, max`
