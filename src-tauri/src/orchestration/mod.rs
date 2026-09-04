@@ -1431,6 +1431,7 @@ loomux_verdict_line5() { # $1=verdict file → sets v_digest, v_mark
       *) break ;;
     esac
   done
+  v_l=${v_l%% *}
   v_digest=''
   case "$v_l" in
     *[!0-9a-fA-F]*) v_l='' ;;
