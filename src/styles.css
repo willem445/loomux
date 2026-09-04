@@ -1757,9 +1757,16 @@ button.orch-item:active { transform: translateX(2px) scale(0.995); }
   margin-top: 3px; padding-left: 2px; font-size: 11px; color: var(--ink-dim);
   line-height: 1.4;
 }
-/* A live group is context, not an offer — dim it so the eye goes to the rows
-   that can actually bring something back. */
+/* A live group cannot be brought back — it is already here — so the ROW stays
+   quieter than the rows that can resume. Its one offer, Focus (#2365), is
+   deliberately exempt from the dimming: the whole point of the button is that
+   the human has lost the pane and needs to see the way back to it. */
 .orch-item.live { opacity: 0.7; }
+.orch-item.live .orch-focus { opacity: 1; }
+.orch-focus {
+  margin-top: 6px; padding: 2px 9px;
+  font-size: 11px; line-height: 1.6;
+}
 
 /* ---------- hint bar ---------- */
 #hintbar {

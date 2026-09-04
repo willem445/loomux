@@ -2,7 +2,12 @@
 // Run with `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { orchRows, type RecordedOrchestration } from "../src/orchlist.ts";
+import {
+  orchRows,
+  orchAction,
+  type OrchRowState,
+  type RecordedOrchestration,
+} from "../src/orchlist.ts";
 
 const rec = (over: Partial<RecordedOrchestration> = {}): RecordedOrchestration => ({
   group_id: "loomux-aaaa1111",
@@ -183,4 +188,50 @@ test("the title is the repo's own basename, on either separator", () => {
   assert.equal(orchRows([rec({ repo: "C:/Projects/loomux" })])[0].title, "loomux");
   assert.equal(orchRows([rec({ repo: "C:\\Projects\\loomux" })])[0].title, "loomux");
   assert.equal(orchRows([rec({ repo: "C:/Projects/loomux/" })])[0].title, "loomux");
+});
+
+// ---------------------------------------------------------------------------
+// The action beside the copy (#2365)
+// ---------------------------------------------------------------------------
+
+test("a live row carries the focus action, so its copy is not the only thing it offers", () => {
+  // The `live` detail has always said "focus its orchestrator pane instead of
+  // resuming it". Before #2365 that was a sentence with no button behind it —
+  // and no way to reach a pane hidden behind a maximized sibling or docked.
+  const [row] = orchRows([rec({ group_live: true })]);
+  assert.equal(row.state, "live");
+  assert.equal(row.action, "focus");
+  assert.equal(row.canResume, false);
+  assert.match(row.detail, /focus its orchestrator pane/);
+});
+
+test("no other state carries an action", () => {
+  // Negative control for the test above, enumerated over the whole state
+  // union rather than sampled — a Focus button on a row whose pane does not
+  // exist is a promise the app cannot keep. Each record is built to land in
+  // exactly one state, and the state is asserted so a fixture that drifts out
+  // of the class it witnesses fails here rather than silently widening this.
+  const cases: [OrchRowState, RecordedOrchestration][] = [
+    ["damaged", rec({ cli: "  " })],
+    ["unidentified", rec({ session_id: null, resumable: false })],
+    ["lost", rec({ resumable: false })],
+    ["resumable", rec()],
+  ];
+  for (const [expected, r] of cases) {
+    const [row] = orchRows([r]);
+    assert.equal(row.state, expected);
+    assert.equal(row.action, null, `${expected} must carry no action`);
+  }
+  // The population control: `live` plus these four is the whole union, so this
+  // pair of tests decides every state rather than the ones anyone remembered.
+  assert.equal(cases.length + 1, 5);
+});
+
+test("orchAction is the one place the rule lives", () => {
+  // Pinned directly as well as through `orchRows`, so the renderer has a rule
+  // to import rather than a ternary to re-derive.
+  const states: OrchRowState[] = ["resumable", "live", "unidentified", "lost", "damaged"];
+  const withAction = states.filter((s) => orchAction(s) !== null);
+  assert.deepEqual(withAction, ["live"]);
+  assert.equal(orchAction("live"), "focus");
 });

@@ -111,6 +111,7 @@ import {
   type SessionRecord,
 } from "./sessionreconcile";
 import { sessionRestoreRoute } from "./sessionroute";
+import { liveSessionAction } from "./panefocus";
 import { planGroupResume, partitionByGroup } from "./groupresume";
 import { startLiveness } from "./liveness";
 import {
@@ -475,6 +476,44 @@ function findPaneAcrossTabs(ptyId: number): { ws: Workspace; pane: Pane } | null
   return findPaneByPty(tabs.tabs, (ws) => ws.grid, ptyId);
 }
 
+/** Make a pane VISIBLE and focused, wherever it is (#2365).
+ *
+ * The three steps every 'go to this pane' surface used to take —
+ * `switchTo`, `setActive`, `focus` — were maximize-blind and dock-blind:
+ * `setActive` on a pane behind a maximized sibling flips a class under
+ * `display:none`, and `focus()` on a hidden textarea is a browser no-op. So
+ * an orchestrator pane could be hidden with its PTY still bound while the
+ * Agents row, `orch-focus` and the Sessions tab all claimed to focus it and
+ * did nothing the human could see.
+ *
+ * One function, so those surfaces cannot drift apart again. The tab step is
+ * here because `main.ts` is the only holder of `tabs`; the structural steps
+ * are `Grid.reveal`'s; the ORDER is `revealPlan`'s (`panefocus.ts`), pinned
+ * across all twelve crossings in `test/panefocus.test.ts`. */
+function revealPane(ws: Workspace, pane: Pane): void {
+  tabs.switchTo(ws.id); // the pane's TAB first — a background tab hides everything in it…
+  ws.grid.reveal(pane); // …then the dock/fullscreen state INSIDE it…
+  pane.focus(); // …then the terminal.
+}
+
+/** The live orchestrator pane of a group, in whichever tab of this window
+ *  holds it (#2365).
+ *
+ *  A live scan over the panes that exist, never a maintained group→pane
+ *  side-map — the discipline `tabroute.ts`'s `findPaneByPty` argues for: a
+ *  pane close, a promotion or a tab teardown leaves a side-map stale with
+ *  nothing to notice it, and the answer here is only ever wanted at the
+ *  moment of a click. `allPanes()` so a DOCKED orchestrator is found — being
+ *  unreachable is the whole case this exists for. */
+function findOrchestratorPane(groupId: string): { ws: Workspace; pane: Pane } | null {
+  for (const ws of tabs.tabs) {
+    for (const pane of ws.grid.allPanes()) {
+      if (pane.orchGroupId === groupId && pane.orchRole === "orchestrator") return { ws, pane };
+    }
+  }
+  return null;
+}
+
 // ---------- project tabs: orchestration routing (#63) ----------
 
 /** Open a new tab the way the user expects (#63): create + activate it, then
@@ -582,9 +621,10 @@ const orchWiring: OrchWiring = {
   focusPty(ptyId): void {
     const found = findPaneAcrossTabs(ptyId);
     if (!found) return;
-    tabs.switchTo(found.ws.id); // switch to the pane's TAB first…
-    found.ws.grid.setActive(found.pane); // …then focus the pane.
-    found.pane.focus();
+    // #2365: a REVEAL, not a focus. This used to be its own copy of switchTo
+    // + setActive + focus, which did nothing visible for a pane behind a
+    // maximized sibling or in the dock.
+    revealPane(found.ws, found.pane);
   },
   applyAttention,
   bindGroupForPane(pane, groupId): void {
@@ -2469,6 +2509,21 @@ const sessions = new SessionBrowser(
     // belong to for as long as the dialog is open.
     openNotes: (session, title) =>
       openNotes({ target: () => ({ sessionId: session.id }), title, store: sessionLog }),
+  },
+  // #2365: the Focus button on a live Orchestrations row. The row's own copy
+  // has always said "focus its orchestrator pane instead of resuming it";
+  // this is what finally makes that sentence actionable. A group whose pane
+  // is not in this window says so rather than doing nothing — the same
+  // answer the Mine-row click gives for the same state.
+  (groupId) => {
+    const found = findOrchestratorPane(groupId);
+    if (!found) {
+      showToast(
+        `Group ${groupId} is running, but its orchestrator pane is not open in this window.`
+      );
+      return;
+    }
+    revealPane(found.ws, found.pane);
   }
 );
 
@@ -2485,11 +2540,9 @@ agentsView = new AgentsView(leftPanel.agentsBody, {
     for (const ws of tabs.tabs) {
       for (const pane of ws.grid.allPanes()) {
         if (pane.facts().key !== key) continue;
-        // The same three steps `orch-focus` takes, in the same order: the pane's
-        // TAB first, then the pane inside it, then the terminal.
-        tabs.switchTo(ws.id);
-        ws.grid.setActive(pane);
-        pane.focus();
+        // The same reveal `orch-focus` takes — one function, so the two can
+        // never come to disagree about what 'go to this pane' means (#2365).
+        revealPane(ws, pane);
         return;
       }
     }
@@ -2761,8 +2814,34 @@ async function restoreSession(s: SessionInfo): Promise<void> {
   // this used to gate on `s.source === "claude"`, which silently demoted every
   // copilot orchestration session to a bare `--resume` the chip beside it
   // promised it would not be.
-  const route = sessionRestoreRoute(s, sessions.roleFor(s));
+  const recorded = sessions.roleFor(s);
+  const route = sessionRestoreRoute(s, recorded);
   if (route.kind === "orchestration") {
+    // #2365: a LIVE group's orchestrator cannot be resumed — the backend
+    // refuses with "already has a live orchestrator — focus its pane
+    // instead" (resume_orch_session). Until now the app called into that
+    // refusal and showed its error, which is advice the human had no way to
+    // act on. Decide it here instead; the rule is pure and pinned across all
+    // eight crossings in test/panefocus.test.ts.
+    const found = findOrchestratorPane(route.groupId);
+    const action = liveSessionAction({
+      groupLive: recorded?.group_live ?? false,
+      paneInWindow: found !== null,
+      // The refusal is role-gated (`if record.role == "orchestrator"`), so a
+      // worker or reviewer row in a live group still REJOINS. Revealing the
+      // orchestrator for it would answer a question nobody asked.
+      isOrchestratorRow: route.role === "orchestrator",
+    });
+    if (action === "reveal" && found) {
+      revealPane(found.ws, found.pane);
+      return;
+    }
+    if (action === "explain") {
+      showToast(
+        `Group ${route.groupId} is running, but its orchestrator pane is not open in this window.`
+      );
+      return;
+    }
     await restoreRecordedSession(route.groupId, route.role, s.id);
     return;
   }

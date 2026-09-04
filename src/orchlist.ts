@@ -57,6 +57,29 @@ export interface RecordedOrchestration {
  *  `damaged` repairs the group record. */
 export type OrchRowState = "resumable" | "live" | "unidentified" | "lost" | "damaged";
 
+/** What a row can DO besides resume. `null` is the honest majority: a row
+ *  that cannot be resumed usually cannot be acted on at all — it can only
+ *  say why (see `detailFor`). */
+export type OrchRowAction = "focus" | null;
+
+/** The action beside a row's copy.
+ *
+ *  Only `live` gets one, and it is `focus` — #2365: the `live` detail has
+ *  always read "Running now — focus its orchestrator pane instead of resuming
+ *  it", and until now that was a sentence with nothing behind it. The human
+ *  was told to focus a pane the app gave them no way to reach — and if that
+ *  pane was behind a maximized sibling or in the dock, no way at all.
+ *
+ *  Every other state is deliberately actionless. `damaged` has no readable
+ *  record to act on, `unidentified` wants waiting, `lost` wants a fresh
+ *  orchestrator, and `resumable` already has the Resume button — giving any
+ *  of them a Focus would be offering to reveal a pane that does not exist.
+ *  Exported so the rule is pinned once, here, rather than re-derived in the
+ *  renderer. */
+export function orchAction(state: OrchRowState): OrchRowAction {
+  return state === "live" ? "focus" : null;
+}
+
 /** One rendered row. `sessionId` is non-null exactly when `canResume` is true,
  *  so the caller cannot build a Resume button with nothing to resume. */
 export interface OrchRow {
@@ -76,6 +99,9 @@ export interface OrchRow {
   title: string;
   sessionId: string | null;
   state: OrchRowState;
+  /** The action the renderer draws beside the copy, or `null` for none.
+   *  Derived from `state` by `orchAction`, never by the renderer (#2365). */
+  action: OrchRowAction;
   /** The one-line explanation under the title. Always present: a row with no
    *  button must still say why. */
   detail: string;
@@ -185,6 +211,7 @@ export function orchRows(
         title: r.repo ? repoName(r.repo) : r.group_id,
         sessionId: r.session_id,
         state,
+        action: orchAction(state),
         detail: detailFor(r, state),
         // The ONLY place a button is authorized, and it re-derives every
         // condition rather than trusting `resumable` alone: the backend

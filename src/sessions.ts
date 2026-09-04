@@ -159,7 +159,14 @@ export class SessionBrowser {
      *  the note count on each row, and the way into that session's notes.
      *  Optional so a caller that only wants the session list (and the tests)
      *  need not supply one; without it a row is exactly the pre-#2116 row. */
-    private notes?: SessionNotesHost
+    private notes?: SessionNotesHost,
+    /** Reveal a live group's orchestrator pane (#2365). The `live` row's copy
+     *  has always told the human to focus that pane instead of resuming it;
+     *  this is the dep that makes the sentence actionable. Optional for the
+     *  same reason the two above it are — a caller that only wants the session
+     *  list, and the tests, need not supply one, and the button is not
+     *  rendered without it rather than being rendered dead. */
+    private focusGroup?: (groupId: string) => void
   ) {
     const head = document.createElement("div");
     head.className = "sessions-head";
@@ -428,6 +435,29 @@ export class SessionBrowser {
       );
     } else {
       item.title = row.groupId;
+    }
+
+    // #2365: the one row state that can act without resuming. A CHILD button
+    // rather than the row itself — a `live` row is a div (`canResume` is
+    // false for it by construction, see `stateOf`), and the resumable row
+    // that IS a button must never gain a nested one. `orchlist.ts` decides
+    // which rows get this; the dep decides whether it can be offered at all,
+    // so a host that cannot reveal a pane shows no button rather than a dead
+    // one — the same rule `canResume` follows for Resume.
+    if (row.action === "focus" && this.focusGroup) {
+      const focus = document.createElement("button");
+      focus.className = "orch-focus bar-btn";
+      focus.textContent = "Focus";
+      focus.title = `Show group ${row.groupId}'s orchestrator pane`;
+      const groupId = row.groupId;
+      focus.addEventListener("click", (e) => {
+        // The row itself is not clickable in this state, but stop anyway:
+        // `stateOf` is free to change which states can resume, and a Focus
+        // that also fired a resume would be the worst of both.
+        e.stopPropagation();
+        this.focusGroup?.(groupId);
+      });
+      item.appendChild(focus);
     }
     return item;
   }
