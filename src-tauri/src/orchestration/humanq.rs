@@ -492,6 +492,7 @@ pub enum DismissSource {
     /// The human clicking Dismiss in the app's own webview, via the
     /// `orch_question_dismiss` Tauri command.
     Webview,
+    Agent,
 }
 
 impl DismissSource {
@@ -509,6 +510,7 @@ impl DismissSource {
     pub fn tag(&self) -> String {
         match self {
             DismissSource::Webview => "webview".to_string(),
+            DismissSource::Agent => "agent".to_string(),
         }
     }
 }
