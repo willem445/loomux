@@ -202,10 +202,13 @@ visible"*, never *"nothing there"* — and `pi_repo_mcp_exposure`'s own tests
 pin both directions so the distinction cannot quietly collapse.
 
 **Upstream.** The clean fix is the adapter honouring `--mcp-config` in
-exclusive mode, which would give loomux the same posture claude has. An issue
-is filed against `nicobailon/pi-mcp-adapter`; when it lands, this section
-becomes `PI_MCP_CONFIG_MODE=exclusive` in `cli_extra_env` and the residual
-above goes away.
+exclusive mode, which would give loomux the same posture claude has — filed as
+[nicobailon/pi-mcp-adapter#496](https://github.com/nicobailon/pi-mcp-adapter/issues/496).
+If it lands, this section becomes `PI_MCP_CONFIG_MODE=exclusive` in
+`cli_extra_env`, the per-agent server name stops being load-bearing (it stays,
+for the direct-tool cache), and the residual above goes away. Until then the
+residual is real, and `pi_repo_mcp_exposure` is what makes it visible rather
+than merely admitted.
 
 ## Containment: the ceiling is `NoEdits`, and a planner cannot run on pi
 
