@@ -28941,11 +28941,13 @@ impl OrchRegistry {
         }));
         // ALWAYS delivered — see this method's doc for why this differs from a
         // note-less resolve. A delivery failure never fails the dismissal.
-        let _ = self.deliver_to_orchestrator(
-            group,
-            &needsyou::dismiss_notice(&item.id, item.task.as_deref(), item.resolution.as_deref()),
-            "human",
-        );
+        if let Some(r) = item.resolution.as_deref() {
+            let _ = self.deliver_to_orchestrator(
+                group,
+                &needsyou::dismiss_notice(&item.id, item.task.as_deref(), Some(r)),
+                "human",
+            );
+        }
         Ok(item)
     }
 
