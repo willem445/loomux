@@ -1001,12 +1001,6 @@ pub fn held_notice(pr: u64, reason: HeldReason, f: &HeldFacts) -> String {
         // never reported would be a false claim about a worker that did. The
         // sentence states what the drive observed; `decide_fix_receipts`
         // carries the residual and why a resume clears it on the first tick.
-        HeldReason::FixStalled if f.held_state == Some(DriveState::CiWait) => format!(
-            "HELD — the worker pushed{at} and the driver has heard nothing from it since, \
-             for a whole fix timeout; the reviewer lanes are held until it reports done, \
-             so the PR body stops moving under them.{session} drive_review resumes the \
-             drive and briefs on the next green, cancel_review_drive stops it."
-        ),
         HeldReason::FixStalled => format!(
             "HELD — the worker neither pushed nor reported inside the fix timeout{at}.\
              {session} drive_review resumes the drive, cancel_review_drive stops it."
