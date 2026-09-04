@@ -6597,17 +6597,25 @@ mod tests {
         let all_good = vec![lane_fact("rev-std", Some(Verdict::Pass), "head-a", "d1")];
         assert_eq!(first_stale_lane(&all_good, "head-a", Some("d1")), 1);
         assert_eq!(first_stale_lane(&[], "head-a", Some("d1")), 0);
+    }
 
-        // **#2168 E2's delegation never reaches across a head, and this is the
-        // row that pins it here rather than in the gate.** The assertion at the
-        // top of this test is what caught the first cut, where
-        // `pass_covers_body`'s direct arm compared digests without asking
-        // whether the pass was bound to the head that would merge: rev-final's
-        // `pass` at `head-OLD` carried digest `d1`, so it read as settling
-        // `head-a` and arc 8 walked straight past the lane #1871 B1 exists to
-        // re-open. The gate's own loop filters that case out one line earlier,
-        // so only the driver could reach it — a predicate whose safety depends
-        // on where it is called.
+    #[test]
+    fn a_body_verification_never_stands_in_for_a_pass_at_another_head() {
+        // **#2168 E2's delegation is bounded by the head, and this is the row
+        // that pins it on the DRIVER side.** Its own test rather than a row
+        // appended to `the_re_entry_point_is_the_first_lane_whose_pass_does_not_stand`,
+        // because that test's first assertion covers the same predicate: a
+        // neuter reddens it there and panics before ever reaching this, so the
+        // red would evidence the older assertion and say nothing about this one
+        // (CLAUDE.md — a red evidences only the assertion it reached and moved).
+        //
+        // What it is for: `pass_covers_body`'s direct arm shipped comparing
+        // digests without asking whether the pass was bound to the head that
+        // would merge. The gate's own loop filters that case out one line
+        // earlier, so only the driver could reach it — and there a `pass`
+        // recorded against code the worker had already fixed read as settling
+        // the revision in front of the drive, walking straight past the lane
+        // #1871 B1 exists to re-open.
         let across_heads = vec![
             verified_lane_fact("rev-std", "head-a", "d2"),
             lane_fact("rev-final", Some(Verdict::Pass), "head-OLD", "d1"),
