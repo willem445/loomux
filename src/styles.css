@@ -1458,19 +1458,30 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 2px solid var(--surface-1); background-clip: padding-box;
 }
 
+/* #2116 slice E2: a row is a WRAPPER holding two sibling buttons — the restore
+   action and the notes chip. The hover/press feedback lives here rather than on
+   .session-item so that hovering either half lifts the whole row exactly once;
+   leaving the transform on the item as well would double it when the item
+   itself is under the cursor, and leaving it there alone would let the chip
+   slide out from under the row it belongs to. */
+.session-row {
+  display: flex; align-items: stretch; gap: 2px; margin-bottom: 3px;
+  transition: transform 0.14s var(--ease);
+}
+.session-row:hover { transform: translateX(2px); }
+.session-row:active { transform: translateX(2px) scale(0.995); }
+
 .session-item {
-  display: block; width: 100%; text-align: left;
+  flex: 1; min-width: 0;
+  display: block; text-align: left;
   background: none; border: 1px solid transparent; border-radius: 9px;
-  padding: 8px 10px; margin-bottom: 3px; cursor: pointer;
+  padding: 8px 10px; cursor: pointer;
   color: var(--ink); font: inherit;
-  transition: background 0.14s var(--ease), border-color 0.14s var(--ease),
-              transform 0.14s var(--ease);
+  transition: background 0.14s var(--ease), border-color 0.14s var(--ease);
 }
-.session-item:hover {
+.session-row:hover .session-item {
   background: var(--surface-2); border-color: var(--line);
-  transform: translateX(2px);
 }
-.session-item:active { transform: translateX(2px) scale(0.995); }
 
 .session-top { display: flex; align-items: center; gap: 8px; }
 .session-badge {
@@ -1515,6 +1526,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   margin-top: 3px; padding-left: 2px; font-size: 11.5px; color: var(--ink);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* #2116: the name the human gave the pane, when it is not the title the row
+   already shows. It reads as the human's own label rather than as more
+   transcript metadata — same weight as the title, one step in and quieter, and
+   directly under it so the two read as one identity. */
+.session-pane-name {
+  margin-top: 3px; padding-left: 2px; font-size: 11.5px; color: var(--ink-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* #1: repo/branch identity — visually quieter than the goal line since it's
    secondary context, matching .session-meta's muted tone. */
 .session-identity {
@@ -1530,6 +1549,28 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   text-overflow: ellipsis; direction: rtl; text-align: left;
 }
 .session-meta .when { flex: none; }
+/* #2116 slice E2: the notes chip — the second action on a session row, and the
+   sessions-tab half of the same overlay the pane header opens. Quiet by
+   default (this is a list of sessions, not a list of notes) and inked once the
+   session is KNOWN to carry some, which is exactly what .has-notes means:
+   notesChipLabel withholds it for an unread file rather than reading a 0 off
+   one. Same restraint the pane header's own Notes button shows — the count is
+   information, not an attention signal, so it gets no accent colour. */
+.session-notes {
+  flex: none; display: flex; align-items: center; gap: 3px;
+  padding: 0 8px;
+  background: none; border: 1px solid transparent; border-radius: 9px;
+  color: var(--ink-dim); font: inherit;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.3px;
+  cursor: pointer;
+  transition: background 0.14s var(--ease), border-color 0.14s var(--ease),
+              color 0.14s var(--ease);
+}
+.session-notes:hover { background: var(--surface-2); border-color: var(--line); }
+.session-notes:hover, .session-notes:focus-visible { color: var(--ink); }
+.session-notes.has-notes { color: var(--ink); }
+.session-notes svg { display: block; }
+
 .sessions-empty { padding: 22px 16px; color: var(--ink-dim); font-size: 12px; line-height: 1.5; }
 
 /* #1592: the "show hidden agent sessions" toggle, under the list rather than

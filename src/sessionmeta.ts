@@ -105,6 +105,61 @@ export function paneNameLine(
   return name;
 }
 
+/** What the notes chip on a session row says (#2116 slice E2).
+ *
+ *  `SessionLogStore.notesCount` returns **0 for a session with no notes and 0
+ *  for a file nobody has read yet** — its own doc says so, and says a caller
+ *  must not collapse the two. This is where that separation is made for the
+ *  chip, because the two situations are the whole reason the chip needs a rule
+ *  rather than a template string:
+ *
+ *   - **unread** (`loaded` false — the read has not landed, or it rejected):
+ *     no number at all. A `0` here would be the chip asserting that a session
+ *     with notes on disk has none, which is the same silent-loss shape the
+ *     overlay's own "could not read the notes file" line exists to avoid;
+ *   - **read, and none**: still no number — a `0` on every row is a mark that
+ *     means nothing — but the tooltip says so plainly and names the action, so
+ *     the chip is an affordance rather than a mystery glyph;
+ *   - **read, and some**: the count, and a tooltip that agrees with it.
+ *
+ *  The chip is rendered in every one of those states. A row whose notes cannot
+ *  be counted still has to be a way IN to that session's notes: the overlay
+ *  reads the file itself and says what it found. */
+export interface NotesChipLabel {
+  /** The count, or `""` when there is no honest number to state. */
+  text: string;
+  /** Tooltip. Always names what the chip is for — never empty. */
+  title: string;
+  /** This session is KNOWN to carry notes. A styling hook, and false for an
+   *  unread store, where "known" is precisely what it is not. */
+  hasNotes: boolean;
+}
+
+export function notesChipLabel(count: number, loaded: boolean): NotesChipLabel {
+  if (!loaded) {
+    return {
+      text: "",
+      title: "Notes about this session — the notes file has not been read.",
+      hasNotes: false,
+    };
+  }
+  if (count <= 0) {
+    return {
+      text: "",
+      title: "No notes about this session yet — click to write one.",
+      hasNotes: false,
+    };
+  }
+  return {
+    text: String(count),
+    title:
+      count === 1
+        ? "1 note about this session"
+        : `${count} notes about this session`,
+    hasNotes: true,
+  };
+}
+
 /** The PR chip label, or null when no PR is known yet. A bare number (how
  *  the board stores most PR refs) renders as "#123"; anything already
  *  prefixed or otherwise shaped is shown verbatim. */

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   taskSummary,
   repoBranchLine,
+  notesChipLabel,
   paneNameLine,
   prLabel,
   restoredPaneName,
@@ -195,4 +196,68 @@ test("a fourth source names itself, on the badge and on the restored pane (#2126
   const labels = sources.map(sessionBadgeLabel);
   assert.deepEqual(labels, ["CLAUDE", "COPILOT", "OPENCODE", "PI"]);
   assert.equal(new Set(labels).size, sources.length, "two sources share one badge label");
+});
+
+// ---- notesChipLabel (#2116 slice E2) ----
+
+test("an unread notes file states no count at all", () => {
+  // THE ONE THIS FUNCTION EXISTS FOR. `SessionLogStore.notesCount` answers 0
+  // for "this session has no notes" AND for "nobody has read the file yet",
+  // and its own doc forbids collapsing the two. A chip that printed the count
+  // unconditionally would tell a human a session they wrote three notes on has
+  // none — the row asserting an absence it cannot know.
+  const chip = notesChipLabel(0, false);
+  assert.equal(chip.text, "");
+  assert.equal(chip.hasNotes, false);
+  // And it must not say the absence in WORDS either, which is the same claim
+  // one layer over. Pinned as a `doesNotMatch` rather than by quoting the
+  // sentence, so a rewording cannot quietly reintroduce it.
+  assert.doesNotMatch(chip.title, /\bno notes\b/i);
+  // Positive control for the two assertions above, which are both about what
+  // is ABSENT: the chip is still rendered, and its tooltip still says what it
+  // is for. An empty title would pass every check above and ship a bare glyph.
+  assert.match(chip.title, /notes about this session/i);
+});
+
+test("an unread store states no count even when a stale count is passed", () => {
+  // The caller reads the count and `loaded` separately, so nothing stops a
+  // non-zero count arriving with `loaded` false. `loaded` decides, not the
+  // number: a count off an unread store is not a number about this session.
+  const chip = notesChipLabel(7, false);
+  assert.equal(chip.text, "");
+  assert.equal(chip.hasNotes, false);
+});
+
+test("a read store with no notes shows no number, and says so in the tooltip", () => {
+  // A "0" on every row is a mark that means nothing. The tooltip is where the
+  // absence is stated — and it names the action, so the chip is an affordance
+  // and not a mystery glyph.
+  const chip = notesChipLabel(0, true);
+  assert.equal(chip.text, "");
+  assert.equal(chip.hasNotes, false);
+  assert.match(chip.title, /no notes/i);
+  assert.match(chip.title, /write one/i);
+});
+
+test("a counted session shows the count, and the tooltip agrees with it", () => {
+  const one = notesChipLabel(1, true);
+  assert.equal(one.text, "1");
+  assert.equal(one.hasNotes, true);
+  assert.equal(one.title, "1 note about this session");
+
+  const many = notesChipLabel(4, true);
+  assert.equal(many.text, "4");
+  assert.equal(many.hasNotes, true);
+  assert.equal(many.title, "4 notes about this session");
+});
+
+test("the singular is used for exactly one, and the plural for everything else", () => {
+  // Pinned as a property over a range rather than on the two literals above,
+  // so a `count < 2` or `count !== 1` mix-up on the boundary reddens here
+  // rather than reading fine on the two cases someone happened to write down.
+  for (const n of [1, 2, 3, 11, 500]) {
+    const { title } = notesChipLabel(n, true);
+    assert.equal(/\bnotes\b/.test(title), n !== 1, `plural for ${n}`);
+    assert.equal(/\b1 note\b/.test(title), n === 1, `singular for ${n}`);
+  }
 });

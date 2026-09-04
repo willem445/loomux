@@ -2444,6 +2444,28 @@ const sessions = new SessionBrowser(
     void restoreRecordedSession(groupId, "orchestrator", sessionId).finally(() => {
       void sessions.refresh();
     });
+  },
+  // #2116 slice E2: the sessions log, as a READ port plus the one gesture.
+  // Deliberately not the store itself — `sessionLog` is the window's single
+  // handle on a multi-tenant file, and a second thing able to publish it is
+  // exactly what its read-before-write rule exists to prevent. The browser
+  // reads four things and subscribes; the overlay stays here, where it already
+  // is for the pane header.
+  {
+    get loaded() {
+      return sessionLog.loaded;
+    },
+    ensureLoaded: () => sessionLog.ensureLoaded(),
+    get: (id) => sessionLog.get(id),
+    notesCount: (id) => sessionLog.notesCount(id),
+    onChange: (cb) => sessionLog.onChange(cb),
+    // A recorded session, live or dead. The target is a constant getter here
+    // rather than a live one: a SESSION id cannot change under the overlay the
+    // way a not-yet-identified pane's can (the case `onOpenNotes` above takes a
+    // live getter for) — this row named an id, and that id is what the notes
+    // belong to for as long as the dialog is open.
+    openNotes: (session, title) =>
+      openNotes({ target: () => ({ sessionId: session.id }), title, store: sessionLog }),
   }
 );
 

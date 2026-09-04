@@ -8,9 +8,18 @@
 import { listSessions, type SessionInfo } from "./pty";
 import type { RecordedOrchestration, SessionRoleInfo } from "./orchestration";
 import { orchRows, type OrchRow } from "./orchlist";
-import { taskSummary, repoBranchLine, prLabel, sessionBadgeLabel } from "./sessionmeta";
+import {
+  notesChipLabel,
+  paneNameLine,
+  prLabel,
+  repoBranchLine,
+  sessionBadgeLabel,
+  taskSummary,
+} from "./sessionmeta";
+import { icon } from "./icons";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
+import type { SessionRecord } from "./sessionlog";
 import {
   DEFAULT_SESSION_MODE,
   decodeSessionMode,
@@ -24,6 +33,39 @@ import {
  *  right home for it for the reason `agents.ts` gives: it is a per-viewer
  *  reading preference, not durable state anything else reads. */
 const MODE_KEY = "loomux.sessions.mode";
+
+/** The notes chip's glyph — the same `file-text` the pane header's Notes button
+ *  carries, so the two entry points into one overlay look like one thing. */
+const NOTES_ICON = icon("file-text", 12);
+
+/** What the session rows need from orrerix's own sessions log (#2116 slice E2):
+ *  four reads, a subscription, and the one gesture — never the store itself.
+ *
+ *  `SessionLogStore` owns a single multi-tenant file whose whole safety rule is
+ *  that a write is published only from a handle that has read it, so a second
+ *  thing able to write it is the shape that rule exists to prevent. This class
+ *  reads; `main.ts` keeps the one writer and supplies `openNotes`, which is
+ *  where the overlay already lives (`notesdialog.ts`). `SessionLogStore`
+ *  satisfies the read half structurally, so the adapter is five lines and no
+ *  new state. */
+export interface SessionNotesHost {
+  /** Whether the log has been read back at least once. What separates "this
+   *  session has no notes" from "nobody has read the file" — `notesChipLabel`
+   *  is where that separation is spent. */
+  readonly loaded: boolean;
+  /** Read the log if it has not been read. Never throws; resolves `false` when
+   *  the read failed, and a later call retries. */
+  ensureLoaded(): Promise<boolean>;
+  /** This session's sidecar record, or `null`. */
+  get(sessionId: string): SessionRecord | null;
+  notesCount(sessionId: string): number;
+  /** Fires on every change the store makes. Returns an unsubscribe. */
+  onChange(cb: () => void): () => void;
+  /** Open the notes overlay against a recorded session — live or dead alike: a
+   *  note is the human's record ABOUT a session, and whether it can still be
+   *  resumed is the harness's concern, not the note's. Resolves on close. */
+  openNotes(session: SessionInfo, title: string): Promise<void>;
+}
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -107,7 +149,12 @@ export class SessionBrowser {
     /** Resume a recorded orchestration: the whole group comes back, exactly
      *  as clicking its ORCH session row does. Only ever called with a row
      *  `orchlist.ts` marked resumable. */
-    private onResumeOrchestration?: (groupId: string, sessionId: string) => void
+    private onResumeOrchestration?: (groupId: string, sessionId: string) => void,
+    /** Orrerix's own sessions log (#2116 slice E2) — the recorded pane name and
+     *  the note count on each row, and the way into that session's notes.
+     *  Optional so a caller that only wants the session list (and the tests)
+     *  need not supply one; without it a row is exactly the pre-#2116 row. */
+    private notes?: SessionNotesHost
   ) {
     const head = document.createElement("div");
     head.className = "sessions-head";
@@ -158,6 +205,21 @@ export class SessionBrowser {
     // box): that slice augmented the append this slice replaced, and the mode
     // control has to stay mounted wherever the column is built.
     this.el.append(head, this.searchEl, this.modeEl, this.orchEl, this.listEl, this.toggleEl);
+
+    // A note added or deleted anywhere — this list, a pane's own header — moves
+    // the chip on every row that shows that session, and a rename moves the
+    // pane-name line. Re-render off the store's own event rather than polling.
+    //
+    // SKIPPED WHILE THE TAB IS NOT THE VISIBLE ONE. `this.el` is the panel body
+    // `leftpanel.ts` hides, and its `onShow` calls `refresh()`, which renders —
+    // so a change that lands while the human is looking at the Agents tab (or
+    // has the panel shut) is picked up the moment they come back, and a pane
+    // rename does not rebuild a list nobody is reading. Never a width change
+    // either way: this replaces the children of a list inside the fixed-width
+    // `.sessions-inner` column, so it reaches no PTY resize (constraint 1).
+    this.notes?.onChange(() => {
+      if (!this.el.hidden) this.render();
+    });
   }
 
   /** Put the cursor in the filter box. The panel calls this when the Sessions
@@ -257,6 +319,13 @@ export class SessionBrowser {
         // answer must not take the session list down with it. An empty
         // result renders the section's own empty line, never a stale list.
         this.loadOrchestrations?.().catch(() => []) ?? Promise.resolve([]),
+        // The sessions log (#2116), so the first render already knows whether
+        // it can state a count. Without this the store is read lazily — the
+        // first thing to open the overlay — and every chip would sit in its
+        // "the notes file has not been read" state until then. Best-effort in
+        // the same sense as the two above: a rejected read leaves `loaded`
+        // false, which the chip states honestly rather than as a zero.
+        this.notes?.ensureLoaded().catch(() => false) ?? Promise.resolve(false),
       ]);
       this.roles = new Map(roles.map((r) => [r.session_id, r]));
       this.orchestrations = orchestrations;
@@ -420,6 +489,16 @@ export class SessionBrowser {
     }
 
     for (const s of shown) {
+      // A ROW IS A WRAPPER, NOT A BUTTON (#2116 slice E2). The restore action
+      // and the notes chip are two independent actions on one row, so they are
+      // two sibling `<button>`s inside a plain div — never a button nested in a
+      // button, which is invalid HTML and leaves a keyboard user with a control
+      // they cannot reach separately. The row's hover/press feedback moved onto
+      // this wrapper for the same reason: hovering either half now lifts the
+      // whole row once, rather than the item alone or twice over.
+      const row = document.createElement("div");
+      row.className = "session-row";
+
       const item = document.createElement("button");
       item.className = "session-item";
       item.title = `${s.resume_command}\nin ${s.cwd || "(unknown cwd)"}`;
@@ -460,6 +539,18 @@ export class SessionBrowser {
         top.appendChild(prChip);
       }
 
+      // The name the human gave the pane (#2116). `paneNameLine` decides when
+      // one is worth a second line — the fallback IS the title the row already
+      // shows, never a placeholder — so a `null` here renders nothing at all.
+      const record = this.notes?.get(s.id) ?? null;
+      const paneName = paneNameLine(record?.pane_name, s.title, s.source);
+      const paneNameEl = paneName ? document.createElement("div") : null;
+      if (paneNameEl) {
+        paneNameEl.className = "session-pane-name";
+        paneNameEl.textContent = paneName!;
+        paneNameEl.title = `You called this pane “${paneName!}”`;
+      }
+
       // Task/goal line (#1): the brief this session's agent was spawned or
       // resumed with — hidden entirely rather than shown empty for a legacy
       // session or the orchestrator (which has no assigned task).
@@ -492,11 +583,60 @@ export class SessionBrowser {
       meta.append(cwd, when);
 
       item.append(top);
+      if (paneNameEl) item.append(paneNameEl);
       if (goalEl) item.append(goalEl);
       if (identityEl) item.append(identityEl);
       item.append(meta);
       item.addEventListener("click", () => this.onRestore(s));
-      this.listEl.appendChild(item);
+      row.appendChild(item);
+      // The overlay is titled with what the human called the pane when there is
+      // one worth showing, and with the transcript title otherwise — the same
+      // fallback the line itself uses, so the row and the dialog cannot
+      // disagree about what this session is called.
+      if (this.notes) row.appendChild(this.notesChipEl(s, paneName ?? s.title));
+      this.listEl.appendChild(row);
     }
+  }
+
+  /** The notes chip on a session row (#2116 slice E2): the count, and the way
+   *  into that session's notes.
+   *
+   *  RENDERED ON EVERY ROW, including a session with no notes and one whose
+   *  count cannot be read. The acceptance criterion asks for "a way to open
+   *  that session's notes", and a chip that appeared only once notes existed
+   *  would be a way to read them and no way to write the first one.
+   *  `notesChipLabel` owns what it SAYS in each of those three states. */
+  private notesChipEl(session: SessionInfo, dialogTitle: string): HTMLButtonElement {
+    const notes = this.notes!;
+    const label = notesChipLabel(notes.notesCount(session.id), notes.loaded);
+    const chip = document.createElement("button");
+    chip.className = "session-notes";
+    chip.type = "button";
+    chip.classList.toggle("has-notes", label.hasNotes);
+    // The glyph first, then the count: `innerHTML` REPLACES, so appending the
+    // count before it would silently drop the number.
+    chip.innerHTML = NOTES_ICON;
+    if (label.text) {
+      const count = document.createElement("span");
+      count.className = "session-notes-count";
+      count.textContent = label.text;
+      chip.appendChild(count);
+    }
+    chip.title = label.title;
+    // The glyph carries no text, so a screen reader would otherwise announce an
+    // unlabelled button on every row. Same sentence as the tooltip.
+    chip.setAttribute("aria-label", label.title);
+    chip.addEventListener("click", () => {
+      void notes.openNotes(session, dialogTitle).then(() => {
+        // Hand focus back to somewhere that survives a re-render. The row this
+        // chip lives on may not exist any more — adding a note fires the store
+        // event that rebuilds the list — so the search box is the panel's own
+        // home position, and it is where a keyboard user came from. Only while
+        // this tab is still the visible one: stealing focus out of a terminal
+        // the human went back to would be worse than losing it.
+        if (!this.el.hidden) this.searchEl.focus();
+      });
+    });
+    return chip;
   }
 }
