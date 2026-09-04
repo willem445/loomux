@@ -301,7 +301,7 @@ fn turn_summary(usage: Option<&Usage>, cost: Option<&Cost>, stop: &StopReason) -
     };
     let mut parts = vec![format!("-- {stop}")];
     if let Some(u) = usage {
-        parts.push(format!("{} tokens (call total)", u.call_cumulative.total()));
+        parts.push(format!("{} tokens (call total)", u.this_turn_main_loop.unwrap_or_default().total()));
     }
     if let Some(c) = cost {
         // "est." is not decoration: the vendor calls this figure a client-side
