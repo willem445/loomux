@@ -77,6 +77,27 @@ This repo bans local `cargo` builds and tests for agent workers (CLAUDE.md):
 push early, open a draft PR, and read CI. `npm run build`, `npm test` and
 `rustfmt --check --edition 2021 <file>` are the only local checks.
 
+## Before report(done)
+
+Before every `report("done")` — and again after EVERY push, including a
+body-only fix (the stale figure is usually collateral of the previous round's
+own edit, #2168):
+
+1. From the worktree at the PR head, run the receipt check and:
+   - (a) `node scripts/pr-body-check.cjs --pr <n>` (#2168 S1) — paste its
+     summary line into the agent layer; MISMATCH must be zero before you
+     report (CHECK rows are sentences to re-read; the script exits 0 always,
+     a report, not a gate);
+   - (b) no figure from recollection: every number in the body is pasted from
+     a command run in this turn, measured at base AND at head;
+   - (c) prefer a property over a count where one exists (#2105 r2);
+   - (d) for every claim the diff EDITS on a permanent surface, list its
+     twins — `node scripts/pr-body-check.cjs --pr <n> --list-claims` plus a
+     grep for the claim's distinctive noun across every root — and re-derive
+     every ordinal and enumeration at head;
+   - (e) a routed non-blocking finding that changes behaviour carries
+     red-before-green, or goes back as "defer to an issue" (#2104 r4).
+
 ## When to hand back
 
 `report("blocked", ...)` immediately, with what you tried and the exact error,

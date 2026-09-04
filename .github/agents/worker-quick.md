@@ -67,7 +67,25 @@ and costs the human a debugging session later.
 4. **Update the doc the change touches** — the `docs/` page for user-visible
    behaviour. If it needs a *new* design note, that is a sign the task was not
    quick: escalate.
-5. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 3, with the
+5. **Run the pre-report receipt check, then mark ready.** Before every
+   `report("done")` — and again after EVERY push, including a body-only fix
+   (the stale figure is usually collateral of the previous round's own edit,
+   #2168):
+   - (a) from the worktree at the PR head, run
+     `node scripts/pr-body-check.cjs --pr <n>` (#2168 S1) and paste its
+     summary line into the agent layer; MISMATCH must be zero before you
+     report (CHECK rows are sentences to re-read; the script exits 0 always,
+     a report, not a gate);
+   - (b) no figure from recollection: every number in the body is pasted from
+     a command run in this turn, measured at base AND at head;
+   - (c) prefer a property over a count where one exists (#2105 r2);
+   - (d) for every claim the diff EDITS on a permanent surface, list its
+     twins — `node scripts/pr-body-check.cjs --pr <n> --list-claims` plus a
+     grep for the claim's distinctive noun across every root — and re-derive
+     every ordinal and enumeration at head;
+   - (e) a routed non-blocking finding that changes behaviour carries
+     red-before-green, or goes back as "defer to an issue" (#2104 r4).
+6. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 3, with the
    description saying what changed and how it was validated, in the two-layer shape
    below. Then `report("done", …)` with the URL. **You never merge** — the human
    gates every merge.
@@ -113,7 +131,12 @@ has to decide — a deviation, a residual, an open question — stays above the 
 ## Reviews
 
 Findings come back naming a file, a line and a failure scenario — that is exactly
-your kind of work. Fix each, push to the same branch, report ready for re-review. If
+your kind of work. Fix each, push to the same branch, report ready for re-review. After
+EVERY push — a code fix or a body-only fix alike — re-run step 5's receipt check and
+re-measure every figure the body carries at the new base and head:
+`node scripts/pr-body-check.cjs --pr <n>` from the worktree at the PR head, its
+summary line pasted into the agent layer. The stale figure is usually collateral of
+the previous round's own fix, not of the original draft (#2168). If
 a finding turns out to need a design call, escalate it rather than inventing one. And
 remember that pushing to an approved PR makes every reviewer's pass **stale**: the
 merge will be refused until they re-review, which is the system working.
