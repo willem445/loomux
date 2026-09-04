@@ -947,9 +947,7 @@ pub fn default_model(cli: &str, role: Role) -> &'static str {
     // silently override a human who had already set `defaultModel` in their
     // own pi settings. A block that wants a specific model pins its own
     // `model:`; the launcher offers whatever `pi --list-models` reports.
-    if cli == "pi" {
-        return "";
-    }
+
     match role {
         // #1161: the manager joins the strong tier. Its output IS a
         // conversation with the human — eliciting requirements, spotting the
