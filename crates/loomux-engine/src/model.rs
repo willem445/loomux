@@ -333,7 +333,7 @@ impl Containment {
 /// `join(", ")` in error messages). The *reasons* a CLI is or isn't in it —
 /// and what it can do once it is — live in [`CLI_CAPS`], pinned against this
 /// list by `supported_clis_match_the_capability_table`.
-pub const SUPPORTED_CLIS: [&str; 5] = ["claude", "copilot", "gemini", "opencode", "pi"];
+pub const SUPPORTED_CLIS: [&str; 4] = ["claude", "copilot", "gemini", "opencode"];
 
 /// A per-CLI **ready marker** (#1591) — a shape the CLI's own output takes
 /// once it is genuinely able to accept typed input, for a CLI whose painted
