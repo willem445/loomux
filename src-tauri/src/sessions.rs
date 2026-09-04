@@ -1080,11 +1080,7 @@ fn parse_candidate(c: &Candidate) -> Option<Parsed> {
         // command that works rather than one that names a session pi has never
         // heard of. A row with NEITHER is dropped, like a copilot directory
         // whose `workspace.yaml` carries no `id`.
-        let id = match (head.id.is_empty(), c.id.clone()) {
-            (false, _) => head.id,
-            (true, Some(from_name)) => from_name,
-            (true, None) => return None,
-        };
+        let id = c.id.clone()?;
         return Some(Parsed { id, title: head.title, cwd: head.cwd, orch_role, orch_gid });
     }
     let s = read_copilot_session(c.path.parent()?)?;
