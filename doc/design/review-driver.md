@@ -1151,7 +1151,7 @@ S3 added two more, described after them:
   live digest still inherits — "we could not check" is not drift.
   `lane_stall_anchor` is that choice,
   made in one place, and `a_dead_panes_replacement_inherits_the_stall_anchor_and_a_new_round_does_not`
-  pins all four of its cases.
+  pins all six of its cases.
 - **`briefed_head` and `briefed_digest`** (per lane) — the revision that lane
   was last *briefed* at, as **one key**. It is the same `(head, digest)` key a
   verdict binds to, which is what arc 4 already names: "the last required lane
