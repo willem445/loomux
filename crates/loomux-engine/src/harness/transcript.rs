@@ -245,7 +245,7 @@ fn preview_input(input: &serde_json::Value) -> String {
     };
     // One line, always: a newline inside a preview would break the "one
     // collapsed line each" property that keeps a busy pane readable.
-    let raw = raw.replace(['\n', '\r'], " ");
+
     let (cut, truncated) = super::truncate_on_char_boundary(&raw, TOOL_PREVIEW_BYTES);
     if truncated {
         format!("{cut}…")
