@@ -1289,6 +1289,17 @@ list since:
   revision cannot be pinned grants nothing. Only a **live** entry grants, for the
   same reason §7 says only a live drive owns a pane: a held or terminal entry's
   old brief is not a standing instruction.
+  **The grant and the sentence announcing it are one decision** (#2308 review 3).
+  The verification paragraph is rendered from the `verify` the step carried and
+  from nothing else, above the template selection, and interpolated into
+  whichever template the lane's history picks — because `rd_open_lane` renders
+  the brief BEFORE `open_lane` writes this field, so the record can never be
+  what decides what the brief says about it. Gating the paragraph on the lane
+  record instead left the ordinary path silent: a PR reviewed undriven and then
+  handed to `drive_review` after a body edit has no `at_head` on any lane, so it
+  rendered the first-round template and was granted anyway. What the sentence
+  asserts is a fact about the VERDICTS — every required lane passed this head —
+  and a lane record's `at_head` is what this drive last observed, which can lag.
 - **`fix_handback_ms`** (per entry) — when the drive last entered `fix-wait`.
   The `fix-stalled` anchor **in `fix-wait`**. **Named for the one thing it
   anchors, not for the state change that writes it**, and it stays that way now
