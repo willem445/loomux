@@ -335,6 +335,12 @@ the pane) and a header survives every one of its rows being replaced. Both are
 keyed rather than rebuilt for the reason the filter chips are — a subtree the
 keyboard is standing in, rebuilt once a second, drops focus to `<body>`.
 
+**A rename re-labels the header on the gesture, not on the next tick.**
+`TabManager.renameTab` ends in `emit()`, so it reaches the `tabs.onChange`
+subscription `main.ts` already points at `refreshAgents()` — the same trigger a
+pane opening or closing uses. The 1 s ticker would have caught it anyway; this
+is why it does not have to.
+
 **No PTY resize, on any of it.** The panel is `#sessions`, which is in flow
 already; nothing here changes its width, and switching order or filter moves
 elements inside `.sessions-inner` only. Constraint 1 is untouched.

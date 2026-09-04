@@ -80,16 +80,10 @@ interface GroupEls {
   title: string;
 }
 
-/** The map key a group's header is held under. The tab id, or one shared
- *  sentinel for the headerless group — see `groupKey`. */
+/** The key a group's header element is held under: the tab's own id. Only a
+ *  group that HAS a tab gets an entry, so this map never needs a sentinel for
+ *  the headerless one — it has no header to hold. */
 type GroupKey = string;
-
-/** Rows whose reading named no tab share one group, and it renders no header.
- *  `""` is not a legal workspace id (`TabManager` mints `ws-<n>`), so it cannot
- *  collide with a real one. */
-const NO_TAB_KEY: GroupKey = "";
-
-const groupKey = (group: AgentGroup): GroupKey => group.tab?.id ?? NO_TAB_KEY;
 
 export class AgentsView {
   private filter: AgentFilter = "all";
@@ -99,7 +93,6 @@ export class AgentsView {
    *  storage is unavailable. */
   private order: AgentOrder = getAgentOrder();
   private chipsEl: HTMLElement;
-  private orderEl: HTMLElement;
   private listEl: HTMLElement;
   private emptyEl: HTMLElement;
   private rows = new Map<string, RowEls>();
@@ -142,10 +135,13 @@ export class AgentsView {
     // because it answers a different question: the chips say WHICH rows, this
     // says in what order their groups come. Built once — the choices are a
     // fixed pair, so unlike the chips nothing here ever appears or disappears.
-    this.orderEl = document.createElement("div");
-    this.orderEl.className = "agents-order";
-    this.orderEl.setAttribute("role", "group");
-    this.orderEl.setAttribute("aria-label", "Group order");
+    // A local, not a field: nothing after construction reads the container —
+    // `renderOrder` writes the pressed state on the BUTTONS, which are keyed in
+    // `orderBtns`.
+    const orderEl = document.createElement("div");
+    orderEl.className = "agents-order";
+    orderEl.setAttribute("role", "group");
+    orderEl.setAttribute("aria-label", "Group order");
     for (const choice of ORDER_CHOICES) {
       const btn = document.createElement("button");
       btn.className = "agents-order-btn";
@@ -162,9 +158,9 @@ export class AgentsView {
         this.refresh();
       });
       this.orderBtns.set(choice, btn);
-      this.orderEl.append(btn);
+      orderEl.append(btn);
     }
-    head.append(title, this.orderEl);
+    head.append(title, orderEl);
 
     this.chipsEl = document.createElement("div");
     this.chipsEl.className = "agents-chips";
@@ -327,11 +323,12 @@ export class AgentsView {
       prev = el;
     };
     for (const group of groups) {
-      const key = groupKey(group);
-      seenGroups.add(key);
       // The headerless group renders no header at all — there is nothing to
-      // call it, and an invented one ("Other") would be a claim.
+      // call it, and an invented one ("Other") would be a claim. Its rows are
+      // still placed, in the position `groupRows` gave the group.
       if (group.tab !== null) {
+        const key: GroupKey = group.tab.id;
+        seenGroups.add(key);
         const header = this.groups.get(key) ?? this.createGroup();
         this.groups.set(key, header);
         // A rename re-labels the header in place. Guarded, so the common case
