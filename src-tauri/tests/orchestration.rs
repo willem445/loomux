@@ -42566,6 +42566,21 @@ fn the_shim_takes_a_body_verification_pass_for_the_lanes_it_supersedes() {
          where the mark lives: {err}"
     );
 
+    // The line the orchestrator reads has to agree with the merge it just
+    // allowed. "Have them re-read and re-record" beside a gate that accepts
+    // them is a false instruction, and it is the instruction an orchestrator
+    // acts on — a whole re-record round for nothing, which is the cost this
+    // slice exists to remove.
+    let line = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(
+        line.contains("VERIFIED SINCE") && line.contains("rev-tests"),
+        "the gate line must say the drifted pass is accepted, and name it: {line}"
+    );
+    assert!(
+        !line.contains("BODY CHANGED SINCE PASS:"),
+        "…and must not ALSO print the send-them-back sentence: {line}"
+    );
+
     // **The mark is what carried it.** Same two verdicts, line 5 rewritten as
     // the bare digest — which is exactly what an ordinary re-review would have
     // written — and the merge is refused again, naming the lane that was never
@@ -42612,6 +42627,32 @@ fn a_body_edit_after_a_pass_merges_where_the_repo_never_declared_body_unchanged(
     // that a pass no longer covers the body.
     reg.set_pr_body_override(Some("a completely different body\n".into()));
     assert!(reg.gate_status_line(&gid, 7).unwrap().contains("BODY CHANGED SINCE PASS"));
+
+    // #2168 E2's delegation is scoped to gates that DECLARE the condition, and
+    // this is where that is pinned. A verification pass is planted by hand —
+    // the same bytes `verdict_file_text` writes — and the line still says the
+    // drifted pass is owed a re-read, because on a gate with no
+    // `body-unchanged` there is no clause to accept anything. Reporting one
+    // would be reporting a decision this gate never makes.
+    let vd = workflow::body_digest("a completely different body\n");
+    let vf = d.path().join(gid.as_str()).join("verdicts").join("pr-7").join("rev-security");
+    fs::write(
+        &vf,
+        format!("pass\n{HEAD}\n1\nrev-9\n{vd} {}\nverified\n", workflow::VERIFIED_BODY_MARK),
+    )
+    .unwrap();
+    let line = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(
+        line.contains("BODY CHANGED SINCE PASS:") && !line.contains("VERIFIED SINCE"),
+        "a gate that never declared body-unchanged accepts nothing, so nothing is reported \
+         as accepted: {line}"
+    );
+    // The positive control on the planted file: it really does parse as a
+    // verification pass, so the row above is the DECLARATION deciding and not
+    // a mark this build failed to read.
+    let planted =
+        workflow::parse_verdict_file(7, "rev-security", &fs::read_to_string(&vf).unwrap()).unwrap();
+    assert!(planted.verified_body && planted.body_digest == vd);
 }
 
 #[test]

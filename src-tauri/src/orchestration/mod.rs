@@ -44429,17 +44429,33 @@ impl OrchRegistry {
         // delegation is that they are not asked again. Read through the gate's
         // own definition rather than re-derived, and over the ROUTED reviewer
         // list, because a block the gate does not name discharges nothing.
-        let verified = head
-            .as_ref()
-            .ok()
-            .is_some_and(|h| mergeq::body_verified_by_required(&gate, &self.verdict_map(group, pr), h, body_digest));
+        //
+        // **Three cheap conditions before the read, each for its own reason.**
+        // No drifted pass: there is nothing to say a different sentence about.
+        // No declared `body-unchanged`: on such a repo the clause accepts
+        // nothing because it is never checked, so the sentence would be a claim
+        // about a condition this gate does not have — the drift is still
+        // REPORTED there, exactly as it always was. And the read itself walks
+        // the verdict directory a second time, after `body_drift` has already
+        // walked it, which is the cost #791 spent a slice removing from this
+        // very function.
+        let verified = !drift_passed.is_empty()
+            && gate.also.iter().any(|c| c == "body-unchanged")
+            && head.as_ref().ok().is_some_and(|h| {
+                mergeq::body_verified_by_required(
+                    &gate,
+                    &self.verdict_map(group, pr),
+                    h,
+                    body_digest,
+                )
+            });
         let mut body_note = String::new();
-        if !drift_passed.is_empty() && verified {
+        if verified {
             body_note.push_str(&format!(
                 " BODY CHANGED SINCE PASS, and VERIFIED SINCE: {} passed an earlier PR body, and \
-                 a required reviewer has since read the body as it stands and passed it. The \
-                 `body-unchanged` condition accepts that, so those reviewers are NOT owed a \
-                 re-read — the code they passed has not moved.",
+                 a required reviewer has since read the body as it stands and passed it. This \
+                 gate's `body-unchanged` condition accepts that, so those reviewers are NOT \
+                 owed a re-read — the code they passed has not moved.",
                 drift_passed.join(", ")
             ));
         } else if !drift_passed.is_empty() {
