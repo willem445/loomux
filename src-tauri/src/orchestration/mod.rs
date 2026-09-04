@@ -6481,8 +6481,10 @@ pub fn group_local_session_store(cli: &str) -> bool {
     matches!(cli, "opencode" | "pi")
 }
 
-/// Where a pi session recorded that it ran, read from a group's own pi store
-/// (#2126) — the pi half of [`session_cwd_in_store`].
+/// The file a pi session wrote itself to inside a group's own pi store
+/// (#2126) — the ONE derivation of "which file is this session", shared by the
+/// resume path ([`pi_session_cwd_in_dir`]) and the usage meter
+/// ([`crate::usage::pi_session_usage_in`]).
 ///
 /// `dir` is [`OrchRegistry::pi_sessions_dir`]: one flat directory holding
 /// `<timestamp>_<uuid>.jsonl` for every pane in the group, because pi writes
@@ -6501,16 +6503,17 @@ pub fn group_local_session_store(cli: &str) -> bool {
 /// exotic — pi defers creating the file to the first assistant response, so a
 /// pane that was spawned and never prompted has no file at all.
 ///
-/// A matched file with no readable header is `Ok(Some(""))`, the same
-/// "recorded, but recorded no working directory" answer `resolve_resume_cwd`
-/// already distinguishes from "not found".
+/// Takes a [`PathSegment`], not a `&str`, for the reason `claude_transcript_path`
+/// does (#925): the id is interpolated into a filename this process then matches
+/// against a directory it did not choose, so proof belongs at the signature
+/// rather than in each caller's memory. `src-tauri/tests/pathseg.rs` names this
+/// as the declared assembly point for a pi session file.
 #[doc(hidden)] // pub for integration tests
-pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<String>, String> {
-    // The same admission `find_session_cwd` applies before it will touch a
-    // store at all (#925): an id that is not a single path component cannot
-    // name a file here, so it is "not found" rather than a lookup.
-    let Ok(seg) = PathSegment::parse(session_id) else { return Ok(None) };
-    let suffix = format!("_{seg}.jsonl");
+pub fn pi_session_file_in_dir(
+    dir: &Path,
+    session: &PathSegment,
+) -> Result<Option<PathBuf>, String> {
+    let suffix = format!("_{session}.jsonl");
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -6522,45 +6525,62 @@ pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<Stri
         if !name.ends_with(&suffix) {
             continue;
         }
-        // The header is pi's FIRST line — `{"type":"session","version":3,
-        // "id":…,"cwd":…}` — and only a BOUNDED PREFIX of the file is read to
-        // get it, never the whole transcript.
-        //
-        // The bound is load-bearing rather than tidy, because of WHO calls
-        // this. `orch_list_recorded`'s `resumable` check asks it once per pi
-        // group on every session-browser refresh — the boot prefetch, each
-        // sidebar open, each resume settle — and a pi transcript is
-        // append-only and unbounded (one line per turn). Reading the whole
-        // file to answer a question the first line answers made the cost of a
-        // listing scale with how much WORK a group had done, which is the
-        // wrong axis entirely (rev-std round 1, finding 2). The earlier
-        // version's doc comment claimed this bound while `read_to_string`
-        // quietly took the lot.
-        //
-        // `read_line` on a `BufReader` stops at the first `\n`, so the tail is
-        // never touched; the extra cap is for the pathological case where a
-        // corrupt or mid-write file carries no newline at all, which would
-        // otherwise make "the first line" mean "everything".
-        //
-        // A file that exists but is empty (created and not yet written
-        // through) reads as "no recorded cwd", not as absent: the session id
-        // is real, its workspace is merely unknown.
-        let cwd = fs::File::open(entry.path())
-            .ok()
-            .and_then(|f| {
-                let mut line = String::new();
-                BufReader::new(f.take(PI_SESSION_HEADER_MAX_BYTES))
-                    .read_line(&mut line)
-                    .ok()
-                    .map(|_| line)
-            })
-            .and_then(|line| serde_json::from_str::<Value>(line.trim_end()).ok())
-            .filter(|v| v.get("type").and_then(Value::as_str) == Some("session"))
-            .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_default();
-        return Ok(Some(cwd));
+        return Ok(Some(entry.path()));
     }
     Ok(None)
+}
+
+/// Where a pi session recorded that it ran, read from a group's own pi store
+/// (#2126) — the pi half of [`session_cwd_in_store`].
+///
+/// A matched file with no readable header is `Ok(Some(""))`, the same
+/// "recorded, but recorded no working directory" answer `resolve_resume_cwd`
+/// already distinguishes from "not found"; an absent file or an absent
+/// directory is `Ok(None)`, per [`pi_session_file_in_dir`].
+#[doc(hidden)] // pub for integration tests
+pub fn pi_session_cwd_in_dir(dir: &Path, session_id: &str) -> Result<Option<String>, String> {
+    // The same admission `find_session_cwd` applies before it will touch a
+    // store at all (#925): an id that is not a single path component cannot
+    // name a file here, so it is "not found" rather than a lookup.
+    let Ok(seg) = PathSegment::parse(session_id) else { return Ok(None) };
+    let Some(path) = pi_session_file_in_dir(dir, &seg)? else { return Ok(None) };
+    // The header is pi's FIRST line — `{"type":"session","version":3,
+    // "id":…,"cwd":…}` — and only a BOUNDED PREFIX of the file is read to
+    // get it, never the whole transcript.
+    //
+    // The bound is load-bearing rather than tidy, because of WHO calls
+    // this. `orch_list_recorded`'s `resumable` check asks it once per pi
+    // group on every session-browser refresh — the boot prefetch, each
+    // sidebar open, each resume settle — and a pi transcript is
+    // append-only and unbounded (one line per turn). Reading the whole
+    // file to answer a question the first line answers made the cost of a
+    // listing scale with how much WORK a group had done, which is the
+    // wrong axis entirely (rev-std round 1, finding 2). The earlier
+    // version's doc comment claimed this bound while `read_to_string`
+    // quietly took the lot.
+    //
+    // `read_line` on a `BufReader` stops at the first `\n`, so the tail is
+    // never touched; the extra cap is for the pathological case where a
+    // corrupt or mid-write file carries no newline at all, which would
+    // otherwise make "the first line" mean "everything".
+    //
+    // A file that exists but is empty (created and not yet written
+    // through) reads as "no recorded cwd", not as absent: the session id
+    // is real, its workspace is merely unknown.
+    let cwd = fs::File::open(&path)
+        .ok()
+        .and_then(|f| {
+            let mut line = String::new();
+            BufReader::new(f.take(PI_SESSION_HEADER_MAX_BYTES))
+                .read_line(&mut line)
+                .ok()
+                .map(|_| line)
+        })
+        .and_then(|line| serde_json::from_str::<Value>(line.trim_end()).ok())
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("session"))
+        .and_then(|v| v.get("cwd").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    Ok(Some(cwd))
 }
 
 /// How much of a pi session file [`pi_session_cwd_in_dir`] will read looking
@@ -41125,9 +41145,13 @@ impl OrchRegistry {
                 // since the previous one — this call is on the app's hottest
                 // poll and used to re-parse every live agent's whole
                 // transcript once a second.
-                if let Some(u) =
-                    root.as_deref().and_then(|r| self.usage_cursors.session_usage(r, sid))
-                {
+                if let Some(u) = root.as_deref().and_then(|r| {
+                    self.usage_cursors.session_usage(
+                        crate::usage::TranscriptKind::Claude,
+                        r,
+                        sid,
+                    )
+                }) {
                     if u.tokens.total() > 0 {
                         snap.source = "transcript".to_string();
                         snap.input_tokens = u.tokens.input_tokens;
@@ -41176,6 +41200,59 @@ impl OrchRegistry {
                         snap.cache_read_tokens = u.tokens.cache_read_tokens;
                         snap.cost_usd = u.cost_usd;
                         snap.estimated = false; // priced by opencode, not by us
+                        snap.model = u.model;
+                        return snap;
+                    }
+                }
+            }
+        }
+
+        // pi writes a JSONL session file per pane, like claude — but into the
+        // GROUP's own store (`pi_sessions_dir`, a `--session-dir` loomux hands
+        // it), not a per-user tree keyed on an encoded cwd. Two consequences
+        // worth stating where the arm is, because they are what this arm is
+        // cheap and reliable BECAUSE of:
+        //
+        // - **#2167 cannot happen here.** That defect was a claude session
+        //   whose transcript existed and whose row read zero, because the
+        //   collector resolved the pane's CLI from its class's DEFAULT block
+        //   rather than its own. The CLI resolution is fixed and shared — this
+        //   arm is reached with the `cli` its two callers took from
+        //   `Guardrails::cli_for_block` (`compute_group_usage`) and
+        //   `cli_for_agent` (`mark_dead`), so a pi pane in a roster's SECOND
+        //   pi block is read as pi like any other. What is additionally true
+        //   for pi is that the file's LOCATION involves no cwd slug at all: the
+        //   store is the group dir and the id is loomux's own, so the
+        //   slug-shaped half of #2167's suspicion has no surface here.
+        // - **The id is present from spawn.** pi premints
+        //   (`CliCaps::premints_session_id`), so unlike opencode this arm does
+        //   not sit idle waiting for the pane to announce a session.
+        //
+        // The dollars are pi's OWN (`usage.cost.total` per entry, summed), so
+        // `estimated: false` — the same reported-not-estimated posture as
+        // opencode, for the same reason: blending a vendor-priced figure into a
+        // total the UI labels a price-table guess would misdescribe both.
+        if cli == "pi" {
+            if let Some(sid) = entry.session_id.as_deref() {
+                let dir = self.pi_sessions_dir(&entry.group);
+                if let Some(u) = self.usage_cursors.session_usage(
+                    crate::usage::TranscriptKind::Pi,
+                    &dir,
+                    sid,
+                ) {
+                    // Same guard as the claude and opencode arms: a session
+                    // file that exists but has counted nothing yet (pi writes
+                    // the header before the first assistant turn) must not
+                    // overwrite history with zeros, nor pre-empt the statusline
+                    // fallback.
+                    if u.tokens.total() > 0 {
+                        snap.source = "pi-transcript".to_string();
+                        snap.input_tokens = u.tokens.input_tokens;
+                        snap.output_tokens = u.tokens.output_tokens;
+                        snap.cache_creation_tokens = u.tokens.cache_creation_tokens;
+                        snap.cache_read_tokens = u.tokens.cache_read_tokens;
+                        snap.cost_usd = u.cost_usd;
+                        snap.estimated = false; // priced by pi, not by us
                         snap.model = u.model;
                         return snap;
                     }

@@ -475,7 +475,193 @@ pub fn claude_session_usage(session_id: &str) -> Option<SessionUsage> {
 pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionUsage> {
     let session = PathSegment::parse(session_id).ok()?;
     let path = claude_transcript_path(root, &session)?;
-    let mut cursor = TranscriptCursor::new(path);
+    let mut cursor = TranscriptCursor::new(TranscriptKind::Claude, path);
+    fold_appended(&mut cursor, false).ok()?;
+    Some(cursor.fold.usage())
+}
+
+// ---------------------------------------------------------------------------
+// pi transcript parsing (#2126)
+// ---------------------------------------------------------------------------
+
+/// Map one pi `Usage` object onto loomux's four token buckets.
+///
+/// **`reasoning` is deliberately NOT folded into `output_tokens`, and that is
+/// the opposite of what [`opencode_session_usage`] does with the same-named
+/// field.** pi's own type says why: *"Reasoning/thinking tokens, when the
+/// provider reports them. This is a subset of `output`: `output` already
+/// includes these tokens."* (`@earendil-works/pi-ai` `dist/types.d.ts`,
+/// `interface Usage`, read off the 0.84.4 install). Adding it would
+/// double-count. pi agrees with itself elsewhere: its `totalTokens` is
+/// `input + output + cacheRead + cacheWrite` and its `calculateCost` prices
+/// exactly those four, so `reasoning` contributes to neither. OpenCode's fifth
+/// bucket is genuinely disjoint from its `output`, which is why that mapping
+/// folds and this one must not.
+///
+/// A caveat recorded rather than smoothed over: on the local install, real
+/// openrouter transcripts carry turns where `reasoning` EXCEEDS `output`, which
+/// the vendor's own subset invariant cannot allow. Whichever way that
+/// provider's numbers are wrong, taking pi's documented contract and pi's own
+/// cost basis is what keeps our tokens and our dollars describing the same
+/// spend.
+///
+/// `cacheWrite` -> `cache_creation_tokens` is the same rename opencode's
+/// mapping makes: tokens written INTO the cache, which is what Claude's
+/// `cache_creation_input_tokens` counts.
+fn pi_tokens(usage: &Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: u64_field(usage, "input"),
+        output_tokens: u64_field(usage, "output"),
+        cache_creation_tokens: u64_field(usage, "cacheWrite"),
+        cache_read_tokens: u64_field(usage, "cacheRead"),
+    }
+}
+
+/// The running state of a pi transcript fold — the pi counterpart of
+/// [`TranscriptFold`], and the second arm of [`TranscriptFolder`].
+///
+/// **No message-id dedupe, unlike claude's fold.** claude's exists because a
+/// `--resume` re-emits assistant messages that were already on disk; pi's
+/// session file is a TREE whose entries each get a fresh id, and re-folding the
+/// same bytes is prevented by the cursor's own guards rather than by a set
+/// here. Every entry carrying a `usage` is spend that happened, including
+/// entries on branches the current leaf has navigated away from — the tokens
+/// were bought either way, so the fold is over the FILE, not over the active
+/// path.
+#[derive(Default)]
+struct PiFold {
+    totals: TokenUsage,
+    cost: f64,
+    /// Any folded `usage` carried a `cost.total`. Distinguishes a genuinely
+    /// free session (`Some(0.0)`) from one pi never priced (`None`) — the same
+    /// distinction `a_free_models_zero_cost_is_reported_as_zero_not_as_unknown`
+    /// pins for opencode.
+    any_cost: bool,
+    /// `provider/model` of the LAST assistant entry seen. Not the
+    /// best-priced-by-output model claude's fold tracks: pi REPORTS its dollars
+    /// rather than having them derived from a price table here, so this field
+    /// carries no pricing decision to explain — it answers "which model is this
+    /// pane on", and for that the latest turn is the truth.
+    last_model: Option<String>,
+}
+
+impl PiFold {
+    /// Fold ONE pi session-file line in.
+    ///
+    /// The four entry shapes that can carry spend, per pi's session-entry union
+    /// (`dist/core/session-manager.d.ts` at 0.84.4):
+    ///
+    /// - `{"type":"message","message":{"role":"assistant",...,"usage":{...}}}` —
+    ///   the ordinary turn, and the only shape carrying `provider`/`model`.
+    /// - the same with `"role":"toolResult"`, whose `usage` is optional and
+    ///   documented as *"Usage from the tool execution itself"* — a tool that
+    ///   called a model of its own. pi excludes it from context accounting; it
+    ///   is still money spent under this session, which is what this meter
+    ///   counts.
+    /// - `{"type":"compaction",...,"usage":{...}}` — *"Usage from the LLM
+    ///   call(s) that generated this summary, if available"*.
+    /// - `{"type":"branch_summary",...,"usage":{...}}` — likewise, for a branch.
+    ///
+    /// Everything else (`session`, `model_change`, `thinking_level_change`,
+    /// `custom`, `label`, user messages) carries no usage and contributes
+    /// nothing. A blank or unparseable line contributes nothing either, which
+    /// is what makes a torn last line harmless the moment the cursor holds it
+    /// back.
+    fn push(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let usage = match v.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let Some(msg) = v.get("message") else { return };
+                match msg.get("role").and_then(Value::as_str) {
+                    Some("assistant") => {
+                        // Recorded even when the turn spent nothing — pi writes
+                        // an all-zero `usage` on an errored turn — because this
+                        // field is "which model is this pane on" rather than
+                        // "which model did the spending".
+                        if let (Some(p), Some(m)) = (
+                            msg.get("provider").and_then(Value::as_str),
+                            msg.get("model").and_then(Value::as_str),
+                        ) {
+                            if !p.is_empty() && !m.is_empty() {
+                                self.last_model = Some(format!("{p}/{m}"));
+                            }
+                        }
+                        msg.get("usage")
+                    }
+                    Some("toolResult") => msg.get("usage"),
+                    _ => None,
+                }
+            }
+            Some("compaction") | Some("branch_summary") => v.get("usage"),
+            _ => None,
+        };
+        let Some(usage) = usage else { return };
+
+        let t = pi_tokens(usage);
+        self.totals.input_tokens += t.input_tokens;
+        self.totals.output_tokens += t.output_tokens;
+        self.totals.cache_creation_tokens += t.cache_creation_tokens;
+        self.totals.cache_read_tokens += t.cache_read_tokens;
+
+        if let Some(total) = usage.get("cost").and_then(|c| c.get("total")).and_then(Value::as_f64)
+        {
+            self.cost += total;
+            self.any_cost = true;
+        }
+    }
+
+    /// The session usage as of everything folded in so far.
+    fn usage(&self) -> SessionUsage {
+        SessionUsage {
+            tokens: self.totals,
+            cost_usd: self.any_cost.then_some(self.cost),
+            model: self.last_model.clone(),
+        }
+    }
+}
+
+/// Parse a pi session file (JSONL text) into summed usage plus the dollar
+/// figure **pi itself reported**. Pure and fixture-testable; no pi is ever run
+/// (constraint 3).
+pub fn parse_pi_transcript(text: &str) -> SessionUsage {
+    parse_pi_transcript_lines(text.lines())
+}
+
+/// [`parse_pi_transcript`] over a LINE ITERATOR — the pi twin of
+/// [`parse_claude_transcript_lines`], and for the same reason: the on-disk
+/// reader must never hold the whole file (#1218).
+pub fn parse_pi_transcript_lines<I, S>(lines: I) -> SessionUsage
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut fold = PiFold::default();
+    for line in lines {
+        fold.push(line.as_ref());
+    }
+    fold.usage()
+}
+
+/// Read and sum a pi session's usage from the group's own pi store at `dir`
+/// (`crate::orchestration::pi_sessions_in`), parsing the file from byte zero.
+/// `None` when no file in `dir` carries that session id, when it cannot be
+/// opened, or when `session_id` is not a usable path component (#925).
+///
+/// The whole-file counterpart of the polled path, exactly as
+/// [`claude_session_usage_in`] is for claude: both go through
+/// [`fold_appended`], so #1218's streaming property and the partial-last-line
+/// rule are shared by construction rather than by two readers being kept in
+/// step.
+pub fn pi_session_usage_in(dir: &Path, session_id: &str) -> Option<SessionUsage> {
+    let session = PathSegment::parse(session_id).ok()?;
+    let path = crate::orchestration::pi_session_file_in_dir(dir, &session).ok().flatten()?;
+    let mut cursor = TranscriptCursor::new(TranscriptKind::Pi, path);
     fold_appended(&mut cursor, false).ok()?;
     Some(cursor.fold.usage())
 }
@@ -569,6 +755,85 @@ pub struct CursorWork {
     pub revalidated: bool,
 }
 
+/// Which CLI's transcript records a cursor is folding (#2126).
+///
+/// **The generalisation is a per-CLI LINE FOLDER, not a second cursor cache**,
+/// and that is the whole design decision. Everything the cursor does that is
+/// hard to get right — the stat verdict, the anchor re-read through the same
+/// handle, holding back a partial trailing line, the revalidation timer, the
+/// TTL eviction, the streaming read — is a fact about an append-only JSONL file
+/// and about nothing else. A second cache would have been a second copy of all
+/// of it, kept in step by review; one cache with a per-CLI [`TranscriptFolder`]
+/// means a fix to any of those guards lands for every harness at once, and a
+/// new harness supplies a `push`/`usage` pair and inherits the rest.
+///
+/// The two arms differ in exactly two places: what a line MEANS (the folder)
+/// and where the file LIVES ([`transcript_path`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TranscriptKind {
+    /// `~/.claude/projects/<encoded-cwd>/<session>.jsonl`, folded by
+    /// [`TranscriptFold`].
+    Claude,
+    /// `<group>/pi/sessions/<timestamp>_<session>.jsonl`, folded by [`PiFold`].
+    Pi,
+}
+
+/// The per-CLI half of a cursor: how one line of THIS harness's transcript
+/// changes the running totals, and what those totals currently say.
+///
+/// An enum rather than a `Box<dyn Fold>` because a cursor has to be able to
+/// build a FRESH folder of its own kind on every reset, and a trait object
+/// cannot do that without a second factory to carry alongside it. Both arms are
+/// concrete, both are in this module, and the match is exhaustive — a new
+/// harness that forgets an arm does not compile.
+enum TranscriptFolder {
+    Claude(TranscriptFold),
+    Pi(PiFold),
+}
+
+impl TranscriptFolder {
+    fn new(kind: TranscriptKind) -> Self {
+        match kind {
+            TranscriptKind::Claude => TranscriptFolder::Claude(TranscriptFold::default()),
+            TranscriptKind::Pi => TranscriptFolder::Pi(PiFold::default()),
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        match self {
+            TranscriptFolder::Claude(f) => f.push(line),
+            TranscriptFolder::Pi(f) => f.push(line),
+        }
+    }
+
+    fn usage(&self) -> SessionUsage {
+        match self {
+            TranscriptFolder::Claude(f) => f.usage(),
+            TranscriptFolder::Pi(f) => f.usage(),
+        }
+    }
+}
+
+/// Locate the transcript file a session wrote, for either harness.
+///
+/// The one place the two stores' shapes differ, and both arms delegate to the
+/// module that already owns that shape rather than re-deriving it here: a
+/// second spelling of "which file is this session's" is exactly the
+/// disagreement `pi_sessions_in`'s own doc warns about.
+///
+/// pi's locator returns a `Result` whose `Err` is a store-level read failure;
+/// this reader has one degrade channel (`None` — no usage for that id), which
+/// is the same answer it already gives for a transcript that has not been
+/// written yet, so both non-answers collapse into it.
+fn transcript_path(kind: TranscriptKind, root: &Path, session: &PathSegment) -> Option<PathBuf> {
+    match kind {
+        TranscriptKind::Claude => claude_transcript_path(root, session),
+        TranscriptKind::Pi => {
+            crate::orchestration::pi_session_file_in_dir(root, session).ok().flatten()
+        }
+    }
+}
+
 /// One transcript's parse position and everything needed to resume from it.
 struct TranscriptCursor {
     /// The transcript file this cursor is bound to.
@@ -582,7 +847,7 @@ struct TranscriptCursor {
     /// tick; pinning it makes that choice stable instead of stable-by-luck.
     path: PathBuf,
     /// The fold this cursor resumes.
-    fold: TranscriptFold,
+    fold: TranscriptFolder,
     /// Bytes CONSUMED. Always sits immediately after a `\n`, so resuming from
     /// it can never land mid-record.
     offset: u64,
@@ -621,10 +886,14 @@ enum StatVerdict {
 }
 
 impl TranscriptCursor {
-    fn new(path: PathBuf) -> Self {
+    /// A cursor at byte zero for `kind`'s record shape. The kind is consumed
+    /// here — it selects the folder and is then no longer a fact the cursor
+    /// needs, because every caller reaches a cursor through
+    /// [`TranscriptCursors`]'s map, whose KEY carries it.
+    fn new(kind: TranscriptKind, path: PathBuf) -> Self {
         TranscriptCursor {
             path,
-            fold: TranscriptFold::default(),
+            fold: TranscriptFolder::new(kind),
             offset: 0,
             len: 0,
             modified: None,
@@ -836,7 +1105,13 @@ fn fold_appended(cursor: &mut TranscriptCursor, verify_anchor: bool) -> std::io:
 /// here is that if this IS the hold that wedges a build, the breadcrumb names
 /// it instead of a human having to guess.
 pub struct TranscriptCursors {
-    cursors: TrackedMutex<HashMap<(PathBuf, String), CursorEntry>>,
+    /// Keyed by (harness, store root, session id). The `kind` is in the key
+    /// rather than merely inside the cursor because two harnesses' roots are
+    /// different directories today and nothing here should depend on that
+    /// staying true — a cache that answered a pi read out of a claude cursor
+    /// because the paths collided would produce a WRONG total, which is the one
+    /// failure this whole design refuses.
+    cursors: TrackedMutex<HashMap<(TranscriptKind, PathBuf, String), CursorEntry>>,
     /// How long any one cursor may fold incrementally before it is discarded
     /// and re-parsed from zero. [`CURSOR_REVALIDATE_AFTER`] in production;
     /// a parameter only so the tests can exercise the timer without waiting
@@ -870,11 +1145,20 @@ impl TranscriptCursors {
         TranscriptCursors { cursors: TrackedMutex::new("usage_cursors", HashMap::new()), revalidate_after }
     }
 
-    /// A Claude session's usage, parsing only what was appended since this
-    /// cache last read the same transcript. Same totals as
-    /// [`claude_session_usage_in`], same `None` cases.
-    pub fn session_usage(&self, root: &Path, session_id: &str) -> Option<SessionUsage> {
-        self.session_usage_measured(root, session_id).map(|(u, _)| u)
+    /// One session's usage, parsing only what was appended since this cache
+    /// last read the same transcript. Same totals as the whole-file readers
+    /// ([`claude_session_usage_in`], [`pi_session_usage_in`]), same `None`
+    /// cases.
+    ///
+    /// `root` is the store `kind` names: claude's projects root, or a group's
+    /// pi sessions directory.
+    pub fn session_usage(
+        &self,
+        kind: TranscriptKind,
+        root: &Path,
+        session_id: &str,
+    ) -> Option<SessionUsage> {
+        self.session_usage_measured(kind, root, session_id).map(|(u, _)| u)
     }
 
     /// [`Self::session_usage`], also reporting what the read cost and what it
@@ -885,6 +1169,7 @@ impl TranscriptCursors {
     #[doc(hidden)] // pub for integration tests
     pub fn session_usage_measured(
         &self,
+        kind: TranscriptKind,
         root: &Path,
         session_id: &str,
     ) -> Option<(SessionUsage, CursorWork)> {
@@ -897,7 +1182,7 @@ impl TranscriptCursors {
             let mut map = self.cursors.lock_safe();
             map.retain(|_, e| e.used.elapsed() < CURSOR_TTL);
             let entry = map
-                .entry((root.to_path_buf(), session_id.to_string()))
+                .entry((kind, root.to_path_buf(), session_id.to_string()))
                 .or_insert_with(|| CursorEntry {
                     used: Instant::now(),
                     cursor: Arc::new(TrackedMutex::new("usage_cursor_cell", None)),
@@ -926,7 +1211,7 @@ impl TranscriptCursors {
             None => {
                 work.scanned_root = true;
                 *slot = None;
-                let p = claude_transcript_path(root, &session)?;
+                let p = transcript_path(kind, root, &session)?;
                 let m = fs::metadata(&p).ok()?;
                 (p, m)
             }
@@ -970,7 +1255,7 @@ impl TranscriptCursors {
             // `reset` is "a cursor was thrown away", so a first-ever read —
             // which also parses from zero — is not one.
             work.reset = had_cursor;
-            *slot = Some(TranscriptCursor::new(path));
+            *slot = Some(TranscriptCursor::new(kind, path));
             // A fresh cursor has no anchor, so this call cannot report a
             // mismatch; both arms mean the same thing here.
             work.bytes_read += match fold_appended(slot.as_mut()?, false).ok()? {
