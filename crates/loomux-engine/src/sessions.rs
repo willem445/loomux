@@ -761,10 +761,22 @@ fn find_pi_session_cwd(root: &Path, session_id: &PathSegment) -> Result<Option<S
         return Ok(None); // pi has never run here — nothing recorded, not an error
     }
     let suffix = pi_file_suffix(session_id);
-    Ok(walk_pi_session_files(root, |path| {
-        let name = path.file_name().and_then(|s| s.to_str())?;
-        name.ends_with(&suffix).then(|| scan_pi_jsonl(path).cwd)
-    }))
+    let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
+    for project in entries.flatten() {
+        let Ok(files) = fs::read_dir(project.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.ends_with(&suffix) {
+                return Ok(Some(scan_pi_jsonl(&path).cwd));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// What one pi session file's head-scan yielded.
