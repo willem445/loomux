@@ -58,6 +58,12 @@ import { mailboxPresentation } from "./mailboxbadge";
 import { makeRenameCommit } from "./panerename";
 import { shouldResizePty } from "./panefit";
 import { planFit, FIT_WINDOW_MS, FIT_MAX_WAIT_MS } from "./resizeburst";
+import {
+  planHeaderFit,
+  menuLeftFor,
+  HEADER_GAP_W,
+  type HeaderControl,
+} from "./paneheader";
 import { swapEditor } from "./domutil";
 import { openInEditor, editorConfigDialog } from "./editor";
 import { GitView } from "./gitview";
@@ -143,6 +149,56 @@ const FILES_ICON = icon("file-pen", ICON_BTN_PX);
 const PAPERCLIP_ICON = icon("paperclip", ICON_BTN_PX);
 // Voice-prompt push-to-talk button (#58): a microphone.
 const MIC_ICON = icon("mic", ICON_BTN_PX);
+// Header overflow (#2191): the single glyph that stands in for the folded set.
+// A TEXT glyph, like the window-control cluster it sits beside (◫ ⬓ — ⤢ ✕) and
+// unlike the dyed registry icons — the overflow button names no ROLE, it names
+// "the rest", so `src/icons.ts`'s role→hue table has nothing to say about it and
+// a vendored Lucide glyph would be a licence obligation bought for nothing.
+const OVERFLOW_GLYPH = "⋯";
+
+/** `.pane-btn.pane-overflow { width: 25px }`, restated here because the button
+ *  is `hidden` (and so measures 0) at exactly the moment the policy needs to
+ *  know what folding would cost. Kept STRICTLY WIDER than `.pane-btn`'s own
+ *  23px, which is not cosmetic: it is what makes `planHeaderFit`'s
+ *  "folding buys nothing" guard refuse to fold a header holding a single
+ *  control — a welcome pane, whose only control is its ✕. */
+const OVERFLOW_BTN_W = 25;
+
+/** Gap between the folder and branch chips (`.pane-meta { gap: 13px }`) — the
+ *  header's own gap does not apply inside that box. */
+const META_GAP_W = 13;
+
+/** How long the header-overflow pass waits after a resize burst settles. The
+ *  decision is not latency-critical (an icon set folding a frame late is
+ *  invisible), and coalescing keeps the measuring reads off every drag frame.
+ *  Deliberately independent of `resizeburst.ts`, which coalesces a DIFFERENT
+ *  thing — the PTY fit. Nothing on this path resizes anything (constraint 1). */
+const HEADER_SYNC_MS = 60;
+
+/** Grace period between the pointer leaving the overflow button (or its menu)
+ *  and the menu closing, so crossing the gap between the two does not dismiss it. */
+const OVERFLOW_CLOSE_MS = 220;
+
+/** An element's width at its NATURAL size, in px — what it would occupy if
+ *  flexbox were not shrinking it. `offsetWidth` alone under-reports a shrunk
+ *  `.pane-queue`/`.pane-mail`/`.pane-cwd` (each `min-width: 0` with
+ *  `text-overflow: ellipsis`), and reporting the shrunk width would make the
+ *  header look roomier the tighter it got. `scrollWidth` is the content box's
+ *  full width, so add back the border the border box carries.
+ *
+ *  Returns 0 for an element that is not in the layout at all — `hidden`, or
+ *  `display: none` by a pane-kind rule (`.pane.is-content .pane-btn.pty-only`).
+ *  A control measuring 0 is not "a zero-width control", it is a control this
+ *  pane kind does not have, and the caller drops it from the set entirely.
+ *  A control inside the CLOSED overflow menu still measures its real width,
+ *  because that menu is `visibility: hidden`, never `display: none` — which is
+ *  what makes the policy's decision independent of the current fold state. */
+function naturalWidth(el: HTMLElement): number {
+  if (el.hidden) return 0;
+  const box = el.offsetWidth;
+  if (box === 0) return 0;
+  return Math.max(box, el.scrollWidth + (box - el.clientWidth));
+}
 
 /** Pull image files out of a paste/drag `DataTransfer`. Returns only entries
  *  the browser tags as images, so a text or mixed paste yields []. */
@@ -821,6 +877,35 @@ export class Pane implements VoiceTargetPane {
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
   private disposed = false;
+  // ---- header overflow (#2191) ----
+  /** The header row itself — the box the overflow policy measures. */
+  private headerEl!: HTMLElement;
+  /** The folder/branch box, which is also the header's flex spacer. Measured by
+   *  its ITEMS, never by its own (stretched) box — see `measureHeaderFixed`. */
+  private metaEl!: HTMLElement;
+  /** The single button the folded set collapses into. Hidden while unfolded. */
+  private overflowBtn!: HTMLButtonElement;
+  /** The floating icon strip the overflow button opens. An OVERLAY over the
+   *  terminal (`position: absolute`, out of flow) — never a second header row,
+   *  which would change `.pane-term`'s box and resize the PTY (constraint 1). */
+  private overflowMenu!: HTMLElement;
+  /** Every header control in DOM order, plus the two members that are not
+   *  controls (the overflow button and its menu) at their slots — replaying this
+   *  sequence with `appendChild` is what restores header order on unfold. */
+  private headerTail: HTMLElement[] = [];
+  /** The foldable/priority registry the policy decides over, in header order. */
+  private headerControls: { id: string; el: HTMLElement; priority: boolean }[] = [];
+  private headerObs: ResizeObserver;
+  /** The header's content-box width from the last `ResizeObserver` delivery. 0
+   *  until the pane is laid out, which `planHeaderFit` reads as "carry state". */
+  private headerContentW = 0;
+  private headerFolded = false;
+  private headerSyncTimer: number | undefined;
+  private overflowOpen = false;
+  private overflowCloseTimer: number | undefined;
+  /** Registered only while the menu is open — a click-away listener per pane,
+   *  live for every pane at once, would be a document listener per terminal. */
+  private overflowAwayListener: ((e: PointerEvent) => void) | null = null;
   /** Welcome / pane-setup content (#194): a pane can exist with NO PTY, showing
    *  the setup form until the user picks a kind. The PTY spawns only on submit
    *  (`startFromWelcome`), so the no-resize invariant holds — there's nothing to
@@ -893,6 +978,7 @@ export class Pane implements VoiceTargetPane {
 
     const header = document.createElement("div");
     header.className = "pane-header";
+    this.headerEl = header;
 
     // The agent-type mark (#992). Appended BEFORE the title so that `setBadge`, which
     // inserts the role chip immediately before the title, lands between the two: the
@@ -1017,6 +1103,7 @@ export class Pane implements VoiceTargetPane {
     });
     meta.append(this.cwdEl, this.branchEl);
     header.appendChild(meta);
+    this.metaEl = meta;
 
     this.tasksBtn = document.createElement("button");
     this.tasksBtn.className = "pane-btn";
@@ -1154,10 +1241,32 @@ export class Pane implements VoiceTargetPane {
       this.events.onMaximize(this);
     });
 
-    for (const [glyph, cls, tip, fn] of [
-      ["◫", "", "Split right", () => this.events.onSplit(this, "row")],
-      ["⬓", "", "Split down", () => this.events.onSplit(this, "column")],
-      ["—", "", "Minimize to dock (Alt+M)", () => this.events.onMinimize(this)],
+    // The overflow affordance (#2191) sits at the head of the window-control
+    // cluster, so a folded header reads ⋯ — ⤢ : "the rest", then the two
+    // controls that never fold. Built here rather than after the cluster so its
+    // MENU (the next node) precedes the priority buttons in DOM order, which is
+    // what puts Tab from the ⋯ button INTO the menu instead of past it.
+    this.overflowBtn = document.createElement("button");
+    this.overflowBtn.className = "pane-btn pane-overflow";
+    this.overflowBtn.textContent = OVERFLOW_GLYPH;
+    this.overflowBtn.title = "More pane controls";
+    this.overflowBtn.setAttribute("aria-haspopup", "true");
+    this.overflowBtn.setAttribute("aria-expanded", "false");
+    this.overflowBtn.hidden = true; // shown only while the header is folded
+    header.appendChild(this.overflowBtn);
+
+    this.overflowMenu = document.createElement("div");
+    this.overflowMenu.className = "pane-overflow-menu";
+    this.overflowMenu.setAttribute("role", "group");
+    this.overflowMenu.setAttribute("aria-label", "More pane controls");
+    header.appendChild(this.overflowMenu);
+    this.wireOverflowMenu();
+
+    const clusterBtns: Record<string, HTMLButtonElement> = {};
+    for (const [id, glyph, cls, tip, fn] of [
+      ["split-right", "◫", "", "Split right", () => this.events.onSplit(this, "row")],
+      ["split-down", "⬓", "", "Split down", () => this.events.onSplit(this, "column")],
+      ["minimize", "—", "", "Minimize to dock (Alt+M)", () => this.events.onMinimize(this)],
     ] as const) {
       const btn = document.createElement("button");
       btn.className = `pane-btn ${cls}`;
@@ -1168,6 +1277,7 @@ export class Pane implements VoiceTargetPane {
         fn();
       });
       header.appendChild(btn);
+      clusterBtns[id] = btn;
     }
     header.appendChild(this.maximizeBtn);
 
@@ -1181,6 +1291,39 @@ export class Pane implements VoiceTargetPane {
     });
     header.appendChild(closeBtn);
     this.el.appendChild(header);
+
+    // The overflow registry (#2191), in header order. `priority: true` is the
+    // set the human named as always-visible — minimize, maximize and the pane
+    // name (the name is not a control, so it is the policy's `titleMinWidth`
+    // floor rather than a row here). Everything else folds, close included;
+    // doc/design/pane-header.md carries the argument, and moving a control
+    // between the two sets is this flag and nothing else.
+    this.headerControls = [
+      { id: "tasks", el: this.tasksBtn, priority: false },
+      { id: "decisions", el: this.decisionsBtn, priority: false },
+      { id: "audit", el: this.auditBtn, priority: false },
+      { id: "timeline", el: this.timelineBtn, priority: false },
+      { id: "group", el: this.groupBtn, priority: false },
+      { id: "group-min", el: this.groupMinBtn, priority: false },
+      { id: "editor", el: editorBtn, priority: false },
+      { id: "issues", el: this.issuesBtn, priority: false },
+      { id: "git", el: this.gitBtn, priority: false },
+      { id: "file-edit", el: this.fileEditBtn, priority: false },
+      { id: "split-right", el: clusterBtns["split-right"], priority: false },
+      { id: "split-down", el: clusterBtns["split-down"], priority: false },
+      { id: "minimize", el: clusterBtns["minimize"], priority: true },
+      { id: "maximize", el: this.maximizeBtn, priority: true },
+      { id: "close", el: closeBtn, priority: false },
+    ];
+    // DOM order, including the two non-controls at their slots. Read OFF the
+    // header rather than re-listed, so it is the append order above by
+    // construction and cannot drift from it — replaying it with `appendChild` is
+    // how `applyHeaderFold` puts the row back exactly as it was, with no
+    // per-element anchor to go stale.
+    const controlEls = new Set<HTMLElement>(this.headerControls.map((c) => c.el));
+    this.headerTail = (Array.from(header.children) as HTMLElement[]).filter(
+      (el) => controlEls.has(el) || el === this.overflowBtn || el === this.overflowMenu
+    );
 
     this.termEl = document.createElement("div");
     this.termEl.className = "pane-term";
@@ -1313,7 +1456,198 @@ export class Pane implements VoiceTargetPane {
     this.term.onCursorMove(() => this.scheduleShift());
 
     this.resizeObs = new ResizeObserver(() => this.applyFit());
+
+    // The header's OWN size decides the overflow fold — never the terminal's,
+    // and nothing on this path calls `fit()` or `resizePty` (constraint 1).
+    // Two targets: the header (a pane resize) and the meta box (a CHIP
+    // appearing or a folder/branch label changing, which leaves the header's own
+    // box untouched but takes room out of the same row — the meta box is the
+    // header's flex spacer, so every such change shows up as its width moving).
+    this.headerObs = new ResizeObserver((entries) => {
+      for (const e of entries) {
+        if (e.target !== header) continue;
+        const box = e.contentBoxSize?.[0];
+        this.headerContentW = box ? box.inlineSize : e.contentRect.width;
+      }
+      this.scheduleHeaderSync();
+    });
+    this.headerObs.observe(header);
+    this.headerObs.observe(meta);
+
     this.setName("shell");
+  }
+
+  // ------------------------------------------------------------------
+  // Header overflow (#2191). See doc/design/pane-header.md and the policy in
+  // src/paneheader.ts; this half owns pixels, elements and dismissal only.
+  // ------------------------------------------------------------------
+
+  /** Coalesce the overflow pass to the end of a resize burst. */
+  private scheduleHeaderSync(): void {
+    if (this.disposed) return;
+    clearTimeout(this.headerSyncTimer);
+    this.headerSyncTimer = window.setTimeout(() => this.syncHeaderOverflow(), HEADER_SYNC_MS);
+  }
+
+  /** Measure the header, ask the policy, and move whatever it names. */
+  private syncHeaderOverflow(): void {
+    if (this.disposed) return;
+    const controls: HeaderControl[] = [];
+    for (const c of this.headerControls) {
+      const width = naturalWidth(c.el);
+      // 0 means the control is not in this pane's layout at all — `hidden`, or
+      // `display: none` by a pane-kind rule. Not a zero-width control: a control
+      // this pane does not have, so it is not the policy's business.
+      if (width > 0) controls.push({ id: c.id, width, priority: c.priority });
+    }
+    const plan = planHeaderFit({
+      headerWidth: this.headerContentW,
+      fixedWidth: this.measureHeaderFixed(),
+      controls,
+      // Measurable only while folded (it is `hidden` otherwise), so an unfolded
+      // header uses the width the stylesheet gives it. That constant is
+      // deliberately WIDER than one `.pane-btn`, which is what makes the
+      // policy's "folding buys nothing" guard refuse to fold a header down to a
+      // single control — a welcome pane, whose only control is its ✕.
+      overflowWidth: naturalWidth(this.overflowBtn) || OVERFLOW_BTN_W,
+      folded: this.headerFolded,
+    });
+    if (plan.folded === this.headerFolded) return; // nothing to move
+    this.applyHeaderFold(plan.folded, new Set(plan.overflow));
+  }
+
+  /** Total width of the header items that are neither the pane name nor a
+   *  control: the CLI mark, the role badge, the four status chips, and the
+   *  folder/branch items. Walked off the header rather than listed, so a chip
+   *  added later is counted without anyone remembering to add it here.
+   *
+   *  Two children are skipped for the same reason — they GROW, so their rendered
+   *  box is the row's leftover space rather than anything they need: the meta box
+   *  (`flex: 1`, the header's spacer — its ITEMS are measured instead) and the
+   *  rename input that replaces the title while F2 is open (`flex: 1`). */
+  private measureHeaderFixed(): number {
+    let total = 0;
+    for (const child of Array.from(this.headerEl.children) as HTMLElement[]) {
+      if (child === this.titleEl || child === this.overflowMenu) continue;
+      if (child.classList.contains("pane-title-input")) continue;
+      if (child === this.metaEl) {
+        for (const item of Array.from(child.children) as HTMLElement[]) {
+          const w = naturalWidth(item);
+          if (w > 0) total += w + META_GAP_W;
+        }
+        continue;
+      }
+      if (this.headerTail.includes(child)) continue;
+      const w = naturalWidth(child);
+      if (w > 0) total += w + HEADER_GAP_W;
+    }
+    return total;
+  }
+
+  /** Move the folded set into the menu (or back), preserving header order in
+   *  both directions. Called only when the state actually flips. */
+  private applyHeaderFold(folded: boolean, overflowIds: Set<string>): void {
+    this.headerFolded = folded;
+    if (!folded) this.closeOverflowMenu();
+    const idOf = new Map<HTMLElement, string>(this.headerControls.map((c) => [c.el, c.id]));
+    for (const el of this.headerTail) {
+      const id = idOf.get(el);
+      const home = folded && id !== undefined && overflowIds.has(id) ? this.overflowMenu : this.headerEl;
+      home.appendChild(el);
+    }
+    this.overflowBtn.hidden = !folded;
+    this.el.classList.toggle("header-folded", folded);
+  }
+
+  private wireOverflowMenu(): void {
+    const btn = this.overflowBtn;
+    const menu = this.overflowMenu;
+
+    btn.addEventListener("pointerenter", () => this.openOverflowMenu());
+    btn.addEventListener("focus", () => this.openOverflowMenu());
+    btn.addEventListener("click", (e) => {
+      // A click TOGGLES, for a pointer that never hovers (touch, and a click
+      // straight onto the button after a keyboard Escape closed it).
+      e.stopPropagation();
+      if (this.overflowOpen) this.closeOverflowMenu();
+      else this.openOverflowMenu();
+    });
+    menu.addEventListener("pointerenter", () => {
+      clearTimeout(this.overflowCloseTimer);
+    });
+    for (const el of [btn, menu]) {
+      el.addEventListener("pointerleave", () => this.scheduleOverflowClose());
+      el.addEventListener("keydown", (e) => {
+        if ((e as KeyboardEvent).key !== "Escape") return;
+        e.stopPropagation();
+        this.closeOverflowMenu(true);
+      });
+      // Tabbing (or clicking) out of the pair closes it. `relatedTarget` is the
+      // element GAINING focus, so this fires once for the whole pair rather than
+      // once per item.
+      el.addEventListener("focusout", (e) => {
+        const next = (e as FocusEvent).relatedTarget as Node | null;
+        if (next && (btn.contains(next) || menu.contains(next))) return;
+        this.closeOverflowMenu();
+      });
+    }
+    // The menu is a header child (so that Tab from ⋯ lands inside it), which puts
+    // it under the grid's pane-reorder pointerdown. Its buttons are already
+    // exempt there; this covers the strip's own padding, which is not a button.
+    menu.addEventListener("pointerdown", (e) => e.stopPropagation());
+  }
+
+  private openOverflowMenu(): void {
+    if (this.disposed || !this.headerFolded || this.overflowOpen) return;
+    clearTimeout(this.overflowCloseTimer);
+    this.overflowOpen = true;
+    this.positionOverflowMenu();
+    this.overflowMenu.classList.add("open");
+    this.overflowBtn.setAttribute("aria-expanded", "true");
+    // Click-away. Registered per OPEN rather than per pane: a document listener
+    // that every pane keeps alive is one per terminal on the wall.
+    this.overflowAwayListener = (e: PointerEvent) => {
+      const t = e.target as Node | null;
+      if (t && (this.overflowBtn.contains(t) || this.overflowMenu.contains(t))) return;
+      this.closeOverflowMenu();
+    };
+    document.addEventListener("pointerdown", this.overflowAwayListener, true);
+  }
+
+  private closeOverflowMenu(returnFocus = false): void {
+    clearTimeout(this.overflowCloseTimer);
+    if (this.overflowAwayListener) {
+      document.removeEventListener("pointerdown", this.overflowAwayListener, true);
+      this.overflowAwayListener = null;
+    }
+    if (!this.overflowOpen) return;
+    this.overflowOpen = false;
+    this.overflowMenu.classList.remove("open");
+    this.overflowBtn.setAttribute("aria-expanded", "false");
+    if (returnFocus && !this.overflowBtn.hidden) this.overflowBtn.focus();
+  }
+
+  private scheduleOverflowClose(): void {
+    clearTimeout(this.overflowCloseTimer);
+    this.overflowCloseTimer = window.setTimeout(
+      () => this.closeOverflowMenu(),
+      OVERFLOW_CLOSE_MS
+    );
+  }
+
+  /** Place the strip under the ⋯ button, inside the pane. The menu is laid out
+   *  even while closed (`visibility: hidden`, not `display: none`), so its width
+   *  is readable here without a flash. */
+  private positionOverflowMenu(): void {
+    const pane = this.el.getBoundingClientRect();
+    const anchor = this.overflowBtn.getBoundingClientRect();
+    const left = menuLeftFor(
+      anchor.left - pane.left,
+      anchor.right - pane.left,
+      this.overflowMenu.offsetWidth,
+      pane.width
+    );
+    this.overflowMenu.style.left = `${Math.round(left)}px`;
   }
 
   /** Mark genuine human input into this pane (#440 B2, review round 3 B2-R;
@@ -2583,6 +2917,12 @@ export class Pane implements VoiceTargetPane {
   setName(name: string): void {
     this.name = name;
     this.titleEl.textContent = name;
+    // The name is priority chrome that ELLIPSISES rather than folding (#2191),
+    // so the tooltip has to carry the full one — on a narrow pane the rendered
+    // text is the only place it appears, and it is cut. The rename hint stays,
+    // second: the tooltip's job is now "what is this pane called", and the
+    // gesture is the footnote.
+    this.titleEl.title = name ? `${name} — double-click to rename (F2)` : "Double-click to rename (F2)";
     // A docked pane's header is detached, so refresh its dock chip too — else an
     // orchestrator/human rename leaves the chip showing the stale name (#95r).
     this.dockSyncListener?.();
@@ -5199,6 +5539,10 @@ export class Pane implements VoiceTargetPane {
     if (this.disposed) return;
     this.disposed = true;
     this.resizeObs.disconnect();
+    this.headerObs.disconnect(); // #2191 header-overflow observer
+    this.closeOverflowMenu(); // drops its document-level click-away listener
+    clearTimeout(this.headerSyncTimer);
+    clearTimeout(this.overflowCloseTimer);
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
     clearTimeout(this.composeStatusTimer);
