@@ -150,10 +150,6 @@ impl LaunchSpec {
             a.push("--disallowedTools".into());
             a.extend(self.disallowed_tools.iter().cloned());
         }
-        if let Some(s) = &self.settings {
-            a.push("--settings".into());
-            a.push(s.to_string_lossy().into_owned());
-        }
         if let Some(agent) = &self.agent {
             a.push("--agent".into());
             a.push(agent.clone());
