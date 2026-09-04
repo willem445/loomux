@@ -173,6 +173,35 @@ export const ORCH_CLIS: OrchCli[] = [
       manager: INHERIT_MODEL,
     },
   },
+  {
+    // #2126. Model ids here are `provider/id` with an optional `:<thinking>`
+    // suffix, and the curated list is EMPTY apart from the inherit row — the
+    // same answer opencode's row gives, for the same two reasons and one more.
+    //
+    //   1. pi has no vendor-neutral alias (no `sonnet`, no `auto`, no `pro`):
+    //      its catalog spans every provider the human has authed, so any id
+    //      loomux picked would be a hardcoded model table (#329) AND a silent
+    //      override of the `defaultModel` they already chose in
+    //      ~/.pi/agent/settings.json.
+    //   2. The backend's `default_model("pi", _)` returns the same nothing, and
+    //      the launcher and the spawn path have to agree or the form advertises
+    //      an inheritance it then overrides.
+    //   3. Unlike copilot, something on the machine DOES answer for pi:
+    //      `pi --list-models` prints only the models whose auth is configured,
+    //      which is exactly the "this machine and this account" answer the
+    //      picker wants. `mergeModelOptions` puts that reply in front of this
+    //      list, so a curated shortcut here would only ever be a staler copy of
+    //      a live one.
+    id: "pi",
+    models: [INHERIT_MODEL],
+    defaults: {
+      orchestrator: INHERIT_MODEL,
+      worker: INHERIT_MODEL,
+      reviewer: INHERIT_MODEL,
+      planner: INHERIT_MODEL,
+      manager: INHERIT_MODEL,
+    },
+  },
 ];
 
 /** The catalog row for a CLI id, falling back to the first row — the launcher's

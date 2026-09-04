@@ -46,8 +46,9 @@ export interface SessionInfo {
    *  `src-tauri/src/sessions.rs` — a plain string over IPC, so nothing checks
    *  the two sets against each other and a scanner added there without a
    *  widening here is silently mis-handled (#722: an opencode row read as
-   *  copilot's) rather than rejected. */
-  source: "claude" | "copilot" | "opencode";
+   *  copilot's) rather than rejected. `pi` joined with #2126 P2, both halves
+   *  in one PR for that reason. */
+  source: "claude" | "copilot" | "opencode" | "pi";
   title: string;
   cwd: string;
   modified_ms: number;

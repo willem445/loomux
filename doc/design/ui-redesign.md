@@ -383,7 +383,7 @@ about this tier:
 - **The bijection above still survives untouched**, which was the real content of the original
   claim. `--cli-*` is a separate token set precisely *because* each `--id-*` hue is claimed by
   exactly one icon role, so no CLI takes a role's meaning. What is no longer true is the "no
-  ninth colour" half: there are seven more pigments, in their own sub-table, argued in §The
+  ninth colour" half: there are eight more pigments, in their own sub-table, argued in §The
   per-CLI hues on the ground that they meet only each other.
 - **`test/icons.test.ts` does not cover these marks for free**, and never quite did — its
   both-directions scan reads bare `.ic-<role>` rules, so `.cli-*` was always outside it. The
@@ -476,12 +476,13 @@ means a new prefix:
 | **gemini** | `--cli-gemini` | `#9677c5` | Gemini's blue-violet |
 | **hermes** | `--cli-hermes` | `#b67c94` | — loomux's own pick |
 | **ante** | `--cli-ante` | `#c3c455` | — loomux's own pick |
+| **pi** | `--cli-pi` | `#00d2f0` | — loomux's own pick |
 
 **Evocation, never replication.** Not one value above is a vendor's own hex, and none is
 presented as one. Leaning a pigment toward a brand's family is the same nominative use that
 lets loomux draw GitHub's own glyph for a pane running GitHub Copilot (§The second tier);
 *copying* a trademark colour exactly would be a claim of affiliation loomux does not make and
-does not need. Three of the seven have no vendor colour identity to lean on at all, so they
+does not need. Four of the eight have no vendor colour identity to lean on at all, so they
 were picked outright, for separation and nothing else — and the table says so rather than
 implying an association that isn't there.
 
@@ -492,30 +493,42 @@ inherits the channel's rules whole: the state positions stay reserved, and a `--
 may no more enter one than an `--id-*` token may. `test/theme.test.ts` counts `--cli-*` as
 identity in the position-mixing check, so that is measured rather than asserted.
 
-**Seven more pigments does not reopen "eight is a measurement".** That ceiling (§The palette)
+**Eight more pigments does not reopen "eight is a measurement".** That ceiling (§The palette)
 was measured for hues that must be told apart *across the whole app*, where a ninth candidate
 landed closer to an existing hue than the eight-set's own closest pair (azure/violet,
-15.3 ΔE). These seven never face that comparison: they appear in exactly **two positions** —
+15.3 ΔE). These eight never face that comparison: they appear in exactly **two positions** —
 the agent mark and the session list's CLI chip — and only ever against each other. Measured
 on their own terms they remain legible, closest pair **31.5 ΔE** (codex/opencode) — a
 comparison that *reversed* at #1320, since the octet they are measured against is now the
 looser of the two (see `theme.ts` §CLI_HUES) — and
 the test derives the bar from `IDENTITY`'s own closest pair rather than hard-coding it, so
-seven extra pigments stay justified only while they remain the more legible set.
+eight extra pigments stay justified only while they remain the more legible set.
+
+pi (#2126) is the eighth, and it did **not** move that 31.5: its nearest neighbours are codex
+at 31.7 and copilot at 32.2, so `codex`/`opencode` is still the pair the number names. It is
+also the brightest of the eight, and that is forced rather than chosen — the one hue region
+the other seven leave empty is cyan-through-blue, whose muted middle is crowded by codex's
+teal and copilot's steel, so every candidate below L\* ≈ 74 there lands inside the 30 ΔE
+floor. A tempered `#4ccfe8` measures 28.5 ΔE from copilot and is therefore not available.
 
 > Every ΔE in this section is CIE76 over the Viénot LMS dichromat simulation in
 > `test/theme.test.ts` — the same code the suite runs, and the only method quoted anywhere in
 > this feature. Two surfaces disagreeing because one of them measured differently is a class
 > of error, not a rounding.
 
-**Colour-vision deficiency — and the worst case is tritan, not the red-green ones.** Seven
+**Colour-vision deficiency — and the worst case is tritan, not the red-green ones.** Eight
 hues on one dark ground do not survive CVD and these do not. Closest pair per simulation:
 
 | Simulation | Closest pair | ΔE |
 | --- | --- | --- |
-| protan | opencode/ante | 15.6 |
-| deutan | codex/hermes | 9.5 |
+| protan | copilot/pi | 14.2 |
+| deutan | copilot/pi | 8.6 |
 | tritan | codex/copilot | **1.4** |
+
+The first two rows are pi's arrival rather than a regression it caused: before it they read
+`opencode`/`ante` 15.6 and `codex`/`hermes` 9.5, and pi takes both over by a little. Neither
+is a collapse, and `copilot`/`pi` is the safest shape pairing on the roster — the vendored
+octicon against a letter `P`.
 
 1.4 ΔE is the honest headline: a tritanope sees codex and copilot as *one colour*. That is
 the same trade identity already makes and states — *which thing this is* is always also
@@ -527,9 +540,9 @@ The roster has three CLIs starting with `C`, and exactly one pair where colour i
 remaining channel: `claude`/`codex`, both badging a plain `C` (`copilot` draws the vendored
 octicon, so it is shape-distinct). Its worst view is **25.1 ΔE** (protan; deutan 42.2, tritan
 135.4), against a floor of 15. And every pair that *does* collapse is shape-distinct —
-codex/copilot is a `C` against the octicon, claude/hermes (3.8, tritan) a `C` against an `H`.
-The test computes the collision set *from the renderer* rather than listing it, so an eighth
-CLI starting with `C` inherits the obligation the day it is added.
+codex/copilot is a `C` against the octicon, copilot/pi (8.6, deutan) the octicon against a
+`P`. The test computes the collision set *from the renderer* rather than listing it, so a
+further CLI starting with `C` inherits the obligation the day it is added.
 
 **Distance from the neutrals, not just from each other.** The first copilot candidate was a
 pewter (`#93a8c4`) chosen to evoke GitHub's monochrome mark. It cleared AA on every ground and
@@ -558,7 +571,7 @@ program-derived token into a `class` attribute inside a string injected with `in
 `program` comes off a launch line. Interpolating it would put `"><img src=x onerror=…>` into
 the markup two attributes to the left of the clamp that makes the letter tier safe. Only a
 name that *matches* the roster is ever interpolated, so what reaches the attribute is one of
-seven compile-time strings — the same discipline as the clamp: make the hostile value
+eight compile-time strings — the same discipline as the clamp: make the hostile value
 unexpressible rather than escaped.
 
 **What this deliberately does not do: the glyphs.** Wave 2 changes the marks' colour and

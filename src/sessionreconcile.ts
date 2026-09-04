@@ -32,8 +32,11 @@
  *  scanner: its rows arrive with a cwd and a session id like any other, so the
  *  matching and refusal logic below applies unchanged, and leaving it out
  *  would silently make every opencode pane unadoptable while the sidebar
- *  listed the very session it should have adopted. */
-export type Cli = "claude" | "copilot" | "opencode";
+ *  listed the very session it should have adopted. `pi` joined it with #2126
+ *  P2 on the same argument: its rows carry a cwd and a session id like any
+ *  other, and its ids are PRE-MINTED, so a pi pane is adoptable from its first
+ *  transcript write rather than after a store watcher learns an id. */
+export type Cli = "claude" | "copilot" | "opencode" | "pi";
 
 /** Just enough of a `listSessions()` row to match against, for both functions
  *  below. main.ts maps the backend's `SessionInfo[]` (source→cli, modified_ms
