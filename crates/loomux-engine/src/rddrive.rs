@@ -1597,6 +1597,57 @@ mod tests {
         );
     }
 
+    /// **`fix-stalled` has two sites since #2168 E1, and each prints what its
+    /// own site observed** (rev-final round 2, finding 2).
+    ///
+    /// The finding this closes is sharper than "untested": no fixture in this
+    /// file could REACH the new arm. The two that drive `held_notice` carry
+    /// `held_state: Some(DriveState::ReviewWait)` and `..HeldFacts::default()`
+    /// (`None`), so both take the fallback — the `for r in HeldReason::ALL`
+    /// sweeps looked like coverage of every reason and were vacuous for this
+    /// one, and deleting the whole arm left every notice test green. That is
+    /// CLAUDE.md's absence-shaped vacuity, on the only new user-visible surface
+    /// in the slice; corroborated by the arm's wording having already moved
+    /// once mid-branch with nothing red to notice either text.
+    ///
+    /// So each arm is asserted to say its own thing AND not the other's. The
+    /// `fix-wait` row is the negative control that keeps this from passing
+    /// under an implementation that prints the `ci-wait` sentence everywhere.
+    #[test]
+    fn fix_stalled_says_which_of_its_two_waits_expired() {
+        let base = HeldFacts { head: HEAD.into(), ..HeldFacts::default() };
+
+        let pushed = HeldFacts { held_state: Some(DriveState::CiWait), ..base.clone() };
+        let n = held_notice(1758, HeldReason::FixStalled, &pushed);
+        assert!(
+            n.contains("pushed") && n.contains("heard nothing from it since"),
+            "the `ci-wait` site reports what the drive observed — a push, then silence: {n}"
+        );
+        assert!(
+            !n.contains("neither pushed nor reported"),
+            "…and never the other site's sentence, which is false about a head that \
+             visibly moved — the exact claim class this arm exists to avoid: {n}"
+        );
+
+        // The control: the older, more general site, whose wording is unchanged
+        // and which any state but `ci-wait` still takes.
+        for from in [None, Some(DriveState::FixWait), Some(DriveState::ReviewWait)] {
+            let m = held_notice(1758, HeldReason::FixStalled, &HeldFacts { held_state: from, ..base.clone() });
+            assert!(
+                m.contains("neither pushed nor reported"),
+                "{from:?} takes the `fix-wait` sentence: {m}"
+            );
+            assert!(!m.contains("heard nothing from it since"), "{from:?}: {m}");
+        }
+
+        // Both sites still name the two tools an orchestrator can reach for,
+        // which §6 requires of every hold and neither arm may drop.
+        for f in [&pushed, &base] {
+            let m = held_notice(1758, HeldReason::FixStalled, f);
+            assert!(m.contains("drive_review") && m.contains("cancel_review_drive"), "{m}");
+        }
+    }
+
     #[test]
     fn the_two_bound_holds_print_the_counter_that_decided_them() {
         let f = HeldFacts {

@@ -2733,6 +2733,16 @@ impl OrchRegistry {
         // next read, successful or not, still misbehaves.
         if !obs.head.is_empty() && entry.head != obs.head {
             entry.head = obs.head.clone();
+            // **A further push while the drive is already waiting on one**
+            // (#2168 E1). In `ci-wait` on an arc-7 head there is no arc to fire
+            // — `transition` refuses a self-arc — so without this the receipts
+            // wait keeps running from the FIRST push and a worker that pushes a
+            // follow-up commit late in the window has minutes to run a fresh
+            // matrix and report. `note_fix_push` re-stamps only an anchor that
+            // already exists, so this cannot start the wait in a state that
+            // never entered it, and it is placed inside the head-actually-moved
+            // guard above so a failed `gh` read can never renew it.
+            entry.note_fix_push(now);
             out.changed = true;
         }
         // **What bounds the superseded-pane lists (#1871 B2, rev-final).** They
