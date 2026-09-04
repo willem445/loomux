@@ -309,7 +309,7 @@ pub enum CompactTrigger {
 /// serialize as the bare string `"ready_marker"` and the whole event would fail
 /// to serialize at runtime, on the one variant no decoder test produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "observed", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ObservedEvent {
     /// The question detector's grid evidence matched.
     QuestionSuspected { matched: String },
