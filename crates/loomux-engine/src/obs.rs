@@ -2817,16 +2817,29 @@ mod tests {
             assert!(h.join().is_err(), "thread must have panicked");
             std::panic::set_hook(prev); // restore before releasing the serial lock
 
-            let dir = fs::read_dir(tmp.path()).unwrap();
-            let crash = dir
+            // SCRATCH REPRODUCER for #2366: a concurrent planted panic wrote a
+            // foreign crash log into this tempdir (planted below), and
+            // read_dir's order is unspecified — sorted-first is a
+            // deterministic stand-in for one of the enumerations the old
+            // first-match find could lose to. Never to merge.
+            fs::write(
+                tmp.path().join("crash-19990101-000000.log"),
+                "loomux crash log\nversion: 0.0.0-foreign\ntime:    19990101-000000\n\
+                 thread:  budget-thread\npanic:   a real panic\nat:      src/budget.rs:1:1\n",
+            )
+            .unwrap();
+            let mut entries: Vec<_> = fs::read_dir(tmp.path())
+                .unwrap()
                 .flatten()
                 .map(|e| e.path())
-                .find(|p| {
+                .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with("crash-"))
                 })
-                .expect("a crash log must exist");
+                .collect();
+            entries.sort();
+            let crash = entries.into_iter().next().expect("a crash log must exist");
             let body = fs::read_to_string(&crash).unwrap();
             assert!(body.contains("crash-test-worker"), "captures the thread name");
             assert!(body.contains("synthetic background crash"), "captures the message");
