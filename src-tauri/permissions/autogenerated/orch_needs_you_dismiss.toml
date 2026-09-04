@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-orch-needs-you-dismiss"
+description = "Enables the orch_needs_you_dismiss command without any pre-configured scope."
+commands.allow = ["orch_needs_you_dismiss"]
+
+[[permission]]
+identifier = "deny-orch-needs-you-dismiss"
+description = "Denies the orch_needs_you_dismiss command without any pre-configured scope."
+commands.deny = ["orch_needs_you_dismiss"]

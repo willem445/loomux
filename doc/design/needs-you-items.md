@@ -84,7 +84,7 @@ carries `#[serde(default)]`, so a file written by an older build loads.
 | `urgency` | `normal` \| `high` — the same `humanq::Urgency`, reused not re-declared |
 | `status` | `open` \| `resolved` |
 | `created_ms` | |
-| `resolved_ms`, `resolved_by`, `resolution` | present once settled |
+| `resolved_ms`, `resolved_by`, `resolution` | present once settled. `resolution` is the human's words about the close: a note when they resolved, a REASON when they dismissed (#2137) — `resolved_by` says which |
 
 **`task` is required for a demo and optional for feedback** (#1151 decision D4).
 The panel opens the board row to show what to run, so a demo with nothing linked
@@ -95,13 +95,27 @@ panel unions items and questions into one list and sorts it urgency-first, so tw
 identical enums would be two spellings of one word that the sort then has to
 reconcile.
 
-**`status` has two states, not three.** A withdrawal and a board move are
-*resolutions with a different `resolved_by`*, not statuses of their own — unlike
-`humanq::Status`, which does carry a separate `withdrawn`. The asymmetry is
-deliberate: a question's terminal states differ in whether the human's decision
-was ever obtained, which every reader needs; an item's do not — nobody decided
-anything, the row is closed, and the provenance lives in `resolved_by` for
-whoever cares exactly.
+**`status` has two states, not four.** A withdrawal, a board move and (since
+#2137) the human's dismissal are *resolutions with a different `resolved_by`*,
+not statuses of their own — unlike `humanq::Status`, which does carry a
+separate `withdrawn` and a separate `dismissed`. The asymmetry is deliberate: a
+question's terminal states differ in whether the human's decision was ever
+obtained, which every reader needs; an item's do not — nobody decided anything,
+the row is closed, and the provenance lives in `resolved_by` for whoever cares
+exactly.
+
+**#2137 is where that argument was tested, and it is a deliberate deviation
+from the issue as written.** The issue asked for "a new terminal state" on both
+registries, and the question side got exactly that. Adding one here would have
+meant a `dismissed` status whose entire content was a `resolved_by` this file
+already carries — a second field with the same job, contradicting the paragraph
+above for no reader's benefit, and starting the drift where a reader has to
+check two fields to learn one fact. So the item side expresses a dismissal as
+`ResolveSource::WebviewDismiss`, writing `resolved_by: "dismissed:webview"` —
+the fourth tag in a column that already had three. The deviation was raised
+before the code was written and approved; what a reader gets is unchanged
+(a dismissal is readable as such, for ever, from one field), and what they are
+spared is a second place to look.
 
 **Ids are legible, not opaque.** `n-{highest + 1}`, read off the file exactly as
 `q-N` and `t-N` are. Constraint 2 (no getrandom-based crates) is satisfied
@@ -155,9 +169,10 @@ the watermark fails toward showing *more*, never toward hiding.
 | --- | --- | --- |
 | `orch_needs_you_list(group_id)` | orch-read | items + `cleared_ms` + the board rows the open items name, in one round trip |
 | `orch_needs_you_resolve(group_id, id, note?)` | orch-control | the human's close-out |
+| `orch_needs_you_dismiss(group_id, id, reason?)` | orch-control | the human's *no longer relevant* (#2137) |
 | `orch_needs_you_clear(group_id)` | orch-control | stamps the watermark, returns it |
 
-All three parse `group_id` at the boundary through `command_group` (CLAUDE.md
+All four parse `group_id` at the boundary through `command_group` (CLAUDE.md
 constraint 6), like every sibling command. Membership is enforced by *which file
 was read*: each group's items live in its own group dir, so another group's id is
 simply absent and gets the same refusal an id that never existed does.
@@ -298,27 +313,39 @@ hook that could not do its job — visible rather than merely silent.
 
 ## The resolve boundary
 
-An item is settled three ways, and they are deliberately not one operation:
+An item is settled four ways, and they are deliberately not one operation:
 
 | how | `resolved_by` | who can do it |
 | --- | --- | --- |
 | the human acknowledges | `webview` | the trusted Tauri command only |
+| the human dismisses (#2137) | `dismissed:webview` | the trusted Tauri command only |
 | the raiser takes it back | `withdrawn:<agent>` | the orchestrator, through `withdraw_attention` |
 | the board moves on | `board:<new-status>` | the lifecycle hook |
 
-**There is no MCP resolve, and `ResolveSource` is a closed enum supplied by the
-entry point.** Resolving is the human clearing their own attention queue — the
-same no-self-served-gate boundary answering a question has, and the same
-structural enforcement: `orch_needs_you_resolve` hard-codes
-`ResolveSource::Webview` rather than taking a `source` string, so "resolve as the
-human" has no spelling, and no `call_tool` arm reaches the method. An agent that
-wants its own ask gone has `withdraw_attention`, which settles it *visibly* as a
-withdrawal.
+**There is no MCP resolve or dismiss, and `ResolveSource` is a closed enum
+supplied by the entry point.** Both are the human clearing their own attention
+queue — the same no-self-served-gate boundary answering a question has, and the
+same structural enforcement: `orch_needs_you_resolve` hard-codes
+`ResolveSource::Webview` and `orch_needs_you_dismiss` hard-codes
+`ResolveSource::WebviewDismiss`, rather than either taking a `source` string, so
+"resolve as the human" has no spelling and neither does "dismiss as the human";
+no `call_tool` arm reaches either method. An agent that wants its own ask gone
+has `withdraw_attention`, which settles it *visibly* as a withdrawal.
+
+**Adding `WebviewDismiss` widened no boundary.** It is the same party — the
+human, in loomux's own webview — saying something different, so it adds no
+surface, only a second thing the surface loomux already trusted can say. The
+guard is that no AGENT-shaped variant exists, and none does.
 
 That is why the board's auto-resolve and an agent's withdraw are **not**
 `ResolveSource` variants. Both are weaker settles that write their own tags;
 giving either one a `ResolveSource` would let it be mistaken for a human's
 acknowledgement, which is the one thing this column exists to keep unambiguous.
+The two human variants keep that property between themselves too, which is what
+makes them two variants rather than a boolean: they write different tags, and
+`the_resolve_and_dismiss_tags_are_not_the_same_string` pins the difference
+rather than the two literals, so a rename cannot collapse "I looked" into "I
+declined to look" while every other check stays green.
 
 **No settle ever deletes a row.** A withdrawn or board-resolved item stays on
 disk so a human who was mid-look can see what happened to it.
@@ -345,6 +372,51 @@ than the attribution.
 **A delivery failure never fails the resolve.** The item is settled durably
 either way, and a cold orchestrator finds it through the list. The registry is
 the record; the notice is only a notification.
+
+### The dismissal notice (#2137)
+
+```
+[orrerix] needs-you item n-N (t-M) dismissed by the human — NOT A LOOK: they
+did not open it, nothing was judged, and the task is exactly where it was. Do
+not raise this ask again unless something changed. — reason: <reason>
+```
+
+(one line on the wire; wrapped here to fit the page).
+
+**It is delivered whether or not there is a reason**, and that is the one place
+dismissing behaves differently from resolving. A note-less resolve is the human
+tidying a queue *after looking*, and a pane delivery per tidy is noise the
+orchestrator pays for on every turn. A dismissal says the ask was not worth
+opening — which is news to the agent that raised it, and the only signal it
+will ever get. Suppressing it would mean the same ask comes back.
+
+The fixed clause precedes the reason for the question notice's reason: the
+words that stop this being read as "the human looked and approved" are
+loomux-built, so the cap can only ever trim a reason's tail. Both the reason
+and the task ref are untrusted text and go through `sanitize_gh_text`, exactly
+as the resolve notice's note and task ref do.
+
+**Dismissing does not move the task**, exactly as resolving does not.
+
+That is three separate methods on the registry rather than one with flags —
+`resolve_needs_you`, `dismiss_needs_you`, `withdraw_needs_you` — because each
+differs in the tag it writes, the audit action it records, and whether it
+delivers at all. A boolean threaded through one method would have made all
+three of those conditionals inside a function whose callers could not see them.
+
+**The split needs a guard, and review round 2 found it missing.** Both settle
+methods take a `ResolveSource` by value while each hard-codes its own tag,
+audit action and delivery rule — so the mismatched pairing
+(`resolve_needs_you(…, WebviewDismiss)`) wrote `resolved_by:
+"dismissed:webview"`, which every reader downstream treats as *the human did
+not look*, while auditing `needs-you-resolve` and, with no note, delivering
+nothing at all. Each method now refuses the other's source via
+`ResolveSource::is_dismissal`, and
+`a_resolve_and_a_dismissal_each_refuse_the_other_s_source` performs both
+forbidden pairings rather than asserting the guard exists. Neither is reachable
+from the two Tauri commands, each of which hard-codes one variant; the guard is
+for the second dismissing surface, which is where an unguarded parameter gets
+passed the wrong way.
 
 ## The board lifecycle mapping
 

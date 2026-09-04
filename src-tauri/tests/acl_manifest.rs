@@ -75,8 +75,8 @@ stub_commands!(
     orch_set_compact_context_threshold, orch_autonomy, orch_group_usage, orch_group_summary,
     orch_group_view, orch_strip_view,
     orch_workflow_preview, orch_set_advanced_orchestrator, orch_workflow_status, orch_group_watches, orch_lock_state,
-    orch_mailbox_status, orch_questions_list, orch_question_answer,
-    orch_needs_you_list, orch_needs_you_resolve, orch_needs_you_clear,
+    orch_mailbox_status, orch_questions_list, orch_question_answer, orch_question_dismiss,
+    orch_needs_you_list, orch_needs_you_resolve, orch_needs_you_dismiss, orch_needs_you_clear,
     orch_end_group, orch_channel_connect,
     orch_channel_disconnect, orch_channel_list, orch_channel_for_pane, orch_channel_set_sender,
     orch_solo_prepare, orch_solo_bind, orch_confirm_solo_copilot_autopilot, orch_solo_adopt,
@@ -166,11 +166,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_159() {
+fn app_commands_len_is_161() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        159,
-        "APP_COMMANDS drifted from the expected count of 159 (120 per the #363 plan's audited \
+        161,
+        "APP_COMMANDS drifted from the expected count of 161 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -208,13 +208,15 @@ fn app_commands_len_is_159() {
          +1 for liveness_stamp — the webview's half of the liveness heartbeat, added in \
          #1601 Phase 0.4, +2 for orch_group_view/orch_strip_view — the published-snapshot \
          reads that replaced the group view's ten-invoke poll batch and the tab strip's \
-         per-group-bound-tab sweep, added in #1608) — \
+         per-group-bound-tab sweep, added in #1608, \
+         +2 for orch_question_dismiss/orch_needs_you_dismiss — the human's \
+         no-longer-relevant close-out on each registry, added in #2137) — \
          if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_159_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_161_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();

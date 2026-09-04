@@ -61,6 +61,22 @@
 //! that supplies it. Do **not** add a `source` parameter, and do not add an
 //! MCP tool.
 //!
+//! # Dismissal — a second human power, deliberately not the same one (#2137)
+//!
+//! The human can also settle a question by saying it no longer matters:
+//! [`Status::Dismissed`], through
+//! [`dismiss_question`](super::OrchRegistry::dismiss_question) and its own
+//! closed [`DismissSource`]. Everything above applies to it unchanged — no MCP
+//! tool reaches it, the source is a property of the entry point, and both the
+//! settle and every refusal are audited.
+//!
+//! What is NOT shared is the closed set. `DismissSource` is its own enum
+//! rather than a variant of `AnswerSource`, because answering and dismissing
+//! are different powers over the same row: an answer is a decision the fleet
+//! acts on, a dismissal decides nothing and only releases a hold. One list
+//! behind both would mean a surface trusted to do one silently acquired the
+//! other. Two lists, two deliberate decisions.
+//!
 //! # Naming
 //!
 //! `Question*` is already taken in `mod.rs` by the pane detector that decides
@@ -114,6 +130,32 @@ pub const SETTLED_RETAINED: usize = 20;
 /// mistaken for the whole one.
 pub const LIST_SETTLED_CAP: usize = 10;
 
+/// Longest dismissal reason accepted from a trusted surface (#2137).
+///
+/// A quarter of [`ANSWER_TEXT_MAX`] on purpose: a dismissal explains why the
+/// question stopped mattering, in a line. Anything needing 2000 characters of
+/// explanation is a DECISION, and a decision belongs in an answer — where the
+/// orchestrator will act on it — rather than in a note attached to a question
+/// it is being told nobody decided.
+pub const DISMISS_REASON_MAX: usize = 500;
+
+/// Total cap on the composed `[orrerix] question q-N dismissed …` notice.
+///
+/// **A backstop on the whole line, not the active limiter** — the same
+/// relationship [`ANSWER_NOTICE_CAP`] (2400) has to [`ANSWER_TEXT_MAX`]
+/// (2000). The reason is already bounded by [`DISMISS_REASON_MAX`] inside
+/// [`dismiss_notice`]'s `sanitize_gh_text` call, so the longest line that
+/// function can compose — the fixed clause plus a full-length reason — is
+/// comfortably under this, and in practice this `take` cuts nothing.
+///
+/// It is kept anyway, because a cap on what enters a pane should not depend on
+/// every future edit to the clause above it staying short. That it cannot bite
+/// TODAY is a residual, and it is pinned as one rather than left to be
+/// rediscovered: `the_dismiss_notice_says_not_an_answer_before_it_says_anything_untrusted`
+/// asserts the arithmetic, so growing the clause past the slack reddens a test
+/// with a sentence instead of quietly making this the limiter.
+pub const DISMISS_NOTICE_CAP: usize = 900;
+
 /// Total cap on the composed `[orrerix] answer to q-N …` notice.
 ///
 /// Wider than `notify::NOTICE_TOTAL_CAP` (400), deliberately: those notices
@@ -122,15 +164,34 @@ pub const LIST_SETTLED_CAP: usize = 10;
 /// throw away the sentence the orchestrator is waiting on.
 pub const ANSWER_NOTICE_CAP: usize = 2400;
 
-/// Where a question is in its life. Terminal states are both settled: an
-/// answered question got its decision, a withdrawn one was overtaken by
-/// events. Neither can be re-settled.
+/// Where a question is in its life. Every terminal state is settled, and the
+/// three of them are three DIFFERENT FACTS about whether a decision was ever
+/// obtained — which is the whole reason this enum has more than two variants
+/// while [`needsyou::Status`](super::needsyou::Status) deliberately has two:
+///
+/// - [`Answered`](Status::Answered) — the human decided. "Your call" is a
+///   decision; so is picking an option. The orchestrator acts on it.
+/// - [`Withdrawn`](Status::Withdrawn) — the ASKER took it back, because the
+///   question was overtaken by events before the human reached it.
+/// - [`Dismissed`](Status::Dismissed) — the HUMAN says it no longer matters
+///   (#2137). Nobody decided anything: the hold the question was placing on
+///   the work is released, and the question is not re-asked unless the
+///   orchestrator still needs the decision.
+///
+/// Reading a dismissal as an answer is the one misreading that costs
+/// something, so it is kept impossible at every layer: the status is its own
+/// value rather than an `answered` row with an empty answer, `answer` stays
+/// `None` on a dismissed row, and the pane notice says *not an answer* in
+/// words before it says anything else.
+///
+/// None can be re-settled — see [`dismiss`], the pure transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Pending,
     Answered,
     Withdrawn,
+    Dismissed,
 }
 
 impl Status {
@@ -142,8 +203,34 @@ impl Status {
             Status::Pending => "pending",
             Status::Answered => "answered",
             Status::Withdrawn => "withdrawn",
+            Status::Dismissed => "dismissed",
         }
     }
+}
+
+/// **The settle transition for a dismissal, as a pure function** (#2137).
+///
+/// Split out of [`OrchRegistry::dismiss_question`](super::OrchRegistry::dismiss_question)
+/// so the rule can be tested without a registry, a temp dir or a clock — and
+/// so there is exactly ONE place that decides what a dismissal may be applied
+/// to. Three properties, and all three are the issue's acceptance criteria:
+///
+/// 1. A pending question dismisses, becoming [`Status::Dismissed`].
+/// 2. `Dismissed` is TERMINAL — dismissing one again is refused, not a no-op.
+/// 3. An already-`Answered` (or `Withdrawn`) question is refused, so a
+///    dismissal can never overwrite a decision the human already made.
+///
+/// The refusal NAMES the state it found, because "already settled" alone
+/// leaves the reader unable to tell an answer they should act on from a
+/// withdrawal they should forget.
+pub fn dismiss(status: Status) -> Result<Status, String> {
+    if status.is_settled() {
+        return Err(format!(
+            "already {} — a settled question cannot be dismissed",
+            status.label()
+        ));
+    }
+    Ok(Status::Dismissed)
 }
 
 /// How loudly this question wants the human's attention.
@@ -328,8 +415,24 @@ pub struct Question {
     #[serde(default)]
     pub created_ms: u64,
     /// The human's decision, verbatim as the trusted surface supplied it.
+    ///
+    /// **Stays `None` on a dismissed row** (#2137), and that is load-bearing
+    /// rather than incidental: a dismissal is the human saying the question
+    /// stopped mattering, so there is no decision to carry, and putting the
+    /// dismissal's reason here would make every reader that checks `answer`
+    /// see a decision nobody made. The reason lives in [`Question::reason`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+    /// Why the human dismissed it, when they said (#2137) — optional, and
+    /// present only on a [`Status::Dismissed`] row.
+    ///
+    /// A separate field from `answer` for the reason that field's doc gives:
+    /// these are two different facts, and one slot holding either would make
+    /// them indistinguishable to every reader downstream. Additive and
+    /// `skip_serializing_if`, like every field past the required core, so a
+    /// file written before this existed still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Which trusted surface settled it — [`AnswerSource::tag`], or
     /// `withdrawn:<agent>` when the asker took it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,6 +465,50 @@ impl AnswerSource {
     pub fn tag(&self) -> String {
         match self {
             AnswerSource::Webview => "webview".to_string(),
+        }
+    }
+}
+
+/// **Which trusted surface a DISMISSAL came from — a closed set, and never a
+/// caller-supplied string** (#2137).
+///
+/// [`AnswerSource`]'s shape, and a SEPARATE type from it on purpose. The two
+/// enums are two different powers over the same registry, and answering is the
+/// strictly greater one: an answer is a decision the whole fleet then acts on,
+/// while a dismissal decides nothing and only releases a hold. Threading a
+/// dismissal through `AnswerSource` would put both powers behind one list, so
+/// a variant added for one — #947's chat bridge is the planned answering
+/// surface — would silently acquire the other. Which surfaces may answer and
+/// which may dismiss is a decision worth making twice rather than inheriting
+/// once.
+///
+/// There is no variant for an agent here either, for
+/// [`AnswerSource`]'s reason: the asker's own take-back already exists as
+/// [`withdraw_question`](super::OrchRegistry::withdraw_question), which
+/// settles the row visibly as `withdrawn`. "The human says it no longer
+/// matters" is not a thing an agent can say on the human's behalf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DismissSource {
+    /// The human clicking Dismiss in the app's own webview, via the
+    /// `orch_question_dismiss` Tauri command.
+    Webview,
+}
+
+impl DismissSource {
+    /// The stable string recorded on the question and in the audit log.
+    ///
+    /// `"webview"` — the same tag an answer from the same surface records,
+    /// deliberately: `settled_by` answers "which surface settled this", and it
+    /// was the same surface. WHAT it did is `status`, which is where a
+    /// dismissal and an answer are already told apart, and duplicating that
+    /// distinction into the tag would give two fields one job.
+    ///
+    /// `String` rather than `&'static str` for [`AnswerSource::tag`]'s reason:
+    /// a future surface carries an identity, and a signature that has to widen
+    /// later is one every call site re-touches.
+    pub fn tag(&self) -> String {
+        match self {
+            DismissSource::Webview => "webview".to_string(),
         }
     }
 }
@@ -519,6 +666,72 @@ pub fn validate_answer(answer: &str) -> Result<String, String> {
         ));
     }
     Ok(answer)
+}
+
+/// Bounds-check an optional dismissal reason from a trusted surface (#2137).
+///
+/// A reason is OPTIONAL — "this stopped mattering" is a complete thought — so
+/// an absent or blank one is `Ok(None)` rather than an error. That is the
+/// opposite posture to [`validate_answer`], and deliberately: an empty ANSWER
+/// is a decision with nothing in it, while an empty dismissal is the ordinary
+/// case.
+///
+/// Rejects rather than truncates, on [`validate_ask`]'s reasoning: a reason
+/// silently cut is one whose point may have been the part that was dropped,
+/// and the human has no way to see that happened.
+pub fn validate_dismiss_reason(reason: Option<&str>) -> Result<Option<String>, String> {
+    let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    if reason.chars().count() > DISMISS_REASON_MAX {
+        return Err(format!(
+            "dismissal reason is {} characters, max {DISMISS_REASON_MAX} — a dismissal says why \
+             the question stopped mattering in a line; if it needs more than that, it is a \
+             decision and belongs in an answer",
+            reason.chars().count()
+        ));
+    }
+    Ok(Some(reason.to_string()))
+}
+
+/// The notice delivered into the orchestrator's pane when the human dismisses
+/// a question (#2137).
+///
+/// **The fixed clause comes before the reason, and that ordering is the whole
+/// point of the shape.** The orchestrator's one dangerous misreading is to
+/// treat this as an answer and act on a decision nobody made, so the words
+/// that rule that out — *not an answer*, *nothing was decided* — are
+/// loomux-built and sit ahead of the payload, so no cap on this line can reach
+/// them. The reason is last and is bounded by [`DISMISS_REASON_MAX`] in the
+/// `sanitize_gh_text` call below, so an over-long one loses its own tail rather
+/// than the sentence that gives it its meaning. [`answer_notice`] orders itself
+/// the same way for the same reason.
+///
+/// [`DISMISS_NOTICE_CAP`] on the composed result is a second, outer bound that
+/// today cuts nothing — see that constant for why it is kept and where the
+/// residual is pinned.
+///
+/// **`reason` is untrusted text entering an `[orrerix]` line.** A human typed
+/// it rather than an agent, but the pane cannot tell those apart and a newline
+/// in it would forge a second line reading as its own legitimate notice — so
+/// it goes through `sanitize_gh_text` like every other notice field. The id
+/// and the source tag are loomux-built and need no sanitizing.
+///
+/// With no reason the trailing clause is omitted entirely rather than emitted
+/// empty: `— reason:` with nothing after it reads like a truncation, and the
+/// orchestrator would have no way to tell it from one.
+pub fn dismiss_notice(id: &str, source_tag: &str, reason: Option<&str>) -> String {
+    let tail = match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => format!(" — reason: {}", sanitize_gh_text(r, DISMISS_REASON_MAX)),
+        None => String::new(),
+    };
+    let text = format!(
+        "[orrerix] question {id} dismissed by the human (via {source_tag}) — NOT AN ANSWER: \
+         nothing was decided, and the hold this question was placing on the work is released. \
+         Un-block the task it cited and carry on; re-ask only if you still need the \
+         decision.{tail}"
+    );
+    text.chars().filter(|c| !c.is_control()).take(DISMISS_NOTICE_CAP).collect()
 }
 
 /// The next id for this group: `q-{highest + 1}`, read off the file rather

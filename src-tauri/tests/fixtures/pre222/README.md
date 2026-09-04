@@ -1259,3 +1259,32 @@ comparison is honest either way. If it still says MISMATCH, that is a real one.
   defect carve-out, the any-round deferral licence) and added a negative assertion so the
   retracted wording cannot silently return. The resident core stays under its 45,000-byte
   budget: 44,807 → 44,990 bytes (raw, LF on both ends — the budget test's own instrument).
+
+- **#2137, a dismissal is not an answer** — `orchestrator-playbook.md` only; `orchestrator.md`,
+  `worker.md`, `reviewer.md`, `planner.md` and `manager.md` are byte-identical to their previous
+  blessed copies. One step added to **Asking the human**'s protocol, numbered 7 after
+  *Withdraw generously*.
+
+  The human can now settle a pending question themselves as **dismissed** — *this no longer
+  matters* — from the needs-you panel, without an orchestrator turn. That is a fourth terminal
+  state beside `answered` and `withdrawn`, and the orchestrator is the reader who has to tell
+  them apart: an answer is a decision to act on, a withdrawal is its own take-back, and a
+  dismissal is *no answer, hold released*. The step says exactly that — un-block the task that
+  cited `q-N`, decide nothing on the human's behalf, and re-ask only if the decision is still
+  needed and only with the ask rewritten, since the last one was not worth the human's time.
+
+  **The playbook rather than `orchestrator.md`, and the choice was measured rather than
+  preferred.** The issue offered either surface. The resident core is paid on every model call
+  and sits under a 45,000-byte budget; at blob `487cde19` it is 44,990 bytes, so the margin is
+  **10 bytes** and this 8-line step could not have gone there —
+  `the_resident_core_is_under_the_byte_budget` would have caught it as a red rather than as a
+  judgement. (Dated to the BLOB, not a commit: this branch first measured 193 bytes of margin,
+  and #2181 spent all but 10 of it while this PR was open. A blob hash survives the rebase that
+  invalidates every SHA, and names what to re-measure on when it moves.) The playbook is
+  on-demand and has no such budget. Both surfaces re-bless this directory either way; the brief's premise that the
+  playbook is not fixture-pinned is wrong for this tree, and is recorded here so the next
+  implementer does not act on it.
+
+  Nothing else in the template moved: `withdraw_question` stays exactly as it was, because an
+  agent still cannot dismiss and taking your own question back is still the verb for a question
+  the fleet no longer needs.

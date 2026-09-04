@@ -35,9 +35,18 @@ import { canApprove, canProceed } from "./taskboard.ts";
 
 // ---------- the question wire shape ----------
 
-/** One question's life stage, as `humanq::Status` serializes it. Both terminal
- *  states are settled; only `pending` is answerable. */
-export type QuestionStatus = "pending" | "answered" | "withdrawn";
+/** One question's life stage, as `humanq::Status` serializes it. Every state
+ *  but `pending` is settled, and the three settled ones are three different
+ *  facts about whether a decision was ever obtained: `answered` = the human
+ *  decided, `withdrawn` = the asker took it back, `dismissed` = the human said
+ *  it no longer matters (#2137). Only `pending` is answerable or dismissable.
+ *
+ *  An UNKNOWN value — a file written by a newer build — must never read as
+ *  pending: `isPending` tests for `"pending"` rather than against a list of
+ *  settled ones, so a state this build has never heard of lands in the settled
+ *  tail (inert) instead of offering the human a Send button that the backend
+ *  would then refuse. */
+export type QuestionStatus = "pending" | "answered" | "withdrawn" | "dismissed";
 
 /** How many of a question's options the human may pick (`humanq::Select`). */
 export type SelectMode = "single" | "multi";
@@ -82,6 +91,11 @@ export interface OrchQuestion {
   status: QuestionStatus;
   created_ms?: number;
   answer?: string | null;
+  /** Why the human dismissed it, when they said (#2137). Present only on a
+   *  `dismissed` row, and never alongside an `answer` — the backend keeps the
+   *  two in separate fields precisely so a reader cannot mistake one for the
+   *  other, and this type does not collapse them back together. */
+  reason?: string | null;
   settled_by?: string | null;
   settled_ms?: number | null;
 }
@@ -124,6 +138,70 @@ export const SETTLED_SHOWN = 10;
 export function isPending(q: OrchQuestion): boolean {
   return q.status === "pending";
 }
+
+/** Mirror of `humanq::DISMISS_REASON_MAX` and `needsyou::DISMISS_REASON_MAX` —
+ *  one number, because the backend shares one const between the two
+ *  registries. The backend REJECTS an over-cap reason rather than truncating
+ *  it, so the panel stops the human before the click rather than after it,
+ *  which is `ANSWER_MAX`'s and `RESOLUTION_MAX`'s rule applied here. */
+export const DISMISS_REASON_MAX = 500;
+
+/** What a Dismiss actually sends, or `null` when the human typed nothing.
+ *
+ *  **A blank box must become `null`, never `""`.** A reason is genuinely
+ *  optional — the backend takes `None` and settles the row happily — so `""`
+ *  would ask it to store an empty string as an explanation. `resolveNote`'s
+ *  rule, arrived at from the other direction: there a blank is refused, here a
+ *  blank is the ordinary case, and both want `null` on the wire. */
+export function dismissReason(text: string): string | null {
+  return text.trim() || null;
+}
+
+/** Why a dismissal cannot be sent as typed, or `null` when it can.
+ *
+ *  Only one reason exists — an empty box is not a block, it is a reasonless
+ *  dismissal. The cap counts CHARACTERS, not UTF-16 units, because
+ *  `validate_dismiss_reason` counts `chars()`: a naive `.length` would refuse
+ *  an all-astral reason the backend would have taken. */
+export function dismissBlock(text: string): "too-long" | null {
+  const reason = dismissReason(text);
+  if (reason && [...reason].length > DISMISS_REASON_MAX) return "too-long";
+  return null;
+}
+
+/** Whether the panel may offer **Dismiss** on this question.
+ *
+ *  Exactly `isPending`, and written as a call to it rather than a second
+ *  `=== "pending"`: what a settled row admits is one rule, and two spellings
+ *  of it is how the Answer button and the Dismiss button would come to
+ *  disagree about a `dismissed` row. This exists as its own name because the
+ *  panel asks a different QUESTION here ("may I dismiss?") and a reader
+ *  should not have to know the two answers coincide — if they ever stop
+ *  coinciding, this is the one line that changes. */
+export function canDismissQuestion(q: OrchQuestion): boolean {
+  return isPending(q);
+}
+
+/** Whether the panel may offer **Dismiss** on this item. `isOpenItem`, for
+ *  `canDismissQuestion`'s reason. */
+export function canDismissItem(i: NeedsYouItem): boolean {
+  return isOpenItem(i);
+}
+
+/** The `resolved_by` tag a dismissed ITEM carries — `ResolveSource::WebviewDismiss`'s
+ *  `tag()`, mirrored once so the string is not spelled at each reader.
+ *
+ *  **Matched WHOLE, not by prefix, and that is a live trade-off.** Today the
+ *  backend can only write this one dismissal tag, so an exact match is the
+ *  precise reading and `the item tag this panel reads is the one the backend
+ *  writes` pins that a near-miss (`"dismissed"`) is not a dismissal. The day a
+ *  second dismissing surface exists — `dismissed:console`, say — this stops
+ *  matching it and that row renders in the settled tail with an answer's
+ *  weight instead of a `Dismissed:` prefix. The fix then is to match the
+ *  `dismissed:` PREFIX here and widen that test; doing it now would be a guard
+ *  for a tag no backend can emit, whose test could only assert against a
+ *  fabricated row. */
+export const DISMISSED_ITEM_TAG = "dismissed:webview";
 
 // A question-only `projectQuestions` used to live here, splitting the file into
 // pending (oldest-first) and a settled tail. `projectPanel` replaced it: the
@@ -523,6 +601,25 @@ export interface PanelProjection {
    *  the watermark hid: those the human cleared on purpose, and reporting them
    *  back as "12 older not shown" would contradict the gesture. */
   omitted: number;
+}
+
+/** Whether a settled row was DISMISSED — what the faded tail reads to say so
+ *  (#2137).
+ *
+ *  Takes the panel's own tagged `SettledRow` rather than a bare union of the
+ *  two wire types, because the two registries record the fact in DIFFERENT
+ *  fields and the tag is what says which to read: a question carries it in
+ *  `status` (its state model distinguishes settle kinds), an item in
+ *  `resolved_by` (its deliberately does not — see `needsyou::Status`). A
+ *  structural sniff at the row's own keys would be a third rule about which
+ *  registry a row came from, when the projection already decided that.
+ *
+ *  One place, so the label the tail shows and any future behaviour keyed on
+ *  "was this dismissed" cannot come to disagree. */
+export function isDismissedRow(row: SettledRow): boolean {
+  return row.source === "question"
+    ? row.question.status === "dismissed"
+    : row.item.resolved_by === DISMISSED_ITEM_TAG;
 }
 
 /** What a card carries as `data-item-id`, which is also what a deep-link

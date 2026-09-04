@@ -10337,7 +10337,8 @@ pub struct AgentEntry {
 /// - `question` — this agent (orchestrator-only today) has a pending
 ///   `ask_human` row nobody has answered yet (#1091 slice D); DERIVED from
 ///   the `questions.json` registry each scan, never latched, so it clears
-///   the instant the row is answered or withdrawn — but it is the live-pane
+///   the instant the row is settled — answered, withdrawn or dismissed — but
+///   it is the live-pane
 ///   PROJECTION of that registry (the asker's pane must still be running),
 ///   not the registry itself; a pending row against a stopped pane raises
 ///   no item here even though the registry still durably holds it
@@ -28771,6 +28772,7 @@ impl OrchRegistry {
                 status: humanq::Status::Pending,
                 created_ms: now_ms(),
                 answer: None,
+                reason: None,
                 settled_by: None,
                 settled_ms: None,
             };
@@ -28917,6 +28919,113 @@ impl OrchRegistry {
         let _ = self.deliver_to_orchestrator(
             group,
             &humanq::answer_notice(&question.id, &tag, &answer),
+            "human",
+        );
+        Ok(question)
+    }
+
+    /// The human settles a pending question by saying it no longer matters,
+    /// and tells the orchestrator (#2137).
+    ///
+    /// # TRUSTED CALLERS ONLY — the same boundary [`Self::answer_question`] holds
+    ///
+    /// **No agent may reach this method.** `mcp.rs`'s `call_tool` is a closed
+    /// match on tool names and no arm of it reaches here, so there is no name
+    /// an agent can call; `no_agent_token_can_dismiss_a_question_through_the_mcp_surface`
+    /// dispatches every tool the surface offers and asserts the question is
+    /// still not dismissed afterwards, and
+    /// `the_mcp_surface_has_no_path_to_the_dismiss_entry_point` scans the
+    /// source so a future slice cannot wire one in quietly.
+    ///
+    /// An agent that no longer needs its own question answered already has
+    /// [`Self::withdraw_question`], which settles the row visibly as
+    /// `withdrawn`. Dismissal is the HUMAN's verb, and letting an agent spell
+    /// it would let the fleet clear the human's queue on the human's behalf.
+    ///
+    /// `source` is a **closed enum supplied by the entry point** —
+    /// `orch_question_dismiss` hard-codes [`humanq::DismissSource::Webview`],
+    /// so "dismiss as someone else" has no spelling. It is a SEPARATE enum
+    /// from [`humanq::AnswerSource`]; see that type's doc for why answering
+    /// and dismissing do not share one list.
+    ///
+    /// **This is not an answer, and nothing downstream may read it as one.**
+    /// `answer` stays `None`, the status is its own value, and the pane notice
+    /// says so in words ([`humanq::dismiss_notice`]). What the orchestrator is
+    /// expected to do with it is release the hold — un-block the cited task —
+    /// and NOT to infer a decision. Nothing here touches the board: which task
+    /// moves, and whether the question is worth re-asking, stay the
+    /// orchestrator's calls.
+    pub fn dismiss_question(
+        &self,
+        group: &GroupId,
+        id: &str,
+        reason: Option<&str>,
+        source: humanq::DismissSource,
+    ) -> Result<humanq::Question, String> {
+        let tag = source.tag();
+        // Validated before the lock, and a bad reason settles nothing: the
+        // audit records what was turned away rather than half-dismissing a row.
+        let reason = match humanq::validate_dismiss_reason(reason) {
+            Ok(r) => r,
+            Err(e) => {
+                self.audit(group, "human", "question-reject", json!({
+                    "id": id, "source": tag, "op": "dismiss",
+                    "reason": "invalid-dismiss-reason", "detail": e,
+                }));
+                return Err(e);
+            }
+        };
+        let question = {
+            let _guard = self.questions_lock.lock_safe();
+            let mut questions = self.questions(group)?;
+            let Some(idx) = questions.iter().position(|q| q.id == id) else {
+                // Group-scoped by construction, exactly as answering is: this
+                // read is the caller's own group's file, so a question
+                // belonging to another group is simply absent. Membership is
+                // checked by WHICH FILE was read, not by comparing a field.
+                self.audit(group, "human", "question-reject", json!({
+                    "id": id, "source": tag, "op": "dismiss", "reason": "unknown-question",
+                }));
+                return Err(format!("unknown question: {id}"));
+            };
+            // The pure transition decides, here and nowhere else — so "a
+            // second settle refuses" is one rule with one test rather than a
+            // condition re-spelled at each settle site.
+            let next = match humanq::dismiss(questions[idx].status) {
+                Ok(next) => next,
+                Err(e) => {
+                    self.audit(group, "human", "question-reject", json!({
+                        "id": id, "source": tag, "op": "dismiss", "reason": "already-settled",
+                        "status": questions[idx].status.label(),
+                    }));
+                    return Err(format!("{id} is {e}"));
+                }
+            };
+            questions[idx].status = next;
+            questions[idx].reason = reason.clone();
+            questions[idx].settled_by = Some(tag.clone());
+            questions[idx].settled_ms = Some(now_ms());
+            let out = questions[idx].clone();
+            humanq::prune(&mut questions, humanq::SETTLED_RETAINED);
+            self.write_questions(group, &questions)?;
+            out
+        };
+        // Audited before it is delivered, and both outside the lock: the
+        // durable record must not depend on a pane existing to receive it.
+        self.audit(group, "human", "question-dismiss", json!({
+            "id": question.id, "source": tag, "reason": question.reason,
+            "task": question.task, "asker": question.asker,
+        }));
+        // ALWAYS delivered, reason or no reason — unlike a note-less needs-you
+        // resolve, which deliberately delivers nothing. A pending question is
+        // HOLDING work: the orchestrator marked a task blocked citing `q-N`
+        // and is waiting for the row to settle, so a silent dismissal would
+        // leave that task blocked on a question that no longer exists.
+        // Delivery failure never fails the dismissal — the row is settled
+        // durably and a cold orchestrator finds it through `list_questions`.
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &humanq::dismiss_notice(&question.id, &tag, question.reason.as_deref()),
             "human",
         );
         Ok(question)
@@ -29181,6 +29290,25 @@ impl OrchRegistry {
         source: needsyou::ResolveSource,
     ) -> Result<needsyou::Item, String> {
         let tag = source.tag();
+        // **This method settles a LOOK, so it refuses a dismissal's source**
+        // (#2137, review round 2 B1). Both gestures take a `ResolveSource` by
+        // value and each hard-codes its own tag, audit action and delivery
+        // rule; without this, `resolve_needs_you(…, WebviewDismiss)` would
+        // write `resolved_by: "dismissed:webview"` — read downstream as *the
+        // human did not look* — while auditing `needs-you-resolve` and, with
+        // no note, delivering nothing at all. Unreachable from today's one
+        // caller, which hard-codes `Webview`; the guard is what keeps
+        // `is_dismissal`'s "the two cannot disagree" a fact rather than an
+        // intention.
+        if source.is_dismissal() {
+            self.audit(group, "human", "needs-you-reject", json!({
+                "id": id, "source": tag, "op": "resolve", "reason": "wrong-source",
+            }));
+            return Err(format!(
+                "{tag} is a dismissal source — resolving records that the human LOOKED, so it \
+                 cannot be settled with it; call dismiss_needs_you instead"
+            ));
+        }
         // Validated before the lock, and a bad note settles nothing: the audit
         // records what was turned away rather than half-resolving a row.
         let note = match note.map(str::trim).filter(|n| !n.is_empty()) {
@@ -29246,6 +29374,116 @@ impl OrchRegistry {
                 "human",
             );
         }
+        Ok(item)
+    }
+
+    /// The human clears an item by saying it no longer matters (#2137).
+    ///
+    /// # TRUSTED CALLERS ONLY — [`Self::resolve_needs_you`]'s boundary
+    ///
+    /// **No agent may reach this method**, for that method's reason: clearing
+    /// the human's own attention queue is the human's gesture. An agent whose
+    /// ask went stale has [`Self::withdraw_needs_you`], which settles the row
+    /// visibly as a withdrawal. `source` is the same closed enum supplied by
+    /// the entry point — `orch_needs_you_dismiss` hard-codes
+    /// [`needsyou::ResolveSource::WebviewDismiss`] — so there is no spelling
+    /// for "dismiss as the human".
+    ///
+    /// # Why this is a separate method and not a flag on `resolve_needs_you`
+    ///
+    /// Three things differ, and each of the three is a decision rather than a
+    /// parameter: the tag written to `resolved_by` (`dismissed:webview`, which
+    /// is what makes the fact readable a week later), the audit action
+    /// (`needs-you-dismiss`), and — the one that actually matters —
+    /// **whether a pane notice is delivered at all**. A note-less resolve
+    /// deliberately delivers nothing, because it is a human tidying a queue
+    /// after looking and one delivery per tidy is noise. A dismissal is always
+    /// delivered, with or without a reason, because it says the ask was not
+    /// worth opening: that is news to the agent that raised it, and the only
+    /// signal it will ever get.
+    ///
+    /// **Like resolving, it does NOT move the linked task.** The row leaves
+    /// the panel; the board keeps whatever status it had.
+    pub fn dismiss_needs_you(
+        &self,
+        group: &GroupId,
+        id: &str,
+        reason: Option<&str>,
+        source: needsyou::ResolveSource,
+    ) -> Result<needsyou::Item, String> {
+        let tag = source.tag();
+        // The mirror of `resolve_needs_you`'s guard, and needed for the same
+        // reason in the other direction: settling a DISMISSAL with a resolve's
+        // source would write `resolved_by: "webview"` — read downstream as *the
+        // human looked* — while auditing `needs-you-dismiss` and delivering the
+        // dismissal notice. Both directions, so the pair cannot disagree
+        // whichever way a future caller gets it wrong.
+        if !source.is_dismissal() {
+            self.audit(group, "human", "needs-you-reject", json!({
+                "id": id, "source": tag, "op": "dismiss", "reason": "wrong-source",
+            }));
+            return Err(format!(
+                "{tag} is not a dismissal source — dismissing records that the ask no longer \
+                 matters, so it cannot be settled with it; call resolve_needs_you instead"
+            ));
+        }
+        // Validated before the lock, and a bad reason settles nothing — the
+        // audit records what was turned away rather than half-dismissing a row.
+        let reason = match needsyou::validate_dismiss_reason(reason) {
+            Ok(r) => r,
+            Err(e) => {
+                self.audit(group, "human", "needs-you-reject", json!({
+                    "id": id, "source": tag, "op": "dismiss",
+                    "reason": "invalid-dismiss-reason", "detail": e,
+                }));
+                return Err(e);
+            }
+        };
+        let item = {
+            let _guard = self.needs_you_lock.lock_safe();
+            let mut items = self.needs_you(group)?;
+            let Some(idx) = items.iter().position(|i| i.id == id) else {
+                // Group-scoped by construction — see `resolve_needs_you`.
+                self.audit(group, "human", "needs-you-reject", json!({
+                    "id": id, "source": tag, "op": "dismiss", "reason": "unknown-item",
+                }));
+                return Err(format!("unknown needs-you item: {id}"));
+            };
+            // The pure transition decides, here and nowhere else.
+            let next = match needsyou::dismiss(items[idx].status) {
+                Ok(next) => next,
+                Err(e) => {
+                    self.audit(group, "human", "needs-you-reject", json!({
+                        "id": id, "source": tag, "op": "dismiss", "reason": "already-resolved",
+                        "resolved_by": items[idx].resolved_by,
+                    }));
+                    return Err(format!("{id} is {e}"));
+                }
+            };
+            items[idx].status = next;
+            items[idx].resolved_by = Some(tag.clone());
+            items[idx].resolved_ms = Some(now_ms());
+            // The REASON rides in `resolution`, and `resolved_by` is what says
+            // which of the two it is. A second field would be a second slot
+            // meaning "the human's words about this close", and the panel's
+            // settled tail would then have to know which one to render.
+            items[idx].resolution = reason.clone();
+            let out = items[idx].clone();
+            needsyou::prune(&mut items, needsyou::RESOLVED_RETAINED);
+            self.write_needs_you(group, &items)?;
+            out
+        };
+        self.audit(group, "human", "needs-you-dismiss", json!({
+            "id": item.id, "source": tag, "kind": item.kind.label(),
+            "task": item.task, "raiser": item.raiser, "reason": item.resolution,
+        }));
+        // ALWAYS delivered — see this method's doc for why this differs from a
+        // note-less resolve. A delivery failure never fails the dismissal.
+        let _ = self.deliver_to_orchestrator(
+            group,
+            &needsyou::dismiss_notice(&item.id, item.task.as_deref(), item.resolution.as_deref()),
+            "human",
+        );
         Ok(item)
     }
 
@@ -56953,6 +57191,34 @@ pub async fn orch_question_answer(
     .await
 }
 
+/// The human dismisses a pending question, from the app's own webview (#2137).
+///
+/// **There is deliberately no `source` parameter**, on `orch_question_answer`'s
+/// reasoning: the source is a property of this entry point —
+/// `DismissSource::Webview`, hard-coded below — not something a caller states
+/// about itself, and there is no MCP tool that reaches the dismiss entry point
+/// at all.
+///
+/// `reason` is optional, and an absent or blank one is the ordinary case — a
+/// dismissal is complete without an explanation. Either way the question is
+/// settled durably before anything is delivered, and the orchestrator always
+/// gets a notice, because a pending question is holding work.
+#[tauri::command]
+pub async fn orch_question_dismiss(
+    app: AppHandle,
+    group_id: String,
+    id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || {
+        reg.dismiss_question(&group_id, &id, reason.as_deref(), humanq::DismissSource::Webview)
+            .map(|_| ())
+    })
+    .await
+}
+
 // ---------- the manager mailbox (human side, #1161 M2) ----------
 // One read, for the pane's unread chip (M5). The WRITE side is an agent
 // surface only (`message_manager`), so there is no trusted-webview twin of it
@@ -57058,6 +57324,34 @@ pub async fn orch_needs_you_resolve(
     run_blocking(move || {
         reg.resolve_needs_you(&group_id, &id, note.as_deref(), needsyou::ResolveSource::Webview)
             .map(|_| ())
+    })
+    .await
+}
+
+/// The human dismisses a needs-you item, from the app's own webview (#2137).
+///
+/// `orch_needs_you_resolve`'s shape with one difference the caller can see:
+/// this settles the row as `dismissed:webview` rather than `webview`, and it
+/// ALWAYS delivers a pane notice — a resolve without a note deliberately
+/// delivers none. See `OrchRegistry::dismiss_needs_you` for why that is a
+/// separate command rather than a boolean on the one beside it.
+#[tauri::command]
+pub async fn orch_needs_you_dismiss(
+    app: AppHandle,
+    group_id: String,
+    id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let reg = reg_of(&app);
+    let group_id = command_group(&group_id)?;
+    run_blocking(move || {
+        reg.dismiss_needs_you(
+            &group_id,
+            &id,
+            reason.as_deref(),
+            needsyou::ResolveSource::WebviewDismiss,
+        )
+        .map(|_| ())
     })
     .await
 }
