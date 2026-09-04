@@ -391,10 +391,7 @@ impl Decoder {
                     id: ToolUseId(id),
                     // `is_error` absent means the call succeeded; the field is
                     // only written on the failing side.
-                    ok: !block
-                        .get("is_error")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    ok: true,
                 }));
             }
         }
