@@ -35789,7 +35789,6 @@ impl OrchRegistry {
                 // is the right answer for their pane: the loomux server is an
                 // ADDITION to what they already had, not a replacement for it.
                 // A group pane is the opposite case and gets the env.
-                "pi" => format!("--mcp-config \"{}\"", cfg.display()),
                 // Not `unreachable!()` any more (constraint 10). `has_seam`
                 // comes from `CLI_CAPS`, so this arm is reached by DATA — a
                 // row landing with `mcp_argv_seam: true` and no arm here would
