@@ -100,8 +100,11 @@ launch warns inline —
 > connection.
 
 — and keeps the value, because it becomes correct the moment you pick a CLI.
-Synthesizing a login shell (`cd … && exec $SHELL -l`) would mean *guessing* the
-remote's login shell, which is exactly what **Remote shell** exists to avoid.
+Synthesizing one (`cd … && exec "$SHELL" -l -i`) would quietly change what the
+pane *is*: with no remote command ssh asks sshd for an interactive session and
+sshd starts your login shell itself, while any remote command — even one whose
+only job is a `cd` — makes it a *command* session with a forced pty. A different
+session shape, to save one `cd` you can type in the pane.
 
 ## Credentials: orrerix holds none
 
@@ -165,11 +168,50 @@ A name orrerix doesn't recognize warns and still runs:
 What actually reaches the far host, with **Remote CLI = Claude Code** and a
 **Remote folder** of `/srv/app` on a POSIX remote, is **one** remote-command
 string — every token individually quoted, so nothing in it can be re-read as
-another argument:
+another argument, and the whole of it handed to your own login shell:
 
 ```
-cd '/srv/app' && exec 'claude' '--session-id' '<uuid>'
+exec "$SHELL" -l -i -c 'cd '\''/srv/app'\'' && exec '\''claude'\'' '\''--session-id'\'' '\''<uuid>'\'''
 ```
+
+### Which shell that runs in, and why it matters
+
+`ssh host -- '<command>'` does **not** get you the shell you get when you log in.
+sshd runs a remote command through your account's shell with `-c`, which makes it
+neither a **login** shell nor an **interactive** one — so none of the files that
+normally build your `PATH` are read, and a CLI you installed yourself is simply
+not there:
+
+```
+bash: exec: copilot: not found
+```
+
+…on a host where `copilot` runs fine the moment you log in by hand. That is why
+the remote command re-enters your shell as `"$SHELL" -l -i -c`. Both flags are
+needed and neither is enough alone:
+
+- **`-l` (login)** is what reads `/etc/profile` and `~/.profile` (or
+  `~/.zprofile`, `~/.zlogin`), where `~/.local/bin` and `~/.npm-global/bin`
+  usually get added.
+- **`-i` (interactive)** is what gets you past the top of `~/.bashrc` — Ubuntu's
+  stock one returns immediately in a non-interactive shell, and **nvm**'s
+  `PATH` export sits below that line. `~/.zshrc` is interactive-only in the same
+  way.
+
+`"$SHELL"` and not a literal `bash`: your account's shell may be zsh or fish, and
+`bash -lic` would read the wrong files entirely. It is read from the environment
+sshd sets up from your account, not guessed here.
+
+**The visible cost: MOTD and rc chatter can appear before the TUI.** A login
+shell prints what a login shell prints — the message of the day, a shell banner,
+anything your rc files `echo`. The pane already forces a pty (`-t`) because a
+remote TUI needs one, so this lands in the scrollback above the CLI and is
+harmless; if it bothers you, the usual `~/.hushlogin` and quieting your own rc
+files work exactly as they do on a normal login.
+
+This applies to the **POSIX** scheme only. **cmd.exe** has no login/non-login
+distinction and no per-user rc file that sshd's invocation skips, so its remote
+command is unchanged.
 
 **Claude Code is the only remote CLI that gets a session id**, and for a
 structural reason rather than a preference: Claude's session identity is a value

@@ -477,13 +477,20 @@ export function sshDiscardedFieldError(raw: SshProfile, kept: SshProfile): strin
  *  second mechanism.
  *
  *  Warned about rather than either honoured or refused, and both alternatives
- *  are worse. Honouring it would mean synthesizing a login-shell command
- *  (`cd … && exec $SHELL -l`), which is a GUESS about the remote's login shell —
- *  the exact class of guess `remoteShell` exists to refuse (plan part 4a: the
- *  remote's shell is unknowable from here, so the user declares it). Refusing to
- *  SAVE it would throw away a setting that becomes correct the moment the human
- *  picks a CLI. So the value is kept, and the human is told when it won't apply.
- *  Not silent, not lost, not guessed at. */
+ *  are worse. Honouring it would mean synthesizing a remote command whose whole
+ *  job is a `cd`, and ANY remote command changes what the pane is: with none,
+ *  ssh asks sshd for an interactive session and sshd starts the account's login
+ *  shell itself; with one, ssh forces a pty and sshd runs `<shell> -c <string>`.
+ *  Refusing to SAVE it would throw away a setting that becomes correct the
+ *  moment the human picks a CLI. So the value is kept, and the human is told
+ *  when it won't apply. Not silent, not lost, not substituted for something
+ *  else.
+ *
+ *  This used to read "`cd … && exec $SHELL -l` is a GUESS about the remote's
+ *  login shell". #2395 retired the phrasing, not the decision: `$SHELL` comes
+ *  from the environment sshd built from the account, and the posix builder now
+ *  emits `exec "$SHELL" -l -i -c` for every remote command (see
+ *  doc/design/ssh-panes.md). What this warning protects is the session shape. */
 export function sshRemoteCwdWarning(remoteCli: string | null, remoteCwd: string | null): string {
   if (!remoteCwd || remoteCli) return "";
   return (

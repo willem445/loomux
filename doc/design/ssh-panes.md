@@ -202,6 +202,91 @@ remotes are unsupported in v1 and reachable as a plain login shell; naming
 cmd.exe's own case is what lets a later slice add PowerShell without redefining a
 value users already have on disk.
 
+## The posix remote command runs in a login+interactive shell
+
+`buildPosixRemoteCommand` emits
+
+```
+exec "$SHELL" -l -i -c '<cd … && exec <cli> …>'
+```
+
+rather than the bare `cd … && exec …` it emitted through v1.3.0-beta7. The
+reason is a live bug (#2395): an SSH pane to Ubuntu with a remote folder and
+**copilot** answered `bash: exec: copilot: not found` on a host where an
+interactive login finds `copilot` immediately.
+
+**Why it broke, and why only the CLI form broke.** sshd runs a remote command
+through the account's shell with `-c` — sshd(8): "the client either requests an
+interactive shell or execution of a non-interactive command, which `sshd` will
+execute via the user's shell using its `-c` option". That shell is neither a
+login shell nor an interactive one, so it reads neither `~/.profile` nor the part
+of `~/.bashrc` below Ubuntu's `case $- in *i*) ;; *) return;; esac`. Everything
+that puts a user-installed CLI on `PATH` — nvm, `~/.local/bin`,
+`~/.npm-global/bin`, pnpm/volta/bun shims — lives in exactly those files. A CLI
+in `/usr/bin` resolved; the ones agents actually install did not. The
+no-`remoteCommand` form was unaffected because sshd starts a real login shell
+there itself, which is why "connect" worked and "connect + folder + CLI" did not.
+
+**Why both flags.** They fix different files and neither alone closes the bug:
+
+- **`-l` alone** reads `/etc/profile` and `~/.profile`, so it recovers
+  `~/.local/bin` and `~/.npm-global/bin` — and still misses nvm on a stock
+  Ubuntu account, whose `NVM_DIR`/`PATH` export sits in `~/.bashrc` *below* the
+  interactive early-return a non-interactive shell takes.
+- **`-i` alone** gets past that early return, and misses `~/.profile` entirely —
+  which is where the other half of the reported host's `PATH` came from.
+
+**Why `"$SHELL"` and not `bash`.** `bash -lic` is shorter and wrong: an account
+whose shell is zsh or fish would be handed a bash login, sourcing files it does
+not use and skipping the ones it does. That *is* the class of guess `remoteShell`
+exists to refuse. `$SHELL` is not a guess in the same sense — it is not detected
+by us at all, it is read from the environment sshd itself built from the
+account's passwd entry (openssh-portable `session.c`:
+`child_set_env(&env, &envsize, "SHELL", shell)` over
+`shell = (pw->pw_shell[0] == '\0') ? _PATH_BSHELL : pw->pw_shell`), so on this
+path it is always set and always non-empty. It is double-quoted so a shell path
+containing a space stays one word.
+
+**Why not a `PATH=` prefix.** Prepending `PATH=$HOME/.local/bin:$HOME/.nvm/…` to
+the remote command would name the directories a CLI *might* be installed in —
+this machine's layout baked into product code, which is what CLAUDE.md constraint
+8 forbids. It also silently stops working for the next installer that picks a
+different directory, with no error to say so.
+
+**Why two `exec`s.** The outer one replaces sshd's `-c` shell with the login
+shell; the inner one replaces the login shell with the CLI. The wrap therefore
+costs no extra process on the far host — the CLI still ends up as the session's
+only process, which is what makes ssh's own disconnect handling behave the same
+as before.
+
+**Quoting.** The `cd`-then-`exec` core is `posixQuote`d once *more*, so it
+arrives as a single `-c` argument regardless of what is in `remoteCwd` or the
+command tokens. The security argument is unchanged from the single-layer form,
+because it is the same scheme applied twice: nothing inside single quotes is
+special except `'`, which is closed/escaped/reopened. `test/sshcommand.test.ts`
+executes the built string through a real `sh` and checks that a hostile
+`remoteCwd` still fails closed under the wrap.
+
+**The accepted cost.** An interactive login shell prints what a login shell
+prints: MOTD, banners, anything an rc file `echo`s. That lands in the pane above
+the TUI. `-t` is already forced for a remote TUI, so a pty was always expected,
+and the alternative — a CLI that cannot be found at all — is strictly worse.
+Documented for users in `docs/features/ssh-panes.md`.
+
+**Known limit, stated rather than guessed around.** `csh`/`tcsh` reject `-l`
+combined with other options, so an account whose shell is one of those cannot run
+the wrapped form. No mitigation is attempted: guessing per-shell flag grammar
+from here is the same class of guess as guessing the shell, and such a host is
+still reachable as a plain login shell (**Remote CLI = None**). If that turns out
+to matter, the honest fix is a declared field, the way `remoteShell` already is.
+
+**`buildCmdRemoteCommand` is deliberately untouched.** cmd.exe has no
+login/non-login distinction and no per-user rc file that sshd's `-c` invocation
+skips, so there is no lost `PATH` for a wrap to recover — and `"$SHELL"` would
+reach cmd.exe as four literal characters rather than an expansion. A test pins
+that path byte-for-byte against its pre-#2395 shape, so "unchanged" is checked
+rather than asserted.
+
 ## The launch seam, and the two rules it taught
 
 S3's review (#921) produced two findings whose lesson generalizes past this
@@ -297,11 +382,21 @@ Two consequences worth stating because they are what makes it safe:
   port or a pasted key is dropped from both or from neither.
 
 `remoteCwd` is the case where "honour it" was the wrong answer, and the reason
-generalizes: honouring it with no remote CLI would mean synthesizing
-`cd … && exec $SHELL -l`, which is a **guess** about the remote's login shell —
-the exact class of guess `remoteShell` exists to refuse. Refusing to *save* it
-would throw away a setting that becomes correct the moment a CLI is picked. So it
-is kept, and the human is told. Not silent, not lost, not guessed at.
+generalizes: honouring it with no remote CLI would mean synthesizing a remote
+command whose entire job is a `cd`, and *any* remote command changes what the
+pane is. With none, ssh asks sshd for an interactive session and sshd starts the
+account's login shell itself; with one, ssh forces a pty and sshd runs
+`<shell> -c <string>` instead. Refusing to *save* the value would throw away a
+setting that becomes correct the moment a CLI is picked. So it is kept, and the
+human is told. Not silent, not lost, not substituted for something else.
+
+That argument used to be written as "`cd … && exec $SHELL -l` is a **guess**
+about the remote's login shell". #2395 retired that phrasing rather than the
+decision: `$SHELL` is read from the environment sshd built from the account, so
+it was never the guessing this codebase refuses — and the posix builder now emits
+exactly `exec "$SHELL" -l -i -c` (see *The posix remote command runs in a
+login+interactive shell*). What the warning is really protecting is the session
+*shape*, which is why the behaviour is unchanged.
 
 ### The other silent loss: a save that publishes a list it never read (#1332)
 

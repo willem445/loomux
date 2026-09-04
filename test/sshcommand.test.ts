@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   buildSshArgv,
@@ -71,7 +71,7 @@ test("remote command: -t precedes options, -- and one quoted string follow desti
     "22",
     "user@host",
     "--",
-    "exec 'claude'",
+    "exec \"$SHELL\" -l -i -c 'exec '\\''claude'\\'''",
   ]);
 });
 
@@ -84,7 +84,8 @@ test("remote command with cwd: posix cd-then-exec", () => {
   };
   const argv = buildSshArgv(FAKE_SSH, params);
   assert.equal(argv.length, 5);
-  assert.equal(argv[argv.length - 1], "cd '/srv/app' && exec 'claude' '--session-id' 'abc-123'");
+  // inner (pre-#2395 shape, now the -c argument): cd '/srv/app' && exec 'claude' '--session-id' 'abc-123'
+  assert.equal(argv[argv.length - 1], "exec \"$SHELL\" -l -i -c 'cd '\\''/srv/app'\\'' && exec '\\''claude'\\'' '\\''--session-id'\\'' '\\''abc-123'\\'''");
 });
 
 test("remote command with cwd: cmd.exe cd /d then bare command", () => {
@@ -151,7 +152,7 @@ test("flag matrix: everything combined, in the documented order", () => {
     "-4",
     "user@host",
     "--",
-    "exec 'claude'",
+    "exec \"$SHELL\" -l -i -c 'exec '\\''claude'\\'''",
   ]);
 });
 
@@ -165,7 +166,8 @@ test("posix quoting: embedded single quote in remoteCwd is escaped, not a shell 
     remoteCommand: ["claude"],
   });
   const cmdString = argv[argv.length - 1];
-  assert.equal(cmdString, "cd '/home/o'\\''brien' && exec 'claude'");
+  // inner (pre-#2395 shape, now the -c argument): cd '/home/o'\''brien' && exec 'claude'
+  assert.equal(cmdString, "exec \"$SHELL\" -l -i -c 'cd '\\''/home/o'\\''\\'\\'''\\''brien'\\'' && exec '\\''claude'\\'''");
   // [program, -t, destination, --, cmdString] — the hostile cwd never split
   // the command into extra argv tokens at the local-spawn level.
   assert.equal(argv.length, 5);
@@ -180,9 +182,88 @@ test("posix quoting: hostile remote-command token with quotes, semicolons and ba
   });
   const cmdString = argv[argv.length - 1];
   // Every embedded `'` is closed/escaped/reopened; nothing outside quotes.
-  assert.equal(cmdString, "exec 'claude' ''\\''; rm -rf ~; echo `whoami`'");
+  // inner (pre-#2395 shape, now the -c argument): exec 'claude' ''\''; rm -rf ~; echo `whoami`'
+  assert.equal(cmdString, "exec \"$SHELL\" -l -i -c 'exec '\\''claude'\\'' '\\'''\\''\\'\\'''\\''; rm -rf ~; echo `whoami`'\\'''");
   assert.equal(argv.length, 5);
   assert.equal(argv[2], "h"); // destination untouched by the hostile token
+});
+
+// ---------- #2395: the posix remote command runs under a login+interactive shell ----------
+//
+// sshd executes a remote command as `$SHELL -c '<cmd>'` — non-login AND
+// non-interactive — so a user-installed CLI (nvm, ~/.local/bin, ~/.npm-global/bin)
+// is off PATH and `exec copilot` dies with "not found" even though an interactive
+// login on the same host finds it. The posix builder therefore re-enters the
+// user's own shell as a login+interactive one and hands it the previous shape as
+// a single, once-more-quoted argument.
+
+test("#2395 posix: the remote command is wrapped in an interactive login shell, cwd form", () => {
+  const params: SshCommandParams = {
+    destination: "user@host",
+    remoteShell: "posix",
+    remoteCwd: "/srv/app",
+    remoteCommand: ["claude", "--session-id", "abc-123"],
+  };
+  const argv = buildSshArgv(FAKE_SSH, params);
+  assert.equal(
+    argv[argv.length - 1],
+    `exec "$SHELL" -l -i -c 'cd '\\''/srv/app'\\'' && exec '\\''claude'\\'' '\\''--session-id'\\'' '\\''abc-123'\\'''`,
+  );
+  // Still exactly ONE argv token after `--` — the wrap adds a quoting layer to
+  // the string, never a second argv word.
+  assert.equal(argv.length, 5);
+});
+
+test("#2395 posix: the wrap applies to the no-cwd form too", () => {
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "user@host",
+    remoteShell: "posix",
+    remoteCommand: ["claude"],
+  });
+  assert.equal(argv[argv.length - 1], `exec "$SHELL" -l -i -c 'exec '\\''claude'\\'''`);
+});
+
+test("#2395 posix: BOTH -l and -i are emitted, and $SHELL is not hardcoded to a shell name", () => {
+  // The two flags are load-bearing for different files and neither alone fixes
+  // the bug: `-l` misses nvm/`~/.local/bin` exports that live past Ubuntu
+  // `.bashrc`'s `case $- in *i*)` early return, `-i` misses `~/.profile`. And
+  // `$SHELL` rather than `bash` because a zsh/fish account must not be handed a
+  // bash login. See doc/design/ssh-panes.md.
+  const cmdString = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "posix",
+    remoteCommand: ["copilot"],
+  })[4];
+  assert.ok(cmdString.startsWith(`exec "$SHELL" -l -i -c `), `unexpected wrap prefix: ${cmdString}`);
+  assert.doesNotMatch(cmdString, /\b(bash|zsh|fish|sh) -l/, "the wrap must not name a concrete shell");
+});
+
+test("#2395 negative control: with no remoteCommand the argv is untouched — no wrap, no -t, no --", () => {
+  // The plain-login-shell form is what already worked on the reported host
+  // (sshd runs a real login shell itself), so it must not acquire the wrap.
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "user@host",
+    remoteShell: "posix",
+    remoteCwd: "/srv/app",
+    port: 2222,
+  });
+  assert.deepEqual(argv, [FAKE_SSH, "-p", "2222", "user@host"]);
+  assert.ok(!argv.some((a) => a.includes("$SHELL")));
+});
+
+test("#2395 negative control: the cmd.exe scheme is byte-identical to its pre-#2395 shape", () => {
+  // cmd.exe has no rc-file PATH problem of this shape: it has no login/
+  // non-login distinction and no per-user rc file that sshd's invocation
+  // skips, so there is nothing for a wrap to recover — and `cmd.exe` would
+  // parse `"$SHELL"` as a literal, not an expansion.
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "user@host",
+    remoteShell: "cmd",
+    remoteCwd: "C:\\repos\\app",
+    remoteCommand: ["claude", "--session-id", "abc-123"],
+  });
+  assert.equal(argv[argv.length - 1], 'cd /d "C:\\repos\\app" && "claude" "--session-id" "abc-123"');
+  assert.ok(!argv[argv.length - 1].includes("$SHELL"));
 });
 
 // ---------- adversarial quoting: cmd.exe ----------
@@ -542,6 +623,58 @@ if (!SH_AVAILABLE) {
   test("real sh injection probes — SKIPPED (no sh on PATH in this environment)", { skip: true }, () => {});
 }
 
+/** Runs a built posix remote-command string the way sshd would: hand it to a
+ *  shell as `-c <one string>`.
+ *
+ *  `SHELL` is forced rather than inherited because the #2395 wrap expands it,
+ *  and a CI runner need not have it set at all (a Windows runner typically does
+ *  not) — which would leave `exec "" -l -i -c …` and turn a quoting test into an
+ *  environment test. On the real path there is nothing to force: sshd sets
+ *  `SHELL` in the remote command's environment from the account's passwd entry,
+ *  falling back to `_PATH_BSHELL` when that field is empty
+ *  (openssh-portable `session.c`: `child_set_env(&env, &envsize, "SHELL", shell)`
+ *  over `shell = (pw->pw_shell[0] == '\0') ? _PATH_BSHELL : pw->pw_shell`), so it
+ *  is always set and always non-empty there.
+ *
+ *  Note `-i` makes bash complain about job control on stderr when stdin is not a
+ *  tty ("cannot set terminal process group"); assertions below read stdout. */
+function runRemoteStringInSh(cmdString: string, rcFile?: string): ReturnType<typeof spawnSync> {
+  const env: Record<string, string | undefined> = { ...process.env, SHELL: "/bin/sh" };
+  // POSIX `ENV`: the file an INTERACTIVE POSIX shell sources at startup — the
+  // one lever that lets a test observe "did an rc file run?" without touching
+  // the runner's HOME. `delete` rather than leave inherited, so a run that
+  // passes no rcFile cannot accidentally source the developer's own.
+  if (rcFile) env.ENV = rcFile.split(path.sep).join("/");
+  else delete env.ENV;
+  return spawnSync("sh", ["-c", cmdString], { encoding: "utf8", env });
+}
+
+const RC_FILES: string[] = [];
+process.on("exit", () => {
+  for (const f of RC_FILES) if (existsSync(f)) rmSync(f, { force: true });
+});
+
+/** Writes the rc file `runRemoteStringInSh`'s `ENV` points at. It both prints a
+ *  marker and EXPORTS one, because those are two different claims: that the rc
+ *  file ran at all, and that what it exported reaches the environment of the
+ *  program the remote command finally `exec`s — which is the shape of the actual
+ *  #2395 bug, where the missing export is `PATH`. */
+function writeRcFile(name: string): string {
+  const file = path.join(SCRATCH_DIR, `rc-${process.pid}-${name}.sh`);
+  writeFileSync(file, "echo RC-2395-SOURCED\nLOOMUX_2395_FROM_RC=on\nexport LOOMUX_2395_FROM_RC\n");
+  RC_FILES.push(file);
+  return file;
+}
+
+/** The pre-#2395 single-layer posix shape, reimplemented here on purpose: it is
+ *  the positive control for the round-trips below, so it must not move when the
+ *  builder does. Same posix quoting scheme, no `"$SHELL" -l -i -c` wrap. */
+function legacyPosixRemoteCommand(remoteCwd: string | undefined, remoteCommand: string[]): string {
+  const q = (t: string) => `'${t.replace(/'/g, `'\\''`)}'`;
+  const cmd = remoteCommand.map(q).join(" ");
+  return remoteCwd ? `cd ${q(remoteCwd)} && exec ${cmd}` : `exec ${cmd}`;
+}
+
 test("real sh: hostile token with quotes, semicolons and backticks does not inject", { skip: !SH_AVAILABLE }, () => {
   const marker = markerPath("posix-hostile");
   cleanupMarker(marker);
@@ -553,7 +686,7 @@ test("real sh: hostile token with quotes, semicolons and backticks does not inje
       remoteCommand: ["echo", hostile],
     });
     const cmdString = argv[argv.length - 1];
-    spawnSync("sh", ["-c", cmdString], { encoding: "utf8" });
+    runRemoteStringInSh(cmdString);
     assert.ok(!existsSync(marker), `injection marker was created via posix quoting: ${cmdString}`);
   } finally {
     cleanupMarker(marker);
@@ -571,7 +704,7 @@ test("real sh: remoteCwd break-out attempt fails closed, no marker", { skip: !SH
       remoteCommand: ["echo", "hi"],
     });
     const cmdString = argv[argv.length - 1];
-    spawnSync("sh", ["-c", cmdString], { encoding: "utf8" });
+    runRemoteStringInSh(cmdString);
     assert.ok(!existsSync(marker), `injection marker was created via a hostile remoteCwd: ${cmdString}`);
   } finally {
     cleanupMarker(marker);
@@ -585,8 +718,132 @@ test("real sh: benign command's literal output is observable (positive control)"
     remoteCommand: ["echo", "hello world"],
   });
   const cmdString = argv[argv.length - 1];
-  const result = spawnSync("sh", ["-c", cmdString], { encoding: "utf8" });
+  const result = runRemoteStringInSh(cmdString);
   assert.ok(result.stdout.includes("hello world"), `expected literal echo, got stdout=${result.stdout}`);
+});
+
+// ---------- #2395 round-trips through a real sh ----------
+//
+// The argv-level tests above pin the string; these EXECUTE it the way sshd does
+// — `<the account's shell> -c <one string>` — so two claims get measured rather
+// than asserted:
+//
+//  - that the wrap really re-enters an interactive LOGIN shell. The lever is
+//    POSIX `ENV`, the file an interactive POSIX shell sources at startup: the
+//    pre-#2395 shape reaches sshd's non-interactive shell, which sources
+//    nothing, so `RC-2395-SOURCED` appearing at all is the fix. That is the
+//    same mechanism as the reported bug one variable over — there it is `PATH`
+//    that an unsourced `~/.profile`/`.bashrc` never exported, and `copilot` is
+//    then not found.
+//  - that the inner command is quoted exactly ONCE more. Under-quote it and the
+//    outer shell eats the `&&`, the spaces and the `$`; over-quote it and
+//    literal quote characters reach the payload. Neither shows up in a string
+//    comparison written by the same hand that wrote the builder.
+
+test("#2395 real sh: an rc file the pre-fix shape never sourced now reaches the exec'd program", { skip: !SH_AVAILABLE }, () => {
+  const rc = writeRcFile("reaches-env");
+  const legacyInner = legacyPosixRemoteCommand(undefined, ["sh", "-c", "echo cli-sees:$LOOMUX_2395_FROM_RC"]);
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "posix",
+    remoteCommand: ["sh", "-c", "echo cli-sees:$LOOMUX_2395_FROM_RC"],
+  });
+
+  const fixed = runRemoteStringInSh(argv[argv.length - 1], rc);
+  assert.equal(fixed.status, 0, `remote string did not parse: stderr=${fixed.stderr}`);
+  assert.match(fixed.stdout, /RC-2395-SOURCED/, `the rc file did not run: stdout=${fixed.stdout}`);
+  assert.match(fixed.stdout, /cli-sees:on/, `the rc file's export did not reach the exec'd program: stdout=${fixed.stdout}`);
+
+  // The control that makes the two assertions above mean something: the SAME
+  // rc file, the SAME probe, under the pre-#2395 single-layer shape — the
+  // program still runs, and sees neither. So what changed is the shell the
+  // command runs under, not the harness.
+  const legacy = runRemoteStringInSh(legacyInner, rc);
+  assert.equal(legacy.status, 0, `control did not parse: stderr=${legacy.stderr}`);
+  assert.doesNotMatch(legacy.stdout, /RC-2395-SOURCED/);
+  assert.match(legacy.stdout, /cli-sees:$/m, `control probe did not run at all: stdout=${legacy.stdout}`);
+});
+
+test("#2395 real sh: the inner command is quoted exactly once — a quote/space/$ payload arrives verbatim", { skip: !SH_AVAILABLE }, () => {
+  // `'` proves the escape/reopen ran at both layers, `$NOT_EXPANDED_2395`
+  // proves nothing was left unquoted for a shell to expand, and the double
+  // space proves no word-splitting happened on the way through.
+  const rc = writeRcFile("verbatim");
+  const payload = "a'b  $NOT_EXPANDED_2395 c";
+  const argv = buildSshArgv(FAKE_SSH, {
+    destination: "h",
+    remoteShell: "posix",
+    remoteCommand: ["echo", payload],
+  });
+  const result = runRemoteStringInSh(argv[argv.length - 1], rc);
+  assert.equal(result.status, 0, `remote string did not parse: stderr=${result.stderr}`);
+  // The rc marker pins that this ran through the wrap, so the verbatim
+  // assertion below is a statement about TWO quoting layers, not one.
+  assert.match(result.stdout, /RC-2395-SOURCED/, `not running under the wrap: stdout=${result.stdout}`);
+  assert.equal(result.stdout.trimEnd().split("\n").pop(), payload);
+});
+
+test("#2395 real sh: a cwd with a quote, a space and a $ survives both layers", { skip: !SH_AVAILABLE }, () => {
+  // A REAL directory, so the `cd` either succeeds and the `&&` runs, or fails
+  // and nothing is echoed — the marker is the whole assertion. It lives in the
+  // same SCRATCH_DIR the injection markers use, so no temp-dir symlink (macOS's
+  // /var -> /private/var) can make the created path and the `cd` argument
+  // differ for a reason unrelated to quoting.
+  const rc = writeRcFile("hostile-cwd");
+  const dir = path.join(SCRATCH_DIR, "loomux-2395 o'brien $HOME");
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  try {
+    const argv = buildSshArgv(FAKE_SSH, {
+      destination: "h",
+      remoteShell: "posix",
+      remoteCwd: dir,
+      remoteCommand: ["echo", "CWD-2395-OK"],
+    });
+    const result = runRemoteStringInSh(argv[argv.length - 1], rc);
+    assert.match(result.stdout, /RC-2395-SOURCED/, `not running under the wrap: stdout=${result.stdout}`);
+    assert.match(
+      result.stdout,
+      /CWD-2395-OK/,
+      `cd into a quote/space/$ cwd did not survive the wrap: stdout=${result.stdout} stderr=${result.stderr}`,
+    );
+
+    // Positive control on the PAYLOAD: the same cwd under the pre-#2395
+    // single-layer shape reaches `cd` too (and, being non-interactive, sources
+    // no rc). Both shapes delivering the same directory is what makes this a
+    // statement about the added layer being inert to the payload, rather than a
+    // re-measurement of quoting that already worked.
+    const legacy = runRemoteStringInSh(legacyPosixRemoteCommand(dir, ["echo", "CWD-2395-LEGACY"]), rc);
+    assert.doesNotMatch(legacy.stdout, /RC-2395-SOURCED/);
+    assert.match(
+      legacy.stdout,
+      /CWD-2395-LEGACY/,
+      `control failed — the single-layer shape could not reach this cwd either: stderr=${legacy.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#2395 real sh: the wrapped form still refuses a remoteCwd break-out", { skip: !SH_AVAILABLE }, () => {
+  // A REGRESSION guard, not a claim about the wrap: the identical probe passes
+  // against the pre-#2395 shape too (see "real sh: remoteCwd break-out attempt
+  // fails closed" above). It is restated against the wrap so a future edit to
+  // the wrap cannot quietly reopen the hole the extra layer sits on top of.
+  const marker = markerPath("posix-2395-wrapped-breakout");
+  cleanupMarker(marker);
+  try {
+    const argv = buildSshArgv(FAKE_SSH, {
+      destination: "h",
+      remoteShell: "posix",
+      remoteCwd: `/nonexistent' && touch ${marker} && echo '`,
+      remoteCommand: ["echo", "hi"],
+    });
+    runRemoteStringInSh(argv[argv.length - 1]);
+    assert.ok(!existsSync(marker), `the wrap reopened a remoteCwd break-out: ${argv[argv.length - 1]}`);
+  } finally {
+    cleanupMarker(marker);
+  }
 });
 
 // ---------- program injection seam ----------
@@ -635,8 +892,10 @@ test("sshResumeArgv: fresh vs resume produce different command-string shapes for
   const freshCmd = freshArgv[freshArgv.length - 1];
   const resumeCmd = resumeArgv[resumeArgv.length - 1];
 
-  assert.equal(freshCmd, "exec 'claude' '--session-id' 'sess-42'");
-  assert.equal(resumeCmd, "exec 'claude' '--resume' 'sess-42'");
+  // inner (pre-#2395 shape, now the -c argument): exec 'claude' '--session-id' 'sess-42'
+  assert.equal(freshCmd, "exec \"$SHELL\" -l -i -c 'exec '\\''claude'\\'' '\\''--session-id'\\'' '\\''sess-42'\\'''");
+  // inner (pre-#2395 shape, now the -c argument): exec 'claude' '--resume' 'sess-42'
+  assert.equal(resumeCmd, "exec \"$SHELL\" -l -i -c 'exec '\\''claude'\\'' '\\''--resume'\\'' '\\''sess-42'\\'''");
   assert.notEqual(freshCmd, resumeCmd);
   // Everything else about the argv (options, destination, --) is unchanged.
   assert.deepEqual(freshArgv.slice(0, -1), resumeArgv.slice(0, -1));

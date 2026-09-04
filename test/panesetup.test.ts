@@ -425,7 +425,7 @@ test("the composed argv is a real ssh command line, end to end", () => {
     "2222",
     "dev@build.example.net",
     "--",
-    "cd '/srv/app' && exec 'claude' '--session-id' 'sess-1'",
+    "exec \"$SHELL\" -l -i -c 'cd '\\''/srv/app'\\'' && exec '\\''claude'\\'' '\\''--session-id'\\'' '\\''sess-1'\\'''",
   ]);
 });
 
@@ -727,6 +727,21 @@ test("SubmitLatch is one-shot once a submit finishes", () => {
  *  remote session" from "loomux resumed the recorded one" by reading the argv. */
 const MINT = () => "minted-id";
 
+/** Undoes #2395's outer `exec "$SHELL" -l -i -c '<inner>'` wrap, so the
+ *  assertions below stay about WHICH remote command the seam composed (fresh
+ *  vs resume, which CLI, which id) instead of restating sshcommand.ts's
+ *  quoting scheme in every regex. It ASSERTS the wrap rather than tolerating
+ *  its absence — a build that stopped emitting it fails here too — and the
+ *  byte-exact shape of the wrap itself is pinned in test/sshcommand.test.ts,
+ *  which is the module that owns it. */
+function unwrapPosixRemoteCommand(cmdString: string): string {
+  const prefix = `exec "$SHELL" -l -i -c `;
+  assert.ok(cmdString.startsWith(prefix), `expected the #2395 login-shell wrap, got: ${cmdString}`);
+  const quoted = cmdString.slice(prefix.length);
+  assert.ok(quoted.startsWith("'") && quoted.endsWith("'"), `inner not single-quoted: ${quoted}`);
+  return quoted.slice(1, -1).split(`'\\''`).join("'");
+}
+
 test("a recorded claude session reconnects in RESUME form, never a second --session-id", () => {
   // The whole point of recording the id: the remote conversation comes back
   // instead of a fresh one starting beside it. `--session-id` CREATES a session,
@@ -740,7 +755,7 @@ test("a recorded claude session reconnects in RESUME form, never a second --sess
   );
   assert.equal(mode, "resume");
   assert.equal(sessionId, "remote-sess-1", "the pane keeps the SAME identity across a reconnect");
-  const remote = argv[argv.length - 1];
+  const remote = unwrapPosixRemoteCommand(argv[argv.length - 1]);
   assert.match(remote, /'claude' '--resume' 'remote-sess-1'/, `resume form expected, got: ${remote}`);
   assert.ok(!remote.includes("--session-id"), `no create flag may survive: ${remote}`);
   assert.ok(!remote.includes("minted-id"), "a recorded session is resumed, not replaced by a fresh mint");
@@ -760,7 +775,7 @@ test("no recorded session on a claude profile MINTS one, so the reconnect is res
   );
   assert.equal(mode, "fresh");
   assert.equal(sessionId, "minted-id");
-  const remote = argv[argv.length - 1];
+  const remote = unwrapPosixRemoteCommand(argv[argv.length - 1]);
   assert.match(remote, /'claude' '--session-id' 'minted-id'/, `fresh form expected, got: ${remote}`);
   assert.ok(!remote.includes("--resume"), `nothing to resume: ${remote}`);
 });
@@ -778,7 +793,7 @@ test("a profile edited to a NON-minting CLI never receives the recorded claude i
   );
   assert.equal(mode, "fresh");
   assert.equal(sessionId, null, "no id is recorded for a CLI whose identity loomux cannot mint");
-  const remote = argv[argv.length - 1];
+  const remote = unwrapPosixRemoteCommand(argv[argv.length - 1]);
   assert.ok(!remote.includes("remote-sess-1"), `the stale id must not reach copilot: ${remote}`);
   assert.ok(!remote.includes("--session-id") && !remote.includes("--resume"), remote);
   assert.match(remote, /exec 'copilot'/);
@@ -852,7 +867,7 @@ test("the fresh ESCAPE (a recorded session that can never be resumed) forces a n
   const escape = sshReconnectArgv("ssh", profile, null, MINT);
   assert.equal(escape.mode, "fresh");
   assert.equal(escape.sessionId, "minted-id", "a NEW id, so the new conversation is itself resumable");
-  const remote = escape.argv[escape.argv.length - 1];
+  const remote = unwrapPosixRemoteCommand(escape.argv[escape.argv.length - 1]);
   assert.ok(!remote.includes(recorded), `the unresumable id must not come back: ${remote}`);
   assert.match(remote, /'claude' '--session-id' 'minted-id'/);
   // …and it is the SAME connection otherwise — the escape changes the session,
