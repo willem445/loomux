@@ -2566,7 +2566,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                     errs.push(format!(
                         "blocks[{i}] ({id}): remote: requires cli: claude{spelled} — a remote \
                          agent's session has to be identified by an id loomux minted before the \
-                         spawn, and claude is the only CLI loomux drives remotely today. pi \
+                         spawn, and claude is the only CLI that accepts one. pi \
                          accepts a pre-minted id too (--session-id), but nothing has exercised \
                          a remote pi block, so the gate stays claude-only rather than widening \
                          on an unvalidated capability. Every other CLI recognizes a session by \
