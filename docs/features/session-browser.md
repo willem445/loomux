@@ -79,7 +79,10 @@ Below that, the individual agent sessions orrerix found on this machine:
 - **pi** — `~/.pi/agent/sessions/--<your-folder>--/<timestamp>_<id>.jsonl`
   (`$PI_CODING_AGENT_SESSION_DIR` and `$PI_CODING_AGENT_DIR` are honoured, in
   that order, exactly as pi itself resolves them), titled by the first real
-  prompt and resumed with `pi --session <id>`.
+  prompt and resumed with `pi --session <id>`. If you point
+  `$PI_CODING_AGENT_SESSION_DIR` somewhere, pi writes session files straight
+  into it with no per-folder subdirectory — both shapes are read, so a store
+  you have used both ways lists everything in it.
 
 If you have moved your pi store using the `sessionDir` key in
 `~/.pi/agent/settings.json` rather than either environment variable, orrerix

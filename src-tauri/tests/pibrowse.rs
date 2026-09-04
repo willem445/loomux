@@ -315,3 +315,54 @@ fn an_absent_pi_store_contributes_nothing_and_is_not_an_error() {
     assert_eq!(stats.files_seen, 0);
     assert_eq!(stats.rows, 0);
 }
+#[test]
+fn a_flat_env_override_store_produces_rows_too() {
+    // REVIEW ROUND 1, FINDING 1, from the browser's side. Under
+    // `PI_CODING_AGENT_SESSION_DIR` pi writes session files FLAT into the named
+    // directory — no per-cwd segment (`SOURCE` `core/session-manager.ts:1521`,
+    // `:954`; its own `list` reads the dir flat at `:824`). A scanner that
+    // walked only the nested layout returned ZERO rows for such a store, with
+    // nothing red to say so, because every fixture in this file modelled the
+    // default shape.
+    let s = seam();
+    let f = write_raw(
+        &s.pi,
+        ".",
+        "20260901T090000_flat-1.jsonl",
+        "{\"type\":\"session\",\"version\":3,\"id\":\"flat-1\",\"cwd\":\"/srv/work\"}\n\
+         {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"flat store\"}}\n",
+    );
+    stamp(&f, 1_700_000_700_000);
+
+    let (rows, _) = list_sessions_for_test();
+    let pi = pi_rows(&rows);
+    assert_eq!(pi.len(), 1, "a flat store must still produce a row");
+    assert_eq!(pi[0].id, "flat-1");
+    assert_eq!(pi[0].cwd, "/srv/work");
+    assert_eq!(pi[0].title, "flat store");
+    assert_eq!(pi[0].resume_command, "pi --session flat-1");
+}
+
+#[test]
+fn both_layouts_list_together_and_neither_hides_the_other() {
+    let s = seam();
+    let flat = write_raw(
+        &s.pi,
+        ".",
+        "20260901T090000_flat-1.jsonl",
+        "{\"type\":\"session\",\"version\":3,\"id\":\"flat-1\",\"cwd\":\"/srv/work\"}\n",
+    );
+    let nested = write_session(&s.pi, "--home-dev-a--", "20260902T090000", "nested-1", "/home/dev/a", "nested");
+    stamp(&flat, 1_700_000_800_000);
+    stamp(&nested, 1_700_000_900_000);
+
+    let (rows, _) = list_sessions_for_test();
+    let ids: Vec<&str> = pi_rows(&rows).iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["nested-1", "flat-1"], "both layouts list, newest first");
+
+    // And the index (#493) keys on the file path, so it works the same for a
+    // flat store — the second scan re-uses both entries rather than re-parsing.
+    let (_, warm) = list_sessions_for_test();
+    assert_eq!(warm.parsed, 0);
+    assert_eq!(warm.reused, 2);
+}

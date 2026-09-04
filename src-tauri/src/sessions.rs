@@ -74,6 +74,7 @@ pub(crate) use loomux_engine::sessions::{
 // `use` keeps them reachable from nowhere else, exactly as before.
 use loomux_engine::sessions::{
     pi_sessions_root, read_copilot_session, scan_claude_jsonl, scan_pi_jsonl, tidy_title,
+    walk_pi_session_files,
 };
 
 // `pi_sessions_root_from` is the pure resolver behind `pi_sessions_root`; the
@@ -240,7 +241,15 @@ fn collect_copilot_candidates(out: &mut Vec<Candidate>) {
 /// Routes through the engine's testable `pi_sessions_root()` rather than a
 /// second `dirs::home_dir()` inline — the #457 gap, not reopened.
 ///
-/// Two directory levels, like claude: `<root>/--<encoded cwd>--/<file>.jsonl`.
+/// **Both of pi's layouts**, through the engine's `walk_pi_session_files` — the
+/// nested default (`<root>/--<encoded cwd>--/<file>.jsonl`) and the FLAT one an
+/// explicit `--session-dir`/`PI_CODING_AGENT_SESSION_DIR` produces. Walking only
+/// the nested shape, as this first did, meant an env-override store yielded zero
+/// rows: every `.jsonl` was `read_dir`-ed as a directory and skipped. That
+/// walker is shared with `find_pi_session_cwd` so the browser and the by-id
+/// lookup cannot disagree about where a pi store keeps its files (review round 1,
+/// finding 1); its doc carries the vendor citations.
+///
 /// A file whose metadata cannot be read is skipped (#493), and a `.jsonl` whose
 /// name carries no `_` is skipped too: it cannot be one of pi's, whose names are
 /// always `<timestamp>_<uuid>`.
@@ -248,34 +257,28 @@ fn collect_pi_candidates(out: &mut Vec<Candidate>) {
     let Some(root) = pi_sessions_root() else {
         return;
     };
-    let Ok(projects) = fs::read_dir(&root) else {
-        return;
-    };
-    for project in projects.flatten() {
-        let Ok(files) = fs::read_dir(project.path()) else {
-            continue;
+    // Always `None`, so the walk never short-circuits and every file is seen;
+    // the rows accumulate through the captured `out`.
+    walk_pi_session_files(&root, |path| -> Option<()> {
+        // The id is everything after the LAST `_` — `rsplit_once`, not
+        // `split_once`: pi's timestamp segment contains no `_` today, but a
+        // left split would silently start returning the timestamp if it ever
+        // did, and an id is the one field a resume command cannot be wrong
+        // about.
+        let id = match path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('_')) {
+            Some((_, id)) if !id.is_empty() => id.to_string(),
+            _ => return None,
         };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            // The id is everything after the LAST `_` — `rsplit_once`, not
-            // `split_once`: pi's timestamp segment contains no `_` today, but a
-            // left split would silently start returning the timestamp if it ever
-            // did, and an id is the one field a resume command cannot be wrong
-            // about. Owned before the push, so nothing borrows `path` across the
-            // move into the `Candidate`.
-            let id = match path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.rsplit_once('_')) {
-                Some((_, id)) if !id.is_empty() => id.to_string(),
-                _ => continue,
-            };
-            let Some((modified_ms, len)) = candidate_meta(&path) else {
-                continue;
-            };
-            out.push(Candidate { path, source: "pi", id: Some(id), modified_ms, len });
-        }
-    }
+        let (modified_ms, len) = candidate_meta(path)?;
+        out.push(Candidate {
+            path: path.to_path_buf(),
+            source: "pi",
+            id: Some(id),
+            modified_ms,
+            len,
+        });
+        None
+    });
 }
 
 // ---------- opencode: the human's OWN store (#722 slice C2) ----------

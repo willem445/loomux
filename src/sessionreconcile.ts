@@ -27,7 +27,7 @@
 // candidate — for any pane it touches — is refused outright rather than
 // guessed. Worst case after a refusal is exactly today's status quo.
 
-import type { SessionInfo } from "./pty.ts";
+import type { SessionSource } from "./sessionsource.ts";
 
 /** The CLIs a `listSessions()` row can name — the set this module matches panes
  *  against, and **derived from the wire type rather than re-spelled** (#2126 P2).
@@ -35,17 +35,19 @@ import type { SessionInfo } from "./pty.ts";
  *  It used to be a hand-written union whose own doc said it was
  *  `SessionInfo["source"]`, which is a claim a reader has to check. Two copies of
  *  one set is one copy too many in the direction that fails silently: a scanner
- *  added on the Rust side widens `SessionInfo["source"]` in `pty.ts`, and a
- *  `Cli` that did not follow left every pane of the new CLI unadoptable while
- *  the sidebar listed the very session it should have adopted. That is exactly
- *  what #722 fixed by hand for opencode; deriving it means the next one cannot
+ *  added on the Rust side widens the wire row's `source`, and a `Cli` that did
+ *  not follow left every pane of the new CLI unadoptable while the sidebar
+ *  listed the very session it should have adopted. That is exactly what #722
+ *  fixed by hand for opencode; sharing one definition means the next one cannot
  *  recur — `main.ts`'s `toRecords` maps `SessionInfo[]` into `SessionRecord[]`,
  *  so the two sets disagreeing is now a compile error rather than a quiet hole.
  *
- *  `import type`, so nothing at runtime is pulled in: `pty.ts` reaches
- *  `transport.ts` (the one module that may import `@tauri-apps/*`), and this
- *  module is DOM-free and I/O-free by design. A type-only import is erased. */
-export type Cli = SessionInfo["source"];
+ *  Taken from the LEAF (`sessionsource.ts`) rather than from `pty.ts`, which
+ *  would be a new import cycle — review round 1 finding 2; that module's doc has
+ *  the argument. `import type` either way, so nothing at runtime is pulled in:
+ *  `pty.ts` reaches `transport.ts` (the one module that may import
+ *  `@tauri-apps/*`) and this module is DOM-free and I/O-free by design. */
+export type Cli = SessionSource;
 
 /** Just enough of a `listSessions()` row to match against, for both functions
  *  below. main.ts maps the backend's `SessionInfo[]` (source→cli, modified_ms
