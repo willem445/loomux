@@ -2286,8 +2286,7 @@ impl DriveEntry {
     /// `fix-wait` is not answered again after it pushes. The same round, the
     /// same answer, once.
     pub fn kickback_owed(&self) -> bool {
-        let handed_back = self.state == DriveState::FixWait
-            || (self.state == DriveState::CiWait && self.fix_pushed());
+        let handed_back = self.state == DriveState::FixWait;
         handed_back && self.fix_kickback_ms < self.fix_handback_ms
     }
 
