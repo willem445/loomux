@@ -402,6 +402,7 @@ impl HarnessEvent {
                 | HarnessEvent::PermissionRequest { .. }
                 | HarnessEvent::PermissionSettled { .. }
                 | HarnessEvent::TurnEnded { .. }
+                | HarnessEvent::Text { .. }
                 | HarnessEvent::Exited { .. }
         )
     }
